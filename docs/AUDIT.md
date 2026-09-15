@@ -78,8 +78,8 @@ data or rely on their own internal caches, e.g. the etherscan client).
 | Tx lookups | `chains/<chain>/tx/<hash>/{receipt.json,status,block_number,gas_used,logs.json,full.json}` | shipped | `chains.rs` (eth_getTransactionByHash + receipt) |
 | Etherscan history (txs, internal, ERC-20, ERC-721, source, abi) | `chains/<chain>/addresses/<a>/{txs,internal_txs,erc20_txs,erc721_txs}` and `chains/<chain>/contracts/<a>/{source,abi}` | shipped | `chains_history.rs` + `crates/bloom-etherscan/src/lib.rs` (TTL cache in `cache.rs`) |
 | Wallets: VFS-driven creation (local / import / watch) | `wallets/new` (writable) | shipped | `wallets.rs::write_new_wallet` + `parse_new_wallet_spec` |
-| Wallets: metadata, balance, nonce, policy round-trip | `wallets/<w>/{address,public_key,kind,policy.json,chains/<c>/{balance,balance.raw,balance.json,nonce}}` | shipped | `wallets.rs`; covered by outbox tests + `acceptance.sh` |
-| Wallets: outbox stage / confirm | `wallets/<w>/chains/<c>/outbox/{new.tx,pending/<id>/{plan.md,policy_check.json,confirm},sent/<id>/*,failed/<id>/*}` | shipped | `wallets.rs::write_outbox` → `crates/bloom-tx/src/tx_engine.rs`. Intents: `send` (native + ERC-20), `approve`, `call`, `raw`, plus NFT writes — `nft_transfer` (auto-detects ERC-721 vs ERC-1155, optional `safe`/`amount`/`data`), `nft_approve` (per-token, ERC-721 only), `nft_approve_all` (`setApprovalForAll`, policy-warned). |
+| Wallets: metadata, balance, nonce, policy round-trip | `wallets/<w>/{kind,policy.json}`, `wallets/<w>/0/{address,public_key,chains/<c>/{balance,balance.raw,balance.json,nonce}}` | shipped | `wallets.rs`; covered by outbox tests + `acceptance.sh` |
+| Wallets: outbox stage / confirm | `wallets/<w>/0/chains/<c>/outbox/{new.tx,pending/<id>/{plan.md,policy_check.json,confirm},sent/<id>/*,failed/<id>/*}` | shipped | `wallets.rs::write_outbox` → `crates/bloom-tx/src/tx_engine.rs`. Intents: `send` (native + ERC-20), `approve`, `call`, `raw`, plus NFT writes — `nft_transfer` (auto-detects ERC-721 vs ERC-1155, optional `safe`/`amount`/`data`), `nft_approve` (per-token, ERC-721 only), `nft_approve_all` (`setApprovalForAll`, policy-warned). |
 | Wallets: sign — EIP-191 + raw hash + EIP-712 | `wallets/<w>/sign/{message,hash,typed_data}` (+ `.sig`) | shipped | `wallets.rs::write_sign` |
 | DeFi (Enso intents, route quoting, stage-confirm) | `petals/enso/intents/<wallet>/{new,<sess>/{intent.txt,route.json,plan.md,tx.json,simulation.json,confirm}}` | extracted to Petal | [`bloom-petal-enso`](https://github.com/bloom-directory/bloom-petal-enso); installed applications mount through `crates/bloom-petals` |
 | Watch (subscriptions, executor task, events tail) | `watch/{new,<id>/{spec.toml,live,history.jsonl[.n],delete}}` | shipped | `crates/bloom-vfs/src/handlers/watch.rs` + `crates/bloom-watch/src/{lib.rs,executor.rs}`; executor started by `Daemon::from_home` |
@@ -104,7 +104,7 @@ data or rely on their own internal caches, e.g. the etherscan client).
 | `chains/<c>/mempool/by_address/<a>/...` | rpc | `chains_mempool::by_address` |
 | `chains/<c>/mempool/by_pool/<a>/recent.jsonl` | rpc | `chains_mempool::by_pool` |
 | `chains/<c>/mempool/<hash>/{tx,decoded,status}` | rpc | `chains_mempool::tx_hash_subtree` |
-| `wallets/<w>/chains/<c>/pending_external.jsonl` | rpc | `bloom-vfs/src/handlers/wallets.rs` |
+| `wallets/<w>/0/chains/<c>/pending_external.jsonl` | rpc | `bloom-vfs/src/handlers/wallets.rs` |
 | `wallets/<w>/outbox/sent/<h>/{bump.tx,cancel.tx,bump_advice.json}` | local | `bloom-tx::bump_scanner` |
 | `wallets/<w>/outbox/pending/<id>/{mev_risk.json,nonce_conflict.json}` | local | `bloom-tx::tx_engine::stage` |
 | `status/backends/{mempool,private_rpc}` | local | `bloom-vfs/src/handlers/status.rs` |

@@ -39,7 +39,7 @@ Petals before choosing paths; their names and availability vary by installation.
 
 `chains/` is EVM-only. Solana status lives under
 `status/chains/<solana-chain>/`; account reads live under
-`wallets/<wallet>/chains/<solana-chain>/`. Native `defi/intents` and
+`wallets/<wallet>/0/chains/<solana-chain>/`. Native `defi/intents` and
 Hyperliquid routes are retired; discover installed Petals instead.
 
 ## Reads
@@ -63,7 +63,7 @@ Representative paths, relative to the mount:
 | ENS / price | `ens/<name>/address`, `prices/spot/eth.usd` |
 | Wallet identity | `wallets/<wallet>/{kind,projection.json,accounts.json}` |
 | Account keys | `wallets/<wallet>/<n>/{account.json,address.evm,address.sol,public_key}` |
-| Solana account | `wallets/<wallet>/chains/<chain>/accounts/<full-fingerprint>/{address,balance,balance.raw,balance.json}` |
+| Solana account | `wallets/<wallet>/0/chains/<chain>/accounts/<full-fingerprint>/{address,balance,balance.raw,balance.json}` |
 | Solana status | `status/chains/<chain>/{status.json,slot,block_height}` |
 
 Braces above abbreviate separate leaves, not action selectors. Solana
@@ -74,7 +74,8 @@ identity; never select by list position.
 
 Numbered accounts live at `wallets/<wallet>/<n>/`: read `account.json` to
 verify the keys, then use `chains/<chain>/outbox/` beneath that account to
-stage and inspect its transactions. Wallet-level outboxes use account 0.
+stage and inspect its transactions. Use the explicit `0` account path for the
+initial account; no wallet-root chain alias exists.
 Address, QR, and public-key files exist only beneath a numbered account.
 Delegated sessions live beneath the numbered account at
 `sessions/<petal>/<key-slot>/`; installed Petals are mounted only at
@@ -91,7 +92,7 @@ transaction was not submitted.
 | Operation | Route / procedure |
 |---|---|
 | Register wallet | `wallets/new`; [wallet creation](./examples.md#creating-a-wallet) |
-| EVM transaction | `wallets/<wallet>/chains/<chain>/outbox/new.tx`; [Anvil workflow](./examples.md#local-anvil-transaction) |
+| EVM transaction | `wallets/<wallet>/0/chains/<chain>/outbox/new.tx`; [Anvil workflow](./examples.md#local-anvil-transaction) |
 | Solana transaction | Same outbox shape with strict JSON; [Solana workflow](./examples.md#solana-account-aware-reads-and-transfer) |
 | Update policy | `wallets/<wallet>/policy.json`; [policy workflow](./examples.md#updating-wallet-policy) |
 | Reusable authority | `wallets/<wallet>/sealed-approvals/` |

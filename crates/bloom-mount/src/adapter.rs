@@ -2033,8 +2033,8 @@ mod tests {
             "/wallets/minnow/sign/message",
             "/wallets/minnow/sign/hash",
             "/wallets/minnow/sign/typed_data",
-            "/wallets/minnow/chains/polygon/outbox/pending/0001/cancel",
-            "/wallets/minnow/chains/polygon/outbox/pending/0001/replace",
+            "/wallets/minnow/0/chains/polygon/outbox/pending/0001/cancel",
+            "/wallets/minnow/0/chains/polygon/outbox/pending/0001/replace",
         ] {
             let p = VfsPath::parse(path).unwrap();
             assert!(mount_write_path_uses_wallet_signer(&p), "{path}");

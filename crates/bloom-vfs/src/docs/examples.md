@@ -22,26 +22,26 @@ ls "$BLOOM/wallets/"
 cat "$BLOOM/chains/anvil/chain_id"
 cat "$BLOOM/wallets/alice/projection.json"
 
-# 2. Stage once. The wallet-level path spends from account 0; a numbered
-#    path (wallets/alice/1/chains/...) spends from that account's key and
-#    sees only its own outbox entries.
+# 2. Stage once through an explicit account path. Account 0 is the initial
+#    account; any other numbered path (wallets/alice/1/chains/...) spends
+#    from that account's key and sees only its own outbox entries.
 printf 'send 0.01 ETH to 0x0000000000000000000000000000000000000001\n' \
-  > "$BLOOM/wallets/alice/chains/anvil/outbox/new.tx"
+  > "$BLOOM/wallets/alice/0/chains/anvil/outbox/new.tx"
 
 # 3. List pending actions. Set ID to the exact entry created by this staging
 #    operation after matching its intent; do not choose by ordering.
-ls "$BLOOM/wallets/alice/chains/anvil/outbox/pending/"
+ls "$BLOOM/wallets/alice/0/chains/anvil/outbox/pending/"
 ID="<exact-id>"
-cat "$BLOOM/wallets/alice/chains/anvil/outbox/pending/$ID/intent.json"
-cat "$BLOOM/wallets/alice/chains/anvil/outbox/pending/$ID/plan.md"
+cat "$BLOOM/wallets/alice/0/chains/anvil/outbox/pending/$ID/intent.json"
+cat "$BLOOM/wallets/alice/0/chains/anvil/outbox/pending/$ID/plan.md"
 
 # 4. Confirm only that inspected action.
-echo y > "$BLOOM/wallets/alice/chains/anvil/outbox/pending/$ID/confirm"
+echo y > "$BLOOM/wallets/alice/0/chains/anvil/outbox/pending/$ID/confirm"
 
 # 5. Inspect the resulting state; a pending action may still need approval.
-ls "$BLOOM/wallets/alice/chains/anvil/outbox/pending/"
-ls "$BLOOM/wallets/alice/chains/anvil/outbox/sent/"
-ls "$BLOOM/wallets/alice/chains/anvil/outbox/failed/"
+ls "$BLOOM/wallets/alice/0/chains/anvil/outbox/pending/"
+ls "$BLOOM/wallets/alice/0/chains/anvil/outbox/sent/"
+ls "$BLOOM/wallets/alice/0/chains/anvil/outbox/failed/"
 ```
 
 If confirmation requires fresh approval, read this exact pending action's
@@ -55,7 +55,7 @@ reporting success; listing `sent/` alone does not prove confirmation. A missing
 pending path or transport error is not a reason to repeat the write. Never use
 a glob, list position, or `latest` as action identity.
 
-The wallet-level outbox above spends from account 0. For another account,
+The explicit account-0 outbox above spends from account 0. For another account,
 verify `wallets/alice/<n>/account.json` and use
 `wallets/alice/<n>/chains/anvil/outbox/` throughout the same procedure.
 Numbered outboxes expose only actions staged by that account.
@@ -95,8 +95,8 @@ mount. Those inputs stay inside the Broker-hosted browser ceremony.
 #    projection. Do not select by position.
 cat "$BLOOM/wallets/alice/accounts.json"
 FP="<full-fingerprint>"
-cat "$BLOOM/wallets/alice/chains/solana/accounts/$FP/address"
-cat "$BLOOM/wallets/alice/chains/solana/accounts/$FP/balance.json"
+cat "$BLOOM/wallets/alice/0/chains/solana/accounts/$FP/address"
+cat "$BLOOM/wallets/alice/0/chains/solana/accounts/$FP/balance.json"
 cat "$BLOOM/status/chains/<solana-chain>/status.json"
 
 # 2. Match the fingerprint to its account number in accounts.json.
@@ -152,7 +152,7 @@ cat "$BLOOM/chains/ethereum/contracts/<contract>/nft/owner_of/<token-id>"
 
 # Stage an ERC-721 transfer, then use the exact transaction loop above.
 printf 'nft transfer <contract> <token-id> to <recipient>\n' \
-  > "$BLOOM/wallets/alice/chains/ethereum/outbox/new.tx"
+  > "$BLOOM/wallets/alice/0/chains/ethereum/outbox/new.tx"
 ```
 
 Inspect `plan.md` before confirmation. Operator-wide approval is broader than

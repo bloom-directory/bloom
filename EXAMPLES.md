@@ -51,12 +51,12 @@ and never accept secret material through the mount.
 ```sh
 printf '%s\n' \
   'send 0.01 eth to 0x70997970C51812dc3A010C7d01b50e0d17dc79C8 on anvil' \
-  > /bloom/wallets/alice/chains/anvil/outbox/new.tx
+  > /bloom/wallets/alice/0/chains/anvil/outbox/new.tx
 
-ls /bloom/wallets/alice/chains/anvil/outbox/pending
-cat /bloom/wallets/alice/chains/anvil/outbox/pending/<id>/plan.md
+ls /bloom/wallets/alice/0/chains/anvil/outbox/pending
+cat /bloom/wallets/alice/0/chains/anvil/outbox/pending/<id>/plan.md
 printf 'confirm\n' \
-  > /bloom/wallets/alice/chains/anvil/outbox/pending/<id>/confirm
+  > /bloom/wallets/alice/0/chains/anvil/outbox/pending/<id>/confirm
 ```
 
 If fresh owner approval is required, the write returns permission denied after

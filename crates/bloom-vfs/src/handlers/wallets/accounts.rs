@@ -3,19 +3,19 @@
 //! A number is a presentation of two derivation paths, EVM
 //! `m/44'/60'/0'/0/<n>` and Solana `m/44'/501'/<n>'/0'`, computed here from
 //! the authenticated projection and never stored or sent anywhere. The
-//! directory re-roots the wallet's chain views at that account's keys: the
-//! same balance, nonce and outbox code as `wallets/<wallet>/chains/...`, with
-//! the sender fixed to the account's key for the chain's family instead of
-//! the wallet's canonical initial key.
+//! wallet's chain views live here and nowhere above: `<n>/chains/<chain>/`
+//! reads balance, nonce and outbox through the account's key for the chain's
+//! family.
 //!
-//! Writes go through the same outbox code with the sender fixed: an EVM stage
-//! is built for the account's address and later signed by the key the
+//! Writes go through the outbox code with the sender fixed: an EVM stage is
+//! built for the account's address and later signed by the key the
 //! transaction engine resolves from that address; a Solana stage pins the
 //! account's fingerprint. Pending controls under `<n>/` act only on entries
 //! that account staged.
 //!
-//! The key files ([`ACCOUNT_KEY_FILES`]) live here and nowhere above: the
-//! wallet directory holds the numbered accounts and wallet-wide state only.
+//! The key files ([`ACCOUNT_KEY_FILES`]) and `chains/` live here and nowhere
+//! above: the wallet directory holds the numbered accounts and wallet-wide
+//! state only.
 //! Installed Petals are never mounted under an account; they live at the
 //! VFS root's `petals/`.
 
@@ -61,48 +61,6 @@ impl FamilyKey {
     /// against (EVM, case-insensitively).
     pub(super) fn address(&self) -> &str {
         &self.address
-    }
-}
-
-/// The sender filter one scoped outbox surface is fenced by.
-///
-/// `Unfiltered` is produced only for an `accounts_unavailable` projection
-/// with no root key: the numbered tree is empty then, so there is no other
-/// account to leak, and owners keep their history. It never applies to
-/// writes.
-#[derive(Clone, Copy, Debug)]
-pub(super) enum OutboxScope<'a> {
-    /// Only entries this family key staged are visible and controllable.
-    Key(&'a FamilyKey),
-    /// No sender filter (the `accounts_unavailable` read fallback).
-    Unfiltered,
-    /// No account-0 key for this family: nothing is visible here.
-    Empty,
-}
-
-/// The wallet-level outbox resolution, per the Wallet contract: the
-/// wallet-level surface is account 0's outbox with the numbered fence.
-pub(super) enum WalletOutboxScope {
-    /// Account 0's key for the chain's family.
-    Account0(Box<FamilyKey>),
-    /// The projection reports `accounts_unavailable` and the wallet has no
-    /// root key (every derived child retired). Reads stay unfiltered;
-    /// writes are refused naming that reason. A root-key wallet (legacy
-    /// BIP-32 custody reports unavailable too) keeps its root as account 0.
-    Unavailable,
-    /// No account 0, or no account-0 key for this family. The
-    /// wallet-level outbox shows nothing and writes fail.
-    Empty,
-}
-
-impl WalletOutboxScope {
-    /// The read scope the shared outbox implementations take.
-    pub(super) fn read_scope(&self) -> OutboxScope<'_> {
-        match self {
-            Self::Account0(family) => OutboxScope::Key(family),
-            Self::Unavailable => OutboxScope::Unfiltered,
-            Self::Empty => OutboxScope::Empty,
-        }
     }
 }
 

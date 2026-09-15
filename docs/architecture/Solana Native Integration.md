@@ -67,7 +67,7 @@ chain Bloom talks to directly.
   `reqwest`-based transport reimplements alloy's retry/throttle/fallback/probe
   pattern on top of those shared pieces rather than the `alloy` stack itself.
 - **Mount surface unchanged.** Solana chains route through the existing
-  `wallets/<wallet>/chains/<chain>/...` VFS family alongside EVM chains —
+  `wallets/<wallet>/0/chains/<chain>/...` VFS family alongside EVM chains —
   same outbox route shape (`outbox/new.tx`, `outbox/pending/<id>/{confirm,cancel}`,
   `outbox/{pending,sent,failed}/<id>/...`), dispatched to a Solana transfer
   engine instead of the EVM `TxEngine` when the chain name resolves to one.
@@ -141,7 +141,7 @@ Genesis reporting distinguishes three states rather than two:
 
 ## Reading Solana state through the VFS
 
-Solana chains appear beside EVM chains under `wallets/<wallet>/chains/` and
+Solana chains appear beside EVM chains under `wallets/<wallet>/0/chains/` and
 in the global `status/chains/` tree. Two rules shape the surface.
 
 **Accounts are addressed by full fingerprint.** The canonical per-account
