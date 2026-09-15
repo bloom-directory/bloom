@@ -91,7 +91,7 @@ transaction was not submitted.
 | EVM transaction | `wallets/<wallet>/chains/<chain>/outbox/new.tx`; [Anvil workflow](./examples.md#local-anvil-transaction) |
 | Solana transaction | Same outbox shape with strict JSON; [Solana workflow](./examples.md#solana-account-aware-reads-and-transfer) |
 | Update policy | `wallets/<wallet>/policy.json`; [policy workflow](./examples.md#updating-wallet-policy) |
-| Reusable authority | `wallets/<wallet>/sealed-approvals/` and `capabilities/` beneath the wallet |
+| Reusable authority | `wallets/<wallet>/sealed-approvals/` |
 | Petal operation | `petals/<name>/`; [installed package workflow](./examples.md#installed-petal-workflow) |
 | Paid HTTP | `requests/`; inspect plan, wallet, payment protocol, cap, approval, and receipt |
 

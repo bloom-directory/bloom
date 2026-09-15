@@ -46,8 +46,6 @@ pub struct Config {
     pub solana_chains: BTreeMap<String, SolanaSpec>,
     #[serde(default)]
     pub etherscan: Option<EtherscanConfig>,
-    #[serde(default)]
-    pub enso: Option<EnsoConfig>,
     /// Trusted, daemon-owned runtime settings for installed Petals.
     /// Endpoint overrides are matched to named manifest bindings and may only
     /// replace the HTTPS authority; the signed method/path policy remains the
@@ -214,13 +212,6 @@ pub struct EtherscanConfig {
     pub api_url: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EnsoConfig {
-    pub api_key: String,
-    #[serde(default = "default_enso_url")]
-    pub api_url: String,
-}
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MempoolChainConfig {
     /// Provider id — must match a `bloom_mempool::providers::*` adapter
@@ -253,9 +244,6 @@ fn default_stage_ttl() -> std::time::Duration {
 }
 fn default_etherscan_url() -> String {
     "https://api.etherscan.io/v2/api".to_string()
-}
-fn default_enso_url() -> String {
-    "https://api.enso.finance".to_string()
 }
 fn default_max_index_size() -> usize {
     50_000
@@ -411,6 +399,7 @@ fn default_chains() -> BTreeMap<String, ChainSpec> {
             "HyperEVM",
             "HYPE",
         ),
+        evm_chain("arc", 5_042, &["https://rpc.arc-scan.org"], "Arc", "USDC"),
         ChainSpec::anvil_default(),
     ] {
         chains.insert(spec.name.clone(), spec);
@@ -452,7 +441,6 @@ impl Config {
                 },
             )]),
             etherscan: None,
-            enso: None,
             petals: PetalsConfig::default(),
             mempool: BTreeMap::new(),
             private_rpc: BTreeMap::new(),
@@ -743,9 +731,8 @@ mod tests {
         assert_eq!(cfg.mount_path, "/bloom");
         assert_eq!(cfg.nfs_listen_addr, "127.0.0.1:12049");
         assert!(cfg.etherscan.is_none());
-        assert!(cfg.enso.is_none());
         assert_eq!(cfg.petals.preinstalled, default_preinstalled_petals());
-        assert_eq!(cfg.chains.len(), 13);
+        assert_eq!(cfg.chains.len(), 14);
         assert_eq!(cfg.solana_chains.len(), 1);
         let solana = cfg
             .solana_chains
@@ -777,6 +764,12 @@ mod tests {
         assert_eq!(robinhood.native_symbol, "ETH");
         let hyperliquid = cfg.chains.get("hyperliquid").expect("hyperliquid entry");
         assert_eq!(hyperliquid.chain_id, 999);
+        let arc = cfg.chains.get("arc").expect("Arc entry");
+        assert_eq!(arc.chain_id, 5_042);
+        assert_eq!(arc.rpc_urls, vec!["https://rpc.arc-scan.org"]);
+        assert_eq!(arc.display_name.as_deref(), Some("Arc"));
+        assert_eq!(arc.native_symbol, "USDC");
+        assert_eq!(arc.native_decimals, 18);
         let anvil = cfg.chains.get("anvil").expect("anvil entry");
         assert_eq!(anvil.chain_id, 31337);
         assert!(!anvil.rpc_urls.is_empty());
@@ -1363,7 +1356,7 @@ rpc_urls = ["http://127.0.0.1:8545"]
     }
 
     #[test]
-    fn etherscan_and_enso_blocks_parse() {
+    fn etherscan_block_parses() {
         let toml_text = r#"
 default_chain = "anvil"
 
@@ -1374,17 +1367,11 @@ rpc_urls = ["http://127.0.0.1:8545"]
 
 [etherscan]
 api_key = "ESKEY"
-
-[enso]
-api_key = "ENKEY"
 "#;
         let cfg: Config = toml::from_str(toml_text).unwrap();
         let es = cfg.etherscan.expect("etherscan parsed");
         assert_eq!(es.api_key, "ESKEY");
         assert_eq!(es.api_url, "https://api.etherscan.io/v2/api");
-        let en = cfg.enso.expect("enso parsed");
-        assert_eq!(en.api_key, "ENKEY");
-        assert_eq!(en.api_url, "https://api.enso.finance");
     }
 
     #[test]
