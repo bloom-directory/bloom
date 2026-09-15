@@ -1798,12 +1798,21 @@ fn write_path_uses_wallet_signer(path: &VfsPath) -> bool {
         // Cancel/replace consume a signer and are not fully covered by the
         // outbox-confirm review-hash marker flow, so they must use
         // write_unlocked rather than a plain IPC write.
-        [root, _wallet, chains, _chain, outbox, pending, _id, action]
-            if root == "wallets"
-                && chains == "chains"
-                && outbox == "outbox"
-                && pending == "pending"
-                && matches!(action.as_str(), "cancel" | "replace") =>
+        [
+            root,
+            _wallet,
+            _account,
+            chains,
+            _chain,
+            outbox,
+            pending,
+            _id,
+            action,
+        ] if root == "wallets"
+            && chains == "chains"
+            && outbox == "outbox"
+            && pending == "pending"
+            && matches!(action.as_str(), "cancel" | "replace") =>
         {
             true
         }
@@ -3091,8 +3100,8 @@ summary = "Demo app used by IPC tests."
             "/wallets/minnow/policy.json",
             "/wallets/minnow/sealed-approvals/new.json",
             "/wallets/minnow/sealed-approvals/approval-1/revoke",
-            "/wallets/minnow/chains/polygon/outbox/new.tx",
-            "/wallets/minnow/chains/polygon/outbox/pending/0001/confirm",
+            "/wallets/minnow/0/chains/polygon/outbox/new.tx",
+            "/wallets/minnow/0/chains/polygon/outbox/pending/0001/confirm",
             // Paid-request confirm reaches its Broker exact-signing handler.
             "/requests/latest/confirm",
             "/requests/req_123/confirm",
@@ -3105,8 +3114,8 @@ summary = "Demo app used by IPC tests."
         }
 
         for path in [
-            "/wallets/minnow/chains/polygon/outbox/pending/0001/cancel",
-            "/wallets/minnow/chains/polygon/outbox/pending/0001/replace",
+            "/wallets/minnow/0/chains/polygon/outbox/pending/0001/cancel",
+            "/wallets/minnow/0/chains/polygon/outbox/pending/0001/replace",
         ] {
             let p = VfsPath::parse(path).unwrap();
             assert!(write_path_uses_wallet_signer(&p), "{path}");
@@ -3124,7 +3133,7 @@ summary = "Demo app used by IPC tests."
                     method: "write".into(),
                     params: json!({
                         "path": format!(
-                            "/wallets/minnow/chains/base/outbox/pending/tx-1/{action}"
+                            "/wallets/minnow/0/chains/base/outbox/pending/tx-1/{action}"
                         ),
                         "bytes_b64": B64.encode(b"body"),
                     }),

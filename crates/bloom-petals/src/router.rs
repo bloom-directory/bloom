@@ -135,10 +135,9 @@ impl PetalRouter {
 }
 
 impl PetalRouter {
-    /// The router scoped to one numbered account. The daemon's
-    /// `AccountPetalMount` implementation delegates here; it cannot
-    /// implement the trait itself because the session inventory and stop
-    /// live in the daemon, next to the Broker edge and the key-state files.
+    /// The router scoped to one numbered account. No VFS mount uses it:
+    /// installed Petals are mounted only at the root `petals/`, never under
+    /// `wallets/<w>/<n>/`.
     pub fn for_account(&self, account: AccountPetalContext) -> Arc<dyn Handler> {
         let mut router = self.clone();
         router.account = Some(account);

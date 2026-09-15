@@ -799,7 +799,7 @@ run_machine_with_deadline \
 
 run_login_with_deadline \
   "$work/cached-wallet-address.log" \
-  /bin/cat "$mount_dir/wallets/$wallet_id/address" || {
+  /bin/cat "$mount_dir/wallets/$wallet_id/0/address.evm" || {
   cat "$work/cached-wallet-address.log" >&2
   echo "packaged Machine did not preserve cached reads through its kernel mount" >&2
   exit 1
@@ -809,7 +809,7 @@ grep -Fx "$wallet_address" "$work/cached-wallet-address.log" >/dev/null
 degraded_intent="send 0.000000000000000001 eth to $wallet_address on anvil"
 mounted_write_with_deadline \
   "$work/stage.log" \
-  "$mount_dir/wallets/$wallet_id/chains/anvil/outbox/new.tx" \
+  "$mount_dir/wallets/$wallet_id/0/chains/anvil/outbox/new.tx" \
   "$degraded_intent" || {
   cat "$work/stage.log" >&2
   echo "packaged Machine did not preserve unsigned staging through its kernel mount with Broker stopped" >&2
@@ -853,7 +853,7 @@ jq -e \
 
 run_login_with_deadline \
   "$work/pending.log" \
-  /bin/ls -1 "$mount_dir/wallets/$wallet_id/chains/anvil/outbox/pending"
+  /bin/ls -1 "$mount_dir/wallets/$wallet_id/0/chains/anvil/outbox/pending"
 staged_id="$(sed -n '1p' "$work/pending.log")"
 [[ -n "$staged_id" ]] || {
   cat "$work/pending.log" >&2
@@ -863,7 +863,7 @@ staged_id="$(sed -n '1p' "$work/pending.log")"
 signing_audit_start="$(audit_sequence)"
 if mounted_write_with_deadline \
   "$work/signing.log" \
-  "$mount_dir/wallets/$wallet_id/chains/anvil/outbox/pending/$staged_id/confirm" \
+  "$mount_dir/wallets/$wallet_id/0/chains/anvil/outbox/pending/$staged_id/confirm" \
   y
 then
   signing_status=0
@@ -877,7 +877,7 @@ fi
 }
 assert_mounted_effect_denied \
   signing \
-  "/wallets/$wallet_id/chains/anvil/outbox/pending/$staged_id/confirm" \
+  "/wallets/$wallet_id/0/chains/anvil/outbox/pending/$staged_id/confirm" \
   y \
   "$signing_audit_start"
 # macOS NFS may acknowledge a close before surfacing a handler denial. The
@@ -886,7 +886,7 @@ assert_mounted_effect_denied \
 run_login_with_deadline \
   "$work/signing-pending.log" \
   /bin/test -d \
-  "$mount_dir/wallets/$wallet_id/chains/anvil/outbox/pending/$staged_id" || {
+  "$mount_dir/wallets/$wallet_id/0/chains/anvil/outbox/pending/$staged_id" || {
   cat "$work/signing.log" >&2
   echo "packaged Machine changed pending signing state without Broker authority" >&2
   exit 1
@@ -894,7 +894,7 @@ run_login_with_deadline \
 if run_login_with_deadline \
   "$work/signing-sent.log" \
   /bin/test -e \
-  "$mount_dir/wallets/$wallet_id/chains/anvil/outbox/sent/$staged_id"
+  "$mount_dir/wallets/$wallet_id/0/chains/anvil/outbox/sent/$staged_id"
 then
   echo "packaged Machine produced a sent transaction without Broker authority" >&2
   exit 1

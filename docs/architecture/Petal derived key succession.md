@@ -560,7 +560,7 @@ the attack surface. The safe default is one active package per lineage.
 
 ## Sessions, stop, and the install guard
 
-Every key a Petal derives through a numbered account is mounted at
+Every key a Petal derives from one of an account's family keys is mounted at
 `wallets/<wallet>/<n>/sessions/<petal>/<key-slot>/session.json` with a sibling
 `stop` write. The document reports the delegating owner, the delegated key,
 the scope, the recorded approvals, and a truthful `signing_authority`

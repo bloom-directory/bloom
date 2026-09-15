@@ -1,8 +1,9 @@
 # Bloom triad release package
 
 `compatibility-v1.toml` is the closed v1 service matrix. It declares each edge
-independently: the Machine–Broker and Broker–Signer authority APIs require
-exactly 1.4, while Signer control and login-session liveness accept 1.0–1.1.
+independently: the Machine–Broker and Broker–Signer authority APIs each require
+one exact minor, while Signer control and login-session liveness accept a range.
+`triad_release` checks every range against the API crate at the pinned revision.
 Service packages may advance independently when every edge remains inside its
 declared range; incompatible edges fail closed.
 It also records the reviewed Broker, Signer, service-runtime, and
@@ -122,8 +123,8 @@ of these private files: its guarded live installer uses the same fresh
 root-owned identity-generation path as the production Unix-principal claim.
 On Linux, Bloom uses the host system clock behind its durable rollback and
 same-boot forward-step guards; it does not install or require a separate time
-daemon. AWS credentials and `aws-kms-ip-allow.conf` are an optional paired
-site overlay.
+daemon. The released Signer has no AWS KMS backend, so the Linux installer
+refuses AWS credentials or `aws-kms-ip-allow.conf` in the payload.
 
 The Linux archive generates a complete fresh per-login enrollment from
 packaged public templates and the host CSPRNG; it does not require site-specific
