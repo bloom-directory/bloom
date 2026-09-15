@@ -142,8 +142,11 @@ jobs:
         with:
           name: nextest-archive
           path: target
-      - name: Run library unit tests from archive
-        run: cargo nextest run --archive-file target/nextest-archive.tar.zst -E 'kind(lib)' --no-fail-fast
+      # Binary-target unit tests (kind(bin): the bin-only `bloom` crate and
+      # `bloom-machine`'s binary) are invisible to kind(lib) alone, so the
+      # triad enrollment regression tests never ran before this filter.
+      - name: Run library and binary unit tests from archive
+        run: cargo nextest run --archive-file target/nextest-archive.tar.zst -E 'kind(lib) or kind(bin)' --no-fail-fast
 
   integration_test:
     name: local integration tests
