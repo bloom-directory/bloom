@@ -5954,10 +5954,11 @@ value = "0""#
     }
 
     /// EVM cancel and replace produce new signatures, so they must stop at
-    /// Broker exact signing. Through both spellings of account 0's route,
-    /// with no signing edge and with one whose chain is unreachable, neither
-    /// control signs, broadcasts, or leaves action artifacts. Account 1's
-    /// entry is not addressable through account 0's numbered route either.
+    /// Broker exact signing. Through the router, for both spellings of
+    /// account 0's route, with no signing edge and with one whose Broker
+    /// refuses to answer, neither control signs, broadcasts, or leaves action
+    /// artifacts. Account 1's entry is not addressable through account 0's
+    /// numbered route either. The engine tests cover the approved path.
     #[tokio::test]
     async fn evm_cancel_and_replace_fail_closed_for_both_account_zero_spellings() {
         let f = make_handler_with_chain(true);
@@ -5970,31 +5971,49 @@ value = "0""#
         ));
         without_signing.wallet_projections = Some(projection);
         without_signing.broker = Some(MachineBrokerClient::new(broker.clone()));
+        // Both shipped installer catalogs authorize these classes, so the
+        // Broker approval is what stands between the write and a signature.
+        let mut catalog = evm_outbox_catalog();
+        for class in ["transaction.cancel", "transaction.replace"] {
+            let mut record = catalog.records[0].clone();
+            record.subject = bloom_broker_api::ProvenanceSubject::System {
+                component_id: bloom_broker_api::Token::new("bloom-machine").unwrap(),
+                operation_class: bloom_broker_api::Token::new(class).unwrap(),
+            };
+            record.operation_classes = vec![bloom_broker_api::ProvenanceOperationClass {
+                operation_class: bloom_broker_api::Token::new(class).unwrap(),
+                fee_asset: None,
+            }];
+            catalog.records.push(record);
+        }
         let mut with_signing = without_signing.clone();
         with_signing.tx_engine =
             TxEngine::new(Outbox::new(f._tmp.path().join("outbox")).unwrap(), 60_000)
-                .with_triad_signing(
-                    MachineBrokerClient::new(broker.clone()),
-                    evm_outbox_catalog(),
-                )
+                .with_triad_signing(MachineBrokerClient::new(broker.clone()), catalog)
                 .unwrap();
         let w = &f.wallet_name;
         let replacement = br#"to = "0x0000000000000000000000000000000000000002"
 value = "0""#;
 
         for handler in [&without_signing, &with_signing] {
-            for prefix in [format!("/{w}"), format!("/{w}/0")] {
+            // IPC writes and mount flushes both enter through the router.
+            let router = crate::Vfs::builder()
+                .mount("wallets", Arc::new(handler.clone()))
+                .build();
+            for prefix in [format!("/wallets/{w}"), format!("/wallets/{w}/0")] {
                 let pending = format!("{prefix}/chains/anvil/outbox/pending/evm-zero");
-                let cancel = handler.write(&vfs(format!("{pending}/cancel")), b"y").await;
+                let cancel = router.write(&vfs(format!("{pending}/cancel")), b"y").await;
                 assert!(cancel.is_err(), "{pending}/cancel: {cancel:?}");
-                let replace = handler
+                let replace = router
                     .write(&vfs(format!("{pending}/replace")), replacement)
                     .await;
                 assert!(replace.is_err(), "{pending}/replace: {replace:?}");
             }
-            let other = handler
+            let other = router
                 .write(
-                    &vfs(format!("/{w}/0/chains/anvil/outbox/pending/evm-one/cancel")),
+                    &vfs(format!(
+                        "/wallets/{w}/0/chains/anvil/outbox/pending/evm-one/cancel"
+                    )),
                     b"y",
                 )
                 .await;
@@ -6021,19 +6040,17 @@ value = "0""#;
                 .collect();
             assert!(artifacts.is_empty(), "{id}: {artifacts:?}");
         }
+        let requests = broker.requests.lock().unwrap();
         assert!(
-            !broker
-                .requests
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|request| matches!(
-                    request,
-                    MachineBrokerRequest::SigningSign(_)
-                        | MachineBrokerRequest::SigningSignBatch(_)
-                )),
-            "{:?}",
-            broker.requests.lock().unwrap()
+            !requests.is_empty(),
+            "the signing edge must reach the Broker"
+        );
+        assert!(
+            !requests.iter().any(|request| matches!(
+                request,
+                MachineBrokerRequest::SigningSign(_) | MachineBrokerRequest::SigningSignBatch(_)
+            )),
+            "{requests:?}"
         );
     }
 
