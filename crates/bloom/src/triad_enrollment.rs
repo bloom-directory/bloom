@@ -1450,7 +1450,7 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(petal_hashes.len(), 20);
+        assert_eq!(petal_hashes.len(), 21);
         for name in ["polymarket", "hyperliquid"] {
             let expected = crate::github_source::preinstalled_petal(name)
                 .unwrap()

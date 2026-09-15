@@ -132,6 +132,10 @@ const HYPERLIQUID_AUTHORITY_ROUTES: &[PetalAuthorityRoute] = &[
         route_id: "r000044",
         operation_classes: &["hyperliquid.usd_send"],
     },
+    PetalAuthorityRoute {
+        route_id: "r000045",
+        operation_classes: &["hyperliquid.withdraw"],
+    },
 ];
 
 const PREINSTALLED_POLYMARKET: PreinstalledPetal = PreinstalledPetal {
@@ -154,11 +158,11 @@ const PREINSTALLED_POLYMARKET: PreinstalledPetal = PreinstalledPetal {
 const PREINSTALLED_HYPERLIQUID: PreinstalledPetal = PreinstalledPetal {
     name: "hyperliquid",
     repository: "https://github.com/bloom-directory/bloom-petal-hyperliquid",
-    commit: "f19e1b10ab2dbeb145704e76b1189bb257622c60",
-    release_tag: "v0.1.5",
-    archive: "hyperliquid-v0.1.5.petal.tar.gz",
-    expected_hash: Some("aa1c50d3443f4c1a710d0ce93a70a65d196fd5842d241e0f78260c8a019d811c"),
-    archive_sha256: "6e4db18c5a3d4cf6d79f97ae79f25b696784492aed584845ccf05124d0918f52",
+    commit: "1d44a1c3586849afe735866c6b54057590f91147",
+    release_tag: "v0.1.6",
+    archive: "hyperliquid-v0.1.6.petal.tar.gz",
+    expected_hash: Some("b29c7afb88ec9d2df774b18dad2699ec169100eeeedbcefca02ea0cc3712a188"),
+    archive_sha256: "2dae21cb207563caea508842f9ad72754acc2bcfb9ba97952520a5fc3f3841ad",
     tooling_commit: "864a80b407387871bae06aabe77b91865e55f7bc",
     petal_abi: "bloom.petal-host/payload-signing-v1",
     default_eligible: true,
