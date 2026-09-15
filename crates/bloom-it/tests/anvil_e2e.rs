@@ -406,3 +406,156 @@ async fn anvil_confirm_refuses_nonce_gap() -> Result<()> {
     drop(anvil);
     Ok(())
 }
+
+/// Disable anvil's auto-mining so a broadcast transaction sits in the mempool
+/// instead of being included immediately. That gap — broadcast but not yet
+/// mined — is the window this test is about.
+async fn set_automine(rpc_url: &str, enabled: bool) -> Result<()> {
+    let out = tokio::process::Command::new(bloom_it::cast_bin())
+        .args(["rpc", "--rpc-url", rpc_url, "evm_setAutomine"])
+        .arg(enabled.to_string())
+        .output()
+        .await
+        .context("invoke cast rpc evm_setAutomine")?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "evm_setAutomine failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    Ok(())
+}
+
+/// Staging a second transaction while the first is broadcast but unmined must
+/// not reuse the first one's nonce.
+///
+/// Regression: staging read the chain nonce from the pinned read session, which
+/// reports the *historical* count at the pinned block and so cannot see a
+/// transaction still in the mempool. `highest_pending_nonce` could not cover
+/// the gap either, because broadcasting moves an entry out of `pending/` and
+/// into `sent/`. Between broadcast and inclusion neither source knew about the
+/// in-flight transaction, so the next stage handed out a nonce that was already
+/// spent — whichever transaction mined second was rejected as a duplicate.
+///
+/// Seen live on a Morpho `approve` → `deposit` pair, where the deposit was
+/// staged at the approve's nonce and had to be re-drafted by hand.
+#[tokio::test(flavor = "multi_thread")]
+async fn anvil_stage_does_not_reuse_the_nonce_of_a_broadcast_but_unmined_tx() -> Result<()> {
+    let anvil = spawn_anvil().await?;
+    let rpc_url = anvil.rpc_url();
+
+    let tmp = tempfile::tempdir()?;
+    let home_root = tmp.path().to_path_buf();
+    write_config(&home_root, &rpc_url)?;
+    let home = HomeDir::at(&home_root);
+    let permit = Arc::new(HomeWritePermit::acquire(&home)?);
+    let test_signer: alloy_signer_local::PrivateKeySigner = TEST_WALLET_PRIVATE_KEY.parse()?;
+    let (broker, fixture) = exact_signing_broker(TEST_WALLET_PRIVATE_KEY)?;
+    let daemon = Daemon::from_home_with_permit_and_broker(
+        home,
+        permit,
+        broker,
+        exact_signing_catalog(&["transaction.confirm"]),
+    )
+    .map_err(|e| anyhow!("daemon: {e}"))?;
+    let alice_addr = format!("{:#x}", test_signer.address());
+    // The owner ceremony is not what this test is about; stand it up once so
+    // the confirm below actually broadcasts.
+    fixture.activate();
+
+    fund_via_cast(&rpc_url, &alice_addr, 10).await?;
+    sleep(Duration::from_millis(250)).await;
+
+    let recipient = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
+    let stage = |label: &'static str| {
+        let vfs = daemon.vfs.clone();
+        async move {
+            let intent = serde_json::json!({
+                "kind": "send",
+                "to": recipient,
+                "value": "1 eth",
+                "chain": "anvil",
+                "usd_value_hint": "1",
+            })
+            .to_string();
+            let new_tx_path = VfsPath::parse("/wallets/alice/chains/anvil/outbox/new.tx").unwrap();
+            vfs.write(&new_tx_path, intent.as_bytes())
+                .await
+                .map_err(|e| anyhow!("stage {label}: {e}"))?;
+            let pending_dir = VfsPath::parse("/wallets/alice/chains/anvil/outbox/pending").unwrap();
+            let entries = vfs
+                .list(&pending_dir)
+                .await
+                .map_err(|e| anyhow!("list pending after {label}: {e}"))?;
+            let entry = entries
+                .last()
+                .ok_or_else(|| anyhow!("no pending entry after staging {label}"))?;
+            Ok::<String, anyhow::Error>(entry.name.clone())
+        }
+    };
+
+    // The first transaction takes nonce 0 and is broadcast.
+    let first_id = stage("first").await?;
+    // Stop mining before the confirm, so the broadcast transaction stays in the
+    // mempool while the second stage reads its nonce.
+    set_automine(&rpc_url, false).await?;
+    let confirm_path = VfsPath::parse(&format!(
+        "/wallets/alice/chains/anvil/outbox/pending/{first_id}/confirm"
+    ))
+    .unwrap();
+    // The first confirm always fails closed while it mints the approval; the
+    // retry is the one that signs and broadcasts.
+    assert!(
+        daemon.vfs.write(&confirm_path, b"y\n").await.is_err(),
+        "initial confirm unexpectedly succeeded without Sealed Approval"
+    );
+    daemon
+        .vfs
+        .write(&confirm_path, b"y\n")
+        .await
+        .map_err(|e| anyhow!("confirm first: {e}"))?;
+
+    // It left `pending/` for `sent/`, so `highest_pending_nonce` no longer
+    // sees it — the chain read is now the only thing standing between the next
+    // stage and a duplicate nonce.
+    let sent_intent = VfsPath::parse(&format!(
+        "/wallets/alice/chains/anvil/outbox/sent/{first_id}/intent.json"
+    ))
+    .unwrap();
+    let first: serde_json::Value = serde_json::from_slice(
+        &daemon
+            .vfs
+            .read(&sent_intent)
+            .await
+            .map_err(|e| anyhow!("read sent intent.json: {e}"))?,
+    )
+    .context("sent intent.json must be valid JSON")?;
+    assert_eq!(
+        first.get("nonce").and_then(|v| v.as_u64()),
+        Some(0),
+        "first transaction should have taken nonce 0"
+    );
+
+    let second_id = stage("second").await?;
+    let second_intent = VfsPath::parse(&format!(
+        "/wallets/alice/chains/anvil/outbox/pending/{second_id}/intent.json"
+    ))
+    .unwrap();
+    let second: serde_json::Value = serde_json::from_slice(
+        &daemon
+            .vfs
+            .read(&second_intent)
+            .await
+            .map_err(|e| anyhow!("read pending intent.json: {e}"))?,
+    )
+    .context("pending intent.json must be valid JSON")?;
+    assert_eq!(
+        second.get("nonce").and_then(|v| v.as_u64()),
+        Some(1),
+        "staging must skip the nonce of the transaction still in the mempool"
+    );
+
+    set_automine(&rpc_url, true).await?;
+    drop(anvil);
+    Ok(())
+}
