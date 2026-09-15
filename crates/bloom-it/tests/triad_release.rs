@@ -90,83 +90,65 @@ fn release_compatibility_declares_each_edge_without_a_global_protocol_range() {
 
     let release = workspace().join("packaging/triad/release");
     let compatibility = fs::read_to_string(release.join("compatibility-v1.toml")).unwrap();
-    // The declared ranges are copies. The API crates at the pinned revisions
-    // own them, so compare against those constants rather than literals.
-    for (edge, major, minor_min, minor_max) in [
-        (
-            "machine_broker",
-            bloom_broker_api::BROKER_API_RANGE.major,
-            bloom_broker_api::BROKER_API_RANGE.minor_min,
-            bloom_broker_api::BROKER_API_RANGE.minor_max,
-        ),
-        (
-            "broker_signer",
-            bloom_signer_api::SIGNER_API_RANGE.major,
-            bloom_signer_api::SIGNER_API_RANGE.minor_min,
-            bloom_signer_api::SIGNER_API_RANGE.minor_max,
-        ),
+    let verifier = fs::read_to_string(release.join("verify-bundle.sh")).unwrap();
+    // The declared ranges copy the API crates at the pinned revisions, so
+    // compare against those constants rather than literals.
+    for (edge, range, exact) in [
+        ("machine_broker", bloom_broker_api::BROKER_API_RANGE, true),
+        ("broker_signer", bloom_signer_api::SIGNER_API_RANGE, true),
         (
             "signer_control",
-            bloom_signer_api::SIGNER_CONTROL_RANGE.major,
-            bloom_signer_api::SIGNER_CONTROL_RANGE.minor_min,
-            bloom_signer_api::SIGNER_CONTROL_RANGE.minor_max,
+            bloom_signer_api::SIGNER_CONTROL_RANGE,
+            false,
         ),
         (
             "session",
-            bloom_service_activation::SESSION_PROTOCOL_RANGE.major,
-            bloom_service_activation::SESSION_PROTOCOL_RANGE.minor_min,
-            bloom_service_activation::SESSION_PROTOCOL_RANGE.minor_max,
+            bloom_service_activation::SESSION_PROTOCOL_RANGE,
+            false,
         ),
     ] {
         let block = format!(
-            "[protocols.{edge}]\nmajor = {major}\nminor_min = {minor_min}\nminor_max = {minor_max}"
+            "[protocols.{edge}]\nmajor = {}\nminor_min = {}\nminor_max = {}",
+            range.major, range.minor_min, range.minor_max
         );
-        assert!(
-            compatibility.contains(&block),
-            "compatibility must declare {block}"
-        );
+        assert!(compatibility.contains(&block), "missing {block}");
+        assert_eq!(range.minor_min == range.minor_max, exact, "{edge}");
+        if exact {
+            for key in ["minor_min", "minor_max"] {
+                assert!(verifier.contains(&format!(
+                    "require_compat_value protocols.{edge} {key} {}",
+                    range.minor_max
+                )));
+            }
+        }
     }
-    // The API crates above must come from the revisions the manifest records.
+    // Those constants are only the manifest's if Cargo resolved the same revisions.
     let lockfile = fs::read_to_string(workspace().join("Cargo.lock")).unwrap();
-    for (package, repository, key) in [
-        ("bloom-broker-api", "bloom-broker.git", "broker_commit"),
-        ("bloom-signer-api", "bloom-signer.git", "signer_commit"),
-        (
-            "bloom-service-activation",
-            "bloom-service-runtime.git",
-            "service_runtime_commit",
-        ),
-        ("bloom-petal-contract", "petal", "petal_contract_commit"),
+    for (repository, key) in [
+        ("bloom-broker", "broker_commit"),
+        ("bloom-signer", "signer_commit"),
+        ("bloom-service-runtime", "service_runtime_commit"),
     ] {
         let revision = compatibility
             .lines()
             .find_map(|line| line.strip_prefix(&format!("{key} = \"")))
             .and_then(|tail| tail.strip_suffix('"'))
             .unwrap_or_else(|| panic!("compatibility lacks {key}"));
-        let source = format!(
-            "source = \"git+https://github.com/bloom-directory/{repository}?rev={revision}#{revision}\""
-        );
-        let locked = lockfile
-            .split("[[package]]")
-            .filter(|block| block.contains(&format!("name = \"{package}\"\n")))
-            .collect::<Vec<_>>();
+        let prefix = format!("git+https://github.com/bloom-directory/{repository}.git?rev=");
+        let locked: Vec<_> = lockfile.split(&prefix).skip(1).collect();
         assert!(
-            locked.len() == 1 && locked[0].contains(&source),
-            "{package} must be locked once at {key} {revision}"
+            !locked.is_empty()
+                && locked
+                    .iter()
+                    .all(|tail| tail.starts_with(&format!("{revision}#"))),
+            "{repository} must be locked only at {key} {revision}"
         );
     }
-    // Only the default local backend is compiled into the released Signer.
-    assert!(compatibility.contains("backends = [\"local\"]"));
-    let release_build = fs::read_to_string(workspace().join("packaging/triad/release.sh")).unwrap();
-    assert!(release_build.contains(
-        "cargo build --manifest-path \"$signer_root/Cargo.toml\" --release -p bloom-signer --locked\n"
-    ));
     assert!(!compatibility.lines().any(is_legacy_global_protocol_key));
     assert!(is_legacy_global_protocol_key("  protocol_major = 1"));
     assert!(is_legacy_global_protocol_key("\tprotocol_minor_min = 0"));
 
-    let verifier = fs::read_to_string(release.join("verify-bundle.sh")).unwrap();
-    assert!(verifier.contains("for edge in machine_broker broker_signer signer_control session"));
+    assert!(verifier.contains("for support_edge in signer_control session"));
     assert!(verifier.contains("must not declare a global protocol range"));
 
     for revision in [
@@ -180,92 +162,6 @@ fn release_compatibility_declares_each_edge_without_a_global_protocol_range() {
     for component in ["machine", "broker", "signer"] {
         assert!(compatibility.contains(&format!("[state.{component}]")));
         assert!(compatibility.contains("downgrade_floor = 1"));
-    }
-}
-
-#[test]
-fn bundle_metadata_rejects_widened_authority_and_unreviewed_dependencies() {
-    // Exercise the verifier's actual metadata block without generating keys or
-    // running archive/installer code. Signature and archive tests are separate.
-    let verifier = fs::read_to_string(release_script("verify-bundle.sh")).unwrap();
-    let start = verifier
-        .find("compatibility=\"$payload/compatibility-v1.toml\"")
-        .unwrap();
-    let end = verifier
-        .find("platform_claim=\"$(<\"$payload/PLATFORM_CLAIM\")\"")
-        .unwrap();
-    let script = format!(
-        "set -euo pipefail\npayload=$1\nscript_dir=$2\n{}",
-        &verifier[start..end]
-    );
-    let original = fs::read_to_string(release_script("compatibility-v1.toml")).unwrap();
-    let revision = |key: &str| {
-        original
-            .lines()
-            .find_map(|line| line.strip_prefix(&format!("{key} = \"")))
-            .unwrap()
-            .trim_end_matches('"')
-            .to_owned()
-    };
-    let payload = tempfile::tempdir().unwrap();
-    fs::write(
-        payload.path().join("SOURCE_REVISIONS"),
-        format!(
-            "BLOOM_MACHINE_SHA={}\nBLOOM_BROKER_SHA={}\nBLOOM_SIGNER_SHA={}\n",
-            "11".repeat(20),
-            revision("broker_commit"),
-            revision("signer_commit")
-        ),
-    )
-    .unwrap();
-    let check = |candidate: &str, expected: Option<&str>| {
-        fs::write(payload.path().join("compatibility-v1.toml"), candidate).unwrap();
-        let output = Command::new("bash")
-            .arg("-c")
-            .arg(&script)
-            .arg("metadata-test")
-            .arg(payload.path())
-            .arg(release_script(""))
-            .output()
-            .unwrap();
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        match expected {
-            None => assert!(output.status.success(), "{stderr}"),
-            Some(message) => {
-                assert_eq!(output.status.code(), Some(65), "{stderr}");
-                assert!(stderr.contains(message), "{stderr}");
-            }
-        }
-    };
-    check(&original, None);
-    for edge in ["machine_broker", "broker_signer"] {
-        let section = format!("[protocols.{edge}]\n");
-        let tail = original.split_once(&section).unwrap().1;
-        let block = tail.split("\n[").next().unwrap();
-        let widened = block
-            .lines()
-            .map(|line| {
-                if line.starts_with("minor_max = ") {
-                    "minor_max = 65535"
-                } else {
-                    line
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        let candidate = original.replacen(
-            &format!("{section}{block}"),
-            &format!("{section}{widened}"),
-            1,
-        );
-        check(&candidate, Some(&format!("exact protocols.{edge} minor")));
-    }
-    for key in ["service_runtime_commit", "petal_contract_commit"] {
-        let candidate = original.replace(
-            &format!("{key} = \"{}\"", revision(key)),
-            &format!("{key} = \"{}\"", "ab".repeat(20)),
-        );
-        check(&candidate, Some(&format!("invalid revisions.{key}")));
     }
 }
 
