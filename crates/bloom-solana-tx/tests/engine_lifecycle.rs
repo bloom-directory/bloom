@@ -526,7 +526,7 @@ async fn full_transfer_lifecycle_stage_sign_broadcast() {
         }
         other => panic!("expected ApprovalRequired, got {other:?}"),
     };
-    assert_eq!(broker.last_prepared_expiry(), 3_601_100);
+    assert_eq!(broker.last_prepared_expiry(), 61_100);
     // Still pending: no signature recorded yet.
     assert!(
         outbox
@@ -1547,10 +1547,13 @@ async fn confirming_the_same_transfer_twice_reaches_the_same_ceremony() {
             .await
             .unwrap(),
     );
-    // Time moves between the two confirms; that must not change the terms.
+    // Time moves between the two confirms while the attempt's window is
+    // still live; that must not change the terms. (A lapsed window is a
+    // different situation: it cannot be resumed, so the next confirm is a
+    // new attempt with a new identity — covered by the dead-approval tests.)
     let second = approval_required(
         engine
-            .sign("wallet", &staged.id, &fee_payer, None, None, 900_000)
+            .sign("wallet", &staged.id, &fee_payer, None, None, 30_000)
             .await
             .unwrap(),
     );
