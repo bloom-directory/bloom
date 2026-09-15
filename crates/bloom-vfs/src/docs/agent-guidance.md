@@ -167,8 +167,7 @@ cat wallets/<wallet>/<n>/chains/<solana-chain>/balance
 ```
 
 `address`, `balance`, `balance.raw` and `balance.json` live directly under the
-selected account's chain directory. There is no `accounts/<fingerprint>/`
-subdirectory or wallet-root `chains/` alias. Use `<n> = 0` only when the intended
+selected account's chain directory. Use `<n> = 0` only when the intended
 key belongs to account 0; Bloom never substitutes another account.
 
 A body `account_fingerprint` in `new.tx` may be a unique prefix, but it must
@@ -280,10 +279,8 @@ walkthrough in `docs/examples.md`.
 
 ## Petals and paid requests
 
-Installed applications live only under `petals/<name>/`. Native Hyperliquid
-and native `defi/intents` routes are retired. Discover the installed package
-and use its local instructions instead of guessing a route from an older
-example.
+Installed applications live under `petals/<name>/`. Discover the installed
+package and follow its local instructions.
 
 Paid HTTP operations live under `requests/`. They are actions, not ordinary
 reads: inspect the request plan, selected payment protocol, maximum amount,

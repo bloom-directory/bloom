@@ -199,7 +199,7 @@ ls "$BLOOM/outbox/"
 ```
 
 Enso, Hyperliquid, Polymarket, and other applications are Petals when installed.
-Do not guess retired native paths or reuse examples from another package.
+Use the selected package's own instructions and examples.
 
 ## Pure tools
 

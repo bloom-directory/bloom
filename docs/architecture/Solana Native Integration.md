@@ -150,8 +150,7 @@ intended Solana key's full fingerprint and derivation path in
 `wallets/<wallet>/accounts.json` to the entry's `number`, then verify the key
 in `wallets/<wallet>/<n>/account.json`. The canonical read path is
 `wallets/<wallet>/<n>/chains/<chain>/`, exposing `address`, `balance`,
-`balance.raw` and `balance.json` directly. There is no fingerprint-directory
-subtree and no wallet-level `chains/` alias.
+`balance.raw` and `balance.json` directly.
 
 Account `0` explicitly selects the canonical initial child; account `n`
 selects that numbered child's key even when other children exist. A missing

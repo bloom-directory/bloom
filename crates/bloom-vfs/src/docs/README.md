@@ -39,8 +39,8 @@ Petals before choosing paths; their names and availability vary by installation.
 
 `chains/` is EVM-only. Solana status lives under
 `status/chains/<solana-chain>/`; account reads live under
-`wallets/<wallet>/0/chains/<solana-chain>/`. Native `defi/intents` and
-Hyperliquid routes are retired; discover installed Petals instead.
+`wallets/<wallet>/<n>/chains/<solana-chain>/`. Discover installed applications
+under `petals/`.
 
 ## Reads
 
@@ -74,7 +74,7 @@ refer only to that account; never select by list position.
 Numbered accounts live at `wallets/<wallet>/<n>/`: read `account.json` to
 verify the keys, then use `chains/<chain>/outbox/` beneath that account to
 stage and inspect its transactions. Use the explicit `0` account path for the
-initial account; no wallet-root chain alias exists.
+initial account.
 Address, QR, and public-key files exist only beneath a numbered account.
 Delegated sessions live beneath the numbered account at
 `sessions/<petal>/<key-slot>/`; installed Petals are mounted only at

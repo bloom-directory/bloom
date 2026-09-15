@@ -96,9 +96,8 @@ wallets/<wallet>/
 ```
 
 Files that name one key (`address.evm`/`address.sol`, their QR images, and
-`public_key`) exist only under a numbered account; the wallet directory holds
-no key files. Installed Petals are mounted only at `/petals/<petal>/`, never
-under a wallet or account.
+`public_key`) live under a numbered account. Installed Petals are mounted at
+`/petals/<petal>/`.
 
 The number is the derivation path itself, not a position in a list: slot `n`
 is EVM `m/44'/60'/0'/0/n` and Solana `m/44'/501'/n'/0'`. Signer owns the
@@ -111,9 +110,9 @@ rendering comes from the authenticated `wallet.accounts` projection, and
 listings, stats, and reads carry no authority side effects (a stale projection
 is marked as such in `account.json`).
 
-Chain views and outboxes exist only under `wallets/<wallet>/<n>/chains/`.
-There is no wallet-level `chains/` alias. Use the explicit number `0` for the
-canonical initial child, and the selected entry's number for any other child.
+Chain views and outboxes live under `wallets/<wallet>/<n>/chains/`.
+Use the explicit number `0` for the canonical initial child, and the selected
+entry's number for any other child.
 Match its fingerprint and derivation path in `accounts.json` and verify
 `<n>/account.json`; the number is a route to the key, not signing authority.
 
@@ -121,8 +120,8 @@ An account can hold only EVM, only Solana, or both. Its chain listing includes
 configured chains for families with Broker-projected addresses; a missing
 family or address never causes key allocation or fallback to another account.
 Solana `address` and `balance*` leaves live directly under the numbered chain
-directory, without an `accounts/<fingerprint>/` subtree. Retired keys remain
-readable while present in the projection but cannot spend. Staged operations
+directory. Retired keys remain readable while present in the projection but
+cannot spend. Staged operations
 and outboxes are fenced to the staging key, so one account can never see or
 confirm another account's pending operations. A body fingerprint naming any
 other account is rejected for both families.
