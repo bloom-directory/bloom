@@ -280,11 +280,7 @@ impl WatchHandler {
 }
 
 fn now_ms() -> u128 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0)
+    u128::from(bloom_proto::now_ms().unwrap_or(0))
 }
 
 /// Inbound TOML schema for `watch/new`. Mirrors [`WatchKind`] with a
