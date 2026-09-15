@@ -64,6 +64,31 @@ impl FamilyKey {
     }
 }
 
+/// The sender filter one numbered-account outbox surface is fenced by.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum OutboxScope<'a> {
+    Key(&'a FamilyKey),
+    Unfiltered,
+    Empty,
+}
+
+/// Legacy internal account-zero resolution retained for shared outbox helpers.
+pub(super) enum WalletOutboxScope {
+    Account0(Box<FamilyKey>),
+    Unavailable,
+    Empty,
+}
+
+impl WalletOutboxScope {
+    pub(super) fn read_scope(&self) -> OutboxScope<'_> {
+        match self {
+            Self::Account0(family) => OutboxScope::Key(family),
+            Self::Unavailable => OutboxScope::Unfiltered,
+            Self::Empty => OutboxScope::Empty,
+        }
+    }
+}
+
 /// A numbered account as the mounted tree presents it.
 #[derive(Clone, Debug)]
 pub(super) struct AccountView {
@@ -570,7 +595,7 @@ impl WalletsHandler {
                     data,
                     &engine,
                     Self::solana_sender(family),
-                    Some(number),
+                    number,
                 )
                 .await;
         }
