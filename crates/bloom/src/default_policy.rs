@@ -18,6 +18,11 @@ use crate::github_source::{self, PetalSetupTemplate};
 /// How often a waiting command asks Machine where the default policy stands.
 pub(crate) const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// How long a waiting command keeps polling a ceremony still reported as
+/// awaiting the owner after its expiry, until the Broker marks it expired and
+/// a new proposal replaces it.
+const EXPIRED_CEREMONY_GRACE_MS: u64 = 30_000;
+
 /// Name shown in the setup menu and in messages.
 pub(crate) fn petal_label(name: &str) -> &str {
     match name {
@@ -346,6 +351,8 @@ pub(crate) enum DefaultPolicyStatus {
     },
     /// The wallet policy allows every chosen, installed Petal.
     Applied { petals: Vec<String> },
+    /// Another command holds the wallet's policy lock; ask again shortly.
+    Busy,
 }
 
 /// Propose the Petals chosen during setup for `wallet` through its existing
@@ -384,27 +391,34 @@ pub(crate) async fn advance_default_policy(
         }
         Err(error) => return Err(error.into()),
     }
-    Ok(
-        match daemon.ensure_default_policy(wallet, &packages).await? {
-            bloom_machine_client::PetalEligibility::Allowed(_) => {
-                DefaultPolicyStatus::Applied { petals }
+    let eligibility = match daemon.ensure_default_policy(wallet, &packages).await {
+        Ok(eligibility) => eligibility,
+        Err(bloom_vfs::HandlerError::Backend(message))
+            if message.starts_with(bloom_vfs::handlers::wallets::POLICY_COORDINATION_BUSY) =>
+        {
+            return Ok(DefaultPolicyStatus::Busy);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    Ok(match eligibility {
+        bloom_machine_client::PetalEligibility::Allowed(_) => {
+            DefaultPolicyStatus::Applied { petals }
+        }
+        bloom_machine_client::PetalEligibility::AwaitingPolicyApproval(pending) => {
+            DefaultPolicyStatus::AwaitingOwner {
+                operation_id: pending.operation_id.as_str().to_owned(),
+                ceremony_url: pending
+                    .prepare
+                    .as_ref()
+                    .map(|prepare| prepare.ceremony_url.clone()),
+                ceremony_expires_at_ms: pending
+                    .prepare
+                    .as_ref()
+                    .map(|prepare| prepare.ceremony_expires_at_ms.get()),
+                petals,
             }
-            bloom_machine_client::PetalEligibility::AwaitingPolicyApproval(pending) => {
-                DefaultPolicyStatus::AwaitingOwner {
-                    operation_id: pending.operation_id.as_str().to_owned(),
-                    ceremony_url: pending
-                        .prepare
-                        .as_ref()
-                        .map(|prepare| prepare.ceremony_url.clone()),
-                    ceremony_expires_at_ms: pending
-                        .prepare
-                        .as_ref()
-                        .map(|prepare| prepare.ceremony_expires_at_ms.get()),
-                    petals,
-                }
-            }
-        },
-    )
+        }
+    })
 }
 
 /// Whether a waiting command should poll again.
@@ -481,6 +495,7 @@ impl DefaultPolicyWait {
                 )?;
                 Ok(WaitStep::Stop)
             }
+            DefaultPolicyStatus::Busy => Ok(WaitStep::Poll),
             DefaultPolicyStatus::AwaitingOwner {
                 operation_id,
                 ceremony_url,
@@ -489,6 +504,15 @@ impl DefaultPolicyWait {
             } => {
                 if self.announced.as_deref() == Some(operation_id.as_str()) {
                     return Ok(WaitStep::Poll);
+                }
+                // The Broker marks an expired ceremony on a later status read and
+                // the next poll proposes a replacement; never hand out a dead link.
+                if let Some(expires_at_ms) = ceremony_expires_at_ms.filter(|at| now_ms >= *at) {
+                    if now_ms < expires_at_ms.saturating_add(EXPIRED_CEREMONY_GRACE_MS) {
+                        return Ok(WaitStep::Poll);
+                    }
+                    self.report_expired(output)?;
+                    return Ok(WaitStep::Stop);
                 }
                 if let Some(url) = ceremony_url {
                     writeln!(
@@ -826,6 +850,60 @@ mod tests {
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("run `bloom wallet default-policy main` for a new one"));
         assert_eq!(output.matches("default_policy_url: ").count(), 1);
+    }
+
+    #[test]
+    fn wait_polls_quietly_while_another_command_holds_the_policy_lock() {
+        let mut wait = DefaultPolicyWait::new("main", 0);
+        let mut output = Vec::new();
+        assert_eq!(
+            wait.observe(&DefaultPolicyStatus::Busy, 10, &mut output)
+                .unwrap(),
+            WaitStep::Poll
+        );
+        assert!(output.is_empty());
+        assert_eq!(
+            serde_json::to_value(DefaultPolicyStatus::Busy).unwrap(),
+            serde_json::json!({"state": "busy"})
+        );
+    }
+
+    #[test]
+    fn wait_never_announces_an_expired_ceremony_and_announces_its_replacement() {
+        let mut wait = DefaultPolicyWait::new("main", 1_000);
+        let mut output = Vec::new();
+        assert_eq!(
+            wait.observe(&awaiting("stale", 5_000), 5_000, &mut output)
+                .unwrap(),
+            WaitStep::Poll
+        );
+        assert!(output.is_empty());
+        assert_eq!(
+            wait.observe(&awaiting("fresh", 9_000), 6_000, &mut output)
+                .unwrap(),
+            WaitStep::Poll
+        );
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(output.matches("default_policy_url: ").count(), 1);
+        assert!(output.contains("ceremony/fresh"));
+    }
+
+    #[test]
+    fn wait_reports_expiry_when_a_stale_ceremony_is_never_replaced() {
+        let mut wait = DefaultPolicyWait::new("main", 1_000);
+        let mut output = Vec::new();
+        assert_eq!(
+            wait.observe(
+                &awaiting("stale", 5_000),
+                5_000 + EXPIRED_CEREMONY_GRACE_MS,
+                &mut output
+            )
+            .unwrap(),
+            WaitStep::Stop
+        );
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("run `bloom wallet default-policy main` for a new one"));
+        assert!(!output.contains("default_policy_url: "));
     }
 
     #[test]

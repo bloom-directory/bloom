@@ -834,6 +834,47 @@ async fn default_wallet_first_proposal_allows_setup_packages_together() {
     );
 }
 
+#[tokio::test]
+async fn expired_default_policy_proposal_is_replaced_by_a_new_ceremony() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = broker_fixture(false);
+    let packages = [Digest32::from_bytes([7; 32]), Digest32::from_bytes([8; 32])];
+    let handler = eligibility_handler(temp.path(), fixture.clone());
+    let PetalEligibility::AwaitingPolicyApproval(first) = handler
+        .ensure_petal_packages_allowed("alice", &packages)
+        .await
+        .unwrap()
+    else {
+        panic!("owner approval must be required");
+    };
+
+    *fixture.ceremony_state_override.lock() = Some(CeremonyState::Expired);
+    let PetalEligibility::AwaitingPolicyApproval(replacement) = handler
+        .ensure_petal_packages_allowed("alice", &packages)
+        .await
+        .unwrap()
+    else {
+        panic!("an expired proposal must be replaced, not reported as terminal");
+    };
+    assert_ne!(replacement.operation_id, first.operation_id);
+    assert!(replacement.prepare.is_some());
+    let updates = temp
+        .path()
+        .join("machine-policy-projections/alice/policy-updates");
+    assert!(
+        updates
+            .join("failed")
+            .join(first.operation_id.as_str())
+            .exists()
+    );
+    assert!(
+        updates
+            .join("pending")
+            .join(replacement.operation_id.as_str())
+            .exists()
+    );
+}
+
 fn eligibility_handler(temp: &std::path::Path, fixture: Arc<BrokerFixture>) -> WalletsHandler {
     let broker = MachineBrokerClient::new(fixture);
     WalletsHandler::new(

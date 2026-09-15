@@ -1388,6 +1388,15 @@ impl WalletsHandler {
                     let projection: TriadPolicyUpdateProjection = read_json(&path)?;
                     return projection.pending_view(package_hash);
                 }
+                // A cancelled, expired, or failed ceremony has left `pending`;
+                // propose again from the current policy.
+                Err(_)
+                    if !self
+                        .policy_update_action_dir(wallet, "pending", &operation_id)
+                        .is_dir() =>
+                {
+                    continue;
+                }
                 Err(error) => return Err(error),
             }
         }
@@ -1531,7 +1540,7 @@ impl WalletsHandler {
             .truncate(false)
             .open(directory.join(".coordinator.lock"))?;
         fs2::FileExt::try_lock_exclusive(&file).map_err(|error| {
-            HandlerError::backend(format!("wallet policy coordination busy; retry: {error}"))
+            HandlerError::backend(format!("{POLICY_COORDINATION_BUSY}; retry: {error}"))
         })?;
         Ok(file)
     }
@@ -2167,6 +2176,10 @@ fn validate_policy_action_id(id: &str) -> Result<(), HandlerError> {
     }
     Ok(())
 }
+
+/// Start of the error a policy writer gets while another command holds the
+/// wallet's policy lock. Waiting commands poll again instead of failing.
+pub const POLICY_COORDINATION_BUSY: &str = "wallet policy coordination busy";
 
 fn tx_open_err(e: TxEngineError) -> HandlerError {
     match e {
