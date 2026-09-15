@@ -122,8 +122,8 @@ of these private files: its guarded live installer uses the same fresh
 root-owned identity-generation path as the production Unix-principal claim.
 On Linux, Bloom uses the host system clock behind its durable rollback and
 same-boot forward-step guards; it does not install or require a separate time
-daemon. AWS credentials and `aws-kms-ip-allow.conf` are an optional paired
-site overlay.
+daemon. The released Signer has no AWS KMS backend, so the Linux installer
+refuses AWS credentials or `aws-kms-ip-allow.conf` in the payload.
 
 The Linux archive generates a complete fresh per-login enrollment from
 packaged public templates and the host CSPRNG; it does not require site-specific
