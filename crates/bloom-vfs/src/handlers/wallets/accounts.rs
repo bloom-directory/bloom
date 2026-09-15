@@ -264,10 +264,16 @@ impl WalletsHandler {
                 solana: None,
                 freshness: projection.freshness,
             });
-            match account.derivation_profile {
-                DerivationProfile::Bip44EvmSecp256k1V1 => view.evm = Some(family),
-                DerivationProfile::Bip44SolanaSlip10Ed25519V1 => view.solana = Some(family),
+            let (slot, family_name) = match account.derivation_profile {
+                DerivationProfile::Bip44EvmSecp256k1V1 => (&mut view.evm, "EVM"),
+                DerivationProfile::Bip44SolanaSlip10Ed25519V1 => (&mut view.solana, "Solana"),
+            };
+            if slot.is_some() {
+                return Err(integrity(&format!(
+                    "duplicate {family_name} entries for account {number}"
+                )));
             }
+            *slot = Some(family);
         }
         Ok(views.into_values().collect())
     }
@@ -696,8 +702,11 @@ impl WalletsHandler {
                     view.evm
                 }
             }
-            // No account 0: nothing to leak and nothing to show.
-            Err(_) => None,
+            // No account 0: nothing to leak and nothing to show. Projection
+            // and backend faults must remain visible rather than becoming an
+            // apparently valid empty outbox.
+            Err(HandlerError::NotFound(_)) => None,
+            Err(error) => return Err(error),
         };
         Ok(family.map_or(WalletOutboxScope::Empty, |family| {
             WalletOutboxScope::Account0(Box::new(family))

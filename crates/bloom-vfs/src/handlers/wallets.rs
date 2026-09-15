@@ -2344,10 +2344,10 @@ fn projected_family_address(
             ("solana", bloom_broker_api::AddressEncoding::Base58)
         }
     };
-    let mut projections = account
-        .chain_projections
-        .iter()
-        .filter(|projection| projection.chain_family.as_str() == family);
+    // The derivation profile defines the account family. `chain_family` is
+    // Broker-owned routing metadata and may name a custom compatible family,
+    // so it must not decide whether this account has an address.
+    let mut projections = account.chain_projections.iter();
     let Some(first) = projections.next() else {
         return Ok(None);
     };
@@ -8230,6 +8230,82 @@ value = "0""#,
         );
     }
 
+    #[tokio::test]
+    async fn duplicate_account_family_entries_are_integrity_faults_in_either_order() {
+        let f = make_handler_with_chain(true);
+        let evm_address = bloom_proto::checksum_address(&f.wallet_addr);
+        let evm = derived_account(
+            bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1,
+            "m/44'/60'/0'/0/0",
+            0x10,
+            &evm_address,
+        );
+        let mut duplicate_evm = derived_account(
+            bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1,
+            "m/44'/60'/0'/0/0",
+            0x11,
+            &Address::repeat_byte(0x22).to_string(),
+        );
+        duplicate_evm.key_ref.locator = "wallet/derived/duplicate-evm-0".into();
+
+        let solana = solana_projection([0x20; 32]);
+        let mut duplicate_solana = solana_projection([0x21; 32]);
+        duplicate_solana.key_ref.locator = "wallet/derived/duplicate-solana-0".into();
+
+        for (family, first, second) in [
+            ("EVM", evm, duplicate_evm),
+            ("Solana", solana, duplicate_solana),
+        ] {
+            for accounts in [
+                vec![first.clone(), second.clone()],
+                vec![second.clone(), first.clone()],
+            ] {
+                let collection = bloom_broker_api::WalletAccountsPublic {
+                    wallet_id: token("alice"),
+                    seed_profile: bloom_broker_api::WalletSeedProfile::Bip39MulticurveV1,
+                    accounts: accounts.clone(),
+                };
+                collection
+                    .validate()
+                    .expect("duplicate account numbers are valid Broker wire shape");
+                let mut handler = f.handler.clone();
+                handler.wallet_projections = Some(bip39_projection(f.wallet_addr, accounts));
+                match handler.account_view(&f.wallet_name, 0).await {
+                    Err(HandlerError::Backend(message)) => assert!(
+                        message.contains(&format!("duplicate {family} entries for account 0")),
+                        "{message}"
+                    ),
+                    _ => panic!("duplicate {family} entries must fail regardless of list order"),
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn wallet_outbox_read_scope_preserves_projection_faults() {
+        let f = make_handler_with_chain(true);
+        let mut evm = derived_account(
+            bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1,
+            "m/44'/60'/0'/0/0",
+            0x10,
+            &bloom_proto::checksum_address(&f.wallet_addr),
+        );
+        evm.chain_projections[0].address_encoding = bloom_broker_api::AddressEncoding::Base58;
+        let mut handler = f.handler;
+        handler.wallet_projections = Some(bip39_projection(f.wallet_addr, vec![evm]));
+
+        match handler
+            .wallet_outbox_read_scope(&f.wallet_name, "anvil")
+            .await
+        {
+            Err(HandlerError::Backend(message)) => assert!(
+                message.contains("wrong address encoding"),
+                "projection fault was not preserved: {message}"
+            ),
+            _ => panic!("a projection fault must not become an empty outbox scope"),
+        }
+    }
+
     /// The wallet directory holds the numbered accounts and wallet-wide
     /// state; nothing that names one key is exposed above `<n>/`.
     #[tokio::test]
@@ -9237,6 +9313,32 @@ value = "0""#,
         assert!(
             SolanaAccount::from_projection(&solana_projection(pubkey)).is_ok(),
             "baseline projection should resolve"
+        );
+
+        // The account profile, not a hard-coded routing token, identifies
+        // the address family. Custom Broker chain families remain usable.
+        let mut custom_solana_family = solana_projection(pubkey);
+        custom_solana_family.chain_projections[0].chain_family =
+            bloom_broker_api::Token::new("svm").unwrap();
+        let solana_address = bs58::encode(pubkey).into_string();
+        assert_eq!(
+            projected_family_address(&custom_solana_family).unwrap(),
+            Some(solana_address.as_str())
+        );
+        assert!(SolanaAccount::from_projection(&custom_solana_family).is_ok());
+
+        let evm_address = Address::repeat_byte(0x11).to_string();
+        let mut custom_evm_family = derived_account(
+            bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1,
+            "m/44'/60'/0'/0/0",
+            0x10,
+            &evm_address,
+        );
+        custom_evm_family.chain_projections[0].chain_family =
+            bloom_broker_api::Token::new("ethereum").unwrap();
+        assert_eq!(
+            projected_family_address(&custom_evm_family).unwrap(),
+            Some(evm_address.as_str())
         );
 
         let mut missing = solana_projection(pubkey);
