@@ -319,6 +319,15 @@ for crate ownership, genesis and broadcast requirements, and account-addressed
 VFS routes. Run the [Solana tests](./TESTING.md#triad-and-solana-ladders) that
 exercise the behavior you changed.
 
+## Preinstalled Petals
+
+Every Bloom home provisions Polymarket, Hyperliquid, Enso, Near Intents, and
+Tolly from the pinned release catalog. `bloom init` installs missing releases
+and updates older catalog releases; Machine startup also attempts provisioning
+in the background. Current verified installations are reused. Legacy
+`[petals] preinstalled` values are ignored, including empty lists, and are no
+longer written to new configs.
+
 ## General local operation
 
 An already running Machine may continue without Broker for cached public reads,

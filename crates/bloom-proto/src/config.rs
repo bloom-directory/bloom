@@ -64,33 +64,14 @@ pub struct Config {
     pub backends: BackendsConfig,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PetalsConfig {
-    /// Built-in Petals provisioned by explicit lifecycle commands such as
-    /// `bloom init`. An explicit empty list is a persistent opt-out.
-    #[serde(default = "default_preinstalled_petals")]
+    /// Ignored legacy setting. Bloom provisions its canonical Petal catalog.
+    #[serde(default, skip_serializing)]
     pub preinstalled: Vec<String>,
     #[serde(default)]
     pub runtime: BTreeMap<String, PetalRuntimeConfig>,
-}
-
-impl Default for PetalsConfig {
-    fn default() -> Self {
-        Self {
-            preinstalled: default_preinstalled_petals(),
-            runtime: BTreeMap::new(),
-        }
-    }
-}
-
-fn default_preinstalled_petals() -> Vec<String> {
-    vec![
-        "polymarket".into(),
-        "hyperliquid".into(),
-        "near-intents".into(),
-        "tolly".into(),
-    ]
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -433,9 +414,8 @@ impl Config {
 
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let s = std::fs::read_to_string(path)?;
-        let document: toml::Value = toml::from_str(&s)?;
         let mut cfg: Self = toml::from_str(&s)?;
-        cfg.migrate(&document);
+        cfg.migrate();
         cfg.validate()?;
         Ok(cfg)
     }
@@ -461,31 +441,10 @@ impl Config {
 
     /// Apply post-load migrations for backwards compatibility.
     ///
-    /// Currently infers `op_stack` for well-known OP-stack chain IDs
-    /// (Optimism=10, Base=8453, …) that predate the `op_stack` field and
-    /// advances legacy default Petal sets to the current release defaults.
-    fn migrate(&mut self, document: &toml::Value) {
+    /// Infers `op_stack` for well-known OP-stack chain IDs that predate the field.
+    fn migrate(&mut self) {
         for spec in self.chains.values_mut() {
             spec.infer_op_stack();
-        }
-
-        let persisted_preinstalled = document
-            .get("petals")
-            .and_then(|petals| petals.get("preinstalled"))
-            .and_then(toml::Value::as_array);
-        let is_legacy_default = persisted_preinstalled.is_some_and(|entries| {
-            let entries = entries.iter().map(toml::Value::as_str).collect::<Vec<_>>();
-            entries == [Some("polymarket"), Some("near-intents"), Some("enso")]
-                || entries == [Some("near-intents"), Some("enso")]
-                || entries
-                    == [
-                        Some("polymarket"),
-                        Some("hyperliquid"),
-                        Some("near-intents"),
-                    ]
-        });
-        if is_legacy_default {
-            self.petals.preinstalled = default_preinstalled_petals();
         }
     }
 
@@ -619,30 +578,6 @@ impl Config {
                 }
             }
         }
-        let mut seen_preinstalled = std::collections::BTreeSet::new();
-        for name in &self.petals.preinstalled {
-            validate_petal_runtime_name("preinstalled entry", name)?;
-            if !matches!(
-                name.as_str(),
-                "polymarket"
-                    | "hyperliquid"
-                    | "near-intents"
-                    | "enso"
-                    | "gasless"
-                    | "privacy-pools"
-                    | "venice-x402"
-                    | "tolly"
-            ) {
-                return Err(ConfigError::Invalid(format!(
-                    "unknown preinstalled Petal {name:?}"
-                )));
-            }
-            if !seen_preinstalled.insert(name) {
-                return Err(ConfigError::Invalid(format!(
-                    "duplicate preinstalled Petal {name:?}"
-                )));
-            }
-        }
         Ok(())
     }
 
@@ -721,7 +656,7 @@ mod tests {
         assert_eq!(cfg.mount_path, "/bloom");
         assert_eq!(cfg.nfs_listen_addr, "127.0.0.1:12049");
         assert!(cfg.etherscan.is_none());
-        assert_eq!(cfg.petals.preinstalled, default_preinstalled_petals());
+        assert!(cfg.petals.preinstalled.is_empty());
         assert_eq!(cfg.chains.len(), 14);
         assert_eq!(cfg.solana_chains.len(), 1);
         let solana = cfg
@@ -965,75 +900,30 @@ mod tests {
     }
 
     #[test]
-    fn preinstalled_petals_support_persistent_opt_out_and_validate_catalog_names() {
-        let mut cfg = Config::local_default();
-        cfg.petals.preinstalled.clear();
-        assert!(cfg.petals.preinstalled.is_empty());
-        cfg.validate().unwrap();
-
-        let serialized = toml::to_string_pretty(&cfg).unwrap();
-        let reloaded: Config = toml::from_str(&serialized).unwrap();
-        assert!(reloaded.petals.preinstalled.is_empty());
-
-        cfg.petals.preinstalled = vec!["near-intents".into()];
-        cfg.validate().unwrap();
-
-        cfg.petals.preinstalled = vec!["hyperliquid".into()];
-        cfg.validate().unwrap();
-
-        cfg.petals.preinstalled = vec!["polymarket".into()];
-        cfg.validate().unwrap();
-
-        cfg.petals.preinstalled = vec!["tolly".into()];
-        cfg.validate().unwrap();
-
-        cfg.petals.preinstalled = vec!["unknown".into()];
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(
-            err.contains("unknown preinstalled Petal \"unknown\""),
-            "{err}"
-        );
-
-        cfg.petals.preinstalled = vec!["near-intents".into(), "near-intents".into()];
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(
-            err.contains("duplicate preinstalled Petal \"near-intents\""),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn load_migrates_the_legacy_default_petal_catalog_only() {
+    fn legacy_preinstalled_values_are_ignored_without_migration() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("config.toml");
-
-        let mut cfg = Config::local_default();
-        cfg.petals.preinstalled = vec!["polymarket".into(), "near-intents".into(), "enso".into()];
-        cfg.save(&path).unwrap();
-
-        let migrated = Config::load(&path).unwrap();
-        assert_eq!(migrated.petals.preinstalled, default_preinstalled_petals());
-
-        cfg.petals.preinstalled = vec![
-            "polymarket".into(),
-            "hyperliquid".into(),
-            "near-intents".into(),
-        ];
-        cfg.save(&path).unwrap();
-        let migrated = Config::load(&path).unwrap();
-        assert_eq!(migrated.petals.preinstalled, default_preinstalled_petals());
-
-        cfg.petals.preinstalled = vec!["near-intents".into(), "enso".into()];
-        cfg.save(&path).unwrap();
-        let migrated = Config::load(&path).unwrap();
-        assert_eq!(migrated.petals.preinstalled, default_preinstalled_petals());
-
-        cfg.petals.preinstalled = vec!["polymarket".into()];
-        cfg.save(&path).unwrap();
-        assert_eq!(
-            Config::load(&path).unwrap().petals.preinstalled,
-            vec!["polymarket"]
-        );
+        for value in [
+            "[]",
+            "[\"polymarket\", \"near-intents\", \"enso\"]",
+            "[\"unknown\", \"unknown\"]",
+        ] {
+            let mut document = toml::Value::try_from(Config::local_default()).unwrap();
+            document["petals"].as_table_mut().unwrap().insert(
+                "preinstalled".into(),
+                toml::from_str::<toml::Value>(&format!("value = {value}")).unwrap()["value"]
+                    .clone(),
+            );
+            let original = toml::to_string_pretty(&document).unwrap();
+            std::fs::write(&path, &original).unwrap();
+            let loaded = Config::load(&path).unwrap();
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+            assert!(
+                !toml::to_string_pretty(&loaded)
+                    .unwrap()
+                    .contains("preinstalled")
+            );
+        }
     }
 
     #[test]
