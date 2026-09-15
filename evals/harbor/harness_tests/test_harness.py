@@ -13,7 +13,16 @@ from types import SimpleNamespace
 from unittest import mock
 
 from harness import hyperliquid_order_cancel
-from harness.core import AgentSpec, EvalDefinition, EvalError, EvalRunContext, run_eval
+from harness.core import (
+    AGENTS,
+    AgentSpec,
+    EvalDefinition,
+    EvalError,
+    EvalRunContext,
+    _agent_spec,
+    run_eval,
+)
+from harness.__main__ import parser
 from harness.hyperliquid_order_cancel import (
     ACTION_FILES,
     MAINNET_ACK,
@@ -62,6 +71,111 @@ class HarnessLifecycleTests(unittest.TestCase):
         self.auth.stop()
         self.temp.cleanup()
 
+    def test_glm_uses_zai_coding_plan_through_claude_code(self) -> None:
+        with mock.patch.dict(os.environ, {"GLM_API_KEY": "test-glm-key"}, clear=True):
+            spec = _agent_spec("glm")
+
+        self.assertEqual(spec.harbor_name, "claude-code")
+        self.assertEqual(spec.model, "glm-5.2")
+        self.assertEqual(spec.env["ANTHROPIC_AUTH_TOKEN"], "test-glm-key")
+        self.assertEqual(
+            spec.env["ANTHROPIC_BASE_URL"], "https://api.z.ai/api/anthropic"
+        )
+
+    def test_cli_agent_choices_come_from_the_agent_registry(self) -> None:
+        action = next(
+            action for action in parser()._actions if action.dest == "agent"
+        )
+        self.assertEqual(tuple(action.choices), tuple(AGENTS))
+
+    def test_smoke_cli_needs_no_agent(self) -> None:
+        args = parser().parse_args(["solana-transfer", "--smoke-only"])
+        self.assertTrue(args.smoke_only)
+        self.assertIsNone(args.agent)
+
+    def test_agent_model_can_be_selected_without_a_code_change(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"ZAI_API_KEY": "test-zai-key", "BLOOM_EVAL_MODEL": "glm-5.3"},
+            clear=True,
+        ):
+            spec = _agent_spec("glm")
+
+        self.assertEqual(spec.model, "glm-5.3")
+
+    def test_an_empty_agent_model_override_is_rejected(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"ZAI_API_KEY": "test-zai-key", "BLOOM_EVAL_MODEL": "  "},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(EvalError, "BLOOM_EVAL_MODEL"):
+                _agent_spec("glm")
+
+    def test_glm_requires_a_zai_coding_plan_key(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(EvalError, "GLM Coding Plan auth is missing"):
+                _agent_spec("glm")
+
+    def test_deepseek_uses_anthropic_compatibility_with_a_turn_limit(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"DEEPSEEK_API_KEY": "test-deepseek-key", "BLOOM_EVAL_MAX_TURNS": "15"},
+            clear=True,
+        ):
+            spec = _agent_spec("deepseek")
+
+        self.assertEqual(spec.harbor_name, "claude-code")
+        self.assertEqual(spec.model, "deepseek-v4-flash")
+        self.assertEqual(spec.env["ANTHROPIC_API_KEY"], "test-deepseek-key")
+        self.assertEqual(
+            spec.env["ANTHROPIC_BASE_URL"],
+            "https://api.deepseek.com/anthropic",
+        )
+        self.assertEqual(spec.kwargs["max_turns"], 15)
+
+    def test_deepseek_requires_its_api_key(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(EvalError, "DeepSeek auth is missing"):
+                _agent_spec("deepseek")
+
+    def test_opencode_uses_deepseek_native_provider(self) -> None:
+        with mock.patch.dict(
+            os.environ, {"DEEPSEEK_API_KEY": "test-deepseek-key"}, clear=True
+        ):
+            spec = _agent_spec("opencode")
+
+        self.assertEqual(spec.harbor_name, "opencode")
+        self.assertEqual(spec.model, "deepseek/deepseek-v4-flash")
+        self.assertEqual(spec.env["DEEPSEEK_API_KEY"], "test-deepseek-key")
+        self.assertNotIn("ANTHROPIC_BASE_URL", spec.env)
+
+    def test_opencode_requires_its_api_key(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(EvalError, "OpenCode DeepSeek auth is missing"):
+                _agent_spec("opencode")
+
+    def test_opencode_model_override_requires_provider_prefix(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "DEEPSEEK_API_KEY": "test-deepseek-key",
+                "BLOOM_EVAL_MODEL": "deepseek-v4-flash",
+            },
+            clear=True,
+        ):
+            with self.assertRaisesRegex(EvalError, "provider/model"):
+                _agent_spec("opencode")
+
+    def test_claude_adapter_turn_limit_is_bounded(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"DEEPSEEK_API_KEY": "test", "BLOOM_EVAL_MAX_TURNS": "101"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(EvalError, "must be from 1 to 100"):
+                _agent_spec("deepseek")
+
     def passing_result(self) -> SimpleNamespace:
         trial = SimpleNamespace(
             exception_info=None,
@@ -98,6 +212,25 @@ class HarnessLifecycleTests(unittest.TestCase):
             },
         )
 
+    def test_run_eval_can_use_a_credential_free_runner_spec(self) -> None:
+        definition = FakeDefinition(self.root)
+
+        async def runner(_context: EvalRunContext, agent: AgentSpec) -> object:
+            definition.events.append(f"runner:{agent.model}")
+            return self.passing_result()
+
+        with mock.patch.dict(os.environ, {}, clear=True):
+            run_eval(
+                definition,
+                "smoke",
+                harbor_runner=runner,
+                agent_spec=AgentSpec("smoke", "deterministic"),
+            )
+        self.assertEqual(
+            definition.events,
+            ["preflight", "provision:smoke", "runner:deterministic", "cleanup"],
+        )
+
     def test_cleanup_runs_when_provision_fails_after_starting(self) -> None:
         definition = FakeDefinition(
             self.root, provision_error=EvalError("provision failed")
@@ -119,6 +252,30 @@ class HarnessLifecycleTests(unittest.TestCase):
 
         with self.assertRaisesRegex(EvalError, "run failed.*cleanup also failed"):
             run_eval(definition, "codex", harbor_runner=runner)
+
+    def test_provider_error_is_reported_instead_of_aggregate_trial_count(self) -> None:
+        definition = FakeDefinition(self.root)
+        trial = SimpleNamespace(
+            exception_info=SimpleNamespace(
+                exception_type="UnknownApiError",
+                exception_message=(
+                    "command failed with a long transcript\n"
+                    'result={"result":"API Error: Request rejected (429) · '
+                    '[1310][Weekly/Monthly Limit Exhausted.]","type":"result"}'
+                ),
+            ),
+            verifier_result=None,
+        )
+        result = SimpleNamespace(
+            stats=SimpleNamespace(n_errored_trials=1, n_cancelled_trials=0),
+            trial_results=[trial],
+        )
+
+        with self.assertRaisesRegex(
+            EvalError,
+            r"UnknownApiError: API Error: Request rejected \(429\).*Limit Exhausted",
+        ):
+            definition.validate_result(result)
 
 
 class HyperliquidDefinitionTests(unittest.TestCase):
