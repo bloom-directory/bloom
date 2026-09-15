@@ -249,13 +249,18 @@ impl WalletsHandler {
             let Some(number) = account_number(account) else {
                 continue;
             };
+            let address = match account.chain_projections.first() {
+                Some(projection) => projection.address.clone(),
+                None => match account.derivation_profile {
+                    DerivationProfile::Bip44SolanaSlip10Ed25519V1 => {
+                        SolanaAccount::from_projection(account)?.address
+                    }
+                    DerivationProfile::Bip44EvmSecp256k1V1 => String::new(),
+                },
+            };
             let family = FamilyKey {
                 key_ref: account.key_ref.clone(),
-                address: account
-                    .chain_projections
-                    .first()
-                    .map(|projection| projection.address.clone())
-                    .unwrap_or_default(),
+                address,
                 public_key: account.canonical_public_key.decode(),
                 fingerprint: account.public_key_fingerprint.as_str().to_owned(),
                 path: account.path.clone(),

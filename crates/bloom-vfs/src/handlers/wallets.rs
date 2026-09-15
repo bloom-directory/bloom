@@ -8095,6 +8095,21 @@ value = "0""#,
         }
     }
 
+    #[tokio::test]
+    async fn solana_address_file_does_not_require_a_chain_projection() {
+        let f = make_handler();
+        let w = f.wallet_name.clone();
+        let pubkey = [0xcc_u8; 32];
+        let expected = bs58::encode(pubkey).into_string();
+        let mut handler = f.handler;
+        handler.wallet_projections = Some(bip39_projection(
+            f.wallet_addr,
+            vec![solana_projection(pubkey)],
+        ));
+
+        assert_family_address_files(&handler, &w, 0, "sol", &expected).await;
+    }
+
     /// The wallet directory holds the numbered accounts and wallet-wide
     /// state; nothing that names one key is exposed above `<n>/`.
     #[tokio::test]
