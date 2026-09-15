@@ -145,12 +145,21 @@ fn blake3_like_hash(bytes: &[u8]) -> u64 {
 fn mount_write_path_uses_wallet_signer(path: &VfsPath) -> bool {
     let segs = path.segments();
     match segs {
-        [root, _wallet, chains, _chain, outbox, pending, _id, action]
-            if root == "wallets"
-                && chains == "chains"
-                && outbox == "outbox"
-                && pending == "pending"
-                && matches!(action.as_str(), "cancel" | "replace") =>
+        [
+            root,
+            _wallet,
+            _account,
+            chains,
+            _chain,
+            outbox,
+            pending,
+            _id,
+            action,
+        ] if root == "wallets"
+            && chains == "chains"
+            && outbox == "outbox"
+            && pending == "pending"
+            && matches!(action.as_str(), "cancel" | "replace") =>
         {
             true
         }

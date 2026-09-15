@@ -1793,12 +1793,21 @@ fn write_path_uses_wallet_signer(path: &VfsPath) -> bool {
         // Cancel/replace consume a signer and are not fully covered by the
         // outbox-confirm review-hash marker flow, so they must use
         // write_unlocked rather than a plain IPC write.
-        [root, _wallet, chains, _chain, outbox, pending, _id, action]
-            if root == "wallets"
-                && chains == "chains"
-                && outbox == "outbox"
-                && pending == "pending"
-                && matches!(action.as_str(), "cancel" | "replace") =>
+        [
+            root,
+            _wallet,
+            _account,
+            chains,
+            _chain,
+            outbox,
+            pending,
+            _id,
+            action,
+        ] if root == "wallets"
+            && chains == "chains"
+            && outbox == "outbox"
+            && pending == "pending"
+            && matches!(action.as_str(), "cancel" | "replace") =>
         {
             true
         }

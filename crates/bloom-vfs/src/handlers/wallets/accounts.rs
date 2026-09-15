@@ -43,6 +43,9 @@ pub const ACCOUNT_KEY_FILES: [&str; 7] = [
 /// only with outbox entries that account's EVM key staged.
 const EVM_MEMPOOL_LEAVES: [&str; 2] = ["pending_external.jsonl", "nonce_conflicts.json"];
 
+/// Sorted account-owned nonces and the transaction hashes grouped by nonce.
+type EvmOutboxNonces = (Vec<u64>, std::collections::BTreeMap<u64, Vec<String>>);
+
 /// One family's key inside an account.
 #[derive(Clone, Debug)]
 pub(super) struct FamilyKey {
@@ -950,7 +953,7 @@ impl WalletsHandler {
         family: &FamilyKey,
         chain: &str,
         state: OutboxState,
-    ) -> Result<(Vec<u64>, std::collections::BTreeMap<u64, Vec<String>>), HandlerError> {
+    ) -> Result<EvmOutboxNonces, HandlerError> {
         let mut nonces = std::collections::BTreeSet::new();
         let mut by_nonce: std::collections::BTreeMap<u64, Vec<String>> =
             std::collections::BTreeMap::new();
