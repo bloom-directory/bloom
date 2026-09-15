@@ -2396,6 +2396,8 @@ dependencies = [
  "bloom-machine-client",
  "bloom-proto",
  "bloom-revert",
+ "bloom-service-activation",
+ "bloom-signer-api",
  "bloom-signer-derive",
  "bloom-solana-tx",
  "bloom-tx",
@@ -2704,6 +2706,21 @@ dependencies = [
  "rustix 1.1.4",
  "tracing",
  "tracing-subscriber 0.3.23",
+]
+
+[[package]]
+name = "bloom-signer-api"
+version = "0.1.0"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=941dd376568b52ccd269ecf495bcff7dcd9af504#941dd376568b52ccd269ecf495bcff7dcd9af504"
+dependencies = [
+ "bloom-rpc-wire",
+ "ed25519-dalek",
+ "hex",
+ "serde",
+ "serde_jcs",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
