@@ -18,7 +18,7 @@ const TRUSTED_GITHUB_OWNER: &str = "bloom-directory";
 // Retain a bounded diagnostic tail for reconciliation after streamed output.
 const SOURCE_BUILD_STREAM_LIMIT: usize = 256 * 1024;
 const NEAR_INTENTS_RELEASE_COMMIT: &str = "ccabb93214f1f18cf9b36946425e60035763f193";
-const ENSO_RELEASE_COMMIT: &str = "59e3c884f83c9c97b69b1b415becf8572791273b";
+const ENSO_RELEASE_COMMIT: &str = "709c8ef8396a562387c8aa8f5ef2cc6f97784cfc";
 
 /// Canonical defaults for every Bloom home, independent of persisted config.
 pub(crate) const DEFAULT_PETALS: &[&str] =
@@ -189,11 +189,11 @@ const PREINSTALLED_ENSO: PreinstalledPetal = PreinstalledPetal {
     name: "enso",
     repository: "https://github.com/bloom-directory/bloom-petal-enso",
     commit: ENSO_RELEASE_COMMIT,
-    release_tag: "v0.1.2",
-    archive: "enso-v0.1.2.petal.tar.gz",
-    expected_hash: Some("82e541b237cd8dde0a566dfca7f3d20d6e688aacd23f62b1d0f1306f9c76ecb7"),
-    archive_sha256: "16abd73df768b5f9aba45f20b5c56a50c064368d25bf5e8efa31d3564608422e",
-    tooling_commit: "ec8fe8e445073e4cbef8a62bb27ab88feca32ef6",
+    release_tag: "v0.1.3",
+    archive: "enso-v0.1.3.petal.tar.gz",
+    expected_hash: Some("4449269cc3b3a55cece350ddbbf0e22c6d523d90eb867c9be1087b99c01239ac"),
+    archive_sha256: "00554421df1e506da36bad346bfd6e0641313ccc0c4c0c9177ffc78600fcf1d2",
+    tooling_commit: "1af3ba971e8b494b58bb85d0c0fcf2ad15cd3b4c",
     petal_abi: "bloom.petal-host/triad-compatible-nonauthority-v1",
     default_eligible: true,
     lineage_id: None,
@@ -1762,9 +1762,9 @@ mod tests {
         assert_eq!(near.archive, "near-intents-v0.1.2.petal.tar.gz");
         assert!(near.repository.ends_with("/bloom-petal-near"));
         let enso = preinstalled_petal("enso").unwrap();
-        assert_eq!(enso.release_tag, "v0.1.2");
+        assert_eq!(enso.release_tag, "v0.1.3");
         assert_eq!(enso.commit, ENSO_RELEASE_COMMIT);
-        assert_eq!(enso.archive, "enso-v0.1.2.petal.tar.gz");
+        assert_eq!(enso.archive, "enso-v0.1.3.petal.tar.gz");
         assert!(enso.repository.ends_with("/bloom-petal-enso"));
         for name in [
             "polymarket",

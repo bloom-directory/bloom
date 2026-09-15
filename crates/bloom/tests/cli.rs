@@ -1432,15 +1432,20 @@ fn vfs_cat_status_update_when_no_cache_reports_unknown() {
 
 #[test]
 fn vfs_cat_status_update_with_seed_cache_reports_behind() {
+    let installed = env!("CARGO_PKG_VERSION");
+    let major: u64 = installed.split('.').next().unwrap().parse().unwrap();
+    let latest = format!("{}.0.0", major + 1);
     let home = fresh_home();
     let cache_dir = home.path().join("cache");
     std::fs::create_dir_all(&cache_dir).unwrap();
     bloom_update::cache::write(
         &cache_dir,
         &bloom_update::UpdateSnapshot::ok(
-            "0.1.0".into(),
-            Some("0.3.0".into()),
-            Some("https://github.com/bloom-directory/bloom/releases/tag/v0.3.0".into()),
+            installed.into(),
+            Some(latest.clone()),
+            Some(format!(
+                "https://github.com/bloom-directory/bloom/releases/tag/v{latest}"
+            )),
         ),
     )
     .unwrap();
@@ -1452,27 +1457,23 @@ fn vfs_cat_status_update_with_seed_cache_reports_behind() {
         .args(["vfs", "cat", "/status/update/latest"])
         .assert()
         .success()
-        .stdout(predicate::eq("0.3.0\n"));
+        .stdout(predicate::eq(format!("{latest}\n")));
     bloom_cmd(home.path())
         .args(["vfs", "cat", "/status/update/available"])
         .assert()
         .success()
-        .stdout(predicate::eq(
-            if bloom_update::compare_semver(env!("CARGO_PKG_VERSION"), "0.3.0")
-                == std::cmp::Ordering::Less
-            {
-                "out_of_date\n"
-            } else {
-                "up_to_date\n"
-            },
-        ));
+        .stdout(predicate::eq("out_of_date\n"));
     bloom_cmd(home.path())
         .arg("status")
         .assert()
         .success()
-        .stdout(predicate::str::contains("latest_release: 0.3.0"))
+        .stdout(predicate::str::contains(format!(
+            "latest_release: {latest}"
+        )))
         .stdout(predicate::str::contains("update_available: out_of_date"))
-        .stderr(predicate::str::contains("hint: bloom v0.3.0 is available"));
+        .stderr(predicate::str::contains(format!(
+            "hint: bloom v{latest} is available"
+        )));
 }
 
 #[test]
@@ -2505,8 +2506,8 @@ fn github_source_install_polymarket_dispatches_route_contract() {
     if std::env::var_os("BLOOM_RUN_NETWORK_TESTS").as_deref() != Some(std::ffi::OsStr::new("1")) {
         return;
     }
-    // This commit uses the same canonical Petal contract revision as Bloom.
-    let petal_ref = "a47e7e462c2be117d497a3edd2399fb1f4acfe8d";
+    // Exercise source installation of the current pinned Polymarket release.
+    let petal_ref = "cb6259f6458fc9a27708b8c4c4e35d28a69d24fc";
     let home = fresh_home();
     let home_dir = bloom_proto::HomeDir::at(home.path());
     let config = bloom_proto::Config::local_default();
