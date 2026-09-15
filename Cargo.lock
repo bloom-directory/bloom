@@ -2200,7 +2200,7 @@ dependencies = [
 [[package]]
 name = "bloom-broker-api"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-broker.git?rev=57cbc6c6fb3b64899061f54b1f3dd68c827b16e1#57cbc6c6fb3b64899061f54b1f3dd68c827b16e1"
+source = "git+https://github.com/bloom-directory/bloom-broker.git?rev=2d0959c4d010eb4bb5f93efa63f30ac80244e638#2d0959c4d010eb4bb5f93efa63f30ac80244e638"
 dependencies = [
  "bloom-rpc-wire",
  "serde",

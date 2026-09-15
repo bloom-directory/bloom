@@ -753,6 +753,7 @@ impl DaemonPetalHost {
         wallet: &bloom_broker_api::WalletPublic,
         scope: &bloom_broker_api::PetalKeyScope,
         key_ref: &bloom_broker_api::KeyRef,
+        scope_expires_at_ms: Option<bloom_broker_api::DecimalU64>,
         provenance_digest: bloom_broker_api::Digest32,
     ) -> Result<(bloom_broker_api::SealedApprovalPrepareResponse, u64), HostError> {
         let catalog = self.provenance_catalog.as_ref().ok_or_else(|| {
@@ -816,6 +817,18 @@ impl DaemonPetalHost {
                 "derived-key lifetime is too short for reusable approval".into(),
             ));
         }
+        // The Signer's authoritative key-scope expiry bounds the approval:
+        // a lifetime computed from retry time must never outlive the
+        // already-created key's remaining scope.
+        let mut approval_expires_at_ms = now_ms.saturating_add(approval_lifetime_ms);
+        if let Some(absolute) = scope_expires_at_ms.as_ref().map(|value| value.get()) {
+            if absolute <= now_ms {
+                return Err(HostError::Denied(
+                    "derived-key scope expired before reusable approval preparation".into(),
+                ));
+            }
+            approval_expires_at_ms = approval_expires_at_ms.min(absolute);
+        }
         let scope_digest = scope
             .digest()
             .map_err(|error| HostError::Invalid(error.to_string()))?;
@@ -873,9 +886,7 @@ impl DaemonPetalHost {
             request_nonce,
             issued_at_ms: bloom_broker_api::DecimalU64::new(now_ms),
             not_before_ms: bloom_broker_api::DecimalU64::new(now_ms),
-            expires_at_ms: bloom_broker_api::DecimalU64::new(
-                now_ms.saturating_add(approval_lifetime_ms),
-            ),
+            expires_at_ms: bloom_broker_api::DecimalU64::new(approval_expires_at_ms),
             renewal_of: None,
         };
         let plan = serde_json::json!({
@@ -1428,8 +1439,47 @@ impl PetalHost for DaemonPetalHost {
                     "Petal key request_id was already used with different terms".into(),
                 ));
             }
-            if let Some(derived_key_ref) = stored.public_key.as_ref().map(|key| key.key_ref.clone())
-            {
+            if let Some(previous_public) = stored.public_key.clone() {
+                let derived_key_ref = previous_public.key_ref.clone();
+                // Refresh Broker-owned scope metadata on every
+                // reconciliation. Older durable records predate the absolute
+                // expiry projection, and a lifetime calculated from retry
+                // time can exceed the Signer scope that actually stands.
+                let public = broker
+                    .key(bloom_broker_api::KeyRequest {
+                        key_ref: derived_key_ref.clone(),
+                    })
+                    .await
+                    .map_err(|error| {
+                        HostError::Denied(format!("{}: {}", error.code.as_str(), error.message))
+                    })?;
+                let mut comparable = public.clone();
+                comparable.petal_scope_expires_at_ms =
+                    previous_public.petal_scope_expires_at_ms.clone();
+                if previous_public.addresses.is_empty() {
+                    // Older Signers projected scoped Ed25519 keys without
+                    // their deterministic Solana address. Accept only that
+                    // one-way metadata repair; a changed non-empty address
+                    // remains a conflict.
+                    comparable.addresses.clear();
+                }
+                if comparable != previous_public
+                    || !scope
+                        .allowed_crypto_suites
+                        .iter()
+                        .all(|suite| public.supported_crypto_suites.contains(suite))
+                {
+                    return Err(HostError::Denied(
+                        "persisted Petal public key conflicts with Broker metadata".into(),
+                    ));
+                }
+                let scope_expires_at_ms =
+                    public.petal_scope_expires_at_ms.clone().ok_or_else(|| {
+                        HostError::Denied(
+                            "Broker omitted the derived Petal key scope expiry".into(),
+                        )
+                    })?;
+                stored.public_key = Some(public);
                 if let Some(approval_id) = stored.reusable_approval_id.clone() {
                     let approval = broker.approval_status(approval_id).await.map_err(|error| {
                         HostError::Denied(format!("{}: {}", error.code.as_str(), error.message))
@@ -1472,6 +1522,7 @@ impl PetalHost for DaemonPetalHost {
                         &wallet,
                         &scope,
                         &derived_key_ref,
+                        Some(scope_expires_at_ms),
                         provenance_digest.clone().ok_or_else(|| {
                             HostError::Denied("Petal provenance digest is missing".into())
                         })?,
@@ -1525,22 +1576,37 @@ impl PetalHost for DaemonPetalHost {
                             "Broker returned public key metadata outside the Petal scope".into(),
                         ));
                     }
-                    if stored
-                        .public_key
-                        .as_ref()
-                        .is_some_and(|previous| previous != &public)
-                    {
-                        return Err(HostError::Denied(
-                            "persisted Petal public key conflicts with Broker custody result"
-                                .into(),
-                        ));
+                    if let Some(previous) = stored.public_key.as_ref() {
+                        let mut comparable = public.clone();
+                        // The scope-expiry projection is Broker-owned and may
+                        // legitimately appear on records that predate it; a
+                        // newly deterministic Solana address is the same
+                        // one-way repair. Anything else is a conflict.
+                        comparable.petal_scope_expires_at_ms =
+                            previous.petal_scope_expires_at_ms.clone();
+                        if previous.addresses.is_empty() {
+                            comparable.addresses.clear();
+                        }
+                        if &comparable != previous {
+                            return Err(HostError::Denied(
+                                "persisted Petal public key conflicts with Broker custody result"
+                                    .into(),
+                            ));
+                        }
                     }
+                    let scope_expires_at_ms =
+                        public.petal_scope_expires_at_ms.clone().ok_or_else(|| {
+                            HostError::Denied(
+                                "Broker omitted the derived Petal key scope expiry".into(),
+                            )
+                        })?;
                     let (reusable, authority_expires_at_ms) = self
                         .prepare_petal_key_reusable_approval(
                             broker,
                             &wallet,
                             &scope,
                             &public.key_ref,
+                            Some(scope_expires_at_ms),
                             provenance_digest.clone().ok_or_else(|| {
                                 HostError::Denied("Petal provenance digest is missing".into())
                             })?,
@@ -5689,6 +5755,11 @@ mod tests {
         prepares: std::sync::atomic::AtomicUsize,
         parent: bloom_broker_api::KeyRef,
         child: bloom_broker_api::KeyRef,
+        /// Absolute Signer key-scope expiry projected through Broker's
+        /// `KeyPublic`. Defaults to far-future; tests tighten it to prove the
+        /// approval never outlives the key scope.
+        scope_expires_at_ms: std::sync::atomic::AtomicU64,
+        last_prepare_expires_at_ms: std::sync::Mutex<Option<u64>>,
     }
 
     struct PetalExactBrokerFixture {
@@ -5748,6 +5819,8 @@ mod tests {
                                 supported_crypto_suites: vec![
                                     bloom_broker_api::CryptoSuite::Secp256k1Sha256Recoverable,
                                 ],
+
+                                petal_scope_expires_at_ms: None,
                             },
                         ))
                     }
@@ -5870,6 +5943,14 @@ mod tests {
                 prepares: std::sync::atomic::AtomicUsize::new(0),
                 parent: key_ref("wallet/primary/root", 1),
                 child,
+                scope_expires_at_ms: std::sync::atomic::AtomicU64::new(
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis() as u64
+                        + 3_600_000,
+                ),
+                last_prepare_expires_at_ms: std::sync::Mutex::new(None),
             }
         }
     }
@@ -5958,10 +6039,16 @@ mod tests {
                                     // narrower scope independently on every use.
                                     bloom_broker_api::CryptoSuite::Secp256k1Sha256Recoverable,
                                 ],
+                                petal_scope_expires_at_ms: Some(bloom_broker_api::DecimalU64::new(
+                                    self.scope_expires_at_ms
+                                        .load(std::sync::atomic::Ordering::SeqCst),
+                                )),
                             },
                         ))
                     }
                     MachineBrokerRequest::SealedApprovalPrepare(request) => {
+                        *self.last_prepare_expires_at_ms.lock().unwrap() =
+                            Some(request.terms.expires_at_ms.get());
                         let bloom_broker_api::ApprovalSelector::Petal { route_grants, .. } =
                             &request.terms.selector
                         else {
@@ -6375,6 +6462,148 @@ mod tests {
         std::fs::write(&state_path, serde_json::to_vec(&tampered).unwrap()).unwrap();
         let tamper_error = host.petal_key_request(request).await.unwrap_err();
         assert!(tamper_error.to_string().contains("different terms"));
+    }
+
+    #[tokio::test]
+    async fn petal_key_approval_never_outlives_the_signer_key_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
+        let fixture = Arc::new(PetalKeyBrokerFixture::new());
+        let provenance_record = bloom_broker_api::ProvenanceRecord {
+            subject: bloom_broker_api::ProvenanceSubject::Petal {
+                package_hash: bloom_broker_api::Digest32::from_bytes([0xaa; 32]),
+                route: "r000007".into(),
+            },
+            publisher: bloom_broker_api::Token::new("fixture-publisher").unwrap(),
+            petal_lineage: Some(bloom_broker_api::PetalLineageMembership {
+                lineage_id: "pln1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                release_sequence: bloom_broker_api::DecimalU64::new(1),
+                predecessor_package_hashes: vec![],
+                controller_key_id: bloom_broker_api::Token::new("fixture-controller").unwrap(),
+                controller_signature: bloom_broker_api::Base64UrlBytes::from_bytes(&[0x44; 64]),
+                active: true,
+            }),
+            operation_classes: vec![bloom_broker_api::ProvenanceOperationClass {
+                operation_class: bloom_broker_api::Token::new("exchange-agent").unwrap(),
+                fee_asset: None,
+            }],
+            installer_key_id: bloom_broker_api::Token::new("fixture-installer").unwrap(),
+            installer_signature: bloom_broker_api::Base64UrlBytes::from_bytes(&[0x55; 64]),
+        };
+        let host = DaemonPetalHost::new(Arc::new(LateVfsHost::new()), audit)
+            .with_broker(Some(MachineBrokerClient::new(fixture.clone())))
+            .with_provenance_catalog(Some(bloom_broker_api::ProvenanceCatalog {
+                schema: bloom_broker_api::PROVENANCE_CATALOG_SCHEMA.into(),
+                records: vec![provenance_record],
+            }))
+            .with_petal_key_state_root(dir.path().join("petal-key-requests"));
+        let context = PetalRouteContext {
+            petal_root: "exchange".into(),
+            package_hash: "aa".repeat(32),
+            route_id: "r000007".into(),
+            op: "write".into(),
+            path: "orders/new".into(),
+            params: Vec::new(),
+            actor: None,
+        };
+        let base_request = bloom_petals::PetalKeyRequest {
+            wallet_id: "primary".into(),
+            key_slot: "scope-a".into(),
+            allowed_routes: vec!["r000007".into()],
+            allowed_operation_classes: vec!["exchange-agent".into()],
+            allowed_crypto_suites: vec!["secp256k1-keccak256-recoverable".into()],
+            maximum_lifetime_ms: 60_000,
+            context: Some(context),
+        };
+        fixture
+            .completed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        // Far-future scope: the approval keeps the half-lifetime margin and is
+        // not clamped by the projection.
+        let request = base_request.clone();
+        host.petal_key_request(request.clone()).await.unwrap();
+        host.petal_key_request(request).await.unwrap();
+        let prepared_expiry = fixture
+            .last_prepare_expires_at_ms
+            .lock()
+            .unwrap()
+            .expect("reusable approval must have been prepared");
+        let before = now_ms_for_fixture();
+        assert!(
+            prepared_expiry > before && prepared_expiry <= before + 30_000,
+            "half-lifetime approval expected, got {prepared_expiry} vs now {before}"
+        );
+
+        // Tight absolute scope: the approval must expire no later than the
+        // Signer's authoritative key-scope deadline, not now + lifetime.
+        let scope_deadline = now_ms_for_fixture() + 10_000;
+        fixture
+            .scope_expires_at_ms
+            .store(scope_deadline, std::sync::atomic::Ordering::SeqCst);
+        let mut request = base_request.clone();
+        request.key_slot = "scope-b".into();
+        host.petal_key_request(request.clone()).await.unwrap();
+        host.petal_key_request(request).await.unwrap();
+        assert_eq!(
+            *fixture.last_prepare_expires_at_ms.lock().unwrap(),
+            Some(scope_deadline),
+            "approval expiry must clamp to the key-scope deadline"
+        );
+
+        // Already-expired scope: fail closed instead of preparing.
+        fixture.scope_expires_at_ms.store(
+            now_ms_for_fixture().saturating_sub(1),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        let mut request = base_request.clone();
+        request.key_slot = "scope-c".into();
+        host.petal_key_request(request.clone()).await.unwrap();
+        let expired = host.petal_key_request(request).await.unwrap_err();
+        assert!(
+            expired.to_string().contains("expired before"),
+            "unexpected error: {expired}"
+        );
+
+        // A durable record from before the projection must reconcile without
+        // a false metadata conflict, and restage against the live deadline.
+        fixture.scope_expires_at_ms.store(
+            now_ms_for_fixture() + 3_600_000,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        let mut request = base_request.clone();
+        request.key_slot = "scope-d".into();
+        host.petal_key_request(request.clone()).await.unwrap();
+        host.petal_key_request(request.clone()).await.unwrap();
+        let state_path = host
+            .petal_key_state_path(
+                "primary",
+                "pln1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "scope-d",
+            )
+            .unwrap();
+        let mut legacy = DaemonPetalHost::read_petal_key_state(&state_path)
+            .unwrap()
+            .unwrap();
+        if let Some(public) = legacy.public_key.as_mut() {
+            public.petal_scope_expires_at_ms = None;
+        }
+        legacy.reusable_approval_id = None;
+        legacy.status = "awaiting_user".into();
+        DaemonPetalHost::write_petal_key_state(&state_path, &legacy).unwrap();
+        let outcome = host.petal_key_request(request).await.unwrap();
+        assert_eq!(serde_json::to_value(&outcome).unwrap()["state"], "pending");
+        let reconciled = DaemonPetalHost::read_petal_key_state(&state_path)
+            .unwrap()
+            .unwrap();
+        assert!(reconciled.reusable_approval_id.is_some());
+        assert!(
+            reconciled
+                .public_key
+                .unwrap()
+                .petal_scope_expires_at_ms
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -8054,6 +8283,7 @@ ws_url = "wss://example.invalid"
                 canonical_public_key: bloom_broker_api::Base64UrlBytes::from_bytes(&child.spki),
                 addresses: vec![child.address.clone()],
                 supported_crypto_suites: child.suites.clone(),
+                petal_scope_expires_at_ms: None,
             }
         }
 
@@ -8733,6 +8963,7 @@ allowed = ["bloom:vfs.read"]
             supported_crypto_suites: vec![
                 bloom_broker_api::CryptoSuite::Secp256k1Keccak256Recoverable,
             ],
+            petal_scope_expires_at_ms: None,
         }
     }
 
