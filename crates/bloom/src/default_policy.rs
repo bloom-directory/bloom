@@ -27,7 +27,9 @@ pub(crate) fn petal_label(name: &str) -> &str {
     match name {
         "polymarket" => "Polymarket",
         "hyperliquid" => "Hyperliquid",
+        "enso" => "Enso",
         "near-intents" => "NEAR Intents",
+        "tolly" => "Tolly",
         other => other,
     }
 }
@@ -40,9 +42,38 @@ fn petal_labels(names: &[String]) -> String {
         .join(", ")
 }
 
-/// Petals the setup menu offers, in the order `bloom init` installs them.
+/// Petals the setup menu offers: Bloom's canonical Petals, in the order
+/// `bloom init` installs them.
 pub(crate) fn menu_petals() -> Vec<String> {
-    PetalsConfig::default().preinstalled
+    github_source::DEFAULT_PETALS
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect()
+}
+
+/// Runtime values a chosen Petal needs before it can act, recorded in
+/// `[petals.runtime.<name>.values]`. Tolly refuses buys, sells, and launches
+/// until writes are enabled; each one still waits for the owner's approval.
+fn setup_runtime_values(name: &str) -> &'static [(&'static str, &'static str)] {
+    match name {
+        "tolly" => &[("tolly_writes", "enabled")],
+        _ => &[],
+    }
+}
+
+/// Record a chosen Petal's runtime values, keeping any the owner already set.
+fn record_runtime_values(petals: &mut PetalsConfig, name: &str) {
+    let values = setup_runtime_values(name);
+    if values.is_empty() {
+        return;
+    }
+    let runtime = petals.runtime.entry(name.to_owned()).or_default();
+    for (key, value) in values {
+        runtime
+            .values
+            .entry((*key).to_owned())
+            .or_insert_with(|| (*value).to_owned());
+    }
 }
 
 /// Whether `bloom init` can ask the setup questions.
@@ -54,8 +85,9 @@ pub(crate) fn interactive_setup_available() -> bool {
 /// Ask which Petals to use and the values each chosen Petal's settings need.
 /// An empty answer, or the end of input, accepts the suggestion.
 ///
-/// Every chosen Petal is recorded in `setup`, which the default policy
-/// proposes, and in `preinstalled`, which Bloom provisions.
+/// Bloom installs every canonical Petal regardless. Each chosen Petal is
+/// recorded in `setup`, which the default policy proposes, along with any
+/// runtime values it needs to act.
 pub(crate) fn run_setup_menu(
     petals: &mut PetalsConfig,
     input: &mut impl BufRead,
@@ -63,7 +95,7 @@ pub(crate) fn run_setup_menu(
 ) -> Result<()> {
     writeln!(
         output,
-        "Choose the Petals to install. The main wallet's policy will allow them, and each transaction still needs your approval."
+        "Choose the Petals your main wallet's policy allows. Each transaction still needs your approval."
     )?;
     let mut chosen = Vec::new();
     for name in menu_petals() {
@@ -82,17 +114,19 @@ pub(crate) fn run_setup_menu(
         }
         setup.insert(name.clone(), PetalSetupConfig { values });
     }
-    petals.preinstalled = chosen;
     petals.setup = setup;
+    for name in &chosen {
+        record_runtime_values(petals, name);
+    }
     Ok(())
 }
 
-/// The non-interactive form of the setup menu: record every provisioned
-/// Petal as chosen, with the catalog's suggested values. Existing choices are
-/// kept.
+/// The non-interactive form of the setup menu: record every canonical Petal
+/// as chosen, with the catalog's suggested values. Existing choices are kept.
 pub(crate) fn accept_setup_suggestions(petals: &mut PetalsConfig) {
-    for name in &petals.preinstalled {
-        let values = setup_template(name)
+    for name in menu_petals() {
+        record_runtime_values(petals, &name);
+        let values = setup_template(&name)
             .map(|template| {
                 template
                     .values
@@ -628,31 +662,41 @@ mod tests {
         petals.setup.keys().map(String::as_str).collect()
     }
 
+    fn tolly_writes(petals: &PetalsConfig) -> Option<&str> {
+        petals
+            .runtime
+            .get("tolly")
+            .and_then(|runtime| runtime.values.get("tolly_writes"))
+            .map(String::as_str)
+    }
+
     #[test]
-    fn menu_offers_the_default_petals_with_polymarket_limit_suggested() {
-        let (petals, output) = menu("\n\n\n\n");
-        assert_eq!(petals.preinstalled, menu_petals());
+    fn menu_offers_the_canonical_petals_with_polymarket_limit_suggested() {
+        let (petals, output) = menu("\n\n\n\n\n\n");
         assert_eq!(
-            petals.preinstalled,
-            ["polymarket", "hyperliquid", "near-intents"]
+            menu_petals(),
+            ["polymarket", "hyperliquid", "enso", "near-intents", "tolly"]
         );
+        assert!(petals.preinstalled.is_empty());
         assert_eq!(
             chosen(&petals),
-            ["hyperliquid", "near-intents", "polymarket"]
+            ["enso", "hyperliquid", "near-intents", "polymarket", "tolly"]
         );
         assert!(petals.setup["hyperliquid"].values.is_empty());
         assert_eq!(polymarket_limit(&petals), Some("100"));
-        assert!(output.contains("Use Polymarket? [Y/n] "));
-        assert!(output.contains("Use NEAR Intents? [Y/n] "));
+        assert_eq!(tolly_writes(&petals), Some("enabled"));
+        for label in ["Polymarket", "Hyperliquid", "Enso", "NEAR Intents", "Tolly"] {
+            assert!(output.contains(&format!("Use {label}? [Y/n] ")), "{output}");
+        }
         assert!(output.contains("Polymarket daily buy limit in pUSD [100]: "));
     }
 
     #[test]
     fn menu_records_declines_and_rejects_invalid_limits() {
-        let (petals, output) = menu("y\nmaybe\nno\nY\nabc\n25.5\n");
-        assert_eq!(petals.preinstalled, ["polymarket", "near-intents"]);
+        let (petals, output) = menu("y\nmaybe\nno\nno\nY\nn\nabc\n25.5\n");
         assert_eq!(chosen(&petals), ["near-intents", "polymarket"]);
         assert_eq!(polymarket_limit(&petals), Some("25.5"));
+        assert_eq!(tolly_writes(&petals), None);
         assert!(output.contains("Answer y or n."));
         assert!(output.contains("Enter a positive amount"));
     }
@@ -660,20 +704,24 @@ mod tests {
     #[test]
     fn menu_accepts_remaining_suggestions_at_end_of_input() {
         let (petals, _) = menu("n\n");
-        assert_eq!(petals.preinstalled, ["hyperliquid", "near-intents"]);
-        assert_eq!(chosen(&petals), ["hyperliquid", "near-intents"]);
+        assert_eq!(
+            chosen(&petals),
+            ["enso", "hyperliquid", "near-intents", "tolly"]
+        );
         assert_eq!(polymarket_limit(&petals), None);
+        assert_eq!(tolly_writes(&petals), Some("enabled"));
     }
 
     #[test]
-    fn scripted_setup_chooses_every_provisioned_petal_and_keeps_existing_values() {
+    fn scripted_setup_chooses_every_canonical_petal_and_keeps_existing_values() {
         let mut petals = PetalsConfig::default();
         accept_setup_suggestions(&mut petals);
         assert_eq!(
             chosen(&petals),
-            ["hyperliquid", "near-intents", "polymarket"]
+            ["enso", "hyperliquid", "near-intents", "polymarket", "tolly"]
         );
         assert_eq!(polymarket_limit(&petals), Some("100"));
+        assert_eq!(tolly_writes(&petals), Some("enabled"));
 
         let mut edited = PetalsConfig::default();
         edited.setup.insert(
@@ -685,10 +733,15 @@ mod tests {
         accept_setup_suggestions(&mut edited);
         assert_eq!(polymarket_limit(&edited), Some("5"));
 
-        let mut opted_out = PetalsConfig::default();
-        opted_out.preinstalled.clear();
-        accept_setup_suggestions(&mut opted_out);
-        assert!(opted_out.setup.is_empty());
+        let mut disabled = PetalsConfig::default();
+        disabled
+            .runtime
+            .entry("tolly".into())
+            .or_default()
+            .values
+            .insert("tolly_writes".into(), "disabled".into());
+        accept_setup_suggestions(&mut disabled);
+        assert_eq!(tolly_writes(&disabled), Some("disabled"));
     }
 
     #[test]
@@ -701,8 +754,10 @@ mod tests {
             encoded.contains("[petals.setup.polymarket.values]\nmax_daily_usd = \"100\""),
             "{encoded}"
         );
+        assert!(encoded.contains("tolly_writes = \"enabled\""), "{encoded}");
         let decoded: bloom_proto::Config = toml::from_str(&encoded).unwrap();
         assert_eq!(decoded.petals.setup, config.petals.setup);
+        assert_eq!(tolly_writes(&decoded.petals), Some("enabled"));
     }
 
     #[test]

@@ -125,8 +125,6 @@ done
 source "$log_dir/triad.env"
 say "triad ready"
 
-grep -A6 '^\[petals' "$machine_home/config.toml" | grep -qE '^preinstalled = \[\]' ||
-  die "launcher did not keep preinstalled = []"
 grep -q '^\[petals.setup.polymarket.values\]' "$machine_home/config.toml" ||
   die "launcher dropped the [petals.setup] tables"
 

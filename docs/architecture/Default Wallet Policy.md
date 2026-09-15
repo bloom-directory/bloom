@@ -17,10 +17,11 @@ The normative security and wire contracts remain
 
 ```text
 bloom init  (once)
-  -> setup menu        choose Petals: Polymarket, Hyperliquid, NEAR Intents
+  -> setup menu        choose which Petals main's policy allows: Polymarket,
+                       Hyperliquid, Enso, NEAR Intents, Tolly
                        review Polymarket's daily buy limit
   -> saves             the choices in Bloom's config
-  -> installs          the chosen Petals, pinned by Bloom's catalog
+  -> installs          Bloom's canonical Petals, pinned by its catalog
   -> writes            each chosen Petal's settings
 
 bloom wallet new main  (or bloom wallet import main)
@@ -46,8 +47,9 @@ Agreed on 2026-09-14:
 1. **Only the `bloom` repository changes.** Broker, Signer, and Petal
    repositories are untouched.
 2. **`bloom init` opens a setup menu** where the user chooses their Petals.
-   It offers Polymarket, Hyperliquid, and NEAR Intents, and Enso once it is
-   fixed.
+   It offers Bloom's canonical Petals: Polymarket, Hyperliquid, Enso, NEAR
+   Intents, and Tolly. Bloom installs all of them for every home; the menu
+   chooses which ones `main`'s policy allows.
 3. **Bloom's setup decides the defaults.** The menu suggests each Petal's
    settings, and the user can change them.
 4. **The default policy is for the first wallet, `main`.** Other wallets
@@ -66,10 +68,15 @@ Agreed on 2026-09-14:
    in its config, writes them again after an update, and says so.
 10. **`bloom init` runs once.** Afterwards users add, update, or remove
     Petals.
-11. **Enso is fixed separately.** Its current release reads a policy file the
-    triad no longer serves, so it cannot run on the triad. Once a fixed
-    release is pinned, the menu offers it, with its route rules in Enso's own
-    settings.
+11. **Enso is offered, and fixed separately.** The default policy allows
+    Enso, but its v0.1.3 release still reads `wallets/<wallet>/policy.toml`,
+    which the triad does not serve. On a local triad a swap intent quotes a
+    route and is then refused with `backend: invalid`. Enso swaps fail until
+    Enso reads its route rules from its own settings.
+12. **Tolly needs writes enabled.** Choosing Tolly sets
+    `[petals.runtime.tolly.values] tolly_writes = "enabled"`, keeping a value
+    the owner already set. Each buy, sell, or launch is still confirmed by the
+    owner.
 
 ## Why it does not work today
 
@@ -78,7 +85,7 @@ Agreed on 2026-09-14:
 | Wallet creation | The create and import ceremony writes a policy that allows no Petals |
 | First use of each Petal | Machine proposes a policy update for that one package, fails the operation with `POLICY_APPROVAL_REQUIRED`, and the owner signs a policy ceremony before retrying |
 | `bloom wallet new` | Returns the ceremony URL immediately. Nothing follows up once the owner completes it ([bloom#199](https://github.com/bloom-directory/bloom/issues/199)) |
-| `bloom init` | Installs the Petals in `[petals] preinstalled` without asking anything. The CLI has no interactive prompts |
+| `bloom init` | Installs Bloom's canonical Petals without asking anything. The CLI has no interactive prompts |
 | Petal changes | `bloom petals install` and `bloom petals uninstall` change installed packages but never propose a policy change |
 | Polymarket | Trading is off until its `settings/<wallet>/venue.toml` sets `enabled = true` |
 
@@ -88,21 +95,25 @@ Agreed on 2026-09-14:
 
 `bloom init` shows a menu when run in a terminal:
 
-1. **Choose Petals.** Polymarket, Hyperliquid, and NEAR Intents, all selected
-   by default.
+1. **Choose Petals.** Polymarket, Hyperliquid, Enso, NEAR Intents, and Tolly,
+   all selected by default.
 2. **Review settings.** Show Polymarket's suggested daily buy limit, 100
    pUSD, and let the user change it. Only positive amounts are accepted.
-3. **Confirm.** Save the choices in Bloom's config, install the chosen
+3. **Confirm.** Save the choices in Bloom's config, install Bloom's canonical
    Petals, and write each chosen Petal's settings.
 
-Setup records each chosen Petal under `[petals.setup]`, with the values the
-menu asked about. The default policy proposes exactly these Petals. Setup
-also sets `[petals] preinstalled` to the same list, but that list only
-controls which catalog Petals Bloom installs and updates:
+Bloom installs its canonical Petals (`DEFAULT_PETALS` in
+`crates/bloom/src/github_source.rs`) for every home and ignores the legacy
+`[petals] preinstalled` setting. Setup records each chosen Petal under
+`[petals.setup]`, with the values the menu asked about, and the default
+policy proposes exactly these Petals. A chosen Petal that needs a runtime
+value before it can act gets it under `[petals.runtime]`:
 
 ```toml
-[petals]
-preinstalled = ["polymarket", "hyperliquid", "near-intents"]
+[petals.runtime.tolly.values]
+tolly_writes = "enabled"
+
+[petals.setup.enso]
 
 [petals.setup.hyperliquid]
 
@@ -110,11 +121,13 @@ preinstalled = ["polymarket", "hyperliquid", "near-intents"]
 
 [petals.setup.polymarket.values]
 max_daily_usd = "100"
+
+[petals.setup.tolly]
 ```
 
-Keeping the two apart lets someone who installs Petals themselves, such as
-the local developer triad, which sets `preinstalled = []`, still choose them
-for the default policy.
+The policy uses the installed package hash for each chosen name, so a Petal
+installed another way, such as the local builds the developer triad installs,
+is still proposed when chosen.
 
 Bloom's built-in catalog (`crates/bloom/src/github_source.rs`) holds each
 Petal's settings template next to its pinned release. For Polymarket that is
@@ -254,7 +267,7 @@ These need other repositories and are out of scope:
 | Sign the policy inside the creation ceremony, for one ceremony in total | bloom-broker, bloom-signer |
 | Count Polymarket sells, add a total limit, and reset a count when its limit changes | bloom-petal-polymarket |
 | Keep Petal settings across updates | The stable installation slot in [Petal derived keys and package succession](./Petal%20derived%20key%20succession.md) |
-| Run Enso on the triad, with route rules in its own settings | bloom-petal-enso, tracked separately |
+| Enso reads its route rules from its own settings instead of `policy.toml`, so its swaps work on the triad | bloom-petal-enso |
 | Create Hyperliquid sessions with fewer ceremonies | [bloom#171](https://github.com/bloom-directory/bloom/issues/171) |
 
 ## Implementation plan
@@ -287,9 +300,10 @@ changes come next.
 
 Automated:
 
-- The menu records declines, rejects invalid limits, and accepts the
-  suggestions at the end of input. The scripted form chooses every
-  provisioned Petal and keeps existing values.
+- The menu offers Bloom's five canonical Petals, records declines, rejects
+  invalid limits, and accepts the suggestions at the end of input. The
+  scripted form chooses every canonical Petal, keeps existing values, and
+  enables Tolly's writes unless the owner already set that value.
 - Chosen Petals round-trip through `config.toml`, and an edited value that
   is not a positive amount cannot change a Petal's settings file.
 - The wait announces each ceremony once, stops when the policy is applied,
