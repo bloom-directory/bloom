@@ -90,29 +90,64 @@ fn release_compatibility_declares_each_edge_without_a_global_protocol_range() {
 
     let release = workspace().join("packaging/triad/release");
     let compatibility = fs::read_to_string(release.join("compatibility-v1.toml")).unwrap();
-    for exact_authority in ["machine_broker", "broker_signer"] {
-        let block =
-            format!("[protocols.{exact_authority}]\nmajor = 1\nminor_min = 4\nminor_max = 4");
-        assert!(compatibility.contains(&block));
+    let verifier = fs::read_to_string(release.join("verify-bundle.sh")).unwrap();
+    // The declared ranges copy the API crates at the pinned revisions, so
+    // compare against those constants rather than literals.
+    for (edge, range, exact) in [
+        ("machine_broker", bloom_broker_api::BROKER_API_RANGE, true),
+        ("broker_signer", bloom_signer_api::SIGNER_API_RANGE, true),
+        (
+            "signer_control",
+            bloom_signer_api::SIGNER_CONTROL_RANGE,
+            false,
+        ),
+        (
+            "session",
+            bloom_service_activation::SESSION_PROTOCOL_RANGE,
+            false,
+        ),
+    ] {
+        let block = format!(
+            "[protocols.{edge}]\nmajor = {}\nminor_min = {}\nminor_max = {}",
+            range.major, range.minor_min, range.minor_max
+        );
+        assert!(compatibility.contains(&block), "missing {block}");
+        assert_eq!(range.minor_min == range.minor_max, exact, "{edge}");
+        if exact {
+            for key in ["minor_min", "minor_max"] {
+                assert!(verifier.contains(&format!(
+                    "require_compat_value protocols.{edge} {key} {}",
+                    range.minor_max
+                )));
+            }
+        }
     }
-    for compatible_support in ["signer_control", "session"] {
-        let block =
-            format!("[protocols.{compatible_support}]\nmajor = 1\nminor_min = 0\nminor_max = 1");
-        assert!(compatibility.contains(&block));
+    // Those constants are only the manifest's if Cargo resolved the same revisions.
+    let lockfile = fs::read_to_string(workspace().join("Cargo.lock")).unwrap();
+    for (repository, key) in [
+        ("bloom-broker", "broker_commit"),
+        ("bloom-signer", "signer_commit"),
+        ("bloom-service-runtime", "service_runtime_commit"),
+    ] {
+        let revision = compatibility
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{key} = \"")))
+            .and_then(|tail| tail.strip_suffix('"'))
+            .unwrap_or_else(|| panic!("compatibility lacks {key}"));
+        let prefix = format!("git+https://github.com/bloom-directory/{repository}.git?rev=");
+        let locked: Vec<_> = lockfile.split(&prefix).skip(1).collect();
+        assert!(
+            !locked.is_empty()
+                && locked
+                    .iter()
+                    .all(|tail| tail.starts_with(&format!("{revision}#"))),
+            "{repository} must be locked only at {key} {revision}"
+        );
     }
     assert!(!compatibility.lines().any(is_legacy_global_protocol_key));
     assert!(is_legacy_global_protocol_key("  protocol_major = 1"));
     assert!(is_legacy_global_protocol_key("\tprotocol_minor_min = 0"));
 
-    let verifier = fs::read_to_string(release.join("verify-bundle.sh")).unwrap();
-    for exact_authority in ["machine_broker", "broker_signer"] {
-        assert!(verifier.contains(&format!(
-            "require_compat_value protocols.{exact_authority} minor_min 4"
-        )));
-        assert!(verifier.contains(&format!(
-            "require_compat_value protocols.{exact_authority} minor_max 4"
-        )));
-    }
     assert!(verifier.contains("for support_edge in signer_control session"));
     assert!(verifier.contains("must not declare a global protocol range"));
 
