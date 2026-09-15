@@ -328,6 +328,12 @@ in the background. Current verified installations are reused. Legacy
 `[petals] preinstalled` values are ignored, including empty lists, and are no
 longer written to new configs.
 
+The canonical list is `DEFAULT_PETALS` in
+[`crates/bloom/src/github_source.rs`](./crates/bloom/src/github_source.rs).
+The `PREINSTALLED_*` entries in that file define each Petal's pinned repository,
+commit, release archive, and verification hashes. Both init and background
+startup provisioning use `DEFAULT_PETALS`.
+
 ## General local operation
 
 An already running Machine may continue without Broker for cached public reads,
