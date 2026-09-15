@@ -18,9 +18,8 @@ use crate::github_source::{self, PetalSetupTemplate};
 /// How often a waiting command asks Machine where the default policy stands.
 pub(crate) const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// How long a waiting command keeps polling a ceremony still reported as
-/// awaiting the owner after its expiry, until the Broker marks it expired and
-/// a new proposal replaces it.
+/// How long a waiting command keeps polling a ceremony past its expiry while
+/// Machine cancels it and proposes a replacement.
 const EXPIRED_CEREMONY_GRACE_MS: u64 = 30_000;
 
 /// Name shown in the setup menu and in messages.
@@ -505,8 +504,8 @@ impl DefaultPolicyWait {
                 if self.announced.as_deref() == Some(operation_id.as_str()) {
                     return Ok(WaitStep::Poll);
                 }
-                // The Broker marks an expired ceremony on a later status read and
-                // the next poll proposes a replacement; never hand out a dead link.
+                // Machine cancels a ceremony past its expiry on the next poll and
+                // proposes a replacement; never hand out a dead link.
                 if let Some(expires_at_ms) = ceremony_expires_at_ms.filter(|at| now_ms >= *at) {
                     if now_ms < expires_at_ms.saturating_add(EXPIRED_CEREMONY_GRACE_MS) {
                         return Ok(WaitStep::Poll);

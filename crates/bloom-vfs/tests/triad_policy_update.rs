@@ -1,6 +1,6 @@
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use bloom_broker_api::{
@@ -42,6 +42,7 @@ struct BrokerFixture {
     complete: AtomicBool,
     lose_prepare_response_once: AtomicBool,
     ceremony_state_override: parking_lot::Mutex<Option<CeremonyState>>,
+    ceremony_expires_at_ms: AtomicU64,
     requests: parking_lot::Mutex<Vec<MachineBrokerRequest>>,
     state: parking_lot::Mutex<FixtureState>,
     baseline: SignedPolicySnapshot,
@@ -194,7 +195,9 @@ impl MachineBrokerService for BrokerFixture {
                             ceremony_kind: CeremonyKind::PolicyUpdate,
                             operation_id: OperationId::new(request.id.as_str().to_owned()).unwrap(),
                             state,
-                            expires_at_ms: DecimalU64::new(u64::MAX),
+                            expires_at_ms: DecimalU64::new(
+                                self.ceremony_expires_at_ms.load(Ordering::SeqCst),
+                            ),
                             ceremony_url: (state == CeremonyState::AwaitingUser).then(|| {
                                 "http://localhost:18734/ceremony/policy-test-secret".into()
                             }),
@@ -277,6 +280,7 @@ fn broker_fixture(lose_prepare_response_once: bool) -> Arc<BrokerFixture> {
         complete: AtomicBool::new(false),
         lose_prepare_response_once: AtomicBool::new(lose_prepare_response_once),
         ceremony_state_override: parking_lot::Mutex::new(None),
+        ceremony_expires_at_ms: AtomicU64::new(u64::MAX),
         requests: parking_lot::Mutex::new(Vec::new()),
         state: parking_lot::Mutex::new(FixtureState {
             operation_id: None,
@@ -883,6 +887,43 @@ async fn expired_default_policy_proposal_is_replaced_by_a_new_ceremony() {
         updates
             .join("pending")
             .join(replacement.operation_id.as_str())
+            .exists()
+    );
+}
+
+#[tokio::test]
+async fn policy_ceremony_past_expiry_is_cancelled_and_replaced() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = broker_fixture(false);
+    let packages = [Digest32::from_bytes([7; 32]), Digest32::from_bytes([8; 32])];
+    let handler = eligibility_handler(temp.path(), fixture.clone());
+    let PetalEligibility::AwaitingPolicyApproval(first) = handler
+        .ensure_petal_packages_allowed("alice", &packages)
+        .await
+        .unwrap()
+    else {
+        panic!("owner approval must be required");
+    };
+
+    // The Broker still reports the ceremony as awaiting the owner after expiry.
+    fixture.ceremony_expires_at_ms.store(1, Ordering::SeqCst);
+    let PetalEligibility::AwaitingPolicyApproval(replacement) = handler
+        .ensure_petal_packages_allowed("alice", &packages)
+        .await
+        .unwrap()
+    else {
+        panic!("a ceremony past its expiry must be replaced");
+    };
+    assert_ne!(replacement.operation_id, first.operation_id);
+    assert!(fixture.requests.lock().iter().any(|request| matches!(
+        request,
+        MachineBrokerRequest::CeremonyCancel(cancel)
+            if cancel.id.as_str() == first.operation_id.as_str()
+    )));
+    assert!(
+        temp.path()
+            .join("machine-policy-projections/alice/policy-updates/failed")
+            .join(first.operation_id.as_str())
             .exists()
     );
 }

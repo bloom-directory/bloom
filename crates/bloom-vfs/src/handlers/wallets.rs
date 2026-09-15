@@ -1366,10 +1366,19 @@ impl WalletsHandler {
                 .join(APPROVAL_CHALLENGE_FILE);
             let projection: TriadPolicyUpdateProjection = read_json(&path)?;
             let proposed_bytes = projection.retained_policy_bytes()?;
-            match self
+            let mut resumed = self
                 .resume_wallet_policy_update(wallet, &operation_id, &proposed_bytes)
-                .await
+                .await;
+            if matches!(resumed, Err(HandlerError::PermissionDenied))
+                && self
+                    .cancel_expired_policy_ceremony(wallet, &operation_id)
+                    .await?
             {
+                resumed = self
+                    .resume_wallet_policy_update(wallet, &operation_id, &proposed_bytes)
+                    .await;
+            }
+            match resumed {
                 Ok(()) => continue,
                 Err(HandlerError::PermissionDenied) => {
                     let projection: TriadPolicyUpdateProjection = read_json(&path)?;
@@ -1435,6 +1444,32 @@ impl WalletsHandler {
                 "fresh policy proposal unexpectedly committed without owner consent",
             )),
         }
+    }
+
+    /// The Broker reports an expired ceremony as awaiting the owner until asked
+    /// to act on it. Cancel a pending policy ceremony past its expiry so the
+    /// next status read is terminal; returns whether the Broker accepted.
+    async fn cancel_expired_policy_ceremony(
+        &self,
+        wallet: &str,
+        operation_id: &str,
+    ) -> Result<bool, HandlerError> {
+        let projection: TriadPolicyUpdateProjection = read_json(
+            self.policy_update_action_dir(wallet, "pending", operation_id)
+                .join(APPROVAL_CHALLENGE_FILE),
+        )?;
+        if !projection
+            .ceremony_expires_at_ms
+            .as_ref()
+            .is_some_and(|expires_at_ms| expires_at_ms.get() <= now_ms_u64())
+        {
+            return Ok(false);
+        }
+        Ok(self
+            .broker()?
+            .cancel_ceremony(projection.operation_id)
+            .await
+            .is_ok())
     }
 
     /// Gate an explicit caller operation without treating policy completion as submission.

@@ -173,8 +173,12 @@ still exists:
 
 - **`bloom wallet default-policy main`** picks up where the command stopped.
   It shows a ceremony that is still open, or opens a new one after expiry.
-  While waiting, Bloom never announces a replacement for a ceremony that
-  expired.
+  The Broker reports an expired ceremony as awaiting the owner until asked to
+  act on it, so Machine cancels a proposal past its expiry and proposes again.
+  A waiting command never announces a ceremony that has already expired.
+- **Several commands can wait on the same wallet.** Only one updates its
+  policy at a time; a command that finds the wallet's policy lock held checks
+  again on its next poll instead of failing.
 - **The first Petal operation on `main`** also proposes the whole default
   policy, not just its own package. `ensure_petal_eligibility` adds the
   chosen Petals to its proposal for the default-policy wallet.
@@ -289,9 +293,12 @@ Automated:
 - Chosen Petals round-trip through `config.toml`, and an edited value that
   is not a positive amount cannot change a Petal's settings file.
 - The wait announces each ceremony once, stops when the policy is applied,
-  and never announces a replacement for an expired ceremony.
+  never announces a ceremony that has already expired, and polls quietly
+  while another command holds the wallet's policy lock.
 - One policy ceremony allows every chosen package, and packages are added
-  once, in order (`crates/bloom-vfs/tests/triad_policy_update.rs`).
+  once, in order. An expired proposal, including one the Broker still reports
+  as awaiting the owner, is replaced by a new ceremony
+  (`crates/bloom-vfs/tests/triad_policy_update.rs`).
 - Catalog provisioning reports an update separately from a fresh install.
 
 Manual, on the developer triad:
