@@ -386,7 +386,6 @@ fn make_installer_payload(root: &Path) -> PathBuf {
         "systemd/bloom-session@.path",
         "systemd/bloom-broker@.service.in",
         "systemd/bloom-signer@.service.in",
-        "systemd/instance-dropins/bloom-signer@LOGIN_UID.service.d/50-aws-kms.conf.in",
         "systemd-user/bloom-session.service",
         "systemd-user/bloom-machine.service",
     ] {
@@ -427,17 +426,6 @@ fn make_installer_payload(root: &Path) -> PathBuf {
   "signer_uid": @BLOOM_SIGNER_UID@,
   "session_socket_gid": @SESSION_SOCKET_GID@
 }"#,
-    )
-    .unwrap();
-    fs::create_dir_all(payload.join("credentials")).unwrap();
-    fs::write(
-        payload.join("config/aws-kms-ip-allow.conf"),
-        b"IPAddressAllow=192.0.2.0/24\n",
-    )
-    .unwrap();
-    fs::write(
-        payload.join("credentials/aws-credentials"),
-        b"[default]\naws_access_key_id=test\n",
     )
     .unwrap();
     payload
@@ -1492,16 +1480,6 @@ fn linux_installer_upgrade_rotation_and_confirmed_uninstall_are_staged_safely() 
             & 0o777,
         0o600
     );
-    let aws_dropin = fs::read_to_string(
-        root.join("usr/lib/systemd/system/bloom-signer@1000.service.d/50-aws-kms.conf"),
-    )
-    .unwrap();
-    assert!(aws_dropin.contains("IPAddressDeny=any"));
-    assert!(aws_dropin.contains("IPAddressAllow=192.0.2.0/24"));
-    assert!(!aws_dropin.contains("@AWS_KMS_IP_ALLOW_DIRECTIVES@"));
-
-    fs::remove_file(payload.join("credentials/aws-credentials")).unwrap();
-    fs::remove_file(payload.join("config/aws-kms-ip-allow.conf")).unwrap();
     fs::write(payload.join("bin/bloom-broker"), b"upgraded-broker").unwrap();
     fs::write(payload.join("SHA256SUMS"), b"upgraded payload\n").unwrap();
     assert!(
@@ -1525,12 +1503,6 @@ fn linux_installer_upgrade_rotation_and_confirmed_uninstall_are_staged_safely() 
             .matches("x-bloom.login-uid=1000")
             .count(),
         1
-    );
-    assert!(!root.join("etc/bloom/1000/signer/aws-credentials").exists());
-    assert!(
-        !root
-            .join("usr/lib/systemd/system/bloom-signer@1000.service.d/50-aws-kms.conf")
-            .exists()
     );
 
     let custody = root.join("var/lib/bloom/1000/signer/wallet-custody");
@@ -1803,39 +1775,11 @@ fn linux_installer_authenticates_payload_before_mutating_existing_files() {
     let pinned_key = directory.path().join("pinned-release-key.pub");
     generate_ed25519_key(&private_key);
     write_ed25519_public_key(&private_key, &pinned_key);
-    fs::remove_file(payload.join("credentials/aws-credentials")).unwrap();
-    fs::remove_file(payload.join("config/aws-kms-ip-allow.conf")).unwrap();
     authenticate_installer_payload(&payload, &private_key);
 
     let installed_binary = root.join("usr/libexec/bloom/current/bloom-broker");
     fs::create_dir_all(installed_binary.parent().unwrap()).unwrap();
     fs::write(&installed_binary, b"existing-install").unwrap();
-    fs::write(
-        payload.join("credentials/aws-credentials"),
-        b"[default]\naws_access_key_id=unsigned\n",
-    )
-    .unwrap();
-    fs::write(
-        payload.join("config/aws-kms-ip-allow.conf"),
-        b"IPAddressAllow=192.0.2.0/24\n",
-    )
-    .unwrap();
-    let unsigned_overlay = Command::new(release_script("install-linux.sh"))
-        .args(["install"])
-        .arg(&root)
-        .args(["1000", "alice"])
-        .arg(&payload)
-        .env("BLOOM_ALLOW_TEST_UNCLAIMED", "true")
-        .env("BLOOM_TEST_VERIFY_RELEASE_PAYLOAD", "true")
-        .env("BLOOM_RELEASE_PUBLIC_KEY", &pinned_key)
-        .output()
-        .unwrap();
-    assert!(!unsigned_overlay.status.success());
-    assert!(
-        String::from_utf8_lossy(&unsigned_overlay.stderr)
-            .contains("optional signer overlay is not authenticated")
-    );
-    assert_eq!(fs::read(&installed_binary).unwrap(), b"existing-install");
 
     authenticate_installer_payload(&payload, &private_key);
     fs::write(payload.join("bin/bloom-broker"), b"tampered").unwrap();
@@ -1874,6 +1818,90 @@ fn linux_installer_authenticates_payload_before_mutating_existing_files() {
             .contains("payload release signature is invalid")
     );
     assert_eq!(fs::read(&installed_binary).unwrap(), b"existing-install");
+}
+
+/// The released Signer is built without AWS KMS support and refuses KMS
+/// configuration. The installer must refuse KMS inputs, and a login that
+/// already has a KMS enrollment, before it changes anything: an install would
+/// leave a Signer that cannot start, and an upgrade would silently discard the
+/// enrollment's credentials and network profile.
+#[test]
+fn linux_installer_refuses_aws_kms_signer_configuration_before_changing_state() {
+    fn tree(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        fn visit(root: &Path, path: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
+            for entry in fs::read_dir(path).unwrap() {
+                let path = entry.unwrap().path();
+                let relative = path.strip_prefix(root).unwrap().to_path_buf();
+                if path.is_dir() {
+                    out.push((relative, Vec::new()));
+                    visit(root, &path, out);
+                } else {
+                    out.push((relative, fs::read(&path).unwrap()));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        visit(root, root, &mut out);
+        out.sort();
+        out
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let payload = make_installer_payload(directory.path());
+    let installer = release_script("install-linux.sh");
+    let install = |root: &Path| {
+        Command::new(&installer)
+            .args(["install"])
+            .arg(root)
+            .args(["1000", "alice"])
+            .arg(&payload)
+            .env("BLOOM_ALLOW_TEST_UNCLAIMED", "true")
+            .output()
+            .unwrap()
+    };
+
+    let root = directory.path().join("payload-overlay-root");
+    fs::create_dir(&root).unwrap();
+    for (overlay, contents) in [
+        ("credentials/aws-credentials", &b"[default]\n"[..]),
+        (
+            "config/aws-kms-ip-allow.conf",
+            &b"IPAddressAllow=192.0.2.0/24\n"[..],
+        ),
+    ] {
+        let path = payload.join(overlay);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, contents).unwrap();
+        let refused = install(&root);
+        assert!(!refused.status.success());
+        assert!(
+            String::from_utf8_lossy(&refused.stderr)
+                .contains("does not support AWS KMS Signer backends"),
+            "{}",
+            String::from_utf8_lossy(&refused.stderr)
+        );
+        assert!(tree(&root).is_empty(), "{overlay}: {:?}", tree(&root));
+        fs::remove_file(&path).unwrap();
+    }
+
+    for enrollment in [
+        "etc/bloom/1000/signer/aws-credentials",
+        "usr/lib/systemd/system/bloom-signer@1000.service.d/50-aws-kms.conf",
+    ] {
+        let root = directory.path().join(enrollment.replace('/', "-"));
+        let path = root.join(enrollment);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"existing KMS enrollment").unwrap();
+        let before = tree(&root);
+        let refused = install(&root);
+        assert!(!refused.status.success());
+        assert!(
+            String::from_utf8_lossy(&refused.stderr).contains("has an AWS KMS Signer enrollment"),
+            "{}",
+            String::from_utf8_lossy(&refused.stderr)
+        );
+        assert_eq!(tree(&root), before, "{enrollment}");
+    }
 }
 
 #[test]
