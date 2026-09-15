@@ -1,6 +1,6 @@
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use bloom_broker_api::{
@@ -42,6 +42,7 @@ struct BrokerFixture {
     complete: AtomicBool,
     lose_prepare_response_once: AtomicBool,
     ceremony_state_override: parking_lot::Mutex<Option<CeremonyState>>,
+    ceremony_expires_at_ms: AtomicU64,
     requests: parking_lot::Mutex<Vec<MachineBrokerRequest>>,
     state: parking_lot::Mutex<FixtureState>,
     baseline: SignedPolicySnapshot,
@@ -194,7 +195,9 @@ impl MachineBrokerService for BrokerFixture {
                             ceremony_kind: CeremonyKind::PolicyUpdate,
                             operation_id: OperationId::new(request.id.as_str().to_owned()).unwrap(),
                             state,
-                            expires_at_ms: DecimalU64::new(u64::MAX),
+                            expires_at_ms: DecimalU64::new(
+                                self.ceremony_expires_at_ms.load(Ordering::SeqCst),
+                            ),
                             ceremony_url: (state == CeremonyState::AwaitingUser).then(|| {
                                 "http://localhost:18734/ceremony/policy-test-secret".into()
                             }),
@@ -277,6 +280,7 @@ fn broker_fixture(lose_prepare_response_once: bool) -> Arc<BrokerFixture> {
         complete: AtomicBool::new(false),
         lose_prepare_response_once: AtomicBool::new(lose_prepare_response_once),
         ceremony_state_override: parking_lot::Mutex::new(None),
+        ceremony_expires_at_ms: AtomicU64::new(u64::MAX),
         requests: parking_lot::Mutex::new(Vec::new()),
         state: parking_lot::Mutex::new(FixtureState {
             operation_id: None,
@@ -779,6 +783,149 @@ fn package_eligibility_preserves_all_existing_policy_restrictions() {
     expected.allowed_petal_packages.push(hash.clone());
     assert_eq!(after, expected);
     assert_eq!(policy_with_package(&after, &hash), after);
+}
+
+#[test]
+fn default_policy_packages_are_appended_once_in_order() {
+    let before = policy(60_000);
+    let first = Digest32::from_bytes([7; 32]);
+    let second = Digest32::from_bytes([8; 32]);
+    let after = bloom_machine_client::policy_with_packages(
+        &before,
+        &[first.clone(), second.clone(), first.clone()],
+    );
+    let mut expected = before.clone();
+    expected.allowed_petal_packages.extend([first, second]);
+    assert_eq!(after, expected);
+}
+
+#[tokio::test]
+async fn default_wallet_first_proposal_allows_setup_packages_together() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = broker_fixture(true);
+    let requested = Digest32::from_bytes([7; 32]);
+    let chosen = Digest32::from_bytes([8; 32]);
+    let defaults: bloom_vfs::handlers::DefaultPolicyPackages = {
+        let chosen = chosen.clone();
+        Arc::new(move |wallet: &str| {
+            if wallet == "alice" {
+                vec![chosen.clone()]
+            } else {
+                Vec::new()
+            }
+        })
+    };
+    let handler = eligibility_handler(temp.path(), fixture.clone())
+        .with_default_policy_packages(defaults.clone());
+    assert!(
+        matches!(handler.ensure_petal_eligibility("alice", &requested).await,
+        Err(HandlerError::Backend(message)) if message.contains("SERVICE_UNAVAILABLE"))
+    );
+    let PetalEligibility::AwaitingPolicyApproval(pending) = handler
+        .ensure_petal_eligibility("alice", &requested)
+        .await
+        .unwrap()
+    else {
+        panic!("owner approval must be required");
+    };
+    assert!(pending.includes_requested_package);
+    drop(handler);
+    fixture.complete.store(true, Ordering::SeqCst);
+    let restarted =
+        eligibility_handler(temp.path(), fixture.clone()).with_default_policy_packages(defaults);
+    let PetalEligibility::Allowed(snapshot) = restarted
+        .ensure_petal_packages_allowed("alice", &[requested.clone(), chosen.clone()])
+        .await
+        .unwrap()
+    else {
+        panic!("one completed ceremony must allow every setup package");
+    };
+    assert_eq!(
+        snapshot.canonical_policy.decode(),
+        serde_jcs::to_vec(&bloom_machine_client::policy_with_packages(
+            &policy(60_000),
+            &[requested, chosen]
+        ))
+        .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn expired_default_policy_proposal_is_replaced_by_a_new_ceremony() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = broker_fixture(false);
+    let packages = [Digest32::from_bytes([7; 32]), Digest32::from_bytes([8; 32])];
+    let handler = eligibility_handler(temp.path(), fixture.clone());
+    let PetalEligibility::AwaitingPolicyApproval(first) = handler
+        .ensure_petal_packages_allowed("alice", &packages)
+        .await
+        .unwrap()
+    else {
+        panic!("owner approval must be required");
+    };
+
+    *fixture.ceremony_state_override.lock() = Some(CeremonyState::Expired);
+    let PetalEligibility::AwaitingPolicyApproval(replacement) = handler
+        .ensure_petal_packages_allowed("alice", &packages)
+        .await
+        .unwrap()
+    else {
+        panic!("an expired proposal must be replaced, not reported as terminal");
+    };
+    assert_ne!(replacement.operation_id, first.operation_id);
+    assert!(replacement.prepare.is_some());
+    let updates = temp
+        .path()
+        .join("machine-policy-projections/alice/policy-updates");
+    assert!(
+        updates
+            .join("failed")
+            .join(first.operation_id.as_str())
+            .exists()
+    );
+    assert!(
+        updates
+            .join("pending")
+            .join(replacement.operation_id.as_str())
+            .exists()
+    );
+}
+
+#[tokio::test]
+async fn policy_ceremony_past_expiry_is_cancelled_and_replaced() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = broker_fixture(false);
+    let packages = [Digest32::from_bytes([7; 32]), Digest32::from_bytes([8; 32])];
+    let handler = eligibility_handler(temp.path(), fixture.clone());
+    let PetalEligibility::AwaitingPolicyApproval(first) = handler
+        .ensure_petal_packages_allowed("alice", &packages)
+        .await
+        .unwrap()
+    else {
+        panic!("owner approval must be required");
+    };
+
+    // The Broker still reports the ceremony as awaiting the owner after expiry.
+    fixture.ceremony_expires_at_ms.store(1, Ordering::SeqCst);
+    let PetalEligibility::AwaitingPolicyApproval(replacement) = handler
+        .ensure_petal_packages_allowed("alice", &packages)
+        .await
+        .unwrap()
+    else {
+        panic!("a ceremony past its expiry must be replaced");
+    };
+    assert_ne!(replacement.operation_id, first.operation_id);
+    assert!(fixture.requests.lock().iter().any(|request| matches!(
+        request,
+        MachineBrokerRequest::CeremonyCancel(cancel)
+            if cancel.id.as_str() == first.operation_id.as_str()
+    )));
+    assert!(
+        temp.path()
+            .join("machine-policy-projections/alice/policy-updates/failed")
+            .join(first.operation_id.as_str())
+            .exists()
+    );
 }
 
 fn eligibility_handler(temp: &std::path::Path, fixture: Arc<BrokerFixture>) -> WalletsHandler {

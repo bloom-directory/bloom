@@ -4371,6 +4371,30 @@ impl Daemon {
             })),
         );
 
+        // Build the petals runtime: content-addressed store under
+        // `~/.bloom/petals/store`, name registry under
+        // `~/.bloom/petals/registry`, and a wasmtime engine. Petal
+        // packages are exposed under `petals/`.
+        let petals_root = home.root().join("petals");
+        let petal_store = PetalStore::open(petals_root.join("store"))
+            .map_err(|e| DaemonError::Audit(format!("petals store: {e}")))?;
+
+        // The default-policy wallet's first Petal proposal also allows every
+        // installed Petal chosen during setup.
+        let default_policy_packages: bloom_vfs::handlers::DefaultPolicyPackages = {
+            let chosen: Vec<String> = config.petals.setup.keys().cloned().collect();
+            let store = petal_store.clone();
+            Arc::new(move |wallet: &str| {
+                if wallet != bloom_proto::config::DEFAULT_POLICY_WALLET {
+                    return Vec::new();
+                }
+                chosen
+                    .iter()
+                    .filter_map(|name| store.resolve_petal_owner(name).ok().flatten())
+                    .filter_map(|hash| bloom_broker_api::Digest32::new(hash).ok())
+                    .collect()
+            })
+        };
         let wallets_handler = Arc::new(
             WalletsHandler::new(
                 chains.clone(),
@@ -4383,16 +4407,9 @@ impl Daemon {
             .with_home_write_permit_opt(home_write_permit.clone())
             .with_mempool_indexes(mempool_indexes.clone())
             .with_solana(solana_engines)
-            .with_solana_reads(solana_chain_registry.clone()),
+            .with_solana_reads(solana_chain_registry.clone())
+            .with_default_policy_packages(default_policy_packages),
         );
-
-        // Build the petals runtime: content-addressed store under
-        // `~/.bloom/petals/store`, name registry under
-        // `~/.bloom/petals/registry`, and a wasmtime engine. Petal
-        // packages are exposed under `petals/`.
-        let petals_root = home.root().join("petals");
-        let petal_store = PetalStore::open(petals_root.join("store"))
-            .map_err(|e| DaemonError::Audit(format!("petals store: {e}")))?;
         let petal_registry = Arc::new(
             NameRegistry::open(petals_root.join("registry"))
                 .map_err(|e| DaemonError::Audit(format!("petals registry: {e}")))?,
@@ -4772,6 +4789,18 @@ impl Daemon {
     /// callers must not construct a second edge over the same Machine journal.
     pub fn broker_client(&self) -> Option<MachineBrokerClient> {
         self.machine_broker.clone()
+    }
+
+    /// Propose every package in `packages` together through the wallet's
+    /// existing policy operation. `Allowed` means the policy allows all of them.
+    pub async fn ensure_default_policy(
+        &self,
+        wallet: &str,
+        packages: &[bloom_broker_api::Digest32],
+    ) -> Result<bloom_machine_client::PetalEligibility, bloom_vfs::HandlerError> {
+        self.wallets
+            .ensure_petal_packages_allowed(wallet, packages)
+            .await
     }
 
     /// Idempotent: ensure background workers are running. Already
