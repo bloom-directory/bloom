@@ -202,7 +202,7 @@ wait_for_fixture_record() {
       record="$(bounded_mounted_read "$record_path" \
         "Petal key request record read")"
       if printf '%s' "$record" | jq -e --arg request_id "$request_id" '
-        .request_id == $request_id and .status == "awaiting_user" and
+        .key_slot == $request_id and .status == "awaiting_user" and
         (.ceremony_url | type == "string")
       ' >/dev/null 2>&1; then
         printf '%s\n' "$record"
@@ -235,45 +235,6 @@ wait_for_fixture_stage() {
     sleep 0.05
   done
   die "fixture Petal did not reach mounted stage ${expected}"
-}
-
-wait_for_approval_prepare() {
-  wallet_id="$1"
-  attempts=0
-  while [ "$attempts" -lt 200 ]; do
-    approval_body="$(bounded_mounted_read \
-      "$(mounted "/wallets/${wallet_id}/sealed-approvals/new.json")" \
-      "Sealed Approval ceremony projection read")"
-    if printf '%s' "$approval_body" | jq -e '
-      (.approval_id | test("^[0-9a-f]{64}$")) and
-      (.ceremony_url | type == "string")
-    ' >/dev/null 2>&1; then
-      printf '%s\n' "$approval_body"
-      return 0
-    fi
-    attempts=$((attempts + 1))
-    sleep 0.05
-  done
-  die "fixture Sealed Approval prepare did not appear through the mounted VFS"
-}
-
-wait_for_approval_active() {
-  wallet_id="$1"
-  approval_id="$2"
-  attempts=0
-  while [ "$attempts" -lt 20 ]; do
-    approvals="$(bounded_mounted_read \
-      "$(mounted "/wallets/${wallet_id}/sealed-approvals/active.json")" \
-      "Sealed Approval active-list projection read")"
-    if printf '%s' "$approvals" | jq -e --arg approval_id "$approval_id" '
-      any(.approvals[]?; .approval_id == $approval_id and .state == "ACTIVE")
-    ' >/dev/null 2>&1; then
-      return 0
-    fi
-    attempts=$((attempts + 1))
-    sleep 0.25
-  done
-  die "fixture Sealed Approval did not become active through the mounted VFS"
 }
 
 assert_machine_secret_artifacts() {
@@ -375,9 +336,25 @@ registration_launch="$(cli wallet new ma03-registration)"
 registration_result="$(complete_launch "$registration_launch" registration-auth --sign-count 1)"
 registered_wallet="$(printf '%s' "$registration_result" | jq -er '.wallet_id')"
 registered_projection="$(assert_projection_pair "$registered_wallet" registration)"
-printf '%s' "$registered_projection" | jq -e '
-  (.credentials | length) == 1 and (.keys | length) == 1
-' >/dev/null || die "registration projection omitted public authority descriptors"
+printf '%s' "$registered_projection" | jq -e \
+  --arg evm_path "m/44'/60'/0'/0/0" --arg solana_path "m/44'/501'/0'/0'" '
+  (.credentials | length) == 1 and (.keys | length) == 2 and
+  ([.keys[] | select(
+    .key_ref.derivation.scheme == "bip39-multicurve" and
+    .key_ref.derivation.profile == "bip44-evm-secp256k1-v1" and
+    .key_ref.derivation.path == $evm_path and
+    .key_ref.key_spec == "secp256k1" and
+    (.supported_crypto_suites | index("secp256k1-keccak256-recoverable") != null)
+  )] | length) == 1 and
+  ([.keys[] | select(
+    .key_ref.derivation.scheme == "bip39-multicurve" and
+    .key_ref.derivation.profile == "bip44-solana-slip10-ed25519-v1" and
+    .key_ref.derivation.path == $solana_path and
+    .key_ref.key_spec == "ed25519" and
+    (.supported_crypto_suites | index("ed25519-message") != null)
+  )] | length) == 1 and
+  ([.keys[].key_ref.public_key_fingerprint] | unique | length) == 2
+' >/dev/null || die "registration projection omitted canonical EVM/Solana authority descriptors"
 original_credential="$(printf '%s' "$registered_projection" | jq -er '.credentials[0].credential_id')"
 wallet_entries="$(bounded_mounted_list "$(mounted "/wallets/${registered_wallet}")" \
   "wallet projection directory read")"
@@ -475,20 +452,33 @@ request_id="ma03-key-derive-$$"
 fixture_request="$(jq -nc \
   --arg request_id "$request_id" --arg wallet_id "$registered_wallet" \
   '{request_id:$request_id,wallet_id:$wallet_id,purpose:"fixture.payload",
-    maximum_lifetime_ms:900000,preimage_hex:"6d613033",
+    maximum_lifetime_ms:300000,preimage_hex:"6d613033",
     nonce_hex:"11111111111111111111111111111111",approval_hint:null}')"
 printf '%s\n' "$fixture_request" > "$(mounted /petals/triad-authority-fixture/session.json)" 2>/dev/null || true
 key_record="$(wait_for_fixture_record "$request_id")"
 key_ceremony_url="$(printf '%s' "$key_record" | jq -er '.ceremony_url')"
-before_key_count="$(printf '%s' "$policy_projection" | jq -er '.keys | length')"
 "$driver_bin" complete "$key_ceremony_url" replacement-auth --sign-count 3 >/dev/null
+# Custody completion is reconciled on the next identical request. It stages a
+# separate reusable signing approval; possession of a derived key is not consent.
+printf '%s\n' "$fixture_request" > "$(mounted /petals/triad-authority-fixture/session.json)" 2>/dev/null || true
+approval_key_record="$(wait_for_fixture_record "$request_id")"
+# The old custody record can remain visible briefly through NFS.
+for attempt in $(seq 1 100); do
+  [ "$(printf '%s' "$approval_key_record" | jq -r '.public_key != null')" = true ] && break
+  sleep 0.05
+  approval_key_record="$(wait_for_fixture_record "$request_id")"
+done
+printf '%s' "$approval_key_record" | jq -e '
+  .status == "awaiting_user" and .public_key.key_ref.derivation != null
+' >/dev/null || die "custody completion did not stage the derived-key approval"
+pending_fixture="$(wait_for_fixture_stage key:pending)"
+printf '%s' "$pending_fixture" | jq -e '
+  .outcome.state == "pending" and .signature_hex == null
+' >/dev/null || die "fixture signed before reusable approval consent"
+reusable_ceremony_url="$(printf '%s' "$approval_key_record" | jq -er '.ceremony_url')"
+[ "$reusable_ceremony_url" != "$key_ceremony_url" ] || die "reusable approval reused the custody ceremony"
+"$driver_bin" complete "$reusable_ceremony_url" replacement-auth --sign-count 4 >/dev/null
 derived_projection="$(assert_projection_pair "$registered_wallet" key-derive)"
-after_key_count="$(printf '%s' "$derived_projection" | jq -er '.keys | length')"
-[ "$after_key_count" -eq $((before_key_count + 1)) ] ||
-  die "derived key did not appear in the public wallet projection"
-printf '%s' "$derived_projection" | jq -e '
-  any(.keys[]; .key_ref.derivation != null)
-' >/dev/null || die "derived key projection omitted public derivation metadata"
 printf '%s' "$derived_projection" | jq -e --arg replacement "$replacement_credential" '
   (.credentials | length) == 1 and
   .credentials[0].credential_id == $replacement
@@ -496,13 +486,16 @@ printf '%s' "$derived_projection" | jq -e --arg replacement "$replacement_creden
 
 printf 'MA-08: signing with the scoped child through the mounted fixture Petal...\n'
 # Re-run the exact mounted request after custody completion.  The Petal must
-# now reach the canonical missing-approval boundary rather than receiving any
-# child secret or a Machine-minted capability.
+# now reject an explicitly unknown approval instead of falling back to the
+# active reusable approval. This keeps exact-hint fail-closed coverage.
+fixture_request="$(printf '%s' "$fixture_request" | jq -cS '
+  .approval_hint = ("0" * 64)
+')"
 printf '%s\n' "$fixture_request" > "$(mounted /petals/triad-authority-fixture/session.json)" 2>/dev/null || true
 fixture_missing_approval="$(wait_for_fixture_stage signing_failed)"
 printf '%s' "$fixture_missing_approval" | jq -e '
   .stage == "signing_failed" and (.error | contains("APPROVAL_NOT_FOUND"))
-' >/dev/null || die "fixture Petal did not fail closed before Sealed Approval preparation"
+' >/dev/null || die "fixture Petal did not reject the explicit unknown approval hint"
 
 fixture_key_record_path=""
 while IFS= read -r record_name; do
@@ -511,7 +504,7 @@ while IFS= read -r record_name; do
   candidate_body="$(bounded_mounted_read "$(mounted "$candidate")" \
     "Petal key request candidate read")"
   if printf '%s' "$candidate_body" | jq -e --arg request_id "$request_id" \
-    '.request_id == $request_id and .status == "succeeded" and .public_key != null' \
+    '.key_slot == $request_id and .status == "succeeded" and .public_key != null' \
     >/dev/null 2>&1
   then
     fixture_key_record_path="$candidate"
@@ -523,59 +516,21 @@ done < <(bounded_mounted_list "$(mounted /petal-key-requests)" \
 [ -n "$fixture_key_record_path" ] || die "completed fixture key record was not found through the mount"
 
 fixture_key_ref="$(printf '%s' "$fixture_key_record_body" | jq -ec '.public_key.key_ref')"
-fixture_provenance_digest="$(printf '%s' "$fixture_key_record_body" | jq -er '.provenance_digest')"
-fixture_agent_id="$(printf '%s' "$fixture_key_record_body" | jq -c '.scope.agent_id')"
-wallet_projection="$(bounded_mounted_read \
-  "$(mounted "/wallets/${registered_wallet}/projection.json")" \
-  "wallet projection read")"
-policy_version="$(printf '%s' "$wallet_projection" | jq -er '.wallet.policy_version')"
-policy_digest="$(printf '%s' "$wallet_projection" | jq -er '.wallet.policy_digest')"
-wallet_revocation_epoch="$(printf '%s' "$wallet_projection" | jq -er '.wallet.wallet_revocation_epoch')"
-approval_now_ms="$(( $(date +%s) * 1000 ))"
-# The approval must outlive Broker's custody ceremony so the completed
-# activation cannot already exceed immutable terms. It remains strictly
-# inside the fixture child's 15-minute scope.
-approval_expires_ms="$((approval_now_ms + 600000))"
-approval_operation_id="$(printf '%s' "${request_id}:approval" | shasum -a 256 | awk '{print $1}')"
-approval_nonce="$(printf '%s' "${request_id}:nonce" | shasum -a 256 | awk '{print substr($1, 1, 32)}')"
-approval_plan="$(jq -ncS \
-  --arg wallet_id "$registered_wallet" --arg package_hash "$fixture_hash" \
-  --arg route "r000001" --arg operation_class "fixture.payload" \
-  --arg payload_sha256 "$(printf 'ma03' | shasum -a 256 | awk '{print $1}')" \
-  '{wallet_id:$wallet_id,package_hash:$package_hash,route:$route,
-    operation_class:$operation_class,payload_sha256:$payload_sha256}')"
-approval_plan_digest="$(printf '%s' "$approval_plan" | shasum -a 256 | awk '{print $1}')"
-approval_request="$(jq -ncS \
-  --arg operation_id "$approval_operation_id" --arg wallet_id "$registered_wallet" \
-  --arg package_hash "$fixture_hash" --arg route "r000001" \
-  --argjson agent_id "$fixture_agent_id" --argjson key_ref "$fixture_key_ref" \
-  --arg policy_version "$policy_version" --arg policy_digest "$policy_digest" \
-  --arg revocation_epoch "$wallet_revocation_epoch" \
-  --arg provenance_digest "$fixture_provenance_digest" --arg nonce "$approval_nonce" \
-  --arg issued_at_ms "$approval_now_ms" --arg expires_at_ms "$approval_expires_ms" \
-  --arg plan_digest "$approval_plan_digest" \
-  '{operation_id:$operation_id,canonical_plan_facts_digest:$plan_digest,terms:{
-    subject:{kind:"petal",package_hash:$package_hash,route:$route,agent_id:$agent_id},
-    wallet_id:$wallet_id,key_ref:$key_ref,
-    allowed_crypto_suites:["secp256k1-sha256-recoverable"],
-    selector:{kind:"petal",package_hash:$package_hash,route:$route,
-      allowed_operation_classes:["fixture.payload"],required_claim_assurance:"machine_asserted"},
-    limits:{max_operations:"1",max_signatures:"1",operation_rate_limits:[],
-      signature_rate_limits:[],value_limits:[]},
-    activation_mode:{kind:"boot_bound"},wallet_revocation_epoch:$revocation_epoch,
-    policy_version:$policy_version,policy_digest:$policy_digest,
-    provenance_digest:$provenance_digest,request_nonce:$nonce,
-    issued_at_ms:$issued_at_ms,not_before_ms:$issued_at_ms,
-    expires_at_ms:$expires_at_ms,renewal_of:null}}')"
-printf '%s\n' "$approval_request" > \
-  "$(mounted "/wallets/${registered_wallet}/sealed-approvals/new.json")"
-approval_projection="$(wait_for_approval_prepare "$registered_wallet")"
-fixture_approval_id="$(printf '%s' "$approval_projection" | jq -er '.approval_id')"
-approval_ceremony_url="$(printf '%s' "$approval_projection" | jq -er '.ceremony_url')"
-"$driver_bin" complete "$approval_ceremony_url" replacement-auth --sign-count 4 >/dev/null
-wait_for_approval_active "$registered_wallet" "$fixture_approval_id"
-fixture_request="$(printf '%s' "$fixture_request" | jq -cS --arg approval_id "$fixture_approval_id" \
-  '.approval_hint = $approval_id')"
+# BIP39 wallet discovery enumerates accounts; the scoped child is projected in
+# the owner-only request record, not added to the canonical account list.
+printf '%s' "$fixture_key_record_body" | jq -e \
+  --arg wallet "$registered_wallet" --arg package "$fixture_hash" --arg slot "$request_id" \
+  --argjson parent "$(printf '%s' "$registered_projection" | jq -c '.keys[] | select(.key_ref.key_spec == "secp256k1") | .key_ref')" '
+  .key_slot == $slot and .scope.wallet_id == $wallet and
+  .scope.package_hash == $package and .scope.parent_key_ref == $parent and
+  .public_key.key_ref.key_spec == "secp256k1" and
+  .public_key.key_ref.derivation.scheme == "bip32-secp256k1" and
+  .public_key.key_ref.public_key_fingerprint != $parent.public_key_fingerprint and
+  (.public_key.supported_crypto_suites | index("secp256k1-sha256-recoverable") != null)
+' >/dev/null || die "derived key projection is not bound to the exact fixture parent and scope"
+# Use the already accepted reusable approval after proving an explicit wrong
+# hint cannot silently fall back to it. No additional authority is minted here.
+fixture_request="$(printf '%s' "$fixture_request" | jq -cS '.approval_hint = null')"
 printf '%s\n' "$fixture_request" > "$(mounted /petals/triad-authority-fixture/session.json)"
 fixture_signed="$(wait_for_fixture_stage complete)"
 printf '%s' "$fixture_signed" | jq -e '
@@ -583,6 +538,9 @@ printf '%s' "$fixture_signed" | jq -e '
   (.public_key.key_ref_jcs | type == "array") and
   (.signature_hex | test("^[0-9a-f]+$"))
 ' >/dev/null || die "fixture Petal did not complete scoped payload signing"
+printf '%s' "$fixture_signed" | jq -e --argjson expected "$fixture_key_ref" '
+  (.public_key.key_ref_jcs | implode | fromjson) == $expected
+' >/dev/null || die "signed result changed the exact derived KeyRef"
 assert_machine_secret_artifacts
 
 printf 'MA-03: deleting the imported wallet through Broker/Signer...\n'

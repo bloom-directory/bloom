@@ -51,7 +51,7 @@ wallet = "test-passkey"
 address = "0x0000000000000000000000000000000000000001"
 session = "manual-mainnet-integration"
 pm_signing_abi = os.environ.get("BLOOM_FAKE_PM_SIGNING_ABI", "0.2.0")
-fixture_package_hash = "2f11ee17f612fbc43f34f81771c53760f56768959624d29fd63b8e4285f5a9ac"
+fixture_package_hash = "6281bb7b222d30eed1e66f416379f18c502575f2fbf5a37892186e559f95a1ae"
 fixture_provenance_digest = "66" * 32
 mutate_approval_policy_digest = (
     os.environ.get("BLOOM_FAKE_MUTATE_APPROVAL_POLICY_DIGEST", "0") == "1"
@@ -397,7 +397,7 @@ def fixture_loop():
                 "petal-key-requests/" + "33" * 32 + ".json",
                 {
                     "schema": "bloom.machine.petal-key-request.v1",
-                    "request_id": request_id,
+                    "key_slot": request_id,
                     "scope": {
                         "wallet_id": wallet,
                         "package_hash": fixture_package_hash,
@@ -405,7 +405,7 @@ def fixture_loop():
                         "agent_id": None,
                         "purpose": "fixture.payload",
                         "allowed_crypto_suites": ["secp256k1-sha256-recoverable"],
-                        "maximum_lifetime_ms": "900000",
+                        "maximum_lifetime_ms": "300000",
                         "custody_operation_id": operation_id,
                     },
                     "scope_digest": scope_digest,
@@ -431,14 +431,25 @@ def fixture_loop():
             key_record = json.loads(
                 (mount / ("petal-key-requests/" + "33" * 32 + ".json")).read_text()
             )
-            key_record["status"] = "succeeded"
-            key_record["ceremony_url"] = None
+            key_record["status"] = "awaiting_user"
+            key_record["ceremony_url"] = "http://127.0.0.1:18734/fixture-reusable"
             key_record["public_key"] = {
                 "key_ref": fixture_key_ref,
                 "canonical_public_key": "Ag",
                 "addresses": [address],
                 "supported_crypto_suites": ["secp256k1-sha256-recoverable"],
             }
+            write_json("petal-key-requests/" + "33" * 32 + ".json", key_record)
+            write_json("petals/triad-authority-fixture/session.json", {
+                "schema": "bloom.triad-authority-fixture.result.v1",
+                "stage": "key", "outcome": {"state": "pending"},
+            })
+        elif stage == 2:
+            key_record = json.loads(
+                (mount / ("petal-key-requests/" + "33" * 32 + ".json")).read_text()
+            )
+            key_record["status"] = "succeeded"
+            key_record["ceremony_url"] = None
             write_json("petal-key-requests/" + "33" * 32 + ".json", key_record)
             write_json(
                 "petals/triad-authority-fixture/session.json",

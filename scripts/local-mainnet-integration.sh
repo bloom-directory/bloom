@@ -8,7 +8,7 @@
 set -euo pipefail
 
 readonly MAX_USD="25"
-readonly FIXTURE_PACKAGE_HASH="2f11ee17f612fbc43f34f81771c53760f56768959624d29fd63b8e4285f5a9ac"
+readonly FIXTURE_PACKAGE_HASH="6281bb7b222d30eed1e66f416379f18c502575f2fbf5a37892186e559f95a1ae"
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # Broker, Signer, and Machine developer state remain persistent so existing
@@ -382,7 +382,7 @@ fixture_request="$(jq -nc \
   --arg request_id "$fixture_request_id" --arg wallet_id "$wallet" \
   --arg nonce_hex "$fixture_nonce" \
   '{request_id:$request_id,wallet_id:$wallet_id,purpose:"fixture.payload",
-    maximum_lifetime_ms:900000,
+    maximum_lifetime_ms:300000,
     preimage_hex:"66697874757265207061796c6f6164",
     nonce_hex:$nonce_hex,approval_hint:null}')"
 printf '\nRequesting a Signer-owned fixture Petal sub-key through the mount...\n'
@@ -400,7 +400,7 @@ while IFS= read -r record_name; do
   candidate="/petal-key-requests/${record_name}"
   candidate_body="$(vcat "$candidate")"
   if printf '%s' "$candidate_body" | jq -e --arg request_id "$fixture_request_id" \
-    '.request_id == $request_id and .status == "awaiting_user"' >/dev/null
+    '.key_slot == $request_id and .status == "awaiting_user"' >/dev/null
   then
     fixture_key_record="$candidate"
     break
@@ -409,15 +409,34 @@ done < <(vls_names "/petal-key-requests")
 [ -n "$fixture_key_record" ] || die "owner-mounted fixture key ceremony record was not found"
 open_approval "$fixture_key_record"
 
+# Reconcile custody and obtain the separate reusable-approval ceremony.
+vwrite_staging "$fixture_path" "$fixture_request"
+for attempt in $(seq 1 100); do
+  fixture_key_record_body="$(vcat "$fixture_key_record")"
+  printf '%s' "$fixture_key_record_body" | jq -e '
+    .status == "awaiting_user" and .public_key != null
+  ' >/dev/null && break
+  sleep 0.1
+done
+printf '%s' "$fixture_key_record_body" | jq -e '
+  .status == "awaiting_user" and .public_key != null
+' >/dev/null || die "fixture reusable signing approval did not appear"
+fixture_result="$(wait_for_fixture_stage "key:pending")"
+printf '%s' "$fixture_result" | jq -e '
+  .outcome.state == "pending" and .signature_hex == null
+' >/dev/null || die "fixture signed before reusable approval consent"
+open_approval "$fixture_key_record"
+# An explicit unknown hint must fail even when a reusable approval exists.
+fixture_request="$(printf '%s' "$fixture_request" | jq -cS '.approval_hint = ("0" * 64)')"
 vwrite_staging "$fixture_path" "$fixture_request"
 fixture_result="$(wait_for_fixture_stage "signing_failed")"
 printf '%s' "$fixture_result" | jq -e '
   .stage == "signing_failed" and
   (.error | contains("APPROVAL_NOT_FOUND"))
-' >/dev/null || die "fixture Petal did not fail closed before Sealed Approval preparation"
+' >/dev/null || die "fixture Petal did not reject the explicit unknown approval hint"
 
-# The Petal cannot mint its own reusable authority and the host does not
-# fabricate an approval from a missing hint. Read only public authority inputs
+# Exercise the explicit one-operation approval adapter in addition to the
+# accepted reusable grant. Read only public authority inputs
 # through owner-mounted projections, prepare the canonical Petal-scoped Sealed
 # Approval through its existing mounted adapter, complete the Broker ceremony,
 # then pass the returned approval ID on the exact fixture retry.
