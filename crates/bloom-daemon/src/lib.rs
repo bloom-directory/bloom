@@ -308,8 +308,10 @@ struct PetalKeyRequestState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     authority_expires_at_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    stopped: Option<SessionStopRecord>,    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    approval_value_limits: Vec<bloom_broker_api::ValueLimit>,}
+    stopped: Option<SessionStopRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    approval_value_limits: Vec<bloom_broker_api::ValueLimit>,
+}
 
 impl PetalKeyRequestState {
     fn guest_outcome(&self) -> Result<bloom_petals::PetalKeyOutcome, HostError> {
@@ -1665,7 +1667,9 @@ impl PetalHost for DaemonPetalHost {
             requested_at_ms: now_ms,
             succeeded_at_ms: None,
             authority_expires_at_ms: None,
-            stopped: None,            approval_value_limits: req.approval_value_limits,        };
+            stopped: None,
+            approval_value_limits: req.approval_value_limits,
+        };
         Self::write_petal_key_state(&path, &stored)?;
         stored.guest_outcome()
     }
