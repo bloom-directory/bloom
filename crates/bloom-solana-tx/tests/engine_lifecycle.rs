@@ -1386,91 +1386,6 @@ async fn broadcast_refuses_when_operator_disables_it() {
 /// An Exact approval cannot authorize the replacement message, but the
 /// attempt counter must survive so the successor does not reuse the dead
 /// predecessor's approval identity.
-#[tokio::test]
-async fn restage_migrates_attempt_identity_without_reusing_the_exact_approval() {
-    let height = Arc::new(std::sync::atomic::AtomicU64::new(1));
-    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let endpoint = spawn_node_with_controls(height.clone(), false, false, requests).await;
-    let dir = tempfile::tempdir().unwrap();
-    let outbox = SolanaOutbox::new(dir.path().join("outbox")).unwrap();
-    let broker = Arc::new(BrokerFixture::new());
-    let signer =
-        SolanaTransferSigner::from_catalog(MachineBrokerClient::new(broker.clone()), &catalog())
-            .unwrap();
-    let engine =
-        SolanaTransferEngine::new(outbox.clone(), client(&endpoint), signer, "solana-devnet");
-    let destination = ed25519_dalek::SigningKey::from_bytes(&[0xdd; 32])
-        .verifying_key()
-        .to_bytes();
-    let original = engine
-        .stage(
-            "wallet",
-            &broker.child_pubkey(),
-            Default::default(),
-            &destination,
-            1_000_000,
-            1_000,
-        )
-        .await
-        .unwrap();
-
-    let entry = outbox
-        .read_in_state(
-            "wallet",
-            "solana-devnet",
-            &original.id,
-            bloom_solana_tx::outbox::SolanaOutboxState::Pending,
-        )
-        .unwrap();
-    let challenge = br#"{"schema":"bloom.solana-approval-challenge/1","approval_id":"beef"}"#;
-    outbox.write_approval_challenge(&entry, challenge).unwrap();
-    outbox
-        .write_approval_attempt(
-            &entry,
-            &bloom_solana_tx::outbox::ApprovalAttempt {
-                attempt: 4,
-                issued_at_ms: 1_000,
-                expires_at_ms: 60_000,
-            },
-        )
-        .unwrap();
-
-    // Advance past the staged window so the restage produces a real successor.
-    height.store(
-        original.last_valid_block_height + 1,
-        std::sync::atomic::Ordering::SeqCst,
-    );
-    let replacement = engine
-        .restage_expired("wallet", &original.id, &broker.child_pubkey(), 10_000)
-        .await
-        .unwrap();
-    assert_ne!(replacement.id, original.id);
-
-    let successor = outbox
-        .read_in_state(
-            "wallet",
-            "solana-devnet",
-            &replacement.id,
-            bloom_solana_tx::outbox::SolanaOutboxState::Pending,
-        )
-        .unwrap();
-    assert!(
-        !successor
-            .dir
-            .join(bloom_solana_tx::outbox::APPROVAL_CHALLENGE_FILE)
-            .exists(),
-        "an Exact approval must not move to a different message"
-    );
-    assert_eq!(
-        outbox.approval_attempt(&successor).unwrap(),
-        Some(bloom_solana_tx::outbox::ApprovalAttempt {
-            attempt: 4,
-            issued_at_ms: 1_000,
-            expires_at_ms: 0,
-        })
-    );
-}
-
 /// Fixtures for the approval-retry tests: a node, an outbox, a Broker that
 /// enforces operation-id stability, and an engine wired to all three.
 async fn retry_fixture() -> (
@@ -1742,7 +1657,7 @@ async fn an_ambiguous_signing_outcome_keeps_the_approval() {
             &staged.id,
             &fee_payer,
             None,
-            Some(approval),
+            Some(approval.clone()),
             1_200,
         )
         .await
@@ -1804,7 +1719,7 @@ async fn a_transient_broker_fault_keeps_the_approval_and_the_retry_succeeds() {
             &staged.id,
             &fee_payer,
             None,
-            Some(approval),
+            Some(approval.clone()),
             1_300,
         )
         .await
@@ -1823,12 +1738,11 @@ async fn a_transient_broker_fault_keeps_the_approval_and_the_retry_succeeds() {
     );
 }
 
-/// A dead approval followed by a restage: the successor carries the same
-/// economic intent, so it rebuilds the same approval operation id. Losing the
-/// attempt counter on the way across makes that id collide with the approval
-/// that just died.
+/// A dead approval followed by a restage: the Exact approval identity hashes
+/// the full replacement message, so the successor's identity is distinct
+/// without carrying the predecessor's attempt counter across messages.
 #[tokio::test]
-async fn a_dead_approval_survives_a_restage_and_the_successor_recovers() {
+async fn a_dead_approval_survives_a_restage_with_a_fresh_identity() {
     let height = Arc::new(std::sync::atomic::AtomicU64::new(1));
     let endpoint = spawn_node_with_controls(
         height.clone(),
@@ -1864,7 +1778,7 @@ async fn a_dead_approval_survives_a_restage_and_the_successor_recovers() {
             &staged.id,
             &fee_payer,
             None,
-            Some(approval),
+            Some(approval.clone()),
             1_200,
         )
         .await
@@ -1892,20 +1806,26 @@ async fn a_dead_approval_survives_a_restage_and_the_successor_recovers() {
         0,
         "the successor must not rebuild the dead approval's operation id"
     );
+    let fresh = approval_required(result.unwrap());
+    assert_ne!(
+        fresh, approval,
+        "the successor must reach a fresh approval, not the dead one"
+    );
     assert_eq!(
         outbox
             .approval_attempt(&pending(&outbox, &successor.id))
             .unwrap()
-            .expect("the successor carries the lineage")
+            .expect("the successor records its own first attempt")
             .attempt,
-        1
+        0,
+        "no attempt counter crosses messages"
     );
 }
 
-/// The same, with the predecessor swept into `failed` before it is restaged.
-/// Retiring an entry must not take its identity lineage with it.
+/// A swept transfer actually retires (one sweep, Failed/Expired state) and
+/// restages onto a fresh Exact approval.
 #[tokio::test]
-async fn a_swept_expired_transfer_keeps_its_approval_lineage() {
+async fn a_swept_transfer_fails_over_and_restages_onto_a_fresh_approval() {
     let height = Arc::new(std::sync::atomic::AtomicU64::new(1));
     let endpoint = spawn_node_with_controls(
         height.clone(),
@@ -1938,7 +1858,7 @@ async fn a_swept_expired_transfer_keeps_its_approval_lineage() {
             &staged.id,
             &fee_payer,
             None,
-            Some(approval),
+            Some(approval.clone()),
             1_200,
         )
         .await
@@ -1954,18 +1874,169 @@ async fn a_swept_expired_transfer_keeps_its_approval_lineage() {
         "solana-devnet".to_string(),
         staged.last_valid_block_height + 1,
     );
-    outbox.sweep_expired(2_000, &heights).unwrap();
+    assert_eq!(
+        outbox
+            .sweep_expired(u128::from(staged.expires_ms), &heights)
+            .unwrap(),
+        1,
+        "exactly the stale entry must be swept at its own deadline"
+    );
+    let retired = outbox
+        .read_in_state(
+            "wallet",
+            "solana-devnet",
+            &staged.id,
+            SolanaOutboxState::Failed,
+        )
+        .expect("the sweeper must have retired the stale entry");
+    assert_eq!(retired.staged.status, SolanaTxStatus::Expired);
 
     let successor = engine
         .restage_expired("wallet", &staged.id, &fee_payer, 2_100)
         .await
         .unwrap();
-    let result = engine
-        .sign("wallet", &successor.id, &fee_payer, None, None, 2_200)
-        .await;
-    assert!(
-        result.is_ok(),
-        "a swept transfer must not lose the identity of its dead approval: {result:?}"
+    let fresh = approval_required(
+        engine
+            .sign("wallet", &successor.id, &fee_payer, None, None, 2_200)
+            .await
+            .unwrap(),
+    );
+    assert_ne!(
+        fresh, approval,
+        "the successor must reach a fresh approval, not the swept one's"
     );
     assert_eq!(broker.conflicts(), 0);
+}
+
+/// Repeated restage of the same predecessor must never disturb a successor
+/// that has already prepared its own live attempt, and must keep returning
+/// that same successor (the reservation is idempotent) even after the
+/// successor's attempt ends at dispatch.
+#[tokio::test]
+async fn repeated_restage_cannot_clobber_the_successor() {
+    let height = Arc::new(std::sync::atomic::AtomicU64::new(1));
+    let endpoint = spawn_node_with_controls(
+        height.clone(),
+        false,
+        false,
+        Arc::new(Mutex::new(Vec::new())),
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let outbox = SolanaOutbox::new(dir.path().join("outbox")).unwrap();
+    let broker = Arc::new(BrokerFixture::new());
+    let signer =
+        SolanaTransferSigner::from_catalog(MachineBrokerClient::new(broker.clone()), &catalog())
+            .unwrap();
+    let engine =
+        SolanaTransferEngine::new(outbox.clone(), client(&endpoint), signer, "solana-devnet");
+    let staged = stage_for_retry(&engine, &broker).await;
+    let fee_payer = broker.child_pubkey();
+
+    height.store(
+        staged.last_valid_block_height + 1,
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    let successor = engine
+        .restage_expired("wallet", &staged.id, &fee_payer, 1_300)
+        .await
+        .unwrap();
+
+    // The successor prepares its own live attempt.
+    let approval = approval_required(
+        engine
+            .sign("wallet", &successor.id, &fee_payer, None, None, 1_400)
+            .await
+            .unwrap(),
+    );
+    let recorded = outbox
+        .approval_attempt(&pending(&outbox, &successor.id))
+        .unwrap()
+        .expect("the successor has a live attempt");
+
+    // A repeated restage of the predecessor returns the same successor and
+    // must not overwrite the successor's live attempt terms.
+    let again = engine
+        .restage_expired("wallet", &staged.id, &fee_payer, 1_500)
+        .await
+        .unwrap();
+    assert_eq!(again.id, successor.id);
+    assert_eq!(
+        outbox
+            .approval_attempt(&pending(&outbox, &successor.id))
+            .unwrap()
+            .expect("the live attempt must survive a repeated restage"),
+        recorded,
+        "a repeated restage must not rewrite the successor's attempt terms"
+    );
+
+    // Complete the signature: the attempt ends. A further restage still
+    // returns the same successor and does not resurrect any attempt state.
+    engine
+        .sign(
+            "wallet",
+            &successor.id,
+            &fee_payer,
+            None,
+            Some(approval.clone()),
+            1_600,
+        )
+        .await
+        .unwrap();
+    let third = engine
+        .restage_expired("wallet", &staged.id, &fee_payer, 1_700)
+        .await
+        .unwrap();
+    assert_eq!(third.id, successor.id);
+    assert!(
+        outbox
+            .approval_attempt(&pending(&outbox, &successor.id))
+            .is_err()
+            || outbox
+                .approval_attempt(&pending(&outbox, &successor.id))
+                .unwrap()
+                .is_none(),
+        "no attempt state may reappear after the successor completed"
+    );
+    assert_eq!(broker.conflicts(), 0);
+}
+
+/// Corrupt persisted approval-attempt state must fail closed: no Broker
+/// preparation may run on top of terms the host cannot read.
+#[tokio::test]
+async fn corrupt_approval_attempt_state_fails_closed() {
+    let height = Arc::new(std::sync::atomic::AtomicU64::new(1));
+    let endpoint = spawn_node_with_controls(
+        height.clone(),
+        false,
+        false,
+        Arc::new(Mutex::new(Vec::new())),
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let outbox = SolanaOutbox::new(dir.path().join("outbox")).unwrap();
+    let broker = Arc::new(BrokerFixture::new());
+    let signer =
+        SolanaTransferSigner::from_catalog(MachineBrokerClient::new(broker.clone()), &catalog())
+            .unwrap();
+    let engine =
+        SolanaTransferEngine::new(outbox.clone(), client(&endpoint), signer, "solana-devnet");
+    let staged = stage_for_retry(&engine, &broker).await;
+    let fee_payer = broker.child_pubkey();
+
+    let entry = pending(&outbox, &staged.id);
+    std::fs::write(entry.dir.join(".approval_attempt"), b"{not json").unwrap();
+
+    let error = engine
+        .sign("wallet", &staged.id, &fee_payer, None, None, 1_100)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("corrupt"),
+        "corrupt attempt state must be reported, got: {error}"
+    );
+    assert!(
+        broker.prepared_ids().is_empty(),
+        "no Broker preparation may run against unreadable terms"
+    );
 }

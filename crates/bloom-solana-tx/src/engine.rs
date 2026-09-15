@@ -402,24 +402,11 @@ impl SolanaTransferEngine {
             ));
         }
 
-        // An Exact approval cannot move to a different message, but its
-        // attempt counter must. Otherwise the successor would reuse the dead
-        // predecessor's approval identity and collide durably at the Broker.
-        if let Some(attempt) = self.outbox.approval_attempt(&entry)? {
-            let successor = self.outbox.read_in_state(
-                wallet,
-                &self.chain,
-                &replacement.id,
-                SolanaOutboxState::Pending,
-            )?;
-            self.outbox.write_approval_attempt(
-                &successor,
-                &ApprovalAttempt {
-                    expires_at_ms: 0,
-                    ..attempt
-                },
-            )?;
-        }
+        // No attempt state crosses from the predecessor: the Exact approval
+        // identity hashes the full replacement message, so the successor's
+        // identity is already distinct, and copying the predecessor's counter
+        // here could overwrite a successor that has since prepared its own
+        // live attempt.
 
         let mut expired = entry;
         expired.staged.status = SolanaTxStatus::Expired;

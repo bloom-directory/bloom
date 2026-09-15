@@ -694,7 +694,9 @@ impl SolanaOutbox {
         entry: &SolanaOutboxEntry,
     ) -> Result<Option<ApprovalAttempt>, OutboxError> {
         match fs::read(entry.dir.join(PRIVATE_APPROVAL_ATTEMPT_FILE)) {
-            Ok(bytes) => Ok(serde_json::from_slice(&bytes).ok()),
+            Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes).map_err(|error| {
+                OutboxError::Other(format!("approval attempt state is corrupt: {error}"))
+            })?)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error.into()),
         }
