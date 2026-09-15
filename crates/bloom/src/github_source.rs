@@ -133,12 +133,12 @@ const HYPERLIQUID_AUTHORITY_ROUTES: &[PetalAuthorityRoute] = &[
 const PREINSTALLED_POLYMARKET: PreinstalledPetal = PreinstalledPetal {
     name: "polymarket",
     repository: "https://github.com/bloom-directory/bloom-petal-polymarket",
-    commit: "c057e6d82f06626e2143213a9dc0c057e4812f89",
-    release_tag: "v0.1.4",
-    archive: "polymarket-v0.1.4.petal.tar.gz",
-    expected_hash: Some("a564d9559a70520995e550df685f74d3ee26af6fbb16facc08de2745bf5ec693"),
-    archive_sha256: "89e781a7c57a95c12345d9b2ea33a8c9a9e800d826f187b7edac4d87bf6596e9",
-    tooling_commit: "864a80b407387871bae06aabe77b91865e55f7bc",
+    commit: "cb6259f6458fc9a27708b8c4c4e35d28a69d24fc",
+    release_tag: "v0.1.5",
+    archive: "polymarket-v0.1.5.petal.tar.gz",
+    expected_hash: Some("5df5a1377dc4d70c71e47ffe6827e691e1f5868543b752dc8d19a500284e5fa6"),
+    archive_sha256: "eb2cfc9c254649ce5e5ed6073925803b206ce5e4615942eff3e9492e3b705cd4",
+    tooling_commit: "1af3ba971e8b494b58bb85d0c0fcf2ad15cd3b4c",
     petal_abi: "bloom.petal-host/payload-signing-v1",
     default_eligible: true,
     lineage_id: Some("pln1_6etojfshqyk6bzm257kzv7noj3perfz4siioiuhj74xosznyzhka"),
@@ -243,6 +243,23 @@ const PREINSTALLED_VENICE_X402: PreinstalledPetal = PreinstalledPetal {
     tooling_commit: "6489cb85e7a0f8804fa3dd712c52c37e732ddcea",
     petal_abi: "bloom.petal-host/legacy-hash-signing-v1",
     default_eligible: false,
+    lineage_id: None,
+    release_sequence: 0,
+    predecessor_package_hashes: &[],
+    authority_routes: &[],
+};
+
+const PREINSTALLED_TOLLY: PreinstalledPetal = PreinstalledPetal {
+    name: "tolly",
+    repository: "https://github.com/TollyLabs/bloom-petal-tolly",
+    commit: "652a88cccfeb8767c76b3fc2305107e4bbac53a7",
+    release_tag: "v0.2.0",
+    archive: "tolly-v0.2.0.petal.tar.gz",
+    expected_hash: Some("f50f9f6f55eca103c11ed40d424311c6e5863ff5046231f57f58822d1aac6709"),
+    archive_sha256: "3a2407e3b9b519ce2be98bfb6f447cd6a6c84607c75c90308af506d3c2237d51",
+    tooling_commit: "73c5b06a77599368fbc79fb7947a629b5b4c630e",
+    petal_abi: "bloom.petal-host/triad-compatible-nonauthority-v1",
+    default_eligible: true,
     lineage_id: None,
     release_sequence: 0,
     predecessor_package_hashes: &[],
@@ -751,8 +768,7 @@ pub(crate) fn prepare_prebuilt_release_petal(
     if context.is_cancelled() {
         bail!("Petal acquisition cancelled");
     }
-    let repo = parse_github_install_url(entry.repository)?
-        .ok_or_else(|| anyhow!("built-in Petal repository is not a GitHub source URL"))?;
+    let repo = built_in_github_repo(entry.repository)?;
     let release_base = format!(
         "https://github.com/{}/{}/releases/download/{}",
         repo.owner, repo.repo, entry.release_tag
@@ -1022,8 +1038,7 @@ fn prepare_prebuilt_petal_archive(
     bloom_petals::package::apply_petal_consent_endpoint_bindings(&mut consent, &bindings)
         .context("apply configured Petal endpoint bindings")?;
 
-    let repo = parse_github_install_url(entry.repository)?
-        .ok_or_else(|| anyhow!("built-in Petal repository is not a GitHub source URL"))?;
+    let repo = built_in_github_repo(entry.repository)?;
     let provenance = PetalSourceProvenance {
         source_kind: "github".to_string(),
         url: repo.canonical_url,
@@ -1050,6 +1065,7 @@ pub(crate) fn preinstalled_petal(name: &str) -> Option<&'static PreinstalledPeta
         "gasless" => Some(&PREINSTALLED_GASLESS),
         "privacy-pools" => Some(&PREINSTALLED_PRIVACY_POOLS),
         "venice-x402" => Some(&PREINSTALLED_VENICE_X402),
+        "tolly" => Some(&PREINSTALLED_TOLLY),
         _ => None,
     }
 }
@@ -1242,6 +1258,18 @@ fn trusted_repo(owner: &str, repo: &str) -> Result<GitHubRepo> {
     if owner != TRUSTED_GITHUB_OWNER {
         bail!("unsupported GitHub owner {owner}; trusted owner is {TRUSTED_GITHUB_OWNER}");
     }
+    github_repo(owner, repo)
+}
+
+fn built_in_github_repo(repository: &str) -> Result<GitHubRepo> {
+    let path = repository
+        .strip_prefix("https://github.com/")
+        .ok_or_else(|| anyhow!("built-in Petal repository must use canonical GitHub HTTPS URL"))?;
+    let (owner, repo) = split_owner_repo(path)?;
+    github_repo(owner, repo)
+}
+
+fn github_repo(owner: &str, repo: &str) -> Result<GitHubRepo> {
     let repo = repo.strip_suffix(".git").unwrap_or(repo);
     if repo.is_empty() || repo.contains('/') {
         bail!("GitHub source URL has invalid repository name");
@@ -1740,6 +1768,7 @@ mod tests {
             "gasless",
             "privacy-pools",
             "venice-x402",
+            "tolly",
         ] {
             let entry = preinstalled_petal(name).unwrap();
             assert_eq!(entry.name, name);
@@ -1747,9 +1776,21 @@ mod tests {
             assert!(entry.expected_hash.is_some());
             assert_eq!(
                 entry.default_eligible,
-                matches!(name, "polymarket" | "hyperliquid" | "near-intents")
+                matches!(
+                    name,
+                    "polymarket" | "hyperliquid" | "near-intents" | "tolly"
+                )
             );
         }
+        let tolly = preinstalled_petal("tolly").unwrap();
+        assert_eq!(
+            tolly.repository,
+            "https://github.com/TollyLabs/bloom-petal-tolly"
+        );
+        assert_eq!(
+            built_in_github_repo(tolly.repository).unwrap().owner,
+            "TollyLabs"
+        );
         assert!(preinstalled_petal("unknown").is_none());
     }
 
