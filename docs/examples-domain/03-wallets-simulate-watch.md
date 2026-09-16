@@ -280,8 +280,7 @@ echo y > /bloom/wallets/alice/0/chains/anvil/outbox/pending/$ID/cancel
 ### Mainnet broadcast
 
 The same paths work for `chain = "ethereum"`. Signing, policy, review, and
-confirmation checks still apply. Set the chain entry's
-`allow_broadcast = false` to make `confirm` fail before broadcast.
+confirmation checks apply on every configured chain.
 
 ## 3. Simulate
 

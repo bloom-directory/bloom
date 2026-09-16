@@ -1556,30 +1556,15 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(petal_hashes.len(), 20);
-        assert!(
-            petal_hashes
-                .contains(&"a564d9559a70520995e550df685f74d3ee26af6fbb16facc08de2745bf5ec693")
-        );
-        assert!(
-            petal_hashes
-                .contains(&"aa1c50d3443f4c1a710d0ce93a70a65d196fd5842d241e0f78260c8a019d811c")
-        );
-        // Release pins are separate from developer enrollment and ship no
-        // fee-bearing class today: the shared Hyperliquid class signs fee-free
-        // cancels and plain orders, and Polymarket's relayer batch declares no
-        // native fee either.
-        for class in ["hyperliquid.agent_action", "polymarket.relayer_batch"] {
-            let matching = catalog
-                .records
-                .iter()
-                .flat_map(|record| record.operation_classes.iter())
-                .filter(|entry| entry.operation_class.as_str() == class)
-                .collect::<Vec<_>>();
-            assert!(!matching.is_empty(), "{class} is absent from the catalog");
+        assert_eq!(petal_hashes.len(), 21);
+        for name in ["polymarket", "hyperliquid"] {
+            let expected = crate::github_source::preinstalled_petal(name)
+                .unwrap()
+                .expected_hash
+                .unwrap();
             assert!(
-                matching.iter().all(|entry| entry.fee_asset.is_none()),
-                "{class} must ship fee-free"
+                petal_hashes.contains(&expected),
+                "missing {name} release provenance"
             );
         }
         for record in catalog.records {

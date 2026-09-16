@@ -636,7 +636,6 @@ The user's `~/.bloom/config.toml` today:
 name = "base"
 chain_id = 8453
 rpc_urls = ["https://mainnet.base.org", "https://base.publicnode.com"]
-allow_broadcast = false
 ```
 
 After the change, both forms work:
@@ -647,13 +646,11 @@ After the change, both forms work:
 name = "base"
 chain_id = 8453
 rpc_urls = ["https://mainnet.base.org", "https://base.publicnode.com"]
-allow_broadcast = false
 
 # Rich
 [chains.base]
 name = "base"
 chain_id = 8453
-allow_broadcast = false
 rpc_urls = []  # tolerated when rpc_endpoints is non-empty
 
 [[chains.base.rpc_endpoints]]
