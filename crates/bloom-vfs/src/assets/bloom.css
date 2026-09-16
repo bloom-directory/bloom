@@ -3,7 +3,7 @@
 
    `skin.css` loads after this file. Every color, font, and radius below is a
    token on :root, so a skin that only redefines tokens restyles every page;
-   a skin may also override any rule here. See `skins/` for a worked example. */
+   a skin may also override any rule here. */
 
 /* 1. Tokens ------------------------------------------------------------- */
 :root {

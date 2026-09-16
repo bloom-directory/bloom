@@ -55,8 +55,7 @@ drawn from the same data as `index.html`.
   reference. Icons are matched on canonical identity (chain id, then asset
   symbol); an unknown name keeps an initials fallback. Provenance is
   documented in the icon sources beside the handler.
-- `skin.css` and `skins/` — the person's own styles and the bundled
-  alternatives. See below.
+- `skin.css` — the person's own styles. See below.
 
 ## Skins
 
@@ -73,17 +72,11 @@ skin that only redefines tokens restyles every page at once:
 :root { --accent: #1f5fbf; --serif: Georgia, serif; }
 ```
 
-A skin may also override any rule. To start from a bundled skin, import it
-and add your own rules after the import:
-
-```css
-@import "skins/winamp.css";
-```
+A skin may also override any rule.
 
 A skin is styling only. The pages' Content-Security-Policy still forbids
 every remote fetch and every script, whatever the stylesheet asks for, and a
-skin cannot change what a page says. Bundled skins under `skins/` follow the
-same rule as `bloom.css`: no images, fonts, or imports from anywhere.
+skin cannot change what a page says.
 
 When a person asks for a different look, edit `~/.bloom/skin.css` on the
 host; the mount itself is read-only.

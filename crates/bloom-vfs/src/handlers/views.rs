@@ -18,7 +18,6 @@
 //! - `views/bloom.css`        — the shared Bloom stylesheet (compiled in)
 //! - `views/skin.css`         — the person's own stylesheet, loaded after
 //!   `bloom.css`: the contents of `<home>/skin.css`, or empty
-//! - `views/skins/`           — bundled alternative skins to `@import`
 //! - `views/bloom.js`         — local, optional sorting for Networks
 //! - `views/AGENTS.md`        — how an agent should use these pages
 //!
@@ -76,10 +75,6 @@ const ICONS_DIR: &str = "icons";
 /// holds, re-read on every access so an edit shows on reload, and an empty
 /// file when there is none. Without it the pages are the base Bloom design.
 const SKIN_CSS_NAME: &str = "skin.css";
-/// Bundled alternative skins. A `skin.css` selects one with
-/// `@import "skins/<name>.css";` and may add its own rules after it.
-const SKINS_DIR: &str = "skins";
-const SKIN_FILES: &[(&str, &str)] = &[("winamp.css", include_str!("../assets/skins/winamp.css"))];
 
 /// Every page, in reading order: what is yours first, then what is public.
 /// Drives both the directory listing and the navigation, so a link can never
@@ -231,13 +226,8 @@ impl ViewsHandler {
             [s] if s == BLOOM_JS_NAME => Ok(js_entry()),
             [s] if s == AGENTS_MD_NAME => Ok(agents_entry()),
             [s] if s == ICONS_DIR => Ok(Entry::dir(ICONS_DIR)),
-            [s] if s == SKINS_DIR => Ok(Entry::dir(SKINS_DIR)),
             [s, file] if s == ICONS_DIR => match icon_by_name(file) {
                 Some(icon) => Ok(icon_entry(icon)),
-                None => Err(HandlerError::not_found(path.to_string_path())),
-            },
-            [s, file] if s == SKINS_DIR => match skin_by_name(file) {
-                Some((name, css)) => Ok(Entry::file(name).with_size(css.len() as u64)),
                 None => Err(HandlerError::not_found(path.to_string_path())),
             },
             _ => Err(HandlerError::not_found(path.to_string_path())),
@@ -257,12 +247,6 @@ impl ViewsHandler {
             [s, file] if s == ICONS_DIR => {
                 return match icon_by_name(file) {
                     Some(icon) => Ok(icon.bytes.to_vec()),
-                    None => Err(HandlerError::NotAFile(path.to_string_path())),
-                };
-            }
-            [s, file] if s == SKINS_DIR => {
-                return match skin_by_name(file) {
-                    Some((_, css)) => Ok(css.as_bytes().to_vec()),
                     None => Err(HandlerError::NotAFile(path.to_string_path())),
                 };
             }
@@ -298,15 +282,9 @@ impl ViewsHandler {
             // briefing is listed so `ls` and agents can discover it.
             entries.push(Entry::file(BRIEFING_MD));
             entries.push(Entry::dir(ICONS_DIR));
-            entries.push(Entry::dir(SKINS_DIR));
             Ok(entries)
         } else if path.segments() == [ICONS_DIR] {
             Ok(ICON_FILES.iter().map(|icon| icon_entry(icon)).collect())
-        } else if path.segments() == [SKINS_DIR] {
-            Ok(SKIN_FILES
-                .iter()
-                .map(|(name, css)| Entry::file(name).with_size(css.len() as u64))
-                .collect())
         } else {
             Err(HandlerError::NotADir(path.to_string_path()))
         }
@@ -3489,10 +3467,6 @@ fn icon_entry(icon: &IconFile) -> Entry {
     Entry::file(icon.name).with_size(icon.bytes.len() as u64)
 }
 
-fn skin_by_name(name: &str) -> Option<(&'static str, &'static str)> {
-    SKIN_FILES.iter().copied().find(|(skin, _)| *skin == name)
-}
-
 fn is_page(name: &str) -> bool {
     // `fees.html` preserves bookmarks to the merged page; `briefing.md` is
     // the chat briefing, not an HTML page. Neither belongs in `PAGES`.
@@ -4219,8 +4193,8 @@ mod tests {
             }
         }
         for e in &entries {
-            if e.name == ICONS_DIR || e.name == SKINS_DIR {
-                assert_eq!(e.kind, EntryKind::Dir, "icons and skins are directories");
+            if e.name == ICONS_DIR {
+                assert_eq!(e.kind, EntryKind::Dir, "icons is a directory");
                 continue;
             }
             assert_eq!(e.kind, EntryKind::File);
@@ -5086,12 +5060,12 @@ mod tests {
         // Absent: still served, still empty, never an error a browser would
         // show as a broken stylesheet.
         assert!(handler.read(&skin).await.unwrap().is_empty());
-        std::fs::write(&path, "@import \"skins/winamp.css\";\n").unwrap();
+        std::fs::write(&path, ":root{--accent:teal}\n").unwrap();
         assert_eq!(
             handler.read(&skin).await.unwrap(),
-            b"@import \"skins/winamp.css\";\n"
+            b":root{--accent:teal}\n"
         );
-        assert_eq!(handler.lookup(&skin).await.unwrap().size, 28);
+        assert_eq!(handler.lookup(&skin).await.unwrap().size, 21);
         // An edit shows on the next read: there is no cache to wait out.
         std::fs::write(&path, ":root { --accent: rebeccapurple; }").unwrap();
         assert_eq!(
@@ -5109,28 +5083,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bundled_skins_are_served_as_files_and_nothing_else() {
+    async fn no_bundled_skins_are_served() {
+        // User stylesheets live on the host (`~/.bloom/skin.css`); the mount
+        // serves no example skins, so nothing under `skins/` may resolve.
         let handler = fixture().handler;
-        let listed = handler
-            .list(&VfsPath::parse(SKINS_DIR).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(listed.len(), SKIN_FILES.len());
-        let winamp = VfsPath::parse("skins/winamp.css").unwrap();
-        let css = String::from_utf8(handler.read(&winamp).await.unwrap()).unwrap();
-        assert!(css.contains(":root"), "a skin overrides the base tokens");
-        // The page policy would block the fetch anyway; a bundled skin must
-        // not depend on one, the same as `bloom.css`.
-        for forbidden in ["url(", "@import", "@font-face", "http"] {
-            assert!(!css.contains(forbidden), "must not reference {forbidden:?}");
+        for probe in ["skins", "skins/winamp.css", "skins/apple.css"] {
+            let path = VfsPath::parse(probe).unwrap();
+            assert!(
+                handler.lookup(&path).await.is_err(),
+                "{probe} must not exist"
+            );
+            assert!(handler.read(&path).await.is_err(), "{probe} must not exist");
         }
-        assert_eq!(
-            handler.lookup(&winamp).await.unwrap().size,
-            css.len() as u64
-        );
-        let stranger = VfsPath::parse("skins/nope.css").unwrap();
-        assert!(handler.read(&stranger).await.is_err());
-        assert!(handler.lookup(&stranger).await.is_err());
+        let entries = handler.list(&VfsPath::root()).await.unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(!names.contains(&"skins"), "skins/ must not be listed");
     }
 
     #[test]
@@ -5435,11 +5402,6 @@ mod tests {
                 .unwrap_or_default(),
         )
         .unwrap();
-        let skins = std::path::Path::new(&out).join(SKINS_DIR);
-        std::fs::create_dir_all(&skins).unwrap();
-        for (name, css) in SKIN_FILES {
-            std::fs::write(skins.join(name), css).unwrap();
-        }
         let icons = std::path::Path::new(&out).join(ICONS_DIR);
         std::fs::create_dir_all(&icons).unwrap();
         for icon in ICON_FILES {
