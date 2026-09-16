@@ -1211,6 +1211,19 @@ mod tests {
             .join("packaging/triad/macos/config")
     }
 
+    fn copy_dir(source: &Path, target: &Path) {
+        fs::create_dir_all(target).unwrap();
+        for entry in fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let destination = target.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_dir(&entry.path(), &destination);
+            } else {
+                fs::copy(entry.path(), destination).unwrap();
+            }
+        }
+    }
+
     #[test]
     fn developer_enrollment_platform_policy_accepts_non_root_linux_and_macos_only() {
         validate_developer_caller(1000, "linux").unwrap();
@@ -1372,15 +1385,14 @@ mod tests {
             release_digest: "44".repeat(32),
         };
         generate_for_owner(&plan, owner).unwrap();
-        let petal_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(Path::parent)
-            .unwrap()
-            .join("tests/fixtures/triad-authority-petal");
+        // Enrollment rebuilds the package artifacts in place, so enroll a copy
+        // rather than rewriting the shared fixture under other tests.
+        let petal_dir = directory.path().join("petal");
+        copy_dir(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/triad-authority-petal"),
+            &petal_dir,
+        );
         enroll_developer_petal_provenance(&output, &petal_dir, owner).unwrap();
-        // Enrollment rebuilds generated package artifacts before signing, so
-        // the asserted hash must be read from the final build, not a stale
-        // pre-enrollment snapshot.
         let package = PreparedPetalPackage::from_dir(&petal_dir).unwrap();
         let first: ProvenanceCatalog =
             serde_json::from_slice(&fs::read(output.join("provenance-catalog.json")).unwrap())
