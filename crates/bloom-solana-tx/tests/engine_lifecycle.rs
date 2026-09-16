@@ -38,6 +38,8 @@ struct BrokerFixture {
     conflicts: Mutex<u32>,
     /// When set, the next signing request is answered with this error.
     next_sign_error: Mutex<Option<(ProtocolErrorCode, String)>>,
+    /// When set, the next signing request never arrives at all.
+    drop_next_sign: std::sync::atomic::AtomicBool,
     prepare_calls: std::sync::atomic::AtomicUsize,
     block_prepares: std::sync::atomic::AtomicBool,
     prepare_release: tokio::sync::Semaphore,
@@ -67,6 +69,7 @@ impl BrokerFixture {
             prepared_ids: Mutex::new(Vec::new()),
             conflicts: Mutex::new(0),
             next_sign_error: Mutex::new(None),
+            drop_next_sign: std::sync::atomic::AtomicBool::new(false),
             prepare_calls: std::sync::atomic::AtomicUsize::new(0),
             block_prepares: std::sync::atomic::AtomicBool::new(false),
             approval_is_active: std::sync::atomic::AtomicBool::new(true),
@@ -110,6 +113,15 @@ impl BrokerFixture {
 
     fn fail_next_signature(&self, code: ProtocolErrorCode, message: &str) {
         *self.next_sign_error.lock().unwrap() = Some((code, message.to_owned()));
+    }
+
+    /// Model the Machine dying before the request leaves it: the transport
+    /// fails and the Broker never sees a signing call. Unlike
+    /// [`Self::fail_next_signature`], this leaves no operation behind, so the
+    /// only thing that advanced is the durable snapshot.
+    fn drop_next_signature(&self) {
+        self.drop_next_sign
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn block_approval_prepares(&self) {
@@ -178,6 +190,15 @@ impl MachineBrokerService for BrokerFixture {
                     }))
                 }
                 MachineBrokerRequest::SigningSign(sign_request) => {
+                    if self
+                        .drop_next_sign
+                        .swap(false, std::sync::atomic::Ordering::SeqCst)
+                    {
+                        return Err(ProtocolError::new(
+                            ProtocolErrorCode::ServiceUnavailable,
+                            "the machine died before the request was sent",
+                        ));
+                    }
                     self.sign_calls
                         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     if let Some((code, message)) = self.next_sign_error.lock().unwrap().take() {
@@ -2419,10 +2440,18 @@ async fn a_confirm_replaces_the_blockhash_once_and_records_what_it_sent() {
         "the signed message carries the refreshed blockhash"
     );
     assert_ne!(snapshot.finalized_staged.message_b64, staged.message_b64);
-    // The projection was restored to what was actually signed.
+    // The projection reports what was actually signed, because it is read
+    // from the snapshot rather than kept in step with a second copy.
     assert_eq!(
         entry.staged.message_b64,
         snapshot.finalized_staged.message_b64
+    );
+    let projected: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(entry.dir.join("intent.json")).unwrap()).unwrap();
+    assert_eq!(
+        projected["message_b64"].as_str().unwrap(),
+        staged.message_b64,
+        "intent.json is never rewritten with the finalized message; there is one record"
     );
     // And the request in the snapshot signs exactly those bytes.
     let bloom_broker_api::SigningPayloads::Single { payload } = &snapshot.request.payloads else {
@@ -2513,6 +2542,128 @@ async fn a_lost_response_replays_the_persisted_request_rather_than_refreshing() 
     );
     // One approval, one ceremony, throughout.
     assert_eq!(broker.prepare_calls(), 1);
+}
+
+/// A crash with the snapshot as the only thing that advanced.
+///
+/// The snapshot is written before the request leaves the process and nothing
+/// else is touched — no signature, no projection rewrite. A restarted process
+/// reading that single file must send the stored request, unchanged, however
+/// far the cluster has moved on since.
+#[tokio::test]
+async fn a_restart_after_only_the_snapshot_sends_the_stored_request() {
+    let blockhash = Arc::new(std::sync::Mutex::new([0x42u8; 32]));
+    let fee = Arc::new(std::sync::atomic::AtomicU64::new(5_000));
+    let endpoint = spawn_rotating_node(blockhash.clone(), fee).await;
+    let dir = tempfile::tempdir().unwrap();
+    let broker = Arc::new(BrokerFixture::new());
+    let build = || {
+        let outbox = SolanaOutbox::new(dir.path().join("outbox")).unwrap();
+        let signer = SolanaTransferSigner::from_catalog(
+            MachineBrokerClient::new(broker.clone()),
+            &catalog(),
+        )
+        .unwrap();
+        let engine =
+            SolanaTransferEngine::new(outbox.clone(), client(&endpoint), signer, "solana-devnet");
+        (outbox, engine)
+    };
+
+    let (outbox, engine) = build();
+    let staged = stage_for_retry(&engine, &broker).await;
+    let fee_payer = broker.child_pubkey();
+    let approval = approval_required(
+        engine
+            .sign("wallet", &staged.id, &fee_payer, None, None, 1_000)
+            .await
+            .unwrap(),
+    );
+
+    // The cluster moves while the owner is at the passkey prompt, then the
+    // process dies with the request built and persisted but never sent.
+    *blockhash.lock().unwrap() = [0x5au8; 32];
+    broker.drop_next_signature();
+    let error = engine
+        .sign(
+            "wallet",
+            &staged.id,
+            &fee_payer,
+            None,
+            Some(approval.clone()),
+            200_000,
+        )
+        .await
+        .expect_err("the request never reached the Broker");
+    assert!(error.to_string().contains("died before"), "{error}");
+    assert_eq!(broker.sign_calls(), 0, "no signing request was ever seen");
+
+    // Exactly one thing advanced: the snapshot. The projection on disk is
+    // untouched, and reading the entry still reports the committed message.
+    let entry = pending(&outbox, &staged.id);
+    let committed = outbox
+        .signing_attempt(&entry)
+        .unwrap()
+        .expect("the snapshot was persisted before the request was sent");
+    assert!(
+        outbox.recorded_signature(&entry).unwrap().is_none(),
+        "nothing was signed"
+    );
+    let projected: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(entry.dir.join("intent.json")).unwrap()).unwrap();
+    assert_eq!(
+        projected["message_b64"].as_str().unwrap(),
+        staged.message_b64,
+        "the projection was not rewritten"
+    );
+    assert_eq!(
+        entry.staged.message_b64, committed.finalized_staged.message_b64,
+        "yet the entry reads as finalized, from the snapshot alone"
+    );
+    drop(entry);
+    drop(outbox);
+    drop(engine);
+
+    // Restart. The cluster has moved again; the retry must ignore it.
+    *blockhash.lock().unwrap() = [0x77u8; 32];
+    let (outbox, engine) = build();
+    let signed = engine
+        .sign(
+            "wallet",
+            &staged.id,
+            &fee_payer,
+            None,
+            Some(approval),
+            260_000,
+        )
+        .await
+        .unwrap();
+    let bloom_solana_tx::signing::SolanaSignOutcome::Signed { signature } = signed else {
+        panic!("expected the stored request to be sent, got {signed:?}");
+    };
+
+    let after = outbox
+        .signing_attempt(&pending(&outbox, &staged.id))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        after.finalized_staged.message_b64, committed.finalized_staged.message_b64,
+        "the restart sent the stored message, not one refreshed onto 0x77"
+    );
+    assert_eq!(
+        after.request.operation_id.as_str(),
+        committed.request.operation_id.as_str(),
+        "and under the stored operation id"
+    );
+    use ed25519_dalek::Verifier as _;
+    ed25519_dalek::VerifyingKey::from_bytes(&fee_payer)
+        .unwrap()
+        .verify(
+            &committed.committed_message().unwrap(),
+            &ed25519_dalek::Signature::from_bytes(&signature),
+        )
+        .expect("the signature covers the committed bytes and nothing else");
+    assert_eq!(broker.sign_calls(), 1, "the Broker saw one signing request");
+    assert_eq!(broker.prepare_calls(), 1, "and one ceremony, throughout");
 }
 
 /// A changed fee is a changed reviewed fact. Refuse before signing; never
@@ -2643,6 +2794,51 @@ async fn a_corrupt_signing_snapshot_fails_closed() {
         .signing_attempt(&entry)
         .expect_err("a corrupt snapshot is an error, never None");
     assert!(error.to_string().contains("signing snapshot"), "{error}");
+
+    // Every reader refuses, because every reader loads through one place. A
+    // reader that fell back to `intent.json` would be reporting, matching or
+    // sweeping a message this entry has already stopped standing behind.
+    for (reader, result) in [
+        (
+            "read_in_state",
+            outbox
+                .read_in_state(
+                    "wallet",
+                    "solana-devnet",
+                    &staged.id,
+                    bloom_solana_tx::outbox::SolanaOutboxState::Pending,
+                )
+                .map(|_| ()),
+        ),
+        (
+            "read",
+            outbox
+                .read("wallet", "solana-devnet", &staged.id)
+                .map(|_| ()),
+        ),
+        (
+            "find_by_message",
+            outbox
+                .find_by_message("wallet", "solana-devnet", &staged.message_b64, None)
+                .map(|_| ()),
+        ),
+        (
+            "sweep_expired",
+            outbox
+                .sweep_expired(u128::MAX, &std::collections::HashMap::new())
+                .map(|_| ()),
+        ),
+    ] {
+        let error = match result {
+            Err(error) => error.to_string(),
+            Ok(()) => panic!("{reader} accepted a corrupt snapshot"),
+        };
+        assert!(
+            error.contains("signing snapshot"),
+            "{reader} failed for the wrong reason: {error}"
+        );
+    }
+
     // And it still blocks the destructive paths.
     assert!(
         outbox

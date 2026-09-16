@@ -290,12 +290,12 @@ impl SolanaTransferEngine {
         // second payment — only a second success receipt for the same one.
         match self
             .outbox
-            .find_by_message(wallet, &self.chain, &message_b64)?
+            .find_by_message(wallet, &self.chain, &message_b64, None)?
         {
             Some(crate::outbox::MessageDuplicate::Pending(existing)) => {
                 return Ok(*existing);
             }
-            Some(crate::outbox::MessageDuplicate::Dispatched) => {
+            Some(crate::outbox::MessageDuplicate::Dispatched { .. }) => {
                 return Err(EngineError::Invalid(
                     "an identical transfer (same account, destination, amount, and blockhash) \
                      was already dispatched; its outcome is reconciled by signature — read its \
@@ -552,27 +552,7 @@ impl SolanaTransferEngine {
         {
             Ok(outcome) => outcome,
             Err(error) => {
-                if error.approval_is_dead() {
-                    // No signature exists and none can under this approval, so
-                    // retire it: stop advertising its ceremony, and mark the
-                    // attempt as past so the next confirm starts a new one.
-                    // The counter has to survive — deleting the record would
-                    // reset it to zero, rebuild the same operation id, and the
-                    // Broker would refuse the replacement as a conflict with
-                    // the very approval that just died.
-                    self.outbox.write_approval_attempt(
-                        &entry,
-                        &ApprovalAttempt {
-                            expires_at_ms: 0,
-                            ..attempt
-                        },
-                    )?;
-                    self.outbox.clear_approval_challenge(&entry)?;
-                } else {
-                    // The outcome is unknown, transient, or already decided
-                    // elsewhere. Keep the approval so reconciliation still has
-                    // one identity to resolve against.
-                }
+                self.retire_dead_approval(&entry, &attempt, &error)?;
                 return Err(EngineError::Signer(error.to_string()));
             }
         };
@@ -638,7 +618,7 @@ impl SolanaTransferEngine {
 
         // 2. No approval yet: prepare from the immutable template and stop.
         let Some(approval_id) = approval_id else {
-            return self
+            let plan = self
                 .plan_normalized(
                     wallet,
                     fee_payer,
@@ -653,21 +633,23 @@ impl SolanaTransferEngine {
                 .map_err(|error| {
                     let _ = self.retire_dead_approval(&entry, &attempt, &error);
                     EngineError::Signer(error.to_string())
-                })
-                .map(|plan| match plan {
-                    crate::signing::SolanaSignPlan::ApprovalRequired {
-                        approval_id,
-                        ceremony_url,
-                        ceremony_expires_at_ms,
-                    } => SolanaSignOutcome::ApprovalRequired {
-                        approval_id,
-                        ceremony_url,
-                        ceremony_expires_at_ms,
-                    },
-                    crate::signing::SolanaSignPlan::Dispatch(_) => {
-                        unreachable!("a request with no approval id cannot resolve to a dispatch")
-                    }
-                });
+                })?;
+            let crate::signing::SolanaSignPlan::ApprovalRequired {
+                approval_id,
+                ceremony_url,
+                ceremony_expires_at_ms,
+            } = plan
+            else {
+                return Err(EngineError::Signer(
+                    "Broker resolved a request carrying no approval id straight to a dispatch"
+                        .into(),
+                ));
+            };
+            return Ok(SolanaSignOutcome::ApprovalRequired {
+                approval_id,
+                ceremony_url,
+                ceremony_expires_at_ms,
+            });
         };
 
         // 3. Having an approval id is not permission to sign. Ask the Broker
@@ -783,33 +765,33 @@ impl SolanaTransferEngine {
             .await?;
         let snapshot = crate::outbox::SolanaSigningAttempt {
             schema: crate::outbox::SIGNING_ATTEMPT_SCHEMA.to_owned(),
-            finalized_staged: finalized_staged.clone(),
+            finalized_staged,
             request: *request,
         };
 
         // 7. Claim the bytes and commit, atomically with respect to any other
-        //    entry trying to claim the same ones.
+        //    entry trying to claim the same ones. The snapshot is this entry's
+        //    only record of the message; every reader loads it from here, so
+        //    there is no second copy to keep in step and a crash on the next
+        //    line loses nothing.
         {
             let _finalizing = self.finalization_lock.lock().await;
             if let Some(owner) =
                 self.outbox
-                    .final_message_owner(wallet, &self.chain, &final_b64, id)?
+                    .find_by_message(wallet, &self.chain, &final_b64, Some(id))?
             {
+                let owner = match &owner {
+                    crate::outbox::MessageDuplicate::Pending(staged) => staged.id.clone(),
+                    crate::outbox::MessageDuplicate::Dispatched { id } => id.clone(),
+                };
                 return Err(EngineError::Invalid(format!(
-                    "transfer {owner} already owns these exact bytes; wait for a new blockhash                      and confirm again"
+                    "transfer {owner} already owns these exact bytes; wait for a new blockhash \
+                     and confirm again"
                 )));
             }
             self.outbox.write_signing_attempt(&entry, &snapshot)?;
         }
 
-        // 8. Projection, then send. The snapshot is already authoritative, so
-        //    a crash here loses nothing.
-        let finalized_entry = SolanaOutboxEntry {
-            state: entry.state,
-            staged: finalized_staged,
-            dir: entry.dir.clone(),
-        };
-        self.outbox.rewrite_intent(&finalized_entry)?;
         self.dispatch_and_record(wallet, id, fee_payer, &snapshot)
             .await
     }
@@ -851,10 +833,15 @@ impl SolanaTransferEngine {
             .await
     }
 
-    /// Retire an approval the Broker says can never sign, mirroring the raw
-    /// path: stop advertising its ceremony and mark the attempt past so the
-    /// next confirm mints a new identity. The counter must survive, or the
-    /// replacement rebuilds the dead approval's operation id.
+    /// Retire an approval the Broker says can never sign: stop advertising its
+    /// ceremony and mark the attempt past, so the next confirm mints a new
+    /// identity. The counter must survive — deleting the record would reset it
+    /// to zero, rebuild the dead approval's operation id, and the Broker would
+    /// refuse the replacement as a conflict with the approval that just died.
+    ///
+    /// Any other error leaves the approval alone. The outcome is unknown,
+    /// transient or already decided elsewhere, and reconciliation still needs
+    /// one identity to resolve against.
     fn retire_dead_approval(
         &self,
         entry: &SolanaOutboxEntry,
@@ -882,9 +869,7 @@ impl SolanaTransferEngine {
         fee_payer: &[u8; 32],
         snapshot: &crate::outbox::SolanaSigningAttempt,
     ) -> Result<SolanaSignOutcome, EngineError> {
-        let message = base64::engine::general_purpose::STANDARD
-            .decode(&snapshot.finalized_staged.message_b64)
-            .map_err(|e| EngineError::Invalid(format!("snapshot message base64: {e}")))?;
+        let message = snapshot.committed_message()?;
         let signature = self
             .signer
             .dispatch(snapshot.request.clone(), fee_payer, &message)
@@ -916,6 +901,7 @@ impl SolanaTransferEngine {
         fee_payer: &[u8; 32],
         snapshot: crate::outbox::SolanaSigningAttempt,
     ) -> Result<SolanaSignOutcome, EngineError> {
+        let message = snapshot.committed_message()?;
         // A signature already recorded locally ends it.
         let entry =
             self.outbox
@@ -929,16 +915,6 @@ impl SolanaTransferEngine {
                 .map_err(|_| EngineError::Invalid("recorded signature is not 64 bytes".into()))?;
             return Ok(SolanaSignOutcome::Signed { signature });
         }
-        // Restore the projection if the crash landed between persisting the
-        // snapshot and rewriting intent.json.
-        if entry.staged.message_b64 != snapshot.finalized_staged.message_b64 {
-            let restored = SolanaOutboxEntry {
-                state: entry.state,
-                staged: snapshot.finalized_staged.clone(),
-                dir: entry.dir.clone(),
-            };
-            self.outbox.rewrite_intent(&restored)?;
-        }
         // Did the operation already produce a result?
         let status = self
             .signer
@@ -948,9 +924,6 @@ impl SolanaTransferEngine {
         if status.operation_digest == snapshot.request.operation_digest
             && let Some(result) = status.result
         {
-            let message = base64::engine::general_purpose::STANDARD
-                .decode(&snapshot.finalized_staged.message_b64)
-                .map_err(|e| EngineError::Invalid(format!("snapshot message base64: {e}")))?;
             let signature =
                 crate::signing::verified_ed25519_signature(&result, fee_payer, &message)
                     .map_err(|error| EngineError::Signer(error.to_string()))?;

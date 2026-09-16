@@ -211,6 +211,31 @@ impl SolanaSigningAttempt {
         }
         Ok(())
     }
+
+    /// The exact bytes this entry committed to signing.
+    ///
+    /// Infallible in practice: `validate` proves the encoding and the digest
+    /// before any snapshot is written or returned.
+    pub fn committed_message(&self) -> Result<Vec<u8>, OutboxError> {
+        base64::engine::general_purpose::STANDARD
+            .decode(&self.finalized_staged.message_b64)
+            .map_err(|error| {
+                OutboxError::Other(format!("signing snapshot message is not base64: {error}"))
+            })
+    }
+
+    /// Apply this snapshot to the staged projection read from `intent.json`.
+    ///
+    /// Only the fields finalization moves are taken. Everything else, `status`
+    /// above all, keeps coming from `intent.json`, which is what later
+    /// transitions write.
+    fn apply_to(&self, staged: &mut StagedSolanaTransfer) {
+        staged.blockhash = self.finalized_staged.blockhash.clone();
+        staged.last_valid_block_height = self.finalized_staged.last_valid_block_height;
+        staged.message_b64 = self.finalized_staged.message_b64.clone();
+        staged.payload_digest_hex = self.finalized_staged.payload_digest_hex.clone();
+        staged.expires_ms = self.finalized_staged.expires_ms;
+    }
 }
 
 #[derive(Clone)]
@@ -233,7 +258,7 @@ pub enum MessageDuplicate {
     /// signature names one on-chain transaction, so a second entry could
     /// never produce a second payment — only a second success receipt for
     /// the same transfer.
-    Dispatched,
+    Dispatched { id: String },
 }
 
 impl SolanaOutbox {
@@ -436,7 +461,7 @@ impl SolanaOutbox {
         ] {
             let dir = self.state_dir(wallet, chain, state)?.join(id);
             if dir.join("intent.json").exists() {
-                let staged = serde_json::from_slice(&fs::read(dir.join("intent.json"))?)?;
+                let staged = load_staged(&dir)?;
                 return Ok(SolanaOutboxEntry { state, staged, dir });
             }
         }
@@ -473,24 +498,32 @@ impl SolanaOutbox {
     /// blockhash, and the Ed25519 signature over it is deterministic, so two
     /// entries with the same message are the same Solana transaction
     /// regardless of their outbox IDs.
+    /// `except` is the entry asking, which never counts as its own duplicate.
+    ///
+    /// Messages are compared as finalized, so an entry that refreshed its
+    /// blockhash is matched on the bytes it actually committed to rather than
+    /// the ones it was staged with.
     pub fn find_by_message(
         &self,
         wallet: &str,
         chain: &str,
         message_b64: &str,
+        except: Option<&str>,
     ) -> Result<Option<MessageDuplicate>, OutboxError> {
         for state in [SolanaOutboxState::Pending, SolanaOutboxState::Sent] {
             for id in self.list(wallet, chain, state)? {
-                let dir = self.state_dir(wallet, chain, state)?.join(&id);
-                let intent = dir.join("intent.json");
-                if !intent.exists() {
+                if except == Some(id.as_str()) {
                     continue;
                 }
-                let staged: StagedSolanaTransfer = serde_json::from_slice(&fs::read(intent)?)?;
+                let dir = self.state_dir(wallet, chain, state)?.join(&id);
+                if !dir.join("intent.json").exists() {
+                    continue;
+                }
+                let staged = load_staged(&dir)?;
                 if staged.message_b64 == message_b64 {
                     return Ok(Some(match state {
                         SolanaOutboxState::Pending => MessageDuplicate::Pending(Box::new(staged)),
-                        _ => MessageDuplicate::Dispatched,
+                        _ => MessageDuplicate::Dispatched { id },
                     }));
                 }
             }
@@ -509,7 +542,7 @@ impl SolanaOutbox {
     ) -> Result<SolanaOutboxEntry, OutboxError> {
         let dir = self.state_dir(wallet, chain, expected)?.join(id);
         if dir.join("intent.json").exists() {
-            let staged = serde_json::from_slice(&fs::read(dir.join("intent.json"))?)?;
+            let staged = load_staged(&dir)?;
             return Ok(SolanaOutboxEntry {
                 state: expected,
                 staged,
@@ -805,27 +838,7 @@ impl SolanaOutbox {
         &self,
         entry: &SolanaOutboxEntry,
     ) -> Result<Option<SolanaSigningAttempt>, OutboxError> {
-        match fs::read(entry.dir.join(PRIVATE_SIGNING_ATTEMPT_FILE)) {
-            Ok(bytes) => {
-                let attempt: SolanaSigningAttempt =
-                    serde_json::from_slice(&bytes).map_err(|error| {
-                        OutboxError::Other(format!("signing snapshot is corrupt: {error}"))
-                    })?;
-                attempt.validate(&entry.staged.id)?;
-                Ok(Some(attempt))
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error.into()),
-        }
-    }
-
-    /// Whether a signing snapshot file exists at all, without interpreting it.
-    ///
-    /// Guards use this: a corrupt snapshot must still block cancellation and
-    /// sweeping, and asking whether the file is *valid* would let corruption
-    /// unlock the very paths it should freeze.
-    pub fn has_signing_attempt(&self, entry: &SolanaOutboxEntry) -> bool {
-        entry.dir.join(PRIVATE_SIGNING_ATTEMPT_FILE).exists()
+        read_signing_attempt(&entry.dir, &entry.staged.id)
     }
 
     /// Persist the signing snapshot. This is the point of no return: after it
@@ -847,54 +860,6 @@ impl SolanaOutbox {
             .map_err(|error| OutboxError::Other(format!("encode signing snapshot: {error}")))?;
         write_private_atomic(&entry.dir.join(PRIVATE_SIGNING_ATTEMPT_FILE), &body)?;
         sync_dir(&entry.dir)
-    }
-
-    /// Every final message this wallet/chain has committed to, other than
-    /// `ignore_id`'s.
-    ///
-    /// Two intents with the same economics can refresh onto the same blockhash
-    /// and become the same bytes, and the same bytes are the same Ed25519
-    /// signature and the same transaction — one payment where the owner
-    /// approved two. Distinct off-chain intent ids do not change that.
-    ///
-    /// Snapshots are included, and are the reason this cannot just read
-    /// `intent.json`: an entry that crashed between persisting its snapshot
-    /// and restoring its projection still owns those bytes.
-    pub fn final_message_owner(
-        &self,
-        wallet: &str,
-        chain: &str,
-        message_b64: &str,
-        ignore_id: &str,
-    ) -> Result<Option<String>, OutboxError> {
-        for state in [SolanaOutboxState::Pending, SolanaOutboxState::Sent] {
-            for id in self.list(wallet, chain, state)? {
-                if id == ignore_id {
-                    continue;
-                }
-                let dir = self.state_dir(wallet, chain, state)?.join(&id);
-                let intent = dir.join("intent.json");
-                if intent.exists() {
-                    let staged: StagedSolanaTransfer = serde_json::from_slice(&fs::read(&intent)?)?;
-                    if staged.message_b64 == message_b64 {
-                        return Ok(Some(id));
-                    }
-                }
-                let snapshot = dir.join(PRIVATE_SIGNING_ATTEMPT_FILE);
-                if snapshot.exists() {
-                    let attempt: SolanaSigningAttempt =
-                        serde_json::from_slice(&fs::read(&snapshot)?).map_err(|error| {
-                            OutboxError::Other(format!(
-                                "signing snapshot of {id} is corrupt: {error}"
-                            ))
-                        })?;
-                    if attempt.finalized_staged.message_b64 == message_b64 {
-                        return Ok(Some(id));
-                    }
-                }
-            }
-        }
-        Ok(None)
     }
 
     /// Forget the recorded approval attempt. The next confirm then starts a
@@ -948,7 +913,7 @@ impl SolanaOutbox {
         // report the transfer dead while its money is still in flight, so it
         // has to be resolved by recovery first. Deliberately asks whether the
         // file exists, not whether it parses: corruption must not unlock this.
-        if self.has_signing_attempt(&entry) {
+        if self.signing_attempt(&entry)?.is_some() {
             return Err(OutboxError::Other(format!(
                 "transfer {id} has committed to signing and cannot be cancelled; its outcome \
                  must be resolved first"
@@ -1011,8 +976,7 @@ impl SolanaOutbox {
                     if !intent_path.exists() {
                         continue;
                     }
-                    let staged: StagedSolanaTransfer =
-                        serde_json::from_slice(&fs::read(&intent_path)?)?;
+                    let staged = load_staged(&ent.path())?;
                     // A signed pending entry may represent a broadcast whose
                     // RPC response was lost. Keep it retryable and visible;
                     // expiry alone must not turn it into a false failure.
@@ -1029,7 +993,7 @@ impl SolanaOutbox {
                     // already granted, so marked entries are left for explicit
                     // cancellation. Unmarked entries keep the old behaviour.
                     if entry.staged.message_normalization.is_some()
-                        || self.has_signing_attempt(&entry)
+                        || self.signing_attempt(&entry)?.is_some()
                     {
                         continue;
                     }
@@ -1054,6 +1018,46 @@ impl SolanaOutbox {
         }
         Ok(count)
     }
+}
+
+/// Read a signing snapshot from `dir`, fully validated against `entry_id`.
+///
+/// Fails closed. An unreadable or incoherent file is an error, never `None`:
+/// "no snapshot" authorises refreshing the blockhash and signing something
+/// new, which is exactly what must not happen once an earlier attempt may
+/// already have reached the Broker.
+fn read_signing_attempt(
+    dir: &Path,
+    entry_id: &str,
+) -> Result<Option<SolanaSigningAttempt>, OutboxError> {
+    match fs::read(dir.join(PRIVATE_SIGNING_ATTEMPT_FILE)) {
+        Ok(bytes) => {
+            let attempt: SolanaSigningAttempt =
+                serde_json::from_slice(&bytes).map_err(|error| {
+                    OutboxError::Other(format!("signing snapshot is corrupt: {error}"))
+                })?;
+            attempt.validate(entry_id)?;
+            Ok(Some(attempt))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Load an entry's staged record from `dir`.
+///
+/// This is the only place a staged record is loaded from disk. `intent.json`
+/// is the projection and owns everything later transitions write; once a
+/// signing snapshot exists it is the authority for the message the entry
+/// committed to, and those fields come from it. Nothing writes the finalized
+/// message to `intent.json`, so the two can never disagree.
+fn load_staged(dir: &Path) -> Result<StagedSolanaTransfer, OutboxError> {
+    let mut staged: StagedSolanaTransfer =
+        serde_json::from_slice(&fs::read(dir.join("intent.json"))?)?;
+    if let Some(attempt) = read_signing_attempt(dir, &staged.id)? {
+        attempt.apply_to(&mut staged);
+    }
+    Ok(staged)
 }
 
 fn blake3_hash(bytes: &[u8]) -> String {
@@ -1113,8 +1117,7 @@ fn parse_sent_entry(
     dir: &Path,
     intent_path: &Path,
 ) -> Option<SolanaSentEntry> {
-    let bytes = fs::read(intent_path).ok()?;
-    let staged: StagedSolanaTransfer = serde_json::from_slice(&bytes).ok()?;
+    let staged = load_staged(dir).ok()?;
     let signature = fs::read(dir.join(BROADCAST_ATTEMPT_FILE))
         .ok()
         .and_then(|bytes| serde_json::from_slice::<SolanaBroadcastAttempt>(&bytes).ok())

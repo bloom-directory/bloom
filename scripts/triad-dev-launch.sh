@@ -53,6 +53,19 @@ esac
 case "$socket_timeout_seconds" in
   ''|*[!0-9]*|0) die "BLOOM_TRIAD_DEV_SOCKET_TIMEOUT_SECONDS must be a positive integer" ;;
 esac
+# Linux normally runs the authority services as systemd user units, which is
+# how the Broker receives its two ceremony listeners. Those units start in the
+# user manager's network namespace, not the caller's, so a run that needs its
+# own loopback cannot use them: the ceremony port is fixed at 18734 and one
+# host can only have one owner of it. `direct` spawns the same two processes
+# from this shell and hands the Broker the same two named listeners through
+# systemd-socket-activate, so they are bound in whatever network namespace the
+# launcher itself was started in.
+linux_service_manager="${BLOOM_TRIAD_DEV_LINUX_SERVICE_MANAGER:-systemd}"
+case "$linux_service_manager" in
+  systemd|direct) ;;
+  *) die "BLOOM_TRIAD_DEV_LINUX_SERVICE_MANAGER must be systemd or direct" ;;
+esac
 socket_wait_attempts=$((socket_timeout_seconds * 10))
 
 [ "$(id -u)" -ne 0 ] || die "developer harness refuses root"
@@ -64,18 +77,29 @@ esac
 
 # Arguments and environment are valid, so this invocation will actually build
 # and launch the triad and genuinely needs the sibling checkouts.
+# Worktrees are the workspace's normal unit of work and they are not siblings
+# of each other, so each repository may also be named outright.
 resolve_sibling_repo() {
-  local name="$1" path
-  path="$(cd "${repo_root}/../${name}" 2>/dev/null && pwd -P)" ||
-    die "sibling repository '${name}' not found next to ${repo_root}; the developer harness expects bloom, bloom-broker, and bloom-signer to be checked out side by side"
+  local name="$1" override="$2" path
+  if [ -n "$override" ]; then
+    path="$(cd "$override" 2>/dev/null && pwd -P)" ||
+      die "requested ${name} checkout does not exist: ${override}"
+  else
+    path="$(cd "${repo_root}/../${name}" 2>/dev/null && pwd -P)" ||
+      die "sibling repository '${name}' not found next to ${repo_root}; the developer harness expects bloom, bloom-broker, and bloom-signer to be checked out side by side, or BLOOM_TRIAD_DEV_BROKER_REPO / BLOOM_TRIAD_DEV_SIGNER_REPO to name them"
+  fi
   printf '%s' "$path"
 }
-broker_repo="$(resolve_sibling_repo bloom-broker)"
-signer_repo="$(resolve_sibling_repo bloom-signer)"
+broker_repo="$(resolve_sibling_repo bloom-broker "${BLOOM_TRIAD_DEV_BROKER_REPO:-}")"
+signer_repo="$(resolve_sibling_repo bloom-signer "${BLOOM_TRIAD_DEV_SIGNER_REPO:-}")"
 
 command -v jq >/dev/null 2>&1 || die "jq is required"
 user_unit_dir=""
-if [ "$host_os" = Linux ]; then
+if [ "$host_os" = Linux ] && [ "$linux_service_manager" = direct ]; then
+  command -v systemd-socket-activate >/dev/null 2>&1 ||
+    die "the direct Linux service manager requires systemd-socket-activate"
+fi
+if [ "$host_os" = Linux ] && [ "$linux_service_manager" = systemd ]; then
   command -v systemctl >/dev/null 2>&1 || die "Linux developer services require systemctl"
   user_runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
   [ -d "$user_runtime_dir" ] && [ ! -L "$user_runtime_dir" ] ||
@@ -163,7 +187,7 @@ broker_bin="${BLOOM_INTEGRATION_BROKER_BIN:-${broker_repo}/target/debug/bloom-br
 signer_bin="${BLOOM_INTEGRATION_SIGNER_BIN:-${signer_repo}/target/debug/bloom-signer}"
 config_dir="${developer_root}/config"
 authority_edge_history="${config_dir}/authority-edge-history.json"
-if [ "$host_os" = Linux ]; then
+if [ "$host_os" = Linux ] && [ "$linux_service_manager" = systemd ]; then
   for unit_value in \
     "$developer_root" "$config_dir" "$log_dir" "$authority_edge_history" \
     "$broker_bin" "$signer_bin"
@@ -356,6 +380,7 @@ session_pid=""; signer_pid=""; broker_pid=""; machine_pid=""
 systemd_units_installed=0
 stop_linux_authority_units() {
   [ "$host_os" = Linux ] || return 0
+  [ "$linux_service_manager" = systemd ] || return 0
   systemctl --user stop "$broker_service_unit" "$signer_service_unit" >/dev/null 2>&1 || true
   systemctl --user stop "$broker_ceremony_v4_socket_unit" "$broker_ceremony_v6_socket_unit" >/dev/null 2>&1 || true
   if [ "$systemd_units_installed" -eq 1 ]; then
@@ -444,7 +469,7 @@ supervise_services() {
       tail -n 80 "${log_dir}/session.log" >&2 || true
       die "session exited while supervising triad services"
     fi
-    if [ "$host_os" = Linux ]; then
+    if [ "$host_os" = Linux ] && [ "$linux_service_manager" = systemd ]; then
       for label in signer broker; do
         case "$label" in
           signer) unit="$signer_service_unit" ;;
@@ -567,9 +592,25 @@ BLOOM_TRIAD_DEVELOPER_RUNTIME="$runtime_dir" \
 session_pid=$!
 wait_for_socket "$session_socket" "$session_pid" session
 
-if [ "$host_os" = Linux ]; then
-  start_linux_authority_services
-else
+# Spawn the two authority services from this shell. macOS always launches this
+# way; Linux does so only under the `direct` service manager, where the Broker
+# is additionally wrapped so it still receives its ceremony listeners as named
+# inherited descriptors rather than binding them itself.
+start_direct_authority_services() {
+  broker_launch=("$broker_bin")
+  if [ "$host_os" = Linux ]; then
+    # --now hands over the descriptors immediately and execs, so the Broker
+    # keeps this pid; --fdname publishes the same two names the .socket units
+    # use, one listener each.
+    broker_launch=(
+      systemd-socket-activate --now
+      --listen '127.0.0.1:18734' --listen '[::1]:18734'
+      --fdname=broker-ceremony-ipv4:broker-ceremony-ipv6
+      "$broker_bin"
+    )
+  fi
+
+  : > "${log_dir}/signer.log"
   env -u BLOOM_OPERATOR_ACCEPT_CLOCK_UTC_MS \
   -u BLOOM_OPERATOR_CONFIRM_EXPIRING_APPROVALS_DIGEST \
   BLOOM_TRIAD_DEVELOPER_ROOT="$developer_root" \
@@ -584,6 +625,7 @@ else
   signer_pid=$!
   wait_for_socket "$signer_socket" "$signer_pid" signer
 
+  : > "${log_dir}/broker.log"
   env -u BLOOM_OPERATOR_ACCEPT_CLOCK_UTC_MS \
   -u BLOOM_OPERATOR_CONFIRM_EXPIRING_APPROVALS_DIGEST \
   BLOOM_TRIAD_DEVELOPER_ROOT="$developer_root" \
@@ -593,10 +635,21 @@ else
   BLOOM_BROKER_SOCKET="$broker_socket" \
   BLOOM_BROKER_CONTROL_SOCKET="$broker_control_socket" \
   BLOOM_BROKER_AUDIT_CHECKPOINT_DIR="$broker_checkpoint_dir" \
+  BLOOM_BROKER_CEREMONY_ACTIVATION_NAME_IPV4=broker-ceremony-ipv4 \
+  BLOOM_BROKER_CEREMONY_ACTIVATION_NAME_IPV6=broker-ceremony-ipv6 \
   BLOOM_SESSION_SOCKET="$session_socket" \
-    "$broker_bin" >"${log_dir}/broker.log" 2>&1 &
+    "${broker_launch[@]}" >"${log_dir}/broker.log" 2>&1 &
   broker_pid=$!
   wait_for_socket "$broker_socket" "$broker_pid" broker
+  if [ "$host_os" = Linux ]; then
+    wait_for_socket "$broker_control_socket" "$broker_pid" broker
+  fi
+}
+
+if [ "$host_os" = Linux ] && [ "$linux_service_manager" = systemd ]; then
+  start_linux_authority_services
+else
+  start_direct_authority_services
 fi
 
 machine_config="${machine_home}/config.toml"
