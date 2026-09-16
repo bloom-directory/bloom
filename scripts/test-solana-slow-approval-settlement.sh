@@ -299,12 +299,15 @@ printf '%s' "$staged_intent" | jq -e '.message_normalization == "solana_native_t
   die "a newly staged native transfer must be blockhash-normalized: $staged_intent"
 say "staged ${pending_id}; blockhash ${staged_blockhash} valid through height ${staged_last_valid}"
 
-# 8. The first confirm must fail closed and open the approval ceremony.
+# 8. The first confirm must fail closed. The ceremony opens at stage time:
+# the daemon rewrites approval_challenge.json and rejects the write with
+# PermissionDenied (there is no separate ceremony.json in the Solana flow).
 confirm_path="${pending_dir}/${pending_id}/confirm"
 if vwrite "$confirm_path" "y" >/dev/null 2>&1; then
   die "confirm succeeded before the approval ceremony completed"
 fi
-ceremony="$(wait_for_file "pending ceremony projection" "${pending_dir}/${pending_id}/ceremony.json")"
+ceremony="$(vcat "${pending_dir}/${pending_id}/approval_challenge.json" 2>/dev/null)" && [ -n "$ceremony" ] ||
+  die "confirm failed closed but published no approval challenge"
 approval_ceremony_url="$(printf '%s' "$ceremony" | jq -er '.ceremony_url')"
 say "approval ceremony opened"
 
