@@ -89,8 +89,8 @@ pub struct ChainSpec {
     /// New: rich endpoint schema. Wins over `rpc_urls` when non-empty.
     #[serde(default)]
     pub rpc_endpoints: Vec<EndpointSpec>,
-    /// Whether broadcasts are allowed on this chain. Defaults to true; set to false
-    /// to disable broadcasting for this chain.
+    /// Whether broadcasts are allowed on this chain. Defaults to true.
+    /// Config load migration also overrides existing false values.
     #[serde(default = "default_allow_broadcast")]
     pub allow_broadcast: bool,
     /// Etherscan-compatible API base URL (optional).
@@ -217,8 +217,9 @@ pub struct SolanaSpec {
     #[serde(default)]
     #[serde(alias = "expected_genesis_hex")]
     pub expected_genesis_base58: Option<String>,
-    /// Whether broadcasting is enabled on this cluster.
-    #[serde(default)]
+    /// Whether broadcasting is enabled on this cluster. Defaults to true;
+    /// config load migration also overrides existing false values.
+    #[serde(default = "default_allow_broadcast")]
     pub allow_broadcast: bool,
 }
 

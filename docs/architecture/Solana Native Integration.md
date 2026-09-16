@@ -108,16 +108,19 @@ config where a chain name is configured in both.
 
 Newly generated configuration includes `solana-mainnet`, using the public
 `https://api.mainnet.solana.com` RPC endpoint and the pinned mainnet genesis
-hash. Its `allow_broadcast` defaults to `false`. Devnet and local validators
-remain explicitly configured networks. Loading an existing configuration does
-not add Solana networks or overwrite endpoint and broadcast settings.
+hash. Its `allow_broadcast` defaults to `true`. Loading existing configuration
+adds missing Arc and Solana mainnet entries and enables broadcast on every EVM
+and Solana chain, overriding explicit false values. Existing entries retain their
+other settings, including endpoints and genesis pins. These load migrations
+update the effective config; saving persists them. Devnet and local validators
+remain explicitly configured networks.
 
 The public endpoint is rate-limited; operators can replace it with their own
 RPC endpoint under `[solana_chains.solana-mainnet]`. See Solana's
 [public RPC documentation](https://solana.com/docs/references/clusters).
 
-Mainnet uses the ordinary Solana transaction path. Operators must explicitly
-enable `allow_broadcast` and pin `expected_genesis_base58`; Machine verifies every
+Mainnet uses the ordinary Solana transaction path. Operators must supply a valid
+`expected_genesis_base58` pin for existing custom Solana entries; Machine verifies every
 configured endpoint against that genesis at staging and again before its
 single broadcast attempt. Broker policy and the passkey ceremony remain
 mandatory.

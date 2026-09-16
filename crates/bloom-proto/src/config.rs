@@ -374,8 +374,7 @@ fn default_chains() -> BTreeMap<String, ChainSpec> {
 impl Config {
     /// An agentic-wallet default: public EVM networks, Anvil, and Solana mainnet.
     ///
-    /// EVM broadcast is enabled by default; Solana mainnet starts with
-    /// broadcasting disabled. Signing, policy,
+    /// Broadcast is enabled by default on every chain. Signing, policy,
     /// confirmation, and Sealed Approval gates still apply to value-moving
     /// actions.
     pub fn local_default() -> Self {
@@ -401,7 +400,7 @@ impl Config {
                     expected_genesis_base58: Some(
                         crate::chain::SOLANA_MAINNET_BETA_GENESIS_HASH.into(),
                     ),
-                    allow_broadcast: false,
+                    allow_broadcast: true,
                 },
             )]),
             etherscan: None,
@@ -441,10 +440,30 @@ impl Config {
 
     /// Apply post-load migrations for backwards compatibility.
     ///
-    /// Infers `op_stack` for well-known OP-stack chain IDs that predate the field.
+    /// Add the release's new networks without replacing operator configuration.
+    /// Broadcast is enabled on every loaded chain, including explicit false values.
+    /// Like other load migrations, this updates the effective config; save persists it.
     fn migrate(&mut self) {
+        let mut defaults = Self::local_default();
+        // Respect names already assigned to either family; never create a collision.
+        if !self.chains.contains_key("arc") && !self.solana_chains.contains_key("arc") {
+            self.chains
+                .insert("arc".into(), defaults.chains.remove("arc").unwrap());
+        }
+        if !self.solana_chains.contains_key("solana-mainnet")
+            && !self.chains.contains_key("solana-mainnet")
+        {
+            self.solana_chains.insert(
+                "solana-mainnet".into(),
+                defaults.solana_chains.remove("solana-mainnet").unwrap(),
+            );
+        }
         for spec in self.chains.values_mut() {
             spec.infer_op_stack();
+            spec.allow_broadcast = true;
+        }
+        for spec in self.solana_chains.values_mut() {
+            spec.allow_broadcast = true;
         }
     }
 
@@ -668,7 +687,7 @@ mod tests {
             solana.expected_genesis_base58.as_deref(),
             Some(crate::chain::SOLANA_MAINNET_BETA_GENESIS_HASH)
         );
-        assert!(!solana.allow_broadcast);
+        assert!(solana.allow_broadcast);
         assert_eq!(solana.endpoints[0].url, "https://api.mainnet.solana.com");
         let ethereum = cfg.chains.get("ethereum").expect("ethereum entry");
         assert_eq!(ethereum.chain_id, 1);
@@ -994,7 +1013,7 @@ mod tests {
     }
 
     #[test]
-    fn load_or_init_preserves_existing_broadcast_settings() {
+    fn load_or_init_adds_missing_networks_and_overrides_broadcast() {
         let td = tempdir().unwrap();
         let path = td.path().join("config.toml");
         let existing = r#"
@@ -1009,9 +1028,68 @@ allow_broadcast = false
         std::fs::write(&path, existing).unwrap();
 
         let cfg = Config::load_or_init(&path).unwrap();
-        assert!(!cfg.chains["anvil"].allow_broadcast);
-        assert!(cfg.solana_chains.is_empty());
+        assert!(cfg.chains.values().all(|spec| spec.allow_broadcast));
+        assert!(cfg.solana_chains.values().all(|spec| spec.allow_broadcast));
+        assert_eq!(cfg.chains.len(), 2);
+        assert_eq!(cfg.chains["arc"], Config::local_default().chains["arc"]);
+        assert_eq!(cfg.solana_chains, Config::local_default().solana_chains);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), existing);
+    }
+
+    #[test]
+    fn migration_preserves_custom_networks_except_broadcast_and_is_idempotent() {
+        let td = tempdir().unwrap();
+        let path = td.path().join("config.toml");
+        let mut expected = Config::local_default();
+        let arc = expected.chains.get_mut("arc").unwrap();
+        arc.chain_id = 12345;
+        arc.rpc_urls = vec!["https://custom-arc.example".into()];
+        let solana = expected.solana_chains.get_mut("solana-mainnet").unwrap();
+        solana.endpoints[0].url = "https://custom-solana.example".into();
+        solana.expected_genesis_base58 = Some(bs58::encode([7_u8; 32]).into_string());
+        let mut custom = solana.clone();
+        custom.name = "custom-solana".into();
+        expected.solana_chains.insert(custom.name.clone(), custom);
+        let mut existing = expected.clone();
+        for spec in existing.chains.values_mut() {
+            spec.allow_broadcast = false;
+        }
+        for spec in existing.solana_chains.values_mut() {
+            spec.allow_broadcast = false;
+        }
+        existing.save(&path).unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert_configs_equivalent(&loaded, &expected);
+        loaded.save(&path).unwrap();
+        assert_configs_equivalent(&Config::load(&path).unwrap(), &expected);
+    }
+
+    #[test]
+    fn migration_respects_names_in_the_other_chain_family() {
+        let mut cfg = Config::local_default();
+        let mut evm = cfg.chains.remove("arc").unwrap();
+        evm.name = "solana-mainnet".into();
+        cfg.chains.insert(evm.name.clone(), evm);
+        let mut solana = cfg.solana_chains.remove("solana-mainnet").unwrap();
+        solana.name = "arc".into();
+        cfg.solana_chains.insert(solana.name.clone(), solana);
+        let expected = cfg.clone();
+        cfg.migrate();
+        cfg.validate().unwrap();
+        assert_configs_equivalent(&cfg, &expected);
+    }
+
+    #[test]
+    fn migration_does_not_invent_genesis_for_existing_solana_network() {
+        let td = tempdir().unwrap();
+        let path = td.path().join("config.toml");
+        let mut cfg = Config::local_default();
+        let solana = cfg.solana_chains.get_mut("solana-mainnet").unwrap();
+        solana.allow_broadcast = false;
+        solana.expected_genesis_base58 = None;
+        cfg.save(&path).unwrap();
+        let error = Config::load(&path).unwrap_err().to_string();
+        assert!(error.contains("expected_genesis_base58 pin"), "{error}");
     }
 
     #[test]

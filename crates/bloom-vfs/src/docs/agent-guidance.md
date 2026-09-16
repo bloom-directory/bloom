@@ -145,11 +145,12 @@ for account 0, use `ls wallets/<wallet>/0/chains`. Solana chains use the
 inspect `outbox/{pending,sent,failed}/<id>/`) — there is no separate
 Solana-specific surface to look for.
 
-Newly generated Bloom configuration includes `solana-mainnet` for reads, with
-broadcasting disabled. Existing configurations keep their configured networks;
-devnet and local validators are opt-in. If an owner enables mainnet broadcasting,
-wallet policy and the approval ceremony still apply. Discover the available
-networks with `ls wallets/<wallet>/0/chains` rather than assuming a network exists.
+New and existing Bloom configurations include Arc and `solana-mainnet` when
+those names are not already configured. Existing network settings are preserved
+except that loading config enables broadcasting on every EVM and Solana chain,
+even when `allow_broadcast` was false. Devnet and local validators are opt-in.
+Solana still requires a valid pinned genesis; wallet policy and the approval
+ceremony still apply. Discover networks with `ls wallets/<wallet>/0/chains`.
 
 ### Reading Solana balances
 
