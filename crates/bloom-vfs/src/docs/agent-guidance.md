@@ -145,7 +145,7 @@ for account 0, use `ls wallets/<wallet>/0/chains`. Solana chains use the
 inspect `outbox/{pending,sent,failed}/<id>/`) — there is no separate
 Solana-specific surface to look for.
 
-Bloom includes Arc and `solana-mainnet` in its default networks and enables
+Bloom includes default networks and enables
 broadcasting on every configured EVM and Solana chain. Devnet and local validators
 are opt-in. The default `solana-mainnet` configuration includes the mainnet genesis
 pin; every Solana network requires a valid pinned genesis. Wallet policy and the

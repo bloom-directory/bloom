@@ -108,9 +108,7 @@ config where a chain name is configured in both.
 
 Newly generated configuration includes `solana-mainnet`, using the public
 `https://api.mainnet.solana.com` RPC endpoint and the pinned mainnet genesis
-hash. Its `allow_broadcast` defaults to `true`. Loading existing configuration
-adds missing Arc and Solana mainnet entries and enables broadcast on every EVM
-and Solana chain, overriding explicit false values. Existing entries retain their
+hash. Its `allow_broadcast` defaults to `true`. Existing entries retain their
 other settings, including endpoints and genesis pins. These load migrations
 update the effective config; saving persists them. Devnet and local validators
 remain explicitly configured networks.
