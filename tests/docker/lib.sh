@@ -39,7 +39,6 @@ default_chain = "base"
 name = "base"
 chain_id = 8453
 rpc_urls = ["$rpc_url"]
-allow_broadcast = false
 display_name = "$display_name"
 native_symbol = "ETH"
 native_decimals = 18
