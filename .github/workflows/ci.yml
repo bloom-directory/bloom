@@ -253,10 +253,6 @@ jobs:
             sed 's|@BLOOM_BROKER_BINARY@|/usr/bin/true|; s|@BLOOM_SIGNER_BINARY@|/usr/bin/true|' \
               "$source" > "$destination"
           done
-          mkdir -p "$unit_dir/bloom-signer@1000.service.d"
-          sed 's|@AWS_KMS_IP_ALLOW_DIRECTIVES@|IPAddressAllow=127.0.0.1/32|' \
-            packaging/triad/linux/systemd/instance-dropins/bloom-signer@LOGIN_UID.service.d/50-aws-kms.conf.in \
-            > "$unit_dir/bloom-signer@1000.service.d/50-aws-kms.conf"
           cp "$unit_dir/bloom-signer@.service" "$unit_dir/bloom-signer@1000.service"
           systemd-analyze verify \
             "$unit_dir"/*.socket \

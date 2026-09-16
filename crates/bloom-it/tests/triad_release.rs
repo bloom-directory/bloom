@@ -90,30 +90,64 @@ fn release_compatibility_declares_each_edge_without_a_global_protocol_range() {
 
     let release = workspace().join("packaging/triad/release");
     let compatibility = fs::read_to_string(release.join("compatibility-v1.toml")).unwrap();
-    for (exact_authority, minor) in [("machine_broker", 5), ("broker_signer", 4)] {
+    let verifier = fs::read_to_string(release.join("verify-bundle.sh")).unwrap();
+    // The declared ranges copy the API crates at the pinned revisions, so
+    // compare against those constants rather than literals.
+    for (edge, range, exact) in [
+        ("machine_broker", bloom_broker_api::BROKER_API_RANGE, true),
+        ("broker_signer", bloom_signer_api::SIGNER_API_RANGE, true),
+        (
+            "signer_control",
+            bloom_signer_api::SIGNER_CONTROL_RANGE,
+            false,
+        ),
+        (
+            "session",
+            bloom_service_activation::SESSION_PROTOCOL_RANGE,
+            false,
+        ),
+    ] {
         let block = format!(
-            "[protocols.{exact_authority}]\nmajor = 1\nminor_min = {minor}\nminor_max = {minor}"
+            "[protocols.{edge}]\nmajor = {}\nminor_min = {}\nminor_max = {}",
+            range.major, range.minor_min, range.minor_max
         );
-        assert!(compatibility.contains(&block));
+        assert!(compatibility.contains(&block), "missing {block}");
+        assert_eq!(range.minor_min == range.minor_max, exact, "{edge}");
+        if exact {
+            for key in ["minor_min", "minor_max"] {
+                assert!(verifier.contains(&format!(
+                    "require_compat_value protocols.{edge} {key} {}",
+                    range.minor_max
+                )));
+            }
+        }
     }
-    for compatible_support in ["signer_control", "session"] {
-        let block =
-            format!("[protocols.{compatible_support}]\nmajor = 1\nminor_min = 0\nminor_max = 1");
-        assert!(compatibility.contains(&block));
+    // Those constants are only the manifest's if Cargo resolved the same revisions.
+    let lockfile = fs::read_to_string(workspace().join("Cargo.lock")).unwrap();
+    for (repository, key) in [
+        ("bloom-broker", "broker_commit"),
+        ("bloom-signer", "signer_commit"),
+        ("bloom-service-runtime", "service_runtime_commit"),
+    ] {
+        let revision = compatibility
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{key} = \"")))
+            .and_then(|tail| tail.strip_suffix('"'))
+            .unwrap_or_else(|| panic!("compatibility lacks {key}"));
+        let prefix = format!("git+https://github.com/bloom-directory/{repository}.git?rev=");
+        let locked: Vec<_> = lockfile.split(&prefix).skip(1).collect();
+        assert!(
+            !locked.is_empty()
+                && locked
+                    .iter()
+                    .all(|tail| tail.starts_with(&format!("{revision}#"))),
+            "{repository} must be locked only at {key} {revision}"
+        );
     }
     assert!(!compatibility.lines().any(is_legacy_global_protocol_key));
     assert!(is_legacy_global_protocol_key("  protocol_major = 1"));
     assert!(is_legacy_global_protocol_key("\tprotocol_minor_min = 0"));
 
-    let verifier = fs::read_to_string(release.join("verify-bundle.sh")).unwrap();
-    for (exact_authority, minor) in [("machine_broker", 5), ("broker_signer", 4)] {
-        assert!(verifier.contains(&format!(
-            "require_compat_value protocols.{exact_authority} minor_min {minor}"
-        )));
-        assert!(verifier.contains(&format!(
-            "require_compat_value protocols.{exact_authority} minor_max {minor}"
-        )));
-    }
     assert!(verifier.contains("for support_edge in signer_control session"));
     assert!(verifier.contains("must not declare a global protocol range"));
 
@@ -352,7 +386,6 @@ fn make_installer_payload(root: &Path) -> PathBuf {
         "systemd/bloom-session@.path",
         "systemd/bloom-broker@.service.in",
         "systemd/bloom-signer@.service.in",
-        "systemd/instance-dropins/bloom-signer@LOGIN_UID.service.d/50-aws-kms.conf.in",
         "systemd-user/bloom-session.service",
         "systemd-user/bloom-machine.service",
     ] {
@@ -393,17 +426,6 @@ fn make_installer_payload(root: &Path) -> PathBuf {
   "signer_uid": @BLOOM_SIGNER_UID@,
   "session_socket_gid": @SESSION_SOCKET_GID@
 }"#,
-    )
-    .unwrap();
-    fs::create_dir_all(payload.join("credentials")).unwrap();
-    fs::write(
-        payload.join("config/aws-kms-ip-allow.conf"),
-        b"IPAddressAllow=192.0.2.0/24\n",
-    )
-    .unwrap();
-    fs::write(
-        payload.join("credentials/aws-credentials"),
-        b"[default]\naws_access_key_id=test\n",
     )
     .unwrap();
     payload
@@ -1458,16 +1480,6 @@ fn linux_installer_upgrade_rotation_and_confirmed_uninstall_are_staged_safely() 
             & 0o777,
         0o600
     );
-    let aws_dropin = fs::read_to_string(
-        root.join("usr/lib/systemd/system/bloom-signer@1000.service.d/50-aws-kms.conf"),
-    )
-    .unwrap();
-    assert!(aws_dropin.contains("IPAddressDeny=any"));
-    assert!(aws_dropin.contains("IPAddressAllow=192.0.2.0/24"));
-    assert!(!aws_dropin.contains("@AWS_KMS_IP_ALLOW_DIRECTIVES@"));
-
-    fs::remove_file(payload.join("credentials/aws-credentials")).unwrap();
-    fs::remove_file(payload.join("config/aws-kms-ip-allow.conf")).unwrap();
     fs::write(payload.join("bin/bloom-broker"), b"upgraded-broker").unwrap();
     fs::write(payload.join("SHA256SUMS"), b"upgraded payload\n").unwrap();
     assert!(
@@ -1491,12 +1503,6 @@ fn linux_installer_upgrade_rotation_and_confirmed_uninstall_are_staged_safely() 
             .matches("x-bloom.login-uid=1000")
             .count(),
         1
-    );
-    assert!(!root.join("etc/bloom/1000/signer/aws-credentials").exists());
-    assert!(
-        !root
-            .join("usr/lib/systemd/system/bloom-signer@1000.service.d/50-aws-kms.conf")
-            .exists()
     );
 
     let custody = root.join("var/lib/bloom/1000/signer/wallet-custody");
@@ -1769,39 +1775,11 @@ fn linux_installer_authenticates_payload_before_mutating_existing_files() {
     let pinned_key = directory.path().join("pinned-release-key.pub");
     generate_ed25519_key(&private_key);
     write_ed25519_public_key(&private_key, &pinned_key);
-    fs::remove_file(payload.join("credentials/aws-credentials")).unwrap();
-    fs::remove_file(payload.join("config/aws-kms-ip-allow.conf")).unwrap();
     authenticate_installer_payload(&payload, &private_key);
 
     let installed_binary = root.join("usr/libexec/bloom/current/bloom-broker");
     fs::create_dir_all(installed_binary.parent().unwrap()).unwrap();
     fs::write(&installed_binary, b"existing-install").unwrap();
-    fs::write(
-        payload.join("credentials/aws-credentials"),
-        b"[default]\naws_access_key_id=unsigned\n",
-    )
-    .unwrap();
-    fs::write(
-        payload.join("config/aws-kms-ip-allow.conf"),
-        b"IPAddressAllow=192.0.2.0/24\n",
-    )
-    .unwrap();
-    let unsigned_overlay = Command::new(release_script("install-linux.sh"))
-        .args(["install"])
-        .arg(&root)
-        .args(["1000", "alice"])
-        .arg(&payload)
-        .env("BLOOM_ALLOW_TEST_UNCLAIMED", "true")
-        .env("BLOOM_TEST_VERIFY_RELEASE_PAYLOAD", "true")
-        .env("BLOOM_RELEASE_PUBLIC_KEY", &pinned_key)
-        .output()
-        .unwrap();
-    assert!(!unsigned_overlay.status.success());
-    assert!(
-        String::from_utf8_lossy(&unsigned_overlay.stderr)
-            .contains("optional signer overlay is not authenticated")
-    );
-    assert_eq!(fs::read(&installed_binary).unwrap(), b"existing-install");
 
     authenticate_installer_payload(&payload, &private_key);
     fs::write(payload.join("bin/bloom-broker"), b"tampered").unwrap();
@@ -1840,6 +1818,90 @@ fn linux_installer_authenticates_payload_before_mutating_existing_files() {
             .contains("payload release signature is invalid")
     );
     assert_eq!(fs::read(&installed_binary).unwrap(), b"existing-install");
+}
+
+/// The released Signer is built without AWS KMS support and refuses KMS
+/// configuration. The installer must refuse KMS inputs, and a login that
+/// already has a KMS enrollment, before it changes anything: an install would
+/// leave a Signer that cannot start, and an upgrade would silently discard the
+/// enrollment's credentials and network profile.
+#[test]
+fn linux_installer_refuses_aws_kms_signer_configuration_before_changing_state() {
+    fn tree(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        fn visit(root: &Path, path: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
+            for entry in fs::read_dir(path).unwrap() {
+                let path = entry.unwrap().path();
+                let relative = path.strip_prefix(root).unwrap().to_path_buf();
+                if path.is_dir() {
+                    out.push((relative, Vec::new()));
+                    visit(root, &path, out);
+                } else {
+                    out.push((relative, fs::read(&path).unwrap()));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        visit(root, root, &mut out);
+        out.sort();
+        out
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let payload = make_installer_payload(directory.path());
+    let installer = release_script("install-linux.sh");
+    let install = |root: &Path| {
+        Command::new(&installer)
+            .args(["install"])
+            .arg(root)
+            .args(["1000", "alice"])
+            .arg(&payload)
+            .env("BLOOM_ALLOW_TEST_UNCLAIMED", "true")
+            .output()
+            .unwrap()
+    };
+
+    let root = directory.path().join("payload-overlay-root");
+    fs::create_dir(&root).unwrap();
+    for (overlay, contents) in [
+        ("credentials/aws-credentials", &b"[default]\n"[..]),
+        (
+            "config/aws-kms-ip-allow.conf",
+            &b"IPAddressAllow=192.0.2.0/24\n"[..],
+        ),
+    ] {
+        let path = payload.join(overlay);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, contents).unwrap();
+        let refused = install(&root);
+        assert!(!refused.status.success());
+        assert!(
+            String::from_utf8_lossy(&refused.stderr)
+                .contains("does not support AWS KMS Signer backends"),
+            "{}",
+            String::from_utf8_lossy(&refused.stderr)
+        );
+        assert!(tree(&root).is_empty(), "{overlay}: {:?}", tree(&root));
+        fs::remove_file(&path).unwrap();
+    }
+
+    for enrollment in [
+        "etc/bloom/1000/signer/aws-credentials",
+        "usr/lib/systemd/system/bloom-signer@1000.service.d/50-aws-kms.conf",
+    ] {
+        let root = directory.path().join(enrollment.replace('/', "-"));
+        let path = root.join(enrollment);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"existing KMS enrollment").unwrap();
+        let before = tree(&root);
+        let refused = install(&root);
+        assert!(!refused.status.success());
+        assert!(
+            String::from_utf8_lossy(&refused.stderr).contains("has an AWS KMS Signer enrollment"),
+            "{}",
+            String::from_utf8_lossy(&refused.stderr)
+        );
+        assert_eq!(tree(&root), before, "{enrollment}");
+    }
 }
 
 #[test]

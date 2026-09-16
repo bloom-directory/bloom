@@ -1155,13 +1155,6 @@ verify_sha256_manifest() {
   fi
 }
 
-manifest_authenticates_path() {
-  awk -v wanted="$2" '
-    $2 == wanted || $2 == "*" wanted { found = 1 }
-    END { exit !found }
-  ' "$1"
-}
-
 verify_release_payload() {
   payload_to_verify="$1"
   expected_pin_uid="$2"
@@ -1311,7 +1304,6 @@ case "$action" in
       installer/linux/systemd/bloom-session@.path \
       installer/linux/systemd/bloom-broker@.service.in \
       installer/linux/systemd/bloom-signer@.service.in \
-      installer/linux/systemd/instance-dropins/bloom-signer@LOGIN_UID.service.d/50-aws-kms.conf.in \
       installer/linux/systemd-user/bloom-session.service \
       installer/linux/systemd-user/bloom-machine.service \
       installer/release/install-linux.sh
@@ -1321,20 +1313,26 @@ case "$action" in
         exit 66
       }
     done
-    if $payload_authenticated &&
-      [[ -e "$payload/credentials/aws-credentials" || \
-        -e "$payload/config/aws-kms-ip-allow.conf" ]]
-    then
-      for overlay_path in \
-        ./credentials/aws-credentials \
-        ./config/aws-kms-ip-allow.conf
-      do
-        manifest_authenticates_path "$payload/SHA256SUMS" "$overlay_path" || {
-          echo "optional signer overlay is not authenticated: $overlay_path" >&2
-          exit 65
-        }
-      done
-    fi
+    # This release's Signer is built without the aws-kms feature and refuses
+    # AWS KMS configuration at startup. Refuse KMS inputs, and an installed
+    # KMS enrollment, before any installed state changes: installing would
+    # leave a Signer that cannot start, and upgrading would silently discard
+    # the enrollment's credentials and network profile.
+    for kms_input in credentials/aws-credentials config/aws-kms-ip-allow.conf; do
+      if [[ -e "$payload/$kms_input" || -L "$payload/$kms_input" ]]; then
+        echo "this Bloom release does not support AWS KMS Signer backends; remove $kms_input from the payload" >&2
+        exit 65
+      fi
+    done
+    for kms_enrollment in \
+      "$root/etc/bloom/$login_uid/signer/aws-credentials" \
+      "$root/usr/lib/systemd/system/bloom-signer@$login_uid.service.d/50-aws-kms.conf"
+    do
+      if [[ -e "$kms_enrollment" || -L "$kms_enrollment" ]]; then
+        echo "login $login_uid has an AWS KMS Signer enrollment that this Bloom release cannot run; nothing was changed" >&2
+        exit 65
+      fi
+    done
     release_digest="$(sha256_digest "$payload/SHA256SUMS")"
     [[ "$release_digest" =~ ^[0-9a-f]{64}$ ]] || {
       echo "signed payload release digest is invalid" >&2
@@ -1640,54 +1638,6 @@ case "$action" in
         "$config_root/machine/revoke-identity.json" \
         "$config_root/session/identity.json"
     fi
-    dropin_root="$unit_root/bloom-signer@$login_uid.service.d"
-    if [[ -e "$payload/credentials/aws-credentials" || -e "$payload/config/aws-kms-ip-allow.conf" ]]; then
-      test -f "$payload/credentials/aws-credentials" &&
-        test -f "$payload/config/aws-kms-ip-allow.conf" || {
-          echo "AWS KMS credentials and reviewed IP allowlist must be supplied together" >&2
-          exit 66
-        }
-      if ! grep -Eq '^IPAddressAllow=[0-9a-fA-F:.]+/[0-9]+$' \
-        "$payload/config/aws-kms-ip-allow.conf" ||
-        grep -Eq '(^|=)(any|0\.0\.0\.0/0|::/0)$' \
-          "$payload/config/aws-kms-ip-allow.conf" ||
-        grep -Ev '^(IPAddressAllow=[0-9a-fA-F:.]+/[0-9]+|[[:space:]]*)$' \
-          "$payload/config/aws-kms-ip-allow.conf" >/dev/null
-      then
-        echo "AWS KMS IP allowlist is empty, wildcard, or malformed" >&2
-        exit 65
-      fi
-      atomic_install \
-        "$payload/credentials/aws-credentials" \
-        "$config_root/signer/aws-credentials" \
-        0600
-      mkdir -p "$dropin_root"
-      awk \
-        -v allowlist="$payload/config/aws-kms-ip-allow.conf" \
-        '{
-          if ($0 == "@AWS_KMS_IP_ALLOW_DIRECTIVES@") {
-            while ((getline line < allowlist) > 0) print line
-            close(allowlist)
-          } else {
-            print
-          }
-        }' \
-        "$payload/installer/linux/systemd/instance-dropins/bloom-signer@LOGIN_UID.service.d/50-aws-kms.conf.in" |
-        sed '/@AWS_KMS_IP_ALLOW_DIRECTIVES@/d' \
-        > "$dropin_root/50-aws-kms.conf.new"
-      chmod 0644 "$dropin_root/50-aws-kms.conf.new"
-      mv -f "$dropin_root/50-aws-kms.conf.new" "$dropin_root/50-aws-kms.conf"
-      if [[ "$root" == "/" ]]; then
-        chown "bloom-signer-$login_uid:bloom-signer-$login_uid" \
-          "$config_root/signer/aws-credentials"
-      fi
-    else
-      rm -f -- \
-        "$config_root/signer/aws-credentials" \
-        "$dropin_root/50-aws-kms.conf"
-      rmdir "$dropin_root" 2>/dev/null || true
-    fi
-
     if [[ "$release_upgrade" == true ]]; then
       rewrite_linux_release_set "$root" "$release_digest" active
     fi
