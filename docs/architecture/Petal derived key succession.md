@@ -166,6 +166,17 @@ When a Petal calls the typed key-derivation host API:
 7. Machine persists only the public `KeyRef`, public-key metadata, scope, and
    ceremony state. The private key remains in Signer.
 
+The key-request JSON may also carry `approval_value_limits`: Broker
+`ValueLimit`s (`asset: {chain, asset}`, decimal-string `lifetime`,
+`rolling_windows`). Machine rejects empty assets, zero lifetimes, zero window
+durations, and repeated assets before custody starts. It then seals the list
+unchanged into the key's reusable approval, where the owner reviews it. A retry
+of the same key slot must carry the same list; a different budget needs a new
+slot. Omitting it authorizes no declared debit or fee asset. The list is stored
+beside the request state (`<state>.value-limits`), not inside it, so that
+released binaries can still read the state file. Budgets never widen the Signer
+custody scope.
+
 The stable `PetalKeyScope` digest deliberately excludes the current package hash
 and requesting route. This is the correct beginning of a version-stable key
 identity. The exact derivation request digest still includes them.
