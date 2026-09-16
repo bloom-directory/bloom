@@ -912,7 +912,6 @@ fn installed_acceptance_runs_the_packaged_machine_runtime_negative() {
         "[chains.anvil]",
         "rpc_urls = [",
         "$rpc_port",
-        "allow_broadcast = true",
         "BLOOM_MA05_LEGACY_AUTHORITY_POISON",
         "legacy-before.manifest",
         "/usr/bin/fs_usage -w -f pathname >",

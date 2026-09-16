@@ -17,8 +17,8 @@ use url::Url;
 const TRUSTED_GITHUB_OWNER: &str = "bloom-directory";
 // Retain a bounded diagnostic tail for reconciliation after streamed output.
 const SOURCE_BUILD_STREAM_LIMIT: usize = 256 * 1024;
-const NEAR_INTENTS_RELEASE_COMMIT: &str = "ccabb93214f1f18cf9b36946425e60035763f193";
-const ENSO_RELEASE_COMMIT: &str = "709c8ef8396a562387c8aa8f5ef2cc6f97784cfc";
+const NEAR_INTENTS_RELEASE_COMMIT: &str = "ab0a2de1044cb4f31b80080859d6fc01d0824e00";
+const ENSO_RELEASE_COMMIT: &str = "8968988c0f03fd3dbd3eb290fcd178066804de6e";
 
 /// Canonical defaults for every Bloom home, independent of persisted config.
 pub(crate) const DEFAULT_PETALS: &[&str] =
@@ -208,11 +208,11 @@ const PREINSTALLED_NEAR_INTENTS: PreinstalledPetal = PreinstalledPetal {
     name: "near-intents",
     repository: "https://github.com/bloom-directory/bloom-petal-near",
     commit: NEAR_INTENTS_RELEASE_COMMIT,
-    release_tag: "v0.1.2",
-    archive: "near-intents-v0.1.2.petal.tar.gz",
-    expected_hash: Some("df2b28a0d852cca0c96828d3ff7371d5ec35211c8872647928beffd794671b71"),
-    archive_sha256: "d990462250a82b1ce98e344156b7f80199355bba35621350f9dea7682d85e95c",
-    tooling_commit: "864a80b407387871bae06aabe77b91865e55f7bc",
+    release_tag: "v0.1.3",
+    archive: "near-intents-v0.1.3.petal.tar.gz",
+    expected_hash: Some("ac2ccab59f36ee863843f92aaf0c975c00dbf32b246df5ccbb79757093785921"),
+    archive_sha256: "2f9c6b5f246017b0ad29708b528f2f4232a3eaa4d641c8ba9a196d1562a15993",
+    tooling_commit: "2beed2ff344ce2b0c112e07096027e1ae0404007",
     petal_abi: "bloom.petal-host/triad-compatible-nonauthority-v1",
     default_eligible: true,
     lineage_id: None,
@@ -226,10 +226,10 @@ const PREINSTALLED_ENSO: PreinstalledPetal = PreinstalledPetal {
     name: "enso",
     repository: "https://github.com/bloom-directory/bloom-petal-enso",
     commit: ENSO_RELEASE_COMMIT,
-    release_tag: "v0.1.3",
-    archive: "enso-v0.1.3.petal.tar.gz",
-    expected_hash: Some("4449269cc3b3a55cece350ddbbf0e22c6d523d90eb867c9be1087b99c01239ac"),
-    archive_sha256: "00554421df1e506da36bad346bfd6e0641313ccc0c4c0c9177ffc78600fcf1d2",
+    release_tag: "v0.1.5",
+    archive: "enso-v0.1.5.petal.tar.gz",
+    expected_hash: Some("97650f327691f01bc4591cde25253d1e20010643e700674cc9759cd1366876b9"),
+    archive_sha256: "910683c8ea64bdd91f3edcbe1da82ab511267257f0be7ab7093466cd097a976f",
     tooling_commit: "1af3ba971e8b494b58bb85d0c0fcf2ad15cd3b4c",
     petal_abi: "bloom.petal-host/triad-compatible-nonauthority-v1",
     default_eligible: true,
@@ -1799,14 +1799,14 @@ mod tests {
     #[test]
     fn built_in_entries_are_immutable_and_incompatible_petals_are_absent() {
         let near = preinstalled_petal("near-intents").unwrap();
-        assert_eq!(near.release_tag, "v0.1.2");
+        assert_eq!(near.release_tag, "v0.1.3");
         assert_eq!(near.commit.len(), 40);
-        assert_eq!(near.archive, "near-intents-v0.1.2.petal.tar.gz");
+        assert_eq!(near.archive, "near-intents-v0.1.3.petal.tar.gz");
         assert!(near.repository.ends_with("/bloom-petal-near"));
         let enso = preinstalled_petal("enso").unwrap();
-        assert_eq!(enso.release_tag, "v0.1.3");
+        assert_eq!(enso.release_tag, "v0.1.5");
         assert_eq!(enso.commit, ENSO_RELEASE_COMMIT);
-        assert_eq!(enso.archive, "enso-v0.1.3.petal.tar.gz");
+        assert_eq!(enso.archive, "enso-v0.1.5.petal.tar.gz");
         assert!(enso.repository.ends_with("/bloom-petal-enso"));
         for name in [
             "polymarket",
