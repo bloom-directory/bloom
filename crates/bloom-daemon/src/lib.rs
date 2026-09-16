@@ -438,6 +438,53 @@ impl DaemonPetalHost {
         Ok(Some(key.key_ref.clone()))
     }
 
+    /// Whether `named` is a session key an Exact Petal signature may use: the
+    /// public key of exactly one recorded key state for this wallet whose
+    /// scope belongs to the executing package's active lineage and covers the
+    /// executing route, operation class, and suite. `account_owner` has
+    /// already tied it to the mounted account's owner. Stopped or expired
+    /// sessions still qualify, because every Exact payload needs its own
+    /// owner approval; this is how a Petal recovers funds from a session.
+    fn is_exact_session_key(
+        &self,
+        subject: &bloom_broker_api::ProvenanceSubject,
+        wallet: &str,
+        operation_class: &str,
+        suite: bloom_broker_api::CryptoSuite,
+        named: &bloom_broker_api::KeyRef,
+    ) -> bool {
+        let bloom_broker_api::ProvenanceSubject::Petal { route, .. } = subject else {
+            return false;
+        };
+        let Some(lineage) = self
+            .provenance_catalog
+            .as_ref()
+            .and_then(|catalog| catalog.record(subject))
+            .and_then(|record| record.petal_lineage.as_ref())
+            .filter(|lineage| lineage.active)
+        else {
+            return false;
+        };
+        Self::petal_key_states_from_root(self.petal_key_state_root.as_deref(), Some(wallet))
+            .iter()
+            .filter(|(_, state)| {
+                state
+                    .public_key
+                    .as_ref()
+                    .is_some_and(|public| &public.key_ref == named)
+                    && state.scope.lineage_id == lineage.lineage_id
+                    && state.scope.allowed_routes.contains(route)
+                    && state
+                        .scope
+                        .allowed_operation_classes
+                        .iter()
+                        .any(|class| class.as_str() == operation_class)
+                    && state.scope.allowed_crypto_suites.contains(&suite)
+            })
+            .count()
+            == 1
+    }
+
     /// Whether `named` is a key this wallet's Petal key states record as
     /// delegated from `owner`. Session keys are the legitimate explicit
     /// selection; their revocation and scope are enforced by Broker.
@@ -1900,31 +1947,40 @@ impl PetalHost for DaemonPetalHost {
             }));
         }
         if req.selector == bloom_broker_api::PetalSignSelector::Exact {
-            if req.key_ref.is_some() {
+            let trusted_subject = bloom_broker_api::ProvenanceSubject::Petal {
+                package_hash: trusted_package_hash.clone(),
+                route: context.route_id.clone(),
+            };
+            if let Some(named) = &req.key_ref
+                && !self.is_exact_session_key(
+                    &trusted_subject,
+                    &req.wallet,
+                    &req.operation_class,
+                    crypto_suite,
+                    named,
+                )
+            {
                 warn!(
                     wallet = %req.wallet,
                     operation_class = %req.operation_class,
                     package_hash = %context.package_hash,
                     route = %context.route_id,
-                    reason = "exact Petal signing supplied a key reference",
+                    reason = "exact Petal signing named a key outside this route's session scope",
                     "petal.sign_payload_denied"
                 );
                 return Err(HostError::Denied(
-                    "exact Petal signing uses Machine-owned root selection and approval state"
+                    "exact Petal signing may name only this Petal's own session key within its scope"
                         .into(),
                 ));
             }
-            let trusted_subject = bloom_broker_api::ProvenanceSubject::Petal {
-                package_hash: trusted_package_hash.clone(),
-                route: context.route_id.clone(),
-            };
+            let signing_key = req.key_ref.clone().or_else(|| account_key.clone());
             let (request_id, exact_state_path, owner_projection_path) = self.petal_signing_paths(
                 context,
                 &req.wallet,
                 &req.operation_class,
                 &req.claimed_hash,
                 &canonical_claim,
-                account_key.as_ref(),
+                signing_key.as_ref(),
             )?;
             if req
                 .approval_hint
@@ -1967,8 +2023,11 @@ impl PetalHost for DaemonPetalHost {
             let catalog = self.provenance_catalog.clone().ok_or_else(|| {
                 HostError::Backend("installer provenance catalog is not configured".into())
             })?;
-            let signer = BrokerExactPayloadSigner::new(broker.clone(), catalog)
-                .with_account_key(account_key.clone());
+            let signer = BrokerExactPayloadSigner::new(broker.clone(), catalog);
+            let signer = match &req.key_ref {
+                Some(named) => signer.with_delegated_key(named.clone()),
+                None => signer.with_account_key(account_key.clone()),
+            };
             let _guard = self.petal_signing_lock.lock().await;
             let outcome = signer
                 .sign_or_prepare_petal(
@@ -5685,6 +5744,7 @@ mod tests {
         active: std::sync::atomic::AtomicBool,
         requests: std::sync::Mutex<Vec<MachineBrokerRequest>>,
         root: bloom_broker_api::KeyRef,
+        session: bloom_broker_api::KeyRef,
     }
 
     impl PetalExactBrokerFixture {
@@ -5698,6 +5758,14 @@ mod tests {
                     locator: "wallet/primary/root".into(),
                     key_spec: bloom_broker_api::KeySpec::Secp256k1,
                     public_key_fingerprint: bloom_broker_api::Digest32::from_bytes([0x31; 32]),
+                    derivation: None,
+                },
+                session: bloom_broker_api::KeyRef {
+                    backend: bloom_broker_api::Token::new("local").unwrap(),
+                    backend_instance: bloom_broker_api::Token::new("primary").unwrap(),
+                    locator: "wallet/primary/petals/session".into(),
+                    key_spec: bloom_broker_api::KeySpec::Secp256k1,
+                    public_key_fingerprint: bloom_broker_api::Digest32::from_bytes([0x61; 32]),
                     derivation: None,
                 },
             }
@@ -5724,11 +5792,15 @@ mod tests {
                         }),
                     ),
                     MachineBrokerRequest::KeyGetPublic(request) => {
-                        assert_eq!(request.key_ref, self.root);
+                        assert!(request.key_ref == self.root || request.key_ref == self.session);
                         Ok(MachineBrokerResponse::KeyGetPublic(
                             bloom_broker_api::KeyPublic {
-                                key_ref: self.root.clone(),
-                                role: bloom_broker_api::KeyRole::WalletRoot,
+                                role: if request.key_ref == self.root {
+                                    bloom_broker_api::KeyRole::WalletRoot
+                                } else {
+                                    bloom_broker_api::KeyRole::Derived
+                                },
+                                key_ref: request.key_ref,
                                 canonical_public_key: bloom_broker_api::Base64UrlBytes::from_bytes(
                                     &[0x02; 33],
                                 ),
@@ -6535,6 +6607,234 @@ mod tests {
             signed.crypto_suite,
             bloom_broker_api::CryptoSuite::Secp256k1Sha256Recoverable
         );
+    }
+
+    /// Exact signing may name a session key only when a recorded key state
+    /// ties it to this wallet's owner, this package's active lineage, and the
+    /// executing route, class, and suite. Anything else is refused before an
+    /// approval is prepared; the matching key signs with its own approval.
+    #[tokio::test]
+    async fn exact_petal_signing_names_only_its_own_session_key_within_scope() {
+        let directory = tempfile::tempdir().unwrap();
+        let key_states = directory.path().join("petal-key-requests");
+        let broker = Arc::new(PetalExactBrokerFixture::new());
+        let lineage = "pln1_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let subject = bloom_broker_api::ProvenanceSubject::Petal {
+            package_hash: bloom_broker_api::Digest32::from_bytes([0xbb; 32]),
+            route: "r000009".into(),
+        };
+        let host = DaemonPetalHost::new(
+            Arc::new(LateVfsHost::new()),
+            Arc::new(AuditLog::open(directory.path().join("audit.jsonl")).unwrap()),
+        )
+        .with_broker(Some(MachineBrokerClient::new(broker.clone())))
+        .with_provenance_catalog(Some(bloom_broker_api::ProvenanceCatalog {
+            schema: bloom_broker_api::PROVENANCE_CATALOG_SCHEMA.into(),
+            records: vec![bloom_broker_api::ProvenanceRecord {
+                petal_lineage: Some(bloom_broker_api::PetalLineageMembership {
+                    lineage_id: lineage.into(),
+                    release_sequence: bloom_broker_api::DecimalU64::new(1),
+                    predecessor_package_hashes: vec![],
+                    controller_key_id: bloom_broker_api::Token::new("fixture-controller").unwrap(),
+                    controller_signature: bloom_broker_api::Base64UrlBytes::from_bytes(&[0x44; 64]),
+                    active: true,
+                }),
+                subject,
+                publisher: bloom_broker_api::Token::new("fixture-publisher").unwrap(),
+                operation_classes: vec![bloom_broker_api::ProvenanceOperationClass {
+                    operation_class: bloom_broker_api::Token::new("order.place").unwrap(),
+                    fee_asset: None,
+                }],
+                installer_key_id: bloom_broker_api::Token::new("fixture-installer").unwrap(),
+                installer_signature: bloom_broker_api::Base64UrlBytes::from_bytes(&[0x55; 64]),
+            }],
+        }))
+        .with_petal_key_state_root(key_states.clone())
+        .with_petal_signing_state_root(directory.path().join("petal-signing-requests"));
+        let write_session = |edit: &dyn Fn(&mut bloom_broker_api::PetalKeyScope)| {
+            let mut scope = bloom_broker_api::PetalKeyScope {
+                wallet_id: bloom_broker_api::Token::new("primary").unwrap(),
+                parent_key_ref: broker.root.clone(),
+                package_hash: bloom_broker_api::Digest32::from_bytes([0xbb; 32]),
+                route: "r000009".into(),
+                lineage_id: lineage.into(),
+                key_slot: bloom_broker_api::Token::new("session-a").unwrap(),
+                allowed_routes: vec!["r000009".into()],
+                allowed_operation_classes: vec![
+                    bloom_broker_api::Token::new("order.place").unwrap(),
+                ],
+                allowed_crypto_suites: vec![
+                    bloom_broker_api::CryptoSuite::Secp256k1Sha256Recoverable,
+                ],
+                maximum_lifetime_ms: bloom_broker_api::DecimalU64::new(60_000),
+                custody_operation_id: bloom_broker_api::OperationId::from_bytes([0x62; 32]),
+            };
+            edit(&mut scope);
+            let state = PetalKeyRequestState {
+                schema: PETAL_KEY_STATE_SCHEMA.into(),
+                key_slot: "session-a".into(),
+                scope_digest: scope.digest().unwrap(),
+                scope,
+                provenance_digest: None,
+                // Stopped sessions still recover funds through Exact.
+                status: "succeeded".into(),
+                ceremony_url: None,
+                ceremony_expires_at_ms: bloom_broker_api::DecimalU64::new(0),
+                public_key: Some(bloom_broker_api::KeyPublic {
+                    key_ref: broker.session.clone(),
+                    role: bloom_broker_api::KeyRole::Derived,
+                    canonical_public_key: bloom_broker_api::Base64UrlBytes::from_bytes(&[0x02; 33]),
+                    addresses: vec!["0x0000000000000000000000000000000000000061".into()],
+                    supported_crypto_suites: vec![
+                        bloom_broker_api::CryptoSuite::Secp256k1Sha256Recoverable,
+                    ],
+                }),
+                reusable_approval_id: None,
+                petal_mount: None,
+                requested_at_ms: 1,
+                succeeded_at_ms: Some(2),
+                authority_expires_at_ms: Some(3),
+                stopped: Some(SessionStopRecord {
+                    at_ms: 4,
+                    operation_id: bloom_broker_api::OperationId::from_bytes([0x63; 32]),
+                    approvals: Vec::new(),
+                    complete: true,
+                }),
+            };
+            DaemonPetalHost::write_petal_key_state(&key_states.join("session-a.json"), &state)
+                .unwrap();
+        };
+        let payload = b"recover session funds".to_vec();
+        let payload_digest =
+            bloom_broker_api::Digest32::from_bytes(sha2::Sha256::digest(&payload).into());
+        let claim = |operation_class: &str| bloom_broker_api::PetalUseClaim {
+            package_hash: bloom_broker_api::Digest32::from_bytes([0xbb; 32]),
+            route: "r000009".into(),
+            operation_class: bloom_broker_api::Token::new(operation_class).unwrap(),
+            crypto_suite: bloom_broker_api::CryptoSuite::Secp256k1Sha256Recoverable,
+            payload_digest: {
+                let mut digest = sha2::Sha256::new();
+                digest.update(b"bloom.petal.payload-batch.v1\0");
+                digest.update(1_u64.to_be_bytes());
+                digest.update((payload.len() as u64).to_be_bytes());
+                digest.update(&payload);
+                bloom_broker_api::Digest32::from_bytes(digest.finalize().into())
+            },
+            ordered_hashes: vec![payload_digest.clone()],
+            declared_debits: Vec::new(),
+            declared_destinations: Vec::new(),
+            declared_fee: bloom_broker_api::DeclaredFee::None,
+            nonce: bloom_broker_api::RequestNonce::from_bytes([0x37; 16]),
+            claim_assurance: bloom_broker_api::ClaimAssurance::MachineAsserted,
+        };
+        let request = PayloadSignRequest {
+            wallet: "primary".into(),
+            preimage: payload.clone(),
+            claimed_hash: payload_digest.to_bytes(),
+            signature_algorithm: "secp256k1-sha256-recoverable".into(),
+            operation_class: "order.place".into(),
+            petal_use_claim_jcs: serde_jcs::to_vec(&claim("order.place")).unwrap(),
+            claim_assurance_evidence: None,
+            approval_hint: None,
+            action: None,
+            advisory: None,
+            selector: bloom_broker_api::PetalSignSelector::Exact,
+            key_ref: Some(broker.session.clone()),
+            context: Some(PetalRouteContext {
+                petal_root: "exchange".into(),
+                package_hash: "bb".repeat(32),
+                route_id: "r000009".into(),
+                op: "write".into(),
+                path: "orders/recover".into(),
+                params: Vec::new(),
+                actor: None,
+            }),
+        };
+        let prepares = || {
+            broker
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| matches!(request, MachineBrokerRequest::SealedApprovalPrepare(_)))
+                .count()
+        };
+
+        let mut unknown = request.clone();
+        unknown.key_ref.as_mut().unwrap().public_key_fingerprint =
+            bloom_broker_api::Digest32::from_bytes([0x70; 32]);
+        let mut root = request.clone();
+        root.key_ref = Some(broker.root.clone());
+        let mut other_class = request.clone();
+        other_class.operation_class = "order.cancel".into();
+        other_class.petal_use_claim_jcs = serde_jcs::to_vec(&claim("order.cancel")).unwrap();
+        write_session(&|_| {});
+        for (label, attempt) in [
+            ("unrecorded key", unknown),
+            ("wallet root key", root),
+            ("class outside scope", other_class),
+        ] {
+            let error = host.sign_payload_outcome(attempt).await.unwrap_err();
+            assert!(matches!(error, HostError::Denied(_)), "{label}: {error}");
+        }
+        type ScopeEdit = fn(&mut bloom_broker_api::PetalKeyScope);
+        let foreign: [(&str, ScopeEdit); 4] = [
+            ("another lineage", |scope| {
+                scope.lineage_id =
+                    "pln1_cccccccccccccccccccccccccccccccccccccccccccccccccccc".into();
+            }),
+            ("route outside scope", |scope| {
+                scope.allowed_routes = vec!["r000010".into()]
+            }),
+            ("suite outside scope", |scope| {
+                scope.allowed_crypto_suites =
+                    vec![bloom_broker_api::CryptoSuite::Secp256k1Keccak256Recoverable];
+            }),
+            ("another wallet", |scope| {
+                scope.wallet_id = bloom_broker_api::Token::new("other").unwrap();
+            }),
+        ];
+        for (label, edit) in foreign {
+            write_session(&edit);
+            let error = host
+                .sign_payload_outcome(request.clone())
+                .await
+                .unwrap_err();
+            assert!(matches!(error, HostError::Denied(_)), "{label}: {error}");
+        }
+        assert_eq!(
+            prepares(),
+            0,
+            "no refused key may reach approval preparation"
+        );
+
+        write_session(&|_| {});
+        let SignOutcome::ApprovalPending(pending) =
+            host.sign_payload_outcome(request.clone()).await.unwrap()
+        else {
+            panic!("a recorded session key needs its own exact approval");
+        };
+        broker
+            .active
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut approved = request;
+        approved.approval_hint = Some(pending.action_id);
+        assert_eq!(
+            host.sign_payload_outcome(approved).await.unwrap(),
+            SignOutcome::Signature(vec![0x34; 65])
+        );
+        let requests = broker.requests.lock().unwrap();
+        for request in requests.iter() {
+            match request {
+                MachineBrokerRequest::SealedApprovalPrepare(request) => {
+                    assert_eq!(request.terms.key_ref, broker.session);
+                }
+                MachineBrokerRequest::SigningSign(request) => {
+                    assert_eq!(request.key_ref, broker.session);
+                }
+                _ => {}
+            }
+        }
     }
 
     #[tokio::test]

@@ -4073,6 +4073,7 @@ fn exact_evm_sign_request(
         canonical_plan_facts_digest: state.canonical_plan_facts_digest.clone(),
         approval_id: state.approval_id.clone(),
         account_key_ref,
+        delegated_key_ref: None,
         petal_use_claim: None,
         system_use_claim: None,
         claim_assurance_evidence: None,

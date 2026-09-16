@@ -192,6 +192,15 @@ expired Petal session can still obtain a fresh payload-specific Exact approval
 within the key's remaining restrictions — that is the recovery path its
 `eligible_exact_routes` projection points at, not a bypass of the stop.
 
+A Petal names the session key for such a signature explicitly. Machine accepts
+the name only when exactly one recorded key state for the wallet holds that
+public key, delegates it from the mounted account's owner, belongs to the
+executing package's active lineage, and covers the executing route, operation
+class, and suite; it never lets Exact select a wallet key by name. Each payload
+still needs its own owner approval. Broker and Signer check the key's scope
+again, but Broker does not compare an Exact claim's operation class with the
+scope's classes, so Machine's class check is the one that binds it.
+
 ## Separation from custody and policy updates
 
 Custody ceremonies share Broker's browser origin and common ceremony status,

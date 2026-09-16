@@ -72,6 +72,7 @@ pub struct BrokerExactPayloadSigner {
     broker: MachineBrokerClient,
     provenance_catalog: ProvenanceCatalog,
     account_key_ref: Option<bloom_broker_api::KeyRef>,
+    delegated_key_ref: Option<bloom_broker_api::KeyRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,12 +166,30 @@ impl BrokerExactPayloadSigner {
             broker,
             provenance_catalog,
             account_key_ref: None,
+            delegated_key_ref: None,
         }
     }
 
     pub fn with_account_key(mut self, key: Option<bloom_broker_api::KeyRef>) -> Self {
         self.account_key_ref = key;
         self
+    }
+
+    /// Sign single Petal payloads with a Petal-scoped delegated key instead
+    /// of a wallet key. The caller must already have tied the key to the
+    /// trusted Petal route.
+    pub fn with_delegated_key(mut self, key: bloom_broker_api::KeyRef) -> Self {
+        self.delegated_key_ref = Some(key);
+        self
+    }
+
+    /// The key a single-payload operation is bound to. Persisted in the
+    /// existing `account_key_ref` state field, so a retry with a different
+    /// key never reuses the operation.
+    fn signing_key(&self) -> Option<bloom_broker_api::KeyRef> {
+        self.delegated_key_ref
+            .clone()
+            .or_else(|| self.account_key_ref.clone())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -328,7 +347,7 @@ impl BrokerExactPayloadSigner {
                     schema: STATE_SCHEMA.into(),
                     action_id: action_id.to_owned(),
                     wallet_id: wallet_id.clone(),
-                    account_key_ref: self.account_key_ref.clone(),
+                    account_key_ref: self.signing_key(),
                     operation_class: operation_class_token.clone(),
                     crypto_suite,
                     payload_digest: payload_digest.clone(),
@@ -348,7 +367,7 @@ impl BrokerExactPayloadSigner {
         if state.schema != STATE_SCHEMA
             || state.action_id != action_id
             || state.wallet_id != wallet_id
-            || state.account_key_ref != self.account_key_ref
+            || state.account_key_ref != self.signing_key()
             || state.operation_class != operation_class_token
             || state.crypto_suite != crypto_suite
             || state.payload_digest != payload_digest
@@ -388,6 +407,7 @@ impl BrokerExactPayloadSigner {
             canonical_plan_facts_digest,
             approval_id: state.approval_id.clone(),
             account_key_ref: self.account_key_ref.clone(),
+            delegated_key_ref: self.delegated_key_ref.clone(),
             petal_use_claim: petal_claim.map(|(claim, _)| claim.clone()),
             system_use_claim: None,
             claim_assurance_evidence: petal_claim
