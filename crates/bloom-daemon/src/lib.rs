@@ -276,6 +276,18 @@ fn session_stop_complete_default() -> bool {
     true
 }
 
+/// Machine-only session terms kept beside a Petal key request's state file
+/// (`<state>.session`). Released binaries read the state file back with
+/// `deny_unknown_fields`, so newer fields live here instead. Every state-root
+/// scan skips this extension, a missing file means the defaults, and unknown
+/// fields are ignored so a later build's record still reads.
+#[derive(Clone, Debug, Default, PartialEq, serde::Deserialize, serde::Serialize)]
+struct PetalKeySessionRecord {
+    /// Budgets sealed into the key's reusable approval.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    value_limits: Vec<bloom_broker_api::ValueLimit>,
+}
+
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct PetalKeyRequestState {
@@ -704,25 +716,21 @@ impl DaemonPetalHost {
         }
     }
 
-    /// Budgets a key request sealed, beside its state file. They are kept out
-    /// of `PetalKeyRequestState` because released binaries read that file
-    /// back with `deny_unknown_fields`. The extension is skipped by every
-    /// state-root scan, and a missing file means no budgets.
-    fn petal_key_value_limits_path(state_path: &Path) -> PathBuf {
-        state_path.with_extension("value-limits")
+    fn petal_key_session_path(state_path: &Path) -> PathBuf {
+        state_path.with_extension("session")
     }
 
-    fn read_petal_key_value_limits(
-        state_path: &Path,
-    ) -> Result<Vec<bloom_broker_api::ValueLimit>, HostError> {
-        let path = Self::petal_key_value_limits_path(state_path);
+    fn read_petal_key_session(state_path: &Path) -> Result<PetalKeySessionRecord, HostError> {
+        let path = Self::petal_key_session_path(state_path);
         match std::fs::read(&path) {
             Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| {
-                HostError::Denied(format!("Petal key value limits are invalid: {error}"))
+                HostError::Denied(format!("Petal key session record is invalid: {error}"))
             }),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(PetalKeySessionRecord::default())
+            }
             Err(error) => Err(HostError::Backend(format!(
-                "read Petal key value limits {}: {error}",
+                "read Petal key session record {}: {error}",
                 path.display()
             ))),
         }
@@ -1453,7 +1461,7 @@ impl PetalHost for DaemonPetalHost {
                     != scope_digest
                 || stored.scope_digest != scope_digest
                 || stored.provenance_digest != provenance_digest
-                || Self::read_petal_key_value_limits(&path)? != req.approval_value_limits
+                || Self::read_petal_key_session(&path)?.value_limits != req.approval_value_limits
                 || !matches!(
                     (
                         stored.status.as_str(),
@@ -1635,8 +1643,10 @@ impl PetalHost for DaemonPetalHost {
         }
 
         Self::write_petal_key_state(
-            &Self::petal_key_value_limits_path(&path),
-            &req.approval_value_limits,
+            &Self::petal_key_session_path(&path),
+            &PetalKeySessionRecord {
+                value_limits: req.approval_value_limits.clone(),
+            },
         )?;
         let prepared = broker
             .prepare_custody(
