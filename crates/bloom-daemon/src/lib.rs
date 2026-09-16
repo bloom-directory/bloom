@@ -4542,7 +4542,8 @@ impl Daemon {
                         bloom_vfs::handlers::MarketData::new(),
                     )
                     .with_address_book(address_book_arc.clone())
-                    .with_petals(petal_router.clone()),
+                    .with_petals(petal_router.clone())
+                    .with_skin(home.skin_path()),
                 ) as _,
             )
             .mount("outbox", central_outbox_handler.clone() as _)

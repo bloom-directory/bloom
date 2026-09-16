@@ -16,6 +16,9 @@
 //! - `views/contacts.html`    — saved contacts and observed transfer recipients
 //! - `views/policy.html`      — what each wallet is allowed to do
 //! - `views/bloom.css`        — the shared Bloom stylesheet (compiled in)
+//! - `views/skin.css`         — the person's own stylesheet, loaded after
+//!   `bloom.css`: the contents of `<home>/skin.css`, or empty
+//! - `views/skins/`           — bundled alternative skins to `@import`
 //! - `views/bloom.js`         — local, optional sorting for Networks
 //! - `views/AGENTS.md`        — how an agent should use these pages
 //!
@@ -68,19 +71,29 @@ const BLOOM_JS_NAME: &str = "bloom.js";
 const BLOOM_JS: &str = include_str!("../assets/bloom.js");
 const AGENTS_MD_NAME: &str = "AGENTS.md";
 const ICONS_DIR: &str = "icons";
+/// The person's own stylesheet, linked after `bloom.css` on every page so
+/// it can override any token or rule. It serves whatever `<home>/skin.css`
+/// holds, re-read on every access so an edit shows on reload, and an empty
+/// file when there is none. Without it the pages are the base Bloom design.
+const SKIN_CSS_NAME: &str = "skin.css";
+/// Bundled alternative skins. A `skin.css` selects one with
+/// `@import "skins/<name>.css";` and may add its own rules after it.
+const SKINS_DIR: &str = "skins";
+const SKIN_FILES: &[(&str, &str)] = &[("winamp.css", include_str!("../assets/skins/winamp.css"))];
 
-/// Every page, in reading order. Drives both the directory listing and the
-/// navigation, so a link can never point at a page that is not served.
+/// Every page, in reading order: what is yours first, then what is public.
+/// Drives both the directory listing and the navigation, so a link can never
+/// point at a page that is not served.
 const PAGES: &[(&str, &str)] = &[
     (INDEX_HTML, "Today"),
     (WALLETS_HTML, "Wallets"),
+    (RECEIVE_HTML, "Receive"),
     (ACTIVITY_HTML, "Activity"),
-    (CHAINS_HTML, "Networks"),
-    (MARKETS_HTML, "Markets"),
     (NEXT_MOVES_HTML, "Next moves"),
     (CONTACTS_HTML, "Contacts"),
-    (RECEIVE_HTML, "Receive"),
     (POLICY_HTML, "Policy"),
+    (CHAINS_HTML, "Networks"),
+    (MARKETS_HTML, "Markets"),
 ];
 
 /// The mount re-reads on every browser access (`actimeo=0`), so a short
@@ -123,6 +136,8 @@ pub struct ViewsHandler {
     /// through its own trait so a page cannot drift from what `/petals`
     /// reports, and absent it the section simply does not appear.
     petals: Option<Arc<dyn Handler>>,
+    /// Where the person's `skin.css` lives, when the daemon has a home.
+    skin: Option<std::path::PathBuf>,
 }
 
 impl ViewsHandler {
@@ -141,7 +156,22 @@ impl ViewsHandler {
             market,
             address_book: Arc::new(AddressBook::default()),
             petals: None,
+            skin: None,
         }
+    }
+
+    /// Serve the stylesheet at `path` as `skin.css`. The file is optional and
+    /// re-read on every access; a missing or unreadable one serves as empty.
+    pub fn with_skin(mut self, path: std::path::PathBuf) -> Self {
+        self.skin = Some(path);
+        self
+    }
+
+    fn skin_css(&self) -> Vec<u8> {
+        self.skin
+            .as_deref()
+            .and_then(|path| std::fs::read(path).ok())
+            .unwrap_or_default()
     }
 
     /// Read Petal positions through the mounted `petals/` router.
@@ -197,25 +227,42 @@ impl ViewsHandler {
             [] => Ok(Entry::dir("")),
             [s] if is_page(s) => Ok(Entry::file(s)),
             [s] if s == BLOOM_CSS_NAME => Ok(css_entry()),
+            [s] if s == SKIN_CSS_NAME => Ok(self.skin_entry()),
             [s] if s == BLOOM_JS_NAME => Ok(js_entry()),
             [s] if s == AGENTS_MD_NAME => Ok(agents_entry()),
             [s] if s == ICONS_DIR => Ok(Entry::dir(ICONS_DIR)),
+            [s] if s == SKINS_DIR => Ok(Entry::dir(SKINS_DIR)),
             [s, file] if s == ICONS_DIR => match icon_by_name(file) {
                 Some(icon) => Ok(icon_entry(icon)),
+                None => Err(HandlerError::not_found(path.to_string_path())),
+            },
+            [s, file] if s == SKINS_DIR => match skin_by_name(file) {
+                Some((name, css)) => Ok(Entry::file(name).with_size(css.len() as u64)),
                 None => Err(HandlerError::not_found(path.to_string_path())),
             },
             _ => Err(HandlerError::not_found(path.to_string_path())),
         }
     }
 
+    fn skin_entry(&self) -> Entry {
+        Entry::file(SKIN_CSS_NAME).with_size(self.skin_css().len() as u64)
+    }
+
     async fn read_inner(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
         let page = match path.segments() {
             [s] if s == BLOOM_CSS_NAME => return Ok(BLOOM_CSS.as_bytes().to_vec()),
+            [s] if s == SKIN_CSS_NAME => return Ok(self.skin_css()),
             [s] if s == BLOOM_JS_NAME => return Ok(BLOOM_JS.as_bytes().to_vec()),
             [s] if s == AGENTS_MD_NAME => return Ok(VIEWS_AGENTS_MD.as_bytes().to_vec()),
             [s, file] if s == ICONS_DIR => {
                 return match icon_by_name(file) {
                     Some(icon) => Ok(icon.bytes.to_vec()),
+                    None => Err(HandlerError::NotAFile(path.to_string_path())),
+                };
+            }
+            [s, file] if s == SKINS_DIR => {
+                return match skin_by_name(file) {
+                    Some((_, css)) => Ok(css.as_bytes().to_vec()),
                     None => Err(HandlerError::NotAFile(path.to_string_path())),
                 };
             }
@@ -243,7 +290,7 @@ impl ViewsHandler {
         if path.is_root() {
             // `ls -l` does not render children, so give the static assets a
             // real size hint here; pages are sized by the mount at getattr.
-            let mut entries = vec![agents_entry(), css_entry(), js_entry()];
+            let mut entries = vec![agents_entry(), css_entry(), self.skin_entry(), js_entry()];
             for (name, _) in PAGES {
                 entries.push(Entry::file(name));
             }
@@ -251,9 +298,15 @@ impl ViewsHandler {
             // briefing is listed so `ls` and agents can discover it.
             entries.push(Entry::file(BRIEFING_MD));
             entries.push(Entry::dir(ICONS_DIR));
+            entries.push(Entry::dir(SKINS_DIR));
             Ok(entries)
         } else if path.segments() == [ICONS_DIR] {
             Ok(ICON_FILES.iter().map(|icon| icon_entry(icon)).collect())
+        } else if path.segments() == [SKINS_DIR] {
+            Ok(SKIN_FILES
+                .iter()
+                .map(|(name, css)| Entry::file(name).with_size(css.len() as u64))
+                .collect())
         } else {
             Err(HandlerError::NotADir(path.to_string_path()))
         }
@@ -1051,13 +1104,14 @@ impl ViewsHandler {
         let index: String = [
             (BRIEFING_MD, "Today as Markdown — quote it into chat."),
             (WALLETS_HTML, "Native balances per wallet."),
+            (RECEIVE_HTML, "Receiving addresses and QR codes."),
             (ACTIVITY_HTML, "Every operation, newest first."),
-            (CHAINS_HTML, "Fees, usage, and your holdings per network."),
-            (MARKETS_HTML, "Public market context — never your holdings."),
             (NEXT_MOVES_HTML, "Staged operations and what blocks them."),
             (CONTACTS_HTML, "Saved names and observed recipients."),
-            (RECEIVE_HTML, "Receiving addresses and QR codes."),
             (POLICY_HTML, "What each wallet may send."),
+            (CHAINS_HTML, "Fees, usage, and your holdings per network."),
+            (MARKETS_HTML, "Public market context — never your holdings."),
+            (SKIN_CSS_NAME, "Your own styles — edit ~/.bloom/skin.css."),
             (AGENTS_MD_NAME, "How agents use these pages."),
         ]
         .iter()
@@ -1074,7 +1128,7 @@ impl ViewsHandler {
              <ul class=\"directory-index\">{index}</ul></section>"
         ));
 
-        page("Today", "Overview", "", INDEX_HTML, &body)
+        page("Today", "Today", "", INDEX_HTML, &body)
     }
 
     async fn render_wallets(&self) -> String {
@@ -1674,7 +1728,7 @@ impl ViewsHandler {
             );
             return page(
                 "Markets",
-                "What is moving?",
+                "Markets",
                 "Public provider observations, read by your daemon. Nothing here is a holding \
                  of yours, and nothing here is advice.",
                 MARKETS_HTML,
@@ -1752,7 +1806,7 @@ impl ViewsHandler {
 
         page(
             "Markets",
-            "What is moving?",
+            "Markets",
             "Public provider observations, read by your daemon. Nothing here is a holding of \
              yours, and nothing here is advice.",
             MARKETS_HTML,
@@ -3435,6 +3489,10 @@ fn icon_entry(icon: &IconFile) -> Entry {
     Entry::file(icon.name).with_size(icon.bytes.len() as u64)
 }
 
+fn skin_by_name(name: &str) -> Option<(&'static str, &'static str)> {
+    SKIN_FILES.iter().copied().find(|(skin, _)| *skin == name)
+}
+
 fn is_page(name: &str) -> bool {
     // `fees.html` preserves bookmarks to the merged page; `briefing.md` is
     // the chat briefing, not an HTML page. Neither belongs in `PAGES`.
@@ -3918,7 +3976,8 @@ fn page(title: &str, heading: &str, lede: &str, current: &str, body: &str) -> St
          <meta name=\"referrer\" content=\"no-referrer\">\
          <meta http-equiv=\"Content-Security-Policy\" content=\"{csp}\">\
          <title>{title} · Bloom</title>\
-         <link rel=\"stylesheet\" href=\"bloom.css\">{script}</head>\
+         <link rel=\"stylesheet\" href=\"bloom.css\">\
+         <link rel=\"stylesheet\" href=\"skin.css\">{script}</head>\
          <body class=\"personal-dashboard\">\
          <a class=\"skip\" href=\"#main\">Skip to content</a>\
          <div class=\"shell\"><header class=\"masthead\"><div>\
@@ -4160,8 +4219,8 @@ mod tests {
             }
         }
         for e in &entries {
-            if e.name == ICONS_DIR {
-                assert_eq!(e.kind, EntryKind::Dir, "the icon set is a directory");
+            if e.name == ICONS_DIR || e.name == SKINS_DIR {
+                assert_eq!(e.kind, EntryKind::Dir, "icons and skins are directories");
                 continue;
             }
             assert_eq!(e.kind, EntryKind::File);
@@ -4993,6 +5052,87 @@ mod tests {
         assert!(handler.lookup(&stranger).await.is_err());
     }
 
+    #[tokio::test]
+    async fn every_page_links_the_skin_after_the_base_stylesheet() {
+        let fixture = fixture();
+        for (page, _) in PAGES {
+            let html = render(&fixture.handler, page).await;
+            let base = html.find("href=\"bloom.css\"").expect(page);
+            let skin = html.find("href=\"skin.css\"").expect(page);
+            assert!(
+                base < skin,
+                "{page}: the skin must be able to override the base"
+            );
+        }
+        // Without a home there is no skin: the link resolves to an empty
+        // file, so the pages are the base Bloom design.
+        let css = fixture
+            .handler
+            .read(&VfsPath::parse(SKIN_CSS_NAME).unwrap())
+            .await
+            .unwrap();
+        assert!(css.is_empty());
+        let entries = fixture.handler.list(&VfsPath::root()).await.unwrap();
+        let skin = entries.iter().find(|e| e.name == SKIN_CSS_NAME).unwrap();
+        assert_eq!(skin.size, 0);
+    }
+
+    #[tokio::test]
+    async fn the_skin_is_the_home_file_re_read_on_every_access() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("skin.css");
+        let handler = fixture().handler.with_skin(path.clone());
+        let skin = VfsPath::parse(SKIN_CSS_NAME).unwrap();
+        // Absent: still served, still empty, never an error a browser would
+        // show as a broken stylesheet.
+        assert!(handler.read(&skin).await.unwrap().is_empty());
+        std::fs::write(&path, "@import \"skins/winamp.css\";\n").unwrap();
+        assert_eq!(
+            handler.read(&skin).await.unwrap(),
+            b"@import \"skins/winamp.css\";\n"
+        );
+        assert_eq!(handler.lookup(&skin).await.unwrap().size, 28);
+        // An edit shows on the next read: there is no cache to wait out.
+        std::fs::write(&path, ":root { --accent: rebeccapurple; }").unwrap();
+        assert_eq!(
+            handler.read(&skin).await.unwrap(),
+            b":root { --accent: rebeccapurple; }"
+        );
+        // A skin is styling only: the page's policy still forbids script and
+        // every remote fetch, whatever the stylesheet asks for.
+        let html = render(&handler, INDEX_HTML).await;
+        assert!(html.contains("default-src 'none'"));
+        assert!(
+            !html.contains("rebeccapurple"),
+            "a skin is linked, not inlined"
+        );
+    }
+
+    #[tokio::test]
+    async fn bundled_skins_are_served_as_files_and_nothing_else() {
+        let handler = fixture().handler;
+        let listed = handler
+            .list(&VfsPath::parse(SKINS_DIR).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), SKIN_FILES.len());
+        let winamp = VfsPath::parse("skins/winamp.css").unwrap();
+        let css = String::from_utf8(handler.read(&winamp).await.unwrap()).unwrap();
+        assert!(css.contains(":root"), "a skin overrides the base tokens");
+        // The page policy would block the fetch anyway; a bundled skin must
+        // not depend on one, the same as `bloom.css`.
+        for forbidden in ["url(", "@import", "@font-face", "http"] {
+            assert!(!css.contains(forbidden), "must not reference {forbidden:?}");
+        }
+        assert_eq!(
+            handler.lookup(&winamp).await.unwrap().size,
+            css.len() as u64
+        );
+        let stranger = VfsPath::parse("skins/nope.css").unwrap();
+        assert!(handler.read(&stranger).await.is_err());
+        assert!(handler.lookup(&stranger).await.is_err());
+    }
+
     #[test]
     fn an_off_market_unit_keeps_initials_even_when_the_spelling_is_familiar() {
         let mut faucet = holding_fixture("tempo", 4217, "ETH", 4.2e57, None);
@@ -5287,6 +5427,21 @@ mod tests {
         std::fs::write(std::path::Path::new(&out).join(BRIEFING_MD), briefing).unwrap();
         std::fs::write(std::path::Path::new(&out).join(BLOOM_CSS_NAME), BLOOM_CSS).unwrap();
         std::fs::write(std::path::Path::new(&out).join(BLOOM_JS_NAME), BLOOM_JS).unwrap();
+        // VIEWS_SKIN=~/.bloom/skin.css dumps a person's skin beside the pages;
+        // otherwise the link resolves to the empty file the mount would serve.
+        std::fs::write(
+            std::path::Path::new(&out).join(SKIN_CSS_NAME),
+            std::env::var("VIEWS_SKIN")
+                .ok()
+                .and_then(|path| std::fs::read(path).ok())
+                .unwrap_or_default(),
+        )
+        .unwrap();
+        let skins = std::path::Path::new(&out).join(SKINS_DIR);
+        std::fs::create_dir_all(&skins).unwrap();
+        for (name, css) in SKIN_FILES {
+            std::fs::write(skins.join(name), css).unwrap();
+        }
         let icons = std::path::Path::new(&out).join(ICONS_DIR);
         std::fs::create_dir_all(&icons).unwrap();
         for icon in ICON_FILES {

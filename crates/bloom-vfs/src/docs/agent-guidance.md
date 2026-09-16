@@ -43,13 +43,14 @@ directory and inspect the resulting projection before retrying or continuing.
 When a person — rather than an agent — needs to see their wallet, `views/`
 holds read-only pages they can open in a browser straight from the mount:
 `views/index.html` for what they hold and what needs them, plus `wallets`,
-`receive`, `next-moves`, `activity` and `access`. Give them the file path and
-let the browser render it; do not paste the HTML into a transcript, and keep
-reading the canonical values from the JSON leaves. When the answer must live
-inside the chat itself, quote `views/briefing.md` — the same Today briefing
-as pasteable Markdown. These pages observe only:
-they carry no script, and nothing in them approves or executes an action.
-See `views/AGENTS.md`.
+`receive`, `activity`, `next-moves`, `contacts`, `policy`, `chains` and
+`markets`. Give them the file path and let the browser render it; do not
+paste the HTML into a transcript, and keep reading the canonical values from
+the JSON leaves. When the answer must live inside the chat itself, quote
+`views/briefing.md` — the same Today briefing as pasteable Markdown. These
+pages observe only: their one local script sorts and selects, and nothing in
+them approves or executes an action. A person who wants them to look
+different edits `~/.bloom/skin.css` on the host. See `views/AGENTS.md`.
 
 ## What an error means
 
