@@ -74,6 +74,20 @@ narrow installed authority at runtime but may not widen it. A package declaring
 select one of them. The retired `bloom:sign/signing@0.1.0` hash-only import is
 incompatible with production signing and fails closed.
 
+If every signature the Petal requests pays a chain fee from the signing key,
+such as a Solana transaction, declare that fee asset:
+
+```toml
+[sign]
+allowed_intents = ["venue.trade"]
+fee_asset = { chain = "solana", asset = "native" }
+```
+
+Each signing claim must then declare its fee in that asset, and the Broker
+counts it against the approval's value limits. Omit `fee_asset` when signatures
+pay no chain fee; claims must then declare no fee. Developer enrollment reads
+this field; release provenance does not yet.
+
 Child-key operation classes are distinct from the signing intent used
 immediately by the route that requests the key. Declare each delegated class on
 the exact route pattern that imports `bloom:key/derive@0.1.0`:

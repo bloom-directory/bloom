@@ -400,7 +400,8 @@ fn enroll_developer_petal_provenance(
 
     let mut additions = Vec::new();
     for route in &package.route_index.routes {
-        let operation_classes = developer_route_operation_classes(route)?;
+        let operation_classes =
+            developer_route_operation_classes(route, package.route_index.sign_fee_asset.as_ref())?;
         if operation_classes.is_empty() {
             continue;
         }
@@ -448,6 +449,7 @@ fn enroll_developer_petal_provenance(
 #[cfg(any(test, feature = "triad-dev-harness"))]
 fn developer_route_operation_classes(
     route: &bloom_petals::package::RouteIndexRecord,
+    fee_asset: Option<&ProvenanceFeeAsset>,
 ) -> Result<Vec<ProvenanceOperationClass>> {
     let mut classes = route
         .key_derive_operation_classes
@@ -460,31 +462,9 @@ fn developer_route_operation_classes(
     classes
         .into_iter()
         .map(|operation_class| {
-            // Route metadata declares no fee asset, so this list is explicit.
-            // These seven Pump.fun classes are the only ones whose Petal
-            // declares a native Solana fee on every claim; Broker denies a
-            // declared fee for any other class with `FEE_NOT_ALLOWED` and
-            // denies a missing fee for these with `FEE_REQUIRED`. Do not
-            // infer a fee from a class prefix, signing suite, or package:
-            // shared classes such as `hyperliquid.agent_action` sign cancels
-            // and plain orders with `declared_fee: none` and must stay
-            // fee-free.
-            let fee_asset = match operation_class.as_str() {
-                "pumpfun.create"
-                | "pumpfun.buy"
-                | "pumpfun.sell"
-                | "pumpfun.collect_fees"
-                | "pumpfun.sharing_config"
-                | "pumpfun.close_token_account"
-                | "pumpfun.sweep" => Some(ProvenanceFeeAsset {
-                    chain: Token::new("solana")?,
-                    asset: "native".into(),
-                }),
-                _ => None,
-            };
             Ok(ProvenanceOperationClass {
                 operation_class: Token::new(operation_class)?,
-                fee_asset,
+                fee_asset: fee_asset.cloned(),
             })
         })
         .collect()
@@ -1275,96 +1255,26 @@ mod tests {
             key_derive_maximum_lifetime_ms: Some(60_000),
         };
 
-        let classes = developer_route_operation_classes(&route)
-            .unwrap()
-            .into_iter()
-            .map(|class| class.operation_class.to_string())
-            .collect::<Vec<_>>();
-        assert_eq!(classes, ["fixture.delegated", "fixture.immediate"]);
-        assert!(!classes.contains(&"fixture.package_wide".to_string()));
-    }
+        let classes = developer_route_operation_classes(&route, None).unwrap();
+        assert_eq!(
+            classes
+                .iter()
+                .map(|class| class.operation_class.as_str())
+                .collect::<Vec<_>>(),
+            ["fixture.delegated", "fixture.immediate"]
+        );
+        assert!(classes.iter().all(|class| class.fee_asset.is_none()));
 
-    /// Every Pump.fun claim declares a native Solana fee, so the seven exact
-    /// catalogued classes must enroll as fee-bearing or Broker denies each
-    /// claim with `FEE_NOT_ALLOWED`. The list is exhaustive and explicit: a
-    /// shared or prefixed class that Pump.fun does not declare must stay
-    /// fee-free, and `hyperliquid.agent_action` must stay fee-free because
-    /// that Petal signs cancels and plain orders with `declared_fee: none`.
-    #[test]
-    fn developer_route_provenance_marks_exactly_the_pumpfun_classes_fee_bearing() {
-        let route = bloom_petals::package::RouteIndexRecord {
-            route_id: "r000002".into(),
-            pattern: "agent_sessions/[wallet]/new.json".into(),
-            source_path: "petal/pumpfun/new.json.wasm".into(),
-            artifact_path: "artifacts/routes/r000002.wasm".into(),
-            artifact_hash: "00".repeat(32),
-            abi: bloom_petals::package::RouteAbi::ComponentBloomRoute010,
-            kind: bloom_petals::package::RouteEntryKind::File,
-            ops: vec![bloom_petals::package::RouteOp::Write],
-            params: vec!["wallet".into()],
-            specificity: [1, 1, 1],
-            install_metadata: bloom_petals::package::InstallRouteMetadata {
-                mode: 0o644,
-                cache_ttl_ms: None,
-                side_effecting_read: false,
-                write_async: true,
-                executable: false,
-                required_caps: vec!["bloom:key.derive".into()],
-                sign_intent: None,
-            },
-            key_derive_operation_classes: [
-                "pumpfun.create",
-                "pumpfun.buy",
-                "pumpfun.sell",
-                "pumpfun.collect_fees",
-                "pumpfun.sharing_config",
-                "pumpfun.close_token_account",
-                "pumpfun.sweep",
-                "hyperliquid.agent_action",
-                "fixture.delegated",
-                "pumpfun.unlisted",
-            ]
-            .into_iter()
-            .map(String::from)
-            .collect(),
-            key_derive_allowed_routes: vec!["r000002".into()],
-            key_derive_scope_declared: true,
-            key_derive_allowed_crypto_suites: vec!["ed25519-message".into()],
-            key_derive_maximum_lifetime_ms: Some(1_800_000),
+        let fee = ProvenanceFeeAsset {
+            chain: Token::new("solana").unwrap(),
+            asset: "native".into(),
         };
-
-        let classes = developer_route_operation_classes(&route).unwrap();
-        for expected in [
-            "pumpfun.create",
-            "pumpfun.buy",
-            "pumpfun.sell",
-            "pumpfun.collect_fees",
-            "pumpfun.sharing_config",
-            "pumpfun.close_token_account",
-            "pumpfun.sweep",
-        ] {
-            let class = classes
+        let classes = developer_route_operation_classes(&route, Some(&fee)).unwrap();
+        assert!(
+            classes
                 .iter()
-                .find(|class| class.operation_class.as_str() == expected)
-                .unwrap();
-            let fee = class
-                .fee_asset
-                .as_ref()
-                .unwrap_or_else(|| panic!("{expected} must enroll as fee-bearing"));
-            assert_eq!(fee.chain.as_str(), "solana");
-            assert_eq!(fee.asset, "native");
-        }
-        for fee_free in [
-            "hyperliquid.agent_action",
-            "fixture.delegated",
-            "pumpfun.unlisted",
-        ] {
-            let class = classes
-                .iter()
-                .find(|class| class.operation_class.as_str() == fee_free)
-                .unwrap();
-            assert!(class.fee_asset.is_none(), "{fee_free} must remain fee-free");
-        }
+                .all(|class| class.fee_asset.as_ref() == Some(&fee))
+        );
     }
 
     #[test]
@@ -1389,7 +1299,8 @@ mod tests {
         // rather than rewriting the shared fixture under other tests.
         let petal_dir = directory.path().join("petal");
         copy_dir(
-            &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/triad-authority-petal"),
+            &Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/triad-authority-petal"),
             &petal_dir,
         );
         enroll_developer_petal_provenance(&output, &petal_dir, owner).unwrap();
