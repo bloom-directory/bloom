@@ -601,11 +601,24 @@ start_direct_authority_services() {
   if [ "$host_os" = Linux ]; then
     # --now hands over the descriptors immediately and execs, so the Broker
     # keeps this pid; --fdname publishes the same two names the .socket units
-    # use, one listener each.
+    # use, one listener each. systemd-socket-activate does not forward its own
+    # environment to the child, so every variable the Broker needs is repeated
+    # as --setenv (kept in step with the spawn site below).
     broker_launch=(
       systemd-socket-activate --now
       --listen '127.0.0.1:18734' --listen '[::1]:18734'
       --fdname=broker-ceremony-ipv4:broker-ceremony-ipv6
+      --setenv="BLOOM_TRIAD_DEVELOPER_ROOT=$developer_root"
+      --setenv="BLOOM_BROKER_IDENTITY=${config_dir}/broker-identity.json"
+      --setenv="BLOOM_EDGE_MANIFEST=${config_dir}/edge-manifest.json"
+      --setenv="BLOOM_BROKER_CONFIG=${config_dir}/broker.json"
+      --setenv="BLOOM_BROKER_SOCKET=$broker_socket"
+      --setenv="BLOOM_BROKER_CONTROL_SOCKET=$broker_control_socket"
+      --setenv="BLOOM_BROKER_AUDIT_CHECKPOINT_DIR=$broker_checkpoint_dir"
+      --setenv=BLOOM_BROKER_CEREMONY_ACTIVATION_NAME_IPV4=broker-ceremony-ipv4
+      --setenv=BLOOM_BROKER_CEREMONY_ACTIVATION_NAME_IPV6=broker-ceremony-ipv6
+      --setenv="BLOOM_SESSION_SOCKET=$session_socket"
+      --setenv="BLOOM_AUTHORITY_EDGE_HISTORY=${config_dir}/authority-edge-history.json"
       "$broker_bin"
     )
   fi
@@ -728,6 +741,7 @@ start_machine() {
   BLOOM_MACHINE_IDENTITY="${config_dir}/machine-identity.json" \
   BLOOM_EDGE_MANIFEST="${config_dir}/edge-manifest.json" \
   BLOOM_PROVENANCE_CATALOG="${config_dir}/provenance-catalog.json" \
+  BLOOM_AUTHORITY_EDGE_HISTORY="${config_dir}/authority-edge-history.json" \
     "$bloom_bin" "${machine_args[@]}" \
       >>"${log_dir}/machine.log" 2>&1 &
   machine_pid=$!

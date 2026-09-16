@@ -139,6 +139,22 @@ impl MachineBrokerService for BrokerFixture {
                         review_manifest_digest: digest(92),
                     },
                 )),
+                // A blockhash-normalized confirm asks what state the approval
+                // is really in before it finalizes anything. This lifecycle
+                // test hands the approval id straight back, which is the
+                // owner having approved: answer ACTIVE.
+                MachineBrokerRequest::SealedApprovalStatus(request) => {
+                    Ok(MachineBrokerResponse::SealedApprovalStatus(
+                        bloom_broker_api::ApprovalPublicStatus {
+                            approval_id: request.id,
+                            wallet_id: token("wallet"),
+                            state: bloom_broker_api::ApprovalLifecycleState::Active,
+                            effective_claim_assurance: None,
+                            ceremony_url: Some("http://localhost:18734/ceremony".into()),
+                            ceremony_expires_at_ms: None,
+                        },
+                    ))
+                }
                 other => Err(ProtocolError::new(
                     ProtocolErrorCode::UnknownMethod,
                     format!("unhandled {other:?}"),

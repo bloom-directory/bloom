@@ -127,6 +127,13 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+# The launcher serves the Machine on $machine_socket (run root), not the
+# --home-derived default: every CLI call must use the launcher endpoint.
+export BLOOM_RPC_ENDPOINT="unix:${machine_socket}"
+# A missing audit-history file means "no predecessors" (clean); pointing at
+# the run root keeps a packaging-installed /etc/bloom history - which a
+# developer UID cannot satisfy - from degrading this throwaway run.
+export BLOOM_MACHINE_AUDIT_HISTORY="${run_root}/machine-audit-history.json"
 cli() { "$bloom_bin" --home "$machine_home" "$@"; }
 vcat() { cli vfs cat "$1"; }
 vwrite() { cli vfs write "$1" --data "$2"; }
@@ -183,10 +190,14 @@ done
 genesis="$(rpc getGenesisHash '[]' | jq -er '.result')"
 say "validator healthy; genesis ${genesis}"
 
-# 2. Machine config: this cluster only, broadcast enabled, genesis pinned.
+# 2. Machine config: canonical base (keeps the required EVM `chains` table
+# and its default) plus this cluster only, broadcast enabled, genesis pinned.
 nfs_port="$(free_port)"
+canonical_machine_config="${HOME}/.bloom/config.toml"
+[ -f "$canonical_machine_config" ] && [ ! -L "$canonical_machine_config" ] ||
+  die "canonical Machine config is not a regular file: $canonical_machine_config"
+cp "$canonical_machine_config" "$machine_config"
 {
-  printf 'default_chain = "%s"\n' "$CHAIN"
   printf 'nfs_listen_addr = "127.0.0.1:%s"\n' "$nfs_port"
   printf '\n[solana_chains.%s]\n' "$CHAIN"
   printf 'name = "%s"\n' "$CHAIN"
@@ -196,7 +207,7 @@ nfs_port="$(free_port)"
   printf 'url = "%s"\n' "$solana_rpc"
   printf 'weight = 100\n'
   printf 'http_only = false\n'
-} > "$machine_config"
+} >> "$machine_config"
 chmod 0600 "$machine_config"
 
 # 3. The real triad: real Signer, real Broker, real Machine, no kernel mount.
