@@ -87,7 +87,7 @@ is that account: `account.json` shows its EVM and Solana keys (path, address,
 fingerprint, lifecycle), and `wallets/<wallet>/<n>/chains/<chain>/...` is that
 account's chain view. A number is the derivation path itself (EVM
 `m/44'/60'/0'/0/<n>`, Solana `m/44'/501'/<n>'/0'`), so it is stable across
-restarts and reorderings. A legacy or imported single-key wallet is account 0.
+restarts and reorderings. A single-key wallet is account 0.
 Outbox entries under an account are only the ones its key staged; another
 account's entry is not found there. Staging works through the numbered path
 (`wallets/<wallet>/<n>/chains/<chain>/outbox/new.tx`), which fixes the sender
@@ -145,12 +145,11 @@ for account 0, use `ls wallets/<wallet>/0/chains`. Solana chains use the
 inspect `outbox/{pending,sent,failed}/<id>/`) — there is no separate
 Solana-specific surface to look for.
 
-New and existing Bloom configurations include Arc and `solana-mainnet` when
-those names are not already configured. Existing network settings are preserved
-except that loading config enables broadcasting on every EVM and Solana chain,
-even when `allow_broadcast` was false. Devnet and local validators are opt-in.
-Solana still requires a valid pinned genesis; wallet policy and the approval
-ceremony still apply. Discover networks with `ls wallets/<wallet>/0/chains`.
+Bloom includes Arc and `solana-mainnet` in its default networks and enables
+broadcasting on every configured EVM and Solana chain. Devnet and local validators
+are opt-in. The default `solana-mainnet` configuration includes the mainnet genesis
+pin; every Solana network requires a valid pinned genesis. Wallet policy and the
+approval ceremony apply. Discover networks with `ls wallets/<wallet>/0/chains`.
 
 ### Reading Solana balances
 
