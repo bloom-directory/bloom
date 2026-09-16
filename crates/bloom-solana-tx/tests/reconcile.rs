@@ -138,7 +138,6 @@ fn client(endpoint: &str) -> SolanaClient {
             http_only: false,
         }],
         expected_genesis_base58: None,
-        allow_broadcast: false,
     })
     .unwrap()
 }
@@ -372,7 +371,6 @@ fn two_endpoint_client(preferred: &str, backup: &str) -> SolanaClient {
             },
         ],
         expected_genesis_base58: None,
-        allow_broadcast: false,
     })
     .unwrap()
 }

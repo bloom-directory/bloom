@@ -2105,9 +2105,7 @@ fn validate_policy_action_id(id: &str) -> Result<(), HandlerError> {
 fn tx_open_err(e: TxEngineError) -> HandlerError {
     match e {
         TxEngineError::ApprovalRequired(_) => HandlerError::PermissionDenied,
-        TxEngineError::PolicyDenied | TxEngineError::BroadcastDisabled(_) => {
-            HandlerError::OperationNotPermitted
-        }
+        TxEngineError::PolicyDenied => HandlerError::OperationNotPermitted,
         TxEngineError::EnsoQuoteStale { .. }
         | TxEngineError::DependencyNotSatisfied { .. }
         | TxEngineError::SimulationReverted { .. }
@@ -6004,7 +6002,6 @@ value = "0""#,
                 chain_id: 31337,
                 rpc_urls: vec!["http://127.0.0.1:1".into()],
                 rpc_endpoints: Vec::new(),
-                allow_broadcast: true,
                 etherscan_api_url: None,
                 display_name: None,
                 native_symbol: "ETH".into(),
@@ -6275,7 +6272,6 @@ value = "0""#,
                 http_only: false,
             }],
             expected_genesis_base58: Some("test-genesis".into()),
-            allow_broadcast: true,
         })
         .unwrap();
         let broker =
@@ -6333,7 +6329,6 @@ value = "0""#,
                 http_only: false,
             }],
             expected_genesis_base58: Some("test-genesis".into()),
-            allow_broadcast: true,
         })
         .unwrap();
         let catalog = bloom_broker_api::ProvenanceCatalog {
@@ -8977,7 +8972,6 @@ value = "0""#,
                     http_only: false,
                 }],
                 expected_genesis_base58: Some("test-genesis".into()),
-                allow_broadcast: false,
             })
             .unwrap(),
         );
