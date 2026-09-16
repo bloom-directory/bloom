@@ -69,10 +69,14 @@ Agreed on 2026-09-14:
 10. **`bloom init` runs once.** Afterwards users add, update, or remove
     Petals.
 11. **Enso is offered, and fixed separately.** The default policy allows
-    Enso, but its v0.1.3 release still reads `wallets/<wallet>/policy.toml`,
-    which the triad does not serve. On a local triad a swap intent quotes a
-    route and is then refused with `backend: invalid`. Enso swaps fail until
-    Enso reads its route rules from its own settings.
+    Enso, but its v0.1.3 release reads `wallets/<wallet>/address`, which the
+    account-layout change removed (addresses now live at
+    `wallets/<wallet>/<n>/address.evm`), and then `wallets/<wallet>/policy.toml`
+    and `addresses.json`, which the triad does not serve. On a local triad a
+    swap intent is refused with `backend: invalid`. The pinned NEAR Intents,
+    Polymarket, and Tolly releases read the same retired address path, so
+    their wallet actions fail the same way until those Petals move to the new
+    layout.
 12. **Tolly needs writes enabled.** Choosing Tolly sets
     `[petals.runtime.tolly.values] tolly_writes = "enabled"`, keeping a value
     the owner already set. Each buy, sell, or launch is still confirmed by the
