@@ -335,7 +335,7 @@ say "blockhash expired: height ${observed_height} > ${staged_last_valid} after $
 vwrite "$confirm_path" "y" || die "post-ceremony confirm retry failed"
 
 sent_dir="/wallets/${wallet_id}/chains/${CHAIN}/outbox/sent"
-signature="$(wait_for_file "broadcast signature" "${sent_dir}/${pending_id}/tx_hash" | tr -d '[:space:]')"
+signature="$(wait_for_file "broadcast receipt" "${sent_dir}/${pending_id}/receipt.json" | jq -er '.signature | select(. != null and . != "")' | tr -d '[:space:]')"
 say "settled as ${signature}"
 
 # 11. On-chain truth.
