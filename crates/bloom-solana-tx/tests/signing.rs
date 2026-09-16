@@ -267,6 +267,8 @@ async fn derived_child_signs_transfer_and_signature_verifies() {
             issued_at_ms: now,
             expires_at_ms: now + 60_000,
             approval_attempt: 0,
+            outbox_id: "00112233445566778899aabbccddeeff",
+            message_normalization: None,
             canonical_plan_facts_digest: plan_facts_digest(),
         })
         .await
@@ -319,6 +321,8 @@ async fn first_attempt_returns_approval_required() {
             issued_at_ms: 1,
             expires_at_ms: 60_000,
             approval_attempt: 0,
+            outbox_id: "00112233445566778899aabbccddeeff",
+            message_normalization: None,
             canonical_plan_facts_digest: plan_facts_digest(),
         })
         .await
@@ -355,6 +359,8 @@ async fn ceremony_retry_preserves_claim_and_authority_identity() {
             issued_at_ms: 1,
             expires_at_ms: 60_000,
             approval_attempt: 0,
+            outbox_id: "00112233445566778899aabbccddeeff",
+            message_normalization: None,
             canonical_plan_facts_digest: plan_facts_digest(),
         })
         .await
@@ -378,6 +384,8 @@ async fn ceremony_retry_preserves_claim_and_authority_identity() {
             issued_at_ms: 1,
             expires_at_ms: 60_000,
             approval_attempt: 0,
+            outbox_id: "00112233445566778899aabbccddeeff",
+            message_normalization: None,
             canonical_plan_facts_digest: plan_facts_digest(),
         })
         .await

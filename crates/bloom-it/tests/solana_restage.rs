@@ -33,7 +33,11 @@ use sha2::{Digest as _, Sha256};
 const MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon \
 abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon \
 abandon abandon art";
-const RPC: &str = "http://127.0.0.1:8899";
+/// The local validator's RPC endpoint, overridable so a run can use its own
+/// validator instead of whatever holds the default port.
+fn rpc_url() -> String {
+    std::env::var("BLOOM_IT_SOLANA_RPC").unwrap_or_else(|_| "http://127.0.0.1:8899".to_string())
+}
 const LAMPORTS: u64 = 250_000_000;
 
 fn tok(s: &str) -> Token {
@@ -230,7 +234,7 @@ fn rpc(method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
     std::thread::spawn(move || -> Result<serde_json::Value> {
         let body = serde_json::json!({"jsonrpc":"2.0","id":1,"method":method,"params":params});
         let resp: serde_json::Value = reqwest::blocking::Client::new()
-            .post(RPC)
+            .post(rpc_url())
             .json(&body)
             .send()?
             .json()?;
@@ -336,7 +340,7 @@ async fn solana_expired_blockhash_fails_closed_then_restages() -> Result<()> {
         SolanaSpec {
             name: "solana-local".into(),
             endpoints: vec![EndpointSpec {
-                url: RPC.into(),
+                url: rpc_url(),
                 weight: 100,
                 cu_per_sec: None,
                 max_rps: None,
@@ -473,11 +477,17 @@ async fn solana_expired_blockhash_fails_closed_then_restages() -> Result<()> {
     }
     println!("    block height {current} now exceeds T1's window {t1_lvbh}");
 
-    // 7. Confirm T1 with owner approval ALREADY active, so the only possible
-    //    reason to refuse is the expired blockhash. It must fail closed.
+    // 7. Confirm T1 past its window.
+    //
+    //    This used to fail closed on the expired blockhash, and that is
+    //    precisely what blockhash-normalized approvals change: the staged
+    //    template going stale is no longer terminal, because the message may
+    //    be restamped once under the owner's standing approval. What must
+    //    still hold is that nothing is signed or broadcast before the owner
+    //    has actually approved — the confirm opens a ceremony and stops.
     step(
         "7",
-        "confirm expired T1 must fail closed (no sign, no broadcast)",
+        "confirm expired T1 stops at the ceremony (no sign, no broadcast)",
     );
     broker.approval_active.store(true, Ordering::SeqCst);
     let confirm_t1 = VfsPath::parse(&format!(
@@ -495,8 +505,9 @@ async fn solana_expired_blockhash_fails_closed_then_restages() -> Result<()> {
     };
     println!("    confirm correctly refused: {refusal_msg}");
     assert!(
-        refusal_msg.contains("expired") || refusal_msg.contains("restage"),
-        "the refusal must be about blockhash expiry, got: {refusal_msg}"
+        refusal_msg.contains("permission denied"),
+        "the refusal must be the missing owner approval, not the stale \
+         blockhash, got: {refusal_msg}"
     );
     // The signer was never asked to sign the expired message.
     assert!(

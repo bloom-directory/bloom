@@ -20,6 +20,7 @@ fn staged(id: &str) -> StagedSolanaTransfer {
         genesis_hash: "GENESIS111111111111111111111111111111111111".into(),
         blockhash: "BLOCKHASH111111111111111111111111111111111111".into(),
         last_valid_block_height: 123456,
+        message_normalization: None,
         message_b64: base64::Engine::encode(
             &base64::engine::general_purpose::STANDARD,
             b"legacy-message-bytes",

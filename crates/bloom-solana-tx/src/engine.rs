@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
 
 use base64::Engine as _;
+use bloom_broker_api::ExactMessageNormalization;
 use bloom_broker_api::{Digest32, KeyRef};
 use bloom_solana::{SolanaClient, SolanaRpcError};
 use sha2::{Digest as _, Sha256};
@@ -39,6 +40,13 @@ struct SimulationArtifact<'a> {
 
 /// Default approval/signing TTL for a staged transfer (ms).
 const SIGN_TTL_MS: u64 = 60_000;
+/// Approval lifetime for a blockhash-normalized native transfer.
+///
+/// Fixed, not configurable: the extra temporal authority this mode grants is
+/// bounded here and nowhere else. The Signer clamps the browser ceremony to
+/// the approval's own expiry, so a longer developer ceremony setting cannot
+/// widen it.
+const NORMALIZED_APPROVAL_LIFETIME_MS: u64 = 300_000;
 
 /// Conservative estimate of Solana's per-slot duration, used only to turn a
 /// block-height-denominated blockhash validity window into a wall-clock
@@ -123,6 +131,13 @@ pub struct SolanaTransferEngine {
     signer: SolanaTransferSigner,
     chain: String,
     operation_locks: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
+    /// Serializes the duplicate-message check with snapshot persistence.
+    ///
+    /// Two entries can refresh onto the same blockhash and become the same
+    /// bytes. Checking and committing under one lock is what makes "nobody
+    /// else owns these bytes" still true at the moment we claim them. Taken
+    /// after the per-entry lock, always, and released before any network call.
+    finalization_lock: tokio::sync::Mutex<()>,
 }
 
 impl SolanaTransferEngine {
@@ -138,6 +153,7 @@ impl SolanaTransferEngine {
             signer,
             chain: chain.into(),
             operation_locks: Mutex::new(HashMap::new()),
+            finalization_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -305,6 +321,10 @@ impl SolanaTransferEngine {
             genesis_hash,
             blockhash: blockhash.blockhash,
             last_valid_block_height: blockhash.last_valid_block_height,
+            // Newly staged native transfers get the mode; nothing upgrades an
+            // entry that already exists, so an approval standing against raw
+            // bytes can never acquire the right to have them replaced.
+            message_normalization: Some(ExactMessageNormalization::SolanaNativeTransferBlockhashV1),
             message_b64,
             payload_digest_hex,
             signature: None,
@@ -462,6 +482,19 @@ impl SolanaTransferEngine {
         let entry =
             self.outbox
                 .read_in_state(wallet, &self.chain, id, SolanaOutboxState::Pending)?;
+        if entry.staged.message_normalization.is_some() {
+            return self
+                .confirm_normalized(
+                    wallet,
+                    id,
+                    fee_payer,
+                    account_key_ref,
+                    approval_id,
+                    now_ms,
+                    entry,
+                )
+                .await;
+        }
         self.require_fresh_blockhash(entry.staged.last_valid_block_height)
             .await?;
         let message = base64::engine::general_purpose::STANDARD
@@ -511,6 +544,8 @@ impl SolanaTransferEngine {
                 issued_at_ms: attempt.issued_at_ms,
                 expires_at_ms: attempt.expires_at_ms,
                 approval_attempt: attempt.attempt,
+                outbox_id: &entry.staged.id,
+                message_normalization: None,
                 canonical_plan_facts_digest: plan_facts_digest,
             })
             .await
@@ -549,6 +584,387 @@ impl SolanaTransferEngine {
             self.outbox.clear_approval_attempt(&entry)?;
         }
         Ok(outcome)
+    }
+
+    /// Confirm a blockhash-normalized native transfer.
+    ///
+    /// The owner approved this transfer with its recent blockhash left
+    /// uncommitted, so the ceremony may finish long after the staged blockhash
+    /// died. The entry and the approval survive that; only the 32 blockhash
+    /// bytes are replaced, once, immediately before signing.
+    #[allow(clippy::too_many_arguments)]
+    async fn confirm_normalized(
+        &self,
+        wallet: &str,
+        id: &str,
+        fee_payer: &[u8; 32],
+        account_key_ref: Option<KeyRef>,
+        approval_id: Option<Digest32>,
+        now_ms: u128,
+        entry: SolanaOutboxEntry,
+    ) -> Result<SolanaSignOutcome, EngineError> {
+        // 1. A snapshot outranks everything, including expiry. Once one
+        //    exists this entry has committed to one message and may already
+        //    have reached the Broker; allocating an approval attempt or
+        //    refreshing the blockhash now could buy a second signature.
+        if let Some(snapshot) = self.outbox.signing_attempt(&entry)? {
+            return self
+                .recover_signing_attempt(wallet, id, fee_payer, snapshot)
+                .await;
+        }
+
+        let template = base64::engine::general_purpose::STANDARD
+            .decode(&entry.staged.message_b64)
+            .map_err(|e| EngineError::Invalid(format!("message base64: {e}")))?;
+        validate_staged_message(&entry.staged, fee_payer, &template)?;
+        validate_staged_account(&entry.staged, account_key_ref.as_ref())?;
+        // Plan facts are the *original* staged record. Prepare must be
+        // byte-reproducible across a lost response, so nothing here may move.
+        let canonical_plan_facts = serde_jcs::to_vec(&entry.staged)
+            .map_err(|e| EngineError::Invalid(format!("canonical plan facts: {e}")))?;
+        let plan_facts_digest = Digest32::from_bytes(Sha256::digest(&canonical_plan_facts).into());
+        let now_ms_u64 = now_ms.min(u128::from(u64::MAX)) as u64;
+        let attempt = match self.outbox.approval_attempt(&entry)? {
+            Some(recorded) if recorded.expires_at_ms > now_ms_u64 => recorded,
+            previous => ApprovalAttempt {
+                attempt: previous.map_or(0, |previous| previous.attempt.saturating_add(1)),
+                issued_at_ms: now_ms_u64,
+                // Five minutes, fixed. Long enough for an unhurried ceremony,
+                // and the only extra temporal authority this mode grants.
+                expires_at_ms: now_ms_u64.saturating_add(NORMALIZED_APPROVAL_LIFETIME_MS),
+            },
+        };
+        self.outbox.write_approval_attempt(&entry, &attempt)?;
+
+        // 2. No approval yet: prepare from the immutable template and stop.
+        let Some(approval_id) = approval_id else {
+            return self
+                .plan_normalized(
+                    wallet,
+                    fee_payer,
+                    account_key_ref,
+                    &entry,
+                    &template,
+                    None,
+                    &attempt,
+                    plan_facts_digest,
+                )
+                .await
+                .map_err(|error| {
+                    let _ = self.retire_dead_approval(&entry, &attempt, &error);
+                    EngineError::Signer(error.to_string())
+                })
+                .map(|plan| match plan {
+                    crate::signing::SolanaSignPlan::ApprovalRequired {
+                        approval_id,
+                        ceremony_url,
+                        ceremony_expires_at_ms,
+                    } => SolanaSignOutcome::ApprovalRequired {
+                        approval_id,
+                        ceremony_url,
+                        ceremony_expires_at_ms,
+                    },
+                    crate::signing::SolanaSignPlan::Dispatch(_) => {
+                        unreachable!("a request with no approval id cannot resolve to a dispatch")
+                    }
+                });
+        };
+
+        // 3. Having an approval id is not permission to sign. Ask the Broker
+        //    what state it is actually in.
+        let status = self
+            .signer
+            .approval_status(approval_id.clone())
+            .await
+            .map_err(|error| EngineError::Signer(error.to_string()))?;
+        match status.state {
+            bloom_broker_api::ApprovalLifecycleState::Active => {}
+            bloom_broker_api::ApprovalLifecycleState::Prepared
+            | bloom_broker_api::ApprovalLifecycleState::AwaitingCeremony => {
+                // Still the owner's move. Hand back the standing ceremony
+                // rather than submitting anything.
+                return Ok(SolanaSignOutcome::ApprovalRequired {
+                    approval_id: status.approval_id,
+                    ceremony_url: status.ceremony_url.unwrap_or_default(),
+                    ceremony_expires_at_ms: status
+                        .ceremony_expires_at_ms
+                        .map_or(attempt.expires_at_ms, |value| value.get()),
+                });
+            }
+            other => {
+                return Err(EngineError::Signer(format!(
+                    "approval {} is {other:?}; it cannot authorize this transfer",
+                    approval_id.as_str()
+                )));
+            }
+        }
+
+        // 4. The chain has to still be the one the owner approved against.
+        let observed_genesis = self.client.verify_genesis().await?;
+        if observed_genesis != entry.staged.genesis_hash {
+            return Err(EngineError::Invalid(format!(
+                "live cluster genesis {observed_genesis} differs from the approved {}",
+                entry.staged.genesis_hash
+            )));
+        }
+
+        // 5. Replace exactly the blockhash, re-quote, and prove nothing else
+        //    moved. A changed fee is a changed reviewed fact: refuse rather
+        //    than quietly approve a new quote.
+        let fresh = self.client.get_latest_blockhash().await?;
+        let destination: [u8; 32] = bs58::decode(&entry.staged.destination)
+            .into_vec()
+            .map_err(|e| EngineError::Invalid(format!("destination base58: {e}")))?
+            .try_into()
+            .map_err(|_| EngineError::Invalid("destination must be 32 bytes".into()))?;
+        let fresh_bytes: [u8; 32] = bs58::decode(&fresh.blockhash)
+            .into_vec()
+            .map_err(|e| EngineError::Invalid(format!("blockhash base58: {e}")))?
+            .try_into()
+            .map_err(|_| EngineError::Invalid("blockhash must be 32 bytes".into()))?;
+        let final_message =
+            build_transfer_message(fee_payer, &destination, entry.staged.lamports, &fresh_bytes)
+                .map_err(|e| EngineError::Invalid(e.to_string()))?;
+        let final_b64 = base64::engine::general_purpose::STANDARD.encode(&final_message);
+        let quoted_fee = self
+            .client
+            .get_fee_for_message(&final_b64)
+            .await?
+            .ok_or_else(|| {
+                EngineError::Invalid("RPC did not quote a fee for the refreshed transfer".into())
+            })?;
+        if quoted_fee != entry.staged.fee_lamports {
+            return Err(EngineError::Invalid(format!(
+                "refreshed transfer quotes {quoted_fee} lamports, but the owner approved {}",
+                entry.staged.fee_lamports
+            )));
+        }
+        let approved_digest = bloom_broker_api::solana_native_transfer_approval_digest(&template)
+            .map_err(|error| EngineError::Invalid(error.to_string()))?;
+        let refreshed_digest =
+            bloom_broker_api::solana_native_transfer_approval_digest(&final_message)
+                .map_err(|error| EngineError::Invalid(error.to_string()))?;
+        if approved_digest != refreshed_digest {
+            return Err(EngineError::Invalid(
+                "refreshed transfer does not normalize to the approved digest".into(),
+            ));
+        }
+
+        // 6. The concrete request, built once and then frozen.
+        let plan = self
+            .plan_normalized(
+                wallet,
+                fee_payer,
+                account_key_ref,
+                &entry,
+                &final_message,
+                Some(approval_id),
+                &attempt,
+                plan_facts_digest,
+            )
+            .await
+            .map_err(|error| {
+                let _ = self.retire_dead_approval(&entry, &attempt, &error);
+                EngineError::Signer(error.to_string())
+            })?;
+        let crate::signing::SolanaSignPlan::Dispatch(request) = plan else {
+            return Err(EngineError::Signer(
+                "Broker asked for another ceremony for an already active approval".into(),
+            ));
+        };
+
+        let mut finalized_staged = entry.staged.clone();
+        finalized_staged.blockhash = fresh.blockhash.clone();
+        finalized_staged.last_valid_block_height = fresh.last_valid_block_height;
+        finalized_staged.message_b64 = final_b64.clone();
+        finalized_staged.payload_digest_hex = hex::encode(Sha256::digest(&final_message));
+        finalized_staged.expires_ms = self
+            .blockhash_expiry_ms(fresh.last_valid_block_height, now_ms)
+            .await?;
+        let snapshot = crate::outbox::SolanaSigningAttempt {
+            schema: crate::outbox::SIGNING_ATTEMPT_SCHEMA.to_owned(),
+            finalized_staged: finalized_staged.clone(),
+            request: *request,
+        };
+
+        // 7. Claim the bytes and commit, atomically with respect to any other
+        //    entry trying to claim the same ones.
+        {
+            let _finalizing = self.finalization_lock.lock().await;
+            if let Some(owner) =
+                self.outbox
+                    .final_message_owner(wallet, &self.chain, &final_b64, id)?
+            {
+                return Err(EngineError::Invalid(format!(
+                    "transfer {owner} already owns these exact bytes; wait for a new blockhash                      and confirm again"
+                )));
+            }
+            self.outbox.write_signing_attempt(&entry, &snapshot)?;
+        }
+
+        // 8. Projection, then send. The snapshot is already authoritative, so
+        //    a crash here loses nothing.
+        let finalized_entry = SolanaOutboxEntry {
+            state: entry.state,
+            staged: finalized_staged,
+            dir: entry.dir.clone(),
+        };
+        self.outbox.rewrite_intent(&finalized_entry)?;
+        self.dispatch_and_record(wallet, id, fee_payer, &snapshot)
+            .await
+    }
+
+    /// Build the Broker request for one normalized attempt without sending it.
+    #[allow(clippy::too_many_arguments)]
+    async fn plan_normalized(
+        &self,
+        wallet: &str,
+        fee_payer: &[u8; 32],
+        account_key_ref: Option<KeyRef>,
+        entry: &SolanaOutboxEntry,
+        message: &[u8],
+        approval_id: Option<Digest32>,
+        attempt: &ApprovalAttempt,
+        canonical_plan_facts_digest: Digest32,
+    ) -> Result<crate::signing::SolanaSignPlan, crate::signing::SolanaSignError> {
+        let blockhash = bs58::encode(&message[100..132]).into_string();
+        self.signer
+            .plan_transfer(crate::signing::SignTransferRequest {
+                wallet_id: wallet,
+                fee_payer,
+                account_key_ref,
+                message_bytes: message,
+                destination: &entry.staged.destination,
+                lamports: entry.staged.lamports,
+                fee_lamports: entry.staged.fee_lamports,
+                genesis_hash: &entry.staged.genesis_hash,
+                recent_blockhash: &blockhash,
+                last_valid_block_height: entry.staged.last_valid_block_height,
+                approval_id,
+                issued_at_ms: attempt.issued_at_ms,
+                expires_at_ms: attempt.expires_at_ms,
+                approval_attempt: attempt.attempt,
+                outbox_id: &entry.staged.id,
+                message_normalization: entry.staged.message_normalization,
+                canonical_plan_facts_digest,
+            })
+            .await
+    }
+
+    /// Retire an approval the Broker says can never sign, mirroring the raw
+    /// path: stop advertising its ceremony and mark the attempt past so the
+    /// next confirm mints a new identity. The counter must survive, or the
+    /// replacement rebuilds the dead approval's operation id.
+    fn retire_dead_approval(
+        &self,
+        entry: &SolanaOutboxEntry,
+        attempt: &ApprovalAttempt,
+        error: &crate::signing::SolanaSignError,
+    ) -> Result<(), EngineError> {
+        if error.approval_is_dead() {
+            self.outbox.write_approval_attempt(
+                entry,
+                &ApprovalAttempt {
+                    expires_at_ms: 0,
+                    ..attempt.clone()
+                },
+            )?;
+            self.outbox.clear_approval_challenge(entry)?;
+        }
+        Ok(())
+    }
+
+    /// Send the persisted request and record the signature it returns.
+    async fn dispatch_and_record(
+        &self,
+        wallet: &str,
+        id: &str,
+        fee_payer: &[u8; 32],
+        snapshot: &crate::outbox::SolanaSigningAttempt,
+    ) -> Result<SolanaSignOutcome, EngineError> {
+        let message = base64::engine::general_purpose::STANDARD
+            .decode(&snapshot.finalized_staged.message_b64)
+            .map_err(|e| EngineError::Invalid(format!("snapshot message base64: {e}")))?;
+        let signature = self
+            .signer
+            .dispatch(snapshot.request.clone(), fee_payer, &message)
+            .await
+            .map_err(|error| EngineError::Signer(error.to_string()))?;
+        self.outbox.record_signature(
+            wallet,
+            &self.chain,
+            id,
+            &bs58::encode(signature).into_string(),
+        )?;
+        let entry =
+            self.outbox
+                .read_in_state(wallet, &self.chain, id, SolanaOutboxState::Pending)?;
+        self.outbox.clear_approval_attempt(&entry)?;
+        Ok(SolanaSignOutcome::Signed { signature })
+    }
+
+    /// Resume an entry that already committed to a message.
+    ///
+    /// The stored request is the only one that may be sent. A missing status,
+    /// a timeout or an expired approval are all "unknown", never "safe to
+    /// start again": the original request could still be in flight, and a
+    /// different message under the same intent is a second payment.
+    async fn recover_signing_attempt(
+        &self,
+        wallet: &str,
+        id: &str,
+        fee_payer: &[u8; 32],
+        snapshot: crate::outbox::SolanaSigningAttempt,
+    ) -> Result<SolanaSignOutcome, EngineError> {
+        // A signature already recorded locally ends it.
+        let entry =
+            self.outbox
+                .read_in_state(wallet, &self.chain, id, SolanaOutboxState::Pending)?;
+        if let Some(existing) = self.outbox.recorded_signature(&entry)? {
+            let raw = bs58::decode(&existing)
+                .into_vec()
+                .map_err(|e| EngineError::Invalid(format!("recorded signature: {e}")))?;
+            let signature: [u8; 64] = raw
+                .try_into()
+                .map_err(|_| EngineError::Invalid("recorded signature is not 64 bytes".into()))?;
+            return Ok(SolanaSignOutcome::Signed { signature });
+        }
+        // Restore the projection if the crash landed between persisting the
+        // snapshot and rewriting intent.json.
+        if entry.staged.message_b64 != snapshot.finalized_staged.message_b64 {
+            let restored = SolanaOutboxEntry {
+                state: entry.state,
+                staged: snapshot.finalized_staged.clone(),
+                dir: entry.dir.clone(),
+            };
+            self.outbox.rewrite_intent(&restored)?;
+        }
+        // Did the operation already produce a result?
+        let status = self
+            .signer
+            .operation_status(snapshot.request.operation_id.clone())
+            .await
+            .map_err(|error| EngineError::Signer(error.to_string()))?;
+        if status.operation_digest == snapshot.request.operation_digest
+            && let Some(result) = status.result
+        {
+            let message = base64::engine::general_purpose::STANDARD
+                .decode(&snapshot.finalized_staged.message_b64)
+                .map_err(|e| EngineError::Invalid(format!("snapshot message base64: {e}")))?;
+            let signature =
+                crate::signing::verified_ed25519_signature(&result, fee_payer, &message)
+                    .map_err(|error| EngineError::Signer(error.to_string()))?;
+            self.outbox.record_signature(
+                wallet,
+                &self.chain,
+                id,
+                &bs58::encode(signature).into_string(),
+            )?;
+            return Ok(SolanaSignOutcome::Signed { signature });
+        }
+        // Not terminal: replay exactly this request, never a rebuilt one.
+        self.dispatch_and_record(wallet, id, fee_payer, &snapshot)
+            .await
     }
 
     /// Broadcast a signed transfer with at-most-once submission semantics.
@@ -852,6 +1268,7 @@ mod tests {
             genesis_hash: "test-genesis".into(),
             blockhash: bs58::encode(blockhash).into_string(),
             last_valid_block_height: 100,
+            message_normalization: None,
             message_b64: base64::engine::general_purpose::STANDARD.encode(&message),
             payload_digest_hex: hex::encode(Sha256::digest(&message)),
             signature: None,

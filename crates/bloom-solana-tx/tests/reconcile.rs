@@ -118,6 +118,7 @@ fn sent_entry(id: &str) -> StagedSolanaTransfer {
         genesis_hash: "GENESIS111111111111111111111111111111111111".into(),
         blockhash: "BLOCKHASH111111111111111111111111111111111111".into(),
         last_valid_block_height: 1,
+        message_normalization: None,
         message_b64: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"m"),
         payload_digest_hex: "ab".repeat(32),
         signature: Some("SIG1111111111111111111111111111111111111111111111111111111111111".into()),

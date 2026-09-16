@@ -1,6 +1,7 @@
 //! Solana-typed durable-state records, mirroring `bloom-proto::StagedTx`'s
 //! role in the EVM outbox but without any `alloy` fields.
 
+use bloom_broker_api::ExactMessageNormalization;
 use serde::{Deserialize, Serialize};
 
 /// Lifecycle status of a staged Solana transfer, mirroring `TxStatus`.
@@ -57,6 +58,15 @@ pub struct StagedSolanaTransfer {
     pub blockhash: String,
     /// The block height at which `blockhash` stops being valid.
     pub last_valid_block_height: u64,
+    /// How this entry's approval matches its message.
+    ///
+    /// Set once, when the entry is staged, and never afterwards: an approval
+    /// already standing against raw bytes must not silently acquire the right
+    /// to have those bytes replaced. Absent means the pre-existing raw Exact
+    /// behaviour, which is what every entry staged before this feature has and
+    /// what every non-native path keeps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_normalization: Option<ExactMessageNormalization>,
     /// Serialized legacy message (base64) — the exact bytes to be signed.
     pub message_b64: String,
     /// SHA-256 of the message bytes (hex) — Bloom's payload commitment.

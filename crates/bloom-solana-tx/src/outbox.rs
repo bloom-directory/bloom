@@ -14,8 +14,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use base64::Engine as _;
 use rand::RngCore as _;
 use serde::{Deserialize, Serialize};
+use sha2::Digest as _;
 use thiserror::Error;
 
 use crate::types::{
@@ -121,7 +123,10 @@ const PRIVATE_SIGNATURE_FILE: &str = ".signature";
 const PRIVATE_APPROVAL_FILE: &str = "approval.json";
 const PRIVATE_APPROVAL_ATTEMPT_FILE: &str = ".approval_attempt";
 
+const PRIVATE_SIGNING_ATTEMPT_FILE: &str = ".signing_attempt";
 const RESTAGE_RESERVATION_FILE: &str = ".restage_replacement";
+/// Schema of the durable signing snapshot. An unrecognised value fails closed.
+pub const SIGNING_ATTEMPT_SCHEMA: &str = "bloom.solana-signing-attempt/1";
 const BROADCAST_SCHEMA: &str = "bloom.solana-broadcast-attempt/1";
 
 /// One attempt to get an owner's approval for a staged transfer.
@@ -141,6 +146,73 @@ pub struct ApprovalAttempt {
     pub issued_at_ms: u64,
     pub expires_at_ms: u64,
 }
+/// The one message this entry has committed to signing, and the exact request
+/// that was or will be sent for it.
+///
+/// Written before the request leaves the process, so a lost response is
+/// replayed byte for byte instead of rebuilt. A rebuilt request could differ —
+/// a newer policy version, a newer blockhash — and a second distinct message
+/// under one approval is a second chance to spend the same money.
+///
+/// Public transaction material only; no signing key ever reaches this file.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct SolanaSigningAttempt {
+    pub schema: String,
+    /// The staged record as finalized: fresh blockhash, height and digest.
+    pub finalized_staged: StagedSolanaTransfer,
+    /// The complete Machine-to-Broker request, including its raw claim and
+    /// operation digest. Broker-to-Signer attempt ids are deliberately absent:
+    /// Machine never owned them and must not recreate them on replay.
+    pub request: bloom_broker_api::MachineSignRequest,
+}
+
+impl SolanaSigningAttempt {
+    /// Check every relationship the snapshot asserts about itself.
+    ///
+    /// A snapshot that does not describe one coherent request is not "no
+    /// attempt" — it is an attempt whose content cannot be trusted, and an
+    /// entry holding one must never be refreshed, cancelled or re-signed.
+    fn validate(&self, entry_id: &str) -> Result<(), OutboxError> {
+        let fail = |reason: &str| {
+            Err(OutboxError::Other(format!(
+                "signing snapshot is unusable: {reason}"
+            )))
+        };
+        if self.schema != SIGNING_ATTEMPT_SCHEMA {
+            return fail(&format!("unknown schema {}", self.schema));
+        }
+        if self.finalized_staged.id != entry_id {
+            return fail("it names a different outbox entry");
+        }
+        let message = match base64::engine::general_purpose::STANDARD
+            .decode(&self.finalized_staged.message_b64)
+        {
+            Ok(message) => message,
+            Err(error) => return fail(&format!("its message is not base64: {error}")),
+        };
+        let digest = sha2::Sha256::digest(&message);
+        if hex::encode(digest) != self.finalized_staged.payload_digest_hex {
+            return fail("its payload digest does not match its message");
+        }
+        let payload = match &self.request.payloads {
+            bloom_broker_api::SigningPayloads::Single { payload } => payload.decode(),
+            bloom_broker_api::SigningPayloads::Batch { .. } => {
+                return fail("a native transfer is never a batch");
+            }
+        };
+        if payload != message {
+            return fail("its request signs different bytes than it finalized");
+        }
+        let Some(claim) = self.request.system_use_claim.as_ref() else {
+            return fail("its request carries no system claim");
+        };
+        if claim.payload_digest.as_str() != self.finalized_staged.payload_digest_hex {
+            return fail("its claim commits to different bytes than it finalized");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 pub struct SolanaOutbox {
     inner: Arc<OutboxInner>,
@@ -723,6 +795,108 @@ impl SolanaOutbox {
         write_private_atomic(&entry.dir.join(PRIVATE_APPROVAL_ATTEMPT_FILE), &body)
     }
 
+    /// Read this entry's durable signing snapshot.
+    ///
+    /// Fails closed. An unreadable or incoherent file is reported as an error,
+    /// never as `None`: "no snapshot" authorises refreshing the blockhash and
+    /// signing something new, which is exactly what must not happen when an
+    /// earlier attempt may already have reached the Broker.
+    pub fn signing_attempt(
+        &self,
+        entry: &SolanaOutboxEntry,
+    ) -> Result<Option<SolanaSigningAttempt>, OutboxError> {
+        match fs::read(entry.dir.join(PRIVATE_SIGNING_ATTEMPT_FILE)) {
+            Ok(bytes) => {
+                let attempt: SolanaSigningAttempt =
+                    serde_json::from_slice(&bytes).map_err(|error| {
+                        OutboxError::Other(format!("signing snapshot is corrupt: {error}"))
+                    })?;
+                attempt.validate(&entry.staged.id)?;
+                Ok(Some(attempt))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Whether a signing snapshot file exists at all, without interpreting it.
+    ///
+    /// Guards use this: a corrupt snapshot must still block cancellation and
+    /// sweeping, and asking whether the file is *valid* would let corruption
+    /// unlock the very paths it should freeze.
+    pub fn has_signing_attempt(&self, entry: &SolanaOutboxEntry) -> bool {
+        entry.dir.join(PRIVATE_SIGNING_ATTEMPT_FILE).exists()
+    }
+
+    /// Persist the signing snapshot. This is the point of no return: after it
+    /// returns, this entry has committed to exactly one message.
+    pub fn write_signing_attempt(
+        &self,
+        entry: &SolanaOutboxEntry,
+        attempt: &SolanaSigningAttempt,
+    ) -> Result<(), OutboxError> {
+        if entry.state != SolanaOutboxState::Pending {
+            return Err(OutboxError::StateMismatch {
+                id: entry.staged.id.clone(),
+                expected: SolanaOutboxState::Pending.dirname(),
+                actual: entry.state.dirname(),
+            });
+        }
+        attempt.validate(&entry.staged.id)?;
+        let body = serde_json::to_vec(attempt)
+            .map_err(|error| OutboxError::Other(format!("encode signing snapshot: {error}")))?;
+        write_private_atomic(&entry.dir.join(PRIVATE_SIGNING_ATTEMPT_FILE), &body)?;
+        sync_dir(&entry.dir)
+    }
+
+    /// Every final message this wallet/chain has committed to, other than
+    /// `ignore_id`'s.
+    ///
+    /// Two intents with the same economics can refresh onto the same blockhash
+    /// and become the same bytes, and the same bytes are the same Ed25519
+    /// signature and the same transaction — one payment where the owner
+    /// approved two. Distinct off-chain intent ids do not change that.
+    ///
+    /// Snapshots are included, and are the reason this cannot just read
+    /// `intent.json`: an entry that crashed between persisting its snapshot
+    /// and restoring its projection still owns those bytes.
+    pub fn final_message_owner(
+        &self,
+        wallet: &str,
+        chain: &str,
+        message_b64: &str,
+        ignore_id: &str,
+    ) -> Result<Option<String>, OutboxError> {
+        for state in [SolanaOutboxState::Pending, SolanaOutboxState::Sent] {
+            for id in self.list(wallet, chain, state)? {
+                if id == ignore_id {
+                    continue;
+                }
+                let dir = self.state_dir(wallet, chain, state)?.join(&id);
+                let intent = dir.join("intent.json");
+                if intent.exists() {
+                    let staged: StagedSolanaTransfer = serde_json::from_slice(&fs::read(&intent)?)?;
+                    if staged.message_b64 == message_b64 {
+                        return Ok(Some(id));
+                    }
+                }
+                let snapshot = dir.join(PRIVATE_SIGNING_ATTEMPT_FILE);
+                if snapshot.exists() {
+                    let attempt: SolanaSigningAttempt =
+                        serde_json::from_slice(&fs::read(&snapshot)?).map_err(|error| {
+                            OutboxError::Other(format!(
+                                "signing snapshot of {id} is corrupt: {error}"
+                            ))
+                        })?;
+                    if attempt.finalized_staged.message_b64 == message_b64 {
+                        return Ok(Some(id));
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
     /// Forget the recorded approval attempt. The next confirm then starts a
     /// new one with a distinct identity.
     pub fn clear_approval_attempt(&self, entry: &SolanaOutboxEntry) -> Result<(), OutboxError> {
@@ -768,6 +942,17 @@ impl SolanaOutbox {
         let entry = self.read_in_state(wallet, chain, id, SolanaOutboxState::Pending)?;
         if entry.dir.join(BROADCAST_ATTEMPT_FILE).exists() {
             return Err(OutboxError::BroadcastAttempted(id.to_owned()));
+        }
+        // A committed signing attempt may already have produced a signature
+        // the Broker knows about and this host does not. Cancelling would
+        // report the transfer dead while its money is still in flight, so it
+        // has to be resolved by recovery first. Deliberately asks whether the
+        // file exists, not whether it parses: corruption must not unlock this.
+        if self.has_signing_attempt(&entry) {
+            return Err(OutboxError::Other(format!(
+                "transfer {id} has committed to signing and cannot be cancelled; its outcome \
+                 must be resolved first"
+            )));
         }
         let mut staged = entry.staged.clone();
         staged.status = SolanaTxStatus::Cancelled;
@@ -836,6 +1021,18 @@ impl SolanaOutbox {
                         staged,
                         dir: ent.path(),
                     };
+                    // A blockhash-normalized approval deliberately outlives
+                    // its staged blockhash: that is the whole feature. Its
+                    // template expiring says nothing about the approval, and
+                    // a committed signing attempt may be mid-flight. Sweeping
+                    // either away would discard an approval the owner has
+                    // already granted, so marked entries are left for explicit
+                    // cancellation. Unmarked entries keep the old behaviour.
+                    if entry.staged.message_normalization.is_some()
+                        || self.has_signing_attempt(&entry)
+                    {
+                        continue;
+                    }
                     let cluster_past_window = live_block_heights
                         .get(&entry.staged.chain)
                         .is_some_and(|height| *height > entry.staged.last_valid_block_height);
@@ -964,6 +1161,7 @@ mod tests {
             genesis_hash: "devnet".into(),
             blockhash: "blockhash".into(),
             last_valid_block_height: 10,
+            message_normalization: None,
             message_b64: "AA==".into(),
             payload_digest_hex: "00".repeat(32),
             signature: Some("sig".into()),

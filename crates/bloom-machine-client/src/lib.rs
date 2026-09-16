@@ -50,15 +50,16 @@ use bloom_broker_api::{
     ApprovalPrepareRequest, ApprovalPublicStatus, ApprovalRenewRequest, ApprovalSelector,
     ApprovalSubject, BROKER_API_CURRENT, BROKER_API_RANGE, Base64UrlBytes, CeremonyPublicStatus,
     CeremonyState, CredentialPublic, CryptoSuite, CustodyPrepareRequest, CustodyPrepareResponse,
-    CustodyResult, DecimalU64, DerivedAccountPublic, Digest32, IdRequest, KeyPublic, KeyRef,
-    KeyRequest, KeyRole, MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService,
-    MachineSignRequest, OperationId, OperationPublicStatus, OperationRequest, PetalUseClaim,
-    PolicyCommitReceipt, PolicyCommitUpdateRequest, PolicyUpdatePrepareResponse,
+    CustodyResult, DecimalU64, DerivedAccountPublic, Digest32, ExactMessageNormalization,
+    IdRequest, KeyPublic, KeyRef, KeyRequest, KeyRole, MachineBrokerRequest, MachineBrokerResponse,
+    MachineBrokerService, MachineSignRequest, OperationId, OperationPublicStatus, OperationRequest,
+    PetalUseClaim, PolicyCommitReceipt, PolicyCommitUpdateRequest, PolicyUpdatePrepareResponse,
     PolicyUpdateRequest, ProtocolError, ProtocolErrorCode, ProvenanceCatalog, ProvenanceSubject,
     RequestNonce, RevocationState, RevokeForKeyRequest, RevokeRequest,
     SealedApprovalPrepareResponse, SealedApprovalTerms, SignedPolicySnapshot, SigningPayloads,
     SigningResult, SystemUseClaim, Token, TypedRequestMethod, ValueLimit, WalletAccountsPublic,
     WalletOperationRequest, WalletPublic, WalletRequest, is_read_only_method,
+    solana_native_transfer_approval_digest,
 };
 use bloom_triad_local_transport::{LocalIdentity, PeerAcl};
 use num_bigint::BigUint;
@@ -782,6 +783,31 @@ impl MachineBrokerClient {
         &self,
         request: ExactPayloadSignRequest,
     ) -> Result<ExactPayloadSignOutcome, ProtocolError> {
+        match self.plan_exact_payload(request).await? {
+            ExactPayloadPlan::Sign(request) => self
+                .sign(*request)
+                .await
+                .map(ExactPayloadSignOutcome::Signed),
+            ExactPayloadPlan::Prepare(request) => self
+                .prepare_approval(*request)
+                .await
+                .map(ExactPayloadSignOutcome::ApprovalRequired),
+        }
+    }
+
+    /// Resolve an exact payload request into the concrete Broker request it
+    /// would send, **without sending it**.
+    ///
+    /// A caller that must durably record what it is about to ask for — the
+    /// native Solana transfer path, which persists its request before dispatch
+    /// so a lost response is replayed byte for byte rather than rebuilt — uses
+    /// this and then hands the result to [`Self::sign`]. Key resolution,
+    /// policy binding and claim validation all happen here, so a persisted
+    /// request cannot later be rebuilt against a newly fetched policy version.
+    pub async fn plan_exact_payload(
+        &self,
+        request: ExactPayloadSignRequest,
+    ) -> Result<ExactPayloadPlan, ProtocolError> {
         request.validate()?;
         let wallet = self.wallet(request.wallet_id.clone()).await?;
         let payload_digest = Digest32::from_bytes(Sha256::digest(&request.preimage).into());
@@ -902,26 +928,23 @@ impl MachineBrokerClient {
                 policy_digest: wallet.policy_digest,
             }
             .digest()?;
-            return self
-                .sign(MachineSignRequest {
-                    operation_id: request.signing_operation_id,
-                    operation_digest,
-                    approval_id,
-                    key_ref,
-                    crypto_suite: request.crypto_suite,
-                    payloads: SigningPayloads::Single {
-                        payload: Base64UrlBytes::from_bytes(&request.preimage),
-                    },
-                    petal_use_claim: request.petal_use_claim,
-                    system_use_claim: request.system_use_claim,
-                    claim_assurance_evidence: request
-                        .claim_assurance_evidence
-                        .as_deref()
-                        .map(Base64UrlBytes::from_bytes),
-                    provenance: request.provenance,
-                })
-                .await
-                .map(ExactPayloadSignOutcome::Signed);
+            return Ok(ExactPayloadPlan::Sign(Box::new(MachineSignRequest {
+                operation_id: request.signing_operation_id,
+                operation_digest,
+                approval_id,
+                key_ref,
+                crypto_suite: request.crypto_suite,
+                payloads: SigningPayloads::Single {
+                    payload: Base64UrlBytes::from_bytes(&request.preimage),
+                },
+                petal_use_claim: request.petal_use_claim,
+                system_use_claim: request.system_use_claim,
+                claim_assurance_evidence: request
+                    .claim_assurance_evidence
+                    .as_deref()
+                    .map(Base64UrlBytes::from_bytes),
+                provenance: request.provenance,
+            })));
         }
 
         let terms = SealedApprovalTerms {
@@ -929,9 +952,22 @@ impl MachineBrokerClient {
             wallet_id: request.wallet_id,
             key_ref,
             allowed_crypto_suites: vec![request.crypto_suite],
-            selector: ApprovalSelector::Exact {
-                ordered_payload_digests: vec![payload_digest],
-                ordered_hashes: vec![ordered_hash],
+            selector: match request.message_normalization {
+                // Only the sealed terms move. The payload, its raw digest, the
+                // claim and the operation identity above are untouched.
+                Some(mode @ ExactMessageNormalization::SolanaNativeTransferBlockhashV1) => {
+                    let normalized = solana_native_transfer_approval_digest(&request.preimage)?;
+                    ApprovalSelector::Exact {
+                        ordered_payload_digests: vec![normalized.clone()],
+                        ordered_hashes: vec![normalized],
+                        message_normalization: Some(mode),
+                    }
+                }
+                None => ApprovalSelector::Exact {
+                    ordered_payload_digests: vec![payload_digest],
+                    ordered_hashes: vec![ordered_hash],
+                    message_normalization: None,
+                },
             },
             limits: ApprovalLimits {
                 max_operations: DecimalU64::new(1),
@@ -955,15 +991,15 @@ impl MachineBrokerClient {
             renewal_of: None,
         };
         terms.validate()?;
-        self.prepare_approval(ApprovalPrepareRequest {
-            operation_id: request.approval_operation_id,
-            terms,
-            canonical_plan_facts_digest: request.canonical_plan_facts_digest,
-            petal_use_claim: request.petal_use_claim,
-            system_use_claim: request.system_use_claim,
-        })
-        .await
-        .map(ExactPayloadSignOutcome::ApprovalRequired)
+        Ok(ExactPayloadPlan::Prepare(Box::new(
+            ApprovalPrepareRequest {
+                operation_id: request.approval_operation_id,
+                terms,
+                canonical_plan_facts_digest: request.canonical_plan_facts_digest,
+                petal_use_claim: request.petal_use_claim,
+                system_use_claim: request.system_use_claim,
+            },
+        )))
     }
 
     /// Prepare or execute one exact ordered payload batch using the existing
@@ -1106,6 +1142,9 @@ impl MachineBrokerClient {
             selector: ApprovalSelector::Exact {
                 ordered_payload_digests,
                 ordered_hashes,
+                // The batch path stays raw; normalization covers exactly one
+                // native transfer message.
+                message_normalization: None,
             },
             limits: ApprovalLimits {
                 max_operations: DecimalU64::new(1),
@@ -1985,6 +2024,13 @@ pub struct ExactPayloadSignRequest {
     /// BIP-39 and holds more than one child for `crypto_suite`; `None` keeps
     /// the single-account and legacy-root behaviour.
     pub account_key_ref: Option<KeyRef>,
+    /// Approval-matching mode for the sealed terms this request may prepare.
+    ///
+    /// `None` is ordinary Exact, which is what every caller but the native
+    /// Solana transfer path passes. When set, only the **terms** commit to the
+    /// normalized digest; `claimed_hash`, the payload, the claim, the
+    /// operation identity and the bytes sent to the Broker all stay raw.
+    pub message_normalization: Option<ExactMessageNormalization>,
 }
 
 #[derive(Clone, Debug)]
@@ -2057,6 +2103,15 @@ impl ExactPayloadSignRequest {
 pub enum ExactPayloadSignOutcome {
     ApprovalRequired(SealedApprovalPrepareResponse),
     Signed(SigningResult),
+}
+
+/// What an [`ExactPayloadSignRequest`] resolves to before anything is sent.
+#[derive(Clone, Debug)]
+pub enum ExactPayloadPlan {
+    /// The approval already exists: this is the exact request to dispatch.
+    Sign(Box<MachineSignRequest>),
+    /// No approval yet: this is the ceremony to prepare.
+    Prepare(Box<ApprovalPrepareRequest>),
 }
 
 /// Durable Machine projection of a Broker-owned ceremony. Launch secrets are
@@ -3746,6 +3801,7 @@ mod tests {
             claim_assurance_evidence: None,
             approval_value_limits: Vec::new(),
             account_key_ref: None,
+            message_normalization: None,
         }
     }
 
@@ -3822,6 +3878,7 @@ mod tests {
                         Sha256::digest(&payload).into()
                     )],
                     ordered_hashes: vec![Digest32::from_bytes(Keccak256::digest(&payload).into())],
+                    message_normalization: None,
                 }
             );
             assert_eq!(request.terms.provenance_digest, digest(60));
@@ -3945,6 +4002,7 @@ mod tests {
                         .iter()
                         .map(|payload| Digest32::from_bytes(Keccak256::digest(payload).into()))
                         .collect(),
+                    message_normalization: None,
                 }
             );
         }
@@ -4412,6 +4470,7 @@ mod tests {
             selector: ApprovalSelector::Exact {
                 ordered_payload_digests: vec![digest(80)],
                 ordered_hashes: vec![digest(81)],
+                message_normalization: None,
             },
             limits: ApprovalLimits {
                 max_operations: DecimalU64::new(1),

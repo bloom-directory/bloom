@@ -41,6 +41,11 @@ struct BrokerFixture {
     prepare_calls: std::sync::atomic::AtomicUsize,
     block_prepares: std::sync::atomic::AtomicBool,
     prepare_release: tokio::sync::Semaphore,
+    /// Whether the owner has completed the ceremony. A normalized confirm
+    /// refuses to finalize until the Broker says the approval is ACTIVE, so
+    /// tests drive that explicitly instead of inferring it from holding an id.
+    approval_is_active: std::sync::atomic::AtomicBool,
+    sign_calls: std::sync::atomic::AtomicUsize,
 }
 
 impl BrokerFixture {
@@ -64,6 +69,8 @@ impl BrokerFixture {
             next_sign_error: Mutex::new(None),
             prepare_calls: std::sync::atomic::AtomicUsize::new(0),
             block_prepares: std::sync::atomic::AtomicBool::new(false),
+            approval_is_active: std::sync::atomic::AtomicBool::new(true),
+            sign_calls: std::sync::atomic::AtomicUsize::new(0),
             prepare_release: tokio::sync::Semaphore::new(0),
         }
     }
@@ -77,6 +84,22 @@ impl BrokerFixture {
 
     /// How many prepares were refused as reusing an operation id with
     /// different terms.
+    /// Whether the fixture reports the owner's approval as ACTIVE.
+    fn set_approval_active(&self, active: bool) {
+        self.approval_is_active
+            .store(active, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// How many ceremonies were prepared.
+    fn prepare_calls(&self) -> usize {
+        self.prepare_calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// How many signing requests actually reached the Broker.
+    fn sign_calls(&self) -> usize {
+        self.sign_calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     fn conflicts(&self) -> u32 {
         *self.conflicts.lock().unwrap()
     }
@@ -155,6 +178,8 @@ impl MachineBrokerService for BrokerFixture {
                     }))
                 }
                 MachineBrokerRequest::SigningSign(sign_request) => {
+                    self.sign_calls
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     if let Some((code, message)) = self.next_sign_error.lock().unwrap().take() {
                         return Err(ProtocolError::new(code, message));
                     }
@@ -226,6 +251,40 @@ impl MachineBrokerService for BrokerFixture {
                             ceremony_url: "http://localhost:18734/ceremony".into(),
                             ceremony_expires_at_ms: terms.expires_at_ms,
                             review_manifest_digest: digest(92),
+                        },
+                    ))
+                }
+                // A blockhash-normalized confirm asks what state the approval
+                // is really in before it finalizes anything. The fixture
+                // answers ACTIVE once the test has said the owner approved,
+                // and AWAITING_CEREMONY until then.
+                MachineBrokerRequest::SealedApprovalStatus(request) => {
+                    let active = self
+                        .approval_is_active
+                        .load(std::sync::atomic::Ordering::SeqCst);
+                    Ok(MachineBrokerResponse::SealedApprovalStatus(
+                        bloom_broker_api::ApprovalPublicStatus {
+                            approval_id: request.id,
+                            wallet_id: Token::new("wallet").unwrap(),
+                            state: if active {
+                                bloom_broker_api::ApprovalLifecycleState::Active
+                            } else {
+                                bloom_broker_api::ApprovalLifecycleState::AwaitingCeremony
+                            },
+                            effective_claim_assurance: None,
+                            ceremony_url: Some("http://localhost:18734/ceremony".into()),
+                            ceremony_expires_at_ms: None,
+                        },
+                    ))
+                }
+                MachineBrokerRequest::OperationStatus(request) => {
+                    Ok(MachineBrokerResponse::OperationStatus(
+                        bloom_broker_api::OperationPublicStatus {
+                            operation_id: request.operation_id,
+                            operation_digest: digest(93),
+                            state: bloom_broker_api::OperationState::Reserved,
+                            result: None,
+                            error: None,
                         },
                     ))
                 }
@@ -526,7 +585,9 @@ async fn full_transfer_lifecycle_stage_sign_broadcast() {
         }
         other => panic!("expected ApprovalRequired, got {other:?}"),
     };
-    assert_eq!(broker.last_prepared_expiry(), 61_100);
+    // Five minutes, not one blockhash: a newly staged native transfer is
+    // blockhash-normalized, so its approval outlives the staged blockhash.
+    assert_eq!(broker.last_prepared_expiry(), 301_100);
     // Still pending: no signature recorded yet.
     assert!(
         outbox
@@ -1084,10 +1145,37 @@ async fn signing_and_broadcast_both_refuse_an_expired_blockhash() {
         .await
         .unwrap();
     height.store(102, std::sync::atomic::Ordering::SeqCst);
-    let sign_error = engine
+    // A blockhash-normalized entry is exactly the case that must NOT refuse
+    // here: the staged blockhash going stale is the situation the mode exists
+    // for, and the approval still stands. It proceeds to the ceremony.
+    let past_expiry = engine
         .sign(
             "wallet",
             &unsigned.id,
+            &broker.child_pubkey(),
+            None,
+            None,
+            1_100,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        past_expiry,
+        bloom_solana_tx::signing::SolanaSignOutcome::ApprovalRequired { .. }
+    ));
+
+    // A legacy unmarked entry keeps the old contract: its message can never be
+    // replaced, so a stale blockhash is terminal and it must be restaged.
+    let mut legacy = unsigned.clone();
+    legacy.id = "sol-00000000000000000000000000000001".into();
+    legacy.message_normalization = None;
+    outbox
+        .write_pending(&legacy, "legacy unmarked entry\n")
+        .unwrap();
+    let sign_error = engine
+        .sign(
+            "wallet",
+            &legacy.id,
             &broker.child_pubkey(),
             None,
             None,
@@ -1149,6 +1237,8 @@ async fn expired_transfer_restages_with_fresh_facts_and_no_reused_authority() {
         )
         .await
         .unwrap();
+    // This case covers the pre-existing unmarked contract.
+    let original = demote_to_legacy(&outbox, &original);
 
     let too_early = engine
         .restage_expired("wallet", &original.id, &broker.child_pubkey(), 1_250)
@@ -1426,6 +1516,29 @@ async fn stage_for_retry(
         .unwrap()
 }
 
+/// Rewrite a staged entry as a legacy unmarked one.
+///
+/// `stage` now marks new native transfers as blockhash-normalized, which
+/// deliberately changes expiry, sweep and dead-approval behaviour. The
+/// pre-existing contract still governs every entry staged before this feature,
+/// so the tests that cover it demote their entry first and keep asserting it.
+fn demote_to_legacy(
+    outbox: &SolanaOutbox,
+    staged: &bloom_solana_tx::types::StagedSolanaTransfer,
+) -> bloom_solana_tx::types::StagedSolanaTransfer {
+    let entry = pending(outbox, &staged.id);
+    let mut legacy = entry.staged.clone();
+    legacy.message_normalization = None;
+    outbox
+        .rewrite_intent(&bloom_solana_tx::outbox::SolanaOutboxEntry {
+            state: entry.state,
+            staged: legacy.clone(),
+            dir: entry.dir,
+        })
+        .unwrap();
+    legacy
+}
+
 fn pending(outbox: &SolanaOutbox, id: &str) -> bloom_solana_tx::outbox::SolanaOutboxEntry {
     outbox
         .read_in_state(
@@ -1454,6 +1567,9 @@ fn approval_required(outcome: bloom_solana_tx::signing::SolanaSignOutcome) -> Di
 async fn confirming_the_same_transfer_twice_reaches_the_same_ceremony() {
     let (_dir, outbox, broker, engine) = retry_fixture().await;
     let staged = stage_for_retry(&engine, &broker).await;
+    // This case covers the pre-existing unmarked contract, which `stage` no
+    // longer produces for native transfers.
+    let staged = demote_to_legacy(&outbox, &staged);
     let fee_payer = broker.child_pubkey();
 
     let first = approval_required(
@@ -1492,8 +1608,11 @@ async fn confirming_the_same_transfer_twice_reaches_the_same_ceremony() {
 
 #[tokio::test]
 async fn overlapping_confirms_are_serialized_through_approval_preparation() {
-    let (_dir, _outbox, broker, engine) = retry_fixture().await;
+    let (_dir, outbox, broker, engine) = retry_fixture().await;
     let staged = stage_for_retry(&engine, &broker).await;
+    // This case covers the pre-existing unmarked contract, which `stage` no
+    // longer produces for native transfers.
+    let staged = demote_to_legacy(&outbox, &staged);
     let engine = Arc::new(engine);
     let fee_payer = broker.child_pubkey();
     broker.block_approval_prepares();
@@ -1552,6 +1671,9 @@ async fn overlapping_confirms_are_serialized_through_approval_preparation() {
 async fn a_definitely_dead_approval_is_retired_and_the_next_confirm_starts_over() {
     let (_dir, outbox, broker, engine) = retry_fixture().await;
     let staged = stage_for_retry(&engine, &broker).await;
+    // This case covers the pre-existing unmarked contract, which `stage` no
+    // longer produces for native transfers.
+    let staged = demote_to_legacy(&outbox, &staged);
     let fee_payer = broker.child_pubkey();
 
     let approval = approval_required(
@@ -1634,6 +1756,9 @@ async fn a_definitely_dead_approval_is_retired_and_the_next_confirm_starts_over(
 async fn an_ambiguous_signing_outcome_keeps_the_approval() {
     let (_dir, outbox, broker, engine) = retry_fixture().await;
     let staged = stage_for_retry(&engine, &broker).await;
+    // This case covers the pre-existing unmarked contract, which `stage` no
+    // longer produces for native transfers.
+    let staged = demote_to_legacy(&outbox, &staged);
     let fee_payer = broker.child_pubkey();
 
     let approval = approval_required(
@@ -1686,6 +1811,9 @@ async fn an_ambiguous_signing_outcome_keeps_the_approval() {
 async fn a_transient_broker_fault_keeps_the_approval_and_the_retry_succeeds() {
     let (_dir, outbox, broker, engine) = retry_fixture().await;
     let staged = stage_for_retry(&engine, &broker).await;
+    // This case covers the pre-existing unmarked contract, which `stage` no
+    // longer produces for native transfers.
+    let staged = demote_to_legacy(&outbox, &staged);
     let fee_payer = broker.child_pubkey();
 
     let approval = approval_required(
@@ -1760,6 +1888,9 @@ async fn a_dead_approval_survives_a_restage_with_a_fresh_identity() {
     let engine =
         SolanaTransferEngine::new(outbox.clone(), client(&endpoint), signer, "solana-devnet");
     let staged = stage_for_retry(&engine, &broker).await;
+    // This case covers the pre-existing unmarked contract, which `stage` no
+    // longer produces for native transfers.
+    let staged = demote_to_legacy(&outbox, &staged);
     let fee_payer = broker.child_pubkey();
 
     let approval = approval_required(
@@ -1843,6 +1974,9 @@ async fn a_swept_transfer_fails_over_and_restages_onto_a_fresh_approval() {
     let engine =
         SolanaTransferEngine::new(outbox.clone(), client(&endpoint), signer, "solana-devnet");
     let staged = stage_for_retry(&engine, &broker).await;
+    // This case covers the pre-existing unmarked contract, which `stage` no
+    // longer produces for native transfers.
+    let staged = demote_to_legacy(&outbox, &staged);
     let fee_payer = broker.child_pubkey();
 
     let approval = approval_required(
@@ -1875,9 +2009,7 @@ async fn a_swept_transfer_fails_over_and_restages_onto_a_fresh_approval() {
         staged.last_valid_block_height + 1,
     );
     assert_eq!(
-        outbox
-            .sweep_expired(staged.expires_ms, &heights)
-            .unwrap(),
+        outbox.sweep_expired(staged.expires_ms, &heights).unwrap(),
         1,
         "exactly the stale entry must be swept at its own deadline"
     );
@@ -1931,6 +2063,9 @@ async fn repeated_restage_cannot_clobber_the_successor() {
     let engine =
         SolanaTransferEngine::new(outbox.clone(), client(&endpoint), signer, "solana-devnet");
     let staged = stage_for_retry(&engine, &broker).await;
+    // This case covers the pre-existing unmarked contract, which `stage` no
+    // longer produces for native transfers.
+    let staged = demote_to_legacy(&outbox, &staged);
     let fee_payer = broker.child_pubkey();
 
     height.store(
@@ -2022,6 +2157,9 @@ async fn corrupt_approval_attempt_state_fails_closed() {
     let engine =
         SolanaTransferEngine::new(outbox.clone(), client(&endpoint), signer, "solana-devnet");
     let staged = stage_for_retry(&engine, &broker).await;
+    // This case covers the pre-existing unmarked contract, which `stage` no
+    // longer produces for native transfers.
+    let staged = demote_to_legacy(&outbox, &staged);
     let fee_payer = broker.child_pubkey();
 
     let entry = pending(&outbox, &staged.id);
@@ -2038,5 +2176,596 @@ async fn corrupt_approval_attempt_state_fails_closed() {
     assert!(
         broker.prepared_ids().is_empty(),
         "no Broker preparation may run against unreadable terms"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Blockhash-normalized native transfers
+//
+// A newly staged native transfer commits its approval to the message with the
+// 32 recent-blockhash bytes zeroed, so the owner's ceremony may finish after
+// the staged blockhash has died. These cases cover what that changes on the
+// Machine side: the approval outlives the template, the blockhash is replaced
+// exactly once immediately before signing, the committed attempt is durable,
+// and nothing may quietly produce a second message for one intent.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_newly_staged_native_transfer_is_normalized_and_legacy_entries_are_not() {
+    let (_dir, outbox, broker, engine) = retry_fixture().await;
+    let staged = stage_for_retry(&engine, &broker).await;
+    assert_eq!(
+        staged.message_normalization,
+        Some(bloom_broker_api::ExactMessageNormalization::SolanaNativeTransferBlockhashV1),
+        "a new native transfer is staged blockhash-normalized"
+    );
+    // The marker is persisted, so a restart still knows how this entry's
+    // approval matches.
+    assert_eq!(
+        pending(&outbox, &staged.id).staged.message_normalization,
+        staged.message_normalization
+    );
+    // An entry staged before the feature has no marker and must not acquire
+    // one: its standing approval pinned raw bytes.
+    let legacy = demote_to_legacy(&outbox, &staged);
+    assert_eq!(legacy.message_normalization, None);
+    assert_eq!(
+        pending(&outbox, &staged.id).staged.message_normalization,
+        None
+    );
+}
+
+#[tokio::test]
+async fn a_normalized_approval_lasts_five_minutes_and_a_retry_reuses_its_window() {
+    let (_dir, _outbox, broker, engine) = retry_fixture().await;
+    let staged = stage_for_retry(&engine, &broker).await;
+    let fee_payer = broker.child_pubkey();
+
+    engine
+        .sign("wallet", &staged.id, &fee_payer, None, None, 1_000)
+        .await
+        .unwrap();
+    assert_eq!(
+        broker.last_prepared_expiry(),
+        301_000,
+        "five minutes, not one blockhash"
+    );
+
+    // Polling must not extend the window. A second confirm inside it presents
+    // the Broker the same terms and so reaches the same standing ceremony.
+    engine
+        .sign("wallet", &staged.id, &fee_payer, None, None, 120_000)
+        .await
+        .unwrap();
+    assert_eq!(broker.last_prepared_expiry(), 301_000);
+    assert_eq!(broker.conflicts(), 0);
+}
+
+#[tokio::test]
+async fn an_unapproved_ceremony_cannot_be_signed_by_presenting_its_id() {
+    let (_dir, _outbox, broker, engine) = retry_fixture().await;
+    let staged = stage_for_retry(&engine, &broker).await;
+    let fee_payer = broker.child_pubkey();
+    let approval = match engine
+        .sign("wallet", &staged.id, &fee_payer, None, None, 1_000)
+        .await
+        .unwrap()
+    {
+        bloom_solana_tx::signing::SolanaSignOutcome::ApprovalRequired { approval_id, .. } => {
+            approval_id
+        }
+        other => panic!("expected ApprovalRequired, got {other:?}"),
+    };
+
+    // The owner has not completed the ceremony. Holding the id is not consent:
+    // the Broker still reports AWAITING_CEREMONY and nothing may be submitted.
+    broker.set_approval_active(false);
+    let outcome = engine
+        .sign(
+            "wallet",
+            &staged.id,
+            &fee_payer,
+            None,
+            Some(approval.clone()),
+            2_000,
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            outcome,
+            bloom_solana_tx::signing::SolanaSignOutcome::ApprovalRequired { .. }
+        ),
+        "an unapproved ceremony must be handed back, not signed"
+    );
+    assert_eq!(broker.sign_calls(), 0, "nothing was submitted for signing");
+}
+
+/// A stub node whose recent blockhash and fee quote can be moved between
+/// calls, so a confirm can be driven across a genuine blockhash rotation.
+async fn spawn_rotating_node(
+    blockhash: Arc<std::sync::Mutex<[u8; 32]>>,
+    fee: Arc<std::sync::atomic::AtomicU64>,
+) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let blockhash = blockhash.clone();
+            let fee = fee.clone();
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = vec![0u8; 8192];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
+                let request_json = serde_json::from_str::<serde_json::Value>(body)
+                    .unwrap_or(serde_json::Value::Null);
+                let method = request_json
+                    .get("method")
+                    .and_then(|m| m.as_str())
+                    .map(String::from)
+                    .unwrap_or_default();
+                let result = match method.as_str() {
+                    "getGenesisHash" => r#""test-genesis""#.to_string(),
+                    "getLatestBlockhash" => {
+                        let current = bs58::encode(*blockhash.lock().unwrap()).into_string();
+                        format!(
+                            r#"{{"context":{{"slot":1}},"value":{{"blockhash":"{current}","lastValidBlockHeight":100}}}}"#
+                        )
+                    }
+                    "getBlockHeight" => "1".to_string(),
+                    "getFeeForMessage" => format!(
+                        r#"{{"context":{{"slot":1}},"value":{}}}"#,
+                        fee.load(std::sync::atomic::Ordering::SeqCst)
+                    ),
+                    "simulateTransaction" => r#"{"context":{"slot":1},"value":{"err":null,"logs":[],"unitsConsumed":150}}"#.to_string(),
+                    "sendTransaction" => {
+                        serde_json::to_string(&submitted_transaction_signature(&request_json))
+                            .unwrap()
+                    }
+                    _ => "null".to_string(),
+                };
+                let payload = format!(r#"{{"jsonrpc":"2.0","id":1,"result":{result}}}"#);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+                    payload.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    format!("http://{addr}/")
+}
+
+async fn rotating_fixture(
+    blockhash: Arc<std::sync::Mutex<[u8; 32]>>,
+    fee: Arc<std::sync::atomic::AtomicU64>,
+) -> (
+    tempfile::TempDir,
+    SolanaOutbox,
+    Arc<BrokerFixture>,
+    SolanaTransferEngine,
+) {
+    let endpoint = spawn_rotating_node(blockhash, fee).await;
+    let dir = tempfile::tempdir().unwrap();
+    let outbox = SolanaOutbox::new(dir.path().join("outbox")).unwrap();
+    let broker = Arc::new(BrokerFixture::new());
+    let signer =
+        SolanaTransferSigner::from_catalog(MachineBrokerClient::new(broker.clone()), &catalog())
+            .unwrap();
+    let engine =
+        SolanaTransferEngine::new(outbox.clone(), client(&endpoint), signer, "solana-devnet");
+    (dir, outbox, broker, engine)
+}
+
+/// The behaviour the whole feature exists for, on the Machine side: the staged
+/// blockhash is replaced once, immediately before signing, under the same
+/// entry and the same approval — and the snapshot records exactly what was
+/// sent.
+#[tokio::test]
+async fn a_confirm_replaces_the_blockhash_once_and_records_what_it_sent() {
+    let blockhash = Arc::new(std::sync::Mutex::new([0x42u8; 32]));
+    let fee = Arc::new(std::sync::atomic::AtomicU64::new(5_000));
+    let (_dir, outbox, broker, engine) = rotating_fixture(blockhash.clone(), fee).await;
+    let staged = stage_for_retry(&engine, &broker).await;
+    let fee_payer = broker.child_pubkey();
+
+    let approval = match engine
+        .sign("wallet", &staged.id, &fee_payer, None, None, 1_000)
+        .await
+        .unwrap()
+    {
+        bloom_solana_tx::signing::SolanaSignOutcome::ApprovalRequired { approval_id, .. } => {
+            approval_id
+        }
+        other => panic!("expected ApprovalRequired, got {other:?}"),
+    };
+
+    // The cluster moves on while the owner is still at the passkey prompt.
+    *blockhash.lock().unwrap() = [0x5au8; 32];
+
+    let signed = engine
+        .sign(
+            "wallet",
+            &staged.id,
+            &fee_payer,
+            None,
+            Some(approval.clone()),
+            200_000,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        signed,
+        bloom_solana_tx::signing::SolanaSignOutcome::Signed { .. }
+    ));
+
+    // Same entry, one approval, one prepare.
+    assert_eq!(broker.prepare_calls(), 1);
+    assert_eq!(broker.sign_calls(), 1);
+
+    let entry = pending(&outbox, &staged.id);
+    let snapshot = outbox
+        .signing_attempt(&entry)
+        .unwrap()
+        .expect("the confirm committed to a message");
+    assert_eq!(
+        snapshot.finalized_staged.blockhash,
+        bs58::encode([0x5au8; 32]).into_string(),
+        "the signed message carries the refreshed blockhash"
+    );
+    assert_ne!(snapshot.finalized_staged.message_b64, staged.message_b64);
+    // The projection was restored to what was actually signed.
+    assert_eq!(
+        entry.staged.message_b64,
+        snapshot.finalized_staged.message_b64
+    );
+    // And the request in the snapshot signs exactly those bytes.
+    let bloom_broker_api::SigningPayloads::Single { payload } = &snapshot.request.payloads else {
+        panic!("a native transfer is never a batch");
+    };
+    assert_eq!(
+        {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode(payload.decode())
+        },
+        snapshot.finalized_staged.message_b64
+    );
+}
+
+/// A committed attempt is replayed, never rebuilt. Rebuilding could pick a
+/// newer blockhash and buy a second signature under one approval.
+#[tokio::test]
+async fn a_lost_response_replays_the_persisted_request_rather_than_refreshing() {
+    let blockhash = Arc::new(std::sync::Mutex::new([0x42u8; 32]));
+    let fee = Arc::new(std::sync::atomic::AtomicU64::new(5_000));
+    let (_dir, outbox, broker, engine) = rotating_fixture(blockhash.clone(), fee).await;
+    let staged = stage_for_retry(&engine, &broker).await;
+    let fee_payer = broker.child_pubkey();
+    let approval = match engine
+        .sign("wallet", &staged.id, &fee_payer, None, None, 1_000)
+        .await
+        .unwrap()
+    {
+        bloom_solana_tx::signing::SolanaSignOutcome::ApprovalRequired { approval_id, .. } => {
+            approval_id
+        }
+        other => panic!("expected ApprovalRequired, got {other:?}"),
+    };
+    *blockhash.lock().unwrap() = [0x5au8; 32];
+
+    // The Broker's response is lost after it has been dispatched.
+    broker.fail_next_signature(
+        bloom_broker_api::ProtocolErrorCode::ServiceUnavailable,
+        "transport closed before the response arrived",
+    );
+    let error = engine
+        .sign(
+            "wallet",
+            &staged.id,
+            &fee_payer,
+            None,
+            Some(approval.clone()),
+            200_000,
+        )
+        .await
+        .expect_err("a lost response is not a success");
+    assert!(error.to_string().contains("transport closed"), "{error}");
+
+    let committed = outbox
+        .signing_attempt(&pending(&outbox, &staged.id))
+        .unwrap()
+        .expect("the attempt was persisted before it was sent");
+
+    // The cluster moves again. The retry must ignore it entirely.
+    *blockhash.lock().unwrap() = [0x77u8; 32];
+    let signed = engine
+        .sign(
+            "wallet",
+            &staged.id,
+            &fee_payer,
+            None,
+            Some(approval),
+            260_000,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        signed,
+        bloom_solana_tx::signing::SolanaSignOutcome::Signed { .. }
+    ));
+    let after = outbox
+        .signing_attempt(&pending(&outbox, &staged.id))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        after.finalized_staged.message_b64, committed.finalized_staged.message_b64,
+        "the replay signed the persisted message, not a freshly refreshed one"
+    );
+    assert_eq!(
+        after.request.operation_id.as_str(),
+        committed.request.operation_id.as_str(),
+        "and under the same operation"
+    );
+    // One approval, one ceremony, throughout.
+    assert_eq!(broker.prepare_calls(), 1);
+}
+
+/// A changed fee is a changed reviewed fact. Refuse before signing; never
+/// silently approve a new quote.
+#[tokio::test]
+async fn a_requoted_fee_refuses_before_anything_is_committed() {
+    let blockhash = Arc::new(std::sync::Mutex::new([0x42u8; 32]));
+    let fee = Arc::new(std::sync::atomic::AtomicU64::new(5_000));
+    let (_dir, outbox, broker, engine) = rotating_fixture(blockhash.clone(), fee.clone()).await;
+    let staged = stage_for_retry(&engine, &broker).await;
+    let fee_payer = broker.child_pubkey();
+    let approval = match engine
+        .sign("wallet", &staged.id, &fee_payer, None, None, 1_000)
+        .await
+        .unwrap()
+    {
+        bloom_solana_tx::signing::SolanaSignOutcome::ApprovalRequired { approval_id, .. } => {
+            approval_id
+        }
+        other => panic!("expected ApprovalRequired, got {other:?}"),
+    };
+    *blockhash.lock().unwrap() = [0x5au8; 32];
+    fee.store(6_000, std::sync::atomic::Ordering::SeqCst);
+
+    let error = engine
+        .sign(
+            "wallet",
+            &staged.id,
+            &fee_payer,
+            None,
+            Some(approval),
+            200_000,
+        )
+        .await
+        .expect_err("a re-quoted fee must refuse");
+    assert!(error.to_string().contains("6000"), "{error}");
+    assert_eq!(broker.sign_calls(), 0, "nothing was submitted");
+    assert!(
+        outbox
+            .signing_attempt(&pending(&outbox, &staged.id))
+            .unwrap()
+            .is_none(),
+        "and nothing was committed"
+    );
+}
+
+/// Sweep and cancel must not discard an approval the owner has granted, nor an
+/// attempt that may be in flight.
+#[tokio::test]
+async fn sweep_and_cancel_respect_a_normalized_entry() {
+    let (_dir, outbox, broker, engine) = retry_fixture().await;
+    let marked = stage_for_retry(&engine, &broker).await;
+
+    // Its template is long past its window, which is exactly the situation
+    // this mode exists to survive.
+    let mut heights = std::collections::HashMap::new();
+    heights.insert(
+        "solana-devnet".to_string(),
+        marked.last_valid_block_height + 1,
+    );
+    assert_eq!(
+        outbox
+            .sweep_expired(marked.expires_ms + 1, &heights)
+            .unwrap(),
+        0,
+        "a normalized entry's expired template must not retire its approval"
+    );
+    assert!(pending(&outbox, &marked.id).staged.lamports > 0);
+
+    // Before anything is committed the owner may still cancel explicitly.
+    outbox
+        .cancel("wallet", "solana-devnet", &marked.id)
+        .unwrap();
+
+    // Once an attempt is committed, cancellation is refused: its outcome has
+    // to be resolved first.
+    let second = stage_for_retry(&engine, &broker).await;
+    let fee_payer = broker.child_pubkey();
+    let approval = match engine
+        .sign("wallet", &second.id, &fee_payer, None, None, 1_000)
+        .await
+        .unwrap()
+    {
+        bloom_solana_tx::signing::SolanaSignOutcome::ApprovalRequired { approval_id, .. } => {
+            approval_id
+        }
+        other => panic!("expected ApprovalRequired, got {other:?}"),
+    };
+    broker.fail_next_signature(
+        bloom_broker_api::ProtocolErrorCode::ServiceUnavailable,
+        "response lost",
+    );
+    let _ = engine
+        .sign(
+            "wallet",
+            &second.id,
+            &fee_payer,
+            None,
+            Some(approval),
+            200_000,
+        )
+        .await;
+    let cancel_error = outbox
+        .cancel("wallet", "solana-devnet", &second.id)
+        .expect_err("an unresolved signing attempt cannot be cancelled away");
+    assert!(
+        cancel_error.to_string().contains("committed to signing"),
+        "{cancel_error}"
+    );
+    assert_eq!(
+        outbox
+            .sweep_expired(second.expires_ms + 1, &heights)
+            .unwrap(),
+        0,
+        "nor swept"
+    );
+}
+
+/// A snapshot that does not describe one coherent request is not "no attempt".
+#[tokio::test]
+async fn a_corrupt_signing_snapshot_fails_closed() {
+    let (_dir, outbox, broker, engine) = retry_fixture().await;
+    let staged = stage_for_retry(&engine, &broker).await;
+    let entry = pending(&outbox, &staged.id);
+    std::fs::write(entry.dir.join(".signing_attempt"), b"{\"schema\":\"nope\"}").unwrap();
+
+    let error = outbox
+        .signing_attempt(&entry)
+        .expect_err("a corrupt snapshot is an error, never None");
+    assert!(error.to_string().contains("signing snapshot"), "{error}");
+    // And it still blocks the destructive paths.
+    assert!(
+        outbox
+            .cancel("wallet", "solana-devnet", &staged.id)
+            .is_err()
+    );
+    let confirm_error = engine
+        .sign(
+            "wallet",
+            &staged.id,
+            &broker.child_pubkey(),
+            None,
+            None,
+            2_000,
+        )
+        .await
+        .expect_err("a corrupt snapshot must not be confirmed past");
+    assert!(
+        confirm_error.to_string().contains("signing snapshot"),
+        "{confirm_error}"
+    );
+}
+
+/// Two intents with identical economics can refresh onto the same blockhash
+/// and become the same bytes — and the same bytes are the same Ed25519
+/// signature and the same transaction. One payment where the owner approved
+/// two. Distinct off-chain intent ids do not change that, so the second
+/// finalization must wait rather than commit.
+#[tokio::test]
+async fn two_intents_that_refresh_onto_one_message_do_not_both_commit() {
+    let blockhash = Arc::new(std::sync::Mutex::new([0x42u8; 32]));
+    let fee = Arc::new(std::sync::atomic::AtomicU64::new(5_000));
+    let (_dir, outbox, broker, engine) = rotating_fixture(blockhash.clone(), fee).await;
+    let fee_payer = broker.child_pubkey();
+
+    // Different initial blockhashes, so stage's duplicate-message guard lets
+    // both exist: two deliberate payments of the same amount.
+    let first = stage_for_retry(&engine, &broker).await;
+    *blockhash.lock().unwrap() = [0x43u8; 32];
+    let second = stage_for_retry(&engine, &broker).await;
+    assert_ne!(first.id, second.id);
+    assert_ne!(first.message_b64, second.message_b64);
+
+    let mut approvals = Vec::new();
+    for staged in [&first, &second] {
+        match engine
+            .sign("wallet", &staged.id, &fee_payer, None, None, 1_000)
+            .await
+            .unwrap()
+        {
+            bloom_solana_tx::signing::SolanaSignOutcome::ApprovalRequired {
+                approval_id, ..
+            } => approvals.push(approval_id),
+            other => panic!("expected ApprovalRequired, got {other:?}"),
+        }
+    }
+    assert_ne!(approvals[0], approvals[1], "two intents, two approvals");
+
+    // Both now refresh onto the same blockhash.
+    *blockhash.lock().unwrap() = [0x5au8; 32];
+    engine
+        .sign(
+            "wallet",
+            &first.id,
+            &fee_payer,
+            None,
+            Some(approvals[0].clone()),
+            200_000,
+        )
+        .await
+        .expect("the first intent owns these bytes");
+
+    let clash = engine
+        .sign(
+            "wallet",
+            &second.id,
+            &fee_payer,
+            None,
+            Some(approvals[1].clone()),
+            200_000,
+        )
+        .await
+        .expect_err("the second must not sign the same message");
+    assert!(
+        clash.to_string().contains("already owns these exact bytes"),
+        "{clash}"
+    );
+    assert!(
+        outbox
+            .signing_attempt(&pending(&outbox, &second.id))
+            .unwrap()
+            .is_none(),
+        "and must not have committed to anything"
+    );
+
+    // Once the cluster moves again the second intent settles on its own bytes,
+    // so two approvals still buy two distinct transfers.
+    *blockhash.lock().unwrap() = [0x6bu8; 32];
+    engine
+        .sign(
+            "wallet",
+            &second.id,
+            &fee_payer,
+            None,
+            Some(approvals[1].clone()),
+            260_000,
+        )
+        .await
+        .expect("a fresh blockhash lets the second intent through");
+    let first_bytes = outbox
+        .signing_attempt(&pending(&outbox, &first.id))
+        .unwrap()
+        .unwrap()
+        .finalized_staged
+        .message_b64;
+    let second_bytes = outbox
+        .signing_attempt(&pending(&outbox, &second.id))
+        .unwrap()
+        .unwrap()
+        .finalized_staged
+        .message_b64;
+    assert_ne!(
+        first_bytes, second_bytes,
+        "two distinct messages, so two distinct signatures and two transfers"
     );
 }

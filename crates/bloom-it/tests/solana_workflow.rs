@@ -25,7 +25,11 @@ use sha2::{Digest as _, Sha256};
 const MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon \
 abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon \
 abandon abandon art";
-const RPC: &str = "http://127.0.0.1:8899";
+/// The local validator's RPC endpoint. Overridable so a run can use its own
+/// validator instead of whatever happens to hold the default port.
+fn rpc_url() -> String {
+    std::env::var("BLOOM_IT_SOLANA_RPC").unwrap_or_else(|_| "http://127.0.0.1:8899".to_string())
+}
 
 fn tok(s: &str) -> Token {
     Token::new(s.to_owned()).unwrap()
@@ -221,7 +225,7 @@ fn rpc(method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
     std::thread::spawn(move || -> Result<serde_json::Value> {
         let body = serde_json::json!({"jsonrpc":"2.0","id":1,"method":method,"params":params});
         let resp: serde_json::Value = reqwest::blocking::Client::new()
-            .post(RPC)
+            .post(rpc_url())
             .json(&body)
             .send()?
             .json()?;
@@ -237,16 +241,16 @@ fn step(n: &str, msg: &str) {
 
 // ------------------------------------------------------------------ main ---
 
-#[tokio::test(flavor = "multi_thread")]
-#[ignore]
-async fn solana_full_stage_confirm_flow() -> Result<()> {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn,bloom_daemon=debug")),
-        )
-        .try_init();
+/// A real Daemon wired to the local validator, with the Solana child derived
+/// from the mnemonic through the production derivation crate.
+struct E2eFixture {
+    daemon: Daemon,
+    broker: Arc<SolanaBroker>,
+    address: String,
+    _tmp: tempfile::TempDir,
+}
 
+async fn e2e_fixture() -> Result<E2eFixture> {
     // 1. Derive the Solana child from the mnemonic, through the production
     //    derivation crate — not a hardcoded fixture key.
     step("1", "derive the Solana account from the BIP-39 mnemonic");
@@ -299,7 +303,7 @@ async fn solana_full_stage_confirm_flow() -> Result<()> {
         SolanaSpec {
             name: "solana-local".into(),
             endpoints: vec![EndpointSpec {
-                url: RPC.into(),
+                url: rpc_url(),
                 weight: 100,
                 cu_per_sec: None,
                 max_rps: None,
@@ -355,6 +359,31 @@ async fn solana_full_stage_confirm_flow() -> Result<()> {
         catalog,
     )
     .map_err(|e| anyhow!("daemon: {e}"))?;
+    Ok(E2eFixture {
+        daemon,
+        broker,
+        address,
+        _tmp: tmp,
+    })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn solana_full_stage_confirm_flow() -> Result<()> {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn,bloom_daemon=debug")),
+        )
+        .try_init();
+
+    step("1-2", "derive the account and build a real Daemon");
+    let E2eFixture {
+        daemon,
+        broker,
+        address,
+        _tmp,
+    } = e2e_fixture().await?;
     println!("    daemon constructed; solana-local admitted by the genesis guard");
 
     // 3. The chain must be enumerable through the VFS.
@@ -589,4 +618,223 @@ async fn solana_full_stage_confirm_flow() -> Result<()> {
     }
     println!("    NO RECEIPT after 45s — reconciler did not finalize");
     Err(anyhow!("reconciliation did not produce a receipt"))
+}
+
+/// The user-visible problem this feature exists for, against a real cluster.
+///
+/// A native SOL transfer's blockhash is honoured for about 150 blocks. A
+/// passkey ceremony that takes longer than that used to leave the owner with
+/// an approval that could never be used: the approved bytes were stale, and a
+/// rebuilt message needed a second ceremony.
+///
+/// Here the staged blockhash is allowed to **actually expire on the
+/// validator** — the test waits until the cluster's block height passes the
+/// staged `lastValidBlockHeight` — before the owner approves. The same entry
+/// and the same approval then sign a freshly stamped message, and it settles.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn solana_slow_approval_survives_real_blockhash_expiry() -> Result<()> {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .try_init();
+
+    step("1", "real Daemon against the local validator");
+    let E2eFixture {
+        daemon,
+        broker,
+        address,
+        _tmp,
+    } = e2e_fixture().await?;
+
+    step("2", "fund the derived account");
+    rpc(
+        "requestAirdrop",
+        serde_json::json!([address, 2_000_000_000u64]),
+    )?;
+    for _ in 0..40 {
+        let bal = rpc("getBalance", serde_json::json!([address]))?["result"]["value"]
+            .as_u64()
+            .unwrap_or(0);
+        if bal >= 2_000_000_000 {
+            println!("    funded: {bal} lamports");
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+
+    step("3", "stage a transfer");
+    let destination = bs58::encode([0xccu8; 32]).into_string();
+    let new_tx = VfsPath::parse("/wallets/alice/chains/solana-local/outbox/new.tx").unwrap();
+    let intent = serde_json::json!({"destination": destination, "lamports": 125_000_000u64});
+    daemon
+        .vfs
+        .write(&new_tx, serde_json::to_vec(&intent)?.as_slice())
+        .await
+        .map_err(|e| anyhow!("stage write: {e}"))?;
+    let pending_dir = VfsPath::parse("/wallets/alice/chains/solana-local/outbox/pending").unwrap();
+    let id = daemon
+        .vfs
+        .list(&pending_dir)
+        .await
+        .map_err(|e| anyhow!("list pending: {e}"))?
+        .first()
+        .ok_or_else(|| anyhow!("no pending entry staged"))?
+        .name
+        .clone();
+    let read_intent = |id: String| {
+        let daemon = &daemon;
+        async move {
+            let bytes = daemon
+                .vfs
+                .read(
+                    &VfsPath::parse(&format!(
+                        "/wallets/alice/chains/solana-local/outbox/pending/{id}/intent.json"
+                    ))
+                    .unwrap(),
+                )
+                .await
+                .map_err(|e| anyhow!("read intent: {e}"))?;
+            Ok::<serde_json::Value, anyhow::Error>(serde_json::from_slice(&bytes)?)
+        }
+    };
+    let staged = read_intent(id.clone()).await?;
+    let staged_blockhash = staged["blockhash"].as_str().unwrap().to_string();
+    let staged_last_valid = staged["last_valid_block_height"].as_u64().unwrap();
+    let staged_message = staged["message_b64"].as_str().unwrap().to_string();
+    println!("    entry {id}");
+    println!("    staged blockhash {staged_blockhash} valid through {staged_last_valid}");
+    assert_eq!(
+        staged["message_normalization"].as_str(),
+        Some("solana_native_transfer_blockhash_v1"),
+        "a new native transfer is staged blockhash-normalized"
+    );
+
+    step("4", "first confirm opens the ceremony and is refused");
+    let confirm = VfsPath::parse(&format!(
+        "/wallets/alice/chains/solana-local/outbox/pending/{id}/confirm"
+    ))
+    .unwrap();
+    let refused = daemon.vfs.write(&confirm, b"y\n").await;
+    assert!(refused.is_err(), "confirm must fail closed before approval");
+    println!("    refused as expected: {}", refused.unwrap_err());
+
+    step(
+        "5",
+        "WAIT for the staged blockhash to actually expire on the validator",
+    );
+    let started = std::time::Instant::now();
+    let mut observed_height = 0u64;
+    for _ in 0..600 {
+        observed_height = rpc("getBlockHeight", serde_json::json!([]))?["result"]
+            .as_u64()
+            .unwrap_or(0);
+        if observed_height > staged_last_valid {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    assert!(
+        observed_height > staged_last_valid,
+        "validator never passed the staged window: {observed_height} <= {staged_last_valid}"
+    );
+    println!(
+        "    cluster height {observed_height} > staged last_valid {staged_last_valid} after {:?}",
+        started.elapsed()
+    );
+    // The staged blockhash is now genuinely unusable: the cluster will reject
+    // a transaction carrying it.
+    let still_valid = rpc(
+        "isBlockhashValid",
+        serde_json::json!([staged_blockhash, {"commitment": "processed"}]),
+    )?["result"]["value"]
+        .as_bool();
+    println!("    isBlockhashValid({staged_blockhash}) = {still_valid:?}");
+    assert_eq!(
+        still_valid,
+        Some(false),
+        "the staged blockhash must actually be expired"
+    );
+
+    step("6", "owner approves late; the same entry and approval sign");
+    broker.approval_active.store(true, Ordering::SeqCst);
+    daemon
+        .vfs
+        .write(&confirm, b"y\n")
+        .await
+        .map_err(|e| anyhow!("confirm after expiry: {e}"))?;
+
+    let sent = daemon
+        .vfs
+        .list(&VfsPath::parse("/wallets/alice/chains/solana-local/outbox/sent").unwrap())
+        .await
+        .map_err(|e| anyhow!("list sent: {e}"))?;
+    let sent_ids: Vec<&str> = sent.iter().map(|e| e.name.as_str()).collect();
+    assert!(
+        sent_ids.contains(&id.as_str()),
+        "the same entry {id} must have been dispatched, got {sent_ids:?}"
+    );
+    println!("    same entry {id} dispatched");
+
+    step(
+        "7",
+        "exactly one message was signed, and it was not the staged one",
+    );
+    let calls = broker.sign_calls.lock().clone();
+    assert_eq!(calls.len(), 1, "exactly one signing request");
+    let signed_payload = calls.last().unwrap().clone();
+    let staged_bytes = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.decode(&staged_message)?
+    };
+    assert_eq!(signed_payload.len(), staged_bytes.len());
+    assert_ne!(
+        signed_payload, staged_bytes,
+        "the signed message must carry a refreshed blockhash"
+    );
+    // Only the blockhash moved.
+    assert_eq!(signed_payload[..100], staged_bytes[..100]);
+    assert_eq!(signed_payload[132..], staged_bytes[132..]);
+    println!(
+        "    signed blockhash {} (staged was {staged_blockhash})",
+        bs58::encode(&signed_payload[100..132]).into_string()
+    );
+
+    step("8", "it settled on chain, once");
+    let mut settled = 0u64;
+    for _ in 0..60 {
+        settled = rpc("getBalance", serde_json::json!([destination]))?["result"]["value"]
+            .as_u64()
+            .unwrap_or(0);
+        if settled > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    assert_eq!(
+        settled, 125_000_000,
+        "the transfer must settle exactly once, for exactly the approved amount"
+    );
+    let receipt = daemon
+        .vfs
+        .read(
+            &VfsPath::parse(&format!(
+                "/wallets/alice/chains/solana-local/outbox/sent/{id}/broadcast_attempted.json"
+            ))
+            .unwrap(),
+        )
+        .await
+        .map_err(|e| anyhow!("read broadcast marker: {e}"))?;
+    let marker: serde_json::Value = serde_json::from_slice(&receipt)?;
+    println!("    signature  {}", marker["signature"]);
+    println!("    blockhash  {}", marker["blockhash"]);
+    assert_ne!(
+        marker["blockhash"].as_str().unwrap(),
+        staged_blockhash,
+        "the landed transaction used the refreshed blockhash"
+    );
+    println!("\n=== SLOW APPROVAL SETTLED AFTER REAL BLOCKHASH EXPIRY ===");
+    Ok(())
 }

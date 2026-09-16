@@ -6639,6 +6639,7 @@ mod tests {
             bloom_broker_api::ApprovalSelector::Exact {
                 ordered_payload_digests: vec![payload_digest.clone()],
                 ordered_hashes: vec![payload_digest],
+                message_normalization: None,
             }
         );
         assert_eq!(
@@ -7418,6 +7419,7 @@ weight = 100
             genesis_hash,
             blockhash: "BLOCKHASH111111111111111111111111111111111111".into(),
             last_valid_block_height: 100,
+            message_normalization: None,
             message_b64: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"m"),
             payload_digest_hex: "ab".repeat(32),
             signature: None,
@@ -7773,6 +7775,7 @@ ws_url = "wss://example.invalid"
             genesis_hash: "GENESIS111111111111111111111111111111111111".into(),
             blockhash: "BLOCKHASH111111111111111111111111111111111111".into(),
             last_valid_block_height: 100,
+            message_normalization: None,
             message_b64: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"m"),
             payload_digest_hex: "ab".repeat(32),
             signature: None,

@@ -393,6 +393,9 @@ impl BrokerExactPayloadSigner {
             claim_assurance_evidence: petal_claim
                 .and_then(|(_, evidence)| evidence.map(<[u8]>::to_vec)),
             approval_value_limits,
+            // Petal and CLI exact signing stays raw; normalization covers only
+            // the native Solana transfer path.
+            message_normalization: None,
         };
         let mut response = self.broker.sign_exact_payload(request.clone()).await;
         if response

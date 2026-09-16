@@ -4113,6 +4113,7 @@ fn exact_evm_sign_request(
         system_use_claim: None,
         claim_assurance_evidence: None,
         approval_value_limits: Vec::new(),
+        message_normalization: None,
     })
 }
 
