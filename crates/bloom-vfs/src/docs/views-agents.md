@@ -1,8 +1,9 @@
 # Bloom views
 
-This directory holds read-only HTML pages meant for a person to open in a
-browser. They render the same facts the surrounding VFS exposes as JSON and
-Markdown; they never introduce a new authority surface.
+This directory holds read-only pages meant for a person to open in a
+browser, plus one Markdown briefing for chat. They render the same facts the
+surrounding VFS exposes as JSON and Markdown; they never introduce a new
+authority surface.
 
 Open one from the mount, for example:
 
@@ -11,8 +12,13 @@ xdg-open ~/bloom/views/index.html    # Linux
 open /Volumes/bloom/views/index.html # macOS
 ```
 
+For chat, quote `briefing.md` — the Today briefing as pasteable Markdown,
+drawn from the same data as `index.html`.
+
 ## Pages
 
+- `briefing.md` — Today for chat: holdings, what needs you, app positions,
+  and recent activity as Markdown to quote into a transcript.
 - `index.html` — Today: what you hold, what needs you, what happened recently.
 - `wallets.html` — every wallet in the current Broker listing, organized by
   projected wallet/account identity. Native balances and Petal positions stay
@@ -52,9 +58,11 @@ open /Volumes/bloom/views/index.html # macOS
 
 ## What to tell a person
 
-Point them at the file path and let the browser render it. Do not paste the
-HTML into a chat transcript, and do not re-render these pages yourself: the
-canonical values live in the sibling JSON leaves
+Point them at the file path and let the browser render it. For anything that
+must be said inside the chat itself, quote `briefing.md` rather than
+summarizing from memory. Do not paste the HTML into a chat transcript, and do
+not re-render these pages yourself: the canonical values live in the sibling
+JSON leaves
 (`wallets/<wallet>/addresses.json`, `wallets/<wallet>/chains/<chain>/balance.json`,
 `outbox/<state>/<action>/intent.json` and `result.json`).
 

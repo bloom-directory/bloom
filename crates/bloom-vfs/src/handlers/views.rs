@@ -1,7 +1,9 @@
-//! `views/...` — read-only HTML pages meant for a person, not an agent.
+//! `views/...` — read-only pages for a person to open, plus one Markdown
+//! briefing for chat. Chat harnesses render Markdown, never raw HTML.
 //!
 //! Paths handled:
 //! - `views/`                 — list the available pages
+//! - `views/briefing.md`      — the Today briefing as pasteable Markdown
 //! - `views/index.html`       — Today: what you hold, what needs you, what
 //!   happened recently
 //! - `views/wallets.html`     — native balances per wallet, with valuation
@@ -18,7 +20,7 @@
 //! - `views/AGENTS.md`        — how an agent should use these pages
 //!
 //! These pages observe. Nothing here stages, approves, or executes an action,
-//! and their only script is a local Networks sorter: the mount serves them as ordinary files, so a
+//! and their only script is the bundled local one (Networks sorter, Receive picker sync): the mount serves them as ordinary files, so a
 //! browser opens one straight off the filesystem. Matching Bloom's visual
 //! language does not make a page a trusted authorization surface — passkeys
 //! and private input stay in Broker's own page.
@@ -57,6 +59,10 @@ const NEXT_MOVES_HTML: &str = "next-moves.html";
 const ACTIVITY_HTML: &str = "activity.html";
 const POLICY_HTML: &str = "policy.html";
 const CONTACTS_HTML: &str = "contacts.html";
+/// The Today briefing as pasteable Markdown: the in-chat half of #114. Kept
+/// out of `PAGES` (whose tests assert whole HTML documents with navigation);
+/// like `FEES_HTML` it is served beside the pages instead.
+const BRIEFING_MD: &str = "briefing.md";
 const BLOOM_CSS_NAME: &str = "bloom.css";
 const BLOOM_JS_NAME: &str = "bloom.js";
 const BLOOM_JS: &str = include_str!("../assets/bloom.js");
@@ -216,7 +222,7 @@ impl ViewsHandler {
             [s] if is_page(s) => s.clone(),
             _ => return Err(HandlerError::NotAFile(path.to_string_path())),
         };
-        let html = match page.as_str() {
+        let rendered = match page.as_str() {
             INDEX_HTML => self.render_index().await,
             MARKETS_HTML => self.render_markets().await,
             CHAINS_HTML => self.render_chains().await,
@@ -227,9 +233,10 @@ impl ViewsHandler {
             ACTIVITY_HTML => self.render_activity().await,
             POLICY_HTML => self.render_policy().await,
             CONTACTS_HTML => self.render_contacts().await,
+            BRIEFING_MD => self.render_briefing().await,
             _ => return Err(HandlerError::NotAFile(path.to_string_path())),
         };
-        Ok(html.into_bytes())
+        Ok(rendered.into_bytes())
     }
 
     async fn list_inner(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
@@ -240,6 +247,9 @@ impl ViewsHandler {
             for (name, _) in PAGES {
                 entries.push(Entry::file(name));
             }
+            // Served but kept out of `PAGES` (see `is_page`): the Markdown
+            // briefing is listed so `ls` and agents can discover it.
+            entries.push(Entry::file(BRIEFING_MD));
             entries.push(Entry::dir(ICONS_DIR));
             Ok(entries)
         } else if path.segments() == [ICONS_DIR] {
@@ -300,7 +310,6 @@ impl ViewsHandler {
                 id: wallet.clone(),
                 address: projection.primary_address().ok().map(str::to_owned),
                 kind: projection.wallet.wallet_kind.as_str().to_owned(),
-                policy_version: projection.wallet.policy_version.as_str().to_owned(),
             });
             if projection.freshness == ProjectionFreshness::Stale {
                 portfolio.stale = true;
@@ -439,7 +448,6 @@ impl ViewsHandler {
                 id: label.clone(),
                 address: Some(from.clone()),
                 kind: "observed address".to_owned(),
-                policy_version: "none projected".to_owned(),
             });
             let (holdings, _) = self.read_balances(&label, address, &chains).await;
             portfolio.holdings.extend(holdings);
@@ -521,7 +529,6 @@ impl ViewsHandler {
                 // The venue denominates equity in dollars itself, so this
                 // needs no quote of ours.
                 value: Some(equity),
-                source: format!("/petals/{path}"),
                 note: "Account equity as the venue reports it, including unrealised profit \
                        and loss. Open position notional is not counted again."
                     .to_owned(),
@@ -582,7 +589,6 @@ impl ViewsHandler {
                     trim_trailing_zeros(&format!("{ether_amount:.18}"))
                 ),
                 value: ether.map(|price| ether_amount * price),
-                source: format!("/petals/privacy-pools/notes/{wallet}/"),
                 note: "Confirmed deposits that have not been withdrawn. Spent and pending \
                        notes are excluded."
                     .to_owned(),
@@ -769,73 +775,193 @@ impl ViewsHandler {
         }
     }
 
+    /// A chain's plain display name for prose contexts. `Action::chain_label`
+    /// returns HTML for the pages; the briefing needs the same name as text.
+    fn action_chain_name(&self, action: &Action) -> String {
+        action
+            .chain
+            .as_deref()
+            .map(|chain| self.network_label(chain))
+            .unwrap_or_else(|| "—".to_owned())
+    }
+
+    /// The Today briefing as pasteable Markdown: the in-chat half of #114.
+    /// Same collectors as `render_index` — headline, allocation, attention,
+    /// app positions, recent activity — restated as plain text with the same
+    /// narrow claims. No QR artwork, icons, charts, or sorter: the sibling
+    /// HTML paths are named as text so the agent can hand them over.
+    async fn render_briefing(&self) -> String {
+        let portfolio = self.portfolio().await;
+        let actions = self.actions().await;
+        let (metric, support, caveat) = balance_headline(&portfolio);
+
+        let mut out = String::from("# Today briefing\n\n");
+        out.push_str("Read-only — nothing here authorizes an action.\n\n");
+        out.push_str(&format!(
+            "**{metric}** — {support}\n\n{cover}\n",
+            metric = md_escape(&metric),
+            support = md_escape(&support),
+            cover = md_escape(&caveat),
+        ));
+        for line in portfolio.coverage_lines() {
+            out.push_str(&format!("> {line}\n", line = md_escape(&line)));
+        }
+        if !portfolio.coverage_lines().is_empty() {
+            out.push('\n');
+        }
+
+        let pending: Vec<&Action> = actions.iter().filter(|a| a.state == "pending").collect();
+        out.push_str("## Needs you\n\n");
+        if pending.is_empty() {
+            out.push_str("Nothing is waiting — no staged operation needs review.\n");
+        } else {
+            out.push_str(&format!(
+                "{moves}:\n",
+                moves = md_escape(&count_noun(
+                    pending.len(),
+                    "staged operation",
+                    "staged operations"
+                ))
+            ));
+            for action in &pending {
+                let blocker = action
+                    .denial
+                    .as_deref()
+                    .map(denial_summary)
+                    .unwrap_or_else(|| "Ready for review in Bloom.".to_owned());
+                out.push_str(&format!(
+                    "- {label} — {headline} ({chain}). {blocker}\n",
+                    label = md_escape(action.label()),
+                    headline = md_escape(&action.headline(&self.address_book)),
+                    chain = md_escape(&self.action_chain_name(action)),
+                    blocker = md_escape(&blocker),
+                ));
+            }
+        }
+        // Stale history is not Today: what never broadcast lives on the
+        // activity page, not in a briefing about right now.
+        out.push('\n');
+
+        let funded = portfolio.funded();
+        let (total, split) = priced_allocation(&funded);
+        out.push_str("## Holdings\n\n");
+        if split.is_empty() {
+            out.push_str("No priced holdings.\n");
+        } else {
+            for (label, value) in &split {
+                let share = if total > 0.0 {
+                    value / total * 100.0
+                } else {
+                    0.0
+                };
+                out.push_str(&format!(
+                    "- {label}: {value} ({share:.1}%)\n",
+                    label = md_escape(label),
+                    value = md_escape(&money(Some(*value))),
+                ));
+            }
+        }
+        let unpriced = funded.iter().filter(|h| h.value.is_none()).count();
+        if unpriced > 0 {
+            out.push_str(&format!(
+                "- {left} (quantities are what the chains reported).\n",
+                left = md_escape(&count_noun(
+                    unpriced,
+                    "holding is unpriced",
+                    "holdings are unpriced"
+                ))
+            ));
+        }
+        // The disclaimer belongs to the group, not to every line: one note
+        // quarantines all of them.
+        let off_market = portfolio.off_market();
+        for holding in &off_market {
+            out.push_str(&format!(
+                "- {symbol} {quantity} on {network}\n",
+                symbol = md_escape(&holding.symbol),
+                quantity = md_escape(&short_quantity(&holding.quantity)),
+                network = md_escape(&holding.label),
+            ));
+        }
+        if !off_market.is_empty() {
+            out.push_str("Faucet and development quantities are real, but are not money.\n");
+        }
+        out.push('\n');
+
+        let addresses = position_addresses(&portfolio, &actions);
+        let positions = self.petal_positions(&addresses).await;
+        if !positions.is_empty() {
+            out.push_str(
+                "## In your apps\n\nReported by Petals; separate from native balances.\n\n",
+            );
+            for position in &positions {
+                if is_development_scope(&position.scope) {
+                    continue;
+                }
+                out.push_str(&format!(
+                    "- {label} — {quantity} ({value}) · {petal}\n",
+                    label = md_escape(&position.label),
+                    quantity = md_escape(&short_quantity_with_unit(&position.quantity)),
+                    value = md_escape(&money(position.value)),
+                    petal = md_escape(&position.petal),
+                ));
+            }
+            let development = positions
+                .iter()
+                .filter(|p| is_development_scope(&p.scope))
+                .count();
+            if development > 0 {
+                out.push_str(&format!(
+                    "- {count} (development records, not production value).\n",
+                    count = md_escape(&count_noun(
+                        development,
+                        "development position",
+                        "development positions"
+                    ))
+                ));
+            }
+            out.push('\n');
+        }
+
+        out.push_str("## Recent activity\n\n");
+        if actions.is_empty() {
+            out.push_str("No activity yet.\n");
+        } else {
+            for action in actions.iter().take(4) {
+                let when = action
+                    .when()
+                    .map(format_utc_ms)
+                    .unwrap_or_else(|| "undated".to_owned());
+                out.push_str(&format!(
+                    "- {label} — {headline} ({chain}, {when})\n",
+                    label = md_escape(action.label()),
+                    headline = md_escape(&action.headline(&self.address_book)),
+                    chain = md_escape(&self.action_chain_name(action)),
+                    when = md_escape(&when),
+                ));
+            }
+        }
+        out.push_str(
+            "\n## Open the dashboard\n\n\
+             Full detail in the browser: `views/index.html` — every page links the rest.\n\n\
+             Broadcast means Bloom submitted the transaction and kept the hash, \
+             not that the chain accepted it.\n",
+        );
+        out
+    }
+
     async fn render_index(&self) -> String {
         let portfolio = self.portfolio().await;
         let actions = self.actions().await;
         let pending = actions.iter().filter(|a| a.state == "pending").count();
 
         let funded = portfolio.funded();
-        let priced: Vec<&&Holding> = funded.iter().filter(|h| h.value.is_some()).collect();
-        let total: f64 = funded.iter().filter_map(|h| h.value).sum();
-        let unpriced = funded.len() - priced.len();
+        let (total, split) = priced_allocation(&funded);
 
         let mut body = String::new();
         body.push_str(&portfolio.notices());
 
-        // A completed set of zero-balance reads has a known dollar value. Keep
-        // a dash for missing reads or funded holdings without a price, but do
-        // not make an answered, empty wallet look unavailable.
-        let (metric, support, caveat) = if portfolio.holdings.is_empty() {
-            (
-                "—".to_owned(),
-                "No balance was read from the configured networks.".to_owned(),
-                "Nothing is counted here yet.".to_owned(),
-            )
-        } else if funded.is_empty() {
-            (
-                "$0.00".to_owned(),
-                format!(
-                    "No native funds on {read} that answered.",
-                    read = count_noun(portfolio.holdings.len(), "network", "networks"),
-                ),
-                "Wallets lists every network that was read, so an empty balance stays \
-                 distinct from one never checked."
-                    .to_owned(),
-            )
-        } else if priced.is_empty() {
-            (
-                "—".to_owned(),
-                format!(
-                    "{held}, none of it priced.",
-                    held = count_noun(funded.len(), "funded holding", "funded holdings"),
-                ),
-                "The quantities are what the chains reported; Wallets explains why each row \
-                 is unpriced."
-                    .to_owned(),
-            )
-        } else {
-            (
-                money(Some(total)),
-                format!(
-                    "Across {wallets} · {priced}",
-                    wallets = count_noun(portfolio.wallets.len(), "wallet", "wallets"),
-                    priced = count_noun(priced.len(), "priced holding", "priced holdings"),
-                ),
-                format!(
-                    "{unpriced} unpriced, and left out of this total. Not your net worth.",
-                    unpriced = count_noun(unpriced, "holding is", "holdings are"),
-                ),
-            )
-        };
-        let mut by_chain: BTreeMap<String, (String, f64)> = BTreeMap::new();
-        for holding in &priced {
-            let entry = by_chain
-                .entry(holding.chain.clone())
-                .or_insert_with(|| (holding.label.clone(), 0.0));
-            entry.1 += holding.value.unwrap_or(0.0);
-        }
-        let mut split: Vec<(String, f64)> = by_chain.into_values().collect();
-        split.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let (metric, support, caveat) = balance_headline(&portfolio);
 
         // An empty wallet needs no allocation chart pretending to be one. The
         // panel only appears once something is priced; otherwise the balance
@@ -859,7 +985,7 @@ impl ViewsHandler {
                 .collect();
                 (
                     format!(
-                        "<div class=\"allocation-panel\"><p class=\"eyebrow\">Allocation</p>\
+                        "<div class=\"allocation-panel\">\
                      <h2>By network</h2><ul class=\"allocation-list\">{rows}</ul></div>"
                     ),
                     "",
@@ -868,7 +994,7 @@ impl ViewsHandler {
 
         if split.is_empty() {
             body.push_str(&format!(
-                "<section class=\"balance-summary\" aria-label=\"Wallet snapshot\"><div><p class=\"eyebrow\">Native balance</p><strong>{metric}</strong><span>{support}</span></div><a href=\"wallets.html\">Wallet details →</a><details><summary>Coverage</summary><p>{caveat}</p></details></section>",
+                "<section class=\"balance-summary\" aria-label=\"Wallet snapshot\"><div><strong>{metric}</strong><span>{support}</span></div><a href=\"wallets.html\">Wallet details →</a><details><summary>Coverage</summary><p>{caveat}</p></details></section>",
                 metric = html_escape(&metric),
                 support = html_escape(&support),
                 caveat = html_escape(&caveat),
@@ -876,7 +1002,7 @@ impl ViewsHandler {
         } else {
             body.push_str(&format!(
                 "<section class=\"wallet-dashboard{class}\" aria-label=\"Wallet snapshot\">\
-                 <div class=\"balance-panel\"><p class=\"eyebrow\">Wallet balances</p>\
+                 <div class=\"balance-panel\">\
                  <div class=\"metric\">{metric}</div><p>{support}</p>\
                  <a class=\"button\" href=\"wallets.html\">Wallet details →</a>\
                  <small>{caveat}</small></div>{dashboard}</section>",
@@ -888,21 +1014,12 @@ impl ViewsHandler {
         }
 
         if pending > 0 {
-            body.push_str(&attention_strip(pending, true));
+            body.push_str(&attention_strip(pending));
         }
         // Wallets reads positions for addresses observed in recorded history
         // as well as projected ones. Use the same coverage here, or the two
         // pages would disagree about what your apps hold.
-        let mut addresses = portfolio
-            .wallets
-            .iter()
-            .filter_map(|w| w.address.clone())
-            .collect::<Vec<_>>();
-        addresses.extend(
-            actions
-                .iter()
-                .filter_map(|action| action.intent.as_ref().and_then(|i| i.from.clone())),
-        );
+        let addresses = position_addresses(&portfolio, &actions);
         let positions = self.petal_positions(&addresses).await;
         if !positions.is_empty() {
             let production: Vec<&PetalPosition> = positions
@@ -929,13 +1046,35 @@ impl ViewsHandler {
             if recent.is_empty() { "<p class=\"empty-state\">No activity yet.</p>".to_owned() } else { format!("<ul class=\"position-list\">{recent}</ul>") }
         ));
 
-        page(
-            "Today",
-            "Overview",
-            "Your balances, app positions, and recent activity.",
-            INDEX_HTML,
-            &body,
-        )
+        // The mount is the navigation: every sibling file, with what it is
+        // for, the way a directory listing with descriptions would read.
+        let index: String = [
+            (BRIEFING_MD, "Today as Markdown — quote it into chat."),
+            (WALLETS_HTML, "Native balances per wallet."),
+            (ACTIVITY_HTML, "Every operation, newest first."),
+            (CHAINS_HTML, "Fees, usage, and your holdings per network."),
+            (MARKETS_HTML, "Public market context — never your holdings."),
+            (NEXT_MOVES_HTML, "Staged operations and what blocks them."),
+            (CONTACTS_HTML, "Saved names and observed recipients."),
+            (RECEIVE_HTML, "Receiving addresses and QR codes."),
+            (POLICY_HTML, "What each wallet may send."),
+            (AGENTS_MD_NAME, "How agents use these pages."),
+        ]
+        .iter()
+        .map(|(file, purpose)| {
+            format!(
+                "<li><a href=\"{file}\"><code>{file}</code></a><span>{purpose}</span></li>",
+                file = html_escape(file),
+                purpose = html_escape(purpose),
+            )
+        })
+        .collect();
+        body.push_str(&format!(
+            "<section><div class=\"section-head\"><h2>In this directory</h2></div>\
+             <ul class=\"directory-index\">{index}</ul></section>"
+        ));
+
+        page("Today", "Overview", "", INDEX_HTML, &body)
     }
 
     async fn render_wallets(&self) -> String {
@@ -977,21 +1116,20 @@ impl ViewsHandler {
             money(Some(total))
         };
         body.push_str(&format!(
-            "<section class=\"inventory-summary\"><div><p class=\"eyebrow\">Wallet inventory</p>\
-             <strong>{count}</strong><span>{coverage}</span></div><div class=\"inventory-value\" {single}>\
+            "<section class=\"inventory-summary\"><div>\
+             <strong>{count}</strong></div><div class=\"inventory-value\" {single}>\
              <strong>{value}</strong><span>Native balances{partial}</span></div></section>",
             count = html_escape(&count_noun(
                 portfolio.wallets.len(),
                 "wallet loaded",
                 "wallets loaded"
             )),
-            coverage = if portfolio.projections_unavailable {
-                "Inventory incomplete: live and cached projections were unavailable."
-            } else {
-                "Available in Bloom · expand a wallet to see its accounts"
-            },
             value = html_escape(&current_native),
-            single = if portfolio.wallets.len() == 1 { "hidden" } else { "" },
+            single = if portfolio.wallets.len() == 1 {
+                "hidden"
+            } else {
+                ""
+            },
             partial = if !portfolio.unavailable.is_empty() || portfolio.price_coverage_gap {
                 " · partial"
             } else {
@@ -999,7 +1137,7 @@ impl ViewsHandler {
             },
         ));
         body.push_str(&portfolio.notices());
-        body.push_str("<p class=\"directory-note\">Only wallets in Bloom’s current listing appear here. Older names and addresses may no longer be connected. Balances cover native coins; token holdings are not scanned.</p><div class=\"wallet-directory\">");
+        body.push_str("<p class=\"directory-note\">Only wallets in Bloom’s current listing. Balances cover native coins; token holdings are not scanned.</p><div class=\"wallet-directory\">");
 
         for wallet in &portfolio.wallets {
             let wallet_funded: Vec<&Holding> = funded
@@ -1052,17 +1190,6 @@ impl ViewsHandler {
                 .iter()
                 .filter(|holding| holding.wallet == wallet.id)
                 .collect();
-            let chain_marks: String = wallet_holdings
-                .iter()
-                .filter(|holding| !holding.is_off_market())
-                .take(8)
-                .map(|holding| network_mark(holding.chain_id, &holding.label))
-                .collect();
-            let explorer_links = wallet
-                .address
-                .as_deref()
-                .map(|address| explorer_links_for_holdings(&wallet_holdings, address))
-                .unwrap_or_default();
             let unavailable_count = portfolio
                 .unavailable
                 .iter()
@@ -1075,16 +1202,13 @@ impl ViewsHandler {
                  <code class=\"wallet-address\">{short_address}</code></span>\
                  <span class=\"wallet-worth\"><strong>{subtitle}</strong><span>Native balance{partial}</span>{apps}</span>\
                  </summary><div class=\"directory-content\"><code class=\"wallet-address\">{address}</code>\
-                 <div class=\"wallet-account-line\"><span class=\"chain-stack\">{chain_marks}</span>\
-                 <span>{answered} networks answered{unavailable}</span></div>\
+                 <p class=\"crumbs\">wallets/{path}/</p>\
+                 <p>{answered} networks answered{unavailable}</p>\
                  <nav class=\"wallet-actions\" aria-label=\"{name} actions\"><a href=\"receive.html#wallet-{id}\">Receive</a>\
-                 <a href=\"policy.html#wallet-{id}\">Policy</a>{explorers}</nav>\
-                 <details><summary>Account evidence</summary><dl class=\"receipt-facts\">\
-                 <div><dt>Address</dt><dd><code>{address}</code></dd></div>\
-                 <div><dt>Wallet kind</dt><dd>{kind}</dd></div>\
-                 <div><dt>Policy</dt><dd>version {version}</dd></div></dl></details>",
+                 <a href=\"policy.html#wallet-{id}\">Policy</a></nav>",
                 id = html_escape(&wallet.id),
                 name = html_escape(&wallet.id),
+                path = html_escape(&wallet.id),
                 subtitle = html_escape(&subtitle),
                 address = html_escape(wallet.address.as_deref().unwrap_or("Unavailable")),
                 short_address = html_escape(&short_hex(wallet.address.as_deref().unwrap_or("Unavailable"))),
@@ -1093,15 +1217,12 @@ impl ViewsHandler {
                     format!("<span>App positions · {}</span>", html_escape(&money(production_positions.iter().map(|p| p.value).collect::<Option<Vec<_>>>().map(|values| values.iter().sum()))))
                 },
                 kind = html_escape(&wallet.kind),
-                version = html_escape(&wallet.policy_version),
-                chain_marks = chain_marks,
                 answered = wallet_holdings.len(),
                 unavailable = if unavailable_count == 0 {
                     String::new()
                 } else {
                     format!(" · {unavailable_count} unavailable")
                 },
-                explorers = explorer_links,
             ));
 
             if !wallet_funded.is_empty() {
@@ -1117,35 +1238,27 @@ impl ViewsHandler {
             if !wallet_off_market.is_empty() {
                 body.push_str(&format!(
                     "<details><summary>Test and development balances · {count}</summary>\
-                     <p>Quantities here are not money: these chains have no market for their \
-                     native unit.</p>{table}</details>",
+                     {table}</details>",
                     count = wallet_off_market.len(),
                     table = holdings_table(
                         &wallet_off_market,
-                        "Balances on chains with no market for their native unit",
+                        "Balances on chains with no market for their native unit. \
+                         Quantities here are not money.",
                     ),
                 ));
             }
 
             // An empty network is reported, not dropped: otherwise "you hold
             // nothing on Base" is indistinguishable from "Base was not read".
+            // The count carries that distinction; the names add nothing.
             if !wallet_empty.is_empty() {
-                let chips: String = wallet_empty
-                    .iter()
-                    .map(|holding| {
-                        format!(
-                            "<li>{}</li>",
-                            asset_label_with(
-                                network_mark(holding.chain_id, &holding.label),
-                                &holding.label
-                            )
-                        )
-                    })
-                    .collect();
                 body.push_str(&format!(
-                    "<details><summary>Empty networks · {count}</summary>\
-                     <ul class=\"receiving-networks\">{chips}</ul></details>",
-                    count = wallet_empty.len(),
+                    "<p class=\"muted\">Empty on {}.</p>",
+                    html_escape(&count_noun(
+                        wallet_empty.len(),
+                        "read network",
+                        "read networks"
+                    )),
                 ));
             }
             if !production_positions.is_empty() {
@@ -1188,7 +1301,6 @@ impl ViewsHandler {
                 }
                 let total: f64 = rows.iter().filter_map(|holding| holding.value).sum();
                 let address = summary.address.as_deref().unwrap_or("Unavailable");
-                let links = explorer_links_for_holdings(&rows, address);
                 let account_positions: Vec<&PetalPosition> = positions
                     .iter()
                     .filter(|position| position_belongs_to_wallet(position, summary))
@@ -1196,12 +1308,12 @@ impl ViewsHandler {
                 body.push_str(&format!(
                     "<details class=\"historical-account directory-entry\"><summary class=\"directory-row\">\
                      <span class=\"directory-icon\" aria-hidden=\"true\">↗</span>\
-                     <span class=\"directory-identity\"><strong>{id}</strong><span>Observed address · control unverified</span>\
+                     <span class=\"directory-identity\"><strong>{id}</strong>\
                      <code class=\"wallet-address\">{short_address}</code></span>\
                      <span class=\"wallet-worth\"><strong>{total}</strong><span>Observed native balance</span>{apps}</span>\
                      </summary><div class=\"directory-content\"><code class=\"wallet-address\">{address}</code>\
                      <p>Seen as a sender in recorded activity. No current Broker projection proves control. App positions are shown separately from native balances.</p>\
-                     <div class=\"wallet-actions\">{links}</div>{table}{positions}</div></details>",
+                     {table}{positions}</div></details>",
                     id = html_escape(&summary.id),
                     address = html_escape(address),
                     short_address = html_escape(&short_hex(address)),
@@ -1214,7 +1326,6 @@ impl ViewsHandler {
                         "No priced balance".to_owned()
                     }),
                     table = holdings_table(&rows, "Observed balances"),
-                    links = links,
                     positions = if account_positions.is_empty() {
                         String::new()
                     } else {
@@ -1271,25 +1382,56 @@ impl ViewsHandler {
             );
         }
 
+        // One wallet first, then its code: a native radio picker switches the
+        // visible panel with no script at all. A single wallet needs no
+        // picker, so the choice only renders when there is one to make.
         let mut stale = false;
-        for wallet in &wallets {
+        let mut options = String::new();
+        let mut panels = String::new();
+        for (n, wallet) in wallets.iter().enumerate() {
             if wallet.freshness == ProjectionFreshness::Stale {
                 stale = true;
             }
-            body.push_str(&self.render_wallet_section(wallet, &mainnets, &testnets));
+            let id = wallet.wallet_id();
+            options.push_str(&format!(
+                "<input type=\"radio\" name=\"wallet\" id=\"pick-{id}\" value=\"{id}\"{checked}>\
+                 <label for=\"pick-{id}\">{id}</label>",
+                id = html_escape(id.as_str()),
+                checked = if n == 0 { " checked" } else { "" },
+            ));
+            panels.push_str(&self.render_wallet_section(wallet, &mainnets, &testnets));
+        }
+        if wallets.len() > 1 {
+            // The radios sit beside the panels (not wrapped) so a plain
+            // sibling selector can switch them with no script and no `:has`.
+            let mut rules = String::new();
+            for wallet in &wallets {
+                rules.push_str(&format!(
+                    "#pick-{id}:checked ~ .receiving-panels #wallet-{id} {{display:block}}",
+                    id = html_escape(wallet.wallet_id().as_str()),
+                ));
+            }
+            body.push_str(&format!(
+                "<div class=\"receive-shell has-picker\" role=\"radiogroup\" aria-label=\"Wallet\" data-wallet-picker>\
+                 {options}\
+                 <style>{rules}</style>\
+                 <div class=\"receiving-panels\">{panels}</div></div>"
+            ));
+        } else {
+            body.push_str(&panels);
         }
         if stale {
             body.push_str(&stale_notice());
         }
 
-        page(
-            "Receive",
-            "Receive",
-            "Scan a wallet's address, or copy it. Select the matching network in the sending \
-             wallet: the code encodes an address, not a network.",
-            RECEIVE_HTML,
-            &body,
-        )
+        // The one safety sentence lives here, once, instead of repeating
+        // under every wallet: a code encodes an address, never a network.
+        body.insert_str(
+            0,
+            "<p class=\"callout\">The code encodes an address, not a network — \
+             select the matching network in the sending wallet.</p>",
+        );
+        page("Receive", "Receive", "", RECEIVE_HTML, &body)
     }
 
     fn render_wallet_section(
@@ -1299,24 +1441,15 @@ impl ViewsHandler {
         testnets: &[String],
     ) -> String {
         let id = wallet.wallet_id().as_str();
-        let (mut card, mut addresses) = match wallet
+        let mut card = match wallet
             .primary_address()
             .ok()
             .filter(|address| address.parse::<alloy::primitives::Address>().is_ok())
         {
-            Some(address) => (
-                self.render_address_card(id, address, mainnets, testnets),
-                1usize,
-            ),
-            None => (
-                format!(
-                    "<article class=\"card receiving-card\"><p class=\"eyebrow\">{} · \
-                         receiving address</p><h3>Ethereum &amp; EVM</h3><p>No EVM receiving address in this wallet’s projection.\
-                         </p></article>",
-                    html_escape(id)
-                ),
-                0usize,
-            ),
+            Some(address) => self.render_address_card(address, mainnets, testnets),
+            None => "<article class=\"card receiving-card\"><h3>Ethereum &amp; EVM</h3><p>No EVM receiving address in this wallet’s projection.\
+                         </p></article>"
+                .to_owned(),
         };
         let mut solana_addresses = std::collections::BTreeSet::new();
         for key in &wallet.keys {
@@ -1351,7 +1484,6 @@ impl ViewsHandler {
             ));
         }
         for address in solana_addresses {
-            addresses += 1;
             card.push_str(&format!(
                 "<article class=\"card receiving-card\"><h3>{mark}</h3>{qr}\
                  <code class=\"address\">{address}</code>\
@@ -1362,49 +1494,42 @@ impl ViewsHandler {
                 address = html_escape(address),
             ));
         }
-        let subtitle = match addresses {
-            0 => "No receiving address".to_owned(),
-            1 => "1 receiving address".to_owned(),
-            n => format!("{n} receiving addresses"),
-        };
         format!(
             "<section class=\"receiving-wallet\" id=\"wallet-{id_attr}\" aria-label=\"{id_attr} receiving addresses\">\
-             <div class=\"section-head\"><h2>{id_text}</h2><p>{subtitle}</p></div>\
+             <div class=\"section-head\"><h2>{id_text}</h2></div>\
              <div class=\"grid\">{card}</div></section>",
             id_attr = html_escape(id),
             id_text = html_escape(id),
-            subtitle = html_escape(&subtitle),
         )
     }
 
     fn render_address_card(
         &self,
-        wallet: &str,
         address: &str,
         mainnets: &[String],
         testnets: &[String],
     ) -> String {
-        let chips: String = mainnets
+        // One sentence names every network; a chip per network repeated the
+        // same address thirteen times without adding meaning.
+        let names: Vec<String> = mainnets
             .iter()
-            .map(|name| {
-                let label = self.network_label(name);
-                let mark = self
-                    .chains
-                    .get(name)
-                    .map(|client| network_mark(client.spec().chain_id, &label))
-                    .unwrap_or_else(|| monogram(&label));
-                format!("<li>{}</li>", asset_label_with(mark, &label))
-            })
+            .map(|name| self.network_label(name))
             .collect();
-        let networks = if chips.is_empty() {
-            "<p class=\"receiving-network\">No networks are configured for this address yet.</p>"
-                .to_owned()
-        } else {
-            format!(
-                "<ul class=\"receiving-networks\">{chips}</ul>\
-                 <p class=\"receiving-network\">One address across these networks. Funds stay \
-                 on the network the sender chooses.</p>"
-            )
+        let networks = match names.as_slice() {
+            [] => "<p class=\"receiving-network\">No networks are configured for this address yet.</p>"
+                .to_owned(),
+            [only] => format!(
+                "<p class=\"receiving-network\">One address on {}.</p>",
+                html_escape(only)
+            ),
+            _ => {
+                let (last, rest) = names.split_last().expect("at least two networks");
+                format!(
+                    "<p class=\"receiving-network\">One address across {} and {}.</p>",
+                    html_escape(&rest.join(", ")),
+                    html_escape(last),
+                )
+            }
         };
         let testing = if testnets.is_empty() {
             String::new()
@@ -1422,14 +1547,13 @@ impl ViewsHandler {
         };
 
         // Inline QR artwork travels with a saved page and always encodes the
-        // exact displayed address, including non-primary accounts.
+        // exact displayed address, including non-primary accounts. The
+        // section heading already names the wallet, so the card is only the
+        // code, the address, and where it works.
         format!(
-            "<article class=\"card receiving-card\"><p class=\"eyebrow\">{wallet} · receiving \
-             address</p><h3>{mark}</h3>{qr}\
+            "<article class=\"card receiving-card\">{qr}\
              <code class=\"address\">{address}</code><div class=\"receiving-network-list\">\
-             <p class=\"label\">Networks for this address</p>{networks}{testing}</div></article>",
-            wallet = html_escape(wallet),
-            mark = asset_label_with(monogram("ETH"), "Ethereum & EVM"),
+             {networks}{testing}</div></article>",
             qr = receiving_qr(address),
             address = html_escape(address),
         )
@@ -1446,7 +1570,7 @@ impl ViewsHandler {
             body.push_str("<p class=\"empty-state\">Nothing needs you right now.</p>");
         } else {
             body.push_str(&format!(
-                "<div class=\"section-head\"><h2>{}</h2><p>Current actions</p></div>",
+                "<div class=\"section-head\"><h2>{}</h2></div>",
                 count_noun(pending.len(), "next move", "next moves")
             ));
             let rows: String = pending
@@ -1472,13 +1596,7 @@ impl ViewsHandler {
             ));
         }
 
-        page(
-            "Next moves",
-            "Next moves",
-            "Pending actions and their blockers.",
-            NEXT_MOVES_HTML,
-            &body,
-        )
+        page("Next moves", "Next moves", "", NEXT_MOVES_HTML, &body)
     }
 
     async fn render_activity(&self) -> String {
@@ -1686,6 +1804,16 @@ impl ViewsHandler {
             );
             return page("Networks", "Networks", "", CHAINS_HTML, &body);
         }
+        // When the provider answers nothing, thirteen identical
+        // "unavailable" footnotes say less than one banner.
+        let blind = networks
+            .iter()
+            .all(|(_, _, _, volume, fees)| volume.is_none() && fees.is_none());
+        if blind {
+            body.push_str(
+                "<p class=\"coverage\">Fee and market history unavailable — the provider did not answer.</p>",
+            );
+        }
         body.push_str("<p class=\"coverage\">Network-wide totals · USD</p>");
         body.push_str("<section class=\"network-list\" data-network-list aria-label=\"Network comparison\"><div class=\"network-columns\" role=\"group\" aria-label=\"Sort networks\"><button type=\"button\" data-sort=\"name\" aria-pressed=\"false\">Network <span aria-hidden=\"true\">↕</span></button><button type=\"button\" data-sort=\"fees-all\" aria-pressed=\"true\" data-direction=\"desc\">Fees · all time <span aria-hidden=\"true\">↓</span></button><button type=\"button\" data-sort=\"fees-day\" aria-pressed=\"false\">Fees · 24h <span aria-hidden=\"true\">↕</span></button><button type=\"button\" data-sort=\"dex-day\" aria-pressed=\"false\">DEX volume · 24h <span aria-hidden=\"true\">↕</span></button></div><p class=\"sort-status\" aria-live=\"polite\">Sorted by Fees · all time, descending.</p><div data-network-rows>");
         for (chain, chain_id, slug, volume, fees) in networks {
@@ -1713,9 +1841,15 @@ impl ViewsHandler {
                         "USD / day"
                     ),
                 ),
-                None => "<div class=\"network-detail\"><p class=\"chart-note\">Fee history is \
+                // When only some networks lack history the gap still varies
+                // per row and stays visible; when none have any, the banner
+                // above already said so.
+                None if !blind => {
+                    "<div class=\"network-detail\"><p class=\"chart-note\">Fee history is \
                      unavailable for this network.</p></div>"
-                    .to_owned(),
+                        .to_owned()
+                }
+                None => String::new(),
             };
             let fees_all = fees.as_ref().and_then(|f| f.total_all_time);
             let fees_day = fees.as_ref().and_then(|f| f.total_24h);
@@ -1730,8 +1864,20 @@ impl ViewsHandler {
                 "Wallet account unavailable".to_owned()
             };
             let source = slug.map(network_source_link).unwrap_or_default();
+            // Same rule as the history footnote: a per-row "not available"
+            // only means something when other rows have values.
+            let change = match &volume {
+                Some(series) => format!(
+                    "<span>DEX volume change · 24h <strong>{}</strong></span>",
+                    signed_percent(series.change_1d)
+                ),
+                None if blind => String::new(),
+                None => {
+                    "<span>DEX volume change · 24h <strong>Not available</strong></span>".to_owned()
+                }
+            };
             body.push_str(&format!(
-                "<details class=\"network-row\" data-name=\"{name_raw}\" data-fees-all=\"{fees_all_raw}\" data-fees-day=\"{fees_day_raw}\" data-dex-day=\"{dex_day_raw}\"><summary><span class=\"network-name\">{label}</span><span class=\"network-number\"><small>All-time fees</small><strong>{all}</strong></span><span class=\"network-number\"><small>24h fees</small>{day}</span><span class=\"network-number\"><small>24h DEX volume</small>{volume}</span></summary><div class=\"network-context\"><span>Your priced native assets <strong>{held}</strong></span><span>DEX volume change · 24h <strong>{change}</strong></span>{source}</div>{history}</details>",
+                "<details class=\"network-row\" data-name=\"{name_raw}\" data-fees-all=\"{fees_all_raw}\" data-fees-day=\"{fees_day_raw}\" data-dex-day=\"{dex_day_raw}\"><summary><span class=\"network-name\">{label}</span><span class=\"network-number\"><small>All-time fees</small><strong>{all}</strong></span><span class=\"network-number\"><small>24h fees</small>{day}</span><span class=\"network-number\"><small>24h DEX volume</small>{volume}</span></summary><div class=\"network-context\"><span>Your priced native assets <strong>{held}</strong></span>{change}{source}</div>{history}</details>",
                 name_raw = html_escape(&label.to_ascii_lowercase()),
                 fees_all_raw = optional_number_attribute(fees_all),
                 fees_day_raw = optional_number_attribute(fees_day),
@@ -1741,7 +1887,7 @@ impl ViewsHandler {
                 day = total(fees_day),
                 volume = total(dex_day),
                 held = html_escape(&held),
-                change = signed_percent(volume.as_ref().and_then(|v| v.change_1d)),
+                change = change,
                 source = source,
             ));
         }
@@ -1780,7 +1926,6 @@ impl ViewsHandler {
             });
             entry.count += 1;
             entry.last_ms = entry.last_ms.max(action.when());
-            entry.operations.push((action.id.clone(), action.label()));
         }
 
         let mut history: Vec<&RecipientHistory> = recipients.values().collect();
@@ -1827,7 +1972,7 @@ impl ViewsHandler {
             })
             .collect();
         body.push_str(&format!(
-            "<section><div class=\"section-head\"><h2>Suggested contacts</h2><p>Repeated recipients</p></div>{suggestions}</section>",
+            "<section><div class=\"section-head\"><h2>Suggested contacts</h2></div>{suggestions}</section>",
             suggestions = if suggestions.is_empty() {
                 "<p class=\"empty-state\">No unnamed recipient appears more than once.</p>".to_owned()
             } else {
@@ -1852,23 +1997,31 @@ impl ViewsHandler {
             ));
         }
         if contract_targets > 0 || unknown_targets > 0 {
+            // Name only what exists: a zero clause ("and 0 unclassified")
+            // answers a question nobody asked.
+            let mut kinds = Vec::new();
+            if contract_targets > 0 {
+                kinds.push(count_noun(
+                    contract_targets,
+                    "contract-call target",
+                    "contract-call targets",
+                ));
+            }
+            if unknown_targets > 0 {
+                kinds.push(count_noun(
+                    unknown_targets,
+                    "unclassified target",
+                    "unclassified targets",
+                ));
+            }
             body.push_str(&format!(
-                "<details><summary>Excluded targets · {count}</summary><p>{contracts} contract-call {contract_noun} and {unknown} unclassified {unknown_noun} were not suggested as contacts. A call target is not necessarily its recipient; unknown stays unknown.</p></details>",
+                "<details><summary>Excluded targets · {count}</summary><p>{kinds} were not suggested as contacts. A call target is not necessarily its recipient; unknown stays unknown.</p></details>",
                 count = contract_targets + unknown_targets,
-                contracts = contract_targets,
-                contract_noun = if contract_targets == 1 { "target" } else { "targets" },
-                unknown = unknown_targets,
-                unknown_noun = if unknown_targets == 1 { "target" } else { "targets" },
+                kinds = html_escape(&kinds.join(" and ")),
             ));
         }
 
-        page(
-            "Contacts",
-            "Contacts",
-            "Named contacts and recipients proven by recorded transfers.",
-            CONTACTS_HTML,
-            &body,
-        )
+        page("Contacts", "Contacts", "", CONTACTS_HTML, &body)
     }
 
     async fn render_policy(&self) -> String {
@@ -1883,6 +2036,10 @@ impl ViewsHandler {
                  be shown. Authority operations remain fail-closed.</p></section>",
             );
         }
+        // Said once per page instead of under every wallet: listing is a
+        // prerequisite, never a permission, and token approvals are outside
+        // this projection entirely.
+        body.push_str("<p class=\"directory-note\">A listed address and app are prerequisites, not permission to execute. Bloom still checks the exact request and available funds before asking for approval. External token approvals are outside this projection.</p>");
         let mut stale = false;
         for wallet in &wallets {
             if wallet.freshness == ProjectionFreshness::Stale {
@@ -1908,21 +2065,11 @@ impl ViewsHandler {
                             .map(|client| network_mark(client.spec().chain_id, &label))
                             .unwrap_or_else(|| monogram(&label));
                         let name = address_alias(&self.address_book, address);
-                        let explorer = client
-                            .as_ref()
-                            .and_then(|client| explorer_address_url(client.spec().chain_id, address))
-                            .map(|url| format!(
-                                "<a class=\"external-link\" href=\"{}\" rel=\"noreferrer noopener\">View address ↗</a>",
-                                html_escape(&url),
-                            ))
-                            .unwrap_or_default();
                         format!(
-                            "<article class=\"policy-exception\"><div>{network}<span class=\"badge good\">Listed destination</span></div><h3>{contact}</h3><code>{address}</code>{explorer}<p>This address passes the destination check on {chain}. The app, request, available funds, and approval window are checked separately.</p></article>",
+                            "<article class=\"policy-exception\"><div>{network}<span class=\"badge good\">Listed destination</span></div><h3>{contact}</h3><code>{address}</code></article>",
                             network = asset_label_with(mark, &label),
                             contact = html_escape(name.unwrap_or("Unnamed destination")),
                             address = html_escape(address),
-                            explorer = explorer,
-                            chain = html_escape(&label),
                         )
                     })
                 })
@@ -1932,16 +2079,6 @@ impl ViewsHandler {
                 .iter()
                 .filter(|chain| !destinations.contains_key(*chain))
                 .count();
-            let packages: String = policy
-                .allowed_petal_packages
-                .iter()
-                .map(|package| {
-                    format!(
-                        "<li><code>{}</code></li>",
-                        html_escape(&package.to_string())
-                    )
-                })
-                .collect();
             let destinations_label = if total == 0 {
                 "No listed destination".to_owned()
             } else {
@@ -1972,14 +2109,12 @@ impl ViewsHandler {
                 format!("{denied_networks} other configured networks have no listed destination.");
             body.push_str(&format!(
                 "<section id=\"wallet-{name}\"><div class=\"section-head\"><h2>{name}</h2>\
-                 <p>Policy version {version} · {kind}</p></div>\
+                 <p>Policy version {version}</p></div>\
                  <p class=\"policy-summary\">{summary}</p>{rows}\
                  <dl class=\"policy-limits\"><div><dt>Where it may send</dt><dd>{destinations}</dd></div><div><dt>Allowed app</dt><dd>{app_access}</dd></div><div><dt>Amount cap</dt><dd>None expressed here</dd></div><div><dt>Approval window</dt><dd>Up to {lifetime}</dd></div></dl>\
-                 <p class=\"policy-plain\">A listed address and app are prerequisites, not permission to execute. Bloom still checks the exact request and available funds before asking for approval. {verifier_text} {other_networks}</p>\
-                 <details><summary>Exact policy and scope</summary><p>The canonical signed policy is at <code>{path}</code>. Allowed app package fingerprints:</p><ul class=\"exact-list\">{packages}</ul><p>External token approvals are outside this projection.</p></details></section>",
+                 <p class=\"policy-plain\">{verifier_text} {other_networks}</p></section>",
                 name = html_escape(id),
                 version = html_escape(wallet.wallet.policy_version.as_str()),
-                kind = html_escape(wallet.wallet.wallet_kind.as_str()),
                 summary = html_escape(&if total == 0 {
                     "No destination is permitted by this policy.".to_owned()
                 } else {
@@ -2002,21 +2137,13 @@ impl ViewsHandler {
                 app_access = app_access,
                 verifier_text = verifier_text,
                 other_networks = other_networks,
-                path = html_escape(&format!("/wallets/{id}/policy.json")),
-                packages = packages,
             ));
         }
         if stale {
             body.push_str(&stale_notice());
         }
 
-        page(
-            "Policy",
-            "Policy",
-            "Where each wallet may send, which app may ask, and how long approval may last.",
-            POLICY_HTML,
-            &body,
-        )
+        page("Policy", "Policy", "", POLICY_HTML, &body)
     }
 }
 
@@ -2029,7 +2156,6 @@ struct PetalPosition {
     owner: Option<String>,
     quantity: String,
     value: Option<f64>,
-    source: String,
     note: String,
     url: Option<String>,
 }
@@ -2048,7 +2174,7 @@ fn petal_position_rows(positions: &[&PetalPosition]) -> String {
         .iter()
         .map(|position| {
             format!(
-                "<li>{mark}<span><strong>{label}</strong><small>{petal} · {scope} · {quantity}</small>{link}<details><summary>Position evidence</summary><p>{note}</p><code>{source}</code></details></span><strong>{value}</strong></li>",
+                "<li>{mark}<span><strong>{label}</strong><small>{petal} · {scope} · {quantity}</small>{link}<details><summary>Position evidence</summary><p>{note}</p></details></span><strong>{value}</strong></li>",
                 mark = monogram(&position.petal),
                 label = html_escape(&position.label),
                 petal = html_escape(&position.petal),
@@ -2059,7 +2185,6 @@ fn petal_position_rows(positions: &[&PetalPosition]) -> String {
                     html_escape(url),
                 )).unwrap_or_default(),
                 note = html_escape(&position.note),
-                source = html_escape(&position.source),
                 value = html_escape(&money(position.value)),
             )
         })
@@ -2098,7 +2223,6 @@ struct WalletSummary {
     id: String,
     address: Option<String>,
     kind: String,
-    policy_version: String,
 }
 
 fn position_belongs_to_wallet(position: &PetalPosition, wallet: &WalletSummary) -> bool {
@@ -2112,54 +2236,12 @@ fn position_belongs_to_wallet(position: &PetalPosition, wallet: &WalletSummary) 
             .is_some_and(|address| owner.eq_ignore_ascii_case(address))
 }
 
-fn explorer_links_for_holdings(holdings: &[&Holding], address: &str) -> String {
-    let mut networks = BTreeMap::new();
-    for holding in holdings {
-        if explorer_address_url(holding.chain_id, address).is_some() {
-            networks
-                .entry(holding.chain_id)
-                .or_insert_with(|| holding.label.clone());
-        }
-    }
-    networks
-        .into_iter()
-        .take(4)
-        .filter_map(|(chain_id, label)| {
-            explorer_address_url(chain_id, address).map(|url| {
-                format!(
-                    "<a class=\"external-link\" href=\"{}\" rel=\"noreferrer noopener\">{} ↗</a>",
-                    html_escape(&url),
-                    html_escape(&label),
-                )
-            })
-        })
-        .collect()
-}
-
 #[derive(Default)]
 struct RecipientHistory {
     chain: String,
     address: String,
     count: usize,
     last_ms: Option<u64>,
-    operations: Vec<(String, &'static str)>,
-}
-
-fn activity_links(items: &[&RecipientHistory]) -> String {
-    let links: String = items
-        .iter()
-        .flat_map(|item| item.operations.iter())
-        .take(6)
-        .map(|(id, state)| {
-            format!(
-                "<li><a href=\"activity.html#operation-{id}\">{state} · {short}</a></li>",
-                id = html_escape(id),
-                state = html_escape(state),
-                short = html_escape(&short_hex(id)),
-            )
-        })
-        .collect();
-    format!("<ul class=\"contact-links\">{links}</ul>")
 }
 
 fn saved_contact_row(
@@ -2172,26 +2254,25 @@ fn saved_contact_row(
     let last = history.iter().filter_map(|item| item.last_ms).max();
     let networks: BTreeSet<&str> = history.iter().map(|item| item.chain.as_str()).collect();
     format!(
-        "<article class=\"contact-row\"><div><span class=\"badge good\">Saved</span><h3>{name}</h3><p>{networks}</p></div><div class=\"contact-stats\"><span><strong>{count}</strong> transfers</span><span>{last}</span></div><details><summary>Address and activity</summary><code>{address}</code><div class=\"quiet-links\">{explorers}</div>{links}</details></article>",
+        "<article class=\"contact-row\"><div><span class=\"badge good\">Saved</span><h3>{name}</h3><p>{networks}</p></div><div class=\"contact-stats\"><span>{count}</span><span>{last}</span></div><details><summary>Address</summary><code>{address}</code><div class=\"quiet-links\">{explorers}</div></details></article>",
         name = html_escape(name),
         networks = html_escape(&if networks.is_empty() {
             "All EVM networks · no recorded transfer".to_owned()
         } else {
             networks.into_iter().collect::<Vec<_>>().join(", ")
         }),
-        count = count,
+        count = html_escape(&count_noun(count, "transfer", "transfers")),
         last = last
             .map(format_utc_ms)
             .unwrap_or_else(|| "No activity".to_owned()),
         address = html_escape(address),
         explorers = explorers,
-        links = activity_links(history),
     )
 }
 
 fn contact_history_row(item: &RecipientHistory, suggested: bool, explorers: &str) -> String {
     format!(
-        "<article class=\"contact-row\"><div>{badge}<h3>{address}</h3><p>{chain}</p></div><div class=\"contact-stats\"><span><strong>{count}</strong> transfers</span><span>{last}</span></div><details><summary>Full address and activity</summary><code>{full}</code><div class=\"quiet-links\">{explorers}</div>{links}</details></article>",
+        "<article class=\"contact-row\"><div>{badge}<h3>{address}</h3><p>{chain}</p></div><div class=\"contact-stats\"><span>{count}</span><span>{last}</span></div><details><summary>Address</summary><code>{full}</code><div class=\"quiet-links\">{explorers}</div></details></article>",
         badge = if suggested {
             "<span class=\"badge\">Suggested</span>"
         } else {
@@ -2199,14 +2280,13 @@ fn contact_history_row(item: &RecipientHistory, suggested: bool, explorers: &str
         },
         address = html_escape(&short_hex(&item.address)),
         chain = html_escape(&item.chain),
-        count = item.count,
+        count = html_escape(&count_noun(item.count, "transfer", "transfers")),
         last = item
             .last_ms
             .map(format_utc_ms)
             .unwrap_or_else(|| "Time unavailable".to_owned()),
         full = html_escape(&item.address),
         explorers = explorers,
-        links = activity_links(&[item]),
     )
 }
 
@@ -2263,11 +2343,12 @@ fn holdings_table(rows: &[&Holding], caption: &str) -> String {
                  <td data-label=\"Network\">{label}</td>\
                  <td class=\"numeric money\" data-label=\"Value\">{value}</td>\
                  <td data-label=\"Evidence\"><details><summary>Details</summary>\
-                 <p>{note}</p><p>Exact quantity: <code>{exact}</code></p>\
-                 <p><code>{source}</code></p></details></td></tr>",
+                 <p>{note}</p><p>Exact quantity: <code>{exact}</code></p></details></td></tr>",
                 // An off-market unit keeps initials even when its spelling is
                 // familiar: the logo belongs to the traded asset, not to a
-                // development chain that borrowed the name.
+                // development chain that borrowed the name. The source leaf
+                // stays out of this person-facing table: agents already know
+                // where the canonical values live.
                 mark = asset_mark(&holding.symbol, !holding.is_off_market()),
                 symbol = html_escape(&holding.symbol),
                 quantity = html_escape(&short_quantity(&holding.quantity)),
@@ -2278,10 +2359,6 @@ fn holdings_table(rows: &[&Holding], caption: &str) -> String {
                 ),
                 value = html_escape(&money(holding.value)),
                 note = html_escape(&holding.note()),
-                source = html_escape(&format!(
-                    "/wallets/{}/chains/{}/balance.json",
-                    holding.wallet, holding.chain
-                )),
             )
         })
         .collect();
@@ -2358,6 +2435,141 @@ impl Portfolio {
         }
         out
     }
+
+    /// One-line coverage notes in plain text, mirroring `notices()` for the
+    /// chat briefing. Same fields, same rules, no markup.
+    fn coverage_lines(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.projections_unavailable {
+            out.push(
+                "Wallet data unavailable — no cached wallet data. Reload when Broker is available."
+                    .to_owned(),
+            );
+        }
+        if !self.unavailable.is_empty() {
+            let mut names: Vec<&str> = self
+                .unavailable
+                .iter()
+                .map(|(_, chain)| chain.as_str())
+                .collect();
+            names.sort();
+            names.dedup();
+            out.push(format!(
+                "Partial balance coverage: {} unavailable and excluded from totals.",
+                names.join(", ")
+            ));
+        }
+        if self.price_coverage_gap {
+            out.push(
+                "Some prices are missing: a quote was unavailable or older than an hour, \
+                 so those rows stay unpriced instead of carrying a stale valuation."
+                    .to_owned(),
+            );
+        }
+        if self.stale {
+            out.push(
+                "Some projections are stale: at least one wallet comes from cached data \
+                 rather than a live Broker read. Confirm in Bloom before acting on it."
+                    .to_owned(),
+            );
+        }
+        out
+    }
+}
+
+/// The holdings headline shared by the Today page and the chat briefing, so
+/// the two surfaces cannot disagree about what you hold. A completed set of
+/// zero-balance reads has a known dollar value: a dash for missing reads or
+/// funded holdings without a price, but an answered, empty wallet never
+/// looks unavailable.
+fn balance_headline(portfolio: &Portfolio) -> (String, String, String) {
+    let funded = portfolio.funded();
+    let priced = funded.iter().filter(|h| h.value.is_some()).count();
+    let total: f64 = funded.iter().filter_map(|h| h.value).sum();
+    let unpriced = funded.len() - priced;
+    if portfolio.holdings.is_empty() {
+        (
+            "—".to_owned(),
+            "No balance was read from the configured networks.".to_owned(),
+            "Nothing is counted here yet.".to_owned(),
+        )
+    } else if funded.is_empty() {
+        (
+            "$0.00".to_owned(),
+            format!(
+                "No native funds on {read} that answered.",
+                read = count_noun(portfolio.holdings.len(), "network", "networks"),
+            ),
+            "Wallets lists every network that was read, so an empty balance stays \
+             distinct from one never checked."
+                .to_owned(),
+        )
+    } else if priced == 0 {
+        (
+            "—".to_owned(),
+            format!(
+                "{held}, none of it priced.",
+                held = count_noun(funded.len(), "funded holding", "funded holdings"),
+            ),
+            "The quantities are what the chains reported; Wallets explains why each row \
+             is unpriced."
+                .to_owned(),
+        )
+    } else {
+        // No zero clause: when nothing is unpriced there is nothing to
+        // disclaim, and the sentence would answer a question nobody asked.
+        let caveat = if unpriced == 0 {
+            "Not your net worth.".to_owned()
+        } else {
+            format!(
+                "{unpriced} unpriced, and left out of this total. Not your net worth.",
+                unpriced = count_noun(unpriced, "holding is", "holdings are"),
+            )
+        };
+        (
+            money(Some(total)),
+            format!(
+                "Across {wallets} · {priced}",
+                wallets = count_noun(portfolio.wallets.len(), "wallet", "wallets"),
+                priced = count_noun(priced, "priced holding", "priced holdings"),
+            ),
+            caveat,
+        )
+    }
+}
+
+/// Priced holdings grouped by network, largest first, with their dollar
+/// total. Shared by the Today page and the chat briefing.
+fn priced_allocation(funded: &[&Holding]) -> (f64, Vec<(String, f64)>) {
+    let mut by_chain: BTreeMap<String, (String, f64)> = BTreeMap::new();
+    let mut total = 0.0;
+    for holding in funded.iter().filter(|h| h.value.is_some()) {
+        total += holding.value.unwrap_or(0.0);
+        let entry = by_chain
+            .entry(holding.chain.clone())
+            .or_insert_with(|| (holding.label.clone(), 0.0));
+        entry.1 += holding.value.unwrap_or(0.0);
+    }
+    let mut split: Vec<(String, f64)> = by_chain.into_values().collect();
+    split.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    (total, split)
+}
+
+/// Every address whose app positions count: projected wallets plus the
+/// senders of recorded operations. The Today page and the chat briefing use
+/// the same coverage, or the two would disagree about what your apps hold.
+fn position_addresses(portfolio: &Portfolio, actions: &[Action]) -> Vec<String> {
+    let mut addresses = portfolio
+        .wallets
+        .iter()
+        .filter_map(|w| w.address.clone())
+        .collect::<Vec<_>>();
+    addresses.extend(
+        actions
+            .iter()
+            .filter_map(|action| action.intent.as_ref().and_then(|i| i.from.clone())),
+    );
+    addresses
 }
 
 struct Holding {
@@ -2423,9 +2635,7 @@ struct Intent {
     gas_limit: Option<u64>,
     created_ms: Option<u64>,
     usd_value: Option<f64>,
-    data_bytes: usize,
     data_hex: Option<String>,
-    petal_version: Option<String>,
 }
 
 struct Action {
@@ -2669,38 +2879,42 @@ impl Action {
             }
             if let Some(to) = &intent.to {
                 let classification = self.target_classification().unwrap_or("unknown");
+                // A saved name earns a prefix; otherwise the full address is
+                // already shown and a shortened echo would only repeat it.
+                let named = address_alias(address_book, to)
+                    .map(|alias| format!("{} ", html_escape(alias)))
+                    .unwrap_or_default();
                 row_fact(
                     "To",
                     format!(
-                        "{} <code>{}</code> <small>({classification})</small>",
-                        html_escape(&address_label(address_book, to)),
+                        "{named}<code>{}</code> <small>({classification})</small>",
                         html_escape(to),
                     ),
                 );
             }
+            // The recipient only earns its own row when the target is not
+            // the recipient: for a plain transfer they are the same address.
             if let Some(recipient) = self.recipient() {
-                row_fact(
-                    "Recipient",
-                    format!(
-                        "{} <code>{}</code>",
-                        html_escape(&address_label(address_book, &recipient)),
-                        html_escape(&recipient),
-                    ),
-                );
+                let same_as_target = intent
+                    .to
+                    .as_deref()
+                    .and_then(normalized_evm_address)
+                    .is_some_and(|to| to.eq_ignore_ascii_case(&recipient));
+                if !same_as_target {
+                    row_fact(
+                        "Recipient",
+                        format!(
+                            "{} <code>{}</code>",
+                            html_escape(&address_label(address_book, &recipient)),
+                            html_escape(&recipient),
+                        ),
+                    );
+                }
             }
             row_fact(
                 "Value",
                 html_escape(self.amount.as_deref().unwrap_or("None — zero value")),
             );
-            if let Some(kind) = &intent.action_kind {
-                row_fact("Kind", html_escape(kind));
-            }
-            if intent.data_bytes > 0 {
-                row_fact(
-                    "Calldata",
-                    html_escape(&count_noun(intent.data_bytes, "byte", "bytes")),
-                );
-            }
             if let Some(nonce) = intent.nonce {
                 row_fact("Nonce", nonce.to_string());
             }
@@ -2710,22 +2924,7 @@ impl Action {
             if let Some(usd) = intent.usd_value {
                 row_fact("Value when staged", html_escape(&money(Some(usd))));
             }
-            if let Some(version) = &intent.petal_version {
-                row_fact("Petal version", html_escape(version));
-            }
         }
-        row_fact("State", html_escape(self.state));
-        row_fact(
-            "Operation",
-            format!("<code>{}</code>", html_escape(&self.id)),
-        );
-        row_fact(
-            "Record",
-            format!(
-                "<code>{}</code>",
-                html_escape(&format!("/outbox/{}/{}/", self.state, self.id))
-            ),
-        );
 
         format!(
             "<article class=\"activity-row {class}\" id=\"operation-{id}\">\
@@ -2797,17 +2996,7 @@ fn parse_intent(text: &str) -> Option<Intent> {
         gas_limit: number("gas_limit"),
         created_ms: number("created_ms"),
         usd_value: value.get("usd_value").and_then(|field| field.as_f64()),
-        // Calldata is reported as a size. Rendering the bytes themselves
-        // invites squinting at hex that the plan already summarises.
-        data_bytes: data_hex
-            .as_deref()
-            .map(|hex| hex.trim_start_matches("0x").len() / 2)
-            .unwrap_or(0),
         data_hex,
-        petal_version: value
-            .pointer("/execution_origin/petal_version")
-            .and_then(|field| field.as_str())
-            .map(str::to_owned),
     })
 }
 
@@ -3203,37 +3392,23 @@ fn duration_ms(ms: u64) -> String {
     }
 }
 
-fn attention_strip(pending: usize, offer_review: bool) -> String {
-    let (heading, detail) = if pending == 0 {
-        (
-            "Nothing is waiting for you".to_owned(),
-            "No staged operation needs your review in the outbox that was checked.".to_owned(),
-        )
+fn attention_strip(pending: usize) -> String {
+    let heading = if pending == 0 {
+        "Nothing is waiting for you".to_owned()
     } else {
-        (
-            format!(
-                "{pending} staged {noun}",
-                noun = if pending == 1 {
-                    "operation"
-                } else {
-                    "operations"
-                }
-            ),
-            "Review the staged details in Bloom before approving.".to_owned(),
+        format!(
+            "{pending} staged {noun}",
+            noun = if pending == 1 {
+                "operation"
+            } else {
+                "operations"
+            }
         )
     };
     format!(
-        "<section class=\"attention-strip\"><div><p class=\"eyebrow\">Your next step</p>\
-         <h3>{heading}</h3><p>{detail}</p></div>\
-         {action}</section>",
+        "<section class=\"attention-strip\"><div><h3>{heading}</h3></div>\
+         <a class=\"button secondary\" href=\"next-moves.html\">Open next moves →</a></section>",
         heading = html_escape(&heading),
-        detail = html_escape(&detail),
-        // The page that *is* the review must not offer a link to itself.
-        action = if offer_review {
-            "<a class=\"button secondary\" href=\"next-moves.html\">Open next moves →</a>"
-        } else {
-            ""
-        },
     )
 }
 
@@ -3261,9 +3436,11 @@ fn icon_entry(icon: &IconFile) -> Entry {
 }
 
 fn is_page(name: &str) -> bool {
-    if name == FEES_HTML {
+    // `fees.html` preserves bookmarks to the merged page; `briefing.md` is
+    // the chat briefing, not an HTML page. Neither belongs in `PAGES`.
+    if name == FEES_HTML || name == BRIEFING_MD {
         return true;
-    } // Preserve bookmarks to the merged page.
+    }
     PAGES.iter().any(|(page, _)| *page == name)
 }
 
@@ -3680,6 +3857,20 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (if month <= 2 { year + 1 } else { year }, month, day)
 }
 
+/// Escape dynamic text for the Markdown briefing: just enough that a value
+/// can never reshape the document (emphasis, links, code spans, tables),
+/// and never so much that ordinary words come back mangled.
+fn md_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '\\' | '`' | '*' | '_' | '[' | ']' | '|') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// Escape text for HTML body and attribute contexts. `&` first, so an escape
 /// is never double-escaped.
 fn html_escape(s: &str) -> String {
@@ -3704,7 +3895,7 @@ fn receiving_qr(address: &str) -> String {
     // The renderer emits an XML declaration intended for standalone files.
     let svg = svg.find("<svg").map(|start| &svg[start..]).unwrap_or(&svg);
     format!(
-        "<figure class=\"receiving-qr\" aria-label=\"Receiving address QR code\"><div>{svg}</div><figcaption>Scan to receive</figcaption></figure>"
+        "<figure class=\"receiving-qr\" aria-label=\"Receiving address QR code\"><div>{svg}</div></figure>"
     )
 }
 
@@ -3730,8 +3921,9 @@ fn page(title: &str, heading: &str, lede: &str, current: &str, body: &str) -> St
          <link rel=\"stylesheet\" href=\"bloom.css\">{script}</head>\
          <body class=\"personal-dashboard\">\
          <a class=\"skip\" href=\"#main\">Skip to content</a>\
-         <div class=\"shell\"><header class=\"masthead\">\
+         <div class=\"shell\"><header class=\"masthead\"><div>\
          <a class=\"brand\" href=\"index.html\"><strong>/bloom</strong></a>\
+         <p class=\"crumbs\"><a href=\"index.html\">views</a> / {current}</p></div>\
          <span class=\"edition\">Read-only · reload to refresh</span></header>\
          <nav aria-label=\"Wallet views\">{nav}</nav>\
          <main id=\"main\"><div class=\"intro\"><div>\
@@ -3741,13 +3933,17 @@ fn page(title: &str, heading: &str, lede: &str, current: &str, body: &str) -> St
          <span><a href=\"AGENTS.md\">How to use these pages</a></span></footer>\
          </div></body></html>\n",
         csp = CSP,
-        script = if current == CHAINS_HTML {
+        // The only script permitted anywhere is the bundled local one: the
+        // Networks sorter and the Receive deep-link picker sync. Every page
+        // remains fully usable without it.
+        script = if current == CHAINS_HTML || current == RECEIVE_HTML {
             "<script src=\"bloom.js\" defer></script>"
         } else {
             ""
         },
         title = html_escape(title),
         heading = html_escape(heading),
+        current = html_escape(current),
         lede = if lede.is_empty() {
             String::new()
         } else {
@@ -3974,7 +4170,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pages_only_allow_the_bundled_sorter() {
+    async fn pages_only_allow_the_bundled_script() {
         let fixture = fixture();
         for (page, _) in PAGES {
             let html = render(&fixture.handler, page).await;
@@ -3983,8 +4179,8 @@ mod tests {
             assert!(html.contains("script-src 'self'"), "{page}");
             assert_eq!(
                 html.contains("<script src=\"bloom.js\" defer>"),
-                *page == CHAINS_HTML,
-                "only Networks needs the sorter: {page}"
+                *page == CHAINS_HTML || *page == RECEIVE_HTML,
+                "only Networks and Receive load the bundled script: {page}"
             );
             assert!(
                 !html.contains("<script>"),
@@ -4035,7 +4231,10 @@ mod tests {
             !html.contains("../wallets/"),
             "the QR must not depend on the mounted wallet tree"
         );
-        assert!(html.contains("1 receiving address"));
+        assert!(
+            html.contains("The code encodes an address, not a network"),
+            "the safety sentence lives once at the top: {html:.300}"
+        );
     }
 
     #[tokio::test]
@@ -4067,7 +4266,10 @@ mod tests {
         );
 
         let html = render(&handler, RECEIVE_HTML).await;
-        assert!(html.contains("2 receiving addresses"), "{html}");
+        assert!(
+            html.contains(ADDRESS),
+            "the EVM card still renders: {html:.300}"
+        );
         assert_eq!(
             html.matches(&format!("class=\"address\">{SOLANA}</code>"))
                 .count(),
@@ -4107,6 +4309,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn receive_selects_one_wallet_before_its_code() {
+        let mut fixture = fixture();
+        let reader = crate::test_support::wallet_projection_reader("first", ADDRESS);
+        let first = reader.list_wallets().await.unwrap().remove(0);
+        let mut second = first.clone();
+        second.wallet.wallet_id = bloom_broker_api::Token::new("second").unwrap();
+        second.keys[0].addresses = vec!["0x000000000000000000000000000000000000bEEF".to_owned()];
+        fixture.handler.projections =
+            crate::test_support::wallet_projection_reader_from_many(vec![first, second]);
+
+        let html = render(&fixture.handler, RECEIVE_HTML).await;
+        assert_eq!(html.matches("type=\"radio\" name=\"wallet\"").count(), 2);
+        assert!(
+            html.contains("id=\"pick-first\" value=\"first\" checked"),
+            "{html:.300}"
+        );
+        assert!(
+            html.contains("id=\"pick-second\" value=\"second\""),
+            "{html:.300}"
+        );
+        assert!(html.contains("#pick-first:checked ~ .receiving-panels #wallet-first"));
+        assert!(html.contains("#pick-second:checked ~ .receiving-panels #wallet-second"));
+        assert!(html.contains("id=\"wallet-first\"") && html.contains("id=\"wallet-second\""));
+    }
+
+    #[tokio::test]
+    async fn receive_shows_the_only_wallet_outright() {
+        let html = render(&fixture().handler, RECEIVE_HTML).await;
+        assert!(
+            !html.contains("data-wallet-picker"),
+            "a choice of one is no choice"
+        );
+        assert!(!html.contains("type=\"radio\" name=\"wallet\""));
+    }
+
+    #[tokio::test]
+    async fn every_page_names_its_place_in_the_mount() {
+        for (page, file) in [
+            (INDEX_HTML, "index.html"),
+            (WALLETS_HTML, "wallets.html"),
+            (RECEIVE_HTML, "receive.html"),
+        ] {
+            let html = render(&fixture().handler, page).await;
+            assert!(html.contains(">views</a> /"), "{page}");
+            assert!(html.contains(&format!("/ {file}</p>")), "{page}");
+        }
+    }
+
+    #[tokio::test]
+    async fn today_lists_the_directory_it_lives_in() {
+        let html = render(&fixture().handler, INDEX_HTML).await;
+        assert!(html.contains("In this directory"), "{html:.300}");
+        for file in [
+            "briefing.md",
+            "wallets.html",
+            "receive.html",
+            "policy.html",
+            "AGENTS.md",
+        ] {
+            assert!(
+                html.contains(&format!("href=\"{file}\"")),
+                "{file}: {html:.300}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn wallet_cards_name_their_directory() {
+        let html = render(&fixture().handler, WALLETS_HTML).await;
+        assert!(html.contains("wallets/alice/"), "{html:.300}");
+    }
+
+    #[tokio::test]
     async fn unpriced_holdings_are_never_valued_at_zero() {
         // No chain is configured, so no balance was read. The page must say so
         // rather than turning missing coverage into $0.00.
@@ -4143,6 +4418,82 @@ mod tests {
             "nothing read must not read as zero"
         );
         assert!(html.contains("No activity yet."));
+    }
+
+    #[tokio::test]
+    async fn briefing_is_listed_cached_and_markdown_not_html() {
+        let fixture = fixture();
+        let entries = fixture.handler.list(&VfsPath::root()).await.unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&BRIEFING_MD), "the briefing must be listed");
+        let entry = fixture
+            .handler
+            .lookup(&VfsPath::parse(BRIEFING_MD).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(entry.kind, EntryKind::File);
+        assert_eq!(entry.mode, 0o444, "the briefing must be read-only");
+        assert_eq!(
+            fixture
+                .handler
+                .cache_ttl(&VfsPath::parse(BRIEFING_MD).unwrap()),
+            Some(PAGE_TTL),
+            "a reloaded chat read should not re-read balances per request"
+        );
+        let md = render(&fixture.handler, BRIEFING_MD).await;
+        assert!(md.starts_with("# Today briefing\n"), "{md:.80}");
+        assert!(
+            md.contains("views/index.html"),
+            "names the dashboard path: {md:.200}"
+        );
+        assert!(
+            !md.contains("<!doctype html>"),
+            "must be chat text, not HTML"
+        );
+        assert!(!md.contains("Content-Security-Policy"), "no HTML shell");
+        assert!(!md.contains("<script"), "no scripts in chat text");
+    }
+
+    #[tokio::test]
+    async fn briefing_states_the_same_headline_as_today() {
+        let fixture = fixture();
+        let md = render(&fixture.handler, BRIEFING_MD).await;
+        // The fixture reads no balances: both surfaces must say so identically.
+        for needle in [
+            "No balance was read from the configured networks.",
+            "Nothing is counted here yet.",
+            "Nothing is waiting",
+            "No activity yet.",
+        ] {
+            assert!(md.contains(needle), "{needle}: {md:.300}");
+        }
+        let html = render(&fixture.handler, INDEX_HTML).await;
+        assert!(html.contains("No balance was read from the configured networks."));
+    }
+
+    #[tokio::test]
+    async fn briefing_surfaces_a_staged_action_with_its_blocker() {
+        let fixture = fixture();
+        stage(
+            &fixture,
+            "pending",
+            "evm-0001",
+            "# Send 0.01 ETH\n\nWallet: primary\nChain:  ethereum (id 1)\n\n## Policy\n\
+             - [Deny] balance.native_funds: account has 0 ETH; fund it before approving.\n",
+        );
+        let md = render(&fixture.handler, BRIEFING_MD).await;
+        assert!(md.contains("1 staged operation"), "{md:.400}");
+        assert!(md.contains("Send 0.01 ETH"), "{md:.400}");
+        assert!(
+            md.contains("Blocked: fund the sending account"),
+            "{md:.400}"
+        );
+    }
+
+    #[test]
+    fn md_escape_neutralises_markup_without_mangling_words() {
+        assert_eq!(md_escape("Send 0.01 ETH on Base"), "Send 0.01 ETH on Base");
+        assert_eq!(md_escape("a*b_c[d]e|f`g"), "a\\*b\\_c\\[d\\]e\\|f\\`g");
     }
 
     #[tokio::test]
@@ -4337,11 +4688,8 @@ mod tests {
         }
         let contacts = render(&fixture.handler, CONTACTS_HTML).await;
         assert!(contacts.contains("Suggested"), "{contacts}");
-        assert!(
-            contacts.contains("<strong>2</strong> transfers"),
-            "{contacts}"
-        );
-        assert_eq!(contacts.matches("Full address and activity").count(), 1);
+        assert!(contacts.contains("2 transfers"), "{contacts}");
+        assert_eq!(contacts.matches("<summary>Address</summary>").count(), 1);
 
         let mut book = AddressBook::default();
         book.set("treasury", parse_address(recipient).unwrap());
@@ -4786,6 +5134,9 @@ mod tests {
         //     (one-file compatibility input)
         //   VIEWS_CONFIG=~/.bloom/config.toml   (real chains, real balances)
         //   VIEWS_REAL_PRICES=1                 (reach the live price source)
+        //   VIEWS_REAL_MARKETS=1                (reach the live fee, volume,
+        //     and market sources; without it those panels render their
+        //     honest empty states instead of live figures)
         let real_outbox = std::env::var("VIEWS_OUTBOX").ok();
         let tmp = tempfile::tempdir().unwrap();
         let outbox_root = match &real_outbox {
@@ -4930,6 +5281,10 @@ mod tests {
         // dashboard visible to anyone following a stale bookmark.
         let alias = render(&staged.handler, CHAINS_HTML).await;
         std::fs::write(std::path::Path::new(&out).join(FEES_HTML), alias).unwrap();
+        // The chat briefing renders beside the pages, so the dump keeps it
+        // next to the HTML it restates.
+        let briefing = render(&staged.handler, BRIEFING_MD).await;
+        std::fs::write(std::path::Path::new(&out).join(BRIEFING_MD), briefing).unwrap();
         std::fs::write(std::path::Path::new(&out).join(BLOOM_CSS_NAME), BLOOM_CSS).unwrap();
         std::fs::write(std::path::Path::new(&out).join(BLOOM_JS_NAME), BLOOM_JS).unwrap();
         let icons = std::path::Path::new(&out).join(ICONS_DIR);
