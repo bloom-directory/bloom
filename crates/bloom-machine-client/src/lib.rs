@@ -10,7 +10,8 @@ mod petal_eligibility;
 mod projection;
 
 pub use petal_eligibility::{
-    PendingPolicyUpdate, PetalEligibility, policy_with_package, policy_with_packages,
+    PendingPolicyUpdate, PetalEligibility, policy_with_destinations, policy_with_package,
+    policy_with_packages,
 };
 
 pub use projection::{

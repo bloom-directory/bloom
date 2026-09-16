@@ -68,8 +68,20 @@ Agreed on 2026-09-14:
    in its config, writes them again after an update, and says so.
 10. **`bloom init` runs once.** Afterwards users add, update, or remove
     Petals.
-11. **Enso is offered, and fixed separately.** The default policy allows
-    Enso, but its v0.1.3 release reads `wallets/<wallet>/address`, which the
+11. **Enso gets route rules for `main`.** Choosing Enso writes
+    `settings/main/route-rules.toml`: routes between Arbitrum, Avalanche,
+    Base, Ethereum, Optimism, and Polygon, to the wallet itself, through Enso
+    Router V2 (`0xf75584ef6673ad213a685a1b58cc0330b8ea22cf`) only. The router
+    address is pinned in Bloom's catalog, checked against Enso's published
+    deployments and the deployed bytecode on each chain, and never taken from
+    a quote. The rules allow at most 100 bps of slippage and do not require
+    calldata verification: Enso cannot yet prove a route's receiver or minimum
+    output, so requiring it would refuse every route. The owner can rewrite
+    the rules afterwards.
+    The rules need an Enso release with per-wallet rules. Its v0.1.3 release
+    has no `settings/<wallet>/route-rules.toml` route, so `bloom init` reports
+    `petal_settings_failed` for Enso and continues; without rules Enso refuses
+    every route. That release also reads `wallets/<wallet>/address`, which the
     account-layout change removed (addresses now live at
     `wallets/<wallet>/<n>/address.evm`), and then `wallets/<wallet>/policy.toml`
     and `addresses.json`, which the triad does not serve. On a local triad a
@@ -81,6 +93,19 @@ Agreed on 2026-09-14:
     `[petals.runtime.tolly.values] tolly_writes = "enabled"`, keeping a value
     the owner already set. Each buy, sell, or launch is still confirmed by the
     owner.
+13. **Chosen Petals' fixed contracts become allowed destinations.** Machine
+    refuses any outbox transaction whose `to` address is not in the wallet
+    policy's `allowed_destinations`, and an empty list refuses all of them.
+    Each catalog entry lists the fixed contracts its Petal transacts with, and
+    the default policy proposes them in the same ceremony as the packages:
+    - Enso: Router V2 on Arbitrum, Avalanche, Base, Ethereum, Optimism, and
+      Polygon.
+    - Polymarket: pUSD, USDC.e, and Enso Router V2 on Polygon, for funding
+      its deposit wallet.
+
+    Destinations that change per transaction cannot be listed ahead of time:
+    an ERC-20 approval's token contract (other than USDC.e for Polymarket) and
+    NEAR Intents deposit addresses. Those still need a policy update.
 
 ## Why it does not work today
 
@@ -104,7 +129,9 @@ Agreed on 2026-09-14:
 2. **Review settings.** Show Polymarket's suggested daily buy limit, 100
    pUSD, and let the user change it. Only positive amounts are accepted.
 3. **Confirm.** Save the choices in Bloom's config, install Bloom's canonical
-   Petals, and write each chosen Petal's settings.
+   Petals, and write each chosen Petal's settings. A settings write that
+   fails is reported and setup continues; that Petal refuses to act until its
+   settings exist.
 
 Bloom installs its canonical Petals (`DEFAULT_PETALS` in
 `crates/bloom/src/github_source.rs`) for every home and ignores the legacy
@@ -158,15 +185,23 @@ chosen Petals:
     "a564d9559a70520995e550df685f74d3ee26af6fbb16facc08de2745bf5ec693",
     "aa1c50d3443f4c1a710d0ce93a70a65d196fd5842d241e0f78260c8a019d811c"
   ],
-  "allowed_destinations": [],
+  "allowed_destinations": [
+    { "chain": "polygon", "destination": "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb" },
+    { "chain": "polygon", "destination": "0x2791bca1f2de4661ed88a30c99a7a9449aa84174" },
+    { "chain": "polygon", "destination": "0xf75584ef6673ad213a685a1b58cc0330b8ea22cf" }
+  ],
   "required_verifiers": []
 }
 ```
 
 - **`allowed_petal_packages`** lists each chosen Petal by the exact hash
   Bloom's catalog pins: Polymarket v0.1.4 and Hyperliquid v0.1.5.
+- **`allowed_destinations`** lists the fixed contracts each chosen Petal
+  transacts with (decision 13), from Bloom's catalog only; an edited config
+  cannot add any. Existing destinations are kept, and a wallet whose policy
+  already allows the packages is proposed the missing destinations.
 - **Everything else** keeps the current defaults: approvals last at most 30
-  days, and destinations and verifiers start empty.
+  days, and verifiers start empty.
 
 ### 3. Signing it right after creation
 
@@ -253,6 +288,8 @@ merge into one proposal, as Machine already reconciles pending proposals.
   ceremony.
 - The policy allows exactly the package hashes it lists. A different or
   tampered build does not match.
+- Allowed destinations are addresses pinned in Bloom's source and shown in
+  the policy ceremony, never taken from a quote or a Petal at runtime.
 - Signing the policy grants no signing authority. Every signature still
   needs an approval the owner gave for that transaction.
 - Petal limits live in each Petal's settings, not the signed policy. Any
@@ -271,7 +308,7 @@ These need other repositories and are out of scope:
 | Sign the policy inside the creation ceremony, for one ceremony in total | bloom-broker, bloom-signer |
 | Count Polymarket sells, add a total limit, and reset a count when its limit changes | bloom-petal-polymarket |
 | Keep Petal settings across updates | The stable installation slot in [Petal derived keys and package succession](./Petal%20derived%20key%20succession.md) |
-| Enso reads its route rules from its own settings instead of `policy.toml`, so its swaps work on the triad | bloom-petal-enso |
+| Release Enso with per-wallet route rules and the new address layout, then re-pin it so the setup rules apply | bloom-petal-enso, then `PREINSTALLED_ENSO` |
 | Create Hyperliquid sessions with fewer ceremonies | [bloom#171](https://github.com/bloom-directory/bloom/issues/171) |
 
 ## Implementation plan

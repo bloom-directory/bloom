@@ -1327,21 +1327,24 @@ impl WalletsHandler {
             package_hash,
             std::slice::from_ref(package_hash),
             &additions,
+            &[],
         )
         .await
     }
 
-    /// Drive a wallet's default policy: propose every package together through
-    /// the existing policy operation. `Allowed` means all of them are allowed.
+    /// Drive a wallet's default policy: propose every package and destination
+    /// together through the existing policy operation. `Allowed` means the
+    /// policy allows all of them.
     pub async fn ensure_petal_packages_allowed(
         &self,
         wallet: &str,
         packages: &[bloom_broker_api::Digest32],
+        destinations: &[bloom_broker_api::PolicyDestination],
     ) -> Result<bloom_machine_client::PetalEligibility, HandlerError> {
         let first = packages
             .first()
             .ok_or_else(|| HandlerError::invalid("no Petal packages to allow"))?;
-        self.ensure_policy_allows(wallet, first, packages, packages)
+        self.ensure_policy_allows(wallet, first, packages, packages, destinations)
             .await
     }
 
@@ -1351,8 +1354,11 @@ impl WalletsHandler {
         package_hash: &bloom_broker_api::Digest32,
         required: &[bloom_broker_api::Digest32],
         additions: &[bloom_broker_api::Digest32],
+        destinations: &[bloom_broker_api::PolicyDestination],
     ) -> Result<bloom_machine_client::PetalEligibility, HandlerError> {
-        use bloom_machine_client::{PetalEligibility, policy_with_packages};
+        use bloom_machine_client::{
+            PetalEligibility, policy_with_destinations, policy_with_packages,
+        };
         use sha2::Digest as _;
 
         self.write_permit()?;
@@ -1418,10 +1424,14 @@ impl WalletsHandler {
         if required
             .iter()
             .all(|package| policy.allowed_petal_packages.contains(package))
+            && destinations
+                .iter()
+                .all(|destination| policy.allowed_destinations.contains(destination))
         {
             return Ok(PetalEligibility::Allowed(current));
         }
-        let proposed = policy_with_packages(&policy, additions);
+        let proposed =
+            policy_with_destinations(&policy_with_packages(&policy, additions), destinations);
         let proposed_bytes = serde_jcs::to_vec(&proposed).map_err(err_be)?;
         match self
             .write_wallet_policy_update_locked(wallet, &proposed_bytes, Some(&current))

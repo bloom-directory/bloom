@@ -4791,15 +4791,17 @@ impl Daemon {
         self.machine_broker.clone()
     }
 
-    /// Propose every package in `packages` together through the wallet's
-    /// existing policy operation. `Allowed` means the policy allows all of them.
+    /// Propose every package in `packages` and every destination in
+    /// `destinations` together through the wallet's existing policy operation.
+    /// `Allowed` means the policy allows all of them.
     pub async fn ensure_default_policy(
         &self,
         wallet: &str,
         packages: &[bloom_broker_api::Digest32],
+        destinations: &[bloom_broker_api::PolicyDestination],
     ) -> Result<bloom_machine_client::PetalEligibility, bloom_vfs::HandlerError> {
         self.wallets
-            .ensure_petal_packages_allowed(wallet, packages)
+            .ensure_petal_packages_allowed(wallet, packages, destinations)
             .await
     }
 

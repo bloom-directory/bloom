@@ -256,7 +256,12 @@ pub(crate) fn render_petal_settings(
             template.path.replace("{wallet}", wallet)
         ),
         body: body.into_bytes(),
-        summary: summary.join(", "),
+        // A template without values reports the file it wrote.
+        summary: if summary.is_empty() {
+            template.path.replace("{wallet}", wallet)
+        } else {
+            summary.join(", ")
+        },
     }))
 }
 
@@ -291,6 +296,10 @@ pub(crate) fn petal_owners(daemon: &Daemon) -> Result<BTreeMap<String, String>> 
 /// After `bloom init` provisions Petals, write settings for each chosen Petal
 /// that setup just configured, installed, or updated. An update replaces the
 /// Petal's stored state, so its saved settings are written again.
+///
+/// A failed write is reported and the rest continue, as in `bloom serve`. A
+/// Petal without its settings fails closed: Polymarket refuses buys and Enso
+/// refuses routes until the owner writes them.
 pub(crate) async fn apply_setup_settings(
     daemon: &Daemon,
     owners_before: &BTreeMap<String, String>,
@@ -307,11 +316,11 @@ pub(crate) async fn apply_setup_settings(
         if !(first_setup || previous.is_none() || updated) {
             continue;
         }
-        let Some(summary) = write_petal_settings(&daemon.vfs, &daemon.config.petals, name).await?
-        else {
-            continue;
-        };
-        messages.push(settings_message(name, &summary, updated));
+        match write_petal_settings(&daemon.vfs, &daemon.config.petals, name).await {
+            Ok(Some(summary)) => messages.push(settings_message(name, &summary, updated)),
+            Ok(None) => {}
+            Err(error) => messages.push(format!("petal_settings_failed: {error:#}")),
+        }
     }
     Ok(messages)
 }
@@ -396,6 +405,7 @@ pub(crate) async fn advance_default_policy(
 ) -> Result<DefaultPolicyStatus> {
     let mut petals = Vec::new();
     let mut packages = Vec::new();
+    let mut destinations = Vec::new();
     for name in daemon.config.petals.setup.keys() {
         let Some(hash) = daemon
             .petals
@@ -409,6 +419,7 @@ pub(crate) async fn advance_default_policy(
             bloom_broker_api::Digest32::new(hash)
                 .with_context(|| format!("installed Petal {name} has an invalid package hash"))?,
         );
+        destinations.extend(policy_destinations(name)?);
         petals.push(name.clone());
     }
     if packages.is_empty() {
@@ -424,7 +435,10 @@ pub(crate) async fn advance_default_policy(
         }
         Err(error) => return Err(error.into()),
     }
-    let eligibility = match daemon.ensure_default_policy(wallet, &packages).await {
+    let eligibility = match daemon
+        .ensure_default_policy(wallet, &packages, &destinations)
+        .await
+    {
         Ok(eligibility) => eligibility,
         Err(bloom_vfs::HandlerError::Backend(message))
             if message.starts_with(bloom_vfs::handlers::wallets::POLICY_COORDINATION_BUSY) =>
@@ -452,6 +466,22 @@ pub(crate) async fn advance_default_policy(
             }
         }
     })
+}
+
+/// The destinations a chosen Petal's transactions need, from Bloom's catalog.
+/// Only the catalog supplies them, so an edited config cannot add any.
+pub(crate) fn policy_destinations(name: &str) -> Result<Vec<bloom_broker_api::PolicyDestination>> {
+    github_source::preinstalled_petal(name)
+        .map(|entry| entry.policy_destinations)
+        .unwrap_or_default()
+        .iter()
+        .map(|destination| {
+            Ok(bloom_broker_api::PolicyDestination {
+                chain: bloom_broker_api::Token::new(destination.chain.to_owned())?,
+                destination: destination.destination.to_owned(),
+            })
+        })
+        .collect()
 }
 
 /// Whether a waiting command should poll again.
@@ -816,6 +846,82 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn enso_rules_allow_only_its_catalog_destinations() {
+        const ROUTER: &str = "0xf75584ef6673ad213a685a1b58cc0330b8ea22cf";
+        let chains = [
+            "arbitrum",
+            "avalanche",
+            "base",
+            "ethereum",
+            "optimism",
+            "polygon",
+        ];
+        let rules = render_petal_settings(&PetalsConfig::default(), "enso", "main")
+            .unwrap()
+            .unwrap();
+        assert_eq!(rules.path, "/petals/enso/settings/main/route-rules.toml");
+        assert_eq!(rules.summary, "settings/main/route-rules.toml");
+        let rules: toml::Value = toml::from_str(std::str::from_utf8(&rules.body).unwrap()).unwrap();
+        let strings = |key: &str| -> Vec<String> {
+            rules["defi"][key]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|value| value.as_str().unwrap().to_owned())
+                .collect()
+        };
+        assert_eq!(rules["mev"]["max_slippage_bps"].as_integer(), Some(100));
+        assert_eq!(rules["defi"]["enabled"].as_bool(), Some(true));
+        assert_eq!(strings("allowed_source_chains"), chains);
+        assert_eq!(strings("allowed_destination_chains"), chains);
+        assert_eq!(strings("allowed_receivers"), ["class:wallet_eoa"]);
+        assert_eq!(
+            rules["defi"]["require_calldata_verification"].as_bool(),
+            Some(false)
+        );
+
+        // The rules' routers and the policy's destinations are the same list.
+        let destinations: Vec<String> = policy_destinations("enso")
+            .unwrap()
+            .into_iter()
+            .map(|destination| {
+                format!("{}:{}", destination.chain.as_str(), destination.destination)
+            })
+            .collect();
+        assert_eq!(
+            destinations,
+            chains.map(|chain| format!("{chain}:{ROUTER}"))
+        );
+        assert_eq!(strings("allowed_routers"), destinations);
+    }
+
+    #[test]
+    fn polymarket_destinations_come_from_the_catalog() {
+        let destinations: Vec<(String, String)> = policy_destinations("polymarket")
+            .unwrap()
+            .into_iter()
+            .map(|destination| {
+                (
+                    destination.chain.as_str().to_owned(),
+                    destination.destination,
+                )
+            })
+            .collect();
+        assert_eq!(
+            destinations,
+            [
+                "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb",
+                "0x2791bca1f2de4661ed88a30c99a7a9449aa84174",
+                "0xf75584ef6673ad213a685a1b58cc0330b8ea22cf",
+            ]
+            .map(|address| ("polygon".to_owned(), address.to_owned()))
+        );
+        for name in ["hyperliquid", "near-intents", "tolly", "not-in-catalog"] {
+            assert!(policy_destinations(name).unwrap().is_empty(), "{name}");
+        }
     }
 
     #[test]

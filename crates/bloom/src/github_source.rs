@@ -42,6 +42,18 @@ pub(crate) struct PreinstalledPetal {
     pub authority_routes: &'static [PetalAuthorityRoute],
     /// Settings `bloom init` writes into this Petal's own settings route.
     pub setup: Option<&'static PetalSetupTemplate>,
+    /// Fixed contracts this Petal stages EVM transactions to, which the
+    /// default policy proposes as allowed destinations together with the
+    /// package. Destinations that vary per transaction cannot be listed.
+    pub policy_destinations: &'static [PetalPolicyDestination],
+}
+
+/// A wallet policy destination: a Bloom chain name and an address on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PetalPolicyDestination {
+    pub chain: &'static str,
+    /// Lowercase `0x` address, matching the Petal's settings and planner output.
+    pub destination: &'static str,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +89,99 @@ const POLYMARKET_SETUP: PetalSetupTemplate = PetalSetupTemplate {
         default: "100",
     }],
 };
+
+/// Per-wallet Enso route rules: routes between the covered chains, to the
+/// wallet itself, through Enso Router V2 only, with at most 1% slippage.
+///
+/// `0xf75584ef6673ad213a685a1b58cc0330b8ea22cf` is Enso Router V2 on each
+/// listed chain, per Enso's published deployments
+/// (https://docs.enso.build/pages/build/reference/deployments); `eth_getCode`
+/// at that address returns identical bytecode on all six. Chains where Enso
+/// deployed its router at another address (Linea, zkSync, Monad, …) are
+/// deliberately absent, as is BNB Chain, which Enso names `bnb` and Bloom
+/// names `bsc`. Adding a chain means checking its router the same way.
+///
+/// Enso cannot yet prove a route's receiver or minimum output from calldata,
+/// so requiring that verification would refuse every route; each plan still
+/// reports the unverified fields. Owners can change these rules afterwards.
+const ENSO_SETUP: PetalSetupTemplate = PetalSetupTemplate {
+    path: "settings/{wallet}/route-rules.toml",
+    body: r#"[mev]
+max_slippage_bps = 100
+
+[defi]
+enabled = true
+allowed_source_chains = ["arbitrum", "avalanche", "base", "ethereum", "optimism", "polygon"]
+allowed_destination_chains = ["arbitrum", "avalanche", "base", "ethereum", "optimism", "polygon"]
+allowed_receivers = ["class:wallet_eoa"]
+denied_receivers = []
+allowed_routers = [
+  "arbitrum:0xf75584ef6673ad213a685a1b58cc0330b8ea22cf",
+  "avalanche:0xf75584ef6673ad213a685a1b58cc0330b8ea22cf",
+  "base:0xf75584ef6673ad213a685a1b58cc0330b8ea22cf",
+  "ethereum:0xf75584ef6673ad213a685a1b58cc0330b8ea22cf",
+  "optimism:0xf75584ef6673ad213a685a1b58cc0330b8ea22cf",
+  "polygon:0xf75584ef6673ad213a685a1b58cc0330b8ea22cf",
+]
+denied_protocols = []
+allow_unknown_protocols = false
+require_calldata_verification = false
+"#,
+    values: &[],
+};
+
+/// Enso Router V2 on each chain the Enso setup rules cover (see
+/// `ENSO_SETUP`). Enso's approvals go to the input token, which varies, so a
+/// route from an ERC-20 still needs that token allowed separately.
+const ENSO_POLICY_DESTINATIONS: &[PetalPolicyDestination] = &[
+    PetalPolicyDestination {
+        chain: "arbitrum",
+        destination: ENSO_ROUTER_V2,
+    },
+    PetalPolicyDestination {
+        chain: "avalanche",
+        destination: ENSO_ROUTER_V2,
+    },
+    PetalPolicyDestination {
+        chain: "base",
+        destination: ENSO_ROUTER_V2,
+    },
+    PetalPolicyDestination {
+        chain: "ethereum",
+        destination: ENSO_ROUTER_V2,
+    },
+    PetalPolicyDestination {
+        chain: "optimism",
+        destination: ENSO_ROUTER_V2,
+    },
+    PetalPolicyDestination {
+        chain: "polygon",
+        destination: ENSO_ROUTER_V2,
+    },
+];
+
+/// Enso Router V2. The address is checked as described on `ENSO_SETUP`.
+const ENSO_ROUTER_V2: &str = "0xf75584ef6673ad213a685a1b58cc0330b8ea22cf";
+
+/// Polymarket funds its deposit wallet on Polygon with a direct pUSD transfer,
+/// or an Enso swap after an exact ERC-20 approval. The pUSD and USDC.e
+/// addresses are Polymarket's own constants (`polymarket/eip712.rs` in the
+/// pinned release); the router is Enso Router V2. Funding from another token
+/// needs that token allowed separately.
+const POLYMARKET_POLICY_DESTINATIONS: &[PetalPolicyDestination] = &[
+    PetalPolicyDestination {
+        chain: "polygon",
+        destination: "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb",
+    },
+    PetalPolicyDestination {
+        chain: "polygon",
+        destination: "0x2791bca1f2de4661ed88a30c99a7a9449aa84174",
+    },
+    PetalPolicyDestination {
+        chain: "polygon",
+        destination: ENSO_ROUTER_V2,
+    },
+];
 
 const POLYMARKET_AUTHORITY_ROUTES: &[PetalAuthorityRoute] = &[
     PetalAuthorityRoute {
@@ -184,6 +289,7 @@ const PREINSTALLED_POLYMARKET: PreinstalledPetal = PreinstalledPetal {
     predecessor_package_hashes: &[],
     authority_routes: POLYMARKET_AUTHORITY_ROUTES,
     setup: Some(&POLYMARKET_SETUP),
+    policy_destinations: POLYMARKET_POLICY_DESTINATIONS,
 };
 
 const PREINSTALLED_HYPERLIQUID: PreinstalledPetal = PreinstalledPetal {
@@ -202,6 +308,7 @@ const PREINSTALLED_HYPERLIQUID: PreinstalledPetal = PreinstalledPetal {
     predecessor_package_hashes: &[],
     authority_routes: HYPERLIQUID_AUTHORITY_ROUTES,
     setup: None,
+    policy_destinations: &[],
 };
 
 const PREINSTALLED_NEAR_INTENTS: PreinstalledPetal = PreinstalledPetal {
@@ -220,6 +327,7 @@ const PREINSTALLED_NEAR_INTENTS: PreinstalledPetal = PreinstalledPetal {
     predecessor_package_hashes: &[],
     authority_routes: &[],
     setup: None,
+    policy_destinations: &[],
 };
 
 const PREINSTALLED_ENSO: PreinstalledPetal = PreinstalledPetal {
@@ -237,7 +345,8 @@ const PREINSTALLED_ENSO: PreinstalledPetal = PreinstalledPetal {
     release_sequence: 0,
     predecessor_package_hashes: &[],
     authority_routes: &[],
-    setup: None,
+    setup: Some(&ENSO_SETUP),
+    policy_destinations: ENSO_POLICY_DESTINATIONS,
 };
 
 const PREINSTALLED_GASLESS: PreinstalledPetal = PreinstalledPetal {
@@ -256,6 +365,7 @@ const PREINSTALLED_GASLESS: PreinstalledPetal = PreinstalledPetal {
     predecessor_package_hashes: &[],
     authority_routes: &[],
     setup: None,
+    policy_destinations: &[],
 };
 
 const PREINSTALLED_PRIVACY_POOLS: PreinstalledPetal = PreinstalledPetal {
@@ -274,6 +384,7 @@ const PREINSTALLED_PRIVACY_POOLS: PreinstalledPetal = PreinstalledPetal {
     predecessor_package_hashes: &[],
     authority_routes: &[],
     setup: None,
+    policy_destinations: &[],
 };
 
 const PREINSTALLED_VENICE_X402: PreinstalledPetal = PreinstalledPetal {
@@ -292,6 +403,7 @@ const PREINSTALLED_VENICE_X402: PreinstalledPetal = PreinstalledPetal {
     predecessor_package_hashes: &[],
     authority_routes: &[],
     setup: None,
+    policy_destinations: &[],
 };
 
 const PREINSTALLED_TOLLY: PreinstalledPetal = PreinstalledPetal {
@@ -310,6 +422,7 @@ const PREINSTALLED_TOLLY: PreinstalledPetal = PreinstalledPetal {
     predecessor_package_hashes: &[],
     authority_routes: &[],
     setup: None,
+    policy_destinations: &[],
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1968,6 +2081,7 @@ mod tests {
             predecessor_package_hashes: &[],
             authority_routes: &[],
             setup: None,
+            policy_destinations: &[],
         }
     }
 
@@ -2469,6 +2583,7 @@ mod tests {
             predecessor_package_hashes: &[],
             authority_routes: &[],
             setup: None,
+            policy_destinations: &[],
         };
         let release = PetalReleaseManifest {
             schema: "bloom.petal.release.v1".into(),
