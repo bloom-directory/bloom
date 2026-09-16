@@ -1706,7 +1706,7 @@ async fn execute_wallet_outbox_action(
         }
     }
     let path = bloom_vfs::VfsPath::parse(&format!(
-        "/wallets/{wallet}/chains/{chain}/outbox/pending/{id}/{action}"
+        "/wallets/{wallet}/0/chains/{chain}/outbox/pending/{id}/{action}"
     ))?;
     bloom_vfs::Handler::write(vfs, &path, body).await?;
     Ok(())
@@ -3291,7 +3291,7 @@ async fn run(cli: Cli) -> Result<()> {
             }
             let (_home_permit, d) = build_write_daemon(home.clone()).context("init daemon")?;
             let preinstalled = github_source::ensure_preinstalled_petals(&home, &d)
-                .context("provision configured pre-installed Petals")?;
+                .context("provision canonical pre-installed Petals")?;
             println!("home: {}", d.home.root().display());
             println!("config: {}", d.home.config_path().display());
             println!("chains: {:?}", d.chains.list_names());
@@ -3653,7 +3653,7 @@ async fn run(cli: Cli) -> Result<()> {
                     buf
                 }
             };
-            let path = format!("/wallets/{wallet}/chains/{chain}/outbox/new.tx");
+            let path = format!("/wallets/{wallet}/0/chains/{chain}/outbox/new.tx");
             let client = IpcClient::new(&client_endpoint.socket);
             let projection = try_ipc(
                 &client,
@@ -3662,7 +3662,7 @@ async fn run(cli: Cli) -> Result<()> {
                 serde_json::json!({
                     "path": path,
                     "bytes_b64": B64.encode(body.as_bytes()),
-                    "projection_path": format!("/wallets/{wallet}/chains/{chain}/outbox/latest"),
+                    "projection_path": format!("/wallets/{wallet}/0/chains/{chain}/outbox/latest"),
                 }),
             )
             .await
@@ -3684,7 +3684,7 @@ async fn run(cli: Cli) -> Result<()> {
             id,
             text,
         }) => {
-            let path = format!("/wallets/{wallet}/chains/{chain}/outbox/pending/{id}/confirm");
+            let path = format!("/wallets/{wallet}/0/chains/{chain}/outbox/pending/{id}/confirm");
             let body = text.into_bytes();
             let client = IpcClient::new(&client_endpoint.socket);
             try_ipc(
@@ -4733,11 +4733,11 @@ mod tests {
             *handler.0.lock().unwrap(),
             vec![
                 (
-                    "/alice/chains/base/outbox/pending/tx-1/cancel".into(),
+                    "/alice/0/chains/base/outbox/pending/tx-1/cancel".into(),
                     b"approve".to_vec(),
                 ),
                 (
-                    "/alice/chains/base/outbox/pending/tx-1/replace".into(),
+                    "/alice/0/chains/base/outbox/pending/tx-1/replace".into(),
                     b"replacement intent".to_vec(),
                 ),
             ]

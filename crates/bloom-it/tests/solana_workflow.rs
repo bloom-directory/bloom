@@ -98,6 +98,7 @@ impl SolanaBroker {
     }
 
     fn accounts(&self, wallet_id: Token) -> WalletAccountsPublic {
+        let address = bs58::encode(self.pubkey).into_string();
         WalletAccountsPublic {
             wallet_id,
             seed_profile: WalletSeedProfile::Bip39MulticurveV1,
@@ -112,7 +113,13 @@ impl SolanaBroker {
                     Sha256::digest(spki(&self.pubkey)).into(),
                 ),
                 supported_crypto_suites: vec![CryptoSuite::Ed25519Message],
-                chain_projections: vec![],
+                chain_projections: vec![ChainAccountProjection {
+                    chain_family: tok("solana"),
+                    caip2: "solana:local".into(),
+                    caip10: format!("solana:local:{address}"),
+                    address,
+                    address_encoding: AddressEncoding::Base58,
+                }],
                 lifecycle: AccountLifecycleState::Active,
             }],
         }
@@ -284,7 +291,7 @@ async fn solana_full_stage_confirm_flow() -> Result<()> {
         sign_calls: parking_lot::Mutex::new(Vec::new()),
     });
 
-    // `allow_broadcast` requires a pinned genesis hash — the config-level
+    // Broadcasting requires a pinned genesis hash — the transaction-level
     // half of the mainnet guard. Discover the local cluster's identity.
     let genesis = rpc("getGenesisHash", serde_json::json!([]))?["result"]
         .as_str()
@@ -306,7 +313,6 @@ async fn solana_full_stage_confirm_flow() -> Result<()> {
                 http_only: false,
             }],
             expected_genesis_base58: Some(genesis.clone()),
-            allow_broadcast: true,
         },
     );
     cfg.save(&tmp.path().join("config.toml"))
@@ -364,7 +370,7 @@ async fn solana_full_stage_confirm_flow() -> Result<()> {
     );
     let chains = daemon
         .vfs
-        .list(&VfsPath::parse("/wallets/alice/chains").unwrap())
+        .list(&VfsPath::parse("/wallets/alice/0/chains").unwrap())
         .await
         .map_err(|e| anyhow!("list chains: {e}"))?;
     let names: Vec<&str> = chains.iter().map(|e| e.name.as_str()).collect();
@@ -397,7 +403,7 @@ async fn solana_full_stage_confirm_flow() -> Result<()> {
         "5",
         "lookup the outbox write sinks (the mount-reachability path)",
     );
-    let new_tx = VfsPath::parse("/wallets/alice/chains/solana-local/outbox/new.tx").unwrap();
+    let new_tx = VfsPath::parse("/wallets/alice/0/chains/solana-local/outbox/new.tx").unwrap();
     match daemon.vfs.lookup(&new_tx).await {
         Ok(entry) => {
             println!("    lookup new.tx -> mode {:o}", entry.mode);
@@ -407,7 +413,7 @@ async fn solana_full_stage_confirm_flow() -> Result<()> {
     }
     let outbox_listing = daemon
         .vfs
-        .list(&VfsPath::parse("/wallets/alice/chains/solana-local/outbox").unwrap())
+        .list(&VfsPath::parse("/wallets/alice/0/chains/solana-local/outbox").unwrap())
         .await
         .map_err(|e| anyhow!("list outbox: {e}"))?;
     println!(
@@ -429,7 +435,7 @@ async fn solana_full_stage_confirm_flow() -> Result<()> {
         .map_err(|e| anyhow!("stage write: {e}"))?;
     let pending = daemon
         .vfs
-        .list(&VfsPath::parse("/wallets/alice/chains/solana-local/outbox/pending").unwrap())
+        .list(&VfsPath::parse("/wallets/alice/0/chains/solana-local/outbox/pending").unwrap())
         .await
         .map_err(|e| anyhow!("list pending: {e}"))?;
     let id = pending
@@ -442,7 +448,7 @@ async fn solana_full_stage_confirm_flow() -> Result<()> {
         .vfs
         .read(
             &VfsPath::parse(&format!(
-                "/wallets/alice/chains/solana-local/outbox/pending/{id}/intent.json"
+                "/wallets/alice/0/chains/solana-local/outbox/pending/{id}/intent.json"
             ))
             .unwrap(),
         )
@@ -461,7 +467,7 @@ async fn solana_full_stage_confirm_flow() -> Result<()> {
         "first confirm must fail closed (no Sealed Approval yet)",
     );
     let confirm = VfsPath::parse(&format!(
-        "/wallets/alice/chains/solana-local/outbox/pending/{id}/confirm"
+        "/wallets/alice/0/chains/solana-local/outbox/pending/{id}/confirm"
     ))
     .unwrap();
     match daemon.vfs.lookup(&confirm).await {
@@ -490,7 +496,7 @@ async fn solana_full_stage_confirm_flow() -> Result<()> {
 
     let sent = daemon
         .vfs
-        .list(&VfsPath::parse("/wallets/alice/chains/solana-local/outbox/sent").unwrap())
+        .list(&VfsPath::parse("/wallets/alice/0/chains/solana-local/outbox/sent").unwrap())
         .await
         .map_err(|e| anyhow!("list sent: {e}"))?;
     println!(
@@ -539,7 +545,7 @@ async fn solana_full_stage_confirm_flow() -> Result<()> {
     // 10. On-chain verification.
     step("10", "verify the transfer on the validator");
     let receipt_path =
-        format!("/wallets/alice/chains/solana-local/outbox/sent/{id}/broadcast_attempted.json");
+        format!("/wallets/alice/0/chains/solana-local/outbox/sent/{id}/broadcast_attempted.json");
     if let Ok(b) = daemon
         .vfs
         .read(&VfsPath::parse(&receipt_path).unwrap())
@@ -572,7 +578,7 @@ async fn solana_full_stage_confirm_flow() -> Result<()> {
             .vfs
             .read(
                 &VfsPath::parse(&format!(
-                    "/wallets/alice/chains/solana-local/outbox/sent/{id}/receipt.json"
+                    "/wallets/alice/0/chains/solana-local/outbox/sent/{id}/receipt.json"
                 ))
                 .unwrap(),
             )

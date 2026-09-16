@@ -60,12 +60,10 @@ Uninstall stops Machine before removing this per-login fstab entry.
 State roots and service configuration live below principal-owned mode-0700
 directories. The edge manifest and binaries are root-owned and not writable by
 any product principal. The local Signer service permits only `AF_UNIX`.
-The AWS KMS drop-in is a separate installer-rendered, instance-specific
-profile. For UID `1000`, the installer renders it to
-`bloom-signer@1000.service.d/50-aws-kms.conf`; it enables IP sockets but
-retains `IPAddressDeny=any`. The installer must render the reviewed KMS
-endpoint CIDRs as `IPAddressAllow` entries. Empty or wildcard egress is an
-installer error.
+The released Signer is built without AWS KMS support. The installer refuses a
+payload carrying AWS KMS credentials or an egress allowlist, and it refuses a
+login that already has an AWS KMS Signer enrollment, before changing any
+installed state.
 
 The templates use `@...@` placeholders where packaging must supply an absolute
 binary path, login identity, or reviewed egress list. `%i` is the systemd
