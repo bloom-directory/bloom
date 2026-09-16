@@ -286,8 +286,9 @@ scripts/evals/run-harbor.sh solana-transfer deepseek
 scripts/evals/run-harbor.sh solana-transfer opencode
 ```
 
-The harness enforces its own ceilings (0.02 SOL transfer, 0.05 SOL balance)
-independently of the configured numbers, refuses a mainnet endpoint whose live
+The harness rejects a configured transfer amount or fee ceiling above 0.02 SOL,
+independently of the operator's numbers; it does not check wallet balances.
+It refuses a mainnet endpoint whose live
 genesis is not mainnet-beta's, refuses a local lane whose endpoint serves the
 mainnet-beta genesis, and requires the sweep keypair to control the
 destination. Cleanup always sweeps the destination back to the source; only
