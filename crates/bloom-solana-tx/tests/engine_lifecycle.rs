@@ -2466,6 +2466,82 @@ async fn a_confirm_replaces_the_blockhash_once_and_records_what_it_sent() {
     );
 }
 
+/// A refreshed blockhash is useless with the height window of the blockhash
+/// it replaces: the Broker's signing record must carry the fresh height
+/// beside the fresh hash, and the finalized snapshot must agree with it.
+#[tokio::test]
+async fn a_confirm_carries_the_fresh_height_with_the_fresh_blockhash() {
+    // `spawn_node_with_controls` derives both the blockhash and its window
+    // from one height, so moving the height rotates both together.
+    let height = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let endpoint = spawn_node_with_controls(height.clone(), false, false, requests).await;
+    let dir = tempfile::tempdir().unwrap();
+    let outbox = SolanaOutbox::new(dir.path().join("outbox")).unwrap();
+    let broker = Arc::new(BrokerFixture::new());
+    let signer =
+        SolanaTransferSigner::from_catalog(MachineBrokerClient::new(broker.clone()), &catalog())
+            .unwrap();
+    let engine =
+        SolanaTransferEngine::new(outbox.clone(), client(&endpoint), signer, "solana-devnet");
+    let staged = stage_for_retry(&engine, &broker).await;
+    assert_eq!(staged.last_valid_block_height, 100);
+    let fee_payer = broker.child_pubkey();
+
+    let approval = match engine
+        .sign("wallet", &staged.id, &fee_payer, None, None, 1_000)
+        .await
+        .unwrap()
+    {
+        bloom_solana_tx::signing::SolanaSignOutcome::ApprovalRequired { approval_id, .. } => {
+            approval_id
+        }
+        other => panic!("expected ApprovalRequired, got {other:?}"),
+    };
+
+    // The cluster moves on — both the hash and its validity window — while
+    // the owner is still at the passkey prompt.
+    height.store(150, std::sync::atomic::Ordering::SeqCst);
+
+    let signed = engine
+        .sign(
+            "wallet",
+            &staged.id,
+            &fee_payer,
+            None,
+            Some(approval.clone()),
+            200_000,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        signed,
+        bloom_solana_tx::signing::SolanaSignOutcome::Signed { .. }
+    ));
+
+    let snapshot = outbox
+        .signing_attempt(&pending(&outbox, &staged.id))
+        .unwrap()
+        .expect("the confirm committed to a message");
+    let fresh_blockhash = bs58::encode([151u8; 32]).into_string();
+    assert_eq!(snapshot.finalized_staged.blockhash, fresh_blockhash);
+    assert_eq!(
+        snapshot.finalized_staged.last_valid_block_height, 250,
+        "the finalized snapshot tracks the fresh validity window"
+    );
+    let claim = snapshot
+        .request
+        .system_use_claim
+        .as_ref()
+        .expect("the signing request carries a system claim");
+    assert_eq!(claim.chain_context.recent_blockhash, fresh_blockhash);
+    assert_eq!(
+        claim.chain_context.last_valid_block_height.get(),
+        250,
+        "a fresh blockhash with a stale height misdescribes the signing facts"
+    );
+}
+
 /// A committed attempt is replayed, never rebuilt. Rebuilding could pick a
 /// newer blockhash and buy a second signature under one approval.
 #[tokio::test]
