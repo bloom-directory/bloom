@@ -18,7 +18,7 @@ const TRUSTED_GITHUB_OWNER: &str = "bloom-directory";
 // Retain a bounded diagnostic tail for reconciliation after streamed output.
 const SOURCE_BUILD_STREAM_LIMIT: usize = 256 * 1024;
 const NEAR_INTENTS_RELEASE_COMMIT: &str = "ccabb93214f1f18cf9b36946425e60035763f193";
-const ENSO_RELEASE_COMMIT: &str = "709c8ef8396a562387c8aa8f5ef2cc6f97784cfc";
+const ENSO_RELEASE_COMMIT: &str = "8968988c0f03fd3dbd3eb290fcd178066804de6e";
 
 /// Canonical defaults for every Bloom home, independent of persisted config.
 pub(crate) const DEFAULT_PETALS: &[&str] =
@@ -193,10 +193,10 @@ const PREINSTALLED_ENSO: PreinstalledPetal = PreinstalledPetal {
     name: "enso",
     repository: "https://github.com/bloom-directory/bloom-petal-enso",
     commit: ENSO_RELEASE_COMMIT,
-    release_tag: "v0.1.3",
-    archive: "enso-v0.1.3.petal.tar.gz",
-    expected_hash: Some("4449269cc3b3a55cece350ddbbf0e22c6d523d90eb867c9be1087b99c01239ac"),
-    archive_sha256: "00554421df1e506da36bad346bfd6e0641313ccc0c4c0c9177ffc78600fcf1d2",
+    release_tag: "v0.1.5",
+    archive: "enso-v0.1.5.petal.tar.gz",
+    expected_hash: Some("97650f327691f01bc4591cde25253d1e20010643e700674cc9759cd1366876b9"),
+    archive_sha256: "910683c8ea64bdd91f3edcbe1da82ab511267257f0be7ab7093466cd097a976f",
     tooling_commit: "1af3ba971e8b494b58bb85d0c0fcf2ad15cd3b4c",
     petal_abi: "bloom.petal-host/triad-compatible-nonauthority-v1",
     default_eligible: true,
@@ -1766,9 +1766,9 @@ mod tests {
         assert_eq!(near.archive, "near-intents-v0.1.2.petal.tar.gz");
         assert!(near.repository.ends_with("/bloom-petal-near"));
         let enso = preinstalled_petal("enso").unwrap();
-        assert_eq!(enso.release_tag, "v0.1.3");
+        assert_eq!(enso.release_tag, "v0.1.5");
         assert_eq!(enso.commit, ENSO_RELEASE_COMMIT);
-        assert_eq!(enso.archive, "enso-v0.1.3.petal.tar.gz");
+        assert_eq!(enso.archive, "enso-v0.1.5.petal.tar.gz");
         assert!(enso.repository.ends_with("/bloom-petal-enso"));
         for name in [
             "polymarket",
