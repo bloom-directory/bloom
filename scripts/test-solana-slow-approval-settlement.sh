@@ -376,12 +376,18 @@ sleep 2
 recipient_final="$(rpc getBalance "$(jq -nc --arg a "$RECIPIENT" '[$a]')" | jq -r '.result.value // 0')"
 [ "$recipient_final" -eq "$recipient_after" ] ||
   die "retry produced a second payment: ${recipient_after} -> ${recipient_final}"
-sender_signatures="$(rpc getSignaturesForAddress "$(jq -nc --arg a "$sender" '[$a, {limit:25}]')" |
-  jq -r '[.result[] | select(.err == null)] | length')"
-# One airdrop credit does not appear under the sender's own signatures; the
-# only signature this account authored is the transfer itself.
+# getSignaturesForAddress lists every transaction touching the account,
+# including the faucet airdrop that funded it. Count only transactions the
+# sender authored (fee payer is accountKeys[0]): the transfer itself.
+sender_signatures=0
+for sig in $(rpc getSignaturesForAddress "$(jq -nc --arg a "$sender" '[$a, {limit:25}]')" |
+  jq -r '.result[] | select(.err == null) | .signature'); do
+  payer="$(rpc getTransaction "$(jq -nc --arg s "$sig" '[$s, {encoding:"json", maxSupportedTransactionVersion:0}]')" |
+    jq -r '.result.transaction.message.accountKeys[0] // empty')"
+  [ "$payer" = "$sender" ] && sender_signatures=$((sender_signatures + 1))
+done
 [ "$sender_signatures" -eq 1 ] ||
-  die "expected exactly one settled signature from ${sender}, found ${sender_signatures}"
+  die "expected exactly one authored signature from ${sender}, found ${sender_signatures}"
 
 say "PASSED"
 printf '  wallet            %s\n' "$wallet_id"
