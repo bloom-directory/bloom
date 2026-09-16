@@ -286,17 +286,21 @@ struct PetalKeySessionRecord {
     /// Budgets sealed into the key's reusable approval.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     value_limits: Vec<bloom_broker_api::ValueLimit>,
-    /// The wallet policy snapshot the current reusable approval was prepared
-    /// against. Approvals prepared before this record existed have none.
+    /// The key's latest reusable-approval prepare, frozen here before it is
+    /// sent. Its terms carry the approval id and the policy snapshot, so a
+    /// lost response or an unrecorded state write is recovered from this
+    /// record rather than by preparing again. Approvals prepared before this
+    /// record existed have none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    approval_policy: Option<PetalKeyApprovalPolicy>,
+    reusable_approval: Option<PetalKeyReusableApproval>,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
-struct PetalKeyApprovalPolicy {
-    approval_id: bloom_broker_api::Digest32,
-    policy_version: bloom_broker_api::DecimalU64,
-    policy_digest: bloom_broker_api::Digest32,
+struct PetalKeyReusableApproval {
+    /// Distinguishes successive prepares for one key and policy, so a
+    /// replacement never reuses an operation id with different terms.
+    attempt: u64,
+    request: bloom_broker_api::ApprovalPrepareRequest,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -792,15 +796,22 @@ impl DaemonPetalHost {
         Ok(())
     }
 
-    async fn prepare_petal_key_reusable_approval(
+    /// The complete prepare request for a key's reusable approval, built once
+    /// and frozen before it is sent. `key_requested_at_ms` is when Machine
+    /// staged the key's derivation: Broker starts the key's lifetime when that
+    /// derivation completes, which is later, so an approval ending no later
+    /// than `key_requested_at_ms + lifetime` never outlives the key.
+    #[allow(clippy::too_many_arguments)]
+    fn build_petal_key_reusable_approval(
         &self,
-        broker: &MachineBrokerClient,
         wallet: &bloom_broker_api::WalletPublic,
         scope: &bloom_broker_api::PetalKeyScope,
         key_ref: &bloom_broker_api::KeyRef,
         provenance_digest: bloom_broker_api::Digest32,
         value_limits: Vec<bloom_broker_api::ValueLimit>,
-    ) -> Result<(bloom_broker_api::SealedApprovalPrepareResponse, u64), HostError> {
+        key_requested_at_ms: u64,
+        attempt: u64,
+    ) -> Result<bloom_broker_api::ApprovalPrepareRequest, HostError> {
         let catalog = self.provenance_catalog.as_ref().ok_or_else(|| {
             HostError::Backend("installer provenance catalog is not configured".into())
         })?;
@@ -862,6 +873,20 @@ impl DaemonPetalHost {
                 "derived-key lifetime is too short for reusable approval".into(),
             ));
         }
+        if key_requested_at_ms == 0 {
+            return Err(HostError::Denied(
+                "Petal key state predates its recorded derivation time; request a new session key"
+                    .into(),
+            ));
+        }
+        let expires_at_ms = now_ms
+            .saturating_add(approval_lifetime_ms)
+            .min(key_requested_at_ms.saturating_add(lifetime_ms));
+        if expires_at_ms <= now_ms {
+            return Err(HostError::Denied(
+                "the Petal session key's lifetime has elapsed; request a new session key".into(),
+            ));
+        }
         let scope_digest = scope
             .digest()
             .map_err(|error| HostError::Invalid(error.to_string()))?;
@@ -874,6 +899,8 @@ impl DaemonPetalHost {
                 wallet.policy_version.get().to_string().as_bytes(),
                 b"\0",
                 wallet.policy_digest.as_str().as_bytes(),
+                b"\0",
+                attempt.to_string().as_bytes(),
             ]
             .concat()
             .as_slice(),
@@ -923,9 +950,7 @@ impl DaemonPetalHost {
             request_nonce,
             issued_at_ms: bloom_broker_api::DecimalU64::new(now_ms),
             not_before_ms: bloom_broker_api::DecimalU64::new(now_ms),
-            expires_at_ms: bloom_broker_api::DecimalU64::new(
-                now_ms.saturating_add(approval_lifetime_ms),
-            ),
+            expires_at_ms: bloom_broker_api::DecimalU64::new(expires_at_ms),
             renewal_of: None,
         };
         let plan = serde_json::json!({
@@ -944,31 +969,35 @@ impl DaemonPetalHost {
             })?)
             .into(),
         );
-        let authority_expires_at_ms = terms.expires_at_ms.get();
-        let expected_approval_id = terms
+        Ok(bloom_broker_api::ApprovalPrepareRequest {
+            operation_id,
+            terms,
+            canonical_plan_facts_digest: plan_digest,
+            // A Petal approval carries neither claim: the Petal path proves
+            // itself through provenance, and the system claim belongs to the
+            // native Solana transfer path.
+            petal_use_claim: None,
+            system_use_claim: None,
+        })
+    }
+
+    async fn send_petal_key_reusable_approval(
+        broker: &MachineBrokerClient,
+        request: bloom_broker_api::ApprovalPrepareRequest,
+    ) -> Result<bloom_broker_api::SealedApprovalPrepareResponse, HostError> {
+        let expected_approval_id = request
+            .terms
             .approval_id()
             .map_err(|error| HostError::Invalid(error.to_string()))?;
-        let prepared = broker
-            .prepare_approval(bloom_broker_api::ApprovalPrepareRequest {
-                operation_id,
-                terms,
-                canonical_plan_facts_digest: plan_digest,
-                // A Petal approval carries neither claim: the Petal path
-                // proves itself through provenance, and the system claim
-                // belongs to the native Solana transfer path.
-                petal_use_claim: None,
-                system_use_claim: None,
-            })
-            .await
-            .map_err(|error| {
-                HostError::Denied(format!("{}: {}", error.code.as_str(), error.message))
-            })?;
+        let prepared = broker.prepare_approval(request).await.map_err(|error| {
+            HostError::Denied(format!("{}: {}", error.code.as_str(), error.message))
+        })?;
         if prepared.approval_id != expected_approval_id {
             return Err(HostError::Denied(
                 "Broker returned an approval outside the requested terms".into(),
             ));
         }
-        Ok((prepared, authority_expires_at_ms))
+        Ok(prepared)
     }
 
     fn reusable_approval_for_key(
@@ -1500,79 +1529,133 @@ impl PetalHost for DaemonPetalHost {
             if let Some(derived_key_ref) = stored.public_key.as_ref().map(|key| key.key_ref.clone())
             {
                 let mut session = Self::read_petal_key_session(&path)?;
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|duration| duration.as_millis() as u64)
+                    .unwrap_or(0);
+                // The approval this key currently relies on: the frozen
+                // prepare when there is one (it is written before it is sent,
+                // so it is newer than anything the state file recorded), else
+                // an approval recorded before frozen prepares existed.
+                let frozen = session.reusable_approval.clone();
+                let current = match &frozen {
+                    Some(frozen) => Some(
+                        frozen
+                            .request
+                            .terms
+                            .approval_id()
+                            .map_err(|error| HostError::Invalid(error.to_string()))?,
+                    ),
+                    None => stored.reusable_approval_id.clone(),
+                };
                 // The Broker refuses an approval once the wallet policy moves
-                // past the snapshot it sealed, whatever its state. Adding the
-                // session address to the destination policy is exactly such a
-                // move, so a changed policy stages a replacement approval.
-                let policy_moved = session.approval_policy.as_ref().is_some_and(|prepared| {
-                    Some(&prepared.approval_id) == stored.reusable_approval_id.as_ref()
-                        && (prepared.policy_version != wallet.policy_version
-                            || prepared.policy_digest != wallet.policy_digest)
+                // past the snapshot it sealed, whatever its state. Admitting
+                // the session address to the destination policy is exactly
+                // such a move, so a changed policy needs a replacement.
+                let policy_moved = frozen.as_ref().is_some_and(|frozen| {
+                    frozen.request.terms.policy_version != wallet.policy_version
+                        || frozen.request.terms.policy_digest != wallet.policy_digest
                 });
-                if let Some(approval_id) = stored
-                    .reusable_approval_id
-                    .clone()
-                    .filter(|_| !policy_moved)
-                {
-                    let approval = broker.approval_status(approval_id).await.map_err(|error| {
-                        HostError::Denied(format!("{}: {}", error.code.as_str(), error.message))
-                    })?;
-                    match approval.state {
-                        bloom_broker_api::ApprovalLifecycleState::Active => {
-                            stored.status = "succeeded".into();
-                            stored.ceremony_url = None;
-                            stored.succeeded_at_ms = Some(
-                                SystemTime::now()
-                                    .duration_since(UNIX_EPOCH)
-                                    .map(|duration| duration.as_millis() as u64)
-                                    .unwrap_or(0),
-                            );
-                            Self::write_petal_key_state(&path, &stored)?;
-                            return stored.guest_outcome();
-                        }
-                        bloom_broker_api::ApprovalLifecycleState::Prepared
-                        | bloom_broker_api::ApprovalLifecycleState::AwaitingCeremony
-                            if stored.status != PETAL_CEREMONY_INVALIDATED_STATUS =>
+                let mut resend = None;
+                if let Some(approval_id) = current.filter(|_| !policy_moved) {
+                    let terms_expiry = frozen
+                        .as_ref()
+                        .map(|frozen| frozen.request.terms.expires_at_ms.get())
+                        .or(stored.authority_expires_at_ms);
+                    match broker.approval_status(approval_id.clone()).await {
+                        Ok(approval) => match approval.state {
+                            bloom_broker_api::ApprovalLifecycleState::Active => {
+                                stored.reusable_approval_id = Some(approval_id);
+                                stored.authority_expires_at_ms = terms_expiry;
+                                stored.status = "succeeded".into();
+                                stored.ceremony_url = None;
+                                stored.succeeded_at_ms = Some(now_ms);
+                                Self::write_petal_key_state(&path, &stored)?;
+                                return stored.guest_outcome();
+                            }
+                            bloom_broker_api::ApprovalLifecycleState::Prepared
+                            | bloom_broker_api::ApprovalLifecycleState::AwaitingCeremony
+                                if stored.status != PETAL_CEREMONY_INVALIDATED_STATUS =>
+                            {
+                                if stored.reusable_approval_id.as_ref() != Some(&approval_id) {
+                                    // The prepare reached Broker but its
+                                    // response was never recorded.
+                                    stored.reusable_approval_id = Some(approval_id);
+                                    stored.authority_expires_at_ms = terms_expiry;
+                                    stored.status = "awaiting_user".into();
+                                    stored.ceremony_url =
+                                        approval.ceremony_url.or(stored.ceremony_url.take());
+                                    if let Some(expires) = approval.ceremony_expires_at_ms {
+                                        stored.ceremony_expires_at_ms = expires;
+                                    }
+                                    Self::write_petal_key_state(&path, &stored)?;
+                                }
+                                return stored.guest_outcome();
+                            }
+                            // Still waiting on an owner, but the ceremony that
+                            // would carry it was retired at startup. Nothing an
+                            // owner can act on remains, so stage a fresh one.
+                            bloom_broker_api::ApprovalLifecycleState::Prepared
+                            | bloom_broker_api::ApprovalLifecycleState::AwaitingCeremony => {}
+                            state => {
+                                return Err(HostError::Denied(format!(
+                                    "Petal reusable approval is not active: {state:?}"
+                                )));
+                            }
+                        },
+                        // A frozen prepare that never reached Broker is sent
+                        // as frozen; its terms and operation id do not change.
+                        Err(error)
+                            if error.code
+                                == bloom_broker_api::ProtocolErrorCode::ApprovalNotFound
+                                && frozen.is_some() =>
                         {
-                            return stored.guest_outcome();
+                            resend = frozen.clone();
                         }
-                        // The approval is still waiting on an owner, but the
-                        // ceremony that would have carried it was retired at
-                        // startup. Leaving it as is would advertise nothing an
-                        // owner can act on ever again, so stage a fresh one.
-                        bloom_broker_api::ApprovalLifecycleState::Prepared
-                        | bloom_broker_api::ApprovalLifecycleState::AwaitingCeremony => {}
-                        state => {
+                        Err(error) => {
                             return Err(HostError::Denied(format!(
-                                "Petal reusable approval is not active: {state:?}"
+                                "{}: {}",
+                                error.code.as_str(),
+                                error.message
                             )));
                         }
                     }
                 }
-                let (reusable, authority_expires_at_ms) = self
-                    .prepare_petal_key_reusable_approval(
-                        broker,
-                        &wallet,
-                        &scope,
-                        &derived_key_ref,
-                        provenance_digest.clone().ok_or_else(|| {
-                            HostError::Denied("Petal provenance digest is missing".into())
-                        })?,
-                        req.approval_value_limits.clone(),
-                    )
-                    .await?;
-                session.approval_policy = Some(PetalKeyApprovalPolicy {
-                    approval_id: reusable.approval_id.clone(),
-                    policy_version: wallet.policy_version.clone(),
-                    policy_digest: wallet.policy_digest.clone(),
-                });
+                let approval = match resend {
+                    Some(frozen) => frozen,
+                    None => {
+                        let attempt = frozen.as_ref().map_or(0, |frozen| frozen.attempt + 1);
+                        let approval = PetalKeyReusableApproval {
+                            attempt,
+                            request: self.build_petal_key_reusable_approval(
+                                &wallet,
+                                &scope,
+                                &derived_key_ref,
+                                provenance_digest.clone().ok_or_else(|| {
+                                    HostError::Denied("Petal provenance digest is missing".into())
+                                })?,
+                                req.approval_value_limits.clone(),
+                                stored.requested_at_ms,
+                                attempt,
+                            )?,
+                        };
+                        session.reusable_approval = Some(approval.clone());
+                        Self::write_petal_key_state(
+                            &Self::petal_key_session_path(&path),
+                            &session,
+                        )?;
+                        approval
+                    }
+                };
+                let authority_expires_at_ms = approval.request.terms.expires_at_ms.get();
+                let reusable =
+                    Self::send_petal_key_reusable_approval(broker, approval.request).await?;
                 stored.reusable_approval_id = Some(reusable.approval_id);
                 stored.authority_expires_at_ms = Some(authority_expires_at_ms);
                 stored.status = "awaiting_user".into();
                 stored.ceremony_url = Some(reusable.ceremony_url);
                 stored.ceremony_expires_at_ms = reusable.ceremony_expires_at_ms;
                 Self::write_petal_key_state(&path, &stored)?;
-                Self::write_petal_key_state(&Self::petal_key_session_path(&path), &session)?;
                 return stored.guest_outcome();
             }
             match broker
@@ -1670,7 +1753,7 @@ impl PetalHost for DaemonPetalHost {
             &Self::petal_key_session_path(&path),
             &PetalKeySessionRecord {
                 value_limits: req.approval_value_limits.clone(),
-                approval_policy: None,
+                reusable_approval: None,
             },
         )?;
         let prepared = broker
@@ -5766,9 +5849,14 @@ mod tests {
         prepares: std::sync::atomic::AtomicUsize,
         parent: bloom_broker_api::KeyRef,
         child: bloom_broker_api::KeyRef,
-        sealed_value_limits: std::sync::Mutex<Vec<bloom_broker_api::ValueLimit>>,
         policy_version: std::sync::atomic::AtomicU64,
-        approval_operations: std::sync::Mutex<Vec<bloom_broker_api::OperationId>>,
+        /// Every reusable-approval prepare Broker recorded, in order.
+        approval_prepares: std::sync::Mutex<Vec<bloom_broker_api::ApprovalPrepareRequest>>,
+        /// Refuse the next prepare before recording it, as if it never
+        /// reached Broker.
+        drop_next_prepare_request: std::sync::atomic::AtomicBool,
+        /// Record the next prepare but lose its response.
+        drop_next_prepare_response: std::sync::atomic::AtomicBool,
     }
 
     struct PetalExactBrokerFixture {
@@ -5950,9 +6038,10 @@ mod tests {
                 prepares: std::sync::atomic::AtomicUsize::new(0),
                 parent: key_ref("wallet/primary/root", 1),
                 child,
-                sealed_value_limits: std::sync::Mutex::new(Vec::new()),
                 policy_version: std::sync::atomic::AtomicU64::new(1),
-                approval_operations: std::sync::Mutex::new(Vec::new()),
+                approval_prepares: std::sync::Mutex::new(Vec::new()),
+                drop_next_prepare_request: std::sync::atomic::AtomicBool::new(false),
+                drop_next_prepare_response: std::sync::atomic::AtomicBool::new(false),
             }
         }
     }
@@ -6055,12 +6144,25 @@ mod tests {
                         };
                         assert_eq!(route_grants.len(), 1);
                         assert_eq!(route_grants[0].route, "r000007");
-                        *self.sealed_value_limits.lock().unwrap() =
-                            request.terms.limits.value_limits.clone();
-                        self.approval_operations
-                            .lock()
-                            .unwrap()
-                            .push(request.operation_id.clone());
+                        if self
+                            .drop_next_prepare_request
+                            .swap(false, std::sync::atomic::Ordering::SeqCst)
+                        {
+                            return Err(bloom_broker_api::ProtocolError::new(
+                                bloom_broker_api::ProtocolErrorCode::ServiceUnavailable,
+                                "prepare never reached Broker",
+                            ));
+                        }
+                        self.approval_prepares.lock().unwrap().push(request.clone());
+                        if self
+                            .drop_next_prepare_response
+                            .swap(false, std::sync::atomic::Ordering::SeqCst)
+                        {
+                            return Err(bloom_broker_api::ProtocolError::new(
+                                bloom_broker_api::ProtocolErrorCode::ServiceUnavailable,
+                                "prepare response lost",
+                            ));
+                        }
                         let approval_id = request.terms.approval_id()?;
                         Ok(MachineBrokerResponse::SealedApprovalPrepare(
                             bloom_broker_api::SealedApprovalPrepareResponse {
@@ -6076,6 +6178,18 @@ mod tests {
                         ))
                     }
                     MachineBrokerRequest::SealedApprovalStatus(request) => {
+                        let prepared = self
+                            .approval_prepares
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .any(|prepare| prepare.terms.approval_id().unwrap() == request.id);
+                        if !prepared {
+                            return Err(bloom_broker_api::ProtocolError::new(
+                                bloom_broker_api::ProtocolErrorCode::ApprovalNotFound,
+                                "approval does not exist",
+                            ));
+                        }
                         let active = self
                             .approval_active
                             .load(std::sync::atomic::Ordering::SeqCst);
@@ -6306,11 +6420,18 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn petal_key_host_reconciles_retry_and_fails_closed_on_changed_or_tampered_state() {
-        let dir = tempfile::tempdir().unwrap();
-        let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
-        let fixture = Arc::new(PetalKeyBrokerFixture::new());
+    /// A Petal key host over `fixture` with one catalogued, lineage-active
+    /// route under `dir`, a budgeted key request for that route, and the
+    /// route's provenance digest.
+    fn petal_key_host(
+        dir: &Path,
+        fixture: &Arc<PetalKeyBrokerFixture>,
+    ) -> (
+        DaemonPetalHost,
+        bloom_petals::PetalKeyRequest,
+        bloom_broker_api::Digest32,
+    ) {
+        let audit = Arc::new(AuditLog::open(dir.join("audit.jsonl")).unwrap());
         let provenance_record = bloom_broker_api::ProvenanceRecord {
             subject: bloom_broker_api::ProvenanceSubject::Petal {
                 package_hash: bloom_broker_api::Digest32::from_bytes([0xaa; 32]),
@@ -6339,7 +6460,7 @@ mod tests {
                 schema: bloom_broker_api::PROVENANCE_CATALOG_SCHEMA.into(),
                 records: vec![provenance_record],
             }))
-            .with_petal_key_state_root(dir.path().join("petal-key-requests"));
+            .with_petal_key_state_root(dir.join("petal-key-requests"));
         let context = PetalRouteContext {
             petal_root: "exchange".into(),
             package_hash: "aa".repeat(32),
@@ -6364,8 +6485,101 @@ mod tests {
                 lifetime: bloom_broker_api::DecimalU256::parse("20000000").unwrap(),
                 rolling_windows: Vec::new(),
             }],
-            context: Some(context.clone()),
+            context: Some(context),
         };
+        (host, request, expected_provenance_digest)
+    }
+
+    /// The reusable-approval prepare is frozen before it is sent. A prepare
+    /// that never reached Broker is sent again unchanged, a lost response is
+    /// recovered by the approval's id without preparing again (also across a
+    /// restart), and an approval never outlives the key's lifetime counted
+    /// from when its derivation was staged.
+    #[tokio::test]
+    async fn petal_key_reusable_approval_recovers_lost_prepares_within_the_key_lifetime() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = Arc::new(PetalKeyBrokerFixture::new());
+        let (host, request, _) = petal_key_host(dir.path(), &fixture);
+        let state_path = host
+            .petal_key_state_path(
+                "primary",
+                "pln1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                &request.key_slot,
+            )
+            .unwrap();
+        let backdate = |age_ms: u64| {
+            let mut state = DaemonPetalHost::read_petal_key_state(&state_path)
+                .unwrap()
+                .unwrap();
+            state.requested_at_ms = now_ms_for_fixture() - age_ms;
+            DaemonPetalHost::write_petal_key_state(&state_path, &state).unwrap();
+            state.requested_at_ms
+        };
+        let prepares = || fixture.approval_prepares.lock().unwrap().clone();
+        host.petal_key_request(request.clone()).await.unwrap();
+        fixture
+            .completed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        host.petal_key_request(request.clone()).await.unwrap();
+
+        // Setup took 50 s of the key's 60 s: the approval must end with the key.
+        let requested_at_ms = backdate(50_000);
+        fixture
+            .drop_next_prepare_request
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        host.petal_key_request(request.clone()).await.unwrap_err();
+        let frozen = DaemonPetalHost::read_petal_key_session(&state_path)
+            .unwrap()
+            .reusable_approval
+            .unwrap()
+            .request;
+        assert!(frozen.terms.expires_at_ms.get() <= requested_at_ms + 60_000);
+        assert!(prepares().is_empty());
+
+        // After a restart, the unsent prepare goes out exactly as frozen, and
+        // this time its response is lost.
+        let (host, request, _) = petal_key_host(dir.path(), &fixture);
+        fixture
+            .drop_next_prepare_response
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        host.petal_key_request(request.clone()).await.unwrap_err();
+        assert_eq!(prepares(), std::slice::from_ref(&frozen));
+
+        let pending = host.petal_key_request(request.clone()).await.unwrap();
+        assert_eq!(serde_json::to_value(&pending).unwrap()["state"], "pending");
+        let recovered = DaemonPetalHost::read_petal_key_state(&state_path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            recovered.reusable_approval_id,
+            Some(frozen.terms.approval_id().unwrap())
+        );
+        assert_eq!(prepares().len(), 1, "a recorded prepare is never repeated");
+        fixture
+            .approval_active
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let ready = host.petal_key_request(request.clone()).await.unwrap();
+        assert_eq!(serde_json::to_value(&ready).unwrap()["state"], "ready");
+
+        // A policy change after the key's lifetime has passed cannot be
+        // restaged: no approval may outlive the key.
+        backdate(70_000);
+        fixture
+            .policy_version
+            .store(2, std::sync::atomic::Ordering::SeqCst);
+        let elapsed = host.petal_key_request(request).await.unwrap_err();
+        assert!(
+            elapsed.to_string().contains("lifetime has elapsed"),
+            "{elapsed}"
+        );
+        assert_eq!(prepares().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn petal_key_host_reconciles_retry_and_fails_closed_on_changed_or_tampered_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = Arc::new(PetalKeyBrokerFixture::new());
+        let (host, request, expected_provenance_digest) = petal_key_host(dir.path(), &fixture);
 
         // Budgets the Broker would refuse are refused before the owner is
         // asked to derive a key for them.
@@ -6473,7 +6687,7 @@ mod tests {
             .unwrap();
         assert!(derived_status.public_key.is_some());
         assert!(derived_status.reusable_approval_id.is_none());
-        assert!(fixture.approval_operations.lock().unwrap().is_empty());
+        assert!(fixture.approval_prepares.lock().unwrap().is_empty());
 
         let reusable_pending = host.petal_key_request(request.clone()).await.unwrap();
         assert_eq!(
@@ -6488,7 +6702,10 @@ mod tests {
             "http://127.0.0.1:18734/ceremony/reusable-owner-only"
         );
         assert_eq!(
-            *fixture.sealed_value_limits.lock().unwrap(),
+            fixture.approval_prepares.lock().unwrap()[0]
+                .terms
+                .limits
+                .value_limits,
             request.approval_value_limits,
             "the owner ceremony seals the requested budgets unchanged"
         );
@@ -6540,7 +6757,13 @@ mod tests {
             restaged_status.reusable_approval_id,
             polled.reusable_approval_id
         );
-        let operations = fixture.approval_operations.lock().unwrap().clone();
+        let operations = fixture
+            .approval_prepares
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|prepare| prepare.operation_id.clone())
+            .collect::<Vec<_>>();
         assert_eq!(operations.len(), 2);
         assert_ne!(operations[0], operations[1]);
         assert_eq!(
@@ -6548,7 +6771,7 @@ mod tests {
             "ready",
             "the replacement approval under the current policy is usable"
         );
-        assert_eq!(fixture.approval_operations.lock().unwrap().len(), 2);
+        assert_eq!(fixture.approval_prepares.lock().unwrap().len(), 2);
 
         let mut tampered: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();

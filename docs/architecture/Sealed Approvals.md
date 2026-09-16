@@ -164,7 +164,13 @@ derivation completes, not in the same step, so the owner can see the key's
 addresses and admit them to the destination policy first. The approval seals
 the wallet policy snapshot then in force; when the policy later changes, the
 next identical request stages a replacement rather than reporting a key whose
-approval Broker would refuse. Machine retains the public approval
+approval Broker would refuse. The approval ends no later than the key: Machine
+bounds its expiry by the key's lifetime counted from when the derivation was
+staged, which is no later than Broker starts that lifetime. Machine freezes each
+prepare request in the key's session record before sending it. A retry looks
+the frozen approval up by id, sends it again unchanged only when Broker has no
+record of it, and never prepares a second time with new timestamps; a
+replacement uses a new attempt number in its operation id. Machine retains the public approval
 binding with the `KeyRef`; the Petal receives neither an approval capability
 nor another ceremony for each matching action.
 
