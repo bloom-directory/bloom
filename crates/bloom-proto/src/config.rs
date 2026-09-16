@@ -240,7 +240,6 @@ fn evm_chain(
         chain_id,
         rpc_urls: rpc_urls.iter().map(|u| (*u).to_string()).collect(),
         rpc_endpoints: Vec::new(),
-        allow_broadcast: true,
         etherscan_api_url: None,
         display_name: Some(display_name.to_string()),
         native_symbol: native_symbol.to_string(),
@@ -400,7 +399,6 @@ impl Config {
                     expected_genesis_base58: Some(
                         crate::chain::SOLANA_MAINNET_BETA_GENESIS_HASH.into(),
                     ),
-                    allow_broadcast: true,
                 },
             )]),
             etherscan: None,
@@ -441,7 +439,6 @@ impl Config {
     /// Apply post-load migrations for backwards compatibility.
     ///
     /// Add the release's new networks without replacing operator configuration.
-    /// Broadcast is enabled on every loaded chain, including explicit false values.
     /// Like other load migrations, this updates the effective config; save persists it.
     fn migrate(&mut self) {
         let mut defaults = Self::local_default();
@@ -460,10 +457,6 @@ impl Config {
         }
         for spec in self.chains.values_mut() {
             spec.infer_op_stack();
-            spec.allow_broadcast = true;
-        }
-        for spec in self.solana_chains.values_mut() {
-            spec.allow_broadcast = true;
         }
     }
 
@@ -547,7 +540,7 @@ impl Config {
                     )));
                 }
             }
-            if spec.allow_broadcast {
+            if spec.expected_genesis_base58.is_some() {
                 let pin = spec.expected_genesis_base58.as_deref().unwrap_or("");
                 let valid_pin = !pin.is_empty()
                     && bs58::decode(pin)
@@ -555,7 +548,7 @@ impl Config {
                         .is_ok_and(|bytes| bytes.len() == 32);
                 if !valid_pin {
                     return Err(ConfigError::Invalid(format!(
-                        "solana chain '{key}' enables broadcast without a valid 32-byte base58 \
+                        "solana chain '{key}' has an invalid 32-byte base58 \
                          expected_genesis_base58 pin",
                     )));
                 }
@@ -602,11 +595,6 @@ impl Config {
 
     pub fn chain(&self, name: &str) -> Option<&ChainSpec> {
         self.chains.get(name)
-    }
-
-    /// Whether broadcast is allowed on this chain.
-    pub fn broadcast_permitted(&self, c: &ChainSpec) -> bool {
-        c.allow_broadcast
     }
 }
 
@@ -676,6 +664,7 @@ mod tests {
         assert_eq!(cfg.nfs_listen_addr, "127.0.0.1:12049");
         assert!(cfg.etherscan.is_none());
         assert!(cfg.petals.preinstalled.is_empty());
+        assert!(!toml::to_string(&cfg).unwrap().contains("allow_broadcast"));
         assert_eq!(cfg.chains.len(), 14);
         assert_eq!(cfg.solana_chains.len(), 1);
         let solana = cfg
@@ -687,11 +676,9 @@ mod tests {
             solana.expected_genesis_base58.as_deref(),
             Some(crate::chain::SOLANA_MAINNET_BETA_GENESIS_HASH)
         );
-        assert!(solana.allow_broadcast);
         assert_eq!(solana.endpoints[0].url, "https://api.mainnet.solana.com");
         let ethereum = cfg.chains.get("ethereum").expect("ethereum entry");
         assert_eq!(ethereum.chain_id, 1);
-        assert!(ethereum.allow_broadcast);
         assert!(!ethereum.rpc_urls.is_empty());
         let base = cfg.chains.get("base").expect("base entry");
         assert_eq!(base.chain_id, 8453);
@@ -747,7 +734,6 @@ mod tests {
                 name: "ethereum".into(),
                 endpoints: vec![],
                 expected_genesis_base58: None,
-                allow_broadcast: false,
             },
         );
         let err = cfg.validate().unwrap_err();
@@ -766,7 +752,6 @@ mod tests {
                 name: "solana-devnet".into(),
                 endpoints: vec![http_endpoint()],
                 expected_genesis_base58: None,
-                allow_broadcast: false,
             },
         );
         cfg.validate().unwrap();
@@ -781,7 +766,6 @@ mod tests {
                 name: "solana-testnet".into(),
                 endpoints: vec![http_endpoint()],
                 expected_genesis_base58: None,
-                allow_broadcast: false,
             },
         );
         let error = cfg.validate().unwrap_err().to_string();
@@ -800,7 +784,6 @@ mod tests {
                 name: "solana-devnet".into(),
                 endpoints: vec![],
                 expected_genesis_base58: None,
-                allow_broadcast: false,
             },
         );
         assert!(
@@ -825,7 +808,6 @@ mod tests {
                     http_only: false,
                 }],
                 expected_genesis_base58: None,
-                allow_broadcast: false,
             },
         );
         assert!(
@@ -845,14 +827,13 @@ mod tests {
                 name: "solana-devnet".into(),
                 endpoints: vec![http_endpoint()],
                 expected_genesis_base58: Some("not-base58-$$$".into()),
-                allow_broadcast: true,
             },
         );
         assert!(
             cfg.validate()
                 .unwrap_err()
                 .to_string()
-                .contains("enables broadcast without a valid 32-byte base58")
+                .contains("has an invalid 32-byte base58")
         );
 
         let mut cfg = Config::local_default();
@@ -863,14 +844,13 @@ mod tests {
                 endpoints: vec![http_endpoint()],
                 // Valid base58, but not 32 bytes: not a genesis hash.
                 expected_genesis_base58: Some("abc".into()),
-                allow_broadcast: true,
             },
         );
         assert!(
             cfg.validate()
                 .unwrap_err()
                 .to_string()
-                .contains("enables broadcast without a valid 32-byte base58")
+                .contains("has an invalid 32-byte base58")
         );
     }
 
@@ -1013,7 +993,7 @@ mod tests {
     }
 
     #[test]
-    fn load_or_init_adds_missing_networks_and_overrides_broadcast() {
+    fn load_or_init_adds_missing_networks_and_ignores_legacy_broadcast() {
         let td = tempdir().unwrap();
         let path = td.path().join("config.toml");
         let existing = r#"
@@ -1028,16 +1008,20 @@ allow_broadcast = false
         std::fs::write(&path, existing).unwrap();
 
         let cfg = Config::load_or_init(&path).unwrap();
-        assert!(cfg.chains.values().all(|spec| spec.allow_broadcast));
-        assert!(cfg.solana_chains.values().all(|spec| spec.allow_broadcast));
+
         assert_eq!(cfg.chains.len(), 2);
         assert_eq!(cfg.chains["arc"], Config::local_default().chains["arc"]);
         assert_eq!(cfg.solana_chains, Config::local_default().solana_chains);
+        assert!(
+            !toml::to_string_pretty(&cfg)
+                .unwrap()
+                .contains("allow_broadcast")
+        );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), existing);
     }
 
     #[test]
-    fn migration_preserves_custom_networks_except_broadcast_and_is_idempotent() {
+    fn migration_preserves_custom_networks_and_is_idempotent() {
         let td = tempdir().unwrap();
         let path = td.path().join("config.toml");
         let mut expected = Config::local_default();
@@ -1050,13 +1034,7 @@ allow_broadcast = false
         let mut custom = solana.clone();
         custom.name = "custom-solana".into();
         expected.solana_chains.insert(custom.name.clone(), custom);
-        let mut existing = expected.clone();
-        for spec in existing.chains.values_mut() {
-            spec.allow_broadcast = false;
-        }
-        for spec in existing.solana_chains.values_mut() {
-            spec.allow_broadcast = false;
-        }
+        let existing = expected.clone();
         existing.save(&path).unwrap();
         let loaded = Config::load(&path).unwrap();
         assert_configs_equivalent(&loaded, &expected);
@@ -1085,11 +1063,14 @@ allow_broadcast = false
         let path = td.path().join("config.toml");
         let mut cfg = Config::local_default();
         let solana = cfg.solana_chains.get_mut("solana-mainnet").unwrap();
-        solana.allow_broadcast = false;
         solana.expected_genesis_base58 = None;
         cfg.save(&path).unwrap();
-        let error = Config::load(&path).unwrap_err().to_string();
-        assert!(error.contains("expected_genesis_base58 pin"), "{error}");
+        let loaded = Config::load(&path).unwrap();
+        assert!(
+            loaded.solana_chains["solana-mainnet"]
+                .expected_genesis_base58
+                .is_none()
+        );
     }
 
     #[test]
@@ -1213,16 +1194,6 @@ allow_broadcast = true
     }
 
     #[test]
-    fn broadcast_permitted_respects_mainnet_chain_allow_flag() {
-        let cfg = Config::local_default();
-        let mut ethereum = cfg.chains["ethereum"].clone();
-        ethereum.allow_broadcast = false;
-        assert!(!cfg.broadcast_permitted(&ethereum));
-        ethereum.allow_broadcast = true;
-        assert!(cfg.broadcast_permitted(&ethereum));
-    }
-
-    #[test]
     fn solana_broadcast_accepts_pinned_mainnet_genesis() {
         let mut cfg = Config::local_default();
         cfg.solana_chains.insert(
@@ -1239,7 +1210,6 @@ allow_broadcast = true
                 expected_genesis_base58: Some(
                     crate::chain::SOLANA_MAINNET_BETA_GENESIS_HASH.into(),
                 ),
-                allow_broadcast: true,
             },
         );
         cfg.validate().unwrap();

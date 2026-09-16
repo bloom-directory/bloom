@@ -408,7 +408,7 @@ Common failures:
 | Ceremony cannot bind | Check port `18734` and stop the older developer launcher |
 | Enrollment is rejected as stale | Start with a new developer root; do not mutate custody files by hand |
 | Wallet/account data is missing | Inspect the authenticated Broker projection and its freshness, not a legacy Machine wallet store |
-| Solana broadcast is disabled | Check `allow_broadcast`, the pinned genesis, every endpoint, and chain status |
+| Solana broadcast is unavailable | Check the pinned genesis, every endpoint, and chain status |
 | Solana child selection is ambiguous | Use the full fingerprint/account path; never select by list position |
 
 Useful public diagnostics include:

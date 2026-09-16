@@ -198,8 +198,7 @@ printf '%s\n' \
   '[chains.anvil]' \
   'name = "anvil"' \
   'chain_id = 31337' \
-  "rpc_urls = [\"http://127.0.0.1:$rpc_port\"]" \
-  'allow_broadcast = true' |
+  "rpc_urls = [\"http://127.0.0.1:$rpc_port\"]" |
   sudo -u "$login_user" /usr/bin/tee "$clean_home/config.toml" >/dev/null
 chmod 0600 "$clean_home/config.toml"
 

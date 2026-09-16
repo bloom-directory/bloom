@@ -89,10 +89,6 @@ pub struct ChainSpec {
     /// New: rich endpoint schema. Wins over `rpc_urls` when non-empty.
     #[serde(default)]
     pub rpc_endpoints: Vec<EndpointSpec>,
-    /// Whether broadcasts are allowed on this chain. Defaults to true.
-    /// Config load migration also overrides existing false values.
-    #[serde(default = "default_allow_broadcast")]
-    pub allow_broadcast: bool,
     /// Etherscan-compatible API base URL (optional).
     #[serde(default)]
     pub etherscan_api_url: Option<String>,
@@ -121,9 +117,6 @@ pub struct ChainSpec {
 fn default_native() -> String {
     "ETH".to_string()
 }
-fn default_allow_broadcast() -> bool {
-    true
-}
 fn default_native_decimals() -> u8 {
     18
 }
@@ -136,7 +129,6 @@ impl ChainSpec {
             chain_id: 31337,
             rpc_urls: vec!["http://127.0.0.1:8545".to_string()],
             rpc_endpoints: Vec::new(),
-            allow_broadcast: true,
             etherscan_api_url: None,
             display_name: Some("Anvil (local)".to_string()),
             native_symbol: "ETH".to_string(),
@@ -202,8 +194,7 @@ impl ChainSpec {
 
 /// Operator configuration for one Solana cluster — the Solana analogue of
 /// [`ChainSpec`]. Chain-neutral endpoint config is reused from
-/// [`EndpointSpec`]; the Solana-specific fields (genesis binding, broadcast
-/// posture) live here.
+/// [`EndpointSpec`]; the Solana-specific genesis binding lives here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SolanaSpec {
     /// Filesystem-friendly name, e.g. `"solana-devnet"`.
@@ -214,13 +205,10 @@ pub struct SolanaSpec {
     /// Expected genesis hash (base58). When set, the client refuses to talk
     /// to a node whose `getGenesisHash` differs — the Solana analogue of
     /// EVM's chain-id binding (a message carries a blockhash, not a chain id).
+    /// Required for transaction submission; unpinned clusters support reads.
     #[serde(default)]
     #[serde(alias = "expected_genesis_hex")]
     pub expected_genesis_base58: Option<String>,
-    /// Whether broadcasting is enabled on this cluster. Defaults to true;
-    /// config load migration also overrides existing false values.
-    #[serde(default = "default_allow_broadcast")]
-    pub allow_broadcast: bool,
 }
 
 /// Solana mainnet-beta's immutable genesis hash for operator configuration and
@@ -270,7 +258,6 @@ mod tests {
         assert_eq!(c.chain_id, 31337);
         assert_eq!(c.id(), ChainId(31337));
         assert_eq!(c.r#ref().as_str(), "anvil");
-        assert!(c.allow_broadcast);
         assert_eq!(c.rpc_urls, vec!["http://127.0.0.1:8545".to_string()]);
         assert_eq!(c.native_symbol, "ETH");
         assert_eq!(c.native_decimals, 18);
@@ -288,16 +275,25 @@ mod tests {
     }
 
     #[test]
-    fn missing_allow_broadcast_defaults_true() {
-        let spec: ChainSpec = toml::from_str(
-            r#"
-name = "base"
-chain_id = 8453
-rpc_urls = ["https://mainnet.base.org"]
-"#,
-        )
-        .unwrap();
-        assert!(spec.allow_broadcast);
+    fn legacy_broadcast_values_are_ignored_and_not_serialized() {
+        for value in ["false", "true", "\"obsolete\""] {
+            let evm: ChainSpec = toml::from_str(&format!(
+                "name = \"base\"\nchain_id = 8453\nrpc_urls = []\nallow_broadcast = {value}"
+            ))
+            .unwrap();
+            assert_eq!(evm.chain_id, 8453);
+            assert!(!toml::to_string(&evm).unwrap().contains("allow_broadcast"));
+            let solana: SolanaSpec = toml::from_str(&format!(
+                "name = \"custom-solana\"\nallow_broadcast = {value}"
+            ))
+            .unwrap();
+            assert!(solana.expected_genesis_base58.is_none());
+            assert!(
+                !toml::to_string(&solana)
+                    .unwrap()
+                    .contains("allow_broadcast")
+            );
+        }
     }
 
     #[test]
@@ -307,7 +303,6 @@ rpc_urls = ["https://mainnet.base.org"]
             chain_id: 1,
             rpc_urls: vec!["https://rpc.example".to_string()],
             rpc_endpoints: Vec::new(),
-            allow_broadcast: false,
             etherscan_api_url: Some("https://api.etherscan.io/v2/api".to_string()),
             display_name: Some("Ethereum Mainnet".to_string()),
             native_symbol: "ETH".to_string(),
@@ -330,7 +325,6 @@ rpc_urls = ["https://mainnet.base.org"]
             chain_id: 1,
             rpc_urls: vec!["a".into(), "b".into(), "c".into()],
             rpc_endpoints: Vec::new(),
-            allow_broadcast: false,
             etherscan_api_url: None,
             display_name: None,
             native_symbol: "ETH".into(),
@@ -378,7 +372,6 @@ rpc_urls = ["https://mainnet.base.org"]
             chain_id: 1,
             rpc_urls: vec!["https://legacy.example".into()],
             rpc_endpoints: rich.clone(),
-            allow_broadcast: false,
             etherscan_api_url: None,
             display_name: None,
             native_symbol: "ETH".into(),
@@ -436,7 +429,6 @@ rpc_urls = ["https://mainnet.base.org"]
         assert_eq!(c.name, "minimal");
         assert_eq!(c.chain_id, 42);
         // serde defaults should fill in everything else
-        assert!(c.allow_broadcast);
         assert_eq!(c.native_symbol, "ETH");
         assert_eq!(c.native_decimals, 18);
         assert!(!c.legacy_tx);

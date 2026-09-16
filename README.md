@@ -66,9 +66,8 @@ Bloom gives an agent a safe wallet workspace:
 
 Bloom ships read-ready RPC defaults for major EVM networks — Ethereum,
 Base, Tempo, Robinhood Chain, Arbitrum, Optimism, Polygon, BNB Smart Chain,
-Avalanche, Gnosis, Linea, HyperEVM, and Arc — plus local Anvil. Per-chain
-broadcasting is enabled by default; set `allow_broadcast = false` on a chain to
-disable it.
+Avalanche, Gnosis, Linea, HyperEVM, and Arc — plus local Anvil.
+Broadcasting is available on every configured chain.
 Public reads, simulations, and planning work without adding API keys;
 local devnet sends require a running Anvil node.
 
@@ -229,9 +228,8 @@ and example crates used by the broader Bloom runtime and examples.
 
 ## Security defaults
 
-- **Broadcast routing enabled by default.** Per-chain `allow_broadcast`
-  defaults to `true`. Signing, policy, confirmation, and Sealed Approval
-  gates still apply.
+- **Broadcast routing available on every chain.** Signing, policy, confirmation,
+  and Sealed Approval gates apply.
 - **Machine contains no wallet keys.** Custody and signing cross Machine's
   authenticated Broker edge; Signer alone owns private keys and delegated
   Petal sub-keys. The mount exposes only public projections and signatures
@@ -253,9 +251,8 @@ and example crates used by the broader Bloom runtime and examples.
 - **Per-login Machine surface.** Production Broker and Signer run as isolated
   service principals and authenticate local RPC peers. The mounted Machine
   surface remains scoped to its enrolled login.
-- **Broadcast config is not an approval boundary.** Set a chain's
-  `allow_broadcast = false` to disable broadcast on that chain. Value-moving
-  actions still pass Bloom's signing, policy, and confirmation controls.
+- **Broadcast requires authorization.** Value-moving actions pass Bloom's
+  signing, policy, and confirmation controls.
 - **Embedded indexer deferred.** Address activity, ERC-20 / ERC-721
   history, and contract source / ABI are served via Etherscan; no
   local block-by-block index yet. The selected backend is visible under

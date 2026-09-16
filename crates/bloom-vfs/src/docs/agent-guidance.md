@@ -54,9 +54,9 @@ whether an earlier operation completed or whether retrying a write is safe.
   mean fresh owner approval is required; look for `approval_challenge.json` in
   the same action directory. Read-only or unsupported write targets can also
   deny access, so do not assume every denial starts a ceremony.
-- **Operation not permitted** — policy or a broadcast gate refused the
-  operation. Inspect `policy_check.json` where exposed and the chain's broadcast
-  configuration and status. Repeating the write does not remove the gate.
+- **Operation not permitted** — policy or a transaction safety check refused the
+  operation. Inspect `policy_check.json` where exposed and the chain's status.
+  Repeating the write does not remove the gate.
 - **Input/output error** — a backend or I/O operation failed. Inspect action
   state and diagnostics before considering a retry. For a possibly submitted
   transaction, reconcile by its recorded hash or signature; never blindly
@@ -145,11 +145,11 @@ for account 0, use `ls wallets/<wallet>/0/chains`. Solana chains use the
 inspect `outbox/{pending,sent,failed}/<id>/`) — there is no separate
 Solana-specific surface to look for.
 
-Bloom includes default networks and enables
-broadcasting on every configured EVM and Solana chain. Devnet and local validators
-are opt-in. The default `solana-mainnet` configuration includes the mainnet genesis
-pin; every Solana network requires a valid pinned genesis. Wallet policy and the
-approval ceremony apply. Discover networks with `ls wallets/<wallet>/0/chains`.
+Broadcasting is available on every configured EVM and Solana chain. Devnet and
+local validators are opt-in. The default `solana-mainnet` configuration includes
+the mainnet genesis pin; Solana transaction submission requires a valid pinned
+genesis. Wallet policy and the approval ceremony apply. Discover networks with
+`ls wallets/<wallet>/0/chains`.
 
 ### Reading Solana balances
 
@@ -189,7 +189,7 @@ cat status/chains/<solana-chain>/connected
 
 `status.json` still renders when calls fail — the failed fields are `null`
 and `errors` says why. `broadcast.eligible` means an attempt is *permitted*
-(broadcast enabled, genesis verified on every endpoint); it does not promise
+(genesis verified on every endpoint); it does not promise
 a transaction will land.
 
 ## Creating a wallet

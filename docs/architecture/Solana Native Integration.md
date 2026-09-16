@@ -108,10 +108,12 @@ config where a chain name is configured in both.
 
 Newly generated configuration includes `solana-mainnet`, using the public
 `https://api.mainnet.solana.com` RPC endpoint and the pinned mainnet genesis
-hash. Its `allow_broadcast` defaults to `true`. Existing entries retain their
-other settings, including endpoints and genesis pins. These load migrations
-update the effective config; saving persists them. Devnet and local validators
-remain explicitly configured networks.
+hash. Broadcasting is available on every configured chain. The obsolete
+`allow_broadcast` configuration field is ignored and is not emitted into new
+configs. Existing network entries retain their endpoints and genesis pins;
+missing Arc and Solana mainnet entries receive the default configuration.
+Devnet and local validators remain explicitly configured networks.
+Unpinned networks can be used for reads, but cannot submit transactions.
 
 The public endpoint is rate-limited; operators can replace it with their own
 RPC endpoint under `[solana_chains.solana-mainnet]`. See Solana's
@@ -126,8 +128,8 @@ mandatory.
 ### Broadcast eligibility is not a delivery guarantee
 
 `status/chains/<chain>/status.json` reports `broadcast.eligible`. That means
-only two things held: the operator enabled broadcast, and live genesis
-verification succeeded against **every** configured endpoint at the moment of
+a genesis is pinned and live verification succeeded against **every**
+configured endpoint at the moment of
 the read. It is not a prediction that a transaction will be accepted or will
 land — fees, blockhash expiry, account state and validator admission all
 still apply, and none of them are observable from a status read.
