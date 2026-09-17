@@ -2065,7 +2065,7 @@ impl PetalHost for DaemonPetalHost {
                         reason = %reason,
                         "petal.sign_payload_denied"
                     );
-                    HostError::Denied(reason)
+                    exact_signing_host_error(reason)
                 })?;
             return match outcome {
                 bloom_vfs::ExactPayloadOutcome::ApprovalRequired {
@@ -2160,7 +2160,17 @@ impl PetalHost for DaemonPetalHost {
                 protocol_error_code = error.code.as_str(),
                 "petal.sign_payload_denied"
             );
-            HostError::Denied(format!("{}: {}", error.code.as_str(), error.message))
+            let refused = error.retry == bloom_broker_api::RetryClass::Never
+                && matches!(
+                    error.durable_effect,
+                    bloom_broker_api::DurableEffect::None
+                        | bloom_broker_api::DurableEffect::ReservationReleased
+                );
+            if refused {
+                HostError::Denied(format!("{}: {}", error.code.as_str(), error.message))
+            } else {
+                HostError::Backend(SIGNING_OUTCOME_UNKNOWN.into())
+            }
         })?;
         let [signature] = result.signatures.as_slice() else {
             return Err(HostError::Backend(
@@ -2397,7 +2407,7 @@ impl PetalHost for DaemonPetalHost {
                 )
                 .await
         }
-        .map_err(HostError::Denied)?;
+        .map_err(exact_signing_host_error)?;
         match outcome {
             bloom_vfs::ExactPayloadBatchOutcome::ApprovalRequired {
                 approval_id,
@@ -3761,6 +3771,22 @@ fn ceremony_projection_records(root: &Path) -> Result<Vec<PathBuf>, DaemonError>
 /// authoritative Machine state and are left exactly as they are. A record this
 /// build cannot parse is reported and left alone rather than deleted: Machine
 /// must not destroy owner-visible state it does not understand.
+/// Host message for a signing request whose outcome is unknown. It carries
+/// no Broker text: Petal SDKs classify host errors by words such as "denied"
+/// or "invalid", and this outcome must never read as a refusal.
+const SIGNING_OUTCOME_UNKNOWN: &str = "signing outcome unknown; it may already be signed";
+
+/// Only a refusal proves no signature exists; a Petal may rebuild after
+/// `Denied` but must keep its payload after `Backend`.
+fn exact_signing_host_error(error: bloom_vfs::ExactSigningError) -> HostError {
+    match error {
+        bloom_vfs::ExactSigningError::Refused(reason) => HostError::Denied(reason),
+        bloom_vfs::ExactSigningError::OutcomeUnknown(_) => {
+            HostError::Backend(SIGNING_OUTCOME_UNKNOWN.into())
+        }
+    }
+}
+
 fn invalidate_stale_ceremony_projections(cache_dir: &Path) -> Result<usize, DaemonError> {
     let mut invalidated = 0usize;
 
