@@ -10,7 +10,7 @@ The original planning and architecture documents are preserved.
 2. [Relay PR 1](https://github.com/bloom-directory/bloom-relay/pull/1): allocation, routing, scoped control, DNS, certificate inventory and CT operations.
 3. [Signer PR 58](https://github.com/bloom-directory/bloom-signer/pull/58): immutable surfaces, privileged administration, credential authority and recovery.
 4. [Broker PR 73](https://github.com/bloom-directory/bloom-broker/pull/73): browser/session, two-leg orchestration, TLS/ACME and exposure reconciliation.
-5. Machine: CLI/VFS projections, installer integration and compatibility pins.
+5. [Machine PR 306](https://github.com/bloom-directory/bloom/pull/306): CLI/VFS projections, installer integration and compatibility pins.
 
 Merge in that order and repin each dependent repository to the merged full commit
 before landing it. Review branches use full published Git revisions, not mutable
@@ -58,17 +58,20 @@ Signer administrator client. It does not add Machine-to-Signer authority.
 | --- | --- |
 | Shared transport | 75 runtime tests; strict Clippy and formatting. PR CI passed workspace, Linux UID isolation and macOS listener checks. |
 | Signer | All-features workspace: 284 passed, one ignored. Existing isolated-origin harness suite: 180 passed, one ignored. Cargo-deny advisories, bans, licenses and sources passed. |
-| Relay borrower revision | 19 integration tests passed at `329b955454db23813e24b0947142c0398bed4b00`, with disposable PostgreSQL and actual opaque TLS tunneling. Server-only delivery follow-up is recorded separately. |
+| Relay borrower revision | 19 integration tests passed at `329b955454db23813e24b0947142c0398bed4b00`, with disposable PostgreSQL and actual opaque TLS tunneling. Server-only delivery follow-up passed 25 tests, strict Clippy, dependency policy, release build, admission/ownership properties and 1,000 fuzz iterations each for ClientHello and control framing; borrower APIs remain frozen. |
 | Machine projections | Final locked workspace: 1,669 passed, one ignored across 64 suites; strict all-target Clippy and the full-commit compatibility gate passed. CLI/VFS selections and status forwarding have focused coverage. |
 | Existing integrations | Final locked run: 38 passed across 14 non-release integration binaries; three local Solana-validator tests ignored because that validator was not running. |
-| Broker | 303 passed at `6f4d18713ee6b9b1dbb3cf14b1821e74cc448256`; exact-pin workspace check and strict Clippy passed. Three canonical listener tests require an isolated host. Five material tests cover TLS validation, atomic rotation and account-loss refusal. |
+| Broker | 303 passed at `f51fc152a35425f09efd2ecbd60eb92b5b243054`; exact-pin workspace check and strict Clippy passed. Three tests were filtered in the local host run; the full suite is also run by isolated Broker CI. Public recovery tests compare admission and authenticated projection with prior wallet activity present. Five material tests cover TLS validation, atomic rotation and account-loss refusal. |
 | Browser wire | Four Node-executed browser tests passed, including both PRF legs decrypted by native Signer HPKE, pairing substitutions, forced adjacent assertion, scoped reload and recovery landing. This is not a real authenticator matrix. |
 | Packaging | Seven Linux packaging tests, twelve macOS release tests and staged macOS installer lifecycle passed. Supplemental Linux container execution passed 48 unchanged release tests, including signed bundle verification and rollback. |
 | Real installed triad | Local execution is blocked by the existing installed Broker occupying canonical port 18734. Installed services were left running. An isolated runner is required. |
 
-Frozen-ref release builds and both macOS conformance runs must be recorded
-against the final review revisions. The supplemental Linux test
-workspace is not a substitute for the full Linux release build.
+Frozen-ref release builds and single-login macOS conformance are linked from
+the PR. The two-login workflow is deferred at the user’s direction. The
+supplemental Linux test workspace does not replace the full Linux release build.
+The macOS workflow runs all Broker tests before installation; installed acceptance
+repeats every test except exclusive canonical-port ownership, and only with an
+explicit marker proving that the preceding full suite passed.
 The initial cross-repository CI fetch failure was resolved when the repository
 owner made bloom-relay public. Final release and conformance runs are linked from
 the PR; no cross-repository credential workaround is required.
@@ -78,12 +81,14 @@ the PR; no cross-repository credential workaround is required.
 No deployment, DNS mutation, real wallet ceremony, release publication or merge
 is performed by this implementation task. Production needs an owned delegated
 zone and ingress placement, PostgreSQL and an independently retained restore
-witness, protected installation administrator state, authentic relay receipt and
+witness, separate API/serving-DNS/TXT worker identities and database grants,
+protected installation administrator state, authentic relay receipt and
 control CA pins, and Broker-owned scoped credentials and TLS material.
 
 Before production, run controlled DNS/CAA and public CA issuance/renewal drills,
 IPv4/IPv6 routing and relocation checks, expiry/rollback and restore exercises,
-and CT alert delivery/containment drills against the configured provider. Exercise
+and CT alert delivery/containment drills against the configured provider. Set
+capacity/dashboard thresholds from measured load and soak tests. Exercise
 real browser/passkey PRF support on host and phone, both enrollment directions,
 remote registration and recovery, approval activation followed by separate
 execution, mode transitions and relay outage with local credentials.

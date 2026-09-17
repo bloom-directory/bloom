@@ -440,19 +440,20 @@ fn make_installer_payload(root: &Path) -> PathBuf {
 fn build(staging: &Path, output: &Path, key: &Path) -> std::process::Output {
     let compatibility = PathBuf::from(format!("{}.compatibility.toml", output.display()));
     let compatibility_source = fs::read_to_string(release_script("compatibility-v1.toml")).unwrap();
-    fs::write(
-        &compatibility,
-        compatibility_source
-            .replace(
-                "broker_commit = \"dd2add2b9d41540521d08c77d19fb467a2d8029e\"",
-                &format!("broker_commit = \"{}\"", "22".repeat(20)),
-            )
-            .replace(
-                "signer_commit = \"ccc9adb3866b17b87d2774018dcfa015184b1918\"",
-                &format!("signer_commit = \"{}\"", "33".repeat(20)),
-            ),
-    )
-    .unwrap();
+    let fixture_compatibility = compatibility_source
+        .lines()
+        .map(|line| {
+            if line.starts_with("broker_commit = ") {
+                format!("broker_commit = \"{}\"", "22".repeat(20))
+            } else if line.starts_with("signer_commit = ") {
+                format!("signer_commit = \"{}\"", "33".repeat(20))
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&compatibility, format!("{fixture_compatibility}\n")).unwrap();
     Command::new(release_script("build-bundle.sh"))
         .args([staging.as_os_str(), output.as_os_str(), key.as_os_str()])
         .arg("1700000000")
