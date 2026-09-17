@@ -28,7 +28,6 @@ bounded by the same exact-match approval.
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import os
 import re
@@ -46,6 +45,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+from collections.abc import Callable
+
 from .core import (
     CEREMONY_URL,
     CeremonyDriver,
@@ -54,6 +55,7 @@ from .core import (
     EvalRunContext,
     MountedTree,
     SignCountStore,
+    poll_until,
     resolve_sign_count,
 )
 
@@ -108,20 +110,146 @@ SMOKE_RESTAGE_ENV = "BLOOM_EVAL_SOLANA_SMOKE_RESTAGE"
 SMOKE_RESTAGE_WAIT_ATTEMPTS = 600
 SMOKE_RESTAGE_WAIT_DELAY_SECONDS = 1.0
 
+# Transport for mounted reads and route writes. "mount" is the agent-facing
+# kernel NFS mount; "vfs" drives the same VFS handlers through `bloom vfs`
+# over the Machine IPC socket, so the deterministic smoke can run as a
+# regression gate wherever the Machine is reachable, without a kernel mount
+# or the sudo rule it requires.
+TRANSPORT_ENV = "BLOOM_EVAL_SOLANA_TRANSPORT"
+VFS_BIN_ENV = "BLOOM_EVAL_SOLANA_VFS_BIN"
+TRANSPORTS = ("mount", "vfs")
 
-def trial_amount(base_lamports: int, trial_id: str) -> int:
-    """Give the amount a per-trial low-order tail.
 
-    The tail turns the amount itself into a fingerprint, so the destination's
-    single transaction can be matched on value as well as on address. It stays
-    well inside the harness ceiling because the caller picks `base`.
+
+class VfsTree:
+    """Mount-free transport: the same VFS handlers, driven via `bloom vfs`.
+
+    Reads, listings, and route writes go through the CLI's IPC client, so
+    paths arriving here are host-mount style (under the configured mount
+    prefix) and are mapped to VFS-root paths by stripping that prefix. The
+    parent-listing existence rule is preserved: `vfs ls` is the boundary for
+    "does this entry exist", exactly as `os.listdir` is for the mount.
     """
-    tail = int(hashlib.sha256(trial_id.encode()).hexdigest()[:4], 16) % 10_000
-    return base_lamports + tail
 
+    def __init__(
+        self,
+        root: Path,
+        binary: str,
+        *,
+        read_timeout: int = CHAIN_READ_TIMEOUT_SECONDS,
+        read_attempts: int = CHAIN_READ_ATTEMPTS,
+    ) -> None:
+        self.root = root
+        self.binary = binary
+        self.read_timeout = read_timeout
+        self.read_attempts = read_attempts
+
+    def _vfs_path(self, path: Path) -> str:
+        try:
+            relative = path.relative_to(self.root)
+        except ValueError as error:
+            raise EvalError(f"vfs path {path} is outside {self.root}") from error
+        return "/" + relative.as_posix()
+
+    def _run(
+        self,
+        arguments: list[str],
+        timeout: int,
+        input: bytes | None = None,  # noqa: A002 - mirror subprocess spelling
+    ) -> subprocess.CompletedProcess[bytes]:
+        try:
+            return subprocess.run(
+                [self.binary, "-q", "vfs", *arguments],
+                input=input,
+                capture_output=True,
+                check=False,
+                timeout=timeout,
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            raise EvalError(f"vfs transport failed: {error}") from error
+
+    def reachable(self) -> str | None:
+        """None when the Machine answers over IPC, else a usable error."""
+        try:
+            completed = subprocess.run(
+                [self.binary, "-q", "vfs", "stat", "/"],
+                capture_output=True,
+                check=False,
+                timeout=self.read_timeout,
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            return f"vfs transport cannot run {self.binary!r}: {error}"
+        if completed.returncode != 0:
+            detail = completed.stderr.decode(errors="replace").strip()
+            return (
+                "vfs transport cannot reach the Machine over "
+                f"BLOOM_RPC_ENDPOINT: {detail}"
+            )
+        return None
+
+    def read_bytes(self, path: Path, timeout: int | None = None) -> bytes:
+        budget = self.read_timeout if timeout is None else timeout
+        completed = self._run(["cat", self._vfs_path(path)], budget)
+        if completed.returncode != 0:
+            detail = completed.stderr.decode(errors="replace").strip()
+            raise EvalError(f"vfs cat {path} failed: {detail}")
+        return completed.stdout
+
+    def read_text(self, path: Path, timeout: int | None = None) -> str:
+        return self.read_bytes(path, timeout).decode(errors="strict")
+
+    def read_json(self, path: Path, timeout: int | None = None) -> Any:
+        """Read and parse JSON, retrying timeouts and torn snapshots."""
+        budget = self.read_timeout if timeout is None else timeout
+        last_error: BaseException | None = None
+        for attempt in range(self.read_attempts):
+            try:
+                return json.loads(self.read_bytes(path, budget))
+            except json.JSONDecodeError as error:
+                last_error = error
+                if attempt + 1 < self.read_attempts:
+                    time.sleep(0.2)
+        raise EvalError(
+            f"could not read {path} as JSON after {self.read_attempts} "
+            f"attempts: {last_error}"
+        ) from last_error
+
+    def list_dir(self, path: Path) -> list[str]:
+        # A failed listing means "not there (or not yet)": the smoke polls
+        # state that the engine is creating concurrently, so absence is a
+        # poll outcome, not an error. Reads and writes stay fail-loud.
+        completed = self._run(["ls", self._vfs_path(path)], self.read_timeout)
+        if completed.returncode != 0:
+            return []
+        names = []
+        for line in completed.stdout.decode(errors="replace").splitlines():
+            if line.strip():
+                names.append(line.split("\t")[0])
+        return names
+
+    def read_json_if_listed(
+        self, path: Path, listing_dir: Path, name: str
+    ) -> Any | None:
+        if name not in self.list_dir(listing_dir):
+            return None
+        return self.read_json(path)
+
+    def write_route(
+        self, path: Path, body: bytes, timeout: int
+    ) -> subprocess.CompletedProcess[bytes]:
+        return self._run(["write", self._vfs_path(path)], timeout, input=body)
+
+    @staticmethod
+    def poll_until(
+        predicate: Callable[[], bool], attempts: int, delay: float
+    ) -> bool:
+        return poll_until(predicate, attempts, delay)
 
 class SolanaTransferEval(EvalDefinition):
     name = "solana-transfer"
+    # Discovery, owner approval, possible blockhash restaging, and finality
+    # can exceed the shared 20-turn default.
+    default_max_turns = "24"
 
     def __init__(self, repo_root: Path, environ: dict[str, str] | None = None) -> None:
         self.repo_root = repo_root.resolve()
@@ -171,10 +299,29 @@ class SolanaTransferEval(EvalDefinition):
         self.key_fingerprint = ""
         self.derivation_path = ""
         self.trial_id: str | None = None
-        self.mount = MountedTree(
-            read_timeout=CHAIN_READ_TIMEOUT_SECONDS,
-            read_attempts=CHAIN_READ_ATTEMPTS,
-        )
+        self.transport = self.env.get(TRANSPORT_ENV, "mount")
+        if self.transport not in TRANSPORTS:
+            raise EvalError(
+                f"{TRANSPORT_ENV} must be one of {', '.join(TRANSPORTS)}; "
+                f"got {self.transport!r}"
+            )
+        self.vfs_bin = self.env.get(VFS_BIN_ENV, "bloom")
+        # The smoke-only escape that admits the vfs transport; agent trials
+        # require the mounted transport and never set it.
+        self.smoke_only = False
+        self.mount: MountedTree | VfsTree
+        if self.transport == "vfs":
+            self.mount = VfsTree(
+                self.bloom_mount,
+                self.vfs_bin,
+                read_timeout=CHAIN_READ_TIMEOUT_SECONDS,
+                read_attempts=CHAIN_READ_ATTEMPTS,
+            )
+        else:
+            self.mount = MountedTree(
+                read_timeout=CHAIN_READ_TIMEOUT_SECONDS,
+                read_attempts=CHAIN_READ_ATTEMPTS,
+            )
         self._approver: threading.Thread | None = None
         self._approver_stop = threading.Event()
         self._approver_error: str | None = None
@@ -231,12 +378,7 @@ class SolanaTransferEval(EvalDefinition):
         )
 
     def _list_state(self, state: str) -> list[str]:
-        try:
-            return sorted(os.listdir(self.outbox_root / state))
-        except FileNotFoundError:
-            return []
-        except OSError as error:
-            raise EvalError(f"could not list outbox/{state}: {error}") from error
+        return sorted(self.mount.list_dir(self.outbox_root / state))
 
     def _list_host_state(self, state: str) -> list[str]:
         """List outbox entries from the host state directory.
@@ -296,16 +438,11 @@ class SolanaTransferEval(EvalDefinition):
             raise EvalError("Solana account projection has a malformed derivation path")
         address_path = self.chain_root / "accounts" / fingerprint / "address"
         try:
-            completed = subprocess.run(
-                ["cat", str(address_path)],
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=CHAIN_READ_TIMEOUT_SECONDS,
-            )
-        except (OSError, subprocess.SubprocessError) as error:
+            address = self.mount.read_text(
+                address_path, CHAIN_READ_TIMEOUT_SECONDS
+            ).strip()
+        except EvalError as error:
             raise EvalError(f"could not read Solana account address: {error}") from error
-        address = completed.stdout.strip()
         if ADDRESS.fullmatch(address) is None:
             raise EvalError("Solana account projection has a malformed address")
         self.source_address = address
@@ -341,8 +478,7 @@ class SolanaTransferEval(EvalDefinition):
                 "could not inspect sweep keypair address: "
                 + (completed.stderr or completed.stdout).strip()
             )
-        observed = completed.stdout.strip()
-        if observed != self.destination:
+        if completed.stdout.strip() != self.destination:
             raise EvalError(
                 "BLOOM_EVAL_SOLANA_DESTINATION is not controlled by the configured "
                 "sweep keypair"
@@ -353,7 +489,7 @@ class SolanaTransferEval(EvalDefinition):
     def _require_mainnet_ack(self) -> None:
         if self.env.get("BLOOM_EVAL_SOLANA_MAINNET_ACK") != MAINNET_ACK:
             raise EvalError(
-                f"set BLOOM_EVAL_SOLANA_MAINNET_ACK={MAINNET_ACK} to authorize "
+                f"set BLOOM_EVAL_SOLANA_MAINNET_ACK={MAINNET_ACK} to confirm "
                 "this mainnet trial"
             )
 
@@ -364,9 +500,7 @@ class SolanaTransferEval(EvalDefinition):
 
     @staticmethod
     def _positive_lamports(name: str, value: str) -> int:
-        if not value or not value.isdigit():
-            raise EvalError(f"{name} must be a positive integer number of lamports")
-        amount = int(value)
+        amount = int(value) if value.isdigit() else 0
         if amount <= 0:
             raise EvalError(f"{name} must be a positive integer number of lamports")
         return amount
@@ -446,6 +580,32 @@ class SolanaTransferEval(EvalDefinition):
 
     # ---- preflight -----------------------------------------------------
 
+    def _require_vfs_transport(self) -> None:
+        """Connection checks for the mount-free transport, fail-fast.
+
+        These run before seed-file and driver validation so an operator
+        wiring the regression gate learns about a missing endpoint or CLI
+        before anything about credentials.
+        """
+        if not self.env.get("BLOOM_RPC_ENDPOINT"):
+            raise EvalError(
+                "the vfs transport requires BLOOM_RPC_ENDPOINT; source the "
+                "triad env file so the CLI can reach the Machine"
+            )
+        if shutil.which(self.vfs_bin) is None:
+            raise EvalError(
+                f"the vfs transport requires the bloom CLI ({self.vfs_bin!r}) "
+                "on PATH or set via " + VFS_BIN_ENV
+            )
+        unreachable = self.mount.reachable()
+        if unreachable is not None:
+            raise EvalError(unreachable)
+        if "new.tx" not in self.mount.list_dir(self.outbox_root):
+            raise EvalError(
+                "wallet outbox is not reachable over vfs; the wallet may "
+                "not have this Solana chain configured"
+            )
+
     def preflight(self) -> None:
         if not self.bloom_mount_value:
             raise EvalError("BLOOM_EVAL_BLOOM_MOUNT is required for a full eval")
@@ -457,11 +617,14 @@ class SolanaTransferEval(EvalDefinition):
             raise EvalError("BLOOM_EVAL_SOLANA_CHAIN is required and must be a token")
         if not self.rpc_url:
             raise EvalError("BLOOM_EVAL_SOLANA_RPC_URL is required")
+        if self.transport == "vfs":
+            self._require_vfs_transport()
 
         # Lane and network are checked before anything else. They are the
         # "did the operator mean this" gates, and burying them behind a seed
         # file or driver check would answer a dangerous misconfiguration with
         # an unrelated error message.
+        self._require_destination()
         if self.lane == "mainnet":
             self._require_mainnet_ack()
             if self.network != MAINNET_NETWORK:
@@ -469,7 +632,6 @@ class SolanaTransferEval(EvalDefinition):
                     f"the mainnet lane requires network {MAINNET_NETWORK}"
                 )
             self._require_mainnet_transfer_parameters()
-            self._require_destination()
             self._require_sweep_keypair()
             self._require_sweep_tool()
         else:
@@ -481,15 +643,19 @@ class SolanaTransferEval(EvalDefinition):
                     "the local lane must not be pointed at mainnet-beta; use the "
                     "mainnet lane"
                 )
-            self._require_destination()
-            base = self.env.get("BLOOM_EVAL_SOLANA_BASE_LAMPORTS", "1000000")
-            if not base.isdigit() or int(base) <= 0:
-                raise EvalError("BLOOM_EVAL_SOLANA_BASE_LAMPORTS must be a positive integer")
-            if int(base) > HARNESS_MAX_TRANSFER_LAMPORTS:
+            base = self._positive_lamports(
+                "BLOOM_EVAL_SOLANA_BASE_LAMPORTS",
+                self.env.get("BLOOM_EVAL_SOLANA_BASE_LAMPORTS", "1000000"),
+            )
+            if base > HARNESS_MAX_TRANSFER_LAMPORTS:
                 raise EvalError(
                     f"BLOOM_EVAL_SOLANA_BASE_LAMPORTS {base} exceeds the harness "
                     f"ceiling {HARNESS_MAX_TRANSFER_LAMPORTS}"
                 )
+            # Preflight is the single place the local amount is decided, so
+            # the ceiling above covers the exact on-chain value: no tail or
+            # second parse may widen it later.
+            self.lamports = base
             self.max_fee_lamports = self._positive_lamports(
                 "BLOOM_EVAL_SOLANA_MAX_FEE_LAMPORTS",
                 self.env.get("BLOOM_EVAL_SOLANA_MAX_FEE_LAMPORTS", "10000"),
@@ -513,18 +679,21 @@ class SolanaTransferEval(EvalDefinition):
         self.sign_count = self._require_sign_count()
         CeremonyDriver(self.driver, self.seed_file, self.sign_count).preflight()
 
-        if not os.path.ismount(self.bloom_mount):
-            raise EvalError(f"Bloom is not mounted at {self.bloom_mount}")
-        # Docker silently creates an empty directory at a missing bind source,
-        # which would mask the real outbox and fail baffingly inside the
-        # container. Refuse before constructing the mount instead.
-        if not self.outbox_root.is_dir():
-            raise EvalError(
-                f"wallet outbox is not present at {self.outbox_root}; the wallet "
-                "may not have this Solana chain configured"
-            )
-        if not (self.outbox_root / "new.tx").exists():
-            raise EvalError(f"{self.outbox_root}/new.tx is missing; the chain is not writable")
+        if self.transport != "vfs":
+            if not os.path.ismount(self.bloom_mount):
+                raise EvalError(f"Bloom is not mounted at {self.bloom_mount}")
+            # Docker silently creates an empty directory at a missing bind
+            # source, which would mask the real outbox and fail bafflingly
+            # inside the container. Refuse before constructing the mount.
+            if not self.outbox_root.is_dir():
+                raise EvalError(
+                    f"wallet outbox is not present at {self.outbox_root}; the "
+                    "wallet may not have this Solana chain configured"
+                )
+            if not (self.outbox_root / "new.tx").exists():
+                raise EvalError(
+                    f"{self.outbox_root}/new.tx is missing; the chain is not writable"
+                )
 
         if self.lane == "local":
             self._load_local_account_identity()
@@ -654,7 +823,7 @@ class SolanaTransferEval(EvalDefinition):
                 return advice
         return None
 
-    def _replacement_is_authorized(self, pending_id: str) -> bool:
+    def _replacement_is_authorized(self, pending_id: str) -> bool | None:
         """Decide whether a differently-named pending entry may be approved.
 
         Only one succession is authorized: the previously approved entry
@@ -662,19 +831,18 @@ class SolanaTransferEval(EvalDefinition):
         entry as the replacement. A second entry staged fresh - identical
         destination and amount, no expiry, no advice - is a new payment
         attempt and is refused, as is any id the lineage does not name.
+
+        Returns None when the predecessor has no advice yet: the restage
+        operation publishes the advice moments after the replacement appears,
+        so absence means "wait", not "refuse".
         """
         if not self._approved_lineage:
             return False
-        predecessor = self._approved_lineage[-1]
-        advice = self._restage_advice(predecessor)
+        advice = self._restage_advice(self._approved_lineage[-1])
         if advice is None:
-            # The restage operation publishes the advice moments after the
-            # replacement appears; wait rather than approve or refuse early.
-            return False
+            return None
         named = advice.get("replacement_id")
-        if not isinstance(named, str) or named != pending_id:
-            return False
-        return True
+        return isinstance(named, str) and named == pending_id
 
     def _approve_loop(self, ceremonies: CeremonyDriver) -> None:
         deadline = time.monotonic() + APPROVER_BUDGET_SECONDS
@@ -694,14 +862,19 @@ class SolanaTransferEval(EvalDefinition):
                             "transfer; refusing to approve it"
                         )
                         return
-                    if self._approved_lineage and not self._replacement_is_authorized(
-                        pending_id
-                    ):
-                        self._approver_error = (
-                            f"staged entry {pending_id} does not continue the approved "
-                            "replacement lineage; refusing to approve it"
-                        )
-                        return
+                    if self._approved_lineage:
+                        lineage_decision = self._replacement_is_authorized(pending_id)
+                        if lineage_decision is None:
+                            # The replacement is staged but its restage advice
+                            # has not landed yet; poll again rather than
+                            # refusing a succession still being published.
+                            continue
+                        if not lineage_decision:
+                            self._approver_error = (
+                                f"staged entry {pending_id} does not continue the approved "
+                                "replacement lineage; refusing to approve it"
+                            )
+                            return
                     ceremonies.complete(url)
                     self._approved_lineage.append(pending_id)
                     self._approver_completed += 1
@@ -712,7 +885,32 @@ class SolanaTransferEval(EvalDefinition):
                 self._approver_error = CeremonyDriver.redact(str(error))
                 self.next_sign_count = ceremonies.next_sign_count
                 return
+            except Exception as error:  # noqa: BLE001 -- a dead thread must leave a trace
+                # An unexpected failure must leave the same trace an expected
+                # one does: a thread that dies quietly masquerades as an agent
+                # that never staged.
+                self._approver_error = (
+                    f"approver failed: {CeremonyDriver.redact(str(error))}"
+                )
+                return
             self._approver_stop.wait(APPROVER_POLL_SECONDS)
+        if self._approver_error is None and not self._approver_stop.is_set():
+            # The budget ran out on its own. Record it only when entries went
+            # unapproved, so a trial the agent never staged stays silent and a
+            # slow staging reads as a budget expiry, never as agent failure.
+            try:
+                unapproved = [
+                    entry
+                    for entry in self._list_host_state("pending")
+                    if entry not in self._approved_lineage
+                ]
+            except EvalError:
+                unapproved = []
+            if unapproved:
+                self._approver_error = (
+                    "approver budget expired with "
+                    f"{len(unapproved)} pending entries unapproved"
+                )
 
     def _start_approver(self, sign_count: int) -> None:
         ceremonies = CeremonyDriver(
@@ -791,8 +989,7 @@ class SolanaTransferEval(EvalDefinition):
 
         Returns the sweep signature, or None when there was nothing to sweep.
         """
-        balance = self._balance(self.destination)
-        if balance == 0:
+        if self._balance(self.destination) == 0:
             return None
         # `ALL` drains the account and lets the CLI compute the fee, which
         # avoids leaving dust behind or over-spending on a hand-computed
@@ -850,16 +1047,17 @@ class SolanaTransferEval(EvalDefinition):
     # ---- provision -----------------------------------------------------
 
     def provision(self, agent_name: str) -> EvalRunContext:
+        if self.transport == "vfs" and not self.smoke_only:
+            raise EvalError(
+                "the vfs transport supports --smoke-only; agent trials require "
+                "the mounted transport so the container sees /bloom"
+            )
         sign_count = self.sign_count or self._require_sign_count()
         stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
         self.trial_id = f"bloom-eval-{agent_name}-{stamp}-{secrets.token_hex(8)}"
 
-        if self.lane == "local":
-            # Only the local lane derives its amount; the mainnet lane is
-            # pinned by the configured exact amount and must not deviate.
-            base = int(self.env.get("BLOOM_EVAL_SOLANA_BASE_LAMPORTS", "1000000"))
-            self.lamports = trial_amount(base, self.trial_id)
-
+        # The local amount was fixed by preflight and the mainnet amount by
+        # operator configuration; provision must not re-derive either.
         mounts: list[dict[str, Any]] = [
             {
                 "type": "bind",
@@ -896,7 +1094,10 @@ class SolanaTransferEval(EvalDefinition):
 
         self._start_approver(sign_count)
         self.jobs_dir.mkdir(parents=True, exist_ok=True)
-        task_dir = self.jobs_dir.parent / "tasks" / self.trial_id
+        # Trial task copies live under the ignored jobs dir, never under the
+        # repo's tasks/ tree: each run litters a README copy plus an
+        # instruction naming the destination.
+        task_dir = self.jobs_dir / self.trial_id
         task_template = Path(__file__).resolve().parent.parent / "tasks/solana-transfer"
         shutil.copytree(task_template, task_dir)
         whole, fractional = divmod(self.lamports, 1_000_000_000)
@@ -967,15 +1168,12 @@ class SolanaTransferEval(EvalDefinition):
         ):
             raise EvalError("smoke staged intent does not match the configured transfer")
         try:
-            plan = subprocess.run(
-                ["cat", str(entry / "plan.md")],
-                check=True,
-                capture_output=True,
-                timeout=CHAIN_READ_TIMEOUT_SECONDS,
+            plan_text = self.mount.read_text(
+                entry / "plan.md", CHAIN_READ_TIMEOUT_SECONDS
             )
-        except (OSError, subprocess.SubprocessError) as error:
+        except EvalError as error:
             raise EvalError(f"smoke could not read plan.md: {error}") from error
-        if not plan.stdout.strip():
+        if not plan_text.strip():
             raise EvalError("smoke plan.md is empty")
 
         first = self.mount.write_route(
@@ -992,12 +1190,10 @@ class SolanaTransferEval(EvalDefinition):
             pending_id, entry, intent = await self._smoke_restage(
                 context, pending_id, entry, intent
             )
-        else:
-            confirmed = await self._smoke_confirm(entry)
-            if not confirmed:
-                raise EvalError(
-                    "smoke confirm did not succeed before the blockhash deadline"
-                )
+        elif not await self._smoke_confirm(entry):
+            raise EvalError(
+                "smoke confirm did not succeed before the blockhash deadline"
+            )
 
         if not self.mount.poll_until(
             lambda: pending_id in self._list_state("sent"), 30, 0.5
@@ -1146,8 +1342,7 @@ class SolanaTransferEval(EvalDefinition):
                 raise EvalError(
                     f"smoke replacement changed the transfer's {field}"
                 )
-        confirmed = await self._smoke_confirm(replacement_entry)
-        if not confirmed:
+        if not await self._smoke_confirm(replacement_entry):
             raise EvalError(
                 "smoke replacement confirm did not succeed before the blockhash deadline"
             )
@@ -1193,8 +1388,7 @@ class SolanaTransferEval(EvalDefinition):
 
             # 2. Zero or one sent entry, and if one, it must have reconciled.
             all_sent = set(self._list_state("sent"))
-            missing_history = self._baseline_sent - all_sent
-            if missing_history:
+            if self._baseline_sent - all_sent:
                 failures.append("historical sent entries disappeared during the trial")
             sent = sorted(all_sent - self._baseline_sent)
             if len(sent) > 1:
@@ -1231,9 +1425,7 @@ class SolanaTransferEval(EvalDefinition):
             if self.lane == "mainnet":
                 if self.source_address and self.destination:
                     try:
-                        signature = self.sweep_destination()
-                        if signature is not None:
-                            self.sweep_signature = signature
+                        self.sweep_destination()
                     except EvalError as error:
                         failures.append(f"host sweep: {error}")
                 else:

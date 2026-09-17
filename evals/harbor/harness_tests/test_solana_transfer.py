@@ -9,6 +9,7 @@ the coverage here.
 from __future__ import annotations
 
 import json
+import subprocess
 import tempfile
 import time
 import unittest
@@ -16,14 +17,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from harness.core import EvalError
+from harness.core import EvalDefinition, EvalError
 from harness.solana_transfer import (
-    HARNESS_MAX_BALANCE_LAMPORTS,
     HARNESS_MAX_TRANSFER_LAMPORTS,
     MAINNET_ACK,
     MAINNET_GENESIS_HASH,
     SolanaTransferEval,
-    trial_amount,
+    VfsTree,
 )
 
 SOURCE = "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin"
@@ -288,9 +288,8 @@ class LocalIdentityTests(SolanaEvalTestCase):
             ],
         }
         with mock.patch.object(definition.mount, "read_json", return_value=projection):
-            with mock.patch(
-                "harness.solana_transfer.subprocess.run",
-                return_value=SimpleNamespace(stdout=SOURCE + "\n"),
+            with mock.patch.object(
+                definition.mount, "read_text", return_value=SOURCE + "\n"
             ):
                 definition._load_local_account_identity()
 
@@ -466,7 +465,7 @@ class ReplacementLineageTests(ApproverMatchTests):
 
     def test_an_unpublished_advice_is_not_yet_an_approval(self) -> None:
         self.definition._approved_lineage.append("0001")
-        self.assertFalse(self.definition._replacement_is_authorized("0002"))
+        self.assertIsNone(self.definition._replacement_is_authorized("0002"))
 
     def test_a_wrong_advice_schema_is_an_error(self) -> None:
         self.definition._approved_lineage.append("0001")
@@ -518,6 +517,9 @@ class ReplacementLineageTests(ApproverMatchTests):
         (second / "approval_challenge.json").write_text(
             json.dumps({"ceremony_url": second_url})
         )
+        # The lineage continues elsewhere, so the second staging is a new
+        # payment attempt and must be refused at once.
+        self.publish_advice("0001", "0009")
         ceremonies = SimpleNamespace(
             completed=set(), next_sign_count=3, complete=mock.Mock()
         )
@@ -529,6 +531,54 @@ class ReplacementLineageTests(ApproverMatchTests):
             "0002 does not continue the approved replacement lineage",
             self.definition._approver_error or "",
         )
+
+    def test_a_replacement_without_advice_waits_for_the_deadline(self) -> None:
+        # No advice has landed yet: the approver must poll, not refuse, and a
+        # short budget must surface as an expiry rather than a refusal.
+        self.definition._approved_lineage.append("0001")
+        replacement = self.stage("0002")
+        url = "http://localhost:18734/ceremony/" + "B" * 43
+        (replacement / "approval_challenge.json").write_text(
+            json.dumps({"ceremony_url": url})
+        )
+        ceremonies = SimpleNamespace(
+            completed=set(), next_sign_count=3, complete=mock.Mock()
+        )
+
+        with mock.patch("harness.solana_transfer.APPROVER_BUDGET_SECONDS", 0.2):
+            self.definition._approve_loop(ceremonies)
+
+        ceremonies.complete.assert_not_called()
+        error = self.definition._approver_error
+        self.assertIsNotNone(error)
+        assert error is not None
+        self.assertIn("budget expired", error)
+
+
+class BudgetExpiryTests(ApproverMatchTests):
+    """A budget expiry must read as a budget expiry, never as agent failure."""
+
+    def run_loop(self) -> None:
+        with mock.patch("harness.solana_transfer.APPROVER_BUDGET_SECONDS", -1):
+            self.definition._approve_loop(mock.Mock())
+
+    def test_an_unapproved_staging_is_recorded_on_expiry(self) -> None:
+        self.run_loop()
+        error = self.definition._approver_error
+        self.assertIsNotNone(error)
+        assert error is not None
+        self.assertIn("budget expired", error)
+        self.assertIn("1 pending", error)
+
+    def test_an_empty_outbox_expires_silently(self) -> None:
+        self.entry.rmdir()
+        self.run_loop()
+        self.assertIsNone(self.definition._approver_error)
+
+    def test_a_stopped_approver_expires_silently(self) -> None:
+        self.definition._approver_stop.set()
+        self.run_loop()
+        self.assertIsNone(self.definition._approver_error)
 
 
 class CeremonyDiscoveryTests(ApproverMatchTests):
@@ -623,17 +673,20 @@ class ProvisionTests(SolanaEvalTestCase):
 
         self.assertEqual(context.extra_docker_compose, [])
 
+    def test_the_trial_task_copy_lives_under_the_ignored_jobs_dir(self) -> None:
+        definition = self.make()
+        definition.destination = DESTINATION
+        definition.source_address = SOURCE
+        with mock.patch.object(definition, "_start_approver"):
+            context = definition.provision("codex")
 
-class TrialAmountTests(unittest.TestCase):
-    def test_the_tail_is_deterministic_and_bounded(self) -> None:
-        first = trial_amount(1_000_000, "trial-a")
-        self.assertEqual(first, trial_amount(1_000_000, "trial-a"))
-        self.assertGreaterEqual(first, 1_000_000)
-        self.assertLess(first, 1_010_000)
+        self.assertEqual(context.task_dir.parent, definition.jobs_dir)
 
-    def test_different_trials_get_different_tails(self) -> None:
-        amounts = {trial_amount(1_000_000, f"trial-{i}") for i in range(50)}
-        self.assertGreater(len(amounts), 40)
+
+class TurnBudgetTests(unittest.TestCase):
+    def test_solana_declares_more_turns_than_the_shared_default(self) -> None:
+        self.assertEqual(EvalDefinition.default_max_turns, "20")
+        self.assertEqual(SolanaTransferEval.default_max_turns, "24")
 
 
 class SweepTests(SolanaEvalTestCase):
@@ -837,3 +890,150 @@ class ContainerBoundaryTests(SolanaEvalTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class VfsTreeTests(unittest.TestCase):
+    """The mount-free transport must behave like the mounted one.
+
+    Every test fakes the `bloom vfs` subprocess; nothing here needs a
+    Machine.
+    """
+
+    def make(self, root: str = "/mnt/bloom") -> VfsTree:
+        return VfsTree(Path(root), "bloom")
+
+    @staticmethod
+    def completed(
+        returncode: int = 0, stdout: bytes = b"", stderr: bytes = b""
+    ) -> subprocess.CompletedProcess:
+        return subprocess.CompletedProcess(["bloom"], returncode, stdout, stderr)
+
+    def test_paths_map_from_the_mount_prefix_to_the_vfs_root(self) -> None:
+        tree = self.make()
+        path = Path("/mnt/bloom/wallets/w/chains/c/outbox/new.tx")
+        self.assertEqual(
+            tree._vfs_path(path), "/wallets/w/chains/c/outbox/new.tx"
+        )
+
+    def test_a_path_outside_the_root_is_refused(self) -> None:
+        with self.assertRaisesRegex(EvalError, "outside"):
+            self.make()._vfs_path(Path("/elsewhere/new.tx"))
+
+    def test_list_dir_parses_name_kind_lines(self) -> None:
+        tree = self.make()
+        output = b"0001\tDir\nnew.tx\tFile\nreceipt.json\tFile\n"
+        with mock.patch.object(
+            tree, "_run", return_value=self.completed(stdout=output)
+        ):
+            self.assertEqual(
+                tree.list_dir(Path("/mnt/bloom/w/outbox")), 
+                ["0001", "new.tx", "receipt.json"],
+            )
+
+    def test_a_failed_listing_is_an_empty_one(self) -> None:
+        tree = self.make()
+        with mock.patch.object(
+            tree, "_run", return_value=self.completed(returncode=1, stderr=b"x")
+        ):
+            self.assertEqual(tree.list_dir(Path("/mnt/bloom/w/pending")), [])
+
+    def test_read_json_retries_a_torn_snapshot(self) -> None:
+        tree = self.make()
+        torn = [self.completed(stdout=b"{trunc"), self.completed(stdout=b'{"a": 1}')]
+        with mock.patch.object(tree, "_run", side_effect=torn):
+            self.assertEqual(tree.read_json(Path("/mnt/bloom/w/intent.json")), {"a": 1})
+
+    def test_a_failed_read_is_loud(self) -> None:
+        tree = self.make()
+        failure = self.completed(returncode=2, stderr=b"ipc cat failed")
+        with mock.patch.object(tree, "_run", return_value=failure):
+            with self.assertRaisesRegex(EvalError, "ipc cat failed"):
+                tree.read_json(Path("/mnt/bloom/w/intent.json"))
+
+    def test_read_json_if_listed_uses_the_parent_listing(self) -> None:
+        tree = self.make()
+        listed = self.completed(stdout=b"receipt.json\tFile\n")
+        payload = self.completed(stdout=b'{"outcome": "success"}')
+        path = Path("/mnt/bloom/sent/1/receipt.json")
+        with mock.patch.object(tree, "_run", side_effect=[listed, payload]):
+            self.assertEqual(
+                tree.read_json_if_listed(path, path.parent, "receipt.json"),
+                {"outcome": "success"},
+            )
+        absent = self.completed(stdout=b"")
+        with mock.patch.object(tree, "_run", return_value=absent):
+            self.assertIsNone(
+                tree.read_json_if_listed(path, path.parent, "receipt.json")
+            )
+
+    def test_write_route_sends_the_body_over_stdin(self) -> None:
+        tree = self.make()
+        recorded: dict[str, object] = {}
+
+        def fake_run(arguments: list[str], timeout: int, input: bytes | None = None):
+            recorded["arguments"] = arguments
+            recorded["input"] = input
+            recorded["timeout"] = timeout
+            return self.completed()
+
+        with mock.patch.object(tree, "_run", side_effect=fake_run):
+            completed = tree.write_route(
+                Path("/mnt/bloom/w/new.tx"), b"payload", 120
+            )
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(
+            recorded["arguments"], ["write", "/w/new.tx"]
+        )
+        self.assertEqual(recorded["input"], b"payload")
+        self.assertEqual(recorded["timeout"], 120)
+
+
+class VfsTransportTests(SolanaEvalTestCase):
+    def test_an_unknown_transport_is_refused_at_construction(self) -> None:
+        with self.assertRaisesRegex(EvalError, "must be one of"):
+            self.make(BLOOM_EVAL_SOLANA_TRANSPORT="carrier-pigeon")
+
+    def test_preflight_requires_the_machine_endpoint(self) -> None:
+        definition = self.make(
+            BLOOM_EVAL_SOLANA_TRANSPORT="vfs",
+            BLOOM_EVAL_RPC_ENDPOINT="",
+        )
+        with self.assertRaisesRegex(EvalError, "BLOOM_RPC_ENDPOINT"):
+            definition.preflight()
+
+    def test_preflight_requires_a_reachable_machine(self) -> None:
+        definition = self.make(
+            BLOOM_EVAL_SOLANA_TRANSPORT="vfs",
+            BLOOM_RPC_ENDPOINT="unix:/nowhere.sock",
+        )
+        with mock.patch("shutil.which", return_value="/usr/bin/bloom"):
+            with mock.patch.object(
+                definition.mount,
+                "reachable",
+                return_value="vfs transport cannot reach the Machine",
+            ):
+                with self.assertRaisesRegex(EvalError, "cannot reach"):
+                    definition.preflight()
+
+    def test_preflight_requires_the_outbox_over_vfs(self) -> None:
+        definition = self.make(
+            BLOOM_EVAL_SOLANA_TRANSPORT="vfs",
+            BLOOM_RPC_ENDPOINT="unix:/nowhere.sock",
+        )
+        with mock.patch("shutil.which", return_value="/usr/bin/bloom"):
+            with mock.patch.object(definition.mount, "reachable", return_value=None):
+                with mock.patch.object(
+                    definition.mount, "list_dir", return_value=[]
+                ):
+                    with self.assertRaisesRegex(EvalError, "not reachable over vfs"):
+                        definition.preflight()
+
+    def test_agent_trials_are_refused_without_the_mounted_transport(self) -> None:
+        definition = self.make(BLOOM_EVAL_SOLANA_TRANSPORT="vfs")
+        with self.assertRaisesRegex(EvalError, "--smoke-only"):
+            definition.provision("glm")
+
+    def test_the_smoke_may_use_the_vfs_transport(self) -> None:
+        definition = self.make(BLOOM_EVAL_SOLANA_TRANSPORT="vfs")
+        definition.smoke_only = True
+        self.assertEqual(definition.transport, "vfs")

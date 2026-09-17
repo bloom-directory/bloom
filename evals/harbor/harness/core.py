@@ -159,6 +159,33 @@ class MountedTree:
         except (OSError, subprocess.SubprocessError) as error:
             raise EvalError(f"route write to {path} failed: {error}") from error
 
+    def read_text(self, path: Path, timeout: int | None = None) -> str:
+        """Read one mounted file as text, a single bounded attempt."""
+        budget = self.read_timeout if timeout is None else timeout
+        try:
+            completed = subprocess.run(
+                ["cat", str(path)],
+                check=True,
+                capture_output=True,
+                timeout=budget,
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            raise EvalError(f"could not read {path}: {error}") from error
+        return completed.stdout.decode(errors="replace")
+
+    def list_dir(self, path: Path) -> list[str]:
+        """List a mounted directory; absence is an empty listing.
+
+        Mirrors the vfs transport: state directories the engine has not
+        created yet are a poll outcome, not an error.
+        """
+        try:
+            return os.listdir(path)
+        except FileNotFoundError:
+            return []
+        except OSError as error:
+            raise EvalError(f"could not list {path}: {error}") from error
+
     @staticmethod
     def poll_until(
         predicate: Callable[[], bool], attempts: int, delay: float
@@ -436,6 +463,10 @@ class EvalDefinition(ABC):
     """
 
     name: str
+    # Default cap for claude-code-adapter agents (claude, glm, deepseek);
+    # codex/opencode use their adapter defaults. An eval whose lifecycle
+    # needs more turns (approval waits, restage, finality) overrides this.
+    default_max_turns: str = "20"
 
     @property
     @abstractmethod
@@ -618,6 +649,9 @@ def run_eval(
     agent_spec: AgentSpec | None = None,
 ) -> Any:
     """Execute one provisioned eval and guarantee outer cleanup."""
+    # An explicit operator setting always wins; otherwise the eval declares
+    # the turn budget its lifecycle was designed around.
+    os.environ.setdefault("BLOOM_EVAL_MAX_TURNS", definition.default_max_turns)
     agent = agent_spec if agent_spec is not None else _agent_spec(agent_name)
     definition.lock_path.parent.mkdir(parents=True, exist_ok=True)
     timings = phase_timings if phase_timings is not None else {}

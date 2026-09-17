@@ -1,5 +1,8 @@
 services:
   main:
-    # The local validator is intentionally bound to host loopback. This overlay
-    # is selected only by the local lane so its verifier reaches that endpoint.
+    # The local validator is intentionally bound to host loopback, so the
+    # trial container shares host networking on the local lane only. This is
+    # accepted deliberately: the container holds no signing keys, so loopback
+    # reach cannot stage, approve, or broadcast outside the mounted outbox,
+    # and the mainnet lane never receives this overlay.
     network_mode: host

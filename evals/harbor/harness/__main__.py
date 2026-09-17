@@ -69,6 +69,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise EvalError("--smoke-only does not accept an agent argument")
             if not isinstance(definition, SolanaTransferEval):
                 raise EvalError("--smoke-only is supported only for solana-transfer")
+            definition.smoke_only = True
             run_eval(
                 definition,
                 "smoke",

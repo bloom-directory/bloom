@@ -118,6 +118,12 @@ Every command below is the real CLI surface; run them in order.
    Point `BLOOM_TRIAD_DEV_MACHINE_CONFIG` at that file; the developer
    launcher copies it into the evaluation Machine home it creates.
 
+   The local-lane trial container shares host networking
+   (`docker-compose.local.yaml`) so it can reach this loopback validator.
+   This is deliberate and local-only: the container holds no signing keys,
+   so loopback reach cannot stage, approve, or broadcast outside the mounted
+   outbox, and the mainnet lane never receives the overlay.
+
 4. Launch the dedicated evaluation triad on canonical port 18734 (one
    terminal; it stays in the foreground):
 
@@ -157,13 +163,11 @@ Every command below is the real CLI surface; run them in order.
    ```
 
    The mnemonic is a dedicated test secret entered only in the ceremony; it
-   must contain no funds and no public-chain history. Then allocate the
-   Solana child and print its address:
+   must contain no funds and no public-chain history. The import ceremony
+   derives the Solana child (`bip44-solana-slip10-ed25519-v1`) itself; print
+   its address:
 
    ```sh
-   bloom wallet account-allocate solana-eval \
-     --profile bip44-solana-slip10-ed25519-v1
-   # → complete the printed ceremony as above with the next sign count
    bloom wallet address solana-eval --profile solana
    ```
 
@@ -182,16 +186,20 @@ Every command below is the real CLI surface; run them in order.
    solana address --keypair /private/path/to/eval-destination.json
    ```
 
-   Then stage the policy update through the mounted surface, complete the
-   printed ceremony, and retry the exact same bytes:
+   Then stage the policy update through the wallet CLI, complete the printed
+   ceremony, and commit it with the operation id the staging step printed
+   (the projection's policy is `{version, canonical_policy}`; the proposal
+   is the base64-decoded `canonical_policy` with the destination added):
 
    ```sh
-   cat "$BLOOM_EVAL_BLOOM_MOUNT/wallets/solana-eval/policy.json" > proposed-policy.json
-   # edit proposed-policy.json: allowed_destinations = [
-   #   {"chain": "solana", "destination": "<destination address>"}]
-   cp proposed-policy.json "$BLOOM_EVAL_BLOOM_MOUNT/wallets/solana-eval/policy.json"
-   # → complete the policy-updates ceremony, then retry:
-   cp proposed-policy.json "$BLOOM_EVAL_BLOOM_MOUNT/wallets/solana-eval/policy.json"
+   bloom wallet projection solana-eval \
+     | jq -r '.policy.canonical_policy' | base64 -d > current-policy.json
+   jq '.allowed_destinations = \
+     [{"chain":"solana","destination":"<destination address>"}]' \
+     current-policy.json > proposed-policy.json
+   bloom wallet update-policy solana-eval --file proposed-policy.json
+   # → ceremony_url + operation id; complete the ceremony as above, then:
+   bloom wallet commit-policy <operation-id>
    ```
 
    Reusing the wallet across trials is supported; each trial still needs a
@@ -212,11 +220,20 @@ Every command below is the real CLI surface; run them in order.
    ```
 
    The deterministic smoke requires no API key, Docker, or Harbor model
-   adapter:
+   adapter. It runs against the kernel mount by default; with
+   `BLOOM_EVAL_SOLANA_TRANSPORT=vfs` it drives the same VFS handlers through
+   `bloom vfs` over the Machine IPC socket instead, so it needs no mount at
+   all (point `BLOOM_EVAL_SOLANA_VFS_BIN` at a `bloom` build and source the
+   triad env so `BLOOM_RPC_ENDPOINT` is set):
 
    ```sh
-   scripts/evals/run-harbor-solana-local.sh smoke
+   scripts/evals/run-harbor-solana-local.sh smoke                 # mounted
+   BLOOM_EVAL_SOLANA_TRANSPORT=vfs \
+     scripts/evals/run-harbor-solana-local.sh smoke               # mount-free
    ```
+
+   The vfs transport is smoke-only; agent trials always use the mounted
+   transport so the container sees `/bloom`.
 
    Model trials additionally require Docker and `uv`:
 
