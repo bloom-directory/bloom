@@ -73,6 +73,7 @@ pub struct BrokerExactPayloadSigner {
     provenance_catalog: ProvenanceCatalog,
     account_key_ref: Option<bloom_broker_api::KeyRef>,
     delegated_key_ref: Option<bloom_broker_api::KeyRef>,
+    approval_ttl_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -167,6 +168,7 @@ impl BrokerExactPayloadSigner {
             provenance_catalog,
             account_key_ref: None,
             delegated_key_ref: None,
+            approval_ttl_ms: APPROVAL_TTL_MS,
         }
     }
 
@@ -178,8 +180,15 @@ impl BrokerExactPayloadSigner {
     /// Sign single Petal payloads with a Petal-scoped delegated key instead
     /// of a wallet key. The caller must already have tied the key to the
     /// trusted Petal route.
-    pub fn with_delegated_key(mut self, key: bloom_broker_api::KeyRef) -> Self {
+    /// Sign with a Petal session key. Signer caps every approval for that
+    /// key at the scope's maximum lifetime, so the approval window is too.
+    pub fn with_delegated_key(
+        mut self,
+        key: bloom_broker_api::KeyRef,
+        maximum_lifetime_ms: u64,
+    ) -> Self {
         self.delegated_key_ref = Some(key);
+        self.approval_ttl_ms = APPROVAL_TTL_MS.min(maximum_lifetime_ms);
         self
     }
 
@@ -299,6 +308,26 @@ impl BrokerExactPayloadSigner {
         result
     }
 
+    /// The ceremony of an approval still waiting on its owner. A retry in
+    /// that state returns the same pending approval: signing would fail with
+    /// CLAIM_INVALID, which callers treat as a final refusal.
+    async fn still_awaiting_owner(&self, approval_id: &Digest32) -> Option<(String, u64)> {
+        let status = self
+            .broker
+            .approval_status(approval_id.clone())
+            .await
+            .ok()?;
+        if !matches!(
+            status.state,
+            bloom_broker_api::ApprovalLifecycleState::Prepared
+                | bloom_broker_api::ApprovalLifecycleState::AwaitingCeremony
+        ) {
+            return None;
+        }
+        let expires_at_ms = status.ceremony_expires_at_ms.as_ref()?.get();
+        Some((status.ceremony_url?, expires_at_ms))
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn sign_or_prepare_locked(
         &self,
@@ -357,7 +386,7 @@ impl BrokerExactPayloadSigner {
                     signing_operation_id: random_operation_id(),
                     request_nonce: random_request_nonce(),
                     issued_at_ms: DecimalU64::new(now),
-                    expires_at_ms: DecimalU64::new(now.saturating_add(APPROVAL_TTL_MS)),
+                    expires_at_ms: DecimalU64::new(now.saturating_add(self.approval_ttl_ms)),
                     canonical_plan_facts_digest: canonical_plan_facts_digest.clone(),
                     approval_id: None,
                 }
@@ -383,7 +412,7 @@ impl BrokerExactPayloadSigner {
             state.signing_operation_id = random_operation_id();
             state.request_nonce = random_request_nonce();
             state.issued_at_ms = DecimalU64::new(now);
-            state.expires_at_ms = DecimalU64::new(now.saturating_add(APPROVAL_TTL_MS));
+            state.expires_at_ms = DecimalU64::new(now.saturating_add(self.approval_ttl_ms));
             state.approval_id = None;
         }
         write_state(state_path, &state)?;
@@ -414,6 +443,16 @@ impl BrokerExactPayloadSigner {
                 .and_then(|(_, evidence)| evidence.map(<[u8]>::to_vec)),
             approval_value_limits,
         };
+        if let Some(approval_id) = state.approval_id.clone()
+            && let Some((ceremony_url, ceremony_expires_at_ms)) =
+                self.still_awaiting_owner(&approval_id).await
+        {
+            return Ok(ExactPayloadOutcome::ApprovalRequired {
+                approval_id,
+                ceremony_url,
+                ceremony_expires_at_ms,
+            });
+        }
         let mut response = self.broker.sign_exact_payload(request.clone()).await;
         if response
             .as_ref()
@@ -813,6 +852,16 @@ impl BrokerExactPayloadSigner {
             petal_use_claim: Some(claim.clone()),
             claim_assurance_evidence: claim_assurance_evidence.map(<[u8]>::to_vec),
         };
+        if let Some(approval_id) = state.approval_id.clone()
+            && let Some((ceremony_url, ceremony_expires_at_ms)) =
+                self.still_awaiting_owner(&approval_id).await
+        {
+            return Ok(ExactPayloadBatchOutcome::ApprovalRequired {
+                approval_id,
+                ceremony_url,
+                ceremony_expires_at_ms,
+            });
+        }
         let mut response = self.broker.sign_exact_payload_batch(request.clone()).await;
         if response
             .as_ref()
@@ -946,6 +995,8 @@ mod tests {
         /// The fee asset the provenance catalog marks for the operation class
         /// under test, mirroring `account_declared_values`' fee matching.
         class_fee_asset: Option<bloom_broker_api::ProvenanceFeeAsset>,
+        /// Prepared approvals still wait on their owner's ceremony.
+        awaiting_owner: AtomicBool,
     }
 
     impl MockBroker {
@@ -1085,6 +1136,24 @@ mod tests {
                                 ceremony_url: "http://localhost:18734/ceremony/test".into(),
                                 ceremony_expires_at_ms: request.terms.expires_at_ms,
                                 review_manifest_digest: digest(8),
+                            },
+                        ))
+                    }
+                    MachineBrokerRequest::SealedApprovalStatus(request) => {
+                        let waiting = self.awaiting_owner.load(Ordering::SeqCst);
+                        Ok(MachineBrokerResponse::SealedApprovalStatus(
+                            bloom_broker_api::ApprovalPublicStatus {
+                                approval_id: request.id,
+                                wallet_id: token("wallet"),
+                                state: if waiting {
+                                    bloom_broker_api::ApprovalLifecycleState::AwaitingCeremony
+                                } else {
+                                    bloom_broker_api::ApprovalLifecycleState::Active
+                                },
+                                effective_claim_assurance: None,
+                                ceremony_url: waiting
+                                    .then(|| "http://localhost:18734/ceremony/test".into()),
+                                ceremony_expires_at_ms: waiting.then(|| DecimalU64::new(u64::MAX)),
                             },
                         ))
                     }
@@ -1250,6 +1319,80 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("differs from its persisted operation identity"));
         assert_eq!(broker.requests.lock().unwrap().len(), requests_after_sign);
+    }
+
+    /// A retry while the owner has not finished the ceremony returns the same
+    /// pending approval and never asks Broker to sign with it.
+    #[tokio::test]
+    async fn a_retry_before_the_owner_approves_stays_pending() {
+        let broker = Arc::new(MockBroker::default());
+        let signer = BrokerExactPayloadSigner::new(
+            MachineBrokerClient::new(broker.clone()),
+            ProvenanceCatalog {
+                schema: PROVENANCE_CATALOG_SCHEMA.into(),
+                records: vec![ProvenanceRecord {
+                    subject: ProvenanceSubject::System {
+                        component_id: token("bloom-machine"),
+                        operation_class: token("transaction.confirm"),
+                    },
+                    publisher: token("bloom-installer"),
+                    petal_lineage: None,
+                    operation_classes: vec![ProvenanceOperationClass {
+                        operation_class: token("transaction.confirm"),
+                        fee_asset: None,
+                    }],
+                    installer_key_id: token("test-key"),
+                    installer_signature: Base64UrlBytes::from_bytes(&[]),
+                }],
+            },
+        );
+        let temporary = tempfile::tempdir().unwrap();
+        let state = temporary.path().join("exact.json");
+        let payload = b"exact transaction bytes";
+        let hash = Digest32::from_bytes(alloy::primitives::keccak256(payload).into());
+        let facts = serde_json::json!({"amount": "1"});
+        let attempt = || {
+            signer.sign_or_prepare(
+                &state,
+                "action-1",
+                "wallet",
+                "transaction.confirm",
+                payload,
+                hash.clone(),
+                &facts,
+            )
+        };
+        let signs = || {
+            broker
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| matches!(request, MachineBrokerRequest::SigningSign(_)))
+                .count()
+        };
+        let ExactPayloadOutcome::ApprovalRequired { approval_id, .. } = attempt().await.unwrap()
+        else {
+            panic!("first attempt must prepare an approval")
+        };
+        broker.awaiting_owner.store(true, Ordering::SeqCst);
+        let ExactPayloadOutcome::ApprovalRequired {
+            approval_id: retried,
+            ceremony_url,
+            ..
+        } = attempt().await.unwrap()
+        else {
+            panic!("a retry before approval must stay pending")
+        };
+        assert_eq!(retried, approval_id);
+        assert_eq!(ceremony_url, "http://localhost:18734/ceremony/test");
+        assert_eq!(signs(), 0, "a waiting approval is never signed with");
+        broker.awaiting_owner.store(false, Ordering::SeqCst);
+        assert_eq!(
+            attempt().await.unwrap(),
+            ExactPayloadOutcome::Signed(vec![7_u8; 65])
+        );
+        assert_eq!(signs(), 1);
     }
 
     #[tokio::test]
@@ -1455,7 +1598,10 @@ mod tests {
             prepared.terms.limits.value_limits[0].lifetime.as_str(),
             "12"
         );
-        let MachineBrokerRequest::SigningSign(signed) = &requests[5] else {
+        let Some(signed) = requests.iter().find_map(|request| match request {
+            MachineBrokerRequest::SigningSign(signed) => Some(signed),
+            _ => None,
+        }) else {
             panic!("approved retry must sign");
         };
         assert_eq!(signed.crypto_suite, CryptoSuite::Secp256k1Sha256Recoverable);

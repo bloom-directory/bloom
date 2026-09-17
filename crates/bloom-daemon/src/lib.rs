@@ -445,44 +445,47 @@ impl DaemonPetalHost {
     /// already tied it to the mounted account's owner. Stopped or expired
     /// sessions still qualify, because every Exact payload needs its own
     /// owner approval; this is how a Petal recovers funds from a session.
-    fn is_exact_session_key(
+    /// The maximum lifetime of `named` when it is exactly one of this route's
+    /// own session keys for the class and suite; `None` otherwise.
+    fn exact_session_key_lifetime_ms(
         &self,
         subject: &bloom_broker_api::ProvenanceSubject,
         wallet: &str,
         operation_class: &str,
         suite: bloom_broker_api::CryptoSuite,
         named: &bloom_broker_api::KeyRef,
-    ) -> bool {
+    ) -> Option<u64> {
         let bloom_broker_api::ProvenanceSubject::Petal { route, .. } = subject else {
-            return false;
+            return None;
         };
-        let Some(lineage) = self
+        let lineage = self
             .provenance_catalog
             .as_ref()
             .and_then(|catalog| catalog.record(subject))
             .and_then(|record| record.petal_lineage.as_ref())
-            .filter(|lineage| lineage.active)
-        else {
-            return false;
-        };
-        Self::petal_key_states_from_root(self.petal_key_state_root.as_deref(), Some(wallet))
-            .iter()
-            .filter(|(_, state)| {
-                state
-                    .public_key
-                    .as_ref()
-                    .is_some_and(|public| &public.key_ref == named)
-                    && state.scope.lineage_id == lineage.lineage_id
-                    && state.scope.allowed_routes.contains(route)
-                    && state
-                        .scope
-                        .allowed_operation_classes
-                        .iter()
-                        .any(|class| class.as_str() == operation_class)
-                    && state.scope.allowed_crypto_suites.contains(&suite)
-            })
-            .count()
-            == 1
+            .filter(|lineage| lineage.active)?;
+        let matches =
+            Self::petal_key_states_from_root(self.petal_key_state_root.as_deref(), Some(wallet))
+                .into_iter()
+                .filter(|(_, state)| {
+                    state
+                        .public_key
+                        .as_ref()
+                        .is_some_and(|public| &public.key_ref == named)
+                        && state.scope.lineage_id == lineage.lineage_id
+                        && state.scope.allowed_routes.contains(route)
+                        && state
+                            .scope
+                            .allowed_operation_classes
+                            .iter()
+                            .any(|class| class.as_str() == operation_class)
+                        && state.scope.allowed_crypto_suites.contains(&suite)
+                })
+                .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [(_, state)] => Some(state.scope.maximum_lifetime_ms.get()),
+            _ => None,
+        }
     }
 
     /// Whether `named` is a key this wallet's Petal key states record as
@@ -1951,15 +1954,16 @@ impl PetalHost for DaemonPetalHost {
                 package_hash: trusted_package_hash.clone(),
                 route: context.route_id.clone(),
             };
-            if let Some(named) = &req.key_ref
-                && !self.is_exact_session_key(
+            let session_key_lifetime_ms = req.key_ref.as_ref().and_then(|named| {
+                self.exact_session_key_lifetime_ms(
                     &trusted_subject,
                     &req.wallet,
                     &req.operation_class,
                     crypto_suite,
                     named,
                 )
-            {
+            });
+            if req.key_ref.is_some() && session_key_lifetime_ms.is_none() {
                 warn!(
                     wallet = %req.wallet,
                     operation_class = %req.operation_class,
@@ -2025,7 +2029,8 @@ impl PetalHost for DaemonPetalHost {
             })?;
             let signer = BrokerExactPayloadSigner::new(broker.clone(), catalog);
             let signer = match &req.key_ref {
-                Some(named) => signer.with_delegated_key(named.clone()),
+                Some(named) => signer
+                    .with_delegated_key(named.clone(), session_key_lifetime_ms.unwrap_or_default()),
                 None => signer.with_account_key(account_key.clone()),
             };
             let _guard = self.petal_signing_lock.lock().await;
@@ -6836,6 +6841,12 @@ mod tests {
             match request {
                 MachineBrokerRequest::SealedApprovalPrepare(request) => {
                     assert_eq!(request.terms.key_ref, broker.session);
+                    // Signer refuses an approval for a session key whose
+                    // window is longer than the key's maximum lifetime.
+                    assert!(
+                        request.terms.expires_at_ms.get() - request.terms.not_before_ms.get()
+                            <= 60_000
+                    );
                 }
                 MachineBrokerRequest::SigningSign(request) => {
                     assert_eq!(request.key_ref, broker.session);
