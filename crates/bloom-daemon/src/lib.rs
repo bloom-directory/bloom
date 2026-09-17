@@ -1573,18 +1573,26 @@ impl PetalHost for DaemonPetalHost {
                                 Self::write_petal_key_state(&path, &stored)?;
                                 return stored.guest_outcome();
                             }
+                            // Still waiting on its owner. Adopt the ceremony
+                            // Broker offers, also when the response to the
+                            // prepare was lost or this process retired the
+                            // record at startup: Broker refuses another
+                            // prepare while the wallet has a live ceremony.
                             bloom_broker_api::ApprovalLifecycleState::Prepared
                             | bloom_broker_api::ApprovalLifecycleState::AwaitingCeremony
-                                if stored.status != PETAL_CEREMONY_INVALIDATED_STATUS =>
+                                if approval.ceremony_url.is_some()
+                                    || stored.status != PETAL_CEREMONY_INVALIDATED_STATUS =>
                             {
-                                if stored.reusable_approval_id.as_ref() != Some(&approval_id) {
-                                    // The prepare reached Broker but its
-                                    // response was never recorded.
+                                let ceremony_url =
+                                    approval.ceremony_url.or(stored.ceremony_url.clone());
+                                if stored.reusable_approval_id.as_ref() != Some(&approval_id)
+                                    || stored.status != "awaiting_user"
+                                    || stored.ceremony_url != ceremony_url
+                                {
                                     stored.reusable_approval_id = Some(approval_id);
                                     stored.authority_expires_at_ms = terms_expiry;
                                     stored.status = "awaiting_user".into();
-                                    stored.ceremony_url =
-                                        approval.ceremony_url.or(stored.ceremony_url.take());
+                                    stored.ceremony_url = ceremony_url;
                                     if let Some(expires) = approval.ceremony_expires_at_ms {
                                         stored.ceremony_expires_at_ms = expires;
                                     }
@@ -1592,11 +1600,13 @@ impl PetalHost for DaemonPetalHost {
                                 }
                                 return stored.guest_outcome();
                             }
-                            // Still waiting on an owner, but the ceremony that
-                            // would carry it was retired at startup. Nothing an
-                            // owner can act on remains, so stage a fresh one.
+                            // Nothing is left for the owner to act on: the
+                            // record was retired and Broker offers no ceremony,
+                            // or the owner step lapsed or died with a Broker
+                            // restart. Prepare the next attempt.
                             bloom_broker_api::ApprovalLifecycleState::Prepared
-                            | bloom_broker_api::ApprovalLifecycleState::AwaitingCeremony => {}
+                            | bloom_broker_api::ApprovalLifecycleState::AwaitingCeremony
+                            | bloom_broker_api::ApprovalLifecycleState::Expired => {}
                             state => {
                                 return Err(HostError::Denied(format!(
                                     "Petal reusable approval is not active: {state:?}"
@@ -5857,6 +5867,9 @@ mod tests {
         drop_next_prepare_request: std::sync::atomic::AtomicBool,
         /// Record the next prepare but lose its response.
         drop_next_prepare_response: std::sync::atomic::AtomicBool,
+        /// Waiting approvals report `Expired`, as Broker does once their owner
+        /// ceremony lapsed or died with a Broker restart.
+        approval_ceremony_lapsed: std::sync::atomic::AtomicBool,
     }
 
     struct PetalExactBrokerFixture {
@@ -6042,6 +6055,7 @@ mod tests {
                 approval_prepares: std::sync::Mutex::new(Vec::new()),
                 drop_next_prepare_request: std::sync::atomic::AtomicBool::new(false),
                 drop_next_prepare_response: std::sync::atomic::AtomicBool::new(false),
+                approval_ceremony_lapsed: std::sync::atomic::AtomicBool::new(false),
             }
         }
     }
@@ -6193,19 +6207,34 @@ mod tests {
                         let active = self
                             .approval_active
                             .load(std::sync::atomic::Ordering::SeqCst);
+                        let lapsed = self
+                            .approval_ceremony_lapsed
+                            .load(std::sync::atomic::Ordering::SeqCst);
+                        // Like Broker, a waiting approval names its live
+                        // ceremony, and one whose ceremony is gone reports
+                        // `Expired`.
+                        let (state, ceremony_url) = if active {
+                            (bloom_broker_api::ApprovalLifecycleState::Active, None)
+                        } else if lapsed {
+                            (bloom_broker_api::ApprovalLifecycleState::Expired, None)
+                        } else {
+                            (
+                                bloom_broker_api::ApprovalLifecycleState::AwaitingCeremony,
+                                Some(format!(
+                                    "http://127.0.0.1:18734/ceremony/{}",
+                                    request.id.as_str()
+                                )),
+                            )
+                        };
                         Ok(MachineBrokerResponse::SealedApprovalStatus(
                             bloom_broker_api::ApprovalPublicStatus {
                                 approval_id: request.id,
                                 wallet_id: bloom_broker_api::Token::new("primary").unwrap(),
-                                state: if active {
-                                    bloom_broker_api::ApprovalLifecycleState::Active
-                                } else {
-                                    bloom_broker_api::ApprovalLifecycleState::AwaitingCeremony
-                                },
+                                state,
                                 effective_claim_assurance: Some(
                                     bloom_broker_api::ClaimAssuranceLevel::MachineAsserted,
                                 ),
-                                ceremony_url: None,
+                                ceremony_url,
                                 ceremony_expires_at_ms: None,
                             },
                         ))
@@ -6573,6 +6602,75 @@ mod tests {
             "{elapsed}"
         );
         assert_eq!(prepares().len(), 1);
+    }
+
+    /// An approval still waiting on its owner survives a Machine restart: the
+    /// retry adopts the ceremony Broker still offers instead of preparing
+    /// another, which Broker would refuse while that ceremony is live. Once
+    /// the owner step has lapsed, the retry prepares the next attempt.
+    #[tokio::test]
+    async fn petal_key_reusable_approval_survives_restarts_while_waiting_on_its_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = Arc::new(PetalKeyBrokerFixture::new());
+        let (host, request, _) = petal_key_host(dir.path(), &fixture);
+        let state_path = host
+            .petal_key_state_path(
+                "primary",
+                "pln1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                &request.key_slot,
+            )
+            .unwrap();
+        let prepares = || fixture.approval_prepares.lock().unwrap().clone();
+        let state = || {
+            DaemonPetalHost::read_petal_key_state(&state_path)
+                .unwrap()
+                .unwrap()
+        };
+        host.petal_key_request(request.clone()).await.unwrap();
+        fixture
+            .completed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        host.petal_key_request(request.clone()).await.unwrap();
+        host.petal_key_request(request.clone()).await.unwrap();
+        let first = prepares()[0].terms.approval_id().unwrap();
+
+        assert_eq!(
+            invalidate_stale_ceremony_projections(dir.path()).unwrap(),
+            1
+        );
+        let (host, request, _) = petal_key_host(dir.path(), &fixture);
+        assert!(state().ceremony_url.is_none());
+        let pending = host.petal_key_request(request.clone()).await.unwrap();
+        assert_eq!(serde_json::to_value(&pending).unwrap()["state"], "pending");
+        assert_eq!(
+            prepares().len(),
+            1,
+            "a live ceremony is adopted, not replaced"
+        );
+        assert_eq!(state().reusable_approval_id, Some(first.clone()));
+        assert_eq!(state().status, "awaiting_user");
+        assert_eq!(
+            state().ceremony_url.as_deref(),
+            Some(format!("http://127.0.0.1:18734/ceremony/{}", first.as_str()).as_str())
+        );
+
+        fixture
+            .approval_ceremony_lapsed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        host.petal_key_request(request.clone()).await.unwrap();
+        assert_eq!(prepares().len(), 2, "a lapsed owner step is prepared again");
+        let second = prepares()[1].terms.approval_id().unwrap();
+        assert_ne!(second, first);
+        assert_eq!(state().reusable_approval_id, Some(second));
+
+        fixture
+            .approval_ceremony_lapsed
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        fixture
+            .approval_active
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let ready = host.petal_key_request(request).await.unwrap();
+        assert_eq!(serde_json::to_value(&ready).unwrap()["state"], "ready");
     }
 
     #[tokio::test]
