@@ -3599,9 +3599,24 @@ impl AccountPetalMount for AccountPetals {
     }
 }
 
+/// The fixed contracts a chosen Petal transacts with, as Broker policy
+/// destinations. The table lives in Bloom's source, never in config.
+fn default_policy_destinations(name: &str) -> Vec<bloom_broker_api::PolicyDestination> {
+    bloom_proto::petal_destinations::for_petal(name)
+        .iter()
+        .filter_map(|destination| {
+            Some(bloom_broker_api::PolicyDestination {
+                chain: bloom_broker_api::Token::new(destination.chain.to_owned()).ok()?,
+                destination: destination.destination.to_owned(),
+            })
+        })
+        .collect()
+}
+
 /// All wired-up state the daemon owns. Cheap to clone (everything is
 /// behind Arc/clone-safe inner types).
 #[derive(Clone)]
+
 pub struct Daemon {
     pub home: HomeDir,
     pub config: Config,
@@ -4386,13 +4401,29 @@ impl Daemon {
             let store = petal_store.clone();
             Arc::new(move |wallet: &str| {
                 if wallet != bloom_proto::config::DEFAULT_POLICY_WALLET {
-                    return Vec::new();
+                    return bloom_vfs::handlers::DefaultPolicySetup::default();
                 }
-                chosen
-                    .iter()
-                    .filter_map(|name| store.resolve_petal_owner(name).ok().flatten())
-                    .filter_map(|hash| bloom_broker_api::Digest32::new(hash).ok())
-                    .collect()
+                let mut setup = bloom_vfs::handlers::DefaultPolicySetup::default();
+                for name in &chosen {
+                    let installed = match store.resolve_petal_owner(name) {
+                        Ok(installed) => installed,
+                        Err(error) => {
+                            warn!(
+                                petal = %name,
+                                error = %error,
+                                "petal.default_policy_owner_unreadable"
+                            );
+                            continue;
+                        }
+                    };
+                    let Some(hash) = installed else { continue };
+                    let Ok(package) = bloom_broker_api::Digest32::new(hash) else {
+                        continue;
+                    };
+                    setup.packages.push(package);
+                    setup.destinations.extend(default_policy_destinations(name));
+                }
+                setup
             })
         };
         let wallets_handler = Arc::new(

@@ -68,38 +68,38 @@ Agreed on 2026-09-14:
    in its config, writes them again after an update, and says so.
 10. **`bloom init` runs once.** Afterwards users add, update, or remove
     Petals.
-11. **Enso gets route rules for `main`.** Choosing Enso writes
-    `settings/main/route-rules.toml`: routes between Arbitrum, Avalanche,
-    Base, Ethereum, Optimism, and Polygon, to the wallet itself, through Enso
-    Router V2 (`0xf75584ef6673ad213a685a1b58cc0330b8ea22cf`) only. The router
-    address is pinned in Bloom's catalog, checked against Enso's published
-    deployments and the deployed bytecode on each chain, and never taken from
-    a quote. The rules allow at most 100 bps of slippage and do not require
-    calldata verification: Enso cannot yet prove a route's receiver or minimum
-    output, so requiring it would refuse every route. The owner can rewrite
-    the rules afterwards.
-    The rules need an Enso release with per-wallet rules. Its v0.1.3 release
-    has no `settings/<wallet>/route-rules.toml` route, so `bloom init` reports
-    `petal_settings_failed` for Enso and continues; without rules Enso refuses
-    every route. That release also reads `wallets/<wallet>/address`, which the
-    account-layout change removed (addresses now live at
-    `wallets/<wallet>/<n>/address.evm`), and then `wallets/<wallet>/policy.toml`
-    and `addresses.json`, which the triad does not serve. On a local triad a
-    swap intent is refused with `backend: invalid`. The pinned NEAR Intents,
-    Polymarket, and Tolly releases read the same retired address path, so
-    their wallet actions fail the same way until those Petals move to the new
-    layout.
+11. **Enso owns its own route rules.** Bloom writes no Enso settings. The
+    pinned Enso v0.1.5 keeps per-wallet rules at
+    `settings/wallets/<wallet>/venue.toml` and ships defaults covering the 13
+    chains it supports, so a fresh wallet can swap without a setup write. The
+    owner can replace those rules through Enso's own route. Bloom's part is
+    decision 13: allowing Enso's router as a destination on each of those
+    chains.
+
+    Enso's shipped rules allow at most 100 bps of slippage and do not require
+    calldata verification, because Enso cannot yet prove a route's receiver or
+    minimum output; each plan still reports both as warnings. Enso v0.1.5 names
+    BNB Chain `bnb` while Bloom names it `bsc`, so its own rules refuse `bsc`
+    routes until Enso accepts Bloom's name, and its token-symbol table covers
+    only Ethereum, Polygon, Base, Optimism, Arbitrum, BNB Chain, and
+    Avalanche; on the other chains an intent needs `0x` token addresses.
 12. **Tolly needs writes enabled.** Choosing Tolly sets
     `[petals.runtime.tolly.values] tolly_writes = "enabled"`, keeping a value
     the owner already set. Each buy, sell, or launch is still confirmed by the
     owner.
 13. **Chosen Petals' fixed contracts become allowed destinations.** Machine
     refuses any outbox transaction whose `to` address is not in the wallet
-    policy's `allowed_destinations`, and an empty list refuses all of them.
-    Each catalog entry lists the fixed contracts its Petal transacts with, and
-    the default policy proposes them in the same ceremony as the packages:
-    - Enso: Router V2 on Arbitrum, Avalanche, Base, Ethereum, Optimism, and
-      Polygon.
+    policy's `allowed_destinations`, and an empty list refuses all of them, so
+    allowing a Petal without its contracts leaves it installed but gated. Each
+    catalog entry lists the fixed contracts its Petal transacts with, and the
+    default policy proposes them in the same ceremony as the packages —
+    including the ceremony a Petal opens on its own first use, so no path
+    allows a Petal it cannot then use:
+    - Enso: its router on every chain its shipped rules allow — one address
+      on Arbitrum, Avalanche, Base, BNB Chain, Ethereum, Gnosis, HyperEVM,
+      Optimism, and Polygon, a second on Linea, and a third shared by Arc,
+      Robinhood Chain, and Tempo. Each address is Enso's published deployment,
+      checked with `eth_getCode`, and never taken from a quote.
     - Polymarket: pUSD, USDC.e, and Enso Router V2 on Polygon, for funding
       its deposit wallet.
 
@@ -282,6 +282,21 @@ merge into one proposal, as Machine already reconciles pending proposals.
   ([bloom#171](https://github.com/bloom-directory/bloom/issues/171)).
 - **Petal changes:** one policy update ceremony each.
 
+## A starting profile, not a cage
+
+The Petals chosen during setup are an installation profile: a safe default
+that makes a new wallet usable in one ceremony. It is deliberately the
+narrowest thing that works — the chosen packages and the fixed contracts they
+transact with, nothing else.
+
+It is a starting point, not a fixed set. Owners can narrow or widen it later
+through the ordinary policy ceremony (`bloom wallet update-policy`), add or
+remove Petals, and replace each Petal's own settings through that Petal's
+routes. Bloom never removes a restriction the owner put in place: proposals
+only add, every change is a ceremony the owner signs, and a package or
+destination the owner removed is not proposed again behind a later request
+(see decision 13 and `first_proposal` in `ensure_policy_allows`).
+
 ## Security properties
 
 - Setup only proposes. Nothing is allowed until the owner signs the policy
@@ -308,7 +323,7 @@ These need other repositories and are out of scope:
 | Sign the policy inside the creation ceremony, for one ceremony in total | bloom-broker, bloom-signer |
 | Count Polymarket sells, add a total limit, and reset a count when its limit changes | bloom-petal-polymarket |
 | Keep Petal settings across updates | The stable installation slot in [Petal derived keys and package succession](./Petal%20derived%20key%20succession.md) |
-| Release Enso with per-wallet route rules and the new address layout, then re-pin it so the setup rules apply | bloom-petal-enso, then `PREINSTALLED_ENSO` |
+| Accept Bloom's `bsc` chain name so BNB Chain routes work | bloom-petal-enso |
 | Create Hyperliquid sessions with fewer ceremonies | [bloom#171](https://github.com/bloom-directory/bloom/issues/171) |
 
 ## Implementation plan

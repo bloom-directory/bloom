@@ -178,12 +178,19 @@ say "$(grep '^default_policy: main allows ' "$new_out")"
 
 # 3. Verify the committed policy and the idempotent resume command.
 policy="$(cli vfs cat "/wallets/$WALLET/policy.json")"
+# Polymarket contributes its three Polygon destinations; Hyperliquid signs
+# payloads rather than transactions and contributes none.
 printf '%s' "$policy" | jq -e --arg hl "$hl_hash" --arg pm "$pm_hash" '
   (.allowed_petal_packages | sort) == ([$hl, $pm] | sort) and
-  (.allowed_destinations | length) == 0 and
+  ([.allowed_destinations[] | select(.chain == "polygon") | .destination] | sort) == ([
+    "0x2791bca1f2de4661ed88a30c99a7a9449aa84174",
+    "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb",
+    "0xf75584ef6673ad213a685a1b58cc0330b8ea22cf"
+  ] | sort) and
+  (.allowed_destinations | length) == 3 and
   (.required_verifiers | length) == 0
-' >/dev/null || die "main's policy does not allow exactly the chosen Petals: $policy"
-say "policy.json allows exactly hyperliquid and polymarket"
+' >/dev/null || die "main's policy does not allow exactly the chosen Petals and their destinations: $policy"
+say "policy.json allows exactly hyperliquid and polymarket, with Polymarket's Polygon destinations"
 
 resume="$(cli wallet default-policy "$WALLET" 2>&1)" || die "default-policy resume failed: $resume"
 printf '%s\n' "$resume" | grep -q '^default_policy: main allows ' ||

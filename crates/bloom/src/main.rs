@@ -3543,8 +3543,14 @@ async fn run(cli: Cli) -> Result<()> {
             .await
         }
         Cmd::Wallet(WalletCmd::DefaultPolicy { name }) => {
-            default_policy::wait_for_default_policy(&client_endpoint, &name, current_unix_ms())
-                .await
+            // Wait out a policy lock another command holds; a ceremony this
+            // command opens extends the deadline to its own expiry.
+            default_policy::wait_for_default_policy(
+                &client_endpoint,
+                &name,
+                current_unix_ms().saturating_add(default_policy::POLICY_LOCK_GRACE_MS),
+            )
+            .await
         }
         Cmd::Wallet(WalletCmd::MigratePasskey { receipt }) => {
             use std::io::Read as _;

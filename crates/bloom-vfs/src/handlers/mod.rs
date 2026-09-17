@@ -35,6 +35,7 @@ pub use simulate::SimulateHandler;
 pub use status::StatusHandler;
 pub use tools::ToolsHandler;
 pub use wallets::{
-    DefaultPolicyPackages, WalletsHandler, accounts_json_with_numbers, derivation_path_number,
+    DefaultPolicyPackages, DefaultPolicySetup, WalletsHandler, accounts_json_with_numbers,
+    derivation_path_number,
 };
 pub use watch::WatchHandler;

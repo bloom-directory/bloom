@@ -18,6 +18,10 @@ use crate::github_source::{self, PetalSetupTemplate};
 /// How often a waiting command asks Machine where the default policy stands.
 pub(crate) const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// How long `bloom wallet default-policy` waits out another command that holds
+/// the wallet's policy lock before telling the owner to try again.
+pub(crate) const POLICY_LOCK_GRACE_MS: u64 = 30_000;
+
 /// How long a waiting command keeps polling a ceremony past its expiry while
 /// Machine cancels it and proposes a replacement.
 const EXPIRED_CEREMONY_GRACE_MS: u64 = 30_000;
@@ -375,21 +379,34 @@ pub(crate) fn settings_message(name: &str, summary: &str, updated: bool) -> Stri
     }
 }
 
+/// Machine before this field existed only reported its own proposal.
+pub(crate) fn proposes_chosen_petals_default() -> bool {
+    true
+}
+
 /// Where a wallet's default policy stands, as reported by Machine.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum DefaultPolicyStatus {
     /// None of the Petals chosen during setup is installed.
     NothingToAllow,
-    /// The wallet does not exist yet.
-    WaitingForWallet,
-    /// A policy change for the wallet is waiting for the owner. It may be an
-    /// unrelated pending change, which must finish first.
+    /// The wallet does not exist yet, or Machine could not read it. `reason`
+    /// carries Broker's message when the read failed for another cause.
+    WaitingForWallet {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    /// A policy change for the wallet is waiting for the owner.
     AwaitingOwner {
         operation_id: String,
         ceremony_url: Option<String>,
         ceremony_expires_at_ms: Option<u64>,
         petals: Vec<String>,
+        /// Whether this pending change is the one that allows the chosen
+        /// Petals. An unrelated change must finish before ours is proposed, and
+        /// must never be announced as if it were ours.
+        #[serde(default = "crate::default_policy::proposes_chosen_petals_default")]
+        proposes_chosen_petals: bool,
     },
     /// The wallet policy allows every chosen, installed Petal.
     Applied { petals: Vec<String> },
@@ -431,7 +448,11 @@ pub(crate) async fn advance_default_policy(
         // The projection reader reports a well-formed wallet absent from the
         // authoritative list this way.
         Err(error) if error.code == bloom_broker_api::ProtocolErrorCode::BackendInvalidRequest => {
-            return Ok(DefaultPolicyStatus::WaitingForWallet);
+            // The projection reader reports an absent wallet this way, but so
+            // does every other invalid-request rejection; keep the message.
+            return Ok(DefaultPolicyStatus::WaitingForWallet {
+                reason: Some(error.message),
+            });
         }
         Err(error) => return Err(error.into()),
     }
@@ -463,6 +484,7 @@ pub(crate) async fn advance_default_policy(
                     .as_ref()
                     .map(|prepare| prepare.ceremony_expires_at_ms.get()),
                 petals,
+                proposes_chosen_petals: pending.includes_requested_package,
             }
         }
     })
@@ -471,9 +493,7 @@ pub(crate) async fn advance_default_policy(
 /// The destinations a chosen Petal's transactions need, from Bloom's catalog.
 /// Only the catalog supplies them, so an edited config cannot add any.
 pub(crate) fn policy_destinations(name: &str) -> Result<Vec<bloom_broker_api::PolicyDestination>> {
-    github_source::preinstalled_petal(name)
-        .map(|entry| entry.policy_destinations)
-        .unwrap_or_default()
+    bloom_proto::petal_destinations::for_petal(name)
         .iter()
         .map(|destination| {
             Ok(bloom_broker_api::PolicyDestination {
@@ -497,6 +517,7 @@ pub(crate) struct DefaultPolicyWait {
     wallet: String,
     deadline_ms: u64,
     announced: Option<String>,
+    announced_unrelated: Option<String>,
 }
 
 impl DefaultPolicyWait {
@@ -507,11 +528,12 @@ impl DefaultPolicyWait {
             wallet: wallet.to_owned(),
             deadline_ms,
             announced: None,
+            announced_unrelated: None,
         }
     }
 
-    /// Whether the announced policy ceremony has expired. Checked before
-    /// polling so an idle owner is not handed a replacement ceremony.
+    /// Whether the announced policy ceremony has expired. Checked after a
+    /// status read so an idle owner is not handed a replacement ceremony.
     pub(crate) fn ceremony_expired(&self, now_ms: u64) -> bool {
         self.announced.is_some() && now_ms >= self.deadline_ms
     }
@@ -523,6 +545,39 @@ impl DefaultPolicyWait {
             "default_policy: the approval for {wallet} expired; run `bloom wallet default-policy {wallet}` for a new one"
         )?;
         Ok(())
+    }
+
+    /// Report an unrelated pending policy change once, without describing it
+    /// as the default policy. It must finish before ours can be proposed.
+    fn observe_unrelated(
+        &mut self,
+        operation_id: &str,
+        ceremony_url: &Option<String>,
+        now_ms: u64,
+        output: &mut impl Write,
+    ) -> Result<WaitStep> {
+        let wallet = &self.wallet;
+        if self.announced_unrelated.as_deref() != Some(operation_id) {
+            self.announced_unrelated = Some(operation_id.to_owned());
+            match ceremony_url {
+                Some(url) => writeln!(
+                    output,
+                    "default_policy: another policy change for {wallet} is waiting for you at {url}; the default policy follows once it finishes"
+                )?,
+                None => writeln!(
+                    output,
+                    "default_policy: another policy change for {wallet} is in progress; the default policy follows once it finishes"
+                )?,
+            }
+        }
+        if now_ms < self.deadline_ms {
+            return Ok(WaitStep::Poll);
+        }
+        writeln!(
+            output,
+            "default_policy: run `bloom wallet default-policy {wallet}` once that change finishes"
+        )?;
+        Ok(WaitStep::Stop)
     }
 
     pub(crate) fn observe(
@@ -548,23 +603,44 @@ impl DefaultPolicyWait {
                 )?;
                 Ok(WaitStep::Stop)
             }
-            DefaultPolicyStatus::WaitingForWallet => {
+            DefaultPolicyStatus::WaitingForWallet { reason } => {
+                if now_ms < self.deadline_ms {
+                    return Ok(WaitStep::Poll);
+                }
+                match reason {
+                    Some(reason) => writeln!(
+                        output,
+                        "default_policy: stopped waiting for wallet {wallet} ({reason}); once it exists, run `bloom wallet default-policy {wallet}`"
+                    )?,
+                    None => writeln!(
+                        output,
+                        "default_policy: stopped waiting for wallet {wallet}; once it exists, run `bloom wallet default-policy {wallet}`"
+                    )?,
+                }
+                Ok(WaitStep::Stop)
+            }
+            // Another command holds the policy lock. Keep asking, but never
+            // past the deadline: the lock holder may outlive this command.
+            DefaultPolicyStatus::Busy => {
                 if now_ms < self.deadline_ms {
                     return Ok(WaitStep::Poll);
                 }
                 writeln!(
                     output,
-                    "default_policy: stopped waiting for wallet {wallet}; once it exists, run `bloom wallet default-policy {wallet}`"
+                    "default_policy: another command is still changing {wallet}'s policy; run `bloom wallet default-policy {wallet}` once it finishes"
                 )?;
                 Ok(WaitStep::Stop)
             }
-            DefaultPolicyStatus::Busy => Ok(WaitStep::Poll),
             DefaultPolicyStatus::AwaitingOwner {
                 operation_id,
                 ceremony_url,
                 ceremony_expires_at_ms,
                 petals,
+                proposes_chosen_petals,
             } => {
+                if !proposes_chosen_petals {
+                    return self.observe_unrelated(operation_id, ceremony_url, now_ms, output);
+                }
                 if self.announced.as_deref() == Some(operation_id.as_str()) {
                     return Ok(WaitStep::Poll);
                 }
@@ -637,9 +713,6 @@ pub(crate) async fn wait_for_default_policy(
 ) -> Result<()> {
     let mut wait = DefaultPolicyWait::new(wallet, deadline_ms);
     loop {
-        if wait.ceremony_expired(crate::current_unix_ms()) {
-            return wait.report_expired(&mut std::io::stderr());
-        }
         let output = crate::machine_command(
             endpoint,
             bloom_daemon::ipc::MachineCommand::WalletDefaultPolicy {
@@ -656,6 +729,11 @@ pub(crate) async fn wait_for_default_policy(
             == WaitStep::Stop
         {
             return Ok(());
+        }
+        // Expiry is judged only after a status read, so a ceremony completed in
+        // the last poll interval still commits instead of being called expired.
+        if wait.ceremony_expired(crate::current_unix_ms()) {
+            return wait.report_expired(&mut std::io::stderr());
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
@@ -849,53 +927,57 @@ mod tests {
     }
 
     #[test]
-    fn enso_rules_allow_only_its_catalog_destinations() {
-        const ROUTER: &str = "0xf75584ef6673ad213a685a1b58cc0330b8ea22cf";
-        let chains = [
-            "arbitrum",
-            "avalanche",
-            "base",
-            "ethereum",
-            "optimism",
-            "polygon",
-        ];
-        let rules = render_petal_settings(&PetalsConfig::default(), "enso", "main")
-            .unwrap()
-            .unwrap();
-        assert_eq!(rules.path, "/petals/enso/settings/main/route-rules.toml");
-        assert_eq!(rules.summary, "settings/main/route-rules.toml");
-        let rules: toml::Value = toml::from_str(std::str::from_utf8(&rules.body).unwrap()).unwrap();
-        let strings = |key: &str| -> Vec<String> {
-            rules["defi"][key]
-                .as_array()
+    fn enso_has_no_settings_template_and_covers_its_own_chains() {
+        // Enso v0.1.5 ships its own per-wallet route rules at
+        // settings/wallets/<wallet>/venue.toml; Bloom writes none.
+        assert!(
+            render_petal_settings(&PetalsConfig::default(), "enso", "main")
                 .unwrap()
-                .iter()
-                .map(|value| value.as_str().unwrap().to_owned())
-                .collect()
-        };
-        assert_eq!(rules["mev"]["max_slippage_bps"].as_integer(), Some(100));
-        assert_eq!(rules["defi"]["enabled"].as_bool(), Some(true));
-        assert_eq!(strings("allowed_source_chains"), chains);
-        assert_eq!(strings("allowed_destination_chains"), chains);
-        assert_eq!(strings("allowed_receivers"), ["class:wallet_eoa"]);
-        assert_eq!(
-            rules["defi"]["require_calldata_verification"].as_bool(),
-            Some(false)
+                .is_none()
         );
 
-        // The rules' routers and the policy's destinations are the same list.
-        let destinations: Vec<String> = policy_destinations("enso")
+        const ROUTER: &str = "0xf75584ef6673ad213a685a1b58cc0330b8ea22cf";
+        const LINEA: &str = "0xa146d46823f3f594b785200102be5385cafce9b5";
+        const ARC_FAMILY: &str = "0xcfbaa9cfce952ca4f4069874ff1df8c05e37a3c7";
+        let destinations: Vec<(String, String)> = policy_destinations("enso")
             .unwrap()
             .into_iter()
             .map(|destination| {
-                format!("{}:{}", destination.chain.as_str(), destination.destination)
+                (
+                    destination.chain.as_str().to_owned(),
+                    destination.destination,
+                )
             })
             .collect();
-        assert_eq!(
-            destinations,
-            chains.map(|chain| format!("{chain}:{ROUTER}"))
-        );
-        assert_eq!(strings("allowed_routers"), destinations);
+        let expected: Vec<(String, String)> = [
+            ("arbitrum", ROUTER),
+            ("avalanche", ROUTER),
+            ("base", ROUTER),
+            ("bsc", ROUTER),
+            ("ethereum", ROUTER),
+            ("gnosis", ROUTER),
+            ("hyperliquid", ROUTER),
+            ("optimism", ROUTER),
+            ("polygon", ROUTER),
+            ("linea", LINEA),
+            ("arc", ARC_FAMILY),
+            ("robinhood", ARC_FAMILY),
+            ("tempo", ARC_FAMILY),
+        ]
+        .map(|(chain, router)| (chain.to_owned(), router.to_owned()))
+        .to_vec();
+        assert_eq!(destinations, expected);
+
+        // Every chain Enso's shipped rules allow is covered, by Bloom's name
+        // for it, so Machine never refuses a route Enso planned.
+        let covered: std::collections::BTreeSet<&str> = destinations
+            .iter()
+            .map(|(chain, _)| chain.as_str())
+            .collect();
+        let configured = bloom_proto::Config::local_default();
+        for chain in covered {
+            assert!(configured.chains.contains_key(chain), "{chain}");
+        }
     }
 
     #[test]
@@ -947,6 +1029,7 @@ mod tests {
             ceremony_url: Some("http://localhost:18734/ceremony/token".into()),
             ceremony_expires_at_ms: Some(10),
             petals: vec!["polymarket".into()],
+            proposes_chosen_petals: true,
         };
         let encoded = serde_json::to_value(&status).unwrap();
         assert_eq!(encoded["state"], "awaiting_owner");
@@ -955,7 +1038,7 @@ mod tests {
             status
         );
         assert_eq!(
-            serde_json::to_value(DefaultPolicyStatus::WaitingForWallet).unwrap(),
+            serde_json::to_value(DefaultPolicyStatus::WaitingForWallet { reason: None }).unwrap(),
             serde_json::json!({"state": "waiting_for_wallet"})
         );
     }
@@ -966,6 +1049,7 @@ mod tests {
             ceremony_url: Some(format!("http://localhost:18734/ceremony/{operation}")),
             ceremony_expires_at_ms: Some(expires_at_ms),
             petals: vec!["polymarket".into(), "near-intents".into()],
+            proposes_chosen_petals: true,
         }
     }
 
@@ -974,8 +1058,12 @@ mod tests {
         let mut wait = DefaultPolicyWait::new("main", 1_000);
         let mut output = Vec::new();
         assert_eq!(
-            wait.observe(&DefaultPolicyStatus::WaitingForWallet, 10, &mut output)
-                .unwrap(),
+            wait.observe(
+                &DefaultPolicyStatus::WaitingForWallet { reason: None },
+                10,
+                &mut output
+            )
+            .unwrap(),
             WaitStep::Poll
         );
         for _ in 0..2 {
@@ -1000,6 +1088,77 @@ mod tests {
     }
 
     #[test]
+    fn wait_never_announces_an_unrelated_change_as_the_default_policy() {
+        let mut wait = DefaultPolicyWait::new("main", 1_000);
+        let mut output = Vec::new();
+        let unrelated = DefaultPolicyStatus::AwaitingOwner {
+            operation_id: "other".into(),
+            ceremony_url: Some("http://localhost:18734/ceremony/other".into()),
+            ceremony_expires_at_ms: Some(5_000),
+            petals: vec!["polymarket".into(), "near-intents".into()],
+            proposes_chosen_petals: false,
+        };
+        for _ in 0..2 {
+            assert_eq!(
+                wait.observe(&unrelated, 20, &mut output).unwrap(),
+                WaitStep::Poll
+            );
+        }
+        // An unrelated change never becomes the announced default policy, so
+        // its expiry never ends this wait.
+        assert!(!wait.ceremony_expired(6_000));
+        assert_eq!(
+            wait.observe(&unrelated, 1_000, &mut output).unwrap(),
+            WaitStep::Stop
+        );
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(output.matches("another policy change for main").count(), 1);
+        assert!(output.contains("http://localhost:18734/ceremony/other"));
+        assert!(!output.contains("approve the policy for main to allow"));
+        assert!(!output.contains("default_policy_url: "));
+    }
+
+    #[test]
+    fn wait_stops_when_the_policy_lock_is_held_past_the_deadline() {
+        let mut wait = DefaultPolicyWait::new("main", 1_000);
+        let mut output = Vec::new();
+        assert_eq!(
+            wait.observe(&DefaultPolicyStatus::Busy, 999, &mut output)
+                .unwrap(),
+            WaitStep::Poll
+        );
+        assert!(output.is_empty());
+        assert_eq!(
+            wait.observe(&DefaultPolicyStatus::Busy, 1_000, &mut output)
+                .unwrap(),
+            WaitStep::Stop
+        );
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("another command is still changing main's policy")
+        );
+    }
+
+    #[test]
+    fn wait_reports_why_a_wallet_read_failed() {
+        let mut wait = DefaultPolicyWait::new("main", 0);
+        let mut output = Vec::new();
+        let status = DefaultPolicyStatus::WaitingForWallet {
+            reason: Some("wallet projection is not trusted".into()),
+        };
+        assert_eq!(
+            wait.observe(&status, 10, &mut output).unwrap(),
+            WaitStep::Stop
+        );
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("wallet projection is not trusted")
+        );
+    }
+
+    #[test]
     fn wait_stops_at_expiry_without_announcing_a_replacement() {
         let mut wait = DefaultPolicyWait::new("main", 1_000);
         let mut output = Vec::new();
@@ -1014,7 +1173,7 @@ mod tests {
 
     #[test]
     fn wait_polls_quietly_while_another_command_holds_the_policy_lock() {
-        let mut wait = DefaultPolicyWait::new("main", 0);
+        let mut wait = DefaultPolicyWait::new("main", 1_000);
         let mut output = Vec::new();
         assert_eq!(
             wait.observe(&DefaultPolicyStatus::Busy, 10, &mut output)
@@ -1071,8 +1230,12 @@ mod tests {
         let mut wait = DefaultPolicyWait::new("main", 1_000);
         let mut output = Vec::new();
         assert_eq!(
-            wait.observe(&DefaultPolicyStatus::WaitingForWallet, 1_000, &mut output)
-                .unwrap(),
+            wait.observe(
+                &DefaultPolicyStatus::WaitingForWallet { reason: None },
+                1_000,
+                &mut output
+            )
+            .unwrap(),
             WaitStep::Stop
         );
         assert!(
