@@ -203,6 +203,11 @@ registration's `cancel` control before acceptance. Do not start a second
 registration merely because the first is waiting. Commands are in the
 wallet-creation walkthrough in `docs/examples.md`.
 
+Pass the complete Broker URL to the human, including any `#` fragment. Do not
+rewrite its hostname, scheme, or port. A localhost ceremony needs a browser on
+the Bloom host; an assigned HTTPS relay ceremony can use another device. Launch
+URLs are owner access capabilities: keep them out of logs and Petal-visible data.
+
 ## The transaction loop
 
 Use this loop for native Machine transaction surfaces and for Petal actions that

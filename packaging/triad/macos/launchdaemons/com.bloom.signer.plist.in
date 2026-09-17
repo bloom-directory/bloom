@@ -34,6 +34,8 @@
     <string>@BLOOM_SIGNER_AUDIT_CHECKPOINT_DIR@</string>
     <key>BLOOM_SIGNER_SOCKET</key>
     <string>@BLOOM_SIGNER_SOCKET@</string>
+    <key>BLOOM_SIGNER_ADMIN_SOCKET</key>
+    <string>@BLOOM_SIGNER_ADMIN_SOCKET@</string>
     <key>BLOOM_SIGNER_CONTROL_SOCKET</key>
     <string>@BLOOM_SIGNER_CONTROL_SOCKET@</string>
     <key>BLOOM_SESSION_SOCKET</key>

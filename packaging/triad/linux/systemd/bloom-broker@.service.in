@@ -48,9 +48,9 @@ RemoveIPC=yes
 CapabilityBoundingSet=
 AmbientCapabilities=
 LimitCORE=0
-RestrictAddressFamilies=AF_UNIX AF_INET
-IPAddressDeny=any
-IPAddressAllow=localhost
+# Broker owns outbound authenticated relay HTTPS, ACME and DNS resolution.
+# Ceremony TLS still binds only the fixed loopback listener; authority RPC is Unix-only.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 ReadWritePaths=/var/lib/bloom/%i/broker /run/bloom/%i/broker
 
 [Install]

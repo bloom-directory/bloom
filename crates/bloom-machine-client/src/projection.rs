@@ -1889,6 +1889,10 @@ mod tests {
             signer_signature: Base64UrlBytes::from_bytes(&[10; 64]),
         };
         fixture.credentials = vec![CredentialPublic {
+            surface: Some(bloom_broker_api::CeremonySurfaceRef {
+                surface_id: bloom_broker_api::Token::new("local").unwrap(),
+                identity_digest: bloom_broker_api::Digest32::from_bytes([0; 32]),
+            }),
             credential_id: Base64UrlBytes::from_bytes(&[11; 16]),
             wallet_id: token("alice"),
             created_at_ms: DecimalU64::new(1),
@@ -1899,6 +1903,11 @@ mod tests {
 
     fn migration_result(operation_id: OperationId, fixture: &ProjectionFixture) -> CustodyResult {
         CustodyResult {
+            surface: Some(bloom_broker_api::CeremonySurfaceRef {
+                surface_id: bloom_broker_api::Token::new("local").unwrap(),
+                identity_digest: bloom_broker_api::Digest32::from_bytes([0; 32]),
+            }),
+            credential_authority_generation: Some(bloom_broker_api::DecimalU64::new(0)),
             ceremony_kind: CeremonyKind::WalletImport,
             custody_operation_id: operation_id,
             public_status: CeremonyState::Succeeded,
@@ -1911,6 +1920,10 @@ mod tests {
                     .expect("legacy migration fixture has a root signing key"),
             ],
             credential_summaries: vec![CredentialSummary {
+                surface: Some(bloom_broker_api::CeremonySurfaceRef {
+                    surface_id: bloom_broker_api::Token::new("local").unwrap(),
+                    identity_digest: bloom_broker_api::Digest32::from_bytes([0; 32]),
+                }),
                 credential_id: Base64UrlBytes::from_bytes(&[11; 16]),
                 rp_id: token("localhost"),
                 active: true,

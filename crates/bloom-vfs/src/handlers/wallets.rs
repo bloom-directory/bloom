@@ -112,6 +112,8 @@ struct ApprovalCeremonyProjection {
 struct WalletRegistrationProjection {
     schema: String,
     requested_name: String,
+    #[serde(default)]
+    surface_selection: bloom_broker_api::CeremonySurfaceSelection,
     operation_id: bloom_broker_api::OperationId,
     ceremony_kind: bloom_broker_api::CeremonyKind,
     ceremony_state: bloom_broker_api::CeremonyState,
@@ -638,11 +640,26 @@ impl WalletsHandler {
         if data.len() > MAX_REQUEST_BYTES {
             return Err(HandlerError::invalid("wallet name is too large"));
         }
-        let requested_name = std::str::from_utf8(data)
-            .map_err(|error| {
-                HandlerError::invalid(format!("wallet name must be valid UTF-8: {error}"))
-            })?
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct RegistrationRequest {
+            name: String,
+            #[serde(default)]
+            surface_selection: bloom_broker_api::CeremonySurfaceSelection,
+        }
+        let text = std::str::from_utf8(data)
+            .map_err(|_| HandlerError::invalid("wallet request must be valid UTF-8"))?
             .trim();
+        let request = if text.starts_with('{') {
+            serde_json::from_str::<RegistrationRequest>(text)
+                .map_err(|_| HandlerError::invalid("invalid wallet registration request"))?
+        } else {
+            RegistrationRequest {
+                name: text.to_owned(),
+                surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
+            }
+        };
+        let requested_name = request.name.as_str();
         if requested_name.is_empty()
             || requested_name.len() > 64
             || !requested_name.chars().all(|character| {
@@ -668,6 +685,11 @@ impl WalletsHandler {
         if let Some((_, projection)) = &existing
             && projection.ceremony_state == bloom_broker_api::CeremonyState::AwaitingUser
         {
+            if projection.surface_selection != request.surface_selection {
+                return Err(HandlerError::invalid(
+                    "a live registration already uses a different surface; cancel it before changing surface",
+                ));
+            }
             // A shell retry (or an NFS client replaying a committed write) must
             // not allocate a second Broker operation for the same live
             // registration. Refreshing also proves that the retained launch is
@@ -695,6 +717,7 @@ impl WalletsHandler {
             .prepare_custody(
                 bloom_machine_client::CustodyPrepareMethod::WalletRegistration,
                 bloom_broker_api::CustodyPrepareRequest {
+                    surface_selection: request.surface_selection,
                     ceremony_kind: bloom_broker_api::CeremonyKind::WalletRegistration,
                     custody_operation_id: operation_id.clone(),
                     wallet_id: Some(wallet_id),
@@ -726,6 +749,7 @@ impl WalletsHandler {
         let projection = WalletRegistrationProjection {
             schema: PROJECTION_SCHEMA.into(),
             requested_name: requested_name.to_owned(),
+            surface_selection: request.surface_selection,
             operation_id,
             ceremony_kind: prepared.ceremony_kind,
             ceremony_state: bloom_broker_api::CeremonyState::AwaitingUser,
@@ -863,6 +887,8 @@ impl WalletsHandler {
             "wallet_id": result.wallet_id,
             "public_key_refs": result.public_key_refs,
             "credential_summaries": result.credential_summaries,
+                "surface": result.surface,
+                "credential_authority_generation": result.credential_authority_generation,
             "initial_policy": result.initial_policy,
             "receipt_digest": result.receipt_digest,
             "signer_key_id": result.signer_key_id,
@@ -3880,6 +3906,13 @@ mod tests {
                     }
                     MachineBrokerRequest::CustodyResult(request) => {
                         Ok(MachineBrokerResponse::CustodyResult(CustodyResult {
+                            surface: Some(bloom_broker_api::CeremonySurfaceRef {
+                                surface_id: bloom_broker_api::Token::new("local").unwrap(),
+                                identity_digest: bloom_broker_api::Digest32::from_bytes([0; 32]),
+                            }),
+                            credential_authority_generation: Some(
+                                bloom_broker_api::DecimalU64::new(0),
+                            ),
                             ceremony_kind: CeremonyKind::WalletRegistration,
                             custody_operation_id: request.operation_id,
                             public_status: *self.state.lock().unwrap(),
@@ -4311,6 +4344,15 @@ mod tests {
                         }
                         Ok(MachineBrokerResponse::CustodyResult(
                             bloom_broker_api::CustodyResult {
+                                surface: Some(bloom_broker_api::CeremonySurfaceRef {
+                                    surface_id: bloom_broker_api::Token::new("local").unwrap(),
+                                    identity_digest: bloom_broker_api::Digest32::from_bytes(
+                                        [0; 32],
+                                    ),
+                                }),
+                                credential_authority_generation: Some(
+                                    bloom_broker_api::DecimalU64::new(0),
+                                ),
                                 ceremony_kind: bloom_broker_api::CeremonyKind::AccountAllocate,
                                 custody_operation_id: bloom_broker_api::OperationId::from_bytes(
                                     [9; 32],
@@ -6801,6 +6843,44 @@ value = "0""#,
     }
 
     #[tokio::test]
+    async fn mounted_registration_local_selection_is_forwarded_and_retry_bound() {
+        let mut fixture = make_handler();
+        let broker = Arc::new(RegistrationBroker {
+            requests: Mutex::new(Vec::new()),
+            state: Mutex::new(CeremonyState::AwaitingUser),
+            omit_ceremony_url: Mutex::new(false),
+            status_error: Mutex::new(None),
+        });
+        fixture.handler = fixture
+            .handler
+            .with_broker(Some(MachineBrokerClient::new(broker.clone())));
+        let new = VfsPath::parse("/new").unwrap();
+        let request = br#"{"name":"main","surface_selection":"local"}"#;
+        fixture.handler.write(&new, request).await.unwrap();
+        fixture.handler.write(&new, request).await.unwrap();
+        assert!(fixture.handler.write(&new, b"main").await.is_err());
+        for invalid in [
+            br#"{"name":"other","surface_selection":"https://foreign.test"}"#.as_slice(),
+            br#"{"name":"other","surface_selection":"local","origin":"https://foreign.test"}"#,
+        ] {
+            assert!(fixture.handler.write(&new, invalid).await.is_err());
+        }
+        let requests = broker.requests.lock().unwrap();
+        let preparations: Vec<_> = requests
+            .iter()
+            .filter_map(|request| match request {
+                MachineBrokerRequest::WalletRegistrationPrepare(request) => Some(request),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(preparations.len(), 1);
+        assert_eq!(
+            preparations[0].surface_selection,
+            bloom_broker_api::CeremonySurfaceSelection::Local
+        );
+    }
+
+    #[tokio::test]
     async fn mounted_registration_accepts_a_trimmed_plain_name() {
         let mut fixture = make_handler();
         let broker = Arc::new(RegistrationBroker {
@@ -7313,6 +7393,7 @@ value = "0""#,
             .handler
             .with_broker(Some(MachineBrokerClient::new(broker.clone())));
         let request = ApprovalPrepareRequest {
+            surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             operation_id: OperationId::from_bytes([30; 32]),
             terms: approval_terms("alice", None),
             canonical_plan_facts_digest: digest(31),
@@ -7359,6 +7440,7 @@ value = "0""#,
                 .handler
                 .with_broker(Some(MachineBrokerClient::new(broker.clone())));
             let request = ApprovalPrepareRequest {
+                surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
                 operation_id: OperationId::from_bytes([30; 32]),
                 terms: approval_terms("alice", None),
                 canonical_plan_facts_digest: digest(31),
@@ -7390,6 +7472,7 @@ value = "0""#,
             .handler
             .with_broker(Some(MachineBrokerClient::new(broker.clone())));
         let request = ApprovalPrepareRequest {
+            surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             operation_id: OperationId::from_bytes([30; 32]),
             terms: approval_terms("alice", None),
             canonical_plan_facts_digest: digest(31),
@@ -7420,6 +7503,7 @@ value = "0""#,
             .handler
             .with_broker(Some(MachineBrokerClient::new(broker)));
         let request = ApprovalPrepareRequest {
+            surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             operation_id: OperationId::from_bytes([30; 32]),
             terms: approval_terms("alice", None),
             canonical_plan_facts_digest: digest(31),

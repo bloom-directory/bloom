@@ -289,6 +289,7 @@ render() {
     -e "s|@BLOOM_SIGNER_SOCKET@|$runtime/broker-signer/signer.sock|g" \
     -e "s|@BLOOM_BROKER_CONTROL_SOCKET@|$runtime/revoke/broker/control.sock|g" \
     -e "s|@BLOOM_SIGNER_CONTROL_SOCKET@|$runtime/revoke/signer/control.sock|g" \
+    -e "s|@BLOOM_SIGNER_ADMIN_SOCKET@|$runtime/signer-admin/admin.sock|g" \
     -e "s|@BLOOM_SESSION_SOCKET@|$runtime/session/session.sock|g" \
     -e "s|@BLOOM_BROKER_STARTUP_STATUS@|$runtime/status/broker-startup.json|g" \
     -e "s|@BLOOM_CONTAINMENT_STATUS@|$runtime/containment/status.json|g" \
@@ -325,6 +326,11 @@ preflight_cli_link() {
     [[ ! -e "$directory" && ! -L "$directory" ]] && continue
     [[ -d "$directory" && ! -L "$directory" ]] || die "Bloom CLI parent path is unsafe: $directory"
   done
+  local admin_link="$cli_bin_dir/bloom-ceremonies"
+  if [[ -e "$admin_link" || -L "$admin_link" ]]; then
+    [[ -L "$admin_link" && "$(readlink "$admin_link")" == ../libexec/bloom/current/bloom-ceremonies ]] ||
+      die "refusing to overwrite unrelated ceremony administration command"
+  fi
   [[ ! -e "$cli_link" && ! -L "$cli_link" ]] && return 0
   [[ -L "$cli_link" ]] || die "refusing to overwrite unrelated Bloom CLI at $cli_link"
   target="$(readlink "$cli_link")"
@@ -335,6 +341,17 @@ preflight_cli_link() {
 install_cli_link() {
   local replacement="$cli_link.new.$$"
   mkdir -p "$cli_bin_dir"
+  local admin_link="$cli_bin_dir/bloom-ceremonies"
+  if [[ -e "$admin_link" || -L "$admin_link" ]]; then
+    [[ -L "$admin_link" && "$(readlink "$admin_link")" == ../libexec/bloom/current/bloom-ceremonies ]] ||
+      die "refusing to overwrite unrelated ceremony administration command"
+    rm -f -- "$admin_link"
+  fi
+  # Old releases have no admin command; rollback must still restore the CLI.
+  if [[ -x "$release_base/current/bloom-ceremonies" ]]; then
+    ln -s ../libexec/bloom/current/bloom-ceremonies "$admin_link"
+    $live && chown -h root:wheel "$admin_link"
+  fi
   ln -s ../libexec/bloom/current/bloom "$replacement"
   $live && chown -h root:wheel "$replacement"
   if [[ "$(uname -s)" == Darwin ]]; then
@@ -345,6 +362,10 @@ install_cli_link() {
 }
 
 remove_cli_link() {
+  local admin_link="$cli_bin_dir/bloom-ceremonies"
+  if [[ -L "$admin_link" && "$(readlink "$admin_link")" == ../libexec/bloom/current/bloom-ceremonies ]]; then
+    rm -f -- "$admin_link"
+  fi
   local target
   [[ ! -e "$cli_link" && ! -L "$cli_link" ]] && return 0
   if [[ -L "$cli_link" ]]; then
@@ -668,6 +689,7 @@ install_release() {
   else
     stage="$release_base/.release.$$.new"; mkdir "$stage"
     install -m 0755 "$payload/bin/bloom" "$stage/bloom"; install -m 0755 "$payload/bin/bloom-broker" "$stage/bloom-broker"
+    install -m 0755 "$payload/installer/release/bloom-ceremonies" "$stage/bloom-ceremonies"
     install -m 0755 "$payload/bin/bloom-signer" "$stage/bloom-signer"; install -m 0755 "$payload/bin/bloom-signer-migrate" "$stage/bloom-signer-migrate"
     $live && chown -R root:wheel "$stage"; mv "$stage" "$release"
   fi
@@ -695,15 +717,16 @@ install_config() {
   mkdir -p "$enrollments" "$broker_config" "$signer_config" "$machine_config" "$session_config" "$installer_config" \
     "$broker_state/audit-checkpoints" "$signer_state/audit-checkpoints" "$machine_state/audit-checkpoints" \
     "$runtime/machine-broker" "$runtime/broker-signer" "$runtime/revoke/broker" "$runtime/revoke/signer" \
-    "$runtime/session" "$runtime/containment" "$runtime/status" "$variable/log/bloom" "$log_root"
+    "$installer_config/admin" "$runtime/signer-admin" "$runtime/session" "$runtime/containment" "$runtime/status" "$variable/log/bloom" "$log_root"
   for directory in "$enrollments" "$broker_config" "$signer_config" "$machine_config" "$session_config" \
-    "$installer_config" "$broker_state" "$signer_state" "$machine_state" "$broker_state/audit-checkpoints" \
+    "$installer_config" "$installer_config/admin" "$broker_state" "$signer_state" "$machine_state" "$broker_state/audit-checkpoints" \
     "$signer_state/audit-checkpoints" "$machine_state/audit-checkpoints" "$runtime" "$runtime/machine-broker" \
     "$runtime/broker-signer" "$runtime/revoke" "$runtime/revoke/broker" "$runtime/revoke/signer" "$runtime/session" \
-    "$runtime/containment" "$runtime/status" "$variable/log/bloom" "$log_root"; do
+    "$runtime/signer-admin" "$runtime/containment" "$runtime/status" "$variable/log/bloom" "$log_root"; do
     [[ -d "$directory" && ! -L "$directory" ]] || die "security directory is missing or substituted: $directory"
   done
   chmod 0711 "$config" "$runtime" "$runtime/revoke"
+  chmod 0700 "$runtime/signer-admin" "$installer_config/admin"
   chmod 0700 "$broker_config" "$signer_config" "$machine_config" "$session_config" "$installer_config" \
     "$broker_state" "$signer_state" "$machine_state" "$broker_state/audit-checkpoints" \
     "$signer_state/audit-checkpoints" "$machine_state/audit-checkpoints"
@@ -777,6 +800,7 @@ secure_ownership() {
   chown -R root:wheel "$installer_config"; chown root:wheel "$config/edge-manifest.json" "$config/"*.json
   chown root:wheel "$runtime" "$runtime/containment" "$runtime/revoke"
   chown "$broker_user:$machine_broker_group" "$runtime/machine-broker" "$runtime/status"
+  chown "$signer_user:$signer_group" "$runtime/signer-admin"
   chown "$signer_user:$broker_signer_group" "$runtime/broker-signer"
   chown "$broker_user:$revoke_group" "$runtime/revoke/broker"; chown "$signer_user:$revoke_group" "$runtime/revoke/signer"
   chown root:"$log_group" "$log_root"
@@ -991,6 +1015,13 @@ find_interrupted_upgrade() {
   echo "resuming interrupted Bloom macOS upgrade toward the requested release" >&2
 }
 
+provision_remote_ceremonies() {
+  $live || return 0
+  if ! "$cli_bin_dir/bloom-ceremonies" provision --login-uid "$login_uid"; then
+    echo "Remote ceremony provisioning is incomplete; localhost remains available. Retry: bloom-ceremonies provision --login-uid $login_uid" >&2
+  fi
+}
+
 upgrade_release() {
   local old="$1" new="$2"
   local record uid
@@ -1070,6 +1101,7 @@ case "$action" in
       remove_legacy_cli || die "Bloom is healthy, but legacy CLI cleanup failed; remove ~/.local/bin/bloom and retry"
       report_legacy_wallet_migrations
       cleanup_legacy_pf
+      provision_remote_ceremonies
       echo "Bloom macOS release upgraded atomically"
       exit 0
     fi
@@ -1079,6 +1111,7 @@ case "$action" in
       remove_legacy_cli || die "Bloom is healthy, but legacy CLI cleanup failed; remove ~/.local/bin/bloom and retry"
       report_legacy_wallet_migrations
       cleanup_legacy_pf
+      provision_remote_ceremonies
       echo "Bloom macOS release upgraded atomically"
       exit 0
     fi
@@ -1094,6 +1127,7 @@ case "$action" in
     if $restoring; then rm -f "$retained"; restore_pending=false; fi
     remove_legacy_cli || die "Bloom is healthy, but legacy CLI cleanup failed; remove ~/.local/bin/bloom and retry"
     report_legacy_wallet_migrations
+    provision_remote_ceremonies
     if $restoring; then echo "Bloom macOS retained custody restored"; else echo "Bloom macOS enrollment installed or repaired"; fi
     ;;
   uninstall)

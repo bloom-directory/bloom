@@ -219,6 +219,11 @@ impl MachineBrokerService for BrokerFixture {
                 }
                 MachineBrokerRequest::CustodyResult(request) => {
                     Ok(MachineBrokerResponse::CustodyResult(CustodyResult {
+                        surface: Some(bloom_broker_api::CeremonySurfaceRef {
+                            surface_id: bloom_broker_api::Token::new("local").unwrap(),
+                            identity_digest: bloom_broker_api::Digest32::from_bytes([0; 32]),
+                        }),
+                        credential_authority_generation: Some(bloom_broker_api::DecimalU64::new(0)),
                         ceremony_kind: CeremonyKind::PolicyUpdate,
                         custody_operation_id: request.operation_id,
                         public_status: CeremonyState::Succeeded,

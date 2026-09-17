@@ -956,6 +956,7 @@ impl MachineBrokerClient {
         };
         terms.validate()?;
         self.prepare_approval(ApprovalPrepareRequest {
+            surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             operation_id: request.approval_operation_id,
             terms,
             canonical_plan_facts_digest: request.canonical_plan_facts_digest,
@@ -1127,6 +1128,7 @@ impl MachineBrokerClient {
         };
         terms.validate()?;
         self.prepare_approval(ApprovalPrepareRequest {
+            surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             operation_id: request.approval_operation_id,
             terms,
             canonical_plan_facts_digest: request.canonical_plan_facts_digest,
@@ -1281,6 +1283,7 @@ impl MachineBrokerClient {
         };
         terms.validate()?;
         self.prepare_approval(ApprovalPrepareRequest {
+            surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             operation_id: request.approval_operation_id,
             terms,
             canonical_plan_facts_digest: request.canonical_plan_facts_digest,
@@ -1777,6 +1780,40 @@ impl MachineBrokerClient {
         Ok(key_ref)
     }
 
+    /// Start paired enrollment through Broker. Browser private keys stay in the browser.
+    pub async fn prepare_cross_surface_credential(
+        &self,
+        request: bloom_broker_api::CeremonyCrossSurfacePrepareRequest,
+    ) -> Result<bloom_broker_api::CeremonyCrossSurfacePrepareResponse, ProtocolError> {
+        let operation_id = request.operation_id.clone();
+        match self
+            .request(MachineBrokerRequest::CredentialCrossSurfacePrepare(request))
+            .await?
+        {
+            MachineBrokerResponse::CredentialCrossSurfacePrepare(response)
+                if response.operation_id == operation_id =>
+            {
+                Ok(response)
+            }
+            _ => Err(response_mismatch("credential.cross_surface_prepare")),
+        }
+    }
+
+    /// Read Signer-approved exposure through Broker; Machine cannot mutate it.
+    pub async fn ceremony_surfaces(
+        &self,
+    ) -> Result<bloom_broker_api::CeremonyExposureStatus, ProtocolError> {
+        match self
+            .request(MachineBrokerRequest::CeremonySurfaceStatus(
+                bloom_broker_api::Empty {},
+            ))
+            .await?
+        {
+            MachineBrokerResponse::CeremonySurfaceStatus(status) => Ok(status),
+            _ => Err(response_mismatch("ceremony.surface_status")),
+        }
+    }
+
     pub async fn credentials(
         &self,
         wallet_id: Token,
@@ -2129,6 +2166,28 @@ impl CeremonyProjection {
             CeremonyProjectionState::Custody(CeremonyState::AwaitingUser),
             response.ceremony_url.clone(),
             response.ceremony_expires_at_ms.clone(),
+            None,
+            now_ms,
+        )
+    }
+
+    pub fn from_cross_surface_prepare(
+        response: &bloom_broker_api::CeremonyCrossSurfacePrepareResponse,
+        now_ms: u64,
+    ) -> Result<Self, ProtocolError> {
+        if response.state != CeremonyState::AwaitingUser {
+            return Err(projection_mismatch(
+                "paired enrollment is not awaiting user",
+            ));
+        }
+        Self::awaiting(
+            CeremonyProjectionIdentity::Custody {
+                operation_id: response.operation_id.clone(),
+                ceremony_kind: bloom_broker_api::CeremonyKind::CredentialAdd,
+            },
+            CeremonyProjectionState::Custody(CeremonyState::AwaitingUser),
+            response.destination_url.clone(),
+            response.expires_at_ms.clone(),
             None,
             now_ms,
         )
@@ -2809,6 +2868,26 @@ mod tests {
     };
     use ed25519_dalek::SigningKey;
     use tracing_subscriber::prelude::*;
+
+    #[test]
+    fn paired_enrollment_projection_preserves_opaque_destination_and_rejects_expiry() {
+        let response = bloom_broker_api::CeremonyCrossSurfacePrepareResponse {
+            operation_id: OperationId::from_bytes([71; 32]),
+            ceremony_id: Digest32::from_bytes([72; 32]),
+            state: CeremonyState::AwaitingUser,
+            destination_url:
+                "https://abcdefghijklmnopqrstuvwxyz.relay.bloom.directory/ceremony#cap=opaque"
+                    .into(),
+            expires_at_ms: DecimalU64::new(2_000),
+        };
+        let projection = CeremonyProjection::from_cross_surface_prepare(&response, 1_000).unwrap();
+        assert_eq!(projection.operation_id(), Some(&response.operation_id));
+        assert_eq!(
+            projection.ceremony_url(),
+            Some(response.destination_url.as_str())
+        );
+        assert!(CeremonyProjection::from_cross_surface_prepare(&response, 2_000).is_err());
+    }
 
     #[test]
     fn petal_claim_value_limits_sum_debits_and_fee_per_asset() {
@@ -4099,14 +4178,15 @@ mod tests {
             ceremony_kind: CeremonyKind::WalletImport,
             custody_operation_id: OperationId::from_bytes([4; 32]),
             state: CustodyPrepareState::AwaitingUser,
-            ceremony_url: "http://127.0.0.1:18734/c/opaque".into(),
+            ceremony_url:
+                "https://abcdefghijklmnopqrstuvwxyz.relay.bloom.directory/ceremony#opaque".into(),
             ceremony_expires_at_ms: DecimalU64::new(2_000),
             signer_contribution_digest: digest(6),
         };
         let mut projection = CeremonyProjection::from_custody_prepare(&prepare, 1_000).unwrap();
         assert_eq!(
             projection.ceremony_url(),
-            Some("http://127.0.0.1:18734/c/opaque")
+            Some("https://abcdefghijklmnopqrstuvwxyz.relay.bloom.directory/ceremony#opaque")
         );
         projection
             .reconcile_custody(
@@ -4116,7 +4196,10 @@ mod tests {
                     operation_id: OperationId::from_bytes([4; 32]),
                     state: CeremonyState::AwaitingUser,
                     expires_at_ms: DecimalU64::new(2_000),
-                    ceremony_url: Some("http://127.0.0.1:18734/c/opaque".into()),
+                    ceremony_url: Some(
+                        "https://abcdefghijklmnopqrstuvwxyz.relay.bloom.directory/ceremony#opaque"
+                            .into(),
+                    ),
                     receipt_digest: None,
                 },
                 1_999,
@@ -4156,7 +4239,8 @@ mod tests {
         let approval = SealedApprovalPrepareResponse {
             approval_id: digest(10),
             state: ApprovalPrepareState::AwaitingCeremony,
-            ceremony_url: "http://127.0.0.1:18734/c/approval".into(),
+            ceremony_url:
+                "https://abcdefghijklmnopqrstuvwxyz.relay.bloom.directory/ceremony#approval".into(),
             ceremony_expires_at_ms: DecimalU64::new(3_000),
             review_manifest_digest: digest(11),
         };
@@ -4331,6 +4415,7 @@ mod tests {
         let client = MachineBrokerClient::new(broker);
 
         let approval = ApprovalPrepareRequest {
+            surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             operation_id: OperationId::from_bytes([94; 32]),
             terms: approval_terms("wallet", None),
             canonical_plan_facts_digest: digest(95),
@@ -4373,6 +4458,7 @@ mod tests {
         );
 
         let custody = CustodyPrepareRequest {
+            surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             ceremony_kind: CeremonyKind::WalletImport,
             custody_operation_id: OperationId::from_bytes([97; 32]),
             wallet_id: None,
@@ -5146,6 +5232,7 @@ mod tests {
         Arc::get_mut(&mut broker).unwrap().corrupt_response = true;
         let client = MachineBrokerClient::new(broker);
         let request = CustodyPrepareRequest {
+            surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             ceremony_kind: CeremonyKind::AccountAllocate,
             custody_operation_id: OperationId::from_bytes([77; 32]),
             wallet_id: Some(token("wallet")),

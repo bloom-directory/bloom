@@ -254,3 +254,64 @@ boundaries; a digest-bound conformance report is supplementary evidence, not a
 required release asset. Machine and session jobs run in the `user/UID` launchd
 domain, while Broker and Signer jobs run in the system domain. The rootless
 code-identity architecture remains a separate future profile.
+
+
+## Remote ceremony packaging contract
+
+The Signer administrative socket is separate from authority RPC and revocation
+control. Linux provisions `/run/bloom/LOGIN_UID/signer/admin/admin.sock`;
+macOS provisions `signer-admin/admin.sock` beneath the per-login runtime root.
+The directory is Signer-owned mode `0700`; production administration accepts
+kernel-authenticated root peers, and the administrative client verifies the
+Signer peer. Neither the Machine-to-Broker group nor the revoke group receives
+administrative socket access. `BLOOM_SIGNER_ADMIN_SOCKET` selects the path only.
+
+Remote setup must retain the existing isolated service principals. Installation
+admin key material belongs in protected local administration state. Broker alone
+owns ACME account keys, certificate keys and the TLS listener; the relay owns
+neither. Signer remains without network access. Only the privileged setup client
+may enroll the installation and deliver an authenticated assignment through
+Signer administration. A hostname from ordinary configuration is insufficient.
+
+Desired remote-enabled is the setup default, but it is not evidence of effective
+remote access. Provisioning must report explicit retryable stages until verified
+assignment, valid TLS and externally observed routing are ready. The installer
+must not report remote setup as complete based on process health alone. Local
+ceremonies stay independently available. Disablement fences remote commits
+immediately and waits for Broker's closure acknowledgement at the same revision.
+
+Release acceptance must exercise the admin peer rejection, multi-wallet local
+credential guard, restart reconciliation, certificate expiry, relay outage and
+retained-hostname re-enable behavior. Public DNS/CA staging drills, ingress
+addresses, relay verification pins and infrastructure accounts are deployment
+prerequisites; fixture tests do not substitute for those observations. No public
+DNS changes or deployment occur as part of ordinary tests.
+
+The Linux Broker service permits IPv4/IPv6 networking for its outbound relay,
+ACME and DNS clients. It retains its isolated UID, protected files and Unix-only
+authority RPC; Signer retains `PrivateNetwork=yes`, `IPAddressDeny=any` and
+`RestrictAddressFamilies=AF_UNIX`. Broker's ceremony TLS listener is loopback-only.
+Deployments requiring network enforcement of exact outbound destinations need a
+reviewed egress proxy or firewall policy covering relay, ACME and DNS lifecycle;
+static ingress addresses alone do not cover CA renewal endpoints.
+
+The remote suite requires Machine–Broker API 1.7 and Broker–Signer API 1.6,
+with release state schema 2 and downgrade floor 2 for all three services.
+Legacy localhost credential wraps, RP IDs and user handles are preserved;
+legacy signed receipts retain their original canonical signed bytes. Old pending
+ceremonies fail on restart. After activating this state version, supported
+rollback must not select the old reusable-recovery or single-origin code.
+The receipt delivery window remains bound to its original Browser key even
+across service restart; a lost recipient key does not authorize re-encryption.
+
+Production provisioning requires root-owned mode `0600` relay configuration and
+CA PEM, and the reviewed relay receipt public key in Signer's configuration.
+The root-only `installer/admin` directory retains the installation admin key.
+Scoped tunnel and DNS credentials are separate `0600` Broker-owned files;
+they convey no surface administration or wallet authority. No production relay
+pin is invented by the example templates: the nullable Signer pin must be
+populated by the deployment's signed configuration before provisioning works.
+Provisioning publishes the validated control CA to Broker's private
+`relay-control-ca.pem` beside its scoped credentials. Broker publishes each
+validated certificate/key pair atomically in `relay-tls-bundle.json`; a failed
+renewal preserves the previous bundle while it remains valid.

@@ -160,8 +160,9 @@ fn release_compatibility_declares_each_edge_without_a_global_protocol_range() {
         assert!(compatibility.contains(&format!("{revision} = \"")));
     }
     for component in ["machine", "broker", "signer"] {
-        assert!(compatibility.contains(&format!("[state.{component}]")));
-        assert!(compatibility.contains("downgrade_floor = 1"));
+        assert!(compatibility.contains(&format!(
+            "[state.{component}]\ncurrent = 2\ndowngrade_floor = 2"
+        )));
     }
 }
 
@@ -396,6 +397,11 @@ fn make_installer_payload(root: &Path) -> PathBuf {
     let release_installer = payload.join("installer/release/install-linux.sh");
     fs::create_dir_all(release_installer.parent().unwrap()).unwrap();
     fs::copy(release_script("install-linux.sh"), release_installer).unwrap();
+    fs::copy(
+        release_script("bloom-ceremonies"),
+        payload.join("installer/release/bloom-ceremonies"),
+    )
+    .unwrap();
     fs::create_dir_all(payload.join("config")).unwrap();
     for config in [
         "edge-manifest.json",
@@ -434,19 +440,20 @@ fn make_installer_payload(root: &Path) -> PathBuf {
 fn build(staging: &Path, output: &Path, key: &Path) -> std::process::Output {
     let compatibility = PathBuf::from(format!("{}.compatibility.toml", output.display()));
     let compatibility_source = fs::read_to_string(release_script("compatibility-v1.toml")).unwrap();
-    fs::write(
-        &compatibility,
-        compatibility_source
-            .replace(
-                "broker_commit = \"dd2add2b9d41540521d08c77d19fb467a2d8029e\"",
-                &format!("broker_commit = \"{}\"", "22".repeat(20)),
-            )
-            .replace(
-                "signer_commit = \"ccc9adb3866b17b87d2774018dcfa015184b1918\"",
-                &format!("signer_commit = \"{}\"", "33".repeat(20)),
-            ),
-    )
-    .unwrap();
+    let fixture_compatibility = compatibility_source
+        .lines()
+        .map(|line| {
+            if line.starts_with("broker_commit = ") {
+                format!("broker_commit = \"{}\"", "22".repeat(20))
+            } else if line.starts_with("signer_commit = ") {
+                format!("signer_commit = \"{}\"", "33".repeat(20))
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&compatibility, format!("{fixture_compatibility}\n")).unwrap();
     Command::new(release_script("build-bundle.sh"))
         .args([staging.as_os_str(), output.as_os_str(), key.as_os_str()])
         .arg("1700000000")
@@ -2074,6 +2081,27 @@ fn linux_services_send_structured_stderr_to_stable_journal_identifiers() {
 }
 
 #[test]
+fn ceremony_admin_wrapper_rejects_unbounded_inputs_before_elevation() {
+    for arguments in [
+        vec!["unknown"],
+        vec![
+            "localhost-only",
+            "--login-uid",
+            "1;touch /tmp/should-not-exist",
+        ],
+        vec!["remote-enabled", "--origin", "https://foreign.test"],
+        vec!["provision", "--login-uid", "0"],
+    ] {
+        let output = Command::new("bash")
+            .arg(release_script("bloom-ceremonies"))
+            .args(arguments)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(64));
+    }
+}
+
+#[test]
 fn linux_installer_materializes_and_checks_service_directories_at_activation() {
     let installer = fs::read_to_string(release_script("install-linux.sh")).unwrap();
     let numericize = installer
@@ -2098,6 +2126,7 @@ fn linux_installer_materializes_and_checks_service_directories_at_activation() {
         "/run/bloom/$layout_uid/broker/control",
         "/run/bloom/$layout_uid/signer/rpc",
         "/run/bloom/$layout_uid/signer/control",
+        "/run/bloom/$layout_uid/signer/admin",
         "/run/bloom/$layout_uid/session",
         "/var/lib/bloom/$layout_uid/broker",
         "/var/lib/bloom/$layout_uid/signer",
@@ -2604,7 +2633,7 @@ fn macos_staged_lifecycle_upgrades_repairs_retains_restores_and_rejects_downgrad
 
     fs::write(
         root.join("Library/Application Support/BloomTriad/state-schema"),
-        b"machine=2\nbroker=1\nsigner=1\n",
+        b"machine=3\nbroker=2\nsigner=2\n",
     )
     .unwrap();
     let downgrade = stage_macos_install_digest(&installer, &root, &candidate, &new_digest);
@@ -2614,7 +2643,7 @@ fn macos_staged_lifecycle_upgrades_repairs_retains_restores_and_rejects_downgrad
 
     fs::write(
         root.join("Library/Application Support/BloomTriad/state-schema"),
-        b"machine=1\nbroker=1\nsigner=1\n",
+        b"machine=2\nbroker=2\nsigner=2\n",
     )
     .unwrap();
     fs::write(
