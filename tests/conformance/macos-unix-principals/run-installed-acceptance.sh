@@ -321,14 +321,17 @@ run_as_login test \
   -p bloom \
   --bin bloom \
   ac26_every_custody_kind
+broker_test_args=()
+if [[ "${BLOOM_MACOS_ACCEPTANCE_EXCLUSIVE_LISTENER_TESTED:-}" == 1 ]]; then
+  # The complete suite ran before installation in the candidate job. Repeat
+  # every other test while the installed Broker retains its canonical port.
+  broker_test_args=(-- --skip paired_loopback_servers_validate_serve_both_families_and_shutdown)
+fi
 run_as_login test \
   --manifest-path "$broker_root/Cargo.toml" \
   --workspace \
   --locked \
-  -- --skip paired_loopback_servers_validate_serve_both_families_and_shutdown
-# The complete Broker suite, including this exclusive-port test, ran before
-# installation in the candidate job. Keep the installed Broker running here;
-# the prebound-listener refusal and policy RPC tests still run in this phase.
+  "${broker_test_args[@]}"
 run_as_login test \
   --manifest-path "$signer_root/Cargo.toml" \
   --workspace \
