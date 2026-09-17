@@ -50,7 +50,7 @@ machine_home = Path(sys.argv[4])
 wallet = "test-passkey"
 address = "0x0000000000000000000000000000000000000001"
 session = "manual-mainnet-integration"
-pm_signing_abi = os.environ.get("BLOOM_FAKE_PM_SIGNING_ABI", "0.4.0")
+pm_signing_abi = os.environ.get("BLOOM_FAKE_PM_SIGNING_ABI", "0.2.0")
 fixture_package_hash = "2f11ee17f612fbc43f34f81771c53760f56768959624d29fd63b8e4285f5a9ac"
 fixture_provenance_digest = "66" * 32
 mutate_approval_policy_digest = (
@@ -109,7 +109,7 @@ def fifo(relative, callback):
 
 
 write(f"wallets/{wallet}/kind", "passkey\n")
-write(f"wallets/{wallet}/address", address + "\n")
+write(f"wallets/{wallet}/0/address.evm", address + "\n")
 initial_policy = {
     "wallet_id": wallet,
     "maximum_approval_lifetime_ms": 900000,
@@ -118,20 +118,18 @@ initial_policy = {
     "required_verifiers": [],
 }
 policy_path = write_json(f"wallets/{wallet}/policy.json", initial_policy)
-addresses_path = write_json(
-    f"wallets/{wallet}/addresses.json",
+projection_path = write_json(
+    f"wallets/{wallet}/projection.json",
     {
-        "wallet": wallet,
-        "kind": "passkey",
-        "owner": address,
-        "signer": address,
-        "policy_status": "broker_verified",
-        "policy_version": "0",
-        "policy_digest": hashlib.sha256(
-            json.dumps(initial_policy, separators=(",", ":"), sort_keys=True).encode()
-        ).hexdigest(),
-        "wallet_revocation_epoch": "0",
-        "roles": {},
+        "wallet": {
+            "wallet_id": wallet,
+            "wallet_kind": "passkey",
+            "policy_version": "0",
+            "policy_digest": hashlib.sha256(
+                json.dumps(initial_policy, separators=(",", ":"), sort_keys=True).encode()
+            ).hexdigest(),
+            "wallet_revocation_epoch": "0",
+        },
     },
 )
 write_json(
@@ -212,12 +210,12 @@ def policy_loop():
             canonical = json.dumps(value, separators=(",", ":"), sort_keys=True)
             committed_policy_digest = hashlib.sha256(canonical.encode()).hexdigest()
             write(f"wallets/{wallet}/policy.json", canonical + "\n")
-            addresses = json.loads(addresses_path.read_text())
-            addresses["policy_version"] = "1"
-            addresses["policy_digest"] = (
+            projection = json.loads(projection_path.read_text())
+            projection["wallet"]["policy_version"] = "1"
+            projection["wallet"]["policy_digest"] = (
                 "99" * 32 if mutate_approval_policy_digest else committed_policy_digest
             )
-            write_json(f"wallets/{wallet}/addresses.json", addresses)
+            write_json(f"wallets/{wallet}/projection.json", projection)
             write_json(
                 f"wallets/{wallet}/policy-updates/confirmed/{action_id}/status.json",
                 {"status": "confirmed", "ceremony_kind": "policy_update", "action_id": action_id},

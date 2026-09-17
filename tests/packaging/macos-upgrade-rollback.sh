@@ -21,9 +21,14 @@ for etc_path in etc private/etc; do
   printf 'new PF\n' >"$root_prefix/etc/pf.anchors/com.bloom.triad.501"
   printf 'new config\n' >"$root_prefix/config/service.json"
   restore_macos_upgrade_state
-  [[ "$(cat "$root_prefix/etc/newsyslog.d/bloom-501.conf")" == 'old rotation' ]]
-  [[ "$(cat "$root_prefix/etc/pf.anchors/com.bloom.triad.501")" == 'old PF' ]]
-  [[ "$(cat "$root_prefix/config/service.json")" == 'old config' ]]
-  [[ -L "$root_prefix/etc" ]]
+  # Bash 3.2 does not apply errexit to standalone [[ ... ]] failures.
+  # Exit explicitly so a failed assertion cannot reach the success message.
+  [[ "$(cat "$root_prefix/etc/newsyslog.d/bloom-501.conf")" == 'old rotation' ]] ||
+    die "$etc_path rollback did not restore the rotation config"
+  [[ "$(cat "$root_prefix/etc/pf.anchors/com.bloom.triad.501")" == 'old PF' ]] ||
+    die "$etc_path rollback did not restore the PF anchor"
+  [[ "$(cat "$root_prefix/config/service.json")" == 'old config' ]] ||
+    die "$etc_path rollback did not restore the service config"
+  [[ -L "$root_prefix/etc" ]] || die "$etc_path rollback did not preserve the etc symlink"
 done
 echo 'macOS rollback restores legacy and canonical etc archive paths'

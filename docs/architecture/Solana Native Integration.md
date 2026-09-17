@@ -66,13 +66,13 @@ chain Bloom talks to directly.
   cooldown/scoring) and the retry-classification rule table. Solana's own
   `reqwest`-based transport reimplements alloy's retry/throttle/fallback/probe
   pattern on top of those shared pieces rather than the `alloy` stack itself.
-- **Mount surface unchanged.** Solana chains route through the existing
-  `wallets/<wallet>/chains/<chain>/...` VFS family alongside EVM chains —
+- **Shared indexed mount surface.** Solana chains route through the
+  `wallets/<wallet>/<n>/chains/<chain>/...` VFS family alongside EVM chains —
   same outbox route shape (`outbox/new.tx`, `outbox/pending/<id>/{confirm,cancel}`,
   `outbox/{pending,sent,failed}/<id>/...`), dispatched to a Solana transfer
   engine instead of the EVM `TxEngine` when the chain name resolves to one.
-  See `crates/bloom-vfs/src/handlers/wallets.rs`'s `lookup_chain`/`list_chain`
-  for the dispatch point, and `docs/examples-domain/01-chains.md` for the
+  See `crates/bloom-vfs/src/handlers/wallets/accounts.rs`'s
+  `lookup_account`/`list_account` for the dispatch point, and `docs/examples-domain/01-chains.md` for the
   general (currently EVM-focused) walkthrough of that surface's read side.
 
 ## Registered semantic verifier: authoritative on the native signing path
@@ -108,16 +108,19 @@ config where a chain name is configured in both.
 
 Newly generated configuration includes `solana-mainnet`, using the public
 `https://api.mainnet.solana.com` RPC endpoint and the pinned mainnet genesis
-hash. Its `allow_broadcast` defaults to `false`. Devnet and local validators
-remain explicitly configured networks. Loading an existing configuration does
-not add Solana networks or overwrite endpoint and broadcast settings.
+hash. Broadcasting is available on every configured chain. The obsolete
+`allow_broadcast` configuration field is ignored and is not emitted into new
+configs. Existing network entries retain their endpoints and genesis pins;
+missing Arc and Solana mainnet entries receive the default configuration.
+Devnet and local validators remain explicitly configured networks.
+Unpinned networks can be used for reads, but cannot submit transactions.
 
 The public endpoint is rate-limited; operators can replace it with their own
 RPC endpoint under `[solana_chains.solana-mainnet]`. See Solana's
 [public RPC documentation](https://solana.com/docs/references/clusters).
 
-Mainnet uses the ordinary Solana transaction path. Operators must explicitly
-enable `allow_broadcast` and pin `expected_genesis_base58`; Machine verifies every
+Mainnet uses the ordinary Solana transaction path. Operators must supply a valid
+`expected_genesis_base58` pin for existing custom Solana entries; Machine verifies every
 configured endpoint against that genesis at staging and again before its
 single broadcast attempt. Broker policy and the passkey ceremony remain
 mandatory.
@@ -125,8 +128,8 @@ mandatory.
 ### Broadcast eligibility is not a delivery guarantee
 
 `status/chains/<chain>/status.json` reports `broadcast.eligible`. That means
-only two things held: the operator enabled broadcast, and live genesis
-verification succeeded against **every** configured endpoint at the moment of
+a genesis is pinned and live verification succeeded against **every**
+configured endpoint at the moment of
 the read. It is not a prediction that a transaction will be accepted or will
 land — fees, blockhash expiry, account state and validator admission all
 still apply, and none of them are observable from a status read.
@@ -141,22 +144,24 @@ Genesis reporting distinguishes three states rather than two:
 
 ## Reading Solana state through the VFS
 
-Solana chains appear beside EVM chains under `wallets/<wallet>/chains/` and
-in the global `status/chains/` tree. Two rules shape the surface.
+Solana chains appear under `wallets/<wallet>/<n>/chains/` when that account
+has a Broker-projected Solana address, and in the global `status/chains/` tree.
+Two rules shape the surface.
 
-**Accounts are addressed by full fingerprint.** The canonical per-account
-path is `chains/<chain>/accounts/<full-lowercase-fingerprint>/`, exposing
-`address`, `balance`, `balance.raw` and `balance.json`. `accounts/` exists
-whenever the chain is configured — empty when no child is active — so the
-namespace does not change shape as children are allocated or retired. A
-unique fingerprint *prefix* is accepted as input convenience when staging a
-transfer through `new.tx`, but never as a path: a prefix that is unique today
-becomes ambiguous when the next child is allocated.
+**Paths select a numbered account; fingerprints identify its key.** Match the
+intended Solana key's full fingerprint and derivation path in
+`wallets/<wallet>/accounts.json` to the entry's `number`, then verify the key
+in `wallets/<wallet>/<n>/account.json`. The canonical read path is
+`wallets/<wallet>/<n>/chains/<chain>/`, exposing `address`, `balance`,
+`balance.raw` and `balance.json` directly.
 
-The chain-level `balance`, `balance.raw` and `balance.json` leaves are
-single-child conveniences. On a wallet with several active Solana children
-they fail and name the canonical `accounts/<fingerprint>/` paths rather than
-selecting by projection order.
+Account `0` explicitly selects the canonical initial child; account `n`
+selects that numbered child's key even when other children exist. A missing
+family or projected address fails instead of substituting another account.
+A unique fingerprint prefix is accepted as input convenience in `new.tx`,
+but it must identify the same account selected by the numbered outbox path.
+Approval and signing bind the exact `KeyRef`, never a list position or number
+alone.
 
 **Reads that need the chain are exactly the reads that say so.** Listing an
 account directory, stat-ing any leaf, and reading `address` are served from
