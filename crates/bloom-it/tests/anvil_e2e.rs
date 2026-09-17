@@ -477,11 +477,13 @@ async fn anvil_stage_does_not_reuse_the_nonce_of_a_broadcast_but_unmined_tx() ->
                 "usd_value_hint": "1",
             })
             .to_string();
-            let new_tx_path = VfsPath::parse("/wallets/alice/chains/anvil/outbox/new.tx").unwrap();
+            let new_tx_path =
+                VfsPath::parse("/wallets/alice/0/chains/anvil/outbox/new.tx").unwrap();
             vfs.write(&new_tx_path, intent.as_bytes())
                 .await
                 .map_err(|e| anyhow!("stage {label}: {e}"))?;
-            let pending_dir = VfsPath::parse("/wallets/alice/chains/anvil/outbox/pending").unwrap();
+            let pending_dir =
+                VfsPath::parse("/wallets/alice/0/chains/anvil/outbox/pending").unwrap();
             let entries = vfs
                 .list(&pending_dir)
                 .await
@@ -499,7 +501,7 @@ async fn anvil_stage_does_not_reuse_the_nonce_of_a_broadcast_but_unmined_tx() ->
     // mempool while the second stage reads its nonce.
     set_automine(&rpc_url, false).await?;
     let confirm_path = VfsPath::parse(&format!(
-        "/wallets/alice/chains/anvil/outbox/pending/{first_id}/confirm"
+        "/wallets/alice/0/chains/anvil/outbox/pending/{first_id}/confirm"
     ))
     .unwrap();
     // The first confirm always fails closed while it mints the approval; the
@@ -518,7 +520,7 @@ async fn anvil_stage_does_not_reuse_the_nonce_of_a_broadcast_but_unmined_tx() ->
     // sees it — the chain read is now the only thing standing between the next
     // stage and a duplicate nonce.
     let sent_intent = VfsPath::parse(&format!(
-        "/wallets/alice/chains/anvil/outbox/sent/{first_id}/intent.json"
+        "/wallets/alice/0/chains/anvil/outbox/sent/{first_id}/intent.json"
     ))
     .unwrap();
     let first: serde_json::Value = serde_json::from_slice(
@@ -537,7 +539,7 @@ async fn anvil_stage_does_not_reuse_the_nonce_of_a_broadcast_but_unmined_tx() ->
 
     let second_id = stage("second").await?;
     let second_intent = VfsPath::parse(&format!(
-        "/wallets/alice/chains/anvil/outbox/pending/{second_id}/intent.json"
+        "/wallets/alice/0/chains/anvil/outbox/pending/{second_id}/intent.json"
     ))
     .unwrap();
     let second: serde_json::Value = serde_json::from_slice(
