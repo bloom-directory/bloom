@@ -64,32 +64,14 @@ pub struct Config {
     pub backends: BackendsConfig,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PetalsConfig {
-    /// Built-in Petals provisioned by explicit lifecycle commands such as
-    /// `bloom init`. An explicit empty list is a persistent opt-out.
-    #[serde(default = "default_preinstalled_petals")]
+    /// Ignored legacy setting. Bloom provisions its canonical Petal catalog.
+    #[serde(default, skip_serializing)]
     pub preinstalled: Vec<String>,
     #[serde(default)]
     pub runtime: BTreeMap<String, PetalRuntimeConfig>,
-}
-
-impl Default for PetalsConfig {
-    fn default() -> Self {
-        Self {
-            preinstalled: default_preinstalled_petals(),
-            runtime: BTreeMap::new(),
-        }
-    }
-}
-
-fn default_preinstalled_petals() -> Vec<String> {
-    vec![
-        "polymarket".into(),
-        "hyperliquid".into(),
-        "near-intents".into(),
-    ]
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -258,7 +240,6 @@ fn evm_chain(
         chain_id,
         rpc_urls: rpc_urls.iter().map(|u| (*u).to_string()).collect(),
         rpc_endpoints: Vec::new(),
-        allow_broadcast: true,
         etherscan_api_url: None,
         display_name: Some(display_name.to_string()),
         native_symbol: native_symbol.to_string(),
@@ -392,8 +373,7 @@ fn default_chains() -> BTreeMap<String, ChainSpec> {
 impl Config {
     /// An agentic-wallet default: public EVM networks, Anvil, and Solana mainnet.
     ///
-    /// EVM broadcast is enabled by default; Solana mainnet starts with
-    /// broadcasting disabled. Signing, policy,
+    /// Broadcast is enabled by default on every chain. Signing, policy,
     /// confirmation, and Sealed Approval gates still apply to value-moving
     /// actions.
     pub fn local_default() -> Self {
@@ -419,7 +399,6 @@ impl Config {
                     expected_genesis_base58: Some(
                         crate::chain::SOLANA_MAINNET_BETA_GENESIS_HASH.into(),
                     ),
-                    allow_broadcast: false,
                 },
             )]),
             etherscan: None,
@@ -432,9 +411,8 @@ impl Config {
 
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let s = std::fs::read_to_string(path)?;
-        let document: toml::Value = toml::from_str(&s)?;
         let mut cfg: Self = toml::from_str(&s)?;
-        cfg.migrate(&document);
+        cfg.migrate();
         cfg.validate()?;
         Ok(cfg)
     }
@@ -460,25 +438,25 @@ impl Config {
 
     /// Apply post-load migrations for backwards compatibility.
     ///
-    /// Currently infers `op_stack` for well-known OP-stack chain IDs
-    /// (Optimism=10, Base=8453, …) that predate the `op_stack` field and
-    /// advances the v0.1.3 default Petal set to the current release defaults.
-    fn migrate(&mut self, document: &toml::Value) {
+    /// Add the release's new networks without replacing operator configuration.
+    /// Like other load migrations, this updates the effective config; save persists it.
+    fn migrate(&mut self) {
+        let mut defaults = Self::local_default();
+        // Respect names already assigned to either family; never create a collision.
+        if !self.chains.contains_key("arc") && !self.solana_chains.contains_key("arc") {
+            self.chains
+                .insert("arc".into(), defaults.chains.remove("arc").unwrap());
+        }
+        if !self.solana_chains.contains_key("solana-mainnet")
+            && !self.chains.contains_key("solana-mainnet")
+        {
+            self.solana_chains.insert(
+                "solana-mainnet".into(),
+                defaults.solana_chains.remove("solana-mainnet").unwrap(),
+            );
+        }
         for spec in self.chains.values_mut() {
             spec.infer_op_stack();
-        }
-
-        let persisted_preinstalled = document
-            .get("petals")
-            .and_then(|petals| petals.get("preinstalled"))
-            .and_then(toml::Value::as_array);
-        let is_legacy_default = persisted_preinstalled.is_some_and(|entries| {
-            let entries = entries.iter().map(toml::Value::as_str).collect::<Vec<_>>();
-            entries == [Some("polymarket"), Some("near-intents"), Some("enso")]
-                || entries == [Some("near-intents"), Some("enso")]
-        });
-        if is_legacy_default {
-            self.petals.preinstalled = default_preinstalled_petals();
         }
     }
 
@@ -562,7 +540,7 @@ impl Config {
                     )));
                 }
             }
-            if spec.allow_broadcast {
+            if spec.expected_genesis_base58.is_some() {
                 let pin = spec.expected_genesis_base58.as_deref().unwrap_or("");
                 let valid_pin = !pin.is_empty()
                     && bs58::decode(pin)
@@ -570,7 +548,7 @@ impl Config {
                         .is_ok_and(|bytes| bytes.len() == 32);
                 if !valid_pin {
                     return Err(ConfigError::Invalid(format!(
-                        "solana chain '{key}' enables broadcast without a valid 32-byte base58 \
+                        "solana chain '{key}' has an invalid 32-byte base58 \
                          expected_genesis_base58 pin",
                     )));
                 }
@@ -612,39 +590,11 @@ impl Config {
                 }
             }
         }
-        let mut seen_preinstalled = std::collections::BTreeSet::new();
-        for name in &self.petals.preinstalled {
-            validate_petal_runtime_name("preinstalled entry", name)?;
-            if !matches!(
-                name.as_str(),
-                "polymarket"
-                    | "hyperliquid"
-                    | "near-intents"
-                    | "enso"
-                    | "gasless"
-                    | "privacy-pools"
-                    | "venice-x402"
-            ) {
-                return Err(ConfigError::Invalid(format!(
-                    "unknown preinstalled Petal {name:?}"
-                )));
-            }
-            if !seen_preinstalled.insert(name) {
-                return Err(ConfigError::Invalid(format!(
-                    "duplicate preinstalled Petal {name:?}"
-                )));
-            }
-        }
         Ok(())
     }
 
     pub fn chain(&self, name: &str) -> Option<&ChainSpec> {
         self.chains.get(name)
-    }
-
-    /// Whether broadcast is allowed on this chain.
-    pub fn broadcast_permitted(&self, c: &ChainSpec) -> bool {
-        c.allow_broadcast
     }
 }
 
@@ -713,7 +663,8 @@ mod tests {
         assert_eq!(cfg.mount_path, "/bloom");
         assert_eq!(cfg.nfs_listen_addr, "127.0.0.1:12049");
         assert!(cfg.etherscan.is_none());
-        assert_eq!(cfg.petals.preinstalled, default_preinstalled_petals());
+        assert!(cfg.petals.preinstalled.is_empty());
+        assert!(!toml::to_string(&cfg).unwrap().contains("allow_broadcast"));
         assert_eq!(cfg.chains.len(), 14);
         assert_eq!(cfg.solana_chains.len(), 1);
         let solana = cfg
@@ -725,11 +676,9 @@ mod tests {
             solana.expected_genesis_base58.as_deref(),
             Some(crate::chain::SOLANA_MAINNET_BETA_GENESIS_HASH)
         );
-        assert!(!solana.allow_broadcast);
         assert_eq!(solana.endpoints[0].url, "https://api.mainnet.solana.com");
         let ethereum = cfg.chains.get("ethereum").expect("ethereum entry");
         assert_eq!(ethereum.chain_id, 1);
-        assert!(ethereum.allow_broadcast);
         assert!(!ethereum.rpc_urls.is_empty());
         let base = cfg.chains.get("base").expect("base entry");
         assert_eq!(base.chain_id, 8453);
@@ -785,7 +734,6 @@ mod tests {
                 name: "ethereum".into(),
                 endpoints: vec![],
                 expected_genesis_base58: None,
-                allow_broadcast: false,
             },
         );
         let err = cfg.validate().unwrap_err();
@@ -804,7 +752,6 @@ mod tests {
                 name: "solana-devnet".into(),
                 endpoints: vec![http_endpoint()],
                 expected_genesis_base58: None,
-                allow_broadcast: false,
             },
         );
         cfg.validate().unwrap();
@@ -819,7 +766,6 @@ mod tests {
                 name: "solana-testnet".into(),
                 endpoints: vec![http_endpoint()],
                 expected_genesis_base58: None,
-                allow_broadcast: false,
             },
         );
         let error = cfg.validate().unwrap_err().to_string();
@@ -838,7 +784,6 @@ mod tests {
                 name: "solana-devnet".into(),
                 endpoints: vec![],
                 expected_genesis_base58: None,
-                allow_broadcast: false,
             },
         );
         assert!(
@@ -863,7 +808,6 @@ mod tests {
                     http_only: false,
                 }],
                 expected_genesis_base58: None,
-                allow_broadcast: false,
             },
         );
         assert!(
@@ -883,14 +827,13 @@ mod tests {
                 name: "solana-devnet".into(),
                 endpoints: vec![http_endpoint()],
                 expected_genesis_base58: Some("not-base58-$$$".into()),
-                allow_broadcast: true,
             },
         );
         assert!(
             cfg.validate()
                 .unwrap_err()
                 .to_string()
-                .contains("enables broadcast without a valid 32-byte base58")
+                .contains("has an invalid 32-byte base58")
         );
 
         let mut cfg = Config::local_default();
@@ -901,14 +844,13 @@ mod tests {
                 endpoints: vec![http_endpoint()],
                 // Valid base58, but not 32 bytes: not a genesis hash.
                 expected_genesis_base58: Some("abc".into()),
-                allow_broadcast: true,
             },
         );
         assert!(
             cfg.validate()
                 .unwrap_err()
                 .to_string()
-                .contains("enables broadcast without a valid 32-byte base58")
+                .contains("has an invalid 32-byte base58")
         );
     }
 
@@ -957,63 +899,30 @@ mod tests {
     }
 
     #[test]
-    fn preinstalled_petals_support_persistent_opt_out_and_validate_catalog_names() {
-        let mut cfg = Config::local_default();
-        cfg.petals.preinstalled.clear();
-        assert!(cfg.petals.preinstalled.is_empty());
-        cfg.validate().unwrap();
-
-        let serialized = toml::to_string_pretty(&cfg).unwrap();
-        let reloaded: Config = toml::from_str(&serialized).unwrap();
-        assert!(reloaded.petals.preinstalled.is_empty());
-
-        cfg.petals.preinstalled = vec!["near-intents".into()];
-        cfg.validate().unwrap();
-
-        cfg.petals.preinstalled = vec!["hyperliquid".into()];
-        cfg.validate().unwrap();
-
-        cfg.petals.preinstalled = vec!["polymarket".into()];
-        cfg.validate().unwrap();
-
-        cfg.petals.preinstalled = vec!["unknown".into()];
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(
-            err.contains("unknown preinstalled Petal \"unknown\""),
-            "{err}"
-        );
-
-        cfg.petals.preinstalled = vec!["near-intents".into(), "near-intents".into()];
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(
-            err.contains("duplicate preinstalled Petal \"near-intents\""),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn load_migrates_the_legacy_default_petal_catalog_only() {
+    fn legacy_preinstalled_values_are_ignored_without_migration() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("config.toml");
-
-        let mut cfg = Config::local_default();
-        cfg.petals.preinstalled = vec!["polymarket".into(), "near-intents".into(), "enso".into()];
-        cfg.save(&path).unwrap();
-
-        let migrated = Config::load(&path).unwrap();
-        assert_eq!(migrated.petals.preinstalled, default_preinstalled_petals());
-
-        cfg.petals.preinstalled = vec!["near-intents".into(), "enso".into()];
-        cfg.save(&path).unwrap();
-        let migrated = Config::load(&path).unwrap();
-        assert_eq!(migrated.petals.preinstalled, default_preinstalled_petals());
-
-        cfg.petals.preinstalled = vec!["polymarket".into()];
-        cfg.save(&path).unwrap();
-        assert_eq!(
-            Config::load(&path).unwrap().petals.preinstalled,
-            vec!["polymarket"]
-        );
+        for value in [
+            "[]",
+            "[\"polymarket\", \"near-intents\", \"enso\"]",
+            "[\"unknown\", \"unknown\"]",
+        ] {
+            let mut document = toml::Value::try_from(Config::local_default()).unwrap();
+            document["petals"].as_table_mut().unwrap().insert(
+                "preinstalled".into(),
+                toml::from_str::<toml::Value>(&format!("value = {value}")).unwrap()["value"]
+                    .clone(),
+            );
+            let original = toml::to_string_pretty(&document).unwrap();
+            std::fs::write(&path, &original).unwrap();
+            let loaded = Config::load(&path).unwrap();
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+            assert!(
+                !toml::to_string_pretty(&loaded)
+                    .unwrap()
+                    .contains("preinstalled")
+            );
+        }
     }
 
     #[test]
@@ -1084,7 +993,7 @@ mod tests {
     }
 
     #[test]
-    fn load_or_init_preserves_existing_broadcast_settings() {
+    fn load_or_init_adds_missing_networks_and_ignores_legacy_broadcast() {
         let td = tempdir().unwrap();
         let path = td.path().join("config.toml");
         let existing = r#"
@@ -1099,9 +1008,69 @@ allow_broadcast = false
         std::fs::write(&path, existing).unwrap();
 
         let cfg = Config::load_or_init(&path).unwrap();
-        assert!(!cfg.chains["anvil"].allow_broadcast);
-        assert!(cfg.solana_chains.is_empty());
+
+        assert_eq!(cfg.chains.len(), 2);
+        assert_eq!(cfg.chains["arc"], Config::local_default().chains["arc"]);
+        assert_eq!(cfg.solana_chains, Config::local_default().solana_chains);
+        assert!(
+            !toml::to_string_pretty(&cfg)
+                .unwrap()
+                .contains("allow_broadcast")
+        );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), existing);
+    }
+
+    #[test]
+    fn migration_preserves_custom_networks_and_is_idempotent() {
+        let td = tempdir().unwrap();
+        let path = td.path().join("config.toml");
+        let mut expected = Config::local_default();
+        let arc = expected.chains.get_mut("arc").unwrap();
+        arc.chain_id = 12345;
+        arc.rpc_urls = vec!["https://custom-arc.example".into()];
+        let solana = expected.solana_chains.get_mut("solana-mainnet").unwrap();
+        solana.endpoints[0].url = "https://custom-solana.example".into();
+        solana.expected_genesis_base58 = Some(bs58::encode([7_u8; 32]).into_string());
+        let mut custom = solana.clone();
+        custom.name = "custom-solana".into();
+        expected.solana_chains.insert(custom.name.clone(), custom);
+        let existing = expected.clone();
+        existing.save(&path).unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert_configs_equivalent(&loaded, &expected);
+        loaded.save(&path).unwrap();
+        assert_configs_equivalent(&Config::load(&path).unwrap(), &expected);
+    }
+
+    #[test]
+    fn migration_respects_names_in_the_other_chain_family() {
+        let mut cfg = Config::local_default();
+        let mut evm = cfg.chains.remove("arc").unwrap();
+        evm.name = "solana-mainnet".into();
+        cfg.chains.insert(evm.name.clone(), evm);
+        let mut solana = cfg.solana_chains.remove("solana-mainnet").unwrap();
+        solana.name = "arc".into();
+        cfg.solana_chains.insert(solana.name.clone(), solana);
+        let expected = cfg.clone();
+        cfg.migrate();
+        cfg.validate().unwrap();
+        assert_configs_equivalent(&cfg, &expected);
+    }
+
+    #[test]
+    fn migration_does_not_invent_genesis_for_existing_solana_network() {
+        let td = tempdir().unwrap();
+        let path = td.path().join("config.toml");
+        let mut cfg = Config::local_default();
+        let solana = cfg.solana_chains.get_mut("solana-mainnet").unwrap();
+        solana.expected_genesis_base58 = None;
+        cfg.save(&path).unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert!(
+            loaded.solana_chains["solana-mainnet"]
+                .expected_genesis_base58
+                .is_none()
+        );
     }
 
     #[test]
@@ -1225,16 +1194,6 @@ allow_broadcast = true
     }
 
     #[test]
-    fn broadcast_permitted_respects_mainnet_chain_allow_flag() {
-        let cfg = Config::local_default();
-        let mut ethereum = cfg.chains["ethereum"].clone();
-        ethereum.allow_broadcast = false;
-        assert!(!cfg.broadcast_permitted(&ethereum));
-        ethereum.allow_broadcast = true;
-        assert!(cfg.broadcast_permitted(&ethereum));
-    }
-
-    #[test]
     fn solana_broadcast_accepts_pinned_mainnet_genesis() {
         let mut cfg = Config::local_default();
         cfg.solana_chains.insert(
@@ -1251,7 +1210,6 @@ allow_broadcast = true
                 expected_genesis_base58: Some(
                     crate::chain::SOLANA_MAINNET_BETA_GENESIS_HASH.into(),
                 ),
-                allow_broadcast: true,
             },
         );
         cfg.validate().unwrap();

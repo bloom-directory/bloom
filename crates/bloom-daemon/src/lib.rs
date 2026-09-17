@@ -7279,7 +7279,6 @@ native_decimals = 18
 
 [solana_chains.solana-devnet]
 name = "solana-devnet"
-allow_broadcast = true
 expected_genesis_base58 = "{genesis_hash}"
 [[solana_chains.solana-devnet.endpoints]]
 url = "{rpc_endpoint}"

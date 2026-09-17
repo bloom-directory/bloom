@@ -145,7 +145,6 @@ nfs_port="$(free_port)"
   printf 'chain_id = 31337\n'
   printf 'rpc_urls = ["%s"]\n' "$rpc_url"
   printf 'rpc_endpoints = []\n'
-  printf 'allow_broadcast = true\n'
   printf 'display_name = "Anvil (local)"\n'
   printf 'native_symbol = "ETH"\n'
   printf 'native_decimals = 18\n'
