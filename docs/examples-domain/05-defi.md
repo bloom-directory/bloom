@@ -62,9 +62,9 @@ The outbox still owns the final broadcast ceremony:
 
 ```sh
 bloom vfs cat \
-  /wallets/alice/chains/base/outbox/pending/<id>/plan.md
+  /wallets/alice/0/chains/base/outbox/pending/<id>/plan.md
 bloom vfs write \
-  /wallets/alice/chains/base/outbox/pending/<id>/confirm \
+  /wallets/alice/0/chains/base/outbox/pending/<id>/confirm \
   --data confirm
 ```
 
@@ -72,7 +72,7 @@ Inspect the receipt and the Petal's settlement state after broadcast:
 
 ```sh
 bloom vfs cat \
-  /wallets/alice/chains/base/outbox/sent/<id>/receipt.json
+  /wallets/alice/0/chains/base/outbox/sent/<id>/receipt.json
 bloom vfs cat \
   "/petals/enso/intents/alice/$session/settlement.json"
 bloom vfs cat \

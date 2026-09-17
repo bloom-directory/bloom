@@ -608,45 +608,6 @@ if [ ! -e "$machine_config" ]; then
   chmod 0600 "$machine_config"
 fi
 
-# Developer Petals are installed through the launched Machine below. Do not
-# download or advertise a stale production release merely to make this isolated
-# harness ready.
-[ -f "$machine_config" ] || die "Machine did not create its configuration"
-machine_config_new="${machine_config}.new.$$"
-awk '
-  $0 == "[petals]" {
-    saw_petals = 1
-    in_petals = 1
-    print
-    next
-  }
-  in_petals && $0 ~ /^preinstalled = \[/ {
-    print "preinstalled = []"
-    replaced_preinstalled = 1
-    if ($0 !~ /\]/) skipping = 1
-    next
-  }
-  skipping {
-    if ($0 == "]") skipping = 0
-    next
-  }
-  in_petals && $0 ~ /^\[/ {
-    if (!replaced_preinstalled) print "preinstalled = []"
-    in_petals = 0
-  }
-  { print }
-  END {
-    if (in_petals && !replaced_preinstalled) print "preinstalled = []"
-    if (!saw_petals) {
-      print ""
-      print "[petals]"
-      print "preinstalled = []"
-    }
-  }
-' "$machine_config" > "$machine_config_new"
-chmod 0600 "$machine_config_new"
-mv -f "$machine_config_new" "$machine_config"
-
 if [ "$services_only" -eq 1 ]; then
   printf 'ready\n' > "$ready_file"
   printf '%s\n' \

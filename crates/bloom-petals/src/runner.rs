@@ -484,10 +484,11 @@ impl PetalRunner {
     }
 
     /// [`Self::dispatch_petal_route`] with host-trusted parameters appended
-    /// next to `bloom.route_id`. The mounted account path is the one caller:
-    /// a route reached under `wallets/<w>/<n>/petals/` runs with the host
-    /// provenance facts `bloom.wallet`, `bloom.account` and
-    /// `bloom.owner_key_fingerprint`, which guest and host both read. A
+    /// next to `bloom.route_id`. An account-scoped router
+    /// ([`crate::PetalRouter::for_account`]) is the one caller that appends
+    /// them: its routes run with the host provenance facts `bloom.wallet`,
+    /// `bloom.account` and `bloom.owner_key_fingerprint`, which guest and
+    /// host both read. A
     /// caller-supplied context entry whose name starts with `bloom.` is
     /// rejected before the host appends its own values, so no dispatch path
     /// can shadow a trusted one.

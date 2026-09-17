@@ -30,11 +30,10 @@ CI runs workspace tests through the split jobs in
 services and tools; run the relevant suite explicitly rather than enabling all
 ignored tests on an unprepared host.
 
-Production authority-boundary checks are:
+Production authority-boundary and release-metadata checks are:
 
 ```sh
-packaging/triad/release/check-machine-authority-boundary.sh
-packaging/triad/release/test-machine-authority-boundary.sh
+cargo test -p bloom-it --test triad_release --locked
 ```
 
 Use a disposable Tart VM for local macOS packaging and principal-isolation
