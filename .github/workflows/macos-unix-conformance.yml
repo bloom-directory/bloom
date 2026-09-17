@@ -119,6 +119,11 @@ jobs:
             "$RUNNER_TEMP/triad-dist/bloom-triad-macos-unix-principals-w0.tar.gz" \
             -C "$RUNNER_TEMP/verified-w0"
 
+      # The canonical-listener test must run before any installed Broker owns
+      # port 18734. Installed acceptance repeats the other tests below.
+      - name: Run complete Broker suite before installation
+        run: cargo test --manifest-path bloom-broker/Cargo.toml --workspace --locked
+
       - name: Upload verified macOS candidate
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:

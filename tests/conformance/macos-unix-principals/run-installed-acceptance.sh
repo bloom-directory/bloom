@@ -324,7 +324,11 @@ run_as_login test \
 run_as_login test \
   --manifest-path "$broker_root/Cargo.toml" \
   --workspace \
-  --locked
+  --locked \
+  -- --skip paired_loopback_servers_validate_serve_both_families_and_shutdown
+# The complete Broker suite, including this exclusive-port test, ran before
+# installation in the candidate job. Keep the installed Broker running here;
+# the prebound-listener refusal and policy RPC tests still run in this phase.
 run_as_login test \
   --manifest-path "$signer_root/Cargo.toml" \
   --workspace \
