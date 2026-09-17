@@ -172,6 +172,58 @@ private sub-key remains inside Signer.
 Use local tests and a Tart VM for macOS packaging or service isolation:
 
 ```sh
-packaging/triad/release/test-machine-authority-boundary.sh
-packaging/triad/release/check-machine-authority-boundary.sh --require-clean
+cargo test -p bloom-it --test triad_release --locked
+cargo test -p bloom-it --test linux_packaging --locked
 ```
+
+## Ceremony surfaces
+
+`bloom ceremony surfaces` (also `bloom vfs cat /status/ceremonies.json`) reports
+Signer-approved desired exposure and Broker-confirmed effective readiness.
+A pending certificate or route is not working remote access. Treat an
+incomplete provisioning stage as retryable setup work.
+
+Wallet creation and import use Broker's default surface. Use
+`bloom wallet new main --local` or `bloom wallet import main --local` to request
+the canonical localhost surface. For the mounted registration control, the
+plain wallet name retains default selection; an explicit local request is
+`{"name":"main","surface_selection":"local"}` written to `/wallets/new`.
+A live registration cannot change surfaces on retry: cancel it before starting
+an attempt on another surface. Wallet secret input remains in the browser.
+
+Copy the full returned ceremony URL, including its fragment. Localhost requires
+a browser on the Bloom host. Remote ceremonies use that installation's assigned
+HTTPS hostname. The two origins require distinct RP-specific passkeys, even
+when both are stored in the same password manager. A synchronized copy is not
+independent redundancy. Completing an approval activates authority; execution
+and broadcast remain separate operations.
+
+The installed `bloom-ceremonies status|remote-enabled|localhost-only|provision`
+command invokes privileged `bloom-signer` administration through the platform's
+elevation prompt (`osascript`, `pkexec`, or `sudo`). Use `--login-uid UID` when
+administering a particular enrollment as root. `provision` retries hosted setup
+with the installation's protected identity; it never accepts an arbitrary domain.
+
+To add access on the other origin, run `bloom wallet add-passkey main --to local`
+or `--to remote`. Open the returned destination URL first, keep that tab open,
+then open its source-approval link where your existing passkey is available.
+Compare the displayed code and both origins, authorize with the existing passkey,
+and return to the destination to create the new passkey. The new credential
+becomes active only after both legs finish; wallet addresses remain unchanged.
+Refreshing or closing the destination before completion requires a fresh pairing.
+
+Machine status and VFS cannot switch modes. Localhost-only switching requires
+local credential coverage for every active passkey-dependent wallet; coverage
+does not prove the authenticator is still available. Enroll missing local
+access through Broker before retrying. Relay outage never extends a ceremony
+or makes a remote-only credential work on localhost.
+
+If source access is lost, open the installation's ceremony origin to begin
+recovery with the wallet ID and saved recovery-record ID. The landing page does
+not collect the secret. Enter the saved secret only in the resulting recovery
+ceremony, and create the replacement passkey. Recovery preserves wallet addresses,
+revokes all previous wallet passkeys, and issues a new single-use recovery record;
+save that record before closing the result. The old recovery factor cannot be
+used again. Encrypted result retrieval lasts 15 minutes after commit and requires
+the original browser key. Losing that key does not undo recovery or permit the
+server to encrypt the record to a new key.

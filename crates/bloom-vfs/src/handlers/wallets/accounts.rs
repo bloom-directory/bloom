@@ -1610,6 +1610,7 @@ impl WalletsHandler {
         };
         let prepared = broker
             .account_allocate(bloom_broker_api::CustodyPrepareRequest {
+                surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
                 ceremony_kind: bloom_broker_api::CeremonyKind::AccountAllocate,
                 custody_operation_id: operation_id.clone(),
                 wallet_id: Some(wallet_id),

@@ -702,6 +702,12 @@ pub enum MachineCommand {
     WalletCustody {
         name: String,
         kind: MachineCustodyKind,
+        #[serde(default)]
+        local: bool,
+    },
+    WalletAddPasskey {
+        name: String,
+        local: bool,
     },
     WalletMigrate {
         receipt: MachineLegacyMigrationReceipt,

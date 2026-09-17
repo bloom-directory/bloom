@@ -296,6 +296,7 @@ for macos_input in "$script_dir"/../macos/*; do
   cp -R "$macos_input" "$payload/installer/macos/"
 done
 install -m 0755 \
+  "$script_dir/bloom-ceremonies" \
   "$script_dir/install-linux.sh" \
   "$script_dir/install-macos.sh" \
   "$script_dir/macos-conformance-subject.sh" \

@@ -73,6 +73,7 @@ materialize_linux_layout() {
     "/run/bloom/$layout_uid/signer" \
     "/run/bloom/$layout_uid/signer/rpc" \
     "/run/bloom/$layout_uid/signer/control" \
+    "/run/bloom/$layout_uid/signer/admin" \
     "/run/bloom/$layout_uid/session" \
     "/var/lib/bloom/$layout_uid/broker" \
     "/var/lib/bloom/$layout_uid/signer" \
@@ -1306,6 +1307,7 @@ case "$action" in
       installer/linux/systemd/bloom-signer@.service.in \
       installer/linux/systemd-user/bloom-session.service \
       installer/linux/systemd-user/bloom-machine.service \
+      installer/release/bloom-ceremonies \
       installer/release/install-linux.sh
     do
       [[ -f "$payload/$required" && ! -L "$payload/$required" ]] || {
@@ -1420,6 +1422,7 @@ case "$action" in
 
     binary_root="$root/usr/libexec/bloom/current"
     atomic_install "$payload/installer/linux/bin/bloom" "$root/usr/bin/bloom" 0755
+    atomic_install "$payload/installer/release/bloom-ceremonies" "$root/usr/bin/bloom-ceremonies" 0755
     atomic_install \
       "$payload/installer/linux/bin/bloom-uninstall" \
       "$root/usr/bin/bloom-uninstall" \
@@ -1681,6 +1684,9 @@ case "$action" in
       else
         systemctl enable --now "bloom-session@$login_uid.path"
       fi
+      if ! /usr/bin/bloom-ceremonies provision --login-uid "$login_uid"; then
+        echo "Remote ceremony provisioning is incomplete; localhost remains available. Retry: bloom-ceremonies provision --login-uid $login_uid" >&2
+      fi
       printf '%s\n' \
         "BLOOM_BIN=/usr/bin/bloom" \
         "BLOOM_INSTALL_MODE=triad-linux-systemd" \
@@ -1891,6 +1897,7 @@ case "$action" in
     done
     if [[ "$active_enrollment" == false && "$retained_custody" == false ]]; then
       rm -f -- \
+        "$root/usr/bin/bloom-ceremonies" \
         "$root/usr/bin/bloom-uninstall" \
         "$root/usr/libexec/bloom/bloom-linux-maintenance"
       rm -rf -- "$root/usr/libexec/bloom/releases"

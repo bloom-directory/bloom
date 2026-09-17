@@ -900,6 +900,7 @@ impl DaemonPetalHost {
             .map_err(|error| HostError::Invalid(error.to_string()))?;
         let prepared = broker
             .prepare_approval(bloom_broker_api::ApprovalPrepareRequest {
+                surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
                 operation_id,
                 terms,
                 canonical_plan_facts_digest: plan_digest,
@@ -1590,6 +1591,7 @@ impl PetalHost for DaemonPetalHost {
             .prepare_custody(
                 bloom_machine_client::CustodyPrepareMethod::KeyDerive,
                 bloom_broker_api::CustodyPrepareRequest {
+                    surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
                     ceremony_kind: bloom_broker_api::CeremonyKind::KeyDerive,
                     custody_operation_id: custody_operation_id.clone(),
                     wallet_id: Some(wallet_id),
@@ -4333,6 +4335,7 @@ impl Daemon {
                 env!("CARGO_PKG_VERSION"),
                 wallet_projections.clone(),
             )
+            .with_ceremony_broker(broker.clone())
             .with_solana_chains(solana_chain_registry.clone())
             .with_mempool_statuses(initial_mempool_statuses)
             .with_update_snapshot_fn(Arc::new(move || {
@@ -5912,6 +5915,15 @@ mod tests {
                         }
                         Ok(MachineBrokerResponse::CustodyResult(
                             bloom_broker_api::CustodyResult {
+                                surface: Some(bloom_broker_api::CeremonySurfaceRef {
+                                    surface_id: bloom_broker_api::Token::new("local").unwrap(),
+                                    identity_digest: bloom_broker_api::Digest32::from_bytes(
+                                        [0; 32],
+                                    ),
+                                }),
+                                credential_authority_generation: Some(
+                                    bloom_broker_api::DecimalU64::new(0),
+                                ),
                                 ceremony_kind: bloom_broker_api::CeremonyKind::KeyDerive,
                                 custody_operation_id: request.operation_id,
                                 public_status: bloom_broker_api::CeremonyState::Succeeded,

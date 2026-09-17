@@ -1,4 +1,5 @@
 {
+  "relay_receipt_public_key_hex": null,
   "database_path": "/var/lib/bloom/@LOGIN_UID@/signer/signer.db",
   "broker_signing_key_id": "bloom-broker-signing-@LOGIN_UID@",
   "broker_signing_public_key_hex": "@BROKER_SIGNING_PUBLIC_KEY_HEX@",
