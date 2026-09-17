@@ -374,6 +374,9 @@ impl PricesClient {
                 "end_ts ({end_ts}) before start_ts ({start_ts})"
             )));
         }
+        if !is_period(period) {
+            return Err(PricesError::Api(format!("invalid period: {period}")));
+        }
         let span = end_ts.saturating_sub(start_ts);
         let url = format!(
             "{}/chart/{}?start={}&span={}&period={}",
@@ -472,9 +475,40 @@ impl PricesClient {
 
 /// Render a coin id to wire form, rejecting symbols / chains we can't
 /// resolve.
+/// True for a non-empty lowercase-alphanumeric-and-hyphen slug, matching
+/// every chain name and coingecko suffix this module's own tables ever
+/// produce. `wire_key`'s output is interpolated directly into a URL path,
+/// and DefiLlama's own wire format needs the literal `:`/`,` characters
+/// there, so this rejects anything URL-structurally-significant (`/`, `?`,
+/// `#`, `&`, whitespace, ...) up front rather than percent-encoding it,
+/// which would just send DefiLlama a different, malformed key.
+fn is_slug(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// True for DefiLlama's documented chart period syntax: a positive integer
+/// followed by a single unit letter (`"1h"`, `"4h"`, `"1d"`). `period` is
+/// interpolated directly into a query string; this rejects `&`/`=`/anything
+/// else that could inject or corrupt sibling query parameters.
+fn is_period(s: &str) -> bool {
+    let Some((digits, unit)) = s.split_at_checked(s.len().saturating_sub(1)) else {
+        return false;
+    };
+    !digits.is_empty()
+        && digits.bytes().all(|b| b.is_ascii_digit())
+        && unit.bytes().all(|b| b.is_ascii_alphabetic())
+}
+
 fn wire_key(coin: &CoinId) -> Result<String, PricesError> {
     match coin {
         CoinId::Erc20 { chain, address } => {
+            if !is_slug(chain) {
+                return Err(PricesError::InvalidCoinId(format!(
+                    "chain must be a lowercase alphanumeric/hyphen slug: {chain}"
+                )));
+            }
             if !address.starts_with("0x") && !address.starts_with("0X") {
                 return Err(PricesError::InvalidCoinId(format!(
                     "erc20 address must start with 0x: {address}"
@@ -482,8 +516,16 @@ fn wire_key(coin: &CoinId) -> Result<String, PricesError> {
             }
             Ok(format!("{}:{}", chain, address.to_lowercase()))
         }
-        CoinId::Native(s) => resolve_native(s)
-            .ok_or_else(|| PricesError::InvalidCoinId(format!("unknown native chain: {s}"))),
+        CoinId::Native(s) => {
+            let key = resolve_native(s)
+                .ok_or_else(|| PricesError::InvalidCoinId(format!("unknown native chain: {s}")))?;
+            match key.strip_prefix("coingecko:") {
+                Some(slug) if !is_slug(slug) => Err(PricesError::InvalidCoinId(format!(
+                    "coingecko slug must be a lowercase alphanumeric/hyphen slug: {s}"
+                ))),
+                _ => Ok(key),
+            }
+        }
         CoinId::Symbol(s) => resolve_symbol(s)
             .ok_or_else(|| PricesError::InvalidCoinId(format!("unknown symbol: {s}"))),
     }
@@ -646,6 +688,51 @@ mod tests {
         })
         .unwrap_err();
         assert!(matches!(err, PricesError::InvalidCoinId(_)));
+    }
+
+    #[test]
+    fn wire_key_rejects_a_chain_carrying_url_metacharacters() {
+        for chain in ["ethereum/../x", "ethereum?x=1", "ethereum&x=1", "eth ereum"] {
+            let err = wire_key(&CoinId::Erc20 {
+                chain: chain.into(),
+                address: "0xdeadbeef".into(),
+            })
+            .unwrap_err();
+            assert!(
+                matches!(err, PricesError::InvalidCoinId(_)),
+                "chain: {chain}"
+            );
+        }
+    }
+
+    #[test]
+    fn wire_key_accepts_known_multi_word_chain_slugs() {
+        assert_eq!(
+            wire_key(&CoinId::Erc20 {
+                chain: "matic-network".into(),
+                address: "0xdeadbeef".into(),
+            })
+            .unwrap(),
+            "matic-network:0xdeadbeef"
+        );
+    }
+
+    #[test]
+    fn wire_key_rejects_a_native_coingecko_suffix_carrying_url_metacharacters() {
+        let err = wire_key(&CoinId::Native("coingecko:eth/../x".into())).unwrap_err();
+        assert!(matches!(err, PricesError::InvalidCoinId(_)));
+    }
+
+    #[test]
+    fn is_period_accepts_defillama_syntax_and_rejects_injection() {
+        assert!(is_period("1h"));
+        assert!(is_period("24h"));
+        assert!(is_period("1d"));
+        assert!(!is_period(""));
+        assert!(!is_period("1"));
+        assert!(!is_period("h"));
+        assert!(!is_period("1h&extra=1"));
+        assert!(!is_period("1 h"));
     }
 
     #[test]

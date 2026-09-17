@@ -24,13 +24,14 @@
 
 #![forbid(unsafe_code)]
 
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
 
+use governor::{DefaultDirectRateLimiter, Quota};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::Semaphore;
 use tracing::{debug, trace};
 use url::Url;
 
@@ -350,8 +351,7 @@ impl EtherscanConfig {
 pub struct EtherscanClient {
     cfg: Arc<EtherscanConfig>,
     http: reqwest::Client,
-    /// 1-permit-per-request semaphore that's permit-replenished on a tick.
-    limiter: Arc<RateLimiter>,
+    limiter: Arc<DefaultDirectRateLimiter>,
     /// Optional cache, used by `json_abi_for` (and any future cached
     /// helpers). Always-on read-through; misses fall back to the network.
     cache: Option<Arc<EtherscanCache>>,
@@ -364,45 +364,15 @@ impl std::fmt::Debug for EtherscanClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EtherscanClient")
             .field("cfg", &self.cfg)
-            .field("limiter", &self.limiter)
             .field("cache", &self.cache.is_some())
             .field("storage", &self.storage.is_some())
             .finish()
     }
 }
 
-#[derive(Debug)]
-struct RateLimiter {
-    sem: Arc<Semaphore>,
-    /// Per-permit hold time. Long-run throughput ≈ capacity / hold_ms.
-    hold: Duration,
-}
-
-impl RateLimiter {
-    fn new(per_sec: u32) -> Self {
-        let capacity = per_sec.max(1);
-        Self {
-            sem: Arc::new(Semaphore::new(capacity as usize)),
-            hold: Duration::from_millis(1000 / u64::from(capacity)),
-        }
-    }
-
-    /// Acquire one slot. The slot is released asynchronously after `hold`
-    /// elapses, so a sustained call rate of `capacity` permits per `hold`
-    /// window is enforced (≈ per_sec / sec).
-    async fn acquire(&self) {
-        let permit = self
-            .sem
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("limiter semaphore is never closed");
-        let hold = self.hold;
-        tokio::spawn(async move {
-            tokio::time::sleep(hold).await;
-            drop(permit);
-        });
-    }
+fn new_rate_limiter(per_sec: u32) -> DefaultDirectRateLimiter {
+    let capacity = NonZeroU32::new(per_sec).unwrap_or(NonZeroU32::MIN);
+    DefaultDirectRateLimiter::direct(Quota::per_second(capacity))
 }
 
 impl EtherscanClient {
@@ -421,7 +391,7 @@ impl EtherscanClient {
     /// Override the requests-per-second limit.
     pub fn with_rate_limit(mut self, per_sec: u32) -> Self {
         Arc::make_mut(&mut self.cfg).rate_limit_per_sec = per_sec;
-        self.limiter = Arc::new(RateLimiter::new(per_sec));
+        self.limiter = Arc::new(new_rate_limiter(per_sec));
         self
     }
 
@@ -431,7 +401,7 @@ impl EtherscanClient {
             .timeout(cfg.request_timeout)
             .build()
             .expect("reqwest client builder");
-        let limiter = Arc::new(RateLimiter::new(cfg.rate_limit_per_sec));
+        let limiter = Arc::new(new_rate_limiter(cfg.rate_limit_per_sec));
         Self {
             cfg: Arc::new(cfg),
             http,
@@ -482,7 +452,7 @@ impl EtherscanClient {
         action: &str,
         extra: &[(&str, String)],
     ) -> Result<Envelope, EtherscanError> {
-        self.limiter.acquire().await;
+        self.limiter.until_ready().await;
         let mut url = self.cfg.base_url.clone();
         {
             let mut q = url.query_pairs_mut();
@@ -1305,6 +1275,59 @@ mod tests {
         let cfg = EtherscanConfig::new("k".into());
         assert_eq!(cfg.base_url.as_str(), "https://api.etherscan.io/v2/api");
         assert_eq!(cfg.rate_limit_per_sec, 5);
+    }
+
+    // ---- Rate limiter -----------------------------------------------------
+    //
+    // `until_ready()` would make these sleep, so they assert through the
+    // limiter's synchronous `check()` instead: same governor state machine,
+    // no wall-clock dependence and nothing to make the suite flaky.
+
+    #[test]
+    fn rate_limiter_admits_one_full_burst_then_throttles() {
+        // `Quota::per_second(n)` carries a burst capacity of n, so the first
+        // n calls are admitted immediately and the next one is refused
+        // until the quota replenishes.
+        let limiter = new_rate_limiter(3);
+        for admitted in 0..3 {
+            assert!(
+                limiter.check().is_ok(),
+                "call {admitted} is inside the burst capacity"
+            );
+        }
+        assert!(
+            limiter.check().is_err(),
+            "the call past the burst capacity must be throttled"
+        );
+    }
+
+    #[test]
+    fn rate_limiter_treats_zero_per_second_as_one() {
+        // `NonZeroU32::new(0)` is `None`. Clamping to one preserves the
+        // hand-rolled limiter's `per_sec.max(1)` behaviour; unwrapping
+        // instead would panic on a caller-supplied zero.
+        let limiter = new_rate_limiter(0);
+        assert!(
+            limiter.check().is_ok(),
+            "a zero limit still admits one call"
+        );
+        assert!(
+            limiter.check().is_err(),
+            "a zero limit must not admit unlimited calls"
+        );
+    }
+
+    #[test]
+    fn with_rate_limit_rebuilds_the_live_limiter() {
+        // The setter has to replace the limiter, not just the recorded
+        // config: a stale limiter would keep enforcing the old quota.
+        let client = EtherscanClient::new("k".into()).with_rate_limit(1);
+        assert_eq!(client.cfg.rate_limit_per_sec, 1);
+        assert!(client.limiter.check().is_ok());
+        assert!(
+            client.limiter.check().is_err(),
+            "the narrowed quota must be the one actually enforced"
+        );
     }
 
     // ---- Live integration (gated) -----------------------------------------

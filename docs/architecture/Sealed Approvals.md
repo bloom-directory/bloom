@@ -97,6 +97,29 @@ call. Hash-only guest signing is unsupported. Machine may validate guest
 capabilities and provenance, but only Broker can authorize and only Signer can
 produce the signature.
 
+### Operation-class granularity and `fee_asset`
+
+A provenance operation class may name a `fee_asset`. That field is not a
+description of what the class *may* charge; it is a requirement on every
+claim in the class. Broker matches the class's `fee_asset` against the
+claim's `declared_fee` and denies the mismatches outright: a class with a
+`fee_asset` denies a claim declaring no fee (`FEE_REQUIRED`), a class
+without one denies a claim declaring a fee (`FEE_NOT_ALLOWED`), and a
+declared asset other than the named one is `FEE_ASSET_MISMATCH`.
+
+So a `fee_asset` is only correct on a class whose every operation is
+fee-bearing. Classes today are deliberately coarse — Hyperliquid signs
+cancels, leverage updates, and plain orders under the same
+`hyperliquid.agent_action` class as builder-fee orders, and the Petal emits
+a fee declaration only for the last of those — so naming a `fee_asset` on
+such a class denies most of its legitimate traffic. Enrollment therefore
+leaves shared classes fee-free, and the fee a builder order does declare is
+bound as a declared-value limit rather than through the class.
+
+Splitting a fee-bearing operation into its own operation class is what makes
+a `fee_asset` safe to assert. Adding one to a shared class is a breaking
+change to every non-fee route that signs under it.
+
 ## Ceremony and public projection
 
 Broker owns the canonical `http://localhost:18734` ceremony application,

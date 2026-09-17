@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import fcntl
+import hashlib
+import json
 import os
 import signal
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Coroutine, Mapping, Sequence
+from contextlib import contextmanager
+from collections.abc import Callable, Coroutine, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -45,6 +48,219 @@ class EvalRunContext:
     verifier_env: Mapping[str, str]
 
 
+#: The last WebAuthn signature counter a ceremony may use (u32 maximum).
+COUNTER_MAX = 0xFFFF_FFFF
+#: Recorded as the next counter once COUNTER_MAX is spent: nothing is left.
+COUNTER_EXHAUSTED = COUNTER_MAX + 1
+
+
+class CounterSidecar:
+    """The durable next-unused-WebAuthn-counter record for one authenticator.
+
+    A counter is spent per credential, not per eval. Two evals configured
+    with the same seed consume the same counter sequence, so they must share
+    one record and one lock; keying either by eval name lets both reserve the
+    same value, and Broker rejects the second assertion as a replay.
+
+    The file holds one integer and is written atomically through a temporary
+    in the same directory. Every reservation takes an exclusive lock on the
+    adjacent `.lock` file, re-reads the record, and writes strictly past it,
+    so concurrent reservations from any eval or process never return the same
+    counter.
+    """
+
+    SCHEMA = "bloom.eval.counter-sidecar.v1"
+    _KEY_DOMAIN = b"bloom.eval.counter-sidecar.v1\x00"
+
+    def __init__(self, path: Path) -> None:
+        self.path = path.expanduser()
+
+    @classmethod
+    def for_credential(
+        cls, seed_file: Path, directory: Path | None = None
+    ) -> "CounterSidecar":
+        """The sidecar for whichever credential `seed_file` derives.
+
+        Keyed by a domain-separated, truncated SHA-256 of the seed contents:
+        it identifies the credential without revealing the seed, and a copy
+        of the same seed at another path still maps to the same record.
+        """
+        try:
+            seed = seed_file.expanduser().read_bytes()
+        except OSError as error:
+            raise EvalError(
+                "BLOOM_EVAL_AUTHENTICATOR_SEED_FILE must be readable to key the "
+                f"counter sidecar: {error}"
+            ) from error
+        if not seed:
+            raise EvalError("authenticator seed file is empty")
+        digest = hashlib.sha256(cls._KEY_DOMAIN + seed).hexdigest()[:24]
+        base = cls.default_directory() if directory is None else directory
+        return cls(base / f"authenticator-{digest}.counter.json")
+
+    @staticmethod
+    def default_directory() -> Path:
+        """Where every checkout and entry point for this user keeps counters.
+
+        Per user, not per checkout: a clone or worktree of this repository
+        using the same seed must reach the same record, or it can spend a
+        counter another checkout already spent. `BLOOM_EVAL_COUNTER_DIR` moves
+        the directory (tests, CI); the file name inside it is always derived
+        from the credential.
+        """
+        return Path(
+            os.environ.get("BLOOM_EVAL_COUNTER_DIR", "~/.bloom/eval-counters")
+        ).expanduser()
+
+    @property
+    def lock_path(self) -> Path:
+        return self.path.with_name(self.path.name + ".lock")
+
+    @contextmanager
+    def locked(self) -> Iterator[None]:
+        """Hold the exclusive per-credential reservation lock."""
+        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        descriptor = os.open(self.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+    def read(self) -> int | None:
+        try:
+            raw = self.path.read_bytes()
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            raise EvalError(f"counter sidecar is unreadable: {error}") from error
+        try:
+            value = json.loads(raw)
+            counter = value["next_sign_count"]
+            schema = value["schema"]
+        except (json.JSONDecodeError, TypeError, KeyError) as error:
+            raise EvalError(f"counter sidecar is malformed: {error}") from error
+        if schema != self.SCHEMA:
+            raise EvalError(f"counter sidecar has unexpected schema {schema!r}")
+        if not isinstance(counter, int) or isinstance(counter, bool):
+            raise EvalError("counter sidecar next_sign_count is not an integer")
+        if not 1 <= counter <= COUNTER_EXHAUSTED:
+            raise EvalError("counter sidecar next_sign_count is out of range")
+        return counter
+
+    def _write_unlocked(self, next_counter: int, *, allow_equal: bool = False) -> None:
+        if not 1 <= next_counter <= COUNTER_EXHAUSTED:
+            raise EvalError("counter sidecar next_sign_count is out of range")
+        recorded = self.read()
+        if recorded is not None and (
+            next_counter < recorded or (next_counter == recorded and not allow_equal)
+        ):
+            # Never move a counter backwards or re-record it: the lower value
+            # may already have been accepted by Broker, and reusing it reads as
+            # a replay.
+            raise EvalError("refusing a non-advancing counter sidecar update")
+        body = json.dumps(
+            {"schema": self.SCHEMA, "next_sign_count": next_counter},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode() + b"\n"
+        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        temporary = self.path.with_name(f".{self.path.name}.new-{os.getpid()}")
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(body)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, self.path)
+            os.chmod(self.path, 0o600)
+            directory = os.open(self.path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        finally:
+            if temporary.exists():
+                temporary.unlink()
+
+    def write(self, next_counter: int) -> None:
+        """Record `next_counter`, strictly advancing, under the lock."""
+        with self.locked():
+            self._write_unlocked(next_counter)
+
+    def reserve(self, candidate: int) -> int:
+        """Atomically claim a counter; return the one the caller must sign with.
+
+        Under the lock, signs with the larger of `candidate` and the recorded
+        next counter, then records the one after it before returning. Another
+        eval or process that already spent `candidate` therefore pushes this
+        caller onto a fresh counter instead of a replay.
+        """
+        if candidate < 1:
+            raise EvalError("authenticator counter candidate must be positive")
+        with self.locked():
+            recorded = self.read()
+            attempt = candidate if recorded is None else max(candidate, recorded)
+            if attempt > COUNTER_MAX:
+                raise EvalError(
+                    "authenticator counter is exhausted: every 32-bit WebAuthn "
+                    "counter for this credential has been spent"
+                )
+            self._write_unlocked(attempt + 1)
+            return attempt
+
+    def reserve_block(self, candidate: int, count: int) -> int:
+        """Atomically claim `count` consecutive counters; return the first.
+
+        The whole range is recorded as spent before this returns, so no other
+        eval or process on the credential can take a counter inside it. A run
+        that reserves its full ceremony budget this way can never be left
+        without the counter its own cleanup needs. Nothing is written when the
+        range does not fit.
+        """
+        if candidate < 1 or count < 1:
+            raise EvalError("authenticator counter reservation must be positive")
+        try:
+            with self.locked():
+                recorded = self.read()
+                start = candidate if recorded is None else max(candidate, recorded)
+                if start + count - 1 > COUNTER_MAX:
+                    remaining = max(0, COUNTER_MAX - start + 1)
+                    raise EvalError(
+                        f"authenticator counter {start} leaves {remaining} usable "
+                        f"counter(s), but this run needs {count} including its "
+                        f"cleanup; the last usable WebAuthn counter is {COUNTER_MAX}"
+                    )
+                self._write_unlocked(start + count)
+                return start
+        except OSError as error:
+            raise EvalError(
+                "authenticator counter sidecar is not writable, so this run's "
+                f"counters could not be reserved: {error}"
+            ) from error
+
+    def verify_writable(self) -> None:
+        """Prove a reservation can land, without moving the counter.
+
+        Takes the same lock a reservation takes, so an unwritable lock file
+        is caught here too.
+        """
+        with self.locked():
+            recorded = self.read()
+            if recorded is None:
+                # Nothing recorded yet: prove the directory accepts a write by
+                # creating and removing the same temporary a commit would use.
+                probe = self.path.with_name(f".{self.path.name}.probe-{os.getpid()}")
+                descriptor = os.open(probe, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                os.close(descriptor)
+                probe.unlink()
+                return
+            self._write_unlocked(recorded, allow_equal=True)
+
+
 class EvalDefinition(ABC):
     """Trusted host-side lifecycle for one kind of Harbor evaluation.
 
@@ -64,12 +280,257 @@ class EvalDefinition(ABC):
         """Validate prerequisites without creating external authority."""
 
     @abstractmethod
+    def preauthorization_preflight(self) -> None:
+        """Verify installed ownership and provenance; never inspect wallet policy."""
+
+    @abstractmethod
     def provision(self, agent_name: str) -> EvalRunContext:
         """Create the least-authority capability and return Harbor inputs."""
 
     @abstractmethod
     def cleanup(self) -> None:
         """Remove residual side effects and revoke the provisioned capability."""
+
+    # ---- WebAuthn counter reservation -------------------------------------
+    #
+    # Every ceremony this harness drives spends one authenticator counter.
+    # Broker rejects a reused counter as a replay, so a counter must be
+    # treated as spent from the moment the driver could possibly reach
+    # Broker -- not once it returns. Both live Hyperliquid evals reserve
+    # through these two methods so the durability rule has one definition.
+
+    #: Set by the operator to persist the next unused counter durably.
+    #: `None` when the eval is driven without an operator state file.
+    counter_committed: Callable[[int], None] | None = None
+    #: Set by the operator to prove that persistence works, without
+    #: advancing anything. `None` when there is no sidecar to check.
+    counter_durability_check: Callable[[], None] | None = None
+    #: The first counter this run has not consumed.
+    next_sign_count: int | None = None
+
+    def attach_counter_sidecar(
+        self,
+        sidecar: "CounterSidecar",
+        *,
+        mirror: Callable[[int], None] | None = None,
+        also_verify: Callable[[], None] | None = None,
+    ) -> None:
+        """Reserve this run's counters through the per-credential `sidecar`.
+
+        Reservation, durability check, and the resume floor all go through
+        the same record and lock, so every eval and entry point sharing the
+        authenticator draws from one counter sequence.
+
+        `mirror`, when given, is told the next unused counter after each
+        reservation lands in the shared record; the operator lifecycle uses it
+        to keep its own state file at or above everything reserved.
+        `also_verify` adds that second store to the durability check.
+        """
+
+        def reserve(candidate: int) -> int:
+            attempted = sidecar.reserve(candidate)
+            if mirror is not None:
+                mirror(attempted + 1)
+            return attempted
+
+        def reserve_block(candidate: int, count: int) -> int:
+            first = sidecar.reserve_block(candidate, count)
+            if mirror is not None:
+                mirror(first + count)
+            return first
+
+        def verify() -> None:
+            sidecar.verify_writable()
+            if also_verify is not None:
+                also_verify()
+
+        self.counter_reserve = reserve
+        self.counter_reserve_block = reserve_block
+        self.counter_committed = None
+        self.counter_durability_check = verify
+        self.counter_floor = sidecar.read
+
+    #: Atomically claims a counter and returns the one to sign with.
+    counter_reserve: Callable[[int], int] | None = None
+    #: Atomically claims `count` consecutive counters and returns the first.
+    counter_reserve_block: Callable[[int, int], int] | None = None
+    #: The counter range this run owns, once preflight has reserved it.
+    _counter_block_next: int | None = None
+    _counter_block_end: int | None = None
+    #: Returns a durably recorded next-unused counter, if one exists.
+    counter_floor: Callable[[], int | None] | None = None
+    #: The most ceremonies one run of this eval may spend, cleanup included.
+    #: Each eval must declare it; there is no safe default.
+    CEREMONY_BUDGET: int | None = None
+
+    def require_counter_capacity(self, start: int) -> int:
+        """Fail unless `start` leaves a valid counter for every ceremony.
+
+        Mandatory cleanup spends counters too. Starting a run that cannot
+        finish would let its first ceremony create authority -- a live grant
+        -- that its cleanup then has no valid counter to reconcile.
+        """
+        budget = self._require_ceremony_budget()
+        if start + budget - 1 > COUNTER_MAX:
+            remaining = max(0, COUNTER_MAX - start + 1)
+            raise EvalError(
+                f"authenticator counter {start} leaves {remaining} usable "
+                f"counter(s), but {self.name} can need {budget} including its "
+                f"cleanup; the last usable WebAuthn counter is {COUNTER_MAX}"
+            )
+        return start
+
+    def _require_ceremony_budget(self) -> int:
+        budget = self.CEREMONY_BUDGET
+        if not isinstance(budget, int) or isinstance(budget, bool) or budget < 1:
+            raise EvalError(f"{self.name} does not declare its ceremony budget")
+        return budget
+
+    def reserve_run_counters(self, start: int) -> int:
+        """Claim this run's whole ceremony budget before any authority exists.
+
+        A capacity check that does not reserve is only advisory: two evals on
+        one passkey can both pass it near the top of the range, and one can
+        then spend the counters the other's mandatory cleanup needs after its
+        grant already exists. Reserving the full budget atomically under the
+        credential lock makes that range this run's alone. Counters it never
+        uses are skipped, which is safe; reuse is not.
+
+        Returns the first counter of the range. Called as preflight's last
+        step. Without a shared sidecar -- the operator lifecycle, which runs
+        one eval under its own lock -- there is no competing eval to reserve
+        against, and capacity was already checked.
+        """
+        budget = self._require_ceremony_budget()
+        if self.counter_reserve_block is None:
+            return start
+        if self._counter_block_end is not None:
+            return self._counter_block_next
+        first = self.counter_reserve_block(start, budget)
+        self._counter_block_next = first
+        self._counter_block_end = first + budget
+        return first
+
+    def resume_counter(self, configured: int) -> int:
+        """The first counter safe to attempt this process.
+
+        Takes the larger of the configured counter and any durably recorded
+        one. A recorded counter is the record of what a previous process
+        already spent, so starting below it replays; an operator raising
+        the configured value above it is still honoured.
+        """
+        if self.counter_floor is None:
+            return configured
+        recorded = self.counter_floor()
+        if recorded is None:
+            return configured
+        return max(configured, recorded)
+
+    def require_counter_durability(self) -> None:
+        """Fail preflight unless a reserved counter can actually be persisted.
+
+        `reserve_counter` commits before invoking the driver precisely so an
+        interrupted run cannot reuse a counter. That guarantee is only as
+        good as the sidecar write behind `counter_committed`: if the
+        operator state file is read-only, or its directory is not writable,
+        the commit raises *after* the assertion may already have reached
+        Broker. The counter is then spent at Broker but not recorded, and
+        the next run starts from a counter Broker will reject as a replay.
+
+        Checking it here converts that into a clean refusal before any
+        authority is created. An eval driven without an operator state file
+        has nothing to verify and is left alone.
+        """
+        if self.counter_durability_check is None:
+            return
+        try:
+            self.counter_durability_check()
+        except EvalError:
+            raise
+        except Exception as error:  # noqa: BLE001 - reported, not swallowed
+            raise EvalError(
+                "authenticator counter sidecar is not writable, so a spent "
+                f"counter could not be recorded: {error}"
+            ) from error
+
+    def reserve_counter(self, candidate: int) -> int:
+        """Durably reserve a counter and return the next unused one.
+
+        The caller signs with the returned value minus one, which can exceed
+        `candidate` when a shared sidecar shows another eval or process
+        already spent it. Commits *before* the caller invokes the driver: the
+        assertion may reach Broker even if this process is interrupted or
+        times out before the subprocess returns, so persisting afterwards is
+        too late to guarantee the counter is never reused.
+        """
+        if self._counter_block_end is not None:
+            # Preflight already recorded this whole range as spent, so a
+            # ceremony inside it needs no further write and cannot collide.
+            attempted = max(candidate, self._counter_block_next)
+            if attempted >= self._counter_block_end:
+                raise EvalError(
+                    f"{self.name} tried to spend more than its budget of "
+                    f"{self.CEREMONY_BUDGET} ceremonies; refusing a counter "
+                    "outside its reserved range"
+                )
+            self._counter_block_next = attempted + 1
+        elif self.counter_reserve is not None:
+            attempted = self.counter_reserve(candidate)
+        else:
+            if candidate > COUNTER_MAX:
+                raise EvalError("authenticator counter is exhausted")
+            attempted = candidate
+            if self.counter_committed is not None:
+                self.counter_committed(attempted + 1)
+        reserved = attempted + 1
+        self.next_sign_count = reserved
+        return reserved
+
+    # ---- Wallet identity binding ------------------------------------------
+
+    def require_wallet_binding(
+        self,
+        addresses: Any,
+        owner_address: str,
+        *,
+        label: str = "BLOOM_EVAL_WALLET",
+    ) -> None:
+        """Fail unless the wallet id actually owns `owner_address`.
+
+        These evals address two different things by two different
+        identifiers: writes go to the Bloom wallet id, while the venue
+        projection that supplies independent evidence is keyed by the
+        on-chain address. Nothing else ties them together, so without this
+        an eval can authorize one wallet and grade another -- and still
+        look entirely consistent, because each half is valid on its own.
+
+        The projection's own trust markers are checked here too: a policy
+        that Broker has not verified, or a stale projection, is not
+        evidence about the wallet this run is about to touch.
+        """
+        if not isinstance(addresses, dict):
+            raise EvalError("eval wallet addresses projection is not a JSON object")
+        owner = addresses.get("owner")
+        if not isinstance(owner, str) or owner.lower() != owner_address:
+            raise EvalError(f"BLOOM_EVAL_WALLET_ID does not own {label}")
+        if addresses.get("policy_status") != "broker_verified":
+            raise EvalError("eval wallet policy is not Broker-verified")
+        if addresses.get("freshness") != "fresh":
+            raise EvalError("eval wallet policy projection is stale")
+
+    @staticmethod
+    def require_policy_digest(addresses: Mapping[str, Any], policy: Any) -> None:
+        """Fail unless the policy's digest matches its public projection.
+
+        Binds the policy bytes this eval validated to the digest Broker
+        published, so a policy file edited underneath the projection is
+        refused rather than trusted.
+        """
+        canonical = json.dumps(policy, sort_keys=True, separators=(",", ":")).encode()
+        if addresses.get("policy_digest") != hashlib.sha256(canonical).hexdigest():
+            raise EvalError(
+                "eval wallet policy digest does not match its public projection"
+            )
 
     def validate_result(self, result: Any) -> None:
         """Fail unless Harbor completed one error-free, positively graded trial."""
