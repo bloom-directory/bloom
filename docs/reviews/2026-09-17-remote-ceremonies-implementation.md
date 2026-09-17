@@ -60,7 +60,7 @@ Signer administrator client. It does not add Machine-to-Signer authority.
 | Signer | All-features workspace: 284 passed, one ignored. Existing isolated-origin harness suite: 180 passed, one ignored. Cargo-deny advisories, bans, licenses and sources passed. |
 | Relay borrower revision | 19 integration tests passed at `329b955454db23813e24b0947142c0398bed4b00`, with disposable PostgreSQL and actual opaque TLS tunneling. Server-only delivery follow-up is recorded separately. |
 | Machine projections | Final locked workspace: 1,669 passed, one ignored across 64 suites; strict all-target Clippy and the full-commit compatibility gate passed. CLI/VFS selections and status forwarding have focused coverage. |
-| Existing integrations | 38 passed across 14 non-release integration binaries; three local Solana-validator tests ignored because that validator was not running. |
+| Existing integrations | Final locked run: 38 passed across 14 non-release integration binaries; three local Solana-validator tests ignored because that validator was not running. |
 | Broker | 303 passed at `6f4d18713ee6b9b1dbb3cf14b1821e74cc448256`; exact-pin workspace check and strict Clippy passed. Three canonical listener tests require an isolated host. Five material tests cover TLS validation, atomic rotation and account-loss refusal. |
 | Browser wire | Four Node-executed browser tests passed, including both PRF legs decrypted by native Signer HPKE, pairing substitutions, forced adjacent assertion, scoped reload and recovery landing. This is not a real authenticator matrix. |
 | Packaging | Seven Linux packaging tests, twelve macOS release tests and staged macOS installer lifecycle passed. Supplemental Linux container execution passed 48 unchanged release tests, including signed bundle verification and rollback. |
@@ -69,9 +69,9 @@ Signer administrator client. It does not add Machine-to-Signer authority.
 Frozen-ref release builds and both macOS conformance runs must be recorded
 against the final review revisions. The supplemental Linux test
 workspace is not a substitute for the full Linux release build.
-Cross-repository GitHub validation currently cannot fetch the private relay
-repository. A read-only CI credential must be configured for dependent builds;
-repository visibility is not changed as a workaround.
+The initial cross-repository CI fetch failure was resolved when the repository
+owner made bloom-relay public. Final release and conformance runs are linked from
+the PR; no cross-repository credential workaround is required.
 
 ## Deployment prerequisites
 
