@@ -135,8 +135,6 @@ pub enum TxEngineError {
     InvalidFeeOverride(String),
     #[error("policy denied")]
     PolicyDenied,
-    #[error("broadcast disabled for chain '{0}' (set allow_broadcast=true)")]
-    BroadcastDisabled(String),
     #[error("broadcast approval required {0}")]
     ApprovalRequired(ApprovalRequirement),
     #[error("approval service unavailable: {0}")]
@@ -1785,17 +1783,6 @@ impl TxEngine {
             return Err(TxEngineError::EnsoQuoteStale { age });
         }
 
-        let spec = chain.spec();
-        if !spec.allow_broadcast {
-            debug!(
-                id = %staged.id,
-                wallet,
-                chain = %spec.name,
-                allow_broadcast = spec.allow_broadcast,
-                "tx.broadcast_disabled"
-            );
-            return Err(TxEngineError::BroadcastDisabled(spec.name.clone()));
-        }
         if !override_warnings {
             self.simulate_or_reject(&staged, chain).await?;
         }
@@ -1940,7 +1927,7 @@ impl TxEngine {
                 {
                     return Err(TxEngineError::EnsoQuoteStale { age });
                 }
-                self.ensure_broadcast_allowed(target.chain.spec())?;
+
                 if policy.private.enabled
                     && !matches!(
                         staged.chain_id,
@@ -2201,18 +2188,6 @@ impl TxEngine {
             return Err(TxEngineError::EnsoQuoteStale { age });
         }
 
-        // Broadcast gate: honor the per-chain setting.
-        let spec = chain.spec();
-        if !spec.allow_broadcast {
-            debug!(
-                id = %staged.id,
-                wallet,
-                chain = %spec.name,
-                allow_broadcast = spec.allow_broadcast,
-                "tx.broadcast_disabled"
-            );
-            return Err(TxEngineError::BroadcastDisabled(spec.name.clone()));
-        }
         // Pre-broadcast simulation first (no side effects): eth_call against
         // current state so a tx that would revert is caught here instead of
         // burning gas. The override sentinel forces it through.
@@ -2360,10 +2335,6 @@ impl TxEngine {
                 })
             }
             BroadcastTransport::PublicRpc => {
-                let spec = chain.spec();
-                if !spec.allow_broadcast {
-                    return Err(TxEngineError::BroadcastDisabled(spec.name.clone()));
-                }
                 if policy.private.enabled {
                     self.write_reconcile_ambiguous(
                         entry,
@@ -2764,7 +2735,7 @@ impl TxEngine {
         prepared: PreparedEvmTx,
     ) -> Result<B256, TxEngineError> {
         let kind = action_kind.broadcast_kind();
-        self.ensure_broadcast_allowed(chain.spec())?;
+
         if policy.private.enabled
             && !matches!(
                 staged.chain_id,
@@ -3447,13 +3418,6 @@ impl TxEngine {
     ) -> Result<Signature, TxEngineError> {
         self.triad_sign_evm_payload(entry, staged, action_kind, signing_preimage, signing_hash)
             .await
-    }
-
-    fn ensure_broadcast_allowed(&self, spec: &ChainSpec) -> Result<(), TxEngineError> {
-        if !spec.allow_broadcast {
-            return Err(TxEngineError::BroadcastDisabled(spec.name.clone()));
-        }
-        Ok(())
     }
 
     /// Refuse to broadcast when a same-chain dependency has not mined
@@ -5274,7 +5238,6 @@ mod tests {
             chain_id: 31337,
             rpc_urls: vec![url.into()],
             rpc_endpoints: Vec::new(),
-            allow_broadcast: true,
             etherscan_api_url: None,
             display_name: None,
             native_symbol: "ETH".into(),
@@ -6969,7 +6932,6 @@ mod tests {
             // Unreachable URL — the stub quoter doesn't hit the chain.
             rpc_urls: vec!["http://127.0.0.1:1".into()],
             rpc_endpoints: Vec::new(),
-            allow_broadcast: true,
             etherscan_api_url: None,
             display_name: None,
             native_symbol: "ETH".into(),
@@ -7005,7 +6967,6 @@ mod tests {
             // not depend on this being reachable.
             rpc_urls: vec!["http://127.0.0.1:1".into()],
             rpc_endpoints: Vec::new(),
-            allow_broadcast: true,
             etherscan_api_url: None,
             display_name: None,
             native_symbol: "ETH".into(),

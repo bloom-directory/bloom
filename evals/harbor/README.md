@@ -421,12 +421,12 @@ bloom-broker-debug-driver complete "$ceremony_url" \
 
 # Commit by replaying byte-identical bytes, then verify the public projection.
 cp "$policy_file" "$BLOOM_EVAL_BLOOM_MOUNT/wallets/$BLOOM_EVAL_WALLET_ID/policy.json"
-cat "$BLOOM_EVAL_BLOOM_MOUNT/wallets/$BLOOM_EVAL_WALLET_ID/addresses.json"
+cat "$BLOOM_EVAL_BLOOM_MOUNT/wallets/$BLOOM_EVAL_WALLET_ID/projection.json"
 cat "$BLOOM_EVAL_BLOOM_MOUNT/wallets/$BLOOM_EVAL_WALLET_ID/policy.json"
 
 # After the eval, repeat this same stage/approve/byte-identical replay process
 # with "$original_policy" and the next strictly greater WebAuthn counter. Verify
-# policy.json equals original_policy and addresses.json reports broker_verified.
+# policy.json equals original_policy and projection.json reports the authenticated policy metadata.
 ```
 
 The policy ceremony consumes the configured WebAuthn counter. Increment

@@ -3273,11 +3273,11 @@ impl ipc::BatchConfirmationService for CanonicalBatchConfirmation {
     }
 }
 
-/// The daemon's account-Petal seam: dispatch through the router, and the
-/// session inventory and stop over the local Petal key-state files plus the
-/// Broker edge. Listing, stat, and `session.json` reads never call Broker.
+/// The daemon's account-session seam: the session inventory and stop over
+/// the local Petal key-state files plus the Broker edge. Listing, stat, and
+/// `session.json` reads never call Broker. Installed Petals are dispatched
+/// only through the root `petals/` mount, never per account.
 struct AccountPetals {
-    router: Arc<PetalRouter>,
     runner: bloom_petals::PetalRunner,
     key_state_root: PathBuf,
     broker: Option<MachineBrokerClient>,
@@ -3501,10 +3501,6 @@ impl AccountPetals {
 
 #[async_trait::async_trait]
 impl AccountPetalMount for AccountPetals {
-    fn for_account(&self, account: AccountPetalContext) -> Arc<dyn bloom_vfs::handler::Handler> {
-        self.router.for_account(account)
-    }
-
     fn sessions(
         &self,
         account: &AccountPetalContext,
@@ -4426,22 +4422,16 @@ impl Daemon {
                 .map_err(|e| DaemonError::Audit(format!("petals runtime configuration: {e}")))?,
         );
         // Exactly one wallets handler exists and is mounted: the account
-        // Petal seam (dispatch through the router, sessions and stop over
-        // the key-state files and the Broker edge) is attached to it after
-        // both are built, rather than cloning a second instance the Petal
-        // host would not see.
+        // session seam (sessions and stop over the key-state files and the
+        // Broker edge) is attached to it after both are built, rather than
+        // cloning a second instance the Petal host would not see.
         let account_petals = Arc::new(AccountPetals {
-            router: petal_router.clone(),
             runner: petals.clone(),
             key_state_root: home.cache_dir().join("petal-key-requests"),
             broker: broker.clone(),
         });
         let active_session_slots: ipc::ActiveSessionSlots = {
             let guard = AccountPetals {
-                router: Arc::new(PetalRouter::new(
-                    petals.clone(),
-                    Arc::new(bloom_petals::DenyHost),
-                )),
                 runner: petals.clone(),
                 key_state_root: home.cache_dir().join("petal-key-requests"),
                 broker: None,
@@ -5659,7 +5649,7 @@ mod tests {
         }
 
         async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, bloom_vfs::handler::HandlerError> {
-            if path.segments().last().map(String::as_str) == Some("address") {
+            if path.segments().last().map(String::as_str) == Some("address.evm") {
                 Ok(b"0x0000000000000000000000000000000000000001\n".to_vec())
             } else {
                 Ok(b"owner-only-launch-token".to_vec())
@@ -5670,7 +5660,7 @@ mod tests {
             &self,
             _path: &VfsPath,
         ) -> Result<Vec<Entry>, bloom_vfs::handler::HandlerError> {
-            Ok(vec![Entry::file("address")])
+            Ok(vec![Entry::file("address.evm")])
         }
 
         async fn write(
@@ -6804,9 +6794,14 @@ mod tests {
             "normalized denied writes must never reach WalletsHandler"
         );
 
-        let adjacent = guest.vfs_read("wallets/alice/address").await.unwrap();
+        let adjacent = guest.vfs_read("wallets/alice/0/address.evm").await.unwrap();
         assert_eq!(adjacent, b"0x0000000000000000000000000000000000000001\n");
-        assert!(guest.vfs_lookup("wallets/alice/address").await.is_ok());
+        assert!(
+            guest
+                .vfs_lookup("wallets/alice/0/address.evm")
+                .await
+                .is_ok()
+        );
         assert!(guest.vfs_list("wallets/alice").await.is_ok());
     }
 
@@ -7284,7 +7279,6 @@ native_decimals = 18
 
 [solana_chains.solana-devnet]
 name = "solana-devnet"
-allow_broadcast = true
 expected_genesis_base58 = "{genesis_hash}"
 [[solana_chains.solana-devnet.endpoints]]
 url = "{rpc_endpoint}"
@@ -7906,9 +7900,9 @@ ws_url = "wss://example.invalid"
     }
 
     fn bs58_number(seed: u8) -> String {
-        // A syntactically distinct stand-in address; nothing parses it in
-        // these tests.
-        std::iter::repeat_n((b'A' + (seed % 26)) as char, 32).collect()
+        // The fixture Broker projects the address belonging to the same raw
+        // Ed25519 public-key bytes carried by the account SPKI.
+        bs58::encode([seed; 32]).into_string()
     }
 
     fn derived_account_public(child: &AccountChild) -> bloom_broker_api::DerivedAccountPublic {
@@ -8414,9 +8408,9 @@ allowed = ["bloom:vfs.read"]
             .with_petal_key_state_root(daemon.home.cache_dir().join("petal-key-requests"))
     }
 
-    /// 1. `wallets/w/1/petals/` dispatches through the mounted aware petal,
-    ///    and the identity chain the mount feeds — context to resolved
-    ///    owner — lands on account 1's family key.
+    /// 1. Alternating the owner key between accounts gives each account its
+    ///    own durable signing identity, and returning to an account reuses
+    ///    its identity.
     #[tokio::test]
     async fn alternating_accounts_have_distinct_durable_signing_requests() {
         let (_dir, daemon, broker) = isolation_daemon().await;
@@ -8459,37 +8453,12 @@ allowed = ["bloom:vfs.read"]
         );
     }
 
+    /// A route context naming account 1 resolves the owner to account 1's
+    /// family key.
     #[tokio::test]
-    async fn account_one_petal_dispatch_runs_aware_petals_and_resolves_account_one_owner() {
+    async fn account_one_route_context_resolves_account_one_owner() {
         let (_dir, daemon, broker) = isolation_daemon().await;
         let evm1 = broker.child(true, 1);
-
-        let message = daemon
-            .vfs
-            .read(&VfsPath::parse("/wallets/w/1/petals/echo/message.txt").unwrap())
-            .await
-            .unwrap();
-        assert_eq!(message, b"component");
-        let zero = daemon
-            .vfs
-            .read(&VfsPath::parse("/wallets/w/0/petals/echo/message.txt").unwrap())
-            .await
-            .unwrap();
-        assert_eq!(zero, b"component");
-
-        let account_one_petals = daemon
-            .vfs
-            .list(&VfsPath::parse("/wallets/w/1/petals").unwrap())
-            .await
-            .unwrap();
-        assert_eq!(
-            account_one_petals
-                .iter()
-                .map(|e| &e.name)
-                .collect::<Vec<_>>(),
-            &["echo"],
-            "only account-aware petals appear under account 1"
-        );
 
         let host = isolation_host(&daemon, broker.clone());
         let outcome = host
@@ -8660,33 +8629,50 @@ allowed = ["bloom:vfs.read"]
         );
     }
 
-    /// 7. An unaware petal is not found under account 1 and names the
-    ///    missing declaration, while account 0 and the flat mount still
-    ///    serve it.
+    /// 7. Installed Petals, account-aware or not, are served only from the
+    ///    root `petals/` mount: no numbered account lists, resolves, or
+    ///    dispatches a `petals/` subtree, while `sessions/` stays mounted.
     #[tokio::test]
-    async fn unaware_petal_is_not_found_under_account_one_only() {
+    async fn installed_petals_are_served_only_from_the_root_mount() {
         let (_dir, daemon, _broker) = isolation_daemon().await;
-        let error = daemon
-            .vfs
-            .read(&VfsPath::parse("/wallets/w/1/petals/plain/message.txt").unwrap())
-            .await
-            .unwrap_err();
-        let message = error.to_string();
-        assert!(message.contains("plain"), "{message}");
-        assert!(message.contains("[account] aware"), "{message}");
-
-        let zero = daemon
-            .vfs
-            .read(&VfsPath::parse("/wallets/w/0/petals/plain/message.txt").unwrap())
-            .await
-            .unwrap();
-        assert_eq!(zero, b"component");
-        let flat = daemon
-            .vfs
-            .read(&VfsPath::parse("/petals/plain/message.txt").unwrap())
-            .await
-            .unwrap();
-        assert_eq!(flat, b"component");
+        for number in [0, 1] {
+            let account = VfsPath::parse(&format!("/wallets/w/{number}")).unwrap();
+            let names: Vec<String> = daemon
+                .vfs
+                .list(&account)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect();
+            assert!(!names.iter().any(|name| name == "petals"), "{names:?}");
+            assert!(names.iter().any(|name| name == "sessions"), "{names:?}");
+            for mount in ["echo", "plain"] {
+                for path in [
+                    format!("/wallets/w/{number}/petals"),
+                    format!("/wallets/w/{number}/petals/{mount}"),
+                    format!("/wallets/w/{number}/petals/{mount}/message.txt"),
+                ] {
+                    let path = VfsPath::parse(&path).unwrap();
+                    assert!(
+                        matches!(
+                            daemon.vfs.lookup(&path).await,
+                            Err(bloom_vfs::handler::HandlerError::NotFound(_))
+                        ),
+                        "lookup {path}"
+                    );
+                    assert!(daemon.vfs.read(&path).await.is_err(), "read {path}");
+                }
+            }
+        }
+        for mount in ["echo", "plain"] {
+            let flat = daemon
+                .vfs
+                .read(&VfsPath::parse(&format!("/petals/{mount}/message.txt")).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(flat, b"component", "{mount}");
+        }
     }
 
     /// 8. Legacy flat dispatch on a two-child wallet signs with account 0
@@ -8924,10 +8910,6 @@ allowed = ["bloom:vfs.read"]
             bloom_petals::PetalVm::new().unwrap(),
         );
         let restarted = AccountPetals {
-            router: Arc::new(PetalRouter::new(
-                runner.clone(),
-                Arc::new(bloom_petals::DenyHost),
-            )),
             runner,
             key_state_root: home.cache_dir().join("petal-key-requests"),
             broker: Some(MachineBrokerClient::new(broker.clone())),

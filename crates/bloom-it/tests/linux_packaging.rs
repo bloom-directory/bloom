@@ -286,21 +286,9 @@ fn service_sandboxes_remove_machine_and_network_authority() {
     assert!(signer.contains("PrivateNetwork=yes"));
     assert!(signer.contains("RestrictAddressFamilies=AF_UNIX"));
     assert!(!signer.contains("IPAddressAllow="));
-
-    let aws_path = "systemd/instance-dropins/bloom-signer@LOGIN_UID.service.d/50-aws-kms.conf.in";
-    let aws = source(aws_path);
-    assert!(
-        aws_path.contains("bloom-signer@LOGIN_UID.service.d/"),
-        "AWS drop-in source must render onto an instance of bloom-signer@.service"
-    );
-    assert!(aws.contains("IPAddressDeny=any"));
-    assert!(aws.contains("PrivateNetwork=no"));
-    assert!(aws.contains("@AWS_KMS_IP_ALLOW_DIRECTIVES@"));
-    assert!(aws.contains("LoadCredential=aws-credentials:"));
-    assert!(
-        !aws.contains("IPAddressAllow=any"),
-        "AWS profile must not permit wildcard egress"
-    );
+    // The released Signer has no network backend, so no profile may relax
+    // its AF_UNIX-only sandbox.
+    assert!(!packaging_root().join("systemd/instance-dropins").exists());
 }
 
 #[test]

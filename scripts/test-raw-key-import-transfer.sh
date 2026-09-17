@@ -145,7 +145,6 @@ nfs_port="$(free_port)"
   printf 'chain_id = 31337\n'
   printf 'rpc_urls = ["%s"]\n' "$rpc_url"
   printf 'rpc_endpoints = []\n'
-  printf 'allow_broadcast = true\n'
   printf 'display_name = "Anvil (local)"\n'
   printf 'native_symbol = "ETH"\n'
   printf 'native_decimals = 18\n'
@@ -242,16 +241,16 @@ printf '%s' "$updated_policy" | jq -e --arg dest "$RECIPIENT" '
 cast send --rpc-url "$rpc_url" --private-key "$FUNDER_PRIV_KEY" \
   "$expected_addr" --value 10ether >/dev/null || die "funding the imported address failed"
 sleep 0.25
-balance="$(wait_for_file "imported wallet balance" "/wallets/${wallet_id}/chains/anvil/balance")"
+balance="$(wait_for_file "imported wallet balance" "/wallets/${wallet_id}/0/chains/anvil/balance")"
 printf '%s' "$balance" | grep -q '^10' || die "imported wallet balance should start with 10: $balance"
 printf '%s' "$balance" | grep -q 'ETH' || die "imported wallet balance missing native symbol: $balance"
 
 # 8. Stage a native transfer from the imported wallet.
 intent="$(jq -nc --arg to "$RECIPIENT" \
   '{kind:"send", to:$to, value:"1 eth", chain:"anvil", usd_value_hint:"1"}')"
-vwrite "/wallets/${wallet_id}/chains/anvil/outbox/new.tx" "$intent" ||
+vwrite "/wallets/${wallet_id}/0/chains/anvil/outbox/new.tx" "$intent" ||
   die "staging the send intent failed"
-pending_dir="/wallets/${wallet_id}/chains/anvil/outbox/pending"
+pending_dir="/wallets/${wallet_id}/0/chains/anvil/outbox/pending"
 pending_id=""
 attempts=0
 while [ "$attempts" -lt 100 ]; do
@@ -284,7 +283,7 @@ printf '%s' "$ceremony" | jq -e '.approval_operation_id | test("^[0-9a-f]{64}$")
 vwrite "$confirm_path" "y" || die "post-ceremony confirm retry failed"
 
 # 11. The entry must reconcile into sent/ with a transaction hash.
-sent_dir="/wallets/${wallet_id}/chains/anvil/outbox/sent"
+sent_dir="/wallets/${wallet_id}/0/chains/anvil/outbox/sent"
 tx_hash="$(wait_for_file "broadcast transaction hash" "${sent_dir}/${pending_id}/tx_hash" | tr -d '[:space:]')"
 printf '%s' "$tx_hash" | grep -Eq '^0x[0-9a-f]{64}$' || die "malformed tx_hash: $tx_hash"
 terminal_ceremony="$(vcat "${sent_dir}/${pending_id}/ceremony.json")"
