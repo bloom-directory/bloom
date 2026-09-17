@@ -438,11 +438,11 @@ fn build(staging: &Path, output: &Path, key: &Path) -> std::process::Output {
         &compatibility,
         compatibility_source
             .replace(
-                "broker_commit = \"af06930e053a417ca332ab0beecf2b9afce1fd5a\"",
+                "broker_commit = \"7ee52d531639709b6bfb38af6c5f678c86123101\"",
                 &format!("broker_commit = \"{}\"", "22".repeat(20)),
             )
             .replace(
-                "signer_commit = \"941dd376568b52ccd269ecf495bcff7dcd9af504\"",
+                "signer_commit = \"ccc9adb3866b17b87d2774018dcfa015184b1918\"",
                 &format!("signer_commit = \"{}\"", "33".repeat(20)),
             ),
     )
@@ -912,7 +912,6 @@ fn installed_acceptance_runs_the_packaged_machine_runtime_negative() {
         "[chains.anvil]",
         "rpc_urls = [",
         "$rpc_port",
-        "allow_broadcast = true",
         "BLOOM_MA05_LEGACY_AUTHORITY_POISON",
         "legacy-before.manifest",
         "/usr/bin/fs_usage -w -f pathname >",

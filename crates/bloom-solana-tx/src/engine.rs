@@ -110,8 +110,6 @@ pub enum EngineError {
     Signer(String),
     #[error("invalid transfer: {0}")]
     Invalid(String),
-    #[error("broadcasting is disabled for chain '{0}' (operator release posture)")]
-    BroadcastDisabled(String),
 }
 
 /// Orchestrates the native SOL transfer lifecycle.
@@ -494,8 +492,10 @@ impl SolanaTransferEngine {
     ) -> Result<String, EngineError> {
         let operation_lock = self.operation_lock(wallet, id);
         let _operation_guard = operation_lock.lock().await;
-        if !self.client.allow_broadcast() {
-            return Err(EngineError::BroadcastDisabled(self.chain.clone()));
+        if self.client.configured_genesis().is_none_or(str::is_empty) {
+            return Err(EngineError::Invalid(
+                "cannot broadcast without an expected genesis hash".into(),
+            ));
         }
         let entry =
             self.outbox
