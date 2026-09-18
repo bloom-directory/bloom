@@ -83,19 +83,17 @@ Never replace this entry point with a single-binary `--all-features` build.
 
 Before merging changes to the release workflow, dispatch the branch with
 `dry_run=true`. That runs all three candidate builds and uploads Actions
-artifacts while skipping production signing and GitHub publication. Naming an
-existing tag builds that exact release source with the branch's reviewed
-orchestration. It does not create
-commits or tags. Installing a candidate additionally requires a trusted
-root-owned pin of its ephemeral key and the explicit
+artifacts while skipping production signing and GitHub publication. It does
+not create commits or tags. Installing a candidate additionally requires a
+trusted root-owned pin of its ephemeral key and the explicit
 `BLOOM_ALLOW_TEST_UNCLAIMED=true` installer opt-in.
 
 ## Sign and publish
 
 A `vX.Y.Z` tag push runs `release.yml`. A manual dispatch with `dry_run=false`
-retries an existing tag from the current default branch. The run builds the
-tag's exact source SHA using Linux x86_64, Linux aarch64, and `macos-15` arm64
-runners.
+retries an existing tag; select that tag as the workflow ref as well. The run
+must originate from the tagged commit and builds its exact source SHA using
+Linux x86_64, Linux aarch64, and `macos-15` arm64 runners.
 
 After all candidate builds succeed, the protected `production-release`
 environment supplies the release key only to the signing step. The isolated

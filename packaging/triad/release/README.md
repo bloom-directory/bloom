@@ -90,11 +90,10 @@ public key. GitHub Actions makes the release key available only to the protected
 x86_64, Linux aarch64, and macOS aarch64 together as a normal GitHub Release.
 
 Before merging release-workflow changes, dispatch the branch with
-`dry_run=true`. With a tag input, that path builds the tag's exact source using
-the branch's reviewed orchestration and an ephemeral test key,
+`dry_run=true`. That path builds the exact branch with an ephemeral test key,
 uploads the `test-unclaimed` candidate for inspection, and skips both the
-protected production-signing job and the publish job. Normal tag pushes and tag
-retries cannot select dry-run mode.
+protected production-signing job and the publish job. Normal tag pushes and
+tag retries cannot select dry-run mode.
 
 Before compiling, `release.sh` rejects the remaining forbidden production
 Machine features from the resolved normal/build Cargo graph. Bundle assembly

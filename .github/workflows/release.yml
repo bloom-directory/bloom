@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag to build exactly or retry (for example v0.3.0).'
+        description: 'Existing tag to retry when dry_run is false (for example v0.2.0).'
         required: false
         default: ''
         type: string
@@ -55,36 +55,23 @@ jobs:
           RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           EVENT_NAME: ${{ github.event_name }}
-          EVENT_REF: ${{ github.ref }}
           EVENT_SHA: ${{ github.sha }}
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run == 'true' && 'true' || 'false' }}
         run: |
           set -euo pipefail
           tag="$RELEASE_TAG"
-          git fetch --tags --force
           if [[ "$DRY_RUN" == "true" ]]; then
             [[ "$EVENT_NAME" == "workflow_dispatch" ]] || {
               echo "::error::release dry runs require workflow_dispatch"
               exit 1
             }
-            if [[ -n "$tag" ]]; then
-              if [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-                echo "::error::release tag must match vX.Y.Z, got: $tag"
-                exit 1
-              fi
-              git rev-parse -q --verify "refs/tags/$tag" >/dev/null || {
-                echo "::error::release tag does not exist: $tag"
-                exit 1
-              }
-              release_sha="$(git rev-parse "refs/tags/$tag^{commit}")"
-            else
-              release_sha="$(git rev-parse "$EVENT_SHA^{commit}")"
-            fi
+            release_sha="$(git rev-parse HEAD)"
           else
             if [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
               echo "::error::release tag must match vX.Y.Z, got: $tag"
               exit 1
             fi
+            git fetch --tags --force
             git rev-parse -q --verify "refs/tags/$tag" >/dev/null || {
               echo "::error::release tag does not exist: $tag"
               exit 1
@@ -93,26 +80,12 @@ jobs:
             # Supplied by the step environment above.
             # shellcheck disable=SC2153
             event_sha="$(git rev-parse "$EVENT_SHA^{commit}")"
-            if [[ "$EVENT_NAME" == "push" ]]; then
-              [[ "$release_sha" == "$event_sha" ]] || {
-                echo "::error::production release runs must originate from the tagged commit"
-                exit 1
-              }
-            else
-              [[ "$EVENT_REF" == "refs/heads/$DEFAULT_BRANCH" ]] || {
-                echo "::error::production release retries must run from $DEFAULT_BRANCH"
-                exit 1
-              }
-            fi
+            [[ "$release_sha" == "$event_sha" ]] || {
+              echo "::error::production release runs must originate from the tagged commit"
+              exit 1
+            }
             git fetch --force origin \
               "refs/heads/$DEFAULT_BRANCH:refs/remotes/origin/$DEFAULT_BRANCH"
-            if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
-              default_sha="$(git rev-parse "refs/remotes/origin/$DEFAULT_BRANCH^{commit}")"
-              [[ "$event_sha" == "$default_sha" ]] || {
-                echo "::error::production release retries must use the current $DEFAULT_BRANCH commit"
-                exit 1
-              }
-            fi
             git merge-base --is-ancestor \
               "$release_sha" \
               "refs/remotes/origin/$DEFAULT_BRANCH" || {
@@ -294,14 +267,6 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Check out release tooling
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
-        with:
-          ref: ${{ github.sha }}
-          path: release-tools
-          fetch-depth: 0
-          persist-credentials: false
-
       - name: Check out locked Broker
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
@@ -331,15 +296,6 @@ jobs:
             bloom-broker
             bloom-signer
 
-      - name: Add reviewed aarch64 release tooling to the locked source
-        run: |
-          set -euo pipefail
-          git -C bloom diff --quiet HEAD
-          git -C release-tools diff --quiet HEAD
-          git -C bloom update-index --assume-unchanged packaging/triad/release.sh
-          install -m 0755 release-tools/packaging/triad/release.sh \
-            bloom/packaging/triad/release.sh
-
       - name: Build signed Linux aarch64 candidate
         working-directory: bloom
         env:
@@ -366,10 +322,9 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Check out release tooling
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ needs.prepare.outputs.release_sha }}
           fetch-depth: 0
           persist-credentials: false
 
