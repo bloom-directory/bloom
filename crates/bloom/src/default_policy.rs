@@ -995,7 +995,9 @@ mod tests {
         assert_eq!(
             destinations,
             [
+                // pUSD, native USDC, USDC.e, and the Enso router.
                 "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb",
+                "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359",
                 "0x2791bca1f2de4661ed88a30c99a7a9449aa84174",
                 "0xf75584ef6673ad213a685a1b58cc0330b8ea22cf",
             ]

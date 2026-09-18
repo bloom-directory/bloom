@@ -109,13 +109,26 @@ const ENSO_ROUTER_V2_ARC_FAMILY: &str = "0xcfbaa9cfce952ca4f4069874ff1df8c05e37a
 /// Polymarket funds its deposit wallet on Polygon with a direct pUSD transfer,
 /// or an Enso swap after an exact ERC-20 approval. The pUSD and USDC.e
 /// addresses are Polymarket's own constants (`polymarket/eip712.rs` in the
-/// pinned release); the router is Enso Router V2. Funding from another token
-/// needs that token allowed separately.
+/// pinned release); the router is Enso Router V2.
+///
+/// The approval in a swap goes to the input token, so each token an owner can
+/// fund from needs its own entry. Native USDC is here because it is what a
+/// Polygon wallet normally holds — `eth_call` on it returns name "USD Coin",
+/// symbol "USDC" and 6 decimals — and onboarding otherwise fails at `confirm`
+/// on a destination denial. Funding from any other token still needs that
+/// token added.
 pub const POLYMARKET_POLICY_DESTINATIONS: &[PetalPolicyDestination] = &[
+    // pUSD, the CLOB collateral.
     PetalPolicyDestination {
         chain: "polygon",
         destination: "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb",
     },
+    // Native USDC (Circle).
+    PetalPolicyDestination {
+        chain: "polygon",
+        destination: "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359",
+    },
+    // USDC.e, the bridged token.
     PetalPolicyDestination {
         chain: "polygon",
         destination: "0x2791bca1f2de4661ed88a30c99a7a9449aa84174",

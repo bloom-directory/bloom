@@ -100,12 +100,17 @@ Agreed on 2026-09-14:
       Optimism, and Polygon, a second on Linea, and a third shared by Arc,
       Robinhood Chain, and Tempo. Each address is Enso's published deployment,
       checked with `eth_getCode`, and never taken from a quote.
-    - Polymarket: pUSD, USDC.e, and Enso Router V2 on Polygon, for funding
-      its deposit wallet.
+    - Polymarket: pUSD, native USDC, USDC.e, and Enso Router V2 on Polygon,
+      for funding its deposit wallet. A swap's exact approval goes to the
+      input token, so each token an owner can fund from needs its own entry;
+      native USDC is included because it is what a Polygon wallet normally
+      holds.
 
     Destinations that change per transaction cannot be listed ahead of time:
-    an ERC-20 approval's token contract (other than USDC.e for Polymarket) and
-    NEAR Intents deposit addresses. Those still need a policy update.
+    the token contract for a swap from a token the catalog does not list, and
+    NEAR Intents deposit addresses. Those still need a policy update. A
+    transaction staged before such a change keeps its denial, so create a
+    fresh request afterwards rather than confirming the old one.
 
 ## Why it does not work today
 
