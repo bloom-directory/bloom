@@ -88,6 +88,9 @@ outer checksum, and refuses a private key that does not match the reviewed
 public key. GitHub Actions makes the release key available only to the protected
 `production-release` signing job. The tag workflow signs and publishes Linux
 x86_64, Linux aarch64, and macOS aarch64 together as a normal GitHub Release.
+The tag must contain this Linux aarch64-capable release driver: a retry executes
+the workflow and `release.sh` from the selected tag and does not backport newer
+release machinery into an existing release.
 
 Before merging release-workflow changes, dispatch the branch with
 `dry_run=true`. That path builds the exact branch with an ephemeral test key,

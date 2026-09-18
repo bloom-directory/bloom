@@ -1,10 +1,16 @@
 # Release process
 
-## Current release contract
+## Published v0.3.0 contract
 
-Bloom v0.3 releases contain signed triad bundles for **Linux x86_64**,
-**Linux aarch64**, and **macOS aarch64**. Each archive includes Machine
-(`bloom`), Broker, Signer,
+The existing Bloom v0.3.0 release contains signed triad bundles for
+**Linux x86_64** and **macOS aarch64**. Its tag predates Linux aarch64 release
+support, so retrying that tag cannot add an ARM artifact.
+
+## Release contract for subsequent tags
+
+A release tag containing this release machinery publishes signed triad bundles
+for **Linux x86_64**, **Linux aarch64**, and **macOS aarch64**. Each archive
+includes Machine (`bloom`), Broker, Signer,
 `bloom-signer-migrate`, public configuration templates, and installers. The
 published assets are:
 
@@ -94,6 +100,8 @@ A `vX.Y.Z` tag push runs `release.yml`. A manual dispatch with `dry_run=false`
 retries an existing tag; select that tag as the workflow ref as well. The run
 must originate from the tagged commit and builds its exact source SHA using
 Linux x86_64, Linux aarch64, and `macos-15` arm64 runners.
+The tag must contain the Linux aarch64 release driver; retries execute the
+workflow and `release.sh` checked into that tag rather than newer machinery.
 
 After all candidate builds succeed, the protected `production-release`
 environment supplies the release key only to the signing step. The isolated
