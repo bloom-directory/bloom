@@ -277,6 +277,12 @@ verify the committed policy and terminal status. Editing or reformatting the
 proposal creates a different request. Commands are in the policy-update
 walkthrough in `docs/examples.md`.
 
+A Petal operation that needs a policy change answers
+`POLICY_APPROVAL_REQUIRED` with a `ceremony_url` and status path. If that
+ceremony expires unapproved, retry the operation: Machine cancels the expired
+ceremony and answers with a new `ceremony_url`. Never give the owner an
+expired URL.
+
 ## Petals and paid requests
 
 Installed applications live under `petals/<name>/`. Discover the installed

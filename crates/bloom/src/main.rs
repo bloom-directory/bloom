@@ -9,6 +9,7 @@
 mod commands {
     pub mod qr;
 }
+mod default_policy;
 mod github_source;
 mod petal_provisioning;
 mod pf_monitor;
@@ -1126,6 +1127,9 @@ fn machine_command_event_fields(
             Some(operation_id.clone()),
             MachineCommandEventClass::DurableMutation,
         ),
+        MachineCommand::WalletDefaultPolicy { .. } => {
+            ("default_policy", None, MachineCommandEventClass::Prepared)
+        }
         MachineCommand::WalletOutboxCancel { id, .. } => (
             "wallet_outbox_cancel",
             Some(id.clone()),
@@ -1589,6 +1593,16 @@ async fn execute_machine_command(
         }
         MachineCommand::WalletPolicyCommit { operation_id } => {
             commit_policy_update(home, machine_broker()?, operation_id).await?
+        }
+        MachineCommand::WalletDefaultPolicy { name } => {
+            validate_wallet_name(&name).map_err(|error| {
+                machine_error(
+                    MachineErrorKind::InvalidParams,
+                    format!("wallet name must be a safe single path segment: {error:#}"),
+                )
+            })?;
+            let status = default_policy::advance_default_policy(daemon, &name).await?;
+            format!("{}\n", serde_json::to_string(&status)?)
         }
         MachineCommand::WalletOutboxCancel {
             wallet,
@@ -2633,6 +2647,9 @@ enum WalletCmd {
         #[arg(long)]
         raw_private_key: bool,
     },
+    /// Approve the default policy for a wallet: one policy ceremony that allows
+    /// the Petals chosen during setup. `new` and `import` run it for `main`.
+    DefaultPolicy { name: String },
     /// Convert a staged v1 passkey wallet into Signer-owned Triad custody.
     /// The receipt contains public binding data only; Machine never opens the
     /// legacy wallet directory.
@@ -3131,6 +3148,10 @@ async fn machine_command(
 
 async fn call_machine_command(endpoint: &ResolvedEndpoint, command: MachineCommand) -> Result<()> {
     let output = machine_command(endpoint, command).await?;
+    print_machine_command_output(&output)
+}
+
+fn print_machine_command_output(output: &MachineCommandOutput) -> Result<()> {
     std::io::Write::write_all(&mut std::io::stdout(), output.stdout.as_bytes())?;
     std::io::Write::write_all(&mut std::io::stderr(), output.stderr.as_bytes())?;
     if output.exit_code != 0 {
@@ -3289,9 +3310,32 @@ async fn run(cli: Cli) -> Result<()> {
             if !structured_service_output() {
                 eprintln!("{ALPHA_DISCLOSURE}");
             }
-            let (_home_permit, d) = build_write_daemon(home.clone()).context("init daemon")?;
+            // A missing config marks first-time setup, the only time the menu runs.
+            let first_setup = !home.config_path().exists();
+            let (_home_permit, mut d) = build_write_daemon(home.clone()).context("init daemon")?;
+            if first_setup {
+                if !structured_service_output() && default_policy::interactive_setup_available() {
+                    default_policy::run_setup_menu(
+                        &mut d.config.petals,
+                        &mut std::io::stdin().lock(),
+                        &mut std::io::stdout(),
+                    )?;
+                } else {
+                    default_policy::accept_setup_suggestions(&mut d.config.petals);
+                }
+                d.config
+                    .save(&d.home.config_path())
+                    .context("save setup choices")?;
+            }
+            let owners_before = default_policy::petal_owners(&d)?;
             let preinstalled = github_source::ensure_preinstalled_petals(&home, &d)
                 .context("provision canonical pre-installed Petals")?;
+            for message in default_policy::apply_setup_settings(&d, &owners_before, first_setup)
+                .await
+                .context("write Petal settings chosen during setup")?
+            {
+                println!("{message}");
+            }
             println!("home: {}", d.home.root().display());
             println!("config: {}", d.home.config_path().display());
             println!("chains: {:?}", d.chains.list_names());
@@ -3480,12 +3524,10 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Cmd::Wallet(WalletCmd::New { name }) => {
-            call_machine_command(
+            default_policy::create_wallet_then_default_policy(
                 &client_endpoint,
-                MachineCommand::WalletCustody {
-                    name,
-                    kind: MachineCustodyKind::New,
-                },
+                name,
+                MachineCustodyKind::New,
             )
             .await
         }
@@ -3493,12 +3535,20 @@ async fn run(cli: Cli) -> Result<()> {
             name,
             raw_private_key,
         }) => {
-            call_machine_command(
+            default_policy::create_wallet_then_default_policy(
                 &client_endpoint,
-                MachineCommand::WalletCustody {
-                    name,
-                    kind: wallet_import_kind(raw_private_key),
-                },
+                name,
+                wallet_import_kind(raw_private_key),
+            )
+            .await
+        }
+        Cmd::Wallet(WalletCmd::DefaultPolicy { name }) => {
+            // Wait out a policy lock another command holds; a ceremony this
+            // command opens extends the deadline to its own expiry.
+            default_policy::wait_for_default_policy(
+                &client_endpoint,
+                &name,
+                current_unix_ms().saturating_add(default_policy::POLICY_LOCK_GRACE_MS),
             )
             .await
         }
@@ -3925,7 +3975,9 @@ async fn run(cli: Cli) -> Result<()> {
                 let context = ready_context.clone();
                 *ready_provisioning.lock().expect("provisioning handle") =
                     Some(tokio::task::spawn_blocking(move || {
-                        petal_provisioning::provision(&daemon, &context)
+                        let results = petal_provisioning::provision(&daemon, &context);
+                        default_policy::apply_provisioned_settings(&daemon, &results);
+                        results
                     }));
             }));
             // Start audited and durable background effects only after every
