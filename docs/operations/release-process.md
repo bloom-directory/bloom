@@ -99,8 +99,9 @@ runners.
 
 After all candidate builds succeed, the protected `production-release`
 environment supplies the release key only to the signing step. The isolated
-`release.sh sign linux|linux-aarch64|macos` pass verifies candidate version, source revisions,
-and target architecture without executing candidate-owned code. It replaces
+`release.sh sign linux|linux-aarch64|macos` pass verifies candidate version,
+source revisions, and target architecture without executing candidate-owned
+code. It replaces
 the ephemeral inner signature, repacks deterministically, and signs the outer
 checksum with a private key matching the reviewed public key. All final
 archives are verified against that pin before publication.

@@ -40,7 +40,6 @@ jobs:
       release_tag: ${{ steps.meta.outputs.release_tag }}
       release_version: ${{ steps.meta.outputs.release_version }}
       release_sha: ${{ steps.meta.outputs.release_sha }}
-      tooling_sha: ${{ steps.meta.outputs.tooling_sha }}
       source_date_epoch: ${{ steps.meta.outputs.source_date_epoch }}
       broker_sha: ${{ steps.meta.outputs.broker_sha }}
       signer_sha: ${{ steps.meta.outputs.signer_sha }}
@@ -62,7 +61,6 @@ jobs:
         run: |
           set -euo pipefail
           tag="$RELEASE_TAG"
-          tooling_sha="$(git rev-parse "$EVENT_SHA^{commit}")"
           git fetch --tags --force
           if [[ "$DRY_RUN" == "true" ]]; then
             [[ "$EVENT_NAME" == "workflow_dispatch" ]] || {
@@ -80,7 +78,7 @@ jobs:
               }
               release_sha="$(git rev-parse "refs/tags/$tag^{commit}")"
             else
-              release_sha="$tooling_sha"
+              release_sha="$(git rev-parse "$EVENT_SHA^{commit}")"
             fi
           else
             if [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
@@ -149,7 +147,6 @@ jobs:
             echo "release_tag=$tag"
             echo "release_version=$version"
             echo "release_sha=$release_sha"
-            echo "tooling_sha=$tooling_sha"
             echo "source_date_epoch=$source_date_epoch"
             echo "broker_sha=$broker_sha"
             echo "signer_sha=$signer_sha"
@@ -289,7 +286,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Check out Machine release source
+      - name: Check out Machine
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           ref: ${{ needs.prepare.outputs.release_sha }}
@@ -297,10 +294,10 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Check out reviewed release tooling
+      - name: Check out release tooling
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
-          ref: ${{ needs.prepare.outputs.tooling_sha }}
+          ref: ${{ github.sha }}
           path: release-tools
           fetch-depth: 0
           persist-credentials: false
@@ -334,15 +331,22 @@ jobs:
             bloom-broker
             bloom-signer
 
+      - name: Add reviewed aarch64 release tooling to the locked source
+        run: |
+          set -euo pipefail
+          git -C bloom diff --quiet HEAD
+          git -C release-tools diff --quiet HEAD
+          git -C bloom update-index --assume-unchanged packaging/triad/release.sh
+          install -m 0755 release-tools/packaging/triad/release.sh \
+            bloom/packaging/triad/release.sh
+
       - name: Build signed Linux aarch64 candidate
+        working-directory: bloom
         env:
           SOURCE_DATE_EPOCH: ${{ needs.prepare.outputs.source_date_epoch }}
         run: |
           uname -m | grep -Fx aarch64
-          release-tools/packaging/triad/release.sh build linux-aarch64 \
-            --machine-root "$GITHUB_WORKSPACE/bloom" \
-            --broker-root "$GITHUB_WORKSPACE/bloom-broker" \
-            --signer-root "$GITHUB_WORKSPACE/bloom-signer" \
+          packaging/triad/release.sh build linux-aarch64 \
             --output-dir "$RUNNER_TEMP/candidate"
 
       - name: Upload verified Linux aarch64 candidate
@@ -362,19 +366,10 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Check out reviewed release tooling
+      - name: Check out release tooling
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
-          ref: ${{ needs.prepare.outputs.tooling_sha }}
-          path: release-tools
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Check out release source contract
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
-        with:
-          ref: ${{ needs.prepare.outputs.release_sha }}
-          path: bloom
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -408,34 +403,31 @@ jobs:
           trap 'rm -f -- "$signing_key"' EXIT
           printf '%s\n' "$RELEASE_SIGNING_KEY" > "$signing_key"
           unset RELEASE_SIGNING_KEY
-          release-tools/packaging/triad/release.sh sign linux \
+          packaging/triad/release.sh sign linux \
             candidate/linux/bloom-triad-test-unclaimed.tar.gz \
             --output-dir signed \
             --signing-key "$signing_key" \
-            --pinned-public-key bloom/packaging/triad/release/bloom-release-v1.pub \
-            --release-root bloom/packaging/triad/release \
+            --pinned-public-key packaging/triad/release/bloom-release-v1.pub \
             --source-date-epoch "$SOURCE_DATE_EPOCH" \
             --version '${{ needs.prepare.outputs.release_version }}' \
             --machine-sha '${{ needs.prepare.outputs.release_sha }}' \
             --broker-sha '${{ needs.prepare.outputs.broker_sha }}' \
             --signer-sha '${{ needs.prepare.outputs.signer_sha }}'
-          release-tools/packaging/triad/release.sh sign macos \
+          packaging/triad/release.sh sign macos \
             candidate/macos/bloom-triad-test-unclaimed.tar.gz \
             --output-dir signed \
             --signing-key "$signing_key" \
-            --pinned-public-key bloom/packaging/triad/release/bloom-release-v1.pub \
-            --release-root bloom/packaging/triad/release \
+            --pinned-public-key packaging/triad/release/bloom-release-v1.pub \
             --source-date-epoch "$SOURCE_DATE_EPOCH" \
             --version '${{ needs.prepare.outputs.release_version }}' \
             --machine-sha '${{ needs.prepare.outputs.release_sha }}' \
             --broker-sha '${{ needs.prepare.outputs.broker_sha }}' \
             --signer-sha '${{ needs.prepare.outputs.signer_sha }}'
-          release-tools/packaging/triad/release.sh sign linux-aarch64 \
+          packaging/triad/release.sh sign linux-aarch64 \
             candidate/linux-aarch64/bloom-triad-test-unclaimed.tar.gz \
             --output-dir signed \
             --signing-key "$signing_key" \
-            --pinned-public-key bloom/packaging/triad/release/bloom-release-v1.pub \
-            --release-root bloom/packaging/triad/release \
+            --pinned-public-key packaging/triad/release/bloom-release-v1.pub \
             --source-date-epoch "$SOURCE_DATE_EPOCH" \
             --version '${{ needs.prepare.outputs.release_version }}' \
             --machine-sha '${{ needs.prepare.outputs.release_sha }}' \
@@ -446,29 +438,29 @@ jobs:
 
       - name: Verify signed archive against reviewed key
         run: |
-          bloom/packaging/triad/release/verify-bundle.sh \
+          packaging/triad/release/verify-bundle.sh \
             signed/bloom-triad-linux-x86_64.tar.gz \
             signed/bloom-triad-linux-x86_64.tar.gz.sha256 \
             signed/bloom-triad-linux-x86_64.tar.gz.sig \
-            bloom/packaging/triad/release/bloom-release-v1.pub
+            packaging/triad/release/bloom-release-v1.pub
           cmp \
-            bloom/packaging/triad/release/bloom-release-v1.pub \
+            packaging/triad/release/bloom-release-v1.pub \
             signed/bloom-triad-linux-x86_64.tar.gz.pub
-          bloom/packaging/triad/release/verify-bundle.sh \
+          packaging/triad/release/verify-bundle.sh \
             signed/bloom-triad-linux-aarch64.tar.gz \
             signed/bloom-triad-linux-aarch64.tar.gz.sha256 \
             signed/bloom-triad-linux-aarch64.tar.gz.sig \
-            bloom/packaging/triad/release/bloom-release-v1.pub
+            packaging/triad/release/bloom-release-v1.pub
           cmp \
-            bloom/packaging/triad/release/bloom-release-v1.pub \
+            packaging/triad/release/bloom-release-v1.pub \
             signed/bloom-triad-linux-aarch64.tar.gz.pub
-          bloom/packaging/triad/release/verify-bundle.sh \
+          packaging/triad/release/verify-bundle.sh \
             signed/bloom-triad-macos-aarch64.tar.gz \
             signed/bloom-triad-macos-aarch64.tar.gz.sha256 \
             signed/bloom-triad-macos-aarch64.tar.gz.sig \
-            bloom/packaging/triad/release/bloom-release-v1.pub
+            packaging/triad/release/bloom-release-v1.pub
           cmp \
-            bloom/packaging/triad/release/bloom-release-v1.pub \
+            packaging/triad/release/bloom-release-v1.pub \
             signed/bloom-triad-macos-aarch64.tar.gz.pub
 
       - name: Upload signed release assets

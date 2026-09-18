@@ -266,8 +266,8 @@ fn linux_aarch64_release_candidate_uses_tagged_source_and_reviewed_tooling() {
     assert!(workflow.contains("runs-on: ubuntu-24.04-arm"));
     assert!(workflow.contains("uname -m | grep -Fx aarch64"));
     assert!(workflow.contains("ref: ${{ needs.prepare.outputs.release_sha }}"));
-    assert!(workflow.contains("ref: ${{ needs.prepare.outputs.tooling_sha }}"));
-    assert!(workflow.contains("--machine-root \"$GITHUB_WORKSPACE/bloom\""));
+    assert!(workflow.contains("path: release-tools"));
+    assert!(workflow.contains("install -m 0755 release-tools/packaging/triad/release.sh"));
     assert!(workflow.contains("name: triad-linux-aarch64-candidate"));
     assert!(workflow.contains("signed/bloom-triad-linux-aarch64.tar.gz"));
     assert!(workflow.contains("release_sha=\"$(git rev-parse \"refs/tags/$tag^{commit}\")\""));

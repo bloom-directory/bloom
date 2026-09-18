@@ -8,8 +8,8 @@ release_dir="$script_dir/release"
 usage() {
   cat >&2 <<'EOF'
 usage:
-  packaging/triad/release.sh build (linux|linux-aarch64|macos) --output-dir DIR [--machine-root DIR] [--broker-root DIR] [--signer-root DIR] [--source-date-epoch INTEGER] [--candidate-signing-key FILE]
-  packaging/triad/release.sh sign (linux|linux-aarch64|macos) CANDIDATE --output-dir DIR --signing-key FILE --pinned-public-key FILE --source-date-epoch INTEGER --version X.Y.Z --machine-sha SHA --broker-sha SHA --signer-sha SHA [--release-root DIR]
+  packaging/triad/release.sh build (linux|linux-aarch64|macos) --output-dir DIR [--broker-root DIR] [--signer-root DIR] [--source-date-epoch INTEGER] [--candidate-signing-key FILE]
+  packaging/triad/release.sh sign (linux|linux-aarch64|macos) CANDIDATE --output-dir DIR --signing-key FILE --pinned-public-key FILE --source-date-epoch INTEGER --version X.Y.Z --machine-sha SHA --broker-sha SHA --signer-sha SHA
 EOF
   exit 64
 }
@@ -103,9 +103,9 @@ require_staged_architecture() {
 }
 
 compatibility_revision() {
-  local key="$1" compatibility_file="$2" value
+  local key="$1" value
   value="$(sed -n -E "s/^${key} = \"([0-9a-f]{40})\"$/\\1/p" \
-    "$compatibility_file")"
+    "$release_dir/compatibility-v1.toml")"
   [[ "$value" =~ ^[0-9a-f]{40}$ ]] ||
     die "compatibility-v1.toml must contain exactly one valid $key"
   printf '%s\n' "$value"
@@ -198,10 +198,9 @@ build_candidate() {
   shift
   require_platform "$platform"
 
-  local machine_root="$main_root" workspace_root broker_root signer_root
-  local output_dir="" source_date_epoch
+  local workspace_root broker_root signer_root output_dir="" source_date_epoch
   local candidate_signing_key=""
-  workspace_root="$(dirname "$machine_root")"
+  workspace_root="$(dirname "$main_root")"
   broker_root="$workspace_root/bloom-broker"
   signer_root="$workspace_root/bloom-signer"
   source_date_epoch="${SOURCE_DATE_EPOCH:-1700000000}"
@@ -210,11 +209,6 @@ build_candidate() {
       --output-dir)
         [[ $# -ge 2 && -n "$2" ]] || usage
         output_dir="$2"
-        shift 2
-        ;;
-      --machine-root)
-        [[ $# -ge 2 && -n "$2" ]] || usage
-        machine_root="$2"
         shift 2
         ;;
       --broker-root)
@@ -245,21 +239,18 @@ build_candidate() {
     die "source date epoch must be an unsigned decimal integer" 64
 
   require_host_platform "$platform"
-  machine_root="$(cd "$machine_root" && pwd -P)"
   broker_root="$(cd "$broker_root" && pwd -P)"
   signer_root="$(cd "$signer_root" && pwd -P)"
-  require_clean_repository "$machine_root"
+  require_clean_repository "$main_root"
   require_clean_repository "$broker_root"
   require_clean_repository "$signer_root"
 
   local machine_sha broker_sha signer_sha pinned_broker_sha pinned_signer_sha artifact_name suffix
-  machine_sha="$(repository_head "$machine_root")"
+  machine_sha="$(repository_head "$main_root")"
   broker_sha="$(repository_head "$broker_root")"
   signer_sha="$(repository_head "$signer_root")"
-  local source_release_dir="$machine_root/packaging/triad/release"
-  local compatibility_file="$source_release_dir/compatibility-v1.toml"
-  pinned_broker_sha="$(compatibility_revision broker_commit "$compatibility_file")"
-  pinned_signer_sha="$(compatibility_revision signer_commit "$compatibility_file")"
+  pinned_broker_sha="$(compatibility_revision broker_commit)"
+  pinned_signer_sha="$(compatibility_revision signer_commit)"
   [[ "$broker_sha" == "$pinned_broker_sha" ]] ||
     die "Broker checkout $broker_sha does not match compatibility-v1.toml pin $pinned_broker_sha"
   [[ "$signer_sha" == "$pinned_signer_sha" ]] ||
@@ -273,13 +264,13 @@ build_candidate() {
   done
 
   local resolved_machine_features forbidden_feature
-  resolved_machine_features="$(cargo tree --manifest-path "$machine_root/Cargo.toml" -p bloom -e normal,build,features --prefix none)"
+  resolved_machine_features="$(cargo tree --manifest-path "$main_root/Cargo.toml" -p bloom -e normal,build,features --prefix none)"
   for forbidden_feature in unsigned-audit-test-seam audit-test-seam; do
     [[ "$resolved_machine_features" != *"feature \"$forbidden_feature\""* ]] ||
       die "forbidden production Machine feature resolved: $forbidden_feature"
   done
 
-  cargo build --manifest-path "$machine_root/Cargo.toml" --release -p bloom --locked
+  cargo build --manifest-path "$main_root/Cargo.toml" --release -p bloom --locked
   cargo build --manifest-path "$broker_root/Cargo.toml" --release -p bloom-broker --locked
   cargo build --manifest-path "$signer_root/Cargo.toml" --release -p bloom-signer --locked
 
@@ -288,7 +279,7 @@ build_candidate() {
   trap 'find "$work" -depth -delete' EXIT
   mkdir -p "$work/staging/bin" "$work/dist-a" "$work/dist-b" "$work/verified"
   for source in \
-    "$machine_root:bloom" \
+    "$main_root:bloom" \
     "$broker_root:bloom-broker" \
     "$signer_root:bloom-signer" \
     "$signer_root:bloom-signer-migrate"
@@ -306,9 +297,9 @@ build_candidate() {
     signing_key="$work/test-only-release-key"
     ssh-keygen -q -t ed25519 -N '' -f "$signing_key"
   fi
-  compatibility="$compatibility_file"
-  builder="$source_release_dir/build-bundle.sh"
-  verifier="$source_release_dir/verify-bundle.sh"
+  compatibility="$release_dir/compatibility-v1.toml"
+  builder="$release_dir/build-bundle.sh"
+  verifier="$release_dir/verify-bundle.sh"
   export BLOOM_MACHINE_SHA="$machine_sha"
   export BLOOM_BROKER_SHA="$broker_sha"
   export BLOOM_SIGNER_SHA="$signer_sha"
@@ -349,7 +340,6 @@ sign_candidate() {
 
   local output_dir="" signing_key="" pinned_public_key=""
   local source_date_epoch="" version="" machine_sha="" broker_sha="" signer_sha=""
-  local source_release_dir="$release_dir"
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --output-dir) [[ $# -ge 2 ]] || usage; output_dir="$2"; shift 2 ;;
@@ -360,7 +350,6 @@ sign_candidate() {
       --machine-sha) [[ $# -ge 2 ]] || usage; machine_sha="$2"; shift 2 ;;
       --broker-sha) [[ $# -ge 2 ]] || usage; broker_sha="$2"; shift 2 ;;
       --signer-sha) [[ $# -ge 2 ]] || usage; signer_sha="$2"; shift 2 ;;
-      --release-root) [[ $# -ge 2 ]] || usage; source_release_dir="$2"; shift 2 ;;
       *) usage ;;
     esac
   done
@@ -368,7 +357,6 @@ sign_candidate() {
   [[ -n "$output_dir" && -n "$signing_key" && -n "$pinned_public_key" &&
     -n "$source_date_epoch" && -n "$version" && -n "$machine_sha" &&
     -n "$broker_sha" && -n "$signer_sha" ]] || usage
-  source_release_dir="$(cd "$source_release_dir" && pwd -P)"
   [[ "$source_date_epoch" =~ ^[0-9]+$ ]] ||
     die "source date epoch must be an unsigned decimal integer" 64
   [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] ||
@@ -383,7 +371,7 @@ sign_candidate() {
   do
     require_regular_file "$revision"
   done
-  BLOOM_ALLOW_TEST_UNCLAIMED=true "$source_release_dir/verify-bundle.sh" \
+  BLOOM_ALLOW_TEST_UNCLAIMED=true "$release_dir/verify-bundle.sh" \
     "$candidate" "$candidate.sha256" "$candidate.sig" "$candidate.pub"
 
   local work payload expected source_line artifact_name output archive_tmp
@@ -431,7 +419,7 @@ sign_candidate() {
   esac
 
   rm -f -- "$payload/RELEASE_PUBLIC_KEY.pem" "$payload/RELEASE_SIGNATURE" "$payload/SHA256SUMS"
-  "$source_release_dir/ssh-ed25519-public-key.sh" "$signing_key" "$payload/RELEASE_PUBLIC_KEY.pem"
+  "$release_dir/ssh-ed25519-public-key.sh" "$signing_key" "$payload/RELEASE_PUBLIC_KEY.pem"
   cmp -s "$pinned_public_key" "$payload/RELEASE_PUBLIC_KEY.pem" ||
     die "release signing key does not match the reviewed public key"
   (
@@ -442,7 +430,7 @@ sign_candidate() {
         shasum -a 256 "$source_line"
       done
   ) >"$payload/SHA256SUMS"
-  "$source_release_dir/ssh-ed25519-sign.sh" \
+  "$release_dir/ssh-ed25519-sign.sh" \
     "$signing_key" bloom-release-payload-v1 "$payload/SHA256SUMS" "$payload/RELEASE_SIGNATURE"
   # shellcheck disable=SC2016
   find "$payload" -print0 |
@@ -474,7 +462,7 @@ sign_candidate() {
     cd "$output_dir"
     shasum -a 256 "$artifact_name" >"$artifact_name.sha256"
   )
-  "$source_release_dir/ssh-ed25519-sign.sh" \
+  "$release_dir/ssh-ed25519-sign.sh" \
     "$signing_key" bloom-release-archive-v1 "$output.sha256" "$output.sig"
   install -m 0644 "$pinned_public_key" "$output.pub"
   trap - EXIT

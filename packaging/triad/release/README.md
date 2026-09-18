@@ -80,12 +80,12 @@ signing or GitHub publication. Live candidate installation requires both a
 root-owned, non-writable pin of that artifact's ephemeral public key and the
 explicit `BLOOM_ALLOW_TEST_UNCLAIMED=true` installer opt-in.
 
-`release.sh sign linux|linux-aarch64|macos` is the isolated production signing pass. It never
-executes a candidate-owned binary or script. It verifies the expected version,
-source revisions, and target architecture, replaces the ephemeral inner
-signature, deterministically repacks the payload, signs the outer checksum,
-and refuses a private key that does not match the reviewed public key. GitHub
-Actions makes the release key available only to the protected
+`release.sh sign linux|linux-aarch64|macos` is the isolated production signing
+pass. It never executes a candidate-owned binary or script. It verifies the
+expected version, source revisions, and target architecture, replaces the
+ephemeral inner signature, deterministically repacks the payload, signs the
+outer checksum, and refuses a private key that does not match the reviewed
+public key. GitHub Actions makes the release key available only to the protected
 `production-release` signing job. The tag workflow signs and publishes Linux
 x86_64, Linux aarch64, and macOS aarch64 together as a normal GitHub Release.
 
