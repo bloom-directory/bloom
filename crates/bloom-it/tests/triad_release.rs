@@ -213,9 +213,11 @@ fn tag_release_builds_the_locked_triad_and_isolates_production_signing() {
     assert!(workflow.contains("repository: bloom-directory/bloom-signer"));
     assert!(workflow.contains("ref: ${{ needs.prepare.outputs.signer_sha }}"));
     assert!(workflow.contains("packaging/triad/release.sh build linux"));
+    assert!(workflow.contains("release.sh build linux-aarch64"));
     assert!(!workflow.contains("--platform-claim linux"));
     assert!(workflow.contains("environment: production-release"));
     assert!(workflow.contains("packaging/triad/release.sh sign linux"));
+    assert!(workflow.contains("packaging/triad/release.sh sign linux-aarch64"));
     assert!(workflow.contains("packaging/triad/release.sh build macos"));
     assert!(workflow.contains("packaging/triad/release.sh sign macos"));
     assert!(!workflow.contains("triad-release-gate.sh"));
@@ -228,7 +230,7 @@ fn tag_release_builds_the_locked_triad_and_isolates_production_signing() {
     assert!(workflow.contains("if: needs.prepare.outputs.dry_run != 'true'"));
     assert!(workflow.contains("release dry runs require workflow_dispatch"));
     assert!(workflow.contains(
-        "sign:\n    name: Sign reviewed candidates\n    needs: [prepare, build, build-macos]\n    if: needs.prepare.outputs.dry_run != 'true'"
+        "sign:\n    name: Sign reviewed candidates\n    needs: [prepare, build, build-macos, build-linux-aarch64]\n    if: needs.prepare.outputs.dry_run != 'true'"
     ));
     assert!(!workflow.contains("--all-features"));
     assert!(!workflow.contains("--clobber"));
@@ -236,6 +238,10 @@ fn tag_release_builds_the_locked_triad_and_isolates_production_signing() {
     assert!(workflow.contains("unset RELEASE_SIGNING_KEY"));
     assert!(workflow.contains("published asset $name is immutable"));
     assert!(workflow.contains("production release runs must originate from the tagged commit"));
+    assert!(workflow.contains("production release retries must run from $DEFAULT_BRANCH"));
+    assert!(
+        workflow.contains("production release retries must use the current $DEFAULT_BRANCH commit")
+    );
     assert!(workflow.contains("release contains unexpected assets"));
     assert!(workflow.contains("gh release view \"$TAG\" --json assets"));
     assert!(workflow.contains("grep -Fqx -- \"$name\" \"$existing/names\""));
@@ -252,6 +258,19 @@ fn tag_release_builds_the_locked_triad_and_isolates_production_signing() {
         fs::read_to_string(workspace().join(".github/workflows/propose-release.yml")).unwrap();
     assert!(proposal.contains("packaging/triad/release/compatibility-v1.toml"));
     assert!(proposal.contains("machine ="));
+}
+
+#[test]
+fn linux_aarch64_release_candidate_uses_tagged_source_and_reviewed_tooling() {
+    let workflow = fs::read_to_string(workspace().join(".github/workflows/release.yml")).unwrap();
+    assert!(workflow.contains("runs-on: ubuntu-24.04-arm"));
+    assert!(workflow.contains("uname -m | grep -Fx aarch64"));
+    assert!(workflow.contains("ref: ${{ needs.prepare.outputs.release_sha }}"));
+    assert!(workflow.contains("ref: ${{ needs.prepare.outputs.tooling_sha }}"));
+    assert!(workflow.contains("--machine-root \"$GITHUB_WORKSPACE/bloom\""));
+    assert!(workflow.contains("name: triad-linux-aarch64-candidate"));
+    assert!(workflow.contains("signed/bloom-triad-linux-aarch64.tar.gz"));
+    assert!(workflow.contains("release_sha=\"$(git rev-parse \"refs/tags/$tag^{commit}\")\""));
 }
 
 #[test]
