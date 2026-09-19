@@ -956,6 +956,11 @@ impl MachineBrokerClient {
         };
         terms.validate()?;
         self.prepare_approval(ApprovalPrepareRequest {
+            evm_review_payloads: if native_evm_review(&request.provenance) {
+                vec![Base64UrlBytes::from_bytes(&request.preimage)]
+            } else {
+                Vec::new()
+            },
             operation_id: request.approval_operation_id,
             terms,
             canonical_plan_facts_digest: request.canonical_plan_facts_digest,
@@ -1127,6 +1132,15 @@ impl MachineBrokerClient {
         };
         terms.validate()?;
         self.prepare_approval(ApprovalPrepareRequest {
+            evm_review_payloads: if native_evm_review(&request.provenance) {
+                request
+                    .preimages
+                    .iter()
+                    .map(|p| Base64UrlBytes::from_bytes(p))
+                    .collect()
+            } else {
+                Vec::new()
+            },
             operation_id: request.approval_operation_id,
             terms,
             canonical_plan_facts_digest: request.canonical_plan_facts_digest,
@@ -1281,6 +1295,7 @@ impl MachineBrokerClient {
         };
         terms.validate()?;
         self.prepare_approval(ApprovalPrepareRequest {
+            evm_review_payloads: Vec::new(),
             operation_id: request.approval_operation_id,
             terms,
             canonical_plan_facts_digest: request.canonical_plan_facts_digest,
@@ -2789,6 +2804,20 @@ fn response_identity_mismatch(method: &str) -> ProtocolError {
 
 fn service_unavailable(message: impl Into<String>) -> ProtocolError {
     ProtocolError::new(ProtocolErrorCode::ServiceUnavailable, message.into())
+}
+
+fn native_evm_review(provenance: &ProvenanceSubject) -> bool {
+    let class = match provenance {
+        ProvenanceSubject::Cli { command_class, .. } => command_class.as_str(),
+        ProvenanceSubject::System {
+            operation_class, ..
+        } => operation_class.as_str(),
+        ProvenanceSubject::Petal { .. } => return false,
+    };
+    matches!(
+        class,
+        "transaction.confirm" | "transaction.replace" | "transaction.cancel"
+    )
 }
 
 #[cfg(test)]
@@ -4331,6 +4360,7 @@ mod tests {
         let client = MachineBrokerClient::new(broker);
 
         let approval = ApprovalPrepareRequest {
+            evm_review_payloads: Vec::new(),
             operation_id: OperationId::from_bytes([94; 32]),
             terms: approval_terms("wallet", None),
             canonical_plan_facts_digest: digest(95),
