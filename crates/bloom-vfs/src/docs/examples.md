@@ -84,7 +84,7 @@ Creation remains subject to exact Broker approval; recipient allowlists do
 not grant deployment permission. Follow-up initialization calls are separate
 transactions and approvals. First add the numeric-chain policy opt-in through
 its normal ceremony: `{"chain":"evm-31337","destination":"exact"}` for Anvil.
-Machine and Broker must both support protocol 1.5.
+Machine and Broker must both support protocol 1.6.
 
 For an existing Foundry project, start the adapter in a separate terminal:
 
