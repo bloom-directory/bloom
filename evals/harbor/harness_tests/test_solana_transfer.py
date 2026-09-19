@@ -48,12 +48,30 @@ class SolanaEvalTestCase(unittest.TestCase):
         self.sweep.write_text("[1,2,3]")
         self.sweep.chmod(0o600)
 
-        outbox = (
-            Path(self.env()["BLOOM_EVAL_BLOOM_MOUNT"])
-            / "wallets" / WALLET_ID / "chains" / CHAIN / "outbox"
-        )
+        mount = Path(self.env()["BLOOM_EVAL_BLOOM_MOUNT"])
+        account_root = mount / "wallets" / WALLET_ID / "0" / "chains" / CHAIN
+        outbox = account_root / "outbox"
         outbox.mkdir(parents=True)
         (outbox / "new.tx").write_text("")
+        # The authenticated account projection the identity resolution reads:
+        # one active Solana child, numbered account directory 0.
+        (mount / "wallets" / WALLET_ID / "accounts.json").write_text(
+            json.dumps(
+                {
+                    "wallet_id": WALLET_ID,
+                    "accounts": [
+                        {
+                            "derivation_profile": "bip44-solana-slip10-ed25519-v1",
+                            "lifecycle": "ACTIVE",
+                            "public_key_fingerprint": FINGERPRINT,
+                            "path": DERIVATION,
+                            "number": 0,
+                        }
+                    ],
+                }
+            )
+        )
+        (account_root / "address").write_text(SOURCE + "\n")
 
     def env(self, **overrides: str) -> dict[str, str]:
         value = {
@@ -284,6 +302,7 @@ class LocalIdentityTests(SolanaEvalTestCase):
                     "lifecycle": "ACTIVE",
                     "public_key_fingerprint": FINGERPRINT,
                     "path": DERIVATION,
+                    "number": 0,
                 }
             ],
         }
@@ -296,6 +315,7 @@ class LocalIdentityTests(SolanaEvalTestCase):
         self.assertEqual(definition.source_address, SOURCE)
         self.assertEqual(definition.key_fingerprint, FINGERPRINT)
         self.assertEqual(definition.derivation_path, DERIVATION)
+        self.assertEqual(definition.account_dir, "0")
 
     def test_local_identity_refuses_multiple_active_solana_accounts(self) -> None:
         definition = self.make()
@@ -304,6 +324,7 @@ class LocalIdentityTests(SolanaEvalTestCase):
             "lifecycle": "ACTIVE",
             "public_key_fingerprint": FINGERPRINT,
             "path": DERIVATION,
+            "number": 0,
         }
         projection = {"wallet_id": WALLET_ID, "accounts": [account, account]}
         with mock.patch.object(definition.mount, "read_json", return_value=projection):
@@ -311,29 +332,19 @@ class LocalIdentityTests(SolanaEvalTestCase):
                 definition._load_local_account_identity()
 
     def test_a_configured_source_must_match_the_projected_account(self) -> None:
-        mount = Path(self.env()["BLOOM_EVAL_BLOOM_MOUNT"])
-        outbox = mount / "wallets" / WALLET_ID / "chains" / CHAIN / "outbox"
-        outbox.mkdir(parents=True, exist_ok=True)
-        (outbox / "new.tx").write_text("")
         definition = self.make(
             BLOOM_EVAL_SOLANA_HOME_ROOT=str(self.root),
             BLOOM_EVAL_SOLANA_SOURCE=DESTINATION,  # not the projected address
         )
 
-        def projected_identity() -> None:
-            definition.source_address = SOURCE
-
         with mock.patch("os.path.ismount", return_value=True):
             with mock.patch.object(definition, "_require_chain_identity"):
                 with mock.patch.object(definition, "_require_sign_count", return_value=2):
                     with mock.patch("harness.core.CeremonyDriver.preflight"):
-                        with mock.patch.object(
-                            definition,
-                            "_load_local_account_identity",
-                            side_effect=projected_identity,
-                        ):
-                            with self.assertRaisesRegex(EvalError, "does not match"):
-                                definition.preflight()
+                        # The setUp projection resolves to SOURCE; the pinned
+                        # BLOOM_EVAL_SOLANA_SOURCE disagrees and must fail.
+                        with self.assertRaisesRegex(EvalError, "projects"):
+                            definition.preflight()
 
 
 class ApproverMatchTests(SolanaEvalTestCase):
@@ -618,6 +629,7 @@ class ProvisionTests(SolanaEvalTestCase):
         definition.destination = DESTINATION
         definition.lamports = TRANSFER
         definition.source_address = SOURCE
+        definition.account_dir = "0"
         with mock.patch.object(definition, "_start_approver"):
             context = definition.provision("codex")
 
@@ -628,7 +640,8 @@ class ProvisionTests(SolanaEvalTestCase):
         # The pending entry id does not exist until the agent stages, so the
         # confirm path cannot be enumerated ahead of time; the subtree is.
         self.assertEqual(
-            outbox["target"], f"/bloom/wallets/{WALLET_ID}/chains/{CHAIN}/outbox"
+            outbox["target"],
+            f"/bloom/wallets/{WALLET_ID}/0/chains/{CHAIN}/outbox",
         )
         self.assertNotIn("read_only", outbox)
 
@@ -636,6 +649,7 @@ class ProvisionTests(SolanaEvalTestCase):
         definition = self.make()
         definition.destination = DESTINATION
         definition.source_address = SOURCE
+        definition.account_dir = "0"
         definition.key_fingerprint = FINGERPRINT
         with mock.patch.object(definition, "_start_approver"):
             context = definition.provision("codex")
@@ -656,6 +670,7 @@ class ProvisionTests(SolanaEvalTestCase):
         definition = self.make()
         definition.destination = DESTINATION
         definition.source_address = SOURCE
+        definition.account_dir = "0"
         with mock.patch.object(definition, "_start_approver"):
             context = definition.provision("codex")
 
@@ -668,6 +683,7 @@ class ProvisionTests(SolanaEvalTestCase):
         definition = self.make_mainnet()
         definition.destination = DESTINATION
         definition.source_address = SOURCE
+        definition.account_dir = "0"
         with mock.patch.object(definition, "_start_approver"):
             context = definition.provision("codex")
 
@@ -677,6 +693,7 @@ class ProvisionTests(SolanaEvalTestCase):
         definition = self.make()
         definition.destination = DESTINATION
         definition.source_address = SOURCE
+        definition.account_dir = "0"
         with mock.patch.object(definition, "_start_approver"):
             context = definition.provision("codex")
 
@@ -768,6 +785,7 @@ class ReusedWalletCleanupTests(SolanaEvalTestCase):
         definition = self.make()
         definition.destination = DESTINATION
         definition.source_address = SOURCE
+        definition.account_dir = "0"
         pending_reads = 0
 
         def listing(state: str) -> list[str]:
@@ -793,6 +811,7 @@ class ReusedWalletCleanupTests(SolanaEvalTestCase):
         definition = self.make()
         definition.destination = DESTINATION
         definition.source_address = SOURCE
+        definition.account_dir = "0"
         definition._baseline_sent = {"historical"}
 
         def listing(state: str) -> list[str]:
@@ -819,6 +838,7 @@ class ReusedWalletCleanupTests(SolanaEvalTestCase):
         definition = self.make()
         definition.destination = DESTINATION
         definition.source_address = SOURCE
+        definition.account_dir = "0"
         definition._baseline_sent = {"historical"}
         with mock.patch.object(definition, "_stop_approver"):
             with mock.patch.object(definition, "_list_state", return_value=[]):
@@ -830,6 +850,7 @@ class ReusedWalletCleanupTests(SolanaEvalTestCase):
         definition = self.make_mainnet()
         definition.destination = DESTINATION
         definition.source_address = SOURCE
+        definition.account_dir = "0"
         with mock.patch.object(definition, "_stop_approver"):
             with mock.patch.object(definition, "_list_state", return_value=["stuck"]):
                 with mock.patch.object(
@@ -853,6 +874,7 @@ class ContainerBoundaryTests(SolanaEvalTestCase):
         definition = self.make()
         definition.destination = DESTINATION
         definition.source_address = SOURCE
+        definition.account_dir = "0"
         definition.lamports = TRANSFER
         with mock.patch.object(definition, "_start_approver"):
             return definition, definition.provision("codex")
@@ -1022,11 +1044,23 @@ class VfsTransportTests(SolanaEvalTestCase):
         )
         with mock.patch("shutil.which", return_value="/usr/bin/bloom"):
             with mock.patch.object(definition.mount, "reachable", return_value=None):
+                # The outbox listing now runs after the account projection
+                # and credentials are validated; floor both so the transport
+                # check itself is what fails.
                 with mock.patch.object(
-                    definition.mount, "list_dir", return_value=[]
+                    definition, "_require_sign_count", return_value=2
                 ):
-                    with self.assertRaisesRegex(EvalError, "not reachable over vfs"):
-                        definition.preflight()
+                    with mock.patch("harness.core.CeremonyDriver.preflight"):
+                        with mock.patch.object(
+                            definition, "_load_local_account_identity"
+                        ):
+                            with mock.patch.object(
+                                definition.mount, "list_dir", return_value=[]
+                            ):
+                                with self.assertRaisesRegex(
+                                    EvalError, "not reachable over vfs"
+                                ):
+                                    definition.preflight()
 
     def test_agent_trials_are_refused_without_the_mounted_transport(self) -> None:
         definition = self.make(BLOOM_EVAL_SOLANA_TRANSPORT="vfs")

@@ -298,6 +298,10 @@ class SolanaTransferEval(EvalDefinition):
         self.source_address = ""
         self.key_fingerprint = ""
         self.derivation_path = ""
+        # Numbered account directory the vfs projects the wallet under
+        # (`wallets/<wallet>/<n>/...`); resolved from the authenticated
+        # account projection in _load_local_account_identity.
+        self.account_dir = ""
         self.trial_id: str | None = None
         self.transport = self.env.get(TRANSPORT_ENV, "mount")
         if self.transport not in TRANSPORTS:
@@ -350,7 +354,10 @@ class SolanaTransferEval(EvalDefinition):
 
     @property
     def chain_root(self) -> Path:
-        return self.wallet_root / "chains" / self.chain
+        # Chain views live under the numbered account directory
+        # (wallets/<wallet>/<n>/chains/...); the wallet directory itself has
+        # no chains/ per the vfs wallets handler.
+        return self.wallet_root / self.account_dir / "chains" / self.chain
 
     @property
     def outbox_root(self) -> Path:
@@ -430,13 +437,23 @@ class SolanaTransferEval(EvalDefinition):
                 f"found {len(solana)}"
             )
         account = solana[0]
+        number = account.get("number")
+        if not isinstance(number, int) or number < 0:
+            raise EvalError(
+                "Solana account projection has no numbered account directory"
+            )
+        # Set before the chain-level reads: they resolve through chain_root,
+        # which is only correct once the numbered directory is known.
+        self.account_dir = str(number)
         fingerprint = account.get("public_key_fingerprint")
         path = account.get("path")
         if not isinstance(fingerprint, str) or FINGERPRINT.fullmatch(fingerprint) is None:
             raise EvalError("Solana account projection has a malformed fingerprint")
         if not isinstance(path, str) or DERIVATION.fullmatch(path) is None:
             raise EvalError("Solana account projection has a malformed derivation path")
-        address_path = self.chain_root / "accounts" / fingerprint / "address"
+        # The account's per-chain address is projected at the chain level
+        # (chains/<chain>/address), not under an accounts/ subtree.
+        address_path = self.chain_root / "address"
         try:
             address = self.mount.read_text(
                 address_path, CHAIN_READ_TIMEOUT_SECONDS
@@ -445,6 +462,22 @@ class SolanaTransferEval(EvalDefinition):
             raise EvalError(f"could not read Solana account address: {error}") from error
         if ADDRESS.fullmatch(address) is None:
             raise EvalError("Solana account projection has a malformed address")
+        # An operator-pinned identity (the mainnet lane configures all three;
+        # BLOOM_EVAL_SOLANA_SOURCE may pin the local lane) must agree with
+        # what the wallet actually projects, or the trial would spend from a
+        # different account than the one that was authorized.
+        projected = {
+            "BLOOM_EVAL_SOLANA_SOURCE": address,
+            "BLOOM_EVAL_SOLANA_KEY_FINGERPRINT": fingerprint,
+            "BLOOM_EVAL_SOLANA_DERIVATION_PATH": path,
+        }
+        for variable, value in projected.items():
+            pinned = self.env.get(variable, "")
+            if pinned and pinned != value:
+                raise EvalError(
+                    f"{variable} is pinned to {pinned} but the wallet's active "
+                    f"Solana account projects {value}"
+                )
         self.source_address = address
         self.key_fingerprint = fingerprint
         self.derivation_path = path
@@ -600,11 +633,6 @@ class SolanaTransferEval(EvalDefinition):
         unreachable = self.mount.reachable()
         if unreachable is not None:
             raise EvalError(unreachable)
-        if "new.tx" not in self.mount.list_dir(self.outbox_root):
-            raise EvalError(
-                "wallet outbox is not reachable over vfs; the wallet may "
-                "not have this Solana chain configured"
-            )
 
     def preflight(self) -> None:
         if not self.bloom_mount_value:
@@ -679,6 +707,20 @@ class SolanaTransferEval(EvalDefinition):
         self.sign_count = self._require_sign_count()
         CeremonyDriver(self.driver, self.seed_file, self.sign_count).preflight()
 
+        # Both transports resolve the account through the same mount
+        # abstraction (the vfs tree for transport=vfs), so the numbered
+        # account directory and the projected identity are known before any
+        # outbox path is used.
+        self._load_local_account_identity()
+        if self.transport == "vfs":
+            listing = self.mount.list_dir(self.outbox_root)
+            if "new.tx" not in listing:
+                raise EvalError(
+                    f"wallet outbox is not reachable over vfs at "
+                    f"{self.outbox_root} (listing: {listing!r}); the wallet "
+                    "may not have this Solana chain configured"
+                )
+
         if self.transport != "vfs":
             if not os.path.ismount(self.bloom_mount):
                 raise EvalError(f"Bloom is not mounted at {self.bloom_mount}")
@@ -693,17 +735,6 @@ class SolanaTransferEval(EvalDefinition):
             if not (self.outbox_root / "new.tx").exists():
                 raise EvalError(
                     f"{self.outbox_root}/new.tx is missing; the chain is not writable"
-                )
-
-        if self.lane == "local":
-            self._load_local_account_identity()
-            # The account the mount projects must be the account the operator
-            # says the trial spends from, when one was configured explicitly.
-            configured_source = self.env.get("BLOOM_EVAL_SOLANA_SOURCE", "")
-            if configured_source and configured_source != self.source_address:
-                raise EvalError(
-                    "BLOOM_EVAL_SOLANA_SOURCE does not match the wallet's active "
-                    "Solana account address"
                 )
 
         pending = self._list_state("pending")
@@ -1077,7 +1108,8 @@ class SolanaTransferEval(EvalDefinition):
                 "type": "bind",
                 "source": str(self.outbox_root),
                 "target": (
-                    f"/bloom/wallets/{self.wallet_id}/chains/{self.chain}/outbox"
+                    f"/bloom/wallets/{self.wallet_id}/{self.account_dir}"
+                    f"/chains/{self.chain}/outbox"
                 ),
             },
         ]

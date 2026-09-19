@@ -2605,7 +2605,16 @@ impl Handler for WalletsHandler {
 
     fn is_async_write_command(&self, path: &VfsPath) -> bool {
         let segs = path.segments();
-        matches!(segs, [_, leaf] if leaf == "policy.json")
+        if matches!(segs, [_, leaf] if leaf == "policy.json") {
+            return true;
+        }
+        // Outbox command sinks are small one-shot writes whose whole
+        // payload arrives in a single offset-zero WRITE. Dispatching them
+        // eagerly keeps confirmation off the kernel's COMMIT schedule: an
+        // UNSTABLE write to a non-async sink buffers until COMMIT, and
+        // shells and script runtimes close without fsync, so a confirm can
+        // strand in the mount adapter until the staged entry expires.
+        is_outbox_command_sink(segs)
     }
 
     async fn prepare_write_open(&self, path: &VfsPath) -> Result<(), HandlerError> {
@@ -2693,12 +2702,21 @@ impl Handler for WalletsHandler {
     /// that bypasses the mode check still cannot trigger a sign or
     /// broadcast just by stat'ing.
     fn is_read_side_effecting(&self, path: &VfsPath) -> bool {
-        pending_outbox_control(path.segments()).is_some_and(|target| {
+        let segs = path.segments();
+        if pending_outbox_control(segs).is_some_and(|target| {
             matches!(
                 target.control,
                 "confirm" | "confirm.override" | "replace" | "cancel" | "restage"
             )
-        })
+        }) {
+            return true;
+        }
+        // Write-only sinks the adapter must never render: the stage file
+        // and an expired entry's `failed/<id>/restage` recovery route.
+        // Rendering either reads it, fails NotFound, and at best warns on
+        // every stat — mounted agents can see the route as missing.
+        segs.ends_with(&["outbox".to_string(), "new.tx".to_string()])
+            || is_failed_outbox_restage(segs)
     }
 }
 
@@ -2709,6 +2727,45 @@ struct PendingOutboxControl<'a> {
     chain: &'a str,
     id: &'a str,
     control: &'a str,
+}
+
+/// Whether this path is a one-shot outbox command sink: the stage file
+/// `outbox/new.tx`, a pending entry's controls, or an expired entry's
+/// `failed/<id>/restage` recovery route. Family-agnostic on purpose: both
+/// the EVM and Solana engines stage through the same shapes.
+fn is_outbox_command_sink(segs: &[String]) -> bool {
+    match segs {
+        [_wallet, _number, chains, _chain, outbox, leaf]
+            if chains == "chains" && outbox == "outbox" && leaf == "new.tx" =>
+        {
+            true
+        }
+        [_wallet, _number, chains, _chain, outbox, pending, _id, control]
+            if chains == "chains"
+                && outbox == "outbox"
+                && pending == "pending"
+                && matches!(
+                    control.as_str(),
+                    "confirm" | "confirm.override" | "cancel" | "restage"
+                ) =>
+        {
+            true
+        }
+        _ if is_failed_outbox_restage(segs) => true,
+        _ => false,
+    }
+}
+
+/// Match `<w>/<n>/chains/<c>/outbox/failed/<id>/restage`.
+fn is_failed_outbox_restage(segs: &[String]) -> bool {
+    matches!(
+        segs,
+        [_wallet, _number, chains, _chain, outbox, failed, _id, restage]
+            if chains == "chains"
+                && outbox == "outbox"
+                && failed == "failed"
+                && restage == "restage"
+    )
 }
 
 /// Match `<w>/<n>/chains/<c>/outbox/pending/<id>/<control>`.
@@ -5266,6 +5323,69 @@ value = "0""#
                 .unwrap();
             assert_eq!(sink.mode, 0o644, "{path}/restage must be writable");
         }
+    }
+
+    /// Outbox command sinks dispatch eagerly and are never rendered. The
+    /// mount adapter relies on both hooks: `is_async_write_command` keeps
+    /// a confirm off the kernel's COMMIT schedule (an UNSTABLE write to a
+    /// non-async sink strands in the adapter's write buffer until COMMIT,
+    /// and shells close without fsync), and `is_read_side_effecting`
+    /// keeps GETATTR from rendering the write-only sink (a render reads,
+    /// fails NotFound, and mounted agents see the route as missing).
+    #[test]
+    fn outbox_command_sinks_are_async_and_never_rendered() {
+        let f = make_handler_with_chain(true);
+        let w = &f.wallet_name;
+        for (path, sink) in [
+            (format!("/{w}/0/chains/anvil/outbox/new.tx"), true),
+            (format!("/{w}/0/chains/anvil/outbox/pending/e1/confirm"), true),
+            (
+                format!("/{w}/0/chains/anvil/outbox/pending/e1/confirm.override"),
+                true,
+            ),
+            (format!("/{w}/0/chains/anvil/outbox/pending/e1/cancel"), true),
+            (format!("/{w}/0/chains/anvil/outbox/pending/e1/restage"), true),
+            (format!("/{w}/0/chains/anvil/outbox/failed/e1/restage"), true),
+            (
+                format!("/{w}/0/chains/solana-local/outbox/pending/s1/confirm"),
+                true,
+            ),
+            (
+                format!("/{w}/0/chains/solana-local/outbox/failed/s1/restage"),
+                true,
+            ),
+            (format!("/{w}/policy.json"), true),
+            (format!("/{w}/0/chains/anvil/balance"), false),
+            (
+                format!("/{w}/0/chains/anvil/outbox/pending/e1/intent.json"),
+                false,
+            ),
+            (
+                format!("/{w}/0/chains/anvil/outbox/sent/e1/receipt.json"),
+                false,
+            ),
+        ] {
+            let p = vfs(path.clone());
+            assert_eq!(
+                f.handler.is_async_write_command(&p),
+                sink,
+                "is_async_write_command {path}"
+            );
+            // policy.json is async but still renders (reads return the
+            // committed policy); every other async sink is write-only.
+            let rendered_ok = path.ends_with("policy.json");
+            if sink && !rendered_ok {
+                assert!(
+                    f.handler.is_read_side_effecting(&p),
+                    "is_read_side_effecting {path}"
+                );
+            }
+        }
+        // The legacy `replace` control stays non-async (its denial is
+        // NFS-visible today) but is still never rendered.
+        let replace = vfs(format!("/{w}/0/chains/anvil/outbox/pending/e1/replace"));
+        assert!(!f.handler.is_async_write_command(&replace));
+        assert!(f.handler.is_read_side_effecting(&replace));
     }
 
     /// Account 0's Solana `new.tx` is pinned to account 0: a body
