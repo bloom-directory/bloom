@@ -217,6 +217,7 @@ impl SolanaTransferSigner {
             petal_use_claim: None,
             system_use_claim: Some(system_use_claim),
             claim_assurance_evidence: Some(message_bytes.to_vec()),
+            safe_review_payload: None,
             account_key_ref,
             approval_value_limits: vec![ValueLimit {
                 asset: AssetId {
