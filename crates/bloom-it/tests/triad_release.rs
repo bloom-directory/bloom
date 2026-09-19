@@ -438,7 +438,7 @@ fn build(staging: &Path, output: &Path, key: &Path) -> std::process::Output {
         &compatibility,
         compatibility_source
             .replace(
-                "broker_commit = \"7ee52d531639709b6bfb38af6c5f678c86123101\"",
+                "broker_commit = \"0874825a1201c34785cf3b609b7fdaa5e82988fe\"",
                 &format!("broker_commit = \"{}\"", "22".repeat(20)),
             )
             .replace(
