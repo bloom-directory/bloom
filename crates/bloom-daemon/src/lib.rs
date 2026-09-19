@@ -225,7 +225,7 @@ pub enum DaemonError {
 /// client should trust. Read only in nonproduction builds; see
 /// [`petal_http_extra_root_certificates`].
 #[cfg(feature = "unsigned-audit-test-seam")]
-pub const PETAL_HTTP_EXTRA_ROOT_CA_ENV: &str = "BLOOM_PETAL_HTTP_EXTRA_ROOT_CA";
+const PETAL_HTTP_EXTRA_ROOT_CA_ENV: &str = "BLOOM_PETAL_HTTP_EXTRA_ROOT_CA";
 
 /// Add developer-harness root certificates to the Petal HTTP client.
 ///
