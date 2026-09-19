@@ -218,6 +218,7 @@ impl SolanaTransferSigner {
             system_use_claim: Some(system_use_claim),
             claim_assurance_evidence: Some(message_bytes.to_vec()),
             account_key_ref,
+            delegated_key_ref: None,
             approval_value_limits: vec![ValueLimit {
                 asset: AssetId {
                     chain: Token::new("solana").map_err(|e| e.to_string())?,

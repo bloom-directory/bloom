@@ -607,24 +607,8 @@ impl MachineBrokerClient {
         let wallet = self.wallet(request.wallet_id.clone()).await?;
         let key_ref = match selected_key_ref {
             Some(key_ref) => {
-                let key = self
-                    .key(KeyRequest {
-                        key_ref: key_ref.clone(),
-                    })
-                    .await?;
-                if key.key_ref != key_ref {
-                    return Err(ProtocolError::new(
-                        ProtocolErrorCode::KeyrefMismatch,
-                        "Broker returned public metadata for a different delegated key",
-                    ));
-                }
-                if !key.supported_crypto_suites.contains(&request.crypto_suite) {
-                    return Err(ProtocolError::new(
-                        ProtocolErrorCode::SuiteNotAllowed,
-                        "selected delegated key does not support the requested CryptoSuite",
-                    ));
-                }
-                key_ref
+                self.verified_delegated_key(&key_ref, request.crypto_suite)
+                    .await?
             }
             None => unique_key_for_suite(&wallet.key_refs, request.crypto_suite)?,
         };
@@ -876,13 +860,20 @@ impl MachineBrokerClient {
                 }
                 (Some(_), Some(_)) => unreachable!("mutual exclusion checked above"),
             };
-        let key_ref = self
-            .verified_signing_key(
-                &wallet,
-                request.crypto_suite,
-                request.account_key_ref.as_ref(),
-            )
-            .await?;
+        let key_ref = match &request.delegated_key_ref {
+            Some(delegated) => {
+                self.verified_delegated_key(delegated, request.crypto_suite)
+                    .await?
+            }
+            None => {
+                self.verified_signing_key(
+                    &wallet,
+                    request.crypto_suite,
+                    request.account_key_ref.as_ref(),
+                )
+                .await?
+            }
+        };
         let activation_mode = request
             .activation_mode
             .clone()
@@ -1651,6 +1642,33 @@ impl MachineBrokerClient {
     /// `SealedApprovalTerms::key_ref` when an approval is prepared and into
     /// `SignOperationIdentity::key_ref` when one is spent, so an approval
     /// issued for one account can never authorise a signature from another.
+    /// Broker's public metadata must name exactly this delegated key and
+    /// support the suite. Scope, lineage, and expiry stay Broker's checks.
+    async fn verified_delegated_key(
+        &self,
+        key_ref: &KeyRef,
+        suite: CryptoSuite,
+    ) -> Result<KeyRef, ProtocolError> {
+        let key = self
+            .key(KeyRequest {
+                key_ref: key_ref.clone(),
+            })
+            .await?;
+        if &key.key_ref != key_ref {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::KeyrefMismatch,
+                "Broker returned public metadata for a different delegated key",
+            ));
+        }
+        if !key.supported_crypto_suites.contains(&suite) {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::SuiteNotAllowed,
+                "selected delegated key does not support the requested CryptoSuite",
+            ));
+        }
+        Ok(key_ref.clone())
+    }
+
     async fn verified_signing_key(
         &self,
         wallet: &WalletPublic,
@@ -1985,6 +2003,11 @@ pub struct ExactPayloadSignRequest {
     /// BIP-39 and holds more than one child for `crypto_suite`; `None` keeps
     /// the single-account and legacy-root behaviour.
     pub account_key_ref: Option<KeyRef>,
+    /// A Petal-scoped delegated key to sign with instead of a wallet key.
+    /// Only valid with Petal provenance and no `account_key_ref`. The caller
+    /// must already have tied the key to the trusted Petal route; Broker and
+    /// Signer independently enforce the key's scope.
+    pub delegated_key_ref: Option<KeyRef>,
 }
 
 #[derive(Clone, Debug)]
@@ -2044,6 +2067,15 @@ impl ExactPayloadSignRequest {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::MalformedFrame,
                 "exact approval validity interval is invalid",
+            ));
+        }
+        if self.delegated_key_ref.is_some()
+            && (self.account_key_ref.is_some()
+                || !matches!(self.provenance, ProvenanceSubject::Petal { .. }))
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::KeyrefMismatch,
+                "a delegated key signs only for trusted Petal provenance and never with an account selection",
             ));
         }
         SigningPayloads::Single {
@@ -3746,7 +3778,31 @@ mod tests {
             claim_assurance_evidence: None,
             approval_value_limits: Vec::new(),
             account_key_ref: None,
+            delegated_key_ref: None,
         }
+    }
+
+    #[test]
+    fn a_delegated_key_needs_petal_provenance_and_no_account_selection() {
+        let delegated = derived_child(7, 0x77);
+        let mut cli = exact_request(b"payload".to_vec(), None);
+        cli.delegated_key_ref = Some(delegated.clone());
+        assert_eq!(
+            cli.validate().unwrap_err().code,
+            ProtocolErrorCode::KeyrefMismatch
+        );
+
+        let mut petal = cli.clone();
+        petal.provenance = ProvenanceSubject::Petal {
+            package_hash: digest(65),
+            route: "r000001".into(),
+        };
+        petal.validate().unwrap();
+        petal.account_key_ref = Some(derived_child(0, 0xa1));
+        assert_eq!(
+            petal.validate().unwrap_err().code,
+            ProtocolErrorCode::KeyrefMismatch
+        );
     }
 
     fn exact_batch_request(
