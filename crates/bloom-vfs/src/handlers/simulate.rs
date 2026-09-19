@@ -341,7 +341,7 @@ fn build_tx_request(
             // outbox where detection + encoding live; surface a clear
             // unsupported here rather than mis-encoding.
             return Err(HandlerError::Unsupported(
-                "NFT intents are simulated via the wallet outbox stage path (see wallets/<w>/chains/<c>/outbox/new.tx)".into(),
+                "NFT intents are simulated via the selected account's outbox stage path (see wallets/<w>/<n>/chains/<c>/outbox/new.tx)".into(),
             ));
         }
         RawIntentBody::Enso { .. } => {

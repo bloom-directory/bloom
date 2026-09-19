@@ -234,8 +234,8 @@ jobs:
       github.ref_name == 'triad-architecture'
     uses: ./.github/workflows/macos-unix-conformance.yml
     with:
-      broker_ref: 7f14102fd1ea41c4ea402b8f360d17c6fcd12207
-      signer_ref: 941dd376568b52ccd269ecf495bcff7dcd9af504
+      broker_ref: 08fe0551067d0b0b4bf1f1be380700a537f14d41
+      signer_ref: ccc9adb3866b17b87d2774018dcfa015184b1918
 
   linux_w0_isolation:
     name: Linux W0 principal and socket isolation
@@ -253,10 +253,6 @@ jobs:
             sed 's|@BLOOM_BROKER_BINARY@|/usr/bin/true|; s|@BLOOM_SIGNER_BINARY@|/usr/bin/true|' \
               "$source" > "$destination"
           done
-          mkdir -p "$unit_dir/bloom-signer@1000.service.d"
-          sed 's|@AWS_KMS_IP_ALLOW_DIRECTIVES@|IPAddressAllow=127.0.0.1/32|' \
-            packaging/triad/linux/systemd/instance-dropins/bloom-signer@LOGIN_UID.service.d/50-aws-kms.conf.in \
-            > "$unit_dir/bloom-signer@1000.service.d/50-aws-kms.conf"
           cp "$unit_dir/bloom-signer@.service" "$unit_dir/bloom-signer@1000.service"
           systemd-analyze verify \
             "$unit_dir"/*.socket \

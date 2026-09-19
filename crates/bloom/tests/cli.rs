@@ -101,15 +101,24 @@ impl RunningBloom {
     fn start_with_automatic_update_checks(home: &Path, automatic_update_checks: bool) -> Self {
         prepare_hermetic_machine_state(home);
         let home_dir = bloom_proto::HomeDir::at(home);
-        let mut config = if home_dir.config_path().is_file() {
+        let config = if home_dir.config_path().is_file() {
             bloom_proto::Config::load(&home_dir.config_path()).unwrap()
         } else {
             bloom_proto::Config::local_default()
         };
-        config.petals.preinstalled.clear();
         config.save(&home_dir.config_path()).unwrap();
         let binary = Command::cargo_bin("bloom").expect("locate bloom binary");
         let mut command = std::process::Command::new(binary.get_program());
+        // Exercise normal provisioning while keeping CLI fixtures offline.
+        if std::env::var_os("BLOOM_RUN_NETWORK_TESTS").as_deref() != Some(std::ffi::OsStr::new("1"))
+        {
+            command
+                .env("HTTPS_PROXY", "http://127.0.0.1:1")
+                .env("https_proxy", "http://127.0.0.1:1")
+                .env("NO_PROXY", "")
+                .env("no_proxy", "");
+        }
+
         command
             .env("BLOOM_HOME", home)
             .env(
@@ -893,26 +902,35 @@ fn help_lists_all_subcommands() {
 }
 
 #[test]
-fn init_respects_persistent_preinstalled_petal_opt_out_without_network() {
+fn init_ignores_legacy_preinstalled_opt_out() {
     let home = fresh_home();
     let home_dir = bloom_proto::HomeDir::at(home.path());
-    let mut config = bloom_proto::Config::local_default();
-    config.petals.preinstalled.clear();
-    config.save(&home_dir.config_path()).unwrap();
+    home_dir.ensure().unwrap();
+    let mut config = toml::Value::try_from(bloom_proto::Config::local_default()).unwrap();
+    config["petals"]
+        .as_table_mut()
+        .unwrap()
+        .insert("preinstalled".into(), toml::Value::Array(vec![]));
+    std::fs::write(
+        home_dir.config_path(),
+        toml::to_string_pretty(&config).unwrap(),
+    )
+    .unwrap();
 
     bloom_cmd(home.path())
+        .env("HTTPS_PROXY", "http://127.0.0.1:1")
+        .env("https_proxy", "http://127.0.0.1:1")
+        .env("NO_PROXY", "")
+        .env("no_proxy", "")
         .arg("init")
         .assert()
-        .success()
-        .stdout(predicate::str::contains("preinstalled_petals: []"));
-
-    let (server, server_thread) = spawn_petals_ipc_server(home.path());
-    bloom_cmd(home.path())
-        .args(["petals", "ls"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("(no petals installed)"));
-    stop_ipc_server(server, server_thread);
+        .failure()
+        .stdout(predicate::str::contains(
+            "preinstalled_petal: installing polymarket",
+        ))
+        .stderr(predicate::str::contains(
+            "provision canonical pre-installed Petals",
+        ));
 }
 
 #[test]
@@ -1414,15 +1432,20 @@ fn vfs_cat_status_update_when_no_cache_reports_unknown() {
 
 #[test]
 fn vfs_cat_status_update_with_seed_cache_reports_behind() {
+    let installed = env!("CARGO_PKG_VERSION");
+    let major: u64 = installed.split('.').next().unwrap().parse().unwrap();
+    let latest = format!("{}.0.0", major + 1);
     let home = fresh_home();
     let cache_dir = home.path().join("cache");
     std::fs::create_dir_all(&cache_dir).unwrap();
     bloom_update::cache::write(
         &cache_dir,
         &bloom_update::UpdateSnapshot::ok(
-            "0.1.0".into(),
-            Some("0.3.0".into()),
-            Some("https://github.com/bloom-directory/bloom/releases/tag/v0.3.0".into()),
+            installed.into(),
+            Some(latest.clone()),
+            Some(format!(
+                "https://github.com/bloom-directory/bloom/releases/tag/v{latest}"
+            )),
         ),
     )
     .unwrap();
@@ -1434,27 +1457,23 @@ fn vfs_cat_status_update_with_seed_cache_reports_behind() {
         .args(["vfs", "cat", "/status/update/latest"])
         .assert()
         .success()
-        .stdout(predicate::eq("0.3.0\n"));
+        .stdout(predicate::eq(format!("{latest}\n")));
     bloom_cmd(home.path())
         .args(["vfs", "cat", "/status/update/available"])
         .assert()
         .success()
-        .stdout(predicate::eq(
-            if bloom_update::compare_semver(env!("CARGO_PKG_VERSION"), "0.3.0")
-                == std::cmp::Ordering::Less
-            {
-                "out_of_date\n"
-            } else {
-                "up_to_date\n"
-            },
-        ));
+        .stdout(predicate::eq("out_of_date\n"));
     bloom_cmd(home.path())
         .arg("status")
         .assert()
         .success()
-        .stdout(predicate::str::contains("latest_release: 0.3.0"))
+        .stdout(predicate::str::contains(format!(
+            "latest_release: {latest}"
+        )))
         .stdout(predicate::str::contains("update_available: out_of_date"))
-        .stderr(predicate::str::contains("hint: bloom v0.3.0 is available"));
+        .stderr(predicate::str::contains(format!(
+            "hint: bloom v{latest} is available"
+        )));
 }
 
 #[test]
@@ -1573,14 +1592,20 @@ fn lifecycle_commands_ignore_invalid_client_endpoint_configuration() {
     let home = fresh_home();
     prepare_hermetic_machine_state(home.path());
     let home_dir = bloom_proto::HomeDir::at(home.path());
-    let mut config = bloom_proto::Config::local_default();
-    config.petals.preinstalled.clear();
+    let config = bloom_proto::Config::local_default();
     config.save(&home_dir.config_path()).unwrap();
     bloom_cmd(home.path())
         .env("BLOOM_RPC_ENDPOINT", "tcp:invalid")
+        .env("HTTPS_PROXY", "http://127.0.0.1:1")
+        .env("https_proxy", "http://127.0.0.1:1")
+        .env("NO_PROXY", "")
+        .env("no_proxy", "")
         .arg("init")
         .assert()
-        .success();
+        .failure()
+        .stderr(predicate::str::contains(
+            "provision canonical pre-installed Petals",
+        ));
 
     let binary = Command::cargo_bin("bloom").expect("locate bloom binary");
     let mut child = std::process::Command::new(binary.get_program())
@@ -1673,8 +1698,7 @@ fn serve_remains_available_with_unavailable_defaults_on_repeated_starts() {
     let home = fresh_home();
     let home_dir = bloom_proto::HomeDir::at(home.path());
     home_dir.ensure().unwrap();
-    let mut config = bloom_proto::Config::local_default();
-    config.petals.preinstalled = vec!["enso".into(), "gasless".into()];
+    let config = bloom_proto::Config::local_default();
     config.save(&home_dir.config_path()).unwrap();
     for _ in 0..2 {
         let daemon = spawn_bloom_serve(home.path());
@@ -1848,7 +1872,7 @@ fn wallet_stage_routes_via_ipc_when_home_write_lock_is_live() {
     stop_ipc_server(server, server_thread);
     let writes = wallets.writes();
     assert_eq!(writes.len(), 1, "writes={writes:?}");
-    assert_eq!(writes[0].0, "/alice/chains/anvil/outbox/new.tx");
+    assert_eq!(writes[0].0, "/alice/0/chains/anvil/outbox/new.tx");
     assert_eq!(String::from_utf8_lossy(&writes[0].1), intent);
 }
 
@@ -2286,7 +2310,7 @@ fn wallet_confirm_uses_plain_ipc_write_when_socket_exists() {
     assert_eq!(writes.len(), 1, "expected one VFS write, got {writes:?}");
     assert_eq!(
         writes[0].0,
-        "/alice/chains/base/outbox/pending/0001-deadbeef/confirm"
+        "/alice/0/chains/base/outbox/pending/0001-deadbeef/confirm"
     );
     assert_eq!(writes[0].1, b"y");
 }
@@ -2482,19 +2506,18 @@ fn github_source_install_polymarket_dispatches_route_contract() {
     if std::env::var_os("BLOOM_RUN_NETWORK_TESTS").as_deref() != Some(std::ffi::OsStr::new("1")) {
         return;
     }
-    // This commit uses the same canonical Petal contract revision as Bloom.
-    let petal_ref = "a47e7e462c2be117d497a3edd2399fb1f4acfe8d";
+    // Exercise source installation of the current pinned Polymarket release.
+    let petal_ref = "cb6259f6458fc9a27708b8c4c4e35d28a69d24fc";
     let home = fresh_home();
     let home_dir = bloom_proto::HomeDir::at(home.path());
-    let mut config = bloom_proto::Config::local_default();
-    config.petals.preinstalled.clear();
+    let config = bloom_proto::Config::local_default();
     config.save(&home_dir.config_path()).unwrap();
 
     bloom_cmd(home.path())
         .arg("init")
         .assert()
         .success()
-        .stdout(predicate::str::contains("preinstalled_petals: []"));
+        .stdout(predicate::str::contains("preinstalled_petals:"));
 
     let daemon = spawn_bloom_serve(home.path());
 

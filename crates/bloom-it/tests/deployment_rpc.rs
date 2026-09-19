@@ -97,7 +97,6 @@ async fn deployment_tools_and_recovery() -> Result<()> {
     let mut config = Config::local_default();
     let mut spec = ChainSpec::anvil_default();
     spec.rpc_urls = vec![anvil.rpc_url()];
-    spec.allow_broadcast = true;
     config.chains.insert("anvil".into(), spec);
     config.save(&dir.path().join("config.toml"))?;
     let home = HomeDir::at(dir.path());
