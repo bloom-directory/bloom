@@ -4113,7 +4113,12 @@ paths = ["/status"]
             "allowed_routes": ["r999999"],
             "allowed_operation_classes": ["order.place"],
             "allowed_crypto_suites": ["secp256k1-keccak256-recoverable"],
-            "maximum_lifetime_ms": 60_000
+            "maximum_lifetime_ms": 60_000,
+            "approval_value_limits": [{
+                "asset": {"chain": "solana", "asset": "native"},
+                "lifetime": "20000000",
+                "rolling_windows": []
+            }]
         }))
         .unwrap();
         let mut result = vec![ComponentVal::Bool(false)];
@@ -4134,6 +4139,11 @@ paths = ["/status"]
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].context, Some(context));
         assert_eq!(calls[0].allowed_routes, ["r000007", "r000008"]);
+        assert_eq!(calls[0].approval_value_limits.len(), 1);
+        assert_eq!(
+            calls[0].approval_value_limits[0].lifetime.as_str(),
+            "20000000"
+        );
     }
 
     #[tokio::test]

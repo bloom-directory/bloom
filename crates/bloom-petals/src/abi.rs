@@ -227,6 +227,11 @@ pub struct PetalKeyGuestRequest {
     pub allowed_operation_classes: Vec<String>,
     pub allowed_crypto_suites: Vec<String>,
     pub maximum_lifetime_ms: u64,
+    /// Asset budgets Machine seals into the key's reusable approval, which
+    /// the owner reviews in that ceremony. Omitted means no declared debit or
+    /// fee asset is authorized.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub approval_value_limits: Vec<bloom_broker_api::ValueLimit>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -237,6 +242,7 @@ pub struct PetalKeyRequest {
     pub allowed_operation_classes: Vec<String>,
     pub allowed_crypto_suites: Vec<String>,
     pub maximum_lifetime_ms: u64,
+    pub approval_value_limits: Vec<bloom_broker_api::ValueLimit>,
     pub context: Option<PetalRouteContext>,
 }
 
@@ -249,6 +255,7 @@ impl From<PetalKeyGuestRequest> for PetalKeyRequest {
             allowed_operation_classes: guest.allowed_operation_classes,
             allowed_crypto_suites: guest.allowed_crypto_suites,
             maximum_lifetime_ms: guest.maximum_lifetime_ms,
+            approval_value_limits: guest.approval_value_limits,
             context: None,
         }
     }
