@@ -221,6 +221,69 @@ pub enum DaemonError {
     Watch(String),
 }
 
+/// Environment variable naming extra PEM root certificates the Petal HTTP
+/// client should trust. Read only in nonproduction builds; see
+/// [`petal_http_extra_root_certificates`].
+#[cfg(feature = "unsigned-audit-test-seam")]
+const PETAL_HTTP_EXTRA_ROOT_CA_ENV: &str = "BLOOM_PETAL_HTTP_EXTRA_ROOT_CA";
+
+/// Add developer-harness root certificates to the Petal HTTP client.
+///
+/// The client verifies TLS against rustls' compiled-in webpki roots, so
+/// neither `SSL_CERT_FILE` nor the system CA bundle can make it trust a
+/// locally issued certificate: a harness serving a Petal's declared host
+/// gets `tlsv1 alert unknown ca` and the request never reaches it. Petal
+/// net policy requires HTTPS on port 443 against the exact declared host, so
+/// there is no plaintext alternative either, and an external harness cannot
+/// exercise a Petal's real HTTP routes without this.
+///
+/// This widens only the trust anchors. The request path, the `[[net.allow]]`
+/// policy check, the audit journal and the per-redirect re-check are
+/// unchanged, so a harness using it still exercises the production path.
+///
+/// Compiled out unless `unsigned-audit-test-seam` is enabled, which release
+/// packaging must not enable.
+fn petal_http_extra_root_certificates(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    #[cfg(not(feature = "unsigned-audit-test-seam"))]
+    {
+        builder
+    }
+    #[cfg(feature = "unsigned-audit-test-seam")]
+    {
+        let Some(path) = std::env::var_os(PETAL_HTTP_EXTRA_ROOT_CA_ENV) else {
+            return builder;
+        };
+        // A named-but-unusable trust file is a harness misconfiguration that
+        // would otherwise surface much later as an opaque TLS error.
+        add_root_certificates_from_pem(builder, Path::new(&path)).unwrap_or_else(|e| {
+            panic!("{PETAL_HTTP_EXTRA_ROOT_CA_ENV}={path:?}: {e}");
+        })
+    }
+}
+
+#[cfg(feature = "unsigned-audit-test-seam")]
+fn add_root_certificates_from_pem(
+    builder: reqwest::ClientBuilder,
+    path: &Path,
+) -> Result<reqwest::ClientBuilder, String> {
+    let pem = std::fs::read(path).map_err(|e| e.to_string())?;
+    let certificates = reqwest::Certificate::from_pem_bundle(&pem)
+        .map_err(|e| format!("not a PEM certificate bundle: {e}"))?;
+    if certificates.is_empty() {
+        return Err("PEM file contains no certificates".into());
+    }
+    warn!(
+        path = %path.display(),
+        count = certificates.len(),
+        "petal.http_extra_root_certificates_trusted"
+    );
+    Ok(certificates
+        .into_iter()
+        .fold(builder, |builder, certificate| {
+            builder.add_root_certificate(certificate)
+        }))
+}
+
 struct DaemonPetalHost {
     vfs: Arc<LateVfsHost>,
     http: reqwest::Client,
@@ -504,9 +567,11 @@ impl DaemonPetalHost {
     }
 
     fn new(vfs: Arc<LateVfsHost>, audit: Arc<AuditLog>) -> Self {
-        let http = reqwest::Client::builder()
+        let builder = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(20))
+            .timeout(Duration::from_secs(20));
+        let builder = petal_http_extra_root_certificates(builder);
+        let http = builder
             .build()
             .expect("daemon petal http client must build");
         Self {
@@ -5458,6 +5523,57 @@ mod tests {
     use bloom_vfs::VfsPath;
     use bloom_vfs::handler::Entry;
     use bloom_vfs::handler::Handler;
+
+    /// A self-signed CA, valid until 2126, used only to check that a PEM
+    /// bundle is parsed and accepted as a trust anchor.
+    #[cfg(feature = "unsigned-audit-test-seam")]
+    const TEST_ROOT_CERTIFICATE_PEM: &str = "-----BEGIN CERTIFICATE-----\nMIIDJTCCAg2gAwIBAgIUV44PxYEgkAX1oB2PfCVSBNd5c2wwDQYJKoZIhvcNAQEL\nBQAwITEfMB0GA1UEAwwWYmxvb20tZGFlbW9uLXRlc3Qtcm9vdDAgFw0yNjA5MTgw\nMzQxMjZaGA8yMTI2MDgyNTAzNDEyNlowITEfMB0GA1UEAwwWYmxvb20tZGFlbW9u\nLXRlc3Qtcm9vdDCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAMPHmbRL\n2aKfcbETPeG0ADrnpxmq/EB/0SaHguMlhtZS+n4AKmihmz+GTD7k6uo7SHDtORAk\ntNoxVdHCk7BbhgErrCwDXMqoKDa8fkocFcjHh4mN2c6RYDilEuu3DwGQImDcudDf\nUgHk1XgiL+ef4x8E4aEhVAIIPpoNWwhvfU0d1CtUXLA1qIH1xuW2Q5N5UxxWOdCu\nEg43CKDJ5uCsbsuwqv4QL4ZJkBemEmBzSmVVgCM6wKCXU52wqilbddXQRUcJBD/V\n9p2jnQKUBk7IBkHA9UJTrwzcdV4MOIs/dg6sx25LLVLkSKC88XNy5IOvWNr+bsSH\nvpnPa6+zSRZ8WrECAwEAAaNTMFEwHQYDVR0OBBYEFLFWvSxNZ8Fi6hpwF5ptiXl5\nkXFJMB8GA1UdIwQYMBaAFLFWvSxNZ8Fi6hpwF5ptiXl5kXFJMA8GA1UdEwEB/wQF\nMAMBAf8wDQYJKoZIhvcNAQELBQADggEBAB0VK6+0WwRWdfsIGgRYhfdS91olEMfL\nW07pFq9QPPOif46VAdjM/7mJCFdzx6Ri81JzwqpMymkPSz9VPkllTq0objeYsx9H\n1ZzQDA9JIASla6AiAz44WvQcW/K++RgjUQFhRX0VWICfKgCBmKZXCmqGvvuBYtXy\nncDzFhoKcdar6TyK8LZYTGflowF/DtqBJlKGFJpeCLCWUd0ybeRV1UNK0QlAmAVd\n03N2VX8z2M9PEtFumQ6IOW9R/a1zW/6V+LZpRxrCyMDrgIMovzcpW+1tPiMARCG5\nn09cCJf8Vgz1oauUKC1J7IXEdVoqt/GqHXUMTAD3xQOBUXBuUm/UczE=\n-----END CERTIFICATE-----\n";
+
+    /// The seam exists because the Petal HTTP client trusts only rustls'
+    /// compiled-in webpki roots: a harness serving a Petal's declared host
+    /// with its own CA gets `tlsv1 alert unknown ca`, and neither
+    /// `SSL_CERT_FILE` nor the system CA bundle changes that. These pin that
+    /// a PEM bundle is accepted and that an unusable one is reported rather
+    /// than silently ignored, which would reproduce the original symptom.
+    #[cfg(feature = "unsigned-audit-test-seam")]
+    #[test]
+    fn petal_http_trusts_an_extra_root_certificate_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let empty = dir.path().join("empty.pem");
+        std::fs::write(&empty, b"").unwrap();
+        assert_eq!(
+            add_root_certificates_from_pem(reqwest::Client::builder(), &empty).unwrap_err(),
+            "PEM file contains no certificates"
+        );
+
+        let garbage = dir.path().join("garbage.pem");
+        std::fs::write(&garbage, b"-----BEGIN CERTIFICATE-----\nnot base64\n").unwrap();
+        assert!(
+            add_root_certificates_from_pem(reqwest::Client::builder(), &garbage)
+                .unwrap_err()
+                .contains("not a PEM certificate bundle")
+        );
+
+        assert!(
+            add_root_certificates_from_pem(reqwest::Client::builder(), &dir.path().join("absent"))
+                .is_err()
+        );
+
+        // Two concatenated certificates: the bundle form a harness produces.
+        let bundle = dir.path().join("bundle.pem");
+        std::fs::write(
+            &bundle,
+            format!("{TEST_ROOT_CERTIFICATE_PEM}{TEST_ROOT_CERTIFICATE_PEM}"),
+        )
+        .unwrap();
+        assert!(
+            add_root_certificates_from_pem(reqwest::Client::builder(), &bundle)
+                .unwrap()
+                .build()
+                .is_ok()
+        );
+    }
 
     #[cfg(feature = "mount")]
     #[test]
