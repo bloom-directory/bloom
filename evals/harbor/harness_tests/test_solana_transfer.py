@@ -1052,15 +1052,18 @@ class VfsTransportTests(SolanaEvalTestCase):
                 ):
                     with mock.patch("harness.core.CeremonyDriver.preflight"):
                         with mock.patch.object(
-                            definition, "_load_local_account_identity"
+                            definition, "_require_chain_identity"
                         ):
                             with mock.patch.object(
-                                definition.mount, "list_dir", return_value=[]
+                                definition, "_load_local_account_identity"
                             ):
-                                with self.assertRaisesRegex(
-                                    EvalError, "not reachable over vfs"
+                                with mock.patch.object(
+                                    definition.mount, "list_dir", return_value=[]
                                 ):
-                                    definition.preflight()
+                                    with self.assertRaisesRegex(
+                                        EvalError, "not reachable over vfs"
+                                    ):
+                                        definition.preflight()
 
     def test_agent_trials_are_refused_without_the_mounted_transport(self) -> None:
         definition = self.make(BLOOM_EVAL_SOLANA_TRANSPORT="vfs")

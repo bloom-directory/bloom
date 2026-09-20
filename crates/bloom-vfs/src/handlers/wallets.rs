@@ -2740,14 +2740,22 @@ fn is_outbox_command_sink(segs: &[String]) -> bool {
         {
             true
         }
-        [_wallet, _number, chains, _chain, outbox, pending, _id, control]
-            if chains == "chains"
-                && outbox == "outbox"
-                && pending == "pending"
-                && matches!(
-                    control.as_str(),
-                    "confirm" | "confirm.override" | "cancel" | "restage"
-                ) =>
+        [
+            _wallet,
+            _number,
+            chains,
+            _chain,
+            outbox,
+            pending,
+            _id,
+            control,
+        ] if chains == "chains"
+            && outbox == "outbox"
+            && pending == "pending"
+            && matches!(
+                control.as_str(),
+                "confirm" | "confirm.override" | "cancel" | "restage"
+            ) =>
         {
             true
         }
@@ -5338,14 +5346,26 @@ value = "0""#
         let w = &f.wallet_name;
         for (path, sink) in [
             (format!("/{w}/0/chains/anvil/outbox/new.tx"), true),
-            (format!("/{w}/0/chains/anvil/outbox/pending/e1/confirm"), true),
+            (
+                format!("/{w}/0/chains/anvil/outbox/pending/e1/confirm"),
+                true,
+            ),
             (
                 format!("/{w}/0/chains/anvil/outbox/pending/e1/confirm.override"),
                 true,
             ),
-            (format!("/{w}/0/chains/anvil/outbox/pending/e1/cancel"), true),
-            (format!("/{w}/0/chains/anvil/outbox/pending/e1/restage"), true),
-            (format!("/{w}/0/chains/anvil/outbox/failed/e1/restage"), true),
+            (
+                format!("/{w}/0/chains/anvil/outbox/pending/e1/cancel"),
+                true,
+            ),
+            (
+                format!("/{w}/0/chains/anvil/outbox/pending/e1/restage"),
+                true,
+            ),
+            (
+                format!("/{w}/0/chains/anvil/outbox/failed/e1/restage"),
+                true,
+            ),
             (
                 format!("/{w}/0/chains/solana-local/outbox/pending/s1/confirm"),
                 true,
