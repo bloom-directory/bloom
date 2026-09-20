@@ -119,15 +119,11 @@ that the envelope's owner equals the key this approval will sign with, and that
 a delegatecall goes to an official library — `safe_tx.to` is an EIP-712 member,
 so the selector binds it. The exact selector remains the signing authority.
 
-Requiring an envelope for the operation class is enforced on Machine, and cannot
-move to Broker as the protocol stands. `ApprovalPrepareRequest` carries no
-operation class for a Petal subject, so Broker cannot distinguish a confirmation
-that omitted its envelope from one that never needed it — and the class cannot
-simply be added to `ApprovalSubject::Petal`, because `SealedApprovalTerms` is
-mirrored field for field in `bloom-signer-api` and Broker and Signer each derive
-the approval ID from the JCS bytes of their own copy. A field added on one side
-alone would split approval identity between them the first time a Petal approval
-carried it. Closing this properly means changing both crates in one step.
+Both sides require the envelope. Machine refuses the class without one; Broker
+reads the package's installer-signed provenance record, and a package declaring
+the class gets no exact approval without an envelope and no reusable approval
+at all. A claim sent beside an envelope may not declare amounts, destinations
+or fees: the rebuilt transaction is the review.
 
 Petals always submit complete payload bytes through a payload-bearing host
 call. Hash-only guest signing is unsupported. Machine may validate guest
