@@ -11,7 +11,7 @@ Ignition plugins in `package-lock.json`. Solana deployment is not included.
 ## Setup
 
 Run matching Bloom Machine and Broker builds supporting Machine/Broker protocol
-1.5. Have a funded Bloom wallet, a configured EVM chain, and `bloom serve` running.
+1.6. Have a funded Bloom wallet, a configured EVM chain, and `bloom serve` running.
 For a local test, start Anvil and configure the `anvil` chain with its RPC URL and
 `allow_broadcast = true`. Use a test wallet funded on that local chain.
 
@@ -116,7 +116,8 @@ framework's state. Confirmed Foundry resume and Ignition reruns are tested not t
 send another transaction; arbitrary user scripts can have their own side effects.
 
 Deployment jobs remain pending until explicitly continued or cancelled; owner
-approval ceremonies keep their independent expiry and can be renewed on retry.
+approval ceremonies keep their independent expiry; the next resume after an
+expired ceremony prepares a fresh approval.
 To cancel or bump, use the existing native wallet outbox controls for the same
 ID (`bloom wallet cancel --help` and `bloom wallet replace --help`). Cancellation after signing/broadcast may need
 its own exact approval. A client disconnect never releases a reserved nonce.

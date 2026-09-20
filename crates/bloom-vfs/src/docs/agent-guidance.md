@@ -281,7 +281,9 @@ broadcast hash alone is not a successful deployment. Constructor ownership and
 effects are not verified. Initialization calls are separate transactions with
 their own approvals. The wallet policy must opt into the numeric chain with
 `{"chain":"evm-31337","destination":"exact"}` (replace 31337 as appropriate),
-through the normal policy-update ceremony. This permits preparation, not signing.
+through the normal policy-update ceremony. This permits preparation, not signing,
+and on that chain it also lifts the local recipient allowlist for calls and sends;
+every transaction still needs its own exact owner approval.
 
 For Foundry scripts, Hardhat remote accounts, and Ignition, run
 `bloom deploy --wallet <wallet> --chain <chain> rpc`. It prints an ephemeral,

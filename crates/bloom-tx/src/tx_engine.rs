@@ -1405,9 +1405,11 @@ impl TxEngine {
             return Err(TxEngineError::PolicyDenied);
         }
 
-        // Open a pinned read session for the nonce + code reads so the
+        // Open a pinned read session for the balance + code reads so the
         // staging fanout sees a self-consistent block even when the
-        // layered fallback transport rotates upstreams between calls.
+        // layered fallback transport rotates upstreams between calls. The
+        // nonce reads the pending block instead so it includes transactions
+        // the node already holds.
         // Sessions are unconditional per the spec's Decisions Ratified
         // #2 — there is no opt-out. `gas_price` and `estimate_gas`
         // intentionally stay on the bare client because they target
