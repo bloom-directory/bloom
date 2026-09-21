@@ -23,6 +23,7 @@ pub struct PetalPolicyDestination {
 pub fn for_petal(name: &str) -> &'static [PetalPolicyDestination] {
     match name {
         "enso" => ENSO_POLICY_DESTINATIONS,
+        "near-intents" => NEAR_INTENTS_POLICY_DESTINATIONS,
         "polymarket" => POLYMARKET_POLICY_DESTINATIONS,
         _ => &[],
     }
@@ -105,6 +106,54 @@ const ENSO_ROUTER_V2: &str = "0xf75584ef6673ad213a685a1b58cc0330b8ea22cf";
 const ENSO_ROUTER_V2_LINEA: &str = "0xa146d46823f3f594b785200102be5385cafce9b5";
 /// Enso's deployment shared by Arc, Robinhood Chain, and Tempo.
 const ENSO_ROUTER_V2_ARC_FAMILY: &str = "0xcfbaa9cfce952ca4f4069874ff1df8c05e37a3c7";
+
+/// NEAR Intents deposits go to a fresh address for every quote, signed by the
+/// 1Click API, so no fixed address can be listed. `petal:near-intents` instead
+/// says the wallet trusts this Petal to choose the destination on these chains:
+/// Machine accepts the address it staged, and nothing else on the wallet is
+/// loosened. The Petal's own venue policy caps the input, pins the payout to
+/// the wallet's address unless the owner says otherwise, and every deposit is
+/// still an approval the owner signs. Removing this entry gates NEAR again.
+///
+/// The chains are the ones the pinned release maps (`route/src/assets.rs`).
+const NEAR_INTENTS_POLICY_DESTINATIONS: &[PetalPolicyDestination] = &[
+    PetalPolicyDestination {
+        chain: "arbitrum",
+        destination: NEAR_INTENTS_STAGED,
+    },
+    PetalPolicyDestination {
+        chain: "avalanche",
+        destination: NEAR_INTENTS_STAGED,
+    },
+    PetalPolicyDestination {
+        chain: "base",
+        destination: NEAR_INTENTS_STAGED,
+    },
+    PetalPolicyDestination {
+        chain: "bsc",
+        destination: NEAR_INTENTS_STAGED,
+    },
+    PetalPolicyDestination {
+        chain: "ethereum",
+        destination: NEAR_INTENTS_STAGED,
+    },
+    PetalPolicyDestination {
+        chain: "gnosis",
+        destination: NEAR_INTENTS_STAGED,
+    },
+    PetalPolicyDestination {
+        chain: "optimism",
+        destination: NEAR_INTENTS_STAGED,
+    },
+    PetalPolicyDestination {
+        chain: "polygon",
+        destination: NEAR_INTENTS_STAGED,
+    },
+];
+
+/// The destination form meaning "whatever this Petal stages". It matches the
+/// `petal_id` Machine records on an outbox entry.
+const NEAR_INTENTS_STAGED: &str = "petal:near-intents";
 
 /// Polymarket funds its deposit wallet on Polygon with a direct pUSD transfer,
 /// or an Enso swap after an exact ERC-20 approval. The pUSD and USDC.e

@@ -1003,8 +1003,43 @@ mod tests {
             ]
             .map(|address| ("polygon".to_owned(), address.to_owned()))
         );
-        for name in ["hyperliquid", "near-intents", "tolly", "not-in-catalog"] {
+        for name in ["hyperliquid", "tolly", "not-in-catalog"] {
             assert!(policy_destinations(name).unwrap().is_empty(), "{name}");
+        }
+    }
+
+    #[test]
+    fn near_intents_is_trusted_with_its_own_per_quote_destinations() {
+        // Its deposit address changes per quote, so the entry names the Petal
+        // instead of an address. Machine matches it against the `petal_id` it
+        // records on the outbox entry.
+        let destinations: Vec<(String, String)> = policy_destinations("near-intents")
+            .unwrap()
+            .into_iter()
+            .map(|destination| {
+                (
+                    destination.chain.as_str().to_owned(),
+                    destination.destination,
+                )
+            })
+            .collect();
+        assert_eq!(
+            destinations,
+            [
+                "arbitrum",
+                "avalanche",
+                "base",
+                "bsc",
+                "ethereum",
+                "gnosis",
+                "optimism",
+                "polygon",
+            ]
+            .map(|chain| (chain.to_owned(), "petal:near-intents".to_owned()))
+        );
+        let configured = bloom_proto::Config::local_default();
+        for (chain, _) in &destinations {
+            assert!(configured.chains.contains_key(chain.as_str()), "{chain}");
         }
     }
 

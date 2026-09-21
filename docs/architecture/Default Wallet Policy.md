@@ -100,17 +100,49 @@ Agreed on 2026-09-14:
       Optimism, and Polygon, a second on Linea, and a third shared by Arc,
       Robinhood Chain, and Tempo. Each address is Enso's published deployment,
       checked with `eth_getCode`, and never taken from a quote.
+    - NEAR Intents: `petal:near-intents` on Arbitrum, Avalanche, Base, BNB
+      Chain, Ethereum, Gnosis, Optimism, and Polygon (decision 14).
     - Polymarket: pUSD, native USDC, USDC.e, and Enso Router V2 on Polygon,
       for funding its deposit wallet. A swap's exact approval goes to the
       input token, so each token an owner can fund from needs its own entry;
       native USDC is included because it is what a Polygon wallet normally
       holds.
 
-    Destinations that change per transaction cannot be listed ahead of time:
-    the token contract for a swap from a token the catalog does not list, and
-    NEAR Intents deposit addresses. Those still need a policy update. A
-    transaction staged before such a change keeps its denial, so create a
-    fresh request afterwards rather than confirming the old one.
+    Destinations that change per transaction cannot be listed ahead of time,
+    such as the token contract for a swap from a token the catalog does not
+    list. Those still need a policy update. A transaction staged before such a
+    change keeps its denial, because policy is evaluated once at staging, so
+    create a fresh request afterwards rather than confirming the old one.
+14. **A Petal may be trusted with its own destinations.** NEAR Intents deposits
+    go to a fresh address for every quote, signed by the 1Click API, so no
+    address can be listed in advance. Its catalog entries are
+    `petal:near-intents` on the chains it supports, and Machine accepts the
+    destination of a transaction that Petal staged, matching the entry against
+    the `petal_id` recorded on the outbox entry.
+
+    What that does not do: it covers only that Petal, only on the chains
+    listed, and only for transactions it staged. A different Petal, or a
+    transaction the owner stages by hand, still matches the listed addresses.
+    Every deposit is still an approval the owner signs, and deleting the entry
+    gates the Petal again.
+
+    What it does not change: whether the Petal's package is allowed at all.
+    That is a separate gate, and it runs later rather than earlier. The
+    destination check, including this entry, is evaluated once at staging;
+    the package check happens at confirm, where `evm_tx_confirm` calls
+    `ensure_petal_eligibility` and refuses with a pending policy proposal if
+    the hash is absent from `allowed_petal_packages`. So a Petal whose
+    package the wallet has not allowed can still cause an outbox entry to be
+    staged against a `petal:` entry naming it — it simply cannot confirm it,
+    and nothing is signed or broadcast. This decision neither adds that check
+    nor relaxes it.
+
+    What backs it: the Petal's own venue policy, at
+    `settings/wallets/<wallet>/venue.toml`, caps the input, caps slippage, and
+    pays out only to the wallet's own address unless the owner lists other
+    recipients; and the deposit address comes from a quote whose signature the
+    Petal verifies. The trade-off is that for that Petal, on those chains, the
+    destination check moves from Bloom's list to the Petal's own logic.
 
 ## Why it does not work today
 
@@ -309,7 +341,9 @@ destination the owner removed is not proposed again behind a later request
 - The policy allows exactly the package hashes it lists. A different or
   tampered build does not match.
 - Allowed destinations are addresses pinned in Bloom's source and shown in
-  the policy ceremony, never taken from a quote or a Petal at runtime.
+  the policy ceremony, never taken from a quote or a Petal at runtime. The one
+  exception is a `petal:<name>` entry (decision 14), which is also pinned in
+  Bloom's source and names the Petal, not an address.
 - Signing the policy grants no signing authority. Every signature still
   needs an approval the owner gave for that transaction.
 - Petal limits live in each Petal's settings, not the signed policy. Any

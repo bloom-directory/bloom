@@ -116,6 +116,43 @@ mod tests {
     }
 
     #[test]
+    fn a_petal_destination_entry_reaches_the_planner_unchanged() {
+        // `petal:<name>` is not an address: the planner passes it through and
+        // the policy engine matches it against the Petal that staged the
+        // transaction. It must also stop the deny-all sentinel being added.
+        let policy = advisory_evm_policy(
+            &projection(vec![PolicyDestination {
+                chain: Token::new("arbitrum").unwrap(),
+                destination: "petal:near-intents".into(),
+            }]),
+            "arbitrum",
+        )
+        .unwrap();
+        assert!(policy.allowlists.recipients.contains("petal:near-intents"));
+        assert!(
+            !policy
+                .allowlists
+                .recipients
+                .contains("__broker_policy_denies_all_destinations__")
+        );
+        // It is scoped to its chain like any other destination.
+        let elsewhere = advisory_evm_policy(
+            &projection(vec![PolicyDestination {
+                chain: Token::new("arbitrum").unwrap(),
+                destination: "petal:near-intents".into(),
+            }]),
+            "base",
+        )
+        .unwrap();
+        assert!(
+            elsewhere
+                .allowlists
+                .recipients
+                .contains("__broker_policy_denies_all_destinations__")
+        );
+    }
+
+    #[test]
     fn canonical_destinations_become_chain_scoped_advisory_allowlist() {
         let allowed = "0x0000000000000000000000000000000000000001";
         let policy = advisory_evm_policy(
