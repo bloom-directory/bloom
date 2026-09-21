@@ -140,3 +140,79 @@ Validation: all 425 VFS tests and strict VFS all-target Clippy passed. Broker's
 HTTP/2 cookie regression, all five executable browser tests, strict workspace
 all-feature Clippy and formatting passed. The dev stack retains prior wallet and
 passkey state; retry with a fresh ceremony URL because the reported URL expired.
+
+
+## Follow-up: authenticated recovery and neutral landing
+
+The bare root now exposes only Bloom Broker identification and the website/docs
+links. Protected Broker configuration `neutral_landing_enabled` defaults to true;
+false returns an empty 404. Local and remote browser reloads use `/ceremony/`,
+and new remote launches use `/ceremony/#cap=…`. Public recovery initiation and
+its form are removed. Recovery starts through the authenticated Machine edge by
+writing a wallet name to `/wallets/recover`; `/wallets/recoveries/<name>/` provides
+status, a public result after `SUCCEEDED`, and cancellation.
+
+Machine persists a public operation intent before dispatch, retains it across
+ambiguous responses, and serializes recovery lifecycle updates. Retries retain
+all nonterminal operations, including browser-result acknowledgement. Secrets
+remain in the browser-to-Signer HPKE flow. Existing Signer recovery revokes old
+credentials, rotates the recovery factor, and preserves the wallet root. No
+Signer, relay, or shared-runtime production change was needed for this follow-up.
+
+The exact case-6 candidate was:
+
+- Machine: `537efa3be070005afbf203cce857d4c2f9affe41`.
+- Broker and debug driver: `ec74ea8caa44c537acc6842b4a3888de7645c2c4`.
+- Signer: `61dbbf14211d54c728e910eb30129a82c2d7a90b` (unchanged).
+- Evidence: `/tmp/bloom-relay-e2e-20260921/case-6-recovery`, owner-private.
+
+| Executable | SHA-256 |
+| --- | --- |
+| Machine | `8e1a63ca0ef43ad5be60a79dcdd55f734f81a98c50033de335fd356e98ff9af0` |
+| Broker | `9f6378bf216108448430cedf8da88b68a61986947bd4b22bb9ca81a012914beb` |
+| Debug driver | `d9d198a5c65bb096fdda03112ef77078df482ccfee0ee28346b5bcbc18de1284` |
+
+With the landing page disabled, the live public HTTP/2 root returned empty 404,
+the public recovery endpoint returned 404, and the dedicated ceremony returned
+200. Native WebAuthn registration and policy authorization passed. VFS recovery
+reused its operation on a repeated write, accepted the browser-only recovery
+record and replacement virtual passkey, returned a rotated private record, and
+projected `SUCCEEDED` with no capability URL. The wallet address was unchanged.
+The replacement passkey then activated a Sealed Approval without executing;
+separate confirmation mined exactly once with nonce 1 and exactly 1 ETH received
+on disposable loopback Anvil. Transaction:
+`0xb0307918618592f8590e17166cbc8d66fe733b62966efc8b8ab982b7bb4dd2b5`.
+
+The test exposed and fixed two integration errors before this passing run:
+the driver must acknowledge registration output as well as recovery output and
+accept HTTP 204, and Machine must use recovery's `SUCCEEDED` terminal state.
+The driver reuses the maintained HPKE implementation and existing typed AAD;
+its custom code only handles Bloom's result/acknowledgement contract and private
+fixture files. Recovery records never enter Machine state or published evidence.
+
+After a persisted-state restart with the landing enabled, public HTTP/2 `/`
+returned 200 with exactly the intended text/links and no forms/scripts. Recovery
+status and public result remained readable. The dev Triad is left running with
+prior wallet/passkey state preserved. Enrollment remains closed.
+
+Focused verification: Broker ceremony suite 51/51, executable browser suite
+5/5, driver 12/12, configuration defaults and authenticated recovery transport
+passed; strict all-feature Broker workspace Clippy passed before the driver-only
+acknowledgement fix, whose strict driver Clippy also passed. Machine recovery
+lifecycle and concurrency tests passed within the 414-test VFS library suite;
+embedded guidance and daemon guest-boundary checks passed. Final Machine strict
+workspace Clippy, formatting and shell syntax checks passed. CI workflow sibling
+pins now agree with Cargo and release compatibility metadata.
+
+This is virtual-authenticator protocol acceptance. Real-browser recovery,
+production backup/restore-witness retention and disaster-recovery drills remain
+required. Installed macOS NFS conformance remains unresolved and the two-login
+workflow stays deferred. No production deployment, merge, or release publication
+was performed.
+
+Final-source workspace verification on macOS: 1,749 passed, four ignored,
+23 Linux-named tests filtered (`cargo test --workspace --locked -- --skip linux_`).
+The Linux installer cases require GNU userland; earlier Linux-container evidence
+is retained above, and fresh Linux CI remains distinct from this macOS result.
+Broker current-head CI passed both workspace and privileged listener ownership:
+https://github.com/bloom-directory/bloom-broker/actions/runs/35659235259.
