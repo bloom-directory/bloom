@@ -243,7 +243,8 @@ activate a remote Sealed Approval, and separately execute one transfer on a
 loopback Anvil chain (chain ID 31337). Set `BLOOM_REMOTE_RELAY_E2E=1`; use a new
 run directory and a dedicated chain. Set `BLOOM_INTEGRATION_DEBUG_DRIVER_BIN`
 to the exact candidate Broker debug driver; its digest is recorded with the
-evidence. The driver verifies public HTTPS normally
+evidence. The test also requires curl with HTTP/2 support to check browser
+landing-page navigation. The driver verifies public HTTPS normally
 and sends genuine WebAuthn proofs with the assigned origin/RP ID. It does not
 bypass certificate validation or substitute localhost for the remote ceremony.
 No NFS mount is required. Test state is retained for inspection and explicit

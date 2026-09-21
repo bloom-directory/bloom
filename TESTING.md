@@ -143,7 +143,8 @@ BLOOM_REMOTE_RELAY_E2E=1 scripts/test-remote-relay-approval.sh \
 ```
 
 This opt-in check uses the Broker debug driver and normal public HTTPS trust to
-enroll a virtual passkey, authorize policy, and activate a Sealed Approval. It
+enroll a virtual passkey, authorize policy, and activate a Sealed Approval. Curl
+with HTTP/2 support separately checks public browser navigation. The test
 checks that approval alone does not execute, then separately confirms the exact
 transfer and verifies its receipt on loopback Anvil (chain ID 31337). It needs no
 NFS mount. See [hosted-relay developer acceptance](./DEVELOPMENT.md#hosted-relay-developer-acceptance)

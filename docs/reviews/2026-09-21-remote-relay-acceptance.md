@@ -8,7 +8,7 @@ loopback Anvil chain (31337); no installed wallet state or real funds were used.
 ## Candidate and evidence
 
 - Machine: the source revision containing this record; `mount,triad-dev-harness`.
-- Broker: `36ab9d89f159bba5abe7927e8ed89f7bf232d4c8`, `triad-dev-harness`.
+- Broker: `76449ab6a19e0982db4c4a739ed48c2f6a63ca10`, `triad-dev-harness`.
 - Signer: `61dbbf14211d54c728e910eb30129a82c2d7a90b`, `triad-dev-harness`.
 - Shared runtime: `a046fd6075853e8591f295983b572c6e1d65d12d`.
 - Relay borrower API: `6c8771b66b618cd13b7cad3e0cd850af2982b5aa`.
@@ -16,17 +16,17 @@ loopback Anvil chain (31337); no installed wallet state or real funds were used.
   (the later borrower revision changes documentation).
 - Installation: `52d66cf9-3347-4b17-858e-b53e786cff0b`.
 - Host: `5ixwab6amyu7e42fjobm3myxqe.relay.bloom.directory`.
-- Local evidence: `/tmp/bloom-relay-e2e-20260921/case-1`, owner-private.
+- Local evidence: `/tmp/bloom-relay-e2e-20260921/case-2`, owner-private.
   Capability URLs and authenticator material are not published with this record.
 
 SHA-256 of the exact copied executables:
 
 | Executable | SHA-256 |
 | --- | --- |
-| Machine | `ef8b19a2439ebe7589779189d9834ae071ead276f46614b1fc620682d55904f3` |
-| Broker | `3a6704718cf32c1c38d10e8e39bc00d841e8508b4274b6d2e75d12e2e4cabbe3` |
+| Machine | `af31556061d54ad7b067fbdd2e1f5e861a5201d43f0e65fba0c70e1a0989dd95` |
+| Broker | `25b39669562fa45ea725ee39d3d968d9453dbaba5af90bb0c7b102513ef33e57` |
 | Signer | `553511d4a0d8d303a12280757bfd4c463f325d30108183347727085748345712` |
-| Debug driver | `3781ef5a32a958466c312ca86a78e710e0a87acfc582390fae870293f5d71d93` |
+| Debug driver | `2469f2f293b3d7587421b19829d227c290070221d43a4134d60b9927dbab0430` |
 
 The saved administrator operation recovered the same allocation after interrupted
 provisioning. Production CA issuance completed through scoped DNS-01; Signer
@@ -34,10 +34,12 @@ reported `remote_enabled`, `remote_tls_ready=true`, and
 `remote_routing_ready=true`. Operator-only enrollment was closed immediately
 after assignment and remained closed during wallet acceptance.
 
-`scripts/test-remote-relay-approval.sh` passed every assertion:
+The final rerun after a persisted-state restart first required HTTP/2 browser
+navigation to return 200 over normal public TLS.
+`scripts/test-remote-relay-approval.sh` then passed every assertion:
 
 1. A fresh virtual WebAuthn authenticator registered wallet
-   `relay-e2e-1790018869` at the exact public origin/RP ID.
+   `relay-e2e-1790019658` at the exact public origin/RP ID.
 2. Remote WebAuthn authorized the destination policy update.
 3. Execution before Sealed Approval was refused and created a durable approval
    operation.
@@ -45,9 +47,9 @@ after assignment and remained closed during wallet acceptance.
    remained unchanged.
 5. A separate VFS confirmation dispatched the approved transfer. The terminal
    projection cleared the ceremony URL and reported `sign_dispatched=true`.
-6. Transaction `0xf055cce96f72b30ebd7b8084089afe877705f6fe03bd81b2b269fede4db50973`
-   mined successfully in block 1. Sender
-   `0xcf3f2d8452df553df75beee39fcc950ee5697627` advanced from nonce 0 to 1;
+6. Transaction `0xfe598d0e6a3af9515bd6814629dae888ab6a3e73d7aa7219aeb0666e82203cc4`
+   mined successfully in block 2. Sender
+   `0x5d4de4a59c124d70add57316c70be6fbb5f28830` advanced from nonce 0 to 1;
    `0x000000000000000000000000000000000000dead` received exactly 1 ETH.
 
 ## Fixes exercised
@@ -57,6 +59,10 @@ after assignment and remained closed during wallet acceptance.
   Production administration remains root-only.
 - WebAuthn RP IDs use their own DNS-validated type. Numeric-leading assigned
   hosts are accepted without relaxing generic protocol tokens or surface scope.
+- Broker normalizes HTTP/2 `:authority` into the existing exact-host checks,
+  rejecting missing, duplicate or conflicting authorities. A live browser-style
+  HTTP/2 request exposed this after the first HTTP/1.1 native acceptance pass;
+  router regressions and the full public rerun now cover it.
 - Broker explicitly selects its existing AWS-LC rustls provider when relay
   dependencies also enable ring.
 - The debug driver reuses maintained `ureq` and `url`, existing virtual WebAuthn,
@@ -79,7 +85,9 @@ lack of `-T`. The maintained Debian container reran all 21 Linux-selected releas
 tests as unprivileged `nobody`: 21 passed, including those ten cases.
 
 Broker: API 44 tests, debug driver 9, browser suites 11 and three canonical
-loopback tests passed; workspace strict Clippy passed. Host Node ICU and sandbox
+loopback tests passed; workspace strict Clippy passed. The final HTTP/2 router
+regression covers root, CSS, exchange, matching authority/Host, and rejection
+cases; all-target/all-feature strict Clippy passed again. Host Node ICU and sandbox
 bind failures were rerun with a working Node and loopback access. Signer: API 51,
 WebAuthn 41 and both production/harness strict Clippy passed.
 

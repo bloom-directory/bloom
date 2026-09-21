@@ -46,6 +46,15 @@ PY
 wallet_name="relay-e2e-$(date +%s)"
 cli wallet new "$wallet_name" > "$run_dir/register.txt"
 url="$(remote_url "$run_dir/register.txt")"
+# Browsers negotiate HTTP/2; check the landing page independently of ureq's
+# HTTP/1.1 ceremony client so authority handling is exercised on both paths.
+navigation="$(curl --http2 --max-time 20 --silent --show-error \
+  -H 'Sec-Fetch-Site: none' -H 'Sec-Fetch-Mode: navigate' \
+  -H 'Sec-Fetch-Dest: document' \
+  --output "$run_dir/landing.html" --write-out '%{http_code} %{http_version}' \
+  "${url%%/#cap=*}/")"
+[ "$navigation" = '200 2' ] || { echo "Public HTTP/2 navigation failed: $navigation" >&2; exit 1; }
+printf 'PASS public HTTP/2 browser navigation\n'
 complete "$url" 1 > "$run_dir/register-result.json"
 wallet="$(jq -er '.wallet_id' "$run_dir/register-result.json")"
 address="$(cli wallet address "$wallet")"
