@@ -216,7 +216,7 @@ forward the complete `ceremony_url` to the human. The recovery ID and secret,
 and the replacement passkey, belong only in the Broker-hosted Browser page;
 never place them in a VFS write, shell argument, or log. A spent one-use URL
 disappears from status while the operation remains readable and cancellable.
-After `COMPLETED`, read `result.json`. A cancelled or expired operation can
+After `SUCCEEDED`, read `result.json`. A cancelled or expired operation can
 be started again with a fresh write to `wallets/recover`.
 
 ## The transaction loop

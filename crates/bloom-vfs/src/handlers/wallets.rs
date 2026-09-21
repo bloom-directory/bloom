@@ -1030,7 +1030,19 @@ impl WalletsHandler {
     }
 
     fn recovery_result_ready(projection: &WalletRecoveryProjection) -> bool {
-        projection.ceremony_state == bloom_broker_api::CeremonyState::Completed
+        Some(projection.ceremony_state)
+            == bloom_broker_api::CeremonyKind::WalletRecovery.successful_terminal_state()
+    }
+
+    fn recovery_terminal(state: bloom_broker_api::CeremonyState) -> bool {
+        matches!(
+            state,
+            bloom_broker_api::CeremonyState::Completed
+                | bloom_broker_api::CeremonyState::Succeeded
+                | bloom_broker_api::CeremonyState::Cancelled
+                | bloom_broker_api::CeremonyState::Expired
+                | bloom_broker_api::CeremonyState::Failed
+        )
     }
 
     fn recovery_status_entry(projection: &WalletRecoveryProjection) -> Result<Entry, HandlerError> {
@@ -1097,7 +1109,7 @@ impl WalletsHandler {
             ));
         }
         if let Some((_, projection)) = &existing
-            && projection.ceremony_state == bloom_broker_api::CeremonyState::AwaitingUser
+            && !Self::recovery_terminal(projection.ceremony_state)
         {
             if projection.surface_selection != request.surface_selection {
                 return Err(HandlerError::invalid(
@@ -1109,7 +1121,7 @@ impl WalletsHandler {
             // recovery. Refreshing also proves that the retained launch is
             // still actionable before reporting the retry as successful.
             let refreshed = self.recovery_projection_unlocked(requested_name).await?;
-            if refreshed.ceremony_state == bloom_broker_api::CeremonyState::AwaitingUser {
+            if !Self::recovery_terminal(refreshed.ceremony_state) {
                 return Ok(());
             }
         }
@@ -1253,14 +1265,7 @@ impl WalletsHandler {
         requested_name: &str,
     ) -> Result<WalletRecoveryProjection, HandlerError> {
         let (path, mut projection) = self.recovery_record(requested_name)?;
-        if matches!(
-            projection.ceremony_state,
-            bloom_broker_api::CeremonyState::Completed
-                | bloom_broker_api::CeremonyState::Succeeded
-                | bloom_broker_api::CeremonyState::Cancelled
-                | bloom_broker_api::CeremonyState::Expired
-                | bloom_broker_api::CeremonyState::Failed
-        ) {
+        if Self::recovery_terminal(projection.ceremony_state) {
             return Ok(projection);
         }
         let local_launch_expired = projection
@@ -1376,7 +1381,8 @@ impl WalletsHandler {
                 .as_ref()
                 .map(|wallet_id| wallet_id.as_str())
                 != Some(requested_name)
-            || result.public_status != bloom_broker_api::CeremonyState::Completed
+            || Some(result.public_status)
+                != bloom_broker_api::CeremonyKind::WalletRecovery.successful_terminal_state()
         {
             return Err(HandlerError::backend(
                 "Broker returned a mismatched wallet recovery result",
@@ -7580,6 +7586,33 @@ value = "0""#,
             serde_json::from_slice(&fixture.handler.read(&status_path).await.unwrap()).unwrap();
         assert!(consumed["ceremony_url"].is_null());
         assert_eq!(consumed["operation_id"], first_operation);
+        for pending_state in [
+            CeremonyState::WalletCommitted,
+            CeremonyState::AwaitingRecoveryAck,
+        ] {
+            *broker.state.lock().unwrap() = pending_state;
+            let pending_status: serde_json::Value =
+                serde_json::from_slice(&fixture.handler.read(&status_path).await.unwrap()).unwrap();
+            assert_eq!(pending_status["operation_id"], first_operation);
+            assert_eq!(
+                pending_status["ceremony_state"],
+                serde_json::to_value(pending_state).unwrap()
+            );
+            fixture.handler.write(&recover, b"lost").await.unwrap();
+            assert_eq!(
+                preparations(),
+                2,
+                "pending recovery must reuse its operation"
+            );
+            assert!(matches!(
+                fixture
+                    .handler
+                    .read(&VfsPath::parse("/recoveries/lost/result.json").unwrap())
+                    .await,
+                Err(HandlerError::NotFound(_))
+            ));
+        }
+        *broker.state.lock().unwrap() = CeremonyState::AwaitingUser;
         assert!(
             fixture
                 .handler
@@ -7614,10 +7647,10 @@ value = "0""#,
         let after_expiry: serde_json::Value =
             serde_json::from_slice(&fixture.handler.read(&status_path).await.unwrap()).unwrap();
         assert_ne!(after_expiry["operation_id"], refreshed["operation_id"]);
-        *broker.state.lock().unwrap() = CeremonyState::Completed;
+        *broker.state.lock().unwrap() = CeremonyState::Succeeded;
         let completed: serde_json::Value =
             serde_json::from_slice(&fixture.handler.read(&status_path).await.unwrap()).unwrap();
-        assert_eq!(completed["ceremony_state"], "COMPLETED");
+        assert_eq!(completed["ceremony_state"], "SUCCEEDED");
         let result: serde_json::Value = serde_json::from_slice(
             &fixture
                 .handler

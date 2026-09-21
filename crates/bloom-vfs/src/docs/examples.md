@@ -94,7 +94,7 @@ mount. Those inputs stay inside the Broker-hosted browser ceremony.
 printf 'main\n' > "$BLOOM/wallets/recover"
 cat "$BLOOM/wallets/recoveries/main/status.json"
 # Open the complete ceremony_url in a browser and enter recovery material there.
-# Poll until ceremony_state is COMPLETED, then inspect:
+# Poll until ceremony_state is SUCCEEDED, then inspect:
 cat "$BLOOM/wallets/recoveries/main/result.json"
 ```
 
