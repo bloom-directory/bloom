@@ -76,10 +76,19 @@ impl Default for ExecutionOrigin {
 }
 
 impl ExecutionOrigin {
+    /// Whether two origins name the same installed Petal, ignoring which of
+    /// its routes produced the request.
+    ///
+    /// Written by clearing `route_id` and comparing whole values rather than
+    /// by listing the fields that matter: a field added later is then compared
+    /// by default, instead of being silently dropped from a check that decides
+    /// whether one Petal may act on another's staged transaction.
     pub fn same_package(&self, other: &Self) -> bool {
-        self.petal_id == other.petal_id
-            && self.petal_digest == other.petal_digest
-            && self.petal_version == other.petal_version
+        let without_route = |origin: &Self| Self {
+            route_id: None,
+            ..origin.clone()
+        };
+        without_route(self) == without_route(other)
     }
 
     pub fn validate(&self) -> Result<(), String> {
