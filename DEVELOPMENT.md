@@ -250,6 +250,21 @@ bypass certificate validation or substitute localhost for the remote ceremony.
 No NFS mount is required. Test state is retained for inspection and explicit
 cleanup; never use this fixture wallet or virtual authenticator for real funds.
 
+Set `BLOOM_REMOTE_RECOVERY_E2E=1` to extend this check with VFS-initiated
+recovery, a replacement virtual passkey, and approval using that replacement.
+Recovery records remain in exclusive mode-0600 files outside Machine's home;
+they are test-only browser output and must not be published with evidence.
+The check verifies retry reuse, unchanged wallet address, terminal projections,
+and removal of public recovery initiation.
+
+To exercise ceremonies with the neutral page disabled, start the launcher with
+`BLOOM_TRIAD_DEV_NEUTRAL_LANDING_ENABLED=false` and run the check with
+`BLOOM_REMOTE_LANDING_EXPECT_STATUS=404`. The launcher sets the protected Broker
+configuration field `neutral_landing_enabled`; this optional harness override
+accepts only `true` or `false`. Set it to `true` on a subsequent launch to restore
+the neutral page. Remote launch URLs use `/ceremony/#cap=…`, so disabling `/`
+does not disable authenticated ceremonies.
+
 ### Sharing a host with other candidates
 
 The examples use fixed paths. Before running another candidate, give it a

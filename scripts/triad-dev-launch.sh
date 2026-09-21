@@ -314,9 +314,16 @@ export BLOOM_MACHINE_AUDIT_CHECKPOINT_DIR="$machine_checkpoint_dir"
 rewrite_broker_config() {
   source="${config_dir}/broker.json"
   temporary="${source}.new.$$"
+  landing_override="${BLOOM_TRIAD_DEV_NEUTRAL_LANDING_ENABLED:-}"
+  case "$landing_override" in
+    ''|true|false) ;;
+    *) die "BLOOM_TRIAD_DEV_NEUTRAL_LANDING_ENABLED must be true or false" ;;
+  esac
   jq --arg signer_socket "$signer_socket" --arg digest "$release_digest" \
+    --arg landing "$landing_override" \
     '.signer_socket_path = $signer_socket | .build_digest = $digest |
-     .network_containment = null | .maximum_requests_per_window = 10000' \
+     .network_containment = null | .maximum_requests_per_window = 10000 |
+     if $landing == "" then . else .neutral_landing_enabled = ($landing == "true") end' \
     "$source" > "$temporary"
   chmod 0600 "$temporary"
   mv -f "$temporary" "$source"

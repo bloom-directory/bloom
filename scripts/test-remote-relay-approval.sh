@@ -32,11 +32,12 @@ wait_vfs() {
 remote_url() {
   local value
   value="$(sed -n 's/^ceremony_url: //p' "$1")"
-  [[ "$value" =~ ^https://[a-z2-7]{26}\.relay\.bloom\.directory/\#cap=[A-Za-z0-9_-]{43}$ ]] || { echo 'Expected an assigned public HTTPS ceremony URL' >&2; return 1; }
+  [[ "$value" =~ ^https://[a-z2-7]{26}\.relay\.bloom\.directory/ceremony/\#cap=[A-Za-z0-9_-]{43}$ ]] || { echo 'Expected an assigned public HTTPS ceremony URL' >&2; return 1; }
   printf '%s' "$value"
 }
+authenticator_seed="$run_dir/authenticator.seed"
 complete() {
-  "$driver" complete "$1" --authenticator-seed-file "$run_dir/authenticator.seed" --sign-count "$2"
+  "$driver" complete "$1" --authenticator-seed-file "$authenticator_seed" --sign-count "$2"
 }
 # Fresh test-only authenticator state stays outside Machine's home.
 python3 - "$run_dir/authenticator.seed" <<'PY'
@@ -52,10 +53,44 @@ navigation="$(curl --http2 --max-time 20 --silent --show-error \
   -H 'Sec-Fetch-Site: none' -H 'Sec-Fetch-Mode: navigate' \
   -H 'Sec-Fetch-Dest: document' \
   --output "$run_dir/landing.html" --write-out '%{http_code} %{http_version}' \
-  "${url%%/#cap=*}/")"
+  "${url%%#cap=*}")"
 [ "$navigation" = '200 2' ] || { echo "Public HTTP/2 navigation failed: $navigation" >&2; exit 1; }
 printf 'PASS public HTTP/2 browser navigation\n'
-complete "$url" 1 > "$run_dir/register-result.json"
+origin="${url%%/ceremony/#cap=*}"
+landing_status="$(curl --http2 --max-time 20 --silent --show-error \
+  --output "$run_dir/neutral.html" --write-out '%{http_code}' "$origin/")"
+expected_landing="${BLOOM_REMOTE_LANDING_EXPECT_STATUS:-200}"
+[ "$landing_status" = "$expected_landing" ] || { echo "Unexpected neutral landing status: $landing_status" >&2; exit 1; }
+case "$expected_landing" in
+  404) [ ! -s "$run_dir/neutral.html" ] || { echo 'Disabled landing page must have an empty body' >&2; exit 1; } ;;
+  200) python3 - "$run_dir/neutral.html" <<'PYHTML'
+from html.parser import HTMLParser
+import sys
+class Page(HTMLParser):
+    def __init__(self): super().__init__(); self.links=[]; self.forms=0
+    def handle_starttag(self, tag, attrs):
+        if tag == 'a': self.links.append(dict(attrs).get('href'))
+        if tag == 'form': self.forms += 1
+p=Page(); html=open(sys.argv[1]).read(); p.feed(html)
+assert set(p.links) == {'https://bloom.directory', 'https://docs.bloom.directory'}
+assert p.forms == 0 and 'Bloom Broker' in html
+PYHTML
+    ;;
+  *) echo 'Expected landing status must be 200 or 404' >&2; exit 1 ;;
+esac
+public_recovery="$(curl --http2 --max-time 20 --silent --show-error \
+  -X POST -H "Origin: $origin" -H 'Sec-Fetch-Site: same-origin' \
+  -H 'Content-Type: application/json' --data '{}' \
+  --output "$run_dir/public-recovery.txt" --write-out '%{http_code}' \
+  "$origin/api/recovery/bootstrap")"
+[ "$public_recovery" = 404 ] || { echo 'Public recovery initiation is still exposed' >&2; exit 1; }
+printf 'PASS neutral landing policy and no public recovery initiation\n'
+if [ "${BLOOM_REMOTE_RECOVERY_E2E:-0}" = 1 ]; then
+  "$driver" complete "$url" --authenticator-seed-file "$authenticator_seed" \
+    --sign-count 1 --browser-result-file "$run_dir/recovery-record.json" > "$run_dir/register-result.json"
+else
+  complete "$url" 1 > "$run_dir/register-result.json"
+fi
 wallet="$(jq -er '.wallet_id' "$run_dir/register-result.json")"
 address="$(cli wallet address "$wallet")"
 printf '%s\n' "$wallet" > "$run_dir/wallet-id"
@@ -68,6 +103,32 @@ complete "$(remote_url "$run_dir/policy.txt")" 2 > "$run_dir/policy-result.json"
 operation="$(sed -n 's/^operation_id: //p' "$run_dir/policy.txt")"
 cli wallet commit-policy "$operation" > "$run_dir/policy-commit.json"
 printf 'PASS remote policy authorization\n'
+if [ "${BLOOM_REMOTE_RECOVERY_E2E:-0}" = 1 ]; then
+  recovery_path="/wallets/recoveries/$wallet"
+  write_vfs /wallets/recover "$wallet" > /dev/null
+  read_vfs "$recovery_path/status.json" > "$run_dir/recovery-status.json"
+  recovery_operation="$(jq -er '.operation_id' "$run_dir/recovery-status.json")"
+  write_vfs /wallets/recover "$wallet" > /dev/null
+  [ "$(read_vfs "$recovery_path/status.json" | jq -er '.operation_id')" = "$recovery_operation" ]
+  recovery_url="$(jq -er '.ceremony_url' "$run_dir/recovery-status.json")"
+  [[ "$recovery_url" =~ ^https://[a-z2-7]{26}\.relay\.bloom\.directory/ceremony/\#cap=[A-Za-z0-9_-]{43}$ ]]
+  python3 - "$run_dir/replacement.seed" <<'PYSEED'
+import secrets,sys
+with open(sys.argv[1], 'x') as f: f.write(secrets.token_hex(32))
+PYSEED
+  "$driver" complete "$recovery_url" \
+    --new-authenticator-seed-file "$run_dir/replacement.seed" \
+    --recovery-record-file "$run_dir/recovery-record.json" \
+    --browser-result-file "$run_dir/rotated-recovery-record.json" \
+    --sign-count 1 > "$run_dir/recovery-result.json"
+  read_vfs "$recovery_path/status.json" > "$run_dir/recovery-terminal.json"
+  jq -e '.ceremony_url == null and (.ceremony_state == "SUCCEEDED" or .ceremony_state == "COMPLETED")' \
+    "$run_dir/recovery-terminal.json" > /dev/null
+  read_vfs "$recovery_path/result.json" > "$run_dir/recovery-public-result.json"
+  [ "$(cli wallet address "$wallet")" = "$address" ]
+  authenticator_seed="$run_dir/replacement.seed"
+  printf 'PASS VFS-initiated remote recovery, stable operation retry, unchanged wallet address\n'
+fi
 cast rpc --rpc-url "$rpc" anvil_setBalance "$address" 0x8ac7230489e80000 > /dev/null
 before="$(cast balance --rpc-url "$rpc" "$recipient")"
 intent="$(jq -nc --arg to "$recipient" '{kind:"send",to:$to,value:"1 eth",chain:"anvil",usd_value_hint:"1"}')"
@@ -87,7 +148,7 @@ fi
 wait_vfs "$pending/$entry/ceremony.json" > "$run_dir/approval.json"
 jq -e '.approval_operation_id | test("^[0-9a-f]{64}$")' "$run_dir/approval.json" > /dev/null
 url="$(jq -er '.ceremony_url' "$run_dir/approval.json")"
-[[ "$url" =~ ^https://[a-z2-7]{26}\.relay\.bloom\.directory/\#cap=[A-Za-z0-9_-]{43}$ ]] || { echo 'Sealed Approval did not use hosted HTTPS' >&2; exit 1; }
+[[ "$url" =~ ^https://[a-z2-7]{26}\.relay\.bloom\.directory/ceremony/\#cap=[A-Za-z0-9_-]{43}$ ]] || { echo 'Sealed Approval did not use hosted HTTPS' >&2; exit 1; }
 [ "$(cast nonce --rpc-url "$rpc" "$address")" = 0 ]
 printf 'PASS execution refused before remote Sealed Approval\n'
 complete "$url" 3 > "$run_dir/approval-result.json"
