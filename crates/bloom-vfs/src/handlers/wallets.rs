@@ -1108,7 +1108,7 @@ impl WalletsHandler {
             // not allocate a second Broker operation for the same live
             // recovery. Refreshing also proves that the retained launch is
             // still actionable before reporting the retry as successful.
-            let refreshed = self.recovery_projection(requested_name).await?;
+            let refreshed = self.recovery_projection_unlocked(requested_name).await?;
             if refreshed.ceremony_state == bloom_broker_api::CeremonyState::AwaitingUser {
                 return Ok(());
             }
@@ -1244,6 +1244,14 @@ impl WalletsHandler {
         &self,
         requested_name: &str,
     ) -> Result<WalletRecoveryProjection, HandlerError> {
+        let _prepare_guard = self.recovery_prepare_lock.lock().await;
+        self.recovery_projection_unlocked(requested_name).await
+    }
+
+    async fn recovery_projection_unlocked(
+        &self,
+        requested_name: &str,
+    ) -> Result<WalletRecoveryProjection, HandlerError> {
         let (path, mut projection) = self.recovery_record(requested_name)?;
         if matches!(
             projection.ceremony_state,
@@ -1317,7 +1325,8 @@ impl WalletsHandler {
     }
 
     async fn cancel_wallet_recovery(&self, requested_name: &str) -> Result<(), HandlerError> {
-        let projection = self.recovery_projection(requested_name).await?;
+        let _prepare_guard = self.recovery_prepare_lock.lock().await;
+        let projection = self.recovery_projection_unlocked(requested_name).await?;
         let operation_id = projection.operation_id.clone();
         if projection.ceremony_state != bloom_broker_api::CeremonyState::AwaitingUser {
             return Err(HandlerError::invalid(
@@ -1337,7 +1346,7 @@ impl WalletsHandler {
                 "Broker did not confirm wallet recovery cancellation",
             ));
         }
-        let _ = self.recovery_projection(requested_name).await?;
+        let _ = self.recovery_projection_unlocked(requested_name).await?;
         Ok(())
     }
 
@@ -1345,7 +1354,13 @@ impl WalletsHandler {
         &self,
         requested_name: &str,
     ) -> Result<Vec<u8>, HandlerError> {
-        let projection = self.recovery_projection(requested_name).await?;
+        let _prepare_guard = self.recovery_prepare_lock.lock().await;
+        let projection = self.recovery_projection_unlocked(requested_name).await?;
+        if !Self::recovery_result_ready(&projection) {
+            return Err(HandlerError::not_found(format!(
+                "wallet recovery result for {requested_name}"
+            )));
+        }
         let operation_id = projection.operation_id;
         let result = self
             .custody_broker()?
@@ -1361,6 +1376,7 @@ impl WalletsHandler {
                 .as_ref()
                 .map(|wallet_id| wallet_id.as_str())
                 != Some(requested_name)
+            || result.public_status != bloom_broker_api::CeremonyState::Completed
         {
             return Err(HandlerError::backend(
                 "Broker returned a mismatched wallet recovery result",
@@ -4406,6 +4422,9 @@ mod tests {
         omit_ceremony_url: Mutex<bool>,
         status_error: Mutex<Option<ProtocolErrorCode>>,
         lose_recovery_prepare_response_once: Mutex<bool>,
+        pause_status_once: Mutex<bool>,
+        status_entered: tokio::sync::Notify,
+        status_release: tokio::sync::Notify,
     }
 
     struct WalletAccountsBroker;
@@ -4497,6 +4516,10 @@ mod tests {
                         }
                         let state = *self.state.lock().unwrap();
                         let omit_ceremony_url = *self.omit_ceremony_url.lock().unwrap();
+                        if std::mem::take(&mut *self.pause_status_once.lock().unwrap()) {
+                            self.status_entered.notify_one();
+                            self.status_release.notified().await;
+                        }
                         Ok(MachineBrokerResponse::CeremonyStatus(
                             CeremonyPublicStatus {
                                 ceremony_id: digest(62),
@@ -7475,6 +7498,9 @@ value = "0""#,
             omit_ceremony_url: Mutex::new(false),
             status_error: Mutex::new(None),
             lose_recovery_prepare_response_once: Mutex::new(false),
+            pause_status_once: Mutex::new(false),
+            status_entered: tokio::sync::Notify::new(),
+            status_release: tokio::sync::Notify::new(),
         });
         fixture.handler = fixture
             .handler
@@ -7614,6 +7640,9 @@ value = "0""#,
             omit_ceremony_url: Mutex::new(false),
             status_error: Mutex::new(None),
             lose_recovery_prepare_response_once: Mutex::new(true),
+            pause_status_once: Mutex::new(false),
+            status_entered: tokio::sync::Notify::new(),
+            status_release: tokio::sync::Notify::new(),
         });
         fixture.handler = fixture
             .handler
@@ -7636,6 +7665,60 @@ value = "0""#,
     }
 
     #[tokio::test]
+    async fn delayed_recovery_status_cannot_overwrite_a_new_operation() {
+        let mut fixture = make_handler();
+        let broker = Arc::new(RegistrationBroker {
+            requests: Mutex::new(Vec::new()),
+            state: Mutex::new(CeremonyState::AwaitingUser),
+            omit_ceremony_url: Mutex::new(false),
+            status_error: Mutex::new(None),
+            lose_recovery_prepare_response_once: Mutex::new(false),
+            pause_status_once: Mutex::new(false),
+            status_entered: tokio::sync::Notify::new(),
+            status_release: tokio::sync::Notify::new(),
+        });
+        fixture.handler = fixture
+            .handler
+            .with_broker(Some(MachineBrokerClient::new(broker.clone())));
+        let recover = VfsPath::parse("/recover").unwrap();
+        fixture.handler.write(&recover, b"lost").await.unwrap();
+        let old_id = fixture
+            .handler
+            .recovery_record("lost")
+            .unwrap()
+            .1
+            .operation_id;
+        *broker.pause_status_once.lock().unwrap() = true;
+        let entered = broker.status_entered.notified();
+        let status_handler = fixture.handler.clone();
+        let status_task = tokio::spawn(async move {
+            status_handler
+                .read(&VfsPath::parse("/recoveries/lost/status.json").unwrap())
+                .await
+        });
+        entered.await;
+        *broker.state.lock().unwrap() = CeremonyState::Expired;
+        let prepare_handler = fixture.handler.clone();
+        let mut prepare_task = tokio::spawn(async move {
+            prepare_handler
+                .write(&VfsPath::parse("/recover").unwrap(), b"lost")
+                .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut prepare_task)
+                .await
+                .is_err(),
+            "a prepare must wait for the older status reconciliation"
+        );
+        broker.status_release.notify_one();
+        status_task.await.unwrap().unwrap();
+        prepare_task.await.unwrap().unwrap();
+        let latest = fixture.handler.recovery_record("lost").unwrap().1;
+        assert_ne!(latest.operation_id, old_id);
+        assert_eq!(latest.ceremony_state, CeremonyState::AwaitingUser);
+    }
+
+    #[tokio::test]
     async fn mounted_registration_local_selection_is_forwarded_and_retry_bound() {
         let mut fixture = make_handler();
         let broker = Arc::new(RegistrationBroker {
@@ -7644,6 +7727,9 @@ value = "0""#,
             omit_ceremony_url: Mutex::new(false),
             status_error: Mutex::new(None),
             lose_recovery_prepare_response_once: Mutex::new(false),
+            pause_status_once: Mutex::new(false),
+            status_entered: tokio::sync::Notify::new(),
+            status_release: tokio::sync::Notify::new(),
         });
         fixture.handler = fixture
             .handler
@@ -7683,6 +7769,9 @@ value = "0""#,
             omit_ceremony_url: Mutex::new(false),
             status_error: Mutex::new(None),
             lose_recovery_prepare_response_once: Mutex::new(false),
+            pause_status_once: Mutex::new(false),
+            status_entered: tokio::sync::Notify::new(),
+            status_release: tokio::sync::Notify::new(),
         });
         fixture.handler = fixture
             .handler
@@ -7951,6 +8040,9 @@ value = "0""#,
             omit_ceremony_url: Mutex::new(false),
             status_error: Mutex::new(None),
             lose_recovery_prepare_response_once: Mutex::new(false),
+            pause_status_once: Mutex::new(false),
+            status_entered: tokio::sync::Notify::new(),
+            status_release: tokio::sync::Notify::new(),
         });
         fixture.handler = fixture
             .handler
@@ -7987,6 +8079,9 @@ value = "0""#,
             omit_ceremony_url: Mutex::new(false),
             status_error: Mutex::new(None),
             lose_recovery_prepare_response_once: Mutex::new(false),
+            pause_status_once: Mutex::new(false),
+            status_entered: tokio::sync::Notify::new(),
+            status_release: tokio::sync::Notify::new(),
         });
         fixture.handler = fixture
             .handler
@@ -8038,6 +8133,9 @@ value = "0""#,
             omit_ceremony_url: Mutex::new(false),
             status_error: Mutex::new(None),
             lose_recovery_prepare_response_once: Mutex::new(false),
+            pause_status_once: Mutex::new(false),
+            status_entered: tokio::sync::Notify::new(),
+            status_release: tokio::sync::Notify::new(),
         });
         fixture.handler = fixture
             .handler
@@ -8073,6 +8171,9 @@ value = "0""#,
             omit_ceremony_url: Mutex::new(false),
             status_error: Mutex::new(None),
             lose_recovery_prepare_response_once: Mutex::new(false),
+            pause_status_once: Mutex::new(false),
+            status_entered: tokio::sync::Notify::new(),
+            status_release: tokio::sync::Notify::new(),
         });
         fixture.handler = fixture
             .handler
