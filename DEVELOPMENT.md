@@ -257,13 +257,10 @@ they are test-only browser output and must not be published with evidence.
 The check verifies retry reuse, unchanged wallet address, terminal projections,
 and removal of public recovery initiation.
 
-To exercise ceremonies with the neutral page disabled, start the launcher with
-`BLOOM_TRIAD_DEV_NEUTRAL_LANDING_ENABLED=false` and run the check with
-`BLOOM_REMOTE_LANDING_EXPECT_STATUS=404`. The launcher sets the protected Broker
-configuration field `neutral_landing_enabled`; this optional harness override
-accepts only `true` or `false`. Set it to `true` on a subsequent launch to restore
-the neutral page. Remote launch URLs use `/ceremony/#cap=…`, so disabling `/`
-does not disable authenticated ceremonies.
+The bare `/` route always redirects to `https://bloom.directory`; there is no
+landing-page configuration. Remote launch URLs use `/ceremony/#cap=…`, and
+local/remote browser reloads use `/ceremony/` independently of the root redirect.
+The acceptance check verifies the redirect and its empty body.
 
 ### Sharing a host with other candidates
 

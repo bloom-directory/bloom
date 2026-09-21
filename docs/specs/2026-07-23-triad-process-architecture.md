@@ -1565,8 +1565,9 @@ An owner starts recovery through the authenticated Machine-to-Broker
 returned one-use ceremony URL under `wallets/recoveries/<name>/status.json`;
 the recovery ID and secret are entered only in the Broker-hosted Browser
 ceremony. Broker does not expose a public recovery bootstrap endpoint or a
-wallet-name probe. The neutral Browser landing page carries no wallet
-identity or recovery capability. Recovery preparation and completion use
+wallet-name probe. The bare root always redirects to `https://bloom.directory`
+without wallet identity or recovery capability; this is not configurable.
+Ceremony launches and reloads use their dedicated routes. Recovery preparation and completion use
 bounded resource and attempt admission; unauthenticated Browser attempts
 must not permanently lock out a wallet. Failed or expired recovery never
 rotates the factor. Exact committed retries return the same encrypted result

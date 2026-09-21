@@ -216,3 +216,29 @@ The Linux installer cases require GNU userland; earlier Linux-container evidence
 is retained above, and fresh Linux CI remains distinct from this macOS result.
 Broker current-head CI passed both workspace and privileged listener ownership:
 https://github.com/bloom-directory/bloom-broker/actions/runs/35659235259.
+
+
+## Follow-up: unconditional website redirect — 2026-09-22
+
+The requested root behavior supersedes the neutral-page option above: `/` always
+returns HTTP 303 to `https://bloom.directory/#`. The explicit empty fragment
+prevents inherited capability fragments from reaching the website. The response
+body is empty; exact-host validation and security headers remain in force.
+The landing page and configuration switch were removed. The developer launcher
+removes the retired field from existing generated config without exposing it.
+
+Broker `fe2f2574e8ddfa18e45f17ea111124a89f3020ac` passed the focused local/remote
+redirect regression, including fixed destination, query removal, rejected wrong
+host, ceremony availability, and removed public recovery endpoint. Five browser
+tests, strict all-feature workspace Clippy, formatting, and eight Machine
+launcher tests passed. The Broker API crate is unchanged. Public acceptance used
+the same copied Machine/Signer/debug-driver binaries as case-6 and the new Broker
+binary, SHA-256 `6a0047eaab1a636af45a05a416acab9cdaf959865fc3664238a3dd23c5a18727`.
+
+Case-8 (`/tmp/bloom-relay-e2e-20260921/case-8-redirect`) passed the raw HTTP/2
+Location/empty-body checks, remote registration, policy, VFS recovery, unchanged
+wallet address, replacement-passkey Sealed Approval without execution, and
+separate exactly-once execution on loopback Anvil. Transaction:
+`0xff57ea11d6045690cf11127dee2620bba2cd340e16a450a5cd6b85dc55c6b9a3`.
+The dev stack remains running with existing state preserved. No production
+rollout or release publication was performed.

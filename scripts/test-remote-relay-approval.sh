@@ -57,34 +57,26 @@ navigation="$(curl --http2 --max-time 20 --silent --show-error \
 [ "$navigation" = '200 2' ] || { echo "Public HTTP/2 navigation failed: $navigation" >&2; exit 1; }
 printf 'PASS public HTTP/2 browser navigation\n'
 origin="${url%%/ceremony/#cap=*}"
-landing_status="$(curl --http2 --max-time 20 --silent --show-error \
-  --output "$run_dir/neutral.html" --write-out '%{http_code}' "$origin/")"
-expected_landing="${BLOOM_REMOTE_LANDING_EXPECT_STATUS:-200}"
-[ "$landing_status" = "$expected_landing" ] || { echo "Unexpected neutral landing status: $landing_status" >&2; exit 1; }
-case "$expected_landing" in
-  404) [ ! -s "$run_dir/neutral.html" ] || { echo 'Disabled landing page must have an empty body' >&2; exit 1; } ;;
-  200) python3 - "$run_dir/neutral.html" <<'PYHTML'
-from html.parser import HTMLParser
+root_status="$(curl --http2 --max-time 20 --silent --show-error \
+  --dump-header "$run_dir/root.headers" --output "$run_dir/root.html" \
+  --write-out '%{http_code}' "$origin/")"
+[ "$root_status" = 303 ] || { echo "Unexpected root status: $root_status" >&2; exit 1; }
+# Check the raw Location: curl's redirect_url normalizes away an empty fragment.
+python3 - "$run_dir/root.headers" <<'PYHEADERS'
 import sys
-class Page(HTMLParser):
-    def __init__(self): super().__init__(); self.links=[]; self.forms=0
-    def handle_starttag(self, tag, attrs):
-        if tag == 'a': self.links.append(dict(attrs).get('href'))
-        if tag == 'form': self.forms += 1
-p=Page(); html=open(sys.argv[1]).read(); p.feed(html)
-assert set(p.links) == {'https://bloom.directory', 'https://docs.bloom.directory'}
-assert p.forms == 0 and 'Bloom Broker' in html
-PYHTML
-    ;;
-  *) echo 'Expected landing status must be 200 or 404' >&2; exit 1 ;;
-esac
+headers = open(sys.argv[1]).read().splitlines()
+locations = [line.split(':', 1)[1].strip() for line in headers
+             if line.lower().startswith('location:')]
+assert locations == ['https://bloom.directory/#'], 'root must clear inherited fragments'
+PYHEADERS
+[ ! -s "$run_dir/root.html" ] || { echo 'Root redirect must have an empty body' >&2; exit 1; }
 public_recovery="$(curl --http2 --max-time 20 --silent --show-error \
   -X POST -H "Origin: $origin" -H 'Sec-Fetch-Site: same-origin' \
   -H 'Content-Type: application/json' --data '{}' \
   --output "$run_dir/public-recovery.txt" --write-out '%{http_code}' \
   "$origin/api/recovery/bootstrap")"
 [ "$public_recovery" = 404 ] || { echo 'Public recovery initiation is still exposed' >&2; exit 1; }
-printf 'PASS neutral landing policy and no public recovery initiation\n'
+printf 'PASS website redirect and no public recovery initiation\n'
 if [ "${BLOOM_REMOTE_RECOVERY_E2E:-0}" = 1 ]; then
   "$driver" complete "$url" --authenticator-seed-file "$authenticator_seed" \
     --sign-count 1 --browser-result-file "$run_dir/recovery-record.json" > "$run_dir/register-result.json"

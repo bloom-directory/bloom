@@ -153,11 +153,10 @@ separate check.
 
 Add `BLOOM_REMOTE_RECOVERY_E2E=1` to test `/wallets/recover`, pending-operation
 reuse, recovery-factor rotation, and approval with the replacement passkey.
-The test also checks that public recovery initiation returns 404. For a Broker
-configured with `neutral_landing_enabled=false`, set
-`BLOOM_REMOTE_LANDING_EXPECT_STATUS=404`; it checks that `/` has an empty body
-while the remote ceremony still succeeds. Private recovery fixture files stay
-outside Machine's home and must not be included in published evidence.
+The test also checks that public recovery initiation returns 404 and `/`
+redirects to `https://bloom.directory` with an empty body while ceremonies still
+succeed. Private recovery fixture files stay outside Machine's home and must not
+be included in published evidence.
 
 ## Environment variables
 
