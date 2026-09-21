@@ -1,7 +1,7 @@
 name: Release
 
-# Dry runs build unsigned test candidates for both supported platforms.
-# Version tags build, production-sign, and publish both artifacts together.
+# Dry runs build unsigned test candidates for every supported target.
+# Version tags build, production-sign, and publish all artifacts together.
 
 on:
   push:
@@ -252,9 +252,70 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
+  build-linux-aarch64:
+    name: Build and test Linux aarch64 candidate
+    needs: prepare
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+    steps:
+      - name: Check out Machine
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ needs.prepare.outputs.release_sha }}
+          path: bloom
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check out locked Broker
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          repository: bloom-directory/bloom-broker
+          ref: ${{ needs.prepare.outputs.broker_sha }}
+          path: bloom-broker
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check out locked Signer
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          repository: bloom-directory/bloom-signer
+          ref: ${{ needs.prepare.outputs.signer_sha }}
+          path: bloom-signer
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: |
+            bloom
+            bloom-broker
+            bloom-signer
+
+      - name: Build signed Linux aarch64 candidate
+        working-directory: bloom
+        env:
+          SOURCE_DATE_EPOCH: ${{ needs.prepare.outputs.source_date_epoch }}
+        run: |
+          uname -m | grep -Fx aarch64
+          packaging/triad/release.sh build linux-aarch64 \
+            --output-dir "$RUNNER_TEMP/candidate"
+
+      - name: Upload verified Linux aarch64 candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: triad-linux-aarch64-candidate
+          path: ${{ runner.temp }}/candidate/bloom-triad-test-unclaimed.tar.gz*
+          if-no-files-found: error
+          retention-days: 3
+
   sign:
     name: Sign reviewed candidates
-    needs: [prepare, build, build-macos]
+    needs: [prepare, build, build-macos, build-linux-aarch64]
     if: needs.prepare.outputs.dry_run != 'true'
     runs-on: ubuntu-24.04
     environment: production-release
@@ -276,6 +337,11 @@ jobs:
         with:
           name: triad-macos-aarch64-candidate
           path: candidate/macos
+
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: triad-linux-aarch64-candidate
+          path: candidate/linux-aarch64
 
       - name: Re-sign candidate without executing it
         env:
@@ -312,6 +378,16 @@ jobs:
             --machine-sha '${{ needs.prepare.outputs.release_sha }}' \
             --broker-sha '${{ needs.prepare.outputs.broker_sha }}' \
             --signer-sha '${{ needs.prepare.outputs.signer_sha }}'
+          packaging/triad/release.sh sign linux-aarch64 \
+            candidate/linux-aarch64/bloom-triad-test-unclaimed.tar.gz \
+            --output-dir signed \
+            --signing-key "$signing_key" \
+            --pinned-public-key packaging/triad/release/bloom-release-v1.pub \
+            --source-date-epoch "$SOURCE_DATE_EPOCH" \
+            --version '${{ needs.prepare.outputs.release_version }}' \
+            --machine-sha '${{ needs.prepare.outputs.release_sha }}' \
+            --broker-sha '${{ needs.prepare.outputs.broker_sha }}' \
+            --signer-sha '${{ needs.prepare.outputs.signer_sha }}'
           rm -f -- "$signing_key"
           trap - EXIT
 
@@ -325,6 +401,14 @@ jobs:
           cmp \
             packaging/triad/release/bloom-release-v1.pub \
             signed/bloom-triad-linux-x86_64.tar.gz.pub
+          packaging/triad/release/verify-bundle.sh \
+            signed/bloom-triad-linux-aarch64.tar.gz \
+            signed/bloom-triad-linux-aarch64.tar.gz.sha256 \
+            signed/bloom-triad-linux-aarch64.tar.gz.sig \
+            packaging/triad/release/bloom-release-v1.pub
+          cmp \
+            packaging/triad/release/bloom-release-v1.pub \
+            signed/bloom-triad-linux-aarch64.tar.gz.pub
           packaging/triad/release/verify-bundle.sh \
             signed/bloom-triad-macos-aarch64.tar.gz \
             signed/bloom-triad-macos-aarch64.tar.gz.sha256 \
@@ -379,8 +463,8 @@ jobs:
           cat > "$notes" <<EOF
           ## Bloom v$VERSION
 
-          This release contains signed Bloom triad bundles for Linux x86_64 and
-          macOS aarch64.
+          This release contains signed Bloom triad bundles for Linux x86_64,
+          Linux aarch64, and macOS aarch64.
 
           Verify the archive checksum signature with the reviewed key at
           \`packaging/triad/release/bloom-release-v1.pub\` and the namespace
