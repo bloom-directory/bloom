@@ -3,6 +3,42 @@
 Bloom's first Harbor task evaluates an agent's ability to use an already-running
 Bloom machine to place and cancel a bounded Hyperliquid order.
 
+## Tasks
+
+| Task | Chain | Runnable |
+|---|---|---|
+| `tasks/hyperliquid-order-cancel` | Hyperliquid mainnet | yes |
+| `tasks/safe-transfer-fork` | disposable EVM fork | not yet: no host provisioning |
+
+## Safe transfer on a fork
+
+`tasks/safe-transfer-fork` grades one native transfer out of a Safe smart
+account: discover the binding through the mount, draft, read the plan, take
+Broker's review, sign as the owner, execute through the outbox under a separate
+executor wallet, reconcile, and report both hashes.
+
+The verifier reads the fork itself through `BLOOM_EVAL_EVM_RPC_URL`. It
+requires the outer receipt to have called this Safe and succeeded, exactly one
+`ExecutionSuccess` from that Safe carrying the reported Safe transaction hash
+and no `ExecutionFailure`, the broadcast `execTransaction` arguments to decode
+to this recipient and amount with no calldata, operation `call` and zero gas
+reimbursement, the recipient's balance to move by exactly the transfer across
+that block, and the Safe nonce to advance by exactly one. A Safe catches a
+failing inner call and still returns successfully, so the outer receipt's
+status is checked but never trusted on its own.
+
+The host-side provisioning — forking a chain, deploying a disposable Safe
+through the canonical factory, installing the Petal, writing the owner and
+executor policies, and completing both approvals — is not implemented yet. It
+depends on the Safe review path landing (bloom#224, bloom-broker#37,
+bloom-petal-safe#2), and writing it against unlanded route shapes would encode
+guesses. `harness/safe_transfer_fork.py` holds the task contract the verifier
+and the task directory are both bound to, so the two cannot drift apart before
+then. Until provisioning exists the task is covered by static checks only:
+`scripts/test-harbor-evals.sh` runs the verifier against a deterministic chain
+plus seventeen report mutations, and `harness_tests/test_safe_transfer_verify.py`
+varies the chain instead of the report.
+
 ## Current task
 
 `tasks/hyperliquid-order-cancel` runs on Hyperliquid **mainnet** with a dedicated
