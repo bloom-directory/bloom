@@ -7,7 +7,7 @@ loopback Anvil chain (31337); no installed wallet state or real funds were used.
 
 ## Candidate and evidence
 
-- Machine: the source revision containing this record; `mount,triad-dev-harness`.
+- Machine: `d47edb11f21fede65b17c8967125ea2c53739a8b`; `mount,triad-dev-harness`.
 - Broker: `76449ab6a19e0982db4c4a739ed48c2f6a63ca10`, `triad-dev-harness`.
 - Signer: `61dbbf14211d54c728e910eb30129a82c2d7a90b`, `triad-dev-harness`.
 - Shared runtime: `a046fd6075853e8591f295983b572c6e1d65d12d`.
@@ -100,3 +100,43 @@ Production rollout still requires independent backup/restore-witness retention
 and disaster-recovery drills tracked by bloom-relay issue #2, monitoring/alert
 and CT containment checks, and real-browser/passkey acceptance. No release was
 published or PR merged by this acceptance run.
+
+## Follow-up: repeated browser ceremonies and HTTP/2 cookies
+
+Real-browser testing reported successful initial registrations followed by a
+page stuck on its initial heading. Curl reproduced the server-side cause without
+accessing browser state: a valid current cookie in the first Cookie field gave
+200, while an unrelated cookie first and the current cookie in a second HTTP/2
+Cookie field gave 403. Broker read only the first field. The affected operation
+had successfully exchanged its one-use fragment before its session read failed.
+
+Broker `4afa2833e79217b58718f056cdebf1094612a3b0` scans every Cookie field for
+exactly one matching ceremony cookie. Duplicate matching cookies, even equal
+ones, and malformed fields fail closed. Existing session expiry, origin and
+CSRF checks remain in force. Browser startup errors now replace the initial
+heading with “Ceremony could not load”. Machine accepts Broker-authoritative
+AWAITING_USER registration status with a consumed URL, clears its cached
+capability, and preserves status/cancellation by operation ID.
+
+The repaired running stack passed public HTTP/2 curl checks: both cookie field
+orders and joined cookies returned 200; duplicate matching cookies returned 403;
+uncommitted result retrieval returned the expected 409; cancellation with split
+cookies and valid CSRF returned 204. Machine's consumed-launch projection was
+readable and contained no capability URL. The original reported operation later
+correctly projected EXPIRED.
+
+Full acceptance passed again in `/tmp/bloom-relay-e2e-20260921/case-3`, including
+HTTP/2 navigation, virtual WebAuthn registration and policy, approval without
+execution, and separate execution exactly once. Disposable Anvil transaction:
+`0x8b89d804c8d27e0eaf496a54eafa4ad7c1e98c266364d447038b121b236d5689`.
+Curl reproduction results are `/tmp/bloom-relay-cookie-debug/fixed-result.txt`.
+Machine binary SHA-256:
+`b81a940a4723c4421970e58701e75665273e2a1c4639f5da6e4baee075aa582b`.
+Broker binary SHA-256:
+`8b1f6a2de2e5eb7be245c2b6afe14c4cf8d4524fd15e6b530cce60ab9ad03509`.
+Signer and debug driver were unchanged from case-2.
+
+Validation: all 425 VFS tests and strict VFS all-target Clippy passed. Broker's
+HTTP/2 cookie regression, all five executable browser tests, strict workspace
+all-feature Clippy and formatting passed. The dev stack retains prior wallet and
+passkey state; retry with a fresh ceremony URL because the reported URL expired.

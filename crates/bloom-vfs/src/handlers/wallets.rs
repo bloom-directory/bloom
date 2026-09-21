@@ -812,20 +812,25 @@ impl WalletsHandler {
         }
         projection.ceremony_state = status.state;
         if status.state == bloom_broker_api::CeremonyState::AwaitingUser {
-            let ceremony_url = status
-                .ceremony_url
-                .filter(|url| !url.trim().is_empty())
-                .ok_or_else(|| {
-                    HandlerError::backend(
-                        "Broker omitted the actionable wallet registration ceremony URL",
-                    )
-                })?;
             if status.expires_at_ms.get() <= now_ms_u64() {
                 return Err(HandlerError::backend(
                     "Broker returned an expired wallet registration ceremony",
                 ));
             }
-            projection.ceremony_url = Some(ceremony_url);
+            if status
+                .ceremony_url
+                .as_ref()
+                .is_some_and(|url| url.trim().is_empty())
+            {
+                return Err(HandlerError::backend(
+                    "Broker returned an empty wallet registration ceremony URL",
+                ));
+            }
+            // A remote fragment capability is single-use. After the Browser
+            // exchanges it, Broker still owns an AWAITING_USER ceremony but
+            // correctly omits the now-spent URL. Clear our cached copy rather
+            // than resurrecting a bearer capability or inventing failure.
+            projection.ceremony_url = status.ceremony_url;
             projection.ceremony_expires_at_ms = Some(status.expires_at_ms);
         } else {
             projection.ceremony_url = None;
@@ -7022,11 +7027,22 @@ value = "0""#,
         );
 
         *broker.omit_ceremony_url.lock().unwrap() = true;
-        assert!(matches!(
-            fixture.handler.read(&status_path).await,
-            Err(HandlerError::Backend(_))
-        ));
-        *broker.omit_ceremony_url.lock().unwrap() = false;
+        let consumed: serde_json::Value =
+            serde_json::from_slice(&fixture.handler.read(&status_path).await.unwrap()).unwrap();
+        assert_eq!(consumed["ceremony_state"], "AWAITING_USER");
+        assert!(consumed["ceremony_url"].is_null());
+        assert_eq!(consumed["operation_id"], persisted.operation_id.as_str());
+        assert_eq!(consumed["ceremony_expires_at_ms"], u64::MAX.to_string());
+        let (_, retained) = fixture.handler.registration_record("main").unwrap();
+        assert!(
+            retained.ceremony_url.is_none(),
+            "spent capability must be cleared durably"
+        );
+        assert_eq!(retained.operation_id, persisted.operation_id);
+        assert_eq!(
+            retained.ceremony_expires_at_ms,
+            persisted.ceremony_expires_at_ms
+        );
 
         assert!(matches!(
             fixture
