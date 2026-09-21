@@ -68,4 +68,8 @@ tempfile.workspace = true
 
 [dev-dependencies]
 bloom-proto = { workspace = true, features = ["audit-test-seam"] }
+# A real TLS server for the Petal HTTP trust-anchor test. Both are already in
+# the lockfile via the workspace's rustls stack.
+rustls-pemfile = "2"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 bs58.workspace = true

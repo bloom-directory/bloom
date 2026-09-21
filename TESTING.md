@@ -145,3 +145,4 @@ signing does not replace these service-boundary checks.
 | `BLOOM_INTEGRATION_SIGNER_BIN` | triad | Exact Signer binary under test. |
 | `BLOOM_INTEGRATION_STARTUP_TIMEOUT_SECS` | triad | Bounded full-stack startup timeout. |
 | `SOLANA_VALIDATOR_HTTP` | Solana acceptance | Local validator JSON-RPC endpoint. |
+| `BLOOM_PETAL_HTTP_EXTRA_ROOT_CA` | Petal HTTP harnesses | PEM bundle of extra trust anchors for the Petal HTTP client, so a local server can stand in for a Petal's declared host. Added to the default roots, never substituted for them. Read only in builds with `unsigned-audit-test-seam`; release packaging rejects that feature and scans built binaries for this name. |

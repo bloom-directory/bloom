@@ -148,6 +148,7 @@ broker-audit-test-1
 accepting_verifier
 mint_approval
 BLOOM_TRIAD_DEVELOPER_ROOT
+BLOOM_PETAL_HTTP_EXTRA_ROOT_CA
 unsafe-debug-signer
 unsigned-audit-test-seam
 audit-test-seam

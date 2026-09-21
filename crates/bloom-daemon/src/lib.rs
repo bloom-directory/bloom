@@ -215,10 +215,104 @@ pub enum DaemonError {
     Outbox(String),
     #[error("audit: {0}")]
     Audit(String),
+    #[error("petal http: {0}")]
+    PetalHttp(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("watch: {0}")]
     Watch(String),
+}
+
+/// Environment variable naming extra PEM root certificates the Petal HTTP
+/// client should trust. Read only in nonproduction builds; see
+/// [`petal_http_client`].
+#[cfg(feature = "unsigned-audit-test-seam")]
+const PETAL_HTTP_EXTRA_ROOT_CA_ENV: &str = "BLOOM_PETAL_HTTP_EXTRA_ROOT_CA";
+
+/// Build the Petal HTTP client, optionally trusting developer-harness roots.
+///
+/// Extra roots are **added to** the default verifier, never substituted for
+/// it, and nothing here disables the built-in roots or accepts an invalid
+/// certificate.
+///
+/// Gated on `unsigned-audit-test-seam` alone, deliberately narrower than the
+/// `any(test, debug_assertions, feature = ...)` this crate's other
+/// nonproduction seams use. Those widen *construction*; this widens the trust
+/// anchors of a client that reaches attacker-influenced hosts, and
+/// `debug_assertions` is on in every ordinary `cargo build`, so a developer
+/// running a dev build on a machine holding real wallets would otherwise
+/// honour the variable from their ambient environment. The feature is also
+/// the only thing release packaging can inspect, so gate and enforcement
+/// coincide.
+fn petal_http_client() -> Result<reqwest::Client, String> {
+    #[cfg(not(feature = "unsigned-audit-test-seam"))]
+    {
+        petal_http_client_with_extra_root(None)
+    }
+    #[cfg(feature = "unsigned-audit-test-seam")]
+    {
+        // An empty value means "not configured", so a harness that exports
+        // the variable unconditionally does not take the daemon down.
+        let extra_root = std::env::var_os(PETAL_HTTP_EXTRA_ROOT_CA_ENV)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
+        petal_http_client_with_extra_root(extra_root.as_deref()).map_err(|error| {
+            match &extra_root {
+                // A named-but-unusable trust file is a harness
+                // misconfiguration. Reporting it is the point: ignoring it
+                // resurfaces later as the opaque TLS error this seam avoids.
+                Some(path) => format!("{PETAL_HTTP_EXTRA_ROOT_CA_ENV}={path:?}: {error}"),
+                None => error,
+            }
+        })
+    }
+}
+
+/// The client itself, with the trust file passed in rather than read from the
+/// environment, so it is testable without racing every other test in the
+/// binary over a process-global variable.
+///
+/// The builder here must never turn off the built-in roots or accept an
+/// invalid certificate or hostname;
+/// `no_daemon_http_client_ever_weakens_verification` pins that by reading this
+/// file, which is why it names no reqwest method in prose.
+fn petal_http_client_with_extra_root(extra_root: Option<&Path>) -> Result<reqwest::Client, String> {
+    let builder = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(20));
+    let builder = match extra_root {
+        #[cfg(feature = "unsigned-audit-test-seam")]
+        Some(path) => add_root_certificates_from_pem(builder, path)?,
+        #[cfg(not(feature = "unsigned-audit-test-seam"))]
+        Some(_) => return Err("extra Petal HTTP trust anchors are not compiled in".into()),
+        None => builder,
+    };
+    builder
+        .build()
+        .map_err(|e| format!("petal http client: {e}"))
+}
+
+#[cfg(feature = "unsigned-audit-test-seam")]
+fn add_root_certificates_from_pem(
+    builder: reqwest::ClientBuilder,
+    path: &Path,
+) -> Result<reqwest::ClientBuilder, String> {
+    let pem = std::fs::read(path).map_err(|e| e.to_string())?;
+    let certificates = reqwest::Certificate::from_pem_bundle(&pem)
+        .map_err(|e| format!("not a PEM certificate bundle: {e}"))?;
+    if certificates.is_empty() {
+        return Err("PEM file contains no certificates".into());
+    }
+    warn!(
+        path = %path.display(),
+        count = certificates.len(),
+        "petal.http_extra_root_certificates_trusted"
+    );
+    Ok(certificates
+        .into_iter()
+        .fold(builder, |builder, certificate| {
+            builder.add_root_certificate(certificate)
+        }))
 }
 
 struct DaemonPetalHost {
@@ -503,13 +597,9 @@ impl DaemonPetalHost {
         Ok(())
     }
 
-    fn new(vfs: Arc<LateVfsHost>, audit: Arc<AuditLog>) -> Self {
-        let http = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(20))
-            .build()
-            .expect("daemon petal http client must build");
-        Self {
+    fn new(vfs: Arc<LateVfsHost>, audit: Arc<AuditLog>) -> Result<Self, DaemonError> {
+        let http = petal_http_client().map_err(DaemonError::PetalHttp)?;
+        Ok(Self {
             vfs,
             http,
             audit,
@@ -524,7 +614,7 @@ impl DaemonPetalHost {
             petal_signing_state_root: None,
             petal_signing_lock: tokio::sync::Mutex::new(()),
             petal_runner: None,
-        }
+        })
     }
 
     fn with_tx_outbox(mut self, tx_outbox: PetalTxOutbox) -> Self {
@@ -4400,7 +4490,7 @@ impl Daemon {
         let petal_vm = PetalVm::new().map_err(|e| DaemonError::Audit(format!("petals vm: {e}")))?;
         let petals = PetalRunner::new(petal_store.clone(), petal_registry.clone(), petal_vm);
         let petal_vfs_host = Arc::new(LateVfsHost::new());
-        let petal_app_host = DaemonPetalHost::new(petal_vfs_host.clone(), audit_arc.clone())
+        let petal_app_host = DaemonPetalHost::new(petal_vfs_host.clone(), audit_arc.clone())?
             .with_broker(broker.clone())
             .with_petal_runner(petals.clone())
             .with_wallets(wallets_handler.clone())
@@ -5459,6 +5549,159 @@ mod tests {
     use bloom_vfs::handler::Entry;
     use bloom_vfs::handler::Handler;
 
+    /// A self-signed CA and a `localhost` leaf it signed, both valid until
+    /// 2126, so a real TLS server can present a chain no public trust store
+    /// carries.
+    #[cfg(feature = "unsigned-audit-test-seam")]
+    const TEST_ROOT_CERTIFICATE_PEM: &str = "-----BEGIN CERTIFICATE-----\nMIIDJTCCAg2gAwIBAgIUA4IbNp6nJm1nA625ZizrVd1tuBswDQYJKoZIhvcNAQEL\nBQAwITEfMB0GA1UEAwwWYmxvb20tZGFlbW9uLXRlc3Qtcm9vdDAgFw0yNjA5MjEx\nNzEwMTNaGA8yMTI2MDgyODE3MTAxM1owITEfMB0GA1UEAwwWYmxvb20tZGFlbW9u\nLXRlc3Qtcm9vdDCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAM02XpyY\nLOrsVOipQbIez/zmS/S8joA1q+44l/BB+It/cri0LtZLUEHgTmCAqKFGSlo1J71L\nUIK0HpcPRUOHTqqzlDVas1/r7EQpIpp2BqE0F6WI03YMLqnC1qzInqswcRjrWanz\nv4q6b3477KIVAtQ8cI0bJ5GIBw3f/z4DX0raPgkbIcv7kmaAY0OpooqzrmE+4x/7\nOSJa3gRa5C0CGUkdBMLzECUpNKAUB8YOFyRAyea8dOc4/Jsps8MHZ/P92XE3jh3n\nrNEH3g/0a5uTcc1FObx96exuOov/n8qwows7U/g0ivuNavzT46BysE3H1DiTxnol\n4al+5tVDOz11aOsCAwEAAaNTMFEwHQYDVR0OBBYEFED0kBolWXhkmWoimjqe5Pmx\nbPLkMB8GA1UdIwQYMBaAFED0kBolWXhkmWoimjqe5PmxbPLkMA8GA1UdEwEB/wQF\nMAMBAf8wDQYJKoZIhvcNAQELBQADggEBAJn87eZWulNkgQhce9Ay4zv7VjwJ3SAm\n/cCHQL74/jeZeNcgP2XxA0ZQb/q5cq/LnB2asnKh1MI5tUJT2D0ShSuEGv90NcGg\nLOs92RHERetAuoE6vSCEz8ZrcL2DjRzwir5Q/GQRlHAGUZtdyquRfZrOUMASxzW/\nQOfta+0hwak8OEIBjpc0ykeR6etkGR7Vl/sYYkBum2nfeutGVfSqwlJ0eqTPoJfi\nbFB0n/Jk9I4jr7OCLshOiSV4WJXltq3B3qc1BjJNiRW5tTGoVxcRlItZ8eXRk1V9\nL3AZUsNKeQQKnq9lBkdsn8wO/88YneIy3aNE5OR/TDNP1ORbMK6Fk8M=\n-----END CERTIFICATE-----\n";
+    #[cfg(feature = "unsigned-audit-test-seam")]
+    const TEST_LEAF_CERTIFICATE_PEM: &str = "-----BEGIN CERTIFICATE-----\nMIIDODCCAiCgAwIBAgIUHjH2+bdIGxO3b/AfUbGLN9XAf5EwDQYJKoZIhvcNAQEL\nBQAwITEfMB0GA1UEAwwWYmxvb20tZGFlbW9uLXRlc3Qtcm9vdDAgFw0yNjA5MjEx\nNzEwMTNaGA8yMTI2MDgyODE3MTAxM1owFDESMBAGA1UEAwwJbG9jYWxob3N0MIIB\nIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAp/SBORwpsJK6Yh8uIZtFtgJO\nV2Yzg1nbxcFQLYYm9Rf9tRRW8826ic5kmRQLG+keoAg9aA4k8hvNIZRCt2X80Eh3\nMeTWbDMMqrqiyaWwPyUQUfo5z5pnGcRBGQ62CTI8NnTyc+cp/6e5VpSMqia+kNk7\nNaaZo0jDiq4wbx64s7mI3WGhf6VP7FvWtSoUO6Om2o3JzgNfUKcqzpok1BGmninW\nHvPLqRRho8FdbZRmP08zXs3pPLqvT+MVNLsxcFMGX33CPmpkKE7vQHBNf2Zsy77U\nUxBFifRW3uAgjCQFQJkLTRLuX3TTRIW7MRGNCe1nHkUmfWntJPSgOKEACmirHwID\nAQABo3MwcTAaBgNVHREEEzARgglsb2NhbGhvc3SHBH8AAAEwEwYDVR0lBAwwCgYI\nKwYBBQUHAwEwHQYDVR0OBBYEFIecaxlnbfEGbO3nydzqzYSAephkMB8GA1UdIwQY\nMBaAFED0kBolWXhkmWoimjqe5PmxbPLkMA0GCSqGSIb3DQEBCwUAA4IBAQA8k8N+\n52ubQUJ44/zxceBIcxaSeq1yUMSr97QRzRHui4HIE1q5HAELjM2GTmJm5N4Vy7mX\nTGNkf9/Ue93cQpXm1A+F+2dzhXMybL77cErUNpsdOkmcuWqRwD9DyE8JLEDxlM+b\n57Tid0PWE1QIbM5mR51iaY/VvyzCxbv8TXwc2UA+iDmLxlr33fqHlsKpyijxb9fW\nsJCG+ScskU6JwuOWy2KNVUCjJdGbZF9YDeVfvw/DT1SXQbsPBmgMufw3FuOgLYT2\nqsHfwjaV4A5JJQiY4gSoLDwNd+YSQ1nuyPeG2TQk5tQj3MTCfZHtOHMOOqu0q04l\ncVLej9EHZMf0qITE\n-----END CERTIFICATE-----\n";
+    #[cfg(feature = "unsigned-audit-test-seam")]
+    const TEST_LEAF_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCn9IE5HCmwkrpi\nHy4hm0W2Ak5XZjODWdvFwVAthib1F/21FFbzzbqJzmSZFAsb6R6gCD1oDiTyG80h\nlEK3ZfzQSHcx5NZsMwyquqLJpbA/JRBR+jnPmmcZxEEZDrYJMjw2dPJz5yn/p7lW\nlIyqJr6Q2Ts1ppmjSMOKrjBvHrizuYjdYaF/pU/sW9a1KhQ7o6bajcnOA19QpyrO\nmiTUEaaeKdYe88upFGGjwV1tlGY/TzNezek8uq9P4xU0uzFwUwZffcI+amQoTu9A\ncE1/ZmzLvtRTEEWJ9Fbe4CCMJAVAmQtNEu5fdNNEhbsxEY0J7WceRSZ9ae0k9KA4\noQAKaKsfAgMBAAECggEABwrdkEN6DAla/1pHWOll1ufp2QhUCKHv8S7V6dLCN2y2\nGq2rp7VsqPKajUCl5pmzywoNaRuOuQgpZcsNsRr5qtIfDVyHESpi0ZXZ1ZK4/SzU\nrltLqUTUJeRwxlgzkdclZzMoJ2v9+tZRkyvPaiMNwo0ZSnqd3pbifCIprb8gB4ki\nq8Uu+tUmkblto0yM4N88QkvccAnbauJ/or53bnVhp2TgQPshCW8Ymxfqyt/Rfiro\nY5DPU0D94ctAjLnEWwOmCPc/CUSps/j85reTzZykVxQMQnyyMTRnN04VoT8bLRzE\nyuZZ7snZXaOUSaH5Xi5CsXwEeowFwlAd8+Hiki7ywQKBgQDSuauQZl1shuhhKuSx\nE6QbWH3d64Ofd9RwNhbxGalOp0obDUXYQXQYXhvwAufm/Qzjg+L+hgTXA19YfFIH\nyh879MHYtO2Qc4IwepFTBpNVE23ebr4Kuqls9GE6Yhild5UAug2T4xCkzKMbR462\nSnnteRTZYw+ZD7vShYnNjF8HeQKBgQDMCmK2jApF4Guxd296f+3s/uI0jtCpa3Z0\nDVLt9ZStObZmrj5YVhmTOO2K96i8jvwEuaQ4Nz1gy9mY8xI89BUjC/cpNaw/VqUq\nHoNyuOBTXho+sS5kvYl6Jx0uhIatRdqAW5P+tiuG1JVPT2b7/zTKh97iSmBDGMYB\n3lTTdtDpVwKBgFpZNyDzcszsTsgSfvkZRbxfxZ+Xsdh2pUPzPQTkjr3lZhWRLEgb\nUC5+cxYF+O4FwzftPS8JwRt7G68xpm4mkBvBxjcm49CSZdhpRNPHNvY8HVhIPP0W\nqTvIz8Mbehu/2Mf1/YpRyboO70Pr+1lXN03FI1ZNbcufflU14i6aJ8hpAoGAe69D\n/WJQi+Ephw9eXUSVRpePKcr0w+5nhJvbDHJUqNkWL5IqKsQuhqb4n8fW2k5WiMq7\nuHQL2dRYWDXodViEQ5VqQunNOyvbvPd4OR/Go+KkSCKBfAHFB24Ua3Fcbkas2Cgr\nQzjMk9PjmosIY3NlXewU+NmbFrE6vkE27GTW6MsCgYEAnd+D8Ai8zh2xzQ33teU+\nS8m+INkFaoylAG1+RVRDK3OEN36a6W+j78F8iK0Y5UKDAfRunav1ypHNpnfhR6m+\nKE+sW5LNYrJRQnTlWp/ZcR4uY6vky0FV17yTdcVlLM2zBI5bwuO95K3/q2+0duLZ\n10nuMCjMqDLOlZldQ4Flh80=\n-----END PRIVATE KEY-----\n";
+
+    #[cfg(feature = "unsigned-audit-test-seam")]
+    async fn spawn_test_tls_server() -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let certs = rustls_pemfile::certs(&mut TEST_LEAF_CERTIFICATE_PEM.as_bytes())
+            .collect::<Result<Vec<_>, _>>()
+            .expect("leaf parses");
+        let key = rustls_pemfile::private_key(&mut TEST_LEAF_KEY_PEM.as_bytes())
+            .expect("key parses")
+            .expect("key present");
+        // Both aws-lc-rs and ring are in this workspace's graph, so rustls
+        // will not choose one on its own. A second install returns Err, which
+        // is fine when another test got there first.
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+        let config = tokio_rustls::rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .expect("server config");
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    // A client that rejects our CA never completes this.
+                    let Ok(mut tls) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    let mut buffer = [0u8; 1024];
+                    let _ = tls.read(&mut buffer).await;
+                    let _ = tls
+                        .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                        .await;
+                    let _ = tls.shutdown().await;
+                });
+            }
+        });
+        address
+    }
+
+    /// The extra root is added, and an unknown authority is still refused.
+    ///
+    /// Asserted against a real TLS server whose certificate chains to a CA no
+    /// public trust store carries: the client given that CA completes the
+    /// request, and a client built exactly as production builds one rejects
+    /// it. The second half is what fails if the seam ever starts accepting
+    /// invalid certificates.
+    ///
+    /// What this cannot show offline is that the *public* roots remain
+    /// enabled, since that needs a publicly trusted endpoint and so a
+    /// network. `no_daemon_http_client_ever_weakens_verification` covers that
+    /// by construction instead.
+    #[cfg(feature = "unsigned-audit-test-seam")]
+    #[tokio::test]
+    async fn petal_http_extra_root_is_added_and_unknown_authorities_still_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("root.pem");
+        std::fs::write(&root, TEST_ROOT_CERTIFICATE_PEM).unwrap();
+        let address = spawn_test_tls_server().await;
+        let url = format!("https://localhost:{}/", address.port());
+
+        let widened = petal_http_client_with_extra_root(Some(&root)).expect("client builds");
+        let response = widened
+            .get(&url)
+            .send()
+            .await
+            .expect("the extra root is trusted");
+        assert_eq!(response.status(), 200);
+
+        let default = petal_http_client_with_extra_root(None).expect("client builds");
+        let error = default
+            .get(&url)
+            .send()
+            .await
+            .expect_err("an unknown authority must still be rejected");
+        assert!(
+            error.to_string().contains("error sending request"),
+            "{error}"
+        );
+    }
+
+    /// No HTTP client in the daemon may weaken verification, only widen the
+    /// anchors.
+    ///
+    /// Read from the source, because the calls that would do it are invisible
+    /// to a behavioural test with no network: disabling the built-in roots
+    /// still refuses this fixture's CA, so the test above cannot see it. The
+    /// needles are split so this test does not match itself, which is also why
+    /// it can scan the whole file rather than a window around one function.
+    /// `production_release_rejects_machine_audit_test_features` reads the
+    /// release scripts as text for the same reason.
+    #[test]
+    fn no_daemon_http_client_ever_weakens_verification() {
+        let source = include_str!("lib.rs");
+        for forbidden in [
+            concat!("tls_built_in", "_root_certs"),
+            concat!("danger_accept", "_invalid_certs"),
+            concat!("danger_accept", "_invalid_hostnames"),
+            concat!("danger_accept", "_invalid_certs_hostnames"),
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "no daemon HTTP client may call {forbidden}"
+            );
+        }
+    }
+
+    /// A trust file that cannot be used is reported, not ignored: ignoring it
+    /// resurfaces later as the opaque TLS error the seam exists to avoid.
+    #[cfg(feature = "unsigned-audit-test-seam")]
+    #[test]
+    fn petal_http_unusable_trust_file_is_reported() {
+        let directory = tempfile::tempdir().unwrap();
+
+        let empty = directory.path().join("empty.pem");
+        std::fs::write(&empty, b"").unwrap();
+        assert_eq!(
+            petal_http_client_with_extra_root(Some(&empty)).unwrap_err(),
+            "PEM file contains no certificates"
+        );
+
+        let garbage = directory.path().join("garbage.pem");
+        std::fs::write(&garbage, b"-----BEGIN CERTIFICATE-----\nnot base64\n").unwrap();
+        assert!(
+            petal_http_client_with_extra_root(Some(&garbage))
+                .unwrap_err()
+                .contains("not a PEM certificate bundle")
+        );
+
+        assert!(petal_http_client_with_extra_root(Some(&directory.path().join("absent"))).is_err());
+
+        // Two concatenated certificates: the bundle form a harness produces.
+        let bundle = directory.path().join("bundle.pem");
+        std::fs::write(
+            &bundle,
+            format!("{TEST_ROOT_CERTIFICATE_PEM}{TEST_ROOT_CERTIFICATE_PEM}"),
+        )
+        .unwrap();
+        assert!(petal_http_client_with_extra_root(Some(&bundle)).is_ok());
+    }
+
     #[cfg(feature = "mount")]
     #[test]
     fn mount_uses_the_configured_nfs_listener() {
@@ -6026,7 +6269,8 @@ mod tests {
     async fn petal_http_audit_intent_failure_prevents_network_dispatch_and_latches() {
         let directory = tempfile::tempdir().unwrap();
         let audit = Arc::new(AuditLog::open(directory.path().join("audit.jsonl")).unwrap());
-        let host = DaemonPetalHost::new(Arc::new(LateVfsHost::new()), audit.clone());
+        let host =
+            DaemonPetalHost::new(Arc::new(LateVfsHost::new()), audit.clone()).expect("petal host");
         audit.fail_next_write_for_test();
         let error = host
             .http_fetch(
@@ -6050,7 +6294,8 @@ mod tests {
     async fn denied_petal_network_attempt_has_exact_intent_and_error_result() {
         let directory = tempfile::tempdir().unwrap();
         let audit = Arc::new(AuditLog::open(directory.path().join("audit.jsonl")).unwrap());
-        let host = DaemonPetalHost::new(Arc::new(LateVfsHost::new()), audit.clone());
+        let host =
+            DaemonPetalHost::new(Arc::new(LateVfsHost::new()), audit.clone()).expect("petal host");
         let error = host
             .http_fetch(
                 bloom_petals::HttpRequest {
@@ -6232,6 +6477,7 @@ mod tests {
         };
         let expected_provenance_digest = provenance_record.digest().unwrap();
         let host = DaemonPetalHost::new(Arc::new(LateVfsHost::new()), audit)
+            .expect("petal host")
             .with_broker(Some(MachineBrokerClient::new(fixture.clone())))
             .with_provenance_catalog(Some(bloom_broker_api::ProvenanceCatalog {
                 schema: bloom_broker_api::PROVENANCE_CATALOG_SCHEMA.into(),
@@ -6394,6 +6640,7 @@ mod tests {
             late_vfs,
             Arc::new(AuditLog::open(directory.path().join("audit.jsonl")).unwrap()),
         )
+        .expect("petal host")
         .with_broker(Some(machine_broker))
         .with_provenance_catalog(Some(bloom_broker_api::ProvenanceCatalog {
             schema: bloom_broker_api::PROVENANCE_CATALOG_SCHEMA.into(),
@@ -6547,6 +6794,7 @@ mod tests {
             Arc::new(LateVfsHost::new()),
             Arc::new(AuditLog::open(directory.path().join("audit.jsonl")).unwrap()),
         )
+        .expect("petal host")
         .with_broker(Some(machine_broker))
         .with_provenance_catalog(Some(bloom_broker_api::ProvenanceCatalog {
             schema: bloom_broker_api::PROVENANCE_CATALOG_SCHEMA.into(),
@@ -6707,7 +6955,7 @@ mod tests {
         let late_vfs = Arc::new(LateVfsHost::new());
         late_vfs.set(owner_vfs);
         let audit = Arc::new(AuditLog::open(directory.path().join("audit.jsonl")).unwrap());
-        let guest = DaemonPetalHost::new(late_vfs, audit);
+        let guest = DaemonPetalHost::new(late_vfs, audit).expect("petal host");
 
         let operations = [
             guest.vfs_lookup("petal-key-requests").await.map(|_| ()),
@@ -6756,7 +7004,7 @@ mod tests {
         let late_vfs = Arc::new(LateVfsHost::new());
         late_vfs.set(owner_vfs);
         let audit = Arc::new(AuditLog::open(directory.path().join("audit.jsonl")).unwrap());
-        let guest = DaemonPetalHost::new(late_vfs, audit);
+        let guest = DaemonPetalHost::new(late_vfs, audit).expect("petal host");
         let protected = vec![
             "wallets/new".to_string(),
             "wallets/registrations".to_string(),
@@ -6849,15 +7097,15 @@ mod tests {
     }
 
     fn test_petal_host(daemon: &Daemon) -> DaemonPetalHost {
-        DaemonPetalHost::new(Arc::new(LateVfsHost::new()), daemon.audit.clone()).with_tx_outbox(
-            PetalTxOutbox {
+        DaemonPetalHost::new(Arc::new(LateVfsHost::new()), daemon.audit.clone())
+            .expect("petal host")
+            .with_tx_outbox(PetalTxOutbox {
                 tx_engine: daemon.tx_engine.clone(),
                 chains: daemon.chains.clone(),
                 wallet_projections: daemon.wallet_projections.clone(),
                 address_book: daemon.address_book.clone(),
                 write_permit: daemon.home_write_permit.clone(),
-            },
-        )
+            })
     }
 
     #[tokio::test]
@@ -8404,6 +8652,7 @@ allowed = ["bloom:vfs.read"]
 
     fn isolation_host(daemon: &Daemon, broker: Arc<TwoFamilyAccountBroker>) -> DaemonPetalHost {
         DaemonPetalHost::new(Arc::new(LateVfsHost::new()), daemon.audit.clone())
+            .expect("petal host")
             .with_broker(Some(MachineBrokerClient::new(broker)))
             .with_petal_key_state_root(daemon.home.cache_dir().join("petal-key-requests"))
     }
