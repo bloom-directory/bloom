@@ -141,12 +141,15 @@ impl TriadPolicyUpdateProjection {
         Ok(bytes)
     }
 
-    /// View a pending policy change. `required` is what the caller asked to be
-    /// allowed; a change that does not carry all of it is somebody else's, and
-    /// must never be presented as the caller's own.
+    /// View a pending policy change. `required` and `destinations` are what
+    /// the caller asked to be allowed; a change that does not carry all of
+    /// both is somebody else's, and must never be presented as the caller's
+    /// own. A change with the packages but not their destinations would leave
+    /// those Petals' outbox transactions denied after it commits.
     fn pending_view(
         &self,
         required: &[bloom_broker_api::Digest32],
+        destinations: &[bloom_broker_api::PolicyDestination],
     ) -> Result<bloom_machine_client::PetalEligibility, HandlerError> {
         let proposed: bloom_broker_api::CanonicalWalletPolicy =
             serde_json::from_slice(&self.retained_policy_bytes()?).map_err(err_be)?;
@@ -183,9 +186,12 @@ impl TriadPolicyUpdateProjection {
                     challenge_path: format!(
                         "/wallets/{wallet}/policy-updates/pending/{operation}/{APPROVAL_CHALLENGE_FILE}"
                     ),
-                    includes_requested_package: required
+                    includes_requested: required
                         .iter()
-                        .all(|package| proposed.allowed_petal_packages.contains(package)),
+                        .all(|package| proposed.allowed_petal_packages.contains(package))
+                        && destinations
+                            .iter()
+                            .all(|destination| proposed.allowed_destinations.contains(destination)),
                 },
             ),
         )
@@ -1409,7 +1415,7 @@ impl WalletsHandler {
                 Ok(()) => continue,
                 Err(HandlerError::PermissionDenied) => {
                     let projection: TriadPolicyUpdateProjection = read_json(&path)?;
-                    return projection.pending_view(required);
+                    return projection.pending_view(required, destinations);
                 }
                 // A cancelled, expired, or failed ceremony has left `pending`;
                 // propose again from the current policy.
@@ -1452,13 +1458,17 @@ impl WalletsHandler {
             return Ok(PetalEligibility::Allowed(current));
         }
         let mut additions = additions.to_vec();
-        let mut destinations = destinations.to_vec();
+        // Kept apart from `destinations`, which stays what the caller asked
+        // for so a pending change is judged against the request alone.
+        let mut proposed_destinations = destinations.to_vec();
         if policy.allowed_petal_packages.is_empty() {
             additions.extend_from_slice(&first_proposal.packages);
-            destinations.extend_from_slice(&first_proposal.destinations);
+            proposed_destinations.extend_from_slice(&first_proposal.destinations);
         }
-        let proposed =
-            policy_with_destinations(&policy_with_packages(&policy, &additions), &destinations);
+        let proposed = policy_with_destinations(
+            &policy_with_packages(&policy, &additions),
+            &proposed_destinations,
+        );
         let proposed_bytes = serde_jcs::to_vec(&proposed).map_err(err_be)?;
         match self
             .write_wallet_policy_update_locked(wallet, &proposed_bytes, Some(&current))
@@ -1474,7 +1484,7 @@ impl WalletsHandler {
                     self.policy_update_action_dir(wallet, "pending", &operation_id)
                         .join(APPROVAL_CHALLENGE_FILE),
                 )?;
-                projection.pending_view(required)
+                projection.pending_view(required, destinations)
             }
             Err(error) => Err(error),
             Ok(()) => Err(HandlerError::backend(

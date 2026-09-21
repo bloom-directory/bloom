@@ -484,7 +484,7 @@ pub(crate) async fn advance_default_policy(
                     .as_ref()
                     .map(|prepare| prepare.ceremony_expires_at_ms.get()),
                 petals,
-                proposes_chosen_petals: pending.includes_requested_package,
+                proposes_chosen_petals: pending.includes_requested,
             }
         }
     })

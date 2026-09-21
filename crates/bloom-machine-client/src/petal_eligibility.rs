@@ -60,5 +60,7 @@ pub struct PendingPolicyUpdate {
     pub prepare: Option<PolicyUpdatePrepareResponse>,
     pub status_path: String,
     pub challenge_path: String,
-    pub includes_requested_package: bool,
+    /// Whether this change carries every package and every destination the
+    /// caller asked for. False means it is somebody else's change.
+    pub includes_requested: bool,
 }

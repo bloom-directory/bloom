@@ -838,7 +838,7 @@ async fn default_wallet_first_proposal_allows_setup_packages_together() {
     else {
         panic!("owner approval must be required");
     };
-    assert!(pending.includes_requested_package);
+    assert!(pending.includes_requested);
     drop(handler);
     fixture.complete.store(true, Ordering::SeqCst);
     let restarted =
@@ -896,7 +896,7 @@ async fn default_policy_proposes_packages_and_destinations_in_one_ceremony() {
     else {
         panic!("owner approval must be required");
     };
-    assert!(pending.includes_requested_package);
+    assert!(pending.includes_requested);
 
     fixture.complete.store(true, Ordering::SeqCst);
     let PetalEligibility::Allowed(snapshot) = handler
@@ -944,7 +944,7 @@ async fn setup_packages_join_only_a_wallets_first_policy_proposal() {
     else {
         panic!("owner approval must be required");
     };
-    assert!(pending.includes_requested_package);
+    assert!(pending.includes_requested);
 
     // The owner removed `chosen` from a policy that already allows a Petal;
     // this proposal must not put it back behind the requested package.
@@ -979,7 +979,7 @@ async fn a_pending_change_without_every_required_package_is_reported_as_unrelate
     else {
         panic!("owner approval must be required");
     };
-    assert!(pending.includes_requested_package);
+    assert!(pending.includes_requested);
 
     // The pending change allows `first` only. A caller asking for both must be
     // told this change is not theirs, so nothing announces it as such.
@@ -990,7 +990,40 @@ async fn a_pending_change_without_every_required_package_is_reported_as_unrelate
     else {
         panic!("owner approval must still be required");
     };
-    assert!(!pending.includes_requested_package);
+    assert!(!pending.includes_requested);
+}
+
+#[tokio::test]
+async fn a_pending_change_without_every_required_destination_is_reported_as_unrelated() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = broker_fixture(false);
+    let packages = [Digest32::from_bytes([7; 32])];
+    let router = bloom_broker_api::PolicyDestination {
+        chain: Token::new("arbitrum").unwrap(),
+        destination: "0xf75584ef6673ad213a685a1b58cc0330b8ea22cf".into(),
+    };
+    let handler = eligibility_handler(temp.path(), fixture.clone());
+
+    let PetalEligibility::AwaitingPolicyApproval(pending) = handler
+        .ensure_petal_packages_allowed("alice", &packages, &[])
+        .await
+        .unwrap()
+    else {
+        panic!("owner approval must be required");
+    };
+    assert!(pending.includes_requested);
+
+    // The pending change allows the package but not its destination. Approving
+    // it would leave the Petal's outbox transactions denied and need a second
+    // ceremony, so it must not be announced as the caller's default policy.
+    let PetalEligibility::AwaitingPolicyApproval(pending) = handler
+        .ensure_petal_packages_allowed("alice", &packages, &[router])
+        .await
+        .unwrap()
+    else {
+        panic!("owner approval must still be required");
+    };
+    assert!(!pending.includes_requested);
 }
 
 #[tokio::test]
@@ -1113,7 +1146,7 @@ async fn petal_eligibility_recovers_lost_prepare_and_commits_after_restart() {
         panic!("owner approval must be required");
     };
     assert_eq!(pending.operation_id, operation);
-    assert!(pending.includes_requested_package);
+    assert!(pending.includes_requested);
     assert!(pending.prepare.is_some());
     drop(handler);
     fixture.complete.store(true, Ordering::SeqCst);
