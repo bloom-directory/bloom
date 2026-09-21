@@ -4397,6 +4397,10 @@ impl Daemon {
         // The default-policy wallet's first Petal proposal also allows every
         // installed Petal chosen during setup.
         let default_policy_packages: bloom_vfs::handlers::DefaultPolicyPackages = {
+            // Read once: only `bloom init` writes `[petals.setup]`, and it needs
+            // the home write lock this daemon holds, so the choice cannot change
+            // while this closure is alive. Installed hashes are resolved on each
+            // call, so a Petal update is picked up without a restart.
             let chosen: Vec<String> = config.petals.setup.keys().cloned().collect();
             let store = petal_store.clone();
             Arc::new(move |wallet: &str| {

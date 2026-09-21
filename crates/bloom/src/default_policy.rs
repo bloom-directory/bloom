@@ -751,6 +751,26 @@ pub(crate) fn ceremony_expiry_from_output(output: &str) -> Option<u64> {
 mod tests {
     use super::*;
 
+    /// Machine refuses an outbox transaction whose destination the wallet
+    /// policy does not list, so a canonical Petal missing from `for_petal`
+    /// would install and then have every transaction denied. Adding a Petal
+    /// to the catalog must be a decision made here, one way or the other.
+    #[test]
+    fn every_canonical_petal_has_destinations_or_is_known_to_need_none() {
+        // Hyperliquid declares no `bloom:tx.outbox` capability: it signs venue
+        // payloads and never stages an on-chain transaction.
+        // Tolly's destinations are not listed yet; see the PR discussion.
+        const NO_DESTINATIONS: &[&str] = &["hyperliquid", "tolly"];
+        for name in menu_petals() {
+            let listed = !bloom_proto::petal_destinations::for_petal(&name).is_empty();
+            let exempt = NO_DESTINATIONS.contains(&name.as_str());
+            assert!(
+                listed != exempt,
+                "{name}: list its destinations in petal_destinations::for_petal, or add it to NO_DESTINATIONS with the reason"
+            );
+        }
+    }
+
     fn menu(answers: &str) -> (PetalsConfig, String) {
         let mut petals = PetalsConfig::default();
         let mut output = Vec::new();

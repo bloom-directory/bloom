@@ -7,14 +7,6 @@ use bloom_broker_api::{
     PolicyUpdatePrepareResponse, SignedPolicySnapshot,
 };
 
-/// Preserve every existing restriction and append only the requested exact package hash.
-pub fn policy_with_package(
-    current: &CanonicalWalletPolicy,
-    package_hash: &Digest32,
-) -> CanonicalWalletPolicy {
-    policy_with_packages(current, std::slice::from_ref(package_hash))
-}
-
 /// Preserve every existing restriction and append each requested exact package
 /// hash once, in order.
 pub fn policy_with_packages(

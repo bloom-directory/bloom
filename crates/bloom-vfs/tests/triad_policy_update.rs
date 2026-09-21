@@ -13,7 +13,7 @@ use bloom_broker_api::{
 };
 use bloom_machine_client::{
     CachedWalletProjectionReader, FileProjectionStore, MachineBrokerClient, PetalEligibility,
-    WalletProjectionReader, policy_with_package,
+    WalletProjectionReader, policy_with_packages,
 };
 use bloom_proto::{AddressBook, HomeDir, HomeWritePermit};
 use bloom_tx::{outbox::Outbox, tx_engine::TxEngine};
@@ -785,11 +785,14 @@ async fn vfs_policy_non_actionable_ceremony_states_never_expose_launch_data() {
 fn package_eligibility_preserves_all_existing_policy_restrictions() {
     let before = policy(60_000);
     let hash = Digest32::from_bytes([7; 32]);
-    let after = policy_with_package(&before, &hash);
+    let after = policy_with_packages(&before, std::slice::from_ref(&hash));
     let mut expected = before.clone();
     expected.allowed_petal_packages.push(hash.clone());
     assert_eq!(after, expected);
-    assert_eq!(policy_with_package(&after, &hash), after);
+    assert_eq!(
+        policy_with_packages(&after, std::slice::from_ref(&hash)),
+        after
+    );
 }
 
 #[test]
@@ -1160,7 +1163,11 @@ async fn petal_eligibility_recovers_lost_prepare_and_commits_after_restart() {
     };
     assert_eq!(
         snapshot.canonical_policy.decode(),
-        serde_jcs::to_vec(&policy_with_package(&policy(60_000), &hash)).unwrap()
+        serde_jcs::to_vec(&policy_with_packages(
+            &policy(60_000),
+            std::slice::from_ref(&hash)
+        ))
+        .unwrap()
     );
     assert!(
         temp.path()
