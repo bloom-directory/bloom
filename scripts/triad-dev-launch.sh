@@ -333,6 +333,59 @@ rewrite_signer_config() {
 rewrite_broker_config
 rewrite_signer_config
 
+# Optional hosted-relay acceptance uses public trust pins and the existing
+# Signer administrator. Private credentials are created by Signer, never here.
+relay_ca="${BLOOM_TRIAD_DEV_RELAY_CONTROL_CA_FILE:-}"
+relay_receipt="${BLOOM_TRIAD_DEV_RELAY_RECEIPT_KEY_FILE:-}"
+if [ -n "$relay_ca" ] || [ -n "$relay_receipt" ]; then
+  [ "$host_os" = Darwin ] || die "developer relay setup currently requires macOS"
+  # macOS temporary directories can inherit wheel; scoped credentials require
+  # the actual Broker principal's primary group even with owner-only access.
+  chgrp "$(id -g)" "$config_dir"
+  chmod 0700 "$config_dir"
+  for public_pin in "$relay_ca" "$relay_receipt"; do
+    [ -f "$public_pin" ] && [ ! -L "$public_pin" ] || die "relay public trust pins must be regular files"
+  done
+  receipt_hex="$(tr -d '\r\n' < "$relay_receipt")"
+  [[ "$receipt_hex" =~ ^[0-9a-f]{64}$ ]] || die "relay receipt pin must contain 64 lowercase hexadecimal characters"
+  if [ -e "${config_dir}/relay.json" ]; then
+    for persisted_pin in "${config_dir}/relay.json" "${config_dir}/relay-control-ca.pem"; do
+      [ -f "$persisted_pin" ] && [ ! -L "$persisted_pin" ] || die "persisted relay trust pins must be regular files"
+    done
+    cmp -s "$relay_ca" "${config_dir}/relay-control-ca.pem" || die "relay control CA changed; refusing to alter enrolled developer trust"
+    jq -e --arg ca "${config_dir}/relay-control-ca.pem" --arg receipt "$receipt_hex" \
+      '.control_ca_pem_path == $ca and .receipt_public_key_hex == $receipt' \
+      "${config_dir}/relay.json" >/dev/null || die "relay trust configuration changed; refusing to alter enrolled developer trust"
+  else
+    [ ! -e "${developer_root}/state/admin/relay-admin-seed.hex" ] && \
+      [ ! -e "${developer_root}/state/admin/allocation-operation.json" ] ||
+      die "enrolled developer relay trust configuration is missing"
+    cp "$relay_ca" "${config_dir}/relay-control-ca.pem.new"
+    chmod 0600 "${config_dir}/relay-control-ca.pem.new"
+    mv "${config_dir}/relay-control-ca.pem.new" "${config_dir}/relay-control-ca.pem"
+    jq -n --arg ca "${config_dir}/relay-control-ca.pem" --arg receipt "$receipt_hex" \
+      '{control_ca_pem_path:$ca,receipt_public_key_hex:$receipt}' > "${config_dir}/relay.json.new"
+    chmod 0600 "${config_dir}/relay.json.new"
+    mv "${config_dir}/relay.json.new" "${config_dir}/relay.json"
+  fi
+  jq --arg receipt "$receipt_hex" '.relay_receipt_public_key_hex = $receipt' \
+    "${config_dir}/signer.json" > "${config_dir}/signer.json.new"
+  chmod 0600 "${config_dir}/signer.json.new"
+  mv -f "${config_dir}/signer.json.new" "${config_dir}/signer.json"
+  mkdir -p "${developer_root}/state/admin"
+  chmod 0700 "${developer_root}/state/admin"
+  mkdir "${runtime_dir}/admin"
+  chmod 0700 "${runtime_dir}/admin"
+  export BLOOM_SIGNER_ADMIN_SOCKET="${runtime_dir}/admin/admin.sock"
+  export BLOOM_SIGNER_ADMIN_STATE_DIR="${developer_root}/state/admin"
+  export BLOOM_SIGNER_RELAY_CONFIG="${config_dir}/relay.json"
+  export BLOOM_SIGNER_BROKER_UID="$(id -u)"
+  export BLOOM_SIGNER_BROKER_GID="$(id -g)"
+  export BLOOM_SIGNER_TUNNEL_CREDENTIAL_PATH="${config_dir}/relay-tunnel.credential"
+  export BLOOM_SIGNER_DNS_CREDENTIAL_PATH="${config_dir}/relay-dns.credential"
+  export BLOOM_SIGNER_ACME_ACCOUNT_URI_PATH="${config_dir}/acme-account-uri"
+fi
+
 env_file="${log_dir}/triad.env"
 {
   printf 'export BLOOM_TRIAD_DEVELOPER_ROOT=%q\n' "$developer_root"
@@ -350,6 +403,15 @@ env_file="${log_dir}/triad.env"
   printf 'export BLOOM_MACHINE_IDENTITY=%q\n' "${config_dir}/machine-identity.json"
   printf 'export BLOOM_EDGE_MANIFEST=%q\n' "${config_dir}/edge-manifest.json"
   printf 'export BLOOM_PROVENANCE_CATALOG=%q\n' "${config_dir}/provenance-catalog.json"
+  if [ -n "$relay_ca" ]; then
+    for variable in BLOOM_SIGNER_ADMIN_SOCKET BLOOM_SIGNER_ADMIN_STATE_DIR \
+      BLOOM_SIGNER_RELAY_CONFIG BLOOM_SIGNER_BROKER_UID BLOOM_SIGNER_BROKER_GID \
+      BLOOM_SIGNER_TUNNEL_CREDENTIAL_PATH BLOOM_SIGNER_DNS_CREDENTIAL_PATH \
+      BLOOM_SIGNER_ACME_ACCOUNT_URI_PATH; do
+      printf 'export %s=%q\n' "$variable" "${!variable}"
+    done
+    printf 'export BLOOM_SIGNER_IDENTITY=%q\n' "${config_dir}/signer-identity.json"
+  fi
 } > "$env_file"
 chmod 0600 "$env_file"
 session_pid=""; signer_pid=""; broker_pid=""; machine_pid=""
@@ -695,6 +757,25 @@ do
 done
 
 kill -0 "$machine_pid" 2>/dev/null || die "Machine exited before readiness could be published"
+health_attempts=0
+until machine_cli serve triad-health-check "$release_digest" >/dev/null 2>&1; do
+  for service_pid in "$session_pid" "$machine_pid"; do
+    kill -0 "$service_pid" 2>/dev/null || die "a Triad service exited before end-to-end readiness"
+  done
+  if [ "$host_os" = Linux ]; then
+    for service_unit in "$signer_service_unit" "$broker_service_unit"; do
+      systemctl --user is-active --quiet "$service_unit" ||
+        die "an authority service exited before end-to-end readiness"
+    done
+  else
+    for service_pid in "$signer_pid" "$broker_pid"; do
+      kill -0 "$service_pid" 2>/dev/null || die "an authority service exited before end-to-end readiness"
+    done
+  fi
+  health_attempts=$((health_attempts + 1))
+  [ "$health_attempts" -lt 30 ] || die "Triad did not pass authenticated end-to-end readiness"
+  sleep 1
+done
 printf 'ready\n' > "$ready_file"
 if [ -z "$mount_dir" ]; then
   printf '%s\n' \

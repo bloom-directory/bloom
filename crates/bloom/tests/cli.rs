@@ -1670,6 +1670,24 @@ fn lifecycle_commands_ignore_invalid_client_endpoint_configuration() {
 }
 
 #[test]
+fn triad_health_check_uses_the_configured_client_endpoint() {
+    let home = fresh_home();
+    let configured_socket = home.path().join("run").join("custom-machine.sock");
+    let default_socket = bloom_daemon::ipc::default_socket_path(home.path());
+    let endpoint = format!("unix:{}", configured_socket.display());
+
+    bloom_cmd(home.path())
+        .env("BLOOM_RPC_ENDPOINT", endpoint)
+        .args(["serve", "triad-health-check", &"11".repeat(32)])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains(configured_socket.display().to_string())
+                .and(predicate::str::contains(default_socket.display().to_string()).not()),
+        );
+}
+
+#[test]
 fn ipc_socket_flag_beats_rpc_endpoint_env() {
     let home = fresh_home();
     let flag_socket = home.path().join("run").join("ipc-flag-missing.sock");

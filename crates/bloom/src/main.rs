@@ -3245,7 +3245,15 @@ async fn run(cli: Cli) -> Result<()> {
         !cli.version || cli.cmd.is_none(),
         "--version cannot be combined with a command"
     );
-    let lifecycle_command = matches!(cli.cmd.as_ref(), Some(Cmd::Init { .. } | Cmd::Serve { .. }));
+    let lifecycle_command = match cli.cmd.as_ref() {
+        Some(Cmd::Init { .. }) => true,
+        Some(Cmd::Serve {
+            internal: Some(ServeInternal::TriadHealthCheck { .. }),
+            ..
+        }) => false,
+        Some(Cmd::Serve { .. }) => true,
+        _ => false,
+    };
     let is_long_running = long_running_role(&cli).is_some();
     let (connect, ipc_socket) = if lifecycle_command {
         (None, None)

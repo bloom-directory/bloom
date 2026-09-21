@@ -195,6 +195,60 @@ scripts/triad-dev-launch.sh \
 Record the actual checkout revisions and dirty state as described under
 [Cross-repository changes](#cross-repository-changes).
 
+### Hosted-relay developer acceptance
+
+On macOS, a `triad-dev-harness` build can provision a disposable hosted relay
+installation without elevating the test services. Set both public trust-pin
+inputs before invoking the launcher:
+
+```sh
+BLOOM_TRIAD_DEV_RELAY_CONTROL_CA_FILE=/restricted/relay-control-ca.pem \
+BLOOM_TRIAD_DEV_RELAY_RECEIPT_KEY_FILE=/restricted/receipt-public-key.hex \
+BLOOM_TRIAD_DEV_MACHINE_CONFIG=/path/to/disposable-machine.toml \
+BLOOM_INTEGRATION_MACHINE_BIN=/path/to/candidate/bloom \
+BLOOM_INTEGRATION_BROKER_BIN=/path/to/candidate/bloom-broker \
+BLOOM_INTEGRATION_SIGNER_BIN=/path/to/candidate/bloom-signer \
+scripts/triad-dev-launch.sh \
+  --developer-root /tmp/relay-dev \
+  --machine-home /tmp/relay-dev/machine-home \
+  --machine-socket /tmp/relay-dev/machine.sock \
+  --log-dir /tmp/relay-dev/logs \
+  --ready-file /tmp/relay-dev/ready
+```
+
+The receipt pin is 64 lowercase hexadecimal characters. The launcher creates
+owner-private relay configuration and a separate private administrative socket;
+Signer creates the administrator identity and scoped Broker credentials. The
+development exception requires the compiled harness feature and validated
+same-UID developer identity/manifest. Production administration remains root-only.
+The launcher checks authenticated Triad health before publishing readiness.
+
+Source the generated `triad.env`, then run the exact candidate Signer binary:
+
+```sh
+/path/to/candidate/bloom-signer admin provision --signer-uid "$(id -u)"
+/path/to/candidate/bloom-signer admin status --signer-uid "$(id -u)"
+```
+
+Provision only while the relay operator has enabled a bounded enrollment window
+for the test machine. A certificate-pending response is not readiness: poll
+status until remote TLS/routing and effective remote mode are confirmed. Close
+enrollment after provisioning. The hostname and administrator operation survive
+retry/restart; do not delete their state to work around an error. Restarts reject
+changed public trust pins for an existing relay configuration.
+
+The opt-in `scripts/test-remote-relay-approval.sh TRIAD_ENV ANVIL_RPC RUN_DIR`
+uses Broker's debug driver to register a remote test wallet, authorize policy,
+activate a remote Sealed Approval, and separately execute one transfer on a
+loopback Anvil chain (chain ID 31337). Set `BLOOM_REMOTE_RELAY_E2E=1`; use a new
+run directory and a dedicated chain. Set `BLOOM_INTEGRATION_DEBUG_DRIVER_BIN`
+to the exact candidate Broker debug driver; its digest is recorded with the
+evidence. The driver verifies public HTTPS normally
+and sends genuine WebAuthn proofs with the assigned origin/RP ID. It does not
+bypass certificate validation or substitute localhost for the remote ceremony.
+No NFS mount is required. Test state is retained for inspection and explicit
+cleanup; never use this fixture wallet or virtual authenticator for real funds.
+
 ### Sharing a host with other candidates
 
 The examples use fixed paths. Before running another candidate, give it a

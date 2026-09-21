@@ -1925,7 +1925,7 @@ mod tests {
                     identity_digest: bloom_broker_api::Digest32::from_bytes([0; 32]),
                 }),
                 credential_id: Base64UrlBytes::from_bytes(&[11; 16]),
-                rp_id: token("localhost"),
+                rp_id: bloom_broker_api::RpId::new("localhost").unwrap(),
                 active: true,
             }],
             initial_policy: Some(fixture.policy.clone()),
