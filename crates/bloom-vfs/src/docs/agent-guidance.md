@@ -208,6 +208,17 @@ rewrite its hostname, scheme, or port. A localhost ceremony needs a browser on
 the Bloom host; an assigned HTTPS relay ceremony can use another device. Launch
 URLs are owner access capabilities: keep them out of logs and Petal-visible data.
 
+To recover a wallet after losing its passkeys, write only its name to
+`wallets/recover`. This starts an authenticated Broker ceremony without
+needing the wallet in Machine's cached inventory. Read
+`wallets/recoveries/<petname>/status.json`, verify `requested_name`, and
+forward the complete `ceremony_url` to the human. The recovery ID and secret,
+and the replacement passkey, belong only in the Broker-hosted Browser page;
+never place them in a VFS write, shell argument, or log. A spent one-use URL
+disappears from status while the operation remains readable and cancellable.
+After `COMPLETED`, read `result.json`. A cancelled or expired operation can
+be started again with a fresh write to `wallets/recover`.
+
 ## The transaction loop
 
 Use this loop for native Machine transaction surfaces and for Petal actions that

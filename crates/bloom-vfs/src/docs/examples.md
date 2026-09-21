@@ -88,6 +88,22 @@ printf 'cancel\n' > "$BLOOM/wallets/registrations/main/cancel"
 Do not put a mnemonic, private key, passkey response, or PRF output in the
 mount. Those inputs stay inside the Broker-hosted browser ceremony.
 
+## Recovering a wallet
+
+```sh
+printf 'main\n' > "$BLOOM/wallets/recover"
+cat "$BLOOM/wallets/recoveries/main/status.json"
+# Open the complete ceremony_url in a browser and enter recovery material there.
+# Poll until ceremony_state is COMPLETED, then inspect:
+cat "$BLOOM/wallets/recoveries/main/result.json"
+```
+
+The write needs only the wallet name, even when Machine has no cached wallet
+inventory. A consumed one-use URL is removed from status. To cancel a pending
+ceremony, write `cancel` to `wallets/recoveries/main/cancel`; after cancellation
+or expiry, write the name to `wallets/recover` again for a new operation.
+Never write the recovery ID or secret into the mount or pass them as arguments.
+
 ## Solana account-aware reads and transfer
 
 ```sh

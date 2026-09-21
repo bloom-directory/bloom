@@ -1560,8 +1560,14 @@ unfinished approval proofs. Already activated approvals retain their existing
 policy, expiry and revocation rules. Recovery never changes wallet root or
 derived addresses.
 
-Browser recovery bootstrap returns uniform non-enumerating responses with
-bounded resource and completion-attempt admission; unauthenticated attempts
+An owner starts recovery through the authenticated Machine-to-Broker
+`recovery.prepare` request using only the wallet name. Machine exposes the
+returned one-use ceremony URL under `wallets/recoveries/<name>/status.json`;
+the recovery ID and secret are entered only in the Broker-hosted Browser
+ceremony. Broker does not expose a public recovery bootstrap endpoint or a
+wallet-name probe. The neutral Browser landing page carries no wallet
+identity or recovery capability. Recovery preparation and completion use
+bounded resource and attempt admission; unauthenticated Browser attempts
 must not permanently lock out a wallet. Failed or expired recovery never
 rotates the factor. Exact committed retries return the same encrypted result
 for a bounded period, only to the original Browser recipient binding. Losing

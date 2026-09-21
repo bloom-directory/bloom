@@ -475,6 +475,8 @@ impl DaemonPetalHost {
             == Some("wallets")
             && ((segments.len() == 2 && segments[1] == "new")
                 || (segments.len() >= 2 && segments[1] == "registrations")
+                || (segments.len() == 2 && segments[1] == "recover")
+                || (segments.len() >= 2 && segments[1] == "recoveries")
                 || (segments.len() == 4
                     && segments[2] == "sealed-approvals"
                     && segments[3] == "new.json")
@@ -6772,6 +6774,11 @@ mod tests {
         let protected = vec![
             "wallets/new".to_string(),
             "wallets/registrations".to_string(),
+            "wallets/recover".to_string(),
+            "wallets/recoveries".to_string(),
+            "wallets/recoveries/alice/status.json".to_string(),
+            "wallets/recoveries/alice/result.json".to_string(),
+            "wallets/recoveries/alice/cancel".to_string(),
             format!("wallets/registrations/{}/status.json", "22".repeat(32)),
             format!("wallets/registrations/{}/result.json", "22".repeat(32)),
             format!("wallets/registrations/{}/cancel", "22".repeat(32)),
