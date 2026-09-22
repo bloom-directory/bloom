@@ -6633,7 +6633,9 @@ mod tests {
         DaemonPetalHost::write_petal_key_state(&state_path, &state).unwrap();
         let predates = host.petal_key_request(request).await.unwrap_err();
         assert!(
-            predates.to_string().contains("predates its recorded derivation time"),
+            predates
+                .to_string()
+                .contains("predates its recorded derivation time"),
             "{predates}"
         );
         assert!(
