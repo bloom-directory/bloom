@@ -47,6 +47,10 @@ jobs:
       - uses: astral-sh/setup-uv@v7
       - name: Validate bounded Harbor harness
         run: scripts/test-harbor-evals.sh
+      # Failure-mode cases for the ceremony-port A/B concurrency script
+      # (stub launchers; binds no ports and needs no Triad).
+      - name: Run concurrency script failure-mode cases
+        run: scripts/test-ceremony-port-concurrency-cases.sh
 
   clippy:
     name: clippy
