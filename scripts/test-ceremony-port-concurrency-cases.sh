@@ -198,13 +198,39 @@ DIE_MSG=""
 require_contender_conflict "$CTR" 28735 "2026-01-01 00:00:00" >/dev/null 2>&1 || status=$?
 [ "$status" -ne 0 ] && report 0 "attribution rejects unrelated runtime pair" || report 1 "attribution rejects unrelated runtime pair" "accepted"
 
-# 7c. Only one of the two units shows a conflict: rejected (both required).
+# 7c. A single unit reporting the conflict suffices (dual-stack listener
+# validation belongs to the targeted listener tests).
 STUB_JOURNAL="$CTR_V4_LINES"
 status=0
 DIE_MSG=""
 require_contender_conflict "$CTR" 28735 "2026-01-01 00:00:00" >/dev/null 2>&1 || status=$?
-[ "$status" -ne 0 ] && report 0 "attribution requires both units" || report 1 "attribution requires both units" "accepted"
+[ "$status" -eq 0 ] && report 0 "attribution accepts a single unit" || report 1 "attribution accepts a single unit" "status=$status msg=$DIE_MSG"
 unset -f journalctl
+
+# 7d. The contender runtime token comes from its own launcher metadata
+# (read, never sourced).
+cat > "$work/fixture-triad.env" <<'EOF'
+export BLOOM_TRIAD_DEVELOPER_ROOT='/tmp/bcp.Ab12Cd/developer'
+export BLOOM_TRIAD_DEVELOPER_RUNTIME='/tmp/bcp.Ab12Cd/developer/runtime.9XyZ12'
+export BLOOM_HOME='/tmp/bcp.Ab12Cd/developer/machine-home'
+export BLOOM_TRIAD_DEV_CEREMONY_PORT='28735'
+EOF
+if token="$(contender_runtime_token "$work/fixture-triad.env")"; then
+  [ "$token" = "runtime.9XyZ12" ] && report 0 "runtime token read from metadata" || report 1 "runtime token read from metadata" "got $token"
+else
+  report 1 "runtime token read from metadata" "rejected"
+fi
+if contender_runtime_token "$work/does-not-exist.env" >/dev/null 2>&1; then
+  report 1 "runtime token rejects missing file" "accepted"
+else
+  report 0 "runtime token rejects missing file"
+fi
+printf 'export BLOOM_HOME=/tmp/x\n' > "$work/noruntime.env"
+if contender_runtime_token "$work/noruntime.env" >/dev/null 2>&1; then
+  report 1 "runtime token rejects absent key" "accepted"
+else
+  report 0 "runtime token rejects absent key"
+fi
 
 # 8. Contender-path PID retention: a contender that ignores SIGTERM keeps
 # its handle for EXIT cleanup instead of losing it.

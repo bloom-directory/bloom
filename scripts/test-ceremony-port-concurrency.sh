@@ -9,9 +9,11 @@
 # to complete a fresh ceremony; restarting A on its stopped root must
 # restore an enrollment that can complete a fresh ceremony.
 #
-# This needs no funded wallet, mainnet transaction, or RPC-provider
-# acceptance test: the local anvil chain exists only so the Machine config
-# mirrors the proven import-transfer setup; nothing is funded or broadcast.
+# This needs no funded wallet, mainnet transaction, RPC node, or
+# RPC-provider acceptance test: enrollment and policy updates only touch
+# local state and the ceremony loopback listeners. The Machine config keeps
+# a dormant chain entry (name validation only; verified with no node
+# running) so the script never depends on ambient ~/.bloom configuration.
 #
 # Linux-only: the collision assertion reads the contender's socket-unit
 # bind-conflict evidence from the user journal.
@@ -126,7 +128,6 @@ wait_pid() {
 # substitution), so wait(1) reaps them and cleanup can prove they stopped.
 # Initialized in main; the EXIT trap owns whatever is still set.
 launcher_a_pid=""; launcher_b_pid=""; contender_pid=""
-anvil_pid=""
 
 cleanup() {
   status=$?
@@ -141,14 +142,6 @@ cleanup() {
       wait "$pid" 2>/dev/null || true
     fi
   done
-  if [ -n "$anvil_pid" ]; then
-    if kill -0 "$anvil_pid" 2>/dev/null; then
-      kill "$anvil_pid" 2>/dev/null || true
-      wait_pid "$anvil_pid" "$stop_timeout_secs" || unreaped="$unreaped anvil($anvil_pid)"
-    else
-      wait "$anvil_pid" 2>/dev/null || true
-    fi
-  fi
   if [ -n "$unreaped" ]; then
     status=1
     printf 'ceremony-port concurrency: cleanup FAILED, owned processes still running:%s; diagnostics retained at: %s\n' "$unreaped" "$run_root" >&2
@@ -217,38 +210,54 @@ stop_candidate() {
   say "$label launcher stopped"
 }
 
-stop_anvil() {
-  [ -n "$anvil_pid" ] || return 0
-  kill "$anvil_pid" 2>/dev/null || true
-  wait_pid "$anvil_pid" "$stop_timeout_secs" || { die "anvil still alive after SIGTERM"; return $?; }
-  anvil_pid=""
-}
-
 # True when one exact socket unit journals the bind conflict on the port.
 unit_shows_conflict() {
   journalctl --user -u "$1" --since "$3" 2>/dev/null |
     grep -F "Address already in use" | grep -F ":$2" >/dev/null
 }
 
-# Require the contender's exact socket units (one runtime token, both
-# families) to journal the bind conflict on the expected port. Both units
-# must show it: the retry loop only stops early when the pair is complete.
+# Require a bind conflict on the expected port from either of the
+# contender's exact socket units, naming which one reported it. One report
+# establishes the cause (the requested port was occupied); dual-stack
+# listener validation belongs to the targeted listener tests.
 require_contender_conflict() {
   token=$1; port=$2; since=$3
   prefix="bloom-triad-dev-$(id -u)-$token"
-  v4=$prefix-broker-ceremony-ipv4.socket
-  v6=$prefix-broker-ceremony-ipv6.socket
   attempt=0
   while [ "$attempt" -lt 3 ]; do
-    if unit_shows_conflict "$v4" "$port" "$since"; then v4ok=1; else v4ok=0; fi
-    if unit_shows_conflict "$v6" "$port" "$since"; then v6ok=1; else v6ok=0; fi
-    if [ "$v4ok" -eq 1 ] && [ "$v6ok" -eq 1 ]; then
-      say "colliding launch on :$port failed on its own units $v4 $v6 (address in use) as required"
-      return 0
-    fi
+    for family in ipv4 ipv6; do
+      unit=$prefix-broker-ceremony-$family.socket
+      if unit_shows_conflict "$unit" "$port" "$since"; then
+        say "colliding launch on :$port failed on its own unit $unit (address in use) as required"
+        return 0
+      fi
+    done
     sleep 2; attempt=$((attempt + 1))
   done
-  die "contender units $v4 $v6 lack journaled bind conflicts on :$port"; return $?
+  die "contender units $prefix-broker-ceremony-ipv4.socket and $prefix-broker-ceremony-ipv6.socket lack journaled bind conflicts on :$port"
+  return $?
+}
+
+# Read the contender's runtime token from its own launcher metadata: the
+# launcher writes logs/triad.env (including BLOOM_TRIAD_DEVELOPER_RUNTIME)
+# before starting socket units, and the log directory survives the
+# contender's cleanup. Only that one line is read; the file is never
+# sourced. Prints the runtime directory basename.
+contender_runtime_token() {
+  env_file=$1
+  [ -f "$env_file" ] || return 1
+  line=$(sed -n 's/^export BLOOM_TRIAD_DEVELOPER_RUNTIME=//p' "$env_file" | head -n 1)
+  [ -n "$line" ] || return 1
+  # Values are shell-quoted (%q); strip one layer of surrounding quotes
+  # defensively without evaluating the contents.
+  case "$line" in
+    \'*\') line=${line#\'}; line=${line%\'} ;;
+    \"*\") line=${line#\"}; line=${line%\"} ;;
+  esac
+  [ -n "$line" ] || return 1
+  token=$(basename "$line")
+  case "$token" in ''|*[^A-Za-z0-9._-]*|.*) return 1 ;; esac
+  printf '%s' "$token"
 }
 
 # Launch the colliding contender, supervise it with a deadline, and prove
@@ -271,19 +280,8 @@ run_contender() {
       --ready-file "$collide_root/run/ready" \
       --ceremony-port "$port_a" >"$run_root/collide.log" 2>&1 &
   contender_pid=$!
-  contender_token=""
   deadline=$(( $(date +%s) + contender_deadline_secs ))
   while kill -0 "$contender_pid" 2>/dev/null; do
-    # Capture the runtime token while the contender is alive: its own
-    # cleanup deletes the directory on exit, so this observation is the
-    # ownership record the journal queries below are checked against.
-    if [ -z "$contender_token" ]; then
-      for runtime_dir in "$collide_root"/developer/runtime.*; do
-        [ -d "$runtime_dir" ] || continue
-        contender_token=$(basename "$runtime_dir")
-        break
-      done
-    fi
     if [ -f "$collide_root/run/ready" ]; then
       kill "$contender_pid" 2>/dev/null || true
       if wait_pid "$contender_pid" "$stop_timeout_secs"; then contender_pid=""; fi
@@ -300,7 +298,8 @@ run_contender() {
   wait "$contender_pid" 2>/dev/null || contender_status=$?
   contender_pid=""
   [ "$contender_status" -ne 0 ] || { die "fresh-root launch on occupied port :$port_a unexpectedly succeeded"; return $?; }
-  [ -n "$contender_token" ] || die "never observed the contender runtime directory; cannot attribute units"
+  contender_token="$(contender_runtime_token "$collide_root/logs/triad.env")" ||
+    { die "contender left no runtime metadata; cannot attribute units"; return $?; }
   require_contender_conflict "$contender_token" "$port_a" "$contender_start" || return $?
 }
 
@@ -393,8 +392,6 @@ main() {
   check_ports
 
   command -v jq >/dev/null 2>&1 || die "jq is required"
-  command -v anvil >/dev/null 2>&1 || die "anvil (foundry) is required"
-  command -v cast >/dev/null 2>&1 || die "cast (foundry) is required"
   command -v journalctl >/dev/null 2>&1 || die "journalctl (systemd user journal) is required"
   [ -x "$launcher" ] || die "launcher is not executable: $launcher"
   [ -x "$bloom_bin" ] || die "Machine binary is not executable: $bloom_bin"
@@ -425,17 +422,9 @@ main() {
   run_root="$(mktemp -d /tmp/bcp.XXXXXX)"
   trap cleanup EXIT INT TERM
 
-  # Local chain only so the Machine config mirrors the proven setup.
-  anvil_port="$(free_port)"
-  anvil --port "$anvil_port" --host 127.0.0.1 --chain-id 31337 >"$run_root/anvil.log" 2>&1 &
-  anvil_pid=$!
-  attempts=0
-  while ! cast block-number --rpc-url "http://127.0.0.1:${anvil_port}" >/dev/null 2>&1; do
-    kill -0 "$anvil_pid" 2>/dev/null || die "anvil exited before RPC became ready"
-    attempts=$((attempts + 1))
-    [ "$attempts" -lt 100 ] || die "anvil RPC did not become ready"
-    sleep 0.1
-  done
+  # Minimal Machine configuration: a dormant chain entry (name validation
+  # only — verified with no node running) so the run never depends on
+  # ambient ~/.bloom configuration. No chain process starts here.
   nfs_port="$(free_port)"
   machine_config="$run_root/machine-config.toml"
   {
@@ -444,9 +433,9 @@ main() {
     printf '\n[chains.anvil]\n'
     printf 'name = "anvil"\n'
     printf 'chain_id = 31337\n'
-    printf 'rpc_urls = ["http://127.0.0.1:%s"]\n' "$anvil_port"
+    printf 'rpc_urls = ["http://127.0.0.1:9"]\n'
     printf 'rpc_endpoints = []\n'
-    printf 'display_name = "Anvil (local)"\n'
+    printf 'display_name = "Anvil (dormant; no node runs)"\n'
     printf 'native_symbol = "ETH"\n'
     printf 'native_decimals = 18\n'
     printf 'legacy_tx = false\n'
@@ -496,7 +485,6 @@ main() {
   launcher_a_pid=""
   stop_candidate "$launcher_b_pid" "$b_socket" B
   launcher_b_pid=""
-  stop_anvil
   rm -rf -- "$run_root" || die "run directory removal failed: $run_root"
   say "PASS ports A=$port_a B=$port_b custody=18734"
 }
