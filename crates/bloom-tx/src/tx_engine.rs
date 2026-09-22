@@ -195,6 +195,14 @@ pub enum TxEngineError {
         /// gap the owner can clear and one they have to go looking for.
         blocking: String,
     },
+    #[error(
+        "nonce already consumed: tx for {from} uses nonce {staged} but the account's next on-chain nonce is {chain_next} — the original already mined or the nonce was spent elsewhere, so no same-nonce replacement can land. Reconcile its receipt or restage."
+    )]
+    NonceConsumed {
+        from: String,
+        staged: u64,
+        chain_next: u64,
+    },
 }
 
 /// In-memory cache for ERC-20 metadata keyed by `(chain_id, address)`.
@@ -2741,6 +2749,40 @@ impl TxEngine {
         Ok(())
     }
 
+    /// A replacement or cancel reuses the original's nonce, so it can only
+    /// land while that nonce is still the account's next one. Once the chain
+    /// has moved past it the original either mined (reconcile its receipt) or
+    /// the nonce was spent by something else (restage); broadcasting a
+    /// same-nonce tx would be guaranteed to fail. Like the gap guard, a failed
+    /// nonce read is not evidence and fails open.
+    async fn assert_nonce_still_replaceable(
+        &self,
+        chain: &ChainClient,
+        from: Address,
+        nonce: u64,
+    ) -> Result<(), TxEngineError> {
+        let chain_next = match chain.nonce(from).await {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    from = %bloom_proto::checksum_address(&from),
+                    nonce,
+                    "nonce_consumed_guard: could not read chain nonce; proceeding"
+                );
+                return Ok(());
+            }
+        };
+        if nonce < chain_next {
+            return Err(TxEngineError::NonceConsumed {
+                from: bloom_proto::checksum_address(&from),
+                staged: nonce,
+                chain_next,
+            });
+        }
+        Ok(())
+    }
+
     /// Persist a machine-readable advisory beside a pending entry when its
     /// broadcast was refused by [`Self::assert_nonce_not_ahead_of_chain`], so an
     /// agent can see the exact gap and how to resolve it without re-deriving it.
@@ -4018,6 +4060,15 @@ impl TxEngine {
         let bump = bump_pct.max(10);
         let entry = self.read_replaceable_entry(wallet, chain_name, original_id)?;
         let original = &entry.staged;
+        self.assert_nonce_still_replaceable(
+            chain,
+            original
+                .from
+                .parse()
+                .map_err(|e: alloy::hex::FromHexError| TxEngineError::Address(e.to_string()))?,
+            original.nonce,
+        )
+        .await?;
 
         let mut bumped = original.clone();
         bumped.status = TxStatus::Pending;
@@ -4124,6 +4175,15 @@ impl TxEngine {
         let bump = bump_pct.max(10);
         let entry = self.read_replaceable_entry(wallet, chain_name, original_id)?;
         let original = &entry.staged;
+        self.assert_nonce_still_replaceable(
+            chain,
+            original
+                .from
+                .parse()
+                .map_err(|e: alloy::hex::FromHexError| TxEngineError::Address(e.to_string()))?,
+            original.nonce,
+        )
+        .await?;
 
         let mut cancel_tx = cancellation_candidate(original)?;
         bump_fees_in_place(&mut cancel_tx, bump);
