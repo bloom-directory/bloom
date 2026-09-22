@@ -226,6 +226,15 @@ another. A fresh-root launch on an occupied port fails and cleans up only its
 own units; it never stops the conflicting listener, restarts shared services,
 or falls back to another port.
 
+All ceremony ports share the `localhost` WebAuthn RP scope (`rpId
+"localhost"` covers every `localhost:<port>` origin), so one platform
+passkey can serve ceremonies on any candidate port. The shared scope does
+not share authorization: a credential must still be enrolled with and
+recognized by the destination Triad's own Signer — a passkey created on
+candidate A cannot approve a ceremony on candidate B, and a page served by
+one Triad posting to another fails the destination's origin check (the
+Broker log names the expected origin).
+
 Run one Machine per home. `bloom serve` and `bloom init` hold an exclusive lock
 on the whole home for their lifetime, so a second one against the same home
 fails with `Bloom home is already open for writing`. Every other command,
