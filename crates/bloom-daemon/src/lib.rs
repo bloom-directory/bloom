@@ -6604,6 +6604,44 @@ mod tests {
         assert_eq!(prepares().len(), 1);
     }
 
+    /// A key state with no recorded derivation time (older than v0.3.0) is
+    /// refused with an instruction to request a new session, instead of
+    /// preparing an approval with an unbounded lifetime.
+    #[tokio::test]
+    async fn petal_key_reusable_approval_refuses_a_key_with_no_recorded_derivation_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = Arc::new(PetalKeyBrokerFixture::new());
+        let (host, request, _) = petal_key_host(dir.path(), &fixture);
+        let state_path = host
+            .petal_key_state_path(
+                "primary",
+                "pln1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                &request.key_slot,
+            )
+            .unwrap();
+        host.petal_key_request(request.clone()).await.unwrap();
+        fixture
+            .completed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        // Custody completes and the key is recorded; the approval is
+        // prepared only on the next identical request.
+        host.petal_key_request(request.clone()).await.unwrap();
+        let mut state = DaemonPetalHost::read_petal_key_state(&state_path)
+            .unwrap()
+            .unwrap();
+        state.requested_at_ms = 0;
+        DaemonPetalHost::write_petal_key_state(&state_path, &state).unwrap();
+        let predates = host.petal_key_request(request).await.unwrap_err();
+        assert!(
+            predates.to_string().contains("predates its recorded derivation time"),
+            "{predates}"
+        );
+        assert!(
+            fixture.approval_prepares.lock().unwrap().is_empty(),
+            "no approval is prepared without a derivation time"
+        );
+    }
+
     /// An approval still waiting on its owner survives a Machine restart: the
     /// retry adopts the ceremony Broker still offers instead of preparing
     /// another, which Broker would refuse while that ceremony is live. Once
