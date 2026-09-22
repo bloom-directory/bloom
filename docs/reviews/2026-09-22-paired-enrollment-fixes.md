@@ -38,7 +38,13 @@ blocks a new enrollment for the wallet. Committed operations remain uncancellabl
   confirmed that a fresh enrollment can immediately be created after backoff.
 
 The existing disposable wallet and relay installation were preserved through
-restarts. Probes did not enroll or replace credentials. Real-browser source
-authorization and destination credential creation remain pending user testing;
-these preparation checks do not establish full paired-enrollment acceptance.
+restarts. Probes did not enroll or replace credentials. The user subsequently
+completed remote-to-local enrollment with a real browser/passkey. Operation
+`8c1f176e644ad7f415c5b92bff58d732545796986b0cc5fe29351fd68d4a3d55`
+reports `SUCCEEDED`, with receipt digest
+`2ac7576fcb77d8ac6daacd7fc1121d6723316dcca3a883ad02ae59adca387717`.
+The authenticated Broker wallet projection for `browser-pair-20260922` shows
+two `ACTIVE` credentials, one on `local` and one on `remote`. This verifies
+real-browser source authorization and destination credential creation. It does
+not establish the reverse direction or a fresh post-enrollment approval test.
 No capability URLs, browser cookies or private key material are included here.
