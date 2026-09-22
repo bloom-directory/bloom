@@ -4533,6 +4533,7 @@ impl Daemon {
                     )
                     .with_address_book(address_book_arc.clone())
                     .with_petals(petal_router.clone())
+                    .with_solana_reads(solana_chain_registry.clone())
                     .with_skin(home.skin_path()),
                 ) as _,
             )

@@ -45,7 +45,7 @@ use bloom_proto::{AddressBook, checksum_address, parse_address};
 
 use super::market_data::{self, MarketData, TokenMarket};
 use super::outbox::OutboxHandler;
-use crate::handler::{Entry, Handler, HandlerError};
+use crate::handler::{Entry, EntryKind, Handler, HandlerError};
 use crate::path::VfsPath;
 
 const BLOOM_CSS: &str = include_str!("../assets/bloom.css");
@@ -131,6 +131,11 @@ pub struct ViewsHandler {
     /// through its own trait so a page cannot drift from what `/petals`
     /// reports, and absent it the section simply does not appear.
     petals: Option<Arc<dyn Handler>>,
+    /// Read-only Solana clients keyed by chain name, for native SOL balances.
+    /// Separate from the EVM registry: a chain readable here but absent from
+    /// the transfer engines is readable but cannot stage, and the pages only
+    /// read. Absent it, Solana rows simply do not appear.
+    solana: Option<bloom_solana::SolanaChainRegistry>,
     /// Where the person's `skin.css` lives, when the daemon has a home.
     skin: Option<std::path::PathBuf>,
 }
@@ -151,8 +156,17 @@ impl ViewsHandler {
             market,
             address_book: Arc::new(AddressBook::default()),
             petals: None,
+            solana: None,
             skin: None,
         }
+    }
+
+    /// Attach the read-only Solana client registry so the pages can read
+    /// native SOL balances beside the EVM ones. Independent of the transfer
+    /// engines: chain listing and balance reads resolve here.
+    pub fn with_solana_reads(mut self, chains: bloom_solana::SolanaChainRegistry) -> Self {
+        self.solana = Some(chains);
+        self
     }
 
     /// Serve the stylesheet at `path` as `skin.css`. The file is optional and
@@ -330,6 +344,7 @@ impl ViewsHandler {
     async fn portfolio(&self) -> Portfolio {
         let (projections, projections_unavailable) = self.wallet_projections().await;
         let chains = self.sorted_chains();
+        let solana_chains = self.solana_chain_names();
         let mut portfolio = Portfolio {
             projections_unavailable,
             ..Portfolio::default()
@@ -337,32 +352,50 @@ impl ViewsHandler {
 
         for projection in &projections {
             let wallet = projection.wallet_id().as_str().to_owned();
+            // Every address the projection reports: the primary EVM key plus
+            // each numbered account's EVM and Solana addresses. One wallet
+            // holds across accounts, so every balance row carries the wallet
+            // id and names its account separately.
+            let inventory = wallet_addresses(projection);
+            let mut known: Vec<String> = inventory
+                .evm
+                .iter()
+                .map(|(_, address)| address.clone())
+                .chain(inventory.solana.iter().map(|(_, address)| address.clone()))
+                .collect();
+            known.dedup();
             portfolio.wallets.push(WalletSummary {
                 id: wallet.clone(),
                 address: projection.primary_address().ok().map(str::to_owned),
+                addresses: known,
                 kind: projection.wallet.wallet_kind.as_str().to_owned(),
             });
             if projection.freshness == ProjectionFreshness::Stale {
                 portfolio.stale = true;
             }
-            let address_text = match projection.primary_address() {
-                Ok(address) => address.to_owned(),
-                Err(error) => {
-                    tracing::debug!(wallet = %wallet, error = %error, "views.address_unavailable");
+            if inventory.evm.is_empty() && inventory.solana.is_empty() {
+                tracing::debug!(wallet = %wallet, "views.address_unavailable");
+            }
+            for (account, address_text) in &inventory.evm {
+                let Ok(address) = address_text.parse::<alloy::primitives::Address>() else {
+                    tracing::debug!(wallet = %wallet, "views.address_unparsed");
                     continue;
+                };
+                let (mut holdings, unavailable) =
+                    self.read_balances(&wallet, address, &chains).await;
+                for holding in &mut holdings {
+                    holding.account = account.clone();
                 }
-            };
-            let address = match address_text.parse::<alloy::primitives::Address>() {
-                Ok(address) => address,
-                Err(error) => {
-                    tracing::debug!(wallet = %wallet, error = %error, "views.address_unparsed");
-                    continue;
-                }
-            };
-
-            let (holdings, unavailable) = self.read_balances(&wallet, address, &chains).await;
-            portfolio.holdings.extend(holdings);
-            portfolio.unavailable.extend(unavailable);
+                portfolio.holdings.extend(holdings);
+                portfolio.unavailable.extend(unavailable);
+            }
+            for (account, address) in &inventory.solana {
+                let (holdings, unavailable) = self
+                    .read_solana_balances(&wallet, account, address, &solana_chains)
+                    .await;
+                portfolio.holdings.extend(holdings);
+                portfolio.unavailable.extend(unavailable);
+            }
         }
 
         self.price(&mut portfolio).await;
@@ -431,8 +464,95 @@ impl ViewsHandler {
                         label: self.network_label(&chain),
                         wallet: owner.to_owned(),
                         chain,
+                        price_key: native_asset_market(chain_id),
+                        account: String::new(),
                         chain_id,
                         symbol,
+                        quantity,
+                        amount,
+                        value: None,
+                    });
+                }
+                None => unavailable.push((owner.to_owned(), chain)),
+            }
+        }
+        (holdings, unavailable)
+    }
+
+    /// Configured Solana chain names, sorted. Empty when no Solana registry
+    /// is attached or no Solana chain is configured: Solana rows then simply
+    /// do not appear.
+    fn solana_chain_names(&self) -> Vec<String> {
+        let mut chains = self
+            .solana
+            .as_ref()
+            .map(|registry| registry.list_names())
+            .unwrap_or_default();
+        chains.sort();
+        chains
+    }
+
+    /// Native SOL balance on every configured Solana chain for one address.
+    /// Lamports become SOL at nine decimals with exact integer math; a zero
+    /// balance is kept for the same reason as on EVM. A test-network chain
+    /// carries no market key, so faucet lamports are never valued as SOL.
+    async fn read_solana_balances(
+        &self,
+        owner: &str,
+        account: &str,
+        address: &str,
+        chains: &[String],
+    ) -> (Vec<Holding>, Vec<(String, String)>) {
+        let Some(registry) = self.solana.clone() else {
+            return (Vec::new(), Vec::new());
+        };
+        let mut reads = tokio::task::JoinSet::new();
+        for chain in chains {
+            let Some(client) = registry.get(chain) else {
+                continue;
+            };
+            let name = chain.clone();
+            let address = address.to_owned();
+            reads.spawn(async move {
+                let lamports =
+                    match tokio::time::timeout(BALANCE_TIMEOUT, client.get_balance(&address)).await
+                    {
+                        Ok(Ok(lamports)) => Some(lamports),
+                        Ok(Err(error)) => {
+                            tracing::debug!(chain = %name, error = %error, "views.solana_balance_unavailable");
+                            None
+                        }
+                        Err(_) => {
+                            tracing::debug!(chain = %name, "views.solana_balance_timeout");
+                            None
+                        }
+                    };
+                (name, lamports)
+            });
+        }
+        let (mut holdings, mut unavailable) = (Vec::new(), Vec::new());
+        while let Some(joined) = reads.join_next().await {
+            let Ok((chain, lamports)) = joined else {
+                continue;
+            };
+            match lamports {
+                Some(raw) => {
+                    let quantity = format!("{}.{:09}", raw / 1_000_000_000, raw % 1_000_000_000);
+                    let amount = quantity.parse::<f64>().unwrap_or(0.0);
+                    // A test network's lamports are faucet funds, never SOL.
+                    let price_key = if is_test_network(&chain) {
+                        None
+                    } else {
+                        Some("coingecko:solana")
+                    };
+                    holdings.push(Holding {
+                        label: self.network_label(&chain),
+                        wallet: owner.to_owned(),
+                        chain,
+                        price_key,
+                        account: account.to_owned(),
+                        chain_id: 0,
+                        symbol: "SOL".to_owned(),
                         quantity,
                         amount,
                         value: None,
@@ -478,6 +598,7 @@ impl ViewsHandler {
             portfolio.wallets.push(WalletSummary {
                 id: label.clone(),
                 address: Some(from.clone()),
+                addresses: vec![from.clone()],
                 kind: "observed address".to_owned(),
             });
             let (holdings, _) = self.read_balances(&label, address, &chains).await;
@@ -626,6 +747,107 @@ impl ViewsHandler {
                 url: None,
             });
         }
+
+        // Every other installed Petal, generically. A Petal without a
+        // dedicated parser above still reports the leaves it holds under a
+        // known address, shown as observed and never valued: inventing a
+        // dollar figure for another app's units would be fabrication.
+        for petal in self.petal_list("").await {
+            if petal == "hyperliquid" || petal == "privacy-pools" {
+                continue;
+            }
+            positions.extend(self.generic_petal_positions(&petal, addresses).await);
+        }
+        positions
+    }
+
+    /// Entries (names and kinds) under one `petals/` path. An unlistable
+    /// path is an absence, not a fault, like an unreadable leaf.
+    async fn petal_entries(&self, path: &str) -> Vec<Entry> {
+        let Some(petals) = self.petals.as_ref() else {
+            return Vec::new();
+        };
+        let Ok(parsed) = VfsPath::parse(path) else {
+            return Vec::new();
+        };
+        match Handler::list(petals.as_ref(), &parsed).await {
+            Ok(entries) => entries,
+            Err(error) => {
+                tracing::debug!(path, error = %error, "views.petal_list_unavailable");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Address-keyed leaves under one Petal that has no dedicated parser.
+    /// The walk stays shallow and bounded (two levels, a couple dozen
+    /// listings, a dozen rows) so one chatty Petal cannot hold up a page.
+    /// Only a leaf whose path names a known address becomes a row, owned by
+    /// that address, so it attributes to the right wallet; anything else is
+    /// the Petal's own business, not a position to show.
+    async fn generic_petal_positions(
+        &self,
+        petal: &str,
+        addresses: &[String],
+    ) -> Vec<PetalPosition> {
+        let lowered: Vec<String> = addresses
+            .iter()
+            .map(|address| address.to_ascii_lowercase())
+            .collect();
+        let mut positions = Vec::new();
+        let mut stack = vec![(String::new(), 0u8)];
+        let mut listed = 0usize;
+        while let Some((rel, depth)) = stack.pop() {
+            if listed >= 24 || positions.len() >= 12 {
+                break;
+            }
+            let prefix = if rel.is_empty() {
+                petal.to_owned()
+            } else {
+                format!("{petal}/{rel}")
+            };
+            listed += 1;
+            for entry in self.petal_entries(&prefix).await {
+                let path = if rel.is_empty() {
+                    entry.name.clone()
+                } else {
+                    format!("{rel}/{}", entry.name)
+                };
+                match entry.kind {
+                    EntryKind::Dir if depth < 2 => stack.push((path, depth + 1)),
+                    EntryKind::File => {
+                        let haystack = path.to_ascii_lowercase();
+                        let Some(owner) = lowered
+                            .iter()
+                            .find(|known| haystack.contains(known.as_str()))
+                        else {
+                            continue;
+                        };
+                        let summary = self
+                            .petal_file(&format!("{petal}/{path}"))
+                            .await
+                            .map(|text| summarize_petal_leaf(&text))
+                            .unwrap_or_default();
+                        positions.push(PetalPosition {
+                            petal: petal.to_owned(),
+                            label: leaf_label(&path),
+                            scope: leaf_scope(petal, &path),
+                            owner: Some(owner.clone()),
+                            quantity: summary,
+                            value: None,
+                            note: format!(
+                                "Reported by the {petal} Petal; shown as observed, without a dollar value."
+                            ),
+                            url: None,
+                        });
+                        if positions.len() >= 12 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
         positions
     }
 
@@ -648,7 +870,7 @@ impl ViewsHandler {
             .holdings
             .iter()
             .filter(|holding| holding.is_funded())
-            .filter_map(|holding| native_asset_market(holding.chain_id))
+            .filter_map(|holding| holding.price_key)
             .collect();
         keys.sort_unstable();
         keys.dedup();
@@ -684,7 +906,7 @@ impl ViewsHandler {
         }
 
         for holding in &mut portfolio.holdings {
-            let Some(key) = native_asset_market(holding.chain_id) else {
+            let Some(key) = holding.price_key else {
                 continue;
             };
             if let Some(price) = quotes.get(key) {
@@ -1473,41 +1695,29 @@ impl ViewsHandler {
         testnets: &[String],
     ) -> String {
         let id = wallet.wallet_id().as_str();
-        let mut card = match wallet
-            .primary_address()
-            .ok()
-            .filter(|address| address.parse::<alloy::primitives::Address>().is_ok())
-        {
-            Some(address) => self.render_address_card(address, mainnets, testnets),
+        // Numbered accounts first: the primary key is account zero's address,
+        // and every further account gets its own card labelled by derivation
+        // path. The primary card keeps its network sentence; extras name the
+        // account they belong to.
+        let inventory = wallet_addresses(wallet);
+        let mut card = match inventory.evm.first() {
+            Some((_, address)) => self.render_address_card(address, mainnets, testnets),
             None => "<article class=\"card receiving-card\"><h3>Ethereum &amp; EVM</h3><p>No EVM receiving address in this wallet’s projection.\
                          </p></article>"
                 .to_owned(),
         };
-        let mut solana_addresses = std::collections::BTreeSet::new();
-        for key in &wallet.keys {
-            if key
-                .supported_crypto_suites
-                .contains(&bloom_broker_api::CryptoSuite::Ed25519Message)
-            {
-                for address in &key.addresses {
-                    // Ed25519 alone does not identify a chain. Require an
-                    // explicit Solana CAIP-10 identity from the projection.
-                    if let Some((network, address)) = address
-                        .strip_prefix("solana:")
-                        .and_then(|account| account.split_once(':'))
-                        && !network.is_empty()
-                        && (32..=44).contains(&address.len())
-                        && address.bytes().all(|byte| {
-                            b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
-                                .contains(&byte)
-                        })
-                    {
-                        solana_addresses.insert(address);
-                    }
-                }
-            }
+        for (account, address) in inventory.evm.iter().skip(1) {
+            card.push_str(&format!(
+                "<article class=\"card receiving-card\"><h3>{mark}</h3>{qr}\
+                 <code class=\"address\">{address}</code>\
+                 <p class=\"receiving-network\">Account <code>{account}</code>. One address across the EVM networks above.</p></article>",
+                mark = asset_label("Ethereum & EVM"),
+                qr = receiving_qr(address),
+                address = html_escape(address),
+                account = html_escape(account),
+            ));
         }
-        if solana_addresses.is_empty() {
+        if inventory.solana.is_empty() {
             card.push_str(&format!(
                 "<article class=\"card receiving-card receiving-unavailable\"><h3>{}</h3>\
                  <p>No Solana receiving address in this wallet’s projection.</p>\
@@ -1515,15 +1725,16 @@ impl ViewsHandler {
                 asset_label("Solana"),
             ));
         }
-        for address in solana_addresses {
+        for (account, address) in &inventory.solana {
             card.push_str(&format!(
                 "<article class=\"card receiving-card\"><h3>{mark}</h3>{qr}\
                  <code class=\"address\">{address}</code>\
-                 <p class=\"receiving-network\">Send on Solana only.</p>\
+                 <p class=\"receiving-network\">Account <code>{account}</code>. Send on Solana only.</p>\
                  <a class=\"external-link\" href=\"https://explorer.solana.com/address/{address}\" rel=\"noreferrer noopener\">View on Solana Explorer ↗</a></article>",
                 mark = asset_label("Solana"),
                 qr = receiving_qr(address),
                 address = html_escape(address),
+                account = html_escape(account),
             ));
         }
         format!(
@@ -2180,6 +2391,7 @@ impl ViewsHandler {
 }
 
 /// A position a Petal reports, valued where the Petal's own units allow it.
+#[derive(Debug)]
 struct PetalPosition {
     petal: String,
     label: String,
@@ -2232,6 +2444,62 @@ fn short_quantity_with_unit(text: &str) -> String {
     }
 }
 
+/// One-line evidence for a Petal leaf no dedicated parser understands.
+/// Collapsed whitespace, capped length: a position row is a pointer, not a
+/// dump. Never a valuation.
+fn summarize_petal_leaf(text: &str) -> String {
+    let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    const CAP: usize = 120;
+    if flat.len() <= CAP {
+        return if flat.is_empty() {
+            "leaf present".to_owned()
+        } else {
+            flat
+        };
+    }
+    let mut end = CAP;
+    while !flat.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", flat[..end].trim_end())
+}
+
+/// A leaf path's file name, without extension, as a row label. An
+/// address-keyed leaf reads as its owner plus what it holds, not as
+/// forty-two undifferentiated hex characters.
+fn leaf_label(path: &str) -> String {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let stem = match name.rsplit_once('.') {
+        Some((stem, _)) if !stem.is_empty() => stem,
+        _ => name,
+    };
+    if stem.len() > 42
+        && stem.starts_with("0x")
+        && stem.as_bytes()[2..]
+            .iter()
+            .take(40)
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        let rest = stem[42..].trim_start_matches(['-', '_', ' ']);
+        return if rest.is_empty() {
+            short_hex(&stem[..42])
+        } else {
+            format!("{} {rest}", short_hex(&stem[..42]))
+        };
+    }
+    stem.to_owned()
+}
+
+/// Where under its Petal a generic leaf lives: the relative parent
+/// directory, so the row names a scope ("mainnet/users") instead of
+/// repeating the Petal name the row already carries.
+fn leaf_scope(petal: &str, path: &str) -> String {
+    match path.rsplit_once('/') {
+        Some((dir, _)) => dir.to_owned(),
+        None => petal.to_owned(),
+    }
+}
+
 fn short_activity_amount(text: &str) -> String {
     let Some((quantity, unit)) = text.split_once(' ') else {
         return short_quantity(text);
@@ -2254,6 +2522,10 @@ fn short_activity_amount(text: &str) -> String {
 struct WalletSummary {
     id: String,
     address: Option<String>,
+    /// Every address the projection reports for this wallet — primary plus
+    /// numbered accounts, both families — so an app position keyed by any of
+    /// them attributes to the wallet that controls it.
+    addresses: Vec<String>,
     kind: String,
 }
 
@@ -2266,6 +2538,10 @@ fn position_belongs_to_wallet(position: &PetalPosition, wallet: &WalletSummary) 
             .address
             .as_deref()
             .is_some_and(|address| owner.eq_ignore_ascii_case(address))
+        || wallet
+            .addresses
+            .iter()
+            .any(|address| owner.eq_ignore_ascii_case(address))
 }
 
 #[derive(Default)]
@@ -2387,7 +2663,11 @@ fn holdings_table(rows: &[&Holding], caption: &str) -> String {
                 exact = html_escape(&trim_trailing_zeros(&holding.quantity)),
                 label = asset_label_with(
                     network_mark(holding.chain_id, &holding.label),
-                    &holding.label
+                    &if holding.account.is_empty() {
+                        holding.label.clone()
+                    } else {
+                        format!("{} · {}", holding.label, holding.account)
+                    }
                 ),
                 value = html_escape(&money(holding.value)),
                 note = html_escape(&holding.note()),
@@ -2594,7 +2874,7 @@ fn position_addresses(portfolio: &Portfolio, actions: &[Action]) -> Vec<String> 
     let mut addresses = portfolio
         .wallets
         .iter()
-        .filter_map(|w| w.address.clone())
+        .flat_map(|w| w.address.clone().into_iter().chain(w.addresses.clone()))
         .collect::<Vec<_>>();
     addresses.extend(
         actions
@@ -2604,10 +2884,99 @@ fn position_addresses(portfolio: &Portfolio, actions: &[Action]) -> Vec<String> 
     addresses
 }
 
+/// Every address one wallet projection reports, grouped by family. The
+/// primary EVM key comes first (it predates the account inventory), then each
+/// numbered account's addresses in projection order. Duplicates collapse so a
+/// primary key that is also account zero reads once.
+#[derive(Debug)]
+struct WalletAddresses {
+    /// `(account label, EVM address)`. The primary entry carries an empty
+    /// label; numbered accounts carry their derivation path.
+    evm: Vec<(String, String)>,
+    /// `(account label, Solana base58 address)`, labelled by derivation path
+    /// or by the projected key they came from.
+    solana: Vec<(String, String)>,
+}
+
+fn wallet_addresses(projection: &WalletProjection) -> WalletAddresses {
+    let mut out = WalletAddresses {
+        evm: Vec::new(),
+        solana: Vec::new(),
+    };
+    let mut seen_evm = BTreeSet::new();
+    let mut seen_sol = BTreeSet::new();
+    if let Ok(primary) = projection.primary_address()
+        && primary.parse::<alloy::primitives::Address>().is_ok()
+        && seen_evm.insert(primary.to_ascii_lowercase())
+    {
+        out.evm.push((String::new(), primary.to_owned()));
+    }
+    if let Ok(inventory) = projection.account_inventory() {
+        for account in &inventory.accounts {
+            let label = account.path.clone();
+            for chain in &account.chain_projections {
+                if chain.chain_family.as_str() == "solana" {
+                    if is_solana_address(&chain.address) && seen_sol.insert(chain.address.clone()) {
+                        out.solana.push((label.clone(), chain.address.clone()));
+                    }
+                } else if chain.address.parse::<alloy::primitives::Address>().is_ok()
+                    && seen_evm.insert(chain.address.to_ascii_lowercase())
+                {
+                    out.evm.push((label.clone(), chain.address.clone()));
+                }
+            }
+        }
+    }
+    // Projections cached from before the account inventory still carry
+    // explicit Solana identities on their Ed25519 keys; keep reading those so
+    // an older Broker does not lose its Solana receive cards.
+    for key in &projection.keys {
+        if !key
+            .supported_crypto_suites
+            .contains(&bloom_broker_api::CryptoSuite::Ed25519Message)
+        {
+            continue;
+        }
+        for address in &key.addresses {
+            if let Some(solana) = explicit_solana_identity(address)
+                && seen_sol.insert(solana.clone())
+            {
+                out.solana.push(("projected key".to_owned(), solana));
+            }
+        }
+    }
+    out
+}
+
+/// A `solana:<network>:<base58>` CAIP-10 identity from a key projection.
+/// Ed25519 alone does not identify a chain, so a bare key never qualifies.
+fn explicit_solana_identity(address: &str) -> Option<String> {
+    let (network, address) = address.strip_prefix("solana:")?.split_once(':')?;
+    if network.is_empty() || !is_solana_address(address) {
+        return None;
+    }
+    Some(address.to_owned())
+}
+
+fn is_solana_address(address: &str) -> bool {
+    (32..=44).contains(&address.len())
+        && address.bytes().all(|byte| {
+            b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz".contains(&byte)
+        })
+}
+
 struct Holding {
     wallet: String,
     chain: String,
     chain_id: u64,
+    /// Which numbered account (derivation path) or key reported this row, so
+    /// two accounts holding on the same chain stay distinguishable. Empty for
+    /// rows that predate the account inventory.
+    account: String,
+    /// Market key for the native unit, when that unit is a traded asset. A
+    /// development chain whose unit happens to read "ETH" carries none, and
+    /// neither does a chain with no market for its unit.
+    price_key: Option<&'static str>,
     label: String,
     symbol: String,
     quantity: String,
@@ -2628,13 +2997,13 @@ impl Holding {
     /// balance; that quantity is real but it is not money, and it must never
     /// share a table with funds that are.
     fn is_off_market(&self) -> bool {
-        !native_asset_has_market(self.chain_id)
+        self.price_key.is_none()
     }
 
     fn note(&self) -> String {
         if is_test_network(&self.chain) {
             "Test network. Test funds are not main-network funds and are never priced.".to_owned()
-        } else if !native_asset_has_market(self.chain_id) {
+        } else if self.price_key.is_none() {
             format!(
                 "This network's native unit is not the traded {} asset, so it carries no \
                  dollar value here. The quantity is what the chain reported.",
@@ -3509,6 +3878,8 @@ fn native_asset_market(chain_id: u64) -> Option<&'static str> {
         .map(|(_, key)| *key)
 }
 
+/// Test-only shorthand: production rows carry their own `price_key`.
+#[cfg(test)]
 fn native_asset_has_market(chain_id: u64) -> bool {
     native_asset_market(chain_id).is_some()
 }
@@ -4341,6 +4712,175 @@ mod tests {
         assert!(!html.contains(&format!("class=\"address\">{PLAIN_BASE58}</code>")));
     }
 
+    /// A numbered Solana account from the account inventory: derivation path,
+    /// chain family, and base58 address straight from the projection.
+    fn solana_numbered_account(address: &str) -> bloom_broker_api::DerivedAccountPublic {
+        bloom_broker_api::DerivedAccountPublic {
+            key_ref: bloom_broker_api::KeyRef {
+                backend: bloom_broker_api::Token::new("test").unwrap(),
+                backend_instance: bloom_broker_api::Token::new("projection").unwrap(),
+                locator: "alice/solana-0".into(),
+                key_spec: bloom_broker_api::KeySpec::Ed25519,
+                public_key_fingerprint: bloom_broker_api::Digest32::from_bytes([7; 32]),
+                derivation: None,
+            },
+            wallet_seed_profile: bloom_broker_api::WalletSeedProfile::Bip39MulticurveV1,
+            derivation_profile: bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+            path: "m/44'/501'/0'/0'".into(),
+            canonical_public_key: bloom_broker_api::Base64UrlBytes::from_bytes(&[8; 32]),
+            public_key_encoding: bloom_broker_api::PublicKeyEncoding::Ed25519SpkiDer,
+            public_key_fingerprint: bloom_broker_api::Digest32::from_bytes([7; 32]),
+            supported_crypto_suites: vec![bloom_broker_api::CryptoSuite::Ed25519Message],
+            chain_projections: vec![bloom_broker_api::ChainAccountProjection {
+                chain_family: bloom_broker_api::Token::new("solana").unwrap(),
+                caip2: "solana:mainnet".into(),
+                caip10: format!("solana:mainnet:{address}"),
+                address: address.to_owned(),
+                address_encoding: bloom_broker_api::AddressEncoding::Base58,
+            }],
+            lifecycle: bloom_broker_api::AccountLifecycleState::Active,
+        }
+    }
+
+    #[tokio::test]
+    async fn receive_lists_a_numbered_solana_account_with_its_path() {
+        const SOLANA: &str = "7Ec4G7dS8v8Y5JvVX8E5S7jvk8eJzEqJqgWkpz6xA4r9";
+        let fixture = fixture();
+        let mut projection = fixture
+            .handler
+            .projections
+            .list_wallets()
+            .await
+            .unwrap()
+            .remove(0);
+        projection.accounts = bloom_broker_api::WalletAccountsPublic {
+            wallet_id: bloom_broker_api::Token::new("alice").unwrap(),
+            seed_profile: bloom_broker_api::WalletSeedProfile::Bip39MulticurveV1,
+            accounts: vec![solana_numbered_account(SOLANA)],
+        };
+        // The inventory names the derivation path and the address family.
+        let inventory = super::wallet_addresses(&projection);
+        assert_eq!(inventory.evm.len(), 1, "primary EVM address: {inventory:?}");
+        assert_eq!(
+            inventory.solana,
+            vec![("m/44'/501'/0'/0'".to_owned(), SOLANA.to_owned())]
+        );
+        let handler = ViewsHandler::new(
+            crate::test_support::wallet_projection_reader_from(projection),
+            ChainRegistry::default(),
+            bloom_prices::PricesClient::with_base_url("http://127.0.0.1:1"),
+            fixture.handler.outbox,
+            MarketData::with_base_url("http://127.0.0.1:1"),
+        );
+
+        let html = render(&handler, RECEIVE_HTML).await;
+        assert!(html.contains(ADDRESS), "the EVM card still renders");
+        assert!(
+            html.contains("m/44&#39;/501&#39;/0&#39;/0&#39;"),
+            "the Solana card names its derivation path: {html}"
+        );
+        assert_eq!(
+            html.matches(&format!("class=\"address\">{SOLANA}</code>"))
+                .count(),
+            1,
+            "one Solana card for the numbered account: {html}"
+        );
+        assert!(html.contains("Send on Solana only."), "{html}");
+    }
+
+    /// A stand-in third Petal with no dedicated parser: one leaf keyed by
+    /// the wallet address, one leaf that names nobody.
+    struct StubThirdPetal;
+    #[async_trait]
+    impl Handler for StubThirdPetal {
+        async fn lookup(&self, _path: &VfsPath) -> Result<Entry, HandlerError> {
+            Ok(Entry::dir(""))
+        }
+
+        async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+            if path.to_string_path().ends_with("positions.json") {
+                Ok("{\"shares\": \"12.5\", \"market\": \"election\"}"
+                    .as_bytes()
+                    .to_vec())
+            } else {
+                Err(HandlerError::not_found(path.to_string_path()))
+            }
+        }
+
+        async fn list(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+            let text = path.to_string_path();
+            if text.is_empty() || text == "/" {
+                return Ok(vec![Entry::dir("polymarket")]);
+            }
+            if text.trim_start_matches('/') == "polymarket" {
+                return Ok(vec![
+                    Entry::file(&format!("{}-positions.json", ADDRESS.to_ascii_lowercase())),
+                    Entry::file("global-config.json"),
+                ]);
+            }
+            Err(HandlerError::not_found(text))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_petal_without_a_parser_still_reports_its_address_keyed_leaf() {
+        let fixture = fixture();
+        let handler = fixture
+            .handler
+            .clone()
+            .with_petals(Arc::new(StubThirdPetal));
+        let positions = handler.petal_positions(&[ADDRESS.to_owned()]).await;
+        assert_eq!(
+            positions.len(),
+            1,
+            "only the address-keyed leaf: {positions:?}"
+        );
+        let position = &positions[0];
+        assert_eq!(position.petal, "polymarket");
+        assert_eq!(position.value, None, "never valued without a parser");
+        assert!(
+            position.note.contains("without a dollar value"),
+            "honest about the missing valuation: {}",
+            position.note
+        );
+        // The leaf owner matches the wallet address, so the row attributes
+        // to the wallet instead of falling into the unassigned section.
+        let wallet = &handler.portfolio().await.wallets[0];
+        assert!(
+            super::position_belongs_to_wallet(position, wallet),
+            "address-keyed leaf attributes to its wallet"
+        );
+    }
+
+    #[test]
+    fn generic_petal_leaf_helpers_stay_short_and_honest() {
+        assert_eq!(
+            super::leaf_label("polymarket/abc-positions.json"),
+            "abc-positions"
+        );
+        assert_eq!(super::leaf_label("balances"), "balances");
+        assert_eq!(
+            super::leaf_label(
+                "mainnet/users/0x000000000000000000000000000000000000dead-positions.json"
+            ),
+            "0x000000…00dead positions"
+        );
+        assert_eq!(
+            super::leaf_scope("polymarket", "mainnet/users/0xabc-positions.json"),
+            "mainnet/users"
+        );
+        assert_eq!(super::leaf_scope("polymarket", "top.json"), "polymarket");
+        assert_eq!(
+            super::summarize_petal_leaf("{\"shares\": \"12.5\"}"),
+            "{\"shares\": \"12.5\"}"
+        );
+        assert_eq!(super::summarize_petal_leaf("  \n "), "leaf present");
+        let long = "x".repeat(200);
+        let summary = super::summarize_petal_leaf(&long);
+        assert!(summary.len() <= 123, "{summary}");
+        assert!(summary.ends_with('…'), "{summary}");
+    }
+
     #[tokio::test]
     async fn receive_selects_one_wallet_before_its_code() {
         let mut fixture = fixture();
@@ -5108,6 +5648,7 @@ mod tests {
             "a development chain's ETH must not wear ether's logo"
         );
         faucet.chain_id = 1;
+        faucet.price_key = native_asset_market(1);
         assert!(
             asset_mark(&faucet.symbol, !faucet.is_off_market())
                 .contains("src=\"icons/token-ethereum.png\""),
@@ -5126,6 +5667,8 @@ mod tests {
             wallet: "w".into(),
             chain: chain.into(),
             chain_id,
+            account: String::new(),
+            price_key: native_asset_market(chain_id),
             label: chain.into(),
             symbol: symbol.into(),
             quantity: format!("{amount}"),
@@ -5322,6 +5865,23 @@ mod tests {
                 ),
                 Err(_) => crate::test_support::wallet_projection_reader("everyday", ADDRESS),
             },
+        };
+        // VIEWS_SOLANA_ACCOUNT=1 injects a numbered Solana account into the
+        // synthetic projection, so the Solana receive cards and per-account
+        // rows can be reviewed without a live Solana RPC.
+        let projections = match std::env::var("VIEWS_SOLANA_ACCOUNT") {
+            Ok(_) => {
+                let mut one = projections.list_wallets().await.unwrap().remove(0);
+                one.accounts = bloom_broker_api::WalletAccountsPublic {
+                    wallet_id: bloom_broker_api::Token::new("everyday").unwrap(),
+                    seed_profile: bloom_broker_api::WalletSeedProfile::Bip39MulticurveV1,
+                    accounts: vec![solana_numbered_account(
+                        "7Ec4G7dS8v8Y5JvVX8E5S7jvk8eJzEqJqgWkpz6xA4r9",
+                    )],
+                };
+                crate::test_support::wallet_projection_reader_from(one)
+            }
+            Err(_) => projections,
         };
         let prices = match std::env::var("VIEWS_REAL_PRICES") {
             Ok(_) => bloom_prices::PricesClient::new(),

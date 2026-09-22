@@ -44,10 +44,11 @@ drawn from the same data as `index.html`.
   targets and unclassified targets are never promoted to contacts.
 - `receive.html` — receiving addresses grouped by wallet and address family,
   with self-contained QR artwork encoding the displayed address. EVM addresses
-  must parse as EVM addresses; Solana requires an explicit `solana:` CAIP-10
-  address on an Ed25519 key. The current key projection does not expose the
-  newer account-list API; absent Solana data gets an unavailable card, never a
-  guessed destination. Full Solana account discovery still needs that API.
+  must parse as EVM addresses. Solana addresses come from the numbered-account
+  inventory (derivation path shown on each card); projections cached from
+  before that inventory still contribute explicit `solana:` CAIP-10 addresses
+  from Ed25519 keys, and a bare Ed25519 key never qualifies. Absent Solana
+  data gets an unavailable card, never a guessed destination.
 - `policy.html` — where each wallet may send, which package fingerprints may
   request it, and how long approval may last, from its signed policy.
 - `bloom.css`, `bloom.js`, and `icons/` — the stylesheet, the small local

@@ -126,7 +126,7 @@ td a { text-decoration:none; }
 /* Positions (Petal accounts, recent activity on Today). */
 .position-list { list-style:none; padding:0; margin:0; border-top:1px solid var(--rule); }
 .position-list li { display:grid; grid-template-columns:32px minmax(0,1fr) auto; align-items:center; gap:14px; padding:18px 0; border-bottom:1px solid var(--rule); }
-.position-list strong { font-weight:550; }
+.position-list strong { font-weight:550; overflow-wrap:anywhere; }
 .position-list li > :last-child { font-variant-numeric:tabular-nums; font-size:14px; }
 .recent-state { display:grid; place-items:center; width:30px; height:30px; border-radius:50%; background:var(--tint); }
 
@@ -404,7 +404,8 @@ nav.wallet-actions a,.wallet-actions a { min-height:auto; padding:2px 0; color:v
   .network-detail { grid-template-columns:1fr; gap:16px; padding:12px; }
   .network-context { margin:0 12px; }
   .position-list li { gap:10px; }
-  .position-list li > :last-child { max-width:95px; text-align:right; overflow-wrap:anywhere; }
+  .position-list li > :last-child { max-width:95px; text-align:right; overflow-wrap:break-word; }
+  .position-list li > :last-child span { overflow-wrap:break-word; }
   .policy-limits { grid-template-columns:1fr 1fr; }
   .policy-limits > div { border-bottom:1px solid var(--rule); }
   .policy-exception > div { align-items:flex-start; }
