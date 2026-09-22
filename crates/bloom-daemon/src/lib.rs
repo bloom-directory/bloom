@@ -2796,17 +2796,21 @@ async fn daemon_petal_chain_read(
                 .map_err(|e| HostError::Backend(format!("eth_call: {e}")))?;
             format!("0x{}", hex::encode(bytes))
         }
-        "eth_getTransactionReceipt" if params.len() == 1 => {
-            let hash: alloy::primitives::B256 = params[0]
+        "eth_getTransactionReceipt" => {
+            let [hash_param] = params.as_slice() else {
+                return Err(HostError::Invalid(
+                    "eth_getTransactionReceipt takes a single transaction hash".into(),
+                ));
+            };
+            let hash: alloy::primitives::B256 = hash_param
                 .as_str()
                 .ok_or_else(|| {
                     HostError::Invalid("eth_getTransactionReceipt hash must be a string".into())
                 })?
                 .parse()
                 .map_err(|e| HostError::Invalid(format!("eth_getTransactionReceipt hash: {e}")))?;
-            // Return the receipt object (or null) directly: unlike the hex
-            // arms below, the guest parses this response as raw JSON, so it
-            // must not pass through the string-quoting tail.
+            // The guest parses this response as raw JSON, so return the
+            // receipt object (or null) without the string-quoting tail below.
             let receipt = chain
                 .receipt_json(hash)
                 .await
@@ -2814,11 +2818,7 @@ async fn daemon_petal_chain_read(
             return serde_json::to_string(&receipt)
                 .map_err(|e| HostError::Backend(format!("encode receipt: {e}")));
         }
-        "eth_chainId"
-        | "eth_getBalance"
-        | "eth_getCode"
-        | "eth_call"
-        | "eth_getTransactionReceipt" => {
+        "eth_chainId" | "eth_getBalance" | "eth_getCode" | "eth_call" => {
             return Err(HostError::Invalid(format!(
                 "invalid {method} parameters; only latest-block reads are allowed"
             )));
@@ -6974,6 +6974,7 @@ mod tests {
         for params in [
             "[]",
             "[\"0xabc\", \"0xdef\"]",
+            "[123]",
             "[\"not-a-hash\"]",
             "[\"0x1234\"]",
         ] {
