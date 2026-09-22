@@ -134,6 +134,11 @@ Use disposable test inputs. Import/transfer suites require `anvil`, `cast`,
 and the selected `BLOOM_INTEGRATION_*_BIN` binaries. Successful fixture
 signing does not replace these service-boundary checks.
 
+The launcher readiness state machine has a fixture-only regression check that
+uses no relay infrastructure: `scripts/test-triad-dev-hosted-relay.sh`. CI runs
+it in the static checks job. `BLOOM_TRIAD_DEV_RELAY_TIMEOUT_SECONDS` controls
+the hosted launcher wait and defaults to 300 seconds.
+
 For an already provisioned disposable hosted-relay Triad, run:
 
 ```sh

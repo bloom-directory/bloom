@@ -47,6 +47,8 @@ jobs:
       - uses: astral-sh/setup-uv@v7
       - name: Validate bounded Harbor harness
         run: scripts/test-harbor-evals.sh
+      - name: Validate hosted relay launcher readiness
+        run: scripts/test-triad-dev-hosted-relay.sh
 
   clippy:
     name: clippy

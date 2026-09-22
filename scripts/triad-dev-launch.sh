@@ -16,9 +16,11 @@ machine_socket=""
 log_dir=""
 ready_file=""
 services_only=0
+hosted_relay=0
 install_authority_fixture="${BLOOM_TRIAD_DEV_AUTHORITY_FIXTURE:-0}"
 build_integration_petals="${BLOOM_TRIAD_DEV_BUILD_PETALS:-1}"
 socket_timeout_seconds="${BLOOM_TRIAD_DEV_SOCKET_TIMEOUT_SECONDS:-30}"
+relay_timeout_seconds="${BLOOM_TRIAD_DEV_RELAY_TIMEOUT_SECONDS:-300}"
 
 die() { printf 'triad developer launcher: %s\n' "$*" >&2; exit 1; }
 need_value() { [ "$#" -ge 2 ] || die "$1 requires a value"; }
@@ -31,6 +33,7 @@ while [ "$#" -gt 0 ]; do
     --log-dir) need_value "$@"; log_dir="$2"; shift 2 ;;
     --ready-file) need_value "$@"; ready_file="$2"; shift 2 ;;
     --services-only) services_only=1; shift ;;
+    --hosted-relay) hosted_relay=1; shift ;;
     *) die "unknown argument: $1" ;;
   esac
 done
@@ -41,6 +44,9 @@ for value in "${required_paths[@]}"; do
 done
 if [ "$services_only" -eq 1 ] && [ -n "$mount_dir" ]; then
   die "--services-only cannot be combined with --mount"
+fi
+if [ "$services_only" -eq 1 ] && [ "$hosted_relay" -eq 1 ]; then
+  die "--hosted-relay requires the complete Triad; omit --services-only"
 fi
 case "$install_authority_fixture" in
   0|1) ;;
@@ -53,6 +59,14 @@ esac
 case "$socket_timeout_seconds" in
   ''|*[!0-9]*|0) die "BLOOM_TRIAD_DEV_SOCKET_TIMEOUT_SECONDS must be a positive integer" ;;
 esac
+case "$relay_timeout_seconds" in
+  ''|*[!0-9]*|0) die "BLOOM_TRIAD_DEV_RELAY_TIMEOUT_SECONDS must be a positive integer" ;;
+esac
+if [ "$hosted_relay" -eq 1 ]; then
+  [ -n "${BLOOM_TRIAD_DEV_RELAY_CONTROL_CA_FILE:-}" ] &&
+    [ -n "${BLOOM_TRIAD_DEV_RELAY_RECEIPT_KEY_FILE:-}" ] ||
+    die "--hosted-relay requires both BLOOM_TRIAD_DEV_RELAY_CONTROL_CA_FILE and BLOOM_TRIAD_DEV_RELAY_RECEIPT_KEY_FILE"
+fi
 socket_wait_attempts=$((socket_timeout_seconds * 10))
 
 [ "$(id -u)" -ne 0 ] || die "developer harness refuses root"
@@ -61,6 +75,9 @@ case "$host_os" in
   Darwin|Linux) ;;
   *) die "developer harness requires Linux or macOS" ;;
 esac
+if [ "$hosted_relay" -eq 1 ] && [ "$host_os" != Darwin ]; then
+  die "--hosted-relay currently requires macOS"
+fi
 
 # Arguments and environment are valid, so this invocation will actually build
 # and launch the triad and genuinely needs the sibling checkouts.
@@ -415,7 +432,7 @@ env_file="${log_dir}/triad.env"
   fi
 } > "$env_file"
 chmod 0600 "$env_file"
-session_pid=""; signer_pid=""; broker_pid=""; machine_pid=""
+session_pid=""; signer_pid=""; broker_pid=""; machine_pid=""; relay_admin_pid=""
 systemd_units_installed=0
 stop_linux_authority_units() {
   [ "$host_os" = Linux ] || return 0
@@ -436,6 +453,12 @@ cleanup() {
   trap - EXIT
   trap '' INT TERM HUP
   rm -f -- "$ready_file"
+  if [ -n "$relay_admin_pid" ] && kill -0 "$relay_admin_pid" 2>/dev/null; then
+    kill "$relay_admin_pid" 2>/dev/null || true
+    sleep 1
+    kill -9 "$relay_admin_pid" 2>/dev/null || true
+    wait "$relay_admin_pid" 2>/dev/null || true
+  fi
   if [ "$host_os" = Linux ]; then
     stop_linux_authority_units
   fi
@@ -777,6 +800,11 @@ until machine_cli serve triad-health-check "$release_digest" >/dev/null 2>&1; do
   [ "$health_attempts" -lt 30 ] || die "Triad did not pass authenticated end-to-end readiness"
   sleep 1
 done
+if [ "$hosted_relay" -eq 1 ]; then
+  # The exact candidate Signer CLI owns all relay administration and persisted state.
+  source "${repo_root}/scripts/lib/triad-dev-hosted-relay.sh"
+  wait_for_hosted_relay
+fi
 printf 'ready\n' > "$ready_file"
 if [ -z "$mount_dir" ]; then
   printf '%s\n' \

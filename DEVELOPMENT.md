@@ -213,7 +213,8 @@ scripts/triad-dev-launch.sh \
   --machine-home /tmp/relay-dev/machine-home \
   --machine-socket /tmp/relay-dev/machine.sock \
   --log-dir /tmp/relay-dev/logs \
-  --ready-file /tmp/relay-dev/ready
+  --ready-file /tmp/relay-dev/ready \
+  --hosted-relay
 ```
 
 The receipt pin is 64 lowercase hexadecimal characters. The launcher creates
@@ -221,21 +222,31 @@ owner-private relay configuration and a separate private administrative socket;
 Signer creates the administrator identity and scoped Broker credentials. The
 development exception requires the compiled harness feature and validated
 same-UID developer identity/manifest. Production administration remains root-only.
-The launcher checks authenticated Triad health before publishing readiness.
+`--hosted-relay` is explicit and requires both trust pins and the complete
+Triad; it cannot be combined with `--services-only`. The launcher first checks
+authenticated Triad health, then uses the exact candidate Signer administrator
+to provision and wait for effective remote mode, TLS, and routing before
+publishing readiness. Without the flag, the launcher does not initiate
+provisioning or wait for remote readiness; it preserves any existing exposure
+state, even when trust pins are supplied. Set
+`BLOOM_TRIAD_DEV_RELAY_TIMEOUT_SECONDS` to change the 300-second upper bound.
+The relay operator must open a bounded enrollment window for the first
+provisioning run; close it after provisioning.
 
-Source the generated `triad.env`, then run the exact candidate Signer binary:
+Source the generated `triad.env` to inspect status or administer the selected
+Signer explicitly:
 
 ```sh
-/path/to/candidate/bloom-signer admin provision --signer-uid "$(id -u)"
 /path/to/candidate/bloom-signer admin status --signer-uid "$(id -u)"
 ```
 
-Provision only while the relay operator has enabled a bounded enrollment window
-for the test machine. A certificate-pending response is not readiness: poll
-status until remote TLS/routing and effective remote mode are confirmed. Close
-enrollment after provisioning. The hostname and administrator operation survive
-retry/restart; do not delete their state to work around an error. Restarts reject
-changed public trust pins for an existing relay configuration.
+For manual provisioning without `--hosted-relay`, run `admin provision` with
+the same binary and UID while enrollment is open, then poll `admin status`.
+A certificate-pending response is not readiness. The hostname and administrator
+operation survive retry/restart; do not delete their state to work around an
+error. Restarts reject changed public trust pins for an existing relay
+configuration. If an administrator has selected `localhost_only`, the hosted
+launcher stops with an actionable error and does not change that choice.
 
 The opt-in `scripts/test-remote-relay-approval.sh TRIAD_ENV ANVIL_RPC RUN_DIR`
 uses Broker's debug driver to register a remote test wallet, authorize policy,

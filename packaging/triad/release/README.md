@@ -315,3 +315,7 @@ Provisioning publishes the validated control CA to Broker's private
 `relay-control-ca.pem` beside its scoped credentials. Broker publishes each
 validated certificate/key pair atomically in `relay-tls-bundle.json`; a failed
 renewal preserves the previous bundle while it remains valid.
+Both installers already run the provisioning call as root. In that path,
+`bloom-ceremonies` uses the current root identity without a second elevation
+prompt. A standalone `bloom-ceremonies` invocation by a login user requests
+elevation for the same root-only administration operation.
