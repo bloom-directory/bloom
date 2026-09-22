@@ -1232,6 +1232,10 @@ impl TxEngine {
                 nonce: request.nonce,
                 gas_limit_hint: request.gas,
                 usd_value_hint: None,
+                // Contract creation carries initcode, not a call to an
+                // existing described contract, so it keeps the exact
+                // envelope review either way.
+                review_mode: None,
             },
             &selected_chain,
             policy,
@@ -1846,6 +1850,10 @@ impl TxEngine {
             },
             status: TxStatus::Pending,
             action_kind,
+            // The owner's choice is recorded with the immutable row, so the
+            // mode at signing is the one staging was reviewed under and not
+            // whatever a later caller asks for.
+            review_mode: intent.review_mode.clone(),
             tx_hash: None,
             token: token_for_plan,
             nft: nft_for_plan,
@@ -3518,6 +3526,19 @@ impl TxEngine {
             .await
             .map_err(protocol_signing_error)?;
         let key = evm_signing_key(&service.broker, &wallet_public, sender).await?;
+        // Broker reviews a batch under one mode. Members that were staged
+        // asking for different reviews are refused here rather than sent for
+        // Broker to reject, because the disagreement is in this outbox.
+        let batch_review_mode = requested_review_mode(&staged_plans[0])?;
+        for staged in &staged_plans[1..] {
+            if requested_review_mode(staged)? != batch_review_mode {
+                return Err(TxEngineError::ApprovalDenied(
+                    "a transaction batch must be reviewed one way; its members ask for different \
+                     reviews. Confirm them separately."
+                        .into(),
+                ));
+            }
+        }
         let request = ExactPayloadBatchSignRequest {
             wallet_id: Token::new(wallet.to_string())
                 .map_err(|error| TxEngineError::ApprovalConstruction(error.to_string()))?,
@@ -3533,6 +3554,7 @@ impl TxEngine {
             issued_at_ms: state.issued_at_ms.clone(),
             expires_at_ms: state.expires_at_ms.clone(),
             canonical_plan_facts_digest: state.canonical_plan_facts_digest.clone(),
+            requested_review_mode: batch_review_mode,
             approval_id: state.approval_id.clone(),
             account_key_ref: key.selector.clone(),
             petal_use_claim: None,
@@ -4225,6 +4247,24 @@ async fn evm_signing_key(
     }
 }
 
+/// The review the staged row asked for.
+///
+/// An unrecognised value is an error rather than a default: a row asking for
+/// a mode this build does not know must not be prepared under some other
+/// one, because the difference is exactly what the owner will be shown.
+fn requested_review_mode(
+    staged: &StagedTx,
+) -> Result<Option<bloom_broker_api::ReviewMode>, TxEngineError> {
+    match staged.review_mode.as_deref() {
+        None => Ok(None),
+        Some("clear") => Ok(Some(bloom_broker_api::ReviewMode::Clear)),
+        Some("opaque_exact") => Ok(Some(bloom_broker_api::ReviewMode::OpaqueExact)),
+        Some(other) => Err(TxEngineError::ApprovalConstruction(format!(
+            "unknown review mode `{other}`; use `clear`, `opaque_exact`, or omit it"
+        ))),
+    }
+}
+
 fn exact_evm_sign_request(
     staged: &StagedTx,
     signing_preimage: &[u8],
@@ -4248,6 +4288,7 @@ fn exact_evm_sign_request(
         issued_at_ms: state.issued_at_ms.clone(),
         expires_at_ms: state.expires_at_ms.clone(),
         canonical_plan_facts_digest: state.canonical_plan_facts_digest.clone(),
+        requested_review_mode: requested_review_mode(staged)?,
         approval_id: state.approval_id.clone(),
         account_key_ref,
         petal_use_claim: None,
@@ -5468,6 +5509,7 @@ mod tests {
             nonce: None,
             gas_limit_hint: None,
             usd_value_hint: usd_hint.map(str::to_string),
+            review_mode: None,
         }
     }
 
@@ -5510,6 +5552,7 @@ mod tests {
             expires_ms: 0,
             status: TxStatus::Pending,
             action_kind: TxActionKind::Unknown,
+            review_mode: None,
             tx_hash: None,
             token: None,
             nft: None,
@@ -5838,6 +5881,7 @@ mod tests {
             nonce: None,
             gas_limit_hint: None,
             usd_value_hint: None,
+            review_mode: None,
         };
         let staged = engine
             .stage(
@@ -5984,6 +6028,7 @@ mod tests {
             nonce: None,
             gas_limit_hint: None,
             usd_value_hint: Some("999999".into()),
+            review_mode: None,
         };
         let staged = engine
             .stage(
@@ -6028,6 +6073,7 @@ mod tests {
             nonce: None,
             gas_limit_hint: None,
             usd_value_hint: Some("999999".into()),
+            review_mode: None,
         };
         let staged = engine
             .stage_with_oracle_valuation_target(

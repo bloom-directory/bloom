@@ -151,3 +151,13 @@ opt-level = 1
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# ---- DIAGNOSTIC LOCAL OVERRIDE: NOT A RELEASE INPUT ----
+# The clear-signing Broker commit this branch calls is not published, so there
+# is no revision to pin yet. This points `bloom-broker-api` at the local
+# Broker worktree so both sides can be built and exercised together now.
+# Delete it and set a 40-character `rev` on the landed Broker commit before
+# publishing or releasing this branch: the release build refuses a path
+# dependency and `bin/bloom-worktree pins` reports it.
+[patch."https://github.com/bloom-directory/bloom-broker.git"]
+bloom-broker-api = { path = "../../bloom-broker/clear-signing/crates/bloom-broker-api" }

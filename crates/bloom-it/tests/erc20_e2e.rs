@@ -166,6 +166,7 @@ async fn erc20_stage_fails_when_decimals_unreadable() -> Result<()> {
         nonce: None,
         gas_limit_hint: None,
         usd_value_hint: None,
+        review_mode: None,
     };
 
     let res = engine
@@ -238,6 +239,7 @@ async fn replace_keeps_nonce_and_bumps_fees() -> Result<()> {
         nonce: None,
         gas_limit_hint: None,
         usd_value_hint: Some("1".into()),
+        review_mode: None,
     };
 
     let staged = engine

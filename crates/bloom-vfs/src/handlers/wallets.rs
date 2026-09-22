@@ -4034,6 +4034,7 @@ mod tests {
             allowed_petal_packages: Vec::new(),
             allowed_destinations: Vec::new(),
             required_verifiers: Vec::new(),
+            clear_signing: None,
         })
         .unwrap();
         let policy_digest = Digest32::from_bytes(sha2::Sha256::digest(&canonical).into());
@@ -4114,6 +4115,7 @@ mod tests {
             allowed_petal_packages: Vec::new(),
             allowed_destinations: Vec::new(),
             required_verifiers: Vec::new(),
+            clear_signing: None,
         })
         .unwrap();
         let policy_digest = Digest32::from_bytes(sha2::Sha256::digest(&canonical).into());
@@ -4830,6 +4832,7 @@ mod tests {
             expires_ms: u128::MAX,
             status: bloom_proto::TxStatus::Pending,
             action_kind: bloom_proto::TxActionKind::Unknown,
+            review_mode: None,
             tx_hash: None,
             token: None,
             nft: None,
@@ -6709,6 +6712,7 @@ value = "0""#,
             expires_ms: u128::MAX,
             status: bloom_proto::TxStatus::Pending,
             action_kind: bloom_proto::TxActionKind::Unknown,
+            review_mode: None,
             tx_hash: None,
             token: None,
             nft: None,
@@ -7324,6 +7328,7 @@ value = "0""#,
             canonical_plan_facts_digest: digest(31),
             petal_use_claim: None,
             system_use_claim: None,
+            requested_review_mode: None,
         };
         let path = VfsPath::parse("/alice/sealed-approvals/new.json").unwrap();
         f.handler
@@ -7371,6 +7376,7 @@ value = "0""#,
                 canonical_plan_facts_digest: digest(31),
                 petal_use_claim: None,
                 system_use_claim: None,
+                requested_review_mode: None,
             };
             let path = VfsPath::parse("/alice/sealed-approvals/new.json").unwrap();
             f.handler
@@ -7403,6 +7409,7 @@ value = "0""#,
             canonical_plan_facts_digest: digest(31),
             petal_use_claim: None,
             system_use_claim: None,
+            requested_review_mode: None,
         };
         let path = VfsPath::parse("/alice/sealed-approvals/new.json").unwrap();
         f.handler
@@ -7434,6 +7441,7 @@ value = "0""#,
             canonical_plan_facts_digest: digest(31),
             petal_use_claim: None,
             system_use_claim: None,
+            requested_review_mode: None,
         };
         let path = VfsPath::parse("/alice/sealed-approvals/new.json").unwrap();
 

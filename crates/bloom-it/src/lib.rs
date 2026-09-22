@@ -62,6 +62,7 @@ impl ExactSigningBrokerFixture {
                 }]
             },
             required_verifiers: Vec::new(),
+            clear_signing: None,
         })
         .unwrap();
         let policy_digest = Digest32::from_bytes(Sha256::digest(&canonical_policy).into());

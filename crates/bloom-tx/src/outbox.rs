@@ -1168,6 +1168,7 @@ mod tests {
             expires_ms: 0,
             status: TxStatus::Pending,
             action_kind: bloom_proto::TxActionKind::Unknown,
+            review_mode: None,
             tx_hash: None,
             token: None,
             nft: None,

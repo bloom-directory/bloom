@@ -55,7 +55,7 @@ use bloom_broker_api::{
     MachineSignRequest, OperationId, OperationPublicStatus, OperationRequest, PetalUseClaim,
     PolicyCommitReceipt, PolicyCommitUpdateRequest, PolicyUpdatePrepareResponse,
     PolicyUpdateRequest, ProtocolError, ProtocolErrorCode, ProvenanceCatalog, ProvenanceSubject,
-    RequestNonce, RevocationState, RevokeForKeyRequest, RevokeRequest,
+    RequestNonce, ReviewMode, RevocationState, RevokeForKeyRequest, RevokeRequest,
     SealedApprovalPrepareResponse, SealedApprovalTerms, SignedPolicySnapshot, SigningPayloads,
     SigningResult, SystemUseClaim, Token, TypedRequestMethod, ValueLimit, WalletAccountsPublic,
     WalletOperationRequest, WalletPublic, WalletRequest, is_read_only_method,
@@ -966,6 +966,7 @@ impl MachineBrokerClient {
             canonical_plan_facts_digest: request.canonical_plan_facts_digest,
             petal_use_claim: request.petal_use_claim,
             system_use_claim: request.system_use_claim,
+            requested_review_mode: request.requested_review_mode,
         })
         .await
         .map(ExactPayloadSignOutcome::ApprovalRequired)
@@ -1146,6 +1147,7 @@ impl MachineBrokerClient {
             canonical_plan_facts_digest: request.canonical_plan_facts_digest,
             petal_use_claim: request.petal_use_claim,
             system_use_claim: None,
+            requested_review_mode: request.requested_review_mode,
         })
         .await
         .map(ExactPayloadSignOutcome::ApprovalRequired)
@@ -1301,6 +1303,9 @@ impl MachineBrokerClient {
             canonical_plan_facts_digest: request.canonical_plan_facts_digest,
             petal_use_claim: Some(claim.clone()),
             system_use_claim: None,
+            // A reusable Petal batch carries no EVM review payloads, so
+            // there is no contract call to read either way.
+            requested_review_mode: None,
         })
         .await
         .map(ExactPayloadSignOutcome::ApprovalRequired)
@@ -2000,6 +2005,15 @@ pub struct ExactPayloadSignRequest {
     /// BIP-39 and holds more than one child for `crypto_suite`; `None` keeps
     /// the single-account and legacy-root behaviour.
     pub account_key_ref: Option<KeyRef>,
+    /// Which review the owner should be shown for a native EVM contract
+    /// call. `None` lets Broker choose under the wallet's policy: clear when
+    /// the wallet enables it and a signed description covers the call,
+    /// otherwise the existing envelope review. `OpaqueExact` is the caller
+    /// deliberately asking to approve bytes Bloom will not explain, and
+    /// Broker refuses it unless policy allows it. Nothing here can downgrade
+    /// a clear review silently: an unreadable call under a clear request
+    /// fails the preparation.
+    pub requested_review_mode: Option<ReviewMode>,
 }
 
 #[derive(Clone, Debug)]
@@ -2026,6 +2040,15 @@ pub struct ExactPayloadBatchSignRequest {
     /// BIP-39 and holds more than one child for `crypto_suite`; `None` keeps
     /// the single-account and legacy-root behaviour.
     pub account_key_ref: Option<KeyRef>,
+    /// Which review the owner should be shown for a native EVM contract
+    /// call. `None` lets Broker choose under the wallet's policy: clear when
+    /// the wallet enables it and a signed description covers the call,
+    /// otherwise the existing envelope review. `OpaqueExact` is the caller
+    /// deliberately asking to approve bytes Bloom will not explain, and
+    /// Broker refuses it unless policy allows it. Nothing here can downgrade
+    /// a clear review silently: an unreadable call under a clear request
+    /// fails the preparation.
+    pub requested_review_mode: Option<ReviewMode>,
 }
 
 impl ExactPayloadBatchSignRequest {
@@ -3133,6 +3156,7 @@ mod tests {
                 verifier_id: Token::new("human").unwrap(),
                 verifier_digest: Digest32::from_bytes([3; 32]),
             }],
+            clear_signing: None,
         };
         let proposed = bloom_broker_api::CanonicalWalletPolicy {
             wallet_id: Token::new("wallet").unwrap(),
@@ -3147,6 +3171,7 @@ mod tests {
                 destination: "new".into(),
             }],
             required_verifiers: Vec::new(),
+            clear_signing: None,
         };
         assert_eq!(
             claimed_policy_authority_diff_digest(&current, &proposed)
@@ -3775,6 +3800,7 @@ mod tests {
             claim_assurance_evidence: None,
             approval_value_limits: Vec::new(),
             account_key_ref: None,
+            requested_review_mode: None,
         }
     }
 
@@ -3807,6 +3833,7 @@ mod tests {
             petal_use_claim: None,
             claim_assurance_evidence: None,
             account_key_ref: None,
+            requested_review_mode: None,
         }
     }
 
@@ -4366,6 +4393,7 @@ mod tests {
             canonical_plan_facts_digest: digest(95),
             petal_use_claim: None,
             system_use_claim: None,
+            requested_review_mode: None,
         };
         assert_eq!(
             client.prepare_approval(approval).await.unwrap_err().code,

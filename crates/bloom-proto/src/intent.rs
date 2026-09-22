@@ -166,6 +166,14 @@ pub struct RawIntent {
     /// transaction is still fully represented by `body`.
     #[serde(default)]
     pub usd_value_hint: Option<String>,
+    /// Ask for a specific owner review of this transaction. Omit it to let
+    /// Broker decide under the wallet's policy. `"opaque_exact"` says the
+    /// caller wants to approve bytes Bloom will not explain, which Broker
+    /// refuses unless policy permits it. There is no value that downgrades a
+    /// readable call quietly: a call that cannot be read under a clear
+    /// request fails preparation instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_mode: Option<String>,
 }
 
 /// A normalised concrete tx-intent (post-resolution): addresses parsed,
