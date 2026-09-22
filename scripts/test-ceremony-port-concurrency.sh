@@ -49,6 +49,7 @@ port_a="${BLOOM_TRIAD_CONCURRENCY_PORT_A:-28735}"
 port_b="${BLOOM_TRIAD_CONCURRENCY_PORT_B:-28736}"
 startup_timeout_secs="${BLOOM_INTEGRATION_STARTUP_TIMEOUT_SECS:-300}"
 stop_timeout_secs="${BLOOM_TRIAD_CONCURRENCY_STOP_TIMEOUT_SECS:-60}"
+contender_deadline_secs="${BLOOM_TRIAD_CONCURRENCY_CONTENDER_DEADLINE_SECS:-120}"
 transcript="${BLOOM_TRIAD_CONCURRENCY_TRANSCRIPT:-}"
 
 # Throwaway determinism: the canonical all-abandon test mnemonic, never
@@ -223,6 +224,86 @@ stop_anvil() {
   anvil_pid=""
 }
 
+# True when one exact socket unit journals the bind conflict on the port.
+unit_shows_conflict() {
+  journalctl --user -u "$1" --since "$3" 2>/dev/null |
+    grep -F "Address already in use" | grep -F ":$2" >/dev/null
+}
+
+# Require the contender's exact socket units (one runtime token, both
+# families) to journal the bind conflict on the expected port. Both units
+# must show it: the retry loop only stops early when the pair is complete.
+require_contender_conflict() {
+  token=$1; port=$2; since=$3
+  prefix="bloom-triad-dev-$(id -u)-$token"
+  v4=$prefix-broker-ceremony-ipv4.socket
+  v6=$prefix-broker-ceremony-ipv6.socket
+  attempt=0
+  while [ "$attempt" -lt 3 ]; do
+    if unit_shows_conflict "$v4" "$port" "$since"; then v4ok=1; else v4ok=0; fi
+    if unit_shows_conflict "$v6" "$port" "$since"; then v6ok=1; else v6ok=0; fi
+    if [ "$v4ok" -eq 1 ] && [ "$v6ok" -eq 1 ]; then
+      say "colliding launch on :$port failed on its own units $v4 $v6 (address in use) as required"
+      return 0
+    fi
+    sleep 2; attempt=$((attempt + 1))
+  done
+  die "contender units $v4 $v6 lack journaled bind conflicts on :$port"; return $?
+}
+
+# Launch the colliding contender, supervise it with a deadline, and prove
+# the failure is the occupied listener on A's port. The contender PID is
+# cleared only after reaping the expected failure; abnormal paths keep it
+# set so EXIT cleanup retries it bounded and reports leftovers.
+run_contender() {
+  collide_root="$run_root/collide"
+  mkdir -p "$collide_root/developer/machine-home" "$collide_root/logs" "$collide_root/run"
+  contender_start="$(date '+%Y-%m-%d %H:%M:%S')"
+  BLOOM_TRIAD_DEV_MACHINE_CONFIG="$machine_config" \
+  BLOOM_INTEGRATION_MACHINE_BIN="$bloom_bin" \
+  BLOOM_INTEGRATION_BROKER_BIN="$broker_bin" \
+  BLOOM_INTEGRATION_SIGNER_BIN="$signer_bin" \
+    "$launcher" \
+      --developer-root "$collide_root/developer" \
+      --machine-home "$collide_root/developer/machine-home" \
+      --machine-socket "$collide_root/run/machine.sock" \
+      --log-dir "$collide_root/logs" \
+      --ready-file "$collide_root/run/ready" \
+      --ceremony-port "$port_a" >"$run_root/collide.log" 2>&1 &
+  contender_pid=$!
+  contender_token=""
+  deadline=$(( $(date +%s) + contender_deadline_secs ))
+  while kill -0 "$contender_pid" 2>/dev/null; do
+    # Capture the runtime token while the contender is alive: its own
+    # cleanup deletes the directory on exit, so this observation is the
+    # ownership record the journal queries below are checked against.
+    if [ -z "$contender_token" ]; then
+      for runtime_dir in "$collide_root"/developer/runtime.*; do
+        [ -d "$runtime_dir" ] || continue
+        contender_token=$(basename "$runtime_dir")
+        break
+      done
+    fi
+    if [ -f "$collide_root/run/ready" ]; then
+      kill "$contender_pid" 2>/dev/null || true
+      if wait_pid "$contender_pid" "$stop_timeout_secs"; then contender_pid=""; fi
+      die "colliding launch on :$port_a unexpectedly became ready"; return $?
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      kill "$contender_pid" 2>/dev/null || true
+      if wait_pid "$contender_pid" "$stop_timeout_secs"; then contender_pid=""; fi
+      die "colliding launch on :$port_a still running after the deadline"; return $?
+    fi
+    sleep 0.5
+  done
+  contender_status=0
+  wait "$contender_pid" 2>/dev/null || contender_status=$?
+  contender_pid=""
+  [ "$contender_status" -ne 0 ] || { die "fresh-root launch on occupied port :$port_a unexpectedly succeeded"; return $?; }
+  [ -n "$contender_token" ] || die "never observed the contender runtime directory; cannot attribute units"
+  require_contender_conflict "$contender_token" "$port_a" "$contender_start" || return $?
+}
+
 cli_for() {
   socket="$1"; home="$2"; shift 2
   BLOOM_RPC_ENDPOINT="unix:${socket}" BLOOM_HOME="$home" "$bloom_bin" --home "$home" "$@"
@@ -302,13 +383,6 @@ usable() {
 }
 
 rev_of_bin() { git -C "$(dirname "$1")" rev-parse HEAD 2>/dev/null || printf 'unknown'; }
-
-# Sorted failed user-unit names. Rows may start with a ● marker; the unit
-# name is the first non-marker field.
-failed_unit_names() {
-  systemctl --user list-units --all --state=failed --no-legend --no-pager 2>/dev/null |
-    awk 'NF {print ($1 == "●" ? $2 : $1)}' | sort -u
-}
 
 free_port() {
   python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()'
@@ -393,95 +467,8 @@ main() {
   policy_change B "$b_socket" "$b_root/developer/machine-home" "$wallet_b" concurrency-b-auth 3 allow "$RECIPIENT" "$port_b"
   say "A wallet $wallet_a and B wallet $wallet_b enrolled with assertion ceremonies"
 
-  # A fresh root on A's occupied port must fail on the occupied listener:
-  # run the contender as a tracked child with the same Machine config, fail
-  # at once if it ever becomes ready, and require the contender's own
-  # socket units (identified exactly, below) to report the address-in-use
-  # conflict on A's port.
-  # Rows may start with a ● marker; the unit name is the first non-marker field.
-  failed_before="$(failed_unit_names)"
-  collide_root="$run_root/collide"
-  mkdir -p "$collide_root/developer/machine-home" "$collide_root/logs" "$collide_root/run"
-  contender_start="$(date '+%Y-%m-%d %H:%M:%S')"
-  BLOOM_TRIAD_DEV_MACHINE_CONFIG="$machine_config" \
-  BLOOM_INTEGRATION_MACHINE_BIN="$bloom_bin" \
-  BLOOM_INTEGRATION_BROKER_BIN="$broker_bin" \
-  BLOOM_INTEGRATION_SIGNER_BIN="$signer_bin" \
-    "$launcher" \
-      --developer-root "$collide_root/developer" \
-      --machine-home "$collide_root/developer/machine-home" \
-      --machine-socket "$collide_root/run/machine.sock" \
-      --log-dir "$collide_root/logs" \
-      --ready-file "$collide_root/run/ready" \
-      --ceremony-port "$port_a" >"$run_root/collide.log" 2>&1 &
-  contender_pid=$!
-  deadline=$(( $(date +%s) + 120 ))
-  while kill -0 "$contender_pid" 2>/dev/null; do
-    if [ -f "$collide_root/run/ready" ]; then
-      kill "$contender_pid" 2>/dev/null || true
-      wait_pid "$contender_pid" "$stop_timeout_secs" || true
-      contender_pid=""
-      die "colliding launch on :$port_a unexpectedly became ready"
-    fi
-    if [ "$(date +%s)" -ge "$deadline" ]; then
-      kill "$contender_pid" 2>/dev/null || true
-      wait_pid "$contender_pid" "$stop_timeout_secs" || true
-      contender_pid=""
-      die "colliding launch on :$port_a still running after the deadline"
-    fi
-    sleep 0.5
-  done
-  contender_status=0
-  wait "$contender_pid" 2>/dev/null || contender_status=$?
-  contender_pid=""
-  [ "$contender_status" -ne 0 ] || die "fresh-root launch on occupied port :$port_a unexpectedly succeeded"
-  # Attribute exactly: failed units that are new since before the contender
-  # ran, UID-scoped, naming ceremony sockets, and not A/B's live runtimes.
-  # The contender's own cleanup removes its runtime directory, so the unit
-  # names (not the directory) are the ownership record.
-  unit_scope="bloom-triad-dev-$(id -u)-"
-  set -- "$a_root"/developer/runtime.* "$b_root"/developer/runtime.*
-  known_tokens=""
-  for candidate_runtime in "$@"; do
-    [ -d "$candidate_runtime" ] || die "live candidate runtime missing: $candidate_runtime"
-    known_tokens="$known_tokens $(basename "$candidate_runtime")"
-  done
-  failed_after="$(failed_unit_names)"
-  new_failed="$(comm -13 <(printf '%s\n' "$failed_before" | sort -u) <(printf '%s\n' "$failed_after" | sort -u))"
-  conflict_units=""
-  for unit in $new_failed; do
-    case "$unit" in
-      "$unit_scope"*-broker-ceremony-ipv4.socket|"$unit_scope"*-broker-ceremony-ipv6.socket) ;;
-      *) continue ;;
-    esac
-    skip=0
-    for token in $known_tokens; do
-      case "$unit" in *"$token"*) skip=1 ;; esac
-    done
-    [ "$skip" -eq 0 ] || continue
-    conflict_units="$conflict_units $unit"
-  done
-  # The journal lags the unit state; allow a grace retry for the evidence.
-  proven_units=""; journal_attempt=0
-  while [ "$journal_attempt" -lt 3 ]; do
-    proven_units=""
-    for unit in $conflict_units; do
-      if journalctl --user -u "$unit" --since "$contender_start" 2>/dev/null |
-        grep -F "Address already in use" | grep -F ":$port_a" >/dev/null; then
-        proven_units="$proven_units $unit"
-      fi
-    done
-    [ -z "$proven_units" ] || break
-    sleep 2; journal_attempt=$((journal_attempt + 1))
-  done
-  set -- $proven_units
-  [ $# -eq 2 ] || die "expected exactly the contender's two ceremony socket units with bind conflicts, saw:$proven_units"
-  first=${1#"$unit_scope"}; second=${2#"$unit_scope"}
-  case "$1" in *"-broker-ceremony-ipv4.socket") token_a=${first%-broker-ceremony-ipv4.socket} ;; *) die "unexpected contender unit shape: $1" ;; esac
-  case "$2" in *"-broker-ceremony-ipv6.socket") token_b=${second%-broker-ceremony-ipv6.socket} ;; *) die "unexpected contender unit shape: $2" ;; esac
-  [ -n "$token_a" ] && [ "$token_a" = "$token_b" ] ||
-    die "contender units do not share one runtime: $1 $2"
-  say "colliding launch on :$port_a failed on its own units $1 $2 (address in use) as required"
+  # A fresh root on A's occupied port must fail on the occupied listener.
+  run_contender
   usable A "$a_socket" "$a_root/developer/machine-home" "$wallet_a"
   usable B "$b_socket" "$b_root/developer/machine-home" "$wallet_b"
   policy_change A "$a_socket" "$a_root/developer/machine-home" "$wallet_a" concurrency-a-auth 5 allow "$RECIPIENT2" "$port_a"

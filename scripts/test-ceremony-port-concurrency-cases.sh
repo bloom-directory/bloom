@@ -157,20 +157,80 @@ else
 fi
 if [ -n "$got" ]; then kill "$got" 2>/dev/null || true; wait "$got" 2>/dev/null || true; fi
 
-# 7. Failed-unit parsing skips the ● row marker.
-systemctl() {
-  printf '● zeta.socket loaded failed failed Zeta listener\n'
-  printf 'alpha.service loaded failed failed Alpha task\n'
-  printf '\n'
+# 7. Contender attribution: the stub journal emulates per-unit filtering,
+# so only the contender's exact units can satisfy the assertion.
+UNIT_SCOPE="bloom-triad-dev-$(id -u)-"
+CTR=CTRTOKEN
+OTHER=OTHERTOKEN
+journalctl() {
+  units=""; prev=""
+  for arg in "$@"; do
+    if [ "$prev" = "-u" ]; then units="$units $arg"; fi
+    prev="$arg"
+  done
+  for u in $units; do
+    printf '%s\n' "$STUB_JOURNAL" | grep -F "$u" || true
+  done
 }
-units="$(failed_unit_names)"
-unset -f systemctl
-want="$(printf 'alpha.service\nzeta.socket')"
-if [ "$units" = "$want" ]; then
-  report 0 "failed-unit parsing skips marker"
+conflict_line() {
+  # conflict_line UNIT_FAMILY_SUFFIX TOKEN ADDR
+  printf 'systemd[1762]: %s%s-broker-ceremony-%s.socket: Failed to create listening socket (%s): Address already in use\n' \
+    "$UNIT_SCOPE" "$2" "$1" "$3"
+}
+CTR_V4_LINES="$(conflict_line ipv4 "$CTR" 127.0.0.1:28735)
+$(conflict_line ipv4 "$CTR" 127.0.0.1:28735)"
+CTR_V6_LINES="$(conflict_line ipv6 "$CTR" '[::1]:28735')"
+OTHER_LINES="$(conflict_line ipv4 "$OTHER" 127.0.0.1:28735)
+$(conflict_line ipv6 "$OTHER" '[::1]:28735')"
+
+# 7a. Both exact units with conflicts: accepted.
+STUB_JOURNAL="$CTR_V4_LINES
+$CTR_V6_LINES"
+status=0
+DIE_MSG=""
+require_contender_conflict "$CTR" 28735 "2026-01-01 00:00:00" >/dev/null 2>&1 || status=$?
+[ "$status" -eq 0 ] && report 0 "attribution accepts contender pair" || report 1 "attribution accepts contender pair" "status=$status msg=$DIE_MSG"
+
+# 7b. Only another runtime's matching pair: rejected.
+STUB_JOURNAL="$OTHER_LINES"
+status=0
+DIE_MSG=""
+require_contender_conflict "$CTR" 28735 "2026-01-01 00:00:00" >/dev/null 2>&1 || status=$?
+[ "$status" -ne 0 ] && report 0 "attribution rejects unrelated runtime pair" || report 1 "attribution rejects unrelated runtime pair" "accepted"
+
+# 7c. Only one of the two units shows a conflict: rejected (both required).
+STUB_JOURNAL="$CTR_V4_LINES"
+status=0
+DIE_MSG=""
+require_contender_conflict "$CTR" 28735 "2026-01-01 00:00:00" >/dev/null 2>&1 || status=$?
+[ "$status" -ne 0 ] && report 0 "attribution requires both units" || report 1 "attribution requires both units" "accepted"
+unset -f journalctl
+
+# 8. Contender-path PID retention: a contender that ignores SIGTERM keeps
+# its handle for EXIT cleanup instead of losing it.
+cat > "$work/stub-contender-ignore-term.sh" <<'EOF'
+#!/bin/sh
+trap '' TERM
+sleep 30
+EOF
+chmod +x "$work/stub-contender-ignore-term.sh"
+launcher="$work/stub-contender-ignore-term.sh"
+collide_root="$work/ct"
+run_root="$work"
+machine_config=/dev/null
+port_a=28735
+contender_deadline_secs=2
+stop_timeout_secs=2
+contender_pid=""
+status=0
+DIE_MSG=""
+run_contender >/dev/null 2>&1 || status=$?
+if [ "$status" -ne 0 ] && printf '%s' "$contender_pid" | grep -qE '^[0-9]+$' && kill -0 "$contender_pid" 2>/dev/null; then
+  report 0 "contender failure retains PID for cleanup"
 else
-  report 1 "failed-unit parsing skips marker" "got: $units"
+  report 1 "contender failure retains PID for cleanup" "status=$status pid=$contender_pid msg=$DIE_MSG"
 fi
+if [ -n "$contender_pid" ]; then kill -9 "$contender_pid" 2>/dev/null || true; wait "$contender_pid" 2>/dev/null || true; contender_pid=""; fi
 
 printf '%s passed, %s failed\n' "$passed" "$failed"
 [ "$failed" -eq 0 ]
