@@ -242,3 +242,27 @@ separate exactly-once execution on loopback Anvil. Transaction:
 `0xff57ea11d6045690cf11127dee2620bba2cd340e16a450a5cd6b85dc55c6b9a3`.
 The dev stack remains running with existing state preserved. No production
 rollout or release publication was performed.
+
+
+## Follow-up: unavailable ceremony links
+
+Broker `fcb3c7b4065b81b952a8a96972caa7711d6e8bc8` replaces startup failures with
+a standalone, uniform message: “This link couldn’t be opened” and “It may have
+expired or already been used. Generate a new link in Bloom, or ask your agent to
+generate one.” The review panel, trust claims, fields and action buttons are
+hidden; stale review/input content is cleared and polling/timers are stopped.
+No underlying launch error is displayed or logged. Browser result keys and
+session storage are retained. This reuses the existing error path and styles.
+
+All five executable browser tests passed, including identical rendering for
+expired, consumed and network errors, hidden/disabled stale controls, cleared
+input, stopped timers and preservation of browser result/session state. Strict
+all-feature workspace Clippy, formatting and the harness build passed.
+
+The dev Triad was restarted with the existing Machine/Signer state and this
+Broker binary (SHA-256
+`5fe72194b735b2641dd89e83f57653c7c1c19b47bd65b4ed2ebb54994d275824`).
+Public HTTP/2 downloads of the HTML, JavaScript and CSS match the tested assets
+byte for byte. A synthetic unavailable capability still returned HTTP 403;
+server-side capability/session authority is unchanged. This is executable
+browser-harness plus served-asset verification, not a real-browser visual test.
