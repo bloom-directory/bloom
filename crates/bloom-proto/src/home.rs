@@ -89,6 +89,11 @@ impl HomeDir {
     pub fn audit_path(&self) -> PathBuf {
         self.root.join("audit.jsonl")
     }
+    /// The person's optional stylesheet for `views/`, served as
+    /// `views/skin.css`. Absent means the base Bloom design.
+    pub fn skin_path(&self) -> PathBuf {
+        self.root.join("skin.css")
+    }
     pub fn admin_socket(&self) -> PathBuf {
         self.root.join("bloom.sock")
     }
