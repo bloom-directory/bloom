@@ -21,17 +21,21 @@
 #   BLOOM_INTEGRATION_MACHINE_BIN / BLOOM_INTEGRATION_BROKER_BIN /
 #   BLOOM_INTEGRATION_SIGNER_BIN / BLOOM_INTEGRATION_DEBUG_DRIVER_BIN
 # The launcher under test defaults to this checkout's script (override with
-# BLOOM_TRIAD_DEV_LAUNCHER). Candidate ports default to 28735/28736 and
-# must be distinct and never 18734. A sanitized transcript (ceremony URLs
-# redacted) is written when BLOOM_TRIAD_CONCURRENCY_TRANSCRIPT names a
-# file outside the disposable run directory.
+# BLOOM_TRIAD_DEV_LAUNCHER). Candidate ports default to 28735/28736; they
+# are normalized to canonical decimal, then required to differ and to avoid
+# 18734. Shutdown patience is BLOOM_TRIAD_CONCURRENCY_STOP_TIMEOUT_SECS
+# (default 60). A sanitized transcript (ceremony URLs redacted) is written
+# when BLOOM_TRIAD_CONCURRENCY_TRANSCRIPT names a file outside the
+# disposable run directory.
 #
 # Evidence hygiene: ceremony URLs and driver output carry session tokens.
 # Progress lines never contain them; every other output passes through the
 # redactor before reaching the console transcript or the retained log.
+#
+# Failure-mode coverage for this script's own process handling and port
+# validation lives in scripts/test-ceremony-port-concurrency-cases.sh,
+# which sources this file (set BLOOM_CONCURRENCY_SOURCED=1 to skip main).
 set -euo pipefail
-
-[ "$(uname -s)" = "Linux" ] || { printf 'ceremony-port concurrency: Linux with a systemd user manager is required\n' >&2; exit 1; }
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 broker_repo="${BLOOM_INTEGRATION_BROKER_REPO:-${repo_root}/../bloom-broker}"
@@ -44,13 +48,14 @@ driver_bin="${BLOOM_INTEGRATION_DEBUG_DRIVER_BIN:-${broker_repo}/target/debug/bl
 port_a="${BLOOM_TRIAD_CONCURRENCY_PORT_A:-28735}"
 port_b="${BLOOM_TRIAD_CONCURRENCY_PORT_B:-28736}"
 startup_timeout_secs="${BLOOM_INTEGRATION_STARTUP_TIMEOUT_SECS:-300}"
+stop_timeout_secs="${BLOOM_TRIAD_CONCURRENCY_STOP_TIMEOUT_SECS:-60}"
 transcript="${BLOOM_TRIAD_CONCURRENCY_TRANSCRIPT:-}"
 
-[ "$port_a" != "$port_b" ] || { printf 'ceremony-port concurrency: candidate ports must differ\n' >&2; exit 1; }
-[ "$port_a" != "18734" ] && [ "$port_b" != "18734" ] || {
-  printf 'ceremony-port concurrency: this acceptance script never takes the custody port 18734\n' >&2
-  exit 1
-}
+# Throwaway determinism: the canonical all-abandon test mnemonic, never
+# funded. Distinct authenticator seeds per candidate.
+MNEMONIC="abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art"
+RECIPIENT="0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
+RECIPIENT2="0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC"
 
 redact() {
   sed -e 's|http://localhost:[0-9][0-9]*/ceremony/[^[:space:]"'"'"']*|http://localhost:PORT/ceremony/<token-redacted>|g' "$@"
@@ -73,47 +78,52 @@ die() {
   exit 1
 }
 
-command -v jq >/dev/null 2>&1 || die "jq is required"
-command -v anvil >/dev/null 2>&1 || die "anvil (foundry) is required"
-command -v cast >/dev/null 2>&1 || die "cast (foundry) is required"
-command -v journalctl >/dev/null 2>&1 || die "journalctl (systemd user journal) is required"
-[ -x "$launcher" ] || die "launcher is not executable: $launcher"
-[ -x "$bloom_bin" ] || die "Machine binary is not executable: $bloom_bin"
-[ -x "$broker_bin" ] || die "Broker binary is not executable: $broker_bin"
-[ -x "$signer_bin" ] || die "Signer binary is not executable: $signer_bin"
-[ -x "$driver_bin" ] || die "debug driver binary is not executable: $driver_bin"
-if [ -n "$transcript" ]; then
-  : > "$transcript" || die "transcript file is not writable: $transcript"
-fi
+# Print the canonical decimal for digit input, rejecting anything else.
+# Callers compare and select on the canonical form, so spellings like
+# 018734 or 028735 cannot slip past the custody and distinctness guards
+# the way raw-string comparison would allow.
+normalize_port() {
+  raw=$1
+  case "$raw" in ''|*[!0-9]*) return 1 ;; esac
+  stripped=$raw
+  while [ -n "$stripped" ] && [ "${stripped#0}" != "$stripped" ]; do
+    stripped=${stripped#0}
+  done
+  [ -n "$stripped" ] || stripped=0
+  [ "${#stripped}" -le 5 ] || return 1
+  value=$((10#$stripped))
+  [ "$value" -ge 1 ] && [ "$value" -le 65535 ] || return 1
+  printf '%s' "$value"
+}
 
-# Throwaway determinism: the canonical all-abandon test mnemonic, never
-# funded. Distinct authenticator seeds per candidate.
-MNEMONIC="abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art"
-RECIPIENT="0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
-RECIPIENT2="0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC"
+check_ports() {
+  # Explicit returns after die keep in-process callers (see the cases
+  # script) honest; with the real die they are unreachable.
+  norm_a="$(normalize_port "$port_a")" || { die "candidate A port must be an integer 1 through 65535"; return $?; }
+  norm_b="$(normalize_port "$port_b")" || { die "candidate B port must be an integer 1 through 65535"; return $?; }
+  port_a=$norm_a; port_b=$norm_b
+  [ "$port_a" != "$port_b" ] || { die "candidate ports must differ (after normalization)"; return $?; }
+  [ "$port_a" != "18734" ] && [ "$port_b" != "18734" ] ||
+    { die "this acceptance script never takes the custody port 18734"; return $?; }
+}
 
-# Provenance: hashes identify the exact files under test; commits identify
-# the sources to rebuild them from (plus the build commands). A checkout
-# HEAD alone cannot prove which binary ran.
-say "binaries under test (sha256 of each executable)"
-for entry in "machine:$bloom_bin" "broker:$broker_bin" "signer:$signer_bin" "driver:$driver_bin"; do
-  name="${entry%%:*}"; path="${entry#*:}"
-  say "  $name $path sha256:$(sha256sum "$path" | awk '{print $1}')"
-done
-rev_of_bin() { git -C "$(dirname "$1")" rev-parse HEAD 2>/dev/null || printf 'unknown'; }
-say "source checkout containing each binary (rebuild from these before running)"
-say "  bloom $(rev_of_bin "$bloom_bin"): cargo build -p bloom --no-default-features --features mount,triad-dev-harness"
-say "  broker $(rev_of_bin "$broker_bin"): cargo build -p bloom-broker --features triad-dev-harness; cargo build -p bloom-broker-debug-driver"
-say "  signer $(rev_of_bin "$signer_bin"): cargo build -p bloom-signer --features triad-dev-harness"
-say "ports A=$port_a B=$port_b (custody 18734 untouched)"
-
-# Unix socket paths must stay under SUN_LEN (108 bytes), so the run root
-# stays short under /tmp regardless of the caller's TMPDIR; unit paths must
-# additionally use only ASCII letters, digits, and `_./:@+-`.
-run_root="$(mktemp -d /tmp/bcp.XXXXXX)"
+# Wait up to secs for pid to exit, then reap it. Returns 0 when the exit
+# was established and reaped, 1 when the child is still alive: callers
+# must report failure instead of blocking on a live child.
+wait_pid() {
+  pid="$1"; secs="$2"
+  deadline=$(( $(date +%s) + secs ))
+  while kill -0 "$pid" 2>/dev/null; do
+    [ "$(date +%s)" -lt "$deadline" ] || return 1
+    sleep 0.2
+  done
+  wait "$pid" 2>/dev/null || true
+  return 0
+}
 
 # Launchers are real children of this shell (never started inside command
 # substitution), so wait(1) reaps them and cleanup can prove they stopped.
+# Initialized in main; the EXIT trap owns whatever is still set.
 launcher_a_pid=""; launcher_b_pid=""; contender_pid=""
 anvil_pid=""
 
@@ -125,22 +135,22 @@ cleanup() {
     [ -n "$pid" ] || continue
     if kill -0 "$pid" 2>/dev/null; then
       kill "$pid" 2>/dev/null || true
-      deadline=$(( $(date +%s) + 60 ))
-      while kill -0 "$pid" 2>/dev/null; do
-        [ "$(date +%s)" -lt "$deadline" ] || break
-        sleep 0.5
-      done
+      wait_pid "$pid" "$stop_timeout_secs" || unreaped="$unreaped $pid"
+    else
+      wait "$pid" 2>/dev/null || true
     fi
-    wait "$pid" 2>/dev/null || true
-    kill -0 "$pid" 2>/dev/null && unreaped="$unreaped $pid"
   done
-  if [ -n "$anvil_pid" ] && kill -0 "$anvil_pid" 2>/dev/null; then
-    kill "$anvil_pid" 2>/dev/null || true
-    wait "$anvil_pid" 2>/dev/null || true
+  if [ -n "$anvil_pid" ]; then
+    if kill -0 "$anvil_pid" 2>/dev/null; then
+      kill "$anvil_pid" 2>/dev/null || true
+      wait_pid "$anvil_pid" "$stop_timeout_secs" || unreaped="$unreaped anvil($anvil_pid)"
+    else
+      wait "$anvil_pid" 2>/dev/null || true
+    fi
   fi
   if [ -n "$unreaped" ]; then
     status=1
-    printf 'ceremony-port concurrency: cleanup FAILED, owned launchers still running:%s; diagnostics retained at: %s\n' "$unreaped" "$run_root" >&2
+    printf 'ceremony-port concurrency: cleanup FAILED, owned processes still running:%s; diagnostics retained at: %s\n' "$unreaped" "$run_root" >&2
   fi
   if [ "$status" -eq 0 ] && [ -z "$unreaped" ]; then
     rm -rf -- "$run_root" 2>/dev/null || true
@@ -149,7 +159,6 @@ cleanup() {
   fi
   exit "$status"
 }
-trap cleanup EXIT INT TERM
 
 fail_with_log() {
   redact "$2" >&2
@@ -159,7 +168,9 @@ fail_with_log() {
   die "candidate $1 exited during startup"
 }
 
-# Launch in the parent shell and assign the child PID to the named variable.
+# Launch in the parent shell and assign the child PID to the named variable
+# immediately, before the readiness loop: a startup failure must still
+# leave the live child discoverable for cleanup.
 launch_candidate() {
   outvar="$1"; label="$2"; port="$3"; root="$4"; socket="$5"; ready="$6"; log="$7"
   mkdir -p "$root/developer/machine-home" "$root/logs" "$(dirname "$socket")"
@@ -176,31 +187,40 @@ launch_candidate() {
       --ready-file "$ready" \
       --ceremony-port "$port" >"$log" 2>&1 &
   pid=$!
+  printf -v "$outvar" '%s' "$pid"
   deadline=$(( $(date +%s) + startup_timeout_secs ))
   while [ ! -f "$ready" ]; do
-    kill -0 "$pid" 2>/dev/null || fail_with_log "$label" "$log"
-    [ "$(date +%s)" -lt "$deadline" ] || { fail_with_log "$label" "$log"; }
+    if ! kill -0 "$pid" 2>/dev/null; then
+      fail_with_log "$label" "$log"; return $?
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      fail_with_log "$label" "$log"; return $?
+    fi
     sleep 0.5
   done
-  printf -v "$outvar" '%s' "$pid"
 }
 
-# Launchers are real children here, so wait reaps and the stop is provable:
 # SIGTERM, bounded patience for process exit and socket release, then reap.
+# Fails (retaining diagnostics) instead of blocking on a live child.
 stop_candidate() {
   pid="$1"; socket="$2"; label="$3"
   kill "$pid" 2>/dev/null || true
-  deadline=$(( $(date +%s) + 60 ))
-  while kill -0 "$pid" 2>/dev/null; do
-    [ "$(date +%s)" -lt "$deadline" ] || die "$label launcher did not exit after SIGTERM"
-    sleep 0.2
-  done
-  deadline=$(( $(date +%s) + 60 ))
+  wait_pid "$pid" "$stop_timeout_secs" || { die "$label launcher still alive after SIGTERM"; return $?; }
+  deadline=$(( $(date +%s) + stop_timeout_secs ))
   while [ -e "$socket" ] || [ -L "$socket" ]; do
-    [ "$(date +%s)" -lt "$deadline" ] || die "$label socket still present after launcher exit: $socket"
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      die "$label socket still present after launcher exit: $socket"; return $?
+    fi
     sleep 0.2
   done
-  wait "$pid" 2>/dev/null || true
+  say "$label launcher stopped"
+}
+
+stop_anvil() {
+  [ -n "$anvil_pid" ] || return 0
+  kill "$anvil_pid" 2>/dev/null || true
+  wait_pid "$anvil_pid" "$stop_timeout_secs" || { die "anvil still alive after SIGTERM"; return $?; }
+  anvil_pid=""
 }
 
 cli_for() {
@@ -281,120 +301,219 @@ usable() {
     die "$1: enrolled wallet not readable"
 }
 
-# Local chain only so the Machine config mirrors the proven setup.
+rev_of_bin() { git -C "$(dirname "$1")" rev-parse HEAD 2>/dev/null || printf 'unknown'; }
+
+# Sorted failed user-unit names. Rows may start with a ● marker; the unit
+# name is the first non-marker field.
+failed_unit_names() {
+  systemctl --user list-units --all --state=failed --no-legend --no-pager 2>/dev/null |
+    awk 'NF {print ($1 == "●" ? $2 : $1)}' | sort -u
+}
+
 free_port() {
   python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()'
 }
-anvil_port="$(free_port)"
-anvil --port "$anvil_port" --host 127.0.0.1 --chain-id 31337 >"$run_root/anvil.log" 2>&1 &
-anvil_pid=$!
-attempts=0
-while ! cast block-number --rpc-url "http://127.0.0.1:${anvil_port}" >/dev/null 2>&1; do
-  kill -0 "$anvil_pid" 2>/dev/null || die "anvil exited before RPC became ready"
-  attempts=$((attempts + 1))
-  [ "$attempts" -lt 100 ] || die "anvil RPC did not become ready"
-  sleep 0.1
-done
-nfs_port="$(free_port)"
-machine_config="$run_root/machine-config.toml"
-{
-  printf 'default_chain = "anvil"\n'
-  printf 'nfs_listen_addr = "127.0.0.1:%s"\n' "$nfs_port"
-  printf '\n[chains.anvil]\n'
-  printf 'name = "anvil"\n'
-  printf 'chain_id = 31337\n'
-  printf 'rpc_urls = ["http://127.0.0.1:%s"]\n' "$anvil_port"
-  printf 'rpc_endpoints = []\n'
-  printf 'display_name = "Anvil (local)"\n'
-  printf 'native_symbol = "ETH"\n'
-  printf 'native_decimals = 18\n'
-  printf 'legacy_tx = false\n'
-  printf 'op_stack = false\n'
-} > "$machine_config"
-chmod 0600 "$machine_config"
 
-# A and B up together as real children of this shell.
-a_root="$run_root/a"; a_socket="$run_root/a/run/machine.sock"; a_ready="$run_root/a/run/ready"
-b_root="$run_root/b"; b_socket="$run_root/b/run/machine.sock"; b_ready="$run_root/b/run/ready"
-launch_candidate launcher_a_pid A "$port_a" "$a_root" "$a_socket" "$a_ready" "$run_root/a-launcher.log"
-launch_candidate launcher_b_pid B "$port_b" "$b_root" "$b_socket" "$b_ready" "$run_root/b-launcher.log"
-say "A (:$port_a) and B (:$port_b) ready"
+main() {
+  [ "$(uname -s)" = "Linux" ] || die "Linux with a systemd user manager is required"
+  check_ports
 
-wallet_a="$(enroll_wallet A "$a_socket" "$a_root/developer/machine-home" concurrency-a concurrency-a-auth "$port_a")"
-policy_change A "$a_socket" "$a_root/developer/machine-home" "$wallet_a" concurrency-a-auth 3 allow "$RECIPIENT" "$port_a"
-wallet_b="$(enroll_wallet B "$b_socket" "$b_root/developer/machine-home" concurrency-b concurrency-b-auth "$port_b")"
-policy_change B "$b_socket" "$b_root/developer/machine-home" "$wallet_b" concurrency-b-auth 3 allow "$RECIPIENT" "$port_b"
-say "A wallet $wallet_a and B wallet $wallet_b enrolled with assertion ceremonies"
+  command -v jq >/dev/null 2>&1 || die "jq is required"
+  command -v anvil >/dev/null 2>&1 || die "anvil (foundry) is required"
+  command -v cast >/dev/null 2>&1 || die "cast (foundry) is required"
+  command -v journalctl >/dev/null 2>&1 || die "journalctl (systemd user journal) is required"
+  [ -x "$launcher" ] || die "launcher is not executable: $launcher"
+  [ -x "$bloom_bin" ] || die "Machine binary is not executable: $bloom_bin"
+  [ -x "$broker_bin" ] || die "Broker binary is not executable: $broker_bin"
+  [ -x "$signer_bin" ] || die "Signer binary is not executable: $signer_bin"
+  [ -x "$driver_bin" ] || die "debug driver binary is not executable: $driver_bin"
+  if [ -n "$transcript" ]; then
+    : > "$transcript" || die "transcript file is not writable: $transcript"
+  fi
 
-# A fresh root on A's occupied port must fail on the occupied listener: run
-# the contender as a tracked child with the same Machine config, fail at
-# once if it ever becomes ready, and require its own socket units to report
-# the address-in-use conflict on A's port.
-collide_root="$run_root/collide"
-mkdir -p "$collide_root/developer/machine-home" "$collide_root/logs" "$collide_root/run"
-contender_start="$(date '+%Y-%m-%d %H:%M:%S')"
-BLOOM_TRIAD_DEV_MACHINE_CONFIG="$machine_config" \
-BLOOM_INTEGRATION_MACHINE_BIN="$bloom_bin" \
-BLOOM_INTEGRATION_BROKER_BIN="$broker_bin" \
-BLOOM_INTEGRATION_SIGNER_BIN="$signer_bin" \
-  "$launcher" \
-    --developer-root "$collide_root/developer" \
-    --machine-home "$collide_root/developer/machine-home" \
-    --machine-socket "$collide_root/run/machine.sock" \
-    --log-dir "$collide_root/logs" \
-    --ready-file "$collide_root/run/ready" \
-    --ceremony-port "$port_a" >"$run_root/collide.log" 2>&1 &
-contender_pid=$!
-deadline=$(( $(date +%s) + 120 ))
-while kill -0 "$contender_pid" 2>/dev/null; do
-  [ ! -f "$collide_root/run/ready" ] ||
-    { kill "$contender_pid" 2>/dev/null || true; wait "$contender_pid" 2>/dev/null || true; contender_pid=""; die "colliding launch on :$port_a unexpectedly became ready"; }
-  [ "$(date +%s)" -lt "$deadline" ] || {
-    kill "$contender_pid" 2>/dev/null || true
-    wait "$contender_pid" 2>/dev/null || true; contender_pid=""
-    die "colliding launch on :$port_a still running after the deadline"
-  }
-  sleep 0.5
-done
-contender_status=0
-wait "$contender_pid" 2>/dev/null || contender_status=$?
-contender_pid=""
-[ "$contender_status" -ne 0 ] || die "fresh-root launch on occupied port :$port_a unexpectedly succeeded"
-# The contender's own cleanup removes its runtime directory, so attribute
-# by journal instead: our UID-scoped unit names reporting address-in-use on
-# A's port since the contender started, excluding A/B's own live runtimes.
-set -- "$a_root"/developer/runtime.* "$b_root"/developer/runtime.*
-known_tokens=""
-for candidate_runtime in "$@"; do
-  [ -d "$candidate_runtime" ] || die "live candidate runtime missing: $candidate_runtime"
-  known_tokens="$known_tokens $(basename "$candidate_runtime")"
-done
-conflict="$(journalctl --user --since "$contender_start" 2>/dev/null)"
-for token in $known_tokens; do
-  conflict="$(printf '%s\n' "$conflict" | grep -vF "$token")"
-done
-printf '%s\n' "$conflict" | grep -F "bloom-triad-dev-$(id -u)-" | grep -F "Address already in use" | grep -F ":$port_a" >/dev/null ||
-  die "colliding launch failed without the expected bind conflict on :$port_a"
-say "colliding launch on :$port_a failed on the occupied listener as required"
-usable A "$a_socket" "$a_root/developer/machine-home" "$wallet_a"
-usable B "$b_socket" "$b_root/developer/machine-home" "$wallet_b"
-policy_change A "$a_socket" "$a_root/developer/machine-home" "$wallet_a" concurrency-a-auth 5 allow "$RECIPIENT2" "$port_a"
-say "A and B usable after the collision, with a fresh A ceremony"
+  # Provenance: hashes identify the exact files under test; commits identify
+  # the sources to rebuild them from (plus the build commands). A checkout
+  # HEAD alone cannot prove which binary ran.
+  say "binaries under test (sha256 of each executable)"
+  for entry in "machine:$bloom_bin" "broker:$broker_bin" "signer:$signer_bin" "driver:$driver_bin"; do
+    name="${entry%%:*}"; path="${entry#*:}"
+    say "  $name $path sha256:$(sha256sum "$path" | awk '{print $1}')"
+  done
+  say "source checkout containing each binary (rebuild from these before running)"
+  say "  bloom $(rev_of_bin "$bloom_bin"): cargo build -p bloom --no-default-features --features mount,triad-dev-harness"
+  say "  broker $(rev_of_bin "$broker_bin"): cargo build -p bloom-broker --features triad-dev-harness; cargo build -p bloom-broker-debug-driver"
+  say "  signer $(rev_of_bin "$signer_bin"): cargo build -p bloom-signer --features triad-dev-harness"
+  say "ports A=$port_a B=$port_b (custody 18734 untouched)"
 
-# Stop A through its own launcher handle; B must complete a fresh ceremony
-# while A is down.
-stop_candidate "$launcher_a_pid" "$a_socket" A
-launcher_a_pid=""
-usable B "$b_socket" "$b_root/developer/machine-home" "$wallet_b"
-policy_change B "$b_socket" "$b_root/developer/machine-home" "$wallet_b" concurrency-b-auth 5 allow "$RECIPIENT2" "$port_b"
-say "B completed a fresh ceremony while A was stopped"
+  # Unix socket paths must stay under SUN_LEN (108 bytes), so the run root
+  # stays short under /tmp regardless of the caller's TMPDIR; unit paths
+  # must additionally use only ASCII letters, digits, and `_./:@+-`.
+  run_root="$(mktemp -d /tmp/bcp.XXXXXX)"
+  trap cleanup EXIT INT TERM
 
-# Restart A on its stopped root and port; its enrollment must persist and
-# complete a fresh ceremony, and B must stay usable.
-launch_candidate launcher_a_pid A "$port_a" "$a_root" "$a_socket" "$a_ready" "$run_root/a2-launcher.log"
-usable A "$a_socket" "$a_root/developer/machine-home" "$wallet_a"
-policy_change A "$a_socket" "$a_root/developer/machine-home" "$wallet_a" concurrency-a-auth 7 remove "$RECIPIENT2" "$port_a"
-usable B "$b_socket" "$b_root/developer/machine-home" "$wallet_b"
-say "A restarted on :$port_a with enrollment intact and a fresh ceremony; B still usable"
+  # Local chain only so the Machine config mirrors the proven setup.
+  anvil_port="$(free_port)"
+  anvil --port "$anvil_port" --host 127.0.0.1 --chain-id 31337 >"$run_root/anvil.log" 2>&1 &
+  anvil_pid=$!
+  attempts=0
+  while ! cast block-number --rpc-url "http://127.0.0.1:${anvil_port}" >/dev/null 2>&1; do
+    kill -0 "$anvil_pid" 2>/dev/null || die "anvil exited before RPC became ready"
+    attempts=$((attempts + 1))
+    [ "$attempts" -lt 100 ] || die "anvil RPC did not become ready"
+    sleep 0.1
+  done
+  nfs_port="$(free_port)"
+  machine_config="$run_root/machine-config.toml"
+  {
+    printf 'default_chain = "anvil"\n'
+    printf 'nfs_listen_addr = "127.0.0.1:%s"\n' "$nfs_port"
+    printf '\n[chains.anvil]\n'
+    printf 'name = "anvil"\n'
+    printf 'chain_id = 31337\n'
+    printf 'rpc_urls = ["http://127.0.0.1:%s"]\n' "$anvil_port"
+    printf 'rpc_endpoints = []\n'
+    printf 'display_name = "Anvil (local)"\n'
+    printf 'native_symbol = "ETH"\n'
+    printf 'native_decimals = 18\n'
+    printf 'legacy_tx = false\n'
+    printf 'op_stack = false\n'
+  } > "$machine_config"
+  chmod 0600 "$machine_config"
 
-say "PASS ports A=$port_a B=$port_b custody=18734"
+  # A and B up together as real children of this shell.
+  a_root="$run_root/a"; a_socket="$run_root/a/run/machine.sock"; a_ready="$run_root/a/run/ready"
+  b_root="$run_root/b"; b_socket="$run_root/b/run/machine.sock"; b_ready="$run_root/b/run/ready"
+  launch_candidate launcher_a_pid A "$port_a" "$a_root" "$a_socket" "$a_ready" "$run_root/a-launcher.log"
+  launch_candidate launcher_b_pid B "$port_b" "$b_root" "$b_socket" "$b_ready" "$run_root/b-launcher.log"
+  say "A (:$port_a) and B (:$port_b) ready"
+
+  wallet_a="$(enroll_wallet A "$a_socket" "$a_root/developer/machine-home" concurrency-a concurrency-a-auth "$port_a")"
+  policy_change A "$a_socket" "$a_root/developer/machine-home" "$wallet_a" concurrency-a-auth 3 allow "$RECIPIENT" "$port_a"
+  wallet_b="$(enroll_wallet B "$b_socket" "$b_root/developer/machine-home" concurrency-b concurrency-b-auth "$port_b")"
+  policy_change B "$b_socket" "$b_root/developer/machine-home" "$wallet_b" concurrency-b-auth 3 allow "$RECIPIENT" "$port_b"
+  say "A wallet $wallet_a and B wallet $wallet_b enrolled with assertion ceremonies"
+
+  # A fresh root on A's occupied port must fail on the occupied listener:
+  # run the contender as a tracked child with the same Machine config, fail
+  # at once if it ever becomes ready, and require the contender's own
+  # socket units (identified exactly, below) to report the address-in-use
+  # conflict on A's port.
+  # Rows may start with a ● marker; the unit name is the first non-marker field.
+  failed_before="$(failed_unit_names)"
+  collide_root="$run_root/collide"
+  mkdir -p "$collide_root/developer/machine-home" "$collide_root/logs" "$collide_root/run"
+  contender_start="$(date '+%Y-%m-%d %H:%M:%S')"
+  BLOOM_TRIAD_DEV_MACHINE_CONFIG="$machine_config" \
+  BLOOM_INTEGRATION_MACHINE_BIN="$bloom_bin" \
+  BLOOM_INTEGRATION_BROKER_BIN="$broker_bin" \
+  BLOOM_INTEGRATION_SIGNER_BIN="$signer_bin" \
+    "$launcher" \
+      --developer-root "$collide_root/developer" \
+      --machine-home "$collide_root/developer/machine-home" \
+      --machine-socket "$collide_root/run/machine.sock" \
+      --log-dir "$collide_root/logs" \
+      --ready-file "$collide_root/run/ready" \
+      --ceremony-port "$port_a" >"$run_root/collide.log" 2>&1 &
+  contender_pid=$!
+  deadline=$(( $(date +%s) + 120 ))
+  while kill -0 "$contender_pid" 2>/dev/null; do
+    if [ -f "$collide_root/run/ready" ]; then
+      kill "$contender_pid" 2>/dev/null || true
+      wait_pid "$contender_pid" "$stop_timeout_secs" || true
+      contender_pid=""
+      die "colliding launch on :$port_a unexpectedly became ready"
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      kill "$contender_pid" 2>/dev/null || true
+      wait_pid "$contender_pid" "$stop_timeout_secs" || true
+      contender_pid=""
+      die "colliding launch on :$port_a still running after the deadline"
+    fi
+    sleep 0.5
+  done
+  contender_status=0
+  wait "$contender_pid" 2>/dev/null || contender_status=$?
+  contender_pid=""
+  [ "$contender_status" -ne 0 ] || die "fresh-root launch on occupied port :$port_a unexpectedly succeeded"
+  # Attribute exactly: failed units that are new since before the contender
+  # ran, UID-scoped, naming ceremony sockets, and not A/B's live runtimes.
+  # The contender's own cleanup removes its runtime directory, so the unit
+  # names (not the directory) are the ownership record.
+  unit_scope="bloom-triad-dev-$(id -u)-"
+  set -- "$a_root"/developer/runtime.* "$b_root"/developer/runtime.*
+  known_tokens=""
+  for candidate_runtime in "$@"; do
+    [ -d "$candidate_runtime" ] || die "live candidate runtime missing: $candidate_runtime"
+    known_tokens="$known_tokens $(basename "$candidate_runtime")"
+  done
+  failed_after="$(failed_unit_names)"
+  new_failed="$(comm -13 <(printf '%s\n' "$failed_before" | sort -u) <(printf '%s\n' "$failed_after" | sort -u))"
+  conflict_units=""
+  for unit in $new_failed; do
+    case "$unit" in
+      "$unit_scope"*-broker-ceremony-ipv4.socket|"$unit_scope"*-broker-ceremony-ipv6.socket) ;;
+      *) continue ;;
+    esac
+    skip=0
+    for token in $known_tokens; do
+      case "$unit" in *"$token"*) skip=1 ;; esac
+    done
+    [ "$skip" -eq 0 ] || continue
+    conflict_units="$conflict_units $unit"
+  done
+  # The journal lags the unit state; allow a grace retry for the evidence.
+  proven_units=""; journal_attempt=0
+  while [ "$journal_attempt" -lt 3 ]; do
+    proven_units=""
+    for unit in $conflict_units; do
+      if journalctl --user -u "$unit" --since "$contender_start" 2>/dev/null |
+        grep -F "Address already in use" | grep -F ":$port_a" >/dev/null; then
+        proven_units="$proven_units $unit"
+      fi
+    done
+    [ -z "$proven_units" ] || break
+    sleep 2; journal_attempt=$((journal_attempt + 1))
+  done
+  set -- $proven_units
+  [ $# -eq 2 ] || die "expected exactly the contender's two ceremony socket units with bind conflicts, saw:$proven_units"
+  first=${1#"$unit_scope"}; second=${2#"$unit_scope"}
+  case "$1" in *"-broker-ceremony-ipv4.socket") token_a=${first%-broker-ceremony-ipv4.socket} ;; *) die "unexpected contender unit shape: $1" ;; esac
+  case "$2" in *"-broker-ceremony-ipv6.socket") token_b=${second%-broker-ceremony-ipv6.socket} ;; *) die "unexpected contender unit shape: $2" ;; esac
+  [ -n "$token_a" ] && [ "$token_a" = "$token_b" ] ||
+    die "contender units do not share one runtime: $1 $2"
+  say "colliding launch on :$port_a failed on its own units $1 $2 (address in use) as required"
+  usable A "$a_socket" "$a_root/developer/machine-home" "$wallet_a"
+  usable B "$b_socket" "$b_root/developer/machine-home" "$wallet_b"
+  policy_change A "$a_socket" "$a_root/developer/machine-home" "$wallet_a" concurrency-a-auth 5 allow "$RECIPIENT2" "$port_a"
+  say "A and B usable after the collision, with a fresh A ceremony"
+
+  # Stop A through its own launcher handle; B must complete a fresh ceremony
+  # while A is down.
+  stop_candidate "$launcher_a_pid" "$a_socket" A
+  launcher_a_pid=""
+  usable B "$b_socket" "$b_root/developer/machine-home" "$wallet_b"
+  policy_change B "$b_socket" "$b_root/developer/machine-home" "$wallet_b" concurrency-b-auth 5 allow "$RECIPIENT2" "$port_b"
+  say "B completed a fresh ceremony while A was stopped"
+
+  # Restart A on its stopped root and port; its enrollment must persist and
+  # complete a fresh ceremony, and B must stay usable.
+  launch_candidate launcher_a_pid A "$port_a" "$a_root" "$a_socket" "$a_ready" "$run_root/a2-launcher.log"
+  usable A "$a_socket" "$a_root/developer/machine-home" "$wallet_a"
+  policy_change A "$a_socket" "$a_root/developer/machine-home" "$wallet_a" concurrency-a-auth 7 remove "$RECIPIENT2" "$port_a"
+  usable B "$b_socket" "$b_root/developer/machine-home" "$wallet_b"
+  say "A restarted on :$port_a with enrollment intact and a fresh ceremony; B still usable"
+
+  # Shut everything down provably before claiming success: each stop fails
+  # instead of blocking, so PASS is only printed after cleanup succeeded.
+  stop_candidate "$launcher_a_pid" "$a_socket" "A (restarted)"
+  launcher_a_pid=""
+  stop_candidate "$launcher_b_pid" "$b_socket" B
+  launcher_b_pid=""
+  stop_anvil
+  rm -rf -- "$run_root" || die "run directory removal failed: $run_root"
+  say "PASS ports A=$port_a B=$port_b custody=18734"
+}
+
+if [ "${BLOOM_CONCURRENCY_SOURCED:-0}" != "1" ]; then
+  main "$@"
+fi
