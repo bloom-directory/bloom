@@ -306,7 +306,17 @@ across service restart; a lost recipient key does not authorize re-encryption.
 
 Production provisioning requires root-owned mode `0600` relay configuration and
 CA PEM, and the reviewed relay receipt public key in Signer's configuration.
-The root-only `installer/admin` directory retains the installation admin key.
+On Linux, `/var/lib/bloom/<login-uid>/installer/admin` retains the installation
+admin key and provisioning retry/binding records in root-only storage.
+Broker's generated relay material lives in
+`/var/lib/bloom/<login-uid>/broker/relay`, owned by Broker. The packaged systemd
+unit selects that directory through `BLOOM_BROKER_RELAY_STATE_DIR`; explicit
+`remote_tls` configuration still takes precedence. This is the initial released
+relay layout, with no migration from earlier unmerged candidates.
+macOS retains its existing `config/<login-uid>/installer/admin` and private
+Broker configuration directory under Application Support. Developer paths are
+unchanged. Linux relay configuration and administrator-supplied trust pins stay
+under `/etc/bloom/<login-uid>`.
 Scoped tunnel and DNS credentials are separate `0600` Broker-owned files;
 they convey no surface administration or wallet authority. No production relay
 pin is invented by the example templates: the nullable Signer pin must be

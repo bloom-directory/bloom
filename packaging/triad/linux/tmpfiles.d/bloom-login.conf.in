@@ -24,5 +24,6 @@ d /etc/bloom/@LOGIN_UID@/machine 0700 @LOGIN_UID@ @LOGIN_GID@ -
 d /etc/bloom/@LOGIN_UID@/session 0700 @LOGIN_UID@ @LOGIN_GID@ -
 
 # Installation administration identity is unavailable to online services.
-d /etc/bloom/@LOGIN_UID@/installer 0700 root root -
-d /etc/bloom/@LOGIN_UID@/installer/admin 0700 root root -
+d /var/lib/bloom/@LOGIN_UID@/installer 0700 root root -
+d /var/lib/bloom/@LOGIN_UID@/installer/admin 0700 root root -
+d /var/lib/bloom/@LOGIN_UID@/broker/relay 0700 bloom-broker-@LOGIN_UID@ bloom-broker-@LOGIN_UID@ -

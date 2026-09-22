@@ -76,6 +76,8 @@ materialize_linux_layout() {
     "/run/bloom/$layout_uid/signer/admin" \
     "/run/bloom/$layout_uid/session" \
     "/var/lib/bloom/$layout_uid/broker" \
+    "/var/lib/bloom/$layout_uid/broker/relay" \
+    "/var/lib/bloom/$layout_uid/installer/admin" \
     "/var/lib/bloom/$layout_uid/signer" \
     "/var/lib/bloom/$layout_uid/machine"
   do

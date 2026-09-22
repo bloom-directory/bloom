@@ -2102,6 +2102,70 @@ fn ceremony_admin_wrapper_rejects_unbounded_inputs_before_elevation() {
 }
 
 #[test]
+fn ceremony_admin_wrapper_selects_platform_relay_state() {
+    let wrapper = fs::read_to_string(release_script("bloom-ceremonies")).unwrap();
+    // Execute the actual path selection and export code without elevation or
+    // invoking Signer. Only filesystem prefixes and ownership lookup are stubbed.
+    let start = wrapper
+        .find("case \"$platform\" in\n  Darwin)\n    config=")
+        .unwrap();
+    let end = wrapper.find("exec \"$signer\" admin").unwrap();
+    for platform in ["Linux", "Darwin"] {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_str().unwrap();
+        let config = if platform == "Linux" {
+            format!("{root}/etc/bloom/1000")
+        } else {
+            format!("{root}/Library/Application Support/BloomTriad/config/1000")
+        };
+        for principal in ["broker", "signer"] {
+            fs::create_dir_all(format!("{config}/{principal}")).unwrap();
+        }
+        let selection = wrapper[start..end]
+            .replace("/etc/bloom/", &format!("{root}/etc/bloom/"))
+            .replace("/var/lib/bloom/", &format!("{root}/var/lib/bloom/"))
+            .replace(
+                "/Library/Application Support/",
+                &format!("{root}/Library/Application Support/"),
+            );
+        let script = format!(
+            r#"set -eu
+platform="$1"; login_uid=1000
+stat() {{ printf '2001\n'; }}
+{selection}
+printf '%s\n' "$BLOOM_SIGNER_ADMIN_STATE_DIR" "$BLOOM_SIGNER_TUNNEL_CREDENTIAL_PATH" "$BLOOM_SIGNER_DNS_CREDENTIAL_PATH" "$BLOOM_SIGNER_ACME_ACCOUNT_URI_PATH" "$BLOOM_SIGNER_RELAY_CONFIG"
+"#
+        );
+        let output = Command::new("bash")
+            .args(["-c", &script, "relay-path-test", platform])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let (admin, broker) = if platform == "Linux" {
+            (
+                format!("{root}/var/lib/bloom/1000/installer/admin"),
+                format!("{root}/var/lib/bloom/1000/broker/relay"),
+            )
+        } else {
+            (
+                format!("{config}/installer/admin"),
+                format!("{config}/broker"),
+            )
+        };
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!(
+                "{admin}\n{broker}/relay-tunnel.credential\n{broker}/relay-dns.credential\n{broker}/acme-account-uri\n{config}/relay.json\n"
+            )
+        );
+    }
+}
+
+#[test]
 fn linux_installer_materializes_and_checks_service_directories_at_activation() {
     let installer = fs::read_to_string(release_script("install-linux.sh")).unwrap();
     let numericize = installer
@@ -2129,6 +2193,8 @@ fn linux_installer_materializes_and_checks_service_directories_at_activation() {
         "/run/bloom/$layout_uid/signer/admin",
         "/run/bloom/$layout_uid/session",
         "/var/lib/bloom/$layout_uid/broker",
+        "/var/lib/bloom/$layout_uid/broker/relay",
+        "/var/lib/bloom/$layout_uid/installer/admin",
         "/var/lib/bloom/$layout_uid/signer",
         "/var/lib/bloom/$layout_uid/machine",
     ] {

@@ -14,6 +14,7 @@ StandardError=journal
 SyslogIdentifier=bloom-broker-%i
 Environment=BLOOM_BROKER_IDENTITY=/etc/bloom/%i/broker/identity.json
 Environment=BLOOM_BROKER_CONFIG=/etc/bloom/%i/broker/config.json
+Environment=BLOOM_BROKER_RELAY_STATE_DIR=/var/lib/bloom/%i/broker/relay
 Environment=BLOOM_EDGE_MANIFEST=/etc/bloom/%i/edge-manifest.json
 Environment=BLOOM_AUTHORITY_EDGE_HISTORY=/etc/bloom/%i/authority-edge-history.json
 Environment=BLOOM_SESSION_SOCKET=/run/bloom/%i/session/session.sock
