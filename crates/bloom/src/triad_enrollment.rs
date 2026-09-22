@@ -10,12 +10,10 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, bail};
-#[cfg(any(test, feature = "triad-dev-harness"))]
-use bloom_broker_api::ProvenanceFeeAsset;
 use bloom_broker_api::{
     Base64UrlBytes, DecimalU64, Digest32, PROVENANCE_RECORD_SIGNATURE_DOMAIN,
-    PetalLineageMembership, ProvenanceCatalog, ProvenanceOperationClass, ProvenanceRecord,
-    ProvenanceSubject, Token,
+    PetalLineageMembership, ProvenanceCatalog, ProvenanceFeeAsset, ProvenanceOperationClass,
+    ProvenanceRecord, ProvenanceSubject, Token,
 };
 #[cfg(any(test, feature = "triad-dev-harness"))]
 use bloom_petals::package::build_petal_package_dir;
@@ -972,6 +970,25 @@ fn sign_provenance_catalog(
     result
 }
 
+/// Operation classes for one release route, carrying the declaration's fee
+/// asset on every class — the same stamp the developer path applies from
+/// the package manifest.
+fn release_route_operation_classes(
+    route: &crate::github_source::PetalAuthorityRoute,
+    fee_asset: Option<&ProvenanceFeeAsset>,
+) -> Result<Vec<ProvenanceOperationClass>> {
+    route
+        .operation_classes
+        .iter()
+        .map(|class| {
+            Ok(ProvenanceOperationClass {
+                operation_class: Token::new(*class)?,
+                fee_asset: fee_asset.cloned(),
+            })
+        })
+        .collect()
+}
+
 fn append_release_petal_provenance(
     catalog: &mut ProvenanceCatalog,
     installer_key_id: &Token,
@@ -1035,17 +1052,9 @@ fn append_release_petal_provenance(
             active: true,
         };
         lineage_message.zeroize();
+        let fee_asset = crate::github_source::release_entry_fee_asset(entry)?;
         for route in entry.authority_routes {
-            let operation_classes = route
-                .operation_classes
-                .iter()
-                .map(|class| {
-                    Ok(ProvenanceOperationClass {
-                        operation_class: Token::new(*class)?,
-                        fee_asset: None,
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
+            let operation_classes = release_route_operation_classes(route, fee_asset.as_ref())?;
             catalog.records.push(ProvenanceRecord {
                 subject: ProvenanceSubject::Petal {
                     package_hash: package_hash.clone(),
@@ -1275,6 +1284,52 @@ mod tests {
                 .iter()
                 .all(|class| class.fee_asset.as_ref() == Some(&fee))
         );
+    }
+
+    #[test]
+    fn release_route_classes_carry_the_declared_fee() {
+        let route = crate::github_source::PetalAuthorityRoute {
+            route_id: "r000001",
+            operation_classes: &["example.action", "example.other"],
+        };
+        let classes = release_route_operation_classes(&route, None).unwrap();
+        assert_eq!(classes.len(), 2);
+        assert!(classes.iter().all(|class| class.fee_asset.is_none()));
+
+        let fee = ProvenanceFeeAsset {
+            chain: Token::new("solana").unwrap(),
+            asset: "native".into(),
+        };
+        let classes = release_route_operation_classes(&route, Some(&fee)).unwrap();
+        assert!(
+            classes
+                .iter()
+                .all(|class| class.fee_asset.as_ref() == Some(&fee))
+        );
+    }
+
+    /// Every release declaration today is fee-free, so the release catalog
+    /// stamps no fee asset anywhere. A future fee-bearing declaration flows
+    /// through the same tested stamping helper above.
+    #[test]
+    fn release_provenance_stamps_no_fee_asset_today() {
+        let mut catalog = ProvenanceCatalog {
+            schema: bloom_broker_api::PROVENANCE_CATALOG_SCHEMA.into(),
+            records: Vec::new(),
+        };
+        let installer = SigningKey::from_bytes(&[7; 32]);
+        append_release_petal_provenance(
+            &mut catalog,
+            &Token::new("test-installer").unwrap(),
+            &installer,
+        )
+        .unwrap();
+        assert!(!catalog.records.is_empty());
+        for record in &catalog.records {
+            for class in &record.operation_classes {
+                assert_eq!(class.fee_asset, None);
+            }
+        }
     }
 
     #[test]

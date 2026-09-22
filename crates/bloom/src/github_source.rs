@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
 use anyhow::{Context, Result, anyhow, bail};
+use bloom_broker_api::{ProvenanceFeeAsset, Token};
 use bloom_daemon::Daemon;
 use bloom_petals::meta::PetalSourceProvenance;
 use bloom_petals::package::{
@@ -40,6 +41,11 @@ pub(crate) struct PreinstalledPetal {
     pub release_sequence: u64,
     pub predecessor_package_hashes: &'static [&'static str],
     pub authority_routes: &'static [PetalAuthorityRoute],
+    /// Native fee the Petal's signatures pay, mirroring its own
+    /// `[sign].fee_asset`. Release enrollment stamps this onto every
+    /// authorized class, and install refuses a package whose manifest
+    /// disagrees. `None` for Petals whose signatures pay no chain fee.
+    pub fee_asset: Option<(&'static str, &'static str)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,6 +146,7 @@ const HYPERLIQUID_AUTHORITY_ROUTES: &[PetalAuthorityRoute] = &[
 
 const PREINSTALLED_POLYMARKET: PreinstalledPetal = PreinstalledPetal {
     name: "polymarket",
+    fee_asset: None,
     repository: "https://github.com/bloom-directory/bloom-petal-polymarket",
     commit: "cb6259f6458fc9a27708b8c4c4e35d28a69d24fc",
     release_tag: "v0.1.5",
@@ -157,6 +164,7 @@ const PREINSTALLED_POLYMARKET: PreinstalledPetal = PreinstalledPetal {
 
 const PREINSTALLED_HYPERLIQUID: PreinstalledPetal = PreinstalledPetal {
     name: "hyperliquid",
+    fee_asset: None,
     repository: "https://github.com/bloom-directory/bloom-petal-hyperliquid",
     commit: "1d44a1c3586849afe735866c6b54057590f91147",
     release_tag: "v0.1.6",
@@ -174,6 +182,7 @@ const PREINSTALLED_HYPERLIQUID: PreinstalledPetal = PreinstalledPetal {
 
 const PREINSTALLED_NEAR_INTENTS: PreinstalledPetal = PreinstalledPetal {
     name: "near-intents",
+    fee_asset: None,
     repository: "https://github.com/bloom-directory/bloom-petal-near",
     commit: NEAR_INTENTS_RELEASE_COMMIT,
     release_tag: "v0.1.3",
@@ -191,6 +200,7 @@ const PREINSTALLED_NEAR_INTENTS: PreinstalledPetal = PreinstalledPetal {
 
 const PREINSTALLED_ENSO: PreinstalledPetal = PreinstalledPetal {
     name: "enso",
+    fee_asset: None,
     repository: "https://github.com/bloom-directory/bloom-petal-enso",
     commit: ENSO_RELEASE_COMMIT,
     release_tag: "v0.1.5",
@@ -208,6 +218,7 @@ const PREINSTALLED_ENSO: PreinstalledPetal = PreinstalledPetal {
 
 const PREINSTALLED_GASLESS: PreinstalledPetal = PreinstalledPetal {
     name: "gasless",
+    fee_asset: None,
     repository: "https://github.com/bloom-directory/bloom-petal-gasless",
     commit: "73ccf05b4f10d7993fbc8fa453e8f91987564aab",
     release_tag: "v0.1.1",
@@ -225,6 +236,7 @@ const PREINSTALLED_GASLESS: PreinstalledPetal = PreinstalledPetal {
 
 const PREINSTALLED_PRIVACY_POOLS: PreinstalledPetal = PreinstalledPetal {
     name: "privacy-pools",
+    fee_asset: None,
     repository: "https://github.com/bloom-directory/bloom-petal-privacy-pools",
     commit: "ae01a7d398416af4fa38a985b684ac973e128208",
     release_tag: "v0.1.2",
@@ -242,6 +254,7 @@ const PREINSTALLED_PRIVACY_POOLS: PreinstalledPetal = PreinstalledPetal {
 
 const PREINSTALLED_VENICE_X402: PreinstalledPetal = PreinstalledPetal {
     name: "venice-x402",
+    fee_asset: None,
     repository: "https://github.com/bloom-directory/bloom-petal-venice-x402",
     commit: "f8d6a1b287397b2c66fa11ca777fe2b762640964",
     release_tag: "v0.1.0",
@@ -259,6 +272,7 @@ const PREINSTALLED_VENICE_X402: PreinstalledPetal = PreinstalledPetal {
 
 const PREINSTALLED_TOLLY: PreinstalledPetal = PreinstalledPetal {
     name: "tolly",
+    fee_asset: None,
     repository: "https://github.com/TollyLabs/bloom-petal-tolly",
     commit: "652a88cccfeb8767c76b3fc2305107e4bbac53a7",
     release_tag: "v0.2.0",
@@ -1084,6 +1098,22 @@ pub(crate) fn release_authority_petals() -> impl Iterator<Item = &'static Preins
     [&PREINSTALLED_POLYMARKET, &PREINSTALLED_HYPERLIQUID].into_iter()
 }
 
+/// A release declaration's fee asset in the shape catalog records carry.
+/// `None` for Petals whose signatures pay no chain fee.
+pub(crate) fn release_entry_fee_asset(
+    entry: &PreinstalledPetal,
+) -> Result<Option<ProvenanceFeeAsset>> {
+    entry
+        .fee_asset
+        .map(|(chain, asset)| {
+            Ok(ProvenanceFeeAsset {
+                chain: Token::new(chain)?,
+                asset: asset.to_owned(),
+            })
+        })
+        .transpose()
+}
+
 fn validate_release_authority(
     entry: &PreinstalledPetal,
     package: &PreparedPetalPackage,
@@ -1138,6 +1168,12 @@ fn validate_release_authority(
     }) {
         bail!(
             "pre-installed Petal {} declares an absent authority route",
+            entry.name
+        );
+    }
+    if package.route_index.sign_fee_asset != release_entry_fee_asset(entry)? {
+        bail!(
+            "pre-installed Petal {} fee declaration differs from its package manifest",
             entry.name
         );
     }
@@ -1916,6 +1952,7 @@ mod tests {
     ) -> PreinstalledPetal {
         PreinstalledPetal {
             name: "near-intents",
+            fee_asset: None,
             repository: "https://github.com/bloom-directory/bloom-petal-near",
             commit,
             release_tag,
@@ -1930,6 +1967,84 @@ mod tests {
             predecessor_package_hashes: &[],
             authority_routes: &[],
         }
+    }
+
+    #[test]
+    fn release_entry_fee_asset_converts_the_declaration() {
+        let entry = preinstalled_petal("polymarket").unwrap();
+        assert_eq!(release_entry_fee_asset(entry).unwrap(), None);
+        let fee_entry = PreinstalledPetal {
+            fee_asset: Some(("solana", "native")),
+            ..*entry
+        };
+        assert_eq!(
+            release_entry_fee_asset(&fee_entry).unwrap(),
+            Some(ProvenanceFeeAsset {
+                chain: Token::new("solana").unwrap(),
+                asset: "native".into(),
+            })
+        );
+    }
+
+    /// A release declaration installs cleanly when its fee matches the
+    /// package manifest, and fails loudly on drift instead of denying
+    /// every fee-bearing claim at runtime.
+    #[test]
+    fn release_fee_declaration_must_match_the_package_manifest() {
+        let release = build_near_release("v0.1.1");
+        let declaration = |fee_asset: Option<(&'static str, &'static str)>| {
+            let routes: Vec<PetalAuthorityRoute> = release
+                .package
+                .route_index
+                .routes
+                .iter()
+                .map(|route| {
+                    let mut classes: Vec<&'static str> = route
+                        .key_derive_operation_classes
+                        .iter()
+                        .map(|class| {
+                            let leaked: &'static str = Box::leak(class.clone().into_boxed_str());
+                            leaked
+                        })
+                        .collect();
+                    if let Some(intent) = &route.install_metadata.sign_intent {
+                        let leaked: &'static str = Box::leak(intent.clone().into_boxed_str());
+                        classes.push(leaked);
+                    }
+                    PetalAuthorityRoute {
+                        route_id: {
+                            let leaked: &'static str =
+                                Box::leak(route.route_id.clone().into_boxed_str());
+                            leaked
+                        },
+                        operation_classes: Box::leak(classes.into_boxed_slice()),
+                    }
+                })
+                .collect();
+            PreinstalledPetal {
+                name: "near-intents",
+                fee_asset,
+                repository: "https://github.com/bloom-directory/bloom-petal-near",
+                commit: NEAR_NEW_COMMIT,
+                release_tag: "v0.1.1",
+                archive: "near-intents-v0.1.1.petal.tar.gz",
+                expected_hash: None,
+                archive_sha256: "2222222222222222222222222222222222222222222222222222222222222222",
+                tooling_commit: "3333333333333333333333333333333333333333",
+                petal_abi: "bloom.petal-host/triad-compatible-nonauthority-v1",
+                default_eligible: true,
+                lineage_id: Some("pln1_fee_validation_fixture"),
+                release_sequence: 1,
+                predecessor_package_hashes: &[],
+                authority_routes: Box::leak(routes.into_boxed_slice()),
+            }
+        };
+        validate_release_authority(&declaration(None), &release.package).unwrap();
+        let err =
+            validate_release_authority(&declaration(Some(("solana", "native"))), &release.package)
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("fee declaration differs"), "{err}");
     }
 
     fn near_release_manifest(
@@ -2415,6 +2530,7 @@ mod tests {
         let daemon = Daemon::from_home(HomeDir::at(home.path())).unwrap();
         let entry = PreinstalledPetal {
             name: "demo",
+            fee_asset: None,
             repository: "https://github.com/bloom-directory/bloom-petal-test-prebuilt",
             commit: "1111111111111111111111111111111111111111",
             release_tag: "v0.1.0",
