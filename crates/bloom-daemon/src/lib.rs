@@ -2804,14 +2804,15 @@ async fn daemon_petal_chain_read(
                 })?
                 .parse()
                 .map_err(|e| HostError::Invalid(format!("eth_getTransactionReceipt hash: {e}")))?;
-            match chain
+            // Return the receipt object (or null) directly: unlike the hex
+            // arms below, the guest parses this response as raw JSON, so it
+            // must not pass through the string-quoting tail.
+            let receipt = chain
                 .receipt_json(hash)
                 .await
-                .map_err(|e| HostError::Backend(format!("transaction receipt: {e}")))?
-            {
-                Some(value) => value.to_string(),
-                None => "null".into(),
-            }
+                .map_err(|e| HostError::Backend(format!("transaction receipt: {e}")))?;
+            return serde_json::to_string(&receipt)
+                .map_err(|e| HostError::Backend(format!("encode receipt: {e}")));
         }
         "eth_chainId"
         | "eth_getBalance"
