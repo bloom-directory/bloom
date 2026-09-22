@@ -6728,6 +6728,188 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn triad_batch_superseded_ceremony_cannot_authorize_reordered_bytes() {
+        // The owner may still complete the abandoned ceremony for the
+        // original order; its signatures must not satisfy the reordered
+        // lineage's result validation.
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        let (engine, _fixture, _) = triad_batch_fixture(outbox.clone(), false, false);
+        let (refs, staged, preimages, hashes) = batch_material(&["auth-a", "auth-b"]);
+        assert!(matches!(
+            engine
+                .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
+                .await,
+            Err(TxEngineError::ApprovalRequired(_))
+        ));
+        let reversed_refs = refs.iter().cloned().rev().collect::<Vec<_>>();
+        let reversed_staged = staged.iter().cloned().rev().collect::<Vec<_>>();
+        let reversed_preimages = preimages.iter().cloned().rev().collect::<Vec<_>>();
+        let reversed_hashes = hashes.iter().copied().rev().collect::<Vec<_>>();
+        assert!(matches!(
+            engine
+                .triad_sign_evm_batch(
+                    "alice",
+                    &reversed_refs,
+                    &reversed_staged,
+                    &reversed_preimages,
+                    &reversed_hashes,
+                )
+                .await,
+            Err(TxEngineError::ApprovalRequired(_))
+        ));
+
+        // A signing result for the ORIGINAL order (what the abandoned
+        // ceremony would produce) is presented for reconciliation against the
+        // reordered lineage's operation: it must be rejected.
+        let state_path = batch_signing_state_path(outbox.root(), "alice", &reversed_refs).unwrap();
+        let reordered_state = read_triad_batch_signing_state(&state_path)
+            .unwrap()
+            .unwrap();
+        let original_result = SigningResult {
+            operation_id: reordered_state.signing_operation_id.clone(),
+            operation_digest: reordered_state
+                .expected_operation_digest
+                .clone()
+                .unwrap_or_else(|| Digest32::from_bytes([11; 32])),
+            signatures: preimages
+                .iter()
+                .map(|payload| {
+                    test_signing::normalized_signature(
+                        &payload.clone(),
+                        CryptoSuite::Secp256k1Keccak256Recoverable,
+                    )
+                })
+                .collect(),
+            signer_receipt_digest: Digest32::from_bytes([9; 32]),
+            broker_receipt_digest: Digest32::from_bytes([10; 32]),
+        };
+        let error = validate_evm_batch_signing_result(&reordered_state, &original_result)
+            .expect_err("signatures for the superseded order must not validate");
+        assert!(
+            error.to_string().contains("batch") || !error.to_string().is_empty(),
+            "{error:?}"
+        );
+        // The reordered lineage pins the reversed hashes, so a reordered-
+        // ordered validation of the same signatures over the ORIGINAL
+        // preimages cannot claim the reversed claimed-hash list.
+        assert_ne!(
+            reordered_state
+                .ordered_hashes
+                .iter()
+                .map(|hash| hash.to_bytes())
+                .collect::<Vec<_>>(),
+            hashes.iter().map(|hash| hash.0).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn triad_batch_dispatched_projection_is_never_superseded_by_reordered_bytes() {
+        // Once the dispatch marker exists a signature may be in flight or
+        // completed; changed bytes must reconcile that operation, not start a
+        // competing lineage that could double-sign.
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        let (engine, _fixture, _) = triad_batch_fixture(outbox.clone(), false, false);
+        let (refs, staged, preimages, hashes) = batch_material(&["guard-a", "guard-b"]);
+        assert!(matches!(
+            engine
+                .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
+                .await,
+            Err(TxEngineError::ApprovalRequired(_))
+        ));
+        let state_path = batch_signing_state_path(outbox.root(), "alice", &refs).unwrap();
+        let mut dispatched = read_triad_batch_signing_state(&state_path)
+            .unwrap()
+            .unwrap();
+        dispatched.sign_dispatched = true;
+        dispatched.expected_operation_digest = Some(Digest32::from_bytes([11; 32]));
+        write_triad_batch_signing_state(&state_path, &dispatched).unwrap();
+
+        let reversed_refs = refs.iter().cloned().rev().collect::<Vec<_>>();
+        let reversed_staged = staged.iter().cloned().rev().collect::<Vec<_>>();
+        let reversed_preimages = preimages.iter().cloned().rev().collect::<Vec<_>>();
+        let reversed_hashes = hashes.iter().copied().rev().collect::<Vec<_>>();
+        let error = engine
+            .triad_sign_evm_batch(
+                "alice",
+                &reversed_refs,
+                &reversed_staged,
+                &reversed_preimages,
+                &reversed_hashes,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, TxEngineError::ApprovalState(_)),
+            "dispatched projection must conflict, not supersede: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn triad_confirm_quarantined_operation_stays_blocked_on_reconciliation() {
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        let mut staged = fake_staged_1559("triad-quarantine");
+        staged.wallet = "alice".into();
+        staged.created_ms = now_ms();
+        outbox.write_pending(&staged, "exact EVM review").unwrap();
+        let entry = outbox
+            .read_in_state("alice", "anvil", "triad-quarantine", OutboxState::Pending)
+            .unwrap();
+        let (engine, fixture, _) = triad_batch_fixture(outbox, false, false);
+        let unsigned = UnsignedEvmTx::Eip1559(TxEip1559 {
+            chain_id: staged.chain_id,
+            nonce: staged.nonce,
+            gas_limit: staged.gas_limit,
+            max_fee_per_gas: 100,
+            max_priority_fee_per_gas: 10,
+            to: TxKind::Call(staged.to.as_deref().unwrap().parse().unwrap()),
+            value: U256::ZERO,
+            access_list: AccessList::default(),
+            input: Bytes::new(),
+        });
+        let preimage = TxEngine::unsigned_signing_preimage(&unsigned);
+        let signing_hash = TxEngine::unsigned_signing_hash(&unsigned);
+
+        assert!(matches!(
+            engine
+                .triad_sign_evm_payload(
+                    &entry,
+                    &staged,
+                    EvmOutboxActionKind::Confirm,
+                    &preimage,
+                    signing_hash,
+                )
+                .await,
+            Err(TxEngineError::ApprovalRequired(_))
+        ));
+        let state_path = entry.dir.join(TRIAD_SIGNING_STATE_FILE);
+        let mut dead = read_triad_signing_state(&state_path).unwrap().unwrap();
+        dead.sign_dispatched = true;
+        dead.expected_operation_digest = Some(Digest32::from_bytes([11; 32]));
+        write_triad_signing_state(&state_path, &dead).unwrap();
+        *fixture.signing_terminal.lock() = Some(OperationState::Quarantined);
+
+        let error = engine
+            .triad_sign_evm_payload(
+                &entry,
+                &staged,
+                EvmOutboxActionKind::Confirm,
+                &preimage,
+                signing_hash,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, TxEngineError::ApprovalDenied(reason) if reason.contains("quarantined")),
+            "ambiguous outcomes must stay blocked: {error:?}"
+        );
+        let after = read_triad_signing_state(&state_path).unwrap().unwrap();
+        assert_eq!(after.signing_operation_id, dead.signing_operation_id);
+    }
+
+    #[tokio::test]
     async fn triad_confirm_supersedes_an_undispatched_conflicting_projection() {
         // Reproduces the demo wedge: a persisted lineage whose bytes no longer
         // match (expired ceremony, restaged plan, or superseded cancel/replace)
@@ -7005,6 +7187,13 @@ mod tests {
                 .await,
             Err(TxEngineError::ApprovalServiceUnavailable(_))
         ));
+        // The dispatch marker and expected digest are durable on disk at the
+        // moment of the loss: a restart must reconcile, never re-dispatch.
+        let on_disk = read_triad_signing_state(&entry.dir.join(TRIAD_SIGNING_STATE_FILE))
+            .unwrap()
+            .unwrap();
+        assert!(on_disk.sign_dispatched);
+        assert!(on_disk.expected_operation_digest.is_some());
 
         let restarted = TxEngine::new(outbox, 60_000)
             .with_triad_signing(broker, triad_catalog())
