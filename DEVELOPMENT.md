@@ -252,6 +252,16 @@ On Linux the launcher starts that candidate's systemd socket before checking
 existing VFS-only launcher mode (omit `--mount`) for the concurrency test; a
 kernel mount adds no evidence about ceremony-port isolation.
 
+`scripts/test-ceremony-port-concurrency.sh` runs the whole acceptance
+sequence repeatably: it launches A and B with explicit ports and binary
+paths, enrolls a disposable wallet plus a policy-update assertion ceremony
+in each, fails a colliding fresh-root launch on A's port, stops A through
+its own launcher handle, and restarts A with its enrollment intact while B
+stays usable. Supply the four binaries explicitly (Machine, Broker, Signer,
+debug driver) and keep run roots short: unix socket paths must fit in
+`SUN_LEN`, so the script uses a short directory under `/tmp` regardless of
+`TMPDIR`.
+
 ## Cross-repository changes
 
 Advance a candidate left to right:
