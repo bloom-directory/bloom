@@ -546,7 +546,7 @@ impl ViewsHandler {
                         Some("coingecko:solana")
                     };
                     holdings.push(Holding {
-                        label: self.network_label(&chain),
+                        label: solana_network_label(&chain),
                         wallet: owner.to_owned(),
                         chain,
                         price_key,
@@ -2462,6 +2462,18 @@ fn summarize_petal_leaf(text: &str) -> String {
         end -= 1;
     }
     format!("{}…", flat[..end].trim_end())
+}
+
+/// A Solana chain's display name. The spec carries a filesystem-friendly
+/// name only, so the three known clusters map to the same "X Mainnet"
+/// shape the EVM specs display with; anything else shows as configured.
+fn solana_network_label(chain: &str) -> String {
+    match chain {
+        "solana-mainnet" => "Solana Mainnet".to_owned(),
+        "solana-devnet" => "Solana Devnet".to_owned(),
+        "solana-testnet" => "Solana Testnet".to_owned(),
+        _ => chain.to_owned(),
+    }
 }
 
 /// A leaf path's file name, without extension, as a row label. An
@@ -5892,6 +5904,21 @@ mod tests {
             Err(_) => MarketData::with_base_url("http://127.0.0.1:1"),
         };
         let handler = ViewsHandler::new(projections, chains, prices, outbox, market);
+        // The same config also feeds the Solana registry, so a real review
+        // covers SOL balances beside the EVM ones.
+        let handler = match std::env::var("VIEWS_CONFIG") {
+            Ok(path) => {
+                let config = bloom_proto::Config::load(std::path::Path::new(&path)).unwrap();
+                let registry = bloom_solana::SolanaChainRegistry::new();
+                for spec in config.solana_chains.values() {
+                    if let Ok(client) = bloom_solana::SolanaClient::build(spec) {
+                        registry.add(client);
+                    }
+                }
+                handler.with_solana_reads(registry)
+            }
+            Err(_) => handler,
+        };
         let handler = match std::env::var("VIEWS_ADDRESS_BOOK") {
             Ok(path) => handler.with_address_book(Arc::new(
                 AddressBook::load(std::path::Path::new(&path)).unwrap(),
