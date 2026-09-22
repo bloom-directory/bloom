@@ -3079,6 +3079,67 @@ fn print_vfs_stat_json(path: &str, entry: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
+enum ConfirmProjection {
+    Ceremony { url: String, expires_at_ms: u128 },
+    Broadcast { tx_hash: String },
+}
+
+fn unix_now_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+/// Read what a wallet confirm achieved from the durable outbox entry: a
+/// pending approval ceremony (with its URL) or an already-broadcast
+/// transaction hash. Returns None when neither projection is readable.
+async fn confirm_projection(
+    endpoint: &ResolvedEndpoint,
+    wallet: &str,
+    chain: &str,
+    id: &str,
+) -> Option<ConfirmProjection> {
+    let ceremony_path =
+        format!("/wallets/{wallet}/0/chains/{chain}/outbox/pending/{id}/ceremony.json");
+    if let Ok(bytes) = ipc_read(endpoint, &ceremony_path).await {
+        let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+        let url = value
+            .get("ceremony_url")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let expires_at_ms = value
+            .get("ceremony_expires_at_ms")
+            .and_then(|field| {
+                field
+                    .as_u64()
+                    .or_else(|| field.as_str().and_then(|s| s.parse::<u64>().ok()))
+            })
+            .map(u128::from);
+        if let Some(url) = url
+            && !url.trim().is_empty()
+            && expires_at_ms.is_some_and(|expires| expires > unix_now_ms())
+        {
+            return Some(ConfirmProjection::Ceremony {
+                url,
+                expires_at_ms: expires_at_ms.unwrap_or(0),
+            });
+        }
+    }
+    let sent_path = format!("/wallets/{wallet}/0/chains/{chain}/outbox/sent/{id}/intent.json");
+    if let Ok(bytes) = ipc_read(endpoint, &sent_path).await {
+        let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+        if let Some(tx_hash) = value.get("tx_hash").and_then(serde_json::Value::as_str)
+            && !tx_hash.trim().is_empty()
+        {
+            return Some(ConfirmProjection::Broadcast {
+                tx_hash: tx_hash.to_string(),
+            });
+        }
+    }
+    None
+}
+
 async fn ipc_read(endpoint: &ResolvedEndpoint, path: &str) -> Result<Vec<u8>> {
     let mut streamed = Vec::new();
     let reply = try_ipc_streaming(
@@ -3699,9 +3760,10 @@ async fn run(cli: Cli) -> Result<()> {
             text,
         }) => {
             let path = format!("/wallets/{wallet}/0/chains/{chain}/outbox/pending/{id}/confirm");
+            let is_cancel = text.trim().eq_ignore_ascii_case("cancel");
             let body = text.into_bytes();
             let client = IpcClient::new(&client_endpoint.socket);
-            try_ipc(
+            let outcome = try_ipc(
                 &client,
                 &client_endpoint,
                 "write",
@@ -3710,10 +3772,41 @@ async fn run(cli: Cli) -> Result<()> {
                     "bytes_b64": B64.encode(&body),
                 }),
             )
-            .await
-            .with_context(|| format!("ipc wallet confirm via {}", client_endpoint.display))?;
+            .await;
             debug!(endpoint = %client_endpoint.display, "cli.wallet.confirm.via_ipc");
-            Ok(())
+            // The write's RPC status alone misleads: an approval ceremony
+            // surfaces as "permission denied" and a repeat after broadcast as
+            // "not found". The durable entry is the source of truth, so report
+            // what confirm actually achieved.
+            match confirm_projection(&client_endpoint, &wallet, &chain, &id).await {
+                Some(ConfirmProjection::Ceremony { url, expires_at_ms }) => {
+                    let remaining = expires_at_ms.saturating_sub(unix_now_ms());
+                    println!("Approval required: open {url}");
+                    println!(
+                        "Ceremony expires in {}s; re-run this confirm after approving.",
+                        remaining / 1000
+                    );
+                    Ok(())
+                }
+                Some(ConfirmProjection::Broadcast { tx_hash }) => {
+                    println!("Broadcast: {tx_hash}");
+                    println!("Entry: wallets/{wallet}/0/chains/{chain}/outbox/sent/{id}");
+                    Ok(())
+                }
+                None => {
+                    outcome.with_context(|| {
+                        format!("ipc wallet confirm via {}", client_endpoint.display)
+                    })?;
+                    if is_cancel {
+                        println!("Discarded entry {id}.");
+                    } else {
+                        println!(
+                            "Confirmed; no broadcast result recorded yet. Inspect wallets/{wallet}/0/chains/{chain}/outbox/"
+                        );
+                    }
+                    Ok(())
+                }
+            }
         }
         Cmd::Wallet(WalletCmd::Cancel {
             wallet,

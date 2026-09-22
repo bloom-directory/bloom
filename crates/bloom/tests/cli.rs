@@ -2317,6 +2317,128 @@ fn wallet_confirm_uses_plain_ipc_write_when_socket_exists() {
 }
 
 #[test]
+fn wallet_confirm_reports_the_pending_ceremony_url() {
+    let home = fresh_home();
+    let expires = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        + 180_000) as u64;
+    let mut files = std::collections::HashMap::new();
+    files.insert(
+        "/alice/0/chains/base/outbox/pending/0001-cafe/cafe.json".to_string(),
+        Vec::new(),
+    );
+    files.insert(
+        "/alice/0/chains/base/outbox/pending/0001-cafe/ceremony.json".to_string(),
+        format!(
+            "{{\"ceremony_url\":\"http://localhost:18734/c/secret\",\"ceremony_expires_at_ms\":\"{expires}\"}}"
+        )
+        .into_bytes(),
+    );
+    let handler = ServingHandler { files };
+    let vfs = bloom_vfs::Vfs::builder()
+        .mount("wallets", Arc::new(handler))
+        .build();
+    let (server, server_thread) = spawn_ipc_server(home.path(), vfs);
+
+    bloom_cmd(home.path())
+        .args([
+            "wallet",
+            "confirm",
+            "alice",
+            "base",
+            "0001-cafe",
+            "--text",
+            "y",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Approval required: open http://localhost:18734/c/secret",
+        ))
+        .stdout(predicate::str::contains(
+            "re-run this confirm after approving",
+        ));
+
+    stop_ipc_server(server, server_thread);
+}
+
+#[test]
+fn wallet_confirm_reports_an_already_broadcast_transaction_instead_of_not_found() {
+    let home = fresh_home();
+    let mut files = std::collections::HashMap::new();
+    files.insert(
+        "/alice/0/chains/base/outbox/sent/0001-beef/intent.json".to_string(),
+        b"{\"tx_hash\":\"0xabc123\"}".to_vec(),
+    );
+    let handler = ServingHandler { files };
+    let vfs = bloom_vfs::Vfs::builder()
+        .mount("wallets", Arc::new(handler))
+        .build();
+    let (server, server_thread) = spawn_ipc_server(home.path(), vfs);
+
+    // The write targets pending/<id>/confirm; a sent entry makes that path
+    // not-found, which previously surfaced as a bare error.
+    bloom_cmd(home.path())
+        .args([
+            "wallet",
+            "confirm",
+            "alice",
+            "base",
+            "0001-beef",
+            "--text",
+            "y",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Broadcast: 0xabc123"))
+        .stdout(predicate::str::contains("outbox/sent/0001-beef"));
+
+    stop_ipc_server(server, server_thread);
+}
+
+/// Serves a fixed in-memory file tree for readback assertions.
+struct ServingHandler {
+    files: std::collections::HashMap<String, Vec<u8>>,
+}
+
+#[async_trait]
+impl Handler for ServingHandler {
+    async fn lookup(&self, p: &VfsPath) -> Result<Entry, HandlerError> {
+        if p.is_root() {
+            return Ok(Entry::dir(""));
+        }
+        if self.files.contains_key(&p.to_string_path()) {
+            Ok(Entry::read_only_file(
+                p.segments().last().map(String::as_str).unwrap_or("file"),
+            ))
+        } else {
+            Err(HandlerError::not_found(p.to_string_path()))
+        }
+    }
+
+    async fn list(&self, p: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+        if p.is_root() {
+            Ok(vec![])
+        } else {
+            Err(HandlerError::NotADir(p.to_string_path()))
+        }
+    }
+
+    async fn read(&self, p: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+        match self.files.get(&p.to_string_path()) {
+            Some(bytes) => Ok(bytes.clone()),
+            None => Err(HandlerError::not_found(p.to_string_path())),
+        }
+    }
+
+    async fn write(&self, _p: &VfsPath, _data: &[u8]) -> Result<(), HandlerError> {
+        Err(HandlerError::PermissionDenied)
+    }
+}
+
+#[test]
 fn wallet_cancel_uses_daemon_owned_machine_command_while_home_lock_is_live() {
     let home = fresh_home();
     let _permit = bloom_proto::HomeWritePermit::acquire(&bloom_proto::HomeDir::at(home.path()))
