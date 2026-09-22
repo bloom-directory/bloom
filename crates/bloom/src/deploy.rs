@@ -123,7 +123,13 @@ impl Bridge {
             eprintln!("Owner approval: {url}");
         }
         let mut status = first;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        // Waiting for a human approval and waiting for chain execution are
+        // different obligations. The approval phase is bounded by the
+        // ceremony's own expiry (the owner is still deliberating while it is
+        // alive); execution after signing gets a tight clock. Both timeouts
+        // leave the durable submission discoverable and resumable.
+        let mut execution_deadline: Option<tokio::time::Instant> = None;
+        let fallback_deadline = tokio::time::Instant::now() + Duration::from_secs(120);
         loop {
             if let Some(hash) = status
                 .pointer("/result/transaction/tx_hash")
@@ -146,12 +152,43 @@ impl Bridge {
                     json!({"id":job,"status":status}),
                 );
             }
-            if tokio::time::Instant::now() >= deadline {
-                return error(
-                    -32001,
-                    "approval/execution pending; continue this ID, then retry the original request",
-                    json!({"id":job}),
-                );
+            let phase = status
+                .pointer("/result/status")
+                .and_then(Value::as_str)
+                .unwrap_or("staged");
+            if phase == "approval_required" {
+                execution_deadline = None;
+                let expires_ms = status
+                    .pointer("/result/approval/expires_ms")
+                    .and_then(|field| {
+                        field
+                            .as_u64()
+                            .or_else(|| field.as_str().and_then(|s| s.parse::<u64>().ok()))
+                    });
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                let expired = expires_ms
+                    .map(|expires| now_ms >= expires)
+                    .unwrap_or(tokio::time::Instant::now() >= fallback_deadline);
+                if expired {
+                    return error(
+                        -32001,
+                        "owner ceremony expired; continue this ID to prepare a fresh ceremony, then retry the original request",
+                        json!({"id":job}),
+                    );
+                }
+            } else {
+                let deadline = execution_deadline
+                    .get_or_insert_with(|| tokio::time::Instant::now() + Duration::from_secs(120));
+                if tokio::time::Instant::now() >= *deadline {
+                    return error(
+                        -32001,
+                        "execution pending after signing; continue this ID, then retry the original request",
+                        json!({"id":job}),
+                    );
+                }
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
             status = match self.call("bloom_deploymentStatus", json!([job])).await {
