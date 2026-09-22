@@ -3324,9 +3324,21 @@ impl TxEngine {
             }
             match status.state {
                 ApprovalLifecycleState::Active => {
-                    state.ceremony_url = None;
-                    state.ceremony_expires_at_ms = None;
-                    write_triad_signing_state(&state_path, &state)?;
+                    if (now_ms() as u64) >= state.expires_at_ms.get() {
+                        // The Broker can report an approval ACTIVE after its
+                        // own expiry has passed while signing-time reservation
+                        // correctly refuses it (observed live as a permanent
+                        // CLAIM_INVALID loop). The lineage's expiry is local
+                        // and authoritative for dispatch: never send expired
+                        // approval authority, and replace the dead lineage
+                        // instead of wedging the entry.
+                        state = new_state()?;
+                        write_triad_signing_state(&state_path, &state)?;
+                    } else {
+                        state.ceremony_url = None;
+                        state.ceremony_expires_at_ms = None;
+                        write_triad_signing_state(&state_path, &state)?;
+                    }
                 }
                 ApprovalLifecycleState::Prepared | ApprovalLifecycleState::AwaitingCeremony => {
                     state.ceremony_url = status.ceremony_url;
@@ -3631,9 +3643,17 @@ impl TxEngine {
             }
             match status.state {
                 ApprovalLifecycleState::Active => {
-                    state.ceremony_url = None;
-                    state.ceremony_expires_at_ms = None;
-                    write_triad_batch_signing_state(&state_path, &state)?;
+                    if (now_ms() as u64) >= state.expires_at_ms.get() {
+                        // Same rule as single payloads: the Broker may report
+                        // an expired approval ACTIVE; the lineage's own expiry
+                        // forbids dispatching it.
+                        state = new_state()?;
+                        write_triad_batch_signing_state(&state_path, &state)?;
+                    } else {
+                        state.ceremony_url = None;
+                        state.ceremony_expires_at_ms = None;
+                        write_triad_batch_signing_state(&state_path, &state)?;
+                    }
                 }
                 ApprovalLifecycleState::Prepared | ApprovalLifecycleState::AwaitingCeremony => {
                     state.ceremony_url = status.ceremony_url;
@@ -6843,6 +6863,97 @@ mod tests {
         assert!(
             matches!(error, TxEngineError::ApprovalState(_)),
             "dispatched projection must conflict, not supersede: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn triad_confirm_replaces_an_active_but_expired_approval_lineage() {
+        // Live reproduction: the Broker reported a lapsed approval ACTIVE
+        // while its signing reservation refused it (CLAIM_INVALID), and the
+        // rejected operation was never recorded, so every confirm re-sent the
+        // same dead authority forever. The lineage's own expiry must stop
+        // dispatch and start a fresh ceremony instead.
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        let mut staged = fake_staged_1559("triad-active-expired");
+        staged.wallet = "alice".into();
+        staged.created_ms = now_ms();
+        outbox.write_pending(&staged, "exact EVM review").unwrap();
+        let entry = outbox
+            .read_in_state(
+                "alice",
+                "anvil",
+                "triad-active-expired",
+                OutboxState::Pending,
+            )
+            .unwrap();
+        let (engine, fixture, _) = triad_batch_fixture(outbox, false, false);
+        let unsigned = UnsignedEvmTx::Eip1559(TxEip1559 {
+            chain_id: staged.chain_id,
+            nonce: staged.nonce,
+            gas_limit: staged.gas_limit,
+            max_fee_per_gas: 100,
+            max_priority_fee_per_gas: 10,
+            to: TxKind::Call(staged.to.as_deref().unwrap().parse().unwrap()),
+            value: U256::ZERO,
+            access_list: AccessList::default(),
+            input: Bytes::new(),
+        });
+        let preimage = TxEngine::unsigned_signing_preimage(&unsigned);
+        let signing_hash = TxEngine::unsigned_signing_hash(&unsigned);
+
+        assert!(matches!(
+            engine
+                .triad_sign_evm_payload(
+                    &entry,
+                    &staged,
+                    EvmOutboxActionKind::Confirm,
+                    &preimage,
+                    signing_hash,
+                )
+                .await,
+            Err(TxEngineError::ApprovalRequired(_))
+        ));
+        let state_path = entry.dir.join(TRIAD_SIGNING_STATE_FILE);
+        let mut lapsed = read_triad_signing_state(&state_path).unwrap().unwrap();
+        // Simulate the observed stuck state: the Broker was queried, reported
+        // ACTIVE, dispatch was attempted (marker set), and the lineage has
+        // since expired while the operation was never recorded.
+        lapsed.sign_dispatched = true;
+        lapsed.ceremony_url = None;
+        lapsed.ceremony_expires_at_ms = None;
+        lapsed.expires_at_ms = DecimalU64::new(1);
+        write_triad_signing_state(&state_path, &lapsed).unwrap();
+        // Broker-side: the approval reads ACTIVE and the operation is absent.
+        fixture.active.store(true, Ordering::SeqCst);
+
+        assert!(
+            matches!(
+                engine
+                    .triad_sign_evm_payload(
+                        &entry,
+                        &staged,
+                        EvmOutboxActionKind::Confirm,
+                        &preimage,
+                        signing_hash,
+                    )
+                    .await,
+                Err(TxEngineError::ApprovalRequired(_))
+            ),
+            "an expired lineage must obtain a fresh ceremony even when the Broker reports ACTIVE"
+        );
+        let fresh = read_triad_signing_state(&state_path).unwrap().unwrap();
+        assert_ne!(fresh.approval_operation_id, lapsed.approval_operation_id);
+        assert_ne!(fresh.signing_operation_id, lapsed.signing_operation_id);
+        assert!(!fresh.sign_dispatched);
+        assert_eq!(
+            fixture
+                .requests
+                .lock()
+                .iter()
+                .filter(|request| matches!(request, MachineBrokerRequest::SealedApprovalPrepare(_)))
+                .count(),
+            2
         );
     }
 
