@@ -3140,6 +3140,41 @@ async fn confirm_projection(
     None
 }
 
+const IPC_ERR_NOT_FOUND: i32 = -32004;
+const IPC_ERR_PERMISSION_DENIED: i32 = -32007;
+
+/// Like [`try_ipc`] but preserves the JSON-RPC error code so callers can
+/// distinguish expected states (approval pending, already broadcast) from
+/// unrelated backend failures.
+async fn try_ipc_coded(
+    client: &IpcClient,
+    endpoint: &ResolvedEndpoint,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, (i32, std::io::Error)> {
+    match client.call(method, params).await {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            let code = match &error {
+                IpcClientError::Rpc(rpc) => rpc.rpc_code,
+                _ => 0,
+            };
+            Err((code, map_ipc_client_error(endpoint, error)))
+        }
+    }
+}
+
+fn confirm_context_note(projection: &ConfirmProjection) -> Option<String> {
+    match projection {
+        ConfirmProjection::Ceremony { url, .. } => Some(format!(
+            "an unexpired approval ceremony exists at {url}; it belongs to this entry"
+        )),
+        ConfirmProjection::Broadcast { tx_hash } => Some(format!(
+            "this entry was already broadcast as {tx_hash}; the failed request may be a repeat"
+        )),
+    }
+}
+
 async fn ipc_read(endpoint: &ResolvedEndpoint, path: &str) -> Result<Vec<u8>> {
     let mut streamed = Vec::new();
     let reply = try_ipc_streaming(
@@ -3763,7 +3798,7 @@ async fn run(cli: Cli) -> Result<()> {
             let is_cancel = text.trim().eq_ignore_ascii_case("cancel");
             let body = text.into_bytes();
             let client = IpcClient::new(&client_endpoint.socket);
-            let outcome = try_ipc(
+            let outcome = try_ipc_coded(
                 &client,
                 &client_endpoint,
                 "write",
@@ -3776,10 +3811,14 @@ async fn run(cli: Cli) -> Result<()> {
             debug!(endpoint = %client_endpoint.display, "cli.wallet.confirm.via_ipc");
             // The write's RPC status alone misleads: an approval ceremony
             // surfaces as "permission denied" and a repeat after broadcast as
-            // "not found". The durable entry is the source of truth, so report
-            // what confirm actually achieved.
-            match confirm_projection(&client_endpoint, &wallet, &chain, &id).await {
-                Some(ConfirmProjection::Ceremony { url, expires_at_ms }) => {
+            // "not found". Only those two expected outcomes are translated
+            // into the durable entry's truth; every other failure surfaces,
+            // with the entry's projection offered as context only.
+            let projection = confirm_projection(&client_endpoint, &wallet, &chain, &id).await;
+            match (outcome, &projection) {
+                (Err((code, _)), Some(ConfirmProjection::Ceremony { url, expires_at_ms }))
+                    if code == IPC_ERR_PERMISSION_DENIED =>
+                {
                     let remaining = expires_at_ms.saturating_sub(unix_now_ms());
                     println!("Approval required: open {url}");
                     println!(
@@ -3788,15 +3827,41 @@ async fn run(cli: Cli) -> Result<()> {
                     );
                     Ok(())
                 }
-                Some(ConfirmProjection::Broadcast { tx_hash }) => {
+                (Err((code, _)), Some(ConfirmProjection::Broadcast { tx_hash }))
+                    if code == IPC_ERR_NOT_FOUND =>
+                {
+                    println!("Already broadcast: {tx_hash}");
+                    println!("Entry: wallets/{wallet}/0/chains/{chain}/outbox/sent/{id}");
+                    Ok(())
+                }
+                (Err((_, error)), Some(context)) => {
+                    if let Some(note) = confirm_context_note(context) {
+                        eprintln!("Note: {note}");
+                    }
+                    Err(anyhow::Error::new(error).context(format!(
+                        "ipc wallet confirm via {}",
+                        client_endpoint.display
+                    )))
+                }
+                (Err((_, error)), None) => Err(anyhow::Error::new(error).context(format!(
+                    "ipc wallet confirm via {}",
+                    client_endpoint.display
+                ))),
+                (Ok(_), Some(ConfirmProjection::Ceremony { url, expires_at_ms })) => {
+                    let remaining = expires_at_ms.saturating_sub(unix_now_ms());
+                    println!("Approval required: open {url}");
+                    println!(
+                        "Ceremony expires in {}s; re-run this confirm after approving.",
+                        remaining / 1000
+                    );
+                    Ok(())
+                }
+                (Ok(_), Some(ConfirmProjection::Broadcast { tx_hash })) => {
                     println!("Broadcast: {tx_hash}");
                     println!("Entry: wallets/{wallet}/0/chains/{chain}/outbox/sent/{id}");
                     Ok(())
                 }
-                None => {
-                    outcome.with_context(|| {
-                        format!("ipc wallet confirm via {}", client_endpoint.display)
-                    })?;
+                (Ok(_), None) => {
                     if is_cancel {
                         println!("Discarded entry {id}.");
                     } else {

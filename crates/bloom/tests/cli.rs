@@ -2336,10 +2336,11 @@ fn wallet_confirm_reports_the_pending_ceremony_url() {
         )
         .into_bytes(),
     );
-    let handler = ServingHandler { files };
-    let vfs = bloom_vfs::Vfs::builder()
-        .mount("wallets", Arc::new(handler))
-        .build();
+    let handler = Arc::new(ServingHandler {
+        files,
+        ..ServingHandler::default()
+    });
+    let vfs = bloom_vfs::Vfs::builder().mount("wallets", handler).build();
     let (server, server_thread) = spawn_ipc_server(home.path(), vfs);
 
     bloom_cmd(home.path())
@@ -2372,10 +2373,11 @@ fn wallet_confirm_reports_an_already_broadcast_transaction_instead_of_not_found(
         "/alice/0/chains/base/outbox/sent/0001-beef/intent.json".to_string(),
         b"{\"tx_hash\":\"0xabc123\"}".to_vec(),
     );
-    let handler = ServingHandler { files };
-    let vfs = bloom_vfs::Vfs::builder()
-        .mount("wallets", Arc::new(handler))
-        .build();
+    let handler = Arc::new(ServingHandler {
+        files,
+        write_error: HandlerError::NotFound("state mismatch".into()),
+    });
+    let vfs = bloom_vfs::Vfs::builder().mount("wallets", handler).build();
     let (server, server_thread) = spawn_ipc_server(home.path(), vfs);
 
     // The write targets pending/<id>/confirm; a sent entry makes that path
@@ -2392,8 +2394,79 @@ fn wallet_confirm_reports_an_already_broadcast_transaction_instead_of_not_found(
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Broadcast: 0xabc123"))
+        .stdout(predicate::str::contains("Already broadcast: 0xabc123"))
         .stdout(predicate::str::contains("outbox/sent/0001-beef"));
+
+    stop_ipc_server(server, server_thread);
+}
+
+#[test]
+fn wallet_confirm_surfaces_unrelated_failures_despite_an_existing_ceremony() {
+    let home = fresh_home();
+    let expires = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        + 180_000) as u64;
+    let mut files = std::collections::HashMap::new();
+    files.insert(
+        "/alice/0/chains/base/outbox/pending/0001-feed/ceremony.json".to_string(),
+        format!(
+            "{{\"ceremony_url\":\"http://localhost:18734/c/old\",\"ceremony_expires_at_ms\":\"{expires}\"}}"
+        )
+        .into_bytes(),
+    );
+    let handler = Arc::new(ServingHandler {
+        files,
+        write_error: HandlerError::Backend("node rejected fee fields".into()),
+    });
+    let vfs = bloom_vfs::Vfs::builder().mount("wallets", handler).build();
+    let (server, server_thread) = spawn_ipc_server(home.path(), vfs);
+
+    // The unexpired ceremony exists, but the write failed for an unrelated
+    // reason: the failure must surface, not be masked as approval guidance.
+    bloom_cmd(home.path())
+        .args([
+            "wallet",
+            "confirm",
+            "alice",
+            "base",
+            "0001-feed",
+            "--text",
+            "y",
+        ])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("Approval required").not())
+        .stderr(predicate::str::contains("node rejected fee fields"))
+        .stderr(predicate::str::contains("http://localhost:18734/c/old"));
+
+    stop_ipc_server(server, server_thread);
+}
+
+#[test]
+fn wallet_confirm_not_found_without_a_sent_entry_still_fails() {
+    let home = fresh_home();
+    let handler = Arc::new(ServingHandler {
+        write_error: HandlerError::NotFound("no such entry".into()),
+        ..ServingHandler::default()
+    });
+    let vfs = bloom_vfs::Vfs::builder().mount("wallets", handler).build();
+    let (server, server_thread) = spawn_ipc_server(home.path(), vfs);
+
+    bloom_cmd(home.path())
+        .args([
+            "wallet",
+            "confirm",
+            "alice",
+            "base",
+            "0001-missing",
+            "--text",
+            "y",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no such entry"));
 
     stop_ipc_server(server, server_thread);
 }
@@ -2401,6 +2474,16 @@ fn wallet_confirm_reports_an_already_broadcast_transaction_instead_of_not_found(
 /// Serves a fixed in-memory file tree for readback assertions.
 struct ServingHandler {
     files: std::collections::HashMap<String, Vec<u8>>,
+    write_error: HandlerError,
+}
+
+impl Default for ServingHandler {
+    fn default() -> Self {
+        Self {
+            files: std::collections::HashMap::new(),
+            write_error: HandlerError::PermissionDenied,
+        }
+    }
 }
 
 #[async_trait]
@@ -2434,7 +2517,11 @@ impl Handler for ServingHandler {
     }
 
     async fn write(&self, _p: &VfsPath, _data: &[u8]) -> Result<(), HandlerError> {
-        Err(HandlerError::PermissionDenied)
+        Err(match &self.write_error {
+            HandlerError::NotFound(what) => HandlerError::NotFound(what.clone()),
+            HandlerError::Backend(what) => HandlerError::Backend(what.clone()),
+            _ => HandlerError::PermissionDenied,
+        })
     }
 }
 
