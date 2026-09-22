@@ -2796,7 +2796,28 @@ async fn daemon_petal_chain_read(
                 .map_err(|e| HostError::Backend(format!("eth_call: {e}")))?;
             format!("0x{}", hex::encode(bytes))
         }
-        "eth_chainId" | "eth_getBalance" | "eth_getCode" | "eth_call" => {
+        "eth_getTransactionReceipt" if params.len() == 1 => {
+            let hash: alloy::primitives::B256 = params[0]
+                .as_str()
+                .ok_or_else(|| {
+                    HostError::Invalid("eth_getTransactionReceipt hash must be a string".into())
+                })?
+                .parse()
+                .map_err(|e| HostError::Invalid(format!("eth_getTransactionReceipt hash: {e}")))?;
+            match chain
+                .receipt_json(hash)
+                .await
+                .map_err(|e| HostError::Backend(format!("transaction receipt: {e}")))?
+            {
+                Some(value) => value.to_string(),
+                None => "null".into(),
+            }
+        }
+        "eth_chainId"
+        | "eth_getBalance"
+        | "eth_getCode"
+        | "eth_call"
+        | "eth_getTransactionReceipt" => {
             return Err(HostError::Invalid(format!(
                 "invalid {method} parameters; only latest-block reads are allowed"
             )));
@@ -6922,6 +6943,51 @@ mod tests {
         assert!(parse_petal_hex_bytes("70a08231", "data").is_err());
         assert!(parse_petal_hex_quantity("0x0", "value").is_ok());
         assert!(parse_petal_hex_quantity("0", "value").is_err());
+    }
+
+    #[tokio::test]
+    async fn daemon_petal_chain_read_serves_receipts_by_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = Daemon::from_home(HomeDir::at(dir.path())).unwrap();
+        let host = test_petal_host(&daemon);
+        let context = PetalRouteContext {
+            petal_root: "reader".into(),
+            package_hash: "a".repeat(64),
+            route_id: "r000001".into(),
+            op: "read".into(),
+            path: "/receipt.json".into(),
+            params: vec![],
+            actor: None,
+        };
+        let chain_name = daemon.chains.list_names().into_iter().next().unwrap();
+        let read = |method: &str, params: &str| {
+            host.chain_read(ChainRequest {
+                chain: chain_name.clone(),
+                method: method.into(),
+                params_json: params.into(),
+                context: Some(context.clone()),
+            })
+        };
+
+        // Wrong arity and malformed hashes fail validation before any network.
+        for params in [
+            "[]",
+            "[\"0xabc\", \"0xdef\"]",
+            "[\"not-a-hash\"]",
+            "[\"0x1234\"]",
+        ] {
+            let error = read("eth_getTransactionReceipt", params).await.unwrap_err();
+            assert!(
+                matches!(error, HostError::Invalid(_)),
+                "unexpected receipt params {params} result: {error}"
+            );
+        }
+        // Unlisted methods stay denied.
+        let error = read("eth_getLogs", "[{}]").await.unwrap_err();
+        assert!(
+            matches!(error, HostError::Denied(_)),
+            "unexpected eth_getLogs result: {error}"
+        );
     }
 
     #[tokio::test]
