@@ -14,7 +14,6 @@ make_payload() {
   cp -R "$workspace/packaging/triad/macos" "$target/installer/macos"
   mkdir -p "$target/installer/release"
   cp "$installer" "$target/installer/release/install-macos.sh"
-  cp "$workspace/packaging/triad/release/bloom-ceremonies" "$target/installer/release/"
   cp "$workspace/packaging/triad/release/compatibility-v1.toml" "$target/"
   printf 'test-unclaimed\n' >"$target/PLATFORM_CLAIM"
   for name in bloom bloom-broker bloom-signer bloom-signer-migrate; do
@@ -67,7 +66,7 @@ make_payload "$payload_a" release-a
 make_payload "$payload_b" release-b
 
 # Foreign CLI entries fail before release, enrollment, or custody paths exist.
-for command_name in bloom bloom-ceremonies; do
+for command_name in bloom; do
   for conflict in file symlink directory; do
     root="$work/conflict-$command_name-$conflict"
     mkdir -p "$root/usr/local/bin"
@@ -102,7 +101,7 @@ resolved_root="$(cd "$root" && pwd -P)"
 # remain untouched, and the notice renders exact principal-bound commands.
 install_output="$(run_installer "$digest_a" install "$root" 501 releaseuser "$payload_a" 2>&1)"
 [[ -L "$root/usr/local/bin/bloom" ]]
-[[ "$(readlink "$root/usr/local/bin/bloom-ceremonies")" == ../libexec/bloom/current/bloom-ceremonies ]]
+[[ ! -e "$root/usr/local/bin/bloom-ceremonies" && ! -L "$root/usr/local/bin/bloom-ceremonies" ]]
 [[ "$(readlink "$root/usr/local/bin/bloom")" == ../libexec/bloom/current/bloom ]]
 [[ ! -e "$legacy" && ! -L "$legacy" ]]
 [[ -d "$legacy_wallet" && -f "$legacy_wallet/kind" ]]

@@ -325,7 +325,21 @@ Provisioning publishes the validated control CA to Broker's private
 `relay-control-ca.pem` beside its scoped credentials. Broker publishes each
 validated certificate/key pair atomically in `relay-tls-bundle.json`; a failed
 renewal preserves the previous bundle while it remains valid.
-Both installers already run the provisioning call as root. In that path,
-`bloom-ceremonies` uses the current root identity without a second elevation
-prompt. A standalone `bloom-ceremonies` invocation by a login user requests
-elevation for the same root-only administration operation.
+Both installers invoke `bloom-signer admin provision --login-uid UID` directly
+inside their existing root step, with no second elevation prompt. There is no
+separate ceremony administration wrapper or automatic elevation in Signer.
+For manual administration, explicitly elevate the installed binary:
+
+```sh
+# Linux
+sudo /usr/libexec/bloom/current/bloom-signer admin status --login-uid "$(id -u)"
+# macOS
+sudo /usr/local/libexec/bloom/current/bloom-signer admin status --login-uid "$(id -u)"
+```
+
+Replace `status` with `provision`, `remote-enabled` or `localhost-only` as needed.
+`--login-uid` selects the installed enrollment and fixed platform paths; it is
+not the Signer service UID. `bloom-signer --help` and `bloom-signer admin --help`
+work without root. The service itself runs as its dedicated unprivileged user;
+root is required for installed administrative operations, not for executing
+the binary or displaying help. See `DEVELOPMENT.md` for harness administration.

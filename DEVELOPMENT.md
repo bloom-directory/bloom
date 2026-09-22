@@ -240,6 +240,13 @@ Signer explicitly:
 /path/to/candidate/bloom-signer admin status --signer-uid "$(id -u)"
 ```
 
+Use `bloom-signer admin --help` for the administrative interface. In the dev
+harness, `--signer-uid` uses the sourced environment paths and validated
+developer identity; no elevation is needed. Installed administration instead
+uses `--login-uid UID` and explicit elevation of the platform's installed
+Signer binary. The installer invokes that same interface inside its existing
+root step. There is no separate administration wrapper or automatic elevation.
+
 For manual provisioning without `--hosted-relay`, run `admin provision` with
 the same binary and UID while enrollment is open, then poll `admin status`.
 A certificate-pending response is not readiness. The hostname and administrator

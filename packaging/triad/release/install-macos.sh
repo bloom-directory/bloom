@@ -326,11 +326,6 @@ preflight_cli_link() {
     [[ ! -e "$directory" && ! -L "$directory" ]] && continue
     [[ -d "$directory" && ! -L "$directory" ]] || die "Bloom CLI parent path is unsafe: $directory"
   done
-  local admin_link="$cli_bin_dir/bloom-ceremonies"
-  if [[ -e "$admin_link" || -L "$admin_link" ]]; then
-    [[ -L "$admin_link" && "$(readlink "$admin_link")" == ../libexec/bloom/current/bloom-ceremonies ]] ||
-      die "refusing to overwrite unrelated ceremony administration command"
-  fi
   [[ ! -e "$cli_link" && ! -L "$cli_link" ]] && return 0
   [[ -L "$cli_link" ]] || die "refusing to overwrite unrelated Bloom CLI at $cli_link"
   target="$(readlink "$cli_link")"
@@ -341,17 +336,6 @@ preflight_cli_link() {
 install_cli_link() {
   local replacement="$cli_link.new.$$"
   mkdir -p "$cli_bin_dir"
-  local admin_link="$cli_bin_dir/bloom-ceremonies"
-  if [[ -e "$admin_link" || -L "$admin_link" ]]; then
-    [[ -L "$admin_link" && "$(readlink "$admin_link")" == ../libexec/bloom/current/bloom-ceremonies ]] ||
-      die "refusing to overwrite unrelated ceremony administration command"
-    rm -f -- "$admin_link"
-  fi
-  # Old releases have no admin command; rollback must still restore the CLI.
-  if [[ -x "$release_base/current/bloom-ceremonies" ]]; then
-    ln -s ../libexec/bloom/current/bloom-ceremonies "$admin_link"
-    $live && chown -h root:wheel "$admin_link"
-  fi
   ln -s ../libexec/bloom/current/bloom "$replacement"
   $live && chown -h root:wheel "$replacement"
   if [[ "$(uname -s)" == Darwin ]]; then
@@ -362,10 +346,6 @@ install_cli_link() {
 }
 
 remove_cli_link() {
-  local admin_link="$cli_bin_dir/bloom-ceremonies"
-  if [[ -L "$admin_link" && "$(readlink "$admin_link")" == ../libexec/bloom/current/bloom-ceremonies ]]; then
-    rm -f -- "$admin_link"
-  fi
   local target
   [[ ! -e "$cli_link" && ! -L "$cli_link" ]] && return 0
   if [[ -L "$cli_link" ]]; then
@@ -689,7 +669,6 @@ install_release() {
   else
     stage="$release_base/.release.$$.new"; mkdir "$stage"
     install -m 0755 "$payload/bin/bloom" "$stage/bloom"; install -m 0755 "$payload/bin/bloom-broker" "$stage/bloom-broker"
-    install -m 0755 "$payload/installer/release/bloom-ceremonies" "$stage/bloom-ceremonies"
     install -m 0755 "$payload/bin/bloom-signer" "$stage/bloom-signer"; install -m 0755 "$payload/bin/bloom-signer-migrate" "$stage/bloom-signer-migrate"
     $live && chown -R root:wheel "$stage"; mv "$stage" "$release"
   fi
@@ -1017,8 +996,8 @@ find_interrupted_upgrade() {
 
 provision_remote_ceremonies() {
   $live || return 0
-  if ! "$cli_bin_dir/bloom-ceremonies" provision --login-uid "$login_uid"; then
-    echo "Remote ceremony provisioning is incomplete; localhost remains available. Retry: bloom-ceremonies provision --login-uid $login_uid" >&2
+  if ! "$release_base/current/bloom-signer" admin provision --login-uid "$login_uid"; then
+    echo "Remote ceremony provisioning is incomplete; localhost remains available. Retry: sudo '$release_base/current/bloom-signer' admin provision --login-uid $login_uid" >&2
   fi
 }
 

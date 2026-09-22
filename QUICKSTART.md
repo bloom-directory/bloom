@@ -198,11 +198,19 @@ when both are stored in the same password manager. A synchronized copy is not
 independent redundancy. Completing an approval activates authority; execution
 and broadcast remain separate operations.
 
-The installed `bloom-ceremonies status|remote-enabled|localhost-only|provision`
-command invokes privileged `bloom-signer` administration through the platform's
-elevation prompt (`osascript`, `pkexec`, or `sudo`). Use `--login-uid UID` when
-administering a particular enrollment as root. `provision` retries hosted setup
-with the installation's protected identity; it never accepts an arbitrary domain.
+Installed administration uses `bloom-signer admin` directly. For your login:
+
+```sh
+# Linux
+sudo /usr/libexec/bloom/current/bloom-signer admin status --login-uid "$(id -u)"
+# macOS
+sudo /usr/local/libexec/bloom/current/bloom-signer admin status --login-uid "$(id -u)"
+```
+
+Use `status`, `remote-enabled`, `localhost-only` or `provision`; help works
+without `sudo`. The installer already provisions within its root step.
+`provision` retries hosted setup with the installation's protected identity;
+it never accepts an arbitrary domain.
 
 To add access on the other origin, run `bloom wallet add-passkey main --to local`
 or `--to remote`. Open the returned destination URL first, keep that tab open,

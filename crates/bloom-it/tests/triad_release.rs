@@ -397,11 +397,6 @@ fn make_installer_payload(root: &Path) -> PathBuf {
     let release_installer = payload.join("installer/release/install-linux.sh");
     fs::create_dir_all(release_installer.parent().unwrap()).unwrap();
     fs::copy(release_script("install-linux.sh"), release_installer).unwrap();
-    fs::copy(
-        release_script("bloom-ceremonies"),
-        payload.join("installer/release/bloom-ceremonies"),
-    )
-    .unwrap();
     fs::create_dir_all(payload.join("config")).unwrap();
     for config in [
         "edge-manifest.json",
@@ -2081,88 +2076,72 @@ fn linux_services_send_structured_stderr_to_stable_journal_identifiers() {
 }
 
 #[test]
-fn ceremony_admin_wrapper_rejects_unbounded_inputs_before_elevation() {
-    for arguments in [
-        vec!["unknown"],
-        vec![
-            "localhost-only",
-            "--login-uid",
-            "1;touch /tmp/should-not-exist",
-        ],
-        vec!["remote-enabled", "--origin", "https://foreign.test"],
-        vec!["provision", "--login-uid", "0"],
+fn installers_invoke_signer_administration_directly_and_report_retry() {
+    for (installer, function) in [
+        ("install-linux.sh", "provision_linux_remote_ceremonies"),
+        ("install-macos.sh", "provision_remote_ceremonies"),
     ] {
-        let output = Command::new("bash")
-            .arg(release_script("bloom-ceremonies"))
-            .args(arguments)
-            .output()
-            .unwrap();
-        assert_eq!(output.status.code(), Some(64));
-    }
-}
-
-#[test]
-fn ceremony_admin_wrapper_selects_platform_relay_state() {
-    let wrapper = fs::read_to_string(release_script("bloom-ceremonies")).unwrap();
-    // Execute the actual path selection and export code without elevation or
-    // invoking Signer. Only filesystem prefixes and ownership lookup are stubbed.
-    let start = wrapper
-        .find("case \"$platform\" in\n  Darwin)\n    config=")
-        .unwrap();
-    let end = wrapper.find("exec \"$signer\" admin").unwrap();
-    for platform in ["Linux", "Darwin"] {
         let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().to_str().unwrap();
-        let config = if platform == "Linux" {
-            format!("{root}/etc/bloom/1000")
-        } else {
-            format!("{root}/Library/Application Support/BloomTriad/config/1000")
-        };
-        for principal in ["broker", "signer"] {
-            fs::create_dir_all(format!("{config}/{principal}")).unwrap();
-        }
-        let selection = wrapper[start..end]
-            .replace("/etc/bloom/", &format!("{root}/etc/bloom/"))
-            .replace("/var/lib/bloom/", &format!("{root}/var/lib/bloom/"))
-            .replace(
-                "/Library/Application Support/",
-                &format!("{root}/Library/Application Support/"),
-            );
+        let release = directory.path().join("release with spaces");
+        let binary = release.join("current/bloom-signer");
+        fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        fs::write(
+            &binary,
+            r#"#!/bin/sh
+printf '%s\n' "$@" > "$ADMIN_TEST_LOG"
+exit "$ADMIN_TEST_EXIT"
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        let source = fs::read_to_string(release_script(installer)).unwrap();
+        let start = source.find(&format!("{function}() {{")).unwrap();
+        let end = start + source[start..].find("\n}").unwrap() + 2;
+        let function_source = source[start..end].replace(
+            "if ! /usr/libexec/bloom/current/bloom-signer admin",
+            "if ! \"$release_base/current/bloom-signer\" admin",
+        );
         let script = format!(
             r#"set -eu
-platform="$1"; login_uid=1000
-stat() {{ printf '2001\n'; }}
-{selection}
-printf '%s\n' "$BLOOM_SIGNER_ADMIN_STATE_DIR" "$BLOOM_SIGNER_TUNNEL_CREDENTIAL_PATH" "$BLOOM_SIGNER_DNS_CREDENTIAL_PATH" "$BLOOM_SIGNER_ACME_ACCOUNT_URI_PATH" "$BLOOM_SIGNER_RELAY_CONFIG"
+release_base="$1"; login_uid=1000; live=true
+{function_source}
+{function} 1000
 "#
         );
-        let output = Command::new("bash")
-            .args(["-c", &script, "relay-path-test", platform])
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let (admin, broker) = if platform == "Linux" {
-            (
-                format!("{root}/var/lib/bloom/1000/installer/admin"),
-                format!("{root}/var/lib/bloom/1000/broker/relay"),
-            )
-        } else {
-            (
-                format!("{config}/installer/admin"),
-                format!("{config}/broker"),
-            )
-        };
-        assert_eq!(
-            String::from_utf8(output.stdout).unwrap(),
-            format!(
-                "{admin}\n{broker}/relay-tunnel.credential\n{broker}/relay-dns.credential\n{broker}/acme-account-uri\n{config}/relay.json\n"
-            )
-        );
+        for exit_code in ["0", "1"] {
+            let log = directory.path().join("invocation");
+            let result = Command::new("bash")
+                .args(["-c", &script, "direct-admin-test"])
+                .arg(&release)
+                .env("ADMIN_TEST_LOG", &log)
+                .env("ADMIN_TEST_EXIT", exit_code)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            assert_eq!(
+                fs::read_to_string(log).unwrap(),
+                "admin\nprovision\n--login-uid\n1000\n"
+            );
+            let stderr = String::from_utf8(result.stderr).unwrap();
+            if exit_code == "0" {
+                assert!(stderr.is_empty());
+            } else {
+                assert!(stderr.contains("localhost remains available. Retry: sudo "));
+                assert!(stderr.contains("bloom-signer"));
+                assert!(stderr.contains("admin provision --login-uid 1000"));
+            }
+        }
     }
+    assert!(!release_script("bloom-ceremonies").exists());
+    assert!(
+        !fs::read_to_string(release_script("build-bundle.sh"))
+            .unwrap()
+            .contains("bloom-ceremonies")
+    );
 }
 
 #[test]

@@ -61,6 +61,13 @@ atomic_install() {
   mv -f "$temporary" "$destination"
 }
 
+provision_linux_remote_ceremonies() {
+  local login_uid="$1"
+  if ! /usr/libexec/bloom/current/bloom-signer admin provision --login-uid "$login_uid"; then
+    echo "Remote ceremony provisioning is incomplete; localhost remains available. Retry: sudo /usr/libexec/bloom/current/bloom-signer admin provision --login-uid $login_uid" >&2
+  fi
+}
+
 materialize_linux_layout() {
   layout_config="$1"
   layout_uid="$2"
@@ -1309,7 +1316,6 @@ case "$action" in
       installer/linux/systemd/bloom-signer@.service.in \
       installer/linux/systemd-user/bloom-session.service \
       installer/linux/systemd-user/bloom-machine.service \
-      installer/release/bloom-ceremonies \
       installer/release/install-linux.sh
     do
       [[ -f "$payload/$required" && ! -L "$payload/$required" ]] || {
@@ -1424,7 +1430,6 @@ case "$action" in
 
     binary_root="$root/usr/libexec/bloom/current"
     atomic_install "$payload/installer/linux/bin/bloom" "$root/usr/bin/bloom" 0755
-    atomic_install "$payload/installer/release/bloom-ceremonies" "$root/usr/bin/bloom-ceremonies" 0755
     atomic_install \
       "$payload/installer/linux/bin/bloom-uninstall" \
       "$root/usr/bin/bloom-uninstall" \
@@ -1686,9 +1691,7 @@ case "$action" in
       else
         systemctl enable --now "bloom-session@$login_uid.path"
       fi
-      if ! /usr/bin/bloom-ceremonies provision --login-uid "$login_uid"; then
-        echo "Remote ceremony provisioning is incomplete; localhost remains available. Retry: bloom-ceremonies provision --login-uid $login_uid" >&2
-      fi
+      provision_linux_remote_ceremonies "$login_uid"
       printf '%s\n' \
         "BLOOM_BIN=/usr/bin/bloom" \
         "BLOOM_INSTALL_MODE=triad-linux-systemd" \
@@ -1899,7 +1902,6 @@ case "$action" in
     done
     if [[ "$active_enrollment" == false && "$retained_custody" == false ]]; then
       rm -f -- \
-        "$root/usr/bin/bloom-ceremonies" \
         "$root/usr/bin/bloom-uninstall" \
         "$root/usr/libexec/bloom/bloom-linux-maintenance"
       rm -rf -- "$root/usr/libexec/bloom/releases"

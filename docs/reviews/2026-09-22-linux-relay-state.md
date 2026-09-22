@@ -1,5 +1,9 @@
 # Linux relay state layout
 
+The subsequent [direct Signer administration change](2026-09-22-direct-signer-administration.md)
+removes the wrapper described in this historical test evidence; the paths and
+principal boundaries below remain the same.
+
 The initial remote-ceremony release stores generated Linux relay material under
 `/var/lib/bloom/<login-uid>`:
 
