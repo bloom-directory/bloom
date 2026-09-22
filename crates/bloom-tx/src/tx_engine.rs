@@ -182,12 +182,18 @@ pub enum TxEngineError {
     #[error("pre-broadcast simulation reverted: {reason} — write 'override' to broadcast anyway")]
     SimulationReverted { reason: String },
     #[error(
-        "nonce gap: tx for {from} uses nonce {staged} but the account's next on-chain nonce is {chain_next} — the node would queue it behind the missing nonce(s) and it could never mine. Broadcast nonce {chain_next} first, or restage with an explicit `nonce` to fill the gap deliberately."
+        "nonce gap: tx for {from} uses nonce {staged} but the account's next on-chain nonce is {chain_next} — the node would queue it behind the missing nonce(s) and it could never mine.{blocking} Broadcast or discard the earlier transaction first, or restage with an explicit `nonce` to fill the gap deliberately."
     )]
     NonceGap {
         from: String,
         staged: u64,
         chain_next: u64,
+        /// The pending transactions holding the missing nonces, already
+        /// rendered. Staging reserves a nonce, so a transaction that is
+        /// refused later — by policy, or by an owner who never confirms it —
+        /// keeps holding one. Naming the holder is the difference between a
+        /// gap the owner can clear and one they have to go looking for.
+        blocking: String,
     },
 }
 
@@ -2176,12 +2182,24 @@ impl TxEngine {
             }
             if let Some(chain_next) = next_nonces.get_mut(&key).and_then(Option::as_mut) {
                 if staged.nonce > *chain_next {
-                    let _ =
-                        self.write_nonce_gap_advisory(&entries[index], staged.nonce, *chain_next);
+                    let holders = self.pending_nonce_holders(
+                        &staged.wallet,
+                        &staged.chain,
+                        &from,
+                        *chain_next,
+                        staged.nonce,
+                    );
+                    let _ = self.write_nonce_gap_advisory(
+                        &entries[index],
+                        staged.nonce,
+                        *chain_next,
+                        &holders,
+                    );
                     return Err(TxEngineError::NonceGap {
                         from: bloom_proto::checksum_address(&from),
                         staged: staged.nonce,
                         chain_next: *chain_next,
+                        blocking: render_nonce_holders(&holders),
                     });
                 }
                 if staged.nonce == *chain_next {
@@ -2717,6 +2735,7 @@ impl TxEngine {
                 from: bloom_proto::checksum_address(&from),
                 staged: nonce,
                 chain_next,
+                blocking: String::new(),
             });
         }
         Ok(())
@@ -2725,11 +2744,48 @@ impl TxEngine {
     /// Persist a machine-readable advisory beside a pending entry when its
     /// broadcast was refused by [`Self::assert_nonce_not_ahead_of_chain`], so an
     /// agent can see the exact gap and how to resolve it without re-deriving it.
+    /// The pending transactions of the same sender holding nonces in
+    /// `[chain_next, staged)`, lowest first.
+    ///
+    /// Staging reserves a nonce before anything is approved, so a transaction
+    /// that is later refused — by wallet policy, or simply never confirmed —
+    /// goes on holding one. Everything staged after it is then correctly
+    /// refused for a gap it did not create, and without this the owner is
+    /// told to "broadcast nonce N first" with nothing saying which row that
+    /// is. Discarding a never-signed row releases its nonce and needs no
+    /// approval, so naming the holder is the whole fix.
+    fn pending_nonce_holders(
+        &self,
+        wallet: &str,
+        chain: &str,
+        from: &Address,
+        chain_next: u64,
+        staged: u64,
+    ) -> Vec<(u64, String)> {
+        let sender = bloom_proto::checksum_address(from);
+        let Ok(ids) = self.outbox.list(wallet, chain, OutboxState::Pending) else {
+            return Vec::new();
+        };
+        let mut holders: Vec<(u64, String)> = ids
+            .iter()
+            .filter_map(|id| self.outbox.read(wallet, chain, id).ok())
+            .filter(|entry| {
+                entry.staged.from.eq_ignore_ascii_case(&sender)
+                    && entry.staged.nonce >= chain_next
+                    && entry.staged.nonce < staged
+            })
+            .map(|entry| (entry.staged.nonce, entry.staged.id.clone()))
+            .collect();
+        holders.sort();
+        holders
+    }
+
     fn write_nonce_gap_advisory(
         &self,
         entry: &crate::outbox::OutboxEntry,
         staged: u64,
         chain_next: u64,
+        holders: &[(u64, String)],
     ) -> Result<(), TxEngineError> {
         let body = serde_json::json!({
             "schema": "bloom.nonce_gap.v1",
@@ -2739,9 +2795,17 @@ impl TxEngine {
             "from": entry.staged.from,
             "staged_nonce": staged,
             "chain_next_nonce": chain_next,
-            "advice": format!(
-                "broadcast nonce {chain_next} first, or restage with an explicit `nonce` to fill the gap deliberately"
-            ),
+            "blocked_by": holders
+                .iter()
+                .map(|(nonce, id)| serde_json::json!({"nonce": nonce, "id": id}))
+                .collect::<Vec<_>>(),
+            "advice": if holders.is_empty() {
+                format!(
+                    "no pending transaction holds nonce {chain_next}; restage with an explicit `nonce` to fill the gap deliberately"
+                )
+            } else {
+                "confirm the transactions listed in `blocked_by`, or discard them by writing `cancel` to their `confirm` file, which releases their nonces without an approval".to_owned()
+            },
             "created_ms": now_ms(),
         });
         self.outbox.write_artefact(
@@ -2948,7 +3012,20 @@ impl TxEngine {
                 ..
             } = &e
             {
-                let _ = self.write_nonce_gap_advisory(entry, *s, *chain_next);
+                let holders = self.pending_nonce_holders(
+                    &staged.wallet,
+                    &staged.chain,
+                    &from,
+                    *chain_next,
+                    *s,
+                );
+                let _ = self.write_nonce_gap_advisory(entry, *s, *chain_next, &holders);
+                return Err(TxEngineError::NonceGap {
+                    from: bloom_proto::checksum_address(&from),
+                    staged: *s,
+                    chain_next: *chain_next,
+                    blocking: render_nonce_holders(&holders),
+                });
             }
             return Err(e);
         }
@@ -4149,6 +4226,27 @@ fn bump_fees_in_place(staged: &mut StagedTx, pct: u32) {
     }
     if let Some(b) = bump_one(&staged.gas_price, pct) {
         staged.gas_price = Some(b);
+    }
+}
+
+/// One sentence naming the pending rows that hold the missing nonces, or
+/// nothing at all when none does — an empty string keeps the generic advice
+/// intact rather than claiming a holder that is not there.
+fn render_nonce_holders(holders: &[(u64, String)]) -> String {
+    match holders {
+        [] => String::new(),
+        [(nonce, id)] => format!(" Nonce {nonce} is held by staged transaction {id}."),
+        many => format!(
+            " Nonces {} are held by staged transactions {}.",
+            many.iter()
+                .map(|(nonce, _)| nonce.to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+            many.iter()
+                .map(|(_, id)| id.clone())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
     }
 }
 
@@ -7147,6 +7245,66 @@ mod tests {
         bump_fees_in_place(&mut s, 12);
         // 1000 + 1000*12/100 = 1120.
         assert_eq!(s.gas_price.as_deref(), Some("1120"));
+    }
+
+    /// Staging reserves a nonce before anything is approved, so a transaction
+    /// refused later — by wallet policy, or simply never confirmed — goes on
+    /// holding one, and everything staged behind it is refused for a gap it
+    /// did not create. That reservation is intended; being unable to tell
+    /// which row holds the missing nonce is not.
+    #[test]
+    fn a_nonce_gap_names_the_pending_rows_holding_the_missing_nonces() {
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        let engine = TxEngine::new(outbox, 60_000);
+
+        // Nonce 1 is refused by policy and never confirmed; 2 and 3 are staged
+        // behind it. The chain is still at nonce 1.
+        for (id, nonce) in [("0002-aaaa", 1_u64), ("0003-bbbb", 2), ("0004-cccc", 3)] {
+            let mut staged = fake_staged_1559(id);
+            staged.wallet = "clearsign".into();
+            staged.chain = "anvil".into();
+            staged.nonce = nonce;
+            let plan = bloom_proto::PlanRender::render(&staged, "ETH", 18);
+            engine.outbox.write_pending(&staged, &plan).unwrap();
+        }
+        let from: Address = TEST_SIGNER_ADDRESS.parse().unwrap();
+
+        // Confirming nonce 3 is blocked by the two rows ahead of it, named.
+        let holders = engine.pending_nonce_holders("clearsign", "anvil", &from, 1, 3);
+        assert_eq!(
+            holders,
+            vec![(1, "0002-aaaa".to_owned()), (2, "0003-bbbb".to_owned())]
+        );
+        let rendered = render_nonce_holders(&holders);
+        assert!(rendered.contains("0002-aaaa"), "{rendered}");
+        assert!(rendered.contains("0003-bbbb"), "{rendered}");
+
+        // Only rows below the staged nonce and at or above the chain nonce
+        // block it: a row that already mined does not, and neither does one
+        // staged further out.
+        assert_eq!(
+            engine.pending_nonce_holders("clearsign", "anvil", &from, 2, 3),
+            vec![(2, "0003-bbbb".to_owned())]
+        );
+
+        // Discarding the refused row releases its nonce, with no approval and
+        // no transaction, and the gap report stops naming it.
+        engine
+            .outbox
+            .cancel("clearsign", "anvil", "0002-aaaa")
+            .unwrap();
+        assert_eq!(
+            engine.pending_nonce_holders("clearsign", "anvil", &from, 1, 3),
+            vec![(2, "0003-bbbb".to_owned())]
+        );
+
+        // A gap nothing is holding says so rather than naming a row.
+        assert_eq!(
+            engine.pending_nonce_holders("clearsign", "anvil", &from, 7, 9),
+            Vec::new()
+        );
+        assert_eq!(render_nonce_holders(&[]), "");
     }
 
     #[test]
