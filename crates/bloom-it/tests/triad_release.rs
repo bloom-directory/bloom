@@ -863,11 +863,7 @@ fn triad_developer_launcher_selects_ceremony_port_without_sibling_checkouts() {
     fs::create_dir_all(&isolated).unwrap();
     let isolated_launcher = isolated.join("triad-dev-launch.sh");
     fs::copy(&launcher_path, &isolated_launcher).unwrap();
-    fs::set_permissions(
-        &isolated_launcher,
-        fs::Permissions::from_mode(0o755),
-    )
-    .unwrap();
+    fs::set_permissions(&isolated_launcher, fs::Permissions::from_mode(0o755)).unwrap();
     let attempted = launch(
         &isolated_launcher,
         &["--ceremony-port", "28735"],
@@ -884,7 +880,12 @@ fn triad_developer_launcher_selects_ceremony_port_without_sibling_checkouts() {
     // Without overrides the sibling requirement still applies once a valid
     // port passes validation.
     let directory = tempfile::tempdir().unwrap();
-    let missing = launch(&isolated_launcher, &["--ceremony-port", "28735"], &[], directory.path());
+    let missing = launch(
+        &isolated_launcher,
+        &["--ceremony-port", "28735"],
+        &[],
+        directory.path(),
+    );
     assert!(!missing.status.success());
     assert!(
         stderr(&missing).contains("sibling repository"),
