@@ -2219,34 +2219,38 @@ impl CeremonyProjection {
         status: &CeremonyPublicStatus,
         now_ms: u64,
     ) -> Result<Self, ProtocolError> {
-        if status.state != CeremonyState::AwaitingUser {
-            return Ok(Self {
-                identity: Some(CeremonyProjectionIdentity::Custody {
+        if status.state == CeremonyState::AwaitingUser
+            && let Some(url) = status.ceremony_url.clone()
+            && status.expires_at_ms.get() > now_ms
+        {
+            return Self::awaiting(
+                CeremonyProjectionIdentity::Custody {
                     operation_id: status.operation_id.clone(),
                     ceremony_kind: status.ceremony_kind,
-                }),
-                ceremony_state: Some(CeremonyProjectionState::Custody(status.state)),
-                ceremony_url: None,
-                ceremony_expires_at_ms: None,
-                review_manifest_digest: None,
-                receipt_digest: status.receipt_digest.clone(),
-                last_error: None,
-            });
+                },
+                CeremonyProjectionState::Custody(status.state),
+                url,
+                status.expires_at_ms.clone(),
+                None,
+                now_ms,
+            );
         }
-        let url = status.ceremony_url.clone().ok_or_else(|| {
-            projection_mismatch("awaiting custody status is missing ceremony URL")
-        })?;
-        Self::awaiting(
-            CeremonyProjectionIdentity::Custody {
+        // Broker withholds the URL once a remote browser has exchanged its
+        // one-time capability, and a status can race the expiry sweep. Both
+        // leave the ceremony awaiting without a usable launch URL, which is the
+        // projection `reconcile_custody` reaches for an existing record.
+        Ok(Self {
+            identity: Some(CeremonyProjectionIdentity::Custody {
                 operation_id: status.operation_id.clone(),
                 ceremony_kind: status.ceremony_kind,
-            },
-            CeremonyProjectionState::Custody(status.state),
-            url,
-            status.expires_at_ms.clone(),
-            None,
-            now_ms,
-        )
+            }),
+            ceremony_state: Some(CeremonyProjectionState::Custody(status.state)),
+            ceremony_url: None,
+            ceremony_expires_at_ms: None,
+            review_manifest_digest: None,
+            receipt_digest: status.receipt_digest.clone(),
+            last_error: None,
+        })
     }
 
     pub fn from_custody_result(result: &CustodyResult) -> Self {
@@ -4291,6 +4295,25 @@ mod tests {
         assert!(status.ceremony_url.is_some());
         let rebuilt = CeremonyProjection::from_custody_status(&status, 8_000).unwrap();
         assert_eq!(rebuilt.ceremony_url(), status.ceremony_url.as_deref());
+
+        // A remote browser consumed the capability, or the status raced the
+        // expiry sweep: the ceremony stays awaiting with no launch URL.
+        let expiry = status.expires_at_ms.get();
+        let opened = CeremonyPublicStatus {
+            ceremony_url: None,
+            ..status.clone()
+        };
+        for (candidate, now_ms) in [(&opened, 8_000), (&status, expiry)] {
+            let rebuilt = CeremonyProjection::from_custody_status(candidate, now_ms).unwrap();
+            assert_eq!(
+                rebuilt.state(),
+                Some(CeremonyProjectionState::Custody(
+                    CeremonyState::AwaitingUser
+                ))
+            );
+            assert_eq!(rebuilt.ceremony_url(), None);
+            assert_eq!(rebuilt.expires_at_ms(), None);
+        }
 
         let cancelled = client.cancel_ceremony(operation_id.clone()).await.unwrap();
         assert_eq!(cancelled.operation_id, operation_id);
