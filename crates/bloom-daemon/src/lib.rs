@@ -5592,7 +5592,9 @@ mod tests {
     #[test]
     fn noncanonical_address_padding_is_refused_rather_than_rewritten() {
         let mut calldata = IERC20::transferCall {
-            to: "0x0000000000000000000000000000000000000020".parse().unwrap(),
+            to: "0x0000000000000000000000000000000000000020"
+                .parse()
+                .unwrap(),
             amount: U256::from(42_u64),
         }
         .abi_encode();
@@ -5613,7 +5615,9 @@ mod tests {
     #[test]
     fn calldata_comparison_ignores_hex_case_but_not_bytes() {
         let calldata = IERC20::transferCall {
-            to: "0x0000000000000000000000000000000000000020".parse().unwrap(),
+            to: "0x0000000000000000000000000000000000000020"
+                .parse()
+                .unwrap(),
             amount: U256::from(42_u64),
         }
         .abi_encode();

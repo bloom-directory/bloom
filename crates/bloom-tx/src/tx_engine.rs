@@ -6222,7 +6222,9 @@ mod tests {
         assert_eq!(token.amount_base_units.as_deref(), Some("1250000"));
         let plan = bloom_proto::PlanRender::render(&staged, "ETH", 18);
         assert!(
-            plan.contains("Action: Transfer 1.25 USDC to 0x2222222222222222222222222222222222222222"),
+            plan.contains(
+                "Action: Transfer 1.25 USDC to 0x2222222222222222222222222222222222222222"
+            ),
             "plan must print the human amount, got:\n{plan}"
         );
     }
