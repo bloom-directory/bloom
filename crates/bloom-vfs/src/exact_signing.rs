@@ -241,13 +241,6 @@ impl BrokerExactPayloadSigner {
         self
     }
 
-    /// The key a single-payload operation is bound to. Persisted in the
-    /// `account_key_ref` state field, so a retry with a different key never
-    /// reuses the operation.
-    fn signing_key(&self) -> Option<bloom_broker_api::KeyRef> {
-        self.account_key_ref.clone()
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub async fn sign_or_prepare(
         &self,
