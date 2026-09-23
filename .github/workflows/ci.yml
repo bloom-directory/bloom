@@ -181,11 +181,13 @@ jobs:
           version: stable
       # The Hardhat half of the deployment compatibility test installs and
       # runs a project with npm, so the Node version is pinned rather than
-      # inherited from whatever the runner image ships this month.
+      # inherited from whatever the runner image ships this month. Hardhat
+      # refuses to start below 22.13, so this floor is the tool's, not a
+      # preference.
       - name: Install Node.js for the Hardhat compatibility project
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
       - name: Download nextest archive
         uses: actions/download-artifact@v4
         with:
