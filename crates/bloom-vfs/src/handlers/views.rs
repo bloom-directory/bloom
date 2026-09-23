@@ -107,6 +107,7 @@ const PRICE_TIMEOUT: Duration = Duration::from_secs(3);
 /// A valuation bound, not a claim that every provider updates hourly. Past
 /// this, a quote does not price anything.
 const QUOTE_MAX_AGE_SECS: u64 = 3600;
+const APP_MAX_AGE_SECS: u64 = 300;
 
 /// Content-Security-Policy for every page. `style-src 'self'` is what lets a
 /// page link the sibling `bloom.css` instead of carrying a copy that drifts;
@@ -313,7 +314,12 @@ impl ViewsHandler {
             Err(error) => {
                 tracing::debug!(error = %error, "views.projections_live_unavailable");
                 match self.projections.cached_wallets() {
-                    Ok(wallets) => (wallets, false),
+                    Ok(mut wallets) => {
+                        for wallet in &mut wallets {
+                            wallet.freshness = ProjectionFreshness::Stale;
+                        }
+                        (wallets, false)
+                    }
                     Err(error) => {
                         tracing::debug!(error = %error, "views.projections_unavailable");
                         (Vec::new(), true)
@@ -424,10 +430,14 @@ impl ViewsHandler {
         chains: &[String],
     ) -> (Vec<Holding>, Vec<(String, String)>) {
         let mut reads = tokio::task::JoinSet::new();
+        let mut seen_chains = BTreeSet::new();
         for chain in chains {
             let Some(client) = self.chains.get(chain) else {
                 continue;
             };
+            if !seen_chains.insert(client.spec().chain_id) {
+                continue;
+            }
             let name = chain.clone();
             reads.spawn(async move {
                 let symbol = client.spec().native_symbol.clone();
@@ -574,7 +584,9 @@ impl ViewsHandler {
         let chains = self.sorted_chains();
         let mut portfolio = Portfolio::default();
         let mut seen: Vec<String> = Vec::new();
-        for action in self.actions().await {
+        let (actions, incomplete) = self.actions().await;
+        portfolio.activity_unavailable = incomplete;
+        for action in actions {
             let Some(intent) = action.intent.as_ref() else {
                 continue;
             };
@@ -608,50 +620,79 @@ impl ViewsHandler {
         portfolio
     }
 
-    /// One leaf out of the `petals/` subtree, absent when the Petal is not
-    /// onboarded or the leaf cannot be computed. Several Petal leaves are
-    /// derived rather than stored, and answer with an error until their
-    /// credentials exist; that is an absence, not a fault.
-    async fn petal_file(&self, path: &str) -> Option<String> {
+    /// Read a supported app leaf. Failed reads reduce coverage, never imply zero.
+    async fn petal_file(&self, path: &str, issues: &mut Vec<String>) -> Option<String> {
+        tokio::task::yield_now().await;
         let petals = self.petals.as_ref()?;
         let parsed = VfsPath::parse(path).ok()?;
         match Handler::read(petals.as_ref(), &parsed).await {
-            Ok(bytes) => String::from_utf8(bytes).ok(),
+            Ok(bytes) if bytes.len() <= 1_048_576 => match String::from_utf8(bytes) {
+                Ok(text) => Some(text),
+                Err(_) => {
+                    issues.push(format!("{path}: invalid text"));
+                    None
+                }
+            },
+            Ok(_) => {
+                issues.push(format!("{path}: response exceeds display limit"));
+                None
+            }
             Err(error) => {
                 tracing::debug!(path, error = %error, "views.petal_read_unavailable");
+                issues.push(format!("{path}: unavailable"));
                 None
             }
         }
     }
 
-    async fn petal_list(&self, path: &str) -> Vec<String> {
-        let Some(petals) = self.petals.as_ref() else {
-            return Vec::new();
-        };
-        let Ok(parsed) = VfsPath::parse(path) else {
-            return Vec::new();
-        };
-        match Handler::list(petals.as_ref(), &parsed).await {
-            Ok(entries) => entries.into_iter().map(|entry| entry.name).collect(),
-            Err(error) => {
-                tracing::debug!(path, error = %error, "views.petal_list_unavailable");
-                Vec::new()
-            }
-        }
+    async fn petal_list(&self, path: &str, issues: &mut Vec<String>) -> Vec<String> {
+        self.petal_entries(path, issues)
+            .await
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect()
     }
 
     /// Value held inside an app rather than as a native balance. A balance
     /// read cannot see any of this, so a wallet with funds in a Petal
     /// otherwise reads as empty.
-    async fn petal_positions(&self, addresses: &[String]) -> Vec<PetalPosition> {
-        if self.petals.is_none() {
-            return Vec::new();
-        }
+    async fn petal_positions(&self, addresses: &[String]) -> (Vec<PetalPosition>, Vec<String>) {
         let mut positions = Vec::new();
+        let mut issues = Vec::new();
+        if self.petals.is_none() {
+            return (positions, issues);
+        }
+        if tokio::time::timeout(
+            Duration::from_secs(5),
+            self.collect_petal_positions(addresses, &mut positions, &mut issues),
+        )
+        .await
+        .is_err()
+        {
+            issues.push(
+                "App reads exceeded the five-second collection budget; coverage is incomplete"
+                    .to_owned(),
+            );
+        }
+        issues.sort();
+        issues.dedup();
+        (positions, issues)
+    }
+
+    async fn collect_petal_positions(
+        &self,
+        addresses: &[String],
+        positions: &mut Vec<PetalPosition>,
+        issues: &mut Vec<String>,
+    ) {
+        let installed = self.petal_list("", issues).await;
 
         // Venue account equity, per address the daemon knows about.
         let mut seen: Vec<String> = Vec::new();
         for address in addresses {
+            if !installed.iter().any(|name| name == "hyperliquid") {
+                break;
+            }
             let Some(lowered) = normalized_evm_address(address) else {
                 continue;
             };
@@ -661,7 +702,7 @@ impl ViewsHandler {
             }
             seen.push(lowered.clone());
             let path = format!("hyperliquid/mainnet/users/{lowered}/clearinghouse.json");
-            let Some(text) = self.petal_file(&path).await else {
+            let Some(text) = self.petal_file(&path, issues).await else {
                 continue;
             };
             let equity = serde_json::from_str::<serde_json::Value>(&text)
@@ -672,21 +713,38 @@ impl ViewsHandler {
                         .and_then(|field| field.as_str())
                         .and_then(|text| text.parse::<f64>().ok())
                 });
-            let Some(equity) = equity.filter(|equity| equity.is_finite() && *equity != 0.0) else {
+            let Some(equity) = equity.filter(|equity| equity.is_finite()) else {
+                issues.push(format!("{path}: invalid account equity"));
                 continue;
             };
+            let observed_ms = serde_json::from_str::<serde_json::Value>(&text)
+                .ok()
+                .and_then(|value| value.get("time").and_then(|time| time.as_u64()));
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|time| time.as_millis())
+                .unwrap_or(0);
+            let fresh = observed_ms.is_some_and(|time| {
+                now_ms
+                    .checked_sub(u128::from(time))
+                    .is_some_and(|age| age <= u128::from(APP_MAX_AGE_SECS) * 1000)
+            });
+            if !fresh {
+                issues.push(format!("{path}: source time is missing, stale or in the future; value excluded from totals"));
+            }
+            if equity == 0.0 {
+                continue;
+            }
             positions.push(PetalPosition {
                 petal: "hyperliquid".to_owned(),
-                label: "Trading account equity".to_owned(),
+                label: "Perpetuals account equity".to_owned(),
                 scope: short_hex(address),
                 owner: Some(address.clone()),
-                quantity: format!("{} USDC", trim_trailing_zeros(&format!("{equity:.6}"))),
+                quantity: format!("{} USD equity", trim_trailing_zeros(&format!("{equity:.6}"))),
                 // The venue denominates equity in dollars itself, so this
                 // needs no quote of ours.
-                value: Some(equity),
-                note: "Account equity as the venue reports it, including unrealised profit \
-                       and loss. Open position notional is not counted again."
-                    .to_owned(),
+                value: fresh.then_some(equity),
+                note: format!("Default perpetuals market equity reported by the venue, including unrealised profit and loss; not a USDC token balance or complete trading-account balance. Source time: {}. Spot and other perpetuals markets are not included.", observed_ms.map(format_utc_ms).unwrap_or_else(|| "not reported".to_owned())),
                 url: Some(format!(
                     "https://app.hyperliquid.xyz/explorer/address/{address}"
                 )),
@@ -694,19 +752,24 @@ impl ViewsHandler {
         }
 
         // Privacy-pool deposits that are confirmed and still unspent.
-        let ether = self.ether_price().await;
-        for wallet in self.petal_list("privacy-pools/notes").await {
-            let mut wei = 0.0_f64;
+        let pool_wallets = if installed.iter().any(|name| name == "privacy-pools") {
+            self.petal_list("privacy-pools/notes", issues).await
+        } else {
+            Vec::new()
+        };
+        for wallet in pool_wallets {
+            let mut wei = alloy::primitives::U256::ZERO;
             let mut notes = 0usize;
             for note in self
-                .petal_list(&format!("privacy-pools/notes/{wallet}"))
+                .petal_list(&format!("privacy-pools/notes/{wallet}"), issues)
                 .await
             {
                 let path = format!("privacy-pools/notes/{wallet}/{note}");
-                let Some(text) = self.petal_file(&path).await else {
+                let Some(text) = self.petal_file(&path, issues).await else {
                     continue;
                 };
                 let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+                    issues.push(format!("{path}: invalid note"));
                     continue;
                 };
                 // A spent note is gone, and a pending one is not yours to
@@ -720,23 +783,32 @@ impl ViewsHandler {
                 if spent || !confirmed {
                     continue;
                 }
+                if value.get("asset").and_then(|asset| asset.as_str()) != Some("eth") {
+                    issues.push(format!("{path}: unsupported deposit asset"));
+                    continue;
+                }
                 let Some(amount) = value
                     .get("value")
                     .and_then(|field| field.as_str())
-                    .and_then(|text| text.parse::<f64>().ok())
-                    .filter(|amount| {
-                        amount.is_finite() && *amount > 0.0 && (wei + amount).is_finite()
+                    .filter(|text| {
+                        !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
                     })
+                    .and_then(|text| text.parse::<alloy::primitives::U256>().ok())
+                    .filter(|amount| !amount.is_zero())
                 else {
+                    issues.push(format!("{path}: invalid deposit amount"));
                     continue;
                 };
-                wei += amount;
+                let Some(sum) = wei.checked_add(amount) else {
+                    issues.push(format!("{path}: deposit total overflow"));
+                    continue;
+                };
+                wei = sum;
                 notes += 1;
             }
             if notes == 0 {
                 continue;
             }
-            let ether_amount = wei / 1e18;
             positions.push(PetalPosition {
                 petal: "privacy-pools".to_owned(),
                 label: count_noun(notes, "unspent deposit", "unspent deposits"),
@@ -744,11 +816,10 @@ impl ViewsHandler {
                 owner: Some(wallet.clone()),
                 quantity: format!(
                     "{} ETH",
-                    trim_trailing_zeros(&format!("{ether_amount:.18}"))
+                    trim_trailing_zeros(&alloy::primitives::utils::format_units(wei, 18).expect("18 is a supported unit"))
                 ),
-                value: ether.map(|price| ether_amount * price),
-                note: "Confirmed deposits that have not been withdrawn. Spent and pending \
-                       notes are excluded."
+                value: None,
+                note: "Locally recorded deposits marked confirmed and unspent. Current on-chain spend status and network identity have not been verified; excluded from dollar totals."
                     .to_owned(),
                 url: None,
             });
@@ -758,18 +829,20 @@ impl ViewsHandler {
         // dedicated parser above still reports the leaves it holds under a
         // known address, shown as observed and never valued: inventing a
         // dollar figure for another app's units would be fabrication.
-        for petal in self.petal_list("").await {
+        for petal in installed {
             if petal == "hyperliquid" || petal == "privacy-pools" {
                 continue;
             }
-            positions.extend(self.generic_petal_positions(&petal, addresses).await);
+            positions.extend(
+                self.generic_petal_positions(&petal, addresses, issues)
+                    .await,
+            );
         }
-        positions
     }
 
-    /// Entries (names and kinds) under one `petals/` path. An unlistable
-    /// path is an absence, not a fault, like an unreadable leaf.
-    async fn petal_entries(&self, path: &str) -> Vec<Entry> {
+    /// Bounded app discovery; every failure or truncation reduces coverage.
+    async fn petal_entries(&self, path: &str, issues: &mut Vec<String>) -> Vec<Entry> {
+        tokio::task::yield_now().await;
         let Some(petals) = self.petals.as_ref() else {
             return Vec::new();
         };
@@ -777,9 +850,32 @@ impl ViewsHandler {
             return Vec::new();
         };
         match Handler::list(petals.as_ref(), &parsed).await {
-            Ok(entries) => entries,
+            Ok(entries) => {
+                if entries.len() > 256 {
+                    issues.push(format!("{path}: listing truncated at 256 entries"));
+                }
+                let mut seen = BTreeSet::new();
+                entries
+                    .into_iter()
+                    .take(256)
+                    .filter(|entry| {
+                        let valid = !entry.name.is_empty()
+                            && entry.name != "."
+                            && entry.name != ".."
+                            && !entry.name.contains(['/', '\\']);
+                        if !valid {
+                            issues.push(format!("{path}: invalid entry name"));
+                        }
+                        valid && seen.insert(entry.name.clone())
+                    })
+                    .collect()
+            }
             Err(error) => {
                 tracing::debug!(path, error = %error, "views.petal_list_unavailable");
+                issues.push(format!(
+                    "{}: listing unavailable",
+                    if path.is_empty() { "Apps" } else { path }
+                ));
                 Vec::new()
             }
         }
@@ -795,16 +891,25 @@ impl ViewsHandler {
         &self,
         petal: &str,
         addresses: &[String],
+        issues: &mut Vec<String>,
     ) -> Vec<PetalPosition> {
         let lowered: Vec<String> = addresses
             .iter()
-            .map(|address| address.to_ascii_lowercase())
+            .filter(|address| !address.is_empty())
+            .map(|address| {
+                normalized_evm_address(address)
+                    .map(|address| address.to_ascii_lowercase())
+                    .unwrap_or_else(|| address.clone())
+            })
             .collect();
         let mut positions = Vec::new();
         let mut stack = vec![(String::new(), 0u8)];
         let mut listed = 0usize;
         while let Some((rel, depth)) = stack.pop() {
             if listed >= 24 || positions.len() >= 12 {
+                issues.push(format!(
+                    "{petal}: discovery limit reached; coverage is incomplete"
+                ));
                 break;
             }
             let prefix = if rel.is_empty() {
@@ -813,7 +918,7 @@ impl ViewsHandler {
                 format!("{petal}/{rel}")
             };
             listed += 1;
-            for entry in self.petal_entries(&prefix).await {
+            for entry in self.petal_entries(&prefix, issues).await {
                 let path = if rel.is_empty() {
                     entry.name.clone()
                 } else {
@@ -821,32 +926,32 @@ impl ViewsHandler {
                 };
                 match entry.kind {
                     EntryKind::Dir if depth < 2 => stack.push((path, depth + 1)),
+                    EntryKind::Dir => {
+                        issues.push(format!("{petal}: deeper records were not inspected"))
+                    }
                     EntryKind::File => {
-                        let haystack = path.to_ascii_lowercase();
-                        let Some(owner) = lowered
-                            .iter()
-                            .find(|known| haystack.contains(known.as_str()))
-                        else {
+                        let Some(owner) = lowered.iter().find(|known| {
+                            path.split('/')
+                                .any(|part| address_path_matches(part, known))
+                        }) else {
                             continue;
                         };
-                        let summary = self
-                            .petal_file(&format!("{petal}/{path}"))
-                            .await
-                            .map(|text| summarize_petal_leaf(&text))
-                            .unwrap_or_default();
                         positions.push(PetalPosition {
                             petal: petal.to_owned(),
                             label: leaf_label(&path),
                             scope: leaf_scope(petal, &path),
                             owner: Some(owner.clone()),
-                            quantity: summary,
+                            quantity: "Account record · not a verified position".to_owned(),
                             value: None,
                             note: format!(
-                                "Reported by the {petal} Petal; shown as observed, without a dollar value."
+                                "Listed by the {petal} Petal. The contents and freshness have not been verified; excluded from dollar totals."
                             ),
                             url: None,
                         });
                         if positions.len() >= 12 {
+                            issues.push(format!(
+                                "{petal}: discovery limit reached; coverage is incomplete"
+                            ));
                             break;
                         }
                     }
@@ -855,17 +960,6 @@ impl ViewsHandler {
             }
         }
         positions
-    }
-
-    /// A fresh ether quote, for Petal positions denominated in ether.
-    async fn ether_price(&self) -> Option<f64> {
-        let coin = CoinId::parse("coingecko:ethereum").ok()?;
-        let quote = tokio::time::timeout(PRICE_TIMEOUT, self.prices.current(coin))
-            .await
-            .ok()?
-            .ok()?;
-        (quote.price.is_finite() && quote.price >= 0.0 && fresh_quote(quote.timestamp, now_secs()))
-            .then_some(quote.price)
     }
 
     /// Value what can be valued. A native asset is priced only on a chain
@@ -916,12 +1010,15 @@ impl ViewsHandler {
             }
         }
 
+        let mut priced_total = 0.0_f64;
         for holding in &mut portfolio.holdings {
             let Some(key) = holding.price_key else {
                 continue;
             };
             if let Some(price) = quotes.get(key) {
-                holding.value = Some(holding.amount * price).filter(|value| value.is_finite());
+                holding.value = Some(holding.amount * price)
+                    .filter(|value| value.is_finite() && (priced_total + value).is_finite());
+                priced_total += holding.value.unwrap_or(0.0);
                 portfolio.price_coverage_gap |= holding.value.is_none();
             }
         }
@@ -930,13 +1027,15 @@ impl ViewsHandler {
     /// Central outbox actions across every lifecycle state, newest first.
     /// Reached through the outbox handler's own trait, so this page cannot
     /// drift from what `/outbox` reports.
-    async fn actions(&self) -> Vec<Action> {
+    async fn actions(&self) -> (Vec<Action>, bool) {
         let mut actions = Vec::new();
+        let mut incomplete = false;
         for state in ACTION_STATES {
             let listing = match Handler::list(&*self.outbox, &state_path(state)).await {
                 Ok(entries) => entries,
                 Err(error) => {
                     tracing::debug!(state = %state, error = %error, "views.outbox_list_unavailable");
+                    incomplete = true;
                     continue;
                 }
             };
@@ -947,16 +1046,22 @@ impl ViewsHandler {
                         .ok()
                         .map(|since| since.as_millis() as u64)
                 });
-                let plan = self.action_file(state, &id, "plan.md").await;
-                let status = self.action_file(state, &id, "status.json").await;
+                let plan = self
+                    .action_file(state, &id, "plan.md", &mut incomplete)
+                    .await;
+                let status = self
+                    .action_file(state, &id, "status.json", &mut incomplete)
+                    .await;
                 let intent = self
-                    .action_file(state, &id, "intent.json")
+                    .action_file(state, &id, "intent.json", &mut incomplete)
                     .await
                     .as_deref()
                     .and_then(parse_intent);
                 // The broadcast hash is the result's own field; `status.json`
                 // repeats it. Either answers, and neither invents one.
-                let result = self.action_file(state, &id, "result.json").await;
+                let result = self
+                    .action_file(state, &id, "result.json", &mut incomplete)
+                    .await;
                 let tx_hash = result
                     .as_deref()
                     .and_then(|text| json_field(text, "tx_hash"))
@@ -965,10 +1070,9 @@ impl ViewsHandler {
                             .as_deref()
                             .and_then(|text| json_field(text, "tx_hash"))
                     });
-                // A challenge file means the operation reached an approval
-                // ceremony. With no result beside it, it never got past one.
+                // A challenge proves a ceremony was prepared, not its outcome.
                 let awaited_approval = self
-                    .action_file(state, &id, "approval_challenge.json")
+                    .action_file(state, &id, "approval_challenge.json", &mut incomplete)
                     .await
                     .is_some();
                 let chain = intent
@@ -981,7 +1085,13 @@ impl ViewsHandler {
                     .as_ref()
                     .and_then(|i| i.value_wei.as_deref())
                     .filter(|wei| *wei != "0")
-                    .map(|wei| self.native_amount(chain.as_deref(), wei));
+                    .map(|wei| {
+                        self.native_amount(
+                            chain.as_deref(),
+                            intent.as_ref().and_then(|i| i.chain_id),
+                            wei,
+                        )
+                    });
                 actions.push(Action {
                     summary: plan.as_deref().map(plan_summary).unwrap_or_else(|| {
                         format!("Operation {}", id.split('-').next().unwrap_or(&id))
@@ -1006,17 +1116,20 @@ impl ViewsHandler {
         // Newest first, by when the intent was created rather than when its
         // directory was last touched: a retry must not reorder history.
         actions.sort_by(|a, b| b.when().cmp(&a.when()).then_with(|| a.id.cmp(&b.id)));
-        actions
+        (actions, incomplete)
     }
 
     /// A native-unit amount on a chain this daemon has configured. Without
     /// that chain's own decimals the raw wei figure is the honest answer:
     /// assuming 18 would silently mis-scale a chain that does not use them.
-    fn native_amount(&self, chain: Option<&str>, wei: &str) -> String {
+    fn native_amount(&self, chain: Option<&str>, recorded_id: Option<u64>, wei: &str) -> String {
         let Ok(raw) = wei.parse::<alloy::primitives::U256>() else {
             return format!("{wei} wei");
         };
-        match chain.and_then(|name| self.chains.get(name)) {
+        match chain
+            .and_then(|name| self.chains.get(name))
+            .filter(|client| recorded_id.is_some_and(|id| id == client.spec().chain_id))
+        {
             Some(client) => {
                 let spec = client.spec();
                 format!(
@@ -1029,12 +1142,31 @@ impl ViewsHandler {
         }
     }
 
-    async fn action_file(&self, state: &str, id: &str, file: &str) -> Option<String> {
+    async fn action_file(
+        &self,
+        state: &str,
+        id: &str,
+        file: &str,
+        incomplete: &mut bool,
+    ) -> Option<String> {
         let path = VfsPath::parse(&format!("{state}/{id}/{file}")).ok()?;
         match Handler::read(&*self.outbox, &path).await {
-            Ok(bytes) => String::from_utf8(bytes).ok(),
+            Ok(bytes) => match String::from_utf8(bytes) {
+                Ok(text)
+                    if !file.ends_with(".json")
+                        || serde_json::from_str::<serde_json::Value>(&text).is_ok() =>
+                {
+                    Some(text)
+                }
+                _ => {
+                    *incomplete = true;
+                    None
+                }
+            },
+            Err(HandlerError::NotFound(_)) => None,
             Err(error) => {
                 tracing::debug!(state = %state, id = %id, file = %file, error = %error, "views.outbox_read_unavailable");
+                *incomplete = true;
                 None
             }
         }
@@ -1043,6 +1175,21 @@ impl ViewsHandler {
     /// A chain's plain display name for prose contexts. `Action::chain_label`
     /// returns HTML for the pages; the briefing needs the same name as text.
     fn action_chain_name(&self, action: &Action) -> String {
+        if let Some(id) = action.intent.as_ref().and_then(|intent| intent.chain_id) {
+            if let Some(client) = action
+                .chain
+                .as_deref()
+                .and_then(|chain| self.chains.get(chain))
+                .filter(|client| client.spec().chain_id == id)
+            {
+                return client
+                    .spec()
+                    .display_name
+                    .clone()
+                    .unwrap_or_else(|| client.spec().name.clone());
+            }
+            return format!("EVM chain {id}");
+        }
         action
             .chain
             .as_deref()
@@ -1057,10 +1204,13 @@ impl ViewsHandler {
     /// HTML paths are named as text so the agent can hand them over.
     async fn render_briefing(&self) -> String {
         let portfolio = self.portfolio().await;
-        let actions = self.actions().await;
+        let (actions, incomplete) = self.actions().await;
         let (metric, support, caveat) = balance_headline(&portfolio);
 
         let mut out = String::from("# Today briefing\n\n");
+        if incomplete {
+            out.push_str("> Activity coverage incomplete. Some records could not be read; counts cover available records only.\n\n");
+        }
         out.push_str("Read-only — nothing here authorizes an action.\n\n");
         out.push_str(&format!(
             "**{metric}** — {support}\n\n{cover}\n",
@@ -1078,7 +1228,11 @@ impl ViewsHandler {
         let pending: Vec<&Action> = actions.iter().filter(|a| a.state == "pending").collect();
         out.push_str("## Needs you\n\n");
         if pending.is_empty() {
-            out.push_str("Nothing is waiting — no staged operation needs review.\n");
+            out.push_str(if incomplete {
+                "Pending work could not be fully checked.\n"
+            } else {
+                "Nothing is waiting — no staged operation needs review.\n"
+            });
         } else {
             out.push_str(&format!(
                 "{moves}:\n",
@@ -1103,7 +1257,7 @@ impl ViewsHandler {
                 ));
             }
         }
-        // Stale history is not Today: what never broadcast lives on the
+        // Stale history is not Today: stopped operations live on the
         // activity page, not in a briefing about right now.
         out.push('\n');
 
@@ -1154,7 +1308,14 @@ impl ViewsHandler {
         out.push('\n');
 
         let addresses = position_addresses(&portfolio, &actions);
-        let positions = self.petal_positions(&addresses).await;
+        let (mut positions, issues) = self.petal_positions(&addresses).await;
+        mark_observed_positions(&mut positions, &portfolio.wallets);
+        for issue in &issues {
+            out.push_str(&format!(
+                "> App coverage incomplete: {}\n",
+                md_escape(issue)
+            ));
+        }
         if !positions.is_empty() {
             out.push_str(
                 "## In your apps\n\nReported by Petals; separate from native balances.\n\n",
@@ -1217,7 +1378,7 @@ impl ViewsHandler {
 
     async fn render_index(&self) -> String {
         let portfolio = self.portfolio().await;
-        let actions = self.actions().await;
+        let (actions, incomplete) = self.actions().await;
         let pending = actions.iter().filter(|a| a.state == "pending").count();
 
         let funded = portfolio.funded();
@@ -1225,6 +1386,7 @@ impl ViewsHandler {
 
         let mut body = String::new();
         body.push_str(&portfolio.notices());
+        body.push_str(activity_coverage_notice(incomplete));
 
         let (metric, support, caveat) = balance_headline(&portfolio);
 
@@ -1285,7 +1447,9 @@ impl ViewsHandler {
         // as well as projected ones. Use the same coverage here, or the two
         // pages would disagree about what your apps hold.
         let addresses = position_addresses(&portfolio, &actions);
-        let positions = self.petal_positions(&addresses).await;
+        let (mut positions, issues) = self.petal_positions(&addresses).await;
+        mark_observed_positions(&mut positions, &portfolio.wallets);
+        body.push_str(&app_coverage_notice(&issues));
         if !positions.is_empty() {
             let production: Vec<&PetalPosition> = positions
                 .iter()
@@ -1371,9 +1535,11 @@ impl ViewsHandler {
                 .iter()
                 .filter_map(|wallet| wallet.address.clone()),
         );
-        let positions = self.petal_positions(&petal_addresses).await;
+        let (positions, issues) = self.petal_positions(&petal_addresses).await;
 
         let mut body = String::new();
+        body.push_str(&app_coverage_notice(&issues));
+        body.push_str(activity_coverage_notice(history.activity_unavailable));
         let current_native = if !portfolio.holdings.iter().any(|h| !h.is_off_market())
             || priced.is_empty() && !funded.is_empty()
         {
@@ -1817,14 +1983,19 @@ impl ViewsHandler {
     }
 
     async fn render_next_moves(&self) -> String {
-        let actions = self.actions().await;
+        let (actions, incomplete) = self.actions().await;
         let pending: Vec<&Action> = actions.iter().filter(|a| a.state == "pending").collect();
         let failed = actions.iter().filter(|a| a.state == "failed").count();
 
         let mut body = String::new();
+        body.push_str(activity_coverage_notice(incomplete));
 
         if pending.is_empty() {
-            body.push_str("<p class=\"empty-state\">Nothing needs you right now.</p>");
+            body.push_str(if incomplete {
+                "<p class=\"empty-state\">Pending work could not be fully checked.</p>"
+            } else {
+                "<p class=\"empty-state\">Nothing needs you right now.</p>"
+            });
         } else {
             body.push_str(&format!(
                 "<div class=\"section-head\"><h2>{}</h2></div>",
@@ -1837,12 +2008,11 @@ impl ViewsHandler {
             body.push_str(&format!("<div class=\"activity-ledger\">{rows}</div>"));
         }
 
-        // "Failed" overstates what these records show. They carry no result
-        // and no transaction hash, so what is known is that nothing was sent.
+        // These are stopped local operations, not chain-confirmed failures.
         if failed > 0 {
             let one = failed == 1;
             body.push_str(&format!(
-                "<details class=\"past-failures\"><summary>{count} never broadcast</summary>\
+                "<details class=\"past-failures\"><summary>{count} stopped</summary>\
                  <p>Historical records only. <a href=\"activity.html\">Inspect {pronoun} →</a></p></details>",
                 count = if one {
                     "One record".to_owned()
@@ -1857,11 +2027,12 @@ impl ViewsHandler {
     }
 
     async fn render_activity(&self) -> String {
-        let actions = self.actions().await;
+        let (actions, incomplete) = self.actions().await;
         let counts = |state: &str| actions.iter().filter(|a| a.state == state).count();
         let (sent, pending, failed) = (counts("sent"), counts("pending"), counts("failed"));
 
         let mut body = String::new();
+        body.push_str(activity_coverage_notice(incomplete));
         body.push_str(&format!(
             "<section class=\"outcome-overview\" aria-label=\"Outcome summary\">\
              <a href=\"#ledger\"><span class=\"mini-outcome\">↗</span><strong>{sent}</strong>\
@@ -2155,7 +2326,7 @@ impl ViewsHandler {
     }
 
     async fn render_contacts(&self) -> String {
-        let actions = self.actions().await;
+        let (actions, incomplete) = self.actions().await;
         let (wallets, _) = self.wallet_projections().await;
         let own_addresses: BTreeSet<String> = wallets
             .iter()
@@ -2163,7 +2334,8 @@ impl ViewsHandler {
             .filter_map(normalized_evm_address)
             .map(|address| address.to_ascii_lowercase())
             .collect();
-        let mut recipients: BTreeMap<(String, String), RecipientHistory> = BTreeMap::new();
+        let mut recipients: BTreeMap<(String, Option<u64>, String), RecipientHistory> =
+            BTreeMap::new();
         let mut contract_targets = 0usize;
         let mut unknown_targets = 0usize;
 
@@ -2176,10 +2348,16 @@ impl ViewsHandler {
             let Some(address) = action.recipient() else {
                 continue;
             };
-            let chain = action.chain.as_deref().unwrap_or("unknown").to_owned();
-            let key = (chain.to_ascii_lowercase(), address.to_ascii_lowercase());
+            let chain = self.action_chain_name(action);
+            let chain_id = action.intent.as_ref().and_then(|intent| intent.chain_id);
+            let key = (
+                chain.to_ascii_lowercase(),
+                chain_id,
+                address.to_ascii_lowercase(),
+            );
             let entry = recipients.entry(key).or_insert_with(|| RecipientHistory {
                 chain: chain.clone(),
+                chain_id,
                 address: address.clone(),
                 ..RecipientHistory::default()
             });
@@ -2196,6 +2374,7 @@ impl ViewsHandler {
         });
 
         let mut body = String::new();
+        body.push_str(activity_coverage_notice(incomplete));
         let saved: String = self
             .address_book
             .iter()
@@ -2205,7 +2384,7 @@ impl ViewsHandler {
                     .copied()
                     .filter(|item| item.address.eq_ignore_ascii_case(address))
                     .collect();
-                let explorers = contact_explorer_links(&self.chains, &matches);
+                let explorers = contact_explorer_links(&matches);
                 saved_contact_row(name, address, &matches, &explorers)
             })
             .collect();
@@ -2226,7 +2405,7 @@ impl ViewsHandler {
             .filter(|item| address_alias(&self.address_book, &item.address).is_none())
             .filter(|item| !own_addresses.contains(&item.address.to_ascii_lowercase()))
             .map(|item| {
-                let explorers = contact_explorer_links(&self.chains, &[item]);
+                let explorers = contact_explorer_links(&[item]);
                 contact_history_row(item, true, &explorers)
             })
             .collect();
@@ -2246,7 +2425,7 @@ impl ViewsHandler {
             .filter(|item| address_alias(&self.address_book, &item.address).is_none())
             .filter(|item| !own_addresses.contains(&item.address.to_ascii_lowercase()))
             .map(|item| {
-                let explorers = contact_explorer_links(&self.chains, &[item]);
+                let explorers = contact_explorer_links(&[item]);
                 contact_history_row(item, false, &explorers)
             })
             .collect();
@@ -2460,24 +2639,43 @@ fn short_quantity_with_unit(text: &str) -> String {
     }
 }
 
-/// One-line evidence for a Petal leaf no dedicated parser understands.
-/// Collapsed whitespace, capped length: a position row is a pointer, not a
-/// dump. Never a valuation.
-fn summarize_petal_leaf(text: &str) -> String {
-    let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    const CAP: usize = 120;
-    if flat.len() <= CAP {
-        return if flat.is_empty() {
-            "leaf present".to_owned()
-        } else {
-            flat
-        };
+fn app_coverage_notice(issues: &[String]) -> String {
+    if issues.is_empty() {
+        return String::new();
     }
-    let mut end = CAP;
-    while !flat.is_char_boundary(end) {
-        end -= 1;
+    format!(
+        "<details class=\"coverage-notice\"><summary>App coverage incomplete · some data is unavailable or unverified</summary><p>Missing records are not zero balances.</p><ul>{}</ul></details>",
+        issues
+            .iter()
+            .map(|issue| format!("<li>{}</li>", html_escape(issue)))
+            .collect::<String>()
+    )
+}
+
+fn activity_coverage_notice(incomplete: bool) -> &'static str {
+    if incomplete {
+        "<p class=\"coverage-notice\"><strong>Activity coverage incomplete</strong> · Some records could not be read. Counts cover available records only.</p>"
+    } else {
+        ""
     }
-    format!("{}…", flat[..end].trim_end())
+}
+
+fn address_path_matches(part: &str, address: &str) -> bool {
+    if address.is_empty() {
+        return false;
+    }
+    let part = if normalized_evm_address(address).is_some() {
+        part.to_ascii_lowercase()
+    } else {
+        part.to_owned()
+    };
+    let address = if normalized_evm_address(address).is_some() {
+        address.to_ascii_lowercase()
+    } else {
+        address.to_owned()
+    };
+    part.strip_prefix(&address)
+        .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with(['-', '_', '.']))
 }
 
 /// A Solana chain's display name. The spec carries a filesystem-friendly
@@ -2561,20 +2759,42 @@ fn position_belongs_to_wallet(position: &PetalPosition, wallet: &WalletSummary) 
     let Some(owner) = position.owner.as_deref() else {
         return false;
     };
-    owner.eq_ignore_ascii_case(&wallet.id)
+    owner == wallet.id
         || wallet
             .address
             .as_deref()
-            .is_some_and(|address| owner.eq_ignore_ascii_case(address))
+            .is_some_and(|address| same_account_address(owner, address))
         || wallet
             .addresses
             .iter()
-            .any(|address| owner.eq_ignore_ascii_case(address))
+            .any(|address| same_account_address(owner, address))
+}
+
+fn mark_observed_positions(positions: &mut [PetalPosition], wallets: &[WalletSummary]) {
+    for position in positions {
+        if !wallets
+            .iter()
+            .any(|wallet| position_belongs_to_wallet(position, wallet))
+        {
+            position.label = format!("Observed account · {}", position.label);
+            position
+                .note
+                .push_str(" No current wallet projection proves control of this account.");
+        }
+    }
+}
+
+fn same_account_address(left: &str, right: &str) -> bool {
+    left == right
+        || (normalized_evm_address(left).is_some()
+            && normalized_evm_address(right).is_some()
+            && left.eq_ignore_ascii_case(right))
 }
 
 #[derive(Default)]
 struct RecipientHistory {
     chain: String,
+    chain_id: Option<u64>,
     address: String,
     count: usize,
     last_ms: Option<u64>,
@@ -2626,22 +2846,16 @@ fn contact_history_row(item: &RecipientHistory, suggested: bool, explorers: &str
     )
 }
 
-fn contact_explorer_links(chains: &ChainRegistry, history: &[&RecipientHistory]) -> String {
+fn contact_explorer_links(history: &[&RecipientHistory]) -> String {
     let mut links = BTreeMap::new();
     for item in history {
-        let Some(client) = chains.get(&item.chain) else {
+        let Some(chain_id) = item.chain_id else {
             continue;
         };
-        let chain_id = client.spec().chain_id;
         let Some(url) = explorer_address_url(chain_id, &item.address) else {
             continue;
         };
-        let label = client
-            .spec()
-            .display_name
-            .as_deref()
-            .unwrap_or(&item.chain)
-            .to_owned();
+        let label = item.chain.clone();
         links.insert((chain_id, item.address.clone()), (label, url));
     }
     links
@@ -2658,6 +2872,7 @@ fn contact_explorer_links(chains: &ChainRegistry, history: &[&RecipientHistory])
 
 #[derive(Default)]
 struct Portfolio {
+    activity_unavailable: bool,
     holdings: Vec<Holding>,
     /// `(wallet, chain)` pairs whose balance could not be read.
     unavailable: Vec<(String, String)>,
@@ -3089,17 +3304,22 @@ struct Action {
 
 impl Action {
     fn chain_label(&self, chains: &ChainRegistry) -> String {
-        let Some(chain) = self.chain.as_deref() else {
-            return "—".to_owned();
-        };
         let recorded_id = self.intent.as_ref().and_then(|intent| intent.chain_id);
+        let fallback = recorded_id
+            .map(|id| format!("EVM chain {id}"))
+            .unwrap_or_else(|| "—".to_owned());
+        let chain = self.chain.as_deref().unwrap_or(&fallback);
         let client = chains
             .get(chain)
             .filter(|client| recorded_id.is_none_or(|id| id == client.spec().chain_id));
         let label = client
             .as_ref()
             .and_then(|client| client.spec().display_name.as_deref())
-            .unwrap_or(chain);
+            .unwrap_or(if recorded_id.is_some() {
+                &fallback
+            } else {
+                chain
+            });
         let chain_id = recorded_id.or_else(|| client.as_ref().map(|client| client.spec().chain_id));
         asset_label_with(
             chain_id
@@ -3154,13 +3374,13 @@ impl Action {
     }
 
     /// The outcome, stated as narrowly as the records support. "Failed" is
-    /// not "reverted": these records carry no receipt at all, so what is
-    /// known is that nothing was ever broadcast.
+    /// not "reverted": absence of a receipt or hash cannot prove no broadcast.
     fn label(&self) -> &'static str {
         match self.state {
             "sent" => "✓ Broadcast",
-            "failed" if self.awaited_approval => "✗ Not approved",
-            "failed" => "✗ Never broadcast",
+            "failed" if self.tx_hash.is_some() => "✗ Stopped · transaction hash recorded",
+            "failed" if self.awaited_approval => "✗ Approval interrupted",
+            "failed" => "✗ No broadcast recorded",
             _ => "◷ Staged · needs you",
         }
     }
@@ -3192,7 +3412,10 @@ impl Action {
         let display_amount = self.amount.as_deref().map(short_activity_amount);
         let head = match (kind, &display_amount) {
             ("native_transfer", Some(amount)) => format!("Send {amount}"),
-            ("native_transfer", None) => "Send (zero value)".to_owned(),
+            ("native_transfer", None) if intent.value_wei.as_deref() == Some("0") => {
+                "Send (zero value)".to_owned()
+            }
+            ("native_transfer", None) => "Send (amount unavailable)".to_owned(),
             ("contract_call", Some(amount)) => format!("Contract call with {amount}"),
             ("contract_call", None) => "Contract call".to_owned(),
             (_, Some(amount)) => format!("Move {amount}"),
@@ -3206,8 +3429,7 @@ impl Action {
     }
 
     /// Why this row reads the way it does. The distinction that matters is
-    /// whether anything reached the network, and only a broadcast hash
-    /// settles that question.
+    /// what Bloom recorded; chain settlement requires a receipt.
     fn outcome_note(&self) -> &'static str {
         match self.state {
             "sent" if self.tx_hash.is_some() => {
@@ -3215,15 +3437,16 @@ impl Action {
                  chain's own receipt for the final outcome."
             }
             "sent" => "Bloom recorded this as sent but kept no transaction hash.",
+            "failed" if self.tx_hash.is_some() => {
+                "This operation stopped with a transaction hash recorded. Check the chain's receipt for its outcome."
+            }
             "failed" if self.awaited_approval => {
-                "This reached an approval ceremony and was never approved, so it was never \
-                 broadcast. No transaction for it exists on any chain."
+                "This reached an approval ceremony before stopping. The available record does not establish whether approval or broadcast completed."
             }
             "failed" => {
-                "This never reached the network: the record carries no result and no \
-                 transaction hash. Nothing was broadcast."
+                "This operation stopped without a recorded transaction hash. That does not prove no transaction reached the network."
             }
-            _ => "Staged and waiting for your review. Nothing has been broadcast.",
+            _ => "Staged operation. No completed broadcast is recorded here.",
         }
     }
 
@@ -4458,6 +4681,13 @@ mod tests {
 
         async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
             let text = path.to_string_path();
+            if text.ends_with("clearinghouse.json") {
+                return Ok(format!(
+                    "{{\"time\":{},\"marginSummary\":{{\"accountValue\":\"5.259383\"}}}}",
+                    now_secs() * 1000
+                )
+                .into_bytes());
+            }
             let body = if text.ends_with("clearinghouse.json") {
                 "{\"marginSummary\":{\"accountValue\":\"5.259383\"}}"
             } else if text.ends_with("unspent.json") {
@@ -4475,7 +4705,9 @@ mod tests {
         async fn list(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
             let text = path.to_string_path();
             // Deepest first: "notes/dev" also ends with "notes" prefixes.
-            let names: &[&str] = if text.ends_with("notes/dev") {
+            let names: &[&str] = if text.is_empty() || text == "/" {
+                &["hyperliquid", "privacy-pools"]
+            } else if text.ends_with("notes/dev") {
                 &["unspent.json", "spent.json"]
             } else if text.ends_with("privacy-pools/notes") {
                 &["dev"]
@@ -4529,7 +4761,7 @@ mod tests {
         assert!(html.contains("App positions"), "{html}");
         // The venue denominates equity in dollars itself, so it is priced
         // even though no quote source is reachable in this fixture.
-        assert!(html.contains("Trading account equity"), "{html}");
+        assert!(html.contains("Perpetuals account equity"), "{html}");
         assert!(html.contains("$5.26"), "{html}");
         // One unspent deposit. A spent note is gone and must not be counted.
         assert!(html.contains("1 unspent deposit"), "{html}");
@@ -4561,10 +4793,13 @@ mod tests {
         ] {
             std::fs::write(
                 &file,
-                format!("{{\"marginSummary\":{{\"accountValue\":\"{value}\"}}}}"),
+                format!(
+                    "{{\"time\":{},\"marginSummary\":{{\"accountValue\":\"{value}\"}}}}",
+                    now_secs() * 1000
+                ),
             )
             .unwrap();
-            let positions = handler
+            let (positions, _) = handler
                 .petal_positions(&[ADDRESS.to_owned(), ADDRESS.to_ascii_lowercase()])
                 .await;
             assert_eq!(positions.len(), usize::from(expected.is_some()));
@@ -4573,6 +4808,216 @@ mod tests {
         assert_eq!(money(Some(f64::INFINITY)), "Not priced");
         assert_eq!(money(Some(f64::NAN)), "Not priced");
         assert_eq!(money(Some(-5.25)), "$-5.25");
+    }
+
+    #[tokio::test]
+    async fn stale_missing_future_and_failed_app_reads_are_visible_not_zero() {
+        let fixture = fixture();
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join(format!(
+            "hyperliquid/mainnet/users/{}/clearinghouse.json",
+            ADDRESS.to_ascii_lowercase()
+        ));
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let handler = fixture
+            .handler
+            .with_petals(Arc::new(FsPetals(root.path().into())));
+        let now = now_secs() * 1000;
+        for time in [
+            serde_json::Value::Null,
+            serde_json::json!(now - (QUOTE_MAX_AGE_SECS + 1) * 1000),
+            serde_json::json!(now + 60_000),
+        ] {
+            std::fs::write(
+                &file,
+                serde_json::json!({"time":time,"marginSummary":{"accountValue":"12.5"}})
+                    .to_string(),
+            )
+            .unwrap();
+            let (positions, issues) = handler.petal_positions(&[ADDRESS.to_owned()]).await;
+            assert_eq!(positions.len(), 1);
+            assert_eq!(positions[0].value, None);
+            assert!(issues.iter().any(|issue| issue.contains("source time")));
+        }
+        std::fs::write(&file, "{broken").unwrap();
+        for page in [INDEX_HTML, WALLETS_HTML, BRIEFING_MD] {
+            let text = render(&handler, page).await;
+            assert!(text.contains("App coverage incomplete"), "{page}: {text}");
+            assert!(!text.contains("$12.50"));
+        }
+        std::fs::remove_file(&file).unwrap();
+        let (positions, issues) = handler.petal_positions(&[ADDRESS.to_owned()]).await;
+        assert!(positions.is_empty());
+        assert!(issues.iter().any(|issue| issue.contains("unavailable")));
+    }
+
+    #[test]
+    fn account_matching_preserves_solana_case_and_address_boundaries() {
+        let sol = "So11111111111111111111111111111111111111112";
+        assert!(address_path_matches(&format!("{sol}-positions.json"), sol));
+        assert!(!address_path_matches(&sol.to_lowercase(), sol));
+        assert!(!same_account_address(sol, &sol.to_lowercase()));
+        assert!(same_account_address(ADDRESS, &ADDRESS.to_lowercase()));
+        assert!(!address_path_matches(&format!("{ADDRESS}ff.json"), ADDRESS));
+        assert!(!address_path_matches("anything", ""));
+        assert!(!address_path_matches(&format!("prefix{ADDRESS}"), ADDRESS));
+    }
+
+    #[tokio::test]
+    async fn pool_records_are_exact_unvalued_and_invalid_assets_are_reported() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("privacy-pools/notes/alice");
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, asset, value) in [
+            ("valid.json", "eth", "1000000000000000001"),
+            ("wrong.json", "usdc", "1000000"),
+            ("invalid.json", "eth", "1e18"),
+        ] {
+            std::fs::write(
+                dir.join(name),
+                serde_json::json!({"asset":asset,"value":value,"status":"confirmed","spent":false})
+                    .to_string(),
+            )
+            .unwrap();
+        }
+        let handler = fixture()
+            .handler
+            .with_petals(Arc::new(FsPetals(root.path().into())));
+        let (positions, issues) = handler.petal_positions(&[]).await;
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].quantity, "1.000000000000000001 ETH");
+        assert_eq!(positions[0].value, None);
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.contains("unsupported deposit asset"))
+        );
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.contains("invalid deposit amount"))
+        );
+    }
+
+    #[tokio::test]
+    async fn recorded_network_controls_activity_links_and_currency() {
+        let fixture = fixture();
+        stage_files(
+            &fixture,
+            "sent",
+            "evm-network",
+            "# Payment\n\nChain: ethereum (id 1)\n",
+            &[
+                (
+                    "intent.json",
+                    "{\"chain\":\"ethereum\",\"chain_id\":8453,\"value_wei\":\"1000000000000000000\",\"action_kind\":\"native_transfer\"}",
+                ),
+                (
+                    "result.json",
+                    "{\"tx_hash\":\"0xabababababababababababababababababababababababababababababababab\"}",
+                ),
+            ],
+        );
+        let (actions, _) = fixture.handler.actions().await;
+        assert_eq!(
+            actions[0].amount.as_deref(),
+            Some("1000000000000000000 wei")
+        );
+        assert_eq!(
+            fixture.handler.action_chain_name(&actions[0]),
+            "EVM chain 8453"
+        );
+        assert!(
+            actions[0]
+                .chain_label(&fixture.handler.chains)
+                .contains("EVM chain 8453")
+        );
+        assert!(
+            actions[0]
+                .explorer_url()
+                .unwrap()
+                .starts_with("https://basescan.org/tx/")
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_activity_does_not_claim_nothing_needs_review() {
+        let fixture = fixture();
+        stage_files(
+            &fixture,
+            "pending",
+            "evm-broken",
+            "# Pending\n",
+            &[("intent.json", "{broken")],
+        );
+        let (_, incomplete) = fixture.handler.actions().await;
+        assert!(incomplete);
+        for page in [
+            INDEX_HTML,
+            NEXT_MOVES_HTML,
+            ACTIVITY_HTML,
+            CONTACTS_HTML,
+            BRIEFING_MD,
+        ] {
+            let html = render(&fixture.handler, page).await;
+            assert!(
+                html.contains("Activity coverage incomplete"),
+                "{page}: {html}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stopped_transaction_with_hash_does_not_claim_no_broadcast() {
+        let fixture = fixture();
+        stage_files(
+            &fixture,
+            "failed",
+            "evm-stopped",
+            "# Stopped\n",
+            &[(
+                "result.json",
+                "{\"tx_hash\":\"0xabababababababababababababababababababababababababababababababab\"}",
+            )],
+        );
+        let (actions, _) = fixture.handler.actions().await;
+        assert!(actions[0].label().contains("transaction hash recorded"));
+        assert!(
+            actions[0]
+                .outcome_note()
+                .contains("Check the chain's receipt")
+        );
+    }
+
+    struct HangingPetals;
+    #[async_trait]
+    impl Handler for HangingPetals {
+        async fn lookup(&self, _: &VfsPath) -> Result<Entry, HandlerError> {
+            Ok(Entry::dir(""))
+        }
+        async fn read(&self, _: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+            std::future::pending().await
+        }
+        async fn list(&self, _: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn app_collection_has_a_total_deadline() {
+        let handler = fixture().handler.with_petals(Arc::new(HangingPetals));
+        let (positions, issues) = tokio::time::timeout(
+            Duration::from_secs(7),
+            handler.petal_positions(&[ADDRESS.to_owned()]),
+        )
+        .await
+        .expect("app collection must finish");
+        assert!(positions.is_empty());
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.contains("collection budget"))
+        );
     }
 
     #[tokio::test]
@@ -4885,13 +5330,7 @@ mod tests {
         }
 
         async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
-            if path.to_string_path().ends_with("positions.json") {
-                Ok("{\"shares\": \"12.5\", \"market\": \"election\"}"
-                    .as_bytes()
-                    .to_vec())
-            } else {
-                Err(HandlerError::not_found(path.to_string_path()))
-            }
+            panic!("Generic app discovery must not read arbitrary contents: {path:?}")
         }
 
         async fn list(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
@@ -4916,7 +5355,7 @@ mod tests {
             .handler
             .clone()
             .with_petals(Arc::new(StubThirdPetal));
-        let positions = handler.petal_positions(&[ADDRESS.to_owned()]).await;
+        let (positions, _) = handler.petal_positions(&[ADDRESS.to_owned()]).await;
         assert_eq!(
             positions.len(),
             1,
@@ -4926,7 +5365,7 @@ mod tests {
         assert_eq!(position.petal, "polymarket");
         assert_eq!(position.value, None, "never valued without a parser");
         assert!(
-            position.note.contains("without a dollar value"),
+            position.note.contains("excluded from dollar totals"),
             "honest about the missing valuation: {}",
             position.note
         );
@@ -4992,15 +5431,6 @@ mod tests {
             "mainnet/users"
         );
         assert_eq!(super::leaf_scope("polymarket", "top.json"), "polymarket");
-        assert_eq!(
-            super::summarize_petal_leaf("{\"shares\": \"12.5\"}"),
-            "{\"shares\": \"12.5\"}"
-        );
-        assert_eq!(super::summarize_petal_leaf("  \n "), "leaf present");
-        let long = "x".repeat(200);
-        let summary = super::summarize_petal_leaf(&long);
-        assert!(summary.len() <= 123, "{summary}");
-        assert!(summary.ends_with('…'), "{summary}");
     }
 
     #[tokio::test]
@@ -5224,7 +5654,7 @@ mod tests {
         // "Failed" would overstate it: these records carry no result and no
         // hash, so the honest claim is that nothing was ever sent.
         assert!(
-            next.contains("One record never broadcast"),
+            next.contains("One record stopped"),
             "a single record must agree in number: {next}"
         );
         assert!(next.contains("Why it stopped"));
@@ -5302,8 +5732,11 @@ mod tests {
             !html.contains("reverted"),
             "nothing here is evidence of a revert: {html}"
         );
-        assert!(html.contains("Not approved"), "{html}");
-        assert!(html.contains("never broadcast"), "{html}");
+        assert!(html.contains("Approval interrupted"), "{html}");
+        assert!(
+            html.contains("does not establish whether approval or broadcast completed"),
+            "{html}"
+        );
     }
 
     #[test]

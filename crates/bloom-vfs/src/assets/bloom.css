@@ -134,6 +134,7 @@ td a { text-decoration:none; }
 .position-list strong { font-weight:550; overflow-wrap:anywhere; }
 .position-list li > :nth-child(3) { font-variant-numeric:tabular-nums; font-size:14px; }
 .position-list .position-evidence { grid-column:2 / -1; margin:0; max-width:none; text-align:left; font-size:14px; }
+.coverage-notice { overflow-wrap:anywhere; }
 .recent-state { display:grid; place-items:center; width:30px; height:30px; border-radius:50%; background:var(--tint); }
 
 /* 5. Today -------------------------------------------------------------- */

@@ -24,8 +24,8 @@ drawn from the same data as `index.html`.
   projected wallet/account identity. Native balances and Petal positions stay
   under the identity their records name. Activity-only addresses are compact
   historical observations and never become controlled wallets.
-- `activity.html` — every operation Bloom staged, broadcast, or never sent,
-  newest first, with the transaction hash where one exists.
+- `activity.html` — central-outbox operations, newest first, with recorded
+  transaction hashes. Separate Solana outboxes are not included.
 - `chains.html` — Networks: every configured network in one sortable list —
   cumulative fee totals, 24h fees and DEX volume, and what your wallets hold
   on it. Opening a row discloses the older fee periods and the 30-day daily
@@ -75,9 +75,9 @@ skin that only redefines tokens restyles every page at once:
 
 A skin may also override any rule.
 
-A skin is styling only. The pages' Content-Security-Policy still forbids
-every remote fetch and every script, whatever the stylesheet asks for, and a
-skin cannot change what a page says.
+A skin is trusted presentation code: CSS can hide warnings or alter apparent
+meaning. The Content-Security-Policy blocks remote assets and permits only the
+bundled same-origin scripts; it does not isolate the page from its stylesheet.
 
 When a person asks for a different look, edit `~/.bloom/skin.css` on the
 host; the mount itself is read-only.
@@ -98,15 +98,30 @@ These pages are deliberately narrow about what they claim:
 
 - **Broadcast** means Bloom submitted the transaction and kept the hash. It is
   not a claim that the chain accepted it. No receipt is read here.
-- **Never broadcast** means the record carries no result and no transaction
-  hash, so nothing reached any chain. It is not the same as reverted — these
-  pages never claim a revert, because they hold no evidence of one.
+- **No broadcast recorded** means no transaction hash was retained. It does
+  not prove no transaction reached a chain. An approval challenge alone does
+  not prove whether the owner approved. Stopped operations with hashes retain
+  their explorer links; settlement must be checked on chain.
 - **Holds nothing** means the network answered and reported an empty balance.
   It is listed rather than dropped, so that holding nothing stays
   distinguishable from a network that was never read.
 - A balance on a chain with no market for its native unit (a faucet or
   development chain) is shown in its own table and never priced. Its quantity
   is real; it is not money.
+- **App coverage incomplete** means a read failed, returned invalid data,
+  exceeded a discovery limit, or supplied no sufficiently recent timestamp.
+  The same warning appears in the briefing. Missing rows are not zero balances.
+- Hyperliquid shows default perpetuals-market equity in USD, not a USDC token
+  balance or the full spot/unified trading account. Only source timestamps no
+  more than five minutes old qualify for app totals; future, missing and stale
+  timestamps leave an unvalued observation. The source time is in the evidence.
+- Privacy-pool notes are local observations, never dollar-valued without
+  verified network identity and spend status. Amounts are summed in exact
+  integer base units. Other apps expose account-record metadata only: unknown
+  file contents are neither read nor treated as balances.
+- App collection has a five-second total deadline, 1 MiB supported-leaf limit,
+  256 entries per listing, and generic discovery limited to depth two,
+  24 listings and 12 records per app. Truncation is disclosed, not completeness.
 
 ## Boundaries
 
