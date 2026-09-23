@@ -881,12 +881,22 @@ impl TxEngine {
                         amount,
                     };
                     let calldata = format!("0x{}", hex::encode(call.abi_encode()));
+                    // `TokenRef.amount` is what the plan prints as a token
+                    // amount, so it is always the human figure. A caller who
+                    // wrote base units gave us the unscaled integer; scaling it
+                    // back here keeps the two representations from disagreeing
+                    // by a factor of 10^decimals in front of an owner.
+                    let display_amount = if parsed.unit == "base" {
+                        bloom_proto::format_units(amount, meta.decimals)
+                    } else {
+                        parsed.number.clone()
+                    };
                     let token_ref = TokenRef {
                         address: bloom_proto::checksum_address(&meta.address),
                         symbol: meta.symbol.clone(),
                         decimals: meta.decimals,
                         recipient: bloom_proto::checksum_address(&to_addr),
-                        amount: parsed.number.clone(),
+                        amount: display_amount,
                         amount_base_units: Some(amount.to_string()),
                     };
                     Ok((token_addr, U256::ZERO, calldata, Some(token_ref), None))
@@ -5446,6 +5456,76 @@ mod tests {
         assert_eq!(subject.total_value_usd_micro, Some(1_250_000));
         assert_eq!(calls.lock().len(), 1);
         assert_eq!(calls.lock()[0].1, "1250000");
+    }
+
+    /// A Petal stages base units, because it never converts a display amount.
+    /// The plan still has to print the human figure: `1250000 base` on a
+    /// six-decimal token is 1.25 tokens, and an owner reading `Transfer
+    /// 1250000 USDC` would misjudge it by a factor of a million.
+    #[tokio::test]
+    async fn base_unit_amounts_reach_the_plan_as_a_human_token_amount() {
+        let url = spawn_stage_rpc(false).await;
+        let oracle = RecordingOracle {
+            calls: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            usd_micro: 1_250_000,
+            age_ms: 0,
+            max_age_ms: 60_000,
+        };
+        let (engine, _dir, permit, chain) = stage_fixture(&url, oracle);
+        let token_addr: Address = "0x1111111111111111111111111111111111111111"
+            .parse()
+            .unwrap();
+        engine.token_cache.write().insert(
+            (31337, token_addr),
+            TokenMeta {
+                address: token_addr,
+                symbol: "USDC".into(),
+                decimals: 6,
+            },
+        );
+        let intent = RawIntent {
+            body: RawIntentBody::Send {
+                to: "0x2222222222222222222222222222222222222222".into(),
+                value: "0".into(),
+                token: Some(token_addr.to_string()),
+                amount: "1250000 base".into(),
+                data: None,
+            },
+            chain: Some("anvil".into()),
+            gas: bloom_proto::intent::GasStrategy::Auto,
+            nonce: None,
+            gas_limit_hint: None,
+            usd_value_hint: None,
+        };
+        let staged = engine
+            .stage(
+                &permit,
+                "alice",
+                "0x3333333333333333333333333333333333333333"
+                    .parse()
+                    .unwrap(),
+                intent,
+                &chain,
+                &policy_with_usd_cap(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(staged.action_kind, TxActionKind::Erc20Transfer);
+        let token = staged.token.as_ref().unwrap();
+        // Same transfer as `stage_erc20_transfer_uses_exact_base_units_for_oracle`,
+        // written in base units instead of a display amount: both records must
+        // come out identical.
+        assert_eq!(token.amount, "1.25");
+        assert_eq!(token.amount_base_units.as_deref(), Some("1250000"));
+        let plan = bloom_proto::PlanRender::render(&staged, "ETH", 18);
+        assert!(
+            plan.contains(
+                "Action: Transfer 1.25 USDC to 0x2222222222222222222222222222222222222222"
+            ),
+            "plan must print the human amount, got:\n{plan}"
+        );
     }
 
     #[tokio::test]
