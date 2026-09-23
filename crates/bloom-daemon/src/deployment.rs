@@ -140,6 +140,9 @@ impl Daemon {
                     }
                 }
                 rows.sort();
+                // A restaged id can briefly exist in two states (fresh
+                // pending row plus its quarantined failed row); list it once.
+                rows.dedup();
                 Ok(json!(rows))
             }
             "bloom_deploymentStatus" | "bloom_deploymentContinue" => {
@@ -238,17 +241,23 @@ impl Daemon {
                     .await
                 {
                     let success = found.status();
-                    let record = bloom_tx::outbox::MinedReceipt {
-                        outcome: if success { "success" } else { "reverted" }.into(),
-                        tx_hash: hash.into(),
-                        block_number: found.block_number,
-                        contract_address: found
-                            .contract_address
-                            .filter(|_| success)
-                            .map(|a| format!("{a:#x}")),
-                        revert_reason: None,
-                    };
-                    if self.home_write_permit.is_some() {
+                    let record = retain_revert_reason(
+                        bloom_tx::outbox::MinedReceipt {
+                            outcome: if success { "success" } else { "reverted" }.into(),
+                            tx_hash: hash.into(),
+                            block_number: found.block_number,
+                            contract_address: found
+                                .contract_address
+                                .filter(|_| success)
+                                .map(|a| format!("{a:#x}")),
+                            revert_reason: None,
+                        },
+                        receipt.as_ref(),
+                    );
+                    // Inspection is read-only (as for deployment-status.json
+                    // above): the live lookup may enrich this response, but
+                    // only Continue persists it.
+                    if !inspection && self.home_write_permit.is_some() {
                         self.tx_engine
                             .outbox
                             .write_artefact(
@@ -342,4 +351,49 @@ fn deployment_policy(
     chain: &bloom_evm::ChainClient,
 ) -> Result<bloom_proto::Policy, String> {
     bloom_vfs::advisory_exact_evm_policy(projection, &chain.spec().name, chain.spec().chain_id)
+}
+
+/// Fill a live receipt record with what the node lookup cannot provide.
+///
+/// The live lookup never carries a decoded revert reason. When the
+/// reconciler already persisted one for this entry, keep it instead of
+/// erasing it with `None`. The record always describes the entry's
+/// immutable tx hash, so the carried reason cannot cross transactions.
+fn retain_revert_reason(
+    mut record: bloom_tx::outbox::MinedReceipt,
+    persisted: Option<&bloom_tx::outbox::MinedReceipt>,
+) -> bloom_tx::outbox::MinedReceipt {
+    if record.revert_reason.is_none() {
+        record.revert_reason = persisted.and_then(|p| p.revert_reason.clone());
+    }
+    record
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn receipt(reason: Option<&str>) -> bloom_tx::outbox::MinedReceipt {
+        bloom_tx::outbox::MinedReceipt {
+            outcome: "reverted".into(),
+            tx_hash: "0xabc".into(),
+            block_number: Some(7),
+            contract_address: None,
+            revert_reason: reason.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn live_refresh_keeps_a_persisted_revert_reason() {
+        let merged = retain_revert_reason(receipt(None), Some(&receipt(Some("Error(string)"))));
+        assert_eq!(merged.revert_reason.as_deref(), Some("Error(string)"));
+        assert_eq!(merged.outcome, "reverted");
+        assert_eq!(merged.block_number, Some(7));
+    }
+
+    #[test]
+    fn live_refresh_without_a_persisted_reason_stays_empty() {
+        let merged = retain_revert_reason(receipt(None), None);
+        assert!(merged.revert_reason.is_none());
+    }
 }

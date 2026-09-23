@@ -1374,6 +1374,10 @@ impl TxEngine {
                 .validate()
                 .map_err(TxEngineError::ApprovalConstruction)?;
         }
+        // Reject an unknown review mode before reserving a nonce or writing
+        // a pending entry; signing-time validation would otherwise fail the
+        // row only after staging side effects.
+        parse_review_mode(intent.review_mode.as_deref())?;
         self.assert_write_permit(permit)?;
         let spec: &ChainSpec = chain.spec();
         if spec.legacy_tx && fee_overrides.is_some() {
@@ -1450,7 +1454,14 @@ impl TxEngine {
         let _nonce_guard = nonce_mutex.lock().await;
         if let Some((id, _)) = deployment {
             match self.outbox.read(wallet, &spec.name, id) {
-                Ok(entry) => return Ok(entry.staged),
+                // A failed row is terminal: fall through and restage the
+                // same id under the current policy instead of replaying the
+                // dead row as a fresh stage. The stale failed/<id> dir stays
+                // quarantined on disk; `read` prefers the fresh pending row.
+                Ok(entry) if entry.state != OutboxState::Failed => {
+                    return Ok(entry.staged);
+                }
+                Ok(_) => {}
                 Err(OutboxError::NotFound(_)) => {}
                 Err(error) => return Err(error.into()),
             }
@@ -4470,15 +4481,15 @@ async fn evm_signing_key(
     }
 }
 
-/// The review the staged row asked for.
+/// Parse a review mode named by an intent or a staged row.
 ///
 /// An unrecognised value is an error rather than a default: a row asking for
 /// a mode this build does not know must not be prepared under some other
 /// one, because the difference is exactly what the owner will be shown.
-fn requested_review_mode(
-    staged: &StagedTx,
+fn parse_review_mode(
+    mode: Option<&str>,
 ) -> Result<Option<bloom_broker_api::ReviewMode>, TxEngineError> {
-    match staged.review_mode.as_deref() {
+    match mode {
         None => Ok(None),
         Some("clear") => Ok(Some(bloom_broker_api::ReviewMode::Clear)),
         Some("opaque_exact") => Ok(Some(bloom_broker_api::ReviewMode::OpaqueExact)),
@@ -4486,6 +4497,13 @@ fn requested_review_mode(
             "unknown review mode `{other}`; use `clear`, `opaque_exact`, or omit it"
         ))),
     }
+}
+
+/// The review the staged row asked for.
+fn requested_review_mode(
+    staged: &StagedTx,
+) -> Result<Option<bloom_broker_api::ReviewMode>, TxEngineError> {
+    parse_review_mode(staged.review_mode.as_deref())
 }
 
 fn exact_evm_sign_request(
@@ -5455,13 +5473,19 @@ mod tests {
     /// tx crate makes the valuation tests independent of a running node and
     /// exercises the complete chain/session/nonce/gas/balance path.
     async fn spawn_stage_rpc(include_code: bool) -> String {
+        spawn_queued_rpc(stage_rpc_responses(include_code)).await
+    }
+
+    /// Serve one queued result per method, in order. Tests that stage several
+    /// transactions against one server repeat the queues they consume.
+    async fn spawn_queued_rpc(responses: HashMap<String, Vec<String>>) -> String {
         use std::net::SocketAddr;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr: SocketAddr = listener.local_addr().unwrap();
-        let responses = Arc::new(parking_lot::Mutex::new(stage_rpc_responses(include_code)));
+        let responses = Arc::new(parking_lot::Mutex::new(responses));
         tokio::spawn(async move {
             loop {
                 let (mut socket, _) = match listener.accept().await {
@@ -6240,6 +6264,118 @@ mod tests {
             decision,
             bloom_proto::AutonomyDecision::ApprovedAutonomous { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn stage_rejects_unknown_review_mode_before_any_write() {
+        let url = spawn_stage_rpc(true).await;
+        let oracle = RecordingOracle {
+            calls: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            usd_micro: 42_000_000,
+            age_ms: 0,
+            max_age_ms: 60_000,
+        };
+        let (engine, _dir, permit, chain) = stage_fixture(&url, oracle);
+        let from: Address = TEST_SIGNER_ADDRESS.parse().unwrap();
+        let body = r#"{"kind":"deploy","data":"0x60006000f3","value":"123 wei"}"#;
+        let mut intent = crate::intent_parser::parse(body).unwrap();
+        intent.review_mode = Some("Clear".into());
+        let error = engine
+            .stage(
+                &permit,
+                "alice",
+                from,
+                intent,
+                &chain,
+                &Policy::default(),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, TxEngineError::ApprovalConstruction(reason) if reason.contains("unknown review mode")),
+            "{error:?}"
+        );
+        // The rejection happens before any nonce reservation or outbox write.
+        assert!(
+            engine
+                .outbox
+                .list("alice", "anvil", OutboxState::Pending)
+                .unwrap()
+                .is_empty()
+        );
+        // A known mode still stages.
+        let mut intent = crate::intent_parser::parse(body).unwrap();
+        intent.review_mode = Some("opaque_exact".into());
+        let staged = engine
+            .stage(
+                &permit,
+                "alice",
+                from,
+                intent,
+                &chain,
+                &Policy::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(staged.review_mode.as_deref(), Some("opaque_exact"));
+    }
+
+    #[tokio::test]
+    async fn stage_deployment_restages_a_failed_row_instead_of_replaying_it() {
+        // Two stagings against one server: repeat every queued response.
+        let mut responses = stage_rpc_responses(true);
+        for queue in responses.values_mut() {
+            queue.extend(queue.clone());
+            queue.extend(queue.clone());
+        }
+        let url = spawn_queued_rpc(responses).await;
+        let oracle = RecordingOracle {
+            calls: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            usd_micro: 42_000_000,
+            age_ms: 0,
+            max_age_ms: 60_000,
+        };
+        let (engine, _dir, permit, chain) = stage_fixture(&url, oracle);
+        let from: Address = TEST_SIGNER_ADDRESS.parse().unwrap();
+        let request = crate::deployment::DeploymentTransaction {
+            chain_id: 31337,
+            from,
+            to: None,
+            data: "0x60006000f3".into(),
+            value: U256::ZERO,
+            nonce: Some(0),
+            gas: None,
+            gas_price: None,
+            max_fee_per_gas: None,
+            max_priority_fee_per_gas: None,
+        };
+        let policy = Policy::default();
+        let first = engine
+            .stage_deployment(&permit, "alice", &request, &chain, &policy)
+            .await
+            .unwrap();
+        assert!(first.id.starts_with("deploy-"));
+        // Simulate the row dying: a hard policy deny at confirm, a user
+        // cancel, or any other terminal transition to Failed.
+        let entry = engine
+            .outbox
+            .read_in_state("alice", "anvil", &first.id, OutboxState::Pending)
+            .unwrap();
+        engine
+            .outbox
+            .transition(&entry, OutboxState::Failed)
+            .unwrap();
+        // A retry of the same request must restage under the current policy
+        // and come back resumable — not replay the dead row as "staged".
+        let second = engine
+            .stage_deployment(&permit, "alice", &request, &chain, &policy)
+            .await
+            .unwrap();
+        assert_eq!(second.id, first.id);
+        let live = engine.outbox.read("alice", "anvil", &first.id).unwrap();
+        assert_eq!(live.state, OutboxState::Pending);
     }
 
     #[tokio::test]

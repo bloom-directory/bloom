@@ -172,6 +172,10 @@ creation, and successful mined receipts persist the node's actual
 prediction from sender and nonce; constructor effects and ownership are not
 verified from arbitrary bytecode.
 
+Creation rows require this build to read: `to: null` with `ContractCreation`
+does not deserialize in older Machines, so do not downgrade a Machine with
+staged or sent deployments in its outbox — re-upgrade before confirming them.
+
 Creation requires exact payload approval and an explicit canonical policy entry
 `{"chain":"evm-<numeric-chain-id>","destination":"exact"}`. On that chain the
 entry replaces Machine's advisory recipient allowlist with exact owner review for

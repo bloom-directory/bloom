@@ -297,3 +297,87 @@ pub async fn run(endpoint: ResolvedEndpoint, args: DeployArgs) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ResolvedEndpoint;
+    use axum::extract::State;
+
+    fn bridge() -> Bridge {
+        Bridge {
+            endpoint: ResolvedEndpoint {
+                socket: std::path::PathBuf::from("/tmp/bloom-test.sock"),
+                display: "unix:/tmp/bloom-test.sock".into(),
+            },
+            wallet: "alice".into(),
+            chain: "anvil".into(),
+            host: "127.0.0.1:1234".into(),
+            slots: Arc::new(tokio::sync::Semaphore::new(32)),
+        }
+    }
+
+    #[tokio::test]
+    async fn request_rejects_malformed_calls_before_contacting_machine() {
+        let bridge = bridge();
+        // No ID: rejected without touching the Machine socket.
+        let reply = bridge
+            .request(json!({"jsonrpc": "2.0", "method": "eth_chainId"}))
+            .await;
+        assert_eq!(reply["error"]["code"], -32600);
+        // Wrong protocol version.
+        let reply = bridge
+            .request(json!({"jsonrpc": "1.0", "id": 1, "method": "eth_chainId"}))
+            .await;
+        assert_eq!(reply["error"]["code"], -32600);
+        // Missing method.
+        let reply = bridge.request(json!({"jsonrpc": "2.0", "id": 1})).await;
+        assert_eq!(reply["error"]["message"], "method is required");
+        // Continue over HTTP would bypass the explicit resume step.
+        let reply = bridge
+            .request(
+                json!({"jsonrpc": "2.0", "id": 1, "method": "bloom_deploymentContinue", "params": ["deploy-abc"]}),
+            )
+            .await;
+        assert_eq!(reply["error"]["code"], -32601);
+    }
+
+    #[tokio::test]
+    async fn handle_enforces_origin_host_and_batch_limits() {
+        let bridge = bridge();
+        let single = Json(json!({"jsonrpc": "2.0", "id": 1, "method": "eth_chainId"}));
+        // Browser origins are never served.
+        let mut headers = HeaderMap::new();
+        headers.insert("origin", "http://localhost:3000".parse().unwrap());
+        headers.insert("host", "127.0.0.1:1234".parse().unwrap());
+        assert_eq!(
+            handle(State(bridge.clone()), headers, single.clone())
+                .await
+                .unwrap_err(),
+            StatusCode::FORBIDDEN
+        );
+        // Host must be the bound loopback address (token alone is not enough).
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "evil.example".parse().unwrap());
+        assert_eq!(
+            handle(State(bridge.clone()), headers, single.clone())
+                .await
+                .unwrap_err(),
+            StatusCode::FORBIDDEN
+        );
+        // Batches are bounded on both ends.
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "127.0.0.1:1234".parse().unwrap());
+        for batch in [
+            json!([]),
+            json!(vec![json!({"jsonrpc": "2.0", "id": 1, "method": "x"}); 17]),
+        ] {
+            assert_eq!(
+                handle(State(bridge.clone()), headers.clone(), Json(batch))
+                    .await
+                    .unwrap_err(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+    }
+}
