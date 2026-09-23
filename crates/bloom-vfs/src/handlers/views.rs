@@ -983,6 +983,7 @@ impl ViewsHandler {
                     chain,
                     amount,
                     tx_hash,
+                    fee: None,
                     awaited_approval,
                     intent,
                     id,
@@ -994,7 +995,56 @@ impl ViewsHandler {
         // Newest first, by when the intent was created rather than when its
         // directory was last touched: a retry must not reorder history.
         actions.sort_by(|a, b| b.when().cmp(&a.when()).then_with(|| a.id.cmp(&b.id)));
+        self.resolve_fees(&mut actions).await;
         actions
+    }
+
+    /// The paid gas fee for every action whose receipt resolves, read from
+    /// the chain itself through this daemon's own registry. Receipts fetch
+    /// concurrently under one budget each, like balances; an unresolvable
+    /// receipt leaves the row without a fee rather than with a guess.
+    async fn resolve_fees(&self, actions: &mut [Action]) {
+        let mut reads = tokio::task::JoinSet::new();
+        for (n, action) in actions.iter().enumerate() {
+            let (Some(chain), Some(hash)) = (action.chain.clone(), action.tx_hash.clone()) else {
+                continue;
+            };
+            let Some(client) = self.chains.get(&chain) else {
+                continue;
+            };
+            let Ok(hash) = hash.parse::<alloy::primitives::B256>() else {
+                continue;
+            };
+            reads.spawn(async move {
+                let receipt =
+                    match tokio::time::timeout(BALANCE_TIMEOUT, client.receipt(hash)).await {
+                        Ok(Ok(receipt)) => receipt,
+                        Ok(Err(error)) => {
+                            tracing::debug!(chain = %chain, error = %error, "views.receipt_unavailable");
+                            None
+                        }
+                        Err(_) => {
+                            tracing::debug!(chain = %chain, "views.receipt_timeout");
+                            None
+                        }
+                    };
+                (n, receipt, client.spec().native_decimals, client.spec().native_symbol.clone())
+            });
+        }
+        while let Some(joined) = reads.join_next().await {
+            let Ok((n, receipt, decimals, symbol)) = joined else {
+                continue;
+            };
+            let Some(receipt) = receipt else {
+                continue;
+            };
+            actions[n].fee = Some(format_fee(
+                receipt.gas_used,
+                receipt.effective_gas_price,
+                decimals,
+                &symbol,
+            ));
+        }
     }
 
     /// A native-unit amount on a chain this daemon has configured. Without
@@ -3046,8 +3096,6 @@ struct Intent {
     recipient: Option<String>,
     value_wei: Option<String>,
     action_kind: Option<String>,
-    nonce: Option<u64>,
-    gas_limit: Option<u64>,
     created_ms: Option<u64>,
     usd_value: Option<f64>,
     data_hex: Option<String>,
@@ -3069,6 +3117,10 @@ struct Action {
     /// The broadcast hash Bloom kept. Its presence is what separates an
     /// operation that reached the network from one that never did.
     tx_hash: Option<String>,
+    /// The paid gas fee as read from the on-chain receipt, formatted with
+    /// the chain's native unit ("0.00042 ETH"). Present only when the
+    /// receipt resolved; a staged cap never stands in for it.
+    fee: Option<String>,
     /// Whether this operation reached an approval ceremony.
     awaited_approval: bool,
 }
@@ -3292,6 +3344,9 @@ impl Action {
             if let Some(from) = &intent.from {
                 row_fact("From", format!("<code>{}</code>", html_escape(from)));
             }
+            // The chain this action ran on, when the record names one the
+            // daemon knows: contract targets link to its explorer.
+            let chain_id = self.intent.as_ref().and_then(|intent| intent.chain_id);
             if let Some(to) = &intent.to {
                 let classification = self.target_classification().unwrap_or("unknown");
                 // A saved name earns a prefix; otherwise the full address is
@@ -3302,8 +3357,9 @@ impl Action {
                 row_fact(
                     "To",
                     format!(
-                        "{named}<code>{}</code> <small>({classification})</small>",
+                        "{named}<code>{}</code> <small>({classification})</small>{explorer}",
                         html_escape(to),
+                        explorer = explorer_address_link(chain_id, to),
                     ),
                 );
             }
@@ -3319,9 +3375,10 @@ impl Action {
                     row_fact(
                         "Recipient",
                         format!(
-                            "{} <code>{}</code>",
+                            "{} <code>{}</code>{explorer}",
                             html_escape(&address_label(address_book, &recipient)),
                             html_escape(&recipient),
+                            explorer = explorer_address_link(chain_id, &recipient),
                         ),
                     );
                 }
@@ -3330,11 +3387,11 @@ impl Action {
                 "Value",
                 html_escape(self.amount.as_deref().unwrap_or("None — zero value")),
             );
-            if let Some(nonce) = intent.nonce {
-                row_fact("Nonce", nonce.to_string());
-            }
-            if let Some(gas) = intent.gas_limit {
-                row_fact("Gas limit", html_escape(&thousands_int(gas)));
+            // The paid fee from the on-chain receipt, never the staged cap:
+            // a limit is what the operation might have burned, the receipt
+            // is what it did. Absent until the receipt resolves.
+            if let Some(fee) = &self.fee {
+                row_fact("Gas fee", html_escape(fee));
             }
             if let Some(usd) = intent.usd_value {
                 row_fact("Value when staged", html_escape(&money(Some(usd))));
@@ -3407,8 +3464,6 @@ fn parse_intent(text: &str) -> Option<Intent> {
         recipient: string("recipient"),
         value_wei: string("value_wei"),
         action_kind: string("action_kind"),
-        nonce: number("nonce"),
-        gas_limit: number("gas_limit"),
         created_ms: number("created_ms"),
         usd_value: value.get("usd_value").and_then(|field| field.as_f64()),
         data_hex,
@@ -3613,6 +3668,14 @@ fn signed_percent(value: Option<f64>) -> String {
     }
 }
 
+/// A paid gas fee from receipt fields: units burned times the effective
+/// price, in the chain's native unit. Exact integer math; the row trims it.
+fn format_fee(used: u64, price_wei: u128, decimals: u8, symbol: &str) -> String {
+    let wei = (used as u128).saturating_mul(price_wei);
+    let quantity = bloom_proto::format_units(alloy::primitives::U256::from(wei), decimals);
+    format!("{} {symbol}", trim_trailing_zeros(&quantity))
+}
+
 /// Direction class for a 24h change: green when up, red when down, none
 /// when flat or unknown. An unknown change is not a flat market, so it
 /// carries no direction at all.
@@ -3681,19 +3744,6 @@ fn decoded_evm_transfer_recipient(data: &str) -> Option<String> {
     let start = 8 + word * 64 + 24;
     let address = format!("0x{}", hex.get(start..start + 40)?);
     normalized_evm_address(&address)
-}
-
-/// Group an integer for reading: `535693` → `535,693`.
-fn thousands_int(value: u64) -> String {
-    let digits = value.to_string();
-    let mut grouped = String::new();
-    for (index, digit) in digits.chars().enumerate() {
-        if index > 0 && (digits.len() - index).is_multiple_of(3) {
-            grouped.push(',');
-        }
-        grouped.push(digit);
-    }
-    grouped
 }
 
 /// `11 Sep 2026`, for grouping a ledger by day.
@@ -3914,34 +3964,58 @@ fn native_asset_has_market(chain_id: u64) -> bool {
 /// explorer themselves. Following one is the reader's own choice: these pages
 /// never fetch from an explorer, and `referrer=no-referrer` keeps the visit
 /// unattributed.
-const EXPLORERS: &[(u64, &str)] = &[
-    (1, "https://etherscan.io"),
-    (10, "https://optimistic.etherscan.io"),
-    (56, "https://bscscan.com"),
-    (100, "https://gnosisscan.io"),
-    (137, "https://polygonscan.com"),
-    (999, "https://hyperevmscan.io"),
-    (4663, "https://robinhoodchain.blockscout.com"),
-    (8453, "https://basescan.org"),
-    (42161, "https://arbiscan.io"),
-    (43114, "https://snowtrace.io"),
-    (59144, "https://lineascan.build"),
-    (81457, "https://blastscan.io"),
-    (534352, "https://scrollscan.com"),
+const EXPLORERS: &[(u64, &str, &str)] = &[
+    (1, "https://etherscan.io", "Etherscan"),
+    (10, "https://optimistic.etherscan.io", "Optimism Etherscan"),
+    (56, "https://bscscan.com", "BscScan"),
+    (100, "https://gnosisscan.io", "Gnosisscan"),
+    (137, "https://polygonscan.com", "Polygonscan"),
+    (999, "https://hyperevmscan.io", "HyperEVMScan"),
+    (
+        4663,
+        "https://robinhoodchain.blockscout.com",
+        "Robinhood Blockscout",
+    ),
+    (8453, "https://basescan.org", "Basescan"),
+    (42161, "https://arbiscan.io", "Arbiscan"),
+    (43114, "https://snowtrace.io", "Snowtrace"),
+    (59144, "https://lineascan.build", "Lineascan"),
+    (81457, "https://blastscan.io", "Blastscan"),
+    (534352, "https://scrollscan.com", "Scrollscan"),
 ];
 
 fn explorer_tx_url(chain_id: u64, hash: &str) -> Option<String> {
     EXPLORERS
         .iter()
-        .find(|(id, _)| *id == chain_id)
-        .map(|(_, base)| format!("{base}/tx/{hash}"))
+        .find(|(id, _, _)| *id == chain_id)
+        .map(|(_, base, _)| format!("{base}/tx/{hash}"))
 }
 
 fn explorer_address_url(chain_id: u64, address: &str) -> Option<String> {
     EXPLORERS
         .iter()
-        .find(|(id, _)| *id == chain_id)
-        .map(|(_, base)| format!("{base}/address/{address}"))
+        .find(|(id, _, _)| *id == chain_id)
+        .map(|(_, base, _)| format!("{base}/address/{address}"))
+}
+
+/// A "View on {explorer} ↗" link for an address on a known chain, or nothing
+/// when the chain is unknown: a link to the wrong explorer is worse than
+/// none.
+fn explorer_address_link(chain_id: Option<u64>, address: &str) -> String {
+    let Some(chain_id) = chain_id else {
+        return String::new();
+    };
+    let Some((_, _, name)) = EXPLORERS.iter().find(|(id, _, _)| *id == chain_id) else {
+        return String::new();
+    };
+    let Some(url) = explorer_address_url(chain_id, address) else {
+        return String::new();
+    };
+    format!(
+        " <a class=\"external-link\" href=\"{}\" rel=\"noreferrer noopener\">View on {} ↗</a>",
+        html_escape(&url),
+        html_escape(name),
+    )
 }
 
 fn coingecko_market_url(id: &str) -> String {
@@ -4914,6 +4988,55 @@ mod tests {
     }
 
     #[test]
+    fn a_paid_fee_reads_as_native_not_as_a_limit() {
+        assert_eq!(
+            super::format_fee(21_000, 1_000_000_000, 18, "ETH"),
+            "0.000021 ETH"
+        );
+        assert_eq!(super::format_fee(0, 1_000_000_000, 18, "ETH"), "0 ETH");
+    }
+
+    #[test]
+    fn explorer_links_name_the_chain_or_nothing() {
+        assert!(
+            super::explorer_address_link(Some(8453), "0x000000000000000000000000000000000000dEaD")
+                .contains("basescan.org")
+        );
+        assert_eq!(super::explorer_address_link(Some(31337), "0xabc"), "");
+        assert_eq!(super::explorer_address_link(None, "0xabc"), "");
+    }
+
+    #[tokio::test]
+    async fn a_contract_target_links_to_its_chain_explorer() {
+        let fixture = fixture();
+        stage_files(
+            &fixture,
+            "sent",
+            "evm-0300",
+            "# Approve spend\\n\\nWallet: primary\\nChain:  base (id 8453)\\n",
+            &[
+                (
+                    "intent.json",
+                    "{\"chain\":\"base\",\"chain_id\":8453,\"from\":\"0x5c3d61167D9dfa2E4171416D08484220F1374456\",\"to\":\"0x6818809EefCe719E480a7526D76bD3e561526b46\",\"value_wei\":\"0\",\"action_kind\":\"contract_call\"}",
+                ),
+                (
+                    "result.json",
+                    "{\"tx_hash\":\"0x4b81a384e07d30624b9dc420b0f1c12e4f9a1d3cf027bdd4a1ab868225eb1748\"}",
+                ),
+            ],
+        );
+        let html = render(&fixture.handler, ACTIVITY_HTML).await;
+        assert!(
+            html.contains("basescan.org/address/0x6818809EefCe719E480a7526D76bD3e561526b46"),
+            "the contract target links to its explorer: {html}"
+        );
+        // No staged cap stands in for the paid fee: the fixture registry
+        // cannot resolve a receipt, so no fee row renders at all.
+        assert!(!html.contains("Gas limit"), "{html}");
+        assert!(!html.contains("Gas fee"), "{html}");
+    }
+
+    #[test]
     fn market_direction_colors_up_down_and_nothing_else() {
         assert_eq!(super::change_direction(Some(1.5)), "up");
         assert_eq!(super::change_direction(Some(-0.2)), "down");
@@ -5221,7 +5344,7 @@ mod tests {
             html.contains("Bloom broadcast this and kept the hash"),
             "{html}"
         );
-        // Counterparty and nonce come from the intent, not the plan title.
+        // The counterparty comes from the intent, not the plan title.
         assert!(
             html.contains("0x6818809EefCe719E480a7526D76bD3e561526b46"),
             "{html}"
@@ -5258,7 +5381,6 @@ mod tests {
         assert_eq!(trim_trailing_zeros("0.010000000000000000"), "0.01");
         assert_eq!(trim_trailing_zeros("1.000000"), "1");
         assert_eq!(trim_trailing_zeros("42"), "42");
-        assert_eq!(thousands_int(535_693), "535,693");
         assert_eq!(format_utc_day(1_789_158_600_000), "11 Sep 2026");
         // A faucet chain hands out balances sixty digits long. Left whole,
         // one row wraps into a blob that swamps every real holding.
