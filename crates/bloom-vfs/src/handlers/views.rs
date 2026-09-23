@@ -492,7 +492,10 @@ impl ViewsHandler {
         // Venue account equity, per address the daemon knows about.
         let mut seen: Vec<String> = Vec::new();
         for address in addresses {
-            let lowered = address.to_ascii_lowercase();
+            let Some(lowered) = normalized_evm_address(address) else {
+                continue;
+            };
+            let lowered = lowered.to_ascii_lowercase();
             if seen.contains(&lowered) {
                 continue;
             }
@@ -509,7 +512,7 @@ impl ViewsHandler {
                         .and_then(|field| field.as_str())
                         .and_then(|text| text.parse::<f64>().ok())
                 });
-            let Some(equity) = equity.filter(|equity| *equity > 0.0) else {
+            let Some(equity) = equity.filter(|equity| equity.is_finite() && *equity != 0.0) else {
                 continue;
             };
             positions.push(PetalPosition {
@@ -562,6 +565,9 @@ impl ViewsHandler {
                     .get("value")
                     .and_then(|field| field.as_str())
                     .and_then(|text| text.parse::<f64>().ok())
+                    .filter(|amount| {
+                        amount.is_finite() && *amount > 0.0 && (wei + amount).is_finite()
+                    })
                 else {
                     continue;
                 };
@@ -599,7 +605,8 @@ impl ViewsHandler {
             .await
             .ok()?
             .ok()?;
-        fresh_quote(quote.timestamp, now_secs()).then_some(quote.price)
+        (quote.price.is_finite() && quote.price >= 0.0 && fresh_quote(quote.timestamp, now_secs()))
+            .then_some(quote.price)
     }
 
     /// Value what can be valued. A native asset is priced only on a chain
@@ -628,7 +635,11 @@ impl ViewsHandler {
                 }
             };
             match tokio::time::timeout(PRICE_TIMEOUT, self.prices.current(coin)).await {
-                Ok(Ok(quote)) if quote.price >= 0.0 && fresh_quote(quote.timestamp, now) => {
+                Ok(Ok(quote))
+                    if quote.price.is_finite()
+                        && quote.price >= 0.0
+                        && fresh_quote(quote.timestamp, now) =>
+                {
                     quotes.insert(key, quote.price);
                 }
                 Ok(Ok(_)) => {
@@ -651,7 +662,8 @@ impl ViewsHandler {
                 continue;
             };
             if let Some(price) = quotes.get(key) {
-                holding.value = Some(holding.amount * price);
+                holding.value = Some(holding.amount * price).filter(|value| value.is_finite());
+                portfolio.price_coverage_gap |= holding.value.is_none();
             }
         }
     }
@@ -822,7 +834,7 @@ impl ViewsHandler {
                     priced = count_noun(priced.len(), "priced holding", "priced holdings"),
                 ),
                 format!(
-                    "{unpriced} unpriced, and left out of this total. Not your net worth.",
+                    "{unpriced} unpriced, and left out of this total.",
                     unpriced = count_noun(unpriced, "holding is", "holdings are"),
                 ),
             )
@@ -921,9 +933,11 @@ impl ViewsHandler {
             ));
         }
         let recent: String = actions.iter().take(4).map(|action| format!(
-            "<li><span class=\"recent-state {}\">{}</span><span><strong>{}</strong><small>{}</small></span><span>{}</span></li>",
+            "<li><span class=\"recent-state {}\">{}</span><span><strong>{}</strong><small>{}</small>{}</span><span>{}</span></li>",
             action.status_class(), action.glyph(), html_escape(&action.headline(&self.address_book)),
-            html_escape(action.label()), action.chain_label(&self.chains)
+            html_escape(action.label()), action.explorer_url().map(|url| format!(
+                "<a class=\"external-link\" href=\"{}\" rel=\"noreferrer noopener\">View transaction ↗</a>", html_escape(&url)
+            )).unwrap_or_default(), action.chain_label(&self.chains)
         )).collect();
         body.push_str(&format!("<section><div class=\"section-head\"><h2>Recent activity</h2><a href=\"activity.html\">All activity →</a></div>{}</section>",
             if recent.is_empty() { "<p class=\"empty-state\">No activity yet.</p>".to_owned() } else { format!("<ul class=\"position-list\">{recent}</ul>") }
@@ -2048,7 +2062,7 @@ fn petal_position_rows(positions: &[&PetalPosition]) -> String {
         .iter()
         .map(|position| {
             format!(
-                "<li>{mark}<span><strong>{label}</strong><small>{petal} · {scope} · {quantity}</small>{link}<details><summary>Position evidence</summary><p>{note}</p><code>{source}</code></details></span><strong>{value}</strong></li>",
+                "<li class=\"app-position\">{mark}<span><strong>{label}</strong><small>{petal} · {scope} · {quantity}</small>{link}</span><strong>{value}</strong><details class=\"position-evidence\"><summary>Position evidence</summary><p>{note}</p><code>{source}</code></details></li>",
                 mark = monogram(&position.petal),
                 label = html_escape(&position.label),
                 petal = html_escape(&position.petal),
@@ -2453,15 +2467,15 @@ impl Action {
         let Some(chain) = self.chain.as_deref() else {
             return "—".to_owned();
         };
-        let client = chains.get(chain);
+        let recorded_id = self.intent.as_ref().and_then(|intent| intent.chain_id);
+        let client = chains
+            .get(chain)
+            .filter(|client| recorded_id.is_none_or(|id| id == client.spec().chain_id));
         let label = client
             .as_ref()
             .and_then(|client| client.spec().display_name.as_deref())
             .unwrap_or(chain);
-        let chain_id = client
-            .as_ref()
-            .map(|client| client.spec().chain_id)
-            .or_else(|| self.intent.as_ref().and_then(|intent| intent.chain_id));
+        let chain_id = recorded_id.or_else(|| client.as_ref().map(|client| client.spec().chain_id));
         asset_label_with(
             chain_id
                 .map(|id| network_mark(id, label))
@@ -3326,6 +3340,10 @@ const EXPLORERS: &[(u64, &str)] = &[
 ];
 
 fn explorer_tx_url(chain_id: u64, hash: &str) -> Option<String> {
+    let hex = hash.strip_prefix("0x")?;
+    if hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
     EXPLORERS
         .iter()
         .find(|(id, _)| *id == chain_id)
@@ -3382,7 +3400,7 @@ fn now_secs() -> u64 {
 
 /// `$1,234.56`, or an explicit absence. A missing price is never a zero.
 fn money(value: Option<f64>) -> String {
-    match value {
+    match value.filter(|value| value.is_finite()) {
         None => "Not priced".to_owned(),
         Some(value) => format!("${}", thousands(value)),
     }
@@ -3889,6 +3907,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn trading_equity_preserves_losses_and_rejects_nonfinite_values() {
+        let fixture = fixture();
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join(format!(
+            "hyperliquid/mainnet/users/{}/clearinghouse.json",
+            ADDRESS.to_ascii_lowercase()
+        ));
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let handler = fixture
+            .handler
+            .with_petals(Arc::new(FsPetals(root.path().into())));
+        for (value, expected) in [
+            ("-5.25", Some(-5.25)),
+            ("5.25", Some(5.25)),
+            ("inf", None),
+            ("NaN", None),
+            ("0", None),
+        ] {
+            std::fs::write(
+                &file,
+                format!("{{\"marginSummary\":{{\"accountValue\":\"{value}\"}}}}"),
+            )
+            .unwrap();
+            let positions = handler
+                .petal_positions(&[ADDRESS.to_owned(), ADDRESS.to_ascii_lowercase()])
+                .await;
+            assert_eq!(positions.len(), usize::from(expected.is_some()));
+            assert_eq!(positions.first().and_then(|p| p.value), expected);
+        }
+        assert_eq!(money(Some(f64::INFINITY)), "Not priced");
+        assert_eq!(money(Some(f64::NAN)), "Not priced");
+        assert_eq!(money(Some(-5.25)), "$-5.25");
+    }
+
+    #[tokio::test]
     async fn wallets_page_renders_every_projected_wallet() {
         let mut fixture = fixture();
         let reader = crate::test_support::wallet_projection_reader("first", ADDRESS);
@@ -4204,7 +4257,7 @@ mod tests {
             &[
                 (
                     "intent.json",
-                    "{\"chain\":\"ethereum\",\"from\":\"0x5c3d61167D9dfa2E4171416D084842\
+                    "{\"chain\":\"ethereum\",\"chain_id\":1,\"from\":\"0x5c3d61167D9dfa2E4171416D084842\
                      20F1374456\",\"to\":\"0x6818809EefCe719E480a7526D76bD3e561526b46\",\
                      \"value_wei\":\"10000000000000000\",\"action_kind\":\"native_transfer\",\
                      \"nonce\":2,\"gas_limit\":535693}",
@@ -4233,6 +4286,10 @@ mod tests {
             html.contains("0x6818809EefCe719E480a7526D76bD3e561526b46"),
             "{html}"
         );
+        let today = render(&fixture.handler, INDEX_HTML).await;
+        assert!(today.contains("https://etherscan.io/tx/0x4b81a384e07d30624b9dc420b0f1c12e4f9a1d3cf027bdd4a1ab868225eb1748"));
+        assert!(today.contains("View transaction ↗"));
+        assert!(!today.contains("Not your net worth"));
     }
 
     #[tokio::test]
@@ -4514,14 +4571,25 @@ mod tests {
 
     #[test]
     fn a_broadcast_hash_links_to_its_own_chain_explorer() {
+        let hash = format!("0x{}", "ab".repeat(32));
         assert_eq!(
-            explorer_tx_url(1, "0xabc").as_deref(),
-            Some("https://etherscan.io/tx/0xabc")
+            explorer_tx_url(1, &hash),
+            Some(format!("https://etherscan.io/tx/{hash}"))
         );
         assert_eq!(
-            explorer_tx_url(8453, "0xabc").as_deref(),
-            Some("https://basescan.org/tx/0xabc")
+            explorer_tx_url(8453, &hash),
+            Some(format!("https://basescan.org/tx/{hash}"))
         );
+        assert_eq!(
+            explorer_tx_url(137, &hash),
+            Some(format!("https://polygonscan.com/tx/{hash}"))
+        );
+        assert_eq!(
+            explorer_tx_url(56, &hash),
+            Some(format!("https://bscscan.com/tx/{hash}"))
+        );
+        assert_eq!(explorer_tx_url(1, "0xabc"), None);
+        assert_eq!(explorer_tx_url(1, &format!("{hash}/../elsewhere")), None);
         assert_eq!(
             explorer_address_url(81457, "0xabc").as_deref(),
             Some("https://blastscan.io/address/0xabc")
@@ -4906,11 +4974,18 @@ mod tests {
                  Mainnet; requires up to 0.010084679918 ETH. Fund the account and restage \
                  this transaction before approving.\n",
             );
-            stage(
+            stage_files(
                 &staged,
                 "sent",
                 "evm-75fb67132a5af7ffb607c2590b60c414",
                 "# Send 0.05 ETH\n\nWallet: everyday\nChain:  base (id 8453)\n",
+                &[
+                    ("intent.json", "{\"chain\":\"base\",\"chain_id\":8453}"),
+                    (
+                        "result.json",
+                        "{\"tx_hash\":\"0xabababababababababababababababababababababababababababababababab\"}",
+                    ),
+                ],
             );
             stage(
                 &staged,
