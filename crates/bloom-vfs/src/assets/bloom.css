@@ -118,10 +118,9 @@ td a { text-decoration:none; }
 .money { overflow-wrap:anywhere; font-variant-numeric:tabular-nums; }
 .market-table th:first-child,.market-table td:first-child { width:40%; }
 .market-table th:not(:first-child),.market-table td:not(:first-child) { width:20%; }
-.holdings-table th:nth-child(1),.holdings-table td:nth-child(1) { width:29%; }
-.holdings-table th:nth-child(2),.holdings-table td:nth-child(2) { width:27%; }
-.holdings-table th:nth-child(3),.holdings-table td:nth-child(3) { width:16%; }
-.holdings-table th:nth-child(4),.holdings-table td:nth-child(4) { width:28%; }
+.holdings-table th:nth-child(1),.holdings-table td:nth-child(1) { width:40%; }
+.holdings-table th:nth-child(2),.holdings-table td:nth-child(2) { width:40%; }
+.holdings-table th:nth-child(3),.holdings-table td:nth-child(3) { width:20%; }
 .market-table td,.holdings-table td { padding-block:14px; }
 /* Market direction: green when up, the house red when down. Unknown or flat
    changes carry no class and keep the body color. */
@@ -390,8 +389,6 @@ nav.wallet-actions a,.wallet-actions a { min-height:auto; padding:2px 0; color:v
   .holdings-table tr { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr) auto; align-items:start; gap:10px 14px; padding:12px 0; }
   .holdings-table td[data-label],.market-table td[data-label] { display:block; min-width:0; }
   .holdings-table td[data-label]::before,.market-table td[data-label]::before { display:block; margin-bottom:4px; }
-  .holdings-table td:nth-child(4) { grid-column:1 / -1; }
-  .holdings-table td:nth-child(4) details { margin:0; padding:0; }
   .market-table th,.market-table td,.holdings-table th,.holdings-table td { width:100% !important; }
   /* Markets: the token on its own line, then its three figures side by side. */
   .market-table tr { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:8px 12px; padding:12px 0; }

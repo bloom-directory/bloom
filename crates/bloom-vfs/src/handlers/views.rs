@@ -1947,13 +1947,19 @@ impl ViewsHandler {
                 "<article class=\"card receiving-card\"><h3>{mark}</h3>{qr}\
                  <code class=\"address\">{address}</code>\
                  <p class=\"receiving-network\">Account <code>{account}</code>. One address across the EVM networks above.</p></article>",
-                mark = asset_label("Ethereum & EVM"),
+                mark = asset_label_with(asset_mark("ETH", true), "Ethereum & EVM"),
                 qr = receiving_qr(address),
                 address = html_escape(address),
                 account = html_escape(account),
             ));
         }
-        if inventory.solana.is_empty() {
+        if wallet.account_inventory().is_err() {
+            card.push_str(
+                "<article class=\"card receiving-card receiving-unavailable\"><h3>Additional accounts unavailable</h3>\
+                 <p>Bloom could not load this wallet’s account inventory. Some receiving addresses may be missing.</p></article>",
+            );
+        }
+        if inventory.solana.is_empty() && wallet.account_inventory().is_ok() {
             card.push_str(&format!(
                 "<article class=\"card receiving-card receiving-unavailable\"><h3>{}</h3>\
                  <p>No Solana receiving address in this wallet’s projection.</p>\
@@ -2027,12 +2033,12 @@ impl ViewsHandler {
 
         // Inline QR artwork travels with a saved page and always encodes the
         // exact displayed address, including non-primary accounts. The
-        // section heading already names the wallet, so the card is only the
-        // code, the address, and where it works.
+        // section heading names the wallet; every card names its address family.
         format!(
-            "<article class=\"card receiving-card\">{qr}\
+            "<article class=\"card receiving-card\"><h3>{mark}</h3>{qr}\
              <code class=\"address\">{address}</code><div class=\"receiving-network-list\">\
              {networks}{testing}</div></article>",
+            mark = asset_label_with(asset_mark("ETH", true), "Ethereum & EVM"),
             qr = receiving_qr(address),
             address = html_escape(address),
         )
@@ -2946,12 +2952,10 @@ fn holdings_table(rows: &[&Holding], caption: &str) -> String {
         .map(|holding| {
             format!(
                 "<tr><td data-label=\"Asset\"><span class=\"asset-label\">\
-                 {mark}<span><strong>{symbol}</strong><small>{quantity} {symbol}\
+                 {mark}<span><strong>{symbol}</strong><small title=\"Exact quantity: {exact} {symbol}\">{quantity} {symbol}\
                  </small></span></span></td>\
                  <td data-label=\"Network\">{label}</td>\
-                 <td class=\"numeric money\" data-label=\"Value\">{value}</td>\
-                 <td data-label=\"Evidence\"><details><summary>Details</summary>\
-                 <p>{note}</p><p>Exact quantity: <code>{exact}</code></p></details></td></tr>",
+                 <td class=\"numeric money\" data-label=\"Value\">{value}</td></tr>",
                 // An off-market unit keeps initials even when its spelling is
                 // familiar: the logo belongs to the traded asset, not to a
                 // development chain that borrowed the name. The source leaf
@@ -2970,14 +2974,13 @@ fn holdings_table(rows: &[&Holding], caption: &str) -> String {
                     }
                 ),
                 value = html_escape(&money(holding.value)),
-                note = html_escape(&holding.note()),
             )
         })
         .collect();
     format!(
         "<div class=\"table-wrap\"><table class=\"holdings-table\"><caption>{caption}</caption><thead><tr>\
          <th scope=\"col\">Asset / quantity</th><th scope=\"col\">Network</th>\
-         <th class=\"numeric\" scope=\"col\">Value</th><th scope=\"col\">Evidence</th></tr></thead>\
+         <th class=\"numeric\" scope=\"col\">Value</th></tr></thead>\
          <tbody>{cells}</tbody></table></div>",
         caption = html_escape(caption),
     )
@@ -3260,9 +3263,9 @@ fn explicit_solana_identity(address: &str) -> Option<String> {
 
 fn is_solana_address(address: &str) -> bool {
     (32..=44).contains(&address.len())
-        && address.bytes().all(|byte| {
-            b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz".contains(&byte)
-        })
+        && bs58::decode(address)
+            .into_vec()
+            .is_ok_and(|bytes| bytes.len() == 32)
 }
 
 struct Holding {
@@ -3298,23 +3301,6 @@ impl Holding {
     /// share a table with funds that are.
     fn is_off_market(&self) -> bool {
         self.price_key.is_none()
-    }
-
-    fn note(&self) -> String {
-        if is_test_network(&self.chain) {
-            "Test network. Test funds are not main-network funds and are never priced.".to_owned()
-        } else if self.price_key.is_none() {
-            format!(
-                "This network's native unit is not the traded {} asset, so it carries no \
-                 dollar value here. The quantity is what the chain reported.",
-                self.symbol
-            )
-        } else if self.value.is_some() {
-            "Native balance, valued with a quote observed within the last hour.".to_owned()
-        } else {
-            "Native balance. No fresh quote was available, so it carries no dollar value."
-                .to_owned()
-        }
     }
 }
 
@@ -4221,6 +4207,7 @@ const EXPLORERS: &[(u64, &str, &str)] = &[
     (100, "https://gnosisscan.io", "Gnosisscan"),
     (137, "https://polygonscan.com", "Polygonscan"),
     (999, "https://hyperevmscan.io", "HyperEVMScan"),
+    (5042, "https://explorer.arc.io", "Arc Explorer"),
     (
         4663,
         "https://robinhoodchain.blockscout.com",
@@ -5275,6 +5262,11 @@ mod tests {
     async fn receive_shows_the_address_and_embeds_a_portable_qr() {
         let html = render(&fixture().handler, RECEIVE_HTML).await;
         assert!(html.contains(ADDRESS));
+        assert!(html.contains("Ethereum &amp; EVM</span></span></h3>"));
+        assert!(
+            !html.contains(">ET</span>"),
+            "use the Ethereum logo, not initials"
+        );
         assert!(
             html.contains("<figure class=\"receiving-qr\"") && html.contains("<svg"),
             "the QR must travel with a saved Receive page: {html}"
@@ -5287,6 +5279,33 @@ mod tests {
             html.contains("The code encodes an address, not a network"),
             "the safety sentence lives once at the top: {html:.300}"
         );
+    }
+
+    #[test]
+    fn solana_receive_requires_a_32_byte_public_key() {
+        assert!(is_solana_address("11111111111111111111111111111111"));
+        assert!(!is_solana_address(&"1".repeat(33)));
+        assert!(!is_solana_address(&"z".repeat(44)));
+        assert!(!is_solana_address(&"0".repeat(32)));
+    }
+
+    #[tokio::test]
+    async fn receive_discloses_an_unavailable_account_inventory() {
+        let fixture = fixture();
+        let mut projection = fixture
+            .handler
+            .projections
+            .list_wallets()
+            .await
+            .unwrap()
+            .remove(0);
+        projection.accounts_unavailable = Some("unavailable".into());
+        let mut handler = fixture.handler;
+        handler.projections = crate::test_support::wallet_projection_reader_from(projection);
+        let html = render(&handler, RECEIVE_HTML).await;
+        assert!(html.contains("Additional accounts unavailable"));
+        assert!(!html.contains("No Solana receiving address"));
+        assert!(html.contains(ADDRESS));
     }
 
     #[tokio::test]

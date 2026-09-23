@@ -138,4 +138,7 @@ These pages are deliberately narrow about what they claim:
 - An address shown here is the wallet's current projected receiving address. A
   network label never changes what an address-only QR code encodes; the sender
   must select the matching network in their own wallet.
+- Receive lists configured EVM networks, not every EVM chain. Account-inventory
+  failures are disclosed rather than treated as proof that no Solana account
+  exists. Solana receiving addresses must decode to 32 bytes.
 - Test networks are listed separately. Test funds are not main-network funds.
