@@ -131,12 +131,13 @@ bloom-petals   = { path = "crates/bloom-petals" }
 bloom-petal-contract = { git = "https://github.com/bloom-directory/petal", rev = "73c5b06a77599368fbc79fb7947a629b5b4c630e" }
 bloom-daemon   = { path = "crates/bloom-daemon" }
 bloom-update   = { path = "crates/bloom-update" }
-# Held at the published #36 head rather than advancing to master's
-# 3352190: this branch calls the clear-signing API, which master does not
-# carry yet. `bloom-broker-api` is byte-identical at cad9b826 and at the
-# Broker candidate this is exercised against, so the seam under test is the
-# published API. Advance it to the landed commit once #36 merges.
-bloom-broker-api = { git = "https://github.com/bloom-directory/bloom-broker.git", rev = "cad9b8269c1ee887685322607628c6a00c42d6a8" }
+# The published #36 head, not master's 3352190: this branch calls the
+# clear-signing API, which master does not carry until #36 merges. It is the
+# same revision the release and conformance references name, so the Broker
+# that gets built and packaged is the one whose approval pages were verified
+# — a matching API alone would not establish that. Advance all of them
+# together to the landed commit once #36 merges.
+bloom-broker-api = { git = "https://github.com/bloom-directory/bloom-broker.git", rev = "717ece2d2b5ec6caeb62df1a7e8fd07fe27b4716" }
 bloom-rpc-wire = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "5db670e1b7507deabfdcf451be8b5d315c1c9d91" }
 bloom-triad-local-transport = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "5db670e1b7507deabfdcf451be8b5d315c1c9d91" }
 bloom-service-activation = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "5db670e1b7507deabfdcf451be8b5d315c1c9d91" }
