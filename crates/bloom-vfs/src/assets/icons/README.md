@@ -8,6 +8,13 @@ into the HTML. See `handlers/views.rs` (`token_icon`, `chain_icon`,
 
 ## Provenance
 
+- `chain-arc.png`: unmodified 256px Arc mark from Arc's official website,
+  downloaded 2026-09-22. Source:
+  https://cdn.prod.website-files.com/685311a976e7c248b5dfde95/68926aad995d4eae931403a4_arc-favicon-256x256.png
+  Used solely to identify the supported network, not as Bloom branding or an
+  endorsement. Brand terms: https://www.arc.io/brand-guidelines-and-partner-toolkit.
+  This asset is not covered by Bloom's code license.
+
 - Captured locally during the PR #118 views research and copied from the
   `pr118-live` preview directory. The upstream URL and license of each mark
   were not recorded at capture time, so treat this set as unverified artwork

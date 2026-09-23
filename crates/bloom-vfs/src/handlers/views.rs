@@ -22,7 +22,7 @@
 //! - `views/AGENTS.md`        — how an agent should use these pages
 //!
 //! These pages observe. Nothing here stages, approves, or executes an action,
-//! and their only script is the bundled local one (Networks sorter, Receive picker sync): the mount serves them as ordinary files, so a
+//! and their only script is the bundled local one (Networks sorter, Receive deep links): the mount serves them as ordinary files, so a
 //! browser opens one straight off the filesystem. Matching Bloom's visual
 //! language does not make a page a trusted authorization surface — passkeys
 //! and private input stay in Broker's own page.
@@ -1872,56 +1872,24 @@ impl ViewsHandler {
             );
         }
 
-        // One wallet first, then its code: a native radio picker switches the
-        // visible panel with no script at all. A single wallet needs no
-        // picker, so the choice only renders when there is one to make.
         let mut stale = false;
-        let mut options = String::new();
-        let mut panels = String::new();
-        for (n, wallet) in wallets.iter().enumerate() {
+        for wallet in &wallets {
             if wallet.freshness == ProjectionFreshness::Stale {
                 stale = true;
             }
-            let id = wallet.wallet_id();
-            options.push_str(&format!(
-                "<input type=\"radio\" name=\"wallet\" id=\"pick-{id}\" value=\"{id}\"{checked}>\
-                 <label for=\"pick-{id}\">{id}</label>",
-                id = html_escape(id.as_str()),
-                checked = if n == 0 { " checked" } else { "" },
-            ));
-            panels.push_str(&self.render_wallet_section(wallet, &mainnets, &testnets));
-        }
-        if wallets.len() > 1 {
-            // The radios sit beside the panels (not wrapped) so a plain
-            // sibling selector can switch them with no script and no `:has`.
-            let mut rules = String::new();
-            for wallet in &wallets {
-                rules.push_str(&format!(
-                    "#pick-{id}:checked ~ .receiving-panels #wallet-{id} {{display:block}}",
-                    id = html_escape(wallet.wallet_id().as_str()),
-                ));
-            }
-            body.push_str(&format!(
-                "<div class=\"receive-shell has-picker\" role=\"radiogroup\" aria-label=\"Wallet\" data-wallet-picker>\
-                 {options}\
-                 <style>{rules}</style>\
-                 <div class=\"receiving-panels\">{panels}</div></div>"
-            ));
-        } else {
-            body.push_str(&panels);
+            body.push_str(&self.render_wallet_section(wallet, &mainnets, &testnets));
         }
         if stale {
             body.push_str(&stale_notice());
         }
 
-        // The one safety sentence lives here, once, instead of repeating
-        // under every wallet: a code encodes an address, never a network.
-        body.insert_str(
-            0,
-            "<p class=\"callout\">The code encodes an address, not a network — \
-             select the matching network in the sending wallet.</p>",
-        );
-        page("Receive", "Receive", "", RECEIVE_HTML, &body)
+        page(
+            "Receive",
+            "Receive",
+            "Choose a wallet to see its receiving addresses.",
+            RECEIVE_HTML,
+            &body,
+        )
     }
 
     fn render_wallet_section(
@@ -1979,12 +1947,25 @@ impl ViewsHandler {
                 account = html_escape(account),
             ));
         }
+        let families = match (inventory.evm.is_empty(), inventory.solana.is_empty()) {
+            (false, false) => "Ethereum & EVM · Solana",
+            (false, true) => "Ethereum & EVM",
+            (true, false) => "Solana",
+            (true, true) => "Addresses unavailable",
+        };
         format!(
-            "<section class=\"receiving-wallet\" id=\"wallet-{id_attr}\" aria-label=\"{id_attr} receiving addresses\">\
-             <div class=\"section-head\"><h2>{id_text}</h2></div>\
-             <div class=\"grid\">{card}</div></section>",
+            "<details class=\"receiving-wallet\" name=\"receiving-wallet\" id=\"wallet-{id_attr}\">\
+             <summary><span class=\"wallet-identity\"><strong>{id_text}</strong><small>{families}</small></span>\
+             <span class=\"wallet-count\">{count}</span></summary>\
+             <div class=\"grid\">{card}</div></details>",
             id_attr = html_escape(id),
             id_text = html_escape(id),
+            families = html_escape(families),
+            count = count_noun(
+                inventory.evm.len() + inventory.solana.len(),
+                "address",
+                "addresses"
+            ),
         )
     }
 
@@ -2675,17 +2656,23 @@ fn petal_position_rows(positions: &[&PetalPosition]) -> String {
     positions
         .iter()
         .map(|position| {
+            let app = html_escape(match position.petal.as_str() {
+                "hyperliquid" => "Hyperliquid",
+                other => other,
+            });
+            let name = position.url.as_deref().map(|url| format!(
+                "<a class=\"app-name\" href=\"{}\" rel=\"noreferrer noopener\">{app} ↗</a>",
+                html_escape(url),
+            )).unwrap_or_else(|| format!("<strong class=\"app-name\">{app}</strong>"));
             format!(
-                "<li class=\"app-position\">{mark}<span><strong>{label}</strong><small>{petal} · {scope} · {quantity}</small>{link}</span><strong>{value}</strong><details class=\"position-evidence\"><summary>Position evidence</summary><p>{note}</p></details></li>",
+                "<li class=\"app-position\"><div class=\"app-identity\">{mark}<div>{name}<small>{label}</small></div></div>\
+                 <strong class=\"app-value\">{value}</strong>\
+                 <details class=\"position-evidence\"><summary>Account details · {scope}</summary><p>{identity}</p><p>{quantity}</p><p>{note}</p></details></li>",
                 mark = monogram(&position.petal),
                 label = html_escape(&position.label),
-                petal = html_escape(&position.petal),
                 scope = html_escape(&short_hex(&position.scope)),
+                identity = html_escape(position.owner.as_deref().unwrap_or(&position.scope)),
                 quantity = html_escape(&short_quantity_with_unit(&position.quantity)),
-                link = position.url.as_deref().map(|url| format!(
-                    "<a class=\"external-link\" href=\"{}\" rel=\"noreferrer noopener\">Open app account ↗</a>",
-                    html_escape(url),
-                )).unwrap_or_default(),
                 note = html_escape(&position.note),
                 value = html_escape(&money(position.value)),
             )
@@ -4169,6 +4156,7 @@ const NATIVE_ASSET_MARKETS: &[(u64, &str)] = &[
     (100, "coingecko:xdai"),                    // Gnosis
     (137, "coingecko:polygon-ecosystem-token"), // Polygon
     (999, "coingecko:hyperliquid"),             // HyperEVM
+    (5042, "coingecko:usd-coin"),               // Arc native USDC (18 decimals)
     (8453, "coingecko:ethereum"),               // Base
     (42161, "coingecko:ethereum"),              // Arbitrum One
     (43114, "coingecko:avalanche-2"),           // Avalanche C-Chain
@@ -4353,6 +4341,7 @@ macro_rules! icon {
 }
 
 icon!(ARBITRUM_CHAIN, "chain-arbitrum.webp");
+icon!(ARC_CHAIN, "chain-arc.png");
 icon!(AVALANCHE_CHAIN, "chain-avalanche.jpg");
 icon!(BASE_CHAIN, "chain-base.webp");
 icon!(BLAST_CHAIN, "chain-blast.jpg");
@@ -4389,6 +4378,7 @@ icon!(ZCASH, "token-zcash.png");
 /// are refused, so a path can never escape into the filesystem, and the dump
 /// helper writes exactly this set.
 const ICON_FILES: &[&IconFile] = &[
+    &ARC_CHAIN,
     &ARBITRUM_CHAIN,
     &AVALANCHE_CHAIN,
     &BASE_CHAIN,
@@ -4476,6 +4466,7 @@ fn token_icon(name: &str) -> Option<&'static IconFile> {
         "blast" => Some(&BLAST_CHAIN),
         "scroll" => Some(&SCROLL_CHAIN),
         "hyperliquid" | "hyperevm" => Some(&HYPERLIQUID_CHAIN),
+        "arc" => Some(&ARC_CHAIN),
         "hype" => Some(&HYPERLIQUID_TOKEN),
         "robinhood" | "robinhood chain" => Some(&ROBINHOOD_CHAIN),
         "xrp" => Some(&RIPPLE),
@@ -4504,6 +4495,7 @@ fn chain_icon(chain_id: u64) -> Option<&'static IconFile> {
         100 => Some(&GNOSIS_CHAIN),
         137 => Some(&POLYGON_CHAIN),
         999 => Some(&HYPERLIQUID_CHAIN),
+        5042 => Some(&ARC_CHAIN),
         4663 => Some(&ROBINHOOD_CHAIN),
         8453 => Some(&BASE_CHAIN),
         43114 => Some(&AVALANCHE_CHAIN),
@@ -4688,7 +4680,7 @@ fn page(title: &str, heading: &str, lede: &str, current: &str, body: &str) -> St
          </div></body></html>\n",
         csp = CSP,
         // The only script permitted anywhere is the bundled local one: the
-        // Networks sorter and the Receive deep-link picker sync. Every page
+        // Networks sorter and the Receive deep links. Every page
         // remains fully usable without it.
         script = if current == CHAINS_HTML || current == RECEIVE_HTML {
             "<script src=\"bloom.js\" defer></script>"
@@ -5275,10 +5267,7 @@ mod tests {
             !html.contains("../wallets/"),
             "the QR must not depend on the mounted wallet tree"
         );
-        assert!(
-            html.contains("The code encodes an address, not a network"),
-            "the safety sentence lives once at the top: {html:.300}"
-        );
+        assert!(!html.contains("The code encodes an address, not a network"));
     }
 
     #[test]
@@ -5622,7 +5611,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn receive_selects_one_wallet_before_its_code() {
+    async fn receive_starts_with_every_wallet_collapsed() {
         let mut fixture = fixture();
         let reader = crate::test_support::wallet_projection_reader("first", ADDRESS);
         let first = reader.list_wallets().await.unwrap().remove(0);
@@ -5633,28 +5622,23 @@ mod tests {
             crate::test_support::wallet_projection_reader_from_many(vec![first, second]);
 
         let html = render(&fixture.handler, RECEIVE_HTML).await;
-        assert_eq!(html.matches("type=\"radio\" name=\"wallet\"").count(), 2);
-        assert!(
-            html.contains("id=\"pick-first\" value=\"first\" checked"),
-            "{html:.300}"
+        assert_eq!(
+            html.matches("<details class=\"receiving-wallet\" name=\"receiving-wallet\"")
+                .count(),
+            2
         );
-        assert!(
-            html.contains("id=\"pick-second\" value=\"second\""),
-            "{html:.300}"
-        );
-        assert!(html.contains("#pick-first:checked ~ .receiving-panels #wallet-first"));
-        assert!(html.contains("#pick-second:checked ~ .receiving-panels #wallet-second"));
+        assert!(!html.contains(" open"));
         assert!(html.contains("id=\"wallet-first\"") && html.contains("id=\"wallet-second\""));
     }
 
     #[tokio::test]
-    async fn receive_shows_the_only_wallet_outright() {
+    async fn receive_also_collapses_a_single_wallet() {
         let html = render(&fixture().handler, RECEIVE_HTML).await;
-        assert!(
-            !html.contains("data-wallet-picker"),
-            "a choice of one is no choice"
+        assert_eq!(
+            html.matches("<details class=\"receiving-wallet\"").count(),
+            1
         );
-        assert!(!html.contains("type=\"radio\" name=\"wallet\""));
+        assert!(!html.contains(" open"));
     }
 
     #[tokio::test]
@@ -6175,6 +6159,8 @@ mod tests {
         }
         assert_eq!(native_asset_market(1), Some("coingecko:ethereum"));
         assert_eq!(native_asset_market(43114), Some("coingecko:avalanche-2"));
+        assert_eq!(native_asset_market(5042), Some("coingecko:usd-coin"));
+        assert_eq!(native_asset_market(5042002), None);
         // A faucet chain naming its unit "ETH" is still not ether.
         assert_eq!(native_asset_market(4217), None);
     }
@@ -6640,6 +6626,19 @@ mod tests {
                 crate::test_support::wallet_projection_reader_from(one)
             }
             Err(_) => projections,
+        };
+        let projections = if std::env::var_os("VIEWS_SECOND_WALLET").is_some() {
+            let mut wallets = projections.list_wallets().await.unwrap();
+            let mut second = wallets[0].clone();
+            second.wallet.wallet_id = bloom_broker_api::Token::new("savings").unwrap();
+            second.accounts.wallet_id = second.wallet.wallet_id.clone();
+            second.keys[0].addresses = vec!["0x000000000000000000000000000000000000bEEF".into()];
+            second.accounts.accounts =
+                vec![solana_numbered_account("11111111111111111111111111111111")];
+            wallets.push(second);
+            crate::test_support::wallet_projection_reader_from_many(wallets)
+        } else {
+            projections
         };
         let prices = match std::env::var("VIEWS_REAL_PRICES") {
             Ok(_) => bloom_prices::PricesClient::new(),

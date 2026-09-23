@@ -141,4 +141,9 @@ These pages are deliberately narrow about what they claim:
 - Receive lists configured EVM networks, not every EVM chain. Account-inventory
   failures are disclosed rather than treated as proof that no Solana account
   exists. Solana receiving addresses must decode to 32 bytes.
+- Receive starts with every wallet collapsed, including a single-wallet page.
+  Selecting a wallet reveals its codes and closes the previous wallet. Native
+  disclosure controls work without JavaScript; explicit wallet deep links open
+  the named wallet. Arc mainnet (5042) uses native USDC with 18 decimals and a
+  fresh USDC market quote; Arc Testnet is not valued as mainnet USDC.
 - Test networks are listed separately. Test funds are not main-network funds.

@@ -98,6 +98,7 @@ details p { margin:4px 0 14px; font-size:13px; color:var(--muted); }
 
 /* Asset marks: bundled artwork, or initials for anything unknown. */
 .asset-mark { display:inline-grid; place-items:center; width:28px; height:28px; flex:0 0 28px; object-fit:contain; border-radius:50%; background:var(--surface); }
+.asset-mark[src$="/chain-arc.png"] { border-radius:0; background:transparent; }
 .monogram { font:10px var(--mono); border:1px solid var(--rule-2); color:var(--muted); }
 .asset-label { display:inline-flex; align-items:center; gap:10px; min-width:0; text-align:left; }
 .asset-label > span { min-width:0; overflow-wrap:anywhere; }
@@ -132,7 +133,16 @@ td a { text-decoration:none; }
 .position-list li { display:grid; grid-template-columns:32px minmax(0,1fr) auto; align-items:center; gap:14px; padding:18px 0; border-bottom:1px solid var(--rule); }
 .position-list strong { font-weight:550; overflow-wrap:anywhere; }
 .position-list li > :nth-child(3) { font-variant-numeric:tabular-nums; font-size:14px; }
-.position-list .position-evidence { grid-column:2 / -1; margin:0; max-width:none; text-align:left; font-size:14px; }
+.position-list .app-position { grid-template-columns:minmax(0,1fr) auto; gap:10px 20px; padding-block:22px; }
+.app-identity { display:flex; align-items:center; gap:14px; min-width:0; }
+.app-identity > .asset-mark,.app-identity > .monogram { flex:none; width:36px; height:36px; }
+.app-identity > div { min-width:0; }
+.app-name { color:var(--ink); font-size:17px; font-weight:600; text-decoration:none; }
+a.app-name:hover { color:var(--accent); text-decoration:underline; }
+.app-identity small { display:block; margin-top:3px; color:var(--muted); font-size:13px; }
+.app-value { font-size:20px; font-variant-numeric:tabular-nums; text-align:right; }
+.position-list .app-position .position-evidence { grid-column:1 / -1; margin:0 0 0 50px; padding:0; border:0; max-width:none; text-align:left; font-size:13px; }
+.position-evidence summary { color:var(--muted); font-size:12px; }
 .coverage-notice { overflow-wrap:anywhere; }
 .recent-state { display:grid; place-items:center; width:30px; height:30px; border-radius:50%; background:var(--tint); }
 
@@ -286,13 +296,18 @@ nav.wallet-actions a,.wallet-actions a { min-height:auto; padding:2px 0; color:v
 .mover-tile small { font-size:11px; }
 
 /* 10. Receive: pick a wallet, scan, copy -------------------------------- */
-.receive-shell.has-picker .receiving-wallet { display:none; }
-.receive-shell > input[type="radio"] { position:absolute; opacity:0; pointer-events:none; }
-.receive-shell > label { display:inline-flex; align-items:center; min-height:44px; margin:0 10px 10px 0; padding:10px 20px; border:1px solid var(--rule-2); border-radius:20px; font:12px var(--mono); color:var(--ink-2); background:var(--surface); cursor:pointer; }
-.receive-shell > input:checked + label { border-color:var(--accent); color:var(--accent-deep); font-weight:650; }
-.receive-shell > input:focus-visible + label { outline:3px solid var(--accent); outline-offset:4px; }
-.receiving-wallet { margin-top:26px; }
-.receiving-wallet .grid { align-items:start; }
+.receiving-wallet { margin:14px 0; padding:0; max-width:none; border:1px solid var(--rule); border-radius:var(--radius); background:var(--surface); overflow:hidden; }
+.receiving-wallet > summary { display:flex; align-items:center; gap:20px; padding:22px 26px; list-style:none; color:var(--ink); }
+.receiving-wallet > summary::-webkit-details-marker { display:none; }
+.receiving-wallet > summary::after { content:"+"; font-size:24px; font-weight:400; color:var(--accent); }
+.receiving-wallet[open] > summary::after { content:"−"; }
+.receiving-wallet > summary:hover { background:var(--paper); }
+.receiving-wallet > summary:focus-visible { outline:3px solid var(--accent); outline-offset:-4px; }
+.wallet-identity { flex:1; min-width:0; }
+.wallet-identity strong { display:block; font-size:20px; font-weight:600; overflow-wrap:anywhere; }
+.wallet-identity small { display:block; margin-top:4px; font-size:13px; color:var(--muted); }
+.wallet-count { color:var(--muted); font-size:13px; white-space:nowrap; }
+.receiving-wallet .grid { align-items:start; margin:0; padding:24px; border-top:1px solid var(--rule); background:var(--paper); }
 .receiving-card { text-align:center; display:flex; flex-direction:column; align-items:stretch; padding:28px; box-shadow:0 8px 28px color-mix(in srgb,var(--ink-2) 2%,transparent); }
 .receiving-card > h3 { margin:0; font-size:18px; }
 .receiving-card h3 .asset-label { justify-content:center; }
@@ -410,6 +425,11 @@ nav.wallet-actions a,.wallet-actions a { min-height:auto; padding:2px 0; color:v
   .position-list li { gap:10px; }
   .position-list li > :nth-child(3) { max-width:95px; text-align:right; overflow-wrap:break-word; }
   .position-list li > :nth-child(3) span { overflow-wrap:break-word; }
+  .position-list .app-position .position-evidence { max-width:none; text-align:left; }
+  .receiving-wallet > summary { padding:18px 16px; gap:12px; }
+  .wallet-count { display:none; }
+  .receiving-wallet .grid { padding:12px; }
+  .receiving-card { padding:20px 14px; }
   .policy-limits { grid-template-columns:1fr 1fr; }
   .policy-limits > div { border-bottom:1px solid var(--rule); }
   .policy-exception > div { align-items:flex-start; }
