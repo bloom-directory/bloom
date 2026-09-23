@@ -6716,14 +6716,30 @@ mod tests {
         }
 
         std::fs::create_dir_all(&out).unwrap();
+        let preview_label = if std::env::var_os("VIEWS_PROJECTIONS").is_none()
+            && std::env::var_os("VIEWS_PROJECTION").is_none()
+        {
+            "Design preview — sample wallets, not your live balances."
+        } else {
+            "Development snapshot — not your live wallet dashboard."
+        };
+        let label_preview = |html: String| {
+            html.replacen(
+                "<main id=\"main\">",
+                &format!(
+                    "<main id=\"main\"><p class=\"callout\"><strong>{preview_label}</strong></p>"
+                ),
+                1,
+            )
+        };
         for (page, _) in PAGES {
-            let html = render(&staged.handler, page).await;
+            let html = label_preview(render(&staged.handler, page).await);
             std::fs::write(std::path::Path::new(&out).join(page), html).unwrap();
         }
         // `fees.html` is no longer in `PAGES` but is still served as an alias
         // of the Networks page. A dump that omits it would leave an old fee
         // dashboard visible to anyone following a stale bookmark.
-        let alias = render(&staged.handler, CHAINS_HTML).await;
+        let alias = label_preview(render(&staged.handler, CHAINS_HTML).await);
         std::fs::write(std::path::Path::new(&out).join(FEES_HTML), alias).unwrap();
         // The chat briefing renders beside the pages, so the dump keeps it
         // next to the HTML it restates.
