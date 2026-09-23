@@ -9,7 +9,6 @@ on:
       - "rust-toolchain.toml"
       - "crates/**"
       - "evals/harbor/**"
-      - "examples/evm-deploy/**"
       - "packaging/**"
       - "scripts/**"
       - "tests/**"
@@ -48,6 +47,10 @@ jobs:
       - uses: astral-sh/setup-uv@v7
       - name: Validate bounded Harbor harness
         run: scripts/test-harbor-evals.sh
+      # Failure-mode cases for the ceremony-port A/B concurrency script
+      # (stub launchers; binds no ports and needs no Triad).
+      - name: Run concurrency script failure-mode cases
+        run: scripts/test-ceremony-port-concurrency-cases.sh
 
   clippy:
     name: clippy
@@ -202,30 +205,10 @@ jobs:
       - name: Run ignored local anvil integration tests from archive
         run: >
           cargo nextest run --archive-file target/nextest-archive.tar.zst
-          -E '(package(bloom-it) and not binary(/^solana_/) and not binary(deployment_rpc)) or package(bloom-watch)'
+          -E '(package(bloom-it) and not binary(/^solana_/)) or package(bloom-watch)'
           --run-ignored ignored-only
           --no-tests=pass
           --no-fail-fast
-
-  deployment_compatibility:
-    name: Foundry, Hardhat and Ignition deployment
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v6
-      - name: Install Rust toolchain
-        run: rustup show
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v6
-        with:
-          node-version: "26"
-      - uses: foundry-rs/foundry-toolchain@v1
-        with:
-          version: v1.7.1
-      - name: Build actual CLI and test remote deployment workflows on Anvil
-        run: |
-          cargo build --locked -p bloom
-          cargo test --locked -p bloom-it --test deployment_rpc -- --ignored --nocapture
 
   macos_unix_principal_disposable_w0:
     name: macOS Unix-principal disposable W0
@@ -234,8 +217,8 @@ jobs:
       github.ref_name == 'triad-architecture'
     uses: ./.github/workflows/macos-unix-conformance.yml
     with:
-      broker_ref: 0874825a1201c34785cf3b609b7fdaa5e82988fe
-      signer_ref: ccc9adb3866b17b87d2774018dcfa015184b1918
+      broker_ref: 717ece2d2b5ec6caeb62df1a7e8fd07fe27b4716
+      signer_ref: 97b9ac7e47ee682e59804d04f6288419f3598a58
 
   linux_w0_isolation:
     name: Linux W0 principal and socket isolation

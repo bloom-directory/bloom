@@ -30,7 +30,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 rust-version = "1.86"
 license = "MIT"
@@ -131,7 +131,7 @@ bloom-petals   = { path = "crates/bloom-petals" }
 bloom-petal-contract = { git = "https://github.com/bloom-directory/petal", rev = "73c5b06a77599368fbc79fb7947a629b5b4c630e" }
 bloom-daemon   = { path = "crates/bloom-daemon" }
 bloom-update   = { path = "crates/bloom-update" }
-bloom-broker-api = { git = "https://github.com/bloom-directory/bloom-broker.git", rev = "0874825a1201c34785cf3b609b7fdaa5e82988fe" }
+bloom-broker-api = { git = "https://github.com/bloom-directory/bloom-broker.git", rev = "717ece2d2b5ec6caeb62df1a7e8fd07fe27b4716" }
 bloom-rpc-wire = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "5db670e1b7507deabfdcf451be8b5d315c1c9d91" }
 bloom-triad-local-transport = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "5db670e1b7507deabfdcf451be8b5d315c1c9d91" }
 bloom-service-activation = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "5db670e1b7507deabfdcf451be8b5d315c1c9d91" }
@@ -151,13 +151,3 @@ opt-level = 1
 [profile.release]
 lto = "thin"
 codegen-units = 1
-
-# ---- DIAGNOSTIC LOCAL OVERRIDE: NOT A RELEASE INPUT ----
-# The clear-signing Broker commit this branch calls is not published, so there
-# is no revision to pin yet. This points `bloom-broker-api` at the local
-# Broker worktree so both sides can be built and exercised together now.
-# Delete it and set a 40-character `rev` on the landed Broker commit before
-# publishing or releasing this branch: the release build refuses a path
-# dependency and `bin/bloom-worktree pins` reports it.
-[patch."https://github.com/bloom-directory/bloom-broker.git"]
-bloom-broker-api = { path = "../../bloom-broker/clear-signing/crates/bloom-broker-api" }
