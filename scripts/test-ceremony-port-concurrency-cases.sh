@@ -97,6 +97,7 @@ EOF
 cat > "$work/stub-ignore-term.sh" <<'EOF'
 #!/bin/sh
 trap '' TERM
+: > "${STUB_TRAP_READY_FILE:?}"
 sleep 30
 EOF
 chmod +x "$work"/stub-*.sh
@@ -128,17 +129,30 @@ else
 fi
 
 # 5. A child that survives SIGTERM fails bounded instead of hanging.
+rm -f "$work/ignore-term.ready"
+export STUB_TRAP_READY_FILE="$work/ignore-term.ready"
 "$work/stub-ignore-term.sh" &
 survivor=$!
 STUBS="$STUBS $survivor"
-start=$(date +%s)
-status=0
-stop_candidate "$survivor" "$work/nonexistent.sock" TERMTEST >/dev/null 2>&1 || status=$?
-elapsed=$(( $(date +%s) - start ))
-if [ "$status" -ne 0 ] && [ "$elapsed" -lt 20 ] && printf '%s' "$DIE_MSG" | grep -q "SIGTERM"; then
-  report 0 "SIGTERM-surviving child fails bounded"
+# Wait until the stub has installed its SIGTERM trap before signaling it:
+# an earlier SIGTERM would kill the child before the trap runs, and the
+# case would pass without exercising the survivor path.
+trap_deadline=$(( $(date +%s) + 5 ))
+while [ ! -e "$work/ignore-term.ready" ] && [ "$(date +%s)" -lt "$trap_deadline" ]; do
+  sleep 0.05
+done
+if [ ! -e "$work/ignore-term.ready" ]; then
+  report 1 "SIGTERM-surviving child fails bounded" "stub never installed SIGTERM trap"
 else
-  report 1 "SIGTERM-surviving child fails bounded" "status=$status elapsed=${elapsed}s msg=$DIE_MSG"
+  start=$(date +%s)
+  status=0
+  stop_candidate "$survivor" "$work/nonexistent.sock" TERMTEST >/dev/null 2>&1 || status=$?
+  elapsed=$(( $(date +%s) - start ))
+  if [ "$status" -ne 0 ] && [ "$elapsed" -lt 20 ] && printf '%s' "$DIE_MSG" | grep -q "SIGTERM"; then
+    report 0 "SIGTERM-surviving child fails bounded"
+  else
+    report 1 "SIGTERM-surviving child fails bounded" "status=$status elapsed=${elapsed}s msg=$DIE_MSG"
+  fi
 fi
 kill -9 "$survivor" 2>/dev/null || true
 wait "$survivor" 2>/dev/null || true
