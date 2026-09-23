@@ -1160,6 +1160,20 @@ fn triad_bundle_is_reproducible_signed_and_self_verifying() {
     );
     assert_eq!(fs::read(&first).unwrap(), fs::read(&second).unwrap());
 
+    for name in ["control-ca.pem", "receipt-public-key.hex"] {
+        let packaged = Command::new("tar")
+            .arg("-xOzf")
+            .arg(&first)
+            .arg(format!("bloom-triad/installer/relay/{name}"))
+            .output()
+            .unwrap();
+        assert!(packaged.status.success());
+        assert_eq!(
+            packaged.stdout,
+            fs::read(workspace().join("packaging/triad/relay").join(name)).unwrap()
+        );
+    }
+
     let compatibility = Command::new("tar")
         .args(["-xOzf"])
         .arg(&first)

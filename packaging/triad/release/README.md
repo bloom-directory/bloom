@@ -326,9 +326,11 @@ Broker configuration directory under Application Support. Developer paths are
 unchanged. Linux relay configuration and administrator-supplied trust pins stay
 under `/etc/bloom/<login-uid>`.
 Scoped tunnel and DNS credentials are separate `0600` Broker-owned files;
-they convey no surface administration or wallet authority. No production relay
-pin is invented by the example templates: the nullable Signer pin must be
-populated by the deployment's signed configuration before provisioning works.
+they convey no surface administration or wallet authority. The signed payload includes the reviewed public pins in `installer/relay`.
+Before service activation, both installers fill an absent/null Signer pin and
+materialize root-only relay configuration from those inputs. Existing matching
+trust is preserved; differing pins fail closed and require explicit rotation.
+See [hosted relay trust](../relay/README.md) for provenance and retry behavior.
 Provisioning publishes the validated control CA to Broker's private
 `relay-control-ca.pem` beside its scoped credentials. Broker publishes each
 validated certificate/key pair atomically in `relay-tls-bundle.json`; a failed

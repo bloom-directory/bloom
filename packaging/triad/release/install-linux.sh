@@ -1637,6 +1637,8 @@ case "$action" in
     fi
     rm -f -- "$authority_edge_history_source"
     if [[ "$root" == "/" ]]; then
+      "$binary_root/bloom" init triad-install-relay-trust \
+        "$payload/installer/relay" "$config_root" "$(id -u "bloom-signer-$login_uid")"
       chown "bloom-broker-$login_uid:bloom-broker-$login_uid" \
         "$config_root/broker/config.json" \
         "$config_root/broker/identity.json"

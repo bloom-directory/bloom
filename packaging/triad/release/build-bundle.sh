@@ -289,6 +289,11 @@ esac
 printf '%s\n' "$platform_claim" > "$payload/PLATFORM_CLAIM"
 install -m 0644 "$compatibility_file" "$payload/compatibility-v1.toml"
 mkdir -p "$payload/installer/release"
+openssl x509 -in "$script_dir/../relay/control-ca.pem" -noout >/dev/null
+[[ "$(tr -d '\n' < "$script_dir/../relay/receipt-public-key.hex")" =~ ^[0-9a-f]{64}$ ]] || {
+  echo "invalid hosted relay receipt public key" >&2; exit 65;
+}
+cp -R "$script_dir/../relay" "$payload/installer/relay"
 cp -R "$script_dir/../linux" "$payload/installer/linux"
 mkdir -p "$payload/installer/macos"
 for macos_input in "$script_dir"/../macos/*; do

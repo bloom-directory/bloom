@@ -752,6 +752,10 @@ install_config() {
   else
     [[ -f "$broker_config/identity.json" && -f "$signer_config/identity.json" ]] || die "installed custody metadata is incomplete"
   fi
+  if $live; then
+    "$release_base/releases/$BLOOM_RELEASE_DIGEST/bloom" init triad-install-relay-trust \
+      "$payload/installer/relay" "$config" "$BLOOM_MACOS_SIGNER_UID"
+  fi
 }
 
 validate_installed_security_inputs() {

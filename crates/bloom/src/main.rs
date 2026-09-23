@@ -14,6 +14,7 @@ mod petal_provisioning;
 mod pf_monitor;
 mod session_sentinel;
 mod triad_enrollment;
+mod triad_relay_setup;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -2437,6 +2438,12 @@ enum InitInternal {
         installer_identity: PathBuf,
         output: PathBuf,
     },
+    #[command(name = "triad-install-relay-trust", hide = true)]
+    InstallRelayTrust {
+        template_dir: PathBuf,
+        config_dir: PathBuf,
+        signer_uid: u32,
+    },
     #[command(name = "triad-render-macos-identity-rotation", hide = true)]
     MacosIdentityRotation {
         current_identity: PathBuf,
@@ -3375,6 +3382,11 @@ async fn run(cli: Cli) -> Result<()> {
                         release_digest,
                     )
                     .context("Bloom Linux enrollment generation failed"),
+                    InitInternal::InstallRelayTrust {
+                        template_dir,
+                        config_dir,
+                        signer_uid,
+                    } => triad_relay_setup::run(&template_dir, &config_dir, signer_uid),
                     InitInternal::RefreshProvenanceCatalog {
                         template,
                         installer_identity,
