@@ -323,3 +323,14 @@ receiving a response updates the same receipt without counting it twice. Other
 requests can proceed within any remaining budget. Do not repeat an unresolved
 payment by restaging it. A failed merchant retry still counts toward recorded
 spending.
+
+A Petal that stages an EVM transaction usually produces a generic contract
+call: Bloom cannot check what the calldata does, so it always needs a fresh
+owner approval. One shape is different. A canonical ERC-20
+`transfer(address,uint256)` call with no native value is decoded to its
+recipient and amount, and Bloom rebuilds the calldata from those two fields
+instead of forwarding the Petal's bytes. It is then classified as a token
+transfer, checked against wallet policy, and eligible for policy-bounded
+autonomy. Extra trailing calldata, a different selector, or any nonzero native
+value keeps it generic. Eligible does not mean automatic: the wallet's policy
+still decides, so handle the ordinary approval challenge either way.
