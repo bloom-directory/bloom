@@ -131,6 +131,22 @@ async fn spawn_anvil(no_mining: bool) -> Result<AnvilGuard> {
     })
 }
 
+/// Mine whatever is queued on a `--no-mining` anvil.
+async fn mine_pending(rpc_url: &str) -> Result<()> {
+    let response = reqwest::Client::new()
+        .post(rpc_url)
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "evm_mine", "params": []
+        }))
+        .send()
+        .await
+        .context("evm_mine")?;
+    if !response.status().is_success() {
+        return Err(anyhow!("evm_mine failed: {}", response.status()));
+    }
+    Ok(())
+}
+
 fn anvil_chain_spec(rpc_url: &str) -> ChainSpec {
     let mut spec = ChainSpec::anvil_default();
     spec.rpc_urls = vec![rpc_url.to_string()];
@@ -188,6 +204,218 @@ async fn erc20_stage_fails_when_decimals_unreadable() -> Result<()> {
         TxEngineError::Token(_) => {}
         other => return Err(anyhow!("expected Token error, got {other:?}")),
     }
+    Ok(())
+}
+
+/// An unmined transaction holds its own nonce in the mempool, so the pending
+/// count already includes it. Reading the pending count to decide whether a
+/// nonce is still replaceable therefore reports every broadcast-but-unmined
+/// transaction as consumed by itself, and refuses exactly the two operations
+/// the guard exists to permit: repricing a stuck transaction and cancelling
+/// one. Only a mined nonce is spent, so the guard reads the latest count.
+///
+/// Anvil runs with `--no-mining` here, so `confirm` leaves the transaction in
+/// the mempool and pending and latest genuinely disagree — the precondition
+/// is asserted rather than assumed.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unmined_nonce_stays_replaceable_and_a_mined_one_does_not() -> Result<()> {
+    let anvil = spawn_anvil(true).await?;
+    let rpc_url = anvil.rpc_url();
+    let chain = ChainClient::new(anvil_chain_spec(&rpc_url)).map_err(|e| anyhow!("chain: {e}"))?;
+
+    let tmp = tempfile::tempdir()?;
+    let permit = bloom_proto::HomeWritePermit::acquire(&bloom_proto::HomeDir::at(tmp.path()))?;
+    let outbox = Outbox::new(tmp.path().join("outbox")).map_err(|e| anyhow!("outbox: {e}"))?;
+    let (broker, broker_fixture) = exact_signing_broker(ANVIL_PK0)?;
+    let engine = TxEngine::new(outbox, 60_000)
+        .with_price_oracle(Arc::new(TestPriceOracle))
+        .with_triad_signing(
+            broker,
+            exact_signing_catalog(&[
+                "transaction.confirm",
+                "transaction.replace",
+                "transaction.cancel",
+            ]),
+        )
+        .map_err(|e| anyhow!("triad signing: {e}"))?;
+    broker_fixture.activate();
+
+    let signer: alloy_signer_local::PrivateKeySigner = ANVIL_PK0.parse()?;
+    let from = signer.address();
+    let policy = {
+        let mut p = Policy::default();
+        p.approval.agent_autonomy = Some(AgentAutonomyMode::UnderPolicy);
+        p.limits.max_tx_usd = Some("1000".into());
+        p.limits.max_day_usd = Some("10000".into());
+        p
+    };
+    let send = || RawIntent {
+        body: RawIntentBody::Send {
+            to: ANVIL_ADDR1.to_string(),
+            value: "0.01 eth".into(),
+            token: None,
+            amount: String::new(),
+            data: None,
+        },
+        chain: Some("anvil".to_string()),
+        gas: Default::default(),
+        nonce: None,
+        gas_limit_hint: None,
+        usd_value_hint: Some("1".into()),
+        review_mode: None,
+    };
+    // Broadcast one transaction and leave it in the mempool.
+    let first = engine
+        .stage(&permit, "alice", from, send(), &chain, &policy, None)
+        .await
+        .map_err(|e| anyhow!("stage first: {e}"))?;
+    // Every value-moving operation needs its own exact approval. The first
+    // attempt prepares one and reports ApprovalRequired; the fixture answers
+    // "approved" for whatever is outstanding, so the retry proceeds. A
+    // one-shot call would pass for the wrong reason, so each step asserts the
+    // refusal before retrying.
+    let first_confirm = engine
+        .confirm(&permit, "alice", "anvil", &first.id, &chain, &policy, "y")
+        .await;
+    assert!(
+        matches!(first_confirm, Err(TxEngineError::ApprovalRequired(_))),
+        "confirm should ask for its own approval first: {first_confirm:?}"
+    );
+    let confirmed = engine
+        .confirm(&permit, "alice", "anvil", &first.id, &chain, &policy, "y")
+        .await
+        .map_err(|e| anyhow!("confirm first: {e}"))?;
+    assert!(confirmed.tx_hash.is_some(), "confirm produced no tx hash");
+
+    // The precondition the guard used to trip over: the transaction is in the
+    // mempool, so pending is ahead of latest and its own nonce is below
+    // pending. A guard reading pending would call this nonce consumed.
+    let pending = chain
+        .nonce(from)
+        .await
+        .map_err(|e| anyhow!("pending nonce: {e}"))?;
+    let latest = chain
+        .nonce_latest(from)
+        .await
+        .map_err(|e| anyhow!("latest nonce: {e}"))?;
+    assert_eq!(
+        latest, first.nonce,
+        "nothing is mined yet, so latest must still be the staged nonce"
+    );
+    assert!(
+        pending > first.nonce,
+        "the unmined transaction should raise the pending count: pending {pending}, nonce {}",
+        first.nonce
+    );
+
+    // Replacement: permitted, same nonce.
+    let first_replace = engine
+        .replace(&permit, "alice", "anvil", &first.id, &chain, 15, &policy)
+        .await;
+    assert!(
+        matches!(first_replace, Err(TxEngineError::ApprovalRequired(_))),
+        "replace should ask for its own approval first: {first_replace:?}"
+    );
+    let replaced = engine
+        .replace(&permit, "alice", "anvil", &first.id, &chain, 15, &policy)
+        .await
+        .map_err(|e| anyhow!("replace of an unmined nonce was refused: {e}"))?;
+    assert_eq!(
+        replaced.nonce, first.nonce,
+        "a replacement must reuse the original nonce"
+    );
+
+    // Cancellation: the same guard, the same verdict. It gets its own
+    // transaction because a cancel re-bumps from the entry's recorded fees,
+    // and cancelling the row just replaced would be underpriced against the
+    // replacement already in the mempool — a fee question, not a nonce one.
+    let second = engine
+        .stage(&permit, "alice", from, send(), &chain, &policy, None)
+        .await
+        .map_err(|e| anyhow!("stage second: {e}"))?;
+    assert!(
+        second.nonce > first.nonce,
+        "the second stage should reserve the next nonce"
+    );
+    let second_confirm = engine
+        .confirm(&permit, "alice", "anvil", &second.id, &chain, &policy, "y")
+        .await;
+    assert!(
+        matches!(second_confirm, Err(TxEngineError::ApprovalRequired(_))),
+        "confirm should ask for its own approval first: {second_confirm:?}"
+    );
+    engine
+        .confirm(&permit, "alice", "anvil", &second.id, &chain, &policy, "y")
+        .await
+        .map_err(|e| anyhow!("confirm second: {e}"))?;
+
+    let first_cancel = engine
+        .cancel(&permit, "alice", "anvil", &second.id, &chain, 15, &policy)
+        .await;
+    assert!(
+        matches!(first_cancel, Err(TxEngineError::ApprovalRequired(_))),
+        "cancel should ask for its own approval first: {first_cancel:?}"
+    );
+    let cancelled = engine
+        .cancel(&permit, "alice", "anvil", &second.id, &chain, 15, &policy)
+        .await
+        .map_err(|e| anyhow!("cancel of an unmined nonce was refused: {e}"))?;
+    assert_eq!(
+        cancelled.nonce, second.nonce,
+        "a cancellation must reuse the original nonce"
+    );
+
+    // A third transaction, left untouched, is what the post-mining cancel
+    // acts on: the row cancelled above is terminal, and a terminal row is
+    // refused for a reason that has nothing to do with nonces.
+    let third = engine
+        .stage(&permit, "alice", from, send(), &chain, &policy, None)
+        .await
+        .map_err(|e| anyhow!("stage third: {e}"))?;
+    let third_confirm = engine
+        .confirm(&permit, "alice", "anvil", &third.id, &chain, &policy, "y")
+        .await;
+    assert!(
+        matches!(third_confirm, Err(TxEngineError::ApprovalRequired(_))),
+        "confirm should ask for its own approval first: {third_confirm:?}"
+    );
+    engine
+        .confirm(&permit, "alice", "anvil", &third.id, &chain, &policy, "y")
+        .await
+        .map_err(|e| anyhow!("confirm third: {e}"))?;
+
+    // Mine what is queued. The nonce is now genuinely spent, and the guard
+    // must say so rather than let a doomed same-nonce broadcast through.
+    mine_pending(&rpc_url).await?;
+    let mined_latest = chain
+        .nonce_latest(from)
+        .await
+        .map_err(|e| anyhow!("latest nonce after mining: {e}"))?;
+    assert!(
+        mined_latest > first.nonce,
+        "mining should advance the latest count past {}: {mined_latest}",
+        first.nonce
+    );
+
+    let after_mining = engine
+        .replace(&permit, "alice", "anvil", &first.id, &chain, 15, &policy)
+        .await;
+    assert!(
+        matches!(after_mining, Err(TxEngineError::NonceConsumed { .. })),
+        "a mined nonce must report NonceConsumed: {after_mining:?}"
+    );
+    let cancel_after_mining = engine
+        .cancel(&permit, "alice", "anvil", &third.id, &chain, 15, &policy)
+        .await;
+    assert!(
+        matches!(
+            cancel_after_mining,
+            Err(TxEngineError::NonceConsumed { .. })
+        ),
+        "cancelling a mined nonce must report NonceConsumed: {cancel_after_mining:?}"
+    );
+
+    drop(anvil);
     Ok(())
 }
 

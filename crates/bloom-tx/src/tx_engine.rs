@@ -2766,13 +2766,20 @@ impl TxEngine {
     /// the nonce was spent by something else (restage); broadcasting a
     /// same-nonce tx would be guaranteed to fail. Like the gap guard, a failed
     /// nonce read is not evidence and fails open.
+    ///
+    /// This reads the *latest* nonce, not the pending one. The transaction
+    /// being replaced is itself sitting in the mempool holding this nonce, so
+    /// the pending count already counts it: asking there would report every
+    /// replaceable transaction as consumed by itself and refuse the one
+    /// operation — repricing a stuck transaction, or cancelling it — that the
+    /// guard exists to allow. Only a mined nonce is spent.
     async fn assert_nonce_still_replaceable(
         &self,
         chain: &ChainClient,
         from: Address,
         nonce: u64,
     ) -> Result<(), TxEngineError> {
-        let chain_next = match chain.nonce(from).await {
+        let chain_next = match chain.nonce_latest(from).await {
             Ok(n) => n,
             Err(e) => {
                 tracing::warn!(
