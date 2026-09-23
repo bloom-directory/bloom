@@ -338,6 +338,11 @@ renewal preserves the previous bundle while it remains valid.
 Both installers invoke `bloom-signer admin provision --login-uid UID` directly
 inside their existing root step, with no second elevation prompt. There is no
 separate ceremony administration wrapper or automatic elevation in Signer.
+On macOS, the installer reports TLS and routing readiness while it waits up to
+10 minutes for the hosted relay. DNS propagation and ACME issuance commonly
+take a few minutes. If readiness is still pending at the deadline, installation
+finishes with localhost available and prints the exact retry command; rerunning
+`admin provision` is safe and resumes the same installation assignment.
 For manual administration, explicitly elevate the installed binary:
 
 ```sh

@@ -1107,9 +1107,59 @@ find_interrupted_upgrade() {
 
 provision_remote_ceremonies() {
   $live || return 0
-  if ! "$release_base/current/bloom-signer" admin provision --login-uid "$login_uid"; then
-    echo "Remote ceremony provisioning is incomplete; localhost remains available. Retry: sudo '$release_base/current/bloom-signer' admin provision --login-uid $login_uid" >&2
+  local signer status_file provision_timeout poll_interval deadline started_at last_report desired effective tls_ready routing_ready stage elapsed
+  signer="$release_base/current/bloom-signer"
+  provision_timeout="${BLOOM_RELAY_PROVISION_TIMEOUT_SECONDS:-600}"
+  poll_interval="${BLOOM_RELAY_PROVISION_POLL_SECONDS:-5}"
+  [[ "$provision_timeout" =~ ^[0-9]+$ && "$poll_interval" =~ ^[0-9]+$ ]] || die "invalid relay provisioning wait configuration"
+  started_at="$SECONDS"
+  deadline=$((started_at + provision_timeout))
+  echo "Preparing hosted ceremony relay (up to ${provision_timeout}s; DNS and certificate issuance can take several minutes)..." >&2
+  if "$signer" admin provision --login-uid "$login_uid"; then
+    echo "Hosted ceremony provisioning command completed." >&2
+    return 0
   fi
+
+  last_report=-1
+  status_file="$(mktemp "$runtime/relay-status.XXXXXX")" || die "could not create temporary relay status file"
+  chmod 0600 "$status_file"
+  while (( SECONDS <= deadline )); do
+    if ! "$signer" admin status --login-uid "$login_uid" >"$status_file"; then
+      echo "Could not read hosted relay status; localhost remains available." >&2
+      rm -f "$status_file"
+      echo "Retry: sudo '$signer' admin provision --login-uid $login_uid" >&2
+      return 0
+    fi
+    desired="$(field "$status_file" desired_mode 2>/dev/null || true)"
+    effective="$(field "$status_file" effective_mode 2>/dev/null || true)"
+    tls_ready="$(field "$status_file" remote_tls_ready 2>/dev/null || true)"
+    routing_ready="$(field "$status_file" remote_routing_ready 2>/dev/null || true)"
+    stage="$(field "$status_file" stage 2>/dev/null || true)"
+    elapsed=$((SECONDS - started_at))
+    if [[ "$desired" == remote_enabled && "$effective" == remote_enabled && "$tls_ready" == true && "$routing_ready" == true ]]; then
+      rm -f "$status_file"
+      echo "Hosted ceremony relay is ready (TLS and routing ready after ${elapsed}s)." >&2
+      return 0
+    fi
+    if [[ "$desired" == localhost_only ]]; then
+      rm -f "$status_file"
+      echo "Hosted ceremonies are configured but disabled (localhost-only mode is unchanged)." >&2
+      return 0
+    fi
+    if [[ "$stage" == unprovisioned ]]; then
+      rm -f "$status_file"
+      echo "Hosted relay has no completed installation assignment; localhost remains available. Check the relay assignment, then retry: sudo '$signer' admin provision --login-uid $login_uid" >&2
+      return 0
+    fi
+    if (( elapsed - last_report >= 15 )); then
+      echo "Hosted relay is still provisioning after ${elapsed}s (stage=${stage:-unknown}, TLS=${tls_ready:-unknown}, routing=${routing_ready:-unknown})." >&2
+      last_report="$elapsed"
+    fi
+    (( SECONDS >= deadline )) && break
+    sleep "$poll_interval"
+  done
+  rm -f "$status_file"
+  echo "Hosted relay is still pending after ${provision_timeout}s; localhost remains available. Retry: sudo '$signer' admin provision --login-uid $login_uid" >&2
 }
 
 upgrade_release() {

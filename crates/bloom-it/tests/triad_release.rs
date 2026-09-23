@@ -2138,7 +2138,11 @@ fn installers_invoke_signer_administration_directly_and_report_retry() {
         fs::write(
             &binary,
             r#"#!/bin/sh
-printf '%s\n' "$@" > "$ADMIN_TEST_LOG"
+printf '%s\n' "$@" >> "$ADMIN_TEST_LOG"
+if [ "$2" = status ]; then
+  printf '{}\n'
+  exit 0
+fi
 exit "$ADMIN_TEST_EXIT"
 "#,
         )
@@ -2153,18 +2157,36 @@ exit "$ADMIN_TEST_EXIT"
         );
         let script = format!(
             r#"set -eu
-release_base="$1"; login_uid=1000; live=true
+release_base="$1"; runtime="$2"; login_uid=1000; live=true
+field() {{
+  case "$2" in
+    desired_mode) printf '%s' "$ADMIN_DESIRED" ;;
+    effective_mode) printf '%s' "$ADMIN_EFFECTIVE" ;;
+    remote_tls_ready) printf '%s' "$ADMIN_TLS" ;;
+    remote_routing_ready) printf '%s' "$ADMIN_ROUTING" ;;
+    stage) printf '%s' "$ADMIN_STAGE" ;;
+  esac
+}}
 {function_source}
 {function} 1000
 "#
         );
         for exit_code in ["0", "1"] {
             let log = directory.path().join("invocation");
+            let _ = fs::remove_file(&log);
             let result = Command::new("bash")
                 .args(["-c", &script, "direct-admin-test"])
                 .arg(&release)
+                .arg(directory.path())
                 .env("ADMIN_TEST_LOG", &log)
                 .env("ADMIN_TEST_EXIT", exit_code)
+                .env("BLOOM_RELAY_PROVISION_TIMEOUT_SECONDS", "0")
+                .env("BLOOM_RELAY_PROVISION_POLL_SECONDS", "0")
+                .env("ADMIN_DESIRED", "remote_enabled")
+                .env("ADMIN_EFFECTIVE", "remote_enabled")
+                .env("ADMIN_TLS", "true")
+                .env("ADMIN_ROUTING", "true")
+                .env("ADMIN_STAGE", "ready")
                 .output()
                 .unwrap();
             assert!(
@@ -2172,17 +2194,26 @@ release_base="$1"; login_uid=1000; live=true
                 "{}",
                 String::from_utf8_lossy(&result.stderr)
             );
-            assert_eq!(
-                fs::read_to_string(log).unwrap(),
-                "admin\nprovision\n--login-uid\n1000\n"
-            );
+            let invocation = fs::read_to_string(log).unwrap();
             let stderr = String::from_utf8(result.stderr).unwrap();
-            if exit_code == "0" {
-                assert!(stderr.is_empty());
+            if installer == "install-macos.sh" {
+                assert!(invocation.starts_with("admin\nprovision\n--login-uid\n1000\n"));
+                if exit_code == "0" {
+                    assert!(invocation.lines().count() == 4);
+                    assert!(stderr.contains("Hosted ceremony provisioning command completed."));
+                } else {
+                    assert!(invocation.contains("admin\nstatus\n--login-uid\n1000\n"));
+                    assert!(stderr.contains("Hosted ceremony relay is ready"));
+                }
             } else {
-                assert!(stderr.contains("localhost remains available. Retry: sudo "));
-                assert!(stderr.contains("bloom-signer"));
-                assert!(stderr.contains("admin provision --login-uid 1000"));
+                assert_eq!(invocation, "admin\nprovision\n--login-uid\n1000\n");
+                if exit_code == "0" {
+                    assert!(stderr.is_empty());
+                } else {
+                    assert!(stderr.contains("localhost remains available. Retry: sudo "));
+                    assert!(stderr.contains("bloom-signer"));
+                    assert!(stderr.contains("admin provision --login-uid 1000"));
+                }
             }
         }
     }
