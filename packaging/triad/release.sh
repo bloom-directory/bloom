@@ -254,11 +254,18 @@ build_candidate() {
       die "release output already exists: $output_dir/$artifact_name$suffix"
   done
 
-  local resolved_machine_features forbidden_feature
+  local resolved_machine_features forbidden_feature forbidden_predecessor
   resolved_machine_features="$(cargo tree --manifest-path "$main_root/Cargo.toml" -p bloom -e normal,build,features --prefix none)"
   for forbidden_feature in unsigned-audit-test-seam audit-test-seam; do
     [[ "$resolved_machine_features" != *"feature \"$forbidden_feature\""* ]] ||
       die "forbidden production Machine feature resolved: $forbidden_feature"
+  done
+  for forbidden_predecessor in \
+    'bloom-broker.git?rev=dd2add2b9d41540521d08c77d19fb467a2d8029e' \
+    'bloom-service-runtime.git?rev=5db670e1b7507deabfdcf451be8b5d315c1c9d91'
+  do
+    [[ "$resolved_machine_features" != *"$forbidden_predecessor"* ]] ||
+      die "predecessor migration fixture resolved in production Machine graph: $forbidden_predecessor"
   done
 
   cargo build --manifest-path "$main_root/Cargo.toml" --release -p bloom --locked

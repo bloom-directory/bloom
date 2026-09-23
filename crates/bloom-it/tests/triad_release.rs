@@ -122,35 +122,10 @@ fn release_compatibility_declares_each_edge_without_a_global_protocol_range() {
             }
         }
     }
-    // Check resolved normal/build edges for both the release and this test's
-    // API constants. The lockfile also intentionally contains an exact released
-    // reader under machine-client's dev-dependencies for migration tests; that
-    // predecessor must never enter either normal dependency graph.
-    let graph = Command::new(env!("CARGO"))
-        .current_dir(workspace())
-        .args([
-            "tree",
-            "--locked",
-            "--offline",
-            "-p",
-            "bloom",
-            "-p",
-            "bloom-it",
-            "--edges",
-            "normal,build",
-            "--prefix",
-            "none",
-            "--format",
-            "{p}",
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        graph.status.success(),
-        "{}",
-        String::from_utf8_lossy(&graph.stderr)
-    );
-    let graph = String::from_utf8(graph.stdout).unwrap();
+    // This test runs from a nextest archive with no Cargo git cache. Inspect
+    // only lockfile `source =` records; package dependency strings are
+    // deliberately ignored because Cargo omits their commit fragment.
+    let lockfile = fs::read_to_string(workspace().join("Cargo.lock")).unwrap();
     for (repository, key) in [
         ("bloom-broker", "broker_commit"),
         ("bloom-signer", "signer_commit"),
@@ -161,15 +136,41 @@ fn release_compatibility_declares_each_edge_without_a_global_protocol_range() {
             .find_map(|line| line.strip_prefix(&format!("{key} = \"")))
             .and_then(|tail| tail.strip_suffix('"'))
             .unwrap_or_else(|| panic!("compatibility lacks {key}"));
-        let prefix = format!("https://github.com/bloom-directory/{repository}.git?rev=");
-        let locked: Vec<_> = graph.split(&prefix).skip(1).collect();
+        let prefix =
+            format!("source = \"git+https://github.com/bloom-directory/{repository}.git?rev=");
+        let locked = lockfile
+            .lines()
+            .filter_map(|line| line.strip_prefix(&prefix))
+            .map(|tail| {
+                let (query, fragment) = tail
+                    .strip_suffix('"')
+                    .and_then(|value| value.split_once('#'))
+                    .expect("git lockfile source must contain query and commit fragment");
+                assert_eq!(query, fragment, "git lockfile source revision drifted");
+                assert_eq!(query.len(), 40, "git lockfile source is not a full commit");
+                assert!(query.bytes().all(|byte| byte.is_ascii_hexdigit()));
+                query
+            })
+            .collect::<Vec<_>>();
+        let allowed_predecessor = match repository {
+            "bloom-broker" => Some("dd2add2b9d41540521d08c77d19fb467a2d8029e"),
+            "bloom-service-runtime" => Some("5db670e1b7507deabfdcf451be8b5d315c1c9d91"),
+            _ => None,
+        };
         assert!(
-            !locked.is_empty()
-                && locked
-                    .iter()
-                    .all(|tail| tail.starts_with(&format!("{revision}#"))),
-            "{repository} normal/build dependencies must resolve only to {key} {revision}"
+            locked.contains(&revision),
+            "{repository} lockfile sources must include {key} {revision}"
         );
+        assert!(
+            locked.iter().all(|locked_revision| {
+                *locked_revision == revision
+                    || allowed_predecessor.is_some_and(|allowed| *locked_revision == allowed)
+            }),
+            "{repository} lockfile contains an unreviewed source revision: {locked:?}"
+        );
+        if let Some(predecessor) = allowed_predecessor {
+            assert!(locked.contains(&predecessor));
+        }
     }
     assert!(!compatibility.lines().any(is_legacy_global_protocol_key));
     assert!(is_legacy_global_protocol_key("  protocol_major = 1"));
@@ -828,6 +829,13 @@ fn production_release_rejects_machine_audit_test_features() {
     assert!(gate.contains("forbidden production Machine feature resolved"));
     assert!(gate.contains("cargo tree"));
     assert!(gate.contains("-e normal,build,features"));
+    for predecessor in [
+        "dd2add2b9d41540521d08c77d19fb467a2d8029e",
+        "5db670e1b7507deabfdcf451be8b5d315c1c9d91",
+    ] {
+        assert!(gate.contains(predecessor));
+    }
+    assert!(gate.contains("predecessor migration fixture resolved in production Machine graph"));
 }
 
 #[test]
