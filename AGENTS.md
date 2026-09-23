@@ -57,7 +57,8 @@ Use separate target directories for concurrent Cargo builds. Select the exact
 Machine, Broker, and Signer binaries for integration work, and record their
 full commits with the evidence. Follow the launcher's
 [repository discovery requirements](./DEVELOPMENT.md#test-the-binaries-you-intended);
-binary overrides do not replace those requirements.
+each sibling checkout is needed only for the service whose binary override is
+absent.
 
 ## Working agreement
 
