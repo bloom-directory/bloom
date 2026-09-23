@@ -226,6 +226,15 @@ another. A fresh-root launch on an occupied port fails and cleans up only its
 own units; it never stops the conflicting listener, restarts shared services,
 or falls back to another port.
 
+All ceremony ports share the `localhost` WebAuthn RP scope (`rpId
+"localhost"` covers every `localhost:<port>` origin), so one platform
+passkey can serve ceremonies on any candidate port. The shared scope does
+not share authorization: a credential must still be enrolled with and
+recognized by the destination Triad's own Signer — a passkey created on
+candidate A cannot approve a ceremony on candidate B, and a page served by
+one Triad posting to another fails the destination's origin check (the
+Broker log names the expected origin).
+
 Run one Machine per home. `bloom serve` and `bloom init` hold an exclusive lock
 on the whole home for their lifetime, so a second one against the same home
 fails with `Bloom home is already open for writing`. Every other command,
@@ -251,6 +260,16 @@ On Linux the launcher starts that candidate's systemd socket before checking
 `--services-only`, so that mode also reserves the candidate's port. Use the
 existing VFS-only launcher mode (omit `--mount`) for the concurrency test; a
 kernel mount adds no evidence about ceremony-port isolation.
+
+`scripts/test-ceremony-port-concurrency.sh` runs the whole acceptance
+sequence repeatably: it launches A and B with explicit ports and binary
+paths, enrolls a disposable wallet plus a policy-update assertion ceremony
+in each, fails a colliding fresh-root launch on A's port, stops A through
+its own launcher handle, and restarts A with its enrollment intact while B
+stays usable. Supply the four binaries explicitly (Machine, Broker, Signer,
+debug driver) and keep run roots short: unix socket paths must fit in
+`SUN_LEN`, so the script uses a short directory under `/tmp` regardless of
+`TMPDIR`.
 
 ## Cross-repository changes
 

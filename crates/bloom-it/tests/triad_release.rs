@@ -454,7 +454,7 @@ fn build(staging: &Path, output: &Path, key: &Path) -> std::process::Output {
                 &format!("broker_commit = \"{}\"", "22".repeat(20)),
             )
             .replace(
-                "signer_commit = \"ccc9adb3866b17b87d2774018dcfa015184b1918\"",
+                "signer_commit = \"97b9ac7e47ee682e59804d04f6288419f3598a58\"",
                 &format!("signer_commit = \"{}\"", "33".repeat(20)),
             ),
     )
@@ -778,8 +778,12 @@ fn triad_developer_launcher_selects_ceremony_port_without_sibling_checkouts() {
         for arg in extra {
             command.arg(arg);
         }
-        // Isolate port selection from the ambient developer shell.
+        // Isolate port selection and binary discovery from the ambient
+        // developer shell; each case opts back in through `envs`.
         command.env_remove("BLOOM_TRIAD_DEV_CEREMONY_PORT");
+        command.env_remove("BLOOM_INTEGRATION_MACHINE_BIN");
+        command.env_remove("BLOOM_INTEGRATION_BROKER_BIN");
+        command.env_remove("BLOOM_INTEGRATION_SIGNER_BIN");
         for (key, value) in envs {
             command.env(key, value);
         }
@@ -797,11 +801,16 @@ fn triad_developer_launcher_selects_ceremony_port_without_sibling_checkouts() {
     ];
 
     // Malformed flag and environment values fail during argument validation.
+    // The oversized decimals would wrap in Bash arithmetic onto valid ports
+    // (one wraps onto the custody port); they must be rejected textually.
     for extra in [
         vec!["--ceremony-port", "bogus"],
         vec!["--ceremony-port", "0"],
         vec!["--ceremony-port", "65536"],
         vec!["--ceremony-port", ""],
+        vec!["--ceremony-port", "18446744073709580351"],
+        vec!["--ceremony-port", "18446744073709570350"],
+        vec!["--ceremony-port", "00018446744073709570350"],
     ] {
         let directory = tempfile::tempdir().unwrap();
         let rejected = launch(&launcher_path, &extra, &overrides, directory.path());
@@ -855,26 +864,52 @@ fn triad_developer_launcher_selects_ceremony_port_without_sibling_checkouts() {
 
     // With every binary supplied, a valid port passes sibling discovery even
     // when no sibling checkout exists. Copy the launcher to an isolated
-    // directory so `../bloom-broker` and `../bloom-signer` cannot resolve;
-    // the run still fails later (no packaging templates there), but never on
-    // sibling discovery.
+    // directory so `../bloom-broker` and `../bloom-signer` cannot resolve.
+    // The run proceeds past validation and discovery to config staging,
+    // which fails there on the missing packaging templates: that later
+    // checkpoint proves the earlier stages passed instead of merely
+    // asserting which error did not appear.
     let directory = tempfile::tempdir().unwrap();
     let isolated = directory.path().join("isolated");
     fs::create_dir_all(&isolated).unwrap();
     let isolated_launcher = isolated.join("triad-dev-launch.sh");
     fs::copy(&launcher_path, &isolated_launcher).unwrap();
     fs::set_permissions(&isolated_launcher, fs::Permissions::from_mode(0o755)).unwrap();
-    let attempted = launch(
+    for extra in [
+        vec!["--ceremony-port", "28735"],
+        // Zero-padded input selects the same port.
+        vec!["--ceremony-port", "0028735"],
+    ] {
+        let attempted = launch(&isolated_launcher, &extra, &overrides, &isolated);
+        assert!(!attempted.status.success(), "extra args: {extra:?}");
+        assert!(
+            stderr(&attempted).contains("edge-manifest.json.in")
+                && !stderr(&attempted).contains("sibling repository"),
+            "extra args {extra:?}: {}",
+            stderr(&attempted)
+        );
+    }
+
+    // A valid flag wins over a malformed environment value and reaches the
+    // same staging checkpoint.
+    let directory = tempfile::tempdir().unwrap();
+    let flag_wins = launch(
         &isolated_launcher,
         &["--ceremony-port", "28735"],
-        &overrides,
-        &isolated,
+        &[
+            ("BLOOM_TRIAD_DEV_CEREMONY_PORT", "bogus"),
+            ("BLOOM_INTEGRATION_MACHINE_BIN", "/bin/true"),
+            ("BLOOM_INTEGRATION_BROKER_BIN", "/bin/true"),
+            ("BLOOM_INTEGRATION_SIGNER_BIN", "/bin/true"),
+        ],
+        directory.path(),
     );
-    assert!(!attempted.status.success());
+    assert!(!flag_wins.status.success());
     assert!(
-        !stderr(&attempted).contains("sibling repository"),
+        stderr(&flag_wins).contains("edge-manifest.json.in")
+            && !stderr(&flag_wins).contains("1 through 65535"),
         "{}",
-        stderr(&attempted)
+        stderr(&flag_wins)
     );
 
     // Without overrides the sibling requirement still applies once a valid

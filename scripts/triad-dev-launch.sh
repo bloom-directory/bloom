@@ -57,12 +57,20 @@ fi
 case "$ceremony_port_raw" in
   ''|*[!0-9]*) die "--ceremony-port (or BLOOM_TRIAD_DEV_CEREMONY_PORT) must be an integer 1 through 65535" ;;
 esac
-if ! ceremony_port="$((10#$ceremony_port_raw))" 2>/dev/null; then
+# Strip leading zeros so ordinary zero-padded input (0028735) keeps
+# selecting 28735; an all-zeros value collapses and fails the range check.
+stripped_port=$ceremony_port_raw
+while [ -n "$stripped_port" ] && [ "${stripped_port#0}" != "$stripped_port" ]; do
+  stripped_port=${stripped_port#0}
+done
+[ -n "$stripped_port" ] || stripped_port=0
+# Bound the digit count before arithmetic: Bash integer arithmetic wraps on
+# overflow, so an oversized decimal could otherwise wrap into the valid range
+# (or onto the custody port). Six or more significant digits always exceed
+# 65535, while five digits can never overflow the arithmetic.
+[ "${#stripped_port}" -le 5 ] ||
   die "--ceremony-port (or BLOOM_TRIAD_DEV_CEREMONY_PORT) must be an integer 1 through 65535"
-fi
-case "$ceremony_port" in
-  '') die "--ceremony-port (or BLOOM_TRIAD_DEV_CEREMONY_PORT) must be an integer 1 through 65535" ;;
-esac
+ceremony_port="$((10#$stripped_port))"
 [ "$ceremony_port" -ge 1 ] && [ "$ceremony_port" -le 65535 ] ||
   die "--ceremony-port (or BLOOM_TRIAD_DEV_CEREMONY_PORT) must be an integer 1 through 65535"
 case "$install_authority_fixture" in
