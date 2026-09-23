@@ -8,18 +8,20 @@
   <a href="https://github.com/bloom-directory/bloom/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/bloom-directory/bloom/ci.yml?branch=master&style=flat-square&label=ci"></a>
   <a href="https://github.com/bloom-directory/bloom/releases"><img alt="Release" src="https://img.shields.io/github/v/release/bloom-directory/bloom?include_prereleases&style=flat-square"></a>
   <a href="./LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-141310?style=flat-square"></a>
-  <img alt="Rust 1.85+" src="https://img.shields.io/badge/rust-1.85%2B-a8324c?style=flat-square">
+  <a href="./Cargo.toml"><img alt="Declared MSRV: 1.86" src="https://img.shields.io/badge/Declared%20MSRV%3A%201.86-a8324c?style=flat-square"></a>
 </p>
 
 <p align="center">
   <a href="./QUICKSTART.md"><strong>Quickstart</strong></a>
+  ·
+  <a href="./DEVELOPMENT.md"><strong>Development</strong></a>
   ·
   <a href="./docs/AGENTIC_WALLET.md"><strong>Wallet guide</strong></a>
   ·
   <a href="https://bloom.directory/SKILL.md"><strong>Agent setup skill</strong></a>
 </p>
 
-Bloom is an **agentic Ethereum wallet mounted as a virtual filesystem**.
+Bloom is an **agentic EVM and Solana wallet mounted as a virtual filesystem**.
 Reads are blockchain queries, writes are transaction intents, and the
 primary interface is an ordinary directory your agent can inspect with
 normal filesystem tools (`ls`, `cat`, `echo`). Depending on OS and
@@ -50,6 +52,8 @@ Bloom gives an agent a safe wallet workspace:
   methods, storage, events, NFTs, ENS, prices, and address history;
 - create/import encrypted wallets without exposing private keys through
   the filesystem;
+- derive EVM and Solana accounts from one BIP-39 mnemonic root, with
+  secp256k1 BIP-44 and hardened Ed25519 SLIP-10 paths;
 - stage native ETH, ERC-20, NFT, contract-call, signing, and installed-Petal
   DeFi intents by writing plain-language or structured files;
 - stage free or paid HTTP requests through `/requests`, including HTTP
@@ -62,11 +66,26 @@ Bloom gives an agent a safe wallet workspace:
 
 Bloom ships read-ready RPC defaults for major EVM networks — Ethereum,
 Base, Tempo, Robinhood Chain, Arbitrum, Optimism, Polygon, BNB Smart Chain,
-Avalanche, Gnosis, Linea, and HyperEVM — plus local Anvil. Per-chain
-broadcasting is enabled by default; set `allow_broadcast = false` on a chain to
-disable it.
+Avalanche, Gnosis, Linea, HyperEVM, and Arc — plus local Anvil.
+Broadcasting is available on every configured chain.
 Public reads, simulations, and planning work without adding API keys;
 local devnet sends require a running Anvil node.
+
+Every new BIP-39 wallet creates its canonical EVM and Solana accounts in the
+registration ceremony. The legacy raw secp256k1 scalar import profile remains
+available only when selected explicitly:
+
+```sh
+bloom wallet new main
+bloom wallet address main --profile solana
+bloom wallet address main --profile evm
+```
+
+Native Solana transfers use the same wallet outbox shape as EVM transfers,
+with genesis pinning, exact-message semantic verification in Broker,
+signature-verifying simulation, explicit owner approval, and finalized
+receipt reconciliation. Solana mainnet-beta uses the same explicitly enabled,
+genesis-pinned transaction path.
 
 ## Try it
 
@@ -78,6 +97,11 @@ cargo run -p bloom -- init
 mkdir -p "$HOME/bloom"
 cargo run -p bloom -- serve --mount "$HOME/bloom"
 ```
+
+This is a Machine-only public-read loop. Wallet custody, approval, and signing
+require the separate Broker and Signer processes. Use the triad quickstart for
+authority-bearing workflows; never add a local signer to make this command
+standalone.
 
 In another terminal, or from your agent:
 
@@ -114,14 +138,18 @@ For the full wallet walkthrough, read
 
 ## Development commands
 
-For local development, use the package-manager-native checks:
+For a focused Machine change, use the package-manager-native checks:
 
 ```sh
-cargo fmt
+cargo fmt --all -- --check
 cargo test -p bloom
 cargo test --workspace --lib
 cargo build -p bloom
 ```
+
+Cross-process, BIP-39, and Solana work uses the staged triad workflow and test
+ladder in [`DEVELOPMENT.md`](./DEVELOPMENT.md); a single-process `cargo run` is
+not evidence for an authority-boundary change.
 
 ## Filesystem layout
 
@@ -147,9 +175,11 @@ A fresh Bloom VFS root exposes these default entries:
 - `addressbook/<alias>` — local petname directory.
 - `ens/<name>.eth` — ENS forward resolution as a read surface.
 - `petals/` — installed local Petal app surfaces. `bloom init` provisions the
-  pinned Near Intents and
-  [Enso](https://github.com/bloom-directory/bloom-petal-enso) packages;
-  unreleased migrated venue Petals are installed explicitly.
+  pinned [Polymarket](https://github.com/bloom-directory/bloom-petal-polymarket),
+  [Hyperliquid](https://github.com/bloom-directory/bloom-petal-hyperliquid),
+  [Enso](https://github.com/bloom-directory/bloom-petal-enso),
+  [Near Intents](https://github.com/bloom-directory/bloom-petal-near), and
+  [Tolly](https://github.com/TollyLabs/bloom-petal-tolly) releases.
   Read `docs/petals.md` in the VFS for the exact installed set, mount
   directories, summaries, and declared capabilities.
 - `requests/` — free and paid HTTP requests. Paid HTTP 402 challenges are
@@ -183,6 +213,7 @@ Bloom is a Rust Cargo workspace. The main user-facing/runtime crates are:
 | `bloom-vfs` | Path router, handler trait, per-path caching, and vendored docs. |
 | `bloom-evm` / `bloom-rpc` | RPC pools, per-chain engines, chain reads, and provider health. |
 | `bloom-tx` | Unsigned transaction staging, simulation, Broker signing orchestration, broadcast, and nonce management. |
+| `bloom-solana` / `bloom-solana-tx` | Genesis-bound Solana RPC, canonical native transfers, durable outbox, simulation, broadcast, restaging, and reconciliation. |
 | `bloom-mempool` | Optional pending-transaction indexing for configured WebSocket providers. |
 | `bloom-watch` | Subscription registry and polling executor. |
 | `bloom-mount` | NFSv4 adapter that mounts Bloom's VFS as an ordinary filesystem. |
@@ -197,9 +228,8 @@ and example crates used by the broader Bloom runtime and examples.
 
 ## Security defaults
 
-- **Broadcast routing enabled by default.** Per-chain `allow_broadcast`
-  defaults to `true`. Signing, policy, confirmation, and Sealed Approval
-  gates still apply.
+- **Broadcast routing available on every chain.** Signing, policy, confirmation,
+  and Sealed Approval gates apply.
 - **Machine contains no wallet keys.** Custody and signing cross Machine's
   authenticated Broker edge; Signer alone owns private keys and delegated
   Petal sub-keys. The mount exposes only public projections and signatures
@@ -221,9 +251,8 @@ and example crates used by the broader Bloom runtime and examples.
 - **Per-login Machine surface.** Production Broker and Signer run as isolated
   service principals and authenticate local RPC peers. The mounted Machine
   surface remains scoped to its enrolled login.
-- **Broadcast config is not an approval boundary.** Set a chain's
-  `allow_broadcast = false` to disable broadcast on that chain. Value-moving
-  actions still pass Bloom's signing, policy, and confirmation controls.
+- **Broadcast requires authorization.** Value-moving actions pass Bloom's
+  signing, policy, and confirmation controls.
 - **Embedded indexer deferred.** Address activity, ERC-20 / ERC-721
   history, and contract source / ABI are served via Etherscan; no
   local block-by-block index yet. The selected backend is visible under

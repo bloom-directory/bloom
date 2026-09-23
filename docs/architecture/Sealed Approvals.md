@@ -174,6 +174,24 @@ Venue-specific custody and signing protocols do not belong in Machine, Broker,
 or Signer. An installed Hyperliquid Petal, for example, uses this generic scope
 instead of a native Machine agent-session key.
 
+## By-key revocation and Exact survival
+
+`sealed_approval.revoke_for_key` revokes every Sealed Approval whose terms
+bind one key. Broker resolves the set from its own journal, so a caller whose
+record of approval ids is stale still stops all of the key's automation, and
+the method is idempotent. Prepared and awaiting-ceremony approvals are
+cancelled by the same journaled operation; a pre-stop ceremony cannot complete
+into a usable approval afterwards. Machine uses it for the session `stop`
+write and treats only terminal reports (revoked, failed, exhausted, expired,
+cancelled, orphaned) as success.
+
+An Exact approval drops only the scope-expiry comparison: wallet, route,
+package, suite, operation class, and lifetime restrictions still bind, and
+reusable approvals still expire on the key scope. Consequently a stopped or
+expired Petal session can still obtain a fresh payload-specific Exact approval
+within the key's remaining restrictions — that is the recovery path its
+`eligible_exact_routes` projection points at, not a bypass of the stop.
+
 ## Separation from custody and policy updates
 
 Custody ceremonies share Broker's browser origin and common ceremony status,

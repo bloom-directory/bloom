@@ -1,8 +1,9 @@
 # Bloom views
 
-This directory holds read-only HTML pages meant for a person to open in a
-browser. They render the same facts the surrounding VFS exposes as JSON and
-Markdown; they never introduce a new authority surface.
+This directory holds read-only pages meant for a person to open in a
+browser, plus one Markdown briefing for chat. They render the same facts the
+surrounding VFS exposes as JSON and Markdown; they never introduce a new
+authority surface.
 
 Open one from the mount, for example:
 
@@ -11,8 +12,13 @@ xdg-open ~/bloom/views/index.html    # Linux
 open /Volumes/bloom/views/index.html # macOS
 ```
 
+For chat, quote `briefing.md` — the Today briefing as pasteable Markdown,
+drawn from the same data as `index.html`.
+
 ## Pages
 
+- `briefing.md` — Today for chat: holdings, what needs you, app positions,
+  and recent activity as Markdown to quote into a transcript.
 - `index.html` — Today: what you hold, what needs you, what happened recently.
 - `wallets.html` — every wallet in the current Broker listing, organized by
   projected wallet/account identity. Native balances and Petal positions stay
@@ -38,10 +44,11 @@ open /Volumes/bloom/views/index.html # macOS
   targets and unclassified targets are never promoted to contacts.
 - `receive.html` — receiving addresses grouped by wallet and address family,
   with self-contained QR artwork encoding the displayed address. EVM addresses
-  must parse as EVM addresses; Solana requires an explicit `solana:` CAIP-10
-  address on an Ed25519 key. The current key projection does not expose the
-  newer account-list API; absent Solana data gets an unavailable card, never a
-  guessed destination. Full Solana account discovery still needs that API.
+  must parse as EVM addresses. Solana addresses come from the numbered-account
+  inventory (derivation path shown on each card); projections cached from
+  before that inventory still contribute explicit `solana:` CAIP-10 addresses
+  from Ed25519 keys, and a bare Ed25519 key never qualifies. Absent Solana
+  data gets an unavailable card, never a guessed destination.
 - `policy.html` — where each wallet may send, which package fingerprints may
   request it, and how long approval may last, from its signed policy.
 - `bloom.css`, `bloom.js`, and `icons/` — the stylesheet, the small local
@@ -49,12 +56,39 @@ open /Volumes/bloom/views/index.html # macOS
   reference. Icons are matched on canonical identity (chain id, then asset
   symbol); an unknown name keeps an initials fallback. Provenance is
   documented in the icon sources beside the handler.
+- `skin.css` — the person's own styles. See below.
+
+## Skins
+
+Every page loads `bloom.css` (the base Bloom design) and then `skin.css`.
+`skin.css` is whatever the file `~/.bloom/skin.css` holds, re-read on every
+access, and empty when that file does not exist, so with no skin the pages
+are the base design.
+
+To restyle the pages, write CSS to `~/.bloom/skin.css` and reload. Every
+color, font, and radius in `bloom.css` is a custom property on `:root`, so a
+skin that only redefines tokens restyles every page at once:
+
+```css
+:root { --accent: #1f5fbf; --serif: Georgia, serif; }
+```
+
+A skin may also override any rule.
+
+A skin is styling only. The pages' Content-Security-Policy still forbids
+every remote fetch and every script, whatever the stylesheet asks for, and a
+skin cannot change what a page says.
+
+When a person asks for a different look, edit `~/.bloom/skin.css` on the
+host; the mount itself is read-only.
 
 ## What to tell a person
 
-Point them at the file path and let the browser render it. Do not paste the
-HTML into a chat transcript, and do not re-render these pages yourself: the
-canonical values live in the sibling JSON leaves
+Point them at the file path and let the browser render it. For anything that
+must be said inside the chat itself, quote `briefing.md` rather than
+summarizing from memory. Do not paste the HTML into a chat transcript, and do
+not re-render these pages yourself: the canonical values live in the sibling
+JSON leaves
 (`wallets/<wallet>/addresses.json`, `wallets/<wallet>/chains/<chain>/balance.json`,
 `outbox/<state>/<action>/intent.json` and `result.json`).
 

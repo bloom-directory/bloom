@@ -1,8 +1,9 @@
 # Bloom triad release package
 
 `compatibility-v1.toml` is the closed v1 service matrix. It declares each edge
-independently: the Machine–Broker and Broker–Signer authority APIs require
-exactly 1.4, while Signer control and login-session liveness accept 1.0–1.1.
+independently: the Machine–Broker and Broker–Signer authority APIs each require
+one exact minor, while Signer control and login-session liveness accept a range.
+`triad_release` checks every range against the API crate at the pinned revision.
 Service packages may advance independently when every edge remains inside its
 declared range; incompatible edges fail closed.
 It also records the reviewed Broker, Signer, service-runtime, and
@@ -58,6 +59,7 @@ The signer refuses a mixture of evidence from different candidates.
 
 ```sh
 packaging/triad/release.sh build linux --output-dir DIR
+packaging/triad/release.sh build linux-aarch64 --output-dir DIR
 packaging/triad/release.sh build macos --output-dir DIR
 ```
 
@@ -67,30 +69,34 @@ builds with locked dependencies, validates the selected binary architecture
 and installer, assembles and verifies the bundle twice, and publishes
 byte-identical `test-unclaimed` output. It does not run
 repository-wide formatting, Clippy, or test suites; those are independent CI
-source-quality gates. Both platforms emit the archive plus `.sha256`, `.sig`,
+source-quality gates. All targets emit the archive plus `.sha256`, `.sig`,
 and `.pub` sidecars.
 
-The release workflow builds the macOS aarch64 candidate on `macos-15` alongside
-the Linux candidate. A manual `dry_run=true` dispatch uploads both
-`test-unclaimed` candidates as Actions artifacts and cannot reach production
+The release workflow builds Linux aarch64 natively on `ubuntu-24.04-arm` and
+macOS aarch64 on `macos-15` alongside Linux x86_64. A manual `dry_run=true`
+dispatch uploads all three `test-unclaimed` candidates as Actions artifacts
+and cannot reach production
 signing or GitHub publication. Live candidate installation requires both a
 root-owned, non-writable pin of that artifact's ephemeral public key and the
 explicit `BLOOM_ALLOW_TEST_UNCLAIMED=true` installer opt-in.
 
-`release.sh sign linux|macos` is the isolated production signing pass. It never
-executes a candidate-owned binary or script. It verifies the expected version,
-source revisions, and target architecture, replaces the ephemeral inner
-signature, deterministically repacks the payload, signs the outer checksum,
-and refuses a private key that does not match the reviewed public key. GitHub
-Actions makes the release key available only to the protected
+`release.sh sign linux|linux-aarch64|macos` is the isolated production signing
+pass. It never executes a candidate-owned binary or script. It verifies the
+expected version, source revisions, and target architecture, replaces the
+ephemeral inner signature, deterministically repacks the payload, signs the
+outer checksum, and refuses a private key that does not match the reviewed
+public key. GitHub Actions makes the release key available only to the protected
 `production-release` signing job. The tag workflow signs and publishes Linux
-x86_64 and macOS aarch64 together as a normal GitHub Release.
+x86_64, Linux aarch64, and macOS aarch64 together as a normal GitHub Release.
+The tag must contain this Linux aarch64-capable release driver: a retry executes
+the workflow and `release.sh` from the selected tag and does not backport newer
+release machinery into an existing release.
 
 Before merging release-workflow changes, dispatch the branch with
 `dry_run=true`. That path builds the exact branch with an ephemeral test key,
 uploads the `test-unclaimed` candidate for inspection, and skips both the
-protected production-signing job and the publish job. Normal tag pushes and tag
-retries cannot select dry-run mode.
+protected production-signing job and the publish job. Normal tag pushes and
+tag retries cannot select dry-run mode.
 
 Before compiling, `release.sh` rejects the remaining forbidden production
 Machine features from the resolved normal/build Cargo graph. Bundle assembly
@@ -122,8 +128,8 @@ of these private files: its guarded live installer uses the same fresh
 root-owned identity-generation path as the production Unix-principal claim.
 On Linux, Bloom uses the host system clock behind its durable rollback and
 same-boot forward-step guards; it does not install or require a separate time
-daemon. AWS credentials and `aws-kms-ip-allow.conf` are an optional paired
-site overlay.
+daemon. The released Signer has no AWS KMS backend, so the Linux installer
+refuses AWS credentials or `aws-kms-ip-allow.conf` in the payload.
 
 The Linux archive generates a complete fresh per-login enrollment from
 packaged public templates and the host CSPRNG; it does not require site-specific
@@ -152,6 +158,36 @@ in active and retained configuration, and validate active services before
 committing. Active enrollments require available user session buses. Failed
 activation and interrupted transactions restore the previous release. Custody,
 identity material, and allocated NFS ports are preserved.
+
+Before any unit is mutated, the transaction (`schema
+bloom.linux-upgrade-transaction.2`) snapshots the installed Bloom-owned unit
+templates — both ceremony sockets, the Broker and Signer service templates, the
+session path, the two user service units, and the retired RPC/control socket
+templates — recording explicit absence alongside bytes and modes. A rollback
+stops the release set, restores that unit contract, reselects the previous
+release, and rewrites release metadata before any restart; a failure at any of
+those steps preserves the transaction instead of starting a Broker over
+mismatched units. The rollback clears the transaction only when every enrolled
+login passes the authenticated health gate. The per-login AWS KMS Signer
+drop-in and its credential are not part of the snapshot: they follow the
+payload of the last installation, so a KMS host that rolls back after an
+upgrade with a payload lacking the KMS overlay is repaired by rerunning the
+installer with that overlay.
+
+Recovery after an interruption restores the coherent previous installation and
+then lets the verified installer retry the requested release; it never
+completes the interrupted candidate in place. Recovery clears the transaction
+as soon as the previous installation is restored and only then restarts it,
+without gating on the health check: a host whose previous release cannot start
+must still be able to install the release that fixes it, and a run that stops
+after recovery, or reinstalls the previous release, must not leave the other
+enrolled logins stopped until a reboot. Uninstalling a login is refused while
+an interrupted upgrade is pending. A
+transaction recorded by an earlier installer (`schema
+bloom.linux-upgrade-transaction.1`) carries no unit snapshot; it is recovered
+by rolling the binary selection and release metadata back on their own, as the
+installer that opened it would have, and the retried installation then rewrites
+every Bloom-owned unit coherently before starting anything.
 
 Linux installs provide `bloom-uninstall`. Its default `--retain-custody` mode
 stops and disables the selected enrollment, removes runtime integration, and

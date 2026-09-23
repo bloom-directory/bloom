@@ -46,3 +46,19 @@
     sort(key, direction);
   }));
 })();
+
+(() => {
+  // Deep links name a wallet (`receive.html#wallet-main`). Without script
+  // the picker still works by hand; with script the linked wallet is
+  // selected on arrival and on hash changes.
+  const shell = document.querySelector("[data-wallet-picker]");
+  if (!shell) return;
+  const select = () => {
+    const match = location.hash.match(/^#wallet-(.+)$/);
+    if (!match) return;
+    const input = document.getElementById(`pick-${match[1]}`);
+    if (input) input.checked = true;
+  };
+  window.addEventListener("hashchange", select);
+  select();
+})();

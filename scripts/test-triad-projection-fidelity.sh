@@ -386,12 +386,34 @@ if printf '%s\n' "$wallet_entries" | grep -Eiq '(credential|passkey|authenticato
 fi
 
 printf 'MA-03: importing wallet through Broker/Signer...\n'
+mnemonic_file="${run_root}/import-mnemonic"
+printf '%s\n' \
+  'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art' \
+  > "$mnemonic_file"
+chmod 0600 "$mnemonic_file"
 import_launch="$(cli wallet import ma03-import)"
 import_result="$(complete_launch "$import_launch" import-auth \
-  --sign-count 1 --raw-private-key ERERERERERERERERERERERERERERERERERERERERERE)"
+  --sign-count 1 --mnemonic-file "$mnemonic_file")"
 imported_wallet="$(printf '%s' "$import_result" | jq -er '.wallet_id')"
 [ "$imported_wallet" != "$registered_wallet" ] || die "registration and import returned one wallet"
 assert_projection_pair "$imported_wallet" import >/dev/null
+imported_accounts="$(cli wallet accounts "$imported_wallet")"
+printf '%s' "$imported_accounts" | jq -e \
+  --arg wallet "$imported_wallet" --arg evm_path "m/44'/60'/0'/0/0" '
+    .wallet_id == $wallet and
+    .seed_profile == "bip39-multicurve-v1" and
+    any(.accounts[];
+      .wallet_seed_profile == "bip39-multicurve-v1" and
+      .derivation_profile == "bip44-evm-secp256k1-v1" and
+      .path == $evm_path and
+      .lifecycle == "ACTIVE")
+  ' >/dev/null || die "mnemonic import omitted its canonical BIP-39 EVM account"
+mounted_accounts="$(bounded_mounted_read \
+  "$(mounted "/wallets/${imported_wallet}/accounts.json")" \
+  "imported BIP-39 account projection read")"
+[ "$(printf '%s' "$imported_accounts" | jq -cS .)" = \
+  "$(printf '%s' "$mounted_accounts" | jq -cS .)" ] ||
+  die "CLI and mounted BIP-39 account projections disagree"
 assert_no_legacy_record "$registered_wallet" "$imported_wallet"
 
 printf 'MA-03: replacing the registered wallet credential...\n'
@@ -503,12 +525,12 @@ done < <(bounded_mounted_list "$(mounted /petal-key-requests)" \
 fixture_key_ref="$(printf '%s' "$fixture_key_record_body" | jq -ec '.public_key.key_ref')"
 fixture_provenance_digest="$(printf '%s' "$fixture_key_record_body" | jq -er '.provenance_digest')"
 fixture_agent_id="$(printf '%s' "$fixture_key_record_body" | jq -c '.scope.agent_id')"
-wallet_authority="$(bounded_mounted_read \
-  "$(mounted "/wallets/${registered_wallet}/addresses.json")" \
-  "wallet authority projection read")"
-policy_version="$(printf '%s' "$wallet_authority" | jq -er '.policy_version')"
-policy_digest="$(printf '%s' "$wallet_authority" | jq -er '.policy_digest')"
-wallet_revocation_epoch="$(printf '%s' "$wallet_authority" | jq -er '.wallet_revocation_epoch')"
+wallet_projection="$(bounded_mounted_read \
+  "$(mounted "/wallets/${registered_wallet}/projection.json")" \
+  "wallet projection read")"
+policy_version="$(printf '%s' "$wallet_projection" | jq -er '.wallet.policy_version')"
+policy_digest="$(printf '%s' "$wallet_projection" | jq -er '.wallet.policy_digest')"
+wallet_revocation_epoch="$(printf '%s' "$wallet_projection" | jq -er '.wallet.wallet_revocation_epoch')"
 approval_now_ms="$(( $(date +%s) * 1000 ))"
 # The approval must outlive Broker's custody ceremony so the completed
 # activation cannot already exceed immutable terms. It remains strictly

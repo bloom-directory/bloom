@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -9,6 +10,7 @@ use bloom_broker_api::{
     ProvenanceRecord, ProvenanceSubject, SealedApprovalPrepareResponse, ServiceFuture,
     SignedPolicySnapshot, SigningResult, Token, WalletPublic,
 };
+use bloom_machine_client::empty_wallet_accounts;
 use bloom_machine_client::{
     MachineBrokerClient, ProjectionFreshness, ProjectionVerification, WalletProjection,
     WalletProjectionReader,
@@ -50,7 +52,7 @@ impl MachineBrokerService for ExactBroker {
                     Ok(MachineBrokerResponse::WalletGetPublic(self.wallet.clone()))
                 }
                 MachineBrokerRequest::KeyGetPublic(request)
-                    if request.key_ref == self.wallet.root_key_ref =>
+                    if Some(request.key_ref.clone()) == self.wallet.root_key_ref =>
                 {
                     Ok(MachineBrokerResponse::KeyGetPublic(KeyPublic {
                         key_ref: request.key_ref,
@@ -140,7 +142,7 @@ fn projection(address: String) -> (WalletPublic, Arc<dyn WalletProjectionReader>
     let wallet = WalletPublic {
         wallet_id: token("alice"),
         wallet_kind: token("local"),
-        root_key_ref: key_ref.clone(),
+        root_key_ref: Some(key_ref.clone()),
         key_refs: vec![key_ref.clone()],
         policy_version: DecimalU64::new(1),
         policy_digest: policy_digest.clone(),
@@ -165,6 +167,8 @@ fn projection(address: String) -> (WalletPublic, Arc<dyn WalletProjectionReader>
             policy_verifying_key: Base64UrlBytes::from_bytes(&[4; 32]),
             signer_signature: Base64UrlBytes::from_bytes(&[5; 64]),
         },
+        accounts: empty_wallet_accounts(bloom_broker_api::Token::new("m2").unwrap()),
+        accounts_unavailable: None,
         source_protocol: "bloom.machine-broker.v1".into(),
         response_digest: digest(6),
         observed_at_ms: 1,
@@ -474,6 +478,322 @@ async fn production_mpp_route_prepares_then_signs_through_broker() {
             .join("requests/sent")
             .join(id)
             .join("private/exact-signing/charge-transaction.json")
+            .exists()
+    );
+}
+
+struct PausedMerchant {
+    url: Url,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Semaphore>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for PausedMerchant {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn paused_merchant() -> PausedMerchant {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let signal = entered.clone();
+    let gate = release.clone();
+    let task = tokio::spawn(async move {
+        let mut connections = tokio::task::JoinSet::new();
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let signal = signal.clone();
+            let gate = gate.clone();
+            connections.spawn(async move {
+                let request = read_request(&mut stream).await;
+                let paid = request.to_ascii_lowercase().contains("payment-signature:");
+                let response = if paid {
+                    signal.notify_one();
+                    gate.acquire().await.unwrap().forget();
+                    "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\npaid".to_owned()
+                } else {
+                    format!("HTTP/1.1 402 Payment Required\r\nPayment-Required: {X402_REQUIRED}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                };
+                stream.write_all(response.as_bytes()).await.unwrap();
+            });
+        }
+    });
+    PausedMerchant {
+        url,
+        entered,
+        release,
+        task,
+    }
+}
+
+async fn stage_paid(handler: &RequestsHandler, root: &std::path::Path, url: &Url) -> String {
+    handler
+        .write(
+            &VfsPath::parse("/new").unwrap(),
+            format!("GET {url} wallet=alice max_amount_usd=20000").as_bytes(),
+        )
+        .await
+        .unwrap();
+    let latest = std::fs::read_to_string(root.join("requests/latest")).unwrap();
+    let id = latest.trim().strip_prefix("pending/").unwrap().to_owned();
+    let confirm = VfsPath::parse(&format!("/pending/{id}/confirm")).unwrap();
+    let error = handler.write(&confirm, b"confirm").await.unwrap_err();
+    assert!(
+        matches!(error, HandlerError::Backend(message) if message == "paid-http Broker approval required")
+    );
+    id
+}
+
+#[tokio::test]
+async fn paid_confirm_excludes_cancel_and_same_wallet_execution() {
+    let root = tempfile::tempdir().unwrap();
+    let (wallet, projections) = projection("0x1111111111111111111111111111111111111111".into());
+    let (signer, _) = exact_signer(wallet);
+    let merchant = paused_merchant().await;
+    let handler = RequestsHandler::new_projected(root.path(), Some("alice".into()), projections)
+        .with_exact_signer(Some(signer));
+    let first = stage_paid(&handler, root.path(), &merchant.url.join("first").unwrap()).await;
+    let second = stage_paid(&handler, root.path(), &merchant.url.join("second").unwrap()).await;
+    let first_path = VfsPath::parse(&format!("/pending/{first}/confirm")).unwrap();
+    let first_confirm = handler.write(&first_path, b"confirm");
+    tokio::pin!(first_confirm);
+    tokio::select! {
+        _ = merchant.entered.notified() => {},
+        result = &mut first_confirm => panic!("confirmation should await merchant: {result:?}"),
+        _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => panic!("merchant not reached"),
+    }
+    let cancel_path = VfsPath::parse(&format!("/pending/{first}/cancel")).unwrap();
+    let cancel = handler.write(&cancel_path, b"cancel");
+    tokio::pin!(cancel);
+    assert!(
+        std::future::poll_fn(|cx| std::task::Poll::Ready(cancel.as_mut().poll(cx)))
+            .await
+            .is_pending(),
+        "cancel must wait for execution"
+    );
+    let second_path = VfsPath::parse(&format!("/pending/{second}/confirm")).unwrap();
+    let clone = handler.clone();
+    let second_confirm = clone.write(&second_path, b"confirm");
+    tokio::pin!(second_confirm);
+    assert!(
+        std::future::poll_fn(|cx| std::task::Poll::Ready(second_confirm.as_mut().poll(cx)))
+            .await
+            .is_pending()
+    );
+    // No second execution may mint a credential while the first holds the wallet.
+    assert!(
+        !root
+            .path()
+            .join(format!("requests/pending/{second}/receipt.json"))
+            .exists()
+    );
+    // An unrelated request can still be staged while payment is parked.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        handler.write(
+            &VfsPath::parse("/new").unwrap(),
+            format!(
+                "GET {} wallet=alice max_amount_usd=20000",
+                merchant.url.join("unrelated").unwrap()
+            )
+            .as_bytes(),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    merchant.release.add_permits(1);
+    first_confirm.await.unwrap();
+    assert!(
+        cancel.await.is_err(),
+        "completed payment cannot be cancelled"
+    );
+    assert!(
+        root.path()
+            .join(format!("requests/sent/{first}/receipt.json"))
+            .exists()
+    );
+    assert!(
+        !root
+            .path()
+            .join(format!("requests/failed/{first}"))
+            .exists()
+    );
+    merchant.release.add_permits(1);
+    second_confirm.await.unwrap();
+}
+
+#[tokio::test]
+async fn interrupted_payment_cannot_be_cancelled_or_free_wallet_budget() {
+    let root = tempfile::tempdir().unwrap();
+    let (wallet, projections) = projection("0x1111111111111111111111111111111111111111".into());
+    let (signer, _) = exact_signer(wallet);
+    let merchant = paused_merchant().await;
+    let handler =
+        RequestsHandler::new_projected(root.path(), Some("alice".into()), projections.clone())
+            .with_exact_signer(Some(signer.clone()));
+    let first = stage_paid(&handler, root.path(), &merchant.url.join("first").unwrap()).await;
+    let second = stage_paid(&handler, root.path(), &merchant.url.join("second").unwrap()).await;
+    let first_path = VfsPath::parse(&format!("/pending/{first}/confirm")).unwrap();
+    let mut confirmation = Box::pin(handler.write(&first_path, b"confirm"));
+    tokio::select! {
+        _ = merchant.entered.notified() => {},
+        result = &mut confirmation => panic!("expected merchant wait: {result:?}"),
+        _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => panic!("merchant not reached"),
+    }
+    drop(confirmation);
+    // A fresh handler models restart: protection must not depend on a live lock.
+    let restarted = RequestsHandler::new_projected(root.path(), Some("alice".into()), projections)
+        .with_exact_signer(Some(signer));
+    let cancel = VfsPath::parse(&format!("/pending/{first}/cancel")).unwrap();
+    let error = restarted.write(&cancel, b"cancel").await.unwrap_err();
+    assert!(
+        error.to_string().contains("execution has started"),
+        "{error}"
+    );
+    let receipt: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(
+            root.path()
+                .join(format!("requests/pending/{first}/receipt.json")),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(receipt["outcome"], "unresolved");
+    assert_eq!(receipt["wallet"], "alice");
+    assert!(receipt["amount_usd"].as_f64().unwrap() > 0.0);
+    assert!(
+        !root
+            .path()
+            .join(format!(
+                "requests/pending/{first}/private/execution_started"
+            ))
+            .exists()
+    );
+    assert!(restarted.write(&first_path, b"confirm").await.is_err());
+    // The uncertain first payment stays charged, but is not a blanket wallet lock.
+    merchant.release.add_permits(2);
+    let confirm = VfsPath::parse(&format!("/pending/{second}/confirm")).unwrap();
+    restarted.write(&confirm, b"confirm").await.unwrap();
+    assert!(
+        root.path()
+            .join(format!("requests/sent/{second}/receipt.json"))
+            .exists()
+    );
+    assert!(
+        root.path()
+            .join(format!("requests/pending/{first}/receipt.json"))
+            .exists()
+    );
+}
+
+#[tokio::test]
+async fn paid_preflight_failure_remains_retryable_and_cancellable() {
+    let root = tempfile::tempdir().unwrap();
+    let (wallet, projections) = projection("0x1111111111111111111111111111111111111111".into());
+    let (signer, _) = exact_signer(wallet);
+    let merchant = spawn_http_fixture("mpp").await;
+    let handler = RequestsHandler::new_projected(root.path(), Some("alice".into()), projections)
+        .with_exact_signer(Some(signer));
+    // Without an RPC resolver, MPP refuses before signing or payment submission.
+    handler
+        .write(
+            &VfsPath::parse("/new").unwrap(),
+            format!(
+                "GET {} wallet=alice max_amount_usd=20000",
+                merchant.join("paid").unwrap()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let latest = std::fs::read_to_string(root.path().join("requests/latest")).unwrap();
+    let id = latest.trim().strip_prefix("pending/").unwrap();
+    let confirm = VfsPath::parse(&format!("/pending/{id}/confirm")).unwrap();
+    let error = handler.write(&confirm, b"confirm").await.unwrap_err();
+    assert!(
+        error.to_string().contains("no configured HTTP RPC URL"),
+        "{error}"
+    );
+    assert!(
+        !root
+            .path()
+            .join(format!("requests/pending/{id}/receipt.json"))
+            .exists()
+    );
+    let repaired = handler
+        .clone()
+        .with_paid_http_rpc_resolver(Arc::new(StaticTempoRpc));
+    let error = repaired.write(&confirm, b"confirm").await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("paid-http Broker approval required"),
+        "{error}"
+    );
+    // No credential has been sent during either error, so cancellation is safe.
+    repaired
+        .write(
+            &VfsPath::parse(&format!("/pending/{id}/cancel")).unwrap(),
+            b"cancel",
+        )
+        .await
+        .unwrap();
+    assert!(root.path().join(format!("requests/failed/{id}")).exists());
+    assert!(repaired.write(&confirm, b"confirm").await.is_err());
+}
+
+/// Exercises a multi-step preparer's failure after signing but before returning
+/// a complete credential. No signed material has been sent to a merchant yet.
+struct IncompletePreparation;
+
+#[async_trait]
+impl bloom_paid_x402::X402PaymentSigner for IncompletePreparation {
+    async fn sign_x402_payment(
+        &self,
+        ctx: &bloom_paid_x402::X402SignContext<'_>,
+    ) -> Result<bloom_paid_x402::X402PaymentCredential, String> {
+        bloom_paid_x402::HostX402PaymentSigner::new()
+            .sign_x402_payment(ctx)
+            .await?;
+        Err("credential preparation incomplete".into())
+    }
+}
+
+#[tokio::test]
+async fn locally_signed_but_unsubmitted_preparation_does_not_block_retry() {
+    let root = tempfile::tempdir().unwrap();
+    let (wallet, projections) = projection("0x1111111111111111111111111111111111111111".into());
+    let (signer, broker) = exact_signer(wallet);
+    let merchant = spawn_http_fixture("x402").await;
+    let handler = RequestsHandler::new_projected(root.path(), Some("alice".into()), projections)
+        .with_exact_signer(Some(signer))
+        .with_x402_signer(Arc::new(IncompletePreparation));
+    let id = stage_paid(&handler, root.path(), &merchant.join("paid").unwrap()).await;
+    let confirm = VfsPath::parse(&format!("/pending/{id}/confirm")).unwrap();
+    let error = handler.write(&confirm, b"confirm").await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("credential preparation incomplete"),
+        "{error}"
+    );
+    assert!(!broker.signing_results.lock().unwrap().is_empty());
+    assert!(
+        !root
+            .path()
+            .join(format!("requests/pending/{id}/receipt.json"))
+            .exists()
+    );
+    let handler = handler.with_x402_signer(Arc::new(bloom_paid_x402::HostX402PaymentSigner::new()));
+    handler.write(&confirm, b"confirm").await.unwrap();
+    assert!(
+        root.path()
+            .join(format!("requests/sent/{id}/receipt.json"))
             .exists()
     );
 }

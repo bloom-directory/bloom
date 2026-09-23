@@ -1175,6 +1175,8 @@ struct OwnedInstallerIdentity {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "triad-dev-harness")]
+    use bloom_petals::package::PreparedPetalPackage;
     use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
     use std::os::unix::fs::PermissionsExt as _;
 
@@ -1448,15 +1450,17 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(petal_hashes.len(), 20);
-        assert!(
-            petal_hashes
-                .contains(&"a564d9559a70520995e550df685f74d3ee26af6fbb16facc08de2745bf5ec693")
-        );
-        assert!(
-            petal_hashes
-                .contains(&"aa1c50d3443f4c1a710d0ce93a70a65d196fd5842d241e0f78260c8a019d811c")
-        );
+        assert_eq!(petal_hashes.len(), 21);
+        for name in ["polymarket", "hyperliquid"] {
+            let expected = crate::github_source::preinstalled_petal(name)
+                .unwrap()
+                .expected_hash
+                .unwrap();
+            assert!(
+                petal_hashes.contains(&expected),
+                "missing {name} release provenance"
+            );
+        }
         for record in catalog.records {
             let mut unsigned = record.clone();
             let signature: [u8; 64] = unsigned.installer_signature.decode().try_into().unwrap();

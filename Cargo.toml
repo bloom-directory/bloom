@@ -9,6 +9,9 @@ members = [
   "crates/bloom-paid-http",
   "crates/bloom-evm",
   "crates/bloom-rpc",
+  "crates/bloom-rpc-common",
+  "crates/bloom-solana",
+  "crates/bloom-solana-tx",
   "crates/bloom-tx",
   "crates/bloom-mempool",
   "crates/bloom-machine-client",
@@ -27,14 +30,14 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.2.1"
+version = "0.3.1"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.86"
 license = "MIT"
 repository = "https://github.com/bloom-directory/bloom"
 
 [workspace.dependencies]
-anyhow = "1"
+anyhow = "~1.0.104"
 thiserror = "2"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "signal", "sync", "time", "fs", "net", "io-util"] }
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["rustls-tls-webpki-roots", "connect"] }
@@ -50,6 +53,7 @@ async-trait = "0.1"
 parking_lot = "0.12"
 dirs = "5"
 hex = "0.4"
+num-bigint = "0.4"
 libc = "0.2"
 rustix = { version = "1", features = ["fs", "process"] }
 blake3 = "1"
@@ -57,12 +61,13 @@ sha3 = "0.10"
 sha2 = "0.10"
 hmac = "0.12"
 base64 = "0.22"
+bs58 = "0.5"
 argon2 = "0.5"
 chacha20poly1305 = "0.10"
 zeroize = { version = "1", features = ["zeroize_derive"] }
 rand = "0.8"
 ml-dsa = { version = "0.1.0", features = ["getrandom", "zeroize"] }
-ed25519-dalek = { version = "2", features = ["rand_core"] }
+ed25519-dalek = { version = "3", features = ["rand_core"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 flate2 = "1"
@@ -72,11 +77,11 @@ humantime = "2"
 humantime-serde = "1"
 tempfile = "3"
 futures = "0.3"
-lru = "0.12"
+lru = "0.18.2"
 fs2 = "0.4"
-bloom-audit-checkpoint = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "bc88cc6760b00bbff0c6a6e5f56d42bb03004436" }
-wasmtime = { version = "36.0.13", default-features = false, features = ["async", "cranelift", "runtime", "cache", "parallel-compilation"] }
-wasmtime-wasi = "36.0.13"
+bloom-audit-checkpoint = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "5db670e1b7507deabfdcf451be8b5d315c1c9d91" }
+wasmtime = { version = "=36.0.13", default-features = false, features = ["async", "cranelift", "runtime", "cache", "parallel-compilation"] }
+wasmtime-wasi = "=36.0.13"
 wat = "1"
 # danger-allow-state-serialisation: webauthn-rs requires this feature to allow
 # the PasskeyRegistration / PasskeyAuthentication state structs to be serialised
@@ -106,7 +111,10 @@ op-alloy = { version = "2", features = ["rpc-types", "consensus", "serde", "netw
 bloom-mempool  = { path = "crates/bloom-mempool" }
 bloom-proto    = { path = "crates/bloom-proto" }
 bloom-rpc      = { path = "crates/bloom-rpc" }
+bloom-rpc-common = { path = "crates/bloom-rpc-common" }
 bloom-evm      = { path = "crates/bloom-evm" }
+bloom-solana   = { path = "crates/bloom-solana" }
+bloom-solana-tx = { path = "crates/bloom-solana-tx" }
 bloom-tx       = { path = "crates/bloom-tx" }
 bloom-vfs      = { path = "crates/bloom-vfs" }
 bloom-paid-mpp = { path = "crates/bloom-paid-mpp" }
@@ -120,17 +128,25 @@ bloom-ens      = { path = "crates/bloom-ens" }
 bloom-prices   = { path = "crates/bloom-prices" }
 bloom-revert   = { path = "crates/bloom-revert" }
 bloom-petals   = { path = "crates/bloom-petals" }
-bloom-petal-contract = { git = "https://github.com/bloom-directory/petal", rev = "61938d0c127cfe03c7e3e55baed0ba1439bc5ca2" }
+bloom-petal-contract = { git = "https://github.com/bloom-directory/petal", rev = "73c5b06a77599368fbc79fb7947a629b5b4c630e" }
 bloom-daemon   = { path = "crates/bloom-daemon" }
 bloom-update   = { path = "crates/bloom-update" }
-bloom-broker-api = { git = "https://github.com/bloom-directory/bloom-broker.git", rev = "582d3dd3add7efb2640b900f005e32a5a52f17c0" }
-bloom-rpc-wire = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "bc88cc6760b00bbff0c6a6e5f56d42bb03004436" }
-bloom-triad-local-transport = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "bc88cc6760b00bbff0c6a6e5f56d42bb03004436" }
-bloom-service-activation = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "bc88cc6760b00bbff0c6a6e5f56d42bb03004436" }
-bloom-service-observability = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "bc88cc6760b00bbff0c6a6e5f56d42bb03004436" }
-bloom-trusted-time = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "bc88cc6760b00bbff0c6a6e5f56d42bb03004436" }
+bloom-broker-api = { git = "https://github.com/bloom-directory/bloom-broker.git", rev = "dd2add2b9d41540521d08c77d19fb467a2d8029e" }
+bloom-rpc-wire = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "5db670e1b7507deabfdcf451be8b5d315c1c9d91" }
+bloom-triad-local-transport = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "5db670e1b7507deabfdcf451be8b5d315c1c9d91" }
+bloom-service-activation = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "5db670e1b7507deabfdcf451be8b5d315c1c9d91" }
+bloom-service-observability = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "5db670e1b7507deabfdcf451be8b5d315c1c9d91" }
+bloom-trusted-time = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "5db670e1b7507deabfdcf451be8b5d315c1c9d91" }
 bloom-machine-client = { path = "crates/bloom-machine-client" }
 # ---- example core petal: generic capability primitives (/bloom/core/cap) ----
+
+[profile.dev]
+debug = "line-tables-only"
+incremental = true
+
+[profile.dev.package."*"]
+debug = false
+opt-level = 1
 
 [profile.release]
 lto = "thin"

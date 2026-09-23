@@ -73,7 +73,7 @@ impl ExactSigningBrokerFixture {
         WalletPublic {
             wallet_id,
             wallet_kind: Token::new("local").unwrap(),
-            root_key_ref: self.key_ref.clone(),
+            root_key_ref: Some(self.key_ref.clone()),
             key_refs: vec![self.key_ref.clone()],
             policy_version: DecimalU64::new(1),
             policy_digest: policy.policy_digest,
@@ -139,6 +139,13 @@ impl MachineBrokerService for ExactSigningBrokerFixture {
                 {
                     Ok(MachineBrokerResponse::PolicyRead(
                         self.policy_snapshot(wallet_id),
+                    ))
+                }
+                // A root-key wallet has no derived accounts; the numbered
+                // tree renders it as account 0 from the root projection.
+                MachineBrokerRequest::WalletAccounts(WalletRequest { wallet_id }) => {
+                    Ok(MachineBrokerResponse::WalletAccounts(
+                        bloom_machine_client::empty_wallet_accounts(wallet_id),
                     ))
                 }
                 MachineBrokerRequest::SealedApprovalPrepare(request) => {

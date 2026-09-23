@@ -133,6 +133,22 @@ if [ -n "$mount_dir" ]; then
   fi
 fi
 log_dir="$(cd "$log_dir" && pwd -P)"
+if [ "$host_os" = Darwin ]; then
+  # macOS Broker requires a pre-created 0640 log with explicit ownership.
+  # Keep developer output in --log-dir, including when the shell inherited
+  # logging settings from an installed service or another developer triad.
+  export BLOOM_BROKER_LOG_PATH="${log_dir}/broker.log"
+  export BLOOM_BROKER_LOG_OWNER_UID="$(id -u)"
+  [ ! -L "$BLOOM_BROKER_LOG_PATH" ] || die "Broker log must not be a symlink"
+  if [ -e "$BLOOM_BROKER_LOG_PATH" ]; then
+    [ -f "$BLOOM_BROKER_LOG_PATH" ] &&
+      [ "$(stat -f %u "$BLOOM_BROKER_LOG_PATH")" = "$BLOOM_BROKER_LOG_OWNER_UID" ] ||
+      die "Broker log must be a regular file owned by the current user"
+  fi
+  : >> "$BLOOM_BROKER_LOG_PATH"
+  chmod 0640 "$BLOOM_BROKER_LOG_PATH"
+  export BLOOM_BROKER_LOG_READER_GID="$(stat -f %g "$BLOOM_BROKER_LOG_PATH")"
+fi
 machine_socket="$(cd "$(dirname "$machine_socket")" && pwd -P)/$(basename "$machine_socket")"
 ready_file="$(cd "$(dirname "$ready_file")" && pwd -P)/$(basename "$ready_file")"
 if [ -e "$machine_socket" ] || [ -L "$machine_socket" ]; then
@@ -198,6 +214,15 @@ if [ ! -f "${config_dir}/edge-manifest.json" ]; then
     cp "$template_source" "${template_dir}/${name}"
     chmod 0600 "${template_dir}/${name}"
   done
+  case "$(uname -s)" in
+    Darwin) developer_trusted_time_source="macos-managed-timed" ;;
+    Linux) developer_trusted_time_source="linux-chrony-nts" ;;
+    *) die "developer triad launcher supports only Darwin and Linux" ;;
+  esac
+  sed "s/\"trusted_time_source\": \"macos-managed-timed\"/\"trusted_time_source\": \"${developer_trusted_time_source}\"/" \
+    "${template_dir}/edge-manifest.json.in" > "${template_dir}/edge-manifest.json.in.new"
+  chmod 0600 "${template_dir}/edge-manifest.json.in.new"
+  mv -f "${template_dir}/edge-manifest.json.in.new" "${template_dir}/edge-manifest.json.in"
   if [ "$install_authority_fixture" -eq 1 ]; then
     catalog="${template_dir}/provenance-catalog.unsigned.json"
     catalog_new="${catalog}.new"
@@ -277,7 +302,8 @@ unit_token="$(basename "$runtime_dir")"
 unit_prefix="bloom-triad-dev-$(id -u)-${unit_token}"
 signer_service_unit="${unit_prefix}-signer.service"
 broker_service_unit="${unit_prefix}-broker.service"
-broker_ceremony_socket_unit="${unit_prefix}-broker-ceremony.socket"
+broker_ceremony_v4_socket_unit="${unit_prefix}-broker-ceremony-ipv4.socket"
+broker_ceremony_v6_socket_unit="${unit_prefix}-broker-ceremony-ipv6.socket"
 broker_checkpoint_dir="${developer_root}/audit-checkpoints/broker"
 signer_checkpoint_dir="${developer_root}/audit-checkpoints/signer"
 machine_checkpoint_dir="${machine_home}/audit-checkpoints/machine"
@@ -331,10 +357,11 @@ systemd_units_installed=0
 stop_linux_authority_units() {
   [ "$host_os" = Linux ] || return 0
   systemctl --user stop "$broker_service_unit" "$signer_service_unit" >/dev/null 2>&1 || true
-  systemctl --user stop "$broker_ceremony_socket_unit" >/dev/null 2>&1 || true
+  systemctl --user stop "$broker_ceremony_v4_socket_unit" "$broker_ceremony_v6_socket_unit" >/dev/null 2>&1 || true
   if [ "$systemd_units_installed" -eq 1 ]; then
     rm -f -- \
-      "${user_unit_dir}/${broker_ceremony_socket_unit}" \
+      "${user_unit_dir}/${broker_ceremony_v4_socket_unit}" \
+      "${user_unit_dir}/${broker_ceremony_v6_socket_unit}" \
       "${user_unit_dir}/${broker_service_unit}" \
       "${user_unit_dir}/${signer_service_unit}"
     systemctl --user daemon-reload >/dev/null 2>&1 || true
@@ -445,6 +472,10 @@ supervise_services() {
   done
 }
 
+# One socket unit per listener. systemd's FileDescriptorName= names every
+# fd a unit passes, so a unit with two ListenStream= lines hands the
+# Broker two fds under one name and the activation crate rejects the
+# duplicate. The Broker takes each family by its own name.
 write_linux_socket_unit() {
   unit="$1"; description="$2"; path="$3"; descriptor="$4"; service="$5"
   {
@@ -461,8 +492,12 @@ start_linux_authority_services() {
   # Mark ownership before the first write so the EXIT trap removes even a
   # partially rendered unit set.
   systemd_units_installed=1
-  write_linux_socket_unit "$broker_ceremony_socket_unit" \
-    'Bloom developer Broker ceremony listener' '127.0.0.1:18734' broker-ceremony "$broker_service_unit"
+  write_linux_socket_unit "$broker_ceremony_v4_socket_unit" \
+    'Bloom developer Broker IPv4 ceremony listener' \
+    '127.0.0.1:18734' broker-ceremony-ipv4 "$broker_service_unit"
+  write_linux_socket_unit "$broker_ceremony_v6_socket_unit" \
+    'Bloom developer Broker IPv6 ceremony listener' \
+    '[::1]:18734' broker-ceremony-ipv6 "$broker_service_unit"
 
   : > "${log_dir}/signer.log"
   {
@@ -487,7 +522,7 @@ start_linux_authority_services() {
   : > "${log_dir}/broker.log"
   {
     printf '%s\n' '[Unit]' 'Description=Bloom developer Broker' \
-      "Requires=$broker_ceremony_socket_unit" \
+      "Requires=$broker_ceremony_v4_socket_unit $broker_ceremony_v6_socket_unit" \
       "After=$signer_service_unit" '' \
       '[Service]' 'Type=simple' 'UMask=0077'
     printf 'ExecStart=%s\n' "$broker_bin"
@@ -503,13 +538,14 @@ start_linux_authority_services() {
       "BLOOM_SESSION_SOCKET=$session_socket" \
       "BLOOM_BROKER_SOCKET=$broker_socket" \
       "BLOOM_BROKER_CONTROL_SOCKET=$broker_control_socket" \
-      'BLOOM_BROKER_CEREMONY_ACTIVATION_NAME=broker-ceremony'
-    printf 'Sockets=%s\n' "$broker_ceremony_socket_unit"
+      'BLOOM_BROKER_CEREMONY_ACTIVATION_NAME_IPV4=broker-ceremony-ipv4' \
+      'BLOOM_BROKER_CEREMONY_ACTIVATION_NAME_IPV6=broker-ceremony-ipv6'
+    printf 'Sockets=%s %s\n' "$broker_ceremony_v4_socket_unit" "$broker_ceremony_v6_socket_unit"
   } > "${user_unit_dir}/${broker_service_unit}"
   chmod 0600 "${user_unit_dir}/${broker_service_unit}"
 
   systemctl --user daemon-reload
-  systemctl --user start "$broker_ceremony_socket_unit"
+  systemctl --user start "$broker_ceremony_v4_socket_unit" "$broker_ceremony_v6_socket_unit"
   systemctl --user start "$signer_service_unit"
   signer_pid="$(systemctl --user show "$signer_service_unit" -p MainPID --value)"
   [ "$signer_pid" -gt 0 ] ||
@@ -571,45 +607,6 @@ if [ ! -e "$machine_config" ]; then
   cp "$canonical_machine_config" "$machine_config"
   chmod 0600 "$machine_config"
 fi
-
-# Developer Petals are installed through the launched Machine below. Do not
-# download or advertise a stale production release merely to make this isolated
-# harness ready.
-[ -f "$machine_config" ] || die "Machine did not create its configuration"
-machine_config_new="${machine_config}.new.$$"
-awk '
-  $0 == "[petals]" {
-    saw_petals = 1
-    in_petals = 1
-    print
-    next
-  }
-  in_petals && $0 ~ /^preinstalled = \[/ {
-    print "preinstalled = []"
-    replaced_preinstalled = 1
-    if ($0 !~ /\]/) skipping = 1
-    next
-  }
-  skipping {
-    if ($0 == "]") skipping = 0
-    next
-  }
-  in_petals && $0 ~ /^\[/ {
-    if (!replaced_preinstalled) print "preinstalled = []"
-    in_petals = 0
-  }
-  { print }
-  END {
-    if (in_petals && !replaced_preinstalled) print "preinstalled = []"
-    if (!saw_petals) {
-      print ""
-      print "[petals]"
-      print "preinstalled = []"
-    }
-  }
-' "$machine_config" > "$machine_config_new"
-chmod 0600 "$machine_config_new"
-mv -f "$machine_config_new" "$machine_config"
 
 if [ "$services_only" -eq 1 ]; then
   printf 'ready\n' > "$ready_file"
