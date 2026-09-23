@@ -2889,8 +2889,20 @@ fn decode_petal_erc20_transfer(
     {
         return Ok(None);
     }
-    let call = IERC20::transferCall::abi_decode(&calldata)
+    // The engine rebuilds the call from the decoded fields, so anything the
+    // decoder tolerates and drops would be a silent payload change. Validate
+    // the encoding, then require the re-encoding to reproduce the exact bytes:
+    // dirty padding in the address word fails both checks instead of being
+    // staged as a different transaction than the Petal handed over.
+    let call = IERC20::transferCall::abi_decode_validate(&calldata)
         .map_err(|error| HostError::Invalid(format!("ERC-20 transfer calldata: {error}")))?;
+    if call.abi_encode() != calldata {
+        return Err(HostError::Invalid(
+            "ERC-20 transfer calldata is not canonical: re-encoding the decoded \
+             recipient and amount does not reproduce the supplied bytes"
+                .into(),
+        ));
+    }
     Ok(Some((call.to, call.amount)))
 }
 
@@ -2913,7 +2925,7 @@ fn petal_pending_request_matches(
             .and_then(|to| to.parse::<Address>().ok())
             == Some(requested_to)
         && staged.value_wei.parse::<U256>().ok() == Some(requested_value)
-        && staged.data_hex == request.data_hex
+        && calldata_bytes_equal(&staged.data_hex, &request.data_hex)
         && request.nonce.is_none_or(|nonce| staged.nonce == nonce)
         && request
             .max_fee_per_gas
@@ -2922,6 +2934,24 @@ fn petal_pending_request_matches(
         && request.max_priority_fee_per_gas.as_ref().is_none_or(|fee| {
             decimal_strings_equal(staged.max_priority_fee_per_gas.as_deref(), fee)
         })
+}
+
+/// Compare calldata by the bytes it denotes, not by its spelling.
+///
+/// A recognized ERC-20 transfer is stored as the calldata the engine
+/// regenerated, which is always lowercase, while the Petal's request keeps
+/// whatever case it sent. Comparing strings makes an identical retry miss its
+/// own pending row and stage a second transfer on the next nonce.
+fn calldata_bytes_equal(stored: &str, requested: &str) -> bool {
+    match (
+        parse_petal_hex_bytes(stored, "stored data-hex"),
+        parse_petal_hex_bytes(requested, "data-hex"),
+    ) {
+        (Ok(stored), Ok(requested)) => stored == requested,
+        // Neither side is guaranteed to parse; fall back to the literal
+        // comparison rather than treating two unparseable values as equal.
+        _ => stored == requested,
+    }
 }
 
 fn decimal_strings_equal(stored: Option<&str>, requested: &str) -> bool {
@@ -5554,6 +5584,48 @@ mod tests {
             decode_petal_erc20_transfer(&request, U256::ZERO).unwrap(),
             None
         );
+    }
+
+    /// `abi_decode` accepts a dirty address word and silently zeroes the
+    /// padding, so the engine would rebuild different bytes than the Petal
+    /// handed over. Refuse the call instead.
+    #[test]
+    fn noncanonical_address_padding_is_refused_rather_than_rewritten() {
+        let mut calldata = IERC20::transferCall {
+            to: "0x0000000000000000000000000000000000000020".parse().unwrap(),
+            amount: U256::from(42_u64),
+        }
+        .abi_encode();
+        // First byte of the address word, which canonical encoding leaves zero.
+        calldata[4] = 1;
+        let request = petal_evm_request("0", format!("0x{}", hex::encode(&calldata)));
+        let error = decode_petal_erc20_transfer(&request, U256::ZERO)
+            .expect_err("dirty address padding must not decode");
+        assert!(
+            matches!(error, HostError::Invalid(_)),
+            "expected an invalid-payload refusal, got {error:?}"
+        );
+    }
+
+    /// The engine stores the calldata it regenerated, always lowercase. An
+    /// identical retry that spelled its hex in uppercase has to find that same
+    /// pending row, or it stages a second transfer on the next nonce.
+    #[test]
+    fn calldata_comparison_ignores_hex_case_but_not_bytes() {
+        let calldata = IERC20::transferCall {
+            to: "0x0000000000000000000000000000000000000020".parse().unwrap(),
+            amount: U256::from(42_u64),
+        }
+        .abi_encode();
+        let lower = format!("0x{}", hex::encode(&calldata));
+        let upper = format!("0x{}", hex::encode_upper(&calldata));
+        assert!(calldata_bytes_equal(&lower, &upper));
+        assert!(calldata_bytes_equal(&lower, &lower));
+
+        let mut different = calldata;
+        different[35] ^= 1;
+        let different = format!("0x{}", hex::encode(different));
+        assert!(!calldata_bytes_equal(&lower, &different));
     }
 
     #[test]
