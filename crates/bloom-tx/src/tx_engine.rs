@@ -794,8 +794,18 @@ impl TxEngine {
                 bloom_proto::checksum_address(&addr)
             ))
         })?;
+        // An address-shaped hint carries no symbol, which is what a Petal-staged
+        // transfer always supplies: it names the token by address because that
+        // is the only part of the calldata Bloom can verify. Read `symbol()`
+        // from the same contract the decimals came from rather than showing the
+        // owner a truncated address where a token name belongs. A token that
+        // does not answer — a reverting or `bytes32` `symbol()` — keeps the
+        // short-address label, which is honest about what is known.
         let symbol = if symbol_hint.starts_with("0x") || symbol_hint.starts_with("0X") {
-            short_addr_label(&addr)
+            match chain.erc20_symbol(addr).await {
+                Ok(Some(symbol)) if is_displayable_symbol(&symbol) => symbol,
+                _ => short_addr_label(&addr),
+            }
         } else {
             symbol_hint.to_ascii_uppercase()
         };
@@ -4658,6 +4668,21 @@ fn parse_u256(s: &str) -> Result<U256, String> {
     U256::from_str_radix(t, 10).map_err(|e| format!("invalid uint256 '{s}': {e}"))
 }
 
+/// Whether a contract-supplied symbol can be shown beside an amount.
+///
+/// The string comes from an untrusted contract, so it is bounded and kept to
+/// printable, non-space ASCII. A token whose "symbol" is empty, oversized, or
+/// carries control characters, spaces or bidi marks gets the short-address
+/// label instead: a symbol is a label an owner reads next to a number, and a
+/// contract does not get to put arbitrary text there.
+fn is_displayable_symbol(symbol: &str) -> bool {
+    !symbol.is_empty()
+        && symbol.len() <= 16
+        && symbol
+            .chars()
+            .all(|c| c.is_ascii_graphic() && !matches!(c, '<' | '>' | '&'))
+}
+
 fn short_addr_label(a: &Address) -> String {
     let s = format!("{a:#x}");
     if s.len() > 10 {
@@ -6823,6 +6848,23 @@ mod tests {
             "0xaf88d065e77c8cc2239327c5edb3a432268e5831"
         );
         assert_eq!(sym, "USDC");
+    }
+
+    #[test]
+    fn a_contract_symbol_is_only_shown_when_it_is_a_label() {
+        // Real tokens.
+        assert!(is_displayable_symbol("USDC"));
+        assert!(is_displayable_symbol("DAI"));
+        assert!(is_displayable_symbol("WETH"));
+        // A contract does not get to put arbitrary text beside an amount.
+        assert!(!is_displayable_symbol(""));
+        assert!(!is_displayable_symbol(
+            "this is far too long to be a symbol"
+        ));
+        assert!(!is_displayable_symbol("US DC"));
+        assert!(!is_displayable_symbol("USD\u{202e}C"));
+        assert!(!is_displayable_symbol("USD\nC"));
+        assert!(!is_displayable_symbol("<b>USDC</b>"));
     }
 
     #[test]
