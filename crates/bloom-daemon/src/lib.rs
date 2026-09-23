@@ -981,10 +981,27 @@ impl DaemonPetalHost {
         let root = self.petal_signing_state_root.as_ref().ok_or_else(|| {
             HostError::Backend("Petal exact signing state is not configured".into())
         })?;
-        let mut identity = blake3::Hasher::new();
-        identity.update(b"bloom-petal-exact-signing/v2\0");
         let key_identity = serde_jcs::to_vec(&account_key)
             .map_err(|error| HostError::Invalid(error.to_string()))?;
+        // Everything but the payload identifies the operation the Petal is
+        // signing for; the payload identifies one attempt at it. Machine keeps
+        // the attempts of one operation together so it can tell, when a Petal
+        // rebuilds, which approval it has just superseded.
+        let mut group = blake3::Hasher::new();
+        group.update(b"bloom-petal-exact-signing-group/v1\0");
+        let mut identity = blake3::Hasher::new();
+        identity.update(b"bloom-petal-exact-signing/v2\0");
+        for part in [
+            context.package_hash.as_bytes(),
+            context.route_id.as_bytes(),
+            wallet.as_bytes(),
+            operation_class.as_bytes(),
+        ] {
+            group.update(&(part.len() as u64).to_be_bytes());
+            group.update(part);
+        }
+        group.update(&(key_identity.len() as u64).to_be_bytes());
+        group.update(&key_identity);
         for part in [
             context.package_hash.as_bytes(),
             context.route_id.as_bytes(),
@@ -1000,7 +1017,9 @@ impl DaemonPetalHost {
         let request_id = identity.finalize().to_hex().to_string();
         Ok((
             request_id.clone(),
-            root.join(".state").join(format!("{request_id}.json")),
+            root.join(".state")
+                .join(group.finalize().to_hex().to_string())
+                .join(format!("{request_id}.json")),
             root.join(format!("{request_id}.json")),
         ))
     }
@@ -1926,24 +1945,38 @@ impl PetalHost for DaemonPetalHost {
                 &canonical_claim,
                 account_key.as_ref(),
             )?;
-            if req
-                .approval_hint
-                .as_deref()
-                .is_some_and(|hint| hint != request_id)
-            {
-                warn!(
-                    wallet = %req.wallet,
-                    operation_class = %req.operation_class,
-                    package_hash = %context.package_hash,
-                    route = %context.route_id,
-                    request_id = %request_id,
-                    reason = "approval hint does not match the derived request id",
-                    "petal.sign_payload_denied"
-                );
-                return Err(HostError::Denied(
-                    "approval artifact does not match the exact Petal operation".into(),
-                ));
-            }
+            // A hint naming a different request is the Petal saying it has
+            // given that one up: it rebuilt an operation whose transaction can
+            // no longer land, and still holds the id of the approval it was
+            // waiting on. Machine resolves the hint inside this operation's
+            // own state directory, so a Petal can only ever name an attempt at
+            // the same operation, and nothing outside it. Everything else is
+            // still denied.
+            let superseded = match req.approval_hint.as_deref() {
+                None => None,
+                Some(hint) if hint == request_id => None,
+                Some(hint)
+                    if hint.len() == request_id.len()
+                        && hint.bytes().all(|byte| byte.is_ascii_hexdigit()) =>
+                {
+                    Some(exact_state_path.with_file_name(format!("{hint}.json")))
+                        .filter(|path| path.is_file())
+                }
+                Some(_) => {
+                    warn!(
+                        wallet = %req.wallet,
+                        operation_class = %req.operation_class,
+                        package_hash = %context.package_hash,
+                        route = %context.route_id,
+                        request_id = %request_id,
+                        reason = "approval hint does not match the derived request id",
+                        "petal.sign_payload_denied"
+                    );
+                    return Err(HostError::Denied(
+                        "approval artifact does not match the exact Petal operation".into(),
+                    ));
+                }
+            };
             let payload_digest =
                 bloom_broker_api::Digest32::from_bytes(sha2::Sha256::digest(&req.preimage).into());
             let canonical_facts = serde_json::json!({
@@ -1968,7 +2001,8 @@ impl PetalHost for DaemonPetalHost {
                 HostError::Backend("installer provenance catalog is not configured".into())
             })?;
             let signer = BrokerExactPayloadSigner::new(broker.clone(), catalog)
-                .with_account_key(account_key.clone());
+                .with_account_key(account_key.clone())
+                .with_superseded_state(superseded);
             let _guard = self.petal_signing_lock.lock().await;
             let outcome = signer
                 .sign_or_prepare_petal(
@@ -6516,6 +6550,27 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(guest_error, HostError::Denied(_)));
+
+        // A hint is either this request's own id or the id of an attempt at
+        // the same operation that the Petal has given up. Anything else names
+        // no artifact Machine derived, and is refused.
+        let mut foreign_hint = request.clone();
+        foreign_hint.approval_hint = Some("../../elsewhere".into());
+        assert!(
+            host.sign_payload_outcome(foreign_hint)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("approval artifact does not match")
+        );
+        // A superseded attempt that is already gone is simply nothing to
+        // release: the request continues under its own approval.
+        let mut released_hint = request.clone();
+        released_hint.approval_hint = Some("ab".repeat(32));
+        assert!(matches!(
+            host.sign_payload_outcome(released_hint).await.unwrap(),
+            SignOutcome::ApprovalPending(_)
+        ));
 
         broker
             .active

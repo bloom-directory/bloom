@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -72,6 +72,8 @@ pub struct BrokerExactPayloadSigner {
     broker: MachineBrokerClient,
     provenance_catalog: ProvenanceCatalog,
     account_key_ref: Option<bloom_broker_api::KeyRef>,
+    /// A stored attempt at this same operation that the caller has given up.
+    superseded_state: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -233,11 +235,18 @@ impl BrokerExactPayloadSigner {
             broker,
             provenance_catalog,
             account_key_ref: None,
+            superseded_state: None,
         }
     }
 
     pub fn with_account_key(mut self, key: Option<bloom_broker_api::KeyRef>) -> Self {
         self.account_key_ref = key;
+        self
+    }
+
+    /// The stored attempt this request replaces, if the caller named one.
+    pub fn with_superseded_state(mut self, state_path: Option<PathBuf>) -> Self {
+        self.superseded_state = state_path;
         self
     }
 
@@ -330,6 +339,9 @@ impl BrokerExactPayloadSigner {
         })
         .await
         .map_err(|error| format!("join exact signing lock task: {error}"))??;
+        if let Some(superseded) = self.superseded_state.clone() {
+            self.release_superseded(&superseded).await;
+        }
         let result = self
             .sign_or_prepare_locked(
                 state_path,
@@ -385,6 +397,59 @@ impl BrokerExactPayloadSigner {
             // now would report a refusal for it. Wait instead of dropping it.
             _ => StoredApprovalCeremony::Unconfirmed,
         }
+    }
+
+    /// Give up the approval a Petal has just superseded, so the wallet is free
+    /// for the one it is about to ask for.
+    ///
+    /// A Petal that rebuilds a transaction — a Solana trade whose blockhash
+    /// expired before the owner answered — asks to sign different bytes under
+    /// a different request id. Nothing about that abandonment reaches Broker
+    /// on its own, so the old approval's ceremony stays live for its full TTL,
+    /// and a wallet holds one live ceremony: the rebuilt transaction cannot
+    /// even be offered until it expires. Revoking the approval ends its
+    /// ceremony. An approval still awaiting its owner has produced no
+    /// signature, so giving it up can duplicate nothing.
+    ///
+    /// Anything else is left alone: an approval past pending may already have
+    /// signed, and one whose status could not be read is not known to be
+    /// abandoned.
+    async fn release_superseded(&self, state_path: &Path) {
+        let Some(state) = fs::read(state_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<ExactSigningState>(&bytes).ok())
+        else {
+            return;
+        };
+        let Some(approval_id) = state.approval_id else {
+            let _ = fs::remove_file(state_path);
+            return;
+        };
+        if !matches!(
+            self.stored_approval_ceremony(&approval_id).await,
+            StoredApprovalCeremony::AwaitingOwner { .. }
+        ) {
+            return;
+        }
+        if let Err(error) = self
+            .broker
+            .revoke_approval(bloom_broker_api::RevokeRequest {
+                operation_id: random_operation_id(),
+                approval_id,
+                wallet_id: state.wallet_id,
+                reason: "superseded: the Petal rebuilt this operation".into(),
+            })
+            .await
+        {
+            tracing::warn!(
+                code = ?error.code,
+                message = %error.message,
+                action_id = %state.action_id,
+                "releasing a superseded exact approval failed"
+            );
+            return;
+        }
+        let _ = fs::remove_file(state_path);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1338,6 +1403,18 @@ mod tests {
                             broker_receipt_digest: digest(10),
                         }))
                     }
+                    MachineBrokerRequest::SealedApprovalRevoke(request) => {
+                        Ok(MachineBrokerResponse::SealedApprovalRevoke(
+                            bloom_broker_api::ApprovalPublicStatus {
+                                approval_id: request.approval_id,
+                                wallet_id: request.wallet_id,
+                                state: bloom_broker_api::ApprovalLifecycleState::Revoked,
+                                effective_claim_assurance: None,
+                                ceremony_url: None,
+                                ceremony_expires_at_ms: None,
+                            },
+                        ))
+                    }
                     _ => Err(ProtocolError::new(
                         ProtocolErrorCode::UnknownMethod,
                         "unexpected request",
@@ -2067,6 +2144,101 @@ mod tests {
         (signer, home, claim, ordered_hash)
     }
 
+    /// A Petal that rebuilds an operation — a trade whose transaction can no
+    /// longer land — gives up the approval it was waiting on and names it on
+    /// the next call. Machine revokes it, which ends its ceremony: a wallet
+    /// holds one live ceremony, so otherwise the rebuilt transaction could not
+    /// be offered until the abandoned one expired. An approval still awaiting
+    /// its owner has produced no signature, so giving it up duplicates
+    /// nothing. An approval past pending is left alone, because it may have.
+    #[tokio::test]
+    async fn a_rebuilt_operation_gives_up_the_approval_it_superseded() {
+        let broker = Arc::new(MockBroker::default());
+        broker.awaiting_owner.store(true, Ordering::SeqCst);
+        let (signer, home, claim, hash) = debiting_claim_fixture(&broker, None);
+        let abandoned = home.path().join("petal-exact.json");
+        let ExactPayloadOutcome::ApprovalRequired {
+            approval_id: waiting_on,
+            ..
+        } = flow_once(&signer, &home, &claim, &hash).await.unwrap()
+        else {
+            panic!("the first attempt must prepare an approval")
+        };
+        assert!(abandoned.is_file());
+
+        let attempt = |signer: BrokerExactPayloadSigner, state: std::path::PathBuf| {
+            let claim = claim.clone();
+            let hash = hash.clone();
+            async move {
+                signer
+                    .sign_or_prepare_petal(
+                        &state,
+                        "withdraw-action",
+                        "wallet",
+                        "hyperliquid.withdraw",
+                        b"exact withdraw payload",
+                        hash,
+                        CryptoSuite::Secp256k1Sha256Recoverable,
+                        &serde_json::json!({"asset": "USDC"}),
+                        &ProvenanceSubject::Petal {
+                            package_hash: claim.package_hash.clone(),
+                            route: "withdraw/request".into(),
+                        },
+                        &claim,
+                        Some(b"assurance"),
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        let revocations = || {
+            broker
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|request| match request {
+                    MachineBrokerRequest::SealedApprovalRevoke(revoke) => {
+                        Some(revoke.approval_id.clone())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let rebuilt_state = home.path().join("petal-exact-rebuilt.json");
+        let (rebuilt, _, _, _) = debiting_claim_fixture(&broker, None);
+        let ExactPayloadOutcome::ApprovalRequired { approval_id, .. } = attempt(
+            rebuilt.with_superseded_state(Some(abandoned.clone())),
+            rebuilt_state.clone(),
+        )
+        .await
+        else {
+            panic!("the rebuilt payload asks for its own approval")
+        };
+        assert_ne!(approval_id, waiting_on);
+        assert_eq!(revocations(), vec![waiting_on]);
+        assert!(
+            !abandoned.exists(),
+            "the released attempt leaves no state to resume"
+        );
+
+        // The owner has answered this one: it is past pending, so it may have
+        // signed, and a later rebuild must not touch it.
+        broker.awaiting_owner.store(false, Ordering::SeqCst);
+        let (again, _, _, _) = debiting_claim_fixture(&broker, None);
+        attempt(
+            again.with_superseded_state(Some(rebuilt_state.clone())),
+            home.path().join("petal-exact-again.json"),
+        )
+        .await;
+        assert_eq!(
+            revocations().len(),
+            1,
+            "only the abandoned one was given up"
+        );
+        assert!(rebuilt_state.is_file());
+    }
     async fn flow_once(
         signer: &BrokerExactPayloadSigner,
         home: &tempfile::TempDir,
