@@ -97,7 +97,9 @@ JSON leaves
 These pages are deliberately narrow about what they claim:
 
 - **Broadcast** means Bloom submitted the transaction and kept the hash. It is
-  not a claim that the chain accepted it. No receipt is read here.
+  not a claim of settlement. The Activity page looks up receipts for up to 64
+  recent records to show execution gas fees; these exclude additional L1-data
+  and blob fees and do not establish finality. Missing receipts show no fee.
 - **No broadcast recorded** means no transaction hash was retained. It does
   not prove no transaction reached a chain. An approval challenge alone does
   not prove whether the owner approved. Stopped operations with hashes retain

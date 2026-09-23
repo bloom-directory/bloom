@@ -1135,7 +1135,11 @@ impl ViewsHandler {
             let Some(client) = self.chains.get(&chain) else {
                 continue;
             };
-            if action.intent.as_ref().and_then(|intent| intent.chain_id) != Some(client.spec().chain_id) { continue; }
+            if action.intent.as_ref().and_then(|intent| intent.chain_id)
+                != Some(client.spec().chain_id)
+            {
+                continue;
+            }
             let Ok(hash) = hash.parse::<alloy::primitives::B256>() else {
                 continue;
             };
@@ -3625,7 +3629,13 @@ impl Action {
             }
             row_fact(
                 "Value",
-                html_escape(self.amount.as_deref().unwrap_or("None — zero value")),
+                html_escape(self.amount.as_deref().unwrap_or(
+                    if intent.value_wei.as_deref() == Some("0") {
+                        "None — zero value"
+                    } else {
+                        "Unavailable"
+                    },
+                )),
             );
             // The paid fee from the on-chain receipt, never the staged cap:
             // a limit is what the operation might have burned, the receipt
@@ -4236,6 +4246,7 @@ fn explorer_tx_url(chain_id: u64, hash: &str) -> Option<String> {
 }
 
 fn explorer_address_url(chain_id: u64, address: &str) -> Option<String> {
+    normalized_evm_address(address)?;
     EXPLORERS
         .iter()
         .find(|(id, _, _)| *id == chain_id)
@@ -4979,6 +4990,22 @@ mod tests {
     #[tokio::test]
     async fn recorded_network_controls_activity_links_and_currency() {
         let fixture = fixture();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        fixture.handler.chains.add(
+            bloom_evm::ChainClient::new(bloom_proto::ChainSpec {
+                name: "ethereum".into(),
+                chain_id: 1,
+                rpc_urls: vec![format!("http://{}", listener.local_addr().unwrap())],
+                rpc_endpoints: Vec::new(),
+                etherscan_api_url: None,
+                display_name: Some("Ethereum".into()),
+                native_symbol: "ETH".into(),
+                native_decimals: 18,
+                legacy_tx: false,
+                op_stack: false,
+            })
+            .unwrap(),
+        );
         stage_files(
             &fixture,
             "sent",
@@ -4995,7 +5022,19 @@ mod tests {
                 ),
             ],
         );
-        let (actions, _) = fixture.handler.actions().await;
+        let (mut actions, _) = fixture.handler.actions().await;
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            fixture.handler.resolve_fees(&mut actions),
+        )
+        .await
+        .expect("a changed chain mapping must not request a receipt");
+        assert!(actions[0].fee.is_none());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
         assert_eq!(
             actions[0].amount.as_deref(),
             Some("1000000000000000000 wei")
@@ -5484,6 +5523,10 @@ mod tests {
 
     #[test]
     fn a_paid_fee_reads_as_native_not_as_a_limit() {
+        assert_eq!(
+            super::format_fee(u64::MAX, u128::MAX, 0, "UNIT"),
+            "6277101735386680763495507056286727952620534092958556749825 UNIT"
+        );
         assert_eq!(
             super::format_fee(21_000, 1_000_000_000, 18, "ETH"),
             "0.000021 ETH"
@@ -6139,13 +6182,14 @@ mod tests {
         assert_eq!(explorer_tx_url(1, "0xabc"), None);
         assert_eq!(explorer_tx_url(1, &format!("{hash}/../elsewhere")), None);
         assert_eq!(
-            explorer_address_url(81457, "0xabc").as_deref(),
-            Some("https://blastscan.io/address/0xabc")
+            explorer_address_url(81457, ADDRESS),
+            Some(format!("https://blastscan.io/address/{ADDRESS}"))
         );
         assert_eq!(
-            explorer_address_url(534352, "0xabc").as_deref(),
-            Some("https://scrollscan.com/address/0xabc")
+            explorer_address_url(534352, ADDRESS),
+            Some(format!("https://scrollscan.com/address/{ADDRESS}"))
         );
+        assert_eq!(explorer_address_url(1, "0xabc"), None);
         // An unknown chain gets no link rather than one pointing at the
         // wrong chain's explorer.
         assert_eq!(explorer_tx_url(4217, "0xabc"), None);
