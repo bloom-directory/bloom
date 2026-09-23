@@ -840,21 +840,17 @@ impl BrokerExactPayloadSigner {
         {
             return Err("exact signing retry differs from its persisted operation identity".into());
         }
-        let now = now_ms()?;
-        if state.expires_at_ms.get() <= now {
-            state.approval_operation_id = random_operation_id();
-            state.signing_operation_id = random_operation_id();
-            state.request_nonce = random_request_nonce();
-            state.issued_at_ms = DecimalU64::new(now);
-            state.expires_at_ms = DecimalU64::new(now.saturating_add(APPROVAL_TTL_MS));
-            state.approval_id = None;
-        }
-        write_state(state_path, &state)?;
         // Every exact Petal request opens its operation record before it asks
         // Broker for anything, so a later replacement always has something to
-        // read. A request that supersedes an earlier attempt inherits that
-        // attempt's operation root here, which is what carries the logical
-        // operation across a change of bytes and across a restart.
+        // read, and it inherits the operation root of an attempt it supersedes,
+        // which is what carries the logical operation across a change of bytes
+        // and across a restart.
+        //
+        // From the state exactly as persisted, and before the expiry path below
+        // rewrites any of it. For a request this Machine did not prepare, the
+        // signing operation id that state carries is the only handle Broker has
+        // on whatever its previous call did, and expiry replaces it in this
+        // very call.
         if self.scope.is_some()
             && let Some(record_dir) = state_path.parent()
         {
@@ -866,6 +862,16 @@ impl BrokerExactPayloadSigner {
                     .as_ref(),
             )?;
         }
+        let now = now_ms()?;
+        if state.expires_at_ms.get() <= now {
+            state.approval_operation_id = random_operation_id();
+            state.signing_operation_id = random_operation_id();
+            state.request_nonce = random_request_nonce();
+            state.issued_at_ms = DecimalU64::new(now);
+            state.expires_at_ms = DecimalU64::new(now.saturating_add(APPROVAL_TTL_MS));
+            state.approval_id = None;
+        }
+        write_state(state_path, &state)?;
         let approval_value_limits = petal_claim
             .map(|(claim, _)| exact_claim_value_limits(claim))
             .transpose()?
@@ -2983,6 +2989,59 @@ mod tests {
         );
         assert!(scope.record(&first).released_at_ms.is_none());
         assert!(scope.revocations().is_empty(), "nothing was given up");
+    }
+
+    /// A request from before this record existed, whose own lifetime had already
+    /// run out by the time this Machine met it. Adopting it has to take the
+    /// signing operation id from the state **as persisted**: the expiry path in
+    /// the same call rotates that id, and the persisted one is the only handle
+    /// Broker has on whatever the previous binary's signing call did.
+    ///
+    /// Broker says that call succeeded. The attempt is therefore unresolved,
+    /// the replacement is blocked, and its approval is left alone.
+    #[tokio::test]
+    async fn an_expired_legacy_request_is_adopted_from_the_id_its_state_persisted() {
+        let broker = Arc::new(MockBroker::default());
+        broker.awaiting_owner.store(true, Ordering::SeqCst);
+        let scope = Scope::open(&broker, "scope-a");
+        let (first, second) = (request_id('1'), request_id('2'));
+        scope.attempt(&first, None).await.unwrap();
+
+        // What the previous binary left behind: a state file whose signing call
+        // Broker has a record of, no operation record, and a lifetime that has
+        // already run out.
+        let original = scope.signing_operation(&first);
+        broker.signing_operations.lock().unwrap().insert(
+            original.as_str().to_owned(),
+            bloom_broker_api::OperationState::Succeeded,
+        );
+        fs::remove_file(scope.state_dir().join(format!("{first}.op.json"))).unwrap();
+        scope.expire(&first);
+
+        // The retry adopts it, and the expiry path rotates the state's id in
+        // the same call.
+        scope.attempt(&first, None).await.unwrap();
+        assert_ne!(scope.signing_operation(&first), original);
+        let record = scope.record(&first);
+        assert!(record.signing_may_have_started);
+        assert!(
+            record.signing_operations.contains(&original),
+            "adoption must keep the id the state persisted, not the one expiry \
+             replaced it with: {:?}",
+            record.signing_operations
+        );
+
+        let refused = scope.attempt(&second, Some(&first)).await.unwrap_err();
+        assert!(
+            matches!(&refused, ExactSigningError::OutcomeUnknown(message)
+                if message.contains("is Succeeded")),
+            "{refused:?}"
+        );
+        assert!(scope.record(&first).released_at_ms.is_none());
+        assert!(
+            scope.revocations().is_empty(),
+            "an attempt that may have signed keeps its approval"
+        );
     }
 
     /// A released request is finished. Its own lifetime expiring must not
