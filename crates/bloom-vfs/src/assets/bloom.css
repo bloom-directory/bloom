@@ -12,6 +12,7 @@
   --rule:#e2d9cb; --rule-2:#d5c9b6;
   --accent:#8a2a3a; --accent-deep:#5e1a26; --accent-tint:#f1e1e1; --accent-rule:#c6a5a8;
   --success:#575065; --success-tint:#eeebf1; --success-rule:#d4ccdc;
+  --up:#2e6b34; --down:#8a2a3a;
   --pending:#765425; --pending-tint:#f6efdf; --pending-rule:#c9b08a;
   --qr-paper:#fff;
   --radius:14px; --radius-sm:8px;
@@ -122,6 +123,10 @@ td a { text-decoration:none; }
 .holdings-table th:nth-child(3),.holdings-table td:nth-child(3) { width:16%; }
 .holdings-table th:nth-child(4),.holdings-table td:nth-child(4) { width:28%; }
 .market-table td,.holdings-table td { padding-block:14px; }
+/* Market direction: green when up, the house red when down. Unknown or flat
+   changes carry no class and keep the body color. */
+.up { color:var(--up); }
+.down { color:var(--down); }
 
 /* Positions (Petal accounts, recent activity on Today). */
 .position-list { list-style:none; padding:0; margin:0; border-top:1px solid var(--rule); }

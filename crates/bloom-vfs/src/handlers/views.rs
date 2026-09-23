@@ -1938,8 +1938,9 @@ impl ViewsHandler {
                 .take(3)
                 .map(|row| {
                     format!(
-                        "<div class=\"mover-tile\"><h3>{symbol}</h3><strong>{change}</strong>\
+                        "<div class=\"mover-tile {direction}\"><h3>{symbol}</h3><strong>{change}</strong>\
                          <small>{volume} reported volume · 24h</small></div>",
+                        direction = change_direction(row.change_24h),
                         symbol = asset_label(&row.symbol),
                         change = html_escape(&signed_percent(row.change_24h)),
                         volume = html_escape(
@@ -1967,12 +1968,13 @@ impl ViewsHandler {
                     "<tr><td data-label=\"Token\"><span class=\"asset-label\">{mark}\
                      <span><strong>{name}</strong><small>{symbol}</small></span></span></td>\
                      <td class=\"numeric\" data-label=\"Price\">{price}</td>\
-                     <td class=\"numeric\" data-label=\"24h change\">{change}</td>\
+                     <td class=\"numeric {direction}\" data-label=\"24h change\">{change}</td>\
                      <td class=\"numeric money\" data-label=\"24h volume\">{volume}</td></tr>",
                     mark = monogram(&row.symbol),
                     name = name_link,
                     symbol = html_escape(&row.symbol),
                     price = html_escape(&row.price.map(money_precise).unwrap_or("—".to_owned())),
+                    direction = change_direction(row.change_24h),
                     change = html_escape(&signed_percent(row.change_24h)),
                     volume =
                         html_escape(&row.volume_24h.map(compact_usd).unwrap_or("—".to_owned())),
@@ -3611,6 +3613,17 @@ fn signed_percent(value: Option<f64>) -> String {
     }
 }
 
+/// Direction class for a 24h change: green when up, red when down, none
+/// when flat or unknown. An unknown change is not a flat market, so it
+/// carries no direction at all.
+fn change_direction(change: Option<f64>) -> &'static str {
+    match change {
+        Some(value) if value > 0.0 => "up",
+        Some(value) if value < 0.0 => "down",
+        _ => "",
+    }
+}
+
 /// A price, which unlike a total needs sub-cent resolution to say anything
 /// honest about an asset trading below a dollar.
 fn money_precise(value: f64) -> String {
@@ -4132,11 +4145,20 @@ fn token_icon(name: &str) -> Option<&'static IconFile> {
         "btc" | "bitcoin" => Some(&BITCOIN),
         "usdc" => Some(&USD_COIN),
         "usdt" => Some(&TETHER),
-        "sol" | "solana" => Some(&SOLANA),
-        "bnb" | "bnb chain" | "binance smart chain" | "binancecoin" => Some(&BINANCECOIN),
-        "base" => Some(&BASE_CHAIN),
+        "sol" | "solana" | "solana mainnet" | "solana devnet" | "solana testnet" => Some(&SOLANA),
+        "bnb" | "bnb chain" | "bnb smart chain" | "binance smart chain" | "binancecoin" => {
+            Some(&BINANCECOIN)
+        }
+        "base" | "base mainnet" => Some(&BASE_CHAIN),
         "arbitrum" | "arbitrum one" => Some(&ARBITRUM_CHAIN),
         "arb" => Some(&ARBITRUM_TOKEN),
+        "optimism" | "op mainnet" | "op" => Some(&OPTIMISM_CHAIN),
+        "matic" | "polygon" | "polygon pos" => Some(&POLYGON_CHAIN),
+        "avax" | "avalanche" | "avalanche c-chain" => Some(&AVALANCHE_CHAIN),
+        "gnosis" | "gnosis chain" | "xdai" => Some(&GNOSIS_CHAIN),
+        "linea" => Some(&LINEA_CHAIN),
+        "blast" => Some(&BLAST_CHAIN),
+        "scroll" => Some(&SCROLL_CHAIN),
         "hyperliquid" | "hyperevm" => Some(&HYPERLIQUID_CHAIN),
         "hype" => Some(&HYPERLIQUID_TOKEN),
         "robinhood" | "robinhood chain" => Some(&ROBINHOOD_CHAIN),
@@ -4862,6 +4884,41 @@ mod tests {
             super::position_belongs_to_wallet(position, wallet),
             "address-keyed leaf attributes to its wallet"
         );
+    }
+
+    #[test]
+    fn chain_display_names_resolve_their_icons() {
+        // The Today allocation labels rows by display name ("Solana
+        // Mainnet", "Base Mainnet"), not by symbol, so the icon matcher
+        // must know those spellings or the row falls back to initials.
+        for name in [
+            "Solana Mainnet",
+            "Solana Devnet",
+            "Base Mainnet",
+            "OP Mainnet",
+            "Optimism",
+            "Arbitrum One",
+            "Ethereum Mainnet",
+            "Avalanche C-Chain",
+            "Gnosis Chain",
+            "Linea",
+            "Blast",
+            "Scroll",
+            "Polygon PoS",
+            "BNB Smart Chain",
+            "Robinhood Chain",
+            "HyperEVM",
+        ] {
+            assert!(super::token_icon(name).is_some(), "{name} needs an icon");
+        }
+    }
+
+    #[test]
+    fn market_direction_colors_up_down_and_nothing_else() {
+        assert_eq!(super::change_direction(Some(1.5)), "up");
+        assert_eq!(super::change_direction(Some(-0.2)), "down");
+        assert_eq!(super::change_direction(Some(0.0)), "");
+        assert_eq!(super::change_direction(None), "");
     }
 
     #[test]
