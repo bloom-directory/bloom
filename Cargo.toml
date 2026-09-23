@@ -151,10 +151,3 @@ opt-level = 1
 [profile.release]
 lto = "thin"
 codegen-units = 1
-
-# TEST-ONLY, never merged: builds against the local bloom-broker worktree at
-# 15afa84ff4f56a616e13552a482d1e36685d4128, which adds the reservation field
-# `signing_possible` reads. The real pin is a full-length rev on that commit
-# once it is published; a sibling-checkout patch is not a release input.
-[patch."https://github.com/bloom-directory/bloom-broker.git"]
-bloom-broker-api = { path = "/home/user/code/bloom/worktrees/pfdirect/bloom-broker/revoke-ends-ceremony/crates/bloom-broker-api" }
