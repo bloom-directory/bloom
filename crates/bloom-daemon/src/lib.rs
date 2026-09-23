@@ -276,6 +276,44 @@ fn session_stop_complete_default() -> bool {
     true
 }
 
+/// The tagged form of `approval-hint` that gives an earlier exact request up.
+///
+/// The field otherwise names the artifact for the request being made, and two
+/// shipped Petals store and replay an action id through it, so a bare id that
+/// is not this request's own stays a refusal. A caller that has abandoned an
+/// attempt has to say so in this form, which nothing produces by accident.
+///
+/// This is a deliberately small contract change. The cleaner shape is a
+/// separate `supersedes` field on `bloom:sign/signing@0.2.0`'s
+/// `payload-sign-request`, and the host reads that record by field name, so it
+/// would be additive here. It is not additive for the SDK: `PayloadSignRequest`
+/// is a public struct that every Petal builds with a literal, so a new field
+/// breaks each of them until they are updated. That sequence belongs with the
+/// field, not with this fix.
+const SUPERSEDES_HINT: &str = "supersedes:";
+
+/// A Machine-derived exact request id: 64 lowercase hex characters. Checked
+/// before any of it reaches a path, so a supersession can never name anything
+/// but a sibling of the state directory.
+fn is_request_id(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Where one exact Petal request keeps its state, and the scope it was made
+/// in. The scope is Machine's: it is derived from the installer-authenticated
+/// package and route and from the wallet, operation class and account key
+/// Machine resolved, never from anything the guest supplied. It is what bounds
+/// which stored requests a request may act on.
+struct PetalSigningPaths {
+    request_id: String,
+    scope: String,
+    state: PathBuf,
+    owner_projection: PathBuf,
+}
+
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct PetalKeyRequestState {
@@ -977,18 +1015,20 @@ impl DaemonPetalHost {
         claimed_hash: &[u8; 32],
         canonical_claim: &[u8],
         account_key: Option<&bloom_broker_api::KeyRef>,
-    ) -> Result<(String, PathBuf, PathBuf), HostError> {
+    ) -> Result<PetalSigningPaths, HostError> {
         let root = self.petal_signing_state_root.as_ref().ok_or_else(|| {
             HostError::Backend("Petal exact signing state is not configured".into())
         })?;
         let key_identity = serde_jcs::to_vec(&account_key)
             .map_err(|error| HostError::Invalid(error.to_string()))?;
-        // Everything but the payload identifies the operation the Petal is
-        // signing for; the payload identifies one attempt at it. Machine keeps
-        // the attempts of one operation together so it can tell, when a Petal
-        // rebuilds, which approval it has just superseded.
-        let mut group = blake3::Hasher::new();
-        group.update(b"bloom-petal-exact-signing-group/v1\0");
+        // The scope an exact request is made in: everything that is not the
+        // payload. It is what bounds which stored requests this one may act
+        // on, and it is derived here, never taken from the guest. The file
+        // layout is deliberately unchanged — `.state/<request>.json` shipped in
+        // v0.2.0 and v0.2.1, and moving it would hide pending requests from an
+        // upgraded Machine.
+        let mut scope = blake3::Hasher::new();
+        scope.update(b"bloom-petal-exact-signing-scope/v1\0");
         let mut identity = blake3::Hasher::new();
         identity.update(b"bloom-petal-exact-signing/v2\0");
         for part in [
@@ -996,12 +1036,11 @@ impl DaemonPetalHost {
             context.route_id.as_bytes(),
             wallet.as_bytes(),
             operation_class.as_bytes(),
+            &key_identity,
         ] {
-            group.update(&(part.len() as u64).to_be_bytes());
-            group.update(part);
+            scope.update(&(part.len() as u64).to_be_bytes());
+            scope.update(part);
         }
-        group.update(&(key_identity.len() as u64).to_be_bytes());
-        group.update(&key_identity);
         for part in [
             context.package_hash.as_bytes(),
             context.route_id.as_bytes(),
@@ -1015,13 +1054,12 @@ impl DaemonPetalHost {
             identity.update(part);
         }
         let request_id = identity.finalize().to_hex().to_string();
-        Ok((
-            request_id.clone(),
-            root.join(".state")
-                .join(group.finalize().to_hex().to_string())
-                .join(format!("{request_id}.json")),
-            root.join(format!("{request_id}.json")),
-        ))
+        Ok(PetalSigningPaths {
+            scope: scope.finalize().to_hex().to_string(),
+            state: root.join(".state").join(format!("{request_id}.json")),
+            owner_projection: root.join(format!("{request_id}.json")),
+            request_id,
+        })
     }
 
     fn petal_reusable_signing_paths(
@@ -1937,7 +1975,7 @@ impl PetalHost for DaemonPetalHost {
                 package_hash: trusted_package_hash.clone(),
                 route: context.route_id.clone(),
             };
-            let (request_id, exact_state_path, owner_projection_path) = self.petal_signing_paths(
+            let paths = self.petal_signing_paths(
                 context,
                 &req.wallet,
                 &req.operation_class,
@@ -1945,37 +1983,39 @@ impl PetalHost for DaemonPetalHost {
                 &canonical_claim,
                 account_key.as_ref(),
             )?;
-            // A hint naming a different request is the Petal saying it has
-            // given that one up: it rebuilt an operation whose transaction can
-            // no longer land, and still holds the id of the approval it was
-            // waiting on. Machine resolves the hint inside this operation's
-            // own state directory, so a Petal can only ever name an attempt at
-            // the same operation, and nothing outside it. Everything else is
-            // still denied.
-            let superseded = match req.approval_hint.as_deref() {
+            let PetalSigningPaths {
+                request_id,
+                scope,
+                state: exact_state_path,
+                owner_projection: owner_projection_path,
+            } = paths;
+            // `approval-hint` still means exactly one thing: the artifact for
+            // *this* request, which Machine derived itself. A caller that has
+            // given an earlier attempt up says so in a separate, tagged form,
+            // so no stale hint from an older attempt can ever be read as
+            // permission to abandon it. Other first-party Petals store and
+            // replay an action id as a plain hint; a bare id that is not this
+            // request's own is refused for them exactly as before.
+            let supersedes = match req.approval_hint.as_deref() {
                 None => None,
                 Some(hint) if hint == request_id => None,
-                Some(hint)
-                    if hint.len() == request_id.len()
-                        && hint.bytes().all(|byte| byte.is_ascii_hexdigit()) =>
-                {
-                    Some(exact_state_path.with_file_name(format!("{hint}.json")))
-                        .filter(|path| path.is_file())
-                }
-                Some(_) => {
-                    warn!(
-                        wallet = %req.wallet,
-                        operation_class = %req.operation_class,
-                        package_hash = %context.package_hash,
-                        route = %context.route_id,
-                        request_id = %request_id,
-                        reason = "approval hint does not match the derived request id",
-                        "petal.sign_payload_denied"
-                    );
-                    return Err(HostError::Denied(
-                        "approval artifact does not match the exact Petal operation".into(),
-                    ));
-                }
+                Some(hint) => match hint.strip_prefix(SUPERSEDES_HINT) {
+                    Some(superseded) if is_request_id(superseded) => Some(superseded.to_owned()),
+                    _ => {
+                        warn!(
+                            wallet = %req.wallet,
+                            operation_class = %req.operation_class,
+                            package_hash = %context.package_hash,
+                            route = %context.route_id,
+                            request_id = %request_id,
+                            reason = "approval hint is neither this request's id nor a well-formed supersession",
+                            "petal.sign_payload_denied"
+                        );
+                        return Err(HostError::Denied(
+                            "approval artifact does not match the exact Petal operation".into(),
+                        ));
+                    }
+                },
             };
             let payload_digest =
                 bloom_broker_api::Digest32::from_bytes(sha2::Sha256::digest(&req.preimage).into());
@@ -2002,7 +2042,7 @@ impl PetalHost for DaemonPetalHost {
             })?;
             let signer = BrokerExactPayloadSigner::new(broker.clone(), catalog)
                 .with_account_key(account_key.clone())
-                .with_superseded_state(superseded);
+                .in_scope(scope, supersedes);
             let _guard = self.petal_signing_lock.lock().await;
             let outcome = signer
                 .sign_or_prepare_petal(
@@ -2273,15 +2313,21 @@ impl PetalHost for DaemonPetalHost {
             package_hash: trusted_package_hash,
             route: context.route_id.clone(),
         };
+        // The batch paths keep the hint contract they already had: it names
+        // this batch's own artifact and nothing else. Supersession is not
+        // offered here, and nothing in this path reads the tagged form.
         let (request_id, exact_state_path, owner_projection_path) = match req.selector {
-            bloom_broker_api::PetalSignSelector::Exact => self.petal_signing_paths(
-                context,
-                &req.wallet,
-                &req.operation_class,
-                &batch_digest_bytes,
-                &canonical_claim,
-                account_key.as_ref(),
-            )?,
+            bloom_broker_api::PetalSignSelector::Exact => {
+                let paths = self.petal_signing_paths(
+                    context,
+                    &req.wallet,
+                    &req.operation_class,
+                    &batch_digest_bytes,
+                    &canonical_claim,
+                    account_key.as_ref(),
+                )?;
+                (paths.request_id, paths.state, paths.owner_projection)
+            }
             bloom_broker_api::PetalSignSelector::Reusable => self.petal_reusable_signing_paths(
                 context,
                 &req.wallet,
@@ -6551,26 +6597,45 @@ mod tests {
             .unwrap_err();
         assert!(matches!(guest_error, HostError::Denied(_)));
 
-        // A hint is either this request's own id or the id of an attempt at
-        // the same operation that the Petal has given up. Anything else names
-        // no artifact Machine derived, and is refused.
-        let mut foreign_hint = request.clone();
-        foreign_hint.approval_hint = Some("../../elsewhere".into());
+        // The hint contract, one input per case. A hint is either this
+        // request's own id, or the tagged form naming an attempt it has given
+        // up. Everything else names no artifact Machine derived.
+        for bad in [
+            // A bare id that is not this request's own: what the two other
+            // first-party Petals store and replay, and still a refusal.
+            "cd".repeat(32),
+            // Malformed: not a path, not hex, not the right length.
+            "../../elsewhere".into(),
+            "supersedes:../../elsewhere".into(),
+            format!("supersedes:{}", "zz".repeat(32)),
+            format!("supersedes:{}", "ab".repeat(20)),
+            // Upper-case hex is not what Machine derives.
+            format!("supersedes:{}", "AB".repeat(32)),
+        ] {
+            let mut hinted = request.clone();
+            hinted.approval_hint = Some(bad.clone());
+            let error = host.sign_payload_outcome(hinted).await.unwrap_err();
+            assert!(
+                matches!(error, HostError::Denied(_))
+                    && error
+                        .to_string()
+                        .contains("approval artifact does not match"),
+                "{bad}: {error}"
+            );
+        }
+        // Well formed, and naming an attempt Machine never prepared: refused as
+        // unresolved rather than silently ignored, because Machine keeps every
+        // operation record and so an absent one is not evidence of a release.
+        // The guest learns only that the outcome is unknown; which of the two
+        // it was stays in Machine's log, so one Petal cannot probe for
+        // another's artifacts.
+        let mut unknown_hint = request.clone();
+        unknown_hint.approval_hint = Some(format!("supersedes:{}", "ab".repeat(32)));
+        let unknown = host.sign_payload_outcome(unknown_hint).await.unwrap_err();
         assert!(
-            host.sign_payload_outcome(foreign_hint)
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("approval artifact does not match")
+            matches!(&unknown, HostError::Backend(message) if message == SIGNING_OUTCOME_UNKNOWN),
+            "{unknown}"
         );
-        // A superseded attempt that is already gone is simply nothing to
-        // release: the request continues under its own approval.
-        let mut released_hint = request.clone();
-        released_hint.approval_hint = Some("ab".repeat(32));
-        assert!(matches!(
-            host.sign_payload_outcome(released_hint).await.unwrap(),
-            SignOutcome::ApprovalPending(_)
-        ));
 
         broker
             .active
@@ -8515,7 +8580,15 @@ allowed = ["bloom:vfs.read"]
             let reusable = host
                 .petal_reusable_signing_paths(&context, "w", "test.intent", 1, Some(key))
                 .unwrap();
-            identities.push((exact, reusable));
+            identities.push((
+                (
+                    exact.request_id,
+                    exact.scope,
+                    exact.state,
+                    exact.owner_projection,
+                ),
+                reusable,
+            ));
         }
         assert_ne!(identities[0], identities[1]);
         assert_eq!(identities[0], identities[2]);

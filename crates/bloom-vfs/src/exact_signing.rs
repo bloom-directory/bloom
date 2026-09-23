@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -72,8 +72,11 @@ pub struct BrokerExactPayloadSigner {
     broker: MachineBrokerClient,
     provenance_catalog: ProvenanceCatalog,
     account_key_ref: Option<bloom_broker_api::KeyRef>,
-    /// A stored attempt at this same operation that the caller has given up.
-    superseded_state: Option<PathBuf>,
+    /// The scope this request is made in: package, route, wallet, operation
+    /// class and account key, as Machine derived them.
+    scope: Option<String>,
+    /// The request id of an earlier attempt the caller says it has given up.
+    supersedes: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -213,6 +216,60 @@ struct ReusablePetalBatchSigningState {
     approval_id: Option<Digest32>,
 }
 
+/// What Machine knows about one exact request beyond the operation state it
+/// already kept: the scope the request was made in, which logical operation it
+/// belongs to, whether a signing call that could have produced a signature was
+/// ever issued for it, and whether it has been safely given up.
+///
+/// A separate record, not new fields on [`ExactSigningState`], because that
+/// state shipped in v0.2.0 and v0.2.1 with `deny_unknown_fields`: a binary from
+/// either release must still be able to read back a state file this one wrote.
+/// It ignores a file it does not know about.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExactOperationRecord {
+    schema: String,
+    /// Package, route, wallet, operation class and account key. Machine will
+    /// only let a request give up an attempt made in its own scope.
+    scope: String,
+    /// The request id of the first attempt in this logical operation. Every
+    /// rebuild inherits it, so the operation survives a change of bytes.
+    operation_root: String,
+    /// Set before any signing call that carries an approval id, and never
+    /// cleared. While false, no signature can exist for this attempt.
+    #[serde(default)]
+    signing_may_have_started: bool,
+    /// Set when Broker reported that it had already finalized a signing
+    /// reservation for this attempt, which is why a fresh one was issued. The
+    /// finalized id is gone, so Broker can no longer be asked about it, and the
+    /// attempt can never be proven not to have signed.
+    #[serde(default)]
+    signing_operation_replaced: bool,
+    /// When this attempt was proven safe to abandon. Kept so a retry of the
+    /// same replacement is idempotent without deleting the evidence needed to
+    /// reconcile it.
+    #[serde(default)]
+    released_at_ms: Option<DecimalU64>,
+}
+
+const OPERATION_SCHEMA: &str = "bloom.machine_exact_operation.v1";
+
+/// What Machine established about the attempt a request asks to replace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Supersession {
+    /// Proven to have produced no signature, and it can no longer produce one.
+    Released,
+    /// Already proven, by an earlier attempt at the same replacement.
+    AlreadyReleased,
+    /// It may already have signed, or may still sign. The replacement must not
+    /// proceed, and the operation's outcome is unresolved.
+    PriorMaySign(String),
+    /// Machine could not establish either, so it must not authorize anything.
+    Unknown(String),
+    /// The request may not replace this attempt at all. Nothing was changed.
+    Invalid(String),
+}
+
 /// What a stored approval's ceremony check found before signing with it.
 enum StoredApprovalCeremony {
     /// Still waiting on its owner: return the same pending approval.
@@ -235,7 +292,8 @@ impl BrokerExactPayloadSigner {
             broker,
             provenance_catalog,
             account_key_ref: None,
-            superseded_state: None,
+            scope: None,
+            supersedes: None,
         }
     }
 
@@ -244,9 +302,13 @@ impl BrokerExactPayloadSigner {
         self
     }
 
-    /// The stored attempt this request replaces, if the caller named one.
-    pub fn with_superseded_state(mut self, state_path: Option<PathBuf>) -> Self {
-        self.superseded_state = state_path;
+    /// The scope Machine derived for this request, and the earlier attempt in
+    /// it — if any — that the caller says it has given up. Both come from
+    /// Machine: `supersedes` is the caller's assertion, but which requests it
+    /// can name is not.
+    pub fn in_scope(mut self, scope: String, supersedes: Option<String>) -> Self {
+        self.scope = Some(scope);
+        self.supersedes = supersedes;
         self
     }
 
@@ -339,8 +401,36 @@ impl BrokerExactPayloadSigner {
         })
         .await
         .map_err(|error| format!("join exact signing lock task: {error}"))??;
-        if let Some(superseded) = self.superseded_state.clone() {
-            self.release_superseded(&superseded).await;
+        let released = match self.supersedes.clone() {
+            None => Ok(()),
+            Some(superseded) if superseded == action_id => Err(ExactSigningError::Refused(
+                "an exact request cannot supersede itself".into(),
+            )),
+            Some(superseded) => match self.release_superseded(parent, &superseded).await {
+                Supersession::Released | Supersession::AlreadyReleased => Ok(()),
+                // The replacement must not become eligible to sign while the
+                // attempt it replaces is unresolved. Both of these are outcomes
+                // the caller retries, and neither rebuilds.
+                Supersession::PriorMaySign(reason) | Supersession::Unknown(reason) => {
+                    Err(ExactSigningError::OutcomeUnknown(format!(
+                        "the attempt this replaces is unresolved: {reason}"
+                    )))
+                }
+                // The reason stays host-side. A guest that could tell "no such
+                // request" from "a request in another scope" would have a way
+                // to probe for other Petals' artifacts, and the two are one
+                // refusal as far as the caller is concerned.
+                Supersession::Invalid(reason) => {
+                    tracing::warn!(superseded, reason, "exact supersession refused");
+                    Err(ExactSigningError::Refused(
+                        "approval artifact does not match the exact Petal operation".into(),
+                    ))
+                }
+            },
+        };
+        if let Err(error) = released {
+            let _ = lock.unlock();
+            return Err(error);
         }
         let result = self
             .sign_or_prepare_locked(
@@ -399,57 +489,226 @@ impl BrokerExactPayloadSigner {
         }
     }
 
-    /// Give up the approval a Petal has just superseded, so the wallet is free
-    /// for the one it is about to ask for.
+    /// Give up the approval a caller has superseded, so the wallet is free for
+    /// the one it is about to ask for — but only once Machine has established
+    /// that doing so cannot strand or duplicate a signature.
     ///
-    /// A Petal that rebuilds a transaction — a Solana trade whose blockhash
+    /// A caller that rebuilds a transaction — a Solana trade whose blockhash
     /// expired before the owner answered — asks to sign different bytes under
-    /// a different request id. Nothing about that abandonment reaches Broker
-    /// on its own, so the old approval's ceremony stays live for its full TTL,
-    /// and a wallet holds one live ceremony: the rebuilt transaction cannot
-    /// even be offered until it expires. Revoking the approval ends its
-    /// ceremony. An approval still awaiting its owner has produced no
-    /// signature, so giving it up can duplicate nothing.
+    /// a different request id. Nothing about that abandonment reaches Broker on
+    /// its own, so the old approval's ceremony stays live for its full TTL, and
+    /// a wallet holds one live ceremony: the rebuilt transaction cannot even be
+    /// offered until it expires.
     ///
-    /// Anything else is left alone: an approval past pending may already have
-    /// signed, and one whose status could not be read is not known to be
-    /// abandoned.
-    async fn release_superseded(&self, state_path: &Path) {
-        let Some(state) = fs::read(state_path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<ExactSigningState>(&bytes).ok())
-        else {
-            return;
+    /// The order matters. Revoking first is what makes the answer stable: after
+    /// it, the approval can never sign, so whatever Broker then says about the
+    /// attempt's signing operation is final. Asking before revoking would only
+    /// describe a moment that the owner can still move past — they may complete
+    /// the ceremony between the two calls, which is why an earlier `Prepared`
+    /// or `AwaitingCeremony` reading is never on its own taken as proof that
+    /// nothing signed.
+    async fn release_superseded(&self, state_dir: &Path, superseded: &str) -> Supersession {
+        let Some(scope) = self.scope.as_deref() else {
+            return Supersession::Invalid("this request has no derived scope".into());
         };
-        let Some(approval_id) = state.approval_id else {
-            let _ = fs::remove_file(state_path);
-            return;
+        let record_path = state_dir.join(format!("{superseded}.op.json"));
+        let record = match fs::read(&record_path) {
+            Ok(bytes) => match serde_json::from_slice::<ExactOperationRecord>(&bytes) {
+                Ok(record) if record.schema == OPERATION_SCHEMA => record,
+                _ => {
+                    return Supersession::Unknown(
+                        "the superseded request's record is unreadable".into(),
+                    );
+                }
+            },
+            // Machine never removes this record, so its absence does not mean
+            // the attempt was released. It means Machine has no attempt by that
+            // name, and cannot say what became of one.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Supersession::Unknown(
+                    "no exact request by that id was prepared here".into(),
+                );
+            }
+            Err(error) => {
+                return Supersession::Unknown(format!(
+                    "the superseded request's record could not be read: {error}"
+                ));
+            }
         };
-        if !matches!(
-            self.stored_approval_ceremony(&approval_id).await,
-            StoredApprovalCeremony::AwaitingOwner { .. }
-        ) {
-            return;
+        if record.scope != scope {
+            return Supersession::Invalid(
+                "the superseded request belongs to another package, route, wallet, operation class or key"
+                    .into(),
+            );
         }
-        if let Err(error) = self
+        if record.released_at_ms.is_some() {
+            return Supersession::AlreadyReleased;
+        }
+        let state = match fs::read(state_dir.join(format!("{superseded}.json"))) {
+            Ok(bytes) => match serde_json::from_slice::<ExactSigningState>(&bytes) {
+                Ok(state) => state,
+                Err(error) => {
+                    return Supersession::Unknown(format!(
+                        "the superseded request's state is malformed: {error}"
+                    ));
+                }
+            },
+            Err(error) => {
+                return Supersession::Unknown(format!(
+                    "the superseded request's state could not be read: {error}"
+                ));
+            }
+        };
+
+        // No approval was ever prepared, and no signing call was ever issued,
+        // so there is nothing at Broker to end and nothing that could have
+        // signed.
+        let Some(approval_id) = state.approval_id.clone() else {
+            if record.signing_may_have_started {
+                return Supersession::PriorMaySign(
+                    "the superseded attempt issued a signing call and kept no approval".into(),
+                );
+            }
+            return self.mark_released(&record_path, record);
+        };
+
+        match self
             .broker
             .revoke_approval(bloom_broker_api::RevokeRequest {
                 operation_id: random_operation_id(),
                 approval_id,
-                wallet_id: state.wallet_id,
-                reason: "superseded: the Petal rebuilt this operation".into(),
+                wallet_id: state.wallet_id.clone(),
+                reason: "superseded: the caller rebuilt this operation".into(),
             })
             .await
         {
-            tracing::warn!(
-                code = ?error.code,
-                message = %error.message,
-                action_id = %state.action_id,
-                "releasing a superseded exact approval failed"
-            );
-            return;
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(
+                    code = ?error.code,
+                    message = %error.message,
+                    action_id = %state.action_id,
+                    "revoking a superseded exact approval failed"
+                );
+                return Supersession::Unknown(format!(
+                    "the superseded approval could not be revoked: {:?}",
+                    error.code
+                ));
+            }
         }
-        let _ = fs::remove_file(state_path);
+
+        // Revoked, so nothing can sign with it from here. Whether something
+        // already did is Broker's to answer, and only for an attempt that
+        // reached a signing call at all.
+        if !record.signing_may_have_started {
+            return self.mark_released(&record_path, record);
+        }
+        if record.signing_operation_replaced {
+            return Supersession::PriorMaySign(
+                "Broker finalized a signing reservation for the superseded attempt".into(),
+            );
+        }
+        match self
+            .broker
+            .operation_status(state.signing_operation_id.clone())
+            .await
+        {
+            // Broker never received a signing request under that id.
+            Err(error) if error.code == ProtocolErrorCode::ApprovalNotFound => {
+                self.mark_released(&record_path, record)
+            }
+            Ok(status)
+                if matches!(
+                    status.state,
+                    bloom_broker_api::OperationState::Cancelled
+                        | bloom_broker_api::OperationState::Denied
+                ) =>
+            {
+                self.mark_released(&record_path, record)
+            }
+            Ok(status) => Supersession::PriorMaySign(format!(
+                "the superseded attempt's signing operation is {:?}",
+                status.state
+            )),
+            Err(error) => Supersession::Unknown(format!(
+                "the superseded attempt's signing operation could not be read: {:?}",
+                error.code
+            )),
+        }
+    }
+
+    /// Record that an attempt was proven safe to abandon. The record stays on
+    /// disk: a later retry of the same replacement reads it instead of asking
+    /// Broker again, and nothing needed to reconcile the attempt is removed.
+    fn mark_released(&self, path: &Path, mut record: ExactOperationRecord) -> Supersession {
+        record.released_at_ms = Some(DecimalU64::new(now_ms().unwrap_or(0)));
+        match write_state(path, &record) {
+            Ok(()) => Supersession::Released,
+            // The approval is already revoked, so nothing can sign; but without
+            // the record a retry cannot tell that, so report it as unresolved
+            // rather than let a replacement through on an unrecorded release.
+            Err(error) => Supersession::Unknown(format!(
+                "the superseded request's release could not be recorded: {error}"
+            )),
+        }
+    }
+
+    /// Open or start this request's operation record. A request that supersedes
+    /// an earlier attempt inherits that attempt's operation root, so the
+    /// logical operation survives every change of bytes and every restart.
+    ///
+    /// `adopting` says the request already had durable state when this Machine
+    /// first saw it — a request from before this record existed, or from
+    /// another binary. Machine cannot know whether such a request issued a
+    /// signing call, so it assumes it did: the worst that costs is one
+    /// operation that cannot be superseded and waits out its ceremony, which
+    /// is what every request did before this change.
+    fn operation_record(
+        &self,
+        state_dir: &Path,
+        request_id: &str,
+        adopting: bool,
+    ) -> Result<ExactOperationRecord, String> {
+        let path = state_dir.join(format!("{request_id}.op.json"));
+        let scope = self
+            .scope
+            .clone()
+            .ok_or_else(|| "this request has no derived scope".to_owned())?;
+        match fs::read(&path) {
+            Ok(bytes) => {
+                let record: ExactOperationRecord = serde_json::from_slice(&bytes)
+                    .map_err(|error| format!("read exact operation record: {error}"))?;
+                if record.schema != OPERATION_SCHEMA || record.scope != scope {
+                    return Err("exact operation record does not match this request".into());
+                }
+                Ok(record)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let operation_root = match self.supersedes.as_deref() {
+                    Some(superseded) => {
+                        let previous = state_dir.join(format!("{superseded}.op.json"));
+                        fs::read(&previous)
+                            .ok()
+                            .and_then(|bytes| {
+                                serde_json::from_slice::<ExactOperationRecord>(&bytes).ok()
+                            })
+                            .map_or_else(|| request_id.to_owned(), |record| record.operation_root)
+                    }
+                    None => request_id.to_owned(),
+                };
+                let record = ExactOperationRecord {
+                    schema: OPERATION_SCHEMA.into(),
+                    scope,
+                    operation_root,
+                    signing_may_have_started: adopting,
+                    signing_operation_replaced: false,
+                    released_at_ms: None,
+                };
+                write_state(&path, &record)?;
+                Ok(record)
+            }
+            Err(error) => Err(format!("read exact operation record: {error}")),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -491,6 +750,10 @@ impl BrokerExactPayloadSigner {
         let canonical_plan_facts_digest = Digest32::from_bytes(Sha256::digest(plan_bytes).into());
         let wallet_id = Token::new(wallet.to_owned()).map_err(|error| error.to_string())?;
 
+        // Whether this request already had durable state before this call.
+        // A request Machine is meeting for the first time with state on disk
+        // was prepared by something else, and nothing here can say what it did.
+        let adopting_existing_state = state_path.exists();
         let mut state = match fs::read(state_path) {
             Ok(bytes) => serde_json::from_slice::<ExactSigningState>(&bytes)
                 .map_err(|error| format!("read exact signing state: {error}"))?,
@@ -540,6 +803,16 @@ impl BrokerExactPayloadSigner {
             state.approval_id = None;
         }
         write_state(state_path, &state)?;
+        // Every exact Petal request opens its operation record before it asks
+        // Broker for anything, so a later replacement always has something to
+        // read. A request that supersedes an earlier attempt inherits that
+        // attempt's operation root here, which is what carries the logical
+        // operation across a change of bytes and across a restart.
+        if self.scope.is_some()
+            && let Some(record_dir) = state_path.parent()
+        {
+            self.operation_record(record_dir, action_id, adopting_existing_state)?;
+        }
         let approval_value_limits = petal_claim
             .map(|(claim, _)| exact_claim_value_limits(claim))
             .transpose()?
@@ -586,6 +859,20 @@ impl BrokerExactPayloadSigner {
                     ));
                 }
             }
+            // Past this point the call carries an approval id, so Broker may
+            // sign rather than prepare. Recorded before the call and never
+            // cleared: whatever the response is, or whether one arrives at
+            // all, a later replacement must treat this attempt as one that may
+            // have signed until Broker says otherwise.
+            if let Some(record_dir) = state_path.parent()
+                && self.scope.is_some()
+            {
+                let mut record = self.operation_record(record_dir, action_id, true)?;
+                if !record.signing_may_have_started {
+                    record.signing_may_have_started = true;
+                    write_state(&record_dir.join(format!("{action_id}.op.json")), &record)?;
+                }
+            }
         }
         let mut response = self.broker.sign_exact_payload(request.clone()).await;
         let prior_attempt_stands = response
@@ -596,6 +883,15 @@ impl BrokerExactPayloadSigner {
             // A prior attempt may have committed at Broker before its response
             // reached Machine. Keep the activated approval and immutable payload,
             // but never retry a signing reservation that Broker finalized.
+            // The finalized id is not kept, so from here nothing can prove this
+            // attempt did not sign, and it can never be superseded.
+            if let Some(record_dir) = state_path.parent()
+                && self.scope.is_some()
+            {
+                let mut record = self.operation_record(record_dir, action_id, true)?;
+                record.signing_operation_replaced = true;
+                write_state(&record_dir.join(format!("{action_id}.op.json")), &record)?;
+            }
             state.signing_operation_id = random_operation_id();
             request.signing_operation_id = state.signing_operation_id.clone();
             write_state(state_path, &state)?;
@@ -1178,6 +1474,18 @@ mod tests {
         sign_errors: Mutex<Vec<ProtocolError>>,
         /// Errors the next approval status queries return, in order.
         status_errors: Mutex<Vec<ProtocolError>>,
+        /// Errors the next revoke calls return, in order.
+        revoke_errors: Mutex<Vec<ProtocolError>>,
+        /// Signing operations Broker has a record of, and what it says about
+        /// them. Anything else answers ApprovalNotFound, which is how Machine
+        /// learns a signing call never reached Broker.
+        signing_operations: Mutex<BTreeMap<String, bloom_broker_api::OperationState>>,
+        /// Errors the next operation status queries return, in order.
+        operation_status_errors: Mutex<Vec<ProtocolError>>,
+        /// Run once, the first time an approval's status is read: the owner
+        /// completing a ceremony between Machine's inspection and its revoke.
+        /// Deterministic, and the point of the race test.
+        on_status_read: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     }
 
     impl MockBroker {
@@ -1329,6 +1637,11 @@ mod tests {
                             return Err(error);
                         }
                         let waiting = self.awaiting_owner.load(Ordering::SeqCst);
+                        // The owner's ceremony lands here, between the read and
+                        // whatever the caller does next.
+                        if let Some(advance) = self.on_status_read.lock().unwrap().take() {
+                            advance();
+                        }
                         Ok(MachineBrokerResponse::SealedApprovalStatus(
                             bloom_broker_api::ApprovalPublicStatus {
                                 approval_id: request.id,
@@ -1403,7 +1716,44 @@ mod tests {
                             broker_receipt_digest: digest(10),
                         }))
                     }
+                    MachineBrokerRequest::OperationStatus(request) => {
+                        let scripted = {
+                            let mut errors = self.operation_status_errors.lock().unwrap();
+                            (!errors.is_empty()).then(|| errors.remove(0))
+                        };
+                        if let Some(error) = scripted {
+                            return Err(error);
+                        }
+                        let state = self
+                            .signing_operations
+                            .lock()
+                            .unwrap()
+                            .get(request.operation_id.as_str())
+                            .copied();
+                        let Some(state) = state else {
+                            return Err(ProtocolError::new(
+                                ProtocolErrorCode::ApprovalNotFound,
+                                "operation not found",
+                            ));
+                        };
+                        Ok(MachineBrokerResponse::OperationStatus(
+                            bloom_broker_api::OperationPublicStatus {
+                                operation_id: request.operation_id,
+                                operation_digest: digest(11),
+                                state,
+                                result: None,
+                                error: None,
+                            },
+                        ))
+                    }
                     MachineBrokerRequest::SealedApprovalRevoke(request) => {
+                        let scripted = {
+                            let mut errors = self.revoke_errors.lock().unwrap();
+                            (!errors.is_empty()).then(|| errors.remove(0))
+                        };
+                        if let Some(error) = scripted {
+                            return Err(error);
+                        }
                         Ok(MachineBrokerResponse::SealedApprovalRevoke(
                             bloom_broker_api::ApprovalPublicStatus {
                                 approval_id: request.approval_id,
@@ -2144,55 +2494,73 @@ mod tests {
         (signer, home, claim, ordered_hash)
     }
 
-    /// A Petal that rebuilds an operation — a trade whose transaction can no
-    /// longer land — gives up the approval it was waiting on and names it on
-    /// the next call. Machine revokes it, which ends its ceremony: a wallet
-    /// holds one live ceremony, so otherwise the rebuilt transaction could not
-    /// be offered until the abandoned one expired. An approval still awaiting
-    /// its owner has produced no signature, so giving it up duplicates
-    /// nothing. An approval past pending is left alone, because it may have.
-    #[tokio::test]
-    async fn a_rebuilt_operation_gives_up_the_approval_it_superseded() {
-        let broker = Arc::new(MockBroker::default());
-        broker.awaiting_owner.store(true, Ordering::SeqCst);
-        let (signer, home, claim, hash) = debiting_claim_fixture(&broker, None);
-        let abandoned = home.path().join("petal-exact.json");
-        let ExactPayloadOutcome::ApprovalRequired {
-            approval_id: waiting_on,
-            ..
-        } = flow_once(&signer, &home, &claim, &hash).await.unwrap()
-        else {
-            panic!("the first attempt must prepare an approval")
-        };
-        assert!(abandoned.is_file());
+    /// One scope's worth of exact signing: a signer, its state directory, and
+    /// the claim and hash every attempt in it shares. Attempts differ by their
+    /// state path, which is what the daemon derives per payload.
+    struct Scope {
+        broker: Arc<MockBroker>,
+        home: tempfile::TempDir,
+        claim: PetalUseClaim,
+        hash: Digest32,
+        scope: String,
+    }
 
-        let attempt = |signer: BrokerExactPayloadSigner, state: std::path::PathBuf| {
-            let claim = claim.clone();
-            let hash = hash.clone();
-            async move {
-                signer
-                    .sign_or_prepare_petal(
-                        &state,
-                        "withdraw-action",
-                        "wallet",
-                        "hyperliquid.withdraw",
-                        b"exact withdraw payload",
-                        hash,
-                        CryptoSuite::Secp256k1Sha256Recoverable,
-                        &serde_json::json!({"asset": "USDC"}),
-                        &ProvenanceSubject::Petal {
-                            package_hash: claim.package_hash.clone(),
-                            route: "withdraw/request".into(),
-                        },
-                        &claim,
-                        Some(b"assurance"),
-                    )
-                    .await
-                    .unwrap()
+    impl Scope {
+        fn open(broker: &Arc<MockBroker>, scope: &str) -> Self {
+            let (_, home, claim, hash) = debiting_claim_fixture(broker, None);
+            Self {
+                broker: broker.clone(),
+                home,
+                claim,
+                hash,
+                scope: scope.to_owned(),
             }
-        };
-        let revocations = || {
-            broker
+        }
+
+        fn state_dir(&self) -> std::path::PathBuf {
+            self.home.path().to_path_buf()
+        }
+
+        fn signer(&self, supersedes: Option<&str>) -> BrokerExactPayloadSigner {
+            let (signer, _, _, _) = debiting_claim_fixture(&self.broker, None);
+            signer.in_scope(self.scope.clone(), supersedes.map(str::to_owned))
+        }
+
+        /// One attempt, named the way the daemon names them: a 64-hex request
+        /// id that is both the state file's stem and the action id.
+        async fn attempt(
+            &self,
+            request_id: &str,
+            supersedes: Option<&str>,
+        ) -> Result<ExactPayloadOutcome, ExactSigningError> {
+            self.signer(supersedes)
+                .sign_or_prepare_petal(
+                    &self.state_dir().join(format!("{request_id}.json")),
+                    request_id,
+                    "wallet",
+                    "hyperliquid.withdraw",
+                    b"exact withdraw payload",
+                    self.hash.clone(),
+                    CryptoSuite::Secp256k1Sha256Recoverable,
+                    &serde_json::json!({"asset": "USDC"}),
+                    &ProvenanceSubject::Petal {
+                        package_hash: self.claim.package_hash.clone(),
+                        route: "withdraw/request".into(),
+                    },
+                    &self.claim,
+                    Some(b"assurance"),
+                )
+                .await
+        }
+
+        fn record(&self, request_id: &str) -> ExactOperationRecord {
+            let bytes = fs::read(self.state_dir().join(format!("{request_id}.op.json")))
+                .expect("operation record");
+            serde_json::from_slice(&bytes).expect("operation record parses")
+        }
+
+        fn revocations(&self) -> Vec<Digest32> {
+            self.broker
                 .requests
                 .lock()
                 .unwrap()
@@ -2203,42 +2571,503 @@ mod tests {
                     }
                     _ => None,
                 })
-                .collect::<Vec<_>>()
-        };
-
-        let rebuilt_state = home.path().join("petal-exact-rebuilt.json");
-        let (rebuilt, _, _, _) = debiting_claim_fixture(&broker, None);
-        let ExactPayloadOutcome::ApprovalRequired { approval_id, .. } = attempt(
-            rebuilt.with_superseded_state(Some(abandoned.clone())),
-            rebuilt_state.clone(),
-        )
-        .await
-        else {
-            panic!("the rebuilt payload asks for its own approval")
-        };
-        assert_ne!(approval_id, waiting_on);
-        assert_eq!(revocations(), vec![waiting_on]);
-        assert!(
-            !abandoned.exists(),
-            "the released attempt leaves no state to resume"
-        );
-
-        // The owner has answered this one: it is past pending, so it may have
-        // signed, and a later rebuild must not touch it.
-        broker.awaiting_owner.store(false, Ordering::SeqCst);
-        let (again, _, _, _) = debiting_claim_fixture(&broker, None);
-        attempt(
-            again.with_superseded_state(Some(rebuilt_state.clone())),
-            home.path().join("petal-exact-again.json"),
-        )
-        .await;
-        assert_eq!(
-            revocations().len(),
-            1,
-            "only the abandoned one was given up"
-        );
-        assert!(rebuilt_state.is_file());
+                .collect()
+        }
     }
+
+    fn request_id(byte: char) -> String {
+        std::iter::repeat_n(byte, 64).collect()
+    }
+
+    fn approval_of(outcome: &ExactPayloadOutcome) -> Digest32 {
+        match outcome {
+            ExactPayloadOutcome::ApprovalRequired { approval_id, .. } => approval_id.clone(),
+            other => panic!("expected a prepared approval, got {other:?}"),
+        }
+    }
+
+    /// Rebuilding one operation releases its own earlier attempt: the approval
+    /// is revoked, which is what ends its ceremony, and the rebuild gets an
+    /// approval of its own without waiting for the old ceremony's TTL. The
+    /// logical operation survives the change of bytes — the rebuild inherits
+    /// the first attempt's operation root — and the release is recorded rather
+    /// than erased.
+    #[tokio::test]
+    async fn a_rebuilt_operation_releases_its_own_earlier_attempt() {
+        let broker = Arc::new(MockBroker::default());
+        broker.awaiting_owner.store(true, Ordering::SeqCst);
+        let scope = Scope::open(&broker, "scope-a");
+        let (first, second) = (request_id('1'), request_id('2'));
+
+        let waiting_on = approval_of(&scope.attempt(&first, None).await.unwrap());
+        let rebuilt = approval_of(&scope.attempt(&second, Some(&first)).await.unwrap());
+
+        assert_ne!(rebuilt, waiting_on, "the rebuild asks for its own approval");
+        assert_eq!(scope.revocations(), vec![waiting_on]);
+        assert_eq!(
+            scope.record(&second).operation_root,
+            first,
+            "a rebuild is the same logical operation as the attempt it replaces"
+        );
+        assert!(
+            scope.record(&first).released_at_ms.is_some(),
+            "the release is recorded"
+        );
+        assert!(
+            scope.state_dir().join(format!("{first}.json")).is_file(),
+            "the superseded attempt's state is kept, not deleted"
+        );
+    }
+
+    /// The boundary Machine enforces. Two operations that share a package,
+    /// route, wallet, operation class and account key are in one scope, and a
+    /// request in another scope may not touch them at all: naming one is
+    /// refused outright, with nothing changed on either side.
+    ///
+    /// Within a scope, which attempt a supersession refers to is the caller's
+    /// assertion, not Machine's: see the contract in the daemon. What Machine
+    /// guarantees is narrower — a supersession can only ever end an approval
+    /// that is still awaiting its owner, and never one that may have signed.
+    #[tokio::test]
+    async fn a_request_cannot_supersede_an_attempt_from_another_scope() {
+        let broker = Arc::new(MockBroker::default());
+        broker.awaiting_owner.store(true, Ordering::SeqCst);
+        let mine = Scope::open(&broker, "scope-a");
+        let (a, b) = (request_id('a'), request_id('b'));
+        let waiting_on = approval_of(&mine.attempt(&a, None).await.unwrap());
+
+        // A second package, route, wallet, class or key is a different scope.
+        // It shares the state directory here, which is exactly the case the
+        // scope check has to catch.
+        let theirs = BrokerExactPayloadSigner::new(
+            MachineBrokerClient::new(broker.clone()),
+            mine.signer(None).provenance_catalog.clone(),
+        )
+        .in_scope("scope-b".into(), Some(a.clone()));
+        let theirs_again = BrokerExactPayloadSigner::new(
+            MachineBrokerClient::new(broker.clone()),
+            mine.signer(None).provenance_catalog.clone(),
+        )
+        .in_scope("scope-b".into(), Some(a.clone()));
+        let refused = theirs
+            .sign_or_prepare_petal(
+                &mine.state_dir().join(format!("{b}.json")),
+                &b,
+                "wallet",
+                "hyperliquid.withdraw",
+                b"exact withdraw payload",
+                mine.hash.clone(),
+                CryptoSuite::Secp256k1Sha256Recoverable,
+                &serde_json::json!({"asset": "USDC"}),
+                &ProvenanceSubject::Petal {
+                    package_hash: mine.claim.package_hash.clone(),
+                    route: "withdraw/request".into(),
+                },
+                &mine.claim,
+                Some(b"assurance"),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&refused, ExactSigningError::Refused(message)
+                if message == "approval artifact does not match the exact Petal operation"),
+            "a cross-scope supersession is one refusal, indistinguishable from an \
+             unknown id, so a Petal cannot probe for another's artifacts: {refused:?}"
+        );
+        // The reason itself is Machine's, and is what the protocol reports.
+        assert!(matches!(
+            theirs_again
+                .release_superseded(&mine.state_dir(), &a)
+                .await,
+            Supersession::Invalid(reason)
+                if reason.contains("another package, route, wallet, operation class or key")
+        ),);
+        assert!(mine.revocations().is_empty(), "nothing was revoked");
+        assert!(
+            mine.record(&a).released_at_ms.is_none(),
+            "the named attempt is untouched"
+        );
+        // And it is still the live approval its own operation is waiting on.
+        assert_eq!(
+            approval_of(&mine.attempt(&a, None).await.unwrap()),
+            waiting_on
+        );
+    }
+
+    /// The whole hint contract, one input per case.
+    #[tokio::test]
+    async fn a_supersession_names_a_known_attempt_or_is_refused() {
+        let broker = Arc::new(MockBroker::default());
+        broker.awaiting_owner.store(true, Ordering::SeqCst);
+        let scope = Scope::open(&broker, "scope-a");
+        let known = request_id('1');
+        scope.attempt(&known, None).await.unwrap();
+
+        // Unknown, and well formed: Machine never removes an operation record,
+        // so an id it has none for was never a request here. Deterministic, and
+        // a refusal rather than a silent no-op.
+        let unknown = scope
+            .attempt(&request_id('9'), Some(&request_id('7')))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&unknown, ExactSigningError::OutcomeUnknown(message)
+                if message.contains("no exact request by that id was prepared here")),
+            "{unknown:?}"
+        );
+
+        // Superseding itself is not a replacement.
+        let itself = scope
+            .attempt(&known, Some(&known))
+            .await
+            .expect_err("a request cannot supersede itself");
+        assert!(
+            matches!(&itself, ExactSigningError::Refused(_)),
+            "{itself:?}"
+        );
+
+        // Already released: the retry is idempotent and revokes nothing new.
+        let second = request_id('2');
+        scope.attempt(&second, Some(&known)).await.unwrap();
+        assert_eq!(scope.revocations().len(), 1);
+        scope.attempt(&second, Some(&known)).await.unwrap();
+        assert_eq!(
+            scope.revocations().len(),
+            1,
+            "replaying the same replacement revokes nothing again"
+        );
+    }
+
+    /// The owner completes the ceremony in the window between Machine reading
+    /// the approval's status and revoking it. The revoke is what makes the
+    /// answer stable, so the replacement is still safe — but only because
+    /// nothing had issued a signing call for that attempt. Machine does not
+    /// conclude "nothing signed" from the earlier pending reading.
+    #[tokio::test]
+    async fn an_owner_approving_mid_replacement_cannot_cause_a_second_signature() {
+        let broker = Arc::new(MockBroker::default());
+        broker.awaiting_owner.store(true, Ordering::SeqCst);
+        let scope = Scope::open(&broker, "scope-a");
+        let (first, second) = (request_id('1'), request_id('2'));
+        let waiting_on = approval_of(&scope.attempt(&first, None).await.unwrap());
+
+        // The ceremony completes the moment Machine looks at it.
+        let advancing = broker.clone();
+        *broker.on_status_read.lock().unwrap() = Some(Box::new(move || {
+            advancing.awaiting_owner.store(false, Ordering::SeqCst);
+        }));
+
+        scope.attempt(&second, Some(&first)).await.unwrap();
+        assert_eq!(
+            scope.revocations(),
+            vec![waiting_on],
+            "the approval the owner just activated is revoked, so it can never sign"
+        );
+        assert!(scope.record(&first).released_at_ms.is_some());
+    }
+
+    /// Once a signing call that could have produced a signature has been
+    /// issued, an earlier pending reading proves nothing. Machine asks Broker
+    /// about that attempt's signing operation, and refuses to replace an
+    /// attempt Broker has a record of.
+    #[tokio::test]
+    async fn an_attempt_that_may_have_signed_is_never_replaced() {
+        let broker = Arc::new(MockBroker::default());
+        broker.awaiting_owner.store(true, Ordering::SeqCst);
+        let scope = Scope::open(&broker, "scope-a");
+        let (first, second) = (request_id('1'), request_id('2'));
+        scope.attempt(&first, None).await.unwrap();
+
+        // The owner approves, and a retry of the first attempt falls through to
+        // a signing call. That is what makes its outcome Broker's to report.
+        broker.awaiting_owner.store(false, Ordering::SeqCst);
+        scope.attempt(&first, None).await.unwrap();
+        assert!(
+            scope.record(&first).signing_may_have_started,
+            "a call that can sign is recorded before it is made"
+        );
+        let signing_operation = {
+            let bytes = fs::read(scope.state_dir().join(format!("{first}.json"))).unwrap();
+            serde_json::from_slice::<ExactSigningState>(&bytes)
+                .unwrap()
+                .signing_operation_id
+        };
+        broker.signing_operations.lock().unwrap().insert(
+            signing_operation.as_str().to_owned(),
+            bloom_broker_api::OperationState::Succeeded,
+        );
+
+        let refused = scope.attempt(&second, Some(&first)).await.unwrap_err();
+        assert!(
+            matches!(&refused, ExactSigningError::OutcomeUnknown(message)
+                if message.contains("signing operation is Succeeded")),
+            "{refused:?}"
+        );
+        assert!(
+            scope.record(&first).released_at_ms.is_none(),
+            "an attempt that may have signed is not recorded as released"
+        );
+    }
+
+    /// Broker reporting that it had already finalized a signing reservation is
+    /// the one case Machine can never resolve later: the finalized operation id
+    /// is not kept, so nothing can be asked about it. That attempt can never be
+    /// superseded, and the replacement is refused for good.
+    #[tokio::test]
+    async fn an_attempt_whose_reservation_broker_finalized_can_never_be_superseded() {
+        let broker = Arc::new(MockBroker::default());
+        broker.awaiting_owner.store(true, Ordering::SeqCst);
+        let scope = Scope::open(&broker, "scope-a");
+        let (first, second) = (request_id('1'), request_id('2'));
+        scope.attempt(&first, None).await.unwrap();
+
+        // The owner approves, and the signing call comes back saying Broker
+        // already finalized a reservation under that operation id.
+        broker.awaiting_owner.store(false, Ordering::SeqCst);
+        broker.conflict_sign_once.store(true, Ordering::SeqCst);
+        scope.attempt(&first, None).await.unwrap();
+        assert!(scope.record(&first).signing_operation_replaced);
+
+        let refused = scope.attempt(&second, Some(&first)).await.unwrap_err();
+        assert!(
+            matches!(&refused, ExactSigningError::OutcomeUnknown(message)
+                if message.contains("finalized a signing reservation")),
+            "{refused:?}"
+        );
+        assert!(scope.record(&first).released_at_ms.is_none());
+    }
+
+    /// A signing call whose response was lost leaves Broker with a record of
+    /// the operation. Retrying the replacement reconciles against that record
+    /// rather than opening a second live attempt, and once Broker reports the
+    /// operation was refused, the replacement proceeds.
+    #[tokio::test]
+    async fn a_lost_signing_response_is_reconciled_before_a_replacement() {
+        let broker = Arc::new(MockBroker::default());
+        broker.awaiting_owner.store(true, Ordering::SeqCst);
+        let scope = Scope::open(&broker, "scope-a");
+        let (first, second) = (request_id('1'), request_id('2'));
+        scope.attempt(&first, None).await.unwrap();
+        broker.awaiting_owner.store(false, Ordering::SeqCst);
+        scope.attempt(&first, None).await.unwrap();
+        let signing_operation = {
+            let bytes = fs::read(scope.state_dir().join(format!("{first}.json"))).unwrap();
+            serde_json::from_slice::<ExactSigningState>(&bytes)
+                .unwrap()
+                .signing_operation_id
+        };
+
+        // Broker cannot be reached: unresolved, and no replacement.
+        broker
+            .operation_status_errors
+            .lock()
+            .unwrap()
+            .push(ProtocolError::new(
+                ProtocolErrorCode::ServiceUnavailable,
+                "broker unreachable",
+            ));
+        let unresolved = scope.attempt(&second, Some(&first)).await.unwrap_err();
+        assert!(
+            matches!(&unresolved, ExactSigningError::OutcomeUnknown(message)
+                if message.contains("could not be read")),
+            "{unresolved:?}"
+        );
+        assert!(scope.record(&first).released_at_ms.is_none());
+
+        // Broker reports the signing operation was refused, so no signature
+        // exists and the replacement is safe.
+        broker.signing_operations.lock().unwrap().insert(
+            signing_operation.as_str().to_owned(),
+            bloom_broker_api::OperationState::Denied,
+        );
+        scope.attempt(&second, Some(&first)).await.unwrap();
+        assert!(scope.record(&first).released_at_ms.is_some());
+    }
+
+    /// Failures that leave the outcome unknown never authorize a replacement:
+    /// an unreadable operation record, and a revoke Broker refused.
+    #[tokio::test]
+    async fn an_unresolved_failure_never_authorizes_a_replacement() {
+        let broker = Arc::new(MockBroker::default());
+        broker.awaiting_owner.store(true, Ordering::SeqCst);
+        let scope = Scope::open(&broker, "scope-a");
+        let (first, second) = (request_id('1'), request_id('2'));
+        scope.attempt(&first, None).await.unwrap();
+
+        // Broker cannot be reached to revoke.
+        broker
+            .revoke_errors
+            .lock()
+            .unwrap()
+            .push(ProtocolError::new(
+                ProtocolErrorCode::ServiceUnavailable,
+                "broker unreachable",
+            ));
+        let unreachable = scope.attempt(&second, Some(&first)).await.unwrap_err();
+        assert!(
+            matches!(&unreachable, ExactSigningError::OutcomeUnknown(message)
+                if message.contains("could not be revoked")),
+            "{unreachable:?}"
+        );
+        assert!(scope.record(&first).released_at_ms.is_none());
+
+        // A corrupt operation record is not an absent one, and neither is proof
+        // of anything.
+        fs::write(
+            scope.state_dir().join(format!("{first}.op.json")),
+            b"{ not json",
+        )
+        .unwrap();
+        let corrupt = scope.attempt(&second, Some(&first)).await.unwrap_err();
+        assert!(
+            matches!(&corrupt, ExactSigningError::OutcomeUnknown(message)
+                if message.contains("unreadable")),
+            "{corrupt:?}"
+        );
+    }
+
+    /// The state layout is the one that shipped. A pending exact request
+    /// written by v0.2.0 or v0.2.1 — flat `.state/<request>.json`, no
+    /// operation record, no `account_key_ref` — is still found and resumed
+    /// after the upgrade, and it keeps its approval rather than preparing a
+    /// second one. Nothing about the replacement work moves it.
+    ///
+    /// The one thing such a request cannot do is take part in a supersession:
+    /// it has no operation record, and Machine will not invent one for state
+    /// it did not write, so naming it is unresolved rather than allowed.
+    #[tokio::test]
+    async fn a_pending_request_written_before_this_change_is_still_resumed() {
+        let broker = Arc::new(MockBroker::default());
+        broker.awaiting_owner.store(true, Ordering::SeqCst);
+        let scope = Scope::open(&broker, "scope-a");
+        let (first, second) = (request_id('1'), request_id('2'));
+        let waiting_on = approval_of(&scope.attempt(&first, None).await.unwrap());
+
+        // Put the state back in the shipped shape: the record this change adds
+        // is a separate file, so removing it is exactly what a state directory
+        // written by the released binary looks like.
+        let shipped = scope.state_dir().join(format!("{first}.op.json"));
+        fs::remove_file(&shipped).unwrap();
+        let state_path = scope.state_dir().join(format!("{first}.json"));
+        let mut state: serde_json::Value =
+            serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        state.as_object_mut().unwrap().remove("account_key_ref");
+        assert_eq!(state["schema"], "bloom.machine_exact_signing.v1");
+        fs::write(&state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+
+        // The upgraded Machine finds it, and it is the same approval.
+        assert_eq!(
+            approval_of(&scope.attempt(&first, None).await.unwrap()),
+            waiting_on,
+            "an upgrade must not hide a request the owner is still deciding"
+        );
+        let prepares = broker
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| matches!(request, MachineBrokerRequest::SealedApprovalPrepare(_)))
+            .count();
+        assert_eq!(prepares, 1, "no second approval was prepared for it");
+
+        // Adopting it does not clear Machine's ignorance about it: it records
+        // that the request may already have issued a signing call, because
+        // nothing here can say that it did not.
+        assert!(
+            scope.record(&first).signing_may_have_started,
+            "a request Machine did not prepare is assumed to have tried to sign"
+        );
+        // So superseding it is only allowed once Broker has answered for the
+        // attempt's signing operation, by the same rule as everywhere else.
+        scope.attempt(&second, Some(&first)).await.unwrap();
+        assert_eq!(scope.revocations(), vec![waiting_on]);
+        assert!(scope.record(&first).released_at_ms.is_some());
+    }
+
+    /// A revoke that Broker carried out but whose response never arrived. The
+    /// replacement does not proceed on a call it cannot account for, and the
+    /// retry reaches the same conclusion by revoking again — which is
+    /// idempotent — rather than by assuming the first one landed. One live
+    /// attempt throughout: the replacement only becomes signable once the
+    /// prior one is resolved.
+    #[tokio::test]
+    async fn a_lost_revoke_response_is_reconciled_by_the_retry() {
+        let broker = Arc::new(MockBroker::default());
+        broker.awaiting_owner.store(true, Ordering::SeqCst);
+        let scope = Scope::open(&broker, "scope-a");
+        let (first, second) = (request_id('1'), request_id('2'));
+        let waiting_on = approval_of(&scope.attempt(&first, None).await.unwrap());
+
+        // Broker revokes, and the answer is lost on the way back.
+        broker
+            .revoke_errors
+            .lock()
+            .unwrap()
+            .push(ProtocolError::new(
+                ProtocolErrorCode::ServiceUnavailable,
+                "connection closed after the request was accepted",
+            ));
+        let lost = scope.attempt(&second, Some(&first)).await.unwrap_err();
+        assert!(
+            matches!(&lost, ExactSigningError::OutcomeUnknown(_)),
+            "{lost:?}"
+        );
+        assert!(
+            scope.record(&first).released_at_ms.is_none(),
+            "an unaccounted-for revoke is not a recorded release"
+        );
+        let prepares = || {
+            broker
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| matches!(request, MachineBrokerRequest::SealedApprovalPrepare(_)))
+                .count()
+        };
+        assert_eq!(prepares(), 1, "no second approval was opened meanwhile");
+
+        // The retry settles it, and only then does the replacement get one.
+        scope.attempt(&second, Some(&first)).await.unwrap();
+        assert_eq!(scope.revocations(), vec![waiting_on.clone(), waiting_on]);
+        assert!(scope.record(&first).released_at_ms.is_some());
+        assert_eq!(prepares(), 2);
+    }
+
+    /// Machine is interrupted after revoking the superseded approval and before
+    /// recording the release. The retry reaches the same conclusion from
+    /// Broker rather than assuming it, and the operation keeps its identity.
+    #[tokio::test]
+    async fn a_release_interrupted_before_it_is_recorded_recovers() {
+        let broker = Arc::new(MockBroker::default());
+        broker.awaiting_owner.store(true, Ordering::SeqCst);
+        let scope = Scope::open(&broker, "scope-a");
+        let (first, second) = (request_id('1'), request_id('2'));
+        let waiting_on = approval_of(&scope.attempt(&first, None).await.unwrap());
+        scope.attempt(&second, Some(&first)).await.unwrap();
+
+        // Put the record back the way a crash between the revoke and the write
+        // would have left it: revoked at Broker, unrecorded here.
+        let mut record = scope.record(&first);
+        record.released_at_ms = None;
+        write_state(&scope.state_dir().join(format!("{first}.op.json")), &record).unwrap();
+
+        let third = request_id('3');
+        scope.attempt(&third, Some(&first)).await.unwrap();
+        assert_eq!(
+            scope.revocations(),
+            vec![waiting_on.clone(), waiting_on],
+            "the retry revokes again rather than assuming the first one landed"
+        );
+        assert!(scope.record(&first).released_at_ms.is_some());
+        assert_eq!(
+            scope.record(&third).operation_root,
+            first,
+            "the logical operation survives the interruption"
+        );
+    }
+
     async fn flow_once(
         signer: &BrokerExactPayloadSigner,
         home: &tempfile::TempDir,
