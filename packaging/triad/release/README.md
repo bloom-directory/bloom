@@ -7,8 +7,12 @@ one exact minor, while Signer control and login-session liveness accept a range.
 Service packages may advance independently when every edge remains inside its
 declared range; incompatible edges fail closed.
 It also records the reviewed Broker, Signer, service-runtime, and
-Petal-contract commits plus the current state schema and downgrade floor for
-Machine, Broker, and Signer. This committed file is the source of truth for
+Petal-contract commits plus the current state schema, migration floor, and
+downgrade floor for Machine, Broker, and Signer. The migration floor names the
+oldest state the candidate can upgrade; it does not authorize an old release
+to reopen migrated state. See the
+[schema migration review](../../../docs/reviews/2026-09-23-schema-migration.md).
+This committed file is the source of truth for
 the Broker and Signer revisions: candidate builds require the supplied
 checkouts to match its exact pins and never rewrite them.
 
@@ -210,13 +214,17 @@ identity-shaped JSON for a production macOS claim.
 The macOS installer stages an immutable release before stopping any installed
 triad. A live install first copies the candidate into a private root-owned
 snapshot and authenticates and installs exclusively from that snapshot. It then
-journals the old and new digests, stops every enrollment before
+journals the old and new digests plus source and target schema watermarks, stops every enrollment before
 the shared atomic `current` switch, updates build-digest state, and validates
-each installed triad before publishing all enrollments active. Failed activation
-and a transaction found after interruption restore the old release, integration
-files, and health. Custody and identity directories are never regenerated or
-replaced during this sequence. The candidate state schemas must be at least the
-installed schemas.
+each installed triad in health-only mode before publishing any enrollment
+active. Same-schema failures before publication may restore the old release.
+Schema migrations become forward-only before candidate authority services
+start; every upgrade commits forward before a full Machine can write its cache
+or accept user work. Interrupted upgrades resume the recorded target or a
+schema-compatible corrected candidate. Custody databases, Machine caches, and
+identity directories are never copied or replaced during this sequence. The
+candidate state schemas must be at least both the installed schemas and any
+journaled target watermark.
 
 The macOS release remains rooted at `/usr/local/libexec/bloom`, with the
 user-facing `/usr/local/bin/bloom` symlink following its atomic `current`

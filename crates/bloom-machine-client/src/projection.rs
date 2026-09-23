@@ -1772,6 +1772,62 @@ mod tests {
     }
 
     #[test]
+    fn schema1_credentials_load_but_surface_projections_require_schema2_reader() {
+        // Serialize with the actual released API, not a current object with
+        // its version marker changed. The surrounding cache format is stable.
+        let old: schema1_broker_api::CredentialPublic = serde_json::from_value(serde_json::json!({
+            "credential_id": "CwsLCwsLCwsLCwsLCwsLCw",
+            "wallet_id": "alice",
+            "created_at_ms": "1",
+            "state": "ACTIVE"
+        }))
+        .unwrap();
+        let legacy_bytes = serde_json::to_vec(&old).unwrap();
+        let credential: CredentialPublic = serde_json::from_slice(&legacy_bytes).unwrap();
+        assert!(credential.surface.is_none());
+        let mut fixture = migrated_fixture();
+        fixture.credentials = vec![credential];
+        let mut projection = build_projection(
+            fixture.wallet,
+            fixture.keys,
+            fixture.credentials,
+            fixture.policy,
+            empty_wallet_accounts(token("alice")),
+            None,
+            1,
+        )
+        .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("wallet-projections.json");
+        let mut cache = ProjectionCache::empty();
+        cache
+            .wallets
+            .insert("alice".into(), CachedWallet::Live(projection.clone()));
+        fs::write(&path, serde_json::to_vec(&cache).unwrap()).unwrap();
+        FileProjectionStore::new(&path).load().unwrap();
+
+        // A new Broker refresh persists a surface, including for local-only
+        // credentials. The released reader rejects this added field.
+        projection.credentials[0].surface = migrated_fixture().credentials[0].surface.clone();
+        projection.response_digest = projection_digest(
+            &projection.wallet,
+            &projection.keys,
+            &projection.credentials,
+            &projection.policy,
+        )
+        .unwrap();
+        let updated = serde_json::to_vec(&projection.credentials[0]).unwrap();
+        let error =
+            serde_json::from_slice::<schema1_broker_api::CredentialPublic>(&updated).unwrap_err();
+        assert!(error.to_string().contains("unknown field `surface`"));
+        cache
+            .wallets
+            .insert("alice".into(), CachedWallet::Live(projection));
+        fs::write(&path, serde_json::to_vec(&cache).unwrap()).unwrap();
+        FileProjectionStore::new(&path).load().unwrap();
+    }
+
+    #[test]
     fn legacy_reconciliation_cache_field_upgrades_to_completed_migrations() {
         let operation_id = OperationId::from_bytes([14; 32]);
         let mut value = serde_json::json!({

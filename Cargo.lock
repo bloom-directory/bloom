@@ -2155,7 +2155,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "blake3",
- "bloom-broker-api",
+ "bloom-broker-api 0.1.0 (git+https://github.com/bloom-directory/bloom-broker.git?rev=937729b41c50daf6b8b8cf30b2b7fa1641b1048a)",
  "bloom-daemon",
  "bloom-evm",
  "bloom-machine-client",
@@ -2199,7 +2199,7 @@ name = "bloom-audit-checkpoint"
 version = "0.1.3"
 source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=a046fd6075853e8591f295983b572c6e1d65d12d#a046fd6075853e8591f295983b572c6e1d65d12d"
 dependencies = [
- "bloom-rpc-wire",
+ "bloom-rpc-wire 0.1.3 (git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=a046fd6075853e8591f295983b572c6e1d65d12d)",
  "ed25519-dalek",
  "hex",
  "rustix 1.1.4",
@@ -2213,9 +2213,20 @@ dependencies = [
 [[package]]
 name = "bloom-broker-api"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-broker.git?rev=a0de774d076dbc49708068cc3ccf7f34799f20f5#a0de774d076dbc49708068cc3ccf7f34799f20f5"
+source = "git+https://github.com/bloom-directory/bloom-broker.git?rev=937729b41c50daf6b8b8cf30b2b7fa1641b1048a#937729b41c50daf6b8b8cf30b2b7fa1641b1048a"
 dependencies = [
- "bloom-rpc-wire",
+ "bloom-rpc-wire 0.1.3 (git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=a046fd6075853e8591f295983b572c6e1d65d12d)",
+ "serde",
+ "serde_jcs",
+ "sha2 0.11.0",
+]
+
+[[package]]
+name = "bloom-broker-api"
+version = "0.1.0"
+source = "git+https://github.com/bloom-directory/bloom-broker.git?rev=dd2add2b9d41540521d08c77d19fb467a2d8029e#dd2add2b9d41540521d08c77d19fb467a2d8029e"
+dependencies = [
+ "bloom-rpc-wire 0.1.3 (git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=5db670e1b7507deabfdcf451be8b5d315c1c9d91)",
  "serde",
  "serde_jcs",
  "sha2 0.11.0",
@@ -2230,7 +2241,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "blake3",
- "bloom-broker-api",
+ "bloom-broker-api 0.1.0 (git+https://github.com/bloom-directory/bloom-broker.git?rev=937729b41c50daf6b8b8cf30b2b7fa1641b1048a)",
  "bloom-ens",
  "bloom-etherscan",
  "bloom-evm",
@@ -2329,7 +2340,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "base64 0.22.1",
- "bloom-broker-api",
+ "bloom-broker-api 0.1.0 (git+https://github.com/bloom-directory/bloom-broker.git?rev=937729b41c50daf6b8b8cf30b2b7fa1641b1048a)",
  "bloom-daemon",
  "bloom-evm",
  "bloom-machine-client",
@@ -2360,7 +2371,7 @@ name = "bloom-machine"
 version = "0.4.0"
 dependencies = [
  "anyhow",
- "bloom-broker-api",
+ "bloom-broker-api 0.1.0 (git+https://github.com/bloom-directory/bloom-broker.git?rev=937729b41c50daf6b8b8cf30b2b7fa1641b1048a)",
  "bloom-machine-client",
  "clap",
  "hex",
@@ -2378,8 +2389,9 @@ version = "0.4.0"
 dependencies = [
  "async-trait",
  "bloom-audit-checkpoint",
- "bloom-broker-api",
- "bloom-rpc-wire",
+ "bloom-broker-api 0.1.0 (git+https://github.com/bloom-directory/bloom-broker.git?rev=937729b41c50daf6b8b8cf30b2b7fa1641b1048a)",
+ "bloom-broker-api 0.1.0 (git+https://github.com/bloom-directory/bloom-broker.git?rev=dd2add2b9d41540521d08c77d19fb467a2d8029e)",
+ "bloom-rpc-wire 0.1.3 (git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=a046fd6075853e8591f295983b572c6e1d65d12d)",
  "bloom-service-observability",
  "bloom-triad-local-transport",
  "ed25519-dalek",
@@ -2500,7 +2512,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "blake3",
- "bloom-broker-api",
+ "bloom-broker-api 0.1.0 (git+https://github.com/bloom-directory/bloom-broker.git?rev=937729b41c50daf6b8b8cf30b2b7fa1641b1048a)",
  "bloom-petal-contract",
  "bloom-proto",
  "bloom-vfs",
@@ -2614,6 +2626,21 @@ dependencies = [
 [[package]]
 name = "bloom-rpc-wire"
 version = "0.1.3"
+source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=5db670e1b7507deabfdcf451be8b5d315c1c9d91#5db670e1b7507deabfdcf451be8b5d315c1c9d91"
+dependencies = [
+ "base64 0.22.1",
+ "ed25519-dalek",
+ "hex",
+ "serde",
+ "serde_jcs",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "bloom-rpc-wire"
+version = "0.1.3"
 source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=a046fd6075853e8591f295983b572c6e1d65d12d#a046fd6075853e8591f295983b572c6e1d65d12d"
 dependencies = [
  "base64 0.23.1",
@@ -2631,7 +2658,7 @@ name = "bloom-service-activation"
 version = "0.1.3"
 source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=a046fd6075853e8591f295983b572c6e1d65d12d#a046fd6075853e8591f295983b572c6e1d65d12d"
 dependencies = [
- "bloom-rpc-wire",
+ "bloom-rpc-wire 0.1.3 (git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=a046fd6075853e8591f295983b572c6e1d65d12d)",
  "libc",
  "thiserror 2.0.18",
 ]
@@ -2650,9 +2677,9 @@ dependencies = [
 [[package]]
 name = "bloom-signer-api"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=8a54dfaf9f74abadf3a5bfdc9d7ecb9cc341f19d#8a54dfaf9f74abadf3a5bfdc9d7ecb9cc341f19d"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=34248a3711d8c1c7ddb99d76b3ff5b976e536485#34248a3711d8c1c7ddb99d76b3ff5b976e536485"
 dependencies = [
- "bloom-rpc-wire",
+ "bloom-rpc-wire 0.1.3 (git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=a046fd6075853e8591f295983b572c6e1d65d12d)",
  "ed25519-dalek",
  "hex",
  "serde",
@@ -2665,7 +2692,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer-derive"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=8a54dfaf9f74abadf3a5bfdc9d7ecb9cc341f19d#8a54dfaf9f74abadf3a5bfdc9d7ecb9cc341f19d"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=34248a3711d8c1c7ddb99d76b3ff5b976e536485#34248a3711d8c1c7ddb99d76b3ff5b976e536485"
 dependencies = [
  "bip39",
  "ed25519-dalek",
@@ -2701,7 +2728,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "blake3",
- "bloom-broker-api",
+ "bloom-broker-api 0.1.0 (git+https://github.com/bloom-directory/bloom-broker.git?rev=937729b41c50daf6b8b8cf30b2b7fa1641b1048a)",
  "bloom-machine-client",
  "bloom-proto",
  "bloom-solana",
@@ -2742,7 +2769,7 @@ name = "bloom-triad-local-transport"
 version = "0.1.3"
 source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=a046fd6075853e8591f295983b572c6e1d65d12d#a046fd6075853e8591f295983b572c6e1d65d12d"
 dependencies = [
- "bloom-rpc-wire",
+ "bloom-rpc-wire 0.1.3 (git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=a046fd6075853e8591f295983b572c6e1d65d12d)",
  "bloom-trusted-time",
  "ed25519-dalek",
  "hex",
@@ -2775,7 +2802,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "blake3",
- "bloom-broker-api",
+ "bloom-broker-api 0.1.0 (git+https://github.com/bloom-directory/bloom-broker.git?rev=937729b41c50daf6b8b8cf30b2b7fa1641b1048a)",
  "bloom-evm",
  "bloom-machine-client",
  "bloom-mempool",
@@ -2820,7 +2847,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "blake3",
- "bloom-broker-api",
+ "bloom-broker-api 0.1.0 (git+https://github.com/bloom-directory/bloom-broker.git?rev=937729b41c50daf6b8b8cf30b2b7fa1641b1048a)",
  "bloom-ens",
  "bloom-etherscan",
  "bloom-evm",

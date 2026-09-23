@@ -117,6 +117,7 @@ require_compat_value revisions petal_contract_commit '"73c5b06a77599368fbc79fb79
 for state_owner in machine broker signer; do
   require_compat_value "state.$state_owner" current 2
   require_compat_value "state.$state_owner" downgrade_floor 2
+  require_compat_value "state.$state_owner" migration_floor 1
 done
 if grep -Eq '^[[:space:]]*(protocol_major|protocol_minor_min|protocol_minor_max)[[:space:]]*=' "$compatibility"; then
   echo "bundle compatibility must not declare a global protocol range" >&2

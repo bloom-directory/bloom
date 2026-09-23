@@ -29,7 +29,9 @@ payload_scratch=""
 created_users=""
 created_groups=""
 upgrade_transaction=""
+upgrade_transaction_scratch=""
 upgrade_old_digest=""
+upgrade_phase=""
 restore_pending=false
 legacy_cli_removed=false
 pf_cleanup_scratch=""
@@ -42,6 +44,7 @@ cleanup() {
   fi
   [[ -z "$scratch" || ! -d "$scratch" ]] || rm -rf -- "$scratch"
   [[ -z "$payload_scratch" || ! -d "$payload_scratch" ]] || rm -rf -- "$payload_scratch"
+  [[ -z "$upgrade_transaction_scratch" || ! -d "$upgrade_transaction_scratch" ]] || rm -rf -- "$upgrade_transaction_scratch"
   if ((rc != 0)) && $live; then
     rollback_failed=false
     for user in $created_users; do
@@ -621,14 +624,16 @@ preflight_compatibility() {
   grep -Fx 'schema = "bloom.triad-compatibility/1"' "$compatibility" >/dev/null || die "unsupported or malformed compatibility metadata"
   candidate_machine_state=""; candidate_broker_state=""; candidate_signer_state=""
   candidate_machine_floor=""; candidate_broker_floor=""; candidate_signer_floor=""
+  candidate_machine_migration_floor=""; candidate_broker_migration_floor=""; candidate_signer_migration_floor=""
   for component in machine broker signer; do
     current="$(compat_field "state.$component" current)"
     floor="$(compat_field "state.$component" downgrade_floor)"
-    [[ "$current" =~ ^[1-9][0-9]*$ && "$floor" =~ ^[1-9][0-9]*$ && "$floor" -le "$current" ]] || die "malformed $component state compatibility metadata"
+    migration_floor="$(compat_field "state.$component" migration_floor)"
+    [[ "$current" =~ ^[1-9][0-9]*$ && "$floor" =~ ^[1-9][0-9]*$ && "$migration_floor" =~ ^[1-9][0-9]*$ && "$migration_floor" -le "$floor" && "$floor" -le "$current" ]] || die "malformed $component state compatibility metadata"
     case "$component" in
-      machine) candidate_machine_state="$current"; candidate_machine_floor="$floor" ;;
-      broker) candidate_broker_state="$current"; candidate_broker_floor="$floor" ;;
-      signer) candidate_signer_state="$current"; candidate_signer_floor="$floor" ;;
+      machine) candidate_machine_state="$current"; candidate_machine_floor="$floor"; candidate_machine_migration_floor="$migration_floor" ;;
+      broker) candidate_broker_state="$current"; candidate_broker_floor="$floor"; candidate_broker_migration_floor="$migration_floor" ;;
+      signer) candidate_signer_state="$current"; candidate_signer_floor="$floor"; candidate_signer_migration_floor="$migration_floor" ;;
     esac
   done
   for dependency in broker_commit signer_commit service_runtime_commit petal_contract_commit; do
@@ -638,16 +643,22 @@ preflight_compatibility() {
   state_record="$product/state-schema"
   if [[ -e "$state_record" ]]; then
     [[ -f "$state_record" && ! -L "$state_record" ]] || die "installed state-schema record is unsafe"
+    state_rows=0; seen_machine=false; seen_broker=false; seen_signer=false
     while IFS='=' read -r component installed; do
       [[ "$component" =~ ^(machine|broker|signer)$ && "$installed" =~ ^[1-9][0-9]*$ ]] || die "installed state-schema record is malformed"
       case "$component" in
-        machine) candidate="$candidate_machine_state"; floor="$candidate_machine_floor" ;;
-        broker) candidate="$candidate_broker_state"; floor="$candidate_broker_floor" ;;
-        signer) candidate="$candidate_signer_state"; floor="$candidate_signer_floor" ;;
+        machine) ! $seen_machine || die "installed state-schema record has duplicate machine"; seen_machine=true; candidate="$candidate_machine_state"; floor="$candidate_machine_migration_floor" ;;
+        broker) ! $seen_broker || die "installed state-schema record has duplicate broker"; seen_broker=true; candidate="$candidate_broker_state"; floor="$candidate_broker_migration_floor" ;;
+        signer) ! $seen_signer || die "installed state-schema record has duplicate signer"; seen_signer=true; candidate="$candidate_signer_state"; floor="$candidate_signer_migration_floor" ;;
       esac
+      state_rows=$((state_rows + 1))
+      # The source versions a candidate can migrate are independent of which
+      # older readers may run after migration. Never treat downgrade_floor as
+      # an upgrade prerequisite; all schema downgrades remain rejected here.
       ((candidate >= installed)) || die "$component state-schema downgrade rejected before activation"
       ((installed >= floor)) || die "$component installed state is below the candidate migration floor"
     done < "$state_record"
+    ((state_rows == 3)) && $seen_machine && $seen_broker && $seen_signer || die "installed state-schema record is incomplete"
   fi
 }
 
@@ -980,16 +991,112 @@ restore_macos_upgrade_state() {
   fi
 }
 
+installed_state_requires_forward_only() {
+  local component installed floor seen=0 seen_machine=false seen_broker=false seen_signer=false
+  [[ -f "$product/state-schema" && ! -L "$product/state-schema" ]] || return 0
+  while IFS='=' read -r component installed; do
+    case "$component" in
+      machine) ! $seen_machine || return 0; seen_machine=true; floor="$candidate_machine_floor" ;;
+      broker) ! $seen_broker || return 0; seen_broker=true; floor="$candidate_broker_floor" ;;
+      signer) ! $seen_signer || return 0; seen_signer=true; floor="$candidate_signer_floor" ;;
+      *) return 0 ;;
+    esac
+    seen=$((seen + 1))
+    ((installed >= floor)) || return 0
+  done < "$product/state-schema"
+  ((seen == 3)) && $seen_machine && $seen_broker && $seen_signer || return 0
+  return 1
+}
+
+write_upgrade_phase() {
+  local phase="$1" temporary="$upgrade_transaction/phase.new.$$"
+  [[ "$phase" == rollback_allowed || "$phase" == forward_only || "$phase" == committed ]] ||
+    die "invalid macOS upgrade phase"
+  printf '%s\n' "$phase" > "$temporary"
+  chmod 0600 "$temporary"; $live && chown root:wheel "$temporary"
+  mv -f "$temporary" "$upgrade_transaction/phase"
+  sync
+  upgrade_phase="$phase"
+}
+
+write_transaction_schema_watermark() {
+  local path="$1" machine="$2" broker="$3" signer="$4" temporary
+  temporary="${path}.new.$$"
+  printf 'machine=%s\nbroker=%s\nsigner=%s\n' "$machine" "$broker" "$signer" > "$temporary"
+  chmod 0600 "$temporary"; $live && chown root:wheel "$temporary"
+  mv -f "$temporary" "$path"
+}
+
+candidate_meets_schema_watermark() {
+  local path="$1" component required candidate seen=0 seen_machine=false seen_broker=false seen_signer=false
+  [[ -f "$path" && ! -L "$path" ]] || return 1
+  while IFS='=' read -r component required; do
+    case "$component" in
+      machine) ! $seen_machine || return 1; seen_machine=true; candidate="$candidate_machine_state" ;;
+      broker) ! $seen_broker || return 1; seen_broker=true; candidate="$candidate_broker_state" ;;
+      signer) ! $seen_signer || return 1; seen_signer=true; candidate="$candidate_signer_state" ;;
+      *) return 1 ;;
+    esac
+    seen=$((seen + 1))
+    [[ "$required" =~ ^[1-9][0-9]*$ ]] && ((candidate >= required)) || return 1
+  done < "$path"
+  ((seen == 3)) && $seen_machine && $seen_broker && $seen_signer
+}
+
+candidate_advances_schema_watermark() {
+  local path="$1" component required candidate
+  while IFS='=' read -r component required; do
+    case "$component" in
+      machine) candidate="$candidate_machine_state" ;;
+      broker) candidate="$candidate_broker_state" ;;
+      signer) candidate="$candidate_signer_state" ;;
+      *) return 0 ;;
+    esac
+    ((candidate > required)) && return 0
+  done < "$path"
+  return 1
+}
+
 find_interrupted_upgrade() {
-  local recorded_old recorded_new
+  local recorded_schema recorded_old recorded_new
   upgrade_transaction="$product/upgrade-transaction"
-  [[ -e "$upgrade_transaction" ]] || { upgrade_transaction=""; upgrade_old_digest=""; return 0; }
+  [[ -e "$upgrade_transaction" ]] || { upgrade_transaction=""; upgrade_old_digest=""; upgrade_phase=""; return 0; }
   [[ -d "$upgrade_transaction" && ! -L "$upgrade_transaction" ]] || die "invalid interrupted Bloom upgrade"
-  grep -Fx bloom.macos-upgrade-transaction.2 "$upgrade_transaction/schema" >/dev/null || die "invalid interrupted Bloom upgrade"
+  recorded_schema="$(<"$upgrade_transaction/schema")"
+  [[ "$recorded_schema" == bloom.macos-upgrade-transaction.2 || "$recorded_schema" == bloom.macos-upgrade-transaction.3 ]] || die "invalid interrupted Bloom upgrade"
   recorded_old="$(<"$upgrade_transaction/old-digest")"
   recorded_new="$(<"$upgrade_transaction/new-digest")"
   [[ "$recorded_old" =~ ^[0-9a-f]{64}$ && "$recorded_new" =~ ^[0-9a-f]{64}$ ]] || die "invalid interrupted Bloom upgrade"
   [[ -f "$upgrade_transaction/rollback-state.tar" && ! -L "$upgrade_transaction/rollback-state.tar" ]] || die "invalid interrupted Bloom upgrade"
+  if [[ "$recorded_schema" == bloom.macos-upgrade-transaction.2 ]]; then
+    # Version 2 could have reached full Machine activation before interruption,
+    # but recorded no point of no return. Resume it only in the forward direction.
+    [[ "$recorded_new" == "$BLOOM_RELEASE_DIGEST" ]] ||
+      die "legacy interrupted upgrade requires its exact recorded candidate"
+    write_upgrade_phase forward_only
+    if [[ -f "$product/state-schema" && ! -L "$product/state-schema" ]]; then
+      cp "$product/state-schema" "$upgrade_transaction/source-state-schema"
+      chmod 0600 "$upgrade_transaction/source-state-schema"; $live && chown root:wheel "$upgrade_transaction/source-state-schema"
+    else
+      write_transaction_schema_watermark "$upgrade_transaction/source-state-schema" \
+        "$candidate_machine_state" "$candidate_broker_state" "$candidate_signer_state"
+    fi
+    write_transaction_schema_watermark "$upgrade_transaction/target-state-schema" \
+      "$candidate_machine_state" "$candidate_broker_state" "$candidate_signer_state"
+    printf '%s\n' bloom.macos-upgrade-transaction.3 > "$upgrade_transaction/schema"
+    chmod 0600 "$upgrade_transaction/schema"; $live && chown root:wheel "$upgrade_transaction/schema"; sync
+  else
+    [[ -f "$upgrade_transaction/phase" && ! -L "$upgrade_transaction/phase" ]] || die "invalid interrupted Bloom upgrade"
+    upgrade_phase="$(<"$upgrade_transaction/phase")"
+    [[ "$upgrade_phase" == rollback_allowed || "$upgrade_phase" == forward_only || "$upgrade_phase" == committed ]] || die "invalid interrupted Bloom upgrade"
+    [[ -f "$upgrade_transaction/source-state-schema" && ! -L "$upgrade_transaction/source-state-schema" ]] || die "invalid interrupted Bloom upgrade"
+    if [[ "$upgrade_phase" == rollback_allowed ]] &&
+       ! cmp -s "$product/state-schema" "$upgrade_transaction/source-state-schema"; then
+      write_upgrade_phase forward_only
+    fi
+  fi
+  candidate_meets_schema_watermark "$upgrade_transaction/target-state-schema" ||
+    die "candidate state schema is below the interrupted upgrade target"
   upgrade_old_digest="$recorded_old"
   echo "resuming interrupted Bloom macOS upgrade toward the requested release" >&2
 }
@@ -1003,7 +1110,7 @@ provision_remote_ceremonies() {
 
 upgrade_release() {
   local old="$1" new="$2"
-  local record uid
+  local record uid transaction_final
   if $live; then
     for record in "$enrollments"/*.json; do
       [[ -f "$record" && ! -L "$record" ]] || continue
@@ -1012,30 +1119,76 @@ upgrade_release() {
         die "all enrolled Bloom users must be logged in before a shared release upgrade"
     done
   fi
-  upgrade_transaction="$product/upgrade-transaction"
-  if [[ ! -e "$upgrade_transaction" ]]; then
-    mkdir -m 0700 "$upgrade_transaction"
+  transaction_final="$product/upgrade-transaction"
+  upgrade_transaction="$transaction_final"
+  if [[ ! -e "$transaction_final" ]]; then
+    upgrade_transaction_scratch="${transaction_final}.new.$$"
+    mkdir -m 0700 "$upgrade_transaction_scratch"
+    upgrade_transaction="$upgrade_transaction_scratch"
+    printf '%s\n' bloom.macos-upgrade-transaction.3 >"$upgrade_transaction/schema"
+    printf '%s\n' "$old" >"$upgrade_transaction/old-digest"
+    printf '%s\n' "$new" >"$upgrade_transaction/new-digest"
+    cp "$product/state-schema" "$upgrade_transaction/source-state-schema"
+    chmod 0600 "$upgrade_transaction/source-state-schema"; $live && chown root:wheel "$upgrade_transaction/source-state-schema"
+    write_transaction_schema_watermark "$upgrade_transaction/target-state-schema" \
+      "$candidate_machine_state" "$candidate_broker_state" "$candidate_signer_state"
+    snapshot_macos_upgrade_state
+    if installed_state_requires_forward_only; then
+      write_upgrade_phase forward_only
+    else
+      write_upgrade_phase rollback_allowed
+    fi
+    chmod 0600 "$upgrade_transaction"/*; $live && chown -R root:wheel "$upgrade_transaction"; sync
+    mv "$upgrade_transaction" "$transaction_final"
+    upgrade_transaction="$transaction_final"; upgrade_transaction_scratch=""; sync
+  else
+    [[ "$(<"$upgrade_transaction/old-digest")" == "$old" ]] ||
+      die "interrupted macOS upgrade does not match the original release"
+    if [[ "$upgrade_phase" == rollback_allowed ]] && installed_state_requires_forward_only; then
+      write_upgrade_phase forward_only
+    fi
+    if candidate_advances_schema_watermark "$upgrade_transaction/target-state-schema"; then
+      [[ "$upgrade_phase" == committed ]] || write_upgrade_phase forward_only
+      write_transaction_schema_watermark "$upgrade_transaction/target-state-schema" \
+        "$candidate_machine_state" "$candidate_broker_state" "$candidate_signer_state"
+      sync
+    fi
+    if [[ "$(<"$upgrade_transaction/new-digest")" != "$new" ]]; then
+      temporary="$upgrade_transaction/new-digest.new.$$"
+      printf '%s\n' "$new" > "$temporary"; chmod 0600 "$temporary"; $live && chown root:wheel "$temporary"
+      mv -f "$temporary" "$upgrade_transaction/new-digest"; sync
+    fi
   fi
   [[ -d "$upgrade_transaction" && ! -L "$upgrade_transaction" ]] || die "invalid interrupted Bloom upgrade"
-  printf '%s\n' bloom.macos-upgrade-transaction.2 >"$upgrade_transaction/schema"
-  printf '%s\n' "$old" >"$upgrade_transaction/old-digest"
-  printf '%s\n' "$new" >"$upgrade_transaction/new-digest"
-  if [[ ! -e "$upgrade_transaction/rollback-state.tar" ]]; then snapshot_macos_upgrade_state; fi
   chmod 0600 "$upgrade_transaction"/*; $live && chown -R root:wheel "$upgrade_transaction"; sync
   stop_all_enrollments
   rewrite_all_enrollments "$new" activating
   switch_release "$new"
-  if ! reload_installed_set || ! activate_installed_set; then
-    echo "new Bloom release failed authenticated activation; restoring $old" >&2; stop_all_enrollments || true
-    restore_macos_upgrade_state; switch_release "$old"
-    if reload_installed_set && activate_installed_set; then install_cli_link; rm -rf -- "$upgrade_transaction"; upgrade_transaction=""
-      echo "previous Bloom release restored after failed activation" >&2
-    else echo "automatic restoration of the previous Bloom release failed" >&2; fi
+  if ! reload_installed_set; then
+    echo "new Bloom release failed authenticated pre-activation health" >&2; stop_all_enrollments || true
+    if [[ "$upgrade_phase" == rollback_allowed ]]; then
+      restore_macos_upgrade_state; switch_release "$old"
+      if reload_installed_set && activate_installed_set; then install_cli_link; rm -rf -- "$upgrade_transaction"; upgrade_transaction=""; upgrade_phase=""
+        echo "previous Bloom release restored after rollback-safe failure" >&2
+      else echo "automatic restoration of the previous Bloom release failed" >&2; fi
+    else
+      rewrite_all_enrollments "$new" activating
+      echo "state migration is forward-only; retry this candidate release" >&2
+    fi
+    return 1
+  fi
+  # No old binary may run after this marker: full Machine startup can write
+  # schema-2 cache fields and expose the candidate to user mutations.
+  write_upgrade_phase committed
+  write_state_schema
+  if ! activate_installed_set; then
+    echo "new Bloom release failed full activation after the forward-only commit" >&2
+    stop_all_enrollments || true
+    rewrite_all_enrollments "$new" activating
     return 1
   fi
   install_cli_link
-  write_state_schema
-  rm -rf -- "$upgrade_transaction"; upgrade_transaction=""; upgrade_old_digest=""
+  rm -rf -- "$upgrade_transaction"; upgrade_transaction=""; upgrade_old_digest=""; upgrade_phase=""
 }
 
 case "$action" in
@@ -1074,8 +1227,8 @@ case "$action" in
     fi
     $live && $fresh && allocate_accounts
     install_release
-    if [[ "$had_active" == true && "$shared_digest" != "$BLOOM_RELEASE_DIGEST" && "$restoring" == false ]]; then
-      upgrade_release "$shared_digest" "$BLOOM_RELEASE_DIGEST"
+    if [[ -n "$upgrade_transaction" ]]; then
+      upgrade_release "$upgrade_old_digest" "$BLOOM_RELEASE_DIGEST"
       login_uid="$requested_uid"; login_user="$requested_user"; load_names; paths; load_ids
       remove_legacy_cli || die "Bloom is healthy, but legacy CLI cleanup failed; remove ~/.local/bin/bloom and retry"
       report_legacy_wallet_migrations
@@ -1084,8 +1237,8 @@ case "$action" in
       echo "Bloom macOS release upgraded atomically"
       exit 0
     fi
-    if [[ -n "$upgrade_transaction" ]]; then
-      upgrade_release "$upgrade_old_digest" "$BLOOM_RELEASE_DIGEST"
+    if [[ "$had_active" == true && "$shared_digest" != "$BLOOM_RELEASE_DIGEST" && "$restoring" == false ]]; then
+      upgrade_release "$shared_digest" "$BLOOM_RELEASE_DIGEST"
       login_uid="$requested_uid"; login_user="$requested_user"; load_names; paths; load_ids
       remove_legacy_cli || die "Bloom is healthy, but legacy CLI cleanup failed; remove ~/.local/bin/bloom and retry"
       report_legacy_wallet_migrations

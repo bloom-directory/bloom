@@ -122,8 +122,35 @@ fn release_compatibility_declares_each_edge_without_a_global_protocol_range() {
             }
         }
     }
-    // Those constants are only the manifest's if Cargo resolved the same revisions.
-    let lockfile = fs::read_to_string(workspace().join("Cargo.lock")).unwrap();
+    // Check resolved normal/build edges for both the release and this test's
+    // API constants. The lockfile also intentionally contains an exact released
+    // reader under machine-client's dev-dependencies for migration tests; that
+    // predecessor must never enter either normal dependency graph.
+    let graph = Command::new(env!("CARGO"))
+        .current_dir(workspace())
+        .args([
+            "tree",
+            "--locked",
+            "--offline",
+            "-p",
+            "bloom",
+            "-p",
+            "bloom-it",
+            "--edges",
+            "normal,build",
+            "--prefix",
+            "none",
+            "--format",
+            "{p}",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        graph.status.success(),
+        "{}",
+        String::from_utf8_lossy(&graph.stderr)
+    );
+    let graph = String::from_utf8(graph.stdout).unwrap();
     for (repository, key) in [
         ("bloom-broker", "broker_commit"),
         ("bloom-signer", "signer_commit"),
@@ -134,14 +161,14 @@ fn release_compatibility_declares_each_edge_without_a_global_protocol_range() {
             .find_map(|line| line.strip_prefix(&format!("{key} = \"")))
             .and_then(|tail| tail.strip_suffix('"'))
             .unwrap_or_else(|| panic!("compatibility lacks {key}"));
-        let prefix = format!("git+https://github.com/bloom-directory/{repository}.git?rev=");
-        let locked: Vec<_> = lockfile.split(&prefix).skip(1).collect();
+        let prefix = format!("https://github.com/bloom-directory/{repository}.git?rev=");
+        let locked: Vec<_> = graph.split(&prefix).skip(1).collect();
         assert!(
             !locked.is_empty()
                 && locked
                     .iter()
                     .all(|tail| tail.starts_with(&format!("{revision}#"))),
-            "{repository} must be locked only at {key} {revision}"
+            "{repository} normal/build dependencies must resolve only to {key} {revision}"
         );
     }
     assert!(!compatibility.lines().any(is_legacy_global_protocol_key));
@@ -161,9 +188,10 @@ fn release_compatibility_declares_each_edge_without_a_global_protocol_range() {
     }
     for component in ["machine", "broker", "signer"] {
         assert!(compatibility.contains(&format!(
-            "[state.{component}]\ncurrent = 2\ndowngrade_floor = 2"
+            "[state.{component}]\ncurrent = 2\ndowngrade_floor = 2\nmigration_floor = 1"
         )));
     }
+    assert!(verifier.contains("require_compat_value \"state.$state_owner\" migration_floor 1"));
 }
 
 #[test]
@@ -2584,6 +2612,14 @@ fn macos_staged_lifecycle_upgrades_repairs_retains_restores_and_rejects_downgrad
         root.join("Library/Application Support/BloomTriad/config/501/signer/identity.json");
     let identity_before = fs::read(&identity).unwrap();
 
+    // Schema 1 is a supported migration source even though schema 2 remains
+    // the lowest state an old release may reopen after the upgrade commits.
+    fs::write(
+        root.join("Library/Application Support/BloomTriad/state-schema"),
+        b"machine=1\nbroker=1\nsigner=1\n",
+    )
+    .unwrap();
+
     let upgraded = stage_macos_install_digest(&installer, &root, &candidate, &new_digest);
     assert!(
         upgraded.status.success(),
@@ -2733,11 +2769,7 @@ fn macos_active_legacy_enrollment_migrates_log_identity_before_upgrade() {
     )
     .unwrap();
     fs::write(transaction.join("old-digest"), format!("{old_digest}\n")).unwrap();
-    fs::write(
-        transaction.join("new-digest"),
-        format!("{}\n", "33".repeat(32)),
-    )
-    .unwrap();
+    fs::write(transaction.join("new-digest"), format!("{new_digest}\n")).unwrap();
     let rollback_archive = transaction.join("rollback-state.tar");
     let rollback = Command::new("tar")
         .current_dir(&root)
@@ -2779,11 +2811,138 @@ fn macos_active_legacy_enrollment_migrates_log_identity_before_upgrade() {
 }
 
 #[test]
+fn macos_upgrade_journal_fences_rollback_and_accepts_a_compatible_fix() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("root");
+    fs::create_dir(&root).unwrap();
+    let baseline = make_installer_payload(&directory.path().join("baseline"));
+    let corrected = make_installer_payload(&directory.path().join("corrected"));
+    let installer = release_script("install-macos.sh");
+    let old_digest = "11".repeat(32);
+    let failed_digest = "22".repeat(32);
+    let corrected_digest = "33".repeat(32);
+    assert!(
+        stage_macos_install_digest(&installer, &root, &baseline, &old_digest)
+            .status
+            .success()
+    );
+
+    let product = root.join("Library/Application Support/BloomTriad");
+    let transaction = product.join("upgrade-transaction");
+    fs::create_dir(&transaction).unwrap();
+    fs::write(
+        transaction.join("schema"),
+        "bloom.macos-upgrade-transaction.3\n",
+    )
+    .unwrap();
+    fs::write(transaction.join("old-digest"), format!("{old_digest}\n")).unwrap();
+    fs::write(transaction.join("new-digest"), format!("{failed_digest}\n")).unwrap();
+    fs::write(transaction.join("phase"), "rollback_allowed\n").unwrap();
+    fs::write(
+        transaction.join("source-state-schema"),
+        "machine=1\nbroker=1\nsigner=1\n",
+    )
+    .unwrap();
+    fs::write(
+        transaction.join("target-state-schema"),
+        "machine=3\nbroker=3\nsigner=3\n",
+    )
+    .unwrap();
+    let archive = transaction.join("rollback-state.tar");
+    let archived = Command::new("tar")
+        .current_dir(&root)
+        .args([
+            "-cpf",
+            archive.to_str().unwrap(),
+            "Library/Application Support/BloomTriad/enrollments",
+            "Library/Application Support/BloomTriad/config",
+            "Library/LaunchDaemons/com.bloom.containment.plist",
+            "Library/LaunchAgents/com.bloom.session.plist",
+            "Library/LaunchAgents/com.bloom.machine.plist",
+            "Library/LaunchDaemons/com.bloom.broker.501.plist",
+            "Library/LaunchDaemons/com.bloom.signer.501.plist",
+            "etc/newsyslog.d/bloom-501.conf",
+        ])
+        .output()
+        .unwrap();
+    assert!(archived.status.success());
+
+    let rejected = stage_macos_install_digest(&installer, &root, &corrected, &corrected_digest);
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr)
+            .contains("candidate state schema is below the interrupted upgrade target")
+    );
+    assert_eq!(
+        fs::read_to_string(transaction.join("phase")).unwrap(),
+        "forward_only\n"
+    );
+    assert_eq!(
+        fs::read_link(root.join("usr/local/libexec/bloom/current")).unwrap(),
+        Path::new("releases").join(&old_digest),
+        "target rejection must occur before selecting the candidate"
+    );
+
+    fs::write(
+        transaction.join("target-state-schema"),
+        "machine=2\nmachine=2\nsigner=2\n",
+    )
+    .unwrap();
+    let duplicate = stage_macos_install_digest(&installer, &root, &corrected, &corrected_digest);
+    assert!(!duplicate.status.success());
+    assert!(
+        String::from_utf8_lossy(&duplicate.stderr)
+            .contains("candidate state schema is below the interrupted upgrade target")
+    );
+
+    fs::write(
+        transaction.join("target-state-schema"),
+        "machine=2\nbroker=2\nsigner=2\n",
+    )
+    .unwrap();
+    let recovered = stage_macos_install_digest(&installer, &root, &corrected, &corrected_digest);
+    assert!(
+        recovered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    assert!(!transaction.exists());
+    assert_eq!(
+        fs::read_link(root.join("usr/local/libexec/bloom/current")).unwrap(),
+        Path::new("releases").join(&corrected_digest)
+    );
+}
+
+#[test]
 fn installer_upgrade_transactions_preserve_recovery_state_atomically() {
     let macos = fs::read_to_string(release_script("install-macos.sh")).unwrap();
     assert!(macos.contains("upgrade_release \"$upgrade_old_digest\" \"$BLOOM_RELEASE_DIGEST\""));
     assert!(macos.contains("snapshot_macos_upgrade_state"));
     assert!(macos.contains("restore_macos_upgrade_state"));
+    assert!(macos.contains("bloom.macos-upgrade-transaction.3"));
+    assert!(macos.contains("write_upgrade_phase forward_only"));
+    assert!(macos.contains("write_upgrade_phase committed"));
+    assert!(macos.contains("source-state-schema"));
+    assert!(macos.contains("target-state-schema"));
+    assert!(macos.contains("upgrade_transaction_scratch=\"${transaction_final}.new.$$\""));
+    assert!(macos.contains("mv \"$upgrade_transaction\" \"$transaction_final\""));
+    assert!(macos.contains(
+        "! cmp -s \"$product/state-schema\" \"$upgrade_transaction/source-state-schema\""
+    ));
+    assert!(macos.contains("candidate state schema is below the interrupted upgrade target"));
+    assert!(macos.contains("state migration is forward-only; retry this candidate release"));
+    let upgrade = &macos
+        [macos.find("upgrade_release() {").unwrap()..macos.find("case \"$action\" in").unwrap()];
+    let committed = upgrade.find("write_upgrade_phase committed").unwrap();
+    assert!(
+        committed < committed + upgrade[committed..].find("activate_installed_set").unwrap(),
+        "the durable commit must precede the first full Machine activation"
+    );
+    let rollback = upgrade.find("restore_macos_upgrade_state").unwrap();
+    assert!(
+        upgrade[..rollback].contains("[[ \"$upgrade_phase\" == rollback_allowed ]]"),
+        "old-release restoration must be limited to the rollback-safe phase"
+    );
 
     let linux = fs::read_to_string(release_script("install-linux.sh")).unwrap();
     assert!(linux.contains("upgrade_transaction_scratch=\"${upgrade_transaction}.new.$$\""));
@@ -2852,6 +3011,108 @@ fn installer_upgrade_transactions_preserve_recovery_state_atomically() {
 
     let daemon = fs::read_to_string(workspace().join("crates/bloom-daemon/src/lib.rs")).unwrap();
     assert!(daemon.contains(".require_outbox_petal_eligibility(&request.wallet, chain_name, id)"));
+}
+
+#[test]
+fn macos_upgrade_runtime_fences_schema_and_publication_failures() {
+    let source = fs::read_to_string(release_script("install-macos.sh")).unwrap();
+    let functions = &source[source
+        .find("installed_state_requires_forward_only() {")
+        .unwrap()..source.find("\ncase \"$action\" in").unwrap()];
+    let harness = format!(
+        r#"set -Eeuo pipefail
+die() {{ echo "$*" >&2; exit 65; }}
+{functions}
+live=false
+product="$ROOT/product"; release_base="$ROOT/releases"; enrollments="$ROOT/enrollments"
+upgrade_transaction=""; upgrade_phase=""; upgrade_old_digest=""
+upgrade_transaction_scratch=""
+candidate_machine_state=2; candidate_broker_state=2; candidate_signer_state=2
+candidate_machine_floor="$CANDIDATE_FLOOR"; candidate_broker_floor="$CANDIDATE_FLOOR"; candidate_signer_floor="$CANDIDATE_FLOOR"
+mkdir -p "$product" "$release_base" "$enrollments"
+printf 'machine=%s\nbroker=%s\nsigner=%s\n' "$SOURCE_SCHEMA" "$SOURCE_SCHEMA" "$SOURCE_SCHEMA" > "$product/state-schema"
+snapshot_macos_upgrade_state() {{ : > "$upgrade_transaction/rollback-state.tar"; }}
+stop_all_enrollments() {{ echo stop >> "$ROOT/log"; }}
+rewrite_all_enrollments() {{ echo "rewrite $1 $2" >> "$ROOT/log"; }}
+switch_release() {{ echo "switch $1" >> "$ROOT/log"; }}
+restore_macos_upgrade_state() {{ echo restore >> "$ROOT/log"; }}
+install_cli_link() {{ echo link >> "$ROOT/log"; }}
+write_state_schema() {{ printf 'machine=2\nbroker=2\nsigner=2\n' > "$product/state-schema"; echo state >> "$ROOT/log"; }}
+reload_installed_set() {{
+  count=$(cat "$ROOT/reload-count" 2>/dev/null || echo 0); count=$((count + 1)); echo "$count" > "$ROOT/reload-count"
+  echo "reload $count" >> "$ROOT/log"
+  case "$SCENARIO" in rollback) [[ "$count" -gt 1 ]];; migration|resume_floor) return 1;; partial) return 0;; esac
+}}
+activate_installed_set() {{
+  echo 'activate first-full-machine then second-fails' >> "$ROOT/log"
+  [[ "$SCENARIO" != partial ]]
+}}
+if [[ "$SCENARIO" == resume_floor ]]; then
+  upgrade_transaction="$product/upgrade-transaction"; mkdir "$upgrade_transaction"
+  printf 'bloom.macos-upgrade-transaction.3\n' > "$upgrade_transaction/schema"
+  printf 'old\n' > "$upgrade_transaction/old-digest"; printf 'new\n' > "$upgrade_transaction/new-digest"
+  printf 'rollback_allowed\n' > "$upgrade_transaction/phase"
+  upgrade_phase=rollback_allowed
+  cp "$product/state-schema" "$upgrade_transaction/source-state-schema"
+  printf 'machine=2\nbroker=2\nsigner=2\n' > "$upgrade_transaction/target-state-schema"
+  : > "$upgrade_transaction/rollback-state.tar"
+fi
+if upgrade_release old new; then echo success > "$ROOT/result"; else echo failure > "$ROOT/result"; fi
+find "$ROOT" -name '*.new.*' -print > "$ROOT/stray"
+"#
+    );
+
+    for (scenario, source_schema, floor) in [
+        ("rollback", "2", "2"),
+        ("migration", "1", "2"),
+        ("resume_floor", "1", "2"),
+        ("partial", "2", "2"),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg(&harness)
+            .env("ROOT", directory.path())
+            .env("SCENARIO", scenario)
+            .env("SOURCE_SCHEMA", source_schema)
+            .env("CANDIDATE_FLOOR", floor)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let log = fs::read_to_string(directory.path().join("log")).unwrap();
+        let transaction = directory.path().join("product/upgrade-transaction");
+        match scenario {
+            "rollback" => {
+                assert!(log.contains("restore\nswitch old"));
+                assert!(!transaction.exists());
+            }
+            "migration" | "resume_floor" => {
+                assert!(!log.contains("restore"));
+                assert_eq!(
+                    fs::read_to_string(transaction.join("phase")).unwrap(),
+                    "forward_only\n"
+                );
+            }
+            "partial" => {
+                assert!(!log.contains("restore"));
+                assert_eq!(
+                    fs::read_to_string(transaction.join("phase")).unwrap(),
+                    "committed\n"
+                );
+                assert!(log.contains("state\nactivate first-full-machine then second-fails"));
+                assert!(log.ends_with("rewrite new activating\n"));
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            fs::read_to_string(directory.path().join("stray")).unwrap(),
+            ""
+        );
+    }
 }
 
 struct LinuxTrackedUnit {
