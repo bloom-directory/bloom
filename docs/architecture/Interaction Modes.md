@@ -169,6 +169,23 @@ state. Their installed package documentation defines their mounted routes.
   Machine decodes the recipient and amount, reconstructs the calldata through
   the typed send path, and evaluates token and recipient policy against those
   verified fields. Other calldata remains a generic contract call.
+
+  Because Machine rebuilds the calldata from the decoded fields rather than
+  forwarding the supplied bytes, that shape is held to an exact encoding.
+  Calldata that is already ERC-20 transfer shaped — the `transfer` selector,
+  exactly 68 bytes, zero native value — must re-encode to the bytes supplied.
+  Calldata carrying noncanonical padding in the address word, where the twelve
+  high-order bytes of that word are not zero, is **rejected at staging** rather
+  than staged. Tolerating it would stage a different transaction than the Petal
+  handed over: the decoder discards those bytes, and the re-encoded call would
+  no longer be the call that was submitted.
+
+  This applies only to that shape. A call the classifier does not recognise is
+  untouched and still stages as a generic contract call with its bytes intact,
+  including one carrying nonzero native value, one whose calldata is any other
+  length, and one bearing another selector — even when such a call contains the
+  same noncanonical padding. Those never reach the decoder, because Machine
+  never rebuilds their calldata.
 - Paid HTTP stages the selected challenge and payment payload, then obtains any
   required signature through Broker/Signer.
 - Installed Polymarket or Hyperliquid Petals use their package-defined mounted
