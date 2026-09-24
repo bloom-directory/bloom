@@ -2155,7 +2155,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "blake3",
- "bloom-broker-api 0.1.0 (git+https://github.com/bloom-directory/bloom-broker.git?rev=1611a6148e60bb9163a8bf2e10170f4e4b22d97e)",
+ "bloom-broker-api 0.1.0 (git+https://github.com/bloom-directory/bloom-broker.git?rev=dde8d3ba1e1dcc3a0c6c6697f8dad5a1c9032c19)",
  "bloom-daemon",
  "bloom-evm",
  "bloom-machine-client",
@@ -2213,9 +2213,9 @@ dependencies = [
 [[package]]
 name = "bloom-broker-api"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-broker.git?rev=1611a6148e60bb9163a8bf2e10170f4e4b22d97e#1611a6148e60bb9163a8bf2e10170f4e4b22d97e"
+source = "git+https://github.com/bloom-directory/bloom-broker.git?rev=dd2add2b9d41540521d08c77d19fb467a2d8029e#dd2add2b9d41540521d08c77d19fb467a2d8029e"
 dependencies = [
- "bloom-rpc-wire 0.1.3 (git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=a046fd6075853e8591f295983b572c6e1d65d12d)",
+ "bloom-rpc-wire 0.1.3 (git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=5db670e1b7507deabfdcf451be8b5d315c1c9d91)",
  "serde",
  "serde_jcs",
  "sha2 0.11.0",
@@ -2224,9 +2224,9 @@ dependencies = [
 [[package]]
 name = "bloom-broker-api"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-broker.git?rev=dd2add2b9d41540521d08c77d19fb467a2d8029e#dd2add2b9d41540521d08c77d19fb467a2d8029e"
+source = "git+https://github.com/bloom-directory/bloom-broker.git?rev=dde8d3ba1e1dcc3a0c6c6697f8dad5a1c9032c19#dde8d3ba1e1dcc3a0c6c6697f8dad5a1c9032c19"
 dependencies = [
- "bloom-rpc-wire 0.1.3 (git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=5db670e1b7507deabfdcf451be8b5d315c1c9d91)",
+ "bloom-rpc-wire 0.1.3 (git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=a046fd6075853e8591f295983b572c6e1d65d12d)",
  "serde",
  "serde_jcs",
  "sha2 0.11.0",
@@ -2241,7 +2241,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "blake3",
- "bloom-broker-api 0.1.0 (git+https://github.com/bloom-directory/bloom-broker.git?rev=1611a6148e60bb9163a8bf2e10170f4e4b22d97e)",
+ "bloom-broker-api 0.1.0 (git+https://github.com/bloom-directory/bloom-broker.git?rev=dde8d3ba1e1dcc3a0c6c6697f8dad5a1c9032c19)",
  "bloom-ens",
  "bloom-etherscan",
  "bloom-evm",
@@ -2340,7 +2340,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "base64 0.22.1",
- "bloom-broker-api 0.1.0 (git+https://github.com/bloom-directory/bloom-broker.git?rev=1611a6148e60bb9163a8bf2e10170f4e4b22d97e)",
+ "bloom-broker-api 0.1.0 (git+https://github.com/bloom-directory/bloom-broker.git?rev=dde8d3ba1e1dcc3a0c6c6697f8dad5a1c9032c19)",
  "bloom-daemon",
  "bloom-evm",
  "bloom-machine-client",
@@ -2371,7 +2371,7 @@ name = "bloom-machine"
 version = "0.4.0"
 dependencies = [
  "anyhow",
- "bloom-broker-api 0.1.0 (git+https://github.com/bloom-directory/bloom-broker.git?rev=1611a6148e60bb9163a8bf2e10170f4e4b22d97e)",
+ "bloom-broker-api 0.1.0 (git+https://github.com/bloom-directory/bloom-broker.git?rev=dde8d3ba1e1dcc3a0c6c6697f8dad5a1c9032c19)",
  "bloom-machine-client",
  "clap",
  "hex",
@@ -2389,8 +2389,8 @@ version = "0.4.0"
 dependencies = [
  "async-trait",
  "bloom-audit-checkpoint",
- "bloom-broker-api 0.1.0 (git+https://github.com/bloom-directory/bloom-broker.git?rev=1611a6148e60bb9163a8bf2e10170f4e4b22d97e)",
  "bloom-broker-api 0.1.0 (git+https://github.com/bloom-directory/bloom-broker.git?rev=dd2add2b9d41540521d08c77d19fb467a2d8029e)",
+ "bloom-broker-api 0.1.0 (git+https://github.com/bloom-directory/bloom-broker.git?rev=dde8d3ba1e1dcc3a0c6c6697f8dad5a1c9032c19)",
  "bloom-rpc-wire 0.1.3 (git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=a046fd6075853e8591f295983b572c6e1d65d12d)",
  "bloom-service-observability",
  "bloom-triad-local-transport",
@@ -2512,7 +2512,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "blake3",
- "bloom-broker-api 0.1.0 (git+https://github.com/bloom-directory/bloom-broker.git?rev=1611a6148e60bb9163a8bf2e10170f4e4b22d97e)",
+ "bloom-broker-api 0.1.0 (git+https://github.com/bloom-directory/bloom-broker.git?rev=dde8d3ba1e1dcc3a0c6c6697f8dad5a1c9032c19)",
  "bloom-petal-contract",
  "bloom-proto",
  "bloom-vfs",
@@ -2728,7 +2728,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "blake3",
- "bloom-broker-api 0.1.0 (git+https://github.com/bloom-directory/bloom-broker.git?rev=1611a6148e60bb9163a8bf2e10170f4e4b22d97e)",
+ "bloom-broker-api 0.1.0 (git+https://github.com/bloom-directory/bloom-broker.git?rev=dde8d3ba1e1dcc3a0c6c6697f8dad5a1c9032c19)",
  "bloom-machine-client",
  "bloom-proto",
  "bloom-solana",
@@ -2802,7 +2802,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "blake3",
- "bloom-broker-api 0.1.0 (git+https://github.com/bloom-directory/bloom-broker.git?rev=1611a6148e60bb9163a8bf2e10170f4e4b22d97e)",
+ "bloom-broker-api 0.1.0 (git+https://github.com/bloom-directory/bloom-broker.git?rev=dde8d3ba1e1dcc3a0c6c6697f8dad5a1c9032c19)",
  "bloom-evm",
  "bloom-machine-client",
  "bloom-mempool",
@@ -2847,7 +2847,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "blake3",
- "bloom-broker-api 0.1.0 (git+https://github.com/bloom-directory/bloom-broker.git?rev=1611a6148e60bb9163a8bf2e10170f4e4b22d97e)",
+ "bloom-broker-api 0.1.0 (git+https://github.com/bloom-directory/bloom-broker.git?rev=dde8d3ba1e1dcc3a0c6c6697f8dad5a1c9032c19)",
  "bloom-ens",
  "bloom-etherscan",
  "bloom-evm",
