@@ -47,6 +47,8 @@ use std::sync::Arc;
 
 /// `wallets/<wallet>/<n>/...`: the numbered account view.
 mod accounts;
+/// `wallets/<wallet>/passkeys/...`: passkeys, nicknames and enrollment.
+mod passkeys;
 use accounts::accounts_json_with_numbers as render_accounts_json;
 
 pub use accounts::{
@@ -317,6 +319,11 @@ pub struct WalletsHandler {
     policy_projection_root: std::path::PathBuf,
     /// Serializes name-keyed recovery intents across handler clones.
     recovery_prepare_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Durable Machine-only passkey nicknames, keyed by full credential ID.
+    /// Defaults beside the workflow projections when not configured.
+    passkey_names_path: Option<std::path::PathBuf>,
+    /// Serializes nickname read-modify-write across handler clones.
+    passkey_names_lock: Arc<tokio::sync::Mutex<()>>,
     /// Solana transfer engines keyed by chain name, dispatching the same
     /// `chains/<chain>/outbox/...` route family as EVM for Solana chains.
     solana: Option<
@@ -351,6 +358,8 @@ impl WalletsHandler {
             wallet_projections: Some(wallet_projections),
             policy_projection_root: policy_projection_root.into(),
             recovery_prepare_lock: Arc::new(tokio::sync::Mutex::new(())),
+            passkey_names_path: None,
+            passkey_names_lock: Arc::new(tokio::sync::Mutex::new(())),
             solana: None,
             solana_reads: None,
             account_petals: Arc::new(parking_lot::RwLock::new(None)),
@@ -419,6 +428,12 @@ impl WalletsHandler {
 
     pub fn with_projection_reader(mut self, projections: Arc<dyn WalletProjectionReader>) -> Self {
         self.wallet_projections = Some(projections);
+        self
+    }
+
+    /// Keep passkey nicknames in a durable file outside the projection cache.
+    pub fn with_passkey_names_path(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.passkey_names_path = Some(path.into());
         self
     }
 
@@ -2574,6 +2589,7 @@ impl WalletsHandler {
             Entry::writable_file("policy.json"),
             Entry::dir("sealed-approvals"),
             Entry::dir("policy-updates"),
+            Entry::dir("passkeys"),
         ]
     }
 }
@@ -3328,9 +3344,12 @@ impl WalletsHandler {
             };
         }
         let wallet = &segs[0];
-        let _projection = self.wallet_projection(wallet).await?;
+        let projection = self.wallet_projection(wallet).await?;
         if segs.len() == 1 {
             return Ok(Entry::dir(wallet));
+        }
+        if segs[1] == "passkeys" {
+            return self.lookup_passkeys(wallet, &projection, &segs[2..]).await;
         }
         if let Some(number) = parse_account_segment(&segs[1]) {
             return self.lookup_account(wallet, number, &segs[2..]).await;
@@ -3502,6 +3521,9 @@ impl WalletsHandler {
         {
             return self.read_account(wallet, number, &segs[2..]).await;
         }
+        if segs.get(1).map(String::as_str) == Some("passkeys") {
+            return self.read_passkeys(wallet, &segs[2..]).await;
+        }
         match segs.get(1).map(|s| s.as_str()).unwrap_or("") {
             "accounts.json" => {
                 // The cached, authenticated inventory; freshness rides on the
@@ -3653,6 +3675,9 @@ impl WalletsHandler {
         {
             return self.write_account(wallet, number, &segs[2..], data).await;
         }
+        if segs.get(1).map(String::as_str) == Some("passkeys") {
+            return self.write_passkeys(wallet, &segs[2..], data).await;
+        }
         if segs.len() == 2 && segs[1] == "policy.json" {
             self.write_permit()?;
             return self
@@ -3761,12 +3786,15 @@ impl WalletsHandler {
             };
         }
         let wallet = &segs[0];
-        let _projection = self.wallet_projection(wallet).await?;
+        let projection = self.wallet_projection(wallet).await?;
         if let Some(number) = segs
             .get(1)
             .and_then(|segment| parse_account_segment(segment))
         {
             return self.list_account(wallet, number, &segs[2..]).await;
+        }
+        if segs.get(1).map(String::as_str) == Some("passkeys") {
+            return self.list_passkeys(wallet, &projection, &segs[2..]).await;
         }
         match segs.len() {
             1 => {
@@ -10305,5 +10333,401 @@ value = "0""#,
             f.handler.list(&path).await,
             Err(HandlerError::NotADir(_))
         ));
+    }
+
+    mod passkeys_tests {
+        use super::*;
+        use bloom_broker_api::{
+            CeremonyCrossSurfacePrepareResponse, CeremonyPublicStatus, CeremonySurfaceRef,
+            CeremonySurfaceSelection, CredentialPublic, CredentialState, OperationId,
+        };
+
+        const LAPTOP_MS: u64 = 1_789_466_400_000; // 2026-09-15T10:00:00Z
+        const PHONE_MS: u64 = 1_790_242_200_000; // 2026-09-24T09:30:00Z
+        const TABLET_MS: u64 = 1_790_275_500_000; // 2026-09-24T18:45:00Z
+
+        fn credential(id: u8, surface: Option<&str>, created_at_ms: u64) -> CredentialPublic {
+            CredentialPublic {
+                credential_id: Base64UrlBytes::from_bytes(&[id; 32]),
+                wallet_id: token("alice"),
+                surface: surface.map(|surface| CeremonySurfaceRef {
+                    surface_id: token(surface),
+                    identity_digest: digest(90),
+                }),
+                created_at_ms: DecimalU64::new(created_at_ms),
+                state: CredentialState::Active,
+            }
+        }
+
+        fn passkey_handler(
+            credentials: Vec<CredentialPublic>,
+        ) -> (tempfile::TempDir, WalletsHandler) {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut projection = static_projection_value(Address::repeat_byte(0x11));
+            projection.credentials = credentials;
+            let home = bloom_proto::HomeDir::at(tmp.path().join("home"));
+            let permit = Arc::new(HomeWritePermit::acquire(&home).unwrap());
+            let handler = WalletsHandler::new(
+                ChainRegistry::new(),
+                TxEngine::new(Outbox::new(tmp.path().join("outbox")).unwrap(), 60_000),
+                AddressBook::default(),
+                Arc::new(StaticProjection(projection)),
+                tmp.path().join("machine-policy-projections"),
+            )
+            .with_home_write_permit(permit);
+            (tmp, handler)
+        }
+
+        fn path(value: &str) -> VfsPath {
+            VfsPath::parse(value).unwrap()
+        }
+
+        async fn text(handler: &WalletsHandler, value: &str) -> String {
+            String::from_utf8(handler.read(&path(value)).await.unwrap()).unwrap()
+        }
+
+        async fn names(handler: &WalletsHandler, value: &str) -> Vec<String> {
+            let mut names: Vec<String> = handler
+                .list(&path(value))
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect();
+            names.sort();
+            names
+        }
+
+        #[tokio::test]
+        async fn passkeys_are_listed_by_date_and_surface_with_machine_nicknames() {
+            let laptop = credential(1, None, LAPTOP_MS);
+            let phone = credential(2, Some("remote"), PHONE_MS);
+            let tablet = credential(3, Some("remote"), TABLET_MS);
+            let (tmp, handler) = passkey_handler(vec![laptop.clone(), phone.clone(), tablet]);
+
+            assert!(
+                names(&handler, "/alice")
+                    .await
+                    .contains(&"passkeys".to_owned())
+            );
+            let listed = names(&handler, "/alice/passkeys").await;
+            let dirs: Vec<&String> = listed
+                .iter()
+                .filter(|name| name.starts_with("2026-"))
+                .collect();
+            assert_eq!(dirs.len(), 3);
+            assert!(dirs[0].starts_with("2026-09-15-local-"));
+            assert!(dirs[1].starts_with("2026-09-24-remote-"));
+            assert!(dirs[2].starts_with("2026-09-24-remote-"));
+            assert!(
+                dirs.iter()
+                    .all(|dir| dir.rsplit('-').next().unwrap().len() == 4)
+            );
+            for fixed in ["by-name", "enrollments", "new"] {
+                assert!(
+                    listed.contains(&fixed.to_owned()),
+                    "{fixed} missing: {listed:?}"
+                );
+            }
+            assert!(!listed.contains(&"latest".to_owned()));
+
+            let laptop_dir = format!("/alice/passkeys/{}", dirs[0]);
+            let mut phone_dir = None;
+            for dir in &dirs[1..] {
+                let dir = format!("/alice/passkeys/{dir}");
+                if text(&handler, &format!("{dir}/credential_id")).await
+                    == format!("{}\n", phone.credential_id.encoded())
+                {
+                    phone_dir = Some(dir);
+                }
+            }
+            let phone_dir = phone_dir.expect("phone passkey is listed");
+            assert_eq!(
+                text(&handler, &format!("{laptop_dir}/surface")).await,
+                "local\n"
+            );
+            assert_eq!(
+                text(&handler, &format!("{laptop_dir}/created")).await,
+                "2026-09-15T10:00:00Z\n"
+            );
+            assert_eq!(
+                text(&handler, &format!("{laptop_dir}/state")).await,
+                "active\n"
+            );
+            assert_eq!(
+                text(&handler, &format!("{laptop_dir}/credential_id")).await,
+                format!("{}\n", laptop.credential_id.encoded())
+            );
+            assert_eq!(text(&handler, &format!("{laptop_dir}/name")).await, "");
+
+            handler
+                .write(&path(&format!("{phone_dir}/name")), b"iPhone\n")
+                .await
+                .unwrap();
+            assert_eq!(
+                text(&handler, &format!("{phone_dir}/name")).await,
+                "iPhone\n"
+            );
+            let link = handler
+                .lookup(&path("/alice/passkeys/by-name/iPhone"))
+                .await
+                .unwrap();
+            assert_eq!(
+                link.link_target.as_deref(),
+                Some(format!("../{}", phone_dir.rsplit('/').next().unwrap()).as_str())
+            );
+            // Nicknames are keyed by the full credential ID, never the display name.
+            let stored: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(
+                    tmp.path()
+                        .join("machine-policy-projections/passkey-names.json"),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(stored["names"][phone.credential_id.encoded()], "iPhone");
+
+            let duplicate = handler
+                .write(&path(&format!("{laptop_dir}/name")), b"iPhone")
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(duplicate, HandlerError::Invalid(_)),
+                "{duplicate:?}"
+            );
+            for invalid in [".hidden", "a/b", "tab\there"] {
+                assert!(
+                    handler
+                        .write(&path(&format!("{laptop_dir}/name")), invalid.as_bytes())
+                        .await
+                        .is_err(),
+                    "{invalid:?} accepted"
+                );
+            }
+            handler
+                .write(&path(&format!("{phone_dir}/name")), b"")
+                .await
+                .unwrap();
+            assert!(names(&handler, "/alice/passkeys/by-name").await.is_empty());
+            assert!(matches!(
+                handler
+                    .lookup(&path("/alice/passkeys/2026-01-01-local-0000"))
+                    .await,
+                Err(HandlerError::NotFound(_))
+            ));
+        }
+
+        #[test]
+        fn colliding_display_names_lengthen_only_their_suffix() {
+            use sha2::Digest as _;
+            let with_id = |bytes: Vec<u8>| CredentialPublic {
+                credential_id: Base64UrlBytes::from_bytes(&bytes),
+                ..credential(0, Some("remote"), PHONE_MS)
+            };
+            // Find two credential IDs whose digests share the 4-hex prefix.
+            let mut seen = std::collections::BTreeMap::new();
+            let (first, second) = (0_u16..=u16::MAX)
+                .find_map(|n| {
+                    let bytes = n.to_be_bytes().to_vec();
+                    let prefix = hex::encode(sha2::Sha256::digest(&bytes))[..4].to_owned();
+                    seen.insert(prefix, bytes.clone())
+                        .map(|other| (other, bytes))
+                })
+                .expect("a 4-hex prefix collision exists");
+            let unrelated = credential(9, Some("remote"), PHONE_MS);
+            let names = super::super::passkeys::tests_support::dir_names(&[
+                with_id(first),
+                with_id(second),
+                unrelated,
+            ]);
+            let suffix = |name: &String| name.rsplit('-').next().unwrap().len();
+            assert!(
+                names
+                    .iter()
+                    .all(|name| name.starts_with("2026-09-24-remote-"))
+            );
+            assert_ne!(names[0], names[1]);
+            assert!(suffix(&names[0]) > 4 && suffix(&names[1]) > 4, "{names:?}");
+            assert_eq!(suffix(&names[2]), 4, "{names:?}");
+        }
+
+        struct PasskeyBroker {
+            requests: Mutex<Vec<MachineBrokerRequest>>,
+            state: Mutex<CeremonyState>,
+            url_spent: Mutex<bool>,
+        }
+
+        impl bloom_broker_api::MachineBrokerService for PasskeyBroker {
+            fn dispatch<'a>(
+                &'a self,
+                request: MachineBrokerRequest,
+            ) -> bloom_broker_api::ServiceFuture<'a, bloom_broker_api::MachineBrokerResponse>
+            {
+                Box::pin(async move {
+                    self.requests.lock().unwrap().push(request.clone());
+                    let status =
+                        |operation_id: OperationId, state: CeremonyState| CeremonyPublicStatus {
+                            ceremony_id: digest(91),
+                            ceremony_kind: bloom_broker_api::CeremonyKind::CredentialAdd,
+                            operation_id,
+                            state,
+                            expires_at_ms: DecimalU64::new(u64::MAX),
+                            ceremony_url: (state == CeremonyState::AwaitingUser
+                                && !*self.url_spent.lock().unwrap())
+                            .then(|| "https://relay.test/ceremony/#cap=abc".to_owned()),
+                            receipt_digest: None,
+                        };
+                    match request {
+                        MachineBrokerRequest::CredentialCrossSurfacePrepare(request) => {
+                            *self.state.lock().unwrap() = CeremonyState::AwaitingUser;
+                            *self.url_spent.lock().unwrap() = false;
+                            Ok(bloom_broker_api::MachineBrokerResponse::CredentialCrossSurfacePrepare(
+                                CeremonyCrossSurfacePrepareResponse {
+                                    operation_id: request.operation_id,
+                                    ceremony_id: digest(91),
+                                    state: CeremonyState::AwaitingUser,
+                                    destination_url: "https://relay.test/ceremony/#cap=abc".into(),
+                                    expires_at_ms: DecimalU64::new(u64::MAX),
+                                },
+                            ))
+                        }
+                        MachineBrokerRequest::CeremonyStatus(request) => {
+                            let operation_id = OperationId::new(request.id.as_str().to_owned())?;
+                            let state = *self.state.lock().unwrap();
+                            Ok(bloom_broker_api::MachineBrokerResponse::CeremonyStatus(
+                                status(operation_id, state),
+                            ))
+                        }
+                        MachineBrokerRequest::CeremonyCancel(request) => {
+                            let operation_id = OperationId::new(request.id.as_str().to_owned())?;
+                            *self.state.lock().unwrap() = CeremonyState::Cancelled;
+                            Ok(bloom_broker_api::MachineBrokerResponse::CeremonyCancel(
+                                status(operation_id, CeremonyState::Cancelled),
+                            ))
+                        }
+                        other => Err(ProtocolError::new(
+                            ProtocolErrorCode::UnknownMethod,
+                            format!("unexpected {other:?}"),
+                        )),
+                    }
+                })
+            }
+        }
+
+        fn prepares(broker: &PasskeyBroker) -> Vec<CeremonySurfaceSelection> {
+            broker
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|request| match request {
+                    MachineBrokerRequest::CredentialCrossSurfacePrepare(request) => {
+                        assert_eq!(request.wallet_id, token("alice"));
+                        Some(request.destination)
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn enrollment_starts_from_new_and_is_followed_through_latest() {
+            let (_tmp, handler) = passkey_handler(vec![credential(1, None, LAPTOP_MS)]);
+            let broker = Arc::new(PasskeyBroker {
+                requests: Mutex::new(Vec::new()),
+                state: Mutex::new(CeremonyState::AwaitingUser),
+                url_spent: Mutex::new(false),
+            });
+            let handler = handler.with_broker(Some(MachineBrokerClient::new(broker.clone())));
+
+            let refused = handler
+                .write(&path("/alice/passkeys/new"), b"phone")
+                .await
+                .unwrap_err();
+            assert!(matches!(refused, HandlerError::Invalid(_)));
+            assert!(prepares(&broker).is_empty());
+
+            handler
+                .write(&path("/alice/passkeys/new"), b"remote\n")
+                .await
+                .unwrap();
+            // A retried write reuses the live enrollment instead of starting another.
+            handler
+                .write(&path("/alice/passkeys/new"), b"remote")
+                .await
+                .unwrap();
+            assert_eq!(prepares(&broker), vec![CeremonySurfaceSelection::Remote]);
+
+            let latest = handler
+                .lookup(&path("/alice/passkeys/latest"))
+                .await
+                .unwrap();
+            let target = latest.link_target.unwrap();
+            let operation = target.strip_prefix("enrollments/").unwrap().to_owned();
+            assert_eq!(
+                names(&handler, "/alice/passkeys/enrollments").await,
+                vec![operation.clone()]
+            );
+            let dir = format!("/alice/passkeys/enrollments/{operation}");
+            assert_eq!(
+                text(&handler, &format!("{dir}/url")).await,
+                "https://relay.test/ceremony/#cap=abc\n"
+            );
+            assert_eq!(
+                text(&handler, &format!("{dir}/status")).await,
+                "awaiting_user\n"
+            );
+
+            // Once the browser uses the one-time link, the URL disappears.
+            *broker.url_spent.lock().unwrap() = true;
+            assert!(matches!(
+                handler.read(&path(&format!("{dir}/url"))).await,
+                Err(HandlerError::NotFound(_))
+            ));
+            assert_eq!(
+                text(&handler, &format!("{dir}/status")).await,
+                "awaiting_user\n"
+            );
+
+            handler
+                .write(&path(&format!("{dir}/cancel")), b"\n")
+                .await
+                .unwrap();
+            assert_eq!(
+                text(&handler, &format!("{dir}/status")).await,
+                "cancelled\n"
+            );
+            let status: serde_json::Value = serde_json::from_slice(
+                &handler
+                    .read(&path(&format!("{dir}/status.json")))
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(status["ceremony_state"], "CANCELLED");
+            assert!(
+                handler
+                    .write(&path(&format!("{dir}/cancel")), b"")
+                    .await
+                    .is_err()
+            );
+
+            // A finished enrollment no longer blocks a new one.
+            handler
+                .write(&path("/alice/passkeys/new"), b"local")
+                .await
+                .unwrap();
+            assert_eq!(
+                prepares(&broker),
+                vec![
+                    CeremonySurfaceSelection::Remote,
+                    CeremonySurfaceSelection::Local
+                ]
+            );
+            assert_eq!(
+                names(&handler, "/alice/passkeys/enrollments").await.len(),
+                2
+            );
+        }
     }
 }

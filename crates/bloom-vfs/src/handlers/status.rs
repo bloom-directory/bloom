@@ -1465,7 +1465,7 @@ fn count_files_recursive(dir: &std::path::Path) -> u64 {
 
 /// Convert a Unix timestamp (seconds since 1970-01-01 UTC) to (Y, M, D, h, m, s).
 /// Algorithm from Howard Hinnant's date library (public domain).
-fn unix_to_civil(secs: u64) -> (i64, u32, u32, u32, u32, u32) {
+pub(crate) fn unix_to_civil(secs: u64) -> (i64, u32, u32, u32, u32, u32) {
     let z = (secs / 86_400) as i64; // days since epoch
     let secs_of_day = secs % 86_400;
     let h = (secs_of_day / 3600) as u32;

@@ -4385,6 +4385,7 @@ impl Daemon {
                 wallet_projections.clone(),
                 home.root().join("machine-policy-projections"),
             )
+            .with_passkey_names_path(home.root().join("passkey-names.json"))
             .with_broker(broker.clone())
             .with_home_write_permit_opt(home_write_permit.clone())
             .with_mempool_indexes(mempool_indexes.clone())

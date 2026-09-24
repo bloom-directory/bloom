@@ -219,6 +219,32 @@ disappears from status while the operation remains readable and cancellable.
 After `SUCCEEDED`, read `result.json`. A cancelled or expired operation can
 be started again with a fresh write to `wallets/recover`.
 
+## Adding a passkey
+
+`wallets/<wallet>/passkeys/` lists the wallet's passkeys, one directory each,
+named `<created date>-<surface>-<digest>`. Each holds `surface` (`local` for
+this host's browser, `remote` for the relay), `created`, `state`,
+`credential_id`, and `name`. To add a passkey on the other surface, for
+example a phone, write the surface to `new` and follow `latest`:
+
+```sh
+echo remote > wallets/<wallet>/passkeys/new
+cat wallets/<wallet>/passkeys/latest/url      # forward the complete link to the human
+cat wallets/<wallet>/passkeys/latest/status   # awaiting_user, then succeeded
+```
+
+The human approves with an existing passkey of the wallet, then creates the
+new one on the chosen surface. The link is single-use: it disappears once
+opened, while `status` stays readable. Write to `latest/cancel` to abandon an
+enrollment. Every enrollment stays under `enrollments/<operation>/`. Writing
+`new` again while one to the same surface is still waiting reuses it.
+
+After enrollment succeeds, ask the human what to call the new passkey and
+write it to that passkey's `name`; `by-name/<name>` then links to it. Names
+are Machine-only labels for telling passkeys apart. They are never shown on
+ceremony pages and carry no authority, so do not use a name to decide which
+passkey approves anything.
+
 ## The transaction loop
 
 Use this loop for native Machine transaction surfaces and for Petal actions that
