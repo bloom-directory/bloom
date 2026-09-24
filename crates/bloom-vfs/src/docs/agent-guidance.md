@@ -314,3 +314,25 @@ receiving a response updates the same receipt without counting it twice. Other
 requests can proceed within any remaining budget. Do not repeat an unresolved
 payment by restaging it. A failed merchant retry still counts toward recorded
 spending.
+
+## Local development chains
+
+A local Anvil node is not configured by default. Bloom reads a chain's files
+from its RPC endpoint, so a configured chain whose endpoint is unreachable
+makes every read under that chain's paths wait for the endpoint to fail.
+
+To work against a local Anvil node, ask the operator to add it to the Machine
+configuration (`~/.bloom/config.toml`) and restart Bloom:
+
+```toml
+[chains.anvil]
+name = "anvil"
+chain_id = 31337
+rpc_urls = ["http://127.0.0.1:8545"]
+display_name = "Anvil (local)"
+native_symbol = "ETH"
+native_decimals = 18
+```
+
+Then confirm it with `ls chains/`. Remove the entry when the node is no longer
+running.

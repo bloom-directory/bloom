@@ -744,6 +744,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn agent_guidance_anvil_example_is_a_valid_chain_config() {
+        let guidance = std::str::from_utf8(AGENT_GUIDANCE).expect("guidance is utf-8");
+        let example = guidance
+            .split_once("```toml\n[chains.anvil]")
+            .and_then(|(_, rest)| rest.split_once("```"))
+            .map(|(body, _)| format!("[chains.anvil]{body}"))
+            .expect("guidance documents an opt-in Anvil chain");
+        // Operators add the documented entry to their existing configuration.
+        let fragment: bloom_proto::config::Config = toml::from_str(&example).unwrap();
+        let anvil = fragment.chains.get("anvil").unwrap().clone();
+        assert_eq!(anvil, bloom_proto::chain::ChainSpec::anvil_default());
+        let mut config = bloom_proto::config::Config::local_default();
+        config.chains.insert("anvil".to_owned(), anvil);
+        config.validate().unwrap();
+    }
+
     #[tokio::test]
     async fn root_agent_guidance_files_are_identical_to_markdown_source() {
         let vfs = Vfs::builder().mount("echo", Arc::new(EchoHandler)).build();

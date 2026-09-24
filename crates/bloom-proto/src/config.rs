@@ -375,7 +375,6 @@ fn default_chains() -> BTreeMap<String, ChainSpec> {
             "HYPE",
         ),
         evm_chain("arc", 5_042, &["https://rpc.arc-scan.org"], "Arc", "USDC"),
-        ChainSpec::anvil_default(),
     ] {
         chains.insert(spec.name.clone(), spec);
     }
@@ -383,7 +382,9 @@ fn default_chains() -> BTreeMap<String, ChainSpec> {
 }
 
 impl Config {
-    /// An agentic-wallet default: public EVM networks, Anvil, and Solana mainnet.
+    /// An agentic-wallet default: public EVM networks and Solana mainnet. A local
+    /// Anvil node is opt-in; an unreachable default endpoint stalls every read of
+    /// its chain files.
     ///
     /// Broadcast is enabled by default on every chain. Signing, policy,
     /// confirmation, and Sealed Approval gates still apply to value-moving
@@ -678,7 +679,7 @@ mod tests {
         assert!(cfg.etherscan.is_none());
         assert!(cfg.petals.preinstalled.is_empty());
         assert!(!toml::to_string(&cfg).unwrap().contains("allow_broadcast"));
-        assert_eq!(cfg.chains.len(), 14);
+        assert_eq!(cfg.chains.len(), 13);
         assert_eq!(cfg.solana_chains.len(), 1);
         let solana = cfg
             .solana_chains
@@ -714,9 +715,10 @@ mod tests {
         assert_eq!(arc.display_name.as_deref(), Some("Arc"));
         assert_eq!(arc.native_symbol, "USDC");
         assert_eq!(arc.native_decimals, 18);
-        let anvil = cfg.chains.get("anvil").expect("anvil entry");
-        assert_eq!(anvil.chain_id, 31337);
-        assert!(!anvil.rpc_urls.is_empty());
+        assert!(
+            !cfg.chains.contains_key("anvil"),
+            "a local Anvil node is opt-in, not a default chain"
+        );
         // Default backends: metadata + history -> Etherscan, rest -> RPC.
         assert_eq!(cfg.backends.contract_metadata, Backend::Etherscan);
         assert_eq!(cfg.backends.address_history, Backend::Etherscan);
@@ -1166,13 +1168,13 @@ allow_broadcast = true
     #[test]
     fn validate_rejects_key_name_mismatch() {
         let mut cfg = Config::local_default();
-        let mut spec = cfg.chains.remove("anvil").unwrap();
+        let mut spec = cfg.chains.remove("ethereum").unwrap();
         spec.name = "renamed".to_string();
-        cfg.chains.insert("anvil".to_string(), spec);
+        cfg.chains.insert("ethereum".to_string(), spec);
         let err = cfg.validate().unwrap_err();
         match err {
             ConfigError::Invalid(m) => {
-                assert!(m.contains("anvil") && m.contains("renamed"), "msg: {m}")
+                assert!(m.contains("ethereum") && m.contains("renamed"), "msg: {m}")
             }
             other => panic!("expected Invalid, got {other:?}"),
         }
@@ -1181,7 +1183,7 @@ allow_broadcast = true
     #[test]
     fn config_rejects_when_both_empty() {
         let mut cfg = Config::local_default();
-        let entry = cfg.chains.get_mut("anvil").unwrap();
+        let entry = cfg.chains.get_mut("ethereum").unwrap();
         entry.rpc_urls.clear();
         entry.rpc_endpoints.clear();
         let err = cfg.validate().unwrap_err();
@@ -1200,7 +1202,7 @@ allow_broadcast = true
         // stand on its own.
         use crate::chain::EndpointSpec;
         let mut cfg = Config::local_default();
-        let entry = cfg.chains.get_mut("anvil").unwrap();
+        let entry = cfg.chains.get_mut("ethereum").unwrap();
         entry.rpc_urls.clear();
         entry.rpc_endpoints.push(EndpointSpec {
             url: "http://127.0.0.1:8545".into(),
@@ -1216,7 +1218,7 @@ allow_broadcast = true
     #[test]
     fn chain_lookup_by_name() {
         let cfg = Config::local_default();
-        assert!(cfg.chain("anvil").is_some());
+        assert!(cfg.chain("anvil").is_none(), "a local Anvil node is opt-in");
         assert!(cfg.chain("ethereum").is_some());
         assert!(cfg.chain("hyperliquid").is_some());
         assert!(cfg.chain("ghost").is_none());
