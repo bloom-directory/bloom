@@ -3733,14 +3733,6 @@ fn ceremony_projection_records(root: &Path) -> Result<Vec<PathBuf>, DaemonError>
     Ok(records)
 }
 
-/// Stop every durable Petal ceremony projection from advertising an owner
-/// ceremony staged before this process started.
-///
-/// See [`PETAL_CEREMONY_INVALIDATED_STATUS`]. Records that already advertise
-/// nothing — a derived key that succeeded, a payload already signed — are
-/// authoritative Machine state and are left exactly as they are. A record this
-/// build cannot parse is reported and left alone rather than deleted: Machine
-/// must not destroy owner-visible state it does not understand.
 /// Host message for a signing request whose outcome is unknown. It carries
 /// no Broker text: Petal SDKs classify host errors by words such as "denied"
 /// or "invalid", and this outcome must never read as a refusal.
@@ -3757,6 +3749,14 @@ fn exact_signing_host_error(error: bloom_vfs::ExactSigningError) -> HostError {
     }
 }
 
+/// Stop every durable Petal ceremony projection from advertising an owner
+/// ceremony staged before this process started.
+///
+/// See [`PETAL_CEREMONY_INVALIDATED_STATUS`]. Records that already advertise
+/// nothing — a derived key that succeeded, a payload already signed — are
+/// authoritative Machine state and are left exactly as they are. A record this
+/// build cannot parse is reported and left alone rather than deleted: Machine
+/// must not destroy owner-visible state it does not understand.
 fn invalidate_stale_ceremony_projections(cache_dir: &Path) -> Result<usize, DaemonError> {
     let mut invalidated = 0usize;
 
