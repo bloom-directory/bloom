@@ -3918,7 +3918,8 @@ impl Daemon {
             )
             .map_err(|error| {
                 DaemonError::Audit(format!("Machine wallet projection cache: {error}"))
-            })?,
+            })?
+            .with_max_age(config.wallet_projection_max_age),
         );
         // Build per-chain mempool indexes + handlers from [mempool.<chain>]
         // config. Each entry creates an LRU index, a VFS handler, and

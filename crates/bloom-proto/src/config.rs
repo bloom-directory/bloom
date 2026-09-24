@@ -38,6 +38,15 @@ pub struct Config {
     /// Outbox stage TTL.
     #[serde(default = "default_stage_ttl", with = "humantime_serde")]
     pub stage_ttl: std::time::Duration,
+    /// How long mounted wallet reads reuse one Broker projection refresh.
+    /// Each refresh costs several Broker requests per wallet, so a shorter
+    /// window spends Broker's request quota faster. Mounted wallet files may
+    /// be this stale; authority always comes from Broker.
+    #[serde(
+        default = "default_wallet_projection_max_age",
+        with = "humantime_serde"
+    )]
+    pub wallet_projection_max_age: std::time::Duration,
     /// Map of chain name -> spec.
     #[serde(default)]
     pub chains: BTreeMap<String, ChainSpec>,
@@ -205,6 +214,9 @@ fn default_chain_name() -> String {
 }
 fn default_stage_ttl() -> std::time::Duration {
     std::time::Duration::from_secs(3600)
+}
+fn default_wallet_projection_max_age() -> std::time::Duration {
+    std::time::Duration::from_secs(1)
 }
 fn default_etherscan_url() -> String {
     "https://api.etherscan.io/v2/api".to_string()
@@ -384,6 +396,7 @@ impl Config {
             default_wallet: None,
             default_chain: default_chain_name(),
             stage_ttl: default_stage_ttl(),
+            wallet_projection_max_age: default_wallet_projection_max_age(),
             chains,
             solana_chains: BTreeMap::from([(
                 "solana-mainnet".into(),
@@ -1131,7 +1144,23 @@ allow_broadcast = true
         )
         .unwrap();
         assert!(cfg.default_wallet.is_none());
+        assert_eq!(
+            cfg.wallet_projection_max_age,
+            std::time::Duration::from_secs(1)
+        );
         cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn wallet_projection_max_age_accepts_durations_including_zero() {
+        for (value, expected) in [("250ms", 250), ("0s", 0)] {
+            let cfg: Config =
+                toml::from_str(&format!("wallet_projection_max_age = \"{value}\"")).unwrap();
+            assert_eq!(
+                cfg.wallet_projection_max_age,
+                std::time::Duration::from_millis(expected)
+            );
+        }
     }
 
     #[test]

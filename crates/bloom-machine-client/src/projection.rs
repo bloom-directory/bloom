@@ -7,7 +7,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
@@ -26,10 +26,6 @@ use crate::MachineBrokerClient;
 const CACHE_SCHEMA: &str = "bloom.machine-wallet-projections.v1";
 const SOURCE_PROTOCOL: &str = "bloom.machine-broker.v1";
 const LIVE_REFRESH_FRESHNESS_MS: u64 = 30_000;
-// Kernel-mounted reads commonly render the same dynamic file for GETATTR and
-// then READ. Coalesce only that burst; authority changes remain observable on
-// the next ordinary interaction rather than waiting for the stale-read TTL.
-const LIVE_REFRESH_COALESCE_MS: u64 = 100;
 static TEMPORARY_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -314,6 +310,7 @@ pub struct CachedWalletProjectionReader {
     store: FileProjectionStore,
     cache: Arc<Mutex<ProjectionCache>>,
     last_live_refresh_ms: Arc<AtomicU64>,
+    max_age_ms: u64,
 }
 
 impl CachedWalletProjectionReader {
@@ -327,7 +324,19 @@ impl CachedWalletProjectionReader {
             store,
             cache: Arc::new(Mutex::new(cache)),
             last_live_refresh_ms: Arc::new(AtomicU64::new(0)),
+            max_age_ms: 0,
         })
+    }
+
+    /// Reuse a live refresh for `max_age` instead of observing Broker on every
+    /// read. One kernel-mounted command issues many LOOKUP, GETATTR and READ
+    /// calls, and each refresh observes every wallet with several Broker
+    /// requests, so reuse keeps interactive use inside Broker's request quota.
+    /// The projection is display state, never authority. Zero, the default,
+    /// observes Broker on every read.
+    pub fn with_max_age(mut self, max_age: Duration) -> Self {
+        self.max_age_ms = duration_ms(max_age);
+        self
     }
 
     pub fn broker(&self) -> Option<&MachineBrokerClient> {
@@ -426,12 +435,22 @@ impl CachedWalletProjectionReader {
         // Serialize the observation as well as the commit. Otherwise an older
         // full-list response can arrive after a newer process has cached a
         // newly-created wallet and incorrectly tombstone it.
+        let requested_at = now_ms()?;
         let store = self.store.clone();
         let refresh_lock = tokio::task::spawn_blocking(move || store.acquire_refresh_lock())
             .await
             .map_err(|error| {
                 unavailable(format!("join Machine projection lock task: {error}"))
             })??;
+        // Readers queued behind a refresh that completed while they waited
+        // share its result instead of each observing every wallet again.
+        if self.max_age_ms > 0 && self.last_live_refresh_ms.load(Ordering::SeqCst) >= requested_at {
+            let cache = self
+                .cache
+                .lock()
+                .map_err(|_| unavailable("Machine projection cache mutex poisoned"))?;
+            return Ok(cache.live(false));
+        }
         let baseline = self.store.load()?;
         let mut observed = Self::observe_wallets(broker).await?;
         let mut completed_migrations = BTreeMap::new();
@@ -508,7 +527,10 @@ impl CachedWalletProjectionReader {
 
     async fn refresh_coalesced(&self) -> Result<Vec<WalletProjection>, ProtocolError> {
         let refreshed_at = self.last_live_refresh_ms.load(Ordering::SeqCst);
-        if refreshed_at != 0 && now_ms()?.saturating_sub(refreshed_at) <= LIVE_REFRESH_COALESCE_MS {
+        if self.max_age_ms > 0
+            && refreshed_at != 0
+            && now_ms()?.saturating_sub(refreshed_at) <= self.max_age_ms
+        {
             let cache = self
                 .cache
                 .lock()
@@ -536,7 +558,7 @@ impl CachedWalletProjectionReader {
 #[async_trait]
 impl WalletProjectionReader for CachedWalletProjectionReader {
     async fn list_wallets(&self) -> Result<Vec<WalletProjection>, ProtocolError> {
-        match self.refresh().await {
+        match self.refresh_coalesced().await {
             Ok(projections) => Ok(projections),
             Err(error) if error.code == ProtocolErrorCode::ServiceUnavailable => {
                 tracing::warn!(
@@ -1132,6 +1154,10 @@ fn now_ms() -> Result<u64, ProtocolError> {
         .map_err(|_| unavailable("system time does not fit projection timestamp"))
 }
 
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 fn invalid_projection(message: impl Into<String>) -> ProtocolError {
     ProtocolError::new(ProtocolErrorCode::BackendInvalidRequest, message)
 }
@@ -1167,6 +1193,8 @@ mod tests {
         ceremony_states: Mutex<BTreeMap<String, CeremonyState>>,
         /// Per-wallet `wallet.accounts` refusals.
         accounts_errors: Mutex<BTreeMap<String, ProtocolError>>,
+        /// `wallet.list_public` calls, one per full refresh.
+        list_requests: std::sync::atomic::AtomicUsize,
     }
 
     struct BlockingEmptyBroker {
@@ -1203,7 +1231,12 @@ mod tests {
                 custody_results: Mutex::new(BTreeMap::new()),
                 ceremony_states: Mutex::new(BTreeMap::new()),
                 accounts_errors: Mutex::new(BTreeMap::new()),
+                list_requests: 0.into(),
             }
+        }
+
+        fn list_requests(&self) -> usize {
+            self.list_requests.load(Ordering::SeqCst)
         }
 
         fn set_available(&self, available: bool) {
@@ -1245,6 +1278,7 @@ mod tests {
                     .cloned();
                 match request {
                     MachineBrokerRequest::WalletListPublic(_) => {
+                        self.list_requests.fetch_add(1, Ordering::SeqCst);
                         Ok(MachineBrokerResponse::WalletListPublic(
                             wallets.values().map(|value| value.wallet.clone()).collect(),
                         ))
@@ -1548,6 +1582,84 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(durable.policy.version.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn mounted_reads_reuse_a_refresh_within_the_configured_age() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = FileProjectionStore::new(directory.path().join("wallets.json"));
+        let broker = Arc::new(FakeBroker::new(fixture(1)));
+        let reader = CachedWalletProjectionReader::new(
+            Some(MachineBrokerClient::new(broker.clone())),
+            store.clone(),
+        )
+        .unwrap()
+        .with_max_age(Duration::from_millis(200));
+
+        // One mounted command's LOOKUP, GETATTR and READ burst shares one
+        // observation of every wallet.
+        for _ in 0..3 {
+            let listed = reader.list_wallets().await.unwrap();
+            assert_eq!(listed.len(), 1);
+            assert_eq!(listed[0].freshness, ProjectionFreshness::Fresh);
+            let wallet = reader.get_wallet(&token("alice")).await.unwrap();
+            assert_eq!(wallet.freshness, ProjectionFreshness::Fresh);
+        }
+        assert_eq!(broker.list_requests(), 1);
+
+        // Once the window passes, the next read observes Broker again.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        reader.get_wallet(&token("alice")).await.unwrap();
+        assert_eq!(broker.list_requests(), 2);
+
+        // Zero, the reader default, observes Broker on every read.
+        let uncached = CachedWalletProjectionReader::new(
+            Some(MachineBrokerClient::new(broker.clone())),
+            store,
+        )
+        .unwrap();
+        uncached.list_wallets().await.unwrap();
+        uncached.get_wallet(&token("alice")).await.unwrap();
+        assert_eq!(broker.list_requests(), 4);
+    }
+
+    #[tokio::test]
+    async fn readers_queued_behind_a_refresh_share_its_result() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = FileProjectionStore::new(directory.path().join("wallets.json"));
+        let entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let reader = CachedWalletProjectionReader::new(
+            Some(MachineBrokerClient::new(Arc::new(BlockingEmptyBroker {
+                entered: entered.clone(),
+                release: release.clone(),
+            }))),
+            store,
+        )
+        .unwrap()
+        .with_max_age(Duration::from_millis(1));
+
+        let spawn_list = || {
+            let reader = reader.clone();
+            tokio::spawn(async move { reader.list_wallets().await })
+        };
+        let first = spawn_list();
+        entered.acquire().await.unwrap().forget();
+        let queued = (0..3).map(|_| spawn_list()).collect::<Vec<_>>();
+        // Let the queued readers wait on the refresh lock and outlast the reuse
+        // window, so only sharing the in-flight result avoids new observations.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        release.add_permits(4);
+
+        assert!(first.await.unwrap().unwrap().is_empty());
+        for reader in queued {
+            assert!(reader.await.unwrap().unwrap().is_empty());
+        }
+        assert_eq!(
+            entered.available_permits(),
+            0,
+            "queued readers must not observe Broker again"
+        );
     }
 
     #[tokio::test]
