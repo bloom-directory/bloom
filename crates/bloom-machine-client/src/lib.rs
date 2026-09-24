@@ -20,12 +20,58 @@ use std::{
     collections::BTreeSet,
     future::Future,
     path::{Path, PathBuf},
-    sync::{Arc, RwLock},
-    time::Duration,
+    sync::{Arc, Mutex, RwLock},
+    time::{Duration, Instant},
 };
 
 const AUTHORITY_HEAD_EXCHANGE_CADENCE: Duration = Duration::from_secs(45);
 const AUTHORITY_HEAD_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
+const QUOTA_BACKOFF_INITIAL: Duration = Duration::from_millis(250);
+const QUOTA_BACKOFF_MAXIMUM: Duration = Duration::from_secs(30);
+
+/// Exponential backoff after Broker reports its request quota exhausted.
+/// Broker admits requests over a sliding window, so callers that retry on
+/// rejection (such as VFS readers after a restart) keep that window saturated.
+/// While backing off, requests are refused locally without reaching Broker.
+#[derive(Default)]
+struct QuotaBackoff {
+    state: Mutex<Option<(Duration, Instant)>>,
+}
+
+impl QuotaBackoff {
+    fn admit(&self, now: Instant) -> Result<(), ProtocolError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| service_unavailable("Broker quota backoff lock poisoned"))?;
+        match *state {
+            Some((_, until)) if now < until => Err(ProtocolError::new(
+                ProtocolErrorCode::QuotaExceeded,
+                format!(
+                    "Broker request quota exhausted; retry in {} ms",
+                    (until - now).as_millis().max(1)
+                ),
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    fn record<T>(&self, result: &Result<T, ProtocolError>, now: Instant) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        match result {
+            Ok(_) => *state = None,
+            Err(error) if error.code == ProtocolErrorCode::QuotaExceeded => {
+                let delay = state.map_or(QUOTA_BACKOFF_INITIAL, |(delay, _)| {
+                    (delay * 2).min(QUOTA_BACKOFF_MAXIMUM)
+                });
+                *state = Some((delay, now + delay));
+            }
+            Err(_) => {}
+        }
+    }
+}
 
 async fn run_periodic_authority_head_exchange<F, Fut, T>(mut exchange: F)
 where
@@ -391,6 +437,7 @@ pub struct MachineBrokerClient {
     service: Arc<dyn MachineBrokerService>,
     local_identity: Option<LocalIdentity>,
     unix_service: Option<Arc<UnixMachineBrokerService>>,
+    quota_backoff: Arc<QuotaBackoff>,
 }
 
 impl MachineBrokerClient {
@@ -399,6 +446,7 @@ impl MachineBrokerClient {
             service,
             local_identity: None,
             unix_service: None,
+            quota_backoff: Arc::default(),
         }
     }
 
@@ -416,6 +464,7 @@ impl MachineBrokerClient {
             service: unix_service.clone(),
             local_identity: Some(identity),
             unix_service: Some(unix_service),
+            quota_backoff: Arc::default(),
         }
     }
 
@@ -539,7 +588,10 @@ impl MachineBrokerClient {
         &self,
         request: MachineBrokerRequest,
     ) -> Result<MachineBrokerResponse, ProtocolError> {
-        self.service.dispatch(request).await
+        self.quota_backoff.admit(Instant::now())?;
+        let result = self.service.dispatch(request).await;
+        self.quota_backoff.record(&result, Instant::now());
+        result
     }
 
     pub async fn sign(&self, request: MachineSignRequest) -> Result<SigningResult, ProtocolError> {
@@ -4630,6 +4682,73 @@ mod tests {
             requests[4],
             MachineBrokerRequest::SealedApprovalRevokeAll(revoke_all)
         );
+    }
+
+    struct QuotaBroker {
+        calls: std::sync::atomic::AtomicUsize,
+        exhausted: std::sync::atomic::AtomicBool,
+    }
+
+    impl MachineBrokerService for QuotaBroker {
+        fn dispatch<'a>(
+            &'a self,
+            _request: MachineBrokerRequest,
+        ) -> ServiceFuture<'a, MachineBrokerResponse> {
+            use std::sync::atomic::Ordering;
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let exhausted = self.exhausted.load(Ordering::SeqCst);
+            Box::pin(async move {
+                if exhausted {
+                    Err(ProtocolError::new(
+                        ProtocolErrorCode::QuotaExceeded,
+                        "request rate quota exhausted",
+                    ))
+                } else {
+                    Ok(MachineBrokerResponse::WalletListPublic(vec![]))
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn quota_rejections_back_off_locally_and_reset_on_success() {
+        use std::sync::atomic::Ordering;
+        let broker = Arc::new(QuotaBroker {
+            calls: 0.into(),
+            exhausted: true.into(),
+        });
+        let client = MachineBrokerClient::new(broker.clone());
+        let expire_backoff = |client: &MachineBrokerClient| {
+            let mut state = client.quota_backoff.state.lock().unwrap();
+            let (delay, _) = state.unwrap();
+            *state = Some((delay, Instant::now()));
+            delay
+        };
+
+        // A burst of readers after one rejection never reaches Broker.
+        for _ in 0..10 {
+            let error = client.wallets().await.unwrap_err();
+            assert_eq!(error.code, ProtocolErrorCode::QuotaExceeded);
+        }
+        assert_eq!(broker.calls.load(Ordering::SeqCst), 1);
+
+        // Each rejected probe doubles the backoff up to its ceiling.
+        let mut delays = vec![expire_backoff(&client)];
+        for _ in 0..10 {
+            client.wallets().await.unwrap_err();
+            delays.push(expire_backoff(&client));
+        }
+        assert_eq!(delays[0], QUOTA_BACKOFF_INITIAL);
+        assert_eq!(delays[1], QUOTA_BACKOFF_INITIAL * 2);
+        assert_eq!(delays.last(), Some(&QUOTA_BACKOFF_MAXIMUM));
+        assert_eq!(broker.calls.load(Ordering::SeqCst), 11);
+
+        // Clones share the backoff, and one success clears it.
+        broker.exhausted.store(false, Ordering::SeqCst);
+        client.clone().wallets().await.unwrap();
+        assert!(client.quota_backoff.state.lock().unwrap().is_none());
+        client.wallets().await.unwrap();
+        assert_eq!(broker.calls.load(Ordering::SeqCst), 13);
     }
 
     struct MismatchedApprovalBroker;
