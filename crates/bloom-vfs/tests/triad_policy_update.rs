@@ -121,6 +121,16 @@ impl MachineBrokerService for BrokerFixture {
                         self.wallet_public(),
                     ]))
                 }
+                MachineBrokerRequest::WalletGetPublic(WalletRequest { wallet_id }) => {
+                    if wallet_id.as_str() == "alice" {
+                        Ok(MachineBrokerResponse::WalletGetPublic(self.wallet_public()))
+                    } else {
+                        Err(ProtocolError::new(
+                            ProtocolErrorCode::ApprovalNotFound,
+                            "wallet policy not found",
+                        ))
+                    }
+                }
                 MachineBrokerRequest::KeyListPublic(WalletRequest { wallet_id })
                     if wallet_id.as_str() == "alice" =>
                 {
@@ -580,7 +590,7 @@ async fn vfs_policy_write_prepares_then_commits_only_with_completed_custody_rece
             MachineBrokerRequest::CeremonyStatus(_),
             MachineBrokerRequest::CustodyResult(_),
             MachineBrokerRequest::PolicyCommitUpdate(_),
-            MachineBrokerRequest::WalletListPublic(_),
+            MachineBrokerRequest::WalletGetPublic(_),
             MachineBrokerRequest::KeyListPublic(_),
             MachineBrokerRequest::CredentialListPublic(_),
             MachineBrokerRequest::PolicyRead(_),
