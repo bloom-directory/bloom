@@ -211,46 +211,6 @@ struct ReusablePetalBatchSigningState {
     approval_id: Option<Digest32>,
 }
 
-/// Which signing operation ids an exact request has issued a signing call
-/// under, and whether any such call was ever made.
-///
-/// This records; it decides nothing. The state file rotates
-/// `signing_operation_id` when the request's own lifetime expires and when
-/// Broker reports an id conflict, and the rotated-away id is the only handle
-/// Broker has on what that call did. Keeping the list means an attempt whose
-/// outcome is uncertain can still be reconciled by hand afterwards.
-///
-/// A separate file, not new fields on [`ExactSigningState`], because that state
-/// shipped in v0.2.0 and v0.2.1 with `deny_unknown_fields`: a binary from
-/// either release must still read back a state file this one wrote. It ignores
-/// a file it does not know about.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ExactOperationRecord {
-    schema: String,
-    /// Set before any signing call that carries an approval id, and never
-    /// cleared. While false, no signature can exist for this attempt.
-    #[serde(default)]
-    signing_may_have_started: bool,
-    /// Every signing operation id this attempt has used, recorded before the
-    /// call that uses it and never removed.
-    #[serde(default)]
-    signing_operations: Vec<OperationId>,
-    /// False when this record was adopted from a state file written before the
-    /// record existed, whose single persisted id may not be the only one that
-    /// attempt used. Missing history is not evidence that nothing signed.
-    #[serde(default = "history_complete_default")]
-    signing_history_complete: bool,
-}
-
-/// Records written by this binary always carry their whole history. Only an
-/// adopted legacy record sets this false, and it must say so explicitly.
-const fn history_complete_default() -> bool {
-    true
-}
-
-const OPERATION_SCHEMA: &str = "bloom.machine_exact_operation.v1";
-
 /// What a stored approval's ceremony check found before signing with it.
 enum StoredApprovalCeremony {
     /// Still waiting on its owner: return the same pending approval.
@@ -427,67 +387,6 @@ impl BrokerExactPayloadSigner {
         }
     }
 
-    /// Open or start this request's record of the signing calls it has issued.
-    ///
-    /// `adopted` carries the signing operation id of a request that already had
-    /// durable state when this Machine first saw it — one written before this
-    /// record existed, or by another binary. Machine cannot know whether such a
-    /// request issued a signing call, so it assumes it did, takes the id from
-    /// its state as the only handle Broker could have on it, and marks the
-    /// history incomplete because that state kept only one.
-    fn operation_record(
-        &self,
-        state_dir: &Path,
-        request_id: &str,
-        adopted: Option<&OperationId>,
-    ) -> Result<ExactOperationRecord, String> {
-        let path = state_dir.join(format!("{request_id}.op.json"));
-        match fs::read(&path) {
-            Ok(bytes) => {
-                let record: ExactOperationRecord = serde_json::from_slice(&bytes)
-                    .map_err(|error| format!("read exact operation record: {error}"))?;
-                if record.schema != OPERATION_SCHEMA {
-                    return Err("exact operation record does not match this request".into());
-                }
-                Ok(record)
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let record = ExactOperationRecord {
-                    schema: OPERATION_SCHEMA.into(),
-                    signing_may_have_started: adopted.is_some(),
-                    signing_operations: adopted.into_iter().cloned().collect(),
-                    signing_history_complete: adopted.is_none(),
-                };
-                write_state(&path, &record)?;
-                Ok(record)
-            }
-            Err(error) => Err(format!("read exact operation record: {error}")),
-        }
-    }
-
-    /// Record that a call which could produce a signature is about to be made,
-    /// and under which id. Both before the call, never after: a response that
-    /// never arrives must still leave Broker's handle on it behind.
-    fn record_signing_attempt(
-        &self,
-        state_path: &Path,
-        request_id: &str,
-        operation_id: &OperationId,
-    ) -> Result<(), String> {
-        let Some(state_dir) = state_path.parent() else {
-            return Ok(());
-        };
-        let mut record = self.operation_record(state_dir, request_id, None)?;
-        if record.signing_may_have_started && record.signing_operations.contains(operation_id) {
-            return Ok(());
-        }
-        record.signing_may_have_started = true;
-        if !record.signing_operations.contains(operation_id) {
-            record.signing_operations.push(operation_id.clone());
-        }
-        write_state(&state_dir.join(format!("{request_id}.op.json")), &record)
-    }
-
     #[allow(clippy::too_many_arguments)]
     async fn sign_or_prepare_locked(
         &self,
@@ -527,10 +426,6 @@ impl BrokerExactPayloadSigner {
         let canonical_plan_facts_digest = Digest32::from_bytes(Sha256::digest(plan_bytes).into());
         let wallet_id = Token::new(wallet.to_owned()).map_err(|error| error.to_string())?;
 
-        // Whether this request already had durable state before this call.
-        // A request Machine is meeting for the first time with state on disk
-        // was prepared by something else, and nothing here can say what it did.
-        let adopting_existing_state = state_path.exists();
         let mut state = match fs::read(state_path) {
             Ok(bytes) => serde_json::from_slice::<ExactSigningState>(&bytes)
                 .map_err(|error| format!("read exact signing state: {error}"))?,
@@ -569,20 +464,6 @@ impl BrokerExactPayloadSigner {
             || state.canonical_plan_facts_digest != canonical_plan_facts_digest
         {
             return Err("exact signing retry differs from its persisted operation identity".into());
-        }
-        // Open the record from the state exactly as persisted, before the
-        // expiry path below rewrites any of it. For a request this Machine did
-        // not prepare, the signing operation id that state carries is the only
-        // handle Broker has on whatever its previous call did, and expiry
-        // replaces it in this very call.
-        if let Some(record_dir) = state_path.parent() {
-            self.operation_record(
-                record_dir,
-                action_id,
-                adopting_existing_state
-                    .then(|| state.signing_operation_id.clone())
-                    .as_ref(),
-            )?;
         }
         let now = now_ms()?;
         if state.expires_at_ms.get() <= now {
@@ -640,13 +521,6 @@ impl BrokerExactPayloadSigner {
                     ));
                 }
             }
-            // Past this point the call carries an approval id, so Broker may
-            // sign rather than prepare. Recorded before the call and never
-            // cleared: whatever the response is, or whether one arrives at
-            // all, a later replacement must treat this attempt as one that may
-            // have signed until Broker says otherwise, and must know which id
-            // to ask about.
-            self.record_signing_attempt(state_path, action_id, &state.signing_operation_id)?;
         }
         let mut response = self.broker.sign_exact_payload(request.clone()).await;
         let prior_attempt_stands = response
@@ -663,7 +537,6 @@ impl BrokerExactPayloadSigner {
             state.signing_operation_id = random_operation_id();
             request.signing_operation_id = state.signing_operation_id.clone();
             write_state(state_path, &state)?;
-            self.record_signing_attempt(state_path, action_id, &state.signing_operation_id)?;
             response = self.broker.sign_exact_payload(request).await;
         }
         match response {
@@ -2271,61 +2144,41 @@ mod tests {
             state.expires_at_ms = DecimalU64::new(1);
             write_state(&path, &state).expect("state rewritten");
         }
-
-        fn record(&self, request_id: &str) -> ExactOperationRecord {
-            let bytes = fs::read(self.state_dir().join(format!("{request_id}.op.json")))
-                .expect("operation record");
-            serde_json::from_slice(&bytes).expect("operation record parses")
-        }
     }
 
     fn request_id(byte: char) -> String {
         std::iter::repeat_n(byte, 64).collect()
     }
 
-    /// A request from before this record existed, whose own lifetime had already
-    /// run out by the time this Machine met it. Adopting it has to take the
-    /// signing operation id from the state **as persisted**: the expiry path in
-    /// the same call rotates that id, and the persisted one is the only handle
-    /// Broker has on whatever the previous binary's signing call did.
+    /// A pre-existing state file, written by a binary this one is replacing,
+    /// whose own lifetime had already run out. It is still resumed rather than
+    /// rejected, and the expiry path gives it a fresh signing operation id.
     ///
-    /// Nothing acts on that id now - the record decides nothing - but losing it
-    /// would throw away the only evidence an uncertain attempt can be
-    /// reconciled from by hand.
+    /// No record is kept beside it any more. Nothing read one, and an
+    /// unreadable file that decides nothing is worse than no file: it invites
+    /// the next reader to believe a mechanism is still there.
     #[tokio::test]
-    async fn an_expired_legacy_request_is_adopted_from_the_id_its_state_persisted() {
+    async fn a_request_whose_state_predates_this_binary_is_still_resumed() {
         let broker = Arc::new(MockBroker::default());
         broker.awaiting_owner.store(true, Ordering::SeqCst);
         let scope = Scope::open(&broker);
-        let (first, second) = (request_id('1'), request_id('2'));
+        let first = request_id('1');
         scope.attempt(&first).await.unwrap();
-
-        // What the previous binary left behind: a state file, no operation
-        // record, and a lifetime that has already run out.
         let original = scope.signing_operation(&first);
-        fs::remove_file(scope.state_dir().join(format!("{first}.op.json"))).unwrap();
+
+        // A file left by the version that wrote one. This binary must neither
+        // read it nor trip over it.
+        let stale = scope.state_dir().join(format!("{first}.op.json"));
+        fs::write(&stale, b"{\"schema\":\"bloom.machine_exact_operation.v1\"}").unwrap();
         scope.expire(&first);
 
-        // The retry adopts it, and the expiry path rotates the state's id in
-        // the same call.
         scope.attempt(&first).await.unwrap();
-        assert_ne!(scope.signing_operation(&first), original);
-        let record = scope.record(&first);
-        assert!(record.signing_may_have_started);
-        assert!(
-            record.signing_operations.contains(&original),
-            "adoption must keep the id the state persisted, not the one expiry \
-             replaced it with: {:?}",
-            record.signing_operations
+        assert_ne!(
+            scope.signing_operation(&first),
+            original,
+            "an expired request gets a fresh signing operation id"
         );
-
-        // Nothing replaces it: the record says the history is incomplete, and
-        // that is the state an operator reconciles from.
-        assert!(
-            !record.signing_history_complete,
-            "an adopted request's history is not known to be complete"
-        );
-        let _ = second;
+        assert!(stale.exists(), "and the stale file is left where it was");
     }
 
     async fn flow_once(
