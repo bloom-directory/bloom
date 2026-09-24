@@ -306,6 +306,15 @@ custody triad keeps `18734`. Pass the port explicitly; the launcher uses
 - Candidate B: `--ceremony-port 28736` with different paths.
 - Installed custody: leave `18734` and all installed units alone.
 
+A candidate that serves a hosted-relay surface also needs its own loopback
+relay upstream, where the Broker receives streams from the relay tunnel. The
+launcher selects `--remote-upstream-port PORT`, otherwise
+`BLOOM_TRIAD_DEV_REMOTE_UPSTREAM_PORT`, otherwise `18735` for the custody
+ceremony port and the ceremony port plus 10000 (minus 10000 above 55535) for
+any other. Candidates A and B therefore default to `38735` and `38736`. The
+upstream must differ from the ceremony port. The Broker binds it only while a
+relay surface is active.
+
 The example ports are choices, not reservations. If one is occupied, choose
 another. A fresh-root launch on an occupied port fails and cleans up only its
 own units; it never stops the conflicting listener, restarts shared services,
@@ -500,13 +509,15 @@ The launcher's optional controls are:
 | `BLOOM_TRIAD_DEV_BUILD_PETALS` | Set to `0` only for already-built reviewed Petals |
 | `BLOOM_TRIAD_DEV_SOCKET_TIMEOUT_SECONDS` | Positive launcher socket timeout |
 | `BLOOM_TRIAD_DEV_CEREMONY_PORT` | Ceremony listener port when `--ceremony-port` is absent |
+| `BLOOM_TRIAD_DEV_REMOTE_UPSTREAM_PORT` | Hosted-relay loopback upstream port when `--remote-upstream-port` is absent |
 
 The launcher also accepts `--ceremony-port PORT`. The selected port is the
 explicit flag, otherwise `BLOOM_TRIAD_DEV_CEREMONY_PORT` when set, otherwise
 `18734`. A malformed value fails during argument validation before any build
 or config change. Every launch rewrites the selected numeric `ceremony_port`
 into both the Broker and Signer configs, so reusing a stopped root never keeps
-a silently different old value.
+a silently different old value. The same holds for `--remote-upstream-port`,
+which the launcher writes as `remote_upstream_port` into the Broker config.
 
 Binary overrides are covered [above](#test-the-binaries-you-intended);
 test-specific variables are in [TESTING.md](./TESTING.md#environment-variables).

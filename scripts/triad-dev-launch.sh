@@ -11,6 +11,8 @@ broker_repo=""
 signer_repo=""
 ceremony_port_arg=""
 ceremony_port_arg_set=0
+remote_upstream_port_arg=""
+remote_upstream_port_arg_set=0
 developer_root=""
 machine_home=""
 mount_dir=""
@@ -35,6 +37,7 @@ while [ "$#" -gt 0 ]; do
     --log-dir) need_value "$@"; log_dir="$2"; shift 2 ;;
     --ready-file) need_value "$@"; ready_file="$2"; shift 2 ;;
     --ceremony-port) need_value "$@"; ceremony_port_arg="$2"; ceremony_port_arg_set=1; shift 2 ;;
+    --remote-upstream-port) need_value "$@"; remote_upstream_port_arg="$2"; remote_upstream_port_arg_set=1; shift 2 ;;
     --services-only) services_only=1; shift ;;
     --hosted-relay) hosted_relay=1; shift ;;
     *) die "unknown argument: $1" ;;
@@ -51,34 +54,56 @@ fi
 if [ "$services_only" -eq 1 ] && [ "$hosted_relay" -eq 1 ]; then
   die "--hosted-relay requires the complete Triad; omit --services-only"
 fi
+# Parse one decimal TCP port or fail naming its source. Runs before any build
+# or config mutation, so a malformed value never touches state.
+parse_port() {
+  local source="$1" raw="$2" stripped
+  case "$raw" in
+    ''|*[!0-9]*) die "${source} must be an integer 1 through 65535" ;;
+  esac
+  # Strip leading zeros so ordinary zero-padded input (0028735) keeps
+  # selecting 28735; an all-zeros value collapses and fails the range check.
+  stripped=$raw
+  while [ -n "$stripped" ] && [ "${stripped#0}" != "$stripped" ]; do
+    stripped=${stripped#0}
+  done
+  [ -n "$stripped" ] || stripped=0
+  # Bound the digit count before arithmetic: Bash integer arithmetic wraps on
+  # overflow, so an oversized decimal could otherwise wrap into the valid range
+  # (or onto the custody port). Six or more significant digits always exceed
+  # 65535, while five digits can never overflow the arithmetic.
+  [ "${#stripped}" -le 5 ] || die "${source} must be an integer 1 through 65535"
+  stripped="$((10#$stripped))"
+  [ "$stripped" -ge 1 ] && [ "$stripped" -le 65535 ] ||
+    die "${source} must be an integer 1 through 65535"
+  printf '%s' "$stripped"
+}
 # Ceremony-port selection is explicit flag, otherwise the existing developer
-# environment override, otherwise the custody default. Validate here, before
-# any build or config mutation, so a malformed value never touches state.
+# environment override, otherwise the custody default.
 ceremony_port_raw="18734"
 if [ "$ceremony_port_arg_set" -eq 1 ]; then
   ceremony_port_raw="$ceremony_port_arg"
 elif [ -n "${BLOOM_TRIAD_DEV_CEREMONY_PORT:-}" ]; then
   ceremony_port_raw="$BLOOM_TRIAD_DEV_CEREMONY_PORT"
 fi
-case "$ceremony_port_raw" in
-  ''|*[!0-9]*) die "--ceremony-port (or BLOOM_TRIAD_DEV_CEREMONY_PORT) must be an integer 1 through 65535" ;;
-esac
-# Strip leading zeros so ordinary zero-padded input (0028735) keeps
-# selecting 28735; an all-zeros value collapses and fails the range check.
-stripped_port=$ceremony_port_raw
-while [ -n "$stripped_port" ] && [ "${stripped_port#0}" != "$stripped_port" ]; do
-  stripped_port=${stripped_port#0}
-done
-[ -n "$stripped_port" ] || stripped_port=0
-# Bound the digit count before arithmetic: Bash integer arithmetic wraps on
-# overflow, so an oversized decimal could otherwise wrap into the valid range
-# (or onto the custody port). Six or more significant digits always exceed
-# 65535, while five digits can never overflow the arithmetic.
-[ "${#stripped_port}" -le 5 ] ||
-  die "--ceremony-port (or BLOOM_TRIAD_DEV_CEREMONY_PORT) must be an integer 1 through 65535"
-ceremony_port="$((10#$stripped_port))"
-[ "$ceremony_port" -ge 1 ] && [ "$ceremony_port" -le 65535 ] ||
-  die "--ceremony-port (or BLOOM_TRIAD_DEV_CEREMONY_PORT) must be an integer 1 through 65535"
+ceremony_port="$(parse_port '--ceremony-port (or BLOOM_TRIAD_DEV_CEREMONY_PORT)' "$ceremony_port_raw")"
+# The Broker's loopback hosted-relay upstream follows the same selection. The
+# custody pair keeps 18735; any other ceremony port derives a distinct
+# upstream 10000 away, so candidates on adjacent ceremony ports never collide
+# with each other's upstream or with the installed Triad.
+if [ "$remote_upstream_port_arg_set" -eq 1 ]; then
+  remote_upstream_port="$(parse_port '--remote-upstream-port (or BLOOM_TRIAD_DEV_REMOTE_UPSTREAM_PORT)' "$remote_upstream_port_arg")"
+elif [ -n "${BLOOM_TRIAD_DEV_REMOTE_UPSTREAM_PORT:-}" ]; then
+  remote_upstream_port="$(parse_port '--remote-upstream-port (or BLOOM_TRIAD_DEV_REMOTE_UPSTREAM_PORT)' "$BLOOM_TRIAD_DEV_REMOTE_UPSTREAM_PORT")"
+elif [ "$ceremony_port" -eq 18734 ]; then
+  remote_upstream_port=18735
+elif [ "$ceremony_port" -le 55535 ]; then
+  remote_upstream_port="$((ceremony_port + 10000))"
+else
+  remote_upstream_port="$((ceremony_port - 10000))"
+fi
+[ "$remote_upstream_port" -ne "$ceremony_port" ] ||
+  die "--remote-upstream-port (or BLOOM_TRIAD_DEV_REMOTE_UPSTREAM_PORT) must differ from the ceremony port"
 case "$install_authority_fixture" in
   0|1) ;;
   *) die "BLOOM_TRIAD_DEV_AUTHORITY_FIXTURE must be 0 or 1" ;;
@@ -377,8 +402,10 @@ rewrite_broker_config() {
   temporary="${source}.new.$$"
   jq --arg signer_socket "$signer_socket" --arg digest "$release_digest" \
     --argjson ceremony_port "$ceremony_port" \
+    --argjson remote_upstream_port "$remote_upstream_port" \
     '.signer_socket_path = $signer_socket | .build_digest = $digest |
      .ceremony_port = $ceremony_port |
+     .remote_upstream_port = $remote_upstream_port |
      .network_containment = null | .maximum_requests_per_window = 10000 |
      del(.neutral_landing_enabled)' \
     "$source" > "$temporary"
@@ -467,6 +494,7 @@ env_file="${log_dir}/triad.env"
   printf 'export BLOOM_MACHINE_AUDIT_CHECKPOINT_DIR=%q\n' "$machine_checkpoint_dir"
   printf 'export BLOOM_TRIAD_DEV_CEREMONY_PORT=%q\n' "$ceremony_port"
   printf 'export BLOOM_TRIAD_DEV_CEREMONY_ORIGIN=%q\n' "$ceremony_origin"
+  printf 'export BLOOM_TRIAD_DEV_REMOTE_UPSTREAM_PORT=%q\n' "$remote_upstream_port"
   printf 'export BLOOM_AUTHORITY_EDGE_HISTORY=%q\n' "$authority_edge_history"
   printf 'export BLOOM_MACHINE_IDENTITY=%q\n' "${config_dir}/machine-identity.json"
   printf 'export BLOOM_EDGE_MANIFEST=%q\n' "${config_dir}/edge-manifest.json"
@@ -749,6 +777,7 @@ if [ "$services_only" -eq 1 ]; then
   printf '%s\n' \
     'Bloom triad services are ready; Machine is developer-managed.' \
     "Public ceremony origin: ${ceremony_origin}" \
+    "Hosted-relay upstream: 127.0.0.1:${remote_upstream_port}" \
     'Source triad.env to put the selected debug bloom binary first on PATH;' \
     'then use bloom directly in that terminal:' \
     "  source ${env_file}" \
@@ -861,6 +890,7 @@ if [ -z "$mount_dir" ]; then
   printf '%s\n' \
     'Bloom is ready without a kernel mount.' \
     "Public ceremony origin: ${ceremony_origin}" \
+    "Hosted-relay upstream: 127.0.0.1:${remote_upstream_port}" \
     'Source triad.env to put the selected debug bloom binary first on PATH;' \
     'then use bloom directly in that terminal:' \
     "  source ${env_file}" \

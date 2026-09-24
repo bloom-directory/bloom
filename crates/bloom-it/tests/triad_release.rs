@@ -812,6 +812,7 @@ fn triad_developer_launcher_selects_ceremony_port_without_sibling_checkouts() {
         // Isolate port selection and binary discovery from the ambient
         // developer shell; each case opts back in through `envs`.
         command.env_remove("BLOOM_TRIAD_DEV_CEREMONY_PORT");
+        command.env_remove("BLOOM_TRIAD_DEV_REMOTE_UPSTREAM_PORT");
         command.env_remove("BLOOM_INTEGRATION_MACHINE_BIN");
         command.env_remove("BLOOM_INTEGRATION_BROKER_BIN");
         command.env_remove("BLOOM_INTEGRATION_SIGNER_BIN");
@@ -943,6 +944,84 @@ fn triad_developer_launcher_selects_ceremony_port_without_sibling_checkouts() {
         stderr(&flag_wins)
     );
 
+    // The hosted-relay upstream port shares the ceremony port's parsing and
+    // must never equal the selected ceremony port, whichever source set it.
+    for (extra, envs) in [
+        (vec!["--remote-upstream-port", "bogus"], vec![]),
+        (vec!["--remote-upstream-port", "0"], vec![]),
+        (vec!["--remote-upstream-port", "65536"], vec![]),
+        (
+            vec!["--remote-upstream-port", "18446744073709570350"],
+            vec![],
+        ),
+        (
+            vec![],
+            vec![("BLOOM_TRIAD_DEV_REMOTE_UPSTREAM_PORT", "bogus")],
+        ),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let envs = overrides.iter().copied().chain(envs).collect::<Vec<_>>();
+        let rejected = launch(&isolated_launcher, &extra, &envs, directory.path());
+        assert!(!rejected.status.success(), "extra args: {extra:?}");
+        assert!(
+            stderr(&rejected).contains("--remote-upstream-port")
+                && stderr(&rejected).contains("1 through 65535"),
+            "extra args {extra:?}: {}",
+            stderr(&rejected)
+        );
+    }
+    for (extra, envs) in [
+        (
+            vec![
+                "--ceremony-port",
+                "28735",
+                "--remote-upstream-port",
+                "28735",
+            ],
+            vec![],
+        ),
+        (
+            vec!["--ceremony-port", "28735"],
+            vec![("BLOOM_TRIAD_DEV_REMOTE_UPSTREAM_PORT", "028735")],
+        ),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let envs = overrides.iter().copied().chain(envs).collect::<Vec<_>>();
+        let rejected = launch(&isolated_launcher, &extra, &envs, directory.path());
+        assert!(!rejected.status.success(), "extra args: {extra:?}");
+        assert!(
+            stderr(&rejected).contains("must differ from the ceremony port"),
+            "extra args {extra:?}: {}",
+            stderr(&rejected)
+        );
+    }
+    // A valid distinct upstream reaches the same staging checkpoint, and a
+    // valid flag wins over a malformed environment value.
+    let directory = tempfile::tempdir().unwrap();
+    let envs = overrides
+        .iter()
+        .copied()
+        .chain([("BLOOM_TRIAD_DEV_REMOTE_UPSTREAM_PORT", "bogus")])
+        .collect::<Vec<_>>();
+    let attempted = launch(
+        &isolated_launcher,
+        &[
+            "--ceremony-port",
+            "28735",
+            "--remote-upstream-port",
+            "38735",
+        ],
+        &envs,
+        directory.path(),
+    );
+    assert!(!attempted.status.success());
+    assert!(
+        stderr(&attempted).contains("edge-manifest.json.in")
+            && !stderr(&attempted).contains("1 through 65535"),
+        "{}",
+        stderr(&attempted)
+    );
+
     // Without overrides the sibling requirement still applies once a valid
     // port passes validation.
     let directory = tempfile::tempdir().unwrap();
@@ -958,6 +1037,24 @@ fn triad_developer_launcher_selects_ceremony_port_without_sibling_checkouts() {
         "{}",
         stderr(&missing)
     );
+}
+
+#[test]
+fn triad_developer_launcher_writes_remote_upstream_port_into_broker_config() {
+    let launcher = fs::read_to_string(workspace().join("scripts/triad-dev-launch.sh")).unwrap();
+
+    assert!(launcher.contains("--argjson remote_upstream_port \"$remote_upstream_port\""));
+    assert!(launcher.contains(".remote_upstream_port = $remote_upstream_port |"));
+    assert!(launcher.contains(
+        "printf 'export BLOOM_TRIAD_DEV_REMOTE_UPSTREAM_PORT=%q\\n' \"$remote_upstream_port\""
+    ));
+    // The custody pair keeps the installed upstream; other candidates derive
+    // a distinct one so adjacent ceremony ports never share an upstream.
+    assert!(
+        launcher
+            .contains("elif [ \"$ceremony_port\" -eq 18734 ]; then\n  remote_upstream_port=18735")
+    );
+    assert!(launcher.contains("remote_upstream_port=\"$((ceremony_port + 10000))\""));
 }
 
 #[test]
