@@ -8,8 +8,8 @@ release_dir="$script_dir/release"
 usage() {
   cat >&2 <<'EOF'
 usage:
-  packaging/triad/release.sh build (linux|macos) --output-dir DIR [--broker-root DIR] [--signer-root DIR] [--source-date-epoch INTEGER] [--candidate-signing-key FILE]
-  packaging/triad/release.sh sign (linux|macos) CANDIDATE --output-dir DIR --signing-key FILE --pinned-public-key FILE --source-date-epoch INTEGER --version X.Y.Z --machine-sha SHA --broker-sha SHA --signer-sha SHA
+  packaging/triad/release.sh build (linux|linux-aarch64|macos) --output-dir DIR [--broker-root DIR] [--signer-root DIR] [--source-date-epoch INTEGER] [--candidate-signing-key FILE]
+  packaging/triad/release.sh sign (linux|linux-aarch64|macos) CANDIDATE --output-dir DIR --signing-key FILE --pinned-public-key FILE --source-date-epoch INTEGER --version X.Y.Z --machine-sha SHA --broker-sha SHA --signer-sha SHA
 EOF
   exit 64
 }
@@ -21,8 +21,8 @@ die() {
 
 require_platform() {
   case "$1" in
-    linux|macos) ;;
-    *) die "platform must be linux or macos" 64 ;;
+    linux|linux-aarch64|macos) ;;
+    *) die "platform must be linux, linux-aarch64, or macos" 64 ;;
   esac
 }
 
@@ -67,6 +67,10 @@ require_host_platform() {
       [[ "$kernel" == Linux && "$architecture" == x86_64 ]] ||
         die "linux release builds require a Linux x86_64 host" 69
       ;;
+    linux-aarch64)
+      [[ "$kernel" == Linux && "$architecture" == aarch64 ]] ||
+        die "linux-aarch64 release builds require a Linux aarch64 host" 69
+      ;;
     macos)
       [[ "$kernel" == Darwin && "$architecture" == arm64 ]] ||
         die "macos release builds require a Darwin arm64 host" 69
@@ -83,6 +87,11 @@ require_staged_architecture() {
         [[ "$description" == *"ELF 64-bit"* &&
           ( "$description" == *"x86-64"* || "$description" == *"x86_64"* ) ]] ||
           die "$binary is not an x86-64 ELF release binary"
+        ;;
+      linux-aarch64)
+        [[ "$description" == *"ELF 64-bit"* &&
+          ( "$description" == *"ARM aarch64"* || "$description" == *"AArch64"* ) ]] ||
+          die "$binary is not an aarch64 ELF release binary"
         ;;
       macos)
         [[ "$description" == *"Mach-O 64-bit executable arm64"* ||
@@ -315,7 +324,7 @@ build_candidate() {
   tar -xzf "$work/dist-a/$artifact_name" -C "$work/verified"
   bundle="$work/verified/bloom-triad"
   case "$platform" in
-    linux) smoke_linux_installer "$bundle" "$work" ;;
+    linux|linux-aarch64) smoke_linux_installer "$bundle" "$work" ;;
     macos) smoke_macos_installer "$bundle" "$work" ;;
   esac
 
@@ -405,6 +414,10 @@ sign_candidate() {
     linux)
       printf 'linux\n' >"$payload/PLATFORM_CLAIM"
       artifact_name="bloom-triad-linux-x86_64.tar.gz"
+      ;;
+    linux-aarch64)
+      printf 'linux\n' >"$payload/PLATFORM_CLAIM"
+      artifact_name="bloom-triad-linux-aarch64.tar.gz"
       ;;
     macos)
       printf 'macos-unix-principals\n' >"$payload/PLATFORM_CLAIM"
