@@ -119,9 +119,17 @@ case "$relay_timeout_seconds" in
   ''|*[!0-9]*|0) die "BLOOM_TRIAD_DEV_RELAY_TIMEOUT_SECONDS must be a positive integer" ;;
 esac
 if [ "$hosted_relay" -eq 1 ]; then
+  # Default to the reviewed public pins the signed release payload ships, so
+  # a candidate trusts exactly what an installed Triad trusts. Overriding
+  # them is all-or-nothing: one custom pin beside a packaged one is a mistake.
+  if [ -z "${BLOOM_TRIAD_DEV_RELAY_CONTROL_CA_FILE:-}" ] &&
+     [ -z "${BLOOM_TRIAD_DEV_RELAY_RECEIPT_KEY_FILE:-}" ]; then
+    export BLOOM_TRIAD_DEV_RELAY_CONTROL_CA_FILE="${repo_root}/packaging/triad/relay/control-ca.pem"
+    export BLOOM_TRIAD_DEV_RELAY_RECEIPT_KEY_FILE="${repo_root}/packaging/triad/relay/receipt-public-key.hex"
+  fi
   [ -n "${BLOOM_TRIAD_DEV_RELAY_CONTROL_CA_FILE:-}" ] &&
     [ -n "${BLOOM_TRIAD_DEV_RELAY_RECEIPT_KEY_FILE:-}" ] ||
-    die "--hosted-relay requires both BLOOM_TRIAD_DEV_RELAY_CONTROL_CA_FILE and BLOOM_TRIAD_DEV_RELAY_RECEIPT_KEY_FILE"
+    die "--hosted-relay requires both BLOOM_TRIAD_DEV_RELAY_CONTROL_CA_FILE and BLOOM_TRIAD_DEV_RELAY_RECEIPT_KEY_FILE, or neither to use the packaged pins"
 fi
 socket_wait_attempts=$((socket_timeout_seconds * 10))
 
@@ -882,6 +890,11 @@ until machine_cli serve triad-health-check "$release_digest" >/dev/null 2>&1; do
 done
 if [ "$hosted_relay" -eq 1 ]; then
   # The exact candidate Signer CLI owns all relay administration and persisted state.
+  # Its harness build accepts --signer-uid only after validating the same
+  # developer identity and manifest the Signer service was started with.
+  export BLOOM_TRIAD_DEVELOPER_ROOT="$developer_root"
+  export BLOOM_SIGNER_IDENTITY="${config_dir}/signer-identity.json"
+  export BLOOM_EDGE_MANIFEST="${config_dir}/edge-manifest.json"
   source "${repo_root}/scripts/lib/triad-dev-hosted-relay.sh"
   wait_for_hosted_relay
 fi

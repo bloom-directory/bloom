@@ -206,12 +206,15 @@ Record the actual checkout revisions and dirty state as described under
 ### Hosted-relay developer acceptance
 
 On macOS, a `triad-dev-harness` build can provision a disposable hosted relay
-installation without elevating the test services. Set both public trust-pin
-inputs before invoking the launcher:
+installation without elevating the test services. By default the launcher
+trusts the same public pins the signed release payload ships,
+`packaging/triad/relay/control-ca.pem` and `receipt-public-key.hex` (see
+[hosted relay trust](./packaging/triad/relay/README.md)). They are public, so
+they live in the repository. To target another relay, set both
+`BLOOM_TRIAD_DEV_RELAY_CONTROL_CA_FILE` and
+`BLOOM_TRIAD_DEV_RELAY_RECEIPT_KEY_FILE`; setting only one fails.
 
 ```sh
-BLOOM_TRIAD_DEV_RELAY_CONTROL_CA_FILE=/restricted/relay-control-ca.pem \
-BLOOM_TRIAD_DEV_RELAY_RECEIPT_KEY_FILE=/restricted/receipt-public-key.hex \
 BLOOM_TRIAD_DEV_MACHINE_CONFIG=/path/to/disposable-machine.toml \
 BLOOM_INTEGRATION_MACHINE_BIN=/path/to/candidate/bloom \
 BLOOM_INTEGRATION_BROKER_BIN=/path/to/candidate/bloom-broker \

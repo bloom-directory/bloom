@@ -10,12 +10,13 @@ launcher_args=(
   --log-dir "$test_root/logs"
   --ready-file "$test_root/ready"
 )
+# Omitting both pins selects the packaged ones; supplying only one fails.
 if env -u BLOOM_TRIAD_DEV_RELAY_CONTROL_CA_FILE \
-  -u BLOOM_TRIAD_DEV_RELAY_RECEIPT_KEY_FILE \
+  BLOOM_TRIAD_DEV_RELAY_RECEIPT_KEY_FILE="$repo_root/packaging/triad/relay/receipt-public-key.hex" \
   "$repo_root/scripts/triad-dev-launch.sh" \
     "${launcher_args[@]}" --hosted-relay \
     > "$test_root/missing-pins.out" 2>&1; then
-  printf 'launcher accepted hosted relay without trust pins\n' >&2
+  printf 'launcher accepted hosted relay with only one trust pin\n' >&2
   exit 1
 fi
 grep -q 'requires both BLOOM_TRIAD_DEV_RELAY_CONTROL_CA_FILE' \
