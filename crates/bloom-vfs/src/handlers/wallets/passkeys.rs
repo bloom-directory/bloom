@@ -5,7 +5,7 @@
 //!     name                           writable Machine-only nickname
 //!     surface  created  state  credential_id
 //! passkeys/by-name/<nickname>        symlink to its passkey directory
-//! passkeys/new                       write `local` or `remote` to enroll
+//! passkeys/new                       write `remote`, `local` or nothing to enroll
 //! passkeys/latest                    symlink to the newest enrollment
 //! passkeys/enrollments/<operation>/  url  status  status.json  cancel
 //! ```
@@ -17,8 +17,10 @@
 //! keyed by full credential ID. They never reach Broker or Signer, so they
 //! cannot appear on a ceremony page, and renaming needs no ceremony.
 //!
-//! Enrollment adds a passkey on the other surface through Broker's
-//! cross-surface ceremony. As with registrations, listing and GETATTR stay
+//! Enrollment adds a passkey on another device through Broker's paired
+//! ceremony; Broker picks which existing passkey approves. A device that
+//! already holds one of the wallet's passkeys ends as `already_registered`
+//! with nothing enrolled. As with registrations, listing and GETATTR stay
 //! local; only reading `url`, `status` or `status.json` asks Broker.
 
 use super::*;
@@ -62,6 +64,7 @@ fn terminal(state: CeremonyState) -> bool {
             | CeremonyState::Cancelled
             | CeremonyState::Expired
             | CeremonyState::Failed
+            | CeremonyState::AlreadyRegistered
     )
 }
 
@@ -318,19 +321,25 @@ impl WalletsHandler {
         wallet: &str,
         data: &[u8],
     ) -> Result<(), HandlerError> {
+        // An empty write takes the default: the hosted surface when it is
+        // effective, otherwise this host's browser.
         let destination = match std::str::from_utf8(data).map(str::trim) {
+            Ok("") => CeremonySurfaceSelection::Default,
             Ok("remote") => CeremonySurfaceSelection::Remote,
             Ok("local") => CeremonySurfaceSelection::Local,
             _ => {
                 return Err(HandlerError::invalid(
-                    "write `remote` or `local` to choose where the new passkey is enrolled",
+                    "write nothing or `remote` for the default surface, or `local` for this host's browser",
                 ));
             }
         };
         // A shell retry or a replayed NFS write must not start a second
         // enrollment while one to the same surface is still usable.
         for (_, record) in self.enrollment_records(wallet)? {
-            if record.destination == destination && !terminal(record.ceremony_state) {
+            if (destination == CeremonySurfaceSelection::Default
+                || record.destination == destination)
+                && !terminal(record.ceremony_state)
+            {
                 let refreshed = self
                     .enrollment_projection(wallet, record.operation_id.as_str())
                     .await?;
@@ -350,7 +359,16 @@ impl WalletsHandler {
                 destination,
             })
             .await
-            .map_err(|error| HandlerError::backend(error.to_string()))?;
+            .map_err(|error| {
+                // No active wallet passkey can approve on any usable surface.
+                // Broker refuses before a link exists, and repeating the
+                // write cannot change that.
+                if error.code == bloom_broker_api::ProtocolErrorCode::ApprovalNotFound {
+                    HandlerError::OperationNotPermitted
+                } else {
+                    HandlerError::backend(error.to_string())
+                }
+            })?;
         if prepared.operation_id != operation_id
             || prepared.state != CeremonyState::AwaitingUser
             || prepared.destination_url.trim().is_empty()
@@ -360,6 +378,16 @@ impl WalletsHandler {
                 "Broker returned an invalid passkey enrollment prepare response",
             ));
         }
+        // Record the surface Broker chose, so `status.json` names it.
+        let destination = match destination {
+            CeremonySurfaceSelection::Default
+                if prepared.destination_url.starts_with("https://") =>
+            {
+                CeremonySurfaceSelection::Remote
+            }
+            CeremonySurfaceSelection::Default => CeremonySurfaceSelection::Local,
+            chosen => chosen,
+        };
         let record = PasskeyEnrollmentProjection {
             schema: ENROLLMENT_SCHEMA.into(),
             wallet: wallet.to_owned(),

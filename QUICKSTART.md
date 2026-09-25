@@ -212,13 +212,19 @@ without `sudo`. The installer already provisions within its root step.
 `provision` retries hosted setup with the installation's protected identity;
 it never accepts an arbitrary domain.
 
-To add access on the other origin, run `bloom wallet add-passkey main --to local`
-or `--to remote`. Open the returned destination URL first, keep that tab open,
-then open its source-approval link where your existing passkey is available.
-Compare the displayed code and both origins, authorize with the existing passkey,
-and return to the destination to create the new passkey. The new credential
-becomes active only after both legs finish; wallet addresses remain unchanged.
-Refreshing or closing the destination before completion requires a fresh pairing.
+To add a passkey on another device, such as a phone, run
+`bloom wallet add-passkey main`. The new passkey is remote by default; add
+`--to local` for a browser on this host. Open the returned URL on the new
+device first and keep that page open. It gives you an approval link: open it on
+a device that already has a passkey for the wallet (the page can share or copy
+it), compare the six-digit code, and approve there. Then return to the new
+device to create its passkey. Bloom chooses which existing passkey approves,
+preferring one on the new passkey's own surface. The new credential becomes
+active only after both steps finish; wallet addresses remain unchanged.
+Refreshing or closing the new device's page before completion requires a fresh
+pairing. If the new device already holds one of the wallet's passkeys, for
+example through iCloud Keychain or another passkey provider that syncs, nothing
+is added and the page says that device can already approve for the wallet.
 
 Machine status and VFS cannot switch modes. Localhost-only switching requires
 local credential coverage for every active passkey-dependent wallet; coverage

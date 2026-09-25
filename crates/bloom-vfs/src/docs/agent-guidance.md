@@ -224,20 +224,52 @@ be started again with a fresh write to `wallets/recover`.
 `wallets/<wallet>/passkeys/` lists the wallet's passkeys, one directory each,
 named `<created date>-<surface>-<digest>`. Each holds `surface` (`local` for
 this host's browser, `remote` for the relay), `created`, `state`,
-`credential_id`, and `name`. To add a passkey on the other surface, for
-example a phone, write the surface to `new` and follow `latest`:
+`credential_id`, and `name`.
+
+To add a passkey on another device, such as a phone, write the new passkey's
+surface to `new` and follow `latest`. Use `remote` unless the human asks for
+this host's browser: a remote passkey works from any device through the relay,
+while `local` only works in a browser on this host. An empty write picks
+`remote` when the relay is available and `local` otherwise.
 
 ```sh
 echo remote > wallets/<wallet>/passkeys/new
 cat wallets/<wallet>/passkeys/latest/url      # forward the complete link to the human
-cat wallets/<wallet>/passkeys/latest/status   # awaiting_user, then succeeded
+cat wallets/<wallet>/passkeys/latest/status   # awaiting_user, then a final state
 ```
 
-The human approves with an existing passkey of the wallet, then creates the
-new one on the chosen surface. The link is single-use: it disappears once
-opened, while `status` stays readable. Write to `latest/cancel` to abandon an
-enrollment. Every enrollment stays under `enrollments/<operation>/`. Writing
-`new` again while one to the same surface is still waiting reuses it.
+Tell the human to open the link on the new device. That page gives them an
+approval link and a six-digit code: they open the approval link on a device
+that already has a passkey for the wallet (the page can share or copy it),
+check that both pages show the same code, and approve there. Bloom chooses
+which existing passkey approves: one on the new passkey's own surface when the
+wallet has it, otherwise one on the other surface. You do not choose it.
+
+When `status` stops being `awaiting_user`, tell the human what happened:
+
+- `succeeded` — the new passkey is enrolled. Name it as described below.
+- `already_registered` — nothing was added, and nothing is wrong. The new
+  device's passkey provider already holds one of this wallet's passkeys,
+  usually because passkeys sync between the human's devices (for example
+  iCloud Keychain, Google Password Manager or 1Password) or because that
+  device was registered earlier. Tell the human that device can already
+  approve for the wallet and nothing else is needed. Do not retry: another
+  attempt from that device ends the same way.
+- `cancelled` or `expired` — nothing changed. Start again with a fresh write
+  to `new` only if the human still wants the passkey.
+- `failed` — nothing changed. Offer to start again with a fresh write to
+  `new`.
+
+If the write to `new` fails with *Operation not permitted*, the wallet has no
+active passkey that could approve an addition on any usable surface, for
+example when all of its passkeys are remote and the relay is unavailable.
+Repeating the write does not help. Tell the human, and check `passkeys/` and
+the relay status.
+
+The link is single-use: it disappears once opened, while `status` stays
+readable. Write to `latest/cancel` to abandon an enrollment. Every enrollment
+stays under `enrollments/<operation>/`. Writing `new` again while one to the
+same surface is still waiting reuses it.
 
 After enrollment succeeds, ask the human what to call the new passkey and
 write it to that passkey's `name`; `by-name/<name>` then links to it. Names

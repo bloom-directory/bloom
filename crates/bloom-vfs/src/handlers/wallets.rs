@@ -10555,6 +10555,8 @@ value = "0""#,
             requests: Mutex<Vec<MachineBrokerRequest>>,
             state: Mutex<CeremonyState>,
             url_spent: Mutex<bool>,
+            /// Refuse prepare as Broker does when no passkey could approve.
+            refuse: Mutex<bool>,
         }
 
         impl bloom_broker_api::MachineBrokerService for PasskeyBroker {
@@ -10578,6 +10580,14 @@ value = "0""#,
                             receipt_digest: None,
                         };
                     match request {
+                        MachineBrokerRequest::CredentialCrossSurfacePrepare(_)
+                            if *self.refuse.lock().unwrap() =>
+                        {
+                            Err(ProtocolError::new(
+                                ProtocolErrorCode::ApprovalNotFound,
+                                "wallet alice has no active passkey that can approve adding another",
+                            ))
+                        }
                         MachineBrokerRequest::CredentialCrossSurfacePrepare(request) => {
                             *self.state.lock().unwrap() = CeremonyState::AwaitingUser;
                             *self.url_spent.lock().unwrap() = false;
@@ -10637,6 +10647,7 @@ value = "0""#,
                 requests: Mutex::new(Vec::new()),
                 state: Mutex::new(CeremonyState::AwaitingUser),
                 url_spent: Mutex::new(false),
+                refuse: Mutex::new(false),
             });
             let handler = handler.with_broker(Some(MachineBrokerClient::new(broker.clone())));
 
@@ -10727,6 +10738,71 @@ value = "0""#,
             assert_eq!(
                 names(&handler, "/alice/passkeys/enrollments").await.len(),
                 2
+            );
+        }
+
+        #[tokio::test]
+        async fn default_enrollment_reports_an_already_registered_device_and_refusals() {
+            let (_tmp, handler) = passkey_handler(vec![credential(1, None, LAPTOP_MS)]);
+            let broker = Arc::new(PasskeyBroker {
+                requests: Mutex::new(Vec::new()),
+                state: Mutex::new(CeremonyState::AwaitingUser),
+                url_spent: Mutex::new(false),
+                refuse: Mutex::new(false),
+            });
+            let handler = handler.with_broker(Some(MachineBrokerClient::new(broker.clone())));
+
+            // An empty write asks Broker for its default surface and records
+            // the one it chose.
+            handler
+                .write(&path("/alice/passkeys/new"), b"\n")
+                .await
+                .unwrap();
+            assert_eq!(prepares(&broker), vec![CeremonySurfaceSelection::Default]);
+            let target = handler
+                .lookup(&path("/alice/passkeys/latest"))
+                .await
+                .unwrap()
+                .link_target
+                .unwrap();
+            let dir = format!("/alice/passkeys/{target}");
+            let status: serde_json::Value = serde_json::from_slice(
+                &handler
+                    .read(&path(&format!("{dir}/status.json")))
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(status["destination"], "remote");
+
+            // The new device already held a wallet passkey: a final state
+            // that neither blocks nor is cancellable.
+            *broker.state.lock().unwrap() = CeremonyState::AlreadyRegistered;
+            assert_eq!(
+                text(&handler, &format!("{dir}/status")).await,
+                "already_registered\n"
+            );
+            assert!(
+                handler
+                    .write(&path(&format!("{dir}/cancel")), b"")
+                    .await
+                    .is_err()
+            );
+
+            // With no passkey able to approve, Broker refuses before any link
+            // exists, and the write says so as a gate rather than a fault.
+            *broker.refuse.lock().unwrap() = true;
+            let refused = handler
+                .write(&path("/alice/passkeys/new"), b"remote")
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(refused, HandlerError::OperationNotPermitted),
+                "{refused:?}"
+            );
+            assert_eq!(
+                names(&handler, "/alice/passkeys/enrollments").await.len(),
+                1
             );
         }
     }

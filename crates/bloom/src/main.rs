@@ -1592,7 +1592,11 @@ async fn execute_machine_command(
                 .await?
             }
         }
-        MachineCommand::WalletAddPasskey { name, local } => {
+        MachineCommand::WalletAddPasskey {
+            name,
+            local,
+            remote,
+        } => {
             use rand::RngCore as _;
             validate_wallet_name(&name).context("wallet name must be a safe path segment")?;
             let client = daemon.machine_broker.as_ref().ok_or_else(|| {
@@ -1610,8 +1614,10 @@ async fn execute_machine_command(
                         wallet_id: bloom_broker_api::Token::new(name)?,
                         destination: if local {
                             bloom_broker_api::CeremonySurfaceSelection::Local
-                        } else {
+                        } else if remote {
                             bloom_broker_api::CeremonySurfaceSelection::Remote
+                        } else {
+                            bloom_broker_api::CeremonySurfaceSelection::Default
                         },
                     },
                 )
@@ -2711,12 +2717,14 @@ enum PasskeyDestination {
 
 #[derive(Subcommand, Debug)]
 enum WalletCmd {
-    /// Add a passkey on another surface using an existing wallet passkey.
+    /// Add a passkey on another device, approved by a passkey the wallet
+    /// already has.
     AddPasskey {
         name: String,
-        /// Surface where the new passkey will be enrolled.
+        /// Surface for the new passkey. Defaults to remote (the hosted relay)
+        /// when it is available, otherwise this host's browser.
         #[arg(long, value_enum)]
-        to: PasskeyDestination,
+        to: Option<PasskeyDestination>,
     },
     /// Start a Broker-hosted wallet registration ceremony.
     New {
@@ -3749,7 +3757,8 @@ async fn run(cli: Cli) -> Result<()> {
                 &client_endpoint,
                 MachineCommand::WalletAddPasskey {
                     name,
-                    local: matches!(to, PasskeyDestination::Local),
+                    local: matches!(to, Some(PasskeyDestination::Local)),
+                    remote: matches!(to, Some(PasskeyDestination::Remote)),
                 },
             )
             .await
@@ -5050,7 +5059,7 @@ mod tests {
     }
 
     #[test]
-    fn passkey_add_requires_an_explicit_bounded_destination() {
+    fn passkey_add_defaults_its_destination_and_bounds_explicit_ones() {
         for destination in ["local", "remote"] {
             assert!(
                 Cli::try_parse_from([
@@ -5064,7 +5073,7 @@ mod tests {
                 .is_ok()
             );
         }
-        assert!(Cli::try_parse_from(["bloom", "wallet", "add-passkey", "main"]).is_err());
+        assert!(Cli::try_parse_from(["bloom", "wallet", "add-passkey", "main"]).is_ok());
         assert!(
             Cli::try_parse_from([
                 "bloom",
