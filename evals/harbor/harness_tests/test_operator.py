@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 from argparse import Namespace
@@ -11,7 +13,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from harness.__main__ import counter_sidecar as main_counter_sidecar
 from harness.core import EvalError
+from harness.hyperliquid_approve_builder_fee import HyperliquidApproveBuilderFeeEval
+from harness.hyperliquid_order_cancel import MAX_SESSION_CEREMONIES
 from harness.operator import (
     DEFAULT_STATE_RELATIVE,
     MAINNET_ACK,
@@ -24,10 +29,12 @@ from harness.operator import (
     definition_env,
     handoff_metadata,
     initialize,
+    operator_definition,
     parser,
     redact,
     require_no_pending_owner_requests,
     run_or_recover,
+    shared_counter,
     validate_lineage,
 )
 
@@ -80,6 +87,35 @@ class OperatorStateTests(unittest.TestCase):
         self.assertFalse(list(self.root.glob(".state.json.new-*")))
         with self.assertRaisesRegex(EvalError, "non-advancing"):
             self.store.update_counter(8)
+
+    def test_verify_writable_proves_the_path_without_moving_the_counter(self) -> None:
+        before = self.store.read()
+        self.store.verify_writable()
+        after = self.store.read()
+        self.assertEqual(after["next_sign_count"], before["next_sign_count"])
+        # Same bytes, so a preflight check can never make a run skip a
+        # counter, and it leaves no temporary behind.
+        self.assertEqual(after, before)
+        self.assertFalse(list(self.root.glob(".state.json.new-*")))
+        self.assertEqual(stat.S_IMODE(self.store.path.stat().st_mode), 0o600)
+
+    @unittest.skipIf(
+        hasattr(os, "geteuid") and os.geteuid() == 0,
+        "root bypasses the permission bits this test relies on",
+    )
+    def test_verify_writable_fails_on_a_read_only_directory(self) -> None:
+        # The real failure mode: update_counter writes through a temporary
+        # in the parent directory, so a writable file inside a read-only
+        # directory still cannot be committed.
+        original = stat.S_IMODE(self.root.stat().st_mode)
+        self.root.chmod(0o500)
+        try:
+            with self.assertRaises(OSError):
+                self.store.verify_writable()
+        finally:
+            # Restore here, not via addCleanup: tearDown removes the
+            # directory first, and a read-only parent would defeat it.
+            self.root.chmod(original)
 
     def test_default_handoff_is_repository_local_and_self_describing(self) -> None:
         args = parser(self.root).parse_args(["status"])
@@ -192,8 +228,8 @@ class OperatorStateTests(unittest.TestCase):
                 side_effect=AssertionError("recovery must not validate lineage"),
             ),
             mock.patch(
-                "harness.operator.HyperliquidOrderCancelEval",
-                return_value=definition,
+                "harness.operator.operator_definition",
+                return_value=(definition, None),
             ),
             mock.patch("harness.operator.PolicyLifecycle", return_value=policy),
             mock.patch("builtins.print"),
@@ -239,8 +275,8 @@ class OperatorStateTests(unittest.TestCase):
         with (
             mock.patch("harness.operator.validate_lineage"),
             mock.patch(
-                "harness.operator.HyperliquidOrderCancelEval",
-                return_value=definition,
+                "harness.operator.operator_definition",
+                return_value=(definition, None),
             ),
             mock.patch("harness.operator.PolicyLifecycle", return_value=policy),
             mock.patch("builtins.print"),
@@ -785,6 +821,197 @@ class PolicyRecoveryTests(unittest.TestCase):
                 "eval-wallet",
                 "b" * 64,
             )
+
+
+class SharedCounterTopologyTests(unittest.TestCase):
+    """Operator runs and direct runs spend one counter sequence per passkey."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        # Never touch the real per-user record from a test.
+        self.counter_dir = self.root / "eval-counters"
+        env = mock.patch.dict(os.environ, {"BLOOM_EVAL_COUNTER_DIR": str(self.counter_dir)})
+        env.start()
+        self.addCleanup(env.stop)
+        self.seed = self.root / "seed"
+        self.seed.write_text("shared-authenticator-seed")
+        self.seed.chmod(0o600)
+        self.store = StateStore(self.root / "state.json")
+        handoff, recovery = handoff_metadata(self.store)
+        self.state = {
+            "schema": STATE_SCHEMA,
+            "purpose": STATE_PURPOSE,
+            "handoff": handoff,
+            "field_guide": {
+                "paths": "paths",
+                "lineage": "lineage",
+                "next_sign_count": "counter",
+                "pending_policy_recovery": "recovery marker",
+            },
+            "recovery": recovery,
+            "next_sign_count": 7,
+            "wallet_id": "eval-wallet",
+            "wallet_address": "0x" + "a" * 40,
+            "package_hash": "b" * 64,
+            "model": "codex",
+            "agent_name": None,
+            "pending_policy_recovery": None,
+            "paths": {
+                "triad_root": str(self.root / "triad"),
+                "bloom_mount": str(self.root / "mount"),
+                "petal_owner_record": str(self.root / "owner.json"),
+                "petal_store": str(self.root / "store"),
+                "provenance_catalog": str(self.root / "catalog.json"),
+                "authenticator_seed_file": str(self.seed),
+                "debug_driver": str(self.root / "driver"),
+                "lock_file": str(self.root / "lock"),
+                "jobs_dir": str(self.root / "jobs"),
+            },
+        }
+        self.store.write(self.state)
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def lifecycle(self) -> tuple[PolicyLifecycle, dict[str, object]]:
+        definition = FakePolicyDefinition(self.root)
+        original = {
+            "allowed_destinations": [],
+            "allowed_petal_packages": [],
+            "maximum_approval_lifetime_ms": 2_592_000_000,
+            "required_verifiers": [],
+            "wallet_id": "eval-wallet",
+        }
+        (definition.wallet_root / "policy.json").write_bytes(canonical_json(original))
+        lifecycle = PolicyLifecycle(
+            self.store,
+            self.store.read(),
+            definition,  # type: ignore[arg-type]
+            sidecar=shared_counter(self.state),
+        )
+        lifecycle._wait_challenge = mock.Mock(
+            return_value={
+                "operation_id": "operation",
+                "ceremony_url": "http://localhost:18734/ceremony/" + "A" * 43,
+            }
+        )
+        lifecycle._commit_policy_replay = mock.Mock()
+        return lifecycle, original
+
+    def run_policy_ceremony(self) -> list[int]:
+        lifecycle, original = self.lifecycle()
+        signed: list[int] = []
+
+        def driver(cmd, **_kwargs):
+            signed.append(int(cmd[cmd.index("--sign-count") + 1]))
+            return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+        target = canonical_json(dict(original, allowed_petal_packages=["b" * 64]))
+        with mock.patch("harness.operator.subprocess.run", side_effect=driver):
+            lifecycle.apply(target)
+        return signed
+
+    def test_policy_ceremony_skips_counters_a_direct_run_already_spent(self) -> None:
+        # A direct run on this passkey has spent counters up to 19, but the
+        # operator's own state file still says 7. It must sign 20, never 7.
+        shared_counter(self.state).write(20)
+        self.assertEqual(self.run_policy_ceremony(), [20])
+        self.assertEqual(shared_counter(self.state).read(), 21)
+        self.assertEqual(self.store.read()["next_sign_count"], 21, "state mirrors the shared record")
+
+    def test_a_direct_run_after_an_operator_ceremony_does_not_reuse_its_counter(self) -> None:
+        self.assertEqual(self.run_policy_ceremony(), [7])
+        direct = HyperliquidApproveBuilderFeeEval(
+            self.root,
+            {
+                "BLOOM_EVAL_AUTHENTICATOR_SIGN_COUNT": "4",
+                "BLOOM_EVAL_AUTHENTICATOR_SEED_FILE": str(self.seed),
+            },
+        )
+        with mock.patch.dict(os.environ, {"BLOOM_EVAL_AUTHENTICATOR_SEED_FILE": str(self.seed)}):
+            direct.attach_counter_sidecar(main_counter_sidecar())
+        start = direct.reserve_run_counters(direct._require_sign_count())
+        self.assertEqual(start, 8, "the direct run starts past the operator's spent counter")
+
+    def test_operator_definition_reserves_from_the_record_a_direct_run_uses(self) -> None:
+        definition, sidecar = operator_definition(self.root, self.state, self.store)
+        with mock.patch.dict(os.environ, {"BLOOM_EVAL_AUTHENTICATOR_SEED_FILE": str(self.seed)}):
+            self.assertEqual(sidecar.path, main_counter_sidecar().path, "both entry points share one record")
+        self.assertTrue(sidecar.path.is_relative_to(self.counter_dir))
+        start = definition.reserve_run_counters(definition._require_sign_count())
+        self.assertEqual(start, 7)
+        self.assertEqual(sidecar.read(), 7 + MAX_SESSION_CEREMONIES)
+        self.assertEqual(
+            self.store.read()["next_sign_count"],
+            7 + MAX_SESSION_CEREMONIES,
+            "the operator state file mirrors the reservation",
+        )
+
+    def test_concurrent_operator_and_direct_processes_never_share_a_counter(self) -> None:
+        harbor = Path(__file__).resolve().parents[1]
+        env = dict(
+            os.environ,
+            BLOOM_EVAL_COUNTER_DIR=str(self.counter_dir),
+            BLOOM_EVAL_AUTHENTICATOR_SEED_FILE=str(self.seed),
+        )
+        operator_code = (
+            "from harness.operator import shared_counter\n"
+            f"print(shared_counter({{'paths': {{'authenticator_seed_file': {str(self.seed)!r}}}}}).reserve(4))\n"
+        )
+        direct_code = "from harness.__main__ import counter_sidecar\nprint(counter_sidecar().reserve(4))\n"
+        workers = [
+            subprocess.Popen(
+                [sys.executable, "-c", code], cwd=harbor, env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            for code in [operator_code, direct_code] * 4
+        ]
+        signed = []
+        for worker in workers:
+            out, err = worker.communicate(timeout=60)
+            self.assertEqual(worker.returncode, 0, err)
+            signed.append(int(out.strip()))
+        self.assertEqual(sorted(signed), list(range(4, 12)), "operator and direct runs shared a counter")
+        self.assertEqual(shared_counter(self.state).read(), 12)
+
+    def test_run_or_recover_hands_the_shared_record_to_policy_ceremonies(self) -> None:
+        # The run summary reads lineage, as in the existing run_or_recover tests.
+        current = self.store.read()
+        current["lineage"] = {}
+        self.store.write(current)
+        atomic_write(self.store.backup_path, b"protected backup\n")
+
+        def restore() -> None:
+            current = self.store.read()
+            current["pending_policy_recovery"] = None
+            self.store.write(current)
+            self.store.backup_path.unlink()
+
+        sidecar = object()
+        with (
+            mock.patch(
+                "harness.operator.operator_definition",
+                return_value=(SimpleNamespace(phase_timings={}), sidecar),
+            ) as build,
+            mock.patch(
+                "harness.operator.PolicyLifecycle",
+                return_value=SimpleNamespace(restore=restore),
+            ) as lifecycle_cls,
+            mock.patch("builtins.print"),
+        ):
+            run_or_recover(
+                Namespace(state=self.store.path, ack=MAINNET_ACK), self.root, recover_only=True
+            )
+        build.assert_called_once()
+        self.assertIs(lifecycle_cls.call_args.kwargs.get("sidecar"), sidecar)
+
+    def test_mirroring_a_non_advancing_counter_is_a_no_op(self) -> None:
+        self.store.raise_counter_to(5)
+        self.store.raise_counter_to(7)
+        self.assertEqual(self.store.read()["next_sign_count"], 7)
+        self.store.raise_counter_to(9)
+        self.assertEqual(self.store.read()["next_sign_count"], 9)
 
 
 if __name__ == "__main__":

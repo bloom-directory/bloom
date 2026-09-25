@@ -1,0 +1,31 @@
+schema_version = "1.4"
+
+[task]
+name = "bloom/hyperliquid-approve-builder-fee"
+version = "0.1.0"
+authors = [{ name = "Bloom", email = "engineering@bloom.directory" }]
+keywords = ["bloom", "hyperliquid", "owner-actions", "builder-fee"]
+
+[metadata]
+difficulty = "easy"
+category = "owner-actions"
+tags = ["testnet", "mainnet", "builder-fee", "cleanup-required"]
+
+[agent]
+timeout_sec = 300.0
+
+[verifier]
+timeout_sec = 60.0
+
+[environment]
+docker_image = "ghcr.io/bloom-directory/bloom-eval-agent-base@sha256:20988c7f8a6751c25e0115c2136710a885bef69d245e077d2ae3b2cc2c0837fd"
+build_timeout_sec = 600.0
+cpus = 2
+memory_mb = 4096
+storage_mb = 10240
+network_mode = "public"
+mcp_servers = []
+
+[verifier.env]
+
+[solution.env]

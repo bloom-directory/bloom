@@ -12,6 +12,7 @@ pub mod audit;
 pub mod audit_ext;
 pub mod ceremony;
 pub mod chain;
+pub mod clock;
 pub mod config;
 pub mod defi_policy;
 pub mod home;
@@ -34,6 +35,7 @@ pub use chain::{
     ChainId, ChainRef, ChainSpec, EndpointSpec, SOLANA_MAINNET_BETA_GENESIS_HASH, SolanaSpec,
     default_endpoint_weight,
 };
+pub use clock::now_ms;
 pub use config::{
     Backend, BackendsConfig, Config, ConfigError, EtherscanConfig, MempoolChainConfig,
     PrivateRpcChainConfig,

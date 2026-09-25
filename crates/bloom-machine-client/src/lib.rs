@@ -2803,9 +2803,9 @@ mod tests {
     };
 
     use bloom_broker_api::{
-        ApprovalPrepareState, CeremonyKind, CustodyPrepareState, DeclaredFee, DerivationProfile,
-        DerivationRef, DerivedAccountRequest, KeySpec, NormalizedSignature, RequestNonce,
-        ServiceFuture, SignatureEncoding,
+        ApprovalPrepareState, AssetId, CeremonyKind, CustodyPrepareState, DecimalU256, DeclaredFee,
+        DerivationProfile, DerivationRef, DerivedAccountRequest, KeySpec, NormalizedSignature,
+        RequestNonce, ServiceFuture, SignatureEncoding,
     };
     use ed25519_dalek::SigningKey;
     use tracing_subscriber::prelude::*;
@@ -3896,6 +3896,107 @@ mod tests {
             client.sign_exact_payload(request).await.unwrap(),
             ExactPayloadSignOutcome::ApprovalRequired(_)
         ));
+    }
+
+    fn asset_id(chain: &str, asset: &str) -> AssetId {
+        AssetId {
+            chain: token(chain),
+            asset: asset.to_owned(),
+        }
+    }
+
+    fn petal_use_claim(
+        declared_debits: Vec<bloom_broker_api::DeclaredDebit>,
+        declared_fee: DeclaredFee,
+    ) -> PetalUseClaim {
+        PetalUseClaim {
+            package_hash: digest(80),
+            route: "r000021".to_owned(),
+            operation_class: token("hyperliquid.agent_action"),
+            crypto_suite: CryptoSuite::Secp256k1Keccak256Recoverable,
+            payload_digest: digest(1),
+            ordered_hashes: vec![digest(2)],
+            declared_debits,
+            declared_destinations: Vec::new(),
+            declared_fee,
+            nonce: RequestNonce::from_bytes([81; 16]),
+            claim_assurance: bloom_broker_api::ClaimAssurance::MachineAsserted,
+        }
+    }
+
+    #[tokio::test]
+    async fn reusable_petal_batch_binds_declared_value_to_the_approval_limits() {
+        // Regression: this path left value_limits empty while requiring a
+        // claim. Broker rejects any nonzero debit or fee whose asset is
+        // absent from the approval's limits (VALUE_ASSET_NOT_ALLOWED), so an
+        // approval prepared here could never sign the batch it was for.
+        let broker = Arc::new(MockBroker {
+            wallet: WalletPublic {
+                wallet_id: token("wallet"),
+                wallet_kind: token("local"),
+                root_key_ref: Some(key_ref()),
+                key_refs: vec![key_ref()],
+                policy_version: DecimalU64::new(7),
+                policy_digest: digest(7),
+                wallet_revocation_epoch: DecimalU64::new(2),
+            },
+            accounts: empty_accounts(),
+            requests: Mutex::new(Vec::new()),
+            corrupt_response: false,
+        });
+        let client = MachineBrokerClient::new(broker.clone());
+        let claim = petal_use_claim(
+            vec![bloom_broker_api::DeclaredDebit {
+                asset: asset_id("hyperliquid", "usdc"),
+                amount: DecimalU256::parse("100").unwrap(),
+            }],
+            DeclaredFee::Fee {
+                chain: token("hyperliquid"),
+                asset: "usdc".to_owned(),
+                amount: DecimalU256::parse("7").unwrap(),
+            },
+        );
+        let preimages = vec![b"reusable child 1".to_vec(), b"reusable child 2".to_vec()];
+        let mut request = exact_batch_request(preimages.clone(), None);
+        request.provenance = ProvenanceSubject::Petal {
+            package_hash: digest(80),
+            route: "r000021".to_owned(),
+        };
+        // petal_use_claim()'s package_hash/route already match the
+        // provenance above; the claim must additionally commit to these
+        // exact payloads or the request is rejected before terms are built.
+        let mut claim = claim;
+        claim.payload_digest = petal_batch_payload_digest(&preimages);
+        claim.ordered_hashes = preimages
+            .iter()
+            .map(|payload| suite_hash(request.crypto_suite, payload))
+            .collect();
+        request.petal_use_claim = Some(claim);
+
+        let prepared = client
+            .sign_reusable_petal_payload_batch(request)
+            .await
+            .unwrap();
+        let ExactPayloadSignOutcome::ApprovalRequired(_) = prepared else {
+            panic!("first call must prepare a reusable Petal approval");
+        };
+
+        let requests = broker.requests.lock().unwrap();
+        let Some(MachineBrokerRequest::SealedApprovalPrepare(request)) = requests
+            .iter()
+            .rev()
+            .find(|entry| matches!(entry, MachineBrokerRequest::SealedApprovalPrepare(_)))
+        else {
+            panic!("a sealed approval must have been prepared");
+        };
+        let limits = &request.terms.limits.value_limits;
+        assert_eq!(limits.len(), 1, "the fee folds into its debit's asset");
+        assert_eq!(limits[0].asset, asset_id("hyperliquid", "usdc"));
+        assert_eq!(
+            limits[0].lifetime.as_str(),
+            "107",
+            "the approval must cover the debit plus the declared fee"
+        );
     }
 
     #[tokio::test]
