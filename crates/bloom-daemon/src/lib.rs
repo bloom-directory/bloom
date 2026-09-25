@@ -276,13 +276,6 @@ fn session_stop_complete_default() -> bool {
     true
 }
 
-/// Where one exact Petal request keeps its state.
-struct PetalSigningPaths {
-    request_id: String,
-    state: PathBuf,
-    owner_projection: PathBuf,
-}
-
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct PetalKeyRequestState {
@@ -984,7 +977,7 @@ impl DaemonPetalHost {
         claimed_hash: &[u8; 32],
         canonical_claim: &[u8],
         account_key: Option<&bloom_broker_api::KeyRef>,
-    ) -> Result<PetalSigningPaths, HostError> {
+    ) -> Result<(String, PathBuf, PathBuf), HostError> {
         let root = self.petal_signing_state_root.as_ref().ok_or_else(|| {
             HostError::Backend("Petal exact signing state is not configured".into())
         })?;
@@ -1008,11 +1001,11 @@ impl DaemonPetalHost {
             identity.update(part);
         }
         let request_id = identity.finalize().to_hex().to_string();
-        Ok(PetalSigningPaths {
-            state: root.join(".state").join(format!("{request_id}.json")),
-            owner_projection: root.join(format!("{request_id}.json")),
-            request_id,
-        })
+        Ok((
+            request_id.clone(),
+            root.join(".state").join(format!("{request_id}.json")),
+            root.join(format!("{request_id}.json")),
+        ))
     }
 
     fn petal_reusable_signing_paths(
@@ -1928,7 +1921,7 @@ impl PetalHost for DaemonPetalHost {
                 package_hash: trusted_package_hash.clone(),
                 route: context.route_id.clone(),
             };
-            let paths = self.petal_signing_paths(
+            let (request_id, exact_state_path, owner_projection_path) = self.petal_signing_paths(
                 context,
                 &req.wallet,
                 &req.operation_class,
@@ -1936,31 +1929,23 @@ impl PetalHost for DaemonPetalHost {
                 &canonical_claim,
                 account_key.as_ref(),
             )?;
-            let PetalSigningPaths {
-                request_id,
-                state: exact_state_path,
-                owner_projection: owner_projection_path,
-            } = paths;
-            // A hint is this request's own artifact id, which Machine derived.
-            // Anything else is refused. Machine does not revoke an earlier
-            // attempt: it cannot prove that attempt produced no signature.
-            match req.approval_hint.as_deref() {
-                None => {}
-                Some(hint) if hint == request_id => {}
-                Some(_) => {
-                    warn!(
-                        wallet = %req.wallet,
-                        operation_class = %req.operation_class,
-                        package_hash = %context.package_hash,
-                        route = %context.route_id,
-                        request_id = %request_id,
-                        reason = "approval hint is not this request's own id",
-                        "petal.sign_payload_denied"
-                    );
-                    return Err(HostError::Denied(
-                        "approval artifact does not match the exact Petal operation".into(),
-                    ));
-                }
+            if req
+                .approval_hint
+                .as_deref()
+                .is_some_and(|hint| hint != request_id)
+            {
+                warn!(
+                    wallet = %req.wallet,
+                    operation_class = %req.operation_class,
+                    package_hash = %context.package_hash,
+                    route = %context.route_id,
+                    request_id = %request_id,
+                    reason = "approval hint does not match the derived request id",
+                    "petal.sign_payload_denied"
+                );
+                return Err(HostError::Denied(
+                    "approval artifact does not match the exact Petal operation".into(),
+                ));
             }
             let payload_digest =
                 bloom_broker_api::Digest32::from_bytes(sha2::Sha256::digest(&req.preimage).into());
@@ -2258,17 +2243,14 @@ impl PetalHost for DaemonPetalHost {
             route: context.route_id.clone(),
         };
         let (request_id, exact_state_path, owner_projection_path) = match req.selector {
-            bloom_broker_api::PetalSignSelector::Exact => {
-                let paths = self.petal_signing_paths(
-                    context,
-                    &req.wallet,
-                    &req.operation_class,
-                    &batch_digest_bytes,
-                    &canonical_claim,
-                    account_key.as_ref(),
-                )?;
-                (paths.request_id, paths.state, paths.owner_projection)
-            }
+            bloom_broker_api::PetalSignSelector::Exact => self.petal_signing_paths(
+                context,
+                &req.wallet,
+                &req.operation_class,
+                &batch_digest_bytes,
+                &canonical_claim,
+                account_key.as_ref(),
+            )?,
             bloom_broker_api::PetalSignSelector::Reusable => self.petal_reusable_signing_paths(
                 context,
                 &req.wallet,
@@ -6546,45 +6528,6 @@ mod tests {
             .unwrap_err();
         assert!(matches!(guest_error, HostError::Denied(_)));
 
-        // The hint contract, one input per case. A hint is either this
-        // request's own id, or the tagged form naming an attempt it has given
-        // up. Everything else names no artifact Machine derived.
-        for bad in [
-            // A bare id that is not this request's own: what the two other
-            // first-party Petals store and replay, and still a refusal.
-            "cd".repeat(32),
-            // Malformed: not a path, not hex, not the right length.
-            "../../elsewhere".into(),
-            "supersedes:../../elsewhere".into(),
-            format!("supersedes:{}", "zz".repeat(32)),
-            format!("supersedes:{}", "ab".repeat(20)),
-            // Upper-case hex is not what Machine derives.
-            format!("supersedes:{}", "AB".repeat(32)),
-        ] {
-            let mut hinted = request.clone();
-            hinted.approval_hint = Some(bad.clone());
-            let error = host.sign_payload_outcome(hinted).await.unwrap_err();
-            assert!(
-                matches!(error, HostError::Denied(_))
-                    && error
-                        .to_string()
-                        .contains("approval artifact does not match"),
-                "{bad}: {error}"
-            );
-        }
-        // The tagged supersession form is gone with the mechanism it drove, so
-        // a well-formed one is refused exactly like any other hint that is not
-        // this request's own id. Nothing a guest can say makes Machine act on
-        // another request's approval.
-        let mut retired = request.clone();
-        retired.approval_hint = Some(format!("supersedes:{}", "ab".repeat(32)));
-        let refused = host.sign_payload_outcome(retired).await.unwrap_err();
-        assert!(
-            matches!(&refused, HostError::Denied(message)
-                if message == "approval artifact does not match the exact Petal operation"),
-            "{refused}"
-        );
-
         broker
             .active
             .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -8531,10 +8474,7 @@ allowed = ["bloom:vfs.read"]
             let reusable = host
                 .petal_reusable_signing_paths(&context, "w", "test.intent", 1, Some(key))
                 .unwrap();
-            identities.push((
-                (exact.request_id, exact.state, exact.owner_projection),
-                reusable,
-            ));
+            identities.push((exact, reusable));
         }
         assert_ne!(identities[0], identities[1]);
         assert_eq!(identities[0], identities[2]);

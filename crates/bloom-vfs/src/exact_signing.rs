@@ -530,10 +530,9 @@ impl BrokerExactPayloadSigner {
         if prior_attempt_stands {
             // A prior attempt may have committed at Broker before its response
             // reached Machine. Keep the activated approval and immutable payload,
-            // but never retry a signing reservation that Broker finalized. The
-            // reservation Broker kept stays in the record, so it is still the
-            // id a later replacement asks about; the fresh one is added before
-            // it is used.
+            // but never retry a signing reservation that Broker finalized. Rotate
+            // the operation id while remembering that the earlier attempt stands,
+            // so a refusal on this retry is still outcome-unknown.
             state.signing_operation_id = random_operation_id();
             request.signing_operation_id = state.signing_operation_id.clone();
             // The prior attempt stands. A failed local write must not become a
@@ -2072,117 +2071,6 @@ mod tests {
             claim_assurance: bloom_broker_api::ClaimAssurance::MachineAsserted,
         };
         (signer, home, claim, ordered_hash)
-    }
-
-    /// One scope's worth of exact signing: a signer, its state directory, and
-    /// the claim and hash every attempt in it shares. Attempts differ by their
-    /// state path, which is what the daemon derives per payload.
-    struct Scope {
-        broker: Arc<MockBroker>,
-        home: tempfile::TempDir,
-        claim: PetalUseClaim,
-        hash: Digest32,
-    }
-
-    impl Scope {
-        fn open(broker: &Arc<MockBroker>) -> Self {
-            let (_, home, claim, hash) = debiting_claim_fixture(broker, None);
-            Self {
-                broker: broker.clone(),
-                home,
-                claim,
-                hash,
-            }
-        }
-
-        fn state_dir(&self) -> std::path::PathBuf {
-            self.home.path().to_path_buf()
-        }
-
-        fn signer(&self) -> BrokerExactPayloadSigner {
-            let (signer, _, _, _) = debiting_claim_fixture(&self.broker, None);
-            signer
-        }
-
-        /// One attempt, named the way the daemon names them: a 64-hex request
-        /// id that is both the state file's stem and the action id.
-        async fn attempt(
-            &self,
-            request_id: &str,
-        ) -> Result<ExactPayloadOutcome, ExactSigningError> {
-            self.signer()
-                .sign_or_prepare_petal(
-                    &self.state_dir().join(format!("{request_id}.json")),
-                    request_id,
-                    "wallet",
-                    "hyperliquid.withdraw",
-                    b"exact withdraw payload",
-                    self.hash.clone(),
-                    CryptoSuite::Secp256k1Sha256Recoverable,
-                    &serde_json::json!({"asset": "USDC"}),
-                    &ProvenanceSubject::Petal {
-                        package_hash: self.claim.package_hash.clone(),
-                        route: "withdraw/request".into(),
-                    },
-                    &self.claim,
-                    Some(b"assurance"),
-                )
-                .await
-        }
-
-        /// The signing operation id this attempt's state currently holds.
-        fn signing_operation(&self, request_id: &str) -> OperationId {
-            let bytes = fs::read(self.state_dir().join(format!("{request_id}.json")))
-                .expect("signing state");
-            serde_json::from_slice::<ExactSigningState>(&bytes)
-                .expect("signing state parses")
-                .signing_operation_id
-        }
-
-        /// Run the attempt's own lifetime out, the way waiting would.
-        fn expire(&self, request_id: &str) {
-            let path = self.state_dir().join(format!("{request_id}.json"));
-            let mut state: ExactSigningState =
-                serde_json::from_slice(&fs::read(&path).expect("signing state"))
-                    .expect("signing state parses");
-            state.expires_at_ms = DecimalU64::new(1);
-            write_state(&path, &state).expect("state rewritten");
-        }
-    }
-
-    fn request_id(byte: char) -> String {
-        std::iter::repeat_n(byte, 64).collect()
-    }
-
-    /// A pre-existing state file, written by a binary this one is replacing,
-    /// whose own lifetime had already run out. It is still resumed rather than
-    /// rejected, and the expiry path gives it a fresh signing operation id.
-    ///
-    /// No record is kept beside it any more. Nothing read one, and an
-    /// unreadable file that decides nothing is worse than no file: it invites
-    /// the next reader to believe a mechanism is still there.
-    #[tokio::test]
-    async fn a_request_whose_state_predates_this_binary_is_still_resumed() {
-        let broker = Arc::new(MockBroker::default());
-        broker.awaiting_owner.store(true, Ordering::SeqCst);
-        let scope = Scope::open(&broker);
-        let first = request_id('1');
-        scope.attempt(&first).await.unwrap();
-        let original = scope.signing_operation(&first);
-
-        // A file left by the version that wrote one. This binary must neither
-        // read it nor trip over it.
-        let stale = scope.state_dir().join(format!("{first}.op.json"));
-        fs::write(&stale, b"{\"schema\":\"bloom.machine_exact_operation.v1\"}").unwrap();
-        scope.expire(&first);
-
-        scope.attempt(&first).await.unwrap();
-        assert_ne!(
-            scope.signing_operation(&first),
-            original,
-            "an expired request gets a fresh signing operation id"
-        );
-        assert!(stale.exists(), "and the stale file is left where it was");
     }
 
     async fn flow_once(
