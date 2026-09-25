@@ -219,6 +219,9 @@ impl SolanaTransferSigner {
             claim_assurance_evidence: Some(message_bytes.to_vec()),
             safe_review_payload: None,
             account_key_ref,
+            // Solana, not EVM: there is no contract call for the EVM review
+            // to read, in either mode.
+            requested_review_mode: None,
             approval_value_limits: vec![ValueLimit {
                 asset: AssetId {
                     chain: Token::new("solana").map_err(|e| e.to_string())?,

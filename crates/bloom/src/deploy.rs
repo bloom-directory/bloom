@@ -123,7 +123,13 @@ impl Bridge {
             eprintln!("Owner approval: {url}");
         }
         let mut status = first;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        // Waiting for a human approval and waiting for chain execution are
+        // different obligations. The approval phase is bounded by the
+        // ceremony's own expiry (the owner is still deliberating while it is
+        // alive); execution after signing gets a tight clock. Both timeouts
+        // leave the durable submission discoverable and resumable.
+        let mut execution_deadline: Option<tokio::time::Instant> = None;
+        let fallback_deadline = tokio::time::Instant::now() + Duration::from_secs(120);
         loop {
             if let Some(hash) = status
                 .pointer("/result/transaction/tx_hash")
@@ -146,12 +152,43 @@ impl Bridge {
                     json!({"id":job,"status":status}),
                 );
             }
-            if tokio::time::Instant::now() >= deadline {
-                return error(
-                    -32001,
-                    "approval/execution pending; continue this ID, then retry the original request",
-                    json!({"id":job}),
-                );
+            let phase = status
+                .pointer("/result/status")
+                .and_then(Value::as_str)
+                .unwrap_or("staged");
+            if phase == "approval_required" {
+                execution_deadline = None;
+                let expires_ms = status
+                    .pointer("/result/approval/expires_ms")
+                    .and_then(|field| {
+                        field
+                            .as_u64()
+                            .or_else(|| field.as_str().and_then(|s| s.parse::<u64>().ok()))
+                    });
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                let expired = expires_ms
+                    .map(|expires| now_ms >= expires)
+                    .unwrap_or(tokio::time::Instant::now() >= fallback_deadline);
+                if expired {
+                    return error(
+                        -32001,
+                        "owner ceremony expired; continue this ID to prepare a fresh ceremony, then retry the original request",
+                        json!({"id":job}),
+                    );
+                }
+            } else {
+                let deadline = execution_deadline
+                    .get_or_insert_with(|| tokio::time::Instant::now() + Duration::from_secs(120));
+                if tokio::time::Instant::now() >= *deadline {
+                    return error(
+                        -32001,
+                        "execution pending after signing; continue this ID, then retry the original request",
+                        json!({"id":job}),
+                    );
+                }
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
             status = match self.call("bloom_deploymentStatus", json!([job])).await {
@@ -259,4 +296,88 @@ pub async fn run(endpoint: ResolvedEndpoint, args: DeployArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ResolvedEndpoint;
+    use axum::extract::State;
+
+    fn bridge() -> Bridge {
+        Bridge {
+            endpoint: ResolvedEndpoint {
+                socket: std::path::PathBuf::from("/tmp/bloom-test.sock"),
+                display: "unix:/tmp/bloom-test.sock".into(),
+            },
+            wallet: "alice".into(),
+            chain: "anvil".into(),
+            host: "127.0.0.1:1234".into(),
+            slots: Arc::new(tokio::sync::Semaphore::new(32)),
+        }
+    }
+
+    #[tokio::test]
+    async fn request_rejects_malformed_calls_before_contacting_machine() {
+        let bridge = bridge();
+        // No ID: rejected without touching the Machine socket.
+        let reply = bridge
+            .request(json!({"jsonrpc": "2.0", "method": "eth_chainId"}))
+            .await;
+        assert_eq!(reply["error"]["code"], -32600);
+        // Wrong protocol version.
+        let reply = bridge
+            .request(json!({"jsonrpc": "1.0", "id": 1, "method": "eth_chainId"}))
+            .await;
+        assert_eq!(reply["error"]["code"], -32600);
+        // Missing method.
+        let reply = bridge.request(json!({"jsonrpc": "2.0", "id": 1})).await;
+        assert_eq!(reply["error"]["message"], "method is required");
+        // Continue over HTTP would bypass the explicit resume step.
+        let reply = bridge
+            .request(
+                json!({"jsonrpc": "2.0", "id": 1, "method": "bloom_deploymentContinue", "params": ["deploy-abc"]}),
+            )
+            .await;
+        assert_eq!(reply["error"]["code"], -32601);
+    }
+
+    #[tokio::test]
+    async fn handle_enforces_origin_host_and_batch_limits() {
+        let bridge = bridge();
+        let single = Json(json!({"jsonrpc": "2.0", "id": 1, "method": "eth_chainId"}));
+        // Browser origins are never served.
+        let mut headers = HeaderMap::new();
+        headers.insert("origin", "http://localhost:3000".parse().unwrap());
+        headers.insert("host", "127.0.0.1:1234".parse().unwrap());
+        assert_eq!(
+            handle(State(bridge.clone()), headers, single.clone())
+                .await
+                .unwrap_err(),
+            StatusCode::FORBIDDEN
+        );
+        // Host must be the bound loopback address (token alone is not enough).
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "evil.example".parse().unwrap());
+        assert_eq!(
+            handle(State(bridge.clone()), headers, single.clone())
+                .await
+                .unwrap_err(),
+            StatusCode::FORBIDDEN
+        );
+        // Batches are bounded on both ends.
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "127.0.0.1:1234".parse().unwrap());
+        for batch in [
+            json!([]),
+            json!(vec![json!({"jsonrpc": "2.0", "id": 1, "method": "x"}); 17]),
+        ] {
+            assert_eq!(
+                handle(State(bridge.clone()), headers.clone(), Json(batch))
+                    .await
+                    .unwrap_err(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+    }
 }

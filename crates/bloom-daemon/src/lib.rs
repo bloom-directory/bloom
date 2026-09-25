@@ -911,6 +911,7 @@ impl DaemonPetalHost {
                 // belongs to the native Solana transfer path.
                 petal_use_claim: None,
                 system_use_claim: None,
+                requested_review_mode: None,
             })
             .await
             .map_err(|error| {
@@ -2552,6 +2553,7 @@ impl PetalHost for DaemonPetalHost {
                     nonce: req.nonce,
                     gas_limit_hint: None,
                     usd_value_hint: None,
+                    review_mode: None,
                 },
                 &chain,
                 &wallet_policy,
@@ -2685,7 +2687,15 @@ impl PetalHost for DaemonPetalHost {
             .outbox
             .read(&wallet, &chain_name, &outbox_id)
             .map_err(|e| HostError::NotFound(format!("outbox {outbox_id}: {e}")))?;
-        if entry.staged.resolved_execution_origin() != origin {
+        // Inspection is read-only, so it is scoped to the package rather than
+        // to the route that staged the entry: a Petal's status route must be
+        // able to reconcile what its execute route staged. Confirmation stays
+        // route-bound because it dispatches signing.
+        if !entry
+            .staged
+            .resolved_execution_origin()
+            .same_package(&origin)
+        {
             return Err(HostError::Denied(
                 "outbox entry was not staged by this trusted Petal".into(),
             ));
@@ -6975,6 +6985,7 @@ mod tests {
             expires_ms: u128::MAX,
             status: bloom_proto::TxStatus::Pending,
             action_kind: bloom_proto::TxActionKind::Unknown,
+            review_mode: None,
             tx_hash: Some(tx_hash.clone()),
             token: None,
             nft: None,
@@ -7062,8 +7073,11 @@ mod tests {
                 .contains("\"block_number\":42")
         );
 
+        // A different route of the same package (a status route reconciling
+        // what the execute route staged) may inspect.
         let mut other_route = context.clone();
-        other_route.path = "/fund/alice/two/confirm".into();
+        other_route.path = "/fund/alice/two/status".into();
+        other_route.route_id = "r000099".into();
         host.evm_tx_inspect(
             "alice".into(),
             "anvil".into(),
@@ -7421,6 +7435,238 @@ ws_url = "wss://example.invalid"
         assert!(daemon.mempool_shutdown.lock().is_empty());
     }
 
+    /// Register an unreachable EVM chain: every validation branch below
+    /// answers before any upstream use, so a regression that starts
+    /// dialling fails loudly (connection refused) instead of hanging.
+    fn deployment_validation_chain(daemon: &Daemon) {
+        let spec = ChainSpec {
+            name: "anvil".into(),
+            chain_id: 31337,
+            rpc_urls: vec!["http://127.0.0.1:1".into()],
+            rpc_endpoints: Vec::new(),
+            etherscan_api_url: None,
+            display_name: None,
+            native_symbol: "ETH".into(),
+            native_decimals: 18,
+            legacy_tx: false,
+            op_stack: false,
+        };
+        daemon.chains.add(ChainClient::new(spec).unwrap());
+    }
+
+    fn deployment_daemon() -> (tempfile::TempDir, Daemon) {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = Daemon::from_home(HomeDir::at(dir.path())).unwrap();
+        deployment_validation_chain(&daemon);
+        (dir, daemon)
+    }
+
+    #[tokio::test]
+    async fn deployment_rpc_rejects_bad_names_and_unknown_chains() {
+        let (_dir, daemon) = deployment_daemon();
+        for (wallet, chain) in [
+            ("", "anvil"),
+            ("alice", ""),
+            ("alice/with-slash", "anvil"),
+            ("alice", "anvil!"),
+        ] {
+            let reply = daemon
+                .deployment_rpc(wallet, chain, "bloom_deploymentList", serde_json::json!([]))
+                .await;
+            assert_eq!(
+                reply["error"]["code"],
+                serde_json::json!(-32602),
+                "{wallet}/{chain}: {reply}"
+            );
+        }
+        let reply = daemon
+            .deployment_rpc(
+                "alice",
+                "nope",
+                "bloom_deploymentList",
+                serde_json::json!([]),
+            )
+            .await;
+        assert_eq!(reply["error"]["message"], "unknown chain");
+    }
+
+    #[tokio::test]
+    async fn deployment_rpc_validates_params_and_ids_without_a_node() {
+        let (_dir, daemon) = deployment_daemon();
+        let reply = daemon
+            .deployment_rpc(
+                "alice",
+                "anvil",
+                "bloom_deploymentList",
+                serde_json::json!({}),
+            )
+            .await;
+        assert_eq!(reply["error"]["message"], "params must be an array");
+        let reply = daemon
+            .deployment_rpc(
+                "alice",
+                "anvil",
+                "bloom_deploymentList",
+                serde_json::json!([]),
+            )
+            .await;
+        assert_eq!(reply["result"], serde_json::json!([]));
+        for params in [
+            serde_json::json!(["nope"]),
+            serde_json::json!(["deploy-abc"]),
+        ] {
+            let reply = daemon
+                .deployment_rpc("alice", "anvil", "bloom_deploymentStatus", params)
+                .await;
+            assert_eq!(
+                reply["error"]["message"], "invalid deployment ID",
+                "{reply}"
+            );
+        }
+        let reply = daemon
+            .deployment_rpc(
+                "alice",
+                "anvil",
+                "bloom_deploymentStatus",
+                serde_json::json!([42]),
+            )
+            .await;
+        assert_eq!(reply["error"]["message"], "expected deployment ID");
+        let missing = format!("deploy-{}", "ab".repeat(32));
+        let reply = daemon
+            .deployment_rpc(
+                "alice",
+                "anvil",
+                "bloom_deploymentStatus",
+                serde_json::json!([missing]),
+            )
+            .await;
+        assert_eq!(reply["error"]["message"], "deployment not found");
+    }
+
+    #[tokio::test]
+    async fn deployment_status_rejects_a_foreign_chain_id() {
+        let (_dir, daemon) = deployment_daemon();
+        let id = format!("deploy-{}", "cd".repeat(32));
+        let staged = bloom_proto::StagedTx {
+            id: id.clone(),
+            wallet: "alice".into(),
+            chain: "anvil".into(),
+            chain_id: 1,
+            from: "0x0000000000000000000000000000000000000001".into(),
+            to: None,
+            value_wei: "0".into(),
+            data_hex: "0x60006000f3".into(),
+            gas_limit: 21_000,
+            max_fee_per_gas: None,
+            max_priority_fee_per_gas: None,
+            gas_price: None,
+            nonce: 0,
+            policy_checks: vec![],
+            created_ms: 1,
+            expires_ms: 0,
+            status: bloom_proto::TxStatus::Pending,
+            action_kind: bloom_proto::TxActionKind::ContractCreation,
+            review_mode: None,
+            tx_hash: None,
+            token: None,
+            nft: None,
+            usd_value: None,
+            valuation: None,
+            depends_on: None,
+            action_id: None,
+            execution_origin: None,
+        };
+        daemon
+            .tx_engine
+            .outbox
+            .write_pending(&staged, "plan")
+            .unwrap();
+        let reply = daemon
+            .deployment_rpc(
+                "alice",
+                "anvil",
+                "bloom_deploymentStatus",
+                serde_json::json!([id]),
+            )
+            .await;
+        assert_eq!(
+            reply["error"]["message"],
+            "deployment belongs to a different chain ID than the current profile"
+        );
+    }
+
+    #[tokio::test]
+    async fn deployment_list_reports_a_restaged_id_once() {
+        let (_dir, daemon) = deployment_daemon();
+        let id = format!("deploy-{}", "ef".repeat(32));
+        let staged = bloom_proto::StagedTx {
+            id: id.clone(),
+            wallet: "alice".into(),
+            chain: "anvil".into(),
+            chain_id: 31337,
+            from: "0x0000000000000000000000000000000000000001".into(),
+            to: None,
+            value_wei: "0".into(),
+            data_hex: "0x60006000f3".into(),
+            gas_limit: 21_000,
+            max_fee_per_gas: None,
+            max_priority_fee_per_gas: None,
+            gas_price: None,
+            nonce: 0,
+            policy_checks: vec![],
+            created_ms: 1,
+            expires_ms: 0,
+            status: bloom_proto::TxStatus::Pending,
+            action_kind: bloom_proto::TxActionKind::ContractCreation,
+            review_mode: None,
+            tx_hash: None,
+            token: None,
+            nft: None,
+            usd_value: None,
+            valuation: None,
+            depends_on: None,
+            action_id: None,
+            execution_origin: None,
+        };
+        daemon
+            .tx_engine
+            .outbox
+            .write_pending(&staged, "plan")
+            .unwrap();
+        // The same id restaged after failure: a fresh pending row plus the
+        // quarantined failed row. List must still show it once.
+        let entry = daemon
+            .tx_engine
+            .outbox
+            .read_in_state(
+                "alice",
+                "anvil",
+                &id,
+                bloom_tx::outbox::OutboxState::Pending,
+            )
+            .unwrap();
+        daemon
+            .tx_engine
+            .outbox
+            .transition(&entry, bloom_tx::outbox::OutboxState::Failed)
+            .unwrap();
+        daemon
+            .tx_engine
+            .outbox
+            .write_pending(&staged, "plan")
+            .unwrap();
+        let reply = daemon
+            .deployment_rpc(
+                "alice",
+                "anvil",
+                "bloom_deploymentList",
+                serde_json::json!([]),
+            )
+            .await;
+        assert_eq!(reply["result"], serde_json::json!([id]));
+    }
+
     /// Boots a daemon with one valid mempool chain and verifies that the
     /// bump scanner and backends probe tasks were both spawned (their
     /// shutdown senders are non-empty), and that the StatusHandler's
@@ -7624,6 +7870,7 @@ ws_url = "wss://example.invalid"
             expires_ms: 1,
             status: bloom_proto::TxStatus::Pending,
             action_kind: bloom_proto::TxActionKind::Unknown,
+            review_mode: None,
             tx_hash: None,
             token: None,
             nft: None,
@@ -7738,6 +7985,7 @@ ws_url = "wss://example.invalid"
             expires_ms: 1,
             status: bloom_proto::TxStatus::Pending,
             action_kind: bloom_proto::TxActionKind::Unknown,
+            review_mode: None,
             tx_hash: None,
             token: None,
             nft: None,
@@ -8036,6 +8284,7 @@ ws_url = "wss://example.invalid"
                 allowed_petal_packages: Vec::new(),
                 allowed_destinations: Vec::new(),
                 required_verifiers: Vec::new(),
+                clear_signing: None,
             })
             .unwrap();
             bloom_broker_api::SignedPolicySnapshot {

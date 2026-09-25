@@ -63,8 +63,11 @@ bloom deploy --wallet alice --chain anvil resume deploy-REPLACE_WITH_ID
 
 If the ceremony is still pending, this returns its details without signing.
 Repeat the same command after completion. Foundry's waiting request receives
-the real broadcast hash and proceeds to its next transaction. An RPC wait is
-bounded to two minutes; timeout does not cancel, sign, or restage the job.
+the real broadcast hash and proceeds to its next transaction. Waiting for the
+owner's approval is bounded by the ceremony's own expiry; execution after
+signing is bounded to two minutes. A timeout does not cancel, sign, or restage
+the job, and an expired ceremony is recovered by continuing the same ID, which
+prepares a fresh ceremony.
 
 Existing scripts should use `vm.startBroadcast()` or its public-address
 overload. Remove private-key reads such as `vm.envUint("PRIVATE_KEY")`. Factory

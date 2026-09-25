@@ -77,10 +77,19 @@ impl Default for ExecutionOrigin {
 }
 
 impl ExecutionOrigin {
+    /// Whether two origins name the same installed Petal, ignoring which of
+    /// its routes produced the request.
+    ///
+    /// Written by clearing `route_id` and comparing whole values rather than
+    /// by listing the fields that matter: a field added later is then compared
+    /// by default, instead of being silently dropped from a check that decides
+    /// whether one Petal may act on another's staged transaction.
     pub fn same_package(&self, other: &Self) -> bool {
-        self.petal_id == other.petal_id
-            && self.petal_digest == other.petal_digest
-            && self.petal_version == other.petal_version
+        let without_route = |origin: &Self| Self {
+            route_id: None,
+            ..origin.clone()
+        };
+        without_route(self) == without_route(other)
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -94,6 +103,72 @@ impl ExecutionOrigin {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod execution_origin_tests {
+    use super::ExecutionOrigin;
+
+    fn origin() -> ExecutionOrigin {
+        ExecutionOrigin {
+            petal_id: "petal:morpho".into(),
+            petal_digest: "de281d44".repeat(8),
+            petal_version: "v1-package".into(),
+            route_id: Some("r000008".into()),
+        }
+    }
+
+    #[test]
+    fn only_the_route_may_differ() {
+        let staged = origin();
+        let other_route = ExecutionOrigin {
+            route_id: Some("r000099".into()),
+            ..origin()
+        };
+        assert!(staged.same_package(&other_route));
+        // Absent and present are both "some route of this package".
+        let no_route = ExecutionOrigin {
+            route_id: None,
+            ..origin()
+        };
+        assert!(staged.same_package(&no_route));
+    }
+
+    #[test]
+    fn a_different_package_is_never_the_same_package() {
+        let staged = origin();
+        for other in [
+            ExecutionOrigin {
+                petal_id: "petal:robinhood".into(),
+                ..origin()
+            },
+            ExecutionOrigin {
+                petal_digest: "ff".repeat(32),
+                ..origin()
+            },
+            ExecutionOrigin {
+                petal_version: "v2-package".into(),
+                ..origin()
+            },
+        ] {
+            assert!(!staged.same_package(&other), "{other:?}");
+        }
+    }
+
+    #[test]
+    fn a_field_added_later_is_compared_by_default() {
+        // `same_package` clears `route_id` and compares whole values rather
+        // than listing the fields that matter, so a field added to this struct
+        // is compared without anyone remembering to add it here. This test
+        // fails if that is ever rewritten as a field list: it counts the
+        // fields a written-out literal must supply.
+        let ExecutionOrigin {
+            petal_id: _,
+            petal_digest: _,
+            petal_version: _,
+            route_id: _,
+        } = origin();
     }
 }
 
@@ -125,6 +200,16 @@ pub struct StagedTx {
     /// on historical entries, which therefore remain unsupported/review-only.
     #[serde(default)]
     pub action_kind: TxActionKind,
+    /// The owner's explicit review choice, recorded when the transaction was
+    /// staged. `None` lets Broker decide under the wallet's policy: a clear
+    /// reading when a signed description covers the call, the existing
+    /// envelope review otherwise. `"opaque_exact"` is the owner asking to
+    /// approve bytes Bloom will not explain, which Broker still refuses
+    /// unless policy permits it. Absent on every row staged before clear
+    /// signing existed, and skipped when absent, so those rows keep their
+    /// exact bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_mode: Option<String>,
     /// Tx hash once broadcast.
     #[serde(default)]
     pub tx_hash: Option<String>,
@@ -431,6 +516,7 @@ mod tests {
             expires_ms: 1_700_000_003_600,
             status: TxStatus::Pending,
             action_kind: TxActionKind::NativeTransfer,
+            review_mode: None,
             tx_hash: None,
             token: None,
             nft: None,

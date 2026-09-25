@@ -56,6 +56,7 @@ pub(crate) fn wallet_projection_reader(
         allowed_petal_packages: Vec::new(),
         allowed_destinations: Vec::new(),
         required_verifiers: Vec::new(),
+        clear_signing: None,
     })
     .unwrap();
     let policy_digest = Digest32::from_bytes(sha2::Sha256::digest(&canonical).into());
