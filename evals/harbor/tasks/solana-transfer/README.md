@@ -104,12 +104,11 @@ Every command below is the real CLI surface; run them in order.
    ```
 
 3. Prepare the evaluation Machine's config with the Solana chain, pinning the
-   genesis from step 2 and enabling broadcast:
+   genesis from step 2 (a pinned genesis is what permits broadcast):
 
    ```toml
    [solana_chains.solana-local]
    name = "solana-local"
-   allow_broadcast = true
    expected_genesis_base58 = "<genesis from step 2>"
 
    [[solana_chains.solana-local.endpoints]]
