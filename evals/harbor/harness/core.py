@@ -23,12 +23,23 @@ class EvalError(RuntimeError):
     """A fail-closed evaluation error suitable for operator display."""
 
 
-# The Broker publishes owner ceremonies at a fixed local origin with a
+# The Broker publishes owner ceremonies at the triad's local origin with a
 # base64url-encoded 32-byte secret. The shape is Broker-wide, not specific to
 # any one Petal or chain, so every eval that drives a passkey ceremony matches
-# and redacts it the same way. Port 18734 is the canonical developer ceremony
-# port the triad launcher binds; there is no alternate-port override.
-CEREMONY_URL = re.compile(r"http://localhost:18734/ceremony/[A-Za-z0-9_-]{43}")
+# and redacts it the same way. Each development triad serves its own ceremony
+# port; scripts/triad-dev-launch.sh records the origin in triad.env, and the
+# default is the launcher's 18734.
+CEREMONY_ORIGIN = os.environ.get(
+    "BLOOM_TRIAD_DEV_CEREMONY_ORIGIN", "http://localhost:18734"
+)
+if re.fullmatch(r"http://localhost(:[1-9][0-9]{0,4})?", CEREMONY_ORIGIN) is None:
+    raise RuntimeError(
+        "BLOOM_TRIAD_DEV_CEREMONY_ORIGIN must be http://localhost[:port], "
+        f"got {CEREMONY_ORIGIN!r}"
+    )
+CEREMONY_URL = re.compile(
+    re.escape(CEREMONY_ORIGIN) + r"/ceremony/[A-Za-z0-9_-]{43}"
+)
 
 # Mounted reads are not local file reads. Under a Petal they are live venue
 # round-trips made by wasm; under a chain outbox they can wait on an RPC. Both
@@ -141,7 +152,8 @@ class MountedTree:
 
         The write runs in a subprocess so the timeout is enforceable: a mounted
         route write stages ceremonies and can make network calls before it
-        returns. A zero exit code means accepted for dispatch, never completed.
+        returns. The fsync makes the route run before the writer exits, so a
+        refusal (policy, an approval-required confirm) is a non-zero exit.
         """
         writer = (
             "import os,sys; data=sys.stdin.buffer.read(); "
@@ -565,7 +577,7 @@ async def run_harbor_job(context: EvalRunContext, agent: AgentSpec) -> Any:
 HarborRunner = Callable[[EvalRunContext, AgentSpec], Coroutine[Any, Any, Any]]
 
 
-def _agent_spec(name: str) -> AgentSpec:
+def _agent_spec(name: str, default_max_turns: str = "20") -> AgentSpec:
     try:
         spec = AGENTS[name]
     except KeyError as error:
@@ -628,7 +640,7 @@ def _agent_spec(name: str) -> AgentSpec:
         )
     agent_kwargs = dict(spec.kwargs)
     if spec.harbor_name == "claude-code":
-        raw_max_turns = os.getenv("BLOOM_EVAL_MAX_TURNS", "20").strip()
+        raw_max_turns = os.getenv("BLOOM_EVAL_MAX_TURNS", default_max_turns).strip()
         try:
             max_turns = int(raw_max_turns)
         except ValueError as error:
@@ -649,10 +661,13 @@ def run_eval(
     agent_spec: AgentSpec | None = None,
 ) -> Any:
     """Execute one provisioned eval and guarantee outer cleanup."""
-    # An explicit operator setting always wins; otherwise the eval declares
-    # the turn budget its lifecycle was designed around.
-    os.environ.setdefault("BLOOM_EVAL_MAX_TURNS", definition.default_max_turns)
-    agent = agent_spec if agent_spec is not None else _agent_spec(agent_name)
+    # An explicit BLOOM_EVAL_MAX_TURNS always wins; otherwise the eval
+    # declares the turn budget its lifecycle was designed around.
+    agent = (
+        agent_spec
+        if agent_spec is not None
+        else _agent_spec(agent_name, definition.default_max_turns)
+    )
     definition.lock_path.parent.mkdir(parents=True, exist_ok=True)
     timings = phase_timings if phase_timings is not None else {}
 

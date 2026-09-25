@@ -9,6 +9,7 @@ the coverage here.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import tempfile
 import time
@@ -17,7 +18,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from harness.core import EvalDefinition, EvalError
+from harness.core import EvalDefinition, EvalError, _agent_spec
 from harness.solana_transfer import (
     HARNESS_MAX_TRANSFER_LAMPORTS,
     MAINNET_ACK,
@@ -31,6 +32,7 @@ DESTINATION = "6dmNQ5jwLeLk5REvio1JcMshcbvkYMwy26sJ8pbkvStu"
 WALLET_ID = "eval-solana"
 CHAIN = "solana-mainnet"
 FINGERPRINT = "a" * 64
+LOCAL_GENESIS = "4uhcVJyU9pJkvQyS88uRDiswHXSCkY3zQawwpjk2NsNY"
 DERIVATION = "m/44'/501'/0'/0'"
 TRANSFER = 1_000_000
 FEE_CAP = 10_000
@@ -111,23 +113,14 @@ class SolanaEvalTestCase(unittest.TestCase):
     def make_mainnet(self, **overrides: str) -> SolanaTransferEval:
         return SolanaTransferEval(self.repo, self.mainnet_env(**overrides))
 
-    def accept_mainnet_identity(self, definition: SolanaTransferEval) -> None:
-        """Mock the sweep-keypair inspection and the RPC genesis answer."""
-        return mock.patch.multiple(
-            definition,
-            _rpc=mock.DEFAULT,
-            _require_sweep_keypair=mock.DEFAULT,
-            _require_sweep_tool=mock.DEFAULT,
-            **{"_rpc.return_value": MAINNET_GENESIS_HASH},
-        )
-
 
 class MainnetParameterTests(SolanaEvalTestCase):
     """The mainnet lane has no authorization file: the operator configures
     the whole transfer contract, and every field is required."""
 
     def preflight_ok(self, definition: SolanaTransferEval) -> None:
-        with mock.patch.object(definition, "_rpc", return_value=MAINNET_GENESIS_HASH):
+        with mock.patch.object(definition, "_rpc", return_value=MAINNET_GENESIS_HASH), \
+                mock.patch.object(definition, "_require_fresh_destination"):
             with mock.patch.object(definition, "_require_sweep_keypair"):
                 with mock.patch.object(definition, "_require_sweep_tool"):
                     with mock.patch.object(definition, "_require_sign_count", return_value=2):
@@ -338,7 +331,11 @@ class LocalIdentityTests(SolanaEvalTestCase):
         )
 
         with mock.patch("os.path.ismount", return_value=True):
-            with mock.patch.object(definition, "_require_chain_identity"):
+            with mock.patch.multiple(
+                definition,
+                _require_chain_identity=mock.DEFAULT,
+                _require_fresh_destination=mock.DEFAULT,
+            ):
                 with mock.patch.object(definition, "_require_sign_count", return_value=2):
                     with mock.patch("harness.core.CeremonyDriver.preflight"):
                         # The setUp projection resolves to SOURCE; the pinned
@@ -361,6 +358,7 @@ class ApproverMatchTests(SolanaEvalTestCase):
         self.definition.source_address = SOURCE
         self.definition.key_fingerprint = FINGERPRINT
         self.definition.derivation_path = DERIVATION
+        self.definition.genesis_hash = LOCAL_GENESIS
         # `HomeDir::solana_outbox_dir` is `<home>/.solana-outbox`, and entries
         # live at `<root>/<wallet>/<chain>/<state>/<id>/`.
         self.entry = (
@@ -378,6 +376,7 @@ class ApproverMatchTests(SolanaEvalTestCase):
             "fee_lamports": 5000,
             "account_fingerprint": FINGERPRINT,
             "account_derivation_path": DERIVATION,
+            "genesis_hash": LOCAL_GENESIS,
         }
         intent.update(overrides)
         entry = self.entry.parent / pending_id
@@ -398,6 +397,16 @@ class ApproverMatchTests(SolanaEvalTestCase):
 
     def test_another_amount_does_not_match(self) -> None:
         self.stage(lamports=TRANSFER + 1)
+        self.assertFalse(self.matches())
+
+    def test_another_cluster_does_not_match(self) -> None:
+        # The genesis the harness checked is the one it approves: an intent
+        # the Machine staged against another cluster is refused.
+        self.stage(genesis_hash=MAINNET_GENESIS_HASH)
+        self.assertFalse(self.matches())
+
+    def test_a_missing_genesis_does_not_match(self) -> None:
+        self.stage(genesis_hash=None)
         self.assertFalse(self.matches())
 
     def test_another_fee_payer_does_not_match(self) -> None:
@@ -700,10 +709,47 @@ class ProvisionTests(SolanaEvalTestCase):
         self.assertEqual(context.task_dir.parent, definition.jobs_dir)
 
 
+class FreshDestinationTests(SolanaEvalTestCase):
+    """The verifier grades exactly one signature on the destination, so a
+    used destination is refused before a real transfer and ceremony."""
+
+    def check(self, history: object) -> None:
+        definition = self.make()
+        definition.destination = DESTINATION
+        with mock.patch.object(definition, "_rpc", return_value=history) as rpc:
+            definition._require_fresh_destination()
+        method, params = rpc.call_args.args
+        self.assertEqual(method, "getSignaturesForAddress")
+        self.assertEqual(params[0], DESTINATION)
+
+    def test_a_fresh_destination_is_accepted(self) -> None:
+        self.check([])
+
+    def test_a_used_destination_is_refused(self) -> None:
+        with self.assertRaisesRegex(EvalError, "already has on-chain history"):
+            self.check([{"signature": "x"}])
+
+    def test_an_unreadable_history_is_refused(self) -> None:
+        with self.assertRaisesRegex(EvalError, "signature history"):
+            self.check(None)
+
+
 class TurnBudgetTests(unittest.TestCase):
     def test_solana_declares_more_turns_than_the_shared_default(self) -> None:
         self.assertEqual(EvalDefinition.default_max_turns, "20")
         self.assertEqual(SolanaTransferEval.default_max_turns, "24")
+
+    def test_the_eval_default_reaches_the_agent_and_the_operator_wins(self) -> None:
+        auth = {"DEEPSEEK_API_KEY": "test-deepseek-key"}
+        with mock.patch.dict(os.environ, auth, clear=True):
+            spec = _agent_spec("deepseek", SolanaTransferEval.default_max_turns)
+            self.assertNotIn("BLOOM_EVAL_MAX_TURNS", os.environ)
+        self.assertEqual(spec.kwargs["max_turns"], 24)
+        with mock.patch.dict(
+            os.environ, {**auth, "BLOOM_EVAL_MAX_TURNS": "7"}, clear=True
+        ):
+            spec = _agent_spec("deepseek", SolanaTransferEval.default_max_turns)
+        self.assertEqual(spec.kwargs["max_turns"], 7)
 
 
 class SweepTests(SolanaEvalTestCase):
@@ -952,12 +998,22 @@ class VfsTreeTests(unittest.TestCase):
                 ["0001", "new.tx", "receipt.json"],
             )
 
-    def test_a_failed_listing_is_an_empty_one(self) -> None:
+    def test_a_missing_directory_is_an_empty_listing(self) -> None:
         tree = self.make()
-        with mock.patch.object(
-            tree, "_run", return_value=self.completed(returncode=1, stderr=b"x")
-        ):
+        missing = self.completed(
+            returncode=1, stderr=b"Error: ipc list: not found: /w/pending"
+        )
+        with mock.patch.object(tree, "_run", return_value=missing):
             self.assertEqual(tree.list_dir(Path("/mnt/bloom/w/pending")), [])
+
+    def test_an_unreachable_machine_is_not_an_empty_listing(self) -> None:
+        # Preflight's "no pending entries" and cleanup's drain must not pass
+        # just because the Machine stopped answering.
+        tree = self.make()
+        down = self.completed(returncode=1, stderr=b"Error: connection refused")
+        with mock.patch.object(tree, "_run", return_value=down):
+            with self.assertRaisesRegex(EvalError, "vfs ls"):
+                tree.list_dir(Path("/mnt/bloom/w/pending"))
 
     def test_read_json_retries_a_torn_snapshot(self) -> None:
         tree = self.make()
@@ -1051,8 +1107,10 @@ class VfsTransportTests(SolanaEvalTestCase):
                     definition, "_require_sign_count", return_value=2
                 ):
                     with mock.patch("harness.core.CeremonyDriver.preflight"):
-                        with mock.patch.object(
-                            definition, "_require_chain_identity"
+                        with mock.patch.multiple(
+                            definition,
+                            _require_chain_identity=mock.DEFAULT,
+                            _require_fresh_destination=mock.DEFAULT,
                         ):
                             with mock.patch.object(
                                 definition, "_load_local_account_identity"

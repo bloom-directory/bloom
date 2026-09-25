@@ -7,7 +7,9 @@ than only through whichever eval happens to exercise them first.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -55,6 +57,44 @@ class PollUntilTests(unittest.TestCase):
 
         with self.assertRaisesRegex(EvalError, "never clears"):
             poll_until(predicate, attempts=2, delay=0)
+
+
+class CeremonyOriginTests(unittest.TestCase):
+    """Each development triad serves its own ceremony port; the harness
+    matches the origin triad.env records, and only that origin."""
+
+    def matches(self, origin: str | None, url: str) -> subprocess.CompletedProcess[str]:
+        env = {k: v for k, v in os.environ.items() if k != "BLOOM_TRIAD_DEV_CEREMONY_ORIGIN"}
+        if origin is not None:
+            env["BLOOM_TRIAD_DEV_CEREMONY_ORIGIN"] = origin
+        script = (
+            "import sys; from harness.core import CEREMONY_URL; "
+            "sys.exit(0 if CEREMONY_URL.fullmatch(sys.argv[1]) else 3)"
+        )
+        return subprocess.run(
+            [sys.executable, "-c", script, url],
+            env=env,
+            cwd=Path(__file__).resolve().parent.parent,
+            capture_output=True,
+            text=True,
+        )
+
+    def test_the_default_is_the_launcher_port(self) -> None:
+        url = "http://localhost:18734/ceremony/" + "A" * 43
+        self.assertEqual(self.matches(None, url).returncode, 0)
+
+    def test_a_candidate_triad_origin_replaces_the_default(self) -> None:
+        origin = "http://localhost:28735"
+        self.assertEqual(
+            self.matches(origin, origin + "/ceremony/" + "A" * 43).returncode, 0
+        )
+        custody = "http://localhost:18734/ceremony/" + "A" * 43
+        self.assertEqual(self.matches(origin, custody).returncode, 3)
+
+    def test_a_non_local_origin_is_refused(self) -> None:
+        result = self.matches("http://example.com:28735", "x")
+        self.assertNotIn(result.returncode, (0, 3))
+        self.assertIn("BLOOM_TRIAD_DEV_CEREMONY_ORIGIN", result.stderr)
 
 
 class MountedTreeTests(unittest.TestCase):

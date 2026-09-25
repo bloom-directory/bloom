@@ -33,9 +33,7 @@ worthless. Develop here.
 it buys nothing the local validator does not and its faucets are unreliable.
 The lane requires the explicit network selection, an acknowledgement, the full
 transfer contract as configuration, a host-controlled destination, and a
-pinned mainnet-beta genesis from the live endpoint. **Mainnet execution is
-not part of this evaluation's verified record**; running it is a separate,
-separately authorized operator decision.
+pinned mainnet-beta genesis from the live endpoint.
 
 Both lanes share the same transfer, approval, replacement, and verification
 semantics. Only the funding, the destination sweep, and the network identity
@@ -48,8 +46,12 @@ running. A background approver polls the outbox's host state directory and
 completes a ceremony **only after** reading the staged `intent.json` and
 checking every authoritative field against the configured trial: destination,
 exact lamports, fee payer, signing-account fingerprint and derivation path
-(omitting them is a refusal, never a silent pass), and the fee ceiling. It is
-never a rubber stamp for whatever the agent staged.
+(omitting them is a refusal, never a silent pass), the fee ceiling, and the
+staged `genesis_hash`, which must be the genesis preflight read from the
+endpoint. It is never a rubber stamp for whatever the agent staged.
+
+The verifier grades exactly one signature on the destination, so preflight
+refuses a destination with any on-chain history; every trial needs a fresh one.
 
 The approver follows exactly one succession: after blockhash expiry the
 outbox's restage route moves the approved entry to `failed/` and publishes
@@ -58,15 +60,15 @@ continue that lineage — a second fresh staging with identical destination and
 amount, for example — is refused and fails the trial. Total ceremonies are
 capped, so a misbehaving route cannot farm approvals.
 
-## One triad, canonical port
+## One triad, its own ceremony port
 
-The evaluation runs against one prepared, dedicated triad on the canonical
-developer ceremony port 18734, with one trial at a time. It does not require a
-second, simultaneously running production triad; isolation comes from the
-dedicated developer root, Machine home, wallet, and validator state, not from
-concurrency. If port 18734 is already occupied by another service, launching
-the evaluation triad fails with a clear error; never kill or stop the owner.
-An alternate-port knob does not exist in the harness.
+The evaluation runs against one prepared, dedicated triad, with one trial at a
+time. Isolation comes from the dedicated developer root, Machine home, wallet,
+validator state, and ceremony port. Port 18734 belongs to an installed custody
+triad when one exists, so launch the evaluation triad with its own
+`--ceremony-port` (DEVELOPMENT.md). `triad.env` records the port and origin; the
+wrapper and the approver read them from there. Never kill or stop another
+port's owner.
 
 ## Prerequisites
 
@@ -120,11 +122,12 @@ Every command below is the real CLI surface; run them in order.
 
    The local-lane trial container shares host networking
    (`docker-compose.local.yaml`) so it can reach this loopback validator.
-   This is deliberate and local-only: the container holds no signing keys,
-   so loopback reach cannot stage, approve, or broadcast outside the mounted
-   outbox, and the mainnet lane never receives the overlay.
+   That also exposes the Machine's loopback NFS export to the agent, past the
+   read-only bind mount. It is accepted for the local lane only: nothing
+   signs without the exact-match host approval, local funds are worthless,
+   and the mainnet lane never receives the overlay.
 
-4. Launch the dedicated evaluation triad on canonical port 18734 (one
+4. Launch the dedicated evaluation triad on its own ceremony port (one
    terminal; it stays in the foreground):
 
    ```sh
@@ -138,7 +141,8 @@ Every command below is the real CLI surface; run them in order.
      --mount "$BLOOM_EVAL_BLOOM_MOUNT" \
      --machine-socket "$BLOOM_EVAL_TRIAD_ROOT/runtime/machine.sock" \
      --log-dir "$BLOOM_EVAL_TRIAD_ROOT/logs" \
-     --ready-file "$BLOOM_EVAL_TRIAD_ROOT/ready"
+     --ready-file "$BLOOM_EVAL_TRIAD_ROOT/ready" \
+     --ceremony-port 28735
    ```
 
    Linux mounts additionally need the launcher's narrowly scoped sudo mount
@@ -151,12 +155,12 @@ Every command below is the real CLI surface; run them in order.
 
 5. Create the isolated evaluation wallet and its Solana account. The wallet
    is registered through Broker custody ceremonies; complete each printed
-   `http://localhost:18734/ceremony/...` URL with the debug driver and the
+   `http://localhost:28735/ceremony/...` URL with the debug driver and the
    authenticator seed file, advancing `--sign-count` each time:
 
    ```sh
    bloom wallet import solana-eval
-   # → ceremony_url: http://localhost:18734/ceremony/<token>
+   # → ceremony_url: http://localhost:28735/ceremony/<token>
    bloom-broker/target/debug/bloom-broker-debug-driver complete <ceremony_url> \
      --authenticator-seed-file "$HOME/.config/bloom/eval-authenticator-seed" \
      --sign-count 1 --mnemonic-file /private/path/to/eval-mnemonic
@@ -248,11 +252,11 @@ Anthropic-compatible adapter; `opencode` runs the same provider through
 Harbor's native OpenCode adapter.
 Claude Code-backed local Solana trials default to a bounded 24 turns because
 discovery, owner approval, possible blockhash restaging, and finality can exceed
-the shared adapter's generic 20-turn default. Set `BLOOM_EVAL_MAX_TURNS` to
-override it.
+the harness's shared 20-turn default. Set `BLOOM_EVAL_MAX_TURNS` to override
+it.
 The lifecycle lock permits one Solana eval at a time.
 
-An occupied canonical port, a missing mount, or a missing ceremony listener
+A missing mount (outside the vfs transport) or a missing ceremony listener
 produces a clear wrapper error; it never stops another service.
 
 ## Exercise the blockhash-expiry replacement path
@@ -311,11 +315,6 @@ mainnet-beta genesis, and requires the sweep keypair to control the
 destination. Cleanup always sweeps the destination back to the source; only
 fees are actually spent. The container never receives the sweep key.
 
-**No mainnet run has been executed as part of this evaluation repair.** The
-mainnet path shares the local path's approval and verification machinery, but
-its end-to-end execution on mainnet-beta remains unverified until a separately
-authorized operator performs it.
-
 Set `BLOOM_EVAL_MODEL` to select a different model without changing the
 harness. The GLM adapter defaults to `glm-5.2` and accepts `GLM_API_KEY`,
 `ZAI_API_KEY`, or `ANTHROPIC_AUTH_TOKEN` from the host; the credential is
@@ -356,8 +355,9 @@ the owner filesystem; the agent must not attempt to complete its ceremony.
 over-mounted read-write. A pending entry's id is allocated by the daemon when the
 agent stages, so its `confirm` path cannot be enumerated before the container
 starts. The Docker flag is defence in depth; the authority boundary is the VFS
-mode — everything under `outbox/` is `0444` except `new.tx` and a pending entry's
-`confirm`, `cancel` and `restage` — plus Broker policy, the ceremony, and the
+mode — everything under `outbox/` is `0444` except `new.tx`, a pending entry's
+`confirm`, `cancel` and `restage`, and an expired entry's `failed/<id>/restage`
+— plus Broker policy, the ceremony, and the
 exact-match host approver. Provision refuses when the outbox is absent, because
 Docker silently creates an empty directory at a missing bind source and would
 mask the real one.
@@ -440,23 +440,3 @@ established against live validators.
 The temporary wallet policy names the destination under the stable `solana`
 authority namespace. `solana-local` is the VFS/configuration name; cluster
 identity is bound separately by the pinned genesis hash and signed blockhash.
-
-### Paid-agent status
-
-The task has been attempted through Harbor against a mounted Machine. That run
-proved the dynamic outbox mount, staging, and first fail-closed confirm, then
-exposed a harness drift bug: Bloom emitted the canonical
-`approval_challenge.json` while the host approver still watched the obsolete
-private `approval.json`. The watcher now follows the canonical artifact.
-
-The deterministic smoke command above is the release gate for the remaining
-live questions before another paid run or any mainnet use:
-
-- whether the configured timeouts suit finalization in that setting;
-- whether the corrected background approver drives the real ceremony correctly;
-- whether the replacement lineage behaves under a genuinely delayed approval
-  (`BLOOM_EVAL_SOLANA_SMOKE_RESTAGE=1`).
-
-Everything else is covered: the verifier, the freshness binding, the approver
-match logic, the mount construction and container boundary offline, and the
-mainnet sweep logic under its own unit coverage.

@@ -4,8 +4,8 @@ set -euo pipefail
 # Developer wrapper for the local-lane native SOL transfer evaluation.
 #
 # It drives the prepared, dedicated evaluation triad from the task README:
-# one triad on the canonical ceremony port 18734, one trial at a time, plus a
-# disposable local validator. This wrapper never launches, restarts, or stops
+# one triad on its own ceremony port, one trial at a time, plus a disposable
+# local validator. This wrapper never launches, restarts, or stops
 # services; lifecycle belongs to scripts/triad-dev-launch.sh and to whoever
 # started the validator.
 
@@ -45,23 +45,25 @@ if [ -z "${BLOOM_EVAL_BLOOM_MOUNT:-}" ]; then
     'at the prepared triad env file.' >&2
   exit 1
 fi
-if ! mount | grep -F " on ${BLOOM_EVAL_BLOOM_MOUNT} " >/dev/null 2>&1; then
+# The vfs transport drives the Machine over IPC and needs no kernel mount.
+if [ "${BLOOM_EVAL_SOLANA_TRANSPORT:-mount}" != vfs ] &&
+  ! mount | grep -F " on ${BLOOM_EVAL_BLOOM_MOUNT} " >/dev/null 2>&1; then
   printf '%s\n' \
     "error: no mount is live at ${BLOOM_EVAL_BLOOM_MOUNT}; start the prepared" \
     'evaluation triad with scripts/triad-dev-launch.sh --mount ... (README).' >&2
   exit 1
 fi
 
-# The canonical ceremony port must be serving. An occupied port is expected
-# here only when it is the dedicated evaluation triad; when another service
-# owns the port, launching the triad fails upstream and this wrapper never
-# kills or stops the owner.
-if ! (exec 3<>"/dev/tcp/127.0.0.1/18734") 2>/dev/null; then
+# The evaluation triad's ceremony port must be serving. triad.env records it;
+# 18734 is the launcher default. This wrapper never kills or stops an owner.
+ceremony_port="${BLOOM_TRIAD_DEV_CEREMONY_PORT:-18734}"
+if ! (exec 3<>"/dev/tcp/127.0.0.1/${ceremony_port}") 2>/dev/null; then
   printf '%s\n' \
-    'error: nothing is listening on the canonical ceremony port 18734; start' \
-    'the dedicated evaluation triad with scripts/triad-dev-launch.sh (README).' >&2
+    "error: nothing is listening on ceremony port ${ceremony_port}; start the" \
+    'dedicated evaluation triad with scripts/triad-dev-launch.sh (README).' >&2
   exit 1
 fi
+export BLOOM_TRIAD_DEV_CEREMONY_ORIGIN="${BLOOM_TRIAD_DEV_CEREMONY_ORIGIN:-http://localhost:${ceremony_port}}"
 
 export BLOOM_EVAL_SOLANA_LANE="${BLOOM_EVAL_SOLANA_LANE:-local}"
 export BLOOM_EVAL_SOLANA_CHAIN="${BLOOM_EVAL_SOLANA_CHAIN:-solana-local}"

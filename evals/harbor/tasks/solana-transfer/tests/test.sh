@@ -11,7 +11,8 @@ mkdir -p /logs/verifier
 reward=0
 cleanup_status=0
 
-outbox="/bloom/wallets/${BLOOM_EVAL_SOLANA_WALLET_ID}/chains/${BLOOM_EVAL_SOLANA_CHAIN}/outbox"
+# Chain views live under the numbered account directory the harness resolved.
+outbox="/bloom/wallets/${BLOOM_EVAL_SOLANA_WALLET_ID}/${BLOOM_EVAL_SOLANA_ACCOUNT}/chains/${BLOOM_EVAL_SOLANA_CHAIN}/outbox"
 
 cleanup() {
   # Cancel every entry still pending. `cancel` is a control write on a staged
@@ -27,7 +28,8 @@ cleanup() {
   # Require the pending directory to drain. A residual staged entry holds a
   # blockhash that could still be broadcast later, so it is not an acceptable
   # end state even when the trial otherwise passed.
-  if ! timeout 60 bash -c '
+  # A missing pending directory is a broken mount, not a drained outbox.
+  if [ ! -d "${outbox}/pending" ] || ! timeout 60 bash -c '
     until [ -z "$(ls -A "$1" 2>/dev/null)" ]; do
       sleep 2
     done
@@ -40,7 +42,8 @@ trap cleanup EXIT
 # The agent is not told about evaluation artifacts. Grade only independent VFS
 # and chain state: no pending action may remain, and the fresh destination must
 # have received the exact finalized transfer.
-if [ -z "$(timeout 30 ls -A "${outbox}/pending" 2>/dev/null)" ] && \
+if [ -d "${outbox}/pending" ] && \
+    [ -z "$(timeout 30 ls -A "${outbox}/pending" 2>/dev/null)" ] && \
     python3 /tests/verify_result.py; then
   reward=1
 fi

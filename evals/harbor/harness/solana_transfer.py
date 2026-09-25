@@ -73,10 +73,9 @@ CHAIN_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
 FINGERPRINT = re.compile(r"[0-9a-f]{16,64}")
 DERIVATION = re.compile(r"m/44'/501'/\d+'/0'")
 
-# Ceilings the harness enforces independently of anything the operator
-# configures, so a fat-fingered parameter cannot widen the blast radius.
-# 0.05 SOL balance, 0.02 SOL transfer.
-HARNESS_MAX_BALANCE_LAMPORTS = 50_000_000
+# A ceiling the harness enforces on the transfer and fee independently of
+# anything the operator configures, so a fat-fingered parameter cannot widen
+# the blast radius: 0.02 SOL.
 HARNESS_MAX_TRANSFER_LAMPORTS = 20_000_000
 
 # Mounted chain reads wait on an RPC round trip, not a disk.
@@ -215,12 +214,16 @@ class VfsTree:
         ) from last_error
 
     def list_dir(self, path: Path) -> list[str]:
-        # A failed listing means "not there (or not yet)": the smoke polls
+        # A missing directory means "not there (or not yet)": the smoke polls
         # state that the engine is creating concurrently, so absence is a
-        # poll outcome, not an error. Reads and writes stay fail-loud.
+        # poll outcome, not an error. Any other failure — an unreachable
+        # Machine above all — is fail-loud, like the mount transport's.
         completed = self._run(["ls", self._vfs_path(path)], self.read_timeout)
         if completed.returncode != 0:
-            return []
+            detail = completed.stderr.decode(errors="replace").strip()
+            if "not found:" in detail:
+                return []
+            raise EvalError(f"vfs ls {path} failed: {detail}")
         names = []
         for line in completed.stdout.decode(errors="replace").splitlines():
             if line.strip():
@@ -298,6 +301,8 @@ class SolanaTransferEval(EvalDefinition):
         self.source_address = ""
         self.key_fingerprint = ""
         self.derivation_path = ""
+        # Set by _require_chain_identity; empty matches no staged intent.
+        self.genesis_hash = ""
         # Numbered account directory the vfs projects the wallet under
         # (`wallets/<wallet>/<n>/...`); resolved from the authenticated
         # account projection in _load_local_account_identity.
@@ -585,9 +590,6 @@ class SolanaTransferEval(EvalDefinition):
                 f"{HARNESS_MAX_TRANSFER_LAMPORTS}"
             )
         self.max_fee_lamports = max_fee
-        # HARNESS_MAX_BALANCE_LAMPORTS bounds the destination's total exposure;
-        # with both per-item ceilings at 20M SOL-lamports the sum can never
-        # exceed it, so no separate sum check is needed here.
 
     def _require_chain_identity(self) -> None:
         """Check the configured endpoint's actual cluster identity.
@@ -599,6 +601,9 @@ class SolanaTransferEval(EvalDefinition):
         observed = self._rpc("getGenesisHash", [])
         if not isinstance(observed, str) or not observed:
             raise EvalError("could not read the endpoint's genesis hash")
+        # The approver requires every staged intent to carry this same
+        # genesis, so the identity checked here is the one approved.
+        self.genesis_hash = observed
         if self.lane == "mainnet":
             if observed != MAINNET_GENESIS_HASH:
                 raise EvalError(
@@ -609,6 +614,22 @@ class SolanaTransferEval(EvalDefinition):
             raise EvalError(
                 "the local lane refuses mainnet-beta endpoints; the configured "
                 "RPC serves the mainnet-beta genesis"
+            )
+
+    def _require_fresh_destination(self) -> None:
+        """The verifier grades exactly one signature on the destination, so
+        a destination with any history would score zero after a real
+        transfer and ceremony. Refuse it before anything moves."""
+        history = self._rpc(
+            "getSignaturesForAddress",
+            [self.destination, {"limit": 1, "commitment": "confirmed"}],
+        )
+        if not isinstance(history, list):
+            raise EvalError("could not read the destination's signature history")
+        if history:
+            raise EvalError(
+                "the destination already has on-chain history; each trial "
+                "needs a fresh host-controlled destination"
             )
 
     # ---- preflight -----------------------------------------------------
@@ -691,6 +712,7 @@ class SolanaTransferEval(EvalDefinition):
 
         # Chain identity is checked from the chain itself, not from labels.
         self._require_chain_identity()
+        self._require_fresh_destination()
 
         # The approver reads the canonical host-side approval challenge the
         # confirm route stages. Current outboxes also project a sanitized copy
@@ -804,6 +826,8 @@ class SolanaTransferEval(EvalDefinition):
             self._host_entry("pending", pending_id) / "intent.json"
         )
         if not isinstance(intent, dict):
+            return False
+        if intent.get("genesis_hash") != self.genesis_hash:
             return False
         if intent.get("destination") != self.destination:
             return False
@@ -1013,10 +1037,12 @@ class SolanaTransferEval(EvalDefinition):
     def sweep_destination(self) -> str | None:
         """Return the destination's lamports to the source.
 
-        This is what makes the mainnet eval economically reversible and
-        therefore repeatable: the transfer itself cannot be undone, but the
-        destination is host-controlled, so the lamports come back and only the
-        fees are actually spent. The container never sees this key.
+        This is what makes the mainnet eval economically reversible: the
+        transfer itself cannot be undone, but the destination is
+        host-controlled, so the lamports come back and only the fees are
+        actually spent. The sweep leaves history on the destination, so the
+        next trial needs a fresh one (preflight refuses a used destination).
+        The container never sees this key.
 
         Returns the sweep signature, or None when there was nothing to sweep.
         """
@@ -1116,6 +1142,7 @@ class SolanaTransferEval(EvalDefinition):
 
         verifier_env = {
             "BLOOM_EVAL_SOLANA_WALLET_ID": self.wallet_id,
+            "BLOOM_EVAL_SOLANA_ACCOUNT": self.account_dir,
             "BLOOM_EVAL_SOLANA_CHAIN": self.chain,
             "BLOOM_EVAL_SOLANA_RPC_URL": self.rpc_url,
             "BLOOM_EVAL_SOLANA_MAX_FEE_LAMPORTS": str(self.max_fee_lamports),

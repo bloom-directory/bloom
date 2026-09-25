@@ -142,12 +142,23 @@ bash -n "${repo_root}/scripts/evals/operate-harbor-hyperliquid.sh"
 bash -n "${repo_root}/scripts/evals/run-harbor.sh"
 bash -n "${repo_root}/scripts/evals/run-harbor-solana-local.sh"
 git -C "$repo_root" check-ignore -q evals/harbor/operator-state.json
-! grep -En 'BLOOM_EVAL_VFS_|VfsTransport|bloom vfs' \
-  "${repo_root}/evals/harbor/harness"/*.py
+# Agent trials go through the mounted filesystem. Only the Solana harness has
+# a `bloom vfs` transport, and it is refused outside --smoke-only.
+if grep -En 'BLOOM_EVAL_VFS_|VfsTransport|bloom vfs' \
+  "${repo_root}/evals/harbor/harness/core.py" \
+  "${repo_root}/evals/harbor/harness/__main__.py" \
+  "${repo_root}/evals/harbor/harness/hyperliquid_order_cancel.py" \
+  "${repo_root}/evals/harbor/harness/operator.py"; then
+  printf '%s\n' 'error: a mount-only harness references the vfs transport' >&2
+  exit 1
+fi
 grep -Fq '`bloom vfs`, the `bloom` executable' \
   "${task}/instruction.md"
 bash -n "${task}/tests/test.sh"
-PYTHONPATH="${repo_root}/evals/harbor" "${python_cmd[@]}" -m unittest discover \
+# Fixtures use the launcher's default ceremony origin; a sourced triad.env
+# for another port must not leak in.
+env -u BLOOM_TRIAD_DEV_CEREMONY_ORIGIN \
+  PYTHONPATH="${repo_root}/evals/harbor" "${python_cmd[@]}" -m unittest discover \
   -s "${repo_root}/evals/harbor/harness_tests" -v
 
 # Validate our programmatic configuration against the exact Harbor API version
@@ -281,6 +292,29 @@ done
 export BLOOM_EVAL_SOLANA_RPC_URL="http://127.0.0.1:$(cat "$port_file")"
 
 "${python_cmd[@]}" "$solana_verifier"
+
+# The container verifier grades the numbered account's outbox. Run a copy with
+# its absolute container paths rebased onto a fixture tree: the real layout
+# with an empty pending directory passes, and a missing outbox is a broken
+# path, never a drained one.
+solana_fixture="$tmp/solana-verifier"
+mkdir -p "$solana_fixture/tests" "$solana_fixture/logs/verifier" \
+  "$solana_fixture/bloom/wallets/solana-eval/0/chains/solana-local/outbox/pending"
+cp "$solana_verifier" "$solana_fixture/tests/verify_result.py"
+sed -e "s#/bloom/#${solana_fixture}/bloom/#g" \
+  -e "s#/logs/#${solana_fixture}/logs/#g" \
+  -e "s#/tests/#${solana_fixture}/tests/#g" \
+  "${solana_task}/tests/test.sh" >"$solana_fixture/test.sh"
+BLOOM_EVAL_SOLANA_WALLET_ID=solana-eval BLOOM_EVAL_SOLANA_ACCOUNT=0 \
+  BLOOM_EVAL_SOLANA_CHAIN=solana-local bash "$solana_fixture/test.sh" >/dev/null
+[ "$(cat "$solana_fixture/logs/verifier/reward.txt")" = 1 ]
+if BLOOM_EVAL_SOLANA_WALLET_ID=solana-eval BLOOM_EVAL_SOLANA_ACCOUNT=1 \
+  BLOOM_EVAL_SOLANA_CHAIN=solana-local bash "$solana_fixture/test.sh" \
+  >/dev/null 2>&1; then
+  echo "solana verifier passed without an outbox" >&2
+  exit 1
+fi
+[ "$(cat "$solana_fixture/logs/verifier/reward.txt")" = 0 ]
 
 "${python_cmd[@]}" - "$solana_verifier" <<'PY'
 import json, os, pathlib, subprocess, sys
