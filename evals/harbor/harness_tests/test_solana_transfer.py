@@ -668,7 +668,10 @@ class ProvisionTests(SolanaEvalTestCase):
         self.assertIn("Using Bloom, send exactly", instruction)
         self.assertIn(WALLET_ID, instruction)
         self.assertIn(DESTINATION, instruction)
-        self.assertNotIn("/bloom", instruction)
+        # Only the mount root, as a user's own setup would say; the wallet's
+        # account path and identity stay for the agent to discover.
+        self.assertIn("Bloom is mounted at `/bloom`.", instruction)
+        self.assertNotIn("/bloom/", instruction)
         self.assertNotIn("BLOOM_EVAL_", instruction)
         self.assertNotIn("result.json", instruction)
         # The verifier needs all of it to grade independently.
