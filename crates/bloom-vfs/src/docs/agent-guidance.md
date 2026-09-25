@@ -295,11 +295,20 @@ project into the central outbox:
 8. Read the sent, failed, or receipt projection before reporting success.
 
 A confirm write may return permission denied while projecting
-`approval_challenge.json`. Verify the challenge's wallet, action, intent, and
-expiry before presenting its ceremony URL. This is a waiting state, not a
-reason to restage. After human approval, retry only its exact `retry_path`;
+`approval_challenge.json` beside the pending entry, on EVM and Solana chains
+alike. Verify the challenge's wallet, action, intent, and expiry before
+presenting its ceremony URL. This is a waiting state, not a reason to restage.
 `plan_path` and `retry_path` name the outbox the confirm was written through
 (`wallets/<wallet>/<n>/chains/...`, including `n = 0` for account 0).
+
+Reading the challenge asks Bloom for the approval's current state, so poll it
+while the human approves. `state` is `awaiting_ceremony` until they finish,
+then `active`, and `next` says what to do. As soon as `state` is `active`,
+write `confirm` to `retry_path`; the approval does not broadcast on its own.
+Retrying `retry_path` before then is also safe: it starts no new ceremony and
+returns permission denied again. Once the ceremony can no longer be used,
+`ceremony_url` is withdrawn. For `expired`, `cancelled` or `refused`, tell the
+human rather than retrying on your own.
 
 `confirm.override` is not a general escape hatch. Use it only when the
 inspected policy projection explicitly permits that control and the human has

@@ -109,7 +109,7 @@ with only the wallet name at `wallets/recover`, then inspect
 
 For a transaction requiring fresh approval, inspect the same action's
 `approval_challenge.json`, verify its identity and expiry, and retry its exact
-`retry_path` only after the human approves. Read the resulting state and
+`retry_path` once its live `state` is `active`. Read the resulting state and
 receipt before reporting success; never restage merely because a pending path
 disappeared.
 

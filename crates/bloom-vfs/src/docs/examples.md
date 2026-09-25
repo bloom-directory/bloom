@@ -46,8 +46,10 @@ ls "$BLOOM/wallets/alice/0/chains/anvil/outbox/failed/"
 
 If confirmation requires fresh approval, read this exact pending action's
 `approval_challenge.json`. Check its wallet, action, intent, and expiry before
-forwarding the ceremony URL to the human. After approval, retry only the
-challenge's `retry_path`. Do not restage while approval is pending.
+forwarding the ceremony URL to the human. Re-read it while they approve: its
+`state` turns from `awaiting_ceremony` to `active` as soon as they finish. Then
+write `confirm` to the challenge's `retry_path`. Do not restage while approval
+is pending.
 
 
 Follow `$ID` into its resulting state and read its intent and receipt before
