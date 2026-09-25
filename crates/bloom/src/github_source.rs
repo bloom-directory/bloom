@@ -411,7 +411,7 @@ struct BuildSection {
     outputs: Vec<String>,
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Deserialize, serde::Serialize, PartialEq, Eq)]
 struct PetalReleaseManifest {
     schema: String,
     petal_name: String,
@@ -823,6 +823,16 @@ pub(crate) fn prepare_prebuilt_release_petal(
     entry: &PreinstalledPetal,
     context: &bloom_daemon::ipc::IpcOperationContext,
 ) -> Result<PreparedReleasePetal> {
+    let mirror = std::env::var_os("BLOOM_PETAL_RELEASE_MIRROR").map(std::path::PathBuf::from);
+    prepare_prebuilt_release_petal_with_mirror(daemon, entry, context, mirror.as_deref())
+}
+
+fn prepare_prebuilt_release_petal_with_mirror(
+    daemon: &Daemon,
+    entry: &PreinstalledPetal,
+    context: &bloom_daemon::ipc::IpcOperationContext,
+    mirror: Option<&Path>,
+) -> Result<PreparedReleasePetal> {
     if context.is_cancelled() {
         bail!("Petal acquisition cancelled");
     }
@@ -831,10 +841,15 @@ pub(crate) fn prepare_prebuilt_release_petal(
         "https://github.com/{}/{}/releases/download/{}",
         repo.owner, repo.repo, entry.release_tag
     );
+    let local_release = mirror
+        .map(|root| local_release_dir(root, &repo, entry.release_tag))
+        .transpose()?;
 
     let manifest_file =
         tempfile::NamedTempFile::new().context("create Petal release manifest download")?;
-    curl_download(
+    acquire_release_asset(
+        local_release.as_deref(),
+        "petal-release.json",
         &format!("{release_base}/petal-release.json"),
         manifest_file.path(),
         context,
@@ -847,10 +862,18 @@ pub(crate) fn prepare_prebuilt_release_petal(
 
     let url = format!("{release_base}/{}", entry.archive);
     let archive = tempfile::NamedTempFile::new().context("create pre-installed Petal download")?;
-    curl_download(&url, archive.path(), context)?;
+    acquire_release_asset(
+        local_release.as_deref(),
+        entry.archive,
+        &url,
+        archive.path(),
+        context,
+    )?;
 
     let checksums = tempfile::NamedTempFile::new().context("create release checksum download")?;
-    curl_download(
+    acquire_release_asset(
+        local_release.as_deref(),
+        "SHA256SUMS",
         &format!("{release_base}/SHA256SUMS"),
         checksums.path(),
         context,
@@ -863,6 +886,56 @@ pub(crate) fn prepare_prebuilt_release_petal(
         );
     }
     prepare_prebuilt_petal_archive(daemon, entry, &manifest, archive.path())
+}
+
+/// A local candidate is a complete release mirror, never a substitute for
+/// any of the manifest, checksum, package-hash, or catalog-pin checks below.
+fn local_release_dir(root: &Path, repo: &GitHubRepo, tag: &str) -> Result<std::path::PathBuf> {
+    if !root.is_absolute() {
+        bail!("BLOOM_PETAL_RELEASE_MIRROR must be an absolute directory");
+    }
+    let root = root
+        .canonicalize()
+        .context("resolve BLOOM_PETAL_RELEASE_MIRROR")?;
+    if !root.is_dir() {
+        bail!("BLOOM_PETAL_RELEASE_MIRROR is not a directory");
+    }
+    let release = root.join(&repo.owner).join(&repo.repo).join(tag);
+    let release = release
+        .canonicalize()
+        .with_context(|| format!("local Petal release is missing: {}", release.display()))?;
+    if !release.starts_with(&root) || !release.is_dir() {
+        bail!("local Petal release directory escapes the configured mirror");
+    }
+    Ok(release)
+}
+
+fn acquire_release_asset(
+    local_release: Option<&Path>,
+    asset: &str,
+    url: &str,
+    output: &Path,
+    context: &bloom_daemon::ipc::IpcOperationContext,
+) -> Result<()> {
+    if context.is_cancelled() {
+        bail!("Petal acquisition cancelled");
+    }
+    if let Some(release) = local_release {
+        let source = release.join(asset);
+        let metadata = std::fs::symlink_metadata(&source).with_context(|| {
+            format!("local Petal release asset is missing: {}", source.display())
+        })?;
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            bail!(
+                "local Petal release asset is not a regular file: {}",
+                source.display()
+            );
+        }
+        std::fs::copy(&source, output)
+            .with_context(|| format!("copy local Petal release asset {}", source.display()))?;
+        return Ok(());
+    }
+    curl_download(url, output, context)
 }
 
 fn curl_download(
@@ -2019,6 +2092,103 @@ mod tests {
             tooling_repository: "bloom-directory/petal".into(),
             tooling_commit: "3".repeat(40),
         }
+    }
+
+    #[test]
+    fn local_release_mirror_uses_the_complete_pinned_validation_pipeline() {
+        let release = build_near_release("local-mirror");
+        let mut entry = near_catalog_entry(
+            NEAR_NEW_COMMIT,
+            "v9.0.0",
+            "near-intents-v9.0.0.petal.tar.gz",
+            Some(Box::leak(release.package.hash.clone().into_boxed_str())),
+        );
+        let archive_bytes = std::fs::read(release.archive.path()).unwrap();
+        let archive_sha = hex::encode(Sha256::digest(&archive_bytes));
+        entry.archive_sha256 = Box::leak(archive_sha.clone().into_boxed_str());
+
+        let mirror = tempfile::tempdir().unwrap();
+        let release_dir = mirror
+            .path()
+            .join("bloom-directory")
+            .join(NEAR_REPO)
+            .join(entry.release_tag);
+        std::fs::create_dir_all(&release_dir).unwrap();
+        std::fs::write(release_dir.join(entry.archive), &archive_bytes).unwrap();
+        let checksum = format!("{archive_sha}  {}\n", entry.archive);
+        std::fs::write(release_dir.join("SHA256SUMS"), &checksum).unwrap();
+        let mut manifest = near_release_manifest(&entry, &release.package.hash);
+        manifest.archive_sha256 = archive_sha;
+        std::fs::write(
+            release_dir.join("petal-release.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let home = tempfile::tempdir().unwrap();
+        let daemon = Daemon::from_home(HomeDir::at(home.path())).unwrap();
+        let context = bloom_daemon::ipc::IpcOperationContext::detached();
+        let prepared = prepare_prebuilt_release_petal_with_mirror(
+            &daemon,
+            &entry,
+            &context,
+            Some(mirror.path()),
+        )
+        .unwrap();
+        assert_eq!(prepared.package.hash, release.package.hash);
+        assert_eq!(prepared.provenance.resolved_commit, entry.commit);
+
+        manifest.source_commit = NEAR_OLD_COMMIT.into();
+        std::fs::write(
+            release_dir.join("petal-release.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            prepare_prebuilt_release_petal_with_mirror(
+                &daemon,
+                &entry,
+                &context,
+                Some(mirror.path()),
+            )
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("pinned catalog entry")
+        );
+        manifest.source_commit = entry.commit.into();
+        std::fs::write(
+            release_dir.join("petal-release.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        std::fs::remove_file(release_dir.join("SHA256SUMS")).unwrap();
+        assert!(
+            prepare_prebuilt_release_petal_with_mirror(
+                &daemon,
+                &entry,
+                &context,
+                Some(mirror.path()),
+            )
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("local Petal release asset is missing")
+        );
+        std::fs::write(release_dir.join("SHA256SUMS"), checksum).unwrap();
+        std::fs::write(release_dir.join(entry.archive), b"tampered").unwrap();
+        assert!(
+            prepare_prebuilt_release_petal_with_mirror(
+                &daemon,
+                &entry,
+                &context,
+                Some(mirror.path()),
+            )
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("checksum verification failed")
+        );
     }
 
     /// A home whose `near-intents` owner came from `repo` at `commit`, matching
