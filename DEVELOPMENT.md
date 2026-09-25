@@ -162,16 +162,23 @@ NTP.
 The launcher writes public connection settings to
 `/tmp/bloom-triad-logs/triad.env`. Source that file only in the terminal meant
 to address this candidate. It places the selected debug Machine binary first
-on `PATH`.
+on `PATH`, and records the selected ceremony port as
+`BLOOM_TRIAD_DEV_CEREMONY_PORT` plus the selected public ceremony origin as
+`BLOOM_TRIAD_DEV_CEREMONY_ORIGIN`. The startup output prints that same origin.
 
 ### Test the binaries you intended
 
-The launcher requires `../bloom-broker` and `../bloom-signer` to resolve even
-when binary overrides are supplied. Arrange candidate checkouts side by side,
-or provide those sibling names as symlinks in an isolated candidate directory;
-do not replace another session's checkout or links. Binary overrides select the
-executables, not the repository discovery paths. Build the candidate worktrees
-first and pin all three binary paths explicitly:
+The launcher resolves each sibling repository (`../bloom-broker`,
+`../bloom-signer`) only when that service's binary override is absent and the
+launcher needs its default build/path. Supplying `BLOOM_INTEGRATION_BROKER_BIN`
+skips Broker discovery; supplying `BLOOM_INTEGRATION_SIGNER_BIN` skips Signer
+discovery. Supplying all three binary paths needs no sibling checkout
+arrangement at all. For the services you do not override, arrange candidate
+checkouts side by side, or provide those sibling names as symlinks in an
+isolated candidate directory; do not replace another session's checkout or
+links. Binary overrides select the executables, not the repository discovery
+paths. Build the candidate worktrees first and pin all three binary paths
+explicitly:
 
 ```sh
 cargo build -p bloom --no-default-features \
@@ -189,7 +196,8 @@ scripts/triad-dev-launch.sh \
   --machine-home "$HOME/.bloom/triad-dev/machine-home" \
   --machine-socket /tmp/bloom-triad-machine.sock \
   --log-dir /tmp/bloom-triad-logs \
-  --ready-file /tmp/bloom-triad-ready
+  --ready-file /tmp/bloom-triad-ready \
+  --ceremony-port 28735
 ```
 
 Record the actual checkout revisions and dirty state as described under
@@ -198,9 +206,34 @@ Record the actual checkout revisions and dirty state as described under
 ### Sharing a host with other candidates
 
 The examples use fixed paths. Before running another candidate, give it a
-distinct developer root, Machine home, socket, log directory, ready file, and
-mountpoint. Suffixing each path with a candidate name is sufficient for state
-isolation; the ceremony-port constraint below still applies.
+distinct developer root, Machine home, socket, log directory, ready file,
+mountpoint, and ceremony port. Suffixing each path with a candidate name is
+sufficient for state isolation.
+
+Each candidate also needs its own ceremony port so two complete development
+triads, including passkey ceremonies, can run side by side while the installed
+custody triad keeps `18734`. Pass the port explicitly; the launcher uses
+`--ceremony-port PORT`, otherwise `BLOOM_TRIAD_DEV_CEREMONY_PORT`, otherwise
+`18734`:
+
+- Candidate A: `--ceremony-port 28735` with its own short developer root,
+  socket, logs, ready file, and optional mount.
+- Candidate B: `--ceremony-port 28736` with different paths.
+- Installed custody: leave `18734` and all installed units alone.
+
+The example ports are choices, not reservations. If one is occupied, choose
+another. A fresh-root launch on an occupied port fails and cleans up only its
+own units; it never stops the conflicting listener, restarts shared services,
+or falls back to another port.
+
+All ceremony ports share the `localhost` WebAuthn RP scope (`rpId
+"localhost"` covers every `localhost:<port>` origin), so one platform
+passkey can serve ceremonies on any candidate port. The shared scope does
+not share authorization: a credential must still be enrolled with and
+recognized by the destination Triad's own Signer — a passkey created on
+candidate A cannot approve a ceremony on candidate B, and a page served by
+one Triad posting to another fails the destination's origin check (the
+Broker log names the expected origin).
 
 Run one Machine per home. `bloom serve` and `bloom init` hold an exclusive lock
 on the whole home for their lifetime, so a second one against the same home
@@ -220,15 +253,23 @@ A client resolves its Machine in this order:
 
 Sourcing a candidate's `triad.env` sets `BLOOM_HOME` and `BLOOM_RPC_ENDPOINT`
 together, which is why it belongs only in the terminal addressing that
-candidate. An unsourced shell addresses `~/.bloom`, which is usually nobody's
-triad.
+candidate: source each candidate's `triad.env` only in its own shell. An
+unsourced shell addresses `~/.bloom`, which is usually nobody's triad.
 
-Separate state paths do not isolate the ceremony listener at `127.0.0.1:18734`.
-On Linux the launcher starts that systemd socket before checking
-`--services-only`, so that mode also reserves the port. Run only one launcher
-candidate at a time in the same network namespace; use separate disposable VMs
-for concurrent full triads. The unique paths above prevent state collisions
-when switching candidates, but do not remove this listener constraint.
+On Linux the launcher starts that candidate's systemd socket before checking
+`--services-only`, so that mode also reserves the candidate's port. Use the
+existing VFS-only launcher mode (omit `--mount`) for the concurrency test; a
+kernel mount adds no evidence about ceremony-port isolation.
+
+`scripts/test-ceremony-port-concurrency.sh` runs the whole acceptance
+sequence repeatably: it launches A and B with explicit ports and binary
+paths, enrolls a disposable wallet plus a policy-update assertion ceremony
+in each, fails a colliding fresh-root launch on A's port, stops A through
+its own launcher handle, and restarts A with its enrollment intact while B
+stays usable. Supply the four binaries explicitly (Machine, Broker, Signer,
+debug driver) and keep run roots short: unix socket paths must fit in
+`SUN_LEN`, so the script uses a short directory under `/tmp` regardless of
+`TMPDIR`.
 
 ## Cross-repository changes
 
@@ -373,6 +414,14 @@ The launcher's optional controls are:
 | `BLOOM_TRIAD_DEV_AUTHORITY_FIXTURE` | Set to `1` to install the deterministic authority fixture |
 | `BLOOM_TRIAD_DEV_BUILD_PETALS` | Set to `0` only for already-built reviewed Petals |
 | `BLOOM_TRIAD_DEV_SOCKET_TIMEOUT_SECONDS` | Positive launcher socket timeout |
+| `BLOOM_TRIAD_DEV_CEREMONY_PORT` | Ceremony listener port when `--ceremony-port` is absent |
+
+The launcher also accepts `--ceremony-port PORT`. The selected port is the
+explicit flag, otherwise `BLOOM_TRIAD_DEV_CEREMONY_PORT` when set, otherwise
+`18734`. A malformed value fails during argument validation before any build
+or config change. Every launch rewrites the selected numeric `ceremony_port`
+into both the Broker and Signer configs, so reusing a stopped root never keeps
+a silently different old value.
 
 Binary overrides are covered [above](#test-the-binaries-you-intended);
 test-specific variables are in [TESTING.md](./TESTING.md#environment-variables).
@@ -405,7 +454,7 @@ Common failures:
 | `Bloom home is already open for writing` | Another Machine owns that home; run one Machine and point clients at its socket |
 | `ipc ... via unix:<path>` | No Machine on that endpoint; check `BLOOM_IPC_SOCKET`, `BLOOM_HOME`, and that `triad.env` was sourced |
 | Linux services never become ready | Confirm an active systemd user manager and inspect Broker/Signer logs |
-| Ceremony cannot bind | Check port `18734` and stop the older developer launcher |
+| Ceremony cannot bind | The selected ceremony port is already owned; choose another port and restart only that candidate, leaving the conflicting triad and the custody port `18734` alone |
 | Enrollment is rejected as stale | Start with a new developer root; do not mutate custody files by hand |
 | Wallet/account data is missing | Inspect the authenticated Broker projection and its freshness, not a legacy Machine wallet store |
 | Solana broadcast is unavailable | Check the pinned genesis, every endpoint, and chain status |
