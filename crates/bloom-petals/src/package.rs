@@ -697,6 +697,7 @@ impl PreparedPetalPackage {
             });
         }
         validate_resolved_key_derive_scopes(&route_index.routes)?;
+        scoped_route_index(&route_index)?;
 
         Ok(Self {
             hash,
@@ -1600,6 +1601,139 @@ impl RouteIndex {
         }
         best
     }
+}
+
+/// The route table visible below `petals/<petal>/wallets/<wallet>/<account>/`.
+/// The original index remains the dispatch authority; this view is used only
+/// to select an original route and reconstruct its package-relative path.
+pub(crate) fn scoped_route_index(index: &RouteIndex) -> Result<RouteIndex, PetalError> {
+    let mut scoped = index.clone();
+    let mut wallet_indexes = std::collections::BTreeSet::new();
+    for route in &index.routes {
+        if route.kind == RouteEntryKind::Dir
+            && route.pattern.split('/').next_back() == Some("[wallet]")
+        {
+            wallet_indexes.insert(project_wallet_pattern(&route.pattern)?.0);
+        }
+    }
+    scoped.routes.clear();
+    for route in &index.routes {
+        let (pattern, projected) = project_wallet_pattern(&route.pattern)?;
+        if !projected && route.kind == RouteEntryKind::Dir && wallet_indexes.contains(&pattern) {
+            continue;
+        }
+        let mut route = route.clone();
+        route.pattern = pattern;
+        for previous in &scoped.routes {
+            if patterns_overlap(&previous.pattern, &route.pattern)? {
+                let previous_original = index
+                    .routes
+                    .iter()
+                    .find(|candidate| candidate.route_id == previous.route_id)
+                    .expect("scoped route comes from original index");
+                let route_original = index
+                    .routes
+                    .iter()
+                    .find(|candidate| candidate.route_id == route.route_id)
+                    .expect("scoped route comes from original index");
+                if patterns_overlap(&previous_original.pattern, &route_original.pattern)? {
+                    continue;
+                }
+                return Err(PetalError::InvalidWasm(format!(
+                    "scoped Petal routes conflict: {} ({}) and {} ({})",
+                    previous.route_id, previous.source_path, route.route_id, route.source_path
+                )));
+            }
+        }
+        scoped.routes.push(route);
+    }
+    Ok(scoped)
+}
+
+fn project_wallet_pattern(pattern: &str) -> Result<(String, bool), PetalError> {
+    let segments = pattern.split('/').collect::<Vec<_>>();
+    let wallet_dirs = segments
+        .iter()
+        .filter(|segment| **segment == "[wallet]")
+        .count();
+    let wallet_files = segments
+        .iter()
+        .filter(|segment| segment.starts_with("[wallet]."))
+        .count();
+    let wallet_positions = wallet_dirs + wallet_files;
+    if wallet_positions > 1 {
+        return Err(PetalError::InvalidWasm(format!(
+            "Petal route {pattern} contains more than one [wallet] segment"
+        )));
+    }
+    if wallet_dirs == 1 {
+        return Ok((
+            segments
+                .into_iter()
+                .filter(|segment| *segment != "[wallet]")
+                .collect::<Vec<_>>()
+                .join("/"),
+            true,
+        ));
+    }
+    if let Some(last) = segments.last()
+        && last.starts_with("[wallet].")
+        && segments.len() > 1
+    {
+        let suffix = last.strip_prefix("[wallet]").expect("prefix checked");
+        return Ok((
+            format!("{}{suffix}", segments[..segments.len() - 1].join("/")),
+            true,
+        ));
+    }
+    Ok((pattern.to_owned(), false))
+}
+
+pub(crate) fn scoped_original_path(
+    original: &RouteIndex,
+    scoped: &RouteIndex,
+    path: &str,
+    special: Option<&str>,
+    wallet: &str,
+) -> Option<String> {
+    let candidate = match special {
+        Some(special) if path.is_empty() => special.to_owned(),
+        Some(special) => format!("{path}/{special}"),
+        None => path.to_owned(),
+    };
+    let matched = scoped.match_route(&candidate)?;
+    let source = original
+        .routes
+        .iter()
+        .find(|route| route.route_id == matched.route.route_id)?;
+    let scoped_segments = matched.route.pattern.split('/').collect::<Vec<_>>();
+    let values = candidate.split('/').collect::<Vec<_>>();
+    let mut value_iter = values.iter();
+    let mut original_values = Vec::new();
+    let source_segments = source.pattern.split('/').collect::<Vec<_>>();
+    let filename_suffix = source_segments
+        .last()
+        .and_then(|segment| segment.strip_prefix("[wallet]."));
+    for (position, segment) in source_segments.iter().enumerate() {
+        if *segment == "[wallet]" {
+            original_values.push(wallet.to_owned());
+        } else if let Some(suffix) = segment.strip_prefix("[wallet].") {
+            original_values.push(format!("{wallet}.{suffix}"));
+        } else if position + 2 == source_segments.len()
+            && let Some(filename_suffix) = filename_suffix
+        {
+            let value = *value_iter.next()?;
+            let suffix = format!(".{filename_suffix}");
+            original_values.push(value.strip_suffix(&suffix)?.to_owned());
+        } else {
+            original_values.push((*value_iter.next()?).to_owned());
+        }
+    }
+    debug_assert_eq!(scoped_segments.len(), values.len());
+    if special.is_some() {
+        original_values.pop();
+    }
+    Some(original_values.join("/"))
 }
 
 pub fn package_hash(files: &[NormalizedPackageFile]) -> String {
@@ -6148,6 +6282,81 @@ allowed = ["bloom:store", "bloom:vfs.read"]
 [store]
 namespaces = ["wallets"]
 "#;
+
+    #[test]
+    fn scoped_routes_project_wallet_and_reject_ambiguous_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_dynamic_dir_package(
+            tmp.path(),
+            DYNAMIC_DIR_MANIFEST,
+            &route_fixtures::dynamic_dir_route_component(
+                true,
+                route_fixtures::FixtureVfsImport::ReadOnly,
+                &["bloom:store", "bloom:vfs.read"],
+                None,
+            ),
+        );
+        let mut original = PreparedPetalPackage::from_dir(tmp.path())
+            .unwrap()
+            .route_index;
+        let template = original.routes[0].clone();
+        original.routes.clear();
+        let route = |id: &str, pattern: &str| {
+            let mut route = template.clone();
+            route.route_id = id.into();
+            route.source_path = format!("petal/example/{pattern}.wasm");
+            route.pattern = pattern.into();
+            route
+        };
+        original
+            .routes
+            .push(route("wallet-index", "intents/[wallet]"));
+        original.routes.push(route("legacy-index", "intents"));
+        original
+            .routes
+            .push(route("item", "intents/[wallet]/[id]/plan.md"));
+        original
+            .routes
+            .push(route("obligations", "obligations/[wallet].json"));
+        let scoped = scoped_route_index(&original).unwrap();
+        assert!(
+            !scoped
+                .routes
+                .iter()
+                .any(|route| route.route_id == "legacy-index")
+        );
+        assert_eq!(
+            scoped_original_path(&original, &scoped, "intents", None, "alice").as_deref(),
+            Some("intents/alice")
+        );
+        assert_eq!(
+            scoped_original_path(&original, &scoped, "intents/42/plan.md", None, "alice")
+                .as_deref(),
+            Some("intents/alice/42/plan.md")
+        );
+        assert_eq!(
+            scoped_original_path(&original, &scoped, "obligations.json", None, "alice").as_deref(),
+            Some("obligations/alice.json")
+        );
+        original
+            .routes
+            .push(route("collision", "intents/[id]/plan.md"));
+        let error = scoped_route_index(&original).unwrap_err().to_string();
+        assert!(
+            error.contains("item") && error.contains("collision"),
+            "{error}"
+        );
+        original.routes.pop();
+        original
+            .routes
+            .push(route("double-wallet", "intents/[wallet]/[wallet]/new"));
+        assert!(
+            scoped_route_index(&original)
+                .unwrap_err()
+                .to_string()
+                .contains("more than one [wallet]")
+        );
+    }
 
     #[test]
     fn petal_parameterized_dir_route_records_imported_caps_ceiling() {

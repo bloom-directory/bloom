@@ -96,8 +96,9 @@ wallets/<wallet>/
 ```
 
 Files that name one key (`address.evm`/`address.sol`, their QR images, and
-`public_key`) live under a numbered account. Installed Petals are mounted at
-`/petals/<petal>/`.
+`public_key`) live under a numbered account. Installed Petal documents are mounted at `/petals/<petal>/`; operations are
+selected through `/petals/<petal>/wallets/<wallet>/<n>/`. The host supplies the
+selected wallet/account to the guest and isolates additional-account stores.
 
 The number is the derivation path itself, not a position in a list: slot `n`
 is EVM `m/44'/60'/0'/0/n` and Solana `m/44'/501'/n'/0'`. Signer owns the

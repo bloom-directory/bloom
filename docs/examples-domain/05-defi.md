@@ -17,9 +17,9 @@ bloom vfs ls /petals/enso
 Write the Enso credential into the Petal's secret store:
 
 ```sh
-bloom vfs write /petals/enso/settings/api-key \
+bloom vfs write /petals/enso/wallets/alice/0/settings/api-key \
   --data 'your-enso-api-key'
-bloom vfs cat /petals/enso/settings/status.json
+bloom vfs cat /petals/enso/wallets/alice/0/settings/status.json
 ```
 
 The Petal secret store is preferred. A runtime `enso-api-key` setting is only
@@ -28,15 +28,15 @@ a compatibility fallback and is reported as unencrypted configuration.
 ## Create and review a swap
 
 ```sh
-bloom vfs write /petals/enso/intents/alice/new \
+bloom vfs write /petals/enso/wallets/alice/0/intents/new \
   --data 'swap 100 usdc to eth on base'
-bloom vfs ls /petals/enso/intents/alice
+bloom vfs ls /petals/enso/wallets/alice/0/intents
 
 session='<session-id-from-the-list>'
-bloom vfs cat "/petals/enso/intents/alice/$session/plan.md"
-bloom vfs cat "/petals/enso/intents/alice/$session/route.json"
-bloom vfs cat "/petals/enso/intents/alice/$session/tx.json"
-bloom vfs cat "/petals/enso/intents/alice/$session/simulation.json"
+bloom vfs cat "/petals/enso/wallets/alice/0/intents/$session/plan.md"
+bloom vfs cat "/petals/enso/wallets/alice/0/intents/$session/route.json"
+bloom vfs cat "/petals/enso/wallets/alice/0/intents/$session/tx.json"
+bloom vfs cat "/petals/enso/wallets/alice/0/intents/$session/simulation.json"
 ```
 
 Treat `plan.md` and the simulation as review material. Route discovery does
@@ -48,7 +48,7 @@ The first confirmation asks the Petal to stage the reviewed transaction into
 Bloom's standard wallet outbox:
 
 ```sh
-bloom vfs write "/petals/enso/intents/alice/$session/confirm" \
+bloom vfs write "/petals/enso/wallets/alice/0/intents/$session/confirm" \
   --data confirm
 ```
 
@@ -74,9 +74,9 @@ Inspect the receipt and the Petal's settlement state after broadcast:
 bloom vfs cat \
   /wallets/alice/0/chains/base/outbox/sent/<id>/receipt.json
 bloom vfs cat \
-  "/petals/enso/intents/alice/$session/settlement.json"
+  "/petals/enso/wallets/alice/0/intents/$session/settlement.json"
 bloom vfs cat \
-  "/petals/enso/intents/alice/$session/status.json"
+  "/petals/enso/wallets/alice/0/intents/$session/status.json"
 ```
 
 ## Safety properties
@@ -98,5 +98,5 @@ value movement.
 
 The installed package is the authority for its current routes. Read
 `/petals/enso/README.md`, `/petals/enso/AGENTS.md`, and
-`/petals/enso/meta/route-contract.json` when those documentation routes are
+`/petals/enso/wallets/alice/0/meta/route-contract.json` when those documentation routes are
 present.

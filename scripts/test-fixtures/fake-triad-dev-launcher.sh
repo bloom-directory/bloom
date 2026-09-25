@@ -133,7 +133,7 @@ projection_path = write_json(
     },
 )
 write_json(
-    "petals/polymarket/meta/route-contract.json",
+    f"petals/polymarket/wallets/{wallet}/0/meta/route-contract.json",
     {
         "schema": "fake.route-contract.v1",
         "abi": "0.1",
@@ -141,15 +141,15 @@ write_json(
     },
 )
 write_json(
-    f"petals/polymarket/onboard/{wallet}/status.json",
+    f"petals/polymarket/wallets/{wallet}/0/onboard/status.json",
     {"stage": "complete", "tradeable": True},
 )
 write_json(
-    f"petals/polymarket/account/{wallet}/status.json",
+    f"petals/polymarket/wallets/{wallet}/0/account/status.json",
     {"status": "ready", "tradeable": True},
 )
 write_json(
-    f"petals/polymarket/account/{wallet}/buying_power.json",
+    f"petals/polymarket/wallets/{wallet}/0/account/buying_power.json",
     {
         "spendable": {"asset": "pUSD", "raw": "20000000"},
         "can_trade_now": True,
@@ -157,15 +157,15 @@ write_json(
     },
 )
 write_json(
-    "petals/polymarket/markets/fixture/market.json",
+    f"petals/polymarket/wallets/{wallet}/0/markets/fixture/market.json",
     {"slug": "fixture", "question": "Fixture?", "outcomes": ["Yes", "No"]},
 )
 write_json(
-    "petals/polymarket/markets/fixture/prices.json",
+    f"petals/polymarket/wallets/{wallet}/0/markets/fixture/prices.json",
     {"Yes": "0.5", "No": "0.5"},
 )
-(mount / f"petals/polymarket/trade/{wallet}/drafts").mkdir(parents=True)
-(mount / f"petals/polymarket/trade/{wallet}/receipts").mkdir(parents=True)
+(mount / f"petals/polymarket/wallets/{wallet}/0/trade/drafts").mkdir(parents=True)
+(mount / f"petals/polymarket/wallets/{wallet}/0/trade/receipts").mkdir(parents=True)
 
 policy_committed = threading.Event()
 committed_policy_digest = None
@@ -229,7 +229,7 @@ def policy_loop():
 threading.Thread(target=policy_loop, daemon=True).start()
 
 fixture_session = write_json(
-    "petals/triad-authority-fixture/session.json",
+    f"petals/triad-authority-fixture/wallets/{wallet}/0/session.json",
     {"schema": "bloom.triad-authority-fixture.result.v1", "state": "empty"},
 )
 (mount / "petal-key-requests").mkdir(parents=True, exist_ok=True)
@@ -389,7 +389,7 @@ def fixture_loop():
         if stage == 0:
             if not policy_committed.is_set():
                 write_json(
-                    "petals/triad-authority-fixture/session.json",
+                    f"petals/triad-authority-fixture/wallets/{wallet}/0/session.json",
                     {"stage": "key_request_failed", "error": "POLICY_DENIED"},
                 )
                 continue
@@ -416,7 +416,7 @@ def fixture_loop():
                 },
             )
             write_json(
-                "petals/triad-authority-fixture/session.json",
+                f"petals/triad-authority-fixture/wallets/{wallet}/0/session.json",
                 {
                     "schema": "bloom.triad-authority-fixture.result.v1",
                     "stage": "key",
@@ -441,7 +441,7 @@ def fixture_loop():
             }
             write_json("petal-key-requests/" + "33" * 32 + ".json", key_record)
             write_json(
-                "petals/triad-authority-fixture/session.json",
+                f"petals/triad-authority-fixture/wallets/{wallet}/0/session.json",
                 {
                     "schema": "bloom.triad-authority-fixture.result.v1",
                     "stage": "signing_failed",
@@ -451,12 +451,12 @@ def fixture_loop():
         else:
             if value.get("approval_hint") != approval_id or not approval_active.is_set():
                 write_json(
-                    "petals/triad-authority-fixture/session.json",
+                    f"petals/triad-authority-fixture/wallets/{wallet}/0/session.json",
                     {"stage": "signing_failed", "error": "APPROVAL_NOT_FOUND"},
                 )
                 continue
             write_json(
-                "petals/triad-authority-fixture/session.json",
+                f"petals/triad-authority-fixture/wallets/{wallet}/0/session.json",
                 {
                     "schema": "bloom.triad-authority-fixture.result.v1",
                     "stage": "complete",
@@ -476,7 +476,7 @@ threading.Thread(target=fixture_loop, daemon=True).start()
 
 def handle_pm_new(_payload):
     state.joinpath("pm-draft-staged").touch()
-    root = f"petals/polymarket/trade/{wallet}/drafts/draft-1"
+    root = f"petals/polymarket/wallets/{wallet}/0/trade/drafts/draft-1"
     Path(mount / root).mkdir(parents=True, exist_ok=True)
     write(f"{root}/plan.md", "# Fixture Polymarket plan\n")
     write_json(f"{root}/policy_check.json", {"policy_deny": False, "policy_status": "pass"})
@@ -505,7 +505,7 @@ def handle_pm_new(_payload):
         else:
             state.joinpath("pm-posted").touch()
             write_json(
-                f"petals/polymarket/trade/{wallet}/receipts/draft-1/receipt.json",
+                f"petals/polymarket/wallets/{wallet}/0/trade/receipts/draft-1/receipt.json",
                 {
                     "draft_id": "draft-1",
                     "clob_status": "matched",
@@ -517,7 +517,7 @@ def handle_pm_new(_payload):
     fifo(f"{root}/post", handle_post)
 
 
-fifo(f"petals/polymarket/trade/{wallet}/new", handle_pm_new)
+fifo(f"petals/polymarket/wallets/{wallet}/0/trade/new", handle_pm_new)
 
 time.sleep(float(os.environ.get("BLOOM_FAKE_STARTUP_DELAY_SECS", "0")))
 try:

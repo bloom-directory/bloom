@@ -217,7 +217,7 @@ jobs:
       github.ref_name == 'triad-architecture'
     uses: ./.github/workflows/macos-unix-conformance.yml
     with:
-      broker_ref: 3352190e5909803a49d577f36dadc9b672982bd0
+      broker_ref: 47c0830760e0870d43e3876454796486766d2cab
       signer_ref: 97b9ac7e47ee682e59804d04f6288419f3598a58
 
   linux_w0_isolation:

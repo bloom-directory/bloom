@@ -92,6 +92,13 @@ impl PetalStore {
             .unwrap_or_else(|| self.base.join("data"))
     }
 
+    pub fn private_account_data_root(&self) -> PathBuf {
+        self.base
+            .parent()
+            .map(|p| p.join("data-accounts"))
+            .unwrap_or_else(|| self.base.join("data-accounts"))
+    }
+
     fn object_path(&self, hash: &str) -> PathBuf {
         self.base.join(OBJECTS).join(hash)
     }
@@ -160,6 +167,7 @@ impl PetalStore {
                 mode,
                 petal: None,
                 source: None,
+                replaced: None,
             },
             Err(e) => return Err(e),
         };
@@ -302,6 +310,7 @@ impl PetalStore {
                 mode: PetalMode::Local,
                 petal: None,
                 source: None,
+                replaced: None,
             },
         };
         meta.name = Some(package.name.clone());
@@ -314,6 +323,13 @@ impl PetalStore {
             route_index_schema: ROUTE_INDEX_SCHEMA.to_string(),
         });
         meta.source = source;
+        // A reinstall of the same content hash must keep its original
+        // predecessor: replacing it with itself would break first-use copy.
+        if meta.replaced.is_none() {
+            meta.replaced = self
+                .resolve_petal_owner(&package.name)?
+                .filter(|owner| owner != &hash);
+        }
         commit_guard()?;
         self.write_meta(&meta)?;
 
@@ -1182,6 +1198,7 @@ name = "echo"
 
         let (replacement, meta, index) = store.install_petal_package_dir(&second).unwrap();
         assert_ne!(replacement.hash, first_hash);
+        assert_eq!(meta.replaced.as_deref(), Some(first_hash.as_str()));
         assert_eq!(meta.petal.as_ref().unwrap().name, "echo");
         assert_eq!(index.routes[0].pattern, "two.txt");
         assert!(store.contains_package(&first_hash));

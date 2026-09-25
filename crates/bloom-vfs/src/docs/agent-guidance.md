@@ -279,8 +279,12 @@ walkthrough in `docs/examples.md`.
 
 ## Petals and paid requests
 
-Installed applications live under `petals/<name>/`. Discover the installed
-package and follow its local instructions.
+Installed application documents and wallet discovery live under `petals/<name>/`.
+Operations live under `petals/<name>/wallets/<wallet>/<n>/`; select an existing
+wallet and numbered account, then follow the installed package instructions.
+Legacy unprefixed operation paths are removed. Account 0 retains existing
+settings; configure additional accounts separately. Keep every follow-up in
+the selected account, including core outbox confirmation paths.
 
 Paid HTTP operations live under `requests/`. They are actions, not ordinary
 reads: inspect the request plan, selected payment protocol, maximum amount,
