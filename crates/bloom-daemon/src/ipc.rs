@@ -714,6 +714,11 @@ pub enum MachineCommand {
     WalletPolicyCommit {
         operation_id: String,
     },
+    /// Propose the Petals chosen during setup for a wallet through its policy
+    /// operation, and report where that default policy stands.
+    WalletDefaultPolicy {
+        name: String,
+    },
     WalletOutboxCancel {
         wallet: String,
         chain: String,

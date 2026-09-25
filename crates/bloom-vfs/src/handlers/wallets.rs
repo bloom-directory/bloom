@@ -141,9 +141,15 @@ impl TriadPolicyUpdateProjection {
         Ok(bytes)
     }
 
+    /// View a pending policy change. `required` and `destinations` are what
+    /// the caller asked to be allowed; a change that does not carry all of
+    /// both is somebody else's, and must never be presented as the caller's
+    /// own. A change with the packages but not their destinations would leave
+    /// those Petals' outbox transactions denied after it commits.
     fn pending_view(
         &self,
-        package_hash: &bloom_broker_api::Digest32,
+        required: &[bloom_broker_api::Digest32],
+        destinations: &[bloom_broker_api::PolicyDestination],
     ) -> Result<bloom_machine_client::PetalEligibility, HandlerError> {
         let proposed: bloom_broker_api::CanonicalWalletPolicy =
             serde_json::from_slice(&self.retained_policy_bytes()?).map_err(err_be)?;
@@ -180,9 +186,12 @@ impl TriadPolicyUpdateProjection {
                     challenge_path: format!(
                         "/wallets/{wallet}/policy-updates/pending/{operation}/{APPROVAL_CHALLENGE_FILE}"
                     ),
-                    includes_requested_package: proposed
-                        .allowed_petal_packages
-                        .contains(package_hash),
+                    includes_requested: required
+                        .iter()
+                        .all(|package| proposed.allowed_petal_packages.contains(package))
+                        && destinations
+                            .iter()
+                            .all(|destination| proposed.allowed_destinations.contains(destination)),
                 },
             ),
         )
@@ -270,6 +279,16 @@ pub trait AccountPetalMount: Send + Sync {
         slot: &str,
     ) -> Result<(), HandlerError>;
 }
+/// What a wallet's first Petal policy proposal also allows: the Petals chosen
+/// during setup and the fixed contracts they transact with. Both are empty for
+/// wallets without a default policy.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DefaultPolicySetup {
+    pub packages: Vec<bloom_broker_api::Digest32>,
+    pub destinations: Vec<bloom_broker_api::PolicyDestination>,
+}
+
+pub type DefaultPolicyPackages = Arc<dyn Fn(&str) -> DefaultPolicySetup + Send + Sync>;
 
 #[derive(Clone)]
 pub struct WalletsHandler {
@@ -301,6 +320,8 @@ pub struct WalletsHandler {
     /// host needs this handler, so there is exactly one of each and the
     /// session seam is attached once both exist.
     account_petals: Arc<parking_lot::RwLock<Option<Arc<dyn AccountPetalMount>>>>,
+    /// Setup choices proposed together with a wallet's first Petal package.
+    default_policy_packages: Option<DefaultPolicyPackages>,
 }
 
 impl WalletsHandler {
@@ -323,7 +344,13 @@ impl WalletsHandler {
             solana: None,
             solana_reads: None,
             account_petals: Arc::new(parking_lot::RwLock::new(None)),
+            default_policy_packages: None,
         }
+    }
+
+    pub fn with_default_policy_packages(mut self, packages: DefaultPolicyPackages) -> Self {
+        self.default_policy_packages = Some(packages);
+        self
     }
 
     /// Attach the session seam that serves `wallets/<w>/<n>/sessions/`.
@@ -1305,7 +1332,60 @@ impl WalletsHandler {
         wallet: &str,
         package_hash: &bloom_broker_api::Digest32,
     ) -> Result<bloom_machine_client::PetalEligibility, HandlerError> {
-        use bloom_machine_client::{PetalEligibility, policy_with_package};
+        // A wallet's first proposal also allows the Petals chosen during setup,
+        // so the owner approves one policy rather than one per Petal. Later
+        // proposals add only the requested package: a Petal the owner removed
+        // from an existing policy must not be proposed again behind another.
+        let setup = self
+            .default_policy_packages
+            .as_ref()
+            .map(|defaults| defaults(wallet))
+            .unwrap_or_default();
+        self.ensure_policy_allows(
+            wallet,
+            std::slice::from_ref(package_hash),
+            std::slice::from_ref(package_hash),
+            &[],
+            &setup,
+        )
+        .await
+    }
+
+    /// Drive a wallet's default policy: propose every package and destination
+    /// together through the existing policy operation. `Allowed` means the
+    /// policy allows all of them.
+    pub async fn ensure_petal_packages_allowed(
+        &self,
+        wallet: &str,
+        packages: &[bloom_broker_api::Digest32],
+        destinations: &[bloom_broker_api::PolicyDestination],
+    ) -> Result<bloom_machine_client::PetalEligibility, HandlerError> {
+        if packages.is_empty() {
+            return Err(HandlerError::invalid("no Petal packages to allow"));
+        }
+        self.ensure_policy_allows(
+            wallet,
+            packages,
+            packages,
+            destinations,
+            &DefaultPolicySetup::default(),
+        )
+        .await
+    }
+
+    async fn ensure_policy_allows(
+        &self,
+        wallet: &str,
+        required: &[bloom_broker_api::Digest32],
+        additions: &[bloom_broker_api::Digest32],
+        destinations: &[bloom_broker_api::PolicyDestination],
+        // Added only when the wallet policy allows no Petal yet, so one
+        // ceremony makes every chosen Petal usable instead of gating each one.
+        first_proposal: &DefaultPolicySetup,
+    ) -> Result<bloom_machine_client::PetalEligibility, HandlerError> {
+        use bloom_machine_client::{
+            PetalEligibility, policy_with_destinations, policy_with_packages,
+        };
         use sha2::Digest as _;
 
         self.write_permit()?;
@@ -1319,14 +1399,32 @@ impl WalletsHandler {
                 .join(APPROVAL_CHALLENGE_FILE);
             let projection: TriadPolicyUpdateProjection = read_json(&path)?;
             let proposed_bytes = projection.retained_policy_bytes()?;
-            match self
+            let mut resumed = self
                 .resume_wallet_policy_update(wallet, &operation_id, &proposed_bytes)
-                .await
+                .await;
+            if matches!(resumed, Err(HandlerError::PermissionDenied))
+                && self
+                    .cancel_expired_policy_ceremony(wallet, &operation_id)
+                    .await?
             {
+                resumed = self
+                    .resume_wallet_policy_update(wallet, &operation_id, &proposed_bytes)
+                    .await;
+            }
+            match resumed {
                 Ok(()) => continue,
                 Err(HandlerError::PermissionDenied) => {
                     let projection: TriadPolicyUpdateProjection = read_json(&path)?;
-                    return projection.pending_view(package_hash);
+                    return projection.pending_view(required, destinations);
+                }
+                // A cancelled, expired, or failed ceremony has left `pending`;
+                // propose again from the current policy.
+                Err(_)
+                    if !self
+                        .policy_update_action_dir(wallet, "pending", &operation_id)
+                        .is_dir() =>
+                {
+                    continue;
                 }
                 Err(error) => return Err(error),
             }
@@ -1350,10 +1448,27 @@ impl WalletsHandler {
                 "Broker eligibility policy has invalid wallet, digest, or canonical bytes",
             ));
         }
-        if policy.allowed_petal_packages.contains(package_hash) {
+        if required
+            .iter()
+            .all(|package| policy.allowed_petal_packages.contains(package))
+            && destinations
+                .iter()
+                .all(|destination| policy.allowed_destinations.contains(destination))
+        {
             return Ok(PetalEligibility::Allowed(current));
         }
-        let proposed = policy_with_package(&policy, package_hash);
+        let mut additions = additions.to_vec();
+        // Kept apart from `destinations`, which stays what the caller asked
+        // for so a pending change is judged against the request alone.
+        let mut proposed_destinations = destinations.to_vec();
+        if policy.allowed_petal_packages.is_empty() {
+            additions.extend_from_slice(&first_proposal.packages);
+            proposed_destinations.extend_from_slice(&first_proposal.destinations);
+        }
+        let proposed = policy_with_destinations(
+            &policy_with_packages(&policy, &additions),
+            &proposed_destinations,
+        );
         let proposed_bytes = serde_jcs::to_vec(&proposed).map_err(err_be)?;
         match self
             .write_wallet_policy_update_locked(wallet, &proposed_bytes, Some(&current))
@@ -1369,13 +1484,39 @@ impl WalletsHandler {
                     self.policy_update_action_dir(wallet, "pending", &operation_id)
                         .join(APPROVAL_CHALLENGE_FILE),
                 )?;
-                projection.pending_view(package_hash)
+                projection.pending_view(required, destinations)
             }
             Err(error) => Err(error),
             Ok(()) => Err(HandlerError::backend(
                 "fresh policy proposal unexpectedly committed without owner consent",
             )),
         }
+    }
+
+    /// The Broker reports an expired ceremony as awaiting the owner until asked
+    /// to act on it. Cancel a pending policy ceremony past its expiry so the
+    /// next status read is terminal; returns whether the Broker accepted.
+    async fn cancel_expired_policy_ceremony(
+        &self,
+        wallet: &str,
+        operation_id: &str,
+    ) -> Result<bool, HandlerError> {
+        let projection: TriadPolicyUpdateProjection = read_json(
+            self.policy_update_action_dir(wallet, "pending", operation_id)
+                .join(APPROVAL_CHALLENGE_FILE),
+        )?;
+        if !projection
+            .ceremony_expires_at_ms
+            .as_ref()
+            .is_some_and(|expires_at_ms| expires_at_ms.get() <= now_ms_u64())
+        {
+            return Ok(false);
+        }
+        Ok(self
+            .broker()?
+            .cancel_ceremony(projection.operation_id)
+            .await
+            .is_ok())
     }
 
     /// Gate an explicit caller operation without treating policy completion as submission.
@@ -1468,7 +1609,7 @@ impl WalletsHandler {
             .truncate(false)
             .open(directory.join(".coordinator.lock"))?;
         fs2::FileExt::try_lock_exclusive(&file).map_err(|error| {
-            HandlerError::backend(format!("wallet policy coordination busy; retry: {error}"))
+            HandlerError::backend(format!("{POLICY_COORDINATION_BUSY}; retry: {error}"))
         })?;
         Ok(file)
     }
@@ -2101,6 +2242,10 @@ fn validate_policy_action_id(id: &str) -> Result<(), HandlerError> {
     }
     Ok(())
 }
+
+/// Start of the error a policy writer gets while another command holds the
+/// wallet's policy lock. Waiting commands poll again instead of failing.
+pub const POLICY_COORDINATION_BUSY: &str = "wallet policy coordination busy";
 
 fn tx_open_err(e: TxEngineError) -> HandlerError {
     match e {

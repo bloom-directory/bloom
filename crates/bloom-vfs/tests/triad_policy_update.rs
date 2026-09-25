@@ -1,6 +1,6 @@
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use bloom_broker_api::{
@@ -13,7 +13,7 @@ use bloom_broker_api::{
 };
 use bloom_machine_client::{
     CachedWalletProjectionReader, FileProjectionStore, MachineBrokerClient, PetalEligibility,
-    WalletProjectionReader, policy_with_package,
+    WalletProjectionReader, policy_with_packages,
 };
 use bloom_proto::{AddressBook, HomeDir, HomeWritePermit};
 use bloom_tx::{outbox::Outbox, tx_engine::TxEngine};
@@ -42,6 +42,7 @@ struct BrokerFixture {
     complete: AtomicBool,
     lose_prepare_response_once: AtomicBool,
     ceremony_state_override: parking_lot::Mutex<Option<CeremonyState>>,
+    ceremony_expires_at_ms: AtomicU64,
     requests: parking_lot::Mutex<Vec<MachineBrokerRequest>>,
     state: parking_lot::Mutex<FixtureState>,
     baseline: SignedPolicySnapshot,
@@ -194,7 +195,9 @@ impl MachineBrokerService for BrokerFixture {
                             ceremony_kind: CeremonyKind::PolicyUpdate,
                             operation_id: OperationId::new(request.id.as_str().to_owned()).unwrap(),
                             state,
-                            expires_at_ms: DecimalU64::new(u64::MAX),
+                            expires_at_ms: DecimalU64::new(
+                                self.ceremony_expires_at_ms.load(Ordering::SeqCst),
+                            ),
                             ceremony_url: (state == CeremonyState::AwaitingUser).then(|| {
                                 "http://localhost:18734/ceremony/policy-test-secret".into()
                             }),
@@ -271,12 +274,20 @@ fn policy(maximum_approval_lifetime_ms: u64) -> CanonicalWalletPolicy {
 }
 
 fn broker_fixture(lose_prepare_response_once: bool) -> Arc<BrokerFixture> {
-    let baseline_bytes = serde_jcs::to_vec(&policy(60_000)).unwrap();
+    broker_fixture_with_policy(lose_prepare_response_once, policy(60_000))
+}
+
+fn broker_fixture_with_policy(
+    lose_prepare_response_once: bool,
+    baseline_policy: CanonicalWalletPolicy,
+) -> Arc<BrokerFixture> {
+    let baseline_bytes = serde_jcs::to_vec(&baseline_policy).unwrap();
     Arc::new(BrokerFixture {
         available: AtomicBool::new(true),
         complete: AtomicBool::new(false),
         lose_prepare_response_once: AtomicBool::new(lose_prepare_response_once),
         ceremony_state_override: parking_lot::Mutex::new(None),
+        ceremony_expires_at_ms: AtomicU64::new(u64::MAX),
         requests: parking_lot::Mutex::new(Vec::new()),
         state: parking_lot::Mutex::new(FixtureState {
             operation_id: None,
@@ -774,11 +785,334 @@ async fn vfs_policy_non_actionable_ceremony_states_never_expose_launch_data() {
 fn package_eligibility_preserves_all_existing_policy_restrictions() {
     let before = policy(60_000);
     let hash = Digest32::from_bytes([7; 32]);
-    let after = policy_with_package(&before, &hash);
+    let after = policy_with_packages(&before, std::slice::from_ref(&hash));
     let mut expected = before.clone();
     expected.allowed_petal_packages.push(hash.clone());
     assert_eq!(after, expected);
-    assert_eq!(policy_with_package(&after, &hash), after);
+    assert_eq!(
+        policy_with_packages(&after, std::slice::from_ref(&hash)),
+        after
+    );
+}
+
+#[test]
+fn default_policy_packages_are_appended_once_in_order() {
+    let before = policy(60_000);
+    let first = Digest32::from_bytes([7; 32]);
+    let second = Digest32::from_bytes([8; 32]);
+    let after = bloom_machine_client::policy_with_packages(
+        &before,
+        &[first.clone(), second.clone(), first.clone()],
+    );
+    let mut expected = before.clone();
+    expected.allowed_petal_packages.extend([first, second]);
+    assert_eq!(after, expected);
+}
+
+#[tokio::test]
+async fn default_wallet_first_proposal_allows_setup_packages_together() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = broker_fixture(true);
+    let requested = Digest32::from_bytes([7; 32]);
+    let chosen = Digest32::from_bytes([8; 32]);
+    let defaults: bloom_vfs::handlers::DefaultPolicyPackages = {
+        let chosen = chosen.clone();
+        Arc::new(move |wallet: &str| {
+            if wallet == "alice" {
+                bloom_vfs::handlers::DefaultPolicySetup {
+                    packages: vec![chosen.clone()],
+                    destinations: vec![setup_destination()],
+                }
+            } else {
+                bloom_vfs::handlers::DefaultPolicySetup::default()
+            }
+        })
+    };
+    let handler = eligibility_handler(temp.path(), fixture.clone())
+        .with_default_policy_packages(defaults.clone());
+    assert!(
+        matches!(handler.ensure_petal_eligibility("alice", &requested).await,
+        Err(HandlerError::Backend(message)) if message.contains("SERVICE_UNAVAILABLE"))
+    );
+    let PetalEligibility::AwaitingPolicyApproval(pending) = handler
+        .ensure_petal_eligibility("alice", &requested)
+        .await
+        .unwrap()
+    else {
+        panic!("owner approval must be required");
+    };
+    assert!(pending.includes_requested);
+    drop(handler);
+    fixture.complete.store(true, Ordering::SeqCst);
+    let restarted =
+        eligibility_handler(temp.path(), fixture.clone()).with_default_policy_packages(defaults);
+    let PetalEligibility::Allowed(snapshot) = restarted
+        .ensure_petal_packages_allowed("alice", &[requested.clone(), chosen.clone()], &[])
+        .await
+        .unwrap()
+    else {
+        panic!("one completed ceremony must allow every setup package");
+    };
+    // One ceremony allows every chosen Petal and the contracts they transact
+    // with, so no Petal is left usable-but-blocked at the outbox.
+    assert_eq!(
+        snapshot.canonical_policy.decode(),
+        serde_jcs::to_vec(&bloom_machine_client::policy_with_destinations(
+            &bloom_machine_client::policy_with_packages(&policy(60_000), &[requested, chosen]),
+            &[setup_destination()],
+        ))
+        .unwrap()
+    );
+}
+
+#[test]
+fn default_policy_destinations_are_appended_once_in_order() {
+    let before = policy(60_000);
+    let existing = before.allowed_destinations[0].clone();
+    let router = bloom_broker_api::PolicyDestination {
+        chain: Token::new("arbitrum").unwrap(),
+        destination: "0xf75584ef6673ad213a685a1b58cc0330b8ea22cf".into(),
+    };
+    let after = bloom_machine_client::policy_with_destinations(
+        &before,
+        &[router.clone(), existing, router.clone()],
+    );
+    let mut expected = before.clone();
+    expected.allowed_destinations.push(router);
+    assert_eq!(after, expected);
+}
+
+#[tokio::test]
+async fn default_policy_proposes_packages_and_destinations_in_one_ceremony() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = broker_fixture(false);
+    let packages = [Digest32::from_bytes([7; 32])];
+    let destinations = [bloom_broker_api::PolicyDestination {
+        chain: Token::new("arbitrum").unwrap(),
+        destination: "0xf75584ef6673ad213a685a1b58cc0330b8ea22cf".into(),
+    }];
+    let handler = eligibility_handler(temp.path(), fixture.clone());
+    let PetalEligibility::AwaitingPolicyApproval(pending) = handler
+        .ensure_petal_packages_allowed("alice", &packages, &destinations)
+        .await
+        .unwrap()
+    else {
+        panic!("owner approval must be required");
+    };
+    assert!(pending.includes_requested);
+
+    fixture.complete.store(true, Ordering::SeqCst);
+    let PetalEligibility::Allowed(snapshot) = handler
+        .ensure_petal_packages_allowed("alice", &packages, &destinations)
+        .await
+        .unwrap()
+    else {
+        panic!("one completed ceremony must allow the packages and destinations");
+    };
+    let expected = bloom_machine_client::policy_with_destinations(
+        &bloom_machine_client::policy_with_packages(&policy(60_000), &packages),
+        &destinations,
+    );
+    assert_eq!(
+        snapshot.canonical_policy.decode(),
+        serde_jcs::to_vec(&expected).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn setup_packages_join_only_a_wallets_first_policy_proposal() {
+    let temp = tempfile::tempdir().unwrap();
+    let existing = Digest32::from_bytes([5; 32]);
+    let mut baseline = policy(60_000);
+    baseline.allowed_petal_packages.push(existing.clone());
+    let fixture = broker_fixture_with_policy(false, baseline.clone());
+    let requested = Digest32::from_bytes([7; 32]);
+    let chosen = Digest32::from_bytes([8; 32]);
+    let defaults: bloom_vfs::handlers::DefaultPolicyPackages = {
+        let chosen = chosen.clone();
+        Arc::new(
+            move |_wallet: &str| bloom_vfs::handlers::DefaultPolicySetup {
+                packages: vec![chosen.clone()],
+                destinations: vec![setup_destination()],
+            },
+        )
+    };
+    let handler =
+        eligibility_handler(temp.path(), fixture.clone()).with_default_policy_packages(defaults);
+
+    let PetalEligibility::AwaitingPolicyApproval(pending) = handler
+        .ensure_petal_eligibility("alice", &requested)
+        .await
+        .unwrap()
+    else {
+        panic!("owner approval must be required");
+    };
+    assert!(pending.includes_requested);
+
+    // The owner removed `chosen` from a policy that already allows a Petal;
+    // this proposal must not put it back behind the requested package.
+    let proposed: CanonicalWalletPolicy = serde_json::from_slice(
+        fixture
+            .state
+            .lock()
+            .proposed_policy
+            .as_ref()
+            .expect("a policy was proposed"),
+    )
+    .unwrap();
+    assert_eq!(
+        proposed.allowed_petal_packages,
+        vec![existing, requested.clone()]
+    );
+    assert!(!proposed.allowed_petal_packages.contains(&chosen));
+}
+
+#[tokio::test]
+async fn a_pending_change_without_every_required_package_is_reported_as_unrelated() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = broker_fixture(false);
+    let first = Digest32::from_bytes([7; 32]);
+    let second = Digest32::from_bytes([8; 32]);
+    let handler = eligibility_handler(temp.path(), fixture.clone());
+
+    let PetalEligibility::AwaitingPolicyApproval(pending) = handler
+        .ensure_petal_eligibility("alice", &first)
+        .await
+        .unwrap()
+    else {
+        panic!("owner approval must be required");
+    };
+    assert!(pending.includes_requested);
+
+    // The pending change allows `first` only. A caller asking for both must be
+    // told this change is not theirs, so nothing announces it as such.
+    let PetalEligibility::AwaitingPolicyApproval(pending) = handler
+        .ensure_petal_packages_allowed("alice", &[first, second], &[])
+        .await
+        .unwrap()
+    else {
+        panic!("owner approval must still be required");
+    };
+    assert!(!pending.includes_requested);
+}
+
+#[tokio::test]
+async fn a_pending_change_without_every_required_destination_is_reported_as_unrelated() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = broker_fixture(false);
+    let packages = [Digest32::from_bytes([7; 32])];
+    let router = bloom_broker_api::PolicyDestination {
+        chain: Token::new("arbitrum").unwrap(),
+        destination: "0xf75584ef6673ad213a685a1b58cc0330b8ea22cf".into(),
+    };
+    let handler = eligibility_handler(temp.path(), fixture.clone());
+
+    let PetalEligibility::AwaitingPolicyApproval(pending) = handler
+        .ensure_petal_packages_allowed("alice", &packages, &[])
+        .await
+        .unwrap()
+    else {
+        panic!("owner approval must be required");
+    };
+    assert!(pending.includes_requested);
+
+    // The pending change allows the package but not its destination. Approving
+    // it would leave the Petal's outbox transactions denied and need a second
+    // ceremony, so it must not be announced as the caller's default policy.
+    let PetalEligibility::AwaitingPolicyApproval(pending) = handler
+        .ensure_petal_packages_allowed("alice", &packages, &[router])
+        .await
+        .unwrap()
+    else {
+        panic!("owner approval must still be required");
+    };
+    assert!(!pending.includes_requested);
+}
+
+#[tokio::test]
+async fn expired_default_policy_proposal_is_replaced_by_a_new_ceremony() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = broker_fixture(false);
+    let packages = [Digest32::from_bytes([7; 32]), Digest32::from_bytes([8; 32])];
+    let handler = eligibility_handler(temp.path(), fixture.clone());
+    let PetalEligibility::AwaitingPolicyApproval(first) = handler
+        .ensure_petal_packages_allowed("alice", &packages, &[])
+        .await
+        .unwrap()
+    else {
+        panic!("owner approval must be required");
+    };
+
+    *fixture.ceremony_state_override.lock() = Some(CeremonyState::Expired);
+    let PetalEligibility::AwaitingPolicyApproval(replacement) = handler
+        .ensure_petal_packages_allowed("alice", &packages, &[])
+        .await
+        .unwrap()
+    else {
+        panic!("an expired proposal must be replaced, not reported as terminal");
+    };
+    assert_ne!(replacement.operation_id, first.operation_id);
+    assert!(replacement.prepare.is_some());
+    let updates = temp
+        .path()
+        .join("machine-policy-projections/alice/policy-updates");
+    assert!(
+        updates
+            .join("failed")
+            .join(first.operation_id.as_str())
+            .exists()
+    );
+    assert!(
+        updates
+            .join("pending")
+            .join(replacement.operation_id.as_str())
+            .exists()
+    );
+}
+
+#[tokio::test]
+async fn policy_ceremony_past_expiry_is_cancelled_and_replaced() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = broker_fixture(false);
+    let packages = [Digest32::from_bytes([7; 32]), Digest32::from_bytes([8; 32])];
+    let handler = eligibility_handler(temp.path(), fixture.clone());
+    let PetalEligibility::AwaitingPolicyApproval(first) = handler
+        .ensure_petal_packages_allowed("alice", &packages, &[])
+        .await
+        .unwrap()
+    else {
+        panic!("owner approval must be required");
+    };
+
+    // The Broker still reports the ceremony as awaiting the owner after expiry.
+    fixture.ceremony_expires_at_ms.store(1, Ordering::SeqCst);
+    let PetalEligibility::AwaitingPolicyApproval(replacement) = handler
+        .ensure_petal_packages_allowed("alice", &packages, &[])
+        .await
+        .unwrap()
+    else {
+        panic!("a ceremony past its expiry must be replaced");
+    };
+    assert_ne!(replacement.operation_id, first.operation_id);
+    assert!(fixture.requests.lock().iter().any(|request| matches!(
+        request,
+        MachineBrokerRequest::CeremonyCancel(cancel)
+            if cancel.id.as_str() == first.operation_id.as_str()
+    )));
+    assert!(
+        temp.path()
+            .join("machine-policy-projections/alice/policy-updates/failed")
+            .join(first.operation_id.as_str())
+            .exists()
+    );
+}
+
+/// A destination the setup Petals contribute, as the catalog does.
+fn setup_destination() -> bloom_broker_api::PolicyDestination {
+    bloom_broker_api::PolicyDestination {
+        chain: Token::new("polygon").unwrap(),
+        destination: "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb".into(),
+    }
 }
 
 fn eligibility_handler(temp: &std::path::Path, fixture: Arc<BrokerFixture>) -> WalletsHandler {
@@ -815,7 +1149,7 @@ async fn petal_eligibility_recovers_lost_prepare_and_commits_after_restart() {
         panic!("owner approval must be required");
     };
     assert_eq!(pending.operation_id, operation);
-    assert!(pending.includes_requested_package);
+    assert!(pending.includes_requested);
     assert!(pending.prepare.is_some());
     drop(handler);
     fixture.complete.store(true, Ordering::SeqCst);
@@ -829,7 +1163,11 @@ async fn petal_eligibility_recovers_lost_prepare_and_commits_after_restart() {
     };
     assert_eq!(
         snapshot.canonical_policy.decode(),
-        serde_jcs::to_vec(&policy_with_package(&policy(60_000), &hash)).unwrap()
+        serde_jcs::to_vec(&policy_with_packages(
+            &policy(60_000),
+            std::slice::from_ref(&hash)
+        ))
+        .unwrap()
     );
     assert!(
         temp.path()

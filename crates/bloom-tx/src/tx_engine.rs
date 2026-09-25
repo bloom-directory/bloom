@@ -1432,7 +1432,15 @@ impl TxEngine {
         // the destination has bytecode we still flag it as a contract
         // call; the heuristic mirrors the spec's "code length > 0 OR data
         // is non-empty" rule.
-        let mut policy_ctx = policy_engine::AddressContext::default();
+        let mut policy_ctx = policy_engine::AddressContext {
+            // A Petal's own destinations are only trusted when the policy names
+            // it; the engine merely reports which Petal staged this.
+            staged_by_petal: execution_origin
+                .as_ref()
+                .map(|origin| origin.petal_id.clone())
+                .filter(|petal| !petal.is_empty()),
+            ..Default::default()
+        };
         // Synthetic policy checks contributed by NFT-aware code paths
         // (e.g. operator-wide approvals) — appended after the rules engine
         // has produced its own checks so they all show up in plan.md.
