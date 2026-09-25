@@ -90,11 +90,15 @@ Every command below is the real CLI surface; run them in order.
 
    ```sh
    export BLOOM_EVAL_SOLANA_VALIDATOR_LEDGER=/private/path/to/eval-ledger
-   solana-test-validator --ledger "$BLOOM_EVAL_SOLANA_VALIDATOR_LEDGER" --reset --quiet &
+   solana-test-validator --ledger "$BLOOM_EVAL_SOLANA_VALIDATOR_LEDGER" --reset \
+     --limit-ledger-size 50000000 --quiet &
    ```
 
-   Whoever starts the validator owns its lifecycle; the harness never stops
-   it or touches its ledger.
+   The default ledger limit keeps only about a minute of slots, which prunes
+   the payment's signature before a slow verifier counts it; preflight refuses
+   a local validator whose history no longer starts at block 0. Whoever starts
+   the validator owns its lifecycle; the harness never stops it or touches its
+   ledger.
 
 2. Read the validator's genesis. The Machine's chain configuration must pin
    it, and the harness independently compares the endpoint's answer:

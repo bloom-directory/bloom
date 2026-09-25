@@ -620,6 +620,20 @@ class SolanaTransferEval(EvalDefinition):
                 "RPC serves the mainnet-beta genesis"
             )
 
+    def _require_full_local_history(self) -> None:
+        """The verifier proves "exactly one payment" from signature history.
+        solana-test-validator keeps only ~10,000 shreds by default, about a
+        minute of slots, so a transfer finalized before a slow verifier runs
+        is pruned and a correct trial scores zero. Require the local
+        validator to still hold its whole history."""
+        first = self._rpc("getFirstAvailableBlock", [])
+        if first != 0:
+            raise EvalError(
+                "the local validator has pruned its history (first available "
+                f"block {first!r}), so the verifier cannot count the payment; "
+                "restart it with --reset --limit-ledger-size 50000000"
+            )
+
     def _require_fresh_destination(self) -> None:
         """The verifier grades exactly one signature on the destination, so
         a destination with any history would score zero after a real
@@ -716,6 +730,8 @@ class SolanaTransferEval(EvalDefinition):
 
         # Chain identity is checked from the chain itself, not from labels.
         self._require_chain_identity()
+        if self.lane == "local":
+            self._require_full_local_history()
         self._require_fresh_destination()
 
         # The approver reads the canonical host-side approval challenge the

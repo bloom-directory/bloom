@@ -335,6 +335,7 @@ class LocalIdentityTests(SolanaEvalTestCase):
                 definition,
                 _require_chain_identity=mock.DEFAULT,
                 _require_fresh_destination=mock.DEFAULT,
+                _require_full_local_history=mock.DEFAULT,
             ):
                 with mock.patch.object(definition, "_require_sign_count", return_value=2):
                     with mock.patch("harness.core.CeremonyDriver.preflight"):
@@ -712,6 +713,22 @@ class ProvisionTests(SolanaEvalTestCase):
             context = definition.provision("codex")
 
         self.assertEqual(context.task_dir.parent, definition.jobs_dir)
+
+
+class LocalHistoryTests(SolanaEvalTestCase):
+    """solana-test-validator prunes to about a minute of slots by default,
+    after which the verifier cannot count the payment."""
+
+    def test_full_history_is_accepted(self) -> None:
+        definition = self.make()
+        with mock.patch.object(definition, "_rpc", return_value=0):
+            definition._require_full_local_history()
+
+    def test_a_pruned_validator_is_refused(self) -> None:
+        definition = self.make()
+        with mock.patch.object(definition, "_rpc", return_value=9240):
+            with self.assertRaisesRegex(EvalError, "--limit-ledger-size"):
+                definition._require_full_local_history()
 
 
 class FreshDestinationTests(SolanaEvalTestCase):
@@ -1116,6 +1133,7 @@ class VfsTransportTests(SolanaEvalTestCase):
                             definition,
                             _require_chain_identity=mock.DEFAULT,
                             _require_fresh_destination=mock.DEFAULT,
+                            _require_full_local_history=mock.DEFAULT,
                         ):
                             with mock.patch.object(
                                 definition, "_load_local_account_identity"
