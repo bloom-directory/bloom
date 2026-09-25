@@ -1,0 +1,9 @@
+services:
+  main:
+    # The local validator is intentionally bound to host loopback, so the
+    # trial container shares host networking on the local lane only. That
+    # also puts the Machine's loopback NFS export within the agent's reach,
+    # read-write and past the read-only bind mount. Accepted for the local
+    # lane: nothing there signs without the exact-match host approval, and
+    # the funds are worthless. The mainnet lane never receives this overlay.
+    network_mode: host

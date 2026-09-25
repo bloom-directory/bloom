@@ -2693,12 +2693,21 @@ impl Handler for WalletsHandler {
     /// that bypasses the mode check still cannot trigger a sign or
     /// broadcast just by stat'ing.
     fn is_read_side_effecting(&self, path: &VfsPath) -> bool {
-        pending_outbox_control(path.segments()).is_some_and(|target| {
+        let segs = path.segments();
+        if pending_outbox_control(segs).is_some_and(|target| {
             matches!(
                 target.control,
                 "confirm" | "confirm.override" | "replace" | "cancel" | "restage"
             )
-        })
+        }) {
+            return true;
+        }
+        // Write-only sinks the adapter must never render: the stage file
+        // and an expired entry's `failed/<id>/restage` recovery route.
+        // Rendering either reads it, fails NotFound, and at best warns on
+        // every stat — mounted agents can see the route as missing.
+        segs.ends_with(&["outbox".to_string(), "new.tx".to_string()])
+            || is_failed_outbox_restage(segs)
     }
 }
 
@@ -2709,6 +2718,18 @@ struct PendingOutboxControl<'a> {
     chain: &'a str,
     id: &'a str,
     control: &'a str,
+}
+
+/// Match `<w>/<n>/chains/<c>/outbox/failed/<id>/restage`.
+fn is_failed_outbox_restage(segs: &[String]) -> bool {
+    matches!(
+        segs,
+        [_wallet, _number, chains, _chain, outbox, failed, _id, restage]
+            if chains == "chains"
+                && outbox == "outbox"
+                && failed == "failed"
+                && restage == "restage"
+    )
 }
 
 /// Match `<w>/<n>/chains/<c>/outbox/pending/<id>/<control>`.
@@ -5266,6 +5287,55 @@ value = "0""#
                 .unwrap();
             assert_eq!(sink.mode, 0o644, "{path}/restage must be writable");
         }
+    }
+
+    /// Outbox command sinks are write-only: GETATTR must never render
+    /// them (a render reads, fails NotFound, and mounted agents see the
+    /// route as missing). They stay synchronous writes so a refusal —
+    /// policy, an approval-required confirm, a premature restage —
+    /// reaches the writer's `close` as an error instead of a log line.
+    #[test]
+    fn outbox_command_sinks_are_synchronous_and_never_rendered() {
+        let f = make_handler_with_chain(true);
+        let w = &f.wallet_name;
+        for path in [
+            format!("/{w}/0/chains/anvil/outbox/new.tx"),
+            format!("/{w}/0/chains/anvil/outbox/pending/e1/confirm"),
+            format!("/{w}/0/chains/anvil/outbox/pending/e1/confirm.override"),
+            format!("/{w}/0/chains/anvil/outbox/pending/e1/cancel"),
+            format!("/{w}/0/chains/anvil/outbox/pending/e1/restage"),
+            format!("/{w}/0/chains/anvil/outbox/pending/e1/replace"),
+            format!("/{w}/0/chains/anvil/outbox/failed/e1/restage"),
+            format!("/{w}/0/chains/solana-local/outbox/new.tx"),
+            format!("/{w}/0/chains/solana-local/outbox/pending/s1/confirm"),
+            format!("/{w}/0/chains/solana-local/outbox/failed/s1/restage"),
+        ] {
+            let p = vfs(path.clone());
+            assert!(
+                !f.handler.is_async_write_command(&p),
+                "is_async_write_command {path}"
+            );
+            assert!(
+                f.handler.is_read_side_effecting(&p),
+                "is_read_side_effecting {path}"
+            );
+        }
+        for path in [
+            format!("/{w}/0/chains/anvil/balance"),
+            format!("/{w}/0/chains/anvil/outbox/pending/e1/intent.json"),
+            format!("/{w}/0/chains/anvil/outbox/sent/e1/receipt.json"),
+            format!("/{w}/0/chains/anvil/outbox/failed/e1/restage.md"),
+        ] {
+            let p = vfs(path.clone());
+            assert!(
+                !f.handler.is_read_side_effecting(&p),
+                "is_read_side_effecting {path}"
+            );
+        }
+        assert!(
+            f.handler
+                .is_async_write_command(&vfs(format!("/{w}/policy.json")))
+        );
     }
 
     /// Account 0's Solana `new.tx` is pinned to account 0: a body
