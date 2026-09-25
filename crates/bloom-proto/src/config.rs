@@ -257,7 +257,7 @@ fn default_chains() -> BTreeMap<String, ChainSpec> {
             1,
             &[
                 "https://ethereum-rpc.publicnode.com",
-                "https://eth.llamarpc.com",
+                "https://ethereum.drpc.org",
             ],
             "Ethereum Mainnet",
             "ETH",
@@ -265,7 +265,12 @@ fn default_chains() -> BTreeMap<String, ChainSpec> {
         evm_chain(
             "base",
             8453,
-            &["https://mainnet.base.org", "https://base.llamarpc.com"],
+            &[
+                "https://mainnet.base.org",
+                "https://base-rpc.publicnode.com",
+                "https://base.drpc.org",
+                "https://1rpc.io/base",
+            ],
             "Base Mainnet",
             "ETH",
         )
@@ -682,6 +687,25 @@ mod tests {
         assert!(!ethereum.rpc_urls.is_empty());
         let base = cfg.chains.get("base").expect("base entry");
         assert_eq!(base.chain_id, 8453);
+        // Base carried one reachable endpoint: its spare was dead and
+        // `mainnet.base.org` alone rate-limits under a read-heavy Petal, which
+        // reads as a broken Petal rather than a thin endpoint list. Pin the
+        // spares so a revert is caught here.
+        assert_eq!(
+            base.rpc_urls,
+            vec![
+                "https://mainnet.base.org",
+                "https://base-rpc.publicnode.com",
+                "https://base.drpc.org",
+                "https://1rpc.io/base",
+            ]
+        );
+        assert!(
+            !cfg.chains
+                .values()
+                .any(|spec| spec.rpc_urls.iter().any(|url| url.contains("llamarpc"))),
+            "llamarpc endpoints stopped resolving; no default chain should depend on one"
+        );
         let tempo = cfg.chains.get("tempo").expect("tempo entry");
         assert_eq!(tempo.chain_id, 4217);
         assert_eq!(tempo.rpc_urls, vec!["https://rpc.tempo.xyz"]);
