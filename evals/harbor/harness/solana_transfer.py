@@ -961,8 +961,8 @@ class SolanaTransferEval(EvalDefinition):
                         if not lineage_decision:
                             self._approver_error = (
                                 f"staged entry {pending_id} does not continue the approved "
-                                "replacement lineage (it was staged fresh, not through "
-                                "the restage route); refusing to approve it"
+                                "replacement lineage (no restage advice names it); "
+                                "refusing to approve it"
                             )
                             return
                     ceremonies.complete(url)

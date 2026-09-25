@@ -592,7 +592,9 @@ class ReplacementLineageTests(ApproverMatchTests):
             self.definition._approve_loop(ceremonies)
 
         ceremonies.complete.assert_not_called()
-        self.assertIn("staged fresh", self.definition._approver_error or "")
+        self.assertIn(
+            "no restage advice names it", self.definition._approver_error or ""
+        )
 
 
 class BudgetExpiryTests(ApproverMatchTests):
