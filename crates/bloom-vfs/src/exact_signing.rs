@@ -217,6 +217,7 @@ impl BrokerExactPayloadSigner {
                 canonical_plan_facts,
                 None,
                 None,
+                None,
             )
             .await;
         let _ = lock.unlock();
@@ -241,6 +242,7 @@ impl BrokerExactPayloadSigner {
         trusted_subject: &ProvenanceSubject,
         claim: &PetalUseClaim,
         claim_assurance_evidence: Option<&[u8]>,
+        safe_review_payload: Option<&[u8]>,
     ) -> Result<ExactPayloadOutcome, String> {
         let parent = state_path
             .parent()
@@ -274,6 +276,7 @@ impl BrokerExactPayloadSigner {
                 canonical_plan_facts,
                 Some(trusted_subject),
                 Some((claim, claim_assurance_evidence)),
+                safe_review_payload,
             )
             .await;
         let _ = lock.unlock();
@@ -293,6 +296,7 @@ impl BrokerExactPayloadSigner {
         canonical_plan_facts: &serde_json::Value,
         trusted_subject: Option<&ProvenanceSubject>,
         petal_claim: Option<(&PetalUseClaim, Option<&[u8]>)>,
+        safe_review_payload: Option<&[u8]>,
     ) -> Result<ExactPayloadOutcome, String> {
         let operation_class_token = Token::new(operation_class.to_owned())
             .map_err(|error| format!("operation class: {error}"))?;
@@ -396,6 +400,7 @@ impl BrokerExactPayloadSigner {
             system_use_claim: None,
             claim_assurance_evidence: petal_claim
                 .and_then(|(_, evidence)| evidence.map(<[u8]>::to_vec)),
+            safe_review_payload: safe_review_payload.map(<[u8]>::to_vec),
             approval_value_limits,
         };
         let mut response = self.broker.sign_exact_payload(request.clone()).await;
@@ -1327,6 +1332,7 @@ mod tests {
                 &subject,
                 &claim,
                 Some(b"assurance"),
+                None,
             )
             .await
             .unwrap();
@@ -1347,6 +1353,7 @@ mod tests {
                 &subject,
                 &claim,
                 Some(b"assurance"),
+                None,
             )
             .await
             .unwrap();
@@ -1371,6 +1378,7 @@ mod tests {
                 &subject,
                 &claim,
                 Some(b"assurance"),
+                None,
             )
             .await
             .unwrap_err();
@@ -1451,6 +1459,118 @@ mod tests {
             panic!("approved retry must sign");
         };
         assert_eq!(signed.crypto_suite, CryptoSuite::Secp256k1Sha256Recoverable);
+    }
+
+    #[tokio::test]
+    async fn safe_confirmation_forwards_its_review_envelope_to_approval_preparation() {
+        let broker = Arc::new(MockBroker::default());
+        let package_hash = digest(30);
+        let subject = ProvenanceSubject::Petal {
+            package_hash: package_hash.clone(),
+            route: "transactions/confirm".into(),
+        };
+        let signer = BrokerExactPayloadSigner::new(
+            MachineBrokerClient::new(broker.clone()),
+            ProvenanceCatalog {
+                schema: PROVENANCE_CATALOG_SCHEMA.into(),
+                records: vec![ProvenanceRecord {
+                    subject: subject.clone(),
+                    publisher: token("bloom-installer"),
+                    petal_lineage: None,
+                    operation_classes: vec![ProvenanceOperationClass {
+                        operation_class: token(bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS),
+                        fee_asset: None,
+                    }],
+                    installer_key_id: token("test-key"),
+                    installer_signature: Base64UrlBytes::from_bytes(&[]),
+                }],
+            },
+        );
+        let temporary = tempfile::tempdir().unwrap();
+        let payload = b"\x19\x01safe preimage";
+        let ordered_hash = Digest32::from_bytes(alloy::primitives::keccak256(payload).into());
+        let claim = PetalUseClaim {
+            package_hash,
+            route: "transactions/confirm".into(),
+            operation_class: token(bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS),
+            crypto_suite: CryptoSuite::Secp256k1Keccak256Recoverable,
+            payload_digest: {
+                let mut digest = Sha256::new();
+                digest.update(b"bloom.petal.payload-batch.v1\0");
+                digest.update(1_u64.to_be_bytes());
+                digest.update((payload.len() as u64).to_be_bytes());
+                digest.update(payload);
+                Digest32::from_bytes(digest.finalize().into())
+            },
+            ordered_hashes: vec![ordered_hash.clone()],
+            declared_debits: Vec::new(),
+            declared_destinations: Vec::new(),
+            declared_fee: bloom_broker_api::DeclaredFee::None,
+            nonce: RequestNonce::from_bytes([31; 16]),
+            claim_assurance: bloom_broker_api::ClaimAssurance::MachineAsserted,
+        };
+        let envelope = br#"{"schema":"bloom.safe.review.v1"}"#;
+        let prepared_envelopes = || {
+            broker
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|request| match request {
+                    MachineBrokerRequest::SealedApprovalPrepare(prepared) => {
+                        Some(prepared.safe_review_payloads.clone())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // Without the envelope the class must not reach approval preparation.
+        let error = signer
+            .sign_or_prepare_petal(
+                &temporary.path().join("missing.json"),
+                "confirm",
+                "wallet",
+                bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS,
+                payload,
+                ordered_hash.clone(),
+                CryptoSuite::Secp256k1Keccak256Recoverable,
+                &serde_json::json!({}),
+                &subject,
+                &claim,
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("Safe review payload"), "{error}");
+        assert!(prepared_envelopes().is_empty());
+
+        let outcome = signer
+            .sign_or_prepare_petal(
+                &temporary.path().join("confirm.json"),
+                "confirm",
+                "wallet",
+                bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS,
+                payload,
+                ordered_hash,
+                CryptoSuite::Secp256k1Keccak256Recoverable,
+                &serde_json::json!({}),
+                &subject,
+                &claim,
+                None,
+                Some(envelope),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            ExactPayloadOutcome::ApprovalRequired { .. }
+        ));
+        assert_eq!(
+            prepared_envelopes(),
+            vec![vec![Base64UrlBytes::from_bytes(envelope)]]
+        );
     }
 
     /// Builds the shared fixture: a petal exact signer whose provenance
@@ -1550,6 +1670,7 @@ mod tests {
                 },
                 claim,
                 Some(b"assurance"),
+                None,
             )
             .await
     }
