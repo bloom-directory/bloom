@@ -8256,6 +8256,137 @@ value = "0""#,
     }
 
     #[tokio::test]
+    async fn evm_approval_challenge_is_public_and_tracks_the_live_approval() {
+        let mut f = make_handler_with_chain(true);
+        let w = f.wallet_name.clone();
+        let approval = digest(21);
+        let broker = approval_broker(vec![approval_status(
+            approval.clone(),
+            &w,
+            ApprovalLifecycleState::AwaitingCeremony,
+        )]);
+        f.handler = f
+            .handler
+            .with_broker(Some(MachineBrokerClient::new(broker.clone())));
+        seed_pending(&f, "needs-approval");
+        let entry = f
+            .handler
+            .tx_engine
+            .outbox
+            .read_in_state(&w, "anvil", "needs-approval", OutboxState::Pending)
+            .unwrap();
+        // The transaction engine's private signing state, as a confirm
+        // write leaves it after requesting an owner approval.
+        std::fs::write(
+            entry.dir.join("ceremony.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema": "bloom.machine-evm-signing.1",
+                "action_id": "evm-abc",
+                "approval_id": approval.as_str(),
+                "ceremony_url": "https://relay.test/ceremony/#cap=abc",
+                "ceremony_expires_at_ms": "60000",
+                "signing_operation_id": "private-operation",
+                "request_nonce": "private-nonce",
+                "sign_dispatched": false,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let dir = format!("/{w}/0/chains/anvil/outbox/pending/needs-approval");
+
+        let names: Vec<String> = f
+            .handler
+            .list(&vfs(dir.clone()))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        assert!(
+            names.contains(&"approval_challenge.json".to_string()),
+            "{names:?}"
+        );
+        assert!(!names.contains(&"ceremony.json".to_string()), "{names:?}");
+        for private in ["ceremony.json", ".ceremony.json.1.tmp"] {
+            assert!(matches!(
+                f.handler.lookup(&vfs(format!("{dir}/{private}"))).await,
+                Err(HandlerError::NotFound(_))
+            ));
+            assert!(matches!(
+                f.handler.read(&vfs(format!("{dir}/{private}"))).await,
+                Err(HandlerError::NotFound(_))
+            ));
+        }
+
+        let read_challenge = || async {
+            serde_json::from_slice::<serde_json::Value>(
+                &f.handler
+                    .read(&vfs(format!("{dir}/approval_challenge.json")))
+                    .await
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        let waiting = read_challenge().await;
+        assert_eq!(waiting["schema"], "bloom.evm-approval-challenge/1");
+        assert_eq!(waiting["state"], "awaiting_ceremony");
+        assert_eq!(waiting["tx_id"], "needs-approval");
+        assert_eq!(waiting["approval_id"], approval.as_str());
+        assert_eq!(
+            waiting["ceremony_url"],
+            "https://relay.test/ceremony/#cap=abc"
+        );
+        assert_eq!(waiting["expiry_ms"], 60_000);
+        assert_eq!(
+            waiting["retry_path"],
+            format!("wallets/{w}/0/chains/anvil/outbox/pending/needs-approval/confirm")
+        );
+        assert!(waiting.get("signing_operation_id").is_none());
+        assert!(waiting.get("request_nonce").is_none());
+
+        // The owner approves on their phone. Nothing is written to the
+        // outbox, yet the next read reports it and withdraws the link.
+        broker.statuses.lock().unwrap()[0].state = ApprovalLifecycleState::Active;
+        let approved = read_challenge().await;
+        assert_eq!(approved["state"], "active");
+        assert!(approved["ceremony_url"].is_null());
+        assert!(
+            approved["next"]
+                .as_str()
+                .unwrap()
+                .contains("retry_path now"),
+            "{approved}"
+        );
+
+        // A Solana-shaped challenge gains the same live state.
+        let solana = f
+            .handler
+            .live_approval_challenge(
+                &w,
+                serde_json::json!({
+                    "schema": "bloom.solana-approval-challenge/1",
+                    "approval_id": approval.as_str(),
+                    "ceremony_url": "https://relay.test/ceremony/#cap=abc",
+                }),
+            )
+            .await
+            .unwrap();
+        let solana: serde_json::Value = serde_json::from_slice(&solana).unwrap();
+        assert_eq!(solana["state"], "active");
+        assert!(solana["ceremony_url"].is_null());
+
+        // An entry that never needed owner approval projects no challenge.
+        seed_pending(&f, "no-approval");
+        let plain = format!("/{w}/0/chains/anvil/outbox/pending/no-approval");
+        assert!(matches!(
+            f.handler
+                .lookup(&vfs(format!("{plain}/approval_challenge.json")))
+                .await,
+            Err(HandlerError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn sealed_approval_vfs_is_broker_backed_sorted_and_wallet_scoped() {
         let mut f = make_handler();
         let first = digest(1);

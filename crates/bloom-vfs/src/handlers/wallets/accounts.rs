@@ -490,7 +490,7 @@ impl WalletsHandler {
                         .await;
                 }
                 let family = Self::evm_family(&view, chain)?;
-                self.read_account_evm_chain(wallet, family, chain, chain_rest)
+                self.read_account_evm_chain(wallet, number, family, chain, chain_rest)
                     .await
             }
             _ => Err(HandlerError::NotAFile(rest.join("/"))),
@@ -692,6 +692,7 @@ impl WalletsHandler {
     async fn read_account_evm_chain(
         &self,
         wallet: &str,
+        number: u32,
         family: &FamilyKey,
         chain: &str,
         rest: &[String],
@@ -738,7 +739,7 @@ impl WalletsHandler {
                 self.evm_nonce_conflicts(wallet, family, chain, address)
             }
             [dir, outbox_rest @ ..] if dir == "outbox" => {
-                self.evm_outbox_read(wallet, family, chain, outbox_rest)
+                self.evm_outbox_read(wallet, number, family, chain, outbox_rest)
                     .await
             }
             _ => Err(HandlerError::NotAFile(rest.join("/"))),
@@ -811,6 +812,14 @@ impl WalletsHandler {
                         Entry::writable_file(fname).with_modified_ms(entry.staged.created_ms)
                     );
                 }
+                if fname == APPROVAL_CHALLENGE {
+                    return evm_signing_state(&entry)
+                        .map(|_| Entry::file(fname))
+                        .ok_or_else(|| HandlerError::not_found(rest.join("/")));
+                }
+                if is_private_evm_outbox_artifact(fname) {
+                    return Err(HandlerError::not_found(rest.join("/")));
+                }
                 open_regular_outbox_artifact(&entry.dir, fname)?;
                 Ok(Entry::file(fname).with_modified_ms(entry.staged.created_ms))
             }
@@ -821,6 +830,7 @@ impl WalletsHandler {
     async fn evm_outbox_read(
         &self,
         wallet: &str,
+        number: u32,
         family: &FamilyKey,
         chain: &str,
         rest: &[String],
@@ -828,6 +838,16 @@ impl WalletsHandler {
         match rest {
             [state, id, fname] => {
                 let entry = self.evm_outbox_entry(wallet, family, chain, state, id)?;
+                if fname == APPROVAL_CHALLENGE {
+                    let signing = evm_signing_state(&entry)
+                        .ok_or_else(|| HandlerError::not_found(rest.join("/")))?;
+                    let outbox = format!("wallets/{wallet}/{number}/chains/{chain}/outbox");
+                    let challenge = evm_approval_challenge(&entry, &signing, &outbox);
+                    return self.live_approval_challenge(wallet, challenge).await;
+                }
+                if is_private_evm_outbox_artifact(fname) {
+                    return Err(HandlerError::not_found(rest.join("/")));
+                }
                 let mut file = open_regular_outbox_artifact(&entry.dir, fname)?;
                 let mut bytes = Vec::new();
                 std::io::Read::read_to_end(&mut file, &mut bytes)?;
@@ -890,10 +910,15 @@ impl WalletsHandler {
                         if let Some(name) = item.file_name().to_str()
                             && item.file_type().map(|t| t.is_file()).unwrap_or(false)
                             && !EVM_PENDING_CONTROLS.contains(&name)
+                            && !is_private_evm_outbox_artifact(name)
+                            && name != APPROVAL_CHALLENGE
                         {
                             out.push(Entry::file(name));
                         }
                     }
+                }
+                if evm_signing_state(&entry).is_some() {
+                    out.push(Entry::file(APPROVAL_CHALLENGE));
                 }
                 if entry.state == OutboxState::Pending {
                     for control in EVM_PENDING_CONTROLS {
@@ -1283,6 +1308,10 @@ impl WalletsHandler {
                 let mut file = open_regular_outbox_artifact(&entry.dir, fname)?;
                 let mut bytes = Vec::new();
                 std::io::Read::read_to_end(&mut file, &mut bytes)?;
+                if fname == APPROVAL_CHALLENGE {
+                    let challenge = serde_json::from_slice(&bytes).map_err(err_be)?;
+                    return self.live_approval_challenge(wallet, challenge).await;
+                }
                 Ok(bytes)
             }
             _ => Err(HandlerError::NotAFile(rest.join("/"))),
@@ -1816,8 +1845,144 @@ impl WalletsHandler {
 
 /// The virtual write sinks a pending EVM entry advertises.
 const EVM_PENDING_CONTROLS: [&str; 4] = ["confirm", "confirm.override", "replace", "cancel"];
+
+/// The owner-visible approval projection every outbox exposes under one name.
+const APPROVAL_CHALLENGE: &str = "approval_challenge.json";
+
+/// The transaction engine's private signing state for one EVM entry. It holds
+/// durable operation identities and digests, not a public contract, so it is
+/// never mounted; `approval_challenge.json` projects its public part.
+const EVM_SIGNING_STATE: &str = "ceremony.json";
+
+fn is_private_evm_outbox_artifact(name: &str) -> bool {
+    name == EVM_SIGNING_STATE || name.starts_with('.')
+}
+
+/// The pending entry's signing state, when it is waiting on or holds an owner
+/// approval. Sent and failed entries project no challenge.
+fn evm_signing_state(entry: &bloom_tx::outbox::OutboxEntry) -> Option<serde_json::Value> {
+    if entry.state != OutboxState::Pending {
+        return None;
+    }
+    let bytes = std::fs::read(entry.dir.join(EVM_SIGNING_STATE)).ok()?;
+    let state: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    state
+        .get("approval_id")
+        .and_then(|id| id.as_str())
+        .is_some_and(|id| !id.is_empty())
+        .then_some(state)
+}
+
+/// The public approval challenge for a pending EVM entry, in the same shape
+/// as a Solana transfer's: identities to verify, the ceremony link, and the
+/// exact paths to review and retry.
+fn evm_approval_challenge(
+    entry: &bloom_tx::outbox::OutboxEntry,
+    signing: &serde_json::Value,
+    outbox: &str,
+) -> serde_json::Value {
+    let staged = &entry.staged;
+    let expiry_ms = signing.get("ceremony_expires_at_ms").and_then(|value| {
+        value
+            .as_u64()
+            .or_else(|| value.as_str().and_then(|text| text.parse::<u64>().ok()))
+    });
+    serde_json::json!({
+        "schema": "bloom.evm-approval-challenge/1",
+        "action_id": signing.get("action_id"),
+        "tx_id": staged.id,
+        "wallet": staged.wallet,
+        "chain": staged.chain,
+        "chain_id": staged.chain_id,
+        "from": staged.from,
+        "to": staged.to,
+        "value_wei": staged.value_wei,
+        "nonce": staged.nonce,
+        "approval_id": signing.get("approval_id"),
+        "ceremony_url": signing.get("ceremony_url"),
+        "expiry_ms": expiry_ms,
+        "plan_path": format!("{outbox}/pending/{}/plan.md", staged.id),
+        "retry_path": format!("{outbox}/pending/{}/confirm", staged.id),
+    })
+}
+
+/// What the approval's live Broker state means for the agent holding the
+/// challenge, as `(state, next)`.
+fn approval_next_step(
+    state: bloom_broker_api::ApprovalLifecycleState,
+) -> (&'static str, &'static str) {
+    use bloom_broker_api::ApprovalLifecycleState as S;
+    match state {
+        S::Prepared | S::AwaitingCeremony => (
+            "awaiting_ceremony",
+            "Give ceremony_url to the owner. As soon as they approve, write confirm to retry_path. Retrying earlier is safe: it starts no new ceremony and returns permission denied again.",
+        ),
+        S::Active => (
+            "active",
+            "The owner approved. Write confirm to retry_path now to sign and broadcast.",
+        ),
+        S::Exhausted => (
+            "exhausted",
+            "This approval has been used. Read the transaction's outbox state before doing anything else.",
+        ),
+        S::Expired => (
+            "expired",
+            "This approval expired unused. Ask the owner before writing confirm to retry_path again, which starts over or says why it cannot.",
+        ),
+        S::Cancelled => (
+            "cancelled",
+            "This approval was cancelled unused. Ask the owner before writing confirm to retry_path again, which starts over or says why it cannot.",
+        ),
+        S::Orphaned | S::Revoked | S::Failed => (
+            "refused",
+            "This approval can no longer authorize the transaction. Tell the owner; do not retry it.",
+        ),
+    }
+}
 /// The virtual write sinks a pending Solana entry advertises.
 const SOLANA_PENDING_CONTROLS: [&str; 3] = ["confirm", "cancel", "restage"];
+
+impl WalletsHandler {
+    /// Render an approval challenge with its approval's current Broker state.
+    ///
+    /// The stored challenge is written only while a confirm write runs, so on
+    /// its own it keeps advertising the ceremony link after the owner has
+    /// approved. Each read therefore asks Broker, adds `state` and `next`, and
+    /// withdraws `ceremony_url` once the ceremony can no longer be used. When
+    /// Broker cannot answer, the stored challenge is returned with
+    /// `state: "unknown"` rather than failing the read.
+    pub(super) async fn live_approval_challenge(
+        &self,
+        wallet: &str,
+        mut challenge: serde_json::Value,
+    ) -> Result<Vec<u8>, HandlerError> {
+        let approval_id = challenge
+            .get("approval_id")
+            .and_then(|id| id.as_str())
+            .map(str::to_owned);
+        let live = match approval_id {
+            Some(id) => self.approval_status_for_wallet(wallet, &id).await.ok(),
+            None => None,
+        };
+        let (state, next) = match &live {
+            Some(status) => approval_next_step(status.state),
+            None => (
+                "unknown",
+                "Bloom could not read this approval's state. Writing confirm to retry_path is safe and reports it.",
+            ),
+        };
+        if let Some(object) = challenge.as_object_mut() {
+            object.insert("state".into(), state.into());
+            object.insert("next".into(), next.into());
+            if live.is_some() && state != "awaiting_ceremony" {
+                object.insert("ceremony_url".into(), serde_json::Value::Null);
+            }
+        }
+        let mut out = serde_json::to_vec_pretty(&challenge).map_err(err_be)?;
+        out.push(b'\n');
+        Ok(out)
+    }
+}
 
 #[cfg(test)]
 mod tests {

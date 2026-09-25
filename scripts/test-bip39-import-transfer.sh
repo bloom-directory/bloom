@@ -253,12 +253,17 @@ confirm_path="${pending_dir}/${pending_id}/confirm"
 if vwrite "$confirm_path" "y" >/dev/null 2>&1; then
   die "confirm succeeded before the approval ceremony completed"
 fi
-ceremony="$(wait_for_file "pending ceremony projection" "${pending_dir}/${pending_id}/ceremony.json")"
-approval_ceremony_url="$(printf '%s' "$ceremony" | jq -er '.ceremony_url')"
+challenge="$(wait_for_file "pending approval challenge" "${pending_dir}/${pending_id}/approval_challenge.json")"
+printf '%s' "$challenge" | jq -e '.state == "awaiting_ceremony"' >/dev/null ||
+  die "pending approval challenge is not awaiting the ceremony: $challenge"
+approval_ceremony_url="$(printf '%s' "$challenge" | jq -er '.ceremony_url')"
 
 # 9. Complete the approval ceremony and confirm on the exact retry.
 "$driver_bin" complete "$approval_ceremony_url" "$AUTH_SEED" --sign-count 4 >/dev/null ||
   die "completing the Sealed Approval ceremony failed"
+challenge_now="$(vcat "${pending_dir}/${pending_id}/approval_challenge.json")"
+printf '%s' "$challenge_now" | jq -e '.state == "active" and .ceremony_url == null' >/dev/null ||
+  die "approval_challenge.json did not report the completed approval before the retry: $challenge_now"
 vwrite "$confirm_path" "y" || die "post-ceremony confirm retry failed"
 
 # 10. The entry must reconcile into sent/ with a transaction hash.

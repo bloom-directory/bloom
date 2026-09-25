@@ -137,8 +137,8 @@ confirm="$pending/$entry/confirm"
 if write_vfs "$confirm" y > "$run_dir/before-approval.txt" 2>&1; then
   echo 'Execution unexpectedly succeeded before approval' >&2; exit 1
 fi
-wait_vfs "$pending/$entry/ceremony.json" > "$run_dir/approval.json"
-jq -e '.approval_operation_id | test("^[0-9a-f]{64}$")' "$run_dir/approval.json" > /dev/null
+wait_vfs "$pending/$entry/approval_challenge.json" > "$run_dir/approval.json"
+jq -e '(.approval_id | test("^[0-9a-f]{64}$")) and .state == "awaiting_ceremony"' "$run_dir/approval.json" > /dev/null
 url="$(jq -er '.ceremony_url' "$run_dir/approval.json")"
 [[ "$url" =~ ^https://[a-z2-7]{26}\.relay\.bloom\.directory/ceremony/\#cap=[A-Za-z0-9_-]{43}$ ]] || { echo 'Sealed Approval did not use hosted HTTPS' >&2; exit 1; }
 [ "$(cast nonce --rpc-url "$rpc" "$address")" = 0 ]
@@ -146,11 +146,16 @@ printf 'PASS execution refused before remote Sealed Approval\n'
 complete "$url" 3 > "$run_dir/approval-result.json"
 [ "$(cast nonce --rpc-url "$rpc" "$address")" = 0 ]
 [ "$(cast balance --rpc-url "$rpc" "$recipient")" = "$before" ]
+read_vfs "$pending/$entry/approval_challenge.json" > "$run_dir/approval-active.json"
+jq -e '.state == "active" and .ceremony_url == null' "$run_dir/approval-active.json" > /dev/null
 printf 'PASS remote Sealed Approval activated without executing\n'
 write_vfs "$confirm" y > "$run_dir/confirm.txt"
 tx="$(wait_vfs "/wallets/$wallet/0/chains/anvil/outbox/sent/$entry/tx_hash" | tr -d '[:space:]')"
-read_vfs "/wallets/$wallet/0/chains/anvil/outbox/sent/$entry/ceremony.json" > "$run_dir/terminal-ceremony.json"
-jq -e '.sign_dispatched == true and .ceremony_url == null' "$run_dir/terminal-ceremony.json" > /dev/null
+for name in approval_challenge.json ceremony.json; do
+  if read_vfs "/wallets/$wallet/0/chains/anvil/outbox/sent/$entry/$name" > /dev/null 2>&1; then
+    echo "Sent entry must not project $name" >&2; exit 1
+  fi
+done
 cast receipt --rpc-url "$rpc" --json "$tx" > "$run_dir/receipt.json"
 jq -e --arg from "$(printf '%s' "$address" | tr '[:upper:]' '[:lower:]')" --arg to "$(printf '%s' "$recipient" | tr '[:upper:]' '[:lower:]')" \
   '(.status == "0x1" or .status == "1") and (.from|ascii_downcase)==$from and (.to|ascii_downcase)==$to' "$run_dir/receipt.json" > /dev/null
