@@ -133,6 +133,7 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         self.session_created = False
         self.counter_committed = counter_committed
         self.phase_timings: dict[str, float] = {}
+        self.cleanup_observations: dict[str, Any] = {}
 
     @property
     def lock_path(self) -> Path:
@@ -279,12 +280,17 @@ class HyperliquidOrderCancelEval(EvalDefinition):
             if not isinstance(scope, dict):
                 continue
             if (
-                record.get("schema") != "bloom.machine.petal-key-request.v2"
-                or record.get("key_slot") != session_key_slot(self.session_id)
+                record.get("key_slot") != session_key_slot(self.session_id)
                 or scope.get("wallet_id") != self.wallet_id
                 or scope.get("package_hash") != self.package_hash
             ):
                 continue
+            if record.get("schema") != "bloom.machine.petal-key-request.v3":
+                raise EvalError(
+                    "matching owner Petal key request has an unsupported schema; "
+                    "expected bloom.machine.petal-key-request.v3; "
+                    "check Machine and Harbor harness compatibility"
+                )
             ceremony_url = record.get("ceremony_url")
             if record.get("status") == "awaiting_user" and isinstance(
                 ceremony_url, str
@@ -680,16 +686,24 @@ class HyperliquidOrderCancelEval(EvalDefinition):
                 nonzero_positions.append(item)
         return nonzero_positions
 
-    def _require_no_orders_or_positions(self) -> None:
+    def _require_no_orders_or_positions(self, *, record_cleanup: bool = False) -> None:
+        if record_cleanup:
+            self.cleanup_observations["open_orders"] = None
+            self.cleanup_observations["positions"] = None
         orders = self._read_json(self.user_root / "open_orders.json")
         if not isinstance(orders, list):
             raise EvalError("open-orders projection is not a JSON array")
+        if record_cleanup:
+            self.cleanup_observations["open_orders"] = len(orders)
         if orders:
             raise EvalError(
                 "dedicated wallet already has an open order; use an empty eval wallet"
             )
 
-        if self._nonzero_positions():
+        positions = self._nonzero_positions()
+        if record_cleanup:
+            self.cleanup_observations["positions"] = len(positions)
+        if positions:
             raise EvalError(
                 "dedicated wallet has an open position; use an empty eval wallet"
             )
@@ -1035,6 +1049,7 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         )
 
     def cleanup(self) -> None:
+        self.cleanup_observations.clear()
         if self.session_base is None or self.session_id is None:
             return
         failures: list[str] = []
@@ -1082,6 +1097,9 @@ class HyperliquidOrderCancelEval(EvalDefinition):
 
             def no_open_orders() -> bool:
                 orders = self._read_json(self.user_root / "open_orders.json")
+                self.cleanup_observations["open_orders"] = (
+                    len(orders) if isinstance(orders, list) else None
+                )
                 return isinstance(orders, list) and not orders
 
             if not self._poll_until(
@@ -1093,6 +1111,13 @@ class HyperliquidOrderCancelEval(EvalDefinition):
 
         try:
             positions = self._nonzero_positions()
+            self.cleanup_observations["positions"] = len(positions)
+
+            def no_positions() -> bool:
+                remaining = self._nonzero_positions()
+                self.cleanup_observations["positions"] = len(remaining)
+                return not remaining
+
             if positions and not stopped:
                 closed = self._write_route(
                     self.session_base / "close_all", b"host-cleanup", 45
@@ -1100,7 +1125,7 @@ class HyperliquidOrderCancelEval(EvalDefinition):
                 if closed.returncode != 0:
                     failures.append("session close_all failed")
                 elif not self._poll_until(
-                    lambda: not self._nonzero_positions(),
+                    no_positions,
                     VENUE_SETTLE_ATTEMPTS,
                     VENUE_SETTLE_DELAY_SECONDS,
                 ):
@@ -1120,7 +1145,14 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         try:
 
             def session_stopped() -> bool:
+                self.cleanup_observations["session_stopped"] = None
                 final_status = self._read_json(self.session_base / "status.json")
+                self.cleanup_observations["session_stopped"] = (
+                    final_status.get("stopped")
+                    if isinstance(final_status, dict)
+                    and isinstance(final_status.get("stopped"), bool)
+                    else None
+                )
                 return (
                     isinstance(final_status, dict)
                     and final_status.get("stopped") is True
@@ -1134,7 +1166,7 @@ class HyperliquidOrderCancelEval(EvalDefinition):
             failures.append(str(error))
 
         try:
-            self._require_no_orders_or_positions()
+            self._require_no_orders_or_positions(record_cleanup=True)
         except EvalError as error:
             failures.append(str(error))
 

@@ -13,7 +13,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from harness import hyperliquid_order_cancel
-from harness.core import AgentSpec, EvalDefinition, EvalError, EvalRunContext, run_eval
+from harness.core import AgentSpec, EvalDefinition, EvalError, EvalEvidence, EvalRunContext, run_eval
 from harness.hyperliquid_order_cancel import (
     ACTION_FILES,
     MAINNET_ACK,
@@ -119,6 +119,23 @@ class HarnessLifecycleTests(unittest.TestCase):
 
         with self.assertRaisesRegex(EvalError, "run failed.*cleanup also failed"):
             run_eval(definition, "codex", harbor_runner=runner)
+
+    def test_zero_reward_retains_result_with_successful_or_failed_cleanup(self) -> None:
+        for cleanup_fails in (False, True):
+            with self.subTest(cleanup_fails=cleanup_fails):
+                definition = FakeDefinition(self.root)
+                if cleanup_fails:
+                    definition.cleanup = mock.Mock(side_effect=EvalError("residual order"))
+                result = self.passing_result()
+                result.trial_results[0].verifier_result.rewards = {"reward": 0}
+                async def runner(_context, _agent):
+                    return result
+                evidence = EvalEvidence()
+                with self.assertRaisesRegex(EvalError, "passing reward"):
+                    run_eval(definition, "codex", harbor_runner=runner, evidence=evidence)
+                self.assertIs(evidence.result, result)
+                self.assertEqual(evidence.cleanup_succeeded, not cleanup_fails)
+                self.assertEqual(evidence.cleanup_error, "residual order" if cleanup_fails else None)
 
 
 class HyperliquidDefinitionTests(unittest.TestCase):
@@ -536,7 +553,7 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         (root / ("d" * 64 + ".json")).write_text(
             json.dumps(
                 {
-                    "schema": "bloom.machine.petal-key-request.v2",
+                    "schema": "bloom.machine.petal-key-request.v3",
                     "key_slot": session_key_slot("exact-session"),
                     "scope": {
                         "wallet_id": self.wallet_id,
@@ -550,7 +567,7 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         (root / ("e" * 64 + ".json")).write_text(
             json.dumps(
                 {
-                    "schema": "bloom.machine.petal-key-request.v2",
+                    "schema": "bloom.machine.petal-key-request.v3",
                     "key_slot": session_key_slot("other-session"),
                     "scope": {
                         "wallet_id": self.wallet_id,
@@ -563,6 +580,33 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         )
 
         self.assertEqual(self.definition._pending_petal_key_ceremony(), ceremony)
+
+    def test_pending_key_schema_fails_only_for_exact_binding(self) -> None:
+        self.definition.session_id = "exact-session"
+        root = self.mount / "petal-key-requests"
+        root.mkdir(parents=True)
+        path = root / ("d" * 64 + ".json")
+        record = {
+            "schema": "bloom.machine.petal-key-request.v99",
+            "key_slot": session_key_slot("exact-session"),
+            "scope": {"wallet_id": self.wallet_id, "package_hash": self.package_hash},
+            "status": "awaiting_user",
+            "ceremony_url": "http://localhost:18734/ceremony/" + "A" * 43,
+        }
+        for schema in ("bloom.machine.petal-key-request.v3", "unknown"):
+            for mismatch in ("wallet_id", "package_hash", "key_slot"):
+                with self.subTest(schema=schema, mismatch=mismatch):
+                    other = copy.deepcopy(record)
+                    other["schema"] = schema
+                    target = other if mismatch == "key_slot" else other["scope"]
+                    target[mismatch] = "different"
+                    path.write_text(json.dumps(other))
+                    self.assertIsNone(self.definition._pending_petal_key_ceremony())
+        for schema in (record["schema"], "bloom.machine.petal-key-request.v2", None):
+            record["schema"] = schema
+            path.write_text(json.dumps(record))
+            with self.subTest(schema=schema), self.assertRaisesRegex(EvalError, "unsupported schema.*v3"):
+                self.definition._pending_petal_key_ceremony()
 
     def test_session_key_slot_is_a_case_sensitive_lowercase_broker_token(self) -> None:
         upper = session_key_slot("bloom-eval-codex-20260814T150000Z-0123456789abcdef")
@@ -866,6 +910,18 @@ class HyperliquidDefinitionTests(unittest.TestCase):
             call.args[0].name for call in self.definition._write_route.call_args_list
         ]
         self.assertEqual(routes, ["cancel_all", "stop"])
+        self.assertEqual(self.definition.cleanup_observations, {
+            "open_orders": 0, "positions": 0, "session_stopped": True,
+        })
+
+    def test_final_cleanup_read_failure_does_not_report_stale_zero_counts(self) -> None:
+        self.definition.cleanup_observations = {"open_orders": 0, "positions": 0}
+        self.definition._read_json = mock.Mock(side_effect=EvalError("I/O error"))
+        with self.assertRaisesRegex(EvalError, "I/O error"):
+            self.definition._require_no_orders_or_positions(record_cleanup=True)
+        self.assertEqual(self.definition.cleanup_observations, {
+            "open_orders": None, "positions": None,
+        })
 
     def test_cleanup_reports_failure_when_postcondition_never_settles(self) -> None:
         # Polling must not paper over a genuine failure: a budget that expires
