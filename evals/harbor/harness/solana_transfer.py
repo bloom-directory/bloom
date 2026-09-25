@@ -262,7 +262,17 @@ class SolanaTransferEval(EvalDefinition):
         self.chain = self.env.get("BLOOM_EVAL_SOLANA_CHAIN", "")
         self.network = self.env.get("BLOOM_EVAL_SOLANA_NETWORK", "")
         self.rpc_url = self.env.get("BLOOM_EVAL_SOLANA_RPC_URL", "")
+        self.transport = self.env.get(TRANSPORT_ENV, "mount")
+        if self.transport not in TRANSPORTS:
+            raise EvalError(
+                f"{TRANSPORT_ENV} must be one of {', '.join(TRANSPORTS)}; "
+                f"got {self.transport!r}"
+            )
         self.bloom_mount_value = self.env.get("BLOOM_EVAL_BLOOM_MOUNT", "").strip()
+        if not self.bloom_mount_value and self.transport == "vfs":
+            # The vfs transport only uses the mount path as a prefix it
+            # strips; a triad launched without --mount has none to give.
+            self.bloom_mount_value = "/bloom"
         self.bloom_mount = Path(self.bloom_mount_value)
         # The Machine's home root, on the host filesystem. The approver reads
         # the canonical approval challenge here so its decision is unaffected
@@ -308,12 +318,6 @@ class SolanaTransferEval(EvalDefinition):
         # account projection in _load_local_account_identity.
         self.account_dir = ""
         self.trial_id: str | None = None
-        self.transport = self.env.get(TRANSPORT_ENV, "mount")
-        if self.transport not in TRANSPORTS:
-            raise EvalError(
-                f"{TRANSPORT_ENV} must be one of {', '.join(TRANSPORTS)}; "
-                f"got {self.transport!r}"
-            )
         self.vfs_bin = self.env.get(VFS_BIN_ENV, "bloom")
         # The smoke-only escape that admits the vfs transport; agent trials
         # require the mounted transport and never set it.

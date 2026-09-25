@@ -31,7 +31,7 @@ esac
 # Pull the prepared triad's connection settings when they are not already
 # exported. triad.env holds public settings only; sourcing it here supplies
 # defaults, and explicit environment always wins.
-if [ -z "${BLOOM_HOME:-}" ] || [ -z "${BLOOM_EVAL_BLOOM_MOUNT:-}" ]; then
+if [ -z "${BLOOM_HOME:-}" ]; then
   triad_env="${BLOOM_TRIAD_ENV:-${BLOOM_EVAL_TRIAD_ROOT:-/tmp/bloom-triad-logs}/logs/triad.env}"
   if [ -f "$triad_env" ]; then
     # shellcheck disable=SC1090
@@ -39,19 +39,20 @@ if [ -z "${BLOOM_HOME:-}" ] || [ -z "${BLOOM_EVAL_BLOOM_MOUNT:-}" ]; then
   fi
 fi
 
-if [ -z "${BLOOM_EVAL_BLOOM_MOUNT:-}" ]; then
-  printf '%s\n' \
-    'error: BLOOM_EVAL_BLOOM_MOUNT is not set; export it or point BLOOM_TRIAD_ENV' \
-    'at the prepared triad env file.' >&2
-  exit 1
-fi
 # The vfs transport drives the Machine over IPC and needs no kernel mount.
-if [ "${BLOOM_EVAL_SOLANA_TRANSPORT:-mount}" != vfs ] &&
-  ! mount | grep -F " on ${BLOOM_EVAL_BLOOM_MOUNT} " >/dev/null 2>&1; then
-  printf '%s\n' \
-    "error: no mount is live at ${BLOOM_EVAL_BLOOM_MOUNT}; start the prepared" \
-    'evaluation triad with scripts/triad-dev-launch.sh --mount ... (README).' >&2
-  exit 1
+if [ "${BLOOM_EVAL_SOLANA_TRANSPORT:-mount}" != vfs ]; then
+  if [ -z "${BLOOM_EVAL_BLOOM_MOUNT:-}" ]; then
+    printf '%s\n' \
+      'error: BLOOM_EVAL_BLOOM_MOUNT is not set; export it or point BLOOM_TRIAD_ENV' \
+      'at the prepared triad env file.' >&2
+    exit 1
+  fi
+  if ! mount | grep -F " on ${BLOOM_EVAL_BLOOM_MOUNT} " >/dev/null 2>&1; then
+    printf '%s\n' \
+      "error: no mount is live at ${BLOOM_EVAL_BLOOM_MOUNT}; start the prepared" \
+      'evaluation triad with scripts/triad-dev-launch.sh --mount ... (README).' >&2
+    exit 1
+  fi
 fi
 
 # The evaluation triad's ceremony port must be serving. triad.env records it;

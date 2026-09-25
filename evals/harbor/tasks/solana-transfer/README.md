@@ -132,22 +132,21 @@ Every command below is the real CLI surface; run them in order.
 
    ```sh
    export BLOOM_EVAL_TRIAD_ROOT=/private/path/to/persistent/eval-triad
-   export BLOOM_EVAL_BLOOM_MOUNT=/private/path/to/empty/mount
-   mkdir -p "$BLOOM_EVAL_TRIAD_ROOT" "$BLOOM_EVAL_BLOOM_MOUNT"
+   mkdir -p "$BLOOM_EVAL_TRIAD_ROOT"
 
    BLOOM_TRIAD_DEV_MACHINE_CONFIG=/private/path/to/machine-config.toml \
    scripts/triad-dev-launch.sh \
      --developer-root "$BLOOM_EVAL_TRIAD_ROOT/developer" \
-     --mount "$BLOOM_EVAL_BLOOM_MOUNT" \
      --machine-socket "$BLOOM_EVAL_TRIAD_ROOT/runtime/machine.sock" \
      --log-dir "$BLOOM_EVAL_TRIAD_ROOT/logs" \
      --ready-file "$BLOOM_EVAL_TRIAD_ROOT/ready" \
      --ceremony-port 28735
    ```
 
-   Linux mounts additionally need the launcher's narrowly scoped sudo mount
-   rule; see DEVELOPMENT.md. Source the written connection settings in a
-   second terminal:
+   The smoke needs no mount. Agent trials do, because the container works
+   through `/bloom`: add `--mount /private/path/to/empty/mount`, which on
+   Linux needs the launcher's narrowly scoped sudo mount rule (DEVELOPMENT.md).
+   Source the written connection settings in a second terminal:
 
    ```sh
    source "$BLOOM_EVAL_TRIAD_ROOT/logs/triad.env"
@@ -213,7 +212,6 @@ Every command below is the real CLI surface; run them in order.
 8. Configure and run the harness:
 
    ```sh
-   export BLOOM_EVAL_BLOOM_MOUNT                      # from step 4
    export BLOOM_EVAL_SOLANA_HOME_ROOT="$BLOOM_HOME"   # the triad Machine home
    export BLOOM_EVAL_SOLANA_WALLET_ID=solana-eval
    export BLOOM_EVAL_SOLANA_CHAIN=solana-local
@@ -223,21 +221,18 @@ Every command below is the real CLI surface; run them in order.
    export BLOOM_EVAL_AUTHENTICATOR_SEED_FILE="$HOME/.config/bloom/eval-authenticator-seed"
    ```
 
-   The deterministic smoke requires no API key, Docker, or Harbor model
-   adapter. It runs against the kernel mount by default; with
-   `BLOOM_EVAL_SOLANA_TRANSPORT=vfs` it drives the same VFS handlers through
-   `bloom vfs` over the Machine IPC socket instead, so it needs no mount at
-   all (point `BLOOM_EVAL_SOLANA_VFS_BIN` at a `bloom` build and source the
-   triad env so `BLOOM_RPC_ENDPOINT` is set):
+   The deterministic smoke requires no API key, Docker, Harbor model
+   adapter, or mount. With `BLOOM_EVAL_SOLANA_TRANSPORT=vfs` it drives the
+   VFS through `bloom vfs` over the Machine IPC socket that `triad.env`
+   names:
 
    ```sh
-   scripts/evals/run-harbor-solana-local.sh smoke                 # mounted
-   BLOOM_EVAL_SOLANA_TRANSPORT=vfs \
-     scripts/evals/run-harbor-solana-local.sh smoke               # mount-free
+   BLOOM_EVAL_SOLANA_TRANSPORT=vfs scripts/evals/run-harbor-solana-local.sh smoke
    ```
 
-   The vfs transport is smoke-only; agent trials always use the mounted
-   transport so the container sees `/bloom`.
+   On a mounted triad, omit the variable to run the same smoke through the
+   mount. Agent trials always use the mounted transport so the container
+   sees `/bloom`.
 
    Model trials additionally require Docker and `uv`:
 

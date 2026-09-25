@@ -1123,6 +1123,20 @@ class VfsTransportTests(SolanaEvalTestCase):
                                     ):
                                         definition.preflight()
 
+    def test_the_vfs_transport_needs_no_mount_path(self) -> None:
+        definition = self.make(
+            BLOOM_EVAL_SOLANA_TRANSPORT="vfs", BLOOM_EVAL_BLOOM_MOUNT=""
+        )
+        self.assertEqual(definition.bloom_mount, Path("/bloom"))
+        self.assertEqual(
+            definition.mount._vfs_path(definition.wallet_root), "/wallets/" + WALLET_ID
+        )
+
+    def test_the_mounted_transport_still_requires_a_mount_path(self) -> None:
+        definition = self.make(BLOOM_EVAL_BLOOM_MOUNT="")
+        with self.assertRaisesRegex(EvalError, "BLOOM_EVAL_BLOOM_MOUNT"):
+            definition.preflight()
+
     def test_agent_trials_are_refused_without_the_mounted_transport(self) -> None:
         definition = self.make(BLOOM_EVAL_SOLANA_TRANSPORT="vfs")
         with self.assertRaisesRegex(EvalError, "--smoke-only"):
