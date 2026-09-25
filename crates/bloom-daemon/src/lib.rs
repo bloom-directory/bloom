@@ -438,6 +438,78 @@ impl DaemonPetalHost {
         Ok(Some(key.key_ref.clone()))
     }
 
+    /// Numbered Petal calls can only inspect or confirm their selected sender's
+    /// outbox. Core outbox records persist the sender address (not a KeyRef), so
+    /// resolve the exact active owner first and compare its authenticated address.
+    async fn authorize_petal_outbox_owner(
+        &self,
+        context: &PetalRouteContext,
+        wallet: &str,
+        staged: &bloom_proto::StagedTx,
+    ) -> Result<(), HostError> {
+        if context.trusted_account().is_none() {
+            // Retain the existing internal unscoped host contract. Mounted
+            // Petal routes always supply a trusted numbered account context.
+            return Ok(());
+        }
+        let owner = self
+            .account_owner(
+                context,
+                wallet,
+                bloom_broker_api::CryptoSuite::Secp256k1Keccak256Recoverable,
+                None,
+            )
+            .await?;
+        let service = self
+            .tx_outbox
+            .as_ref()
+            .ok_or_else(|| HostError::Denied("EVM outbox is unavailable".into()))?;
+        let wallet_id = bloom_broker_api::Token::new(wallet.to_owned())
+            .map_err(|error| HostError::Invalid(error.to_string()))?;
+        let projection = service
+            .wallet_projections
+            .get_wallet(&wallet_id)
+            .await
+            .map_err(|error| HostError::Denied(error.to_string()))?;
+        let address = if let Some(owner) = owner {
+            let inventory = projection
+                .account_inventory()
+                .map_err(|error| HostError::Denied(error.to_string()))?;
+            let account = inventory
+                .accounts
+                .iter()
+                .find(|account| account.key_ref == owner)
+                .ok_or_else(|| HostError::Denied("selected owner absent from projection".into()))?;
+            let addresses: Vec<_> = account
+                .chain_projections
+                .iter()
+                .filter(|p| p.chain_family.as_str() == "evm")
+                .map(|p| p.address.parse::<Address>())
+                .collect::<Result<_, _>>()
+                .map_err(|error| HostError::Denied(format!("owner address: {error}")))?;
+            match addresses.first() {
+                Some(first) if addresses.iter().all(|address| address == first) => *first,
+                _ => {
+                    return Err(HostError::Denied(
+                        "selected owner has no unique EVM address".into(),
+                    ));
+                }
+            }
+        } else {
+            projection
+                .primary_address()
+                .map_err(|error| HostError::Denied(error.to_string()))?
+                .parse::<Address>()
+                .map_err(|error| HostError::Denied(error.to_string()))?
+        };
+        if staged.wallet != wallet || staged.from.parse::<Address>().ok() != Some(address) {
+            return Err(HostError::Denied(
+                "outbox entry belongs to another account".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Whether `named` is a key this wallet's Petal key states record as
     /// delegated from `owner`. Session keys are the legitimate explicit
     /// selection; their revocation and scope are enforced by Broker.
@@ -454,8 +526,7 @@ impl DaemonPetalHost {
                     .public_key
                     .as_ref()
                     .is_some_and(|public| &public.key_ref == named)
-                    && state.scope.parent_key_ref.public_key_fingerprint
-                        == owner.public_key_fingerprint
+                    && &state.scope.parent_key_ref == owner
             })
     }
 
@@ -1351,15 +1422,17 @@ impl PetalHost for DaemonPetalHost {
                 "executing route is outside the requested Petal key scope".into(),
             ));
         }
-        let operation_hash = blake3::hash(
-            format!(
-                "bloom-petal-key-custody-operation/v2\0{}\0{}\0{}",
-                wallet_id.as_str(),
-                lineage.lineage_id,
-                key_slot.as_str()
-            )
-            .as_bytes(),
-        );
+        let numbered_parent = context
+            .trusted_account()
+            .filter(|account| account.number > 0)
+            .map(|_| parent_key_ref);
+        let operation_hash = petal_scoped_identity(
+            "bloom-petal-key-custody-operation/v2",
+            wallet_id.as_str(),
+            &lineage.lineage_id,
+            key_slot.as_str(),
+            numbered_parent,
+        )?;
         let custody_operation_id =
             bloom_broker_api::OperationId::from_bytes(*operation_hash.as_bytes());
         let scope = bloom_broker_api::PetalKeyScope {
@@ -1393,8 +1466,39 @@ impl PetalHost for DaemonPetalHost {
                 .digest()
                 .map_err(|error| HostError::Denied(error.to_string()))?,
         );
-        let path =
-            self.petal_key_state_path(wallet_id.as_str(), &lineage.lineage_id, key_slot.as_str())?;
+        // A core session path has one slot per account, not one per family.
+        // Reject conflicting family bindings instead of making stop ambiguous.
+        for (_, stored) in Self::petal_key_states_from_root(
+            self.petal_key_state_root.as_deref(),
+            Some(wallet_id.as_str()),
+        ) {
+            if stored.scope.lineage_id == lineage.lineage_id
+                && stored.key_slot == req.key_slot
+                && stored.scope.parent_key_ref != *parent_key_ref
+                && owner_account_number(&stored.scope.parent_key_ref)
+                    == owner_account_number(parent_key_ref)
+            {
+                return Err(HostError::Denied(
+                    "session slot already belongs to another family or owner of this account"
+                        .into(),
+                ));
+            }
+        }
+        let path = if let Some(parent) = numbered_parent {
+            let root = self.petal_key_state_root.as_ref().ok_or_else(|| {
+                HostError::Backend("Petal key request state is not configured".into())
+            })?;
+            let identity = petal_scoped_identity(
+                "bloom-petal-key-request-state/v3",
+                wallet_id.as_str(),
+                &lineage.lineage_id,
+                key_slot.as_str(),
+                Some(parent),
+            )?;
+            root.join(format!("{}.json", identity.to_hex()))
+        } else {
+            self.petal_key_state_path(wallet_id.as_str(), &lineage.lineage_id, key_slot.as_str())?
+        };
 
         if let Some(mut stored) = Self::read_petal_key_state(&path)? {
             if !matches!(
@@ -2512,6 +2616,7 @@ impl PetalHost for DaemonPetalHost {
                 &entry.staged,
                 &req,
                 &origin,
+                wallet_address,
                 requested_to,
                 requested_value,
             ) {
@@ -2584,6 +2689,8 @@ impl PetalHost for DaemonPetalHost {
             .outbox
             .read(&wallet, &chain_name, &outbox_id)
             .map_err(|e| HostError::NotFound(format!("outbox {outbox_id}: {e}")))?;
+        self.authorize_petal_outbox_owner(context, &wallet, &entry.staged)
+            .await?;
         if entry.staged.resolved_execution_origin() != origin {
             return Err(HostError::Denied(
                 "outbox entry was not staged by this trusted Petal".into(),
@@ -2674,6 +2781,8 @@ impl PetalHost for DaemonPetalHost {
             .outbox
             .read(&wallet, &chain_name, &outbox_id)
             .map_err(|e| HostError::NotFound(format!("outbox {outbox_id}: {e}")))?;
+        self.authorize_petal_outbox_owner(context, &wallet, &entry.staged)
+            .await?;
         // Inspection is read-only, so it is scoped to the package rather than
         // to the route that staged the entry: a Petal's status route must be
         // able to reconcile what its execute route staged. Confirmation stays
@@ -2863,10 +2972,49 @@ fn parse_petal_hex_bytes(value: &str, field: &str) -> Result<Vec<u8>, HostError>
     hex::decode(value).map_err(|e| HostError::Invalid(format!("{field}: {e}")))
 }
 
+/// Retain account-0 operation hashes exactly. Additional accounts bind the
+/// entire parent (or stop target) KeyRef, not a guest slot or display path.
+fn petal_scoped_identity(
+    domain: &str,
+    wallet: &str,
+    lineage: &str,
+    slot: &str,
+    key: Option<&bloom_broker_api::KeyRef>,
+) -> Result<blake3::Hash, HostError> {
+    let legacy = format!("{domain}\0{wallet}\0{lineage}\0{slot}");
+    let Some(key) = key else {
+        return Ok(blake3::hash(legacy.as_bytes()));
+    };
+    let canonical =
+        serde_jcs::to_vec(key).map_err(|error| HostError::Invalid(error.to_string()))?;
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"bloom-numbered-petal-identity/v1\0");
+    hash.update(&(legacy.len() as u64).to_be_bytes());
+    hash.update(legacy.as_bytes());
+    hash.update(&canonical);
+    Ok(hash.finalize())
+}
+
+/// Used only to detect session-name collisions, never to authorize a key.
+fn owner_account_number(key: &bloom_broker_api::KeyRef) -> Option<u32> {
+    match &key.derivation {
+        None => Some(0),
+        Some(bloom_broker_api::DerivationRef::Bip39Multicurve { path, .. }) => path
+            .strip_prefix("m/44'/60'/0'/0/")
+            .or_else(|| {
+                path.strip_prefix("m/44'/501'/")
+                    .and_then(|rest| rest.strip_suffix("'/0'"))
+            })
+            .and_then(|number| number.parse().ok()),
+        _ => None,
+    }
+}
+
 fn petal_pending_request_matches(
     staged: &bloom_proto::StagedTx,
     request: &EvmTransactionRequest,
     origin: &bloom_proto::plan::ExecutionOrigin,
+    requested_from: Address,
     requested_to: Address,
     requested_value: U256,
 ) -> bool {
@@ -2876,6 +3024,7 @@ fn petal_pending_request_matches(
         .unwrap_or(u128::MAX);
     staged.expires_ms > now_ms
         && staged.resolved_execution_origin() == *origin
+        && staged.from.parse::<Address>().ok() == Some(requested_from)
         && staged.to.parse::<Address>().ok() == Some(requested_to)
         && staged.value_wei.parse::<U256>().ok() == Some(requested_value)
         && staged.data_hex == request.data_hex
@@ -3526,13 +3675,18 @@ impl AccountPetalMount for AccountPetals {
         mount: &str,
         slot: &str,
     ) -> Result<(), bloom_vfs::handler::HandlerError> {
-        let (path, state) = self
+        let mut matching = self
             .states_for(account)
             .into_iter()
-            .find(|(_, state)| Self::rendered_mount(state) == mount && state.key_slot == *slot)
-            .ok_or_else(|| {
-                bloom_vfs::handler::HandlerError::not_found(format!("sessions/{mount}/{slot}"))
-            })?;
+            .filter(|(_, state)| Self::rendered_mount(state) == mount && state.key_slot == *slot);
+        let (path, state) = matching.next().ok_or_else(|| {
+            bloom_vfs::handler::HandlerError::not_found(format!("sessions/{mount}/{slot}"))
+        })?;
+        if matching.next().is_some() {
+            return Err(bloom_vfs::handler::HandlerError::invalid(
+                "ambiguous session slot",
+            ));
+        }
         let Some(public) = &state.public_key else {
             return Err(bloom_vfs::handler::HandlerError::invalid(
                 "session has no delegated key to stop",
@@ -3548,13 +3702,14 @@ impl AccountPetalMount for AccountPetals {
                 "Broker edge is unavailable to stop a session",
             )
         })?;
-        let operation_hash = blake3::hash(
-            format!(
-                "bloom-session-stop/v1\0{}\0{}\0{}",
-                account.wallet, state.scope.lineage_id, slot
-            )
-            .as_bytes(),
-        );
+        let operation_hash = petal_scoped_identity(
+            "bloom-session-stop/v1",
+            &account.wallet,
+            &state.scope.lineage_id,
+            slot,
+            (account.number > 0).then_some(&public.key_ref),
+        )
+        .map_err(|error| bloom_vfs::handler::HandlerError::invalid(error.to_string()))?;
         let operation_id = bloom_broker_api::OperationId::from_bytes(*operation_hash.as_bytes());
         let statuses = broker
             .revoke_approvals_for_key(bloom_broker_api::RevokeForKeyRequest {
@@ -4406,7 +4561,8 @@ impl Daemon {
                 .map_err(|e| DaemonError::Audit(format!("petals registry: {e}")))?,
         );
         let petal_vm = PetalVm::new().map_err(|e| DaemonError::Audit(format!("petals vm: {e}")))?;
-        let petals = PetalRunner::new(petal_store.clone(), petal_registry.clone(), petal_vm);
+        let petals = PetalRunner::new(petal_store.clone(), petal_registry.clone(), petal_vm)
+            .with_provenance_catalog(provenance_catalog.clone());
         let petal_vfs_host = Arc::new(LateVfsHost::new());
         let petal_app_host = DaemonPetalHost::new(petal_vfs_host.clone(), audit_arc.clone())
             .with_broker(broker.clone())
@@ -6991,9 +7147,23 @@ mod tests {
             &staged,
             &request,
             &origin,
+            staged.from.parse().unwrap(),
             staged.to.parse().unwrap(),
             staged.value_wei.parse().unwrap(),
         ));
+        assert!(
+            !petal_pending_request_matches(
+                &staged,
+                &request,
+                &origin,
+                "0x0000000000000000000000000000000000000003"
+                    .parse()
+                    .unwrap(),
+                staged.to.parse().unwrap(),
+                staged.value_wei.parse().unwrap(),
+            ),
+            "the same request from another account must not reuse this outbox"
+        );
         let mut equivalent_fee_request = request.clone();
         equivalent_fee_request.max_fee_per_gas = Some("00100".into());
         equivalent_fee_request.max_priority_fee_per_gas = Some("00010".into());
@@ -7001,6 +7171,7 @@ mod tests {
             &staged,
             &equivalent_fee_request,
             &origin,
+            staged.from.parse().unwrap(),
             staged.to.parse().unwrap(),
             staged.value_wei.parse().unwrap(),
         ));
@@ -7010,6 +7181,7 @@ mod tests {
             &staged,
             &changed_request,
             &origin,
+            staged.from.parse().unwrap(),
             staged.to.parse().unwrap(),
             staged.value_wei.parse().unwrap(),
         ));
@@ -8464,6 +8636,147 @@ allowed = ["bloom:vfs.read"]
         );
     }
 
+    #[tokio::test]
+    async fn numbered_petal_outbox_inspection_and_confirmation_reject_another_sender() {
+        let (_dir, daemon, broker) = isolation_daemon().await;
+        let host =
+            test_petal_host(&daemon).with_broker(Some(MachineBrokerClient::new(broker.clone())));
+        let mut context = account_route_context("w", Some(0), None);
+        let staged: bloom_proto::StagedTx = serde_json::from_value(serde_json::json!({
+            "id": "scoped-outbox", "wallet": "w", "chain": "anvil", "chain_id": 31337,
+            "from": broker.child(true, 0).address, "to": broker.child(true, 1).address,
+            "value_wei": "0", "data_hex": "0x", "gas_limit": 21000,
+            "nonce": 0, "policy_checks": [], "created_ms": 1,
+            "expires_ms": 99999999999999u64, "status": "pending",
+            "execution_origin": DaemonPetalHost::petal_execution_origin(&context).unwrap(),
+        }))
+        .unwrap();
+        daemon
+            .tx_engine
+            .outbox
+            .write_pending(&staged, "# scoped fixture")
+            .unwrap();
+        host.evm_tx_inspect(
+            "w".into(),
+            "anvil".into(),
+            staged.id.clone(),
+            Some(context.clone()),
+        )
+        .await
+        .unwrap();
+        context.params = vec![
+            ("bloom.wallet".into(), "w".into()),
+            ("bloom.account".into(), "1".into()),
+        ];
+        let error = host
+            .evm_tx_inspect(
+                "w".into(),
+                "anvil".into(),
+                staged.id.clone(),
+                Some(context.clone()),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, HostError::Denied(ref message) if message.contains("another account")),
+            "{error}"
+        );
+        let error = host
+            .evm_tx_confirm("w".into(), "anvil".into(), staged.id, false, Some(context))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, HostError::Denied(ref message) if message.contains("another account")),
+            "{error}"
+        );
+        assert!(broker.sign_calls.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn identical_petal_evm_stage_requests_reuse_only_the_selected_account_pending_entry() {
+        let (_dir, daemon, broker) = isolation_daemon().await;
+        let host =
+            test_petal_host(&daemon).with_broker(Some(MachineBrokerClient::new(broker.clone())));
+        let to = broker.child(true, 0).address.clone();
+
+        for number in [0, 1] {
+            let context = account_route_context("w", Some(number), None);
+            let staged: bloom_proto::StagedTx = serde_json::from_value(serde_json::json!({
+                "id": format!("account-{number}-pending"),
+                "wallet": "w", "chain": "anvil", "chain_id": 31337,
+                "from": broker.child(true, number).address, "to": to,
+                "value_wei": "0", "data_hex": "0x", "gas_limit": 21000,
+                "nonce": 0, "policy_checks": [], "created_ms": 1,
+                "expires_ms": 99999999999999u64, "status": "pending",
+                "execution_origin": DaemonPetalHost::petal_execution_origin(&context).unwrap(),
+            }))
+            .unwrap();
+            daemon
+                .tx_engine
+                .outbox
+                .write_pending(&staged, "# scoped fixture")
+                .unwrap();
+        }
+
+        for number in [0, 1, 0] {
+            let outcome = host
+                .evm_tx_stage(EvmTransactionRequest {
+                    wallet: "w".into(),
+                    chain: "anvil".into(),
+                    to: to.clone(),
+                    value_wei: "0".into(),
+                    data_hex: "0x".into(),
+                    nonce: None,
+                    max_fee_per_gas: None,
+                    max_priority_fee_per_gas: None,
+                    context: Some(account_route_context("w", Some(number), None)),
+                })
+                .await
+                .unwrap();
+            assert_eq!(outcome.outbox_id, format!("account-{number}-pending"));
+        }
+        assert_eq!(
+            daemon
+                .tx_engine
+                .outbox
+                .list("w", "anvil", OutboxState::Pending)
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn numbered_session_identities_bind_exact_key_and_preserve_account_zero() {
+        let broker = TwoFamilyAccountBroker::new();
+        let domain = "bloom-petal-key-custody-operation/v2";
+        let legacy = petal_scoped_identity(domain, "w", "lineage", "slot", None).unwrap();
+        assert_eq!(
+            legacy,
+            blake3::hash(b"bloom-petal-key-custody-operation/v2\0w\0lineage\0slot")
+        );
+        let first = &broker.child(true, 1).key_ref;
+        let second = &broker.child(false, 1).key_ref;
+        let id = petal_scoped_identity(domain, "w", "lineage", "slot", Some(first)).unwrap();
+        assert_ne!(legacy, id);
+        assert_eq!(
+            id,
+            petal_scoped_identity(domain, "w", "lineage", "slot", Some(first)).unwrap()
+        );
+        assert_ne!(
+            id,
+            petal_scoped_identity(domain, "w", "lineage", "slot", Some(second)).unwrap()
+        );
+        let mut rebound = first.clone();
+        rebound.locator.push_str("/other");
+        assert_ne!(
+            id,
+            petal_scoped_identity(domain, "w", "lineage", "slot", Some(&rebound)).unwrap()
+        );
+        assert_eq!(owner_account_number(first), Some(1));
+        assert_eq!(owner_account_number(second), Some(1));
+    }
+
     /// A route context naming account 1 resolves the owner to account 1's
     /// family key.
     #[tokio::test]
@@ -8677,13 +8990,29 @@ allowed = ["bloom:vfs.read"]
             }
         }
         for mount in ["echo", "plain"] {
-            let flat = daemon
+            let legacy = VfsPath::parse(&format!("/petals/{mount}/message.txt")).unwrap();
+            assert!(daemon.vfs.read(&legacy).await.is_err());
+            let scoped = daemon
                 .vfs
-                .read(&VfsPath::parse(&format!("/petals/{mount}/message.txt")).unwrap())
+                .read(&VfsPath::parse(&format!("/petals/{mount}/wallets/w/0/message.txt")).unwrap())
                 .await
                 .unwrap();
-            assert_eq!(flat, b"component", "{mount}");
+            assert_eq!(scoped, b"component", "{mount}");
         }
+        assert!(
+            daemon
+                .vfs
+                .read(&VfsPath::parse("/petals/echo/wallets/w/1/message.txt").unwrap())
+                .await
+                .is_ok()
+        );
+        assert!(
+            daemon
+                .vfs
+                .read(&VfsPath::parse("/petals/plain/wallets/w/1/message.txt").unwrap())
+                .await
+                .is_err()
+        );
     }
 
     /// 8. Legacy flat dispatch on a two-child wallet signs with account 0
@@ -8866,9 +9195,14 @@ allowed = ["bloom:vfs.read"]
             assert_eq!(requests.len(), 1, "one journaled revoke request");
             assert_eq!(requests[0].wallet_id.as_str(), "w");
             assert_eq!(requests[0].key_ref.locator, "wallet/derived/session-main");
-            let expected_operation = blake3::hash(
-                b"bloom-session-stop/v1\0w\0pln1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\0main",
-            );
+            let expected_operation = petal_scoped_identity(
+                "bloom-session-stop/v1",
+                "w",
+                "pln1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "main",
+                Some(&session_key_public().key_ref),
+            )
+            .unwrap();
             assert_eq!(
                 requests[0].operation_id.as_str(),
                 expected_operation.to_hex().as_str()

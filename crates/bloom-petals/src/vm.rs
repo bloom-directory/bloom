@@ -54,6 +54,16 @@ use crate::meta::Capability;
 use crate::policy::{NetPolicy, StoreNamespacePolicy};
 use crate::private_store::PrivateStore;
 
+fn open_selected_private_store(
+    root: PathBuf,
+    account: Option<&(String, u32)>,
+) -> Result<PrivateStore, crate::host::HostError> {
+    match account {
+        Some((wallet, number)) => PrivateStore::open_account(root, wallet, *number),
+        None => PrivateStore::open(root),
+    }
+}
+
 const DEFAULT_FUEL: u64 = 100_000_000;
 const DEFAULT_MEMORY_PAGES: u32 = 256; // 16 MiB (64 KiB pages).
 const STDOUT_CAP: usize = 1 << 20; // 1 MiB.
@@ -135,6 +145,8 @@ pub struct RunOptions {
     pub key_derive_maximum_lifetime_ms: Option<u64>,
     pub http_response_cap: usize,
     pub private_store_root: Option<PathBuf>,
+    /// Selected wallet account for a per-account private store (n > 0).
+    pub private_store_account: Option<(String, u32)>,
     /// Force mediated env helpers to deterministic values for install-time checks.
     pub deterministic_env: bool,
     /// Daemon-owned settings exposed read-only through `bloom:env`.
@@ -158,6 +170,7 @@ impl Default for RunOptions {
             key_derive_maximum_lifetime_ms: None,
             http_response_cap: DEFAULT_HTTP_RESPONSE_CAP,
             private_store_root: None,
+            private_store_account: None,
             deterministic_env: false,
             runtime_settings: BTreeMap::new(),
             endpoint_bindings: BTreeMap::new(),
@@ -296,7 +309,7 @@ impl PetalVm {
                 limiter: MemLimiter::new(opts.memory_pages),
                 private_store: match opts.private_store_root.clone() {
                     Some(root) => Some(
-                        PrivateStore::open(root)
+                        open_selected_private_store(root, opts.private_store_account.as_ref())
                             .map_err(|e| PetalError::vm(format!("private store open: {e}")))?,
                     ),
                     None => None,
@@ -375,7 +388,7 @@ impl PetalVm {
                 limiter: MemLimiter::new(opts.memory_pages),
                 private_store: match opts.private_store_root.clone() {
                     Some(root) => Some(
-                        PrivateStore::open(root)
+                        open_selected_private_store(root, opts.private_store_account.as_ref())
                             .map_err(|e| PetalError::vm(format!("private store open: {e}")))?,
                     ),
                     None => None,
@@ -453,7 +466,7 @@ impl PetalVm {
                 limiter: MemLimiter::new(opts.memory_pages),
                 private_store: match opts.private_store_root.clone() {
                     Some(root) => Some(
-                        PrivateStore::open(root)
+                        open_selected_private_store(root, opts.private_store_account.as_ref())
                             .map_err(|e| PetalError::vm(format!("private store open: {e}")))?,
                     ),
                     None => None,
@@ -1581,9 +1594,42 @@ fn trusted_account(data: &StoreData) -> Option<crate::abi::TrustedAccountContext
     data.sign_context.as_ref().and_then(|c| c.trusted_account())
 }
 
+/// Constrain nested VFS access to the account selected by the outer route,
+/// and never dispatch a nested Petal route. Parse first so dot segments cannot
+/// make a path appear to be in scope while the VFS host resolves it elsewhere.
+fn authorize_guest_vfs_account(data: &StoreData, path: &str) -> Result<(), HostError> {
+    let account = trusted_account(data);
+    authorize_guest_vfs_path(account.as_ref(), path)
+}
+
+fn authorize_guest_vfs_path(
+    account: Option<&crate::abi::TrustedAccountContext>,
+    path: &str,
+) -> Result<(), HostError> {
+    let parsed = bloom_vfs::path::VfsPath::parse(path)
+        .map_err(|error| HostError::Invalid(format!("path: {error}")))?;
+    let segments = parsed.segments();
+    let selected = |wallet: &str, number: &str| {
+        account
+            .is_some_and(|account| wallet == account.wallet && number == account.number.to_string())
+    };
+    let allowed = match segments {
+        [root, wallet, number, ..] if root == "wallets" => selected(wallet, number),
+        [root, ..] if root == "wallets" || root == "petals" => false,
+        _ => true,
+    };
+    if allowed {
+        Ok(())
+    } else {
+        Err(HostError::Denied(
+            "guest VFS path is outside the selected account or targets a Petal".into(),
+        ))
+    }
+}
+
 /// Reject petal-supplied wallets that do not match the mounted account's
-/// trusted wallet. Account-0 and legacy mounts carry no trusted context and
-/// keep the documented unconstrained behavior.
+/// trusted wallet, including account 0. Internal legacy invocations without
+/// trusted context retain their existing behavior.
 fn require_trusted_wallet(data: &StoreData, wallet: &str) -> Result<(), HostError> {
     if let Some(account) = trusted_account(data)
         && wallet != account.wallet
@@ -2161,6 +2207,9 @@ async fn component_vfs_lookup(
         Ok(path) => path,
         Err(e) => return set_component_result(results, component_host_err(e)),
     };
+    if let Err(e) = authorize_guest_vfs_account(store.data(), &path) {
+        return set_component_result(results, component_host_err(e));
+    }
     let host = store.data().host.clone();
     match host.vfs_lookup(&path).await {
         Ok(entry) => set_component_result(results, component_ok(Some(component_vfs_entry(entry)))),
@@ -2184,6 +2233,9 @@ async fn component_vfs_list(
         Ok(path) => path,
         Err(e) => return set_component_result(results, component_host_err(e)),
     };
+    if let Err(e) = authorize_guest_vfs_account(store.data(), &path) {
+        return set_component_result(results, component_host_err(e));
+    }
     let host = store.data().host.clone();
     match host.vfs_list(&path).await {
         Ok(names) => {
@@ -2210,6 +2262,9 @@ async fn component_vfs_read(
         Ok(path) => path,
         Err(e) => return set_component_result(results, component_host_err(e)),
     };
+    if let Err(e) = authorize_guest_vfs_account(store.data(), &path) {
+        return set_component_result(results, component_host_err(e));
+    }
     let host = store.data().host.clone();
     match host.vfs_read(&path).await {
         Ok(bytes) => set_component_result(results, component_ok(Some(component_bytes(bytes)))),
@@ -2239,6 +2294,9 @@ async fn component_vfs_write(
         Ok(path) => path,
         Err(e) => return set_component_result(results, component_host_err(e)),
     };
+    if let Err(e) = authorize_guest_vfs_account(store.data(), &path) {
+        return set_component_result(results, component_host_err(e));
+    }
     let body = match component_byte_list(body, "body") {
         Ok(body) => body,
         Err(e) => return set_component_result(results, component_host_err(e)),
@@ -2709,6 +2767,9 @@ fn link_vfs_imports(linker: &mut Linker<StoreData>, module: &'static str) -> any
                     Ok(s) => s,
                     Err(c) => return c,
                 };
+                if let Err(e) = authorize_guest_vfs_account(caller.data(), &path) {
+                    return e.as_wasm_code();
+                }
                 let host = caller.data().host.clone();
                 match host.vfs_read(&path).await {
                     Ok(bytes) => {
@@ -2751,6 +2812,9 @@ fn link_vfs_imports(linker: &mut Linker<StoreData>, module: &'static str) -> any
                     Ok(s) => s,
                     Err(c) => return c,
                 };
+                if let Err(e) = authorize_guest_vfs_account(caller.data(), &path) {
+                    return e.as_wasm_code();
+                }
                 let bytes = match read_bytes(&mem, &mut caller, src_ptr, src_len) {
                     Ok(b) => b,
                     Err(c) => return c,
@@ -3465,6 +3529,56 @@ mod tests {
         assert_eq!(out.stdout, vec![5u8]); // "VALUE".len()
     }
 
+    #[tokio::test]
+    async fn core_wasm_guest_cannot_read_or_write_wallet_or_petal_paths_without_route_context() {
+        let vm = PetalVm::new().unwrap();
+        let host = Arc::new(MockHost::default());
+        for private_path in [
+            "wallets/alice/1/address.evm",
+            "petals/enso/wallets/alice/1/status.json",
+        ] {
+            host.store
+                .lock()
+                .insert(private_path.into(), b"SECRET".to_vec());
+            for (import, capability) in [
+                ("vfs_read", Capability::VfsRead),
+                ("vfs_write", Capability::VfsWrite),
+            ] {
+                let module = format!(
+                    r#"(module
+                    (import "bloom" "{import}" (func $vfs (param i32 i32 i32 i32) (result i32)))
+                    (import "wasi_snapshot_preview1" "fd_write"
+                      (func $fd_write (param i32 i32 i32 i32) (result i32)))
+                    (memory (export "memory") 1)
+                    (data (i32.const 0) "{private_path}")
+                    (data (i32.const 400) "\9c\01\00\00\01\00\00\00")
+                    (func (export "_start")
+                      (i32.store8 (i32.const 412)
+                        (call $vfs (i32.const 0) (i32.const {path_len})
+                          (i32.const 64) (i32.const 1)))
+                      (drop (call $fd_write (i32.const 1) (i32.const 400)
+                        (i32.const 1) (i32.const 420))))
+                  )"#,
+                    path_len = private_path.len()
+                );
+                let out = vm
+                    .run(
+                        &wat(&module),
+                        Vec::new(),
+                        BTreeSet::from([capability]),
+                        host.clone(),
+                        "h",
+                        PetalMode::Local,
+                        RunOptions::default(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(out.stdout, vec![denied_byte()], "{import}: {private_path}");
+            }
+            assert_eq!(host.store.lock()[private_path], b"SECRET");
+        }
+    }
+
     #[test]
     fn component_route_response_maps_read_lookup_and_errors() {
         let params = route_component_params(
@@ -3902,9 +4016,9 @@ mod tests {
         let host = Arc::new(MockHost::default());
         host.store
             .lock()
-            .insert("wallets/alice.txt".into(), b"alice".to_vec());
+            .insert("public/alice.txt".into(), b"alice".to_vec());
         host.lists.lock().insert(
-            "wallets".into(),
+            "public".into(),
             vec![HostVfsEntry {
                 name: "alice.txt".into(),
                 kind: HostVfsEntryKind::File,
@@ -3994,7 +4108,7 @@ paths = ["/status"]
         let mut read = vec![ComponentVal::Bool(false)];
         component_vfs_read(
             store.as_context_mut(),
-            &[ComponentVal::String("wallets/alice.txt".into())],
+            &[ComponentVal::String("public/alice.txt".into())],
             &mut read,
         )
         .await
@@ -4004,7 +4118,7 @@ paths = ["/status"]
         let mut list = vec![ComponentVal::Bool(false)];
         component_vfs_list(
             store.as_context_mut(),
-            &[ComponentVal::String("wallets".into())],
+            &[ComponentVal::String("public".into())],
             &mut list,
         )
         .await
@@ -4015,7 +4129,7 @@ paths = ["/status"]
         let mut lookup = vec![ComponentVal::Bool(false)];
         component_vfs_lookup(
             store.as_context_mut(),
-            &[ComponentVal::String("wallets/alice.txt".into())],
+            &[ComponentVal::String("public/alice.txt".into())],
             &mut lookup,
         )
         .await
@@ -4030,7 +4144,7 @@ paths = ["/status"]
         component_vfs_write(
             store.as_context_mut(),
             &[
-                ComponentVal::String("wallets/bob.txt".into()),
+                ComponentVal::String("public/bob.txt".into()),
                 component_bytes(b"bob".to_vec()),
             ],
             &mut write,
@@ -4039,9 +4153,164 @@ paths = ["/status"]
         .unwrap();
         assert_component_ok_none(&write[0]);
         assert_eq!(
-            host.store.lock().get("wallets/bob.txt").cloned().unwrap(),
+            host.store.lock().get("public/bob.txt").cloned().unwrap(),
             b"bob"
         );
+    }
+
+    #[tokio::test]
+    async fn component_vfs_operations_enforce_selected_account_before_host() {
+        let host = Arc::new(MockHost::default());
+        host.store
+            .lock()
+            .insert("wallets/alice/1/status.json".into(), b"ok".to_vec());
+        let nested_petal = "petals/enso/wallets/alice/1/status.json";
+        host.store
+            .lock()
+            .insert(nested_petal.into(), b"must-stay-unchanged".to_vec());
+        host.lists
+            .lock()
+            .insert("wallets/alice/1".into(), Vec::new());
+        host.lists.lock().insert(nested_petal.into(), Vec::new());
+        let mut store = component_test_store(
+            BTreeSet::from([Capability::VfsRead, Capability::VfsWrite]),
+            None,
+            host.clone(),
+        );
+        store.data_mut().sign_context = Some(account_context("alice", 1, None));
+
+        for forbidden in [
+            "wallets/bob/1/status.json",
+            "wallets/alice/0/status.json",
+            "petals/enso/wallets/alice/0/status.json",
+            nested_petal,
+        ] {
+            let mut result = vec![ComponentVal::Bool(false)];
+            component_vfs_lookup(
+                store.as_context_mut(),
+                &[ComponentVal::String(forbidden.into())],
+                &mut result,
+            )
+            .await
+            .unwrap();
+            assert_component_err_contains(&result[0], "outside the selected account");
+            component_vfs_read(
+                store.as_context_mut(),
+                &[ComponentVal::String(forbidden.into())],
+                &mut result,
+            )
+            .await
+            .unwrap();
+            assert_component_err_contains(&result[0], "outside the selected account");
+            component_vfs_list(
+                store.as_context_mut(),
+                &[ComponentVal::String(forbidden.into())],
+                &mut result,
+            )
+            .await
+            .unwrap();
+            assert_component_err_contains(&result[0], "outside the selected account");
+            component_vfs_write(
+                store.as_context_mut(),
+                &[
+                    ComponentVal::String(forbidden.into()),
+                    component_bytes(b"bad".to_vec()),
+                ],
+                &mut result,
+            )
+            .await
+            .unwrap();
+            assert_component_err_contains(&result[0], "outside the selected account");
+        }
+        assert!(host.vfs_reads.lock().is_empty());
+        assert!(host.store.lock().get("wallets/bob/1/status.json").is_none());
+        assert_eq!(host.store.lock()[nested_petal], b"must-stay-unchanged");
+
+        let mut result = vec![ComponentVal::Bool(false)];
+        component_vfs_lookup(
+            store.as_context_mut(),
+            &[ComponentVal::String("wallets/alice/1/status.json".into())],
+            &mut result,
+        )
+        .await
+        .unwrap();
+        assert_component_ok_entry(&result[0], "status.json", "file", 0o644);
+        component_vfs_read(
+            store.as_context_mut(),
+            &[ComponentVal::String("wallets/alice/1/status.json".into())],
+            &mut result,
+        )
+        .await
+        .unwrap();
+        assert_component_ok_bytes(&result[0], b"ok");
+        component_vfs_list(
+            store.as_context_mut(),
+            &[ComponentVal::String("wallets/alice/1".into())],
+            &mut result,
+        )
+        .await
+        .unwrap();
+        assert_component_ok_entry_names(&result[0], &[]);
+        component_vfs_write(
+            store.as_context_mut(),
+            &[
+                ComponentVal::String("wallets/alice/1/updated.json".into()),
+                component_bytes(b"yes".to_vec()),
+            ],
+            &mut result,
+        )
+        .await
+        .unwrap();
+        assert_component_ok_none(&result[0]);
+        assert_eq!(
+            host.store
+                .lock()
+                .get("wallets/alice/1/updated.json")
+                .unwrap(),
+            b"yes"
+        );
+
+        store.data_mut().sign_context = None;
+        for path in [
+            "wallets/alice/1/status.json",
+            "petals/enso/wallets/alice/1/status.json",
+        ] {
+            component_vfs_lookup(
+                store.as_context_mut(),
+                &[ComponentVal::String(path.into())],
+                &mut result,
+            )
+            .await
+            .unwrap();
+            assert_component_err_contains(&result[0], "outside the selected account");
+            component_vfs_read(
+                store.as_context_mut(),
+                &[ComponentVal::String(path.into())],
+                &mut result,
+            )
+            .await
+            .unwrap();
+            assert_component_err_contains(&result[0], "outside the selected account");
+            component_vfs_list(
+                store.as_context_mut(),
+                &[ComponentVal::String(path.into())],
+                &mut result,
+            )
+            .await
+            .unwrap();
+            assert_component_err_contains(&result[0], "outside the selected account");
+            component_vfs_write(
+                store.as_context_mut(),
+                &[
+                    ComponentVal::String(path.into()),
+                    component_bytes(b"bad".to_vec()),
+                ],
+                &mut result,
+            )
+            .await
+            .unwrap();
+            assert_component_err_contains(&result[0], "outside the selected account");
+        }
     }
 
     #[tokio::test]
@@ -5056,6 +5325,47 @@ paths = ["/status"]
         let mut missing = account_context("w", 2, None);
         missing.params.clear();
         assert!(missing.trusted_account().is_none());
+    }
+
+    #[test]
+    fn nested_guest_vfs_is_bound_to_selected_account() {
+        let account = crate::abi::TrustedAccountContext {
+            wallet: "alice".into(),
+            number: 1,
+            owner_key_fingerprint: None,
+        };
+        assert!(authorize_guest_vfs_path(Some(&account), "wallets/alice/1/address.evm").is_ok());
+        for path in [
+            "wallets/bob/1/address.evm",
+            "wallets/alice/0/address.evm",
+            "petals/enso/wallets/alice/1/status.json",
+            "petals/enso/wallets/alice/0/status.json",
+            "petals/enso/wallets/bob/1/status.json",
+            "wallets",
+            "petals",
+            "wallets/alice/1/../../bob/1/address.evm",
+        ] {
+            assert!(
+                matches!(
+                    authorize_guest_vfs_path(Some(&account), path),
+                    Err(HostError::Denied(_))
+                ),
+                "{path}"
+            );
+        }
+        for path in [
+            "wallets/alice/1/address.evm",
+            "petals/enso/wallets/alice/1/status.json",
+        ] {
+            assert!(
+                matches!(
+                    authorize_guest_vfs_path(None, path),
+                    Err(HostError::Denied(_))
+                ),
+                "{path}"
+            );
+        }
+        assert!(authorize_guest_vfs_path(None, "chains/ethereum/status.json").is_ok());
     }
 
     #[tokio::test]

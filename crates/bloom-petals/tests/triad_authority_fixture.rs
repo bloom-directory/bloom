@@ -4,8 +4,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bloom_broker_api::{DerivationRef, Digest32, KeyRef, KeySpec, Token};
 use bloom_petals::{
-    HostError, HostVfsEntry, PayloadSignRequest, PetalHost, PetalKeyOutcome, PetalKeyRequest,
-    PetalRouter, PetalRunner, PetalStore, PetalVm, SignOutcome,
+    HostError, HostVfsEntry, HostVfsEntryKind, PayloadSignRequest, PetalHost, PetalKeyOutcome,
+    PetalKeyRequest, PetalRouter, PetalRunner, PetalStore, PetalVm, SignOutcome,
 };
 use bloom_vfs::path::VfsPath;
 use bloom_vfs::{Handler, Vfs};
@@ -31,16 +31,32 @@ impl PetalHost for AuthorityHost {
         ))
     }
 
-    async fn vfs_read(&self, _path: &str) -> Result<Vec<u8>, HostError> {
+    async fn vfs_read(&self, path: &str) -> Result<Vec<u8>, HostError> {
+        if path == "wallets/wallet/0/account.json" {
+            return Ok(format!(r#"{{"schema":"bloom.account.v1","wallet":"wallet","number":0,"freshness":"fresh","evm":{{"public_key_fingerprint":"{}"}},"solana":{{"state":"missing"}}}}"#, "44".repeat(32)).into_bytes());
+        }
         Err(HostError::Denied(
             "fixture does not import VFS authority".into(),
         ))
     }
 
-    async fn vfs_list(&self, _path: &str) -> Result<Vec<HostVfsEntry>, HostError> {
-        Err(HostError::Denied(
-            "fixture does not import VFS authority".into(),
-        ))
+    async fn vfs_list(&self, path: &str) -> Result<Vec<HostVfsEntry>, HostError> {
+        let name = match path {
+            "wallets" => "wallet",
+            "wallets/wallet" => "0",
+            _ => {
+                return Err(HostError::Denied(
+                    "fixture does not import VFS authority".into(),
+                ));
+            }
+        };
+        Ok(vec![HostVfsEntry {
+            name: name.into(),
+            kind: HostVfsEntryKind::Dir,
+            mode: 0o755,
+            size: None,
+            link_target: None,
+        }])
     }
 
     async fn vfs_write(&self, _path: &str, _bytes: &[u8]) -> Result<(), HostError> {
@@ -109,7 +125,8 @@ async fn mounted_fixture_reconciles_public_key_then_payload_signs_with_its_keyre
     let vfs = Vfs::builder()
         .mount("petals", Arc::new(PetalRouter::new(runner, host.clone())))
         .build();
-    let mounted = VfsPath::parse("/petals/triad-authority-fixture/session.json").unwrap();
+    let mounted =
+        VfsPath::parse("/petals/triad-authority-fixture/wallets/wallet/0/session.json").unwrap();
     let request = serde_json::to_vec(&serde_json::json!({
         "request_id": "mounted-fixture-1",
         "wallet_id": "wallet",

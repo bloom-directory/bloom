@@ -484,6 +484,7 @@ pub struct IpcOperationContext {
     petal_active_sessions: Option<ActiveSessionSlots>,
     /// Set by an install that explicitly overrides the session guard.
     petal_install_force: bool,
+    petal_runner: Option<PetalRunner>,
 }
 
 impl IpcOperationContext {
@@ -494,6 +495,7 @@ impl IpcOperationContext {
             petal_mutation: None,
             petal_active_sessions: None,
             petal_install_force: false,
+            petal_runner: None,
         }
     }
 
@@ -504,6 +506,7 @@ impl IpcOperationContext {
             petal_mutation: None,
             petal_active_sessions: None,
             petal_install_force: false,
+            petal_runner: None,
         }
     }
 
@@ -525,6 +528,7 @@ impl IpcOperationContext {
         PetalError,
     > {
         let name = package.name.clone();
+        let hash = package.hash.clone();
         let check = || {
             if self.is_cancelled() {
                 return Err(PetalError::vm("Petal install cancelled"));
@@ -535,6 +539,9 @@ impl IpcOperationContext {
                 return Err(PetalError::vm(format!(
                     "Petal {name} owner changed during acquisition; refusing stale install"
                 )));
+            }
+            if let Some(runner) = &self.petal_runner {
+                runner.check_activation(&hash, &name)?;
             }
             // Replacing a package strands the sessions scoped to it: their
             // routes and keys stop matching any installed code, so their
@@ -829,6 +836,7 @@ impl IpcServer {
     pub fn petal_operation_context(&self) -> IpcOperationContext {
         let mut context = IpcOperationContext::detached();
         context.petal_mutation = Some(self.petal_mutation.clone());
+        context.petal_runner = self.petals.clone();
         context
     }
 
@@ -1275,6 +1283,7 @@ impl IpcServer {
             .map_err(|error| PetalError::vm(format!("invalid petals.install request: {error}")))?;
         context.petal_active_sessions = self.active_session_slots.clone();
         context.petal_install_force = request.force;
+        context.petal_runner = self.petals.clone();
         let remote_path = Some(request.path.as_str());
         if remote_path
             .is_some_and(|path| path.contains("://") || path.starts_with("git@github.com:"))

@@ -708,7 +708,7 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         # lowercase letter. An on-chain address begins with a digit, so passing
         # one here fails inside Broker as an unqualified permission error.
         route_parts = written[0][0].parts
-        segment = route_parts[route_parts.index("agent_sessions") + 1]
+        segment = route_parts[route_parts.index("wallets") + 1]
         self.assertEqual(segment, self.definition.wallet_id)
         self.assertNotEqual(segment, self.definition.wallet)
         self.assertRegex(segment, r"^[a-z][a-z0-9._/-]{0,63}$")
@@ -722,7 +722,7 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         # the agent needs both identifiers to address sessions and account reads.
         for mount in context.mounts[1:]:
             self.assertIn(
-                f"/agent_sessions/{self.definition.wallet_id}/", mount["target"]
+                f"/wallets/{self.definition.wallet_id}/0/mainnet/agent_sessions/", mount["target"]
             )
         self.assertEqual(
             context.agent_env["BLOOM_EVAL_WALLET_ID"], self.definition.wallet_id

@@ -191,7 +191,7 @@ A fresh Bloom VFS root exposes these default entries:
 
 Application-specific surfaces live under `petals/`, not in Bloom core. For
 example, the Enso Petal accepts swap intents at
-`petals/enso/intents/<wallet>/new`, exposes a reviewable `plan.md`, and stages
+`petals/enso/wallets/<wallet>/0/intents/new`, exposes a reviewable `plan.md`, and stages
 confirmed transactions into the standard wallet outbox.
 
 See [QUICKSTART.md](./QUICKSTART.md) for an Anvil-backed walkthrough.

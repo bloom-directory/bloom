@@ -2491,8 +2491,13 @@ fn petal_cli_build_install_list_and_vfs_read_happy_path() {
     bloom_cmd(home.path())
         .args(["vfs", "cat", "/petals/demo/hello.txt"])
         .assert()
+        .failure(); // Operations require an existing wallet/account selector.
+
+    bloom_cmd(home.path())
+        .args(["vfs", "ls", "/petals/demo"])
+        .assert()
         .success()
-        .stdout(predicate::eq("component"));
+        .stdout(predicate::str::contains("wallets"));
 
     bloom_cmd(home.path())
         .args(["vfs", "cat", "/petals/demo/README.md"])
@@ -2550,10 +2555,13 @@ fn github_source_install_polymarket_dispatches_route_contract() {
     bloom_cmd(home.path())
         .args(["vfs", "cat", "/petals/polymarket/meta/route-contract.json"])
         .assert()
+        .failure(); // Legacy operation paths are removed.
+
+    bloom_cmd(home.path())
+        .args(["vfs", "ls", "/petals/polymarket"])
+        .assert()
         .success()
-        .stdout(predicate::str::contains(
-            "bloom.polymarket.petal-route-contract.v1",
-        ));
+        .stdout(predicate::str::contains("wallets"));
 
     bloom_cmd(home.path())
         .args(["vfs", "cat", "/petals/polymarket/README.md"])

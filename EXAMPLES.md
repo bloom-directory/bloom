@@ -178,7 +178,7 @@ Petals are external packages with immutable manifests and route contracts:
 ```sh
 cat /bloom/docs/petals.md
 find /bloom/petals -path '*/meta/route-contract.json' -maxdepth 4 -print
-cat /bloom/petals/<name>/meta/route-contract.json
+cat /bloom/petals/<name>/wallets/<wallet>/0/meta/route-contract.json
 ```
 
 Payload-bearing Petal signing follows Machine to Broker to Signer. A Petal may
@@ -199,7 +199,7 @@ is unreleased. Install a compatible package explicitly; it is then available at
 
 ```sh
 bloom petals install ../bloom-petal-polymarket
-bloom vfs cat /petals/polymarket/meta/route-contract.json
+bloom vfs cat /petals/polymarket/wallets/alice/0/meta/route-contract.json
 ```
 
 The installed route contract describes the supported workflow for that exact

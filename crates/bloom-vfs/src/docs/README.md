@@ -78,7 +78,8 @@ initial account.
 Address, QR, and public-key files exist only beneath a numbered account.
 Delegated sessions live beneath the numbered account at
 `sessions/<petal>/<key-slot>/`; installed Petals are mounted only at
-`petals/<petal>/`. See the mount `AGENTS.md` for account creation, session
+`petals/<petal>/`, with operations under `wallets/<wallet>/<n>/` inside that
+Petal. See the mount `AGENTS.md` for account creation, session
 status, and revocation rules.
 
 ## Writes and authority
@@ -95,7 +96,7 @@ transaction was not submitted.
 | Solana transaction | Same outbox shape with strict JSON; [Solana workflow](./examples.md#solana-account-aware-reads-and-transfer) |
 | Update policy | `wallets/<wallet>/policy.json`; [policy workflow](./examples.md#updating-wallet-policy) |
 | Reusable authority | `wallets/<wallet>/sealed-approvals/` |
-| Petal operation | `petals/<name>/`; [installed package workflow](./examples.md#installed-petal-workflow) |
+| Petal operation | `petals/<name>/wallets/<wallet>/<n>/`; [installed package workflow](./examples.md#installed-petal-workflow) |
 | Paid HTTP | `requests/`; inspect plan, wallet, payment protocol, cap, approval, and receipt |
 
 Wallet registration is asynchronous and does not create a local wallet.

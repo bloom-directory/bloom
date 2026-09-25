@@ -25,7 +25,13 @@ side effects, approval steps, idempotency, and how to recognize completion.
 
 The `name` in `petal.toml` must equal the sole directory under `petal/`. It may
 contain ASCII letters, digits, `-`, and `_`; it may not contain dots or Unicode.
-Bloom mounts `petal/example/` at `/petals/example/`.
+Bloom exposes its operations at `/petals/example/wallets/<wallet>/<n>/`.
+The root `/petals/example/` contains wallet discovery and package documents.
+The selected wallet is supplied for each `[wallet]` capture, which is removed
+from the visible operation path. Trusted `bloom.wallet`, `bloom.account`, and
+`bloom.route_prefix` parameters identify the invocation. Set `[account] aware =
+true` to support accounts above 0, use numbered core wallet paths, and emit
+follow-up links beneath the supplied route prefix.
 
 ## Manifest
 
@@ -67,6 +73,15 @@ Supported component imports map to manifest capabilities as follows:
 | `bloom:chain/read@0.1.0` | `bloom:chain` |
 | `bloom:vfs/readwrite@0.1.0` | `bloom:vfs.read` and/or `bloom:vfs.write`, according to used exports |
 | `bloom:env/runtime@0.1.0` | no additional capability |
+
+When releasing an upgrade in an authenticated Petal lineage, expect Bloom to
+copy the previous release's private `bloom:store/kv` bytes into the new
+package's store on first use. A successor must read its predecessor's stored
+format or tolerate and replace it. Test the new release against a fixture
+store written by the previous release, including settings and secrets. Bloom
+does not interpret those bytes or run a migration hook. Account 0 remains
+shared by wallets; each account above 0 has a separate store per wallet and
+account number.
 
 Imports, route metadata, and the top-level manifest must agree. Metadata may
 narrow installed authority at runtime but may not widen it. A package declaring
@@ -132,7 +147,7 @@ The canonical [`route.wit`](https://github.com/bloom-directory/petal/blob/main/w
 
 The route tree is the public VFS declaration:
 
-- `status.json.wasm` creates the file `/petals/example/status.json`;
+- `status.json.wasm` creates the file `/petals/example/wallets/<wallet>/<n>/status.json`;
 - `$index.wasm` handles the containing directory;
 - `$lookup.wasm` refines lookup for dynamic entries;
 - `[wallet]/balance.json.wasm` binds a dynamic `wallet` parameter; and
@@ -164,6 +179,11 @@ to a primary component under `modules/` or `components/` and dependencies under
 [file-driven package design](../superpowers/specs/2026-06-23-petals-v1.md)
 for route precedence, sidecar composition, metadata narrowing, and archive
 normalization rules.
+
+Guest VFS calls cannot invoke another Petal or re-enter the current Petal:
+every `petals/…` path is denied, even under the selected wallet and account.
+Wallet VFS access is restricted to the selected numbered account. Component
+composition described above does not enable nested Petal VFS dispatch.
 
 ## Build and validate
 

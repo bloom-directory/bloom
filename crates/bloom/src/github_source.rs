@@ -48,7 +48,7 @@ pub(crate) struct PetalAuthorityRoute {
     pub operation_classes: &'static [&'static str],
 }
 
-const POLYMARKET_AUTHORITY_ROUTES: &[PetalAuthorityRoute] = &[
+const BASELINE_POLYMARKET_AUTHORITY_ROUTES: &[PetalAuthorityRoute] = &[
     PetalAuthorityRoute {
         route_id: "r000036",
         operation_classes: &["polymarket.onboard"],
@@ -71,7 +71,7 @@ const POLYMARKET_AUTHORITY_ROUTES: &[PetalAuthorityRoute] = &[
     },
 ];
 
-const HYPERLIQUID_AUTHORITY_ROUTES: &[PetalAuthorityRoute] = &[
+const BASELINE_HYPERLIQUID_AUTHORITY_ROUTES: &[PetalAuthorityRoute] = &[
     PetalAuthorityRoute {
         route_id: "r000008",
         operation_classes: &["hyperliquid.agent_action"],
@@ -138,6 +138,46 @@ const HYPERLIQUID_AUTHORITY_ROUTES: &[PetalAuthorityRoute] = &[
     },
 ];
 
+// Keep baseline declarations when successor pins change so the executing
+// daemon can still verify the outgoing release until activation completes.
+const POLYMARKET_AUTHORITY_ROUTES: &[PetalAuthorityRoute] = BASELINE_POLYMARKET_AUTHORITY_ROUTES;
+const HYPERLIQUID_AUTHORITY_ROUTES: &[PetalAuthorityRoute] = BASELINE_HYPERLIQUID_AUTHORITY_ROUTES;
+
+pub(crate) struct ReleaseLineagePredecessor {
+    pub hash: &'static str,
+    pub authority_routes: &'static [PetalAuthorityRoute],
+}
+
+pub(crate) fn release_lineage_predecessor(name: &str) -> Option<ReleaseLineagePredecessor> {
+    let (hash, authority_routes) = match name {
+        "polymarket" => (
+            "5df5a1377dc4d70c71e47ffe6827e691e1f5868543b752dc8d19a500284e5fa6",
+            BASELINE_POLYMARKET_AUTHORITY_ROUTES,
+        ),
+        "hyperliquid" => (
+            "b29c7afb88ec9d2df774b18dad2699ec169100eeeedbcefca02ea0cc3712a188",
+            BASELINE_HYPERLIQUID_AUTHORITY_ROUTES,
+        ),
+        "enso" => (
+            "97650f327691f01bc4591cde25253d1e20010643e700674cc9759cd1366876b9",
+            &[][..],
+        ),
+        "near-intents" => (
+            "ac2ccab59f36ee863843f92aaf0c975c00dbf32b246df5ccbb79757093785921",
+            &[][..],
+        ),
+        "tolly" => (
+            "f50f9f6f55eca103c11ed40d424311c6e5863ff5046231f57f58822d1aac6709",
+            &[][..],
+        ),
+        _ => return None,
+    };
+    Some(ReleaseLineagePredecessor {
+        hash,
+        authority_routes,
+    })
+}
+
 const PREINSTALLED_POLYMARKET: PreinstalledPetal = PreinstalledPetal {
     name: "polymarket",
     repository: "https://github.com/bloom-directory/bloom-petal-polymarket",
@@ -184,7 +224,7 @@ const PREINSTALLED_NEAR_INTENTS: PreinstalledPetal = PreinstalledPetal {
     petal_abi: "bloom.petal-host/triad-compatible-nonauthority-v1",
     default_eligible: true,
     lineage_id: None,
-    release_sequence: 0,
+    release_sequence: 1,
     predecessor_package_hashes: &[],
     authority_routes: &[],
 };
@@ -201,7 +241,7 @@ const PREINSTALLED_ENSO: PreinstalledPetal = PreinstalledPetal {
     petal_abi: "bloom.petal-host/triad-compatible-nonauthority-v1",
     default_eligible: true,
     lineage_id: None,
-    release_sequence: 0,
+    release_sequence: 1,
     predecessor_package_hashes: &[],
     authority_routes: &[],
 };
@@ -269,7 +309,7 @@ const PREINSTALLED_TOLLY: PreinstalledPetal = PreinstalledPetal {
     petal_abi: "bloom.petal-host/triad-compatible-nonauthority-v1",
     default_eligible: true,
     lineage_id: None,
-    release_sequence: 0,
+    release_sequence: 1,
     predecessor_package_hashes: &[],
     authority_routes: &[],
 };
@@ -580,6 +620,10 @@ fn install_github_source_with_expectation(
         )?;
         ensure_source_install_connected(context)?;
         let detached = bloom_daemon::ipc::IpcOperationContext::detached();
+        daemon
+            .petals
+            .check_activation(&package.hash, &package.name)
+            .context("verify loaded Petal successor release information")?;
         let (result, meta, index) = context
             .unwrap_or(&detached)
             .commit_petal_package(
@@ -748,6 +792,10 @@ impl PreparedReleasePetal {
         context: &bloom_daemon::ipc::IpcOperationContext,
         expected_owner: Option<Option<String>>,
     ) -> Result<GitHubInstallOutput> {
+        daemon
+            .petals
+            .check_default_activation(&self.package.hash, &self.package.name)
+            .context("verify loaded bundled Petal release information")?;
         let (result, meta, index) = context
             .commit_petal_package(
                 daemon.petals.store(),
@@ -1080,15 +1128,23 @@ pub(crate) fn preinstalled_petal(name: &str) -> Option<&'static PreinstalledPeta
     }
 }
 
-pub(crate) fn release_authority_petals() -> impl Iterator<Item = &'static PreinstalledPetal> {
-    [&PREINSTALLED_POLYMARKET, &PREINSTALLED_HYPERLIQUID].into_iter()
+/// Bundled releases whose signed lineage also controls private-state
+/// carry-forward. Non-authority Petals receive a lineage-only catalog record.
+pub(crate) fn release_lineage_petals() -> [&'static PreinstalledPetal; 5] {
+    [
+        &PREINSTALLED_POLYMARKET,
+        &PREINSTALLED_HYPERLIQUID,
+        &PREINSTALLED_ENSO,
+        &PREINSTALLED_NEAR_INTENTS,
+        &PREINSTALLED_TOLLY,
+    ]
 }
 
 fn validate_release_authority(
     entry: &PreinstalledPetal,
     package: &PreparedPetalPackage,
 ) -> Result<()> {
-    if entry.lineage_id.is_none() {
+    if !entry.default_eligible {
         return Ok(());
     }
     let declared = entry
@@ -1810,6 +1866,7 @@ mod tests {
         let hash = entry.expected_hash.unwrap().to_string();
         let mut meta = PetalMeta {
             hash: hash.clone(),
+            replaced: None,
             size: 1,
             installed_at_ms: 1,
             name: Some("near-intents".into()),
@@ -1908,6 +1965,20 @@ mod tests {
         PetalRelease { package, archive }
     }
 
+    #[test]
+    fn eligible_nonauthority_release_rejects_undeclared_signing_class() {
+        let mut release = build_near_release("authority-check");
+        let entry = preinstalled_petal("near-intents").unwrap();
+        validate_release_authority(entry, &release.package).unwrap();
+        release.package.route_index.routes[0]
+            .key_derive_operation_classes
+            .push("unexpected.sign".into());
+        let error = validate_release_authority(entry, &release.package)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("authority differs"), "{error}");
+    }
+
     fn near_catalog_entry(
         commit: &'static str,
         release_tag: &'static str,
@@ -1983,6 +2054,43 @@ mod tests {
         (home, home_dir, daemon)
     }
 
+    // Provisioning fixtures model an installer catalog already loaded by the
+    // executing daemon. Approval signatures are outside this installer test.
+    fn load_successor_catalog(daemon: &mut Daemon, hash: &str) {
+        use bloom_broker_api::{
+            Base64UrlBytes, DecimalU64, Digest32, PetalLineageMembership, ProvenanceCatalog,
+            ProvenanceOperationClass, ProvenanceRecord, ProvenanceSubject, Token,
+        };
+        let record = ProvenanceRecord {
+            subject: ProvenanceSubject::Petal {
+                package_hash: Digest32::new(hash.to_owned()).unwrap(),
+                route: "hello.txt".into(),
+            },
+            publisher: Token::new("test-publisher").unwrap(),
+            petal_lineage: Some(PetalLineageMembership {
+                lineage_id: "pln1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                release_sequence: DecimalU64::new(2),
+                predecessor_package_hashes: vec![],
+                controller_key_id: Token::new("test-controller").unwrap(),
+                controller_signature: Base64UrlBytes::from_bytes(&[1; 64]),
+                active: true,
+            }),
+            operation_classes: vec![ProvenanceOperationClass {
+                operation_class: Token::new("petal.run").unwrap(),
+                fee_asset: None,
+            }],
+            installer_key_id: Token::new("test-installer").unwrap(),
+            installer_signature: Base64UrlBytes::from_bytes(&[2; 64]),
+        };
+        daemon.petals = daemon
+            .petals
+            .clone()
+            .with_provenance_catalog(Some(ProvenanceCatalog {
+                schema: "bloom.provenance-catalog.1".into(),
+                records: vec![record],
+            }));
+    }
+
     fn installed_owner(daemon: &Daemon) -> Option<String> {
         daemon
             .petals
@@ -2000,8 +2108,9 @@ mod tests {
             "the two releases must be distinguishable packages"
         );
 
-        let (home, home_dir, daemon) =
+        let (home, home_dir, mut daemon) =
             near_home_with_installed(&old.package, NEAR_REPO, NEAR_OLD_COMMIT, None);
+        load_successor_catalog(&mut daemon, &new.package.hash);
         assert_eq!(
             installed_owner(&daemon).as_deref(),
             Some(&*old.package.hash)
@@ -2074,10 +2183,10 @@ mod tests {
             .block_on(
                 serve_daemon
                     .vfs
-                    .read(&VfsPath::parse("/petals/near-intents/hello.txt").unwrap()),
+                    .list(&VfsPath::parse("/petals/near-intents/wallets").unwrap()),
             )
             .unwrap();
-        assert_eq!(body, b"component");
+        assert!(body.is_empty());
 
         // A third run over the same home changes nothing.
         let ready = ensure_preinstalled_petals_with(
@@ -2099,8 +2208,9 @@ mod tests {
         let old = build_near_release("old");
         let pending = build_near_release("pending");
         let manual = build_near_release("manual");
-        let (_home, _, daemon) =
+        let (_home, _, mut daemon) =
             near_home_with_installed(&old.package, NEAR_REPO, NEAR_OLD_COMMIT, None);
+        load_successor_catalog(&mut daemon, &pending.package.hash);
         let entry = near_catalog_entry(NEAR_NEW_COMMIT, "v0.1.1", "near.tar.gz", None);
         let server =
             IpcServer::new(daemon.vfs.clone(), "test", vec![]).with_petals(daemon.petals.clone());
@@ -2153,10 +2263,10 @@ mod tests {
         assert_eq!(version, "test");
         let body = daemon
             .vfs
-            .read(&VfsPath::parse("/petals/near-intents/hello.txt").unwrap())
+            .list(&VfsPath::parse("/petals/near-intents/wallets").unwrap())
             .await
             .unwrap();
-        assert_eq!(body, b"component");
+        assert!(body.is_empty());
         let manual_tar = tempfile::NamedTempFile::new().unwrap();
         manual
             .package
@@ -2195,8 +2305,9 @@ mod tests {
         use crate::petal_provisioning::{ProvisioningOutcome, provision_with};
         let old = build_near_release("old");
         let next = build_near_release("new");
-        let (_home, _, daemon) =
+        let (_home, _, mut daemon) =
             near_home_with_installed(&old.package, NEAR_REPO, NEAR_OLD_COMMIT, None);
+        load_successor_catalog(&mut daemon, &next.package.hash);
         let entry = near_catalog_entry(NEAR_NEW_COMMIT, "v0.1.1", "near.tar.gz", None);
         let context = bloom_daemon::ipc::IpcOperationContext::detached();
         let calls = std::cell::Cell::new(0);
@@ -2759,10 +2870,10 @@ mod tests {
             .block_on(
                 daemon
                     .vfs
-                    .read(&VfsPath::parse("/petals/demo/hello.txt").unwrap()),
+                    .list(&VfsPath::parse("/petals/demo/wallets").unwrap()),
             )
             .unwrap();
-        assert_eq!(body, b"component");
+        assert!(body.is_empty());
     }
 
     #[tokio::test]

@@ -153,7 +153,7 @@ class HyperliquidOrderCancelEval(EvalDefinition):
 
     @property
     def network_root(self) -> Path:
-        return self.bloom_mount / "petals/hyperliquid/mainnet"
+        return self.bloom_mount / "petals/hyperliquid/wallets" / self.wallet_id / "0/mainnet"
 
     @property
     def user_root(self) -> Path:
@@ -844,7 +844,7 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         # Broker token, which must start with a lowercase letter, so a `0x…`
         # address fails deep inside signing as an unqualified permission error.
         self.session_base = (
-            self.network_root / "agent_sessions" / self.wallet_id / self.session_id
+            self.network_root / "agent_sessions" / self.session_id
         )
         request = {
             "id": self.session_id,
@@ -859,7 +859,7 @@ class HyperliquidOrderCancelEval(EvalDefinition):
             "assets": ["0"],
         }
         body = json.dumps(request, separators=(",", ":")).encode()
-        new_route = self.network_root / "agent_sessions" / self.wallet_id / "new.json"
+        new_route = self.network_root / "agent_sessions" / "new.json"
 
         first = self._write_route(new_route, body, SESSION_WRITE_TIMEOUT_SECONDS)
         output = (first.stdout + first.stderr).decode(errors="replace")
@@ -1003,8 +1003,8 @@ class HyperliquidOrderCancelEval(EvalDefinition):
             }
         ]
         container_base = (
-            f"/bloom/petals/hyperliquid/mainnet/agent_sessions/"
-            f"{self.wallet_id}/{self.session_id}"
+            f"/bloom/petals/hyperliquid/wallets/{self.wallet_id}/0/mainnet/agent_sessions/"
+            f"{self.session_id}"
         )
         mounts.extend(
             {

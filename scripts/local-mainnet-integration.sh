@@ -178,7 +178,7 @@ wait_for_fixture_stage() {
   expected="$1"
   attempts=0
   while [ "$attempts" -lt 100 ]; do
-    fixture_body="$(cat "$(mounted_path "/petals/triad-authority-fixture/session.json")" 2>/dev/null || true)"
+    fixture_body="$(cat "$(mounted_path "/petals/triad-authority-fixture/wallets/${wallet}/0/session.json")" 2>/dev/null || true)"
     fixture_stage="$(printf '%s' "$fixture_body" | jq -r '
       if .stage == "key" then "key:" + (.outcome.state // "")
       else .stage // ""
@@ -375,7 +375,7 @@ fi
 # Prove the generic Petal authority path before checking venue compatibility:
 # ordinary mounted write -> owner-mounted key ceremony -> exact retry ->
 # payload-signing ceremony -> exact retry. No CLI or RPC shortcut is used.
-fixture_path="/petals/triad-authority-fixture/session.json"
+fixture_path="/petals/triad-authority-fixture/wallets/${wallet}/0/session.json"
 fixture_request_id="manual-fixture-$(date +%s)-$$"
 fixture_nonce="$(printf '%s' "$fixture_request_id" | shasum -a 256 | awk '{print substr($1, 1, 32)}')"
 fixture_request="$(jq -nc \
@@ -485,12 +485,12 @@ printf '%s' "$fixture_result" | jq -e '
 printf 'Fixture Petal: Signer-owned sub-key derived and payload signed through mounted files\n'
 
 if [ "$live" -eq 0 ] || [ "$execute_pm" -eq 1 ]; then
-  route_contract="$(vcat "/petals/polymarket/meta/route-contract.json")"
+  route_contract="$(vcat "/petals/polymarket/wallets/${wallet}/0/meta/route-contract.json")"
   printf '%s' "$route_contract" | jq -e . >/dev/null ||
     die "Polymarket Petal route contract is unavailable"
-  vls_names "/petals/polymarket/onboard" >/dev/null
-  vls_names "/petals/polymarket/account" >/dev/null
-  vls_names "/petals/polymarket/trade" >/dev/null
+  vls_names "/petals/polymarket/wallets/${wallet}/0/onboard" >/dev/null
+  vls_names "/petals/polymarket/wallets/${wallet}/0/account" >/dev/null
+  vls_names "/petals/polymarket/wallets/${wallet}/0/trade" >/dev/null
   printf 'Polymarket Petal: mounted and route contract loaded\n'
   pm_triad_compatible="$(printf '%s' "$route_contract" | jq -r '
     [.. | strings] | any(contains("bloom:sign/signing@0.2.0"))
@@ -529,17 +529,17 @@ if [ "$execute_pm" -eq 1 ]; then
     --argjson bound "$pm_price_json" \
     '{slug:$slug,outcome:$outcome,side:$side,amount:$amount,order_type:$order_type} + $bound')"
   printf '\nCreating the unsigned Polymarket draft for review...\n'
-  drafts_before="$(vls_names "/petals/polymarket/trade/${wallet}/drafts" 2>/dev/null || true)"
-  if ! vwrite "/petals/polymarket/trade/${wallet}/new" "$pm_request"; then
+  drafts_before="$(vls_names "/petals/polymarket/wallets/${wallet}/0/trade/drafts" 2>/dev/null || true)"
+  if ! vwrite "/petals/polymarket/wallets/${wallet}/0/trade/new" "$pm_request"; then
     die "mounted Polymarket draft creation failed; verify onboarding, funding, market, and policy"
   fi
-  drafts_after="$(vls_names "/petals/polymarket/trade/${wallet}/drafts")"
+  drafts_after="$(vls_names "/petals/polymarket/wallets/${wallet}/0/trade/drafts")"
   draft_id="$(comm -13 \
     <(printf '%s\n' "$drafts_before" | sed '/^$/d' | sort) \
     <(printf '%s\n' "$drafts_after" | sed '/^$/d' | sort) | tail -n 1)"
   [ -n "$draft_id" ] ||
     die "mounted Polymarket draft was not created; verify onboarding, funding, market, and policy"
-  draft_path="/petals/polymarket/trade/${wallet}/drafts/${draft_id}"
+  draft_path="/petals/polymarket/wallets/${wallet}/0/trade/drafts/${draft_id}"
   vwrite "${draft_path}/revalidate" '{"revalidate":true}'
   printf '\nPolymarket draft plan:\n'
   vcat "${draft_path}/plan.md"
@@ -565,7 +565,7 @@ if [ "$execute_pm" -eq 1 ]; then
   vwrite_staging "${draft_path}/post" "$post_request"
   open_approval "${draft_path}/approval.json"
   vwrite "${draft_path}/post" "$post_request"
-  pm_receipt="$(vcat "/petals/polymarket/trade/${wallet}/receipts/${draft_id}/receipt.json")"
+  pm_receipt="$(vcat "/petals/polymarket/wallets/${wallet}/0/trade/receipts/${draft_id}/receipt.json")"
   printf '\nPolymarket receipt:\n'
   printf '%s\n' "$pm_receipt" | jq .
   printf '%s' "$pm_receipt" | jq -e '
