@@ -794,8 +794,18 @@ impl TxEngine {
                 bloom_proto::checksum_address(&addr)
             ))
         })?;
+        // An address-shaped hint carries no symbol, which is what a Petal-staged
+        // transfer always supplies: it names the token by address because that
+        // is the only part of the calldata Bloom can verify. Read `symbol()`
+        // from the same contract the decimals came from rather than showing the
+        // owner a truncated address where a token name belongs. A token that
+        // does not answer — a reverting or `bytes32` `symbol()` — keeps the
+        // short-address label, which is honest about what is known.
         let symbol = if symbol_hint.starts_with("0x") || symbol_hint.starts_with("0X") {
-            short_addr_label(&addr)
+            match chain.erc20_symbol(addr).await {
+                Ok(Some(symbol)) if is_displayable_symbol(&symbol) => symbol,
+                _ => short_addr_label(&addr),
+            }
         } else {
             symbol_hint.to_ascii_uppercase()
         };
@@ -881,12 +891,22 @@ impl TxEngine {
                         amount,
                     };
                     let calldata = format!("0x{}", hex::encode(call.abi_encode()));
+                    // `TokenRef.amount` is what the plan prints as a token
+                    // amount, so it is always the human figure. A caller who
+                    // wrote base units gave us the unscaled integer; scaling it
+                    // back here keeps the two representations from disagreeing
+                    // by a factor of 10^decimals in front of an owner.
+                    let display_amount = if parsed.unit == "base" {
+                        bloom_proto::format_units(amount, meta.decimals)
+                    } else {
+                        parsed.number.clone()
+                    };
                     let token_ref = TokenRef {
                         address: bloom_proto::checksum_address(&meta.address),
                         symbol: meta.symbol.clone(),
                         decimals: meta.decimals,
                         recipient: bloom_proto::checksum_address(&to_addr),
-                        amount: parsed.number.clone(),
+                        amount: display_amount,
                         amount_base_units: Some(amount.to_string()),
                     };
                     Ok((token_addr, U256::ZERO, calldata, Some(token_ref), None))
@@ -4648,6 +4668,21 @@ fn parse_u256(s: &str) -> Result<U256, String> {
     U256::from_str_radix(t, 10).map_err(|e| format!("invalid uint256 '{s}': {e}"))
 }
 
+/// Whether a contract-supplied symbol can be shown beside an amount.
+///
+/// The string comes from an untrusted contract, so it is bounded and kept to
+/// printable, non-space ASCII. A token whose "symbol" is empty, oversized, or
+/// carries control characters, spaces or bidi marks gets the short-address
+/// label instead: a symbol is a label an owner reads next to a number, and a
+/// contract does not get to put arbitrary text there.
+fn is_displayable_symbol(symbol: &str) -> bool {
+    !symbol.is_empty()
+        && symbol.len() <= 16
+        && symbol
+            .chars()
+            .all(|c| c.is_ascii_graphic() && !matches!(c, '<' | '>' | '&'))
+}
+
 fn short_addr_label(a: &Address) -> String {
     let s = format!("{a:#x}");
     if s.len() > 10 {
@@ -5446,6 +5481,76 @@ mod tests {
         assert_eq!(subject.total_value_usd_micro, Some(1_250_000));
         assert_eq!(calls.lock().len(), 1);
         assert_eq!(calls.lock()[0].1, "1250000");
+    }
+
+    /// A Petal stages base units, because it never converts a display amount.
+    /// The plan still has to print the human figure: `1250000 base` on a
+    /// six-decimal token is 1.25 tokens, and an owner reading `Transfer
+    /// 1250000 USDC` would misjudge it by a factor of a million.
+    #[tokio::test]
+    async fn base_unit_amounts_reach_the_plan_as_a_human_token_amount() {
+        let url = spawn_stage_rpc(false).await;
+        let oracle = RecordingOracle {
+            calls: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            usd_micro: 1_250_000,
+            age_ms: 0,
+            max_age_ms: 60_000,
+        };
+        let (engine, _dir, permit, chain) = stage_fixture(&url, oracle);
+        let token_addr: Address = "0x1111111111111111111111111111111111111111"
+            .parse()
+            .unwrap();
+        engine.token_cache.write().insert(
+            (31337, token_addr),
+            TokenMeta {
+                address: token_addr,
+                symbol: "USDC".into(),
+                decimals: 6,
+            },
+        );
+        let intent = RawIntent {
+            body: RawIntentBody::Send {
+                to: "0x2222222222222222222222222222222222222222".into(),
+                value: "0".into(),
+                token: Some(token_addr.to_string()),
+                amount: "1250000 base".into(),
+                data: None,
+            },
+            chain: Some("anvil".into()),
+            gas: bloom_proto::intent::GasStrategy::Auto,
+            nonce: None,
+            gas_limit_hint: None,
+            usd_value_hint: None,
+        };
+        let staged = engine
+            .stage(
+                &permit,
+                "alice",
+                "0x3333333333333333333333333333333333333333"
+                    .parse()
+                    .unwrap(),
+                intent,
+                &chain,
+                &policy_with_usd_cap(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(staged.action_kind, TxActionKind::Erc20Transfer);
+        let token = staged.token.as_ref().unwrap();
+        // Same transfer as `stage_erc20_transfer_uses_exact_base_units_for_oracle`,
+        // written in base units instead of a display amount: both records must
+        // come out identical.
+        assert_eq!(token.amount, "1.25");
+        assert_eq!(token.amount_base_units.as_deref(), Some("1250000"));
+        let plan = bloom_proto::PlanRender::render(&staged, "ETH", 18);
+        assert!(
+            plan.contains(
+                "Action: Transfer 1.25 USDC to 0x2222222222222222222222222222222222222222"
+            ),
+            "plan must print the human amount, got:\n{plan}"
+        );
     }
 
     #[tokio::test]
@@ -6743,6 +6848,23 @@ mod tests {
             "0xaf88d065e77c8cc2239327c5edb3a432268e5831"
         );
         assert_eq!(sym, "USDC");
+    }
+
+    #[test]
+    fn a_contract_symbol_is_only_shown_when_it_is_a_label() {
+        // Real tokens.
+        assert!(is_displayable_symbol("USDC"));
+        assert!(is_displayable_symbol("DAI"));
+        assert!(is_displayable_symbol("WETH"));
+        // A contract does not get to put arbitrary text beside an amount.
+        assert!(!is_displayable_symbol(""));
+        assert!(!is_displayable_symbol(
+            "this is far too long to be a symbol"
+        ));
+        assert!(!is_displayable_symbol("US DC"));
+        assert!(!is_displayable_symbol("USD\u{202e}C"));
+        assert!(!is_displayable_symbol("USD\nC"));
+        assert!(!is_displayable_symbol("<b>USDC</b>"));
     }
 
     #[test]

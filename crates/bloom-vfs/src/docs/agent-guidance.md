@@ -298,3 +298,32 @@ receiving a response updates the same receipt without counting it twice. Other
 requests can proceed within any remaining budget. Do not repeat an unresolved
 payment by restaging it. A failed merchant retry still counts toward recorded
 spending.
+
+A Petal that stages an EVM transaction usually produces a generic contract
+call: Bloom cannot check what the calldata does, so it always needs a fresh
+owner approval. One shape is different. A canonical ERC-20
+`transfer(address,uint256)` call with no native value is decoded to its
+recipient and amount, and Bloom rebuilds the calldata from those two fields
+instead of forwarding the Petal's bytes. It is then classified as a token
+transfer, checked against wallet policy, and eligible for policy-bounded
+autonomy. Extra trailing calldata, a different selector, or any nonzero native
+value keeps it generic. Eligible does not mean automatic: the wallet's policy
+still decides, so handle the ordinary approval challenge either way.
+
+Because Bloom rebuilds that one shape, it must encode exactly. Calldata that
+is already ERC-20 transfer shaped — the `transfer` selector, exactly 68 bytes,
+no native value — has to decode and then re-encode back to the bytes you
+supplied. In practice what fails this is noncanonical padding: the address
+argument occupies a 32-byte word whose twelve high-order bytes must be zero.
+Such a write is refused at staging, and the error begins `ERC-20 transfer
+calldata` — `… : type check failed for "(address,uint256)"` when the word is
+dirty, and `… is not canonical` when the bytes decode but do not round-trip.
+Nothing is staged and no nonce is reserved: the check runs before Bloom takes
+the staging lock. Left-pad the address with zeros and stage again; retrying
+the same bytes fails the same way.
+
+This is not a general rule about padding. A call Bloom leaves generic keeps
+the bytes you gave it and stages normally, even with that padding — including
+a call carrying nonzero native value, one of any other calldata length, and
+one bearing another selector. Bloom only rejects what it would otherwise
+rewrite.
