@@ -2595,7 +2595,17 @@ impl PetalHost for DaemonPetalHost {
             .outbox
             .read(&wallet, &chain_name, &outbox_id)
             .map_err(|e| HostError::NotFound(format!("outbox {outbox_id}: {e}")))?;
-        if entry.staged.resolved_execution_origin() != origin {
+        // Scoped to the package, like inspection: a Petal that stages from one
+        // route and confirms from another is the documented layout, and Morpho
+        // and Robinhood both use it. Route-binding made their confirm
+        // unreachable, so a multi-step deposit wedged at its first step. The
+        // digest is what establishes "this same trusted Petal"; the route id
+        // names a file inside one immutable artifact, not a principal.
+        if !entry
+            .staged
+            .resolved_execution_origin()
+            .same_package(&origin)
+        {
             return Err(HostError::Denied(
                 "outbox entry was not staged by this trusted Petal".into(),
             ));
@@ -2685,10 +2695,9 @@ impl PetalHost for DaemonPetalHost {
             .outbox
             .read(&wallet, &chain_name, &outbox_id)
             .map_err(|e| HostError::NotFound(format!("outbox {outbox_id}: {e}")))?;
-        // Inspection is read-only, so it is scoped to the package rather than
-        // to the route that staged the entry: a Petal's status route must be
-        // able to reconcile what its execute route staged. Confirmation stays
-        // route-bound because it dispatches signing.
+        // Scoped to the package rather than to the route that staged the
+        // entry: a Petal's status route must be able to reconcile what its
+        // execute route staged.
         if !entry
             .staged
             .resolved_execution_origin()
