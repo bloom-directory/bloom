@@ -629,7 +629,28 @@ fn validate_link_target(target: &str) -> Result<(), HandlerError> {
     Ok(())
 }
 
+/// The longest Petal-authored refusal reason worth recording.
+///
+/// The dispatch ABI already caps a guest string at 64 KiB, which is far more
+/// than a log line should carry on a path a Petal can reach on every write.
+const MAX_LOGGED_REASON_CHARS: usize = 512;
+
 fn dispatch_error(code: i32, message: String, path: String) -> HandlerError {
+    // `-2` is the one code whose message has nowhere else to go: it becomes a
+    // message-free `PermissionDenied`, the mount turns that into a bare EACCES,
+    // and the Petal's own explanation — "session has expired", "approval
+    // required for order" — is lost for every read, lookup and list as well as
+    // for writes. Recording it here is the only place it survives today.
+    //
+    // INFO, not WARN: a refusal is an ordinary outcome here. Asking for an
+    // approval is reported as `-2`, so every approval-gated write would
+    // otherwise raise a warning during a completely normal ceremony. It
+    // matches the other denial records in `vm.rs`, and the services default to
+    // an `info` filter, so it is on without configuration.
+    if code == -2 {
+        let reason: String = message.chars().take(MAX_LOGGED_REASON_CHARS).collect();
+        tracing::info!(path = %path, reason = %reason, "petal.request_denied");
+    }
     match code {
         -1 => HandlerError::NotFound(if message.is_empty() { path } else { message }),
         -2 => HandlerError::PermissionDenied,
@@ -1012,6 +1033,48 @@ name = "example"
         assert!(
             error.to_string().contains("component route write"),
             "unexpected write error: {error}"
+        );
+    }
+    /// A Petal's `-2` becomes a message-free `PermissionDenied`, which the
+    /// mount renders as a bare EACCES. The reason has nowhere else to go, so
+    /// losing this record loses it entirely.
+    ///
+    /// The reason is also bounded here, counting characters rather than bytes
+    /// so that truncation cannot split one, and it goes through the real
+    /// logger so that removing either behaviour fails this test.
+    #[test]
+    fn a_petal_refusal_records_a_bounded_version_of_the_reason_it_gave() {
+        // A real reason, then a multi-byte tail that runs past the bound.
+        let prefix = "Safe configuration or nonce changed; create a new transaction";
+        let tail = "\u{20ac}".repeat(MAX_LOGGED_REASON_CHARS);
+        let kept_tail = MAX_LOGGED_REASON_CHARS - prefix.chars().count();
+
+        let captured = bloom_service_observability::CapturedWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+
+        let error = tracing::subscriber::with_default(subscriber, || {
+            dispatch_error(
+                -2,
+                format!("{prefix}{tail}"),
+                "/petals/safe/transactions/owner/payment/confirm.json".into(),
+            )
+        });
+
+        assert!(matches!(error, HandlerError::PermissionDenied));
+        let log = captured.text();
+        assert!(log.contains("petal.request_denied"), "missing event: {log}");
+        assert!(log.contains(prefix), "missing reason: {log}");
+        assert!(
+            log.contains("confirm.json"),
+            "missing the path that was refused: {log}"
+        );
+        assert_eq!(
+            log.matches('\u{20ac}').count(),
+            kept_tail,
+            "the reason is bounded to {MAX_LOGGED_REASON_CHARS} characters, not bytes: {log}"
         );
     }
 }
