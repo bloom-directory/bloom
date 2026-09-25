@@ -59,6 +59,7 @@ The signer refuses a mixture of evidence from different candidates.
 
 ```sh
 packaging/triad/release.sh build linux --output-dir DIR
+packaging/triad/release.sh build linux-aarch64 --output-dir DIR
 packaging/triad/release.sh build macos --output-dir DIR
 ```
 
@@ -68,30 +69,34 @@ builds with locked dependencies, validates the selected binary architecture
 and installer, assembles and verifies the bundle twice, and publishes
 byte-identical `test-unclaimed` output. It does not run
 repository-wide formatting, Clippy, or test suites; those are independent CI
-source-quality gates. Both platforms emit the archive plus `.sha256`, `.sig`,
+source-quality gates. All targets emit the archive plus `.sha256`, `.sig`,
 and `.pub` sidecars.
 
-The release workflow builds the macOS aarch64 candidate on `macos-15` alongside
-the Linux candidate. A manual `dry_run=true` dispatch uploads both
-`test-unclaimed` candidates as Actions artifacts and cannot reach production
+The release workflow builds Linux aarch64 natively on `ubuntu-24.04-arm` and
+macOS aarch64 on `macos-15` alongside Linux x86_64. A manual `dry_run=true`
+dispatch uploads all three `test-unclaimed` candidates as Actions artifacts
+and cannot reach production
 signing or GitHub publication. Live candidate installation requires both a
 root-owned, non-writable pin of that artifact's ephemeral public key and the
 explicit `BLOOM_ALLOW_TEST_UNCLAIMED=true` installer opt-in.
 
-`release.sh sign linux|macos` is the isolated production signing pass. It never
-executes a candidate-owned binary or script. It verifies the expected version,
-source revisions, and target architecture, replaces the ephemeral inner
-signature, deterministically repacks the payload, signs the outer checksum,
-and refuses a private key that does not match the reviewed public key. GitHub
-Actions makes the release key available only to the protected
+`release.sh sign linux|linux-aarch64|macos` is the isolated production signing
+pass. It never executes a candidate-owned binary or script. It verifies the
+expected version, source revisions, and target architecture, replaces the
+ephemeral inner signature, deterministically repacks the payload, signs the
+outer checksum, and refuses a private key that does not match the reviewed
+public key. GitHub Actions makes the release key available only to the protected
 `production-release` signing job. The tag workflow signs and publishes Linux
-x86_64 and macOS aarch64 together as a normal GitHub Release.
+x86_64, Linux aarch64, and macOS aarch64 together as a normal GitHub Release.
+The tag must contain this Linux aarch64-capable release driver: a retry executes
+the workflow and `release.sh` from the selected tag and does not backport newer
+release machinery into an existing release.
 
 Before merging release-workflow changes, dispatch the branch with
 `dry_run=true`. That path builds the exact branch with an ephemeral test key,
 uploads the `test-unclaimed` candidate for inspection, and skips both the
-protected production-signing job and the publish job. Normal tag pushes and tag
-retries cannot select dry-run mode.
+protected production-signing job and the publish job. Normal tag pushes and
+tag retries cannot select dry-run mode.
 
 Before compiling, `release.sh` rejects the remaining forbidden production
 Machine features from the resolved normal/build Cargo graph. Bundle assembly
