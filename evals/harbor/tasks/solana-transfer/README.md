@@ -322,8 +322,9 @@ The deterministic `smoke` lane is the protocol conformance fixture: it checks
 the real mounted route, approval boundary, broadcast, and verifier without an
 LLM. For each model trial the harness renders one concrete sentence containing
 only the request a user would make: wallet, destination, network, amount, a
-request to wait for finality, and where Bloom is mounted (`/bloom`), as the
-user's own setup would tell their agent. It exposes no eval variables, account
+request to wait for finality, where Bloom is mounted (`/bloom`), and that the
+owner approves any passkey prompt out of band, so the agent should retry rather
+than hand back. A one-shot agent has no turn in which to hear "approved". It exposes no eval variables, account
 path, procedure, or reporting schema to the agent. The operational workflow must be
 discovered from the mounted VFS. The verifier grades independent chain and VFS
 state, not an agent-authored report.

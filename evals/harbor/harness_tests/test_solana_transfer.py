@@ -671,6 +671,8 @@ class ProvisionTests(SolanaEvalTestCase):
         # Only the mount root, as a user's own setup would say; the wallet's
         # account path and identity stay for the agent to discover.
         self.assertIn("Bloom is mounted at `/bloom`.", instruction)
+        # The owner approves out of band; a one-shot agent cannot hand back.
+        self.assertIn("retry once it's approved", instruction)
         self.assertNotIn("/bloom/", instruction)
         self.assertNotIn("BLOOM_EVAL_", instruction)
         self.assertNotIn("result.json", instruction)

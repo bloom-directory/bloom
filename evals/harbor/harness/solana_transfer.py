@@ -1172,7 +1172,9 @@ class SolanaTransferEval(EvalDefinition):
         (task_dir / "instruction.md").write_text(
             f"Using Bloom, send exactly {sol} SOL from my `{self.wallet_id}` wallet "
             f"to `{self.destination}` on `{self.chain}`. Wait until it is finalized "
-            "and tell me the result. Bloom is mounted at `/bloom`.\n"
+            "and tell me the result. Bloom is mounted at `/bloom`. I'll approve "
+            "any passkey prompt myself; don't wait for my reply — retry once "
+            "it's approved.\n"
         )
         extra_docker_compose: list[Path] = []
         if self.lane == "local":
