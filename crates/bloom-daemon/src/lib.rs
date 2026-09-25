@@ -990,12 +990,9 @@ impl DaemonPetalHost {
         })?;
         let key_identity = serde_jcs::to_vec(&account_key)
             .map_err(|error| HostError::Invalid(error.to_string()))?;
-        // The scope an exact request is made in: everything that is not the
-        // payload. It is what bounds which stored requests this one may act
-        // on, and it is derived here, never taken from the guest. The file
-        // layout is deliberately unchanged — `.state/<request>.json` shipped in
-        // v0.2.0 and v0.2.1, and moving it would hide pending requests from an
-        // upgraded Machine.
+        // Derived here, never taken from the guest. `.state/<request>.json`
+        // shipped in v0.2.0 and v0.2.1; moving it would hide pending requests
+        // from an upgraded Machine.
         let mut identity = blake3::Hasher::new();
         identity.update(b"bloom-petal-exact-signing/v2\0");
         for part in [
@@ -1944,16 +1941,9 @@ impl PetalHost for DaemonPetalHost {
                 state: exact_state_path,
                 owner_projection: owner_projection_path,
             } = paths;
-            // `approval-hint` means exactly one thing: the artifact for *this*
-            // request, which Machine derived itself. Anything else is refused.
-            //
-            // There was a tagged `supersedes:<id>` form here that let a caller
-            // say it had given an earlier attempt up, so Machine could revoke
-            // that approval and free the wallet at once. Deciding whether the
-            // earlier attempt might already have signed turned out to rest on
-            // a Broker classification that is wrong in exactly the partial
-            // signing case, so the form is gone rather than guessed at. An
-            // abandoned ceremony now expires on its own.
+            // A hint is this request's own artifact id, which Machine derived.
+            // Anything else is refused. Machine does not revoke an earlier
+            // attempt: it cannot prove that attempt produced no signature.
             match req.approval_hint.as_deref() {
                 None => {}
                 Some(hint) if hint == request_id => {}
@@ -2267,9 +2257,6 @@ impl PetalHost for DaemonPetalHost {
             package_hash: trusted_package_hash,
             route: context.route_id.clone(),
         };
-        // The batch paths keep the hint contract they already had: it names
-        // this batch's own artifact and nothing else. Supersession is not
-        // offered here, and nothing in this path reads the tagged form.
         let (request_id, exact_state_path, owner_projection_path) = match req.selector {
             bloom_broker_api::PetalSignSelector::Exact => {
                 let paths = self.petal_signing_paths(

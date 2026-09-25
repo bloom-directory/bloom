@@ -536,7 +536,9 @@ impl BrokerExactPayloadSigner {
             // it is used.
             state.signing_operation_id = random_operation_id();
             request.signing_operation_id = state.signing_operation_id.clone();
-            write_state(state_path, &state)?;
+            // The prior attempt stands. A failed local write must not become a
+            // refusal: the caller would treat that as proof nothing was signed.
+            write_state(state_path, &state).map_err(ExactSigningError::OutcomeUnknown)?;
             response = self.broker.sign_exact_payload(request).await;
         }
         match response {
@@ -550,14 +552,14 @@ impl BrokerExactPayloadSigner {
                 })
             }
             Ok(ExactPayloadSignOutcome::Signed(result)) => {
-                let signature = result
-                    .signatures
-                    .first()
-                    .ok_or_else(|| "Broker returned no exact signature".to_owned())?;
                 if result.signatures.len() != 1 {
-                    return Err("Broker returned an unexpected exact signature count".into());
+                    return Err(ExactSigningError::OutcomeUnknown(
+                        "Broker returned an unexpected exact signature count".into(),
+                    ));
                 }
-                Ok(ExactPayloadOutcome::Signed(signature.bytes.decode()))
+                Ok(ExactPayloadOutcome::Signed(
+                    result.signatures[0].bytes.decode(),
+                ))
             }
             Err(error) => {
                 tracing::error!(code = ?error.code, message = %error.message, action_id, "petal exact signing failed");
@@ -985,7 +987,7 @@ impl BrokerExactPayloadSigner {
             // finalized signing operation ID.
             state.signing_operation_id = random_operation_id();
             request.signing_operation_id = state.signing_operation_id.clone();
-            write_state(state_path, &state)?;
+            write_state(state_path, &state).map_err(ExactSigningError::OutcomeUnknown)?;
             response = self.broker.sign_exact_payload_batch(request).await;
         }
         match response {
@@ -1000,7 +1002,9 @@ impl BrokerExactPayloadSigner {
             }
             Ok(ExactPayloadSignOutcome::Signed(result)) => {
                 if result.signatures.len() != preimages.len() {
-                    return Err("Broker returned an unexpected exact batch signature count".into());
+                    return Err(ExactSigningError::OutcomeUnknown(
+                        "Broker returned an unexpected exact batch signature count".into(),
+                    ));
                 }
                 Ok(ExactPayloadBatchOutcome::Signed(
                     result
