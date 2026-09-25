@@ -981,10 +981,13 @@ impl DaemonPetalHost {
         let root = self.petal_signing_state_root.as_ref().ok_or_else(|| {
             HostError::Backend("Petal exact signing state is not configured".into())
         })?;
-        let mut identity = blake3::Hasher::new();
-        identity.update(b"bloom-petal-exact-signing/v2\0");
         let key_identity = serde_jcs::to_vec(&account_key)
             .map_err(|error| HostError::Invalid(error.to_string()))?;
+        // Derived here, never taken from the guest. `.state/<request>.json`
+        // shipped in v0.2.0 and v0.2.1; moving it would hide pending requests
+        // from an upgraded Machine.
+        let mut identity = blake3::Hasher::new();
+        identity.update(b"bloom-petal-exact-signing/v2\0");
         for part in [
             context.package_hash.as_bytes(),
             context.route_id.as_bytes(),
@@ -2001,7 +2004,7 @@ impl PetalHost for DaemonPetalHost {
                         reason = %reason,
                         "petal.sign_payload_denied"
                     );
-                    HostError::Denied(reason)
+                    exact_signing_host_error(reason)
                 })?;
             return match outcome {
                 bloom_vfs::ExactPayloadOutcome::ApprovalRequired {
@@ -2096,7 +2099,17 @@ impl PetalHost for DaemonPetalHost {
                 protocol_error_code = error.code.as_str(),
                 "petal.sign_payload_denied"
             );
-            HostError::Denied(format!("{}: {}", error.code.as_str(), error.message))
+            let refused = error.retry == bloom_broker_api::RetryClass::Never
+                && matches!(
+                    error.durable_effect,
+                    bloom_broker_api::DurableEffect::None
+                        | bloom_broker_api::DurableEffect::ReservationReleased
+                );
+            if refused {
+                HostError::Denied(format!("{}: {}", error.code.as_str(), error.message))
+            } else {
+                HostError::Backend(SIGNING_OUTCOME_UNKNOWN.into())
+            }
         })?;
         let [signature] = result.signatures.as_slice() else {
             return Err(HostError::Backend(
@@ -2333,7 +2346,7 @@ impl PetalHost for DaemonPetalHost {
                 )
                 .await
         }
-        .map_err(HostError::Denied)?;
+        .map_err(exact_signing_host_error)?;
         match outcome {
             bloom_vfs::ExactPayloadBatchOutcome::ApprovalRequired {
                 approval_id,
@@ -3695,6 +3708,22 @@ fn ceremony_projection_records(root: &Path) -> Result<Vec<PathBuf>, DaemonError>
     }
     records.sort();
     Ok(records)
+}
+
+/// Host message for a signing request whose outcome is unknown. It carries
+/// no Broker text: Petal SDKs classify host errors by words such as "denied"
+/// or "invalid", and this outcome must never read as a refusal.
+const SIGNING_OUTCOME_UNKNOWN: &str = "signing outcome unknown; it may already be signed";
+
+/// Only a refusal proves no signature exists; a Petal may rebuild after
+/// `Denied` but must keep its payload after `Backend`.
+fn exact_signing_host_error(error: bloom_vfs::ExactSigningError) -> HostError {
+    match error {
+        bloom_vfs::ExactSigningError::Refused(reason) => HostError::Denied(reason),
+        bloom_vfs::ExactSigningError::OutcomeUnknown(_) => {
+            HostError::Backend(SIGNING_OUTCOME_UNKNOWN.into())
+        }
+    }
 }
 
 /// Stop every durable Petal ceremony projection from advertising an owner
