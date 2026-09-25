@@ -61,7 +61,7 @@ use bloom_vfs::handlers::{
     AddressBookHandler, CentralOutbox, ChainsHandler, DocsHandler, EnsHandler, OutboxHandler,
     PETAL_SIGNING_STATE_SCHEMA, PetalKeyRequestsHandler, PetalSigningRequestProjection,
     PetalSigningRequestsHandler, PricesHandler, RequestsHandler, SimulateHandler, StatusHandler,
-    ToolsHandler, WalletsHandler, WatchHandler,
+    ToolsHandler, ViewsHandler, WalletsHandler, WatchHandler,
 };
 use bloom_vfs::{
     BrokerExactPayloadSigner, FileOperationIndex, OperationIndex, PathCache, Vfs, VfsPath,
@@ -4452,6 +4452,15 @@ impl Daemon {
         let petals_doc_renderer: Arc<dyn Fn() -> Vec<u8> + Send + Sync> =
             Arc::new(move || render_installed_petals_doc(&petals_for_docs));
 
+        // The central outbox handler is shared: `/outbox` serves it, and the
+        // views pages read staged and recorded operations back through its own
+        // trait so a page cannot drift from what `/outbox` reports.
+        let central_outbox_handler = Arc::new(OutboxHandler::new(CentralOutbox::new(
+            home.root().join("central_outbox"),
+        )));
+        // Cloned before the prices mount consumes the client.
+        let views_prices = prices.clone();
+
         let mut vfs_builder = Vfs::builder()
             .mount(
                 "petal-key-requests",
@@ -4466,7 +4475,7 @@ impl Daemon {
                     broker.clone(),
                 )) as _,
             )
-            .mount("petals", petal_router as _)
+            .mount("petals", petal_router.clone() as _)
             .mount(
                 "chains",
                 Arc::new(
@@ -4517,12 +4526,26 @@ impl Daemon {
             )
             .mount("ens", Arc::new(EnsHandler::new(ens_client.clone())) as _)
             .mount("prices", Arc::new(PricesHandler::new(prices)) as _)
+            // views/ — read-only HTML pages a person opens in a browser from
+            // the mount. Observation only: it holds the public wallet
+            // projection and the chain registry, and no write surface.
             .mount(
-                "outbox",
-                Arc::new(OutboxHandler::new(CentralOutbox::new(
-                    home.root().join("central_outbox"),
-                ))) as _,
+                "views",
+                Arc::new(
+                    ViewsHandler::new(
+                        wallet_projections.clone(),
+                        chains.clone(),
+                        views_prices,
+                        central_outbox_handler.clone(),
+                        bloom_vfs::handlers::MarketData::new(),
+                    )
+                    .with_address_book(address_book_arc.clone())
+                    .with_petals(petal_router.clone())
+                    .with_solana_reads(solana_chain_registry.clone())
+                    .with_skin(home.skin_path()),
+                ) as _,
             )
+            .mount("outbox", central_outbox_handler.clone() as _)
             .mount(
                 "addressbook",
                 Arc::new(
@@ -6202,6 +6225,7 @@ mod tests {
         assert!(d.vfs.handler("addressbook").is_some());
         assert!(d.vfs.handler("ens").is_some());
         assert!(d.vfs.handler("petals").is_some());
+        assert!(d.vfs.handler("views").is_some());
         assert!(
             d.vfs.handler("hyperliquid").is_none(),
             "native Hyperliquid must not be mounted; use petals/hyperliquid"

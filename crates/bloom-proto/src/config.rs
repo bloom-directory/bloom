@@ -367,7 +367,7 @@ fn default_chains() -> BTreeMap<String, ChainSpec> {
             "HyperEVM",
             "HYPE",
         ),
-        evm_chain("arc", 5_042, &["https://rpc.arc-scan.org"], "Arc", "USDC"),
+        evm_chain("arc", 5_042, &["https://rpc.mainnet.arc.io"], "Arc", "USDC"),
         ChainSpec::anvil_default(),
     ] {
         chains.insert(spec.name.clone(), spec);
@@ -722,7 +722,7 @@ mod tests {
         assert_eq!(hyperliquid.chain_id, 999);
         let arc = cfg.chains.get("arc").expect("Arc entry");
         assert_eq!(arc.chain_id, 5_042);
-        assert_eq!(arc.rpc_urls, vec!["https://rpc.arc-scan.org"]);
+        assert_eq!(arc.rpc_urls, vec!["https://rpc.mainnet.arc.io"]);
         assert_eq!(arc.display_name.as_deref(), Some("Arc"));
         assert_eq!(arc.native_symbol, "USDC");
         assert_eq!(arc.native_decimals, 18);
