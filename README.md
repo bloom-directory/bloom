@@ -178,8 +178,9 @@ A fresh Bloom VFS root exposes these default entries:
   pinned [Polymarket](https://github.com/bloom-directory/bloom-petal-polymarket),
   [Hyperliquid](https://github.com/bloom-directory/bloom-petal-hyperliquid),
   [Enso](https://github.com/bloom-directory/bloom-petal-enso),
-  [Near Intents](https://github.com/bloom-directory/bloom-petal-near), and
-  [Tolly](https://github.com/TollyLabs/bloom-petal-tolly) releases.
+  [Near Intents](https://github.com/bloom-directory/bloom-petal-near),
+  [Tolly](https://github.com/TollyLabs/bloom-petal-tolly), and
+  [Feedback](https://github.com/bloom-directory/bloom-petal-feedback) releases.
   Read `docs/petals.md` in the VFS for the exact installed set, mount
   directories, summaries, and declared capabilities.
 - `requests/` — free and paid HTTP requests. Paid HTTP 402 challenges are
