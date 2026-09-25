@@ -173,8 +173,16 @@ impl WalletsHandler {
     /// imported single-key wallet is account 0 from its projection; a BIP-39
     /// wallet's accounts come from the authenticated `wallet.accounts`
     /// projection, grouped by the number their paths encode.
-    async fn account_views(&self, wallet: &str) -> Result<Vec<AccountView>, HandlerError> {
-        let projection = self.wallet_projection(wallet).await?;
+    async fn account_views(
+        &self,
+        wallet: &str,
+        navigation: bool,
+    ) -> Result<Vec<AccountView>, HandlerError> {
+        let projection = if navigation {
+            self.wallet_projection_navigation(wallet).await?
+        } else {
+            self.wallet_projection(wallet).await?
+        };
         if let Some(root) = &projection.wallet.root_key_ref {
             // A root-key wallet is account 0 in the root key's own family:
             // an imported Secp256k1 root renders as EVM, an Ed25519 root as
@@ -249,7 +257,21 @@ impl WalletsHandler {
         wallet: &str,
         number: u32,
     ) -> Result<AccountView, HandlerError> {
-        self.account_views(wallet)
+        self.account_views(wallet, false)
+            .await?
+            .into_iter()
+            .find(|view| view.number == number)
+            .ok_or_else(|| {
+                HandlerError::not_found(format!("wallet '{wallet}' has no account {number}"))
+            })
+    }
+
+    async fn account_view_navigation(
+        &self,
+        wallet: &str,
+        number: u32,
+    ) -> Result<AccountView, HandlerError> {
+        self.account_views(wallet, true)
             .await?
             .into_iter()
             .find(|view| view.number == number)
@@ -264,7 +286,7 @@ impl WalletsHandler {
         wallet: &str,
     ) -> Result<Vec<Entry>, HandlerError> {
         Ok(self
-            .account_views(wallet)
+            .account_views(wallet, true)
             .await?
             .into_iter()
             .map(|view| Entry::dir(&view.number.to_string()))
@@ -435,7 +457,7 @@ impl WalletsHandler {
         number: u32,
         rest: &[String],
     ) -> Result<Entry, HandlerError> {
-        let view = self.account_view(wallet, number).await?;
+        let view = self.account_view_navigation(wallet, number).await?;
         match rest {
             [] => Ok(Entry::dir(&number.to_string())),
             [dir] if dir == "sessions" => Ok(Entry::dir("sessions")),
@@ -468,7 +490,15 @@ impl WalletsHandler {
         number: u32,
         rest: &[String],
     ) -> Result<Vec<u8>, HandlerError> {
-        let view = self.account_view(wallet, number).await?;
+        // The Petal router consumes account.json as an authorization context
+        // even for guest writes and side-effecting reads. Keep that document
+        // on the live authority path; only ordinary navigation uses the
+        // bounded snapshot.
+        let view = if rest == ["account.json"] {
+            self.account_view(wallet, number).await?
+        } else {
+            self.account_view_navigation(wallet, number).await?
+        };
         match rest {
             [leaf] if leaf == "account.json" => self.account_json(wallet, &view),
             [leaf] if ACCOUNT_KEY_FILES.contains(&leaf.as_str()) => {
@@ -503,7 +533,7 @@ impl WalletsHandler {
         number: u32,
         rest: &[String],
     ) -> Result<Vec<Entry>, HandlerError> {
-        let view = self.account_view(wallet, number).await?;
+        let view = self.account_view_navigation(wallet, number).await?;
         match rest {
             [] => Ok(Self::account_dir_entries(&view)),
             [dir] if dir == "sessions" => {
