@@ -553,9 +553,9 @@ class ReplacementLineageTests(ApproverMatchTests):
             self.definition._approver_error or "",
         )
 
-    def test_a_replacement_without_advice_waits_for_the_deadline(self) -> None:
-        # No advice has landed yet: the approver must poll, not refuse, and a
-        # short budget must surface as an expiry rather than a refusal.
+    def test_a_replacement_without_advice_waits_within_the_grace(self) -> None:
+        # No advice has landed yet: inside the grace the approver polls rather
+        # than refusing, and a short budget surfaces as an expiry.
         self.definition._approved_lineage.append("0001")
         replacement = self.stage("0002")
         url = "http://localhost:18734/ceremony/" + "B" * 43
@@ -574,6 +574,25 @@ class ReplacementLineageTests(ApproverMatchTests):
         self.assertIsNotNone(error)
         assert error is not None
         self.assertIn("budget expired", error)
+
+    def test_a_fresh_staging_is_refused_after_the_grace(self) -> None:
+        # The predecessor expired but was never restaged, so no advice will
+        # ever land: refuse with the reason instead of idling out the budget.
+        self.definition._approved_lineage.append("0001")
+        replacement = self.stage("0002")
+        url = "http://localhost:18734/ceremony/" + "B" * 43
+        (replacement / "approval_challenge.json").write_text(
+            json.dumps({"ceremony_url": url})
+        )
+        ceremonies = SimpleNamespace(
+            completed=set(), next_sign_count=3, complete=mock.Mock()
+        )
+
+        with mock.patch("harness.solana_transfer.RESTAGE_ADVICE_GRACE_SECONDS", 0.0):
+            self.definition._approve_loop(ceremonies)
+
+        ceremonies.complete.assert_not_called()
+        self.assertIn("staged fresh", self.definition._approver_error or "")
 
 
 class BudgetExpiryTests(ApproverMatchTests):

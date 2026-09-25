@@ -92,6 +92,11 @@ APPROVER_BUDGET_SECONDS = 420.0
 # blockhash-expiry re-approval. The cap bounds a misbehaving route rather
 # than describing the expected count.
 MAX_TRANSFER_CEREMONIES = 3
+# The restage route stages the replacement, then writes the predecessor's
+# advice in the same call, so an entry can briefly exist without advice. Past
+# this grace, a confirmable entry with no advice was staged fresh, not
+# restaged, and is refused.
+RESTAGE_ADVICE_GRACE_SECONDS = 10.0
 
 RPC_TIMEOUT_SECONDS = 30
 SWEEP_TIMEOUT_SECONDS = 180
@@ -908,8 +913,8 @@ class SolanaTransferEval(EvalDefinition):
         attempt and is refused, as is any id the lineage does not name.
 
         Returns None when the predecessor has no advice yet: the restage
-        operation publishes the advice moments after the replacement appears,
-        so absence means "wait", not "refuse".
+        operation writes the advice just after it stages the replacement, so
+        absence is briefly "wait". The approver refuses once the grace passes.
         """
         if not self._approved_lineage:
             return False
@@ -921,6 +926,7 @@ class SolanaTransferEval(EvalDefinition):
 
     def _approve_loop(self, ceremonies: CeremonyDriver) -> None:
         deadline = time.monotonic() + APPROVER_BUDGET_SECONDS
+        awaiting_advice: dict[str, float] = {}
         while not self._approver_stop.is_set() and time.monotonic() < deadline:
             try:
                 for pending_id in self._list_host_state("pending"):
@@ -941,13 +947,22 @@ class SolanaTransferEval(EvalDefinition):
                         lineage_decision = self._replacement_is_authorized(pending_id)
                         if lineage_decision is None:
                             # The replacement is staged but its restage advice
-                            # has not landed yet; poll again rather than
-                            # refusing a succession still being published.
-                            continue
+                            # has not landed yet; poll again, but only briefly:
+                            # the route writes the advice in the same call.
+                            first_seen = awaiting_advice.setdefault(
+                                pending_id, time.monotonic()
+                            )
+                            if (
+                                time.monotonic() - first_seen
+                                < RESTAGE_ADVICE_GRACE_SECONDS
+                            ):
+                                continue
+                            lineage_decision = False
                         if not lineage_decision:
                             self._approver_error = (
                                 f"staged entry {pending_id} does not continue the approved "
-                                "replacement lineage; refusing to approve it"
+                                "replacement lineage (it was staged fresh, not through "
+                                "the restage route); refusing to approve it"
                             )
                             return
                     ceremonies.complete(url)
