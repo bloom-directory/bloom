@@ -118,11 +118,26 @@ jobs:
           cache-targets: false
       - name: Build nextest archive
         run: cargo nextest archive --workspace --all-targets --archive-file target/nextest-archive.tar.zst
+      # deployment_tools_and_recovery drives the real `bloom deploy … rpc`
+      # bridge as a subprocess, so it needs the CLI itself and not a test
+      # binary. A nextest archive carries test binaries only, so the lanes
+      # that run it would find nothing at target/debug/bloom. Build it in the
+      # one job that compiles and ship it beside the archive: the execution
+      # lanes stay compile-free.
+      - name: Build the bloom CLI for the deployment bridge
+        run: cargo build --bin bloom --locked
       - name: Upload nextest archive
         uses: actions/upload-artifact@v4
         with:
           name: nextest-archive
           path: target/nextest-archive.tar.zst
+          if-no-files-found: error
+          retention-days: 3
+      - name: Upload the bloom CLI
+        uses: actions/upload-artifact@v4
+        with:
+          name: bloom-cli
+          path: target/debug/bloom
           if-no-files-found: error
           retention-days: 3
       - name: Show sccache stats
@@ -164,11 +179,27 @@ jobs:
         uses: foundry-rs/foundry-toolchain@v1
         with:
           version: stable
+      # The Hardhat half of the deployment compatibility test installs and
+      # runs a project with npm, so the Node version is pinned rather than
+      # inherited from whatever the runner image ships this month. Hardhat
+      # refuses to start below 22.13, so this floor is the tool's, not a
+      # preference.
+      - name: Install Node.js for the Hardhat compatibility project
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
       - name: Download nextest archive
         uses: actions/download-artifact@v4
         with:
           name: nextest-archive
           path: target
+      - name: Download the bloom CLI
+        uses: actions/download-artifact@v4
+        with:
+          name: bloom-cli
+          path: target/debug
+      - name: Make the bloom CLI executable
+        run: chmod +x target/debug/bloom
       - name: Run CLI and default local integration tests from archive
         run: |
           cargo nextest run --archive-file target/nextest-archive.tar.zst \
@@ -202,12 +233,32 @@ jobs:
       # does not start; they run in the dedicated solana-validator workflow.
       # Matching the prefix rather than one binary name keeps a new Solana
       # suite from silently landing in this anvil-only step.
+      # The filter stays on one line. In a YAML folded scalar a line indented
+      # deeper than the block keeps its newline, which silently pushed the
+      # trailing flags onto their own shell line: the run then executed
+      # without --run-ignored and swept up every non-ignored test, including
+      # the macOS installer tests the packaging step excludes on purpose.
       - name: Run ignored local anvil integration tests from archive
         run: >
           cargo nextest run --archive-file target/nextest-archive.tar.zst
-          -E '(package(bloom-it) and not binary(/^solana_/)) or package(bloom-watch)'
+          -E '(package(bloom-it) and not binary(/^solana_/) and not binary(deployment_rpc)) or package(bloom-watch)'
           --run-ignored ignored-only
           --no-tests=pass
+          --no-fail-fast
+      # Split out so its prerequisites are visible and a failure is
+      # attributable. Inside the blanket step above this test had no CLI to
+      # run and its outcome was not separable from a dozen others.
+      # --no-tests=fail is deliberate: the point of this step is that the
+      # deployment compatibility test actually executes, so a filter that
+      # stops matching it must fail the job rather than pass silently.
+      - name: Run deployment compatibility tests from archive
+        env:
+          BLOOM_TEST_BINARY: ${{ github.workspace }}/target/debug/bloom
+        run: >
+          cargo nextest run --archive-file target/nextest-archive.tar.zst
+          -E 'package(bloom-it) and binary(deployment_rpc)'
+          --run-ignored all
+          --no-tests=fail
           --no-fail-fast
 
   macos_unix_principal_disposable_w0:
@@ -217,7 +268,7 @@ jobs:
       github.ref_name == 'triad-architecture'
     uses: ./.github/workflows/macos-unix-conformance.yml
     with:
-      broker_ref: 3352190e5909803a49d577f36dadc9b672982bd0
+      broker_ref: 070c34c83ec303198bfb706fd8f891a46b292d66
       signer_ref: 97b9ac7e47ee682e59804d04f6288419f3598a58
 
   linux_w0_isolation:

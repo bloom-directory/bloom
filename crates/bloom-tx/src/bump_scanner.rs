@@ -204,7 +204,7 @@ impl BumpScanner {
         let bumped = bloom_mempool::compute_replacement_fees(entry.fees);
         let replaces = format!("{:#x}", entry.hash);
         let bump_tx = serde_json::json!({
-            "to": format!("{:#x}", entry.to),
+            "to": entry.to.map(|address| format!("{address:#x}")),
             "value": entry.value.to_string(),
             "data": entry.data,
             "nonce": entry.nonce,
@@ -392,7 +392,7 @@ mod tests {
             chain: chain.into(),
             chain_id: 1,
             from: "0x0000000000000000000000000000000000000001".into(),
-            to: "0x0000000000000000000000000000000000000002".into(),
+            to: Some("0x0000000000000000000000000000000000000002".into()),
             value_wei: "0".into(),
             data_hex: "0x".into(),
             gas_limit: 21_000,
@@ -405,6 +405,7 @@ mod tests {
             expires_ms: 0,
             status,
             action_kind: bloom_proto::TxActionKind::Unknown,
+            review_mode: None,
             tx_hash: Some(hash.into()),
             token: None,
             nft: None,
