@@ -266,10 +266,10 @@ fn default_chains() -> BTreeMap<String, ChainSpec> {
             "base",
             8453,
             &[
-                "https://mainnet.base.org",
                 "https://base-rpc.publicnode.com",
                 "https://base.drpc.org",
-                "https://1rpc.io/base",
+                "https://base.gateway.tenderly.co",
+                "https://mainnet.base.org",
             ],
             "Base Mainnet",
             "ETH",
@@ -687,17 +687,18 @@ mod tests {
         assert!(!ethereum.rpc_urls.is_empty());
         let base = cfg.chains.get("base").expect("base entry");
         assert_eq!(base.chain_id, 8453);
-        // Base carried one reachable endpoint: its spare was dead and
-        // `mainnet.base.org` alone rate-limits under a read-heavy Petal, which
-        // reads as a broken Petal rather than a thin endpoint list. Pin the
-        // spares so a revert is caught here.
+        // Base carried one reachable endpoint and it rate-limits: 11 of 25
+        // sequential `eth_call`s to `mainnet.base.org` return -32016, which
+        // reads as a broken Petal rather than a thin endpoint list. Keep it
+        // last, behind spares that survive the same burst, and pin the list so
+        // a revert is caught here.
         assert_eq!(
             base.rpc_urls,
             vec![
-                "https://mainnet.base.org",
                 "https://base-rpc.publicnode.com",
                 "https://base.drpc.org",
-                "https://1rpc.io/base",
+                "https://base.gateway.tenderly.co",
+                "https://mainnet.base.org",
             ]
         );
         assert!(
