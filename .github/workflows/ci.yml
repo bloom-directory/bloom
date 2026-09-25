@@ -146,8 +146,10 @@ jobs:
         with:
           name: nextest-archive
           path: target
-      - name: Run library unit tests from archive
-        run: cargo nextest run --archive-file target/nextest-archive.tar.zst -E 'kind(lib)' --no-fail-fast
+      # kind(bin) covers unit tests in binary targets, such as the bin-only
+      # `bloom` crate's triad enrollment tests.
+      - name: Run library and binary unit tests from archive
+        run: cargo nextest run --archive-file target/nextest-archive.tar.zst -E 'kind(lib) or kind(bin)' --no-fail-fast
 
   integration_test:
     name: local integration tests

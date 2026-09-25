@@ -136,6 +136,8 @@ struct NetAllowToml {
 struct SignPolicy {
     #[serde(default)]
     allowed_intents: Vec<String>,
+    #[serde(default)]
+    fee_asset: Option<bloom_broker_api::ProvenanceFeeAsset>,
 }
 
 /// `[account]`: whether the Petal understands host-injected account
@@ -344,6 +346,9 @@ pub struct RouteIndex {
     pub petal_root: String,
     pub policy_hash: String,
     pub routes: Vec<RouteIndexRecord>,
+    /// Native fee every signing intent in the package pays, from `[sign].fee_asset`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sign_fee_asset: Option<bloom_broker_api::ProvenanceFeeAsset>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -543,6 +548,7 @@ impl PreparedPetalPackage {
             petal_root: manifest.name.clone(),
             policy_hash,
             routes: Vec::with_capacity(route_files.len()),
+            sign_fee_asset: manifest.sign.fee_asset.clone(),
         };
         for route in route_files {
             let source_path = route.source_path.to_string_lossy().replace('\\', "/");
@@ -6932,6 +6938,51 @@ maximum_lifetime_ms = 60000
         assert!(!legacy.key_derive_scope_declared);
         assert!(legacy.key_derive_allowed_crypto_suites.is_empty());
         assert_eq!(legacy.key_derive_maximum_lifetime_ms, None);
+    }
+
+    #[test]
+    fn petal_sign_fee_asset_is_recorded_in_the_route_index() {
+        let manifest = |sign: &str| {
+            format!(
+                r#"schema = "bloom.petal.package.v1"
+name = "triad-authority-fixture"
+[caps]
+allowed = ["bloom:key.derive", "bloom:sign", "bloom:store"]
+
+[sign]
+allowed_intents = ["fixture.payload"]
+{sign}
+
+[store]
+namespaces = ["fixture-public"]
+"#
+            )
+        };
+        let fee_free = prepared_triad_fixture_with_manifest(manifest("").as_bytes()).unwrap();
+        assert_eq!(fee_free.route_index.sign_fee_asset, None);
+        assert!(
+            serde_json::to_value(&fee_free.route_index)
+                .unwrap()
+                .get("sign_fee_asset")
+                .is_none()
+        );
+
+        let fee_bearing = prepared_triad_fixture_with_manifest(
+            manifest(r#"fee_asset = { chain = "solana", asset = "native" }"#).as_bytes(),
+        )
+        .unwrap();
+        let fee = fee_bearing.route_index.sign_fee_asset.unwrap();
+        assert_eq!(
+            (fee.chain.as_str(), fee.asset.as_str()),
+            ("solana", "native")
+        );
+
+        assert!(
+            prepared_triad_fixture_with_manifest(
+                manifest(r#"fee_asset = { chain = "Solana!", asset = "native" }"#).as_bytes(),
+            )
+            .is_err()
+        );
     }
 
     #[test]
