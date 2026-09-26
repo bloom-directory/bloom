@@ -527,7 +527,11 @@ impl PreparedPetalPackage {
             .iter()
             .cloned()
             .collect::<BTreeSet<_>>();
-        validate_sign_policy(&allowed_caps, &allowed_sign_intents)?;
+        validate_sign_policy(
+            &allowed_caps,
+            &allowed_sign_intents,
+            manifest.sign.fee_asset.as_ref(),
+        )?;
         let store_policy = store_policy_from_manifest(&manifest);
         validate_store_policy(&allowed_caps, &store_policy)?;
         validate_net_policy(&allowed_caps, &manifest.net)?;
@@ -1013,7 +1017,11 @@ pub fn sign_intents_from_manifest_toml(bytes: &[u8]) -> Result<BTreeSet<String>,
         .iter()
         .cloned()
         .collect::<BTreeSet<_>>();
-    validate_sign_policy(&allowed_caps, &allowed_sign_intents)?;
+    validate_sign_policy(
+        &allowed_caps,
+        &allowed_sign_intents,
+        manifest.sign.fee_asset.as_ref(),
+    )?;
     Ok(allowed_sign_intents)
 }
 
@@ -3907,6 +3915,7 @@ fn validate_petal_name(name: &str) -> Result<(), PetalError> {
 fn validate_sign_policy(
     allowed_caps: &BTreeSet<String>,
     allowed_sign_intents: &BTreeSet<String>,
+    fee_asset: Option<&bloom_broker_api::ProvenanceFeeAsset>,
 ) -> Result<(), PetalError> {
     if allowed_caps.contains("bloom:sign") && allowed_sign_intents.is_empty() {
         return Err(PetalError::InvalidWasm(
@@ -3915,6 +3924,11 @@ fn validate_sign_policy(
     }
     for intent in allowed_sign_intents {
         validate_sign_intent(intent)?;
+    }
+    if fee_asset.is_some_and(|fee| fee.asset.is_empty()) {
+        return Err(PetalError::InvalidWasm(
+            "Petal package [sign].fee_asset asset must be non-empty".into(),
+        ));
     }
     Ok(())
 }
@@ -6982,6 +6996,16 @@ namespaces = ["fixture-public"]
                 manifest(r#"fee_asset = { chain = "Solana!", asset = "native" }"#).as_bytes(),
             )
             .is_err()
+        );
+        let error = prepared_triad_fixture_with_manifest(
+            manifest(r#"fee_asset = { chain = "solana", asset = "" }"#).as_bytes(),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("[sign].fee_asset asset must be non-empty"),
+            "{error}"
         );
     }
 
