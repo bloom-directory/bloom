@@ -11,6 +11,8 @@ broker_repo=""
 signer_repo=""
 ceremony_port_arg=""
 ceremony_port_arg_set=0
+remote_upstream_port_arg=""
+remote_upstream_port_arg_set=0
 developer_root=""
 machine_home=""
 mount_dir=""
@@ -18,9 +20,11 @@ machine_socket=""
 log_dir=""
 ready_file=""
 services_only=0
+hosted_relay=0
 install_authority_fixture="${BLOOM_TRIAD_DEV_AUTHORITY_FIXTURE:-0}"
 build_integration_petals="${BLOOM_TRIAD_DEV_BUILD_PETALS:-1}"
 socket_timeout_seconds="${BLOOM_TRIAD_DEV_SOCKET_TIMEOUT_SECONDS:-30}"
+relay_timeout_seconds="${BLOOM_TRIAD_DEV_RELAY_TIMEOUT_SECONDS:-300}"
 
 die() { printf 'triad developer launcher: %s\n' "$*" >&2; exit 1; }
 need_value() { [ "$#" -ge 2 ] || die "$1 requires a value"; }
@@ -33,7 +37,9 @@ while [ "$#" -gt 0 ]; do
     --log-dir) need_value "$@"; log_dir="$2"; shift 2 ;;
     --ready-file) need_value "$@"; ready_file="$2"; shift 2 ;;
     --ceremony-port) need_value "$@"; ceremony_port_arg="$2"; ceremony_port_arg_set=1; shift 2 ;;
+    --remote-upstream-port) need_value "$@"; remote_upstream_port_arg="$2"; remote_upstream_port_arg_set=1; shift 2 ;;
     --services-only) services_only=1; shift ;;
+    --hosted-relay) hosted_relay=1; shift ;;
     *) die "unknown argument: $1" ;;
   esac
 done
@@ -45,34 +51,59 @@ done
 if [ "$services_only" -eq 1 ] && [ -n "$mount_dir" ]; then
   die "--services-only cannot be combined with --mount"
 fi
+if [ "$services_only" -eq 1 ] && [ "$hosted_relay" -eq 1 ]; then
+  die "--hosted-relay requires the complete Triad; omit --services-only"
+fi
+# Parse one decimal TCP port or fail naming its source. Runs before any build
+# or config mutation, so a malformed value never touches state.
+parse_port() {
+  local source="$1" raw="$2" stripped
+  case "$raw" in
+    ''|*[!0-9]*) die "${source} must be an integer 1 through 65535" ;;
+  esac
+  # Strip leading zeros so ordinary zero-padded input (0028735) keeps
+  # selecting 28735; an all-zeros value collapses and fails the range check.
+  stripped=$raw
+  while [ -n "$stripped" ] && [ "${stripped#0}" != "$stripped" ]; do
+    stripped=${stripped#0}
+  done
+  [ -n "$stripped" ] || stripped=0
+  # Bound the digit count before arithmetic: Bash integer arithmetic wraps on
+  # overflow, so an oversized decimal could otherwise wrap into the valid range
+  # (or onto the custody port). Six or more significant digits always exceed
+  # 65535, while five digits can never overflow the arithmetic.
+  [ "${#stripped}" -le 5 ] || die "${source} must be an integer 1 through 65535"
+  stripped="$((10#$stripped))"
+  [ "$stripped" -ge 1 ] && [ "$stripped" -le 65535 ] ||
+    die "${source} must be an integer 1 through 65535"
+  printf '%s' "$stripped"
+}
 # Ceremony-port selection is explicit flag, otherwise the existing developer
-# environment override, otherwise the custody default. Validate here, before
-# any build or config mutation, so a malformed value never touches state.
+# environment override, otherwise the custody default.
 ceremony_port_raw="18734"
 if [ "$ceremony_port_arg_set" -eq 1 ]; then
   ceremony_port_raw="$ceremony_port_arg"
 elif [ -n "${BLOOM_TRIAD_DEV_CEREMONY_PORT:-}" ]; then
   ceremony_port_raw="$BLOOM_TRIAD_DEV_CEREMONY_PORT"
 fi
-case "$ceremony_port_raw" in
-  ''|*[!0-9]*) die "--ceremony-port (or BLOOM_TRIAD_DEV_CEREMONY_PORT) must be an integer 1 through 65535" ;;
-esac
-# Strip leading zeros so ordinary zero-padded input (0028735) keeps
-# selecting 28735; an all-zeros value collapses and fails the range check.
-stripped_port=$ceremony_port_raw
-while [ -n "$stripped_port" ] && [ "${stripped_port#0}" != "$stripped_port" ]; do
-  stripped_port=${stripped_port#0}
-done
-[ -n "$stripped_port" ] || stripped_port=0
-# Bound the digit count before arithmetic: Bash integer arithmetic wraps on
-# overflow, so an oversized decimal could otherwise wrap into the valid range
-# (or onto the custody port). Six or more significant digits always exceed
-# 65535, while five digits can never overflow the arithmetic.
-[ "${#stripped_port}" -le 5 ] ||
-  die "--ceremony-port (or BLOOM_TRIAD_DEV_CEREMONY_PORT) must be an integer 1 through 65535"
-ceremony_port="$((10#$stripped_port))"
-[ "$ceremony_port" -ge 1 ] && [ "$ceremony_port" -le 65535 ] ||
-  die "--ceremony-port (or BLOOM_TRIAD_DEV_CEREMONY_PORT) must be an integer 1 through 65535"
+ceremony_port="$(parse_port '--ceremony-port (or BLOOM_TRIAD_DEV_CEREMONY_PORT)' "$ceremony_port_raw")"
+# The Broker's loopback hosted-relay upstream follows the same selection. The
+# custody pair keeps 18735; any other ceremony port derives a distinct
+# upstream 10000 away, so candidates on adjacent ceremony ports never collide
+# with each other's upstream or with the installed Triad.
+if [ "$remote_upstream_port_arg_set" -eq 1 ]; then
+  remote_upstream_port="$(parse_port '--remote-upstream-port (or BLOOM_TRIAD_DEV_REMOTE_UPSTREAM_PORT)' "$remote_upstream_port_arg")"
+elif [ -n "${BLOOM_TRIAD_DEV_REMOTE_UPSTREAM_PORT:-}" ]; then
+  remote_upstream_port="$(parse_port '--remote-upstream-port (or BLOOM_TRIAD_DEV_REMOTE_UPSTREAM_PORT)' "$BLOOM_TRIAD_DEV_REMOTE_UPSTREAM_PORT")"
+elif [ "$ceremony_port" -eq 18734 ]; then
+  remote_upstream_port=18735
+elif [ "$ceremony_port" -le 55535 ]; then
+  remote_upstream_port="$((ceremony_port + 10000))"
+else
+  remote_upstream_port="$((ceremony_port - 10000))"
+fi
+[ "$remote_upstream_port" -ne "$ceremony_port" ] ||
+  die "--remote-upstream-port (or BLOOM_TRIAD_DEV_REMOTE_UPSTREAM_PORT) must differ from the ceremony port"
 case "$install_authority_fixture" in
   0|1) ;;
   *) die "BLOOM_TRIAD_DEV_AUTHORITY_FIXTURE must be 0 or 1" ;;
@@ -84,6 +115,22 @@ esac
 case "$socket_timeout_seconds" in
   ''|*[!0-9]*|0) die "BLOOM_TRIAD_DEV_SOCKET_TIMEOUT_SECONDS must be a positive integer" ;;
 esac
+case "$relay_timeout_seconds" in
+  ''|*[!0-9]*|0) die "BLOOM_TRIAD_DEV_RELAY_TIMEOUT_SECONDS must be a positive integer" ;;
+esac
+if [ "$hosted_relay" -eq 1 ]; then
+  # Default to the reviewed public pins the signed release payload ships, so
+  # a candidate trusts exactly what an installed Triad trusts. Overriding
+  # them is all-or-nothing: one custom pin beside a packaged one is a mistake.
+  if [ -z "${BLOOM_TRIAD_DEV_RELAY_CONTROL_CA_FILE:-}" ] &&
+     [ -z "${BLOOM_TRIAD_DEV_RELAY_RECEIPT_KEY_FILE:-}" ]; then
+    export BLOOM_TRIAD_DEV_RELAY_CONTROL_CA_FILE="${repo_root}/packaging/triad/relay/control-ca.pem"
+    export BLOOM_TRIAD_DEV_RELAY_RECEIPT_KEY_FILE="${repo_root}/packaging/triad/relay/receipt-public-key.hex"
+  fi
+  [ -n "${BLOOM_TRIAD_DEV_RELAY_CONTROL_CA_FILE:-}" ] &&
+    [ -n "${BLOOM_TRIAD_DEV_RELAY_RECEIPT_KEY_FILE:-}" ] ||
+    die "--hosted-relay requires both BLOOM_TRIAD_DEV_RELAY_CONTROL_CA_FILE and BLOOM_TRIAD_DEV_RELAY_RECEIPT_KEY_FILE, or neither to use the packaged pins"
+fi
 socket_wait_attempts=$((socket_timeout_seconds * 10))
 
 [ "$(id -u)" -ne 0 ] || die "developer harness refuses root"
@@ -92,6 +139,9 @@ case "$host_os" in
   Darwin|Linux) ;;
   *) die "developer harness requires Linux or macOS" ;;
 esac
+if [ "$hosted_relay" -eq 1 ] && [ "$host_os" != Darwin ]; then
+  die "--hosted-relay currently requires macOS"
+fi
 
 # Arguments and environment are valid, so this invocation will actually build
 # and launch the triad. Each sibling checkout is resolved only when that
@@ -360,9 +410,12 @@ rewrite_broker_config() {
   temporary="${source}.new.$$"
   jq --arg signer_socket "$signer_socket" --arg digest "$release_digest" \
     --argjson ceremony_port "$ceremony_port" \
+    --argjson remote_upstream_port "$remote_upstream_port" \
     '.signer_socket_path = $signer_socket | .build_digest = $digest |
      .ceremony_port = $ceremony_port |
-     .network_containment = null | .maximum_requests_per_window = 10000' \
+     .remote_upstream_port = $remote_upstream_port |
+     .network_containment = null | .maximum_requests_per_window = 10000 |
+     del(.neutral_landing_enabled)' \
     "$source" > "$temporary"
   chmod 0600 "$temporary"
   mv -f "$temporary" "$source"
@@ -381,6 +434,59 @@ rewrite_signer_config() {
 rewrite_broker_config
 rewrite_signer_config
 
+# Optional hosted-relay acceptance uses public trust pins and the existing
+# Signer administrator. Private credentials are created by Signer, never here.
+relay_ca="${BLOOM_TRIAD_DEV_RELAY_CONTROL_CA_FILE:-}"
+relay_receipt="${BLOOM_TRIAD_DEV_RELAY_RECEIPT_KEY_FILE:-}"
+if [ -n "$relay_ca" ] || [ -n "$relay_receipt" ]; then
+  [ "$host_os" = Darwin ] || die "developer relay setup currently requires macOS"
+  # macOS temporary directories can inherit wheel; scoped credentials require
+  # the actual Broker principal's primary group even with owner-only access.
+  chgrp "$(id -g)" "$config_dir"
+  chmod 0700 "$config_dir"
+  for public_pin in "$relay_ca" "$relay_receipt"; do
+    [ -f "$public_pin" ] && [ ! -L "$public_pin" ] || die "relay public trust pins must be regular files"
+  done
+  receipt_hex="$(tr -d '\r\n' < "$relay_receipt")"
+  [[ "$receipt_hex" =~ ^[0-9a-f]{64}$ ]] || die "relay receipt pin must contain 64 lowercase hexadecimal characters"
+  if [ -e "${config_dir}/relay.json" ]; then
+    for persisted_pin in "${config_dir}/relay.json" "${config_dir}/relay-control-ca.pem"; do
+      [ -f "$persisted_pin" ] && [ ! -L "$persisted_pin" ] || die "persisted relay trust pins must be regular files"
+    done
+    cmp -s "$relay_ca" "${config_dir}/relay-control-ca.pem" || die "relay control CA changed; refusing to alter enrolled developer trust"
+    jq -e --arg ca "${config_dir}/relay-control-ca.pem" --arg receipt "$receipt_hex" \
+      '.control_ca_pem_path == $ca and .receipt_public_key_hex == $receipt' \
+      "${config_dir}/relay.json" >/dev/null || die "relay trust configuration changed; refusing to alter enrolled developer trust"
+  else
+    [ ! -e "${developer_root}/state/admin/relay-admin-seed.hex" ] && \
+      [ ! -e "${developer_root}/state/admin/allocation-operation.json" ] ||
+      die "enrolled developer relay trust configuration is missing"
+    cp "$relay_ca" "${config_dir}/relay-control-ca.pem.new"
+    chmod 0600 "${config_dir}/relay-control-ca.pem.new"
+    mv "${config_dir}/relay-control-ca.pem.new" "${config_dir}/relay-control-ca.pem"
+    jq -n --arg ca "${config_dir}/relay-control-ca.pem" --arg receipt "$receipt_hex" \
+      '{control_ca_pem_path:$ca,receipt_public_key_hex:$receipt}' > "${config_dir}/relay.json.new"
+    chmod 0600 "${config_dir}/relay.json.new"
+    mv "${config_dir}/relay.json.new" "${config_dir}/relay.json"
+  fi
+  jq --arg receipt "$receipt_hex" '.relay_receipt_public_key_hex = $receipt' \
+    "${config_dir}/signer.json" > "${config_dir}/signer.json.new"
+  chmod 0600 "${config_dir}/signer.json.new"
+  mv -f "${config_dir}/signer.json.new" "${config_dir}/signer.json"
+  mkdir -p "${developer_root}/state/admin"
+  chmod 0700 "${developer_root}/state/admin"
+  mkdir "${runtime_dir}/admin"
+  chmod 0700 "${runtime_dir}/admin"
+  export BLOOM_SIGNER_ADMIN_SOCKET="${runtime_dir}/admin/admin.sock"
+  export BLOOM_SIGNER_ADMIN_STATE_DIR="${developer_root}/state/admin"
+  export BLOOM_SIGNER_RELAY_CONFIG="${config_dir}/relay.json"
+  export BLOOM_SIGNER_BROKER_UID="$(id -u)"
+  export BLOOM_SIGNER_BROKER_GID="$(id -g)"
+  export BLOOM_SIGNER_TUNNEL_CREDENTIAL_PATH="${config_dir}/relay-tunnel.credential"
+  export BLOOM_SIGNER_DNS_CREDENTIAL_PATH="${config_dir}/relay-dns.credential"
+  export BLOOM_SIGNER_ACME_ACCOUNT_URI_PATH="${config_dir}/acme-account-uri"
+fi
+
 env_file="${log_dir}/triad.env"
 {
   printf 'export BLOOM_TRIAD_DEVELOPER_ROOT=%q\n' "$developer_root"
@@ -396,13 +502,23 @@ env_file="${log_dir}/triad.env"
   printf 'export BLOOM_MACHINE_AUDIT_CHECKPOINT_DIR=%q\n' "$machine_checkpoint_dir"
   printf 'export BLOOM_TRIAD_DEV_CEREMONY_PORT=%q\n' "$ceremony_port"
   printf 'export BLOOM_TRIAD_DEV_CEREMONY_ORIGIN=%q\n' "$ceremony_origin"
+  printf 'export BLOOM_TRIAD_DEV_REMOTE_UPSTREAM_PORT=%q\n' "$remote_upstream_port"
   printf 'export BLOOM_AUTHORITY_EDGE_HISTORY=%q\n' "$authority_edge_history"
   printf 'export BLOOM_MACHINE_IDENTITY=%q\n' "${config_dir}/machine-identity.json"
   printf 'export BLOOM_EDGE_MANIFEST=%q\n' "${config_dir}/edge-manifest.json"
   printf 'export BLOOM_PROVENANCE_CATALOG=%q\n' "${config_dir}/provenance-catalog.json"
+  if [ -n "$relay_ca" ]; then
+    for variable in BLOOM_SIGNER_ADMIN_SOCKET BLOOM_SIGNER_ADMIN_STATE_DIR \
+      BLOOM_SIGNER_RELAY_CONFIG BLOOM_SIGNER_BROKER_UID BLOOM_SIGNER_BROKER_GID \
+      BLOOM_SIGNER_TUNNEL_CREDENTIAL_PATH BLOOM_SIGNER_DNS_CREDENTIAL_PATH \
+      BLOOM_SIGNER_ACME_ACCOUNT_URI_PATH; do
+      printf 'export %s=%q\n' "$variable" "${!variable}"
+    done
+    printf 'export BLOOM_SIGNER_IDENTITY=%q\n' "${config_dir}/signer-identity.json"
+  fi
 } > "$env_file"
 chmod 0600 "$env_file"
-session_pid=""; signer_pid=""; broker_pid=""; machine_pid=""
+session_pid=""; signer_pid=""; broker_pid=""; machine_pid=""; relay_admin_pid=""
 systemd_units_installed=0
 stop_linux_authority_units() {
   [ "$host_os" = Linux ] || return 0
@@ -423,6 +539,12 @@ cleanup() {
   trap - EXIT
   trap '' INT TERM HUP
   rm -f -- "$ready_file"
+  if [ -n "$relay_admin_pid" ] && kill -0 "$relay_admin_pid" 2>/dev/null; then
+    kill "$relay_admin_pid" 2>/dev/null || true
+    sleep 1
+    kill -9 "$relay_admin_pid" 2>/dev/null || true
+    wait "$relay_admin_pid" 2>/dev/null || true
+  fi
   if [ "$host_os" = Linux ]; then
     stop_linux_authority_units
   fi
@@ -663,6 +785,7 @@ if [ "$services_only" -eq 1 ]; then
   printf '%s\n' \
     'Bloom triad services are ready; Machine is developer-managed.' \
     "Public ceremony origin: ${ceremony_origin}" \
+    "Hosted-relay upstream: 127.0.0.1:${remote_upstream_port}" \
     'Source triad.env to put the selected debug bloom binary first on PATH;' \
     'then use bloom directly in that terminal:' \
     "  source ${env_file}" \
@@ -746,11 +869,41 @@ do
 done
 
 kill -0 "$machine_pid" 2>/dev/null || die "Machine exited before readiness could be published"
+health_attempts=0
+until machine_cli serve triad-health-check "$release_digest" >/dev/null 2>&1; do
+  for service_pid in "$session_pid" "$machine_pid"; do
+    kill -0 "$service_pid" 2>/dev/null || die "a Triad service exited before end-to-end readiness"
+  done
+  if [ "$host_os" = Linux ]; then
+    for service_unit in "$signer_service_unit" "$broker_service_unit"; do
+      systemctl --user is-active --quiet "$service_unit" ||
+        die "an authority service exited before end-to-end readiness"
+    done
+  else
+    for service_pid in "$signer_pid" "$broker_pid"; do
+      kill -0 "$service_pid" 2>/dev/null || die "an authority service exited before end-to-end readiness"
+    done
+  fi
+  health_attempts=$((health_attempts + 1))
+  [ "$health_attempts" -lt 30 ] || die "Triad did not pass authenticated end-to-end readiness"
+  sleep 1
+done
+if [ "$hosted_relay" -eq 1 ]; then
+  # The exact candidate Signer CLI owns all relay administration and persisted state.
+  # Its harness build accepts --signer-uid only after validating the same
+  # developer identity and manifest the Signer service was started with.
+  export BLOOM_TRIAD_DEVELOPER_ROOT="$developer_root"
+  export BLOOM_SIGNER_IDENTITY="${config_dir}/signer-identity.json"
+  export BLOOM_EDGE_MANIFEST="${config_dir}/edge-manifest.json"
+  source "${repo_root}/scripts/lib/triad-dev-hosted-relay.sh"
+  wait_for_hosted_relay
+fi
 printf 'ready\n' > "$ready_file"
 if [ -z "$mount_dir" ]; then
   printf '%s\n' \
     'Bloom is ready without a kernel mount.' \
     "Public ceremony origin: ${ceremony_origin}" \
+    "Hosted-relay upstream: 127.0.0.1:${remote_upstream_port}" \
     'Source triad.env to put the selected debug bloom binary first on PATH;' \
     'then use bloom directly in that terminal:' \
     "  source ${env_file}" \

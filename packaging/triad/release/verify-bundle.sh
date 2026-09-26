@@ -34,6 +34,8 @@ for required in \
   PLATFORM_CLAIM \
   compatibility-v1.toml \
   installer/release/install-linux.sh \
+  installer/relay/control-ca.pem \
+  installer/relay/receipt-public-key.hex \
   installer/linux/bin/bloom-uninstall \
   installer/linux/systemd-user/bloom-machine.service \
   installer/macos/launchagents/com.bloom.machine.plist.in \
@@ -78,11 +80,11 @@ require_compat_value() {
   }
 }
 require_compat_value protocols.machine_broker major 1
-require_compat_value protocols.machine_broker minor_min 6
-require_compat_value protocols.machine_broker minor_max 6
+require_compat_value protocols.machine_broker minor_min 7
+require_compat_value protocols.machine_broker minor_max 7
 require_compat_value protocols.broker_signer major 1
-require_compat_value protocols.broker_signer minor_min 5
-require_compat_value protocols.broker_signer minor_max 5
+require_compat_value protocols.broker_signer minor_min 6
+require_compat_value protocols.broker_signer minor_max 6
 for support_edge in signer_control session; do
   require_compat_value "protocols.$support_edge" major 1
   require_compat_value "protocols.$support_edge" minor_min 0
@@ -112,11 +114,12 @@ signer_revision="$(source_revision BLOOM_SIGNER_SHA)"
   echo "bundle compatibility revision does not match SOURCE_REVISIONS" >&2
   exit 65
 }
-require_compat_value revisions service_runtime_commit '"5db670e1b7507deabfdcf451be8b5d315c1c9d91"'
+require_compat_value revisions service_runtime_commit '"a046fd6075853e8591f295983b572c6e1d65d12d"'
 require_compat_value revisions petal_contract_commit '"73c5b06a77599368fbc79fb7947a629b5b4c630e"'
 for state_owner in machine broker signer; do
-  require_compat_value "state.$state_owner" current 1
-  require_compat_value "state.$state_owner" downgrade_floor 1
+  require_compat_value "state.$state_owner" current 2
+  require_compat_value "state.$state_owner" downgrade_floor 2
+  require_compat_value "state.$state_owner" migration_floor 1
 done
 if grep -Eq '^[[:space:]]*(protocol_major|protocol_minor_min|protocol_minor_max)[[:space:]]*=' "$compatibility"; then
   echo "bundle compatibility must not declare a global protocol range" >&2

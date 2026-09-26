@@ -47,10 +47,8 @@ jobs:
       - uses: astral-sh/setup-uv@v7
       - name: Validate bounded Harbor harness
         run: scripts/test-harbor-evals.sh
-      # Failure-mode cases for the ceremony-port A/B concurrency script
-      # (stub launchers; binds no ports and needs no Triad).
-      - name: Run concurrency script failure-mode cases
-        run: scripts/test-ceremony-port-concurrency-cases.sh
+      - name: Validate hosted relay launcher readiness
+        run: scripts/test-triad-dev-hosted-relay.sh
 
   clippy:
     name: clippy
@@ -217,8 +215,8 @@ jobs:
       github.ref_name == 'triad-architecture'
     uses: ./.github/workflows/macos-unix-conformance.yml
     with:
-      broker_ref: 3352190e5909803a49d577f36dadc9b672982bd0
-      signer_ref: 97b9ac7e47ee682e59804d04f6288419f3598a58
+      broker_ref: 1d65c0df68a649a64f91e2a17627dbad67fd7baa
+      signer_ref: 7922b22b37663a7860bd607823521b2c13e41f91
 
   linux_w0_isolation:
     name: Linux W0 principal and socket isolation

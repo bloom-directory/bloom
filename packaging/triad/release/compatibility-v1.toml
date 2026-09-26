@@ -1,32 +1,37 @@
 schema = "bloom.triad-compatibility/1"
 
 [revisions]
-broker_commit = "3352190e5909803a49d577f36dadc9b672982bd0"
-signer_commit = "97b9ac7e47ee682e59804d04f6288419f3598a58"
-service_runtime_commit = "5db670e1b7507deabfdcf451be8b5d315c1c9d91"
+broker_commit = "1d65c0df68a649a64f91e2a17627dbad67fd7baa"
+signer_commit = "7922b22b37663a7860bd607823521b2c13e41f91"
+service_runtime_commit = "a046fd6075853e8591f295983b572c6e1d65d12d"
 petal_contract_commit = "73c5b06a77599368fbc79fb7947a629b5b4c630e"
 
+# Persisted credential surfaces and registration selections are unreadable by
+# the released Machine reader; see docs/reviews/2026-09-23-schema-migration.md.
 [state.machine]
-current = 1
-downgrade_floor = 1
+current = 2
+downgrade_floor = 2
+migration_floor = 1
 
 [state.broker]
-current = 1
-downgrade_floor = 1
+current = 2
+downgrade_floor = 2
+migration_floor = 1
 
 [state.signer]
-current = 1
-downgrade_floor = 1
+current = 2
+downgrade_floor = 2
+migration_floor = 1
 
 [protocols.machine_broker]
 major = 1
-minor_min = 6
-minor_max = 6
+minor_min = 7
+minor_max = 7
 
 [protocols.broker_signer]
 major = 1
-minor_min = 5
-minor_max = 5
+minor_min = 6
+minor_max = 6
 
 [protocols.signer_control]
 major = 1
@@ -39,7 +44,7 @@ minor_min = 0
 minor_max = 1
 
 [[bundles]]
-machine = "0.3.1"
+machine = "0.4.0"
 broker = "0.1.0"
 signer = "0.1.0"
 backends = ["local"]

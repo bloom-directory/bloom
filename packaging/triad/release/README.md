@@ -7,8 +7,12 @@ one exact minor, while Signer control and login-session liveness accept a range.
 Service packages may advance independently when every edge remains inside its
 declared range; incompatible edges fail closed.
 It also records the reviewed Broker, Signer, service-runtime, and
-Petal-contract commits plus the current state schema and downgrade floor for
-Machine, Broker, and Signer. This committed file is the source of truth for
+Petal-contract commits plus the current state schema, migration floor, and
+downgrade floor for Machine, Broker, and Signer. The migration floor names the
+oldest state the candidate can upgrade; it does not authorize an old release
+to reopen migrated state. See the
+[schema migration review](../../../docs/reviews/2026-09-23-schema-migration.md).
+This committed file is the source of truth for
 the Broker and Signer revisions: candidate builds require the supplied
 checkouts to match its exact pins and never rewrite them.
 
@@ -215,13 +219,17 @@ identity-shaped JSON for a production macOS claim.
 The macOS installer stages an immutable release before stopping any installed
 triad. A live install first copies the candidate into a private root-owned
 snapshot and authenticates and installs exclusively from that snapshot. It then
-journals the old and new digests, stops every enrollment before
+journals the old and new digests plus source and target schema watermarks, stops every enrollment before
 the shared atomic `current` switch, updates build-digest state, and validates
-each installed triad before publishing all enrollments active. Failed activation
-and a transaction found after interruption restore the old release, integration
-files, and health. Custody and identity directories are never regenerated or
-replaced during this sequence. The candidate state schemas must be at least the
-installed schemas.
+each installed triad in health-only mode before publishing any enrollment
+active. Same-schema failures before publication may restore the old release.
+Schema migrations become forward-only before candidate authority services
+start; every upgrade commits forward before a full Machine can write its cache
+or accept user work. Interrupted upgrades resume the recorded target or a
+schema-compatible corrected candidate. Custody databases, Machine caches, and
+identity directories are never copied or replaced during this sequence. The
+candidate state schemas must be at least both the installed schemas and any
+journaled target watermark.
 
 The macOS release remains rooted at `/usr/local/libexec/bloom`, with the
 user-facing `/usr/local/bin/bloom` symlink following its atomic `current`
@@ -259,3 +267,99 @@ boundaries; a digest-bound conformance report is supplementary evidence, not a
 required release asset. Machine and session jobs run in the `user/UID` launchd
 domain, while Broker and Signer jobs run in the system domain. The rootless
 code-identity architecture remains a separate future profile.
+
+
+## Remote ceremony packaging contract
+
+The Signer administrative socket is separate from authority RPC and revocation
+control. Linux provisions `/run/bloom/LOGIN_UID/signer/admin/admin.sock`;
+macOS provisions `signer-admin/admin.sock` beneath the per-login runtime root.
+The directory is Signer-owned mode `0700`; production administration accepts
+kernel-authenticated root peers, and the administrative client verifies the
+Signer peer. Neither the Machine-to-Broker group nor the revoke group receives
+administrative socket access. `BLOOM_SIGNER_ADMIN_SOCKET` selects the path only.
+
+Remote setup must retain the existing isolated service principals. Installation
+admin key material belongs in protected local administration state. Broker alone
+owns ACME account keys, certificate keys and the TLS listener; the relay owns
+neither. Signer remains without network access. Only the privileged setup client
+may enroll the installation and deliver an authenticated assignment through
+Signer administration. A hostname from ordinary configuration is insufficient.
+
+Desired remote-enabled is the setup default, but it is not evidence of effective
+remote access. Provisioning must report explicit retryable stages until verified
+assignment, valid TLS and externally observed routing are ready. The installer
+must not report remote setup as complete based on process health alone. Local
+ceremonies stay independently available. Disablement fences remote commits
+immediately and waits for Broker's closure acknowledgement at the same revision.
+
+Release acceptance must exercise the admin peer rejection, multi-wallet local
+credential guard, restart reconciliation, certificate expiry, relay outage and
+retained-hostname re-enable behavior. Public DNS/CA staging drills, ingress
+addresses, relay verification pins and infrastructure accounts are deployment
+prerequisites; fixture tests do not substitute for those observations. No public
+DNS changes or deployment occur as part of ordinary tests.
+
+The Linux Broker service permits IPv4/IPv6 networking for its outbound relay,
+ACME and DNS clients. It retains its isolated UID, protected files and Unix-only
+authority RPC; Signer retains `PrivateNetwork=yes`, `IPAddressDeny=any` and
+`RestrictAddressFamilies=AF_UNIX`. Broker's ceremony TLS listener is loopback-only.
+Deployments requiring network enforcement of exact outbound destinations need a
+reviewed egress proxy or firewall policy covering relay, ACME and DNS lifecycle;
+static ingress addresses alone do not cover CA renewal endpoints.
+
+The remote suite requires Machine–Broker API 1.7 and Broker–Signer API 1.6,
+with release state schema 2 and downgrade floor 2 for all three services.
+Legacy localhost credential wraps, RP IDs and user handles are preserved;
+legacy signed receipts retain their original canonical signed bytes. Old pending
+ceremonies fail on restart. After activating this state version, supported
+rollback must not select the old reusable-recovery or single-origin code.
+The receipt delivery window remains bound to its original Browser key even
+across service restart; a lost recipient key does not authorize re-encryption.
+
+Production provisioning requires root-owned mode `0600` relay configuration and
+CA PEM, and the reviewed relay receipt public key in Signer's configuration.
+On Linux, `/var/lib/bloom/<login-uid>/installer/admin` retains the installation
+admin key and provisioning retry/binding records in root-only storage.
+Broker's generated relay material lives in
+`/var/lib/bloom/<login-uid>/broker/relay`, owned by Broker. The packaged systemd
+unit selects that directory through `BLOOM_BROKER_RELAY_STATE_DIR`; explicit
+`remote_tls` configuration still takes precedence. This is the initial released
+relay layout, with no migration from earlier unmerged candidates.
+macOS retains its existing `config/<login-uid>/installer/admin` and private
+Broker configuration directory under Application Support. Developer paths are
+unchanged. Linux relay configuration and administrator-supplied trust pins stay
+under `/etc/bloom/<login-uid>`.
+Scoped tunnel and DNS credentials are separate `0600` Broker-owned files;
+they convey no surface administration or wallet authority. The signed payload includes the reviewed public pins in `installer/relay`.
+Before service activation, both installers fill an absent/null Signer pin and
+materialize root-only relay configuration from those inputs. Existing matching
+trust is preserved; differing pins fail closed and require explicit rotation.
+See [hosted relay trust](../relay/README.md) for provenance and retry behavior.
+Provisioning publishes the validated control CA to Broker's private
+`relay-control-ca.pem` beside its scoped credentials. Broker publishes each
+validated certificate/key pair atomically in `relay-tls-bundle.json`; a failed
+renewal preserves the previous bundle while it remains valid.
+Both installers invoke `bloom-signer admin provision --login-uid UID` directly
+inside their existing root step, with no second elevation prompt. There is no
+separate ceremony administration wrapper or automatic elevation in Signer.
+On macOS, the installer reports TLS and routing readiness while it waits up to
+10 minutes for the hosted relay. DNS propagation and ACME issuance commonly
+take a few minutes. If readiness is still pending at the deadline, installation
+finishes with localhost available and prints the exact retry command; rerunning
+`admin provision` is safe and resumes the same installation assignment.
+For manual administration, explicitly elevate the installed binary:
+
+```sh
+# Linux
+sudo /usr/libexec/bloom/current/bloom-signer admin status --login-uid "$(id -u)"
+# macOS
+sudo /usr/local/libexec/bloom/current/bloom-signer admin status --login-uid "$(id -u)"
+```
+
+Replace `status` with `provision`, `remote-enabled` or `localhost-only` as needed.
+`--login-uid` selects the installed enrollment and fixed platform paths; it is
+not the Signer service UID. `bloom-signer --help` and `bloom-signer admin --help`
+work without root. The service itself runs as its dedicated unprivileged user;
+root is required for installed administrative operations, not for executing
+the binary or displaying help. See `DEVELOPMENT.md` for harness administration.

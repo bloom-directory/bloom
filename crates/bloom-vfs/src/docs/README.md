@@ -91,6 +91,7 @@ transaction was not submitted.
 | Operation | Route / procedure |
 |---|---|
 | Register wallet | `wallets/new`; [wallet creation](./examples.md#creating-a-wallet) |
+| Recover wallet | `wallets/recover`; [recovery](./examples.md#recovering-a-wallet) |
 | EVM transaction | `wallets/<wallet>/0/chains/<chain>/outbox/new.tx`; [Anvil workflow](./examples.md#local-anvil-transaction) |
 | Solana transaction | Same outbox shape with strict JSON; [Solana workflow](./examples.md#solana-account-aware-reads-and-transfer) |
 | Update policy | `wallets/<wallet>/policy.json`; [policy workflow](./examples.md#updating-wallet-policy) |
@@ -102,10 +103,13 @@ Wallet registration is asynchronous and does not create a local wallet.
 Read `wallets/registrations/<petname>/status.json`, verify `requested_name`,
 complete the human ceremony, then check `COMPLETED` and `result.json`.
 Mnemonic and raw-key input stays in the Broker-hosted browser ceremony.
+Recovery ID and secret input likewise stays in the Browser ceremony; start it
+with only the wallet name at `wallets/recover`, then inspect
+`wallets/recoveries/<petname>/status.json`.
 
 For a transaction requiring fresh approval, inspect the same action's
 `approval_challenge.json`, verify its identity and expiry, and retry its exact
-`retry_path` only after the human approves. Read the resulting state and
+`retry_path` once its live `state` is `active`. Read the resulting state and
 receipt before reporting success; never restage merely because a pending path
 disappeared.
 

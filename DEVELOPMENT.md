@@ -203,6 +203,94 @@ scripts/triad-dev-launch.sh \
 Record the actual checkout revisions and dirty state as described under
 [Cross-repository changes](#cross-repository-changes).
 
+### Hosted-relay developer acceptance
+
+On macOS, a `triad-dev-harness` build can provision a disposable hosted relay
+installation without elevating the test services. By default the launcher
+trusts the same public pins the signed release payload ships,
+`packaging/triad/relay/control-ca.pem` and `receipt-public-key.hex` (see
+[hosted relay trust](./packaging/triad/relay/README.md)). They are public, so
+they live in the repository. To target another relay, set both
+`BLOOM_TRIAD_DEV_RELAY_CONTROL_CA_FILE` and
+`BLOOM_TRIAD_DEV_RELAY_RECEIPT_KEY_FILE`; setting only one fails.
+
+```sh
+BLOOM_TRIAD_DEV_MACHINE_CONFIG=/path/to/disposable-machine.toml \
+BLOOM_INTEGRATION_MACHINE_BIN=/path/to/candidate/bloom \
+BLOOM_INTEGRATION_BROKER_BIN=/path/to/candidate/bloom-broker \
+BLOOM_INTEGRATION_SIGNER_BIN=/path/to/candidate/bloom-signer \
+scripts/triad-dev-launch.sh \
+  --developer-root /tmp/relay-dev \
+  --machine-home /tmp/relay-dev/machine-home \
+  --machine-socket /tmp/relay-dev/machine.sock \
+  --log-dir /tmp/relay-dev/logs \
+  --ready-file /tmp/relay-dev/ready \
+  --hosted-relay
+```
+
+The receipt pin is 64 lowercase hexadecimal characters. The launcher creates
+owner-private relay configuration and a separate private administrative socket;
+Signer creates the administrator identity and scoped Broker credentials. The
+development exception requires the compiled harness feature and validated
+same-UID developer identity/manifest. Production administration remains root-only.
+`--hosted-relay` is explicit and requires both trust pins and the complete
+Triad; it cannot be combined with `--services-only`. The launcher first checks
+authenticated Triad health, then uses the exact candidate Signer administrator
+to provision and wait for effective remote mode, TLS, and routing before
+publishing readiness. Without the flag, the launcher does not initiate
+provisioning or wait for remote readiness; it preserves any existing exposure
+state, even when trust pins are supplied. Set
+`BLOOM_TRIAD_DEV_RELAY_TIMEOUT_SECONDS` to change the 300-second upper bound.
+The relay operator must open a bounded enrollment window for the first
+provisioning run; close it after provisioning.
+
+Source the generated `triad.env` to inspect status or administer the selected
+Signer explicitly:
+
+```sh
+/path/to/candidate/bloom-signer admin status --signer-uid "$(id -u)"
+```
+
+Use `bloom-signer admin --help` for the administrative interface. In the dev
+harness, `--signer-uid` uses the sourced environment paths and validated
+developer identity; no elevation is needed. Installed administration instead
+uses `--login-uid UID` and explicit elevation of the platform's installed
+Signer binary. The installer invokes that same interface inside its existing
+root step. There is no separate administration wrapper or automatic elevation.
+
+For manual provisioning without `--hosted-relay`, run `admin provision` with
+the same binary and UID while enrollment is open, then poll `admin status`.
+A certificate-pending response is not readiness. The hostname and administrator
+operation survive retry/restart; do not delete their state to work around an
+error. Restarts reject changed public trust pins for an existing relay
+configuration. If an administrator has selected `localhost_only`, the hosted
+launcher stops with an actionable error and does not change that choice.
+
+The opt-in `scripts/test-remote-relay-approval.sh TRIAD_ENV ANVIL_RPC RUN_DIR`
+uses Broker's debug driver to register a remote test wallet, authorize policy,
+activate a remote Sealed Approval, and separately execute one transfer on a
+loopback Anvil chain (chain ID 31337). Set `BLOOM_REMOTE_RELAY_E2E=1`; use a new
+run directory and a dedicated chain. Set `BLOOM_INTEGRATION_DEBUG_DRIVER_BIN`
+to the exact candidate Broker debug driver; its digest is recorded with the
+evidence. The test also requires curl with HTTP/2 support to check browser
+landing-page navigation. The driver verifies public HTTPS normally
+and sends genuine WebAuthn proofs with the assigned origin/RP ID. It does not
+bypass certificate validation or substitute localhost for the remote ceremony.
+No NFS mount is required. Test state is retained for inspection and explicit
+cleanup; never use this fixture wallet or virtual authenticator for real funds.
+
+Set `BLOOM_REMOTE_RECOVERY_E2E=1` to extend this check with VFS-initiated
+recovery, a replacement virtual passkey, and approval using that replacement.
+Recovery records remain in exclusive mode-0600 files outside Machine's home;
+they are test-only browser output and must not be published with evidence.
+The check verifies retry reuse, unchanged wallet address, terminal projections,
+and removal of public recovery initiation.
+
+The bare `/` route always redirects to `https://bloom.directory`; there is no
+landing-page configuration. Remote launch URLs use `/ceremony/#cap=…`, and
+local/remote browser reloads use `/ceremony/` independently of the root redirect.
+The acceptance check verifies the redirect and its empty body.
+
 ### Sharing a host with other candidates
 
 The examples use fixed paths. Before running another candidate, give it a
@@ -220,6 +308,15 @@ custody triad keeps `18734`. Pass the port explicitly; the launcher uses
   socket, logs, ready file, and optional mount.
 - Candidate B: `--ceremony-port 28736` with different paths.
 - Installed custody: leave `18734` and all installed units alone.
+
+A candidate that serves a hosted-relay surface also needs its own loopback
+relay upstream, where the Broker receives streams from the relay tunnel. The
+launcher selects `--remote-upstream-port PORT`, otherwise
+`BLOOM_TRIAD_DEV_REMOTE_UPSTREAM_PORT`, otherwise `18735` for the custody
+ceremony port and the ceremony port plus 10000 (minus 10000 above 55535) for
+any other. Candidates A and B therefore default to `38735` and `38736`. The
+upstream must differ from the ceremony port. The Broker binds it only while a
+relay surface is active.
 
 The example ports are choices, not reservations. If one is occupied, choose
 another. A fresh-root launch on an occupied port fails and cleans up only its
@@ -415,13 +512,15 @@ The launcher's optional controls are:
 | `BLOOM_TRIAD_DEV_BUILD_PETALS` | Set to `0` only for already-built reviewed Petals |
 | `BLOOM_TRIAD_DEV_SOCKET_TIMEOUT_SECONDS` | Positive launcher socket timeout |
 | `BLOOM_TRIAD_DEV_CEREMONY_PORT` | Ceremony listener port when `--ceremony-port` is absent |
+| `BLOOM_TRIAD_DEV_REMOTE_UPSTREAM_PORT` | Hosted-relay loopback upstream port when `--remote-upstream-port` is absent |
 
 The launcher also accepts `--ceremony-port PORT`. The selected port is the
 explicit flag, otherwise `BLOOM_TRIAD_DEV_CEREMONY_PORT` when set, otherwise
 `18734`. A malformed value fails during argument validation before any build
 or config change. Every launch rewrites the selected numeric `ceremony_port`
 into both the Broker and Signer configs, so reusing a stopped root never keeps
-a silently different old value.
+a silently different old value. The same holds for `--remote-upstream-port`,
+which the launcher writes as `remote_upstream_port` into the Broker config.
 
 Binary overrides are covered [above](#test-the-binaries-you-intended);
 test-specific variables are in [TESTING.md](./TESTING.md#environment-variables).

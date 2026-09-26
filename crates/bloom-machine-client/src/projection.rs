@@ -7,7 +7,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
@@ -26,10 +26,6 @@ use crate::MachineBrokerClient;
 const CACHE_SCHEMA: &str = "bloom.machine-wallet-projections.v1";
 const SOURCE_PROTOCOL: &str = "bloom.machine-broker.v1";
 const LIVE_REFRESH_FRESHNESS_MS: u64 = 30_000;
-// Kernel-mounted reads commonly render the same dynamic file for GETATTR and
-// then READ. Coalesce only that burst; authority changes remain observable on
-// the next ordinary interaction rather than waiting for the stale-read TTL.
-const LIVE_REFRESH_COALESCE_MS: u64 = 100;
 static TEMPORARY_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -262,6 +258,17 @@ impl FileProjectionStore {
         Ok(cache)
     }
 
+    fn replace_after_wallet_refresh(
+        &self,
+        projection: WalletProjection,
+        _refresh_lock: &ProjectionRefreshLock,
+    ) -> Result<ProjectionCache, ProtocolError> {
+        let mut cache = self.load()?;
+        cache.apply_wallet_refresh(projection)?;
+        self.save_unlocked(&cache)?;
+        Ok(cache)
+    }
+
     fn begin_legacy_migration(
         &self,
         operation_id: &OperationId,
@@ -314,6 +321,9 @@ pub struct CachedWalletProjectionReader {
     store: FileProjectionStore,
     cache: Arc<Mutex<ProjectionCache>>,
     last_live_refresh_ms: Arc<AtomicU64>,
+    /// When each wallet was last observed by a single-wallet refresh.
+    wallet_refreshed_ms: Arc<Mutex<BTreeMap<String, u64>>>,
+    max_age_ms: u64,
 }
 
 impl CachedWalletProjectionReader {
@@ -327,11 +337,96 @@ impl CachedWalletProjectionReader {
             store,
             cache: Arc::new(Mutex::new(cache)),
             last_live_refresh_ms: Arc::new(AtomicU64::new(0)),
+            wallet_refreshed_ms: Arc::new(Mutex::new(BTreeMap::new())),
+            max_age_ms: 0,
         })
+    }
+
+    /// Reuse a live refresh for `max_age` instead of observing Broker on every
+    /// read. One kernel-mounted command issues many LOOKUP, GETATTR and READ
+    /// calls, and each refresh observes every wallet with several Broker
+    /// requests, so reuse keeps interactive use inside Broker's request quota.
+    /// The projection is display state, never authority. Zero, the default,
+    /// observes Broker on every read.
+    pub fn with_max_age(mut self, max_age: Duration) -> Self {
+        self.max_age_ms = duration_ms(max_age);
+        self
     }
 
     pub fn broker(&self) -> Option<&MachineBrokerClient> {
         self.broker.as_ref()
+    }
+
+    /// Observe one wallet's keys, credentials, policy and accounts.
+    async fn observe_wallet(
+        broker: &MachineBrokerClient,
+        wallet: WalletPublic,
+    ) -> Result<WalletProjection, ProtocolError> {
+        let wallet_id = wallet.wallet_id.clone();
+        let mut keys = broker.keys(wallet_id.clone()).await?;
+        let mut described = keys
+            .iter()
+            .map(|key| serde_json::to_string(&key.key_ref))
+            .collect::<Result<BTreeSet<_>, _>>()
+            .map_err(|error| invalid_projection(format!("encode Broker key reference: {error}")))?;
+        for key_ref in &wallet.key_refs {
+            let encoded = serde_json::to_string(key_ref).map_err(|error| {
+                invalid_projection(format!("encode wallet key reference: {error}"))
+            })?;
+            if described.contains(&encoded) {
+                continue;
+            }
+            let key = broker
+                .key(KeyRequest {
+                    key_ref: key_ref.clone(),
+                })
+                .await?;
+            if key.key_ref != *key_ref {
+                return Err(invalid_projection(format!(
+                    "Broker returned a different key for wallet {}",
+                    wallet_id.as_str()
+                )));
+            }
+            described.insert(encoded);
+            keys.push(key);
+        }
+        let credentials = broker.credentials(wallet_id.clone()).await?;
+        let policy = broker.policy(wallet_id.clone()).await?;
+        // A wallet the Broker refuses to characterise (no root key and no
+        // active derived key, or legacy BIP-32 custody) is still a wallet:
+        // keep it mounted with the reason recorded, so one such wallet
+        // never blocks every sibling's `/wallets` tree. Only that verdict
+        // about this wallet's own custody shape is contained. Everything
+        // else, a transport failure or a Signer/Broker disagreement about
+        // the live registry, still fails the refresh, so nothing is served
+        // on a broken edge.
+        let (accounts, accounts_unavailable) = match broker.wallet_accounts(wallet_id.clone()).await
+        {
+            Ok(accounts) => (accounts, None),
+            Err(error) if error.code == ProtocolErrorCode::BackendUnsupported => {
+                tracing::warn!(
+                    wallet_id = %wallet_id.as_str(),
+                    protocol_error_code = error.code.as_str(),
+                    message = %error.message,
+                    "Broker cannot project this wallet's account inventory; \
+                     mounting it without numbered accounts"
+                );
+                (
+                    empty_wallet_accounts(wallet_id.clone()),
+                    Some(format!("{}: {}", error.code.as_str(), error.message)),
+                )
+            }
+            Err(error) => return Err(error),
+        };
+        build_projection(
+            wallet,
+            keys,
+            credentials,
+            policy,
+            accounts,
+            accounts_unavailable,
+            now_ms()?,
+        )
     }
 
     async fn observe_wallets(
@@ -347,72 +442,7 @@ impl CachedWalletProjectionReader {
                     wallet_id.as_str()
                 )));
             }
-            let mut keys = broker.keys(wallet_id.clone()).await?;
-            let mut described = keys
-                .iter()
-                .map(|key| serde_json::to_string(&key.key_ref))
-                .collect::<Result<BTreeSet<_>, _>>()
-                .map_err(|error| {
-                    invalid_projection(format!("encode Broker key reference: {error}"))
-                })?;
-            for key_ref in &wallet.key_refs {
-                let encoded = serde_json::to_string(key_ref).map_err(|error| {
-                    invalid_projection(format!("encode wallet key reference: {error}"))
-                })?;
-                if described.contains(&encoded) {
-                    continue;
-                }
-                let key = broker
-                    .key(KeyRequest {
-                        key_ref: key_ref.clone(),
-                    })
-                    .await?;
-                if key.key_ref != *key_ref {
-                    return Err(invalid_projection(format!(
-                        "Broker returned a different key for wallet {}",
-                        wallet_id.as_str()
-                    )));
-                }
-                described.insert(encoded);
-                keys.push(key);
-            }
-            let credentials = broker.credentials(wallet_id.clone()).await?;
-            let policy = broker.policy(wallet_id.clone()).await?;
-            // A wallet the Broker refuses to characterise (no root key and no
-            // active derived key, or legacy BIP-32 custody) is still a wallet:
-            // keep it mounted with the reason recorded, so one such wallet
-            // never blocks every sibling's `/wallets` tree. Only that verdict
-            // about this wallet's own custody shape is contained. Everything
-            // else, a transport failure or a Signer/Broker disagreement about
-            // the live registry, still fails the refresh, so nothing is served
-            // on a broken edge.
-            let (accounts, accounts_unavailable) =
-                match broker.wallet_accounts(wallet_id.clone()).await {
-                    Ok(accounts) => (accounts, None),
-                    Err(error) if error.code == ProtocolErrorCode::BackendUnsupported => {
-                        tracing::warn!(
-                            wallet_id = %wallet_id.as_str(),
-                            protocol_error_code = error.code.as_str(),
-                            message = %error.message,
-                            "Broker cannot project this wallet's account inventory; \
-                             mounting it without numbered accounts"
-                        );
-                        (
-                            empty_wallet_accounts(wallet_id.clone()),
-                            Some(format!("{}: {}", error.code.as_str(), error.message)),
-                        )
-                    }
-                    Err(error) => return Err(error),
-                };
-            let projection = build_projection(
-                wallet,
-                keys,
-                credentials,
-                policy,
-                accounts,
-                accounts_unavailable,
-                now_ms()?,
-            )?;
+            let projection = Self::observe_wallet(broker, wallet).await?;
             observed.insert(wallet_id.as_str().to_owned(), projection);
         }
         Ok(observed)
@@ -426,12 +456,22 @@ impl CachedWalletProjectionReader {
         // Serialize the observation as well as the commit. Otherwise an older
         // full-list response can arrive after a newer process has cached a
         // newly-created wallet and incorrectly tombstone it.
+        let requested_at = now_ms()?;
         let store = self.store.clone();
         let refresh_lock = tokio::task::spawn_blocking(move || store.acquire_refresh_lock())
             .await
             .map_err(|error| {
                 unavailable(format!("join Machine projection lock task: {error}"))
             })??;
+        // Readers queued behind a refresh that completed while they waited
+        // share its result instead of each observing every wallet again.
+        if self.max_age_ms > 0 && self.last_live_refresh_ms.load(Ordering::SeqCst) >= requested_at {
+            let cache = self
+                .cache
+                .lock()
+                .map_err(|_| unavailable("Machine projection cache mutex poisoned"))?;
+            return Ok(cache.live(false));
+        }
         let baseline = self.store.load()?;
         let mut observed = Self::observe_wallets(broker).await?;
         let mut completed_migrations = BTreeMap::new();
@@ -508,7 +548,10 @@ impl CachedWalletProjectionReader {
 
     async fn refresh_coalesced(&self) -> Result<Vec<WalletProjection>, ProtocolError> {
         let refreshed_at = self.last_live_refresh_ms.load(Ordering::SeqCst);
-        if refreshed_at != 0 && now_ms()?.saturating_sub(refreshed_at) <= LIVE_REFRESH_COALESCE_MS {
+        if self.max_age_ms > 0
+            && refreshed_at != 0
+            && now_ms()?.saturating_sub(refreshed_at) <= self.max_age_ms
+        {
             let cache = self
                 .cache
                 .lock()
@@ -516,6 +559,115 @@ impl CachedWalletProjectionReader {
             return Ok(cache.live(false));
         }
         self.refresh().await
+    }
+
+    /// When `wallet_id` was last observed, by a full or single-wallet refresh.
+    fn wallet_refreshed_at(&self, wallet_id: &Token) -> Result<u64, ProtocolError> {
+        let single = self
+            .wallet_refreshed_ms
+            .lock()
+            .map_err(|_| unavailable("Machine projection freshness mutex poisoned"))?
+            .get(wallet_id.as_str())
+            .copied()
+            .unwrap_or(0);
+        Ok(single.max(self.last_live_refresh_ms.load(Ordering::SeqCst)))
+    }
+
+    fn cached_live_wallet(
+        &self,
+        wallet_id: &Token,
+    ) -> Result<Option<WalletProjection>, ProtocolError> {
+        let cache = self
+            .cache
+            .lock()
+            .map_err(|_| unavailable("Machine projection cache mutex poisoned"))?;
+        Ok(match cache.wallets.get(wallet_id.as_str()) {
+            Some(CachedWallet::Live(projection)) => Some(projection.clone()),
+            _ => None,
+        })
+    }
+
+    /// Observe only `wallet_id`, so reading one wallet does not cost a Broker
+    /// round trip per wallet. Absence and pending legacy migrations are left
+    /// to the full refresh, which alone may tombstone a wallet.
+    async fn refresh_wallet(
+        &self,
+        wallet_id: &Token,
+    ) -> Result<Option<WalletProjection>, ProtocolError> {
+        let broker = self
+            .broker
+            .as_ref()
+            .ok_or_else(|| unavailable("authenticated Broker edge is unavailable"))?;
+        let requested_at = now_ms()?;
+        let store = self.store.clone();
+        let refresh_lock = tokio::task::spawn_blocking(move || store.acquire_refresh_lock())
+            .await
+            .map_err(|error| {
+                unavailable(format!("join Machine projection lock task: {error}"))
+            })??;
+        if self.max_age_ms > 0 && self.wallet_refreshed_at(wallet_id)? >= requested_at {
+            return self.cached_live_wallet(wallet_id);
+        }
+        let migrating = self
+            .store
+            .load()?
+            .pending_legacy_migrations
+            .values()
+            .any(|pending| pending.wallet_id == wallet_id.as_str());
+        let wallet = if migrating {
+            None
+        } else {
+            match broker.wallet(wallet_id.clone()).await {
+                Ok(wallet) => Some(wallet),
+                Err(error) if error.code == ProtocolErrorCode::ApprovalNotFound => None,
+                Err(error) => return Err(error),
+            }
+        };
+        let Some(wallet) = wallet else {
+            drop(refresh_lock);
+            return Ok(self
+                .refresh()
+                .await?
+                .into_iter()
+                .find(|projection| projection.wallet_id() == wallet_id));
+        };
+        if wallet.wallet_id != *wallet_id {
+            return Err(invalid_projection(format!(
+                "Broker returned a different wallet for {}",
+                wallet_id.as_str()
+            )));
+        }
+        let projection = Self::observe_wallet(broker, wallet).await?;
+        let updated = self
+            .store
+            .replace_after_wallet_refresh(projection, &refresh_lock)?;
+        let observed = match updated.wallets.get(wallet_id.as_str()) {
+            Some(CachedWallet::Live(projection)) => Some(projection.clone()),
+            _ => None,
+        };
+        *self
+            .cache
+            .lock()
+            .map_err(|_| unavailable("Machine projection cache mutex poisoned"))? = updated;
+        self.wallet_refreshed_ms
+            .lock()
+            .map_err(|_| unavailable("Machine projection freshness mutex poisoned"))?
+            .insert(wallet_id.as_str().to_owned(), now_ms()?);
+        Ok(observed)
+    }
+
+    async fn refresh_wallet_coalesced(
+        &self,
+        wallet_id: &Token,
+    ) -> Result<Option<WalletProjection>, ProtocolError> {
+        let refreshed_at = self.wallet_refreshed_at(wallet_id)?;
+        if self.max_age_ms > 0
+            && refreshed_at != 0
+            && now_ms()?.saturating_sub(refreshed_at) <= self.max_age_ms
+        {
+            return self.cached_live_wallet(wallet_id);
+        }
+        self.refresh_wallet(wallet_id).await
     }
 
     fn cached(&self) -> Result<Vec<WalletProjection>, ProtocolError> {
@@ -536,7 +688,7 @@ impl CachedWalletProjectionReader {
 #[async_trait]
 impl WalletProjectionReader for CachedWalletProjectionReader {
     async fn list_wallets(&self) -> Result<Vec<WalletProjection>, ProtocolError> {
-        match self.refresh().await {
+        match self.refresh_coalesced().await {
             Ok(projections) => Ok(projections),
             Err(error) if error.code == ProtocolErrorCode::ServiceUnavailable => {
                 tracing::warn!(
@@ -550,14 +702,13 @@ impl WalletProjectionReader for CachedWalletProjectionReader {
     }
 
     async fn get_wallet(&self, wallet_id: &Token) -> Result<WalletProjection, ProtocolError> {
-        let broker_error = match self.refresh_coalesced().await {
-            Ok(projections) => {
-                return projections
-                    .into_iter()
-                    .find(|projection| projection.wallet_id() == wallet_id)
-                    .ok_or_else(|| {
-                        invalid_projection(format!("wallet {} not found", wallet_id.as_str()))
-                    });
+        let broker_error = match self.refresh_wallet_coalesced(wallet_id).await {
+            Ok(Some(projection)) => return Ok(projection),
+            Ok(None) => {
+                return Err(invalid_projection(format!(
+                    "wallet {} not found",
+                    wallet_id.as_str()
+                )));
             }
             Err(error) if error.code == ProtocolErrorCode::ServiceUnavailable => error,
             Err(error) => return Err(error),
@@ -698,47 +849,7 @@ impl ProjectionCache {
             if authorized_wallets.contains(wallet_id) {
                 continue;
             }
-            match self.wallets.get(wallet_id) {
-                Some(CachedWallet::Live(current))
-                    if candidate.policy.version.get() < current.policy.version.get() =>
-                {
-                    return Err(ProtocolError::new(
-                        ProtocolErrorCode::PolicyBaselineStale,
-                        format!(
-                            "Broker policy version for {wallet_id} rolled back from {} to {}",
-                            current.policy.version.get(),
-                            candidate.policy.version.get()
-                        ),
-                    ));
-                }
-                Some(CachedWallet::Live(current))
-                    if candidate.policy.policy_signing_key_id
-                        != current.policy.policy_signing_key_id
-                        || candidate.policy.policy_verifying_key
-                            != current.policy.policy_verifying_key =>
-                {
-                    return Err(ProtocolError::new(
-                        ProtocolErrorCode::PolicyBaselineStale,
-                        format!("Broker changed the pinned policy key for wallet {wallet_id}"),
-                    ));
-                }
-                Some(CachedWallet::Tombstone {
-                    policy_version,
-                    wallet_revocation_epoch,
-                    ..
-                }) if candidate.policy.version.get() < policy_version.get()
-                    || candidate.wallet.wallet_revocation_epoch.get()
-                        <= wallet_revocation_epoch.get() =>
-                {
-                    return Err(ProtocolError::new(
-                        ProtocolErrorCode::PolicyBaselineStale,
-                        format!(
-                            "Broker attempted to resurrect tombstoned wallet {wallet_id} with a stale policy version or revocation epoch"
-                        ),
-                    ));
-                }
-                _ => {}
-            }
+            self.check_observed(wallet_id, candidate)?;
         }
         for previous in self.wallets.keys().cloned().collect::<Vec<_>>() {
             if !observed.contains_key(&previous) {
@@ -760,6 +871,66 @@ impl ProjectionCache {
             self.wallets
                 .insert(wallet_id, CachedWallet::Live(projection));
         }
+        Ok(())
+    }
+
+    /// Reject an observation that would roll back, re-key or resurrect a wallet.
+    fn check_observed(
+        &self,
+        wallet_id: &str,
+        candidate: &WalletProjection,
+    ) -> Result<(), ProtocolError> {
+        match self.wallets.get(wallet_id) {
+            Some(CachedWallet::Live(current))
+                if candidate.policy.version.get() < current.policy.version.get() =>
+            {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::PolicyBaselineStale,
+                    format!(
+                        "Broker policy version for {wallet_id} rolled back from {} to {}",
+                        current.policy.version.get(),
+                        candidate.policy.version.get()
+                    ),
+                ));
+            }
+            Some(CachedWallet::Live(current))
+                if candidate.policy.policy_signing_key_id
+                    != current.policy.policy_signing_key_id
+                    || candidate.policy.policy_verifying_key
+                        != current.policy.policy_verifying_key =>
+            {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::PolicyBaselineStale,
+                    format!("Broker changed the pinned policy key for wallet {wallet_id}"),
+                ));
+            }
+            Some(CachedWallet::Tombstone {
+                policy_version,
+                wallet_revocation_epoch,
+                ..
+            }) if candidate.policy.version.get() < policy_version.get()
+                || candidate.wallet.wallet_revocation_epoch.get()
+                    <= wallet_revocation_epoch.get() =>
+            {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::PolicyBaselineStale,
+                    format!(
+                        "Broker attempted to resurrect tombstoned wallet {wallet_id} with a stale policy version or revocation epoch"
+                    ),
+                ));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Apply one wallet's observation. Unlike a full refresh it never
+    /// tombstones other wallets; absence is only decided by a full list.
+    fn apply_wallet_refresh(&mut self, projection: WalletProjection) -> Result<(), ProtocolError> {
+        let wallet_id = projection.wallet_id().as_str().to_owned();
+        self.check_observed(&wallet_id, &projection)?;
+        self.wallets
+            .insert(wallet_id, CachedWallet::Live(projection));
         Ok(())
     }
 
@@ -1132,6 +1303,10 @@ fn now_ms() -> Result<u64, ProtocolError> {
         .map_err(|_| unavailable("system time does not fit projection timestamp"))
 }
 
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 fn invalid_projection(message: impl Into<String>) -> ProtocolError {
     ProtocolError::new(ProtocolErrorCode::BackendInvalidRequest, message)
 }
@@ -1167,6 +1342,10 @@ mod tests {
         ceremony_states: Mutex<BTreeMap<String, CeremonyState>>,
         /// Per-wallet `wallet.accounts` refusals.
         accounts_errors: Mutex<BTreeMap<String, ProtocolError>>,
+        /// `wallet.list_public` calls, one per full refresh.
+        list_requests: std::sync::atomic::AtomicUsize,
+        /// `wallet.get_public` calls, one per single-wallet refresh.
+        get_requests: std::sync::atomic::AtomicUsize,
     }
 
     struct BlockingEmptyBroker {
@@ -1203,7 +1382,17 @@ mod tests {
                 custody_results: Mutex::new(BTreeMap::new()),
                 ceremony_states: Mutex::new(BTreeMap::new()),
                 accounts_errors: Mutex::new(BTreeMap::new()),
+                list_requests: 0.into(),
+                get_requests: 0.into(),
             }
+        }
+
+        fn list_requests(&self) -> usize {
+            self.list_requests.load(Ordering::SeqCst)
+        }
+
+        fn get_requests(&self) -> usize {
+            self.get_requests.load(Ordering::SeqCst)
         }
 
         fn set_available(&self, available: bool) {
@@ -1244,7 +1433,22 @@ mod tests {
                     .and_then(|wallet_id| wallets.get(wallet_id))
                     .cloned();
                 match request {
+                    MachineBrokerRequest::WalletGetPublic(WalletRequest { wallet_id }) => {
+                        self.get_requests.fetch_add(1, Ordering::SeqCst);
+                        wallets
+                            .get(wallet_id.as_str())
+                            .map(|value| {
+                                MachineBrokerResponse::WalletGetPublic(value.wallet.clone())
+                            })
+                            .ok_or_else(|| {
+                                ProtocolError::new(
+                                    ProtocolErrorCode::ApprovalNotFound,
+                                    "wallet policy not found",
+                                )
+                            })
+                    }
                     MachineBrokerRequest::WalletListPublic(_) => {
+                        self.list_requests.fetch_add(1, Ordering::SeqCst);
                         Ok(MachineBrokerResponse::WalletListPublic(
                             wallets.values().map(|value| value.wallet.clone()).collect(),
                         ))
@@ -1551,6 +1755,175 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mounted_reads_reuse_a_refresh_within_the_configured_age() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = FileProjectionStore::new(directory.path().join("wallets.json"));
+        let broker = Arc::new(FakeBroker::new(fixture(1)));
+        let reader = CachedWalletProjectionReader::new(
+            Some(MachineBrokerClient::new(broker.clone())),
+            store.clone(),
+        )
+        .unwrap()
+        .with_max_age(Duration::from_millis(200));
+
+        // One mounted command's LOOKUP, GETATTR and READ burst shares one
+        // observation of every wallet.
+        for _ in 0..3 {
+            let listed = reader.list_wallets().await.unwrap();
+            assert_eq!(listed.len(), 1);
+            assert_eq!(listed[0].freshness, ProjectionFreshness::Fresh);
+            let wallet = reader.get_wallet(&token("alice")).await.unwrap();
+            assert_eq!(wallet.freshness, ProjectionFreshness::Fresh);
+        }
+        assert_eq!(broker.list_requests(), 1);
+        assert_eq!(broker.get_requests(), 0);
+
+        // Once the window passes, the next read observes Broker again, and a
+        // single-wallet read observes only that wallet.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        reader.get_wallet(&token("alice")).await.unwrap();
+        assert_eq!(broker.list_requests(), 1);
+        assert_eq!(broker.get_requests(), 1);
+
+        // Zero, the reader default, observes Broker on every read.
+        let uncached = CachedWalletProjectionReader::new(
+            Some(MachineBrokerClient::new(broker.clone())),
+            store,
+        )
+        .unwrap();
+        uncached.list_wallets().await.unwrap();
+        uncached.get_wallet(&token("alice")).await.unwrap();
+        assert_eq!(broker.list_requests(), 2);
+        assert_eq!(broker.get_requests(), 2);
+    }
+
+    #[tokio::test]
+    async fn reading_one_wallet_observes_only_that_wallet() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = FileProjectionStore::new(directory.path().join("wallets.json"));
+        let broker = Arc::new(FakeBroker::new(fixture(1)));
+        broker
+            .wallets
+            .lock()
+            .unwrap()
+            .insert("bob".into(), named_fixture("bob", 1));
+        let reader = CachedWalletProjectionReader::new(
+            Some(MachineBrokerClient::new(broker.clone())),
+            store.clone(),
+        )
+        .unwrap();
+
+        let alice = reader.get_wallet(&token("alice")).await.unwrap();
+        assert_eq!(alice.freshness, ProjectionFreshness::Fresh);
+        assert_eq!((broker.list_requests(), broker.get_requests()), (0, 1));
+
+        // Bob was never observed, so nothing about him was cached or tombstoned.
+        let offline = CachedWalletProjectionReader::new(None, store).unwrap();
+        let cached = offline.cached_wallets().unwrap();
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].wallet_id(), &token("alice"));
+        assert!(offline.get_wallet(&token("bob")).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_missing_wallet_is_decided_by_a_full_refresh_and_stays_tombstoned() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = FileProjectionStore::new(directory.path().join("wallets.json"));
+        let broker = Arc::new(FakeBroker::new(fixture(1)));
+        let reader = CachedWalletProjectionReader::new(
+            Some(MachineBrokerClient::new(broker.clone())),
+            store,
+        )
+        .unwrap();
+        reader.get_wallet(&token("alice")).await.unwrap();
+
+        broker.wallets.lock().unwrap().clear();
+        let error = reader.get_wallet(&token("alice")).await.unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::BackendInvalidRequest);
+        assert_eq!(error.message, "wallet alice not found");
+        assert_eq!(
+            broker.list_requests(),
+            1,
+            "only a full list may decide that a wallet is gone"
+        );
+
+        broker
+            .wallets
+            .lock()
+            .unwrap()
+            .insert("alice".into(), fixture(1));
+        let resurrection = reader.get_wallet(&token("alice")).await.unwrap_err();
+        assert_eq!(resurrection.code, ProtocolErrorCode::PolicyBaselineStale);
+    }
+
+    #[tokio::test]
+    async fn a_single_wallet_read_rejects_policy_rollback() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = FileProjectionStore::new(directory.path().join("wallets.json"));
+        let broker = Arc::new(FakeBroker::new(fixture(2)));
+        let reader = CachedWalletProjectionReader::new(
+            Some(MachineBrokerClient::new(broker.clone())),
+            store.clone(),
+        )
+        .unwrap();
+        reader.get_wallet(&token("alice")).await.unwrap();
+        broker
+            .wallets
+            .lock()
+            .unwrap()
+            .insert("alice".into(), fixture(1));
+
+        let error = reader.get_wallet(&token("alice")).await.unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::PolicyBaselineStale);
+        assert_eq!(broker.list_requests(), 0);
+        let cached = CachedWalletProjectionReader::new(None, store)
+            .unwrap()
+            .get_wallet(&token("alice"))
+            .await
+            .unwrap();
+        assert_eq!(cached.policy.version.get(), 2);
+    }
+
+    #[tokio::test]
+    async fn readers_queued_behind_a_refresh_share_its_result() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = FileProjectionStore::new(directory.path().join("wallets.json"));
+        let entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let reader = CachedWalletProjectionReader::new(
+            Some(MachineBrokerClient::new(Arc::new(BlockingEmptyBroker {
+                entered: entered.clone(),
+                release: release.clone(),
+            }))),
+            store,
+        )
+        .unwrap()
+        .with_max_age(Duration::from_millis(1));
+
+        let spawn_list = || {
+            let reader = reader.clone();
+            tokio::spawn(async move { reader.list_wallets().await })
+        };
+        let first = spawn_list();
+        entered.acquire().await.unwrap().forget();
+        let queued = (0..3).map(|_| spawn_list()).collect::<Vec<_>>();
+        // Let the queued readers wait on the refresh lock and outlast the reuse
+        // window, so only sharing the in-flight result avoids new observations.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        release.add_permits(4);
+
+        assert!(first.await.unwrap().unwrap().is_empty());
+        for reader in queued {
+            assert!(reader.await.unwrap().unwrap().is_empty());
+        }
+        assert_eq!(
+            entered.available_permits(),
+            0,
+            "queued readers must not observe Broker again"
+        );
+    }
+
+    #[tokio::test]
     async fn tombstones_deleted_wallets_and_never_resurrects_them_offline() {
         let directory = tempfile::tempdir().unwrap();
         let store = FileProjectionStore::new(directory.path().join("wallets.json"));
@@ -1772,6 +2145,62 @@ mod tests {
     }
 
     #[test]
+    fn schema1_credentials_load_but_surface_projections_require_schema2_reader() {
+        // Serialize with the actual released API, not a current object with
+        // its version marker changed. The surrounding cache format is stable.
+        let old: schema1_broker_api::CredentialPublic = serde_json::from_value(serde_json::json!({
+            "credential_id": "CwsLCwsLCwsLCwsLCwsLCw",
+            "wallet_id": "alice",
+            "created_at_ms": "1",
+            "state": "ACTIVE"
+        }))
+        .unwrap();
+        let legacy_bytes = serde_json::to_vec(&old).unwrap();
+        let credential: CredentialPublic = serde_json::from_slice(&legacy_bytes).unwrap();
+        assert!(credential.surface.is_none());
+        let mut fixture = migrated_fixture();
+        fixture.credentials = vec![credential];
+        let mut projection = build_projection(
+            fixture.wallet,
+            fixture.keys,
+            fixture.credentials,
+            fixture.policy,
+            empty_wallet_accounts(token("alice")),
+            None,
+            1,
+        )
+        .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("wallet-projections.json");
+        let mut cache = ProjectionCache::empty();
+        cache
+            .wallets
+            .insert("alice".into(), CachedWallet::Live(projection.clone()));
+        fs::write(&path, serde_json::to_vec(&cache).unwrap()).unwrap();
+        FileProjectionStore::new(&path).load().unwrap();
+
+        // A new Broker refresh persists a surface, including for local-only
+        // credentials. The released reader rejects this added field.
+        projection.credentials[0].surface = migrated_fixture().credentials[0].surface.clone();
+        projection.response_digest = projection_digest(
+            &projection.wallet,
+            &projection.keys,
+            &projection.credentials,
+            &projection.policy,
+        )
+        .unwrap();
+        let updated = serde_json::to_vec(&projection.credentials[0]).unwrap();
+        let error =
+            serde_json::from_slice::<schema1_broker_api::CredentialPublic>(&updated).unwrap_err();
+        assert!(error.to_string().contains("unknown field `surface`"));
+        cache
+            .wallets
+            .insert("alice".into(), CachedWallet::Live(projection));
+        fs::write(&path, serde_json::to_vec(&cache).unwrap()).unwrap();
+        FileProjectionStore::new(&path).load().unwrap();
+    }
+
+    #[test]
     fn legacy_reconciliation_cache_field_upgrades_to_completed_migrations() {
         let operation_id = OperationId::from_bytes([14; 32]);
         let mut value = serde_json::json!({
@@ -1826,16 +2255,20 @@ mod tests {
     }
 
     fn fixture(version: u64) -> ProjectionFixture {
-        let wallet_id = token("alice");
+        named_fixture("alice", version)
+    }
+
+    fn named_fixture(name: &str, version: u64) -> ProjectionFixture {
+        let wallet_id = token(name);
         let key_ref = KeyRef {
             backend: token("local"),
             backend_instance: token("primary"),
-            locator: "alice/root".into(),
+            locator: format!("{name}/root"),
             key_spec: KeySpec::Secp256k1,
             public_key_fingerprint: Digest32::from_bytes([3; 32]),
             derivation: None,
         };
-        let policy_bytes = br#"{"wallet_id":"alice"}"#.to_vec();
+        let policy_bytes = format!(r#"{{"wallet_id":"{name}"}}"#).into_bytes();
         let policy_digest = Digest32::from_bytes(Sha256::digest(&policy_bytes).into());
         ProjectionFixture {
             wallet: WalletPublic {
@@ -1889,6 +2322,10 @@ mod tests {
             signer_signature: Base64UrlBytes::from_bytes(&[10; 64]),
         };
         fixture.credentials = vec![CredentialPublic {
+            surface: Some(bloom_broker_api::CeremonySurfaceRef {
+                surface_id: bloom_broker_api::Token::new("local").unwrap(),
+                identity_digest: bloom_broker_api::Digest32::from_bytes([0; 32]),
+            }),
             credential_id: Base64UrlBytes::from_bytes(&[11; 16]),
             wallet_id: token("alice"),
             created_at_ms: DecimalU64::new(1),
@@ -1899,6 +2336,11 @@ mod tests {
 
     fn migration_result(operation_id: OperationId, fixture: &ProjectionFixture) -> CustodyResult {
         CustodyResult {
+            surface: Some(bloom_broker_api::CeremonySurfaceRef {
+                surface_id: bloom_broker_api::Token::new("local").unwrap(),
+                identity_digest: bloom_broker_api::Digest32::from_bytes([0; 32]),
+            }),
+            credential_authority_generation: Some(bloom_broker_api::DecimalU64::new(0)),
             ceremony_kind: CeremonyKind::WalletImport,
             custody_operation_id: operation_id,
             public_status: CeremonyState::Succeeded,
@@ -1911,8 +2353,12 @@ mod tests {
                     .expect("legacy migration fixture has a root signing key"),
             ],
             credential_summaries: vec![CredentialSummary {
+                surface: Some(bloom_broker_api::CeremonySurfaceRef {
+                    surface_id: bloom_broker_api::Token::new("local").unwrap(),
+                    identity_digest: bloom_broker_api::Digest32::from_bytes([0; 32]),
+                }),
                 credential_id: Base64UrlBytes::from_bytes(&[11; 16]),
-                rp_id: token("localhost"),
+                rp_id: bloom_broker_api::RpId::new("localhost").unwrap(),
                 active: true,
             }],
             initial_policy: Some(fixture.policy.clone()),

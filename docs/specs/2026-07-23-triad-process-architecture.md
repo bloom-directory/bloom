@@ -982,7 +982,8 @@ advertises an empty set, and every reusable approval on that build operates at
 
 Broker owns:
 
-- the loopback HTTP listener and stable browser origin;
+- the canonical loopback HTTP listener and the assigned remote HTTPS listener;
+- TLS termination, certificate keys and the outbound blind-relay tunnel;
 - embedded static HTML, JavaScript, CSS, and images;
 - ceremony URL/session tokens;
 - canonical plan rendering;
@@ -1034,7 +1035,7 @@ them against the payload, and that a compromised Petal or Machine can consume
 the full remaining capacity. Where a verifier is present, fields inside and
 outside its contract are rendered as visibly distinct categories.
 
-The initial origin is:
+The canonical localhost surface remains active in both exposure modes:
 
 ```text
 listener = 127.0.0.1:18734
@@ -1051,6 +1052,33 @@ falls back to another port, and Machine never proxies or re-hosts the ceremony
 surface. This prevents a local process from pre-empting the canonical origin;
 it does not prevent a same-RP-ID listener on a *different* port, which remains
 the accepted residual recorded in section 6.
+
+Remote ceremonies extend this application at exactly one immutable assigned
+`https://<random>.relay.bloom.directory` origin, with the exact hostname as RP
+ID. Only privileged Signer administration can enroll that identity. Neither
+Browser, Machine nor ordinary Broker requests can create an origin. Custom
+origins, LAN/VPN origins and alternate relays are outside v1. Broker terminates
+Browser TLS; relay forwards opaque bytes only to Broker's fixed ceremony
+listener, with no access to authority RPC or administrative sockets.
+
+Signer owns desired exposure and monotonic revisions. Broker reconciles them
+and reports effective listener/tunnel readiness over the existing authenticated
+Broker-to-Signer edge. Enabling activates remote ceremonies only after valid
+TLS and external routing readiness for that revision. Disabling immediately
+fences remote commits and completes only after Broker confirms closure. The
+localhost-only preflight atomically checks every active passkey-dependent
+wallet for a local credential; unknown backend requirements fail closed.
+Credential coverage does not prove continued possession of an authenticator.
+Exposure changes never revoke credentials or previously activated approvals.
+
+Remote launch uses a 256-bit single-use fragment capability whose verifier is
+stored by Broker. First-party code removes and exchanges the fragment over TLS
+for a ceremony-scoped host-only `__Host-` cookie with `Secure; HttpOnly;
+SameSite=Strict; Path=/`. Every operation, including result retrieval and
+acknowledgement, is bound to its own session and leg. Concurrent ceremonies
+must not share authorization through one cookie. Local HTTP retains its
+existing session mechanism. No capability goes into logs, telemetry, initial
+HTTP requests or durable browser storage.
 
 Every request requires exact Host. Mutations require exact Origin, JSON
 content type, Fetch Metadata `same-origin`, and a single-use 256-bit session
@@ -1197,8 +1225,10 @@ SealedApprovalPrepareResponse {
 }
 ```
 
-`ceremony_url` is the Broker-owned
-`http://localhost:18734/ceremony/<single-use-token>` launch URL.
+`ceremony_url` is the Broker-owned localhost launch URL or the assigned
+HTTPS remote launch URL with a single-use fragment capability. Machine carries
+the complete returned URL without changing its origin, path or fragment; it
+never selects an origin from a browser claim or constructs its own launch URL.
 `ceremony_expires_at` is the Broker session expiry and is no later than the
 Signer contribution or immutable approval expiry. The URL is an owner-readable
 launch secret: it may appear in the originating VFS status projection and CLI
@@ -1346,6 +1376,7 @@ WalletCredentialRecord {
   credential_id
   public_key
   rp_id
+  surface_identity_digest
   user_handle
   prf_salt
   wrapped_wkek
@@ -1459,6 +1490,28 @@ registration retry never creates two wallets under one operation ID.
 
 ### 13.4 Adding, replacing, and removing passkeys
 
+Each credential belongs to one immutable Signer-approved surface. Options
+include only eligible credentials for the selected surface; user handles are
+stable per wallet/surface and distinct between surfaces. Legacy localhost
+migration preserves existing RP IDs, user handles and wrap AAD. Mutable
+surface lifecycle has a separate revision from immutable identity. Signed
+contributions, challenges, completions, receipts and audit bind the surface
+identity digest and wallet credential-authority generation, with eligibility
+rechecked at prepare and commit.
+
+For cross-origin addition, a destination browser first pairs a fresh ephemeral
+proof-of-possession key and non-authoritative session. Source authorization
+binds that exact destination session/key, wallet, Signer, both surfaces, exact
+credential-add terms and absolute deadline. Only then may destination
+credential creation and enrollment proceed. The handoff is bearer enrollment
+authority additionally constrained by the paired key; losing that key requires
+restarting both legs. Independent capabilities, one-use proof challenges and
+exact retries prevent substitution or replay in either local-to-remote or
+remote-to-local direction. Intermediate PRF/WKEK stays only in protected,
+zeroized volatile Signer memory; restart durably fails incomplete attempts.
+Committed results remain reconcilable.
+
+
 Adding a passkey is authority-changing and uses one Broker ceremony with two
 bound WebAuthn phases:
 
@@ -1499,8 +1552,29 @@ excluding policy version for the same reason. When all
 passkeys are unavailable, `wallet_recovery` uses the
 recovery factor as its root authentication instead of pretending an existing
 WebAuthn assertion is available. The common Broker UI then creates and verifies
-a new passkey, and Signer activates it before optionally revoking lost
-credentials. Recovery never changes wallet root or derived addresses.
+a new passkey. Successful recovery atomically activates that replacement,
+revokes every prior credential across both surfaces, rotates the recovery
+ID/secret/wrap and advances a wallet credential-authority generation. Every
+pending passkey-authorized completion checks that generation, including
+unfinished approval proofs. Already activated approvals retain their existing
+policy, expiry and revocation rules. Recovery never changes wallet root or
+derived addresses.
+
+An owner starts recovery through the authenticated Machine-to-Broker
+`recovery.prepare` request using only the wallet name. Machine exposes the
+returned one-use ceremony URL under `wallets/recoveries/<name>/status.json`;
+the recovery ID and secret are entered only in the Broker-hosted Browser
+ceremony. Broker does not expose a public recovery bootstrap endpoint or a
+wallet-name probe. The bare root always redirects to `https://bloom.directory`
+without wallet identity or recovery capability; this is not configurable.
+Ceremony launches and reloads use their dedicated routes. Recovery preparation and completion use
+bounded resource and attempt admission; unauthenticated Browser attempts
+must not permanently lock out a wallet. Failed or expired recovery never
+rotates the factor. Exact committed retries return the same encrypted result
+for a bounded period, only to the original Browser recipient binding. Losing
+that key does not permit re-encryption or an implicit recovery-factor reset.
+The replacement passkey remains usable for normal credential management.
+Disabled or tombstoned surfaces cannot receive recovery.
 
 If every passkey is lost and no valid recovery factor exists, the wallet is
 unrecoverable by design. Broker, Signer metadata, PRF salts, and WebAuthn public

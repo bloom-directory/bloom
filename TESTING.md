@@ -134,6 +134,35 @@ Use disposable test inputs. Import/transfer suites require `anvil`, `cast`,
 and the selected `BLOOM_INTEGRATION_*_BIN` binaries. Successful fixture
 signing does not replace these service-boundary checks.
 
+The launcher readiness state machine has a fixture-only regression check that
+uses no relay infrastructure: `scripts/test-triad-dev-hosted-relay.sh`. CI runs
+it in the static checks job. `BLOOM_TRIAD_DEV_RELAY_TIMEOUT_SECONDS` controls
+the hosted launcher wait and defaults to 300 seconds.
+
+For an already provisioned disposable hosted-relay Triad, run:
+
+```sh
+BLOOM_INTEGRATION_DEBUG_DRIVER_BIN=/path/to/candidate/bloom-broker-debug-driver \
+BLOOM_REMOTE_RELAY_E2E=1 scripts/test-remote-relay-approval.sh \
+  /path/to/logs/triad.env http://127.0.0.1:8545 /path/to/new-evidence-directory
+```
+
+This opt-in check uses the Broker debug driver and normal public HTTPS trust to
+enroll a virtual passkey, authorize policy, and activate a Sealed Approval. Curl
+with HTTP/2 support separately checks public browser navigation. The test
+checks that approval alone does not execute, then separately confirms the exact
+transfer and verifies its receipt on loopback Anvil (chain ID 31337). It needs no
+NFS mount. See [hosted-relay developer acceptance](./DEVELOPMENT.md#hosted-relay-developer-acceptance)
+for provisioning and trust pins. Real-browser/passkey acceptance remains a
+separate check.
+
+Add `BLOOM_REMOTE_RECOVERY_E2E=1` to test `/wallets/recover`, pending-operation
+reuse, recovery-factor rotation, and approval with the replacement passkey.
+The test also checks that public recovery initiation returns 404 and `/`
+redirects to `https://bloom.directory` with an empty body while ceremonies still
+succeed. Private recovery fixture files stay outside Machine's home and must not
+be included in published evidence.
+
 ## Environment variables
 
 | Var | Used by | Purpose |
