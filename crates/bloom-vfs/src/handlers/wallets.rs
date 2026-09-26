@@ -2656,8 +2656,7 @@ fn tx_open_err(e: TxEngineError) -> HandlerError {
     match e {
         TxEngineError::ApprovalRequired(_) => HandlerError::PermissionDenied,
         TxEngineError::PolicyDenied => HandlerError::OperationNotPermitted,
-        TxEngineError::EnsoQuoteStale { .. }
-        | TxEngineError::DependencyNotSatisfied { .. }
+        TxEngineError::DependencyNotSatisfied { .. }
         | TxEngineError::SimulationReverted { .. }
         | TxEngineError::NonceGap { .. } => HandlerError::invalid(e.to_string()),
         other => err_be(other),
@@ -4333,9 +4332,6 @@ impl WalletsHandler {
                     )
                     .await
                     .map_err(|e| match e {
-                        TxEngineError::EnsoQuoteStale { .. } => {
-                            HandlerError::invalid(e.to_string())
-                        }
                         TxEngineError::ApprovalRequired(_) => HandlerError::PermissionDenied,
                         other => err_be(other),
                     })?;
