@@ -107,10 +107,18 @@ Every command below is the real CLI surface; run them in order.
    solana genesis-hash --url http://127.0.0.1:8899
    ```
 
-3. Prepare the evaluation Machine's config with the Solana chain, pinning the
-   genesis from step 2 (a pinned genesis is what permits broadcast):
+3. Write the evaluation Machine's config, pinning the genesis from step 2 (a
+   pinned genesis is what permits broadcast). A Machine config needs at least
+   one EVM chain for `default_chain`; an unused local one is enough:
 
    ```toml
+   default_chain = "anvil"
+
+   [chains.anvil]
+   name = "anvil"
+   chain_id = 31337
+   rpc_urls = ["http://127.0.0.1:8545"]
+
    [solana_chains.solana-local]
    name = "solana-local"
    expected_genesis_base58 = "<genesis from step 2>"
