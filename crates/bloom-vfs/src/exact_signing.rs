@@ -22,6 +22,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 const STATE_SCHEMA: &str = "bloom.machine_exact_signing.v1";
+const REUSABLE_ATTEMPT_SCHEMA: &str = "bloom.machine_reusable_signing_attempt.v1";
+const REUSABLE_ATTEMPT_DOMAIN: &[u8] = b"bloom.machine.reusable-signing-attempt/v1\0";
 const APPROVAL_TTL_MS: u64 = 5 * 60 * 1000;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -157,12 +159,22 @@ struct ReusablePetalBatchSigningState {
     expires_at_ms: DecimalU64,
     canonical_plan_facts_digest: Digest32,
     approval_id: Option<Digest32>,
-    /// The payload digests this state's approval signed. A reusable approval
-    /// covers one operation, so once it has signed, a retry of the same
-    /// payloads repeats that signing operation and anything else starts a
-    /// fresh approval instead of waiting for this one to expire.
-    #[serde(default)]
-    signed_payload_digests: Option<Vec<Digest32>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReusablePetalBatchSigningAttempt {
+    schema: String,
+    signing_operation_id: OperationId,
+    request_digest: Digest32,
+}
+
+#[derive(Serialize)]
+struct ReusablePetalBatchSigningAttemptIdentity<'a> {
+    ordered_payload_digests: &'a [Digest32],
+    ordered_hashes: &'a [Digest32],
+    petal_use_claim: &'a PetalUseClaim,
+    claim_assurance_evidence_digest: Option<Digest32>,
 }
 
 impl BrokerExactPayloadSigner {
@@ -613,7 +625,6 @@ impl BrokerExactPayloadSigner {
                     expires_at_ms: DecimalU64::new(now.saturating_add(APPROVAL_TTL_MS)),
                     canonical_plan_facts_digest: canonical_plan_facts_digest.clone(),
                     approval_id: None,
-                    signed_payload_digests: None,
                 }
             }
             Err(error) => return Err(format!("read reusable batch signing state: {error}")),
@@ -636,21 +647,58 @@ impl BrokerExactPayloadSigner {
             .iter()
             .map(|payload| Digest32::from_bytes(Sha256::digest(payload).into()))
             .collect::<Vec<_>>();
-        let now = now_ms()?;
-        let spent = state
-            .signed_payload_digests
+        let attempt_identity = ReusablePetalBatchSigningAttemptIdentity {
+            ordered_payload_digests: &payload_digests,
+            ordered_hashes: claimed_hashes,
+            petal_use_claim: claim,
+            claim_assurance_evidence_digest: claim_assurance_evidence
+                .map(|evidence| Digest32::from_bytes(Sha256::digest(evidence).into())),
+        };
+        let attempt_bytes = serde_jcs::to_vec(&attempt_identity)
+            .map_err(|error| format!("canonicalize reusable signing attempt: {error}"))?;
+        let mut attempt_hasher = Sha256::new();
+        attempt_hasher.update(REUSABLE_ATTEMPT_DOMAIN);
+        attempt_hasher.update(attempt_bytes);
+        let request_digest = Digest32::from_bytes(attempt_hasher.finalize().into());
+        let attempt_path = state_path.with_extension("attempt.json");
+        let previous_attempt = match fs::read(&attempt_path) {
+            Ok(bytes) => Some(
+                serde_json::from_slice::<ReusablePetalBatchSigningAttempt>(&bytes)
+                    .map_err(|error| format!("read reusable signing attempt: {error}"))?,
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(format!("read reusable signing attempt: {error}")),
+        };
+        if previous_attempt
             .as_ref()
-            .is_some_and(|signed| *signed != payload_digests);
-        if spent || state.expires_at_ms.get() <= now {
+            .is_some_and(|attempt| attempt.schema != REUSABLE_ATTEMPT_SCHEMA)
+        {
+            return Err("reusable signing attempt schema is unsupported".into());
+        }
+        let now = now_ms()?;
+        let attempted_different_request = previous_attempt.as_ref().is_some_and(|attempt| {
+            attempt.signing_operation_id == state.signing_operation_id
+                && attempt.request_digest != request_digest
+        });
+        if attempted_different_request || state.expires_at_ms.get() <= now {
             state.approval_operation_id = random_operation_id();
             state.signing_operation_id = random_operation_id();
             state.request_nonce = random_request_nonce();
             state.issued_at_ms = DecimalU64::new(now);
             state.expires_at_ms = DecimalU64::new(now.saturating_add(APPROVAL_TTL_MS));
             state.approval_id = None;
-            state.signed_payload_digests = None;
         }
         write_state(state_path, &state)?;
+        if state.approval_id.is_some() {
+            write_state(
+                &attempt_path,
+                &ReusablePetalBatchSigningAttempt {
+                    schema: REUSABLE_ATTEMPT_SCHEMA.into(),
+                    signing_operation_id: state.signing_operation_id.clone(),
+                    request_digest,
+                },
+            )?;
+        }
         let request = ExactPayloadBatchSignRequest {
             wallet_id,
             preimages: preimages.to_vec(),
@@ -686,8 +734,6 @@ impl BrokerExactPayloadSigner {
                         "Broker returned an unexpected reusable batch signature count".into(),
                     );
                 }
-                state.signed_payload_digests = Some(payload_digests);
-                write_state(state_path, &state)?;
                 Ok(ExactPayloadBatchOutcome::Signed(
                     result
                         .signatures
@@ -928,15 +974,16 @@ mod tests {
     use bloom_broker_api::{
         ApprovalPrepareState, Base64UrlBytes, KeyPublic, KeyRef, KeyRole, KeySpec,
         MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService, NormalizedSignature,
-        PROVENANCE_CATALOG_SCHEMA, ProtocolError, ProtocolErrorCode, ProvenanceOperationClass,
-        ProvenanceRecord, SealedApprovalPrepareResponse, ServiceFuture, SigningResult,
-        WalletPublic,
+        OperationPublicStatus, OperationState, PROVENANCE_CATALOG_SCHEMA, ProtocolError,
+        ProtocolErrorCode, ProvenanceOperationClass, ProvenanceRecord,
+        SealedApprovalPrepareResponse, ServiceFuture, SigningResult, WalletPublic,
     };
 
     #[derive(Default)]
     struct MockBroker {
         requests: Mutex<Vec<MachineBrokerRequest>>,
         conflict_sign_once: AtomicBool,
+        lose_batch_response_once: AtomicBool,
         /// Simulates the pre-#265 derivation defect for the negative twin: the
         /// approval presents no `value_limits` even though the claim declares
         /// value, so the accounting mirror must refuse it.
@@ -1132,12 +1179,14 @@ mod tests {
                     MachineBrokerRequest::SigningSignBatch(request) => {
                         let mut signings = self.batch_signings.lock().unwrap();
                         for (approval, operation, operation_digest) in signings.iter() {
-                            if *operation == request.operation_id
-                                && *operation_digest != request.operation_digest
-                            {
+                            if *operation == request.operation_id {
                                 return Err(ProtocolError::new(
                                     ProtocolErrorCode::OperationIdConflict,
-                                    "signing operation id reused for a different payload",
+                                    if *operation_digest == request.operation_digest {
+                                        "signing operation already finalized"
+                                    } else {
+                                        "signing operation id reused for a different request"
+                                    },
                                 ));
                             }
                             if *approval == request.approval_id
@@ -1154,6 +1203,12 @@ mod tests {
                             request.operation_id.clone(),
                             request.operation_digest.clone(),
                         ));
+                        if self.lose_batch_response_once.swap(false, Ordering::SeqCst) {
+                            return Err(ProtocolError::new(
+                                ProtocolErrorCode::ServiceUnavailable,
+                                "simulated lost response after signing committed",
+                            ));
+                        }
                         Ok(MachineBrokerResponse::SigningSignBatch(SigningResult {
                             operation_id: request.operation_id,
                             operation_digest: request.operation_digest,
@@ -1164,6 +1219,37 @@ mod tests {
                             signer_receipt_digest: digest(9),
                             broker_receipt_digest: digest(10),
                         }))
+                    }
+                    MachineBrokerRequest::OperationStatus(request) => {
+                        let signings = self.batch_signings.lock().unwrap();
+                        let (_, operation_id, operation_digest) = signings
+                            .iter()
+                            .find(|(_, operation, _)| *operation == request.operation_id)
+                            .ok_or_else(|| {
+                                ProtocolError::new(
+                                    ProtocolErrorCode::ServiceUnavailable,
+                                    "signing operation is not retained",
+                                )
+                            })?;
+                        let result = SigningResult {
+                            operation_id: operation_id.clone(),
+                            operation_digest: operation_digest.clone(),
+                            signatures: vec![NormalizedSignature {
+                                crypto_suite: CryptoSuite::Secp256k1Sha256Recoverable,
+                                bytes: Base64UrlBytes::from_bytes(&[7_u8; 65]),
+                            }],
+                            signer_receipt_digest: digest(9),
+                            broker_receipt_digest: digest(10),
+                        };
+                        Ok(MachineBrokerResponse::OperationStatus(
+                            OperationPublicStatus {
+                                operation_id: operation_id.clone(),
+                                operation_digest: operation_digest.clone(),
+                                state: OperationState::Succeeded,
+                                result: Some(result),
+                                error: None,
+                            },
+                        ))
                     }
                     _ => Err(ProtocolError::new(
                         ProtocolErrorCode::UnknownMethod,
@@ -1771,11 +1857,10 @@ mod tests {
         );
     }
 
-    /// A retry of the payload that was signed repeats the same signing
-    /// operation under the same approval, so the Broker can answer it
-    /// idempotently. It never prepares a second approval for those bytes.
+    /// A retry of the exact signing attempt recovers the Broker's retained
+    /// result for the same operation. It never prepares a second approval.
     #[tokio::test]
-    async fn a_retry_of_the_signed_payload_repeats_its_signing_operation() {
+    async fn a_retry_of_the_signed_attempt_recovers_its_result() {
         let broker = Arc::new(MockBroker::default());
         let (signer, home, claim, _) = debiting_claim_fixture(&broker, None);
 
@@ -1797,8 +1882,84 @@ mod tests {
             .count();
         assert_eq!(prepares, 1);
         let signings = broker.batch_signings.lock().unwrap();
-        assert_eq!(signings.len(), 2);
-        assert_eq!(signings[0], signings[1]);
+        assert_eq!(signings.len(), 1, "Broker signs the operation only once");
+        assert!(
+            requests
+                .iter()
+                .any(|request| { matches!(request, MachineBrokerRequest::OperationStatus(_)) })
+        );
+    }
+
+    #[tokio::test]
+    async fn the_same_payload_with_a_different_claim_gets_a_fresh_approval() {
+        let broker = Arc::new(MockBroker::default());
+        let (signer, home, claim, _) = debiting_claim_fixture(&broker, None);
+
+        let first = approval_of(
+            &reusable_once(&signer, &home, &claim, b"same")
+                .await
+                .unwrap(),
+        );
+        reusable_once(&signer, &home, &claim, b"same")
+            .await
+            .unwrap();
+
+        let mut changed_claim = claim;
+        changed_claim.nonce = RequestNonce::from_bytes([99; 16]);
+        let next = approval_of(
+            &reusable_once(&signer, &home, &changed_claim, b"same")
+                .await
+                .unwrap(),
+        );
+        assert_ne!(first, next);
+        assert_eq!(broker.batch_signings.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_lost_signing_response_is_recovered_without_reusing_it_for_new_bytes() {
+        let broker = Arc::new(MockBroker {
+            lose_batch_response_once: AtomicBool::new(true),
+            ..MockBroker::default()
+        });
+        let (signer, home, claim, _) = debiting_claim_fixture(&broker, None);
+
+        reusable_once(&signer, &home, &claim, b"first")
+            .await
+            .unwrap();
+        assert_eq!(
+            reusable_once(&signer, &home, &claim, b"first")
+                .await
+                .unwrap(),
+            ExactPayloadBatchOutcome::Signed(vec![vec![7_u8; 65]])
+        );
+
+        let main_state: serde_json::Value =
+            serde_json::from_slice(&fs::read(home.path().join("petal-reusable.json")).unwrap())
+                .unwrap();
+        assert!(main_state.get("signed_payload_digests").is_none());
+        assert!(home.path().join("petal-reusable.attempt.json").is_file());
+        assert!(
+            broker
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| { matches!(request, MachineBrokerRequest::OperationStatus(_)) })
+        );
+
+        assert_eq!(
+            reusable_once(&signer, &home, &claim, b"first")
+                .await
+                .unwrap(),
+            ExactPayloadBatchOutcome::Signed(vec![vec![7_u8; 65]])
+        );
+        assert!(matches!(
+            reusable_once(&signer, &home, &claim, b"second")
+                .await
+                .unwrap(),
+            ExactPayloadBatchOutcome::ApprovalRequired { .. }
+        ));
+        assert_eq!(broker.batch_signings.lock().unwrap().len(), 1);
     }
 
     fn token(value: &str) -> Token {
