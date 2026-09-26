@@ -87,7 +87,11 @@ ROUTE_WRITE_TIMEOUT_SECONDS = 120
 # running. The approver polls for it rather than the host completing every
 # ceremony up front the way the Hyperliquid provision does.
 APPROVER_POLL_SECONDS = 2.0
-APPROVER_BUDGET_SECONDS = 420.0
+# The approver starts at provision, before Harbor builds the environment and
+# runs the agent, and is stopped when the trial ends. It must outlast both
+# task.toml timeouts: an approver that quits first silently fails any agent
+# that needs longer, including one following the documented restage path.
+APPROVER_BUDGET_SECONDS = 1800.0
 # One confirm ceremony, plus at most one first-use key derivation and one
 # blockhash-expiry re-approval. The cap bounds a misbehaving route rather
 # than describing the expected count.

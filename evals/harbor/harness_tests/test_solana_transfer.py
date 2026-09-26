@@ -752,6 +752,20 @@ class LocalHistoryTests(SolanaEvalTestCase):
                 definition._require_full_local_history()
 
 
+class ApproverBudgetTests(unittest.TestCase):
+    def test_the_approver_outlasts_environment_build_and_agent(self) -> None:
+        import tomllib
+
+        from harness.solana_transfer import APPROVER_BUDGET_SECONDS
+
+        task = Path(__file__).resolve().parent.parent / "tasks/solana-transfer/task.toml"
+        config = tomllib.loads(task.read_text())
+        needed = (
+            config["environment"]["build_timeout_sec"] + config["agent"]["timeout_sec"]
+        )
+        self.assertGreaterEqual(APPROVER_BUDGET_SECONDS, needed)
+
+
 class FreshDestinationTests(SolanaEvalTestCase):
     """The verifier grades exactly one signature on the destination, so a
     used destination is refused before a real transfer and ceremony."""
