@@ -475,7 +475,7 @@ materially from Hyperliquid's reversible order/cancel workflow.
 
 Its deterministic smoke lane checks protocol conformance on the prepared
 evaluation triad and a local validator. Paid model lanes are
-documentation-discovery evaluations: they are told to enter through the
-mount-root `AGENTS.md`, whose mounted Sealed Approval section documents the
-native Solana transfer workflow. Harbor's `opencode` agent is available with
+documentation-discovery evaluations: they are told only where Bloom is mounted
+and must find the mount-root `AGENTS.md`, whose mounted Sealed Approval section
+documents the native Solana transfer workflow. Harbor's `opencode` agent is available with
 DeepSeek as `scripts/evals/run-harbor-solana-local.sh opencode`.

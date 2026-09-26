@@ -220,6 +220,12 @@ Every command below is the real CLI surface; run them in order.
    fresh host-controlled destination so its chain evidence remains
    unambiguous, which means repeating this step per destination.
 
+   Each ceremony consumes one WebAuthn counter. The harness records the next
+   unused one at `<seed file>.sign-count` after its own ceremonies, but not
+   after the ones you complete by hand. After a by-hand ceremony, write the
+   next value to that file (or set `BLOOM_EVAL_AUTHENTICATOR_SIGN_COUNT`), or
+   the Broker rejects the stale counter and the run fails before anything moves.
+
 8. Configure and run the harness:
 
    ```sh
@@ -230,6 +236,8 @@ Every command below is the real CLI surface; run them in order.
    export BLOOM_EVAL_SOLANA_RPC_URL=http://127.0.0.1:8899
    export BLOOM_EVAL_SOLANA_DESTINATION=<destination address>
    export BLOOM_EVAL_AUTHENTICATOR_SEED_FILE="$HOME/.config/bloom/eval-authenticator-seed"
+   # First run only: the import used counter 1 and the policy update used 2.
+   export BLOOM_EVAL_AUTHENTICATOR_SIGN_COUNT=3
    ```
 
    The deterministic smoke requires no API key, Docker, Harbor model
