@@ -5,7 +5,18 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 task="${repo_root}/evals/harbor/tasks/hyperliquid-order-cancel"
 verifier="${task}/tests/verify_result.py"
 tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT
+# Fake servers run under `uv run`, so stop each wrapper's child as well; one
+# trap covers every server started below.
+fake_pids=()
+cleanup() {
+  local pid
+  for pid in "${fake_pids[@]}"; do
+    pkill -P "$pid" 2>/dev/null || true
+    kill "$pid" 2>/dev/null || true
+  done
+  rm -rf "$tmp"
+}
+trap cleanup EXIT
 python_cmd=(uv run --isolated --no-project --python 3.12 python)
 
 wallet="0x1111111111111111111111111111111111111111"
@@ -82,8 +93,7 @@ server.serve_forever()
 PY
 port_file="$tmp/fake-hyperliquid.port"
 FAKE_HYPERLIQUID_PORT_FILE="$port_file" "${python_cmd[@]}" "$tmp/fake_hyperliquid.py" &
-fake_hyperliquid_pid=$!
-trap 'kill "$fake_hyperliquid_pid" 2>/dev/null || true; rm -rf "$tmp"' EXIT
+fake_pids+=("$!")
 for _ in $(seq 1 50); do
   [ -s "$port_file" ] && break
   sleep 0.1
@@ -142,14 +152,10 @@ bash -n "${repo_root}/scripts/evals/operate-harbor-hyperliquid.sh"
 bash -n "${repo_root}/scripts/evals/run-harbor.sh"
 bash -n "${repo_root}/scripts/evals/run-harbor-solana-local.sh"
 git -C "$repo_root" check-ignore -q evals/harbor/operator-state.json
-# Agent trials go through the mounted filesystem. Only the Solana harness has
-# a `bloom vfs` transport, and it is refused outside --smoke-only.
+# Agent trials go through the mounted filesystem, never the vfs transport.
 if grep -En 'BLOOM_EVAL_VFS_|VfsTransport|bloom vfs' \
-  "${repo_root}/evals/harbor/harness/core.py" \
-  "${repo_root}/evals/harbor/harness/__main__.py" \
-  "${repo_root}/evals/harbor/harness/hyperliquid_order_cancel.py" \
-  "${repo_root}/evals/harbor/harness/operator.py"; then
-  printf '%s\n' 'error: a mount-only harness references the vfs transport' >&2
+  "${repo_root}/evals/harbor/harness"/*.py; then
+  printf '%s\n' 'error: a harness references the vfs transport' >&2
   exit 1
 fi
 grep -Fq '`bloom vfs`, the `bloom` executable' \
@@ -282,8 +288,7 @@ server.serve_forever()
 PY
 port_file="$tmp/fake-solana.port"
 FAKE_SOLANA_PORT_FILE="$port_file" "${python_cmd[@]}" "$tmp/fake_solana_rpc.py" &
-fake_solana_pid=$!
-trap 'kill "$fake_solana_pid" 2>/dev/null || true; rm -rf "$tmp"' EXIT
+fake_pids+=("$!")
 for _ in $(seq 1 50); do
   [ -s "$port_file" ] && break
   sleep 0.1
