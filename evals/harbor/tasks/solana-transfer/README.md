@@ -87,13 +87,24 @@ configuration.
    weight = 100
    ```
 
-3. Launch the evaluation triad with the mount and its own ceremony port. Port
-   18734 belongs to an installed custody triad. The command stays in the
-   foreground:
+3. Build the triad in release mode, then launch it with the mount and its own
+   ceremony port (port 18734 belongs to an installed custody triad). Debug
+   builds take about 20 seconds per signing call, a third of the transfer's
+   one-minute blockhash window; release builds take well under a second. The
+   launch command stays in the foreground:
 
    ```sh
+   cargo build --release -p bloom --no-default-features --features mount,triad-dev-harness
+   cargo build --release --manifest-path ../bloom-broker/Cargo.toml \
+     -p bloom-broker --features triad-dev-harness
+   cargo build --release --manifest-path ../bloom-signer/Cargo.toml \
+     -p bloom-signer --features triad-dev-harness
+
    export BLOOM_EVAL_TRIAD_ROOT=/private/path/to/eval-triad
    BLOOM_TRIAD_DEV_MACHINE_CONFIG=/private/path/to/machine-config.toml \
+   BLOOM_INTEGRATION_MACHINE_BIN="$PWD/target/release/bloom" \
+   BLOOM_INTEGRATION_BROKER_BIN="$PWD/../bloom-broker/target/release/bloom-broker" \
+   BLOOM_INTEGRATION_SIGNER_BIN="$PWD/../bloom-signer/target/release/bloom-signer" \
    scripts/triad-dev-launch.sh \
      --developer-root "$BLOOM_EVAL_TRIAD_ROOT/developer" \
      --machine-socket "$BLOOM_EVAL_TRIAD_ROOT/runtime/machine.sock" \
@@ -172,15 +183,17 @@ the loopback validator, which also exposes the Machine's loopback NFS export.
 That is accepted: nothing signs without the exact-match approval, and the funds
 are worthless.
 
-Cleanup is host-owned and fail-closed. Pending entries are cancelled and must
-drain, since a staged entry still holds a broadcastable blockhash. At most one
-new entry may be sent, and it must reconcile to a receipt. The container's own
-cleanup only cancels staged entries.
+Cleanup is host-owned and fail-closed. Pending entries must drain, since a
+staged entry may still hold a broadcastable blockhash. The mount refuses
+`cancel` on outbox entries, so the expiry sweep drains them. The sweep keeps a
+signed entry that was never sent, so cleanup restages one that is past its
+window: the only route that retires it. At most one new entry may be sent, and
+it must reconcile to a receipt.
 
 ## Known limitation
 
 A staged transfer's blockhash lives about a minute. An agent must inspect,
-confirm, wait for approval, and retry inside it. Reasoning-heavy agents often
-cannot, even with instant approval, and restage repeatedly until the ceremony
-cap. Removing that race is a Machine and Broker design change, tracked in
+confirm, wait for approval, and retry inside it. The mounted walkthrough shows
+how: confirm and keep retrying in one command. Agents that retry a turn later
+often miss the window and restage repeatedly until the ceremony cap. Removing that race is a Machine and Broker design change, tracked in
 [pm#58](https://github.com/bloom-directory/pm/issues/58).

@@ -96,8 +96,9 @@ MAX_RESTAGE_HOPS = 10
 LOCAL_HISTORY_MIN_SLOTS = 4500
 
 RPC_TIMEOUT_SECONDS = 30
-PENDING_DRAIN_ATTEMPTS = 30
-PENDING_DRAIN_DELAY_SECONDS = 2.0
+# Long enough for a restaged replacement's blockhash to expire and be swept.
+PENDING_DRAIN_ATTEMPTS = 60
+PENDING_DRAIN_DELAY_SECONDS = 3.0
 RECEIPT_SETTLE_ATTEMPTS = 45
 RECEIPT_SETTLE_DELAY_SECONDS = 2.0
 SMOKE_CONFIRM_BUDGET_SECONDS = 45.0
@@ -184,8 +185,9 @@ class SolanaTransferEval(EvalDefinition):
         self._approved_lineage: list[str] = []
         self._baseline_sent: set[str] = set()
         # Every host outbox entry that existed at preflight, so the trial
-        # summary counts only this trial's stagings.
-        self._baseline_entries: set[str] = set()
+        # summary counts only this trial's stagings. None until preflight
+        # completes; without it there is nothing to count against.
+        self._baseline_entries: set[str] | None = None
 
     # ---- paths ---------------------------------------------------------
 
@@ -1114,19 +1116,28 @@ class SolanaTransferEval(EvalDefinition):
         mounted_error: BaseException | None = None
         try:
             # 1. Drain pending. A residual staged entry still holds a
-            #    broadcastable blockhash, so it is never an acceptable end state.
-            for pending_id in self._list_state("pending"):
-                self.mount.write_route(
-                    self.outbox_root / "pending" / pending_id / "cancel",
-                    b"host-cleanup",
-                    ROUTE_WRITE_TIMEOUT_SECONDS,
-                )
-                # A concurrent expiry sweep can move an entry to failed/ after
-                # the listing but before this write. In that case cancel
-                # correctly fails because the route moved, while the cleanup
-                # postcondition is already satisfied. Judge the state below.
+            #    blockhash that may be broadcastable, so it is never an
+            #    acceptable end state. The mount refuses `cancel` on outbox
+            #    entries (it signs for EVM), so the expiry sweep drains them.
+            #    The sweep keeps a signed entry, which may have been sent; one
+            #    that is past its window is restaged, the only route that
+            #    retires it, and its unsigned replacement then expires too.
+            def drained() -> bool:
+                pending = self._list_state("pending")
+                for pending_id in pending:
+                    # Only a signed entry: the sweep retires the rest, and
+                    # restaging one would race the sweep with a new entry.
+                    if not (self._host_entry("pending", pending_id) / ".signature").exists():
+                        continue
+                    self.mount.write_route(
+                        self.outbox_root / "pending" / pending_id / "restage",
+                        b"host-cleanup",
+                        ROUTE_WRITE_TIMEOUT_SECONDS,
+                    )
+                return not pending
+
             if not self.mount.poll_until(
-                lambda: not self._list_state("pending"),
+                drained,
                 PENDING_DRAIN_ATTEMPTS,
                 PENDING_DRAIN_DELAY_SECONDS,
             ):
@@ -1185,8 +1196,11 @@ class SolanaTransferEval(EvalDefinition):
 
         The reward says whether one correct payment landed; this says why not:
         stagings, approvals, entries that expired or were cancelled unsent,
-        and any staging the approver refused.
+        and any staging the approver refused. Empty when preflight never
+        finished, since there is no baseline to count this trial against.
         """
+        if self._baseline_entries is None:
+            return ""
         created: dict[str, int] = {}
         expired = cancelled = 0
         for state in ("pending", "sent", "failed"):

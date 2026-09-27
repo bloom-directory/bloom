@@ -312,6 +312,23 @@ class VerdictTests(unittest.TestCase):
                 self.result(exception_type="AgentTimeoutError")
             )
 
+    def test_running_out_of_turns_is_an_agent_failure(self) -> None:
+        agent = self.root / "trial" / "agent"
+        agent.mkdir(parents=True)
+        (agent / "claude-code.txt").write_text('{"type":"result","subtype":"error_max_turns"}\n')
+        result = self.result(exception_type="NonZeroAgentExitCodeError")
+        result.trial_results[0].trial_uri = (self.root / "trial").as_uri()
+        with self.assertRaises(AgentFailure):
+            FakeDefinition(self.root).validate_result(result)
+
+    def test_a_crashed_agent_is_not_an_agent_failure(self) -> None:
+        (self.root / "trial" / "agent").mkdir(parents=True)
+        result = self.result(exception_type="NonZeroAgentExitCodeError")
+        result.trial_results[0].trial_uri = (self.root / "trial").as_uri()
+        with self.assertRaises(EvalError) as raised:
+            FakeDefinition(self.root).validate_result(result)
+        self.assertNotIsInstance(raised.exception, AgentFailure)
+
     def test_a_provider_error_is_not_an_agent_failure(self) -> None:
         with self.assertRaises(EvalError) as raised:
             FakeDefinition(self.root).validate_result(

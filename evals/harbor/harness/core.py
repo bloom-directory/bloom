@@ -12,6 +12,7 @@ import subprocess
 import sys
 import signal
 import time
+import urllib.parse
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Coroutine, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -521,11 +522,12 @@ class EvalDefinition(ABC):
             detail = api_error.group(0).strip() if api_error else message.strip()
             if len(detail) > 500:
                 detail = detail[:497] + "..."
-            # Running out of time is the agent's outcome; any other exception
-            # (provider, auth, environment) is not.
+            # Running out of time or turns is the agent's outcome; any other
+            # exception (provider, auth, environment) is not.
             failure = (
                 AgentFailure
                 if trial.exception_info.exception_type == "AgentTimeoutError"
+                or _ran_out_of_turns(trial)
                 else EvalError
             )
             raise failure(
@@ -546,6 +548,19 @@ class EvalDefinition(ABC):
             raise AgentFailure(
                 f"Harbor verifier did not award a passing reward: {rewards}"
             )
+
+
+def _ran_out_of_turns(trial: Any) -> bool:
+    """Whether Claude Code stopped at its turn cap, which it reports as a
+    non-zero exit rather than as a timeout."""
+    uri = getattr(trial, "trial_uri", None)
+    if not isinstance(uri, str) or not uri.startswith("file://"):
+        return False
+    log = Path(urllib.parse.urlparse(uri).path) / "agent" / "claude-code.txt"
+    try:
+        return '"subtype":"error_max_turns"' in log.read_text(errors="replace")
+    except OSError:
+        return False
 
 
 async def run_harbor_job(context: EvalRunContext, agent: AgentSpec) -> Any:

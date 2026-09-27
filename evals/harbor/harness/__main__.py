@@ -78,9 +78,11 @@ def run_trials(
         note = getattr(definition, "trial_note", None)
         if callable(note):
             try:
-                detail = f"{detail} [{note()}]" if detail else f"[{note()}]"
+                text = note()
             except EvalError:
-                pass
+                text = ""
+            if text:
+                detail = f"{detail} [{text}]" if detail else f"[{text}]"
         print(
             f"trial {number}/{trials}: {verdict}" + (f": {detail}" if detail else ""),
             file=sys.stderr if verdict != "PASS" else sys.stdout,

@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -761,6 +762,9 @@ class TrialNoteTests(SolanaEvalTestCase):
             "refused: staged entry d does not match",
         )
 
+    def test_no_note_without_a_preflight_baseline(self) -> None:
+        self.assertEqual(self.make().trial_note(), "")
+
     def test_a_refusal_is_the_agents_outcome_not_a_cleanup_failure(self) -> None:
         definition = self.make()
         definition._approver_refusal = "staged entry x does not match"
@@ -860,6 +864,41 @@ class ReusedWalletCleanupTests(SolanaEvalTestCase):
         with mock.patch.object(definition, "_list_state", return_value=[]):
             with self.assertRaisesRegex(EvalError, "historical sent entries"):
                 definition.cleanup()
+
+
+class StuckEntryCleanupTests(SolanaEvalTestCase):
+    """Cancel is refused on the mount, so cleanup relies on the expiry sweep
+    and restages only what the sweep keeps: a signed entry."""
+
+    def run_cleanup(self, signed: bool) -> list[str]:
+        home = self.root / "home"
+        definition = self.make(BLOOM_EVAL_SOLANA_HOME_ROOT=str(home))
+        definition.account_dir = "0"
+        entry = home / ".solana-outbox" / WALLET_ID / CHAIN / "pending" / "stuck"
+        entry.mkdir(parents=True)
+        if signed:
+            (entry / ".signature").write_text("sig")
+        listings = iter([["stuck"], []])
+        writes: list[str] = []
+
+        def write_route(path: Path, _body: bytes, _timeout: int):
+            writes.append(path.name)
+            return subprocess.CompletedProcess([], 0)
+
+        with mock.patch.object(definition, "_stop_approver"), mock.patch.object(
+            definition,
+            "_list_state",
+            side_effect=lambda state: next(listings, []) if state == "pending" else [],
+        ), mock.patch.object(definition.mount, "write_route", side_effect=write_route), \
+                mock.patch.object(definition.mount, "poll_until", side_effect=lambda p, *_: p() or p()):
+            definition.cleanup()
+        return writes
+
+    def test_a_signed_stuck_entry_is_restaged(self) -> None:
+        self.assertEqual(self.run_cleanup(signed=True), ["restage"])
+
+    def test_an_unsigned_entry_is_left_to_the_sweep(self) -> None:
+        self.assertEqual(self.run_cleanup(signed=False), [])
 
 
 class ContainerBoundaryTests(SolanaEvalTestCase):
