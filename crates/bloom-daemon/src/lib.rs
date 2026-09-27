@@ -2674,7 +2674,15 @@ impl PetalHost for DaemonPetalHost {
             .outbox
             .read(&wallet, &chain_name, &outbox_id)
             .map_err(|e| HostError::NotFound(format!("outbox {outbox_id}: {e}")))?;
-        if entry.staged.resolved_execution_origin() != origin {
+        // Inspection is read-only, so it is scoped to the package rather than
+        // to the route that staged the entry: a Petal's status route must be
+        // able to reconcile what its execute route staged. Confirmation stays
+        // route-bound because it dispatches signing.
+        if !entry
+            .staged
+            .resolved_execution_origin()
+            .same_package(&origin)
+        {
             return Err(HostError::Denied(
                 "outbox entry was not staged by this trusted Petal".into(),
             ));
@@ -7044,8 +7052,11 @@ mod tests {
                 .contains("\"block_number\":42")
         );
 
+        // A different route of the same package (a status route reconciling
+        // what the execute route staged) may inspect.
         let mut other_route = context.clone();
-        other_route.path = "/fund/alice/two/confirm".into();
+        other_route.path = "/fund/alice/two/status".into();
+        other_route.route_id = "r000099".into();
         host.evm_tx_inspect(
             "alice".into(),
             "anvil".into(),
