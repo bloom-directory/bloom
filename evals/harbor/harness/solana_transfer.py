@@ -749,7 +749,13 @@ class SolanaTransferEval(EvalDefinition):
         canonical = projection.get("policy", {}).get("canonical_policy")
         if not isinstance(canonical, str):
             raise EvalError("wallet projection has no canonical policy")
-        return json.loads(base64.b64decode(canonical))
+        # Broker's Base64UrlBytes: URL-safe alphabet, no padding.
+        try:
+            return json.loads(
+                base64.urlsafe_b64decode(canonical + "=" * (-len(canonical) % 4))
+            )
+        except (ValueError, json.JSONDecodeError) as error:
+            raise EvalError(f"wallet projection policy is malformed: {error}") from error
 
     def _allow_only_destination(self, ceremonies: CeremonyDriver) -> None:
         """Allow this trial's destination, and only it, in the wallet policy.

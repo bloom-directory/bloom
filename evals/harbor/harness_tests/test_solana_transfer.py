@@ -685,10 +685,11 @@ class AllowOnlyDestinationTests(SolanaEvalTestCase):
     OPERATION = "ab" * 32
 
     def projection(self, allowed: list[dict[str, str]]) -> str:
-        policy = {"wallet_id": WALLET_ID, "allowed_destinations": allowed}
-        return json.dumps(
-            {"policy": {"canonical_policy": base64.b64encode(json.dumps(policy).encode()).decode()}}
-        )
+        # Broker encodes the canonical policy as URL-safe base64 without
+        # padding; a standard decoder rejects it.
+        policy = {"wallet_id": WALLET_ID, "allowed_destinations": allowed, "note": "?>"}
+        encoded = base64.urlsafe_b64encode(json.dumps(policy).encode()).decode().rstrip("=")
+        return json.dumps({"policy": {"canonical_policy": encoded}})
 
     def run_allow(self, committed: list[dict[str, str]], staged: str | None = None):
         definition = self.make()
