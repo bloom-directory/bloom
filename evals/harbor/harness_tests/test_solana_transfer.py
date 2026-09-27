@@ -23,6 +23,7 @@ from harness.solana_transfer import (
     HARNESS_MAX_TRANSFER_LAMPORTS,
     MAINNET_ACK,
     LOCAL_HISTORY_MIN_SLOTS,
+    MAX_TRANSFER_CEREMONIES,
     MAINNET_GENESIS_HASH,
     SolanaTransferEval,
     VfsTree,
@@ -590,6 +591,24 @@ class ReplacementLineageTests(ApproverMatchTests):
         self.assertIsNotNone(error)
         assert error is not None
         self.assertIn("budget expired", error)
+
+    def test_an_approval_past_the_cap_is_refused_with_its_reason(self) -> None:
+        self.definition._approved_lineage.append("0001")
+        self.definition._approver_completed = MAX_TRANSFER_CEREMONIES
+        self.publish_advice("0001", "0002")
+        replacement = self.stage("0002")
+        url = "http://localhost:18734/ceremony/" + "C" * 43
+        (replacement / "approval_challenge.json").write_text(
+            json.dumps({"ceremony_url": url})
+        )
+        ceremonies = SimpleNamespace(
+            completed=set(), next_sign_count=3, complete=mock.Mock()
+        )
+
+        self.definition._approve_loop(ceremonies)
+
+        ceremonies.complete.assert_not_called()
+        self.assertIn("past the cap", self.definition._approver_error or "")
 
     def test_a_fresh_staging_is_refused_after_the_grace(self) -> None:
         # The predecessor expired but was never restaged, so no advice will

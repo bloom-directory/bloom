@@ -992,12 +992,19 @@ class SolanaTransferEval(EvalDefinition):
                                 "refusing to approve it"
                             )
                             return
+                    if self._approver_completed >= MAX_TRANSFER_CEREMONIES:
+                        # Say why the agent's next approval never comes; a
+                        # silent stop reads as an approver that hung.
+                        self._approver_error = (
+                            f"staged entry {pending_id} needs a ceremony past the "
+                            f"cap of {MAX_TRANSFER_CEREMONIES}; each restaged "
+                            "entry expired before its confirm was retried"
+                        )
+                        return
                     ceremonies.complete(url)
                     self._approved_lineage.append(pending_id)
                     self._approver_completed += 1
                     self.next_sign_count = ceremonies.next_sign_count
-                    if self._approver_completed >= MAX_TRANSFER_CEREMONIES:
-                        return
             except EvalError as error:
                 self._approver_error = CeremonyDriver.redact(str(error))
                 self.next_sign_count = ceremonies.next_sign_count
