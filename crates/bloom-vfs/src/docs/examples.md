@@ -128,6 +128,16 @@ and fee payer. After submission, read the same action under `sent/`: its
 and confirmation status. The receipt contains no account fingerprint. Do not
 blindly retry an ambiguous broadcast.
 
+A staged Solana transfer is valid only until its blockhash expires, about a
+minute (`last_valid_block_height` in `intent.json`). If it expires before it
+is sent, its `intent.json` status becomes `expired`. Do not stage the transfer
+again through `new.tx`. Write to that action's own `restage` file instead
+(`pending/$ID/restage`, or `failed/$ID/restage` once it has moved): Bloom
+stages exactly one replacement with a fresh blockhash, even if the write is
+repeated, and names it in the expired action's `restage_advice.json`. Inspect
+and confirm that replacement; it needs its own approval. An action under
+`sent/` is never restaged; reconcile it by signature.
+
 ## ERC-20 discovery
 
 ```sh

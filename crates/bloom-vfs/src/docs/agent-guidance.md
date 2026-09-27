@@ -223,7 +223,10 @@ project into the central outbox:
 A confirm write may return permission denied while projecting
 `approval_challenge.json`. Verify the challenge's wallet, action, intent, and
 expiry before presenting its ceremony URL. This is a waiting state, not a
-reason to restage. After human approval, retry only its exact `retry_path`;
+reason to restage. If a Solana transfer's blockhash expires before it is sent,
+restage it through its own `restage` file, never by staging it again; see the
+Solana walkthrough in `docs/examples.md`. After human approval, retry only its
+exact `retry_path`;
 `plan_path` and `retry_path` name the outbox the confirm was written through
 (`wallets/<wallet>/<n>/chains/...`, including `n = 0` for account 0).
 

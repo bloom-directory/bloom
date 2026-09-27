@@ -53,12 +53,16 @@ endpoint. It is never a rubber stamp for whatever the agent staged.
 The verifier grades exactly one signature on the destination, so preflight
 refuses a destination with any on-chain history; every trial needs a fresh one.
 
-The approver follows exactly one succession: after blockhash expiry the
-outbox's restage route moves the approved entry to `failed/` and publishes
-`restage_advice.json` naming the replacement id. A pending entry that does not
-continue that lineage — a second fresh staging with identical destination and
-amount, for example — is refused and fails the trial. Total ceremonies are
-capped, so a misbehaving route cannot farm approvals.
+The approver follows only restage successions: after blockhash expiry the
+outbox's restage route moves the entry to `failed/` and publishes
+`restage_advice.json` naming the replacement id, and the approver follows that
+chain from its last approval, including through replacements that expired
+before they were approved. A pending entry the chain does not reach — the same
+transfer staged again through `new.tx`, for example — is refused and fails the
+trial. The mounted Solana walkthrough documents the restage route, so this
+measures the safe recovery Bloom offers: restaging is idempotent, staging again
+is not. Total ceremonies are capped, so a misbehaving route cannot farm
+approvals.
 
 ## One triad, its own ceremony port
 
