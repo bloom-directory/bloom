@@ -101,6 +101,9 @@ MAX_TRANSFER_CEREMONIES = 3
 # this grace, a confirmable entry with no advice was staged fresh, not
 # restaged, and is refused.
 RESTAGE_ADVICE_GRACE_SECONDS = 10.0
+# Slots of history a local validator must retain to cover one trial: the
+# environment build plus the agent timeout (1800 s) at ~2.5 slots per second.
+LOCAL_HISTORY_MIN_SLOTS = 4500
 
 RPC_TIMEOUT_SECONDS = 30
 SWEEP_TIMEOUT_SECONDS = 180
@@ -322,6 +325,8 @@ class SolanaTransferEval(EvalDefinition):
         self.derivation_path = ""
         # Set by _require_chain_identity; empty matches no staged intent.
         self.genesis_hash = ""
+        # Local lane: the slot preflight saw, from which history must survive.
+        self.history_start_slot: int | None = None
         # Numbered account directory the vfs projects the wallet under
         # (`wallets/<wallet>/<n>/...`); resolved from the authenticated
         # account projection in _load_local_account_identity.
@@ -629,19 +634,25 @@ class SolanaTransferEval(EvalDefinition):
                 "RPC serves the mainnet-beta genesis"
             )
 
-    def _require_full_local_history(self) -> None:
+    def _require_local_history_window(self) -> None:
         """The verifier proves "exactly one payment" from signature history.
         solana-test-validator keeps only ~10,000 shreds by default, about a
-        minute of slots, so a transfer finalized before a slow verifier runs
-        is pruned and a correct trial scores zero. Require the local
-        validator to still hold its whole history."""
+        minute of slots, so a payment made early in a trial is pruned before
+        the verifier runs and a correct trial scores zero. A validator that is
+        already pruning must retain a whole trial; one that is not yet pruning
+        cannot be judged here, so the verifier re-checks against the slot
+        recorded now and names pruning as the reason if it happened."""
+        slot = self._rpc("getSlot", [])
         first = self._rpc("getFirstAvailableBlock", [])
-        if first != 0:
+        if not all(isinstance(v, int) and not isinstance(v, bool) for v in (slot, first)):
+            raise EvalError("could not read the local validator's history window")
+        if first > 0 and slot - first < LOCAL_HISTORY_MIN_SLOTS:
             raise EvalError(
-                "the local validator has pruned its history (first available "
-                f"block {first!r}), so the verifier cannot count the payment; "
-                "restart it with --reset --limit-ledger-size 50000000"
+                f"the local validator retains only {slot - first} slots of history; "
+                f"a trial needs {LOCAL_HISTORY_MIN_SLOTS}. Restart it with "
+                "--reset --limit-ledger-size 500000"
             )
+        self.history_start_slot = slot
 
     def _require_fresh_destination(self) -> None:
         """The verifier grades exactly one signature on the destination, so
@@ -740,7 +751,7 @@ class SolanaTransferEval(EvalDefinition):
         # Chain identity is checked from the chain itself, not from labels.
         self._require_chain_identity()
         if self.lane == "local":
-            self._require_full_local_history()
+            self._require_local_history_window()
         self._require_fresh_destination()
 
         # The approver reads the canonical host-side approval challenge the
@@ -1189,6 +1200,10 @@ class SolanaTransferEval(EvalDefinition):
             "BLOOM_EVAL_SOLANA_DESTINATION": self.destination,
             "BLOOM_EVAL_SOLANA_LAMPORTS": str(self.lamports),
         }
+        if self.history_start_slot is not None:
+            verifier_env["BLOOM_EVAL_SOLANA_HISTORY_FROM_SLOT"] = str(
+                self.history_start_slot
+            )
 
         self._start_approver(sign_count)
         self.jobs_dir.mkdir(parents=True, exist_ok=True)

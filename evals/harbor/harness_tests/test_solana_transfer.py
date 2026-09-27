@@ -22,6 +22,7 @@ from harness.core import EvalDefinition, EvalError, _agent_spec
 from harness.solana_transfer import (
     HARNESS_MAX_TRANSFER_LAMPORTS,
     MAINNET_ACK,
+    LOCAL_HISTORY_MIN_SLOTS,
     MAINNET_GENESIS_HASH,
     SolanaTransferEval,
     VfsTree,
@@ -335,7 +336,7 @@ class LocalIdentityTests(SolanaEvalTestCase):
                 definition,
                 _require_chain_identity=mock.DEFAULT,
                 _require_fresh_destination=mock.DEFAULT,
-                _require_full_local_history=mock.DEFAULT,
+                _require_local_history_window=mock.DEFAULT,
             ):
                 with mock.patch.object(definition, "_require_sign_count", return_value=2):
                     with mock.patch("harness.core.CeremonyDriver.preflight"):
@@ -740,16 +741,38 @@ class LocalHistoryTests(SolanaEvalTestCase):
     """solana-test-validator prunes to about a minute of slots by default,
     after which the verifier cannot count the payment."""
 
-    def test_full_history_is_accepted(self) -> None:
+    def window(self, slot: int, first: int) -> SolanaTransferEval:
         definition = self.make()
-        with mock.patch.object(definition, "_rpc", return_value=0):
-            definition._require_full_local_history()
+        answers = {"getSlot": slot, "getFirstAvailableBlock": first}
+        with mock.patch.object(
+            definition, "_rpc", side_effect=lambda method, _params: answers[method]
+        ):
+            definition._require_local_history_window()
+        return definition
 
-    def test_a_pruned_validator_is_refused(self) -> None:
+    def test_a_validator_not_yet_pruning_is_accepted_and_its_slot_recorded(self) -> None:
+        definition = self.window(slot=300, first=0)
+        self.assertEqual(definition.history_start_slot, 300)
+
+    def test_a_pruning_validator_that_retains_a_trial_is_accepted(self) -> None:
+        self.window(slot=20_000, first=20_000 - LOCAL_HISTORY_MIN_SLOTS)
+
+    def test_a_pruning_validator_with_a_short_window_is_refused(self) -> None:
+        # The default ledger limit: about 130 slots.
+        with self.assertRaisesRegex(EvalError, "--limit-ledger-size 500000"):
+            self.window(slot=9368, first=9240)
+
+    def test_the_verifier_is_told_where_history_must_start(self) -> None:
         definition = self.make()
-        with mock.patch.object(definition, "_rpc", return_value=9240):
-            with self.assertRaisesRegex(EvalError, "--limit-ledger-size"):
-                definition._require_full_local_history()
+        definition.destination = DESTINATION
+        definition.source_address = SOURCE
+        definition.account_dir = "0"
+        definition.history_start_slot = 300
+        with mock.patch.object(definition, "_start_approver"):
+            context = definition.provision("codex")
+        self.assertEqual(
+            context.verifier_env["BLOOM_EVAL_SOLANA_HISTORY_FROM_SLOT"], "300"
+        )
 
 
 class ApproverBudgetTests(unittest.TestCase):
@@ -1168,7 +1191,7 @@ class VfsTransportTests(SolanaEvalTestCase):
                             definition,
                             _require_chain_identity=mock.DEFAULT,
                             _require_fresh_destination=mock.DEFAULT,
-                            _require_full_local_history=mock.DEFAULT,
+                            _require_local_history_window=mock.DEFAULT,
                         ):
                             with mock.patch.object(
                                 definition, "_load_local_account_identity"

@@ -82,6 +82,18 @@ def verify() -> None:
     except ValueError as error:
         raise InvalidTransfer(f"lamport expectation is not an integer: {error}") from error
 
+    history_from = os.environ.get("BLOOM_EVAL_SOLANA_HISTORY_FROM_SLOT", "")
+    if history_from:
+        # A pruned history cannot show the payment; say so rather than
+        # reporting a missing transfer the agent may well have made.
+        first = rpc("getFirstAvailableBlock", [])
+        require(
+            isinstance(first, int) and first <= int(history_from),
+            f"the validator pruned history past this trial's start (first "
+            f"available block {first} > {history_from}), so it cannot show the "
+            "payment; start it with --limit-ledger-size 500000",
+        )
+
     signatures = rpc("getSignaturesForAddress", [destination, {"limit": 10}])
     require(isinstance(signatures, list), "signature history is not a list")
     require(

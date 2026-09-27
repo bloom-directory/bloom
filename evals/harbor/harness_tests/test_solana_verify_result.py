@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import importlib.util
+import io
 import os
 import unittest
 from pathlib import Path
@@ -72,8 +74,10 @@ class SolanaVerifierTests(unittest.TestCase):
         signatures: object = DEFAULT,
         transaction: object = DEFAULT,
         environment: dict[str, str] | None = None,
+        first_available: int = 0,
     ) -> int:
         responses = {
+            "getFirstAvailableBlock": first_available,
             "getSignaturesForAddress": (
                 signatures_result() if signatures is DEFAULT else signatures
             ),
@@ -92,6 +96,18 @@ class SolanaVerifierTests(unittest.TestCase):
 
     def test_the_exact_finalized_transfer_passes(self) -> None:
         self.assertEqual(self.run_verifier(), 0)
+
+    def test_history_intact_since_the_trial_start_passes(self) -> None:
+        env = {"BLOOM_EVAL_SOLANA_HISTORY_FROM_SLOT": "300"}
+        self.assertEqual(self.run_verifier(environment=env, first_available=300), 0)
+
+    def test_history_pruned_past_the_trial_start_is_named(self) -> None:
+        env = {"BLOOM_EVAL_SOLANA_HISTORY_FROM_SLOT": "300"}
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            code = self.run_verifier(environment=env, first_available=301)
+        self.assertEqual(code, 1)
+        self.assertIn("pruned history", stderr.getvalue())
 
     def test_no_destination_signature_is_rejected(self) -> None:
         self.assertEqual(self.run_verifier(signatures=[]), 1)
