@@ -72,7 +72,9 @@ ROUTE_WRITE_TIMEOUT_SECONDS = 120
 # The agent drives the confirm, so its ceremony is published while Harbor is
 # running. The approver polls for it rather than the host completing every
 # ceremony up front the way the Hyperliquid provision does.
-APPROVER_POLL_SECONDS = 2.0
+# Every second of approval latency comes out of the agent's ~60 s blockhash
+# window.
+APPROVER_POLL_SECONDS = 1.0
 # The approver starts at provision, before Harbor builds the environment and
 # runs the agent, and is stopped when the trial ends. It must outlast both
 # task.toml timeouts: an approver that quits first silently fails any agent

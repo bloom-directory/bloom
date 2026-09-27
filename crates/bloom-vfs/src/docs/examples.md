@@ -119,6 +119,19 @@ ls "$BLOOM/wallets/alice/$N/chains/$CHAIN/outbox/pending/"
 ID="<exact-id>"
 cat "$BLOOM/wallets/alice/$N/chains/$CHAIN/outbox/pending/$ID/intent.json"
 cat "$BLOOM/wallets/alice/$N/chains/$CHAIN/outbox/pending/$ID/plan.md"
+
+# 4. Confirm, and once the owner has approved, retry in the same command.
+#    The staged blockhash lives about a minute, so a turn spent between
+#    approval and retry can let it expire. A repeated confirm reuses the
+#    pending approval. A redirect's exit status does not show a refusal, so
+#    judge by where the action is, not by the write.
+E="$BLOOM/wallets/alice/$N/chains/$CHAIN/outbox"
+printf 'confirm\n' > "$E/pending/$ID/confirm"
+cat "$E/pending/$ID/approval_challenge.json"  # verify, then give the owner its URL
+until [ -e "$E/sent/$ID" ] || [ -e "$E/failed/$ID" ]; do
+  printf 'confirm\n' > "$E/pending/$ID/confirm" 2>/dev/null
+  sleep 2
+done
 ```
 
 Verify that the staged intent names the chosen fingerprint, derivation path,
