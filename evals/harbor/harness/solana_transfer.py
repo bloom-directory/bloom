@@ -652,7 +652,7 @@ class SolanaTransferEval(EvalDefinition):
             raise EvalError(
                 f"the local validator retains only {slot - first} slots of history; "
                 f"a trial needs {LOCAL_HISTORY_MIN_SLOTS}. Restart it with "
-                "--reset --limit-ledger-size 500000"
+                "--reset --limit-ledger-size 1000000"
             )
         self.history_start_slot = slot
 

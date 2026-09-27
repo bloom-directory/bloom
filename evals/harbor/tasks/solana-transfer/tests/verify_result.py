@@ -91,7 +91,7 @@ def verify() -> None:
             isinstance(first, int) and first <= int(history_from),
             f"the validator pruned history past this trial's start (first "
             f"available block {first} > {history_from}), so it cannot show the "
-            "payment; start it with --limit-ledger-size 500000",
+            "payment; start it with --limit-ledger-size 1000000",
         )
 
     signatures = rpc("getSignaturesForAddress", [destination, {"limit": 10}])

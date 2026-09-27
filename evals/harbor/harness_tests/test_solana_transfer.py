@@ -774,7 +774,7 @@ class LocalHistoryTests(SolanaEvalTestCase):
 
     def test_a_pruning_validator_with_a_short_window_is_refused(self) -> None:
         # The default ledger limit: about 130 slots.
-        with self.assertRaisesRegex(EvalError, "--limit-ledger-size 500000"):
+        with self.assertRaisesRegex(EvalError, "--limit-ledger-size 1000000"):
             self.window(slot=9368, first=9240)
 
     def test_the_verifier_is_told_where_history_must_start(self) -> None:
