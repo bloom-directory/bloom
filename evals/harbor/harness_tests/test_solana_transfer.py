@@ -475,6 +475,21 @@ class ReplacementLineageTests(ApproverMatchTests):
         self.publish_advice("0001", "0002")
         self.assertTrue(self.definition._replacement_is_authorized("0002"))
 
+    def test_a_replacement_restaged_again_before_approval_is_accepted(self) -> None:
+        # 0001 approved and expired; its replacement 0002 expired before it
+        # was approved and was restaged to 0003. The chain still reaches 0003.
+        self.definition._approved_lineage.append("0001")
+        self.publish_advice("0001", "0002")
+        self.publish_advice("0002", "0003")
+        self.assertTrue(self.definition._replacement_is_authorized("0003"))
+
+    def test_a_chain_that_never_reaches_the_entry_is_refused(self) -> None:
+        self.definition._approved_lineage.append("0001")
+        self.publish_advice("0001", "0002")
+        self.publish_advice("0002", "0003")
+        # 0003 has no advice yet, so 0009 is not reached: wait, not accept.
+        self.assertIsNone(self.definition._replacement_is_authorized("0009"))
+
     def test_a_replacement_for_a_different_id_is_refused(self) -> None:
         self.definition._approved_lineage.append("0001")
         self.publish_advice("0001", "0009")

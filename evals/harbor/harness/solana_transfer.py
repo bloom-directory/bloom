@@ -101,6 +101,8 @@ MAX_TRANSFER_CEREMONIES = 3
 # this grace, a confirmable entry with no advice was staged fresh, not
 # restaged, and is refused.
 RESTAGE_ADVICE_GRACE_SECONDS = 10.0
+# Bounds the restage chain the approver follows from its last approval.
+MAX_RESTAGE_HOPS = 10
 # Slots of history a local validator must retain to cover one trial: the
 # environment build plus the agent timeout (1800 s) at ~2.5 slots per second.
 LOCAL_HISTORY_MIN_SLOTS = 4500
@@ -921,23 +923,33 @@ class SolanaTransferEval(EvalDefinition):
     def _replacement_is_authorized(self, pending_id: str) -> bool | None:
         """Decide whether a differently-named pending entry may be approved.
 
-        Only one succession is authorized: the previously approved entry
-        expired, the agent restaged it, and the outbox's own advice names this
-        entry as the replacement. A second entry staged fresh - identical
-        destination and amount, no expiry, no advice - is a new payment
-        attempt and is refused, as is any id the lineage does not name.
+        Only restage successions are authorized: starting from the last
+        approved entry, each expired entry's own outbox advice names its
+        replacement, and this entry is reached by following that chain. A
+        replacement may itself expire before it is approved and be restaged
+        again, so the chain can run through unapproved entries. An entry
+        staged fresh - no advice names it - is a new payment attempt and is
+        refused.
 
-        Returns None when the predecessor has no advice yet: the restage
-        operation writes the advice just after it stages the replacement, so
-        absence is briefly "wait". The approver refuses once the grace passes.
+        Returns None when an entry on the chain has no advice yet: the
+        restage operation writes the advice just after it stages the
+        replacement, so absence is briefly "wait". The approver refuses once
+        the grace passes.
         """
         if not self._approved_lineage:
             return False
-        advice = self._restage_advice(self._approved_lineage[-1])
-        if advice is None:
-            return None
-        named = advice.get("replacement_id")
-        return isinstance(named, str) and named == pending_id
+        current = self._approved_lineage[-1]
+        for _ in range(MAX_RESTAGE_HOPS):
+            advice = self._restage_advice(current)
+            if advice is None:
+                return None
+            named = advice.get("replacement_id")
+            if not isinstance(named, str):
+                return False
+            if named == pending_id:
+                return True
+            current = named
+        return False
 
     def _approve_loop(self, ceremonies: CeremonyDriver) -> None:
         deadline = time.monotonic() + APPROVER_BUDGET_SECONDS
