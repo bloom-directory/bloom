@@ -470,12 +470,11 @@ have installed.
 
 The [native SOL transfer evaluation](tasks/solana-transfer/README.md) has its
 own operator guide because its irreversible transfer, exact-match host
-approval, mainnet destination sweep, and outbox replacement model differ
-materially from Hyperliquid's reversible order/cancel workflow.
+approval, and outbox replacement model differ materially from Hyperliquid's
+reversible order/cancel workflow. It runs on a disposable local validator.
 
-Its deterministic smoke lane checks protocol conformance on the prepared
-evaluation triad and a local validator. Paid model lanes are
-documentation-discovery evaluations: they are told only where Bloom is mounted
-and must find the mount-root `AGENTS.md`, whose mounted Sealed Approval section
-documents the native Solana transfer workflow. Harbor's `opencode` agent is available with
-DeepSeek as `scripts/evals/run-harbor-solana-local.sh opencode`.
+Its deterministic smoke checks the Bloom lifecycle without an LLM. Model
+trials are documentation-discovery evaluations: the agent is told only where
+Bloom is mounted and must find the mount-root `AGENTS.md`. Run several with
+`--trials N`; each trial reports PASS, FAIL (the agent's outcome), or INVALID
+(the harness or environment failed).
