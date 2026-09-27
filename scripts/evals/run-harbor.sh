@@ -10,7 +10,7 @@ harbor_version="${HARBOR_VERSION:-0.21.0}"
 
 if [ "$#" -lt 1 ]; then
   printf '%s\n' \
-    'Usage: scripts/evals/run-harbor.sh EVAL claude|codex|glm|deepseek|opencode|--smoke-only|--preauthorization-only' >&2
+    'Usage: scripts/evals/run-harbor.sh EVAL claude|codex|glm|deepseek|opencode|--smoke-only|--preauthorization-only [--trials N]' >&2
   exit 2
 fi
 

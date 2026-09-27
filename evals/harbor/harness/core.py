@@ -23,6 +23,14 @@ class EvalError(RuntimeError):
     """A fail-closed evaluation error suitable for operator display."""
 
 
+class AgentFailure(EvalError):
+    """The trial ran and the agent did not earn the reward.
+
+    Every other EvalError means the harness, environment, or cleanup failed,
+    so the trial says nothing about the agent.
+    """
+
+
 # The Broker publishes owner ceremonies at the triad's local origin with a
 # base64url-encoded 32-byte secret. The shape is Broker-wide, not specific to
 # any one Petal or chain, so every eval that drives a passkey ceremony matches
@@ -188,8 +196,8 @@ class MountedTree:
     def list_dir(self, path: Path) -> list[str]:
         """List a mounted directory; absence is an empty listing.
 
-        Mirrors the vfs transport: state directories the engine has not
-        created yet are a poll outcome, not an error.
+        State directories the engine has not created yet are a poll
+        outcome, not an error.
         """
         try:
             return os.listdir(path)
@@ -513,7 +521,14 @@ class EvalDefinition(ABC):
             detail = api_error.group(0).strip() if api_error else message.strip()
             if len(detail) > 500:
                 detail = detail[:497] + "..."
-            raise EvalError(
+            # Running out of time is the agent's outcome; any other exception
+            # (provider, auth, environment) is not.
+            failure = (
+                AgentFailure
+                if trial.exception_info.exception_type == "AgentTimeoutError"
+                else EvalError
+            )
+            raise failure(
                 "Harbor trial failed with "
                 f"{trial.exception_info.exception_type}: "
                 f"{detail}"
@@ -528,7 +543,7 @@ class EvalDefinition(ABC):
             raise EvalError("Harbor trial returned no verifier result")
         rewards = trial.verifier_result.rewards
         if not rewards or any(float(value) <= 0 for value in rewards.values()):
-            raise EvalError(
+            raise AgentFailure(
                 f"Harbor verifier did not award a passing reward: {rewards}"
             )
 

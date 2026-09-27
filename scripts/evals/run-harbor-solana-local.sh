@@ -1,30 +1,34 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Developer wrapper for the local-lane native SOL transfer evaluation.
+# Developer wrapper for the native SOL transfer evaluation.
 #
-# It drives the prepared, dedicated evaluation triad from the task README:
-# one triad on its own ceremony port, one trial at a time, plus a disposable
-# local validator. This wrapper never launches, restarts, or stops
-# services; lifecycle belongs to scripts/triad-dev-launch.sh and to whoever
-# started the validator.
+# It drives the prepared, dedicated evaluation triad from the task README: one
+# triad on its own ceremony port with the kernel mount, plus a disposable local
+# validator. This wrapper never launches, restarts, or stops services;
+# lifecycle belongs to scripts/triad-dev-launch.sh and to whoever started the
+# validator.
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 
 usage() {
   printf '%s\n' \
-    'Usage: scripts/evals/run-harbor-solana-local.sh [claude|codex|glm|deepseek|opencode]' \
-    '       scripts/evals/run-harbor-solana-local.sh smoke' \
+    'Usage: scripts/evals/run-harbor-solana-local.sh [claude|codex|glm|deepseek|opencode|smoke] [--trials N]' \
     'Prepare the evaluation triad and local validator first; see' \
     'evals/harbor/tasks/solana-transfer/README.md.' >&2
   exit 2
 }
 
 mode="${1:-glm}"
-[ "$#" -le 1 ] || usage
+[ "$#" -eq 0 ] || shift
 case "$mode" in
   smoke) harness_args=(--smoke-only) ;;
   claude|codex|glm|deepseek|opencode) harness_args=("$mode") ;;
+  *) usage ;;
+esac
+case "$#" in
+  0) ;;
+  2) [ "$1" = --trials ] || usage; harness_args+=(--trials "$2") ;;
   *) usage ;;
 esac
 
@@ -39,20 +43,17 @@ if [ -z "${BLOOM_HOME:-}" ]; then
   fi
 fi
 
-# The vfs transport drives the Machine over IPC and needs no kernel mount.
-if [ "${BLOOM_EVAL_SOLANA_TRANSPORT:-mount}" != vfs ]; then
-  if [ -z "${BLOOM_EVAL_BLOOM_MOUNT:-}" ]; then
-    printf '%s\n' \
-      'error: BLOOM_EVAL_BLOOM_MOUNT is not set; export it or point BLOOM_TRIAD_ENV' \
-      'at the prepared triad env file.' >&2
-    exit 1
-  fi
-  if ! mount | grep -F " on ${BLOOM_EVAL_BLOOM_MOUNT} " >/dev/null 2>&1; then
-    printf '%s\n' \
-      "error: no mount is live at ${BLOOM_EVAL_BLOOM_MOUNT}; start the prepared" \
-      'evaluation triad with scripts/triad-dev-launch.sh --mount ... (README).' >&2
-    exit 1
-  fi
+if [ -z "${BLOOM_EVAL_BLOOM_MOUNT:-}" ]; then
+  printf '%s\n' \
+    'error: BLOOM_EVAL_BLOOM_MOUNT is not set; launch the triad with --mount and' \
+    'point BLOOM_TRIAD_ENV at its triad.env.' >&2
+  exit 1
+fi
+if ! mount | grep -F " on ${BLOOM_EVAL_BLOOM_MOUNT} " >/dev/null 2>&1; then
+  printf '%s\n' \
+    "error: no mount is live at ${BLOOM_EVAL_BLOOM_MOUNT}; start the prepared" \
+    'evaluation triad with scripts/triad-dev-launch.sh --mount ... (README).' >&2
+  exit 1
 fi
 
 # The evaluation triad's ceremony port must be serving. triad.env records it;
@@ -66,11 +67,9 @@ if ! (exec 3<>"/dev/tcp/127.0.0.1/${ceremony_port}") 2>/dev/null; then
 fi
 export BLOOM_TRIAD_DEV_CEREMONY_ORIGIN="${BLOOM_TRIAD_DEV_CEREMONY_ORIGIN:-http://localhost:${ceremony_port}}"
 
-export BLOOM_EVAL_SOLANA_LANE="${BLOOM_EVAL_SOLANA_LANE:-local}"
 export BLOOM_EVAL_SOLANA_CHAIN="${BLOOM_EVAL_SOLANA_CHAIN:-solana-local}"
 export BLOOM_EVAL_SOLANA_WALLET_ID="${BLOOM_EVAL_SOLANA_WALLET_ID:-solana-eval}"
 export BLOOM_EVAL_SOLANA_RPC_URL="${BLOOM_EVAL_SOLANA_RPC_URL:-http://127.0.0.1:8899}"
-export BLOOM_EVAL_SOLANA_NETWORK="${BLOOM_EVAL_SOLANA_NETWORK:-localnet}"
 export BLOOM_EVAL_SOLANA_HOME_ROOT="${BLOOM_EVAL_SOLANA_HOME_ROOT:-${BLOOM_HOME:-}}"
 
 exec "$repo_root/scripts/evals/run-harbor.sh" solana-transfer "${harness_args[@]}"

@@ -15,6 +15,7 @@ from unittest import mock
 from harness import hyperliquid_order_cancel
 from harness.core import (
     AGENTS,
+    AgentFailure,
     AgentSpec,
     EvalDefinition,
     EvalError,
@@ -22,7 +23,7 @@ from harness.core import (
     _agent_spec,
     run_eval,
 )
-from harness.__main__ import parser
+from harness.__main__ import parser, run_trials
 from harness.hyperliquid_order_cancel import (
     ACTION_FILES,
     MAINNET_ACK,
@@ -276,6 +277,77 @@ class HarnessLifecycleTests(unittest.TestCase):
             r"UnknownApiError: API Error: Request rejected \(429\).*Limit Exhausted",
         ):
             definition.validate_result(result)
+
+
+class VerdictTests(unittest.TestCase):
+    """FAIL is the agent's outcome; INVALID says nothing about the agent."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+
+    def result(self, *, reward: float = 1, exception_type: str | None = None) -> SimpleNamespace:
+        info = (
+            None
+            if exception_type is None
+            else SimpleNamespace(exception_type=exception_type, exception_message="x")
+        )
+        trial = SimpleNamespace(
+            exception_info=info,
+            verifier_result=SimpleNamespace(rewards={"reward": reward}),
+        )
+        return SimpleNamespace(
+            stats=SimpleNamespace(n_errored_trials=0, n_cancelled_trials=0),
+            trial_results=[trial],
+        )
+
+    def test_a_zero_reward_is_an_agent_failure(self) -> None:
+        with self.assertRaises(AgentFailure):
+            FakeDefinition(self.root).validate_result(self.result(reward=0))
+
+    def test_running_out_of_time_is_an_agent_failure(self) -> None:
+        with self.assertRaises(AgentFailure):
+            FakeDefinition(self.root).validate_result(
+                self.result(exception_type="AgentTimeoutError")
+            )
+
+    def test_a_provider_error_is_not_an_agent_failure(self) -> None:
+        with self.assertRaises(EvalError) as raised:
+            FakeDefinition(self.root).validate_result(
+                self.result(exception_type="UnknownApiError")
+            )
+        self.assertNotIsInstance(raised.exception, AgentFailure)
+
+    def test_trials_are_independent_and_counted_by_verdict(self) -> None:
+        outcomes = [None, AgentFailure("reward 0"), EvalError("validator down"), None]
+        made: list[FakeDefinition] = []
+
+        def make() -> FakeDefinition:
+            made.append(FakeDefinition(self.root))
+            return made[-1]
+
+        def run(definition: EvalDefinition) -> None:
+            outcome = outcomes[len(made) - 1]
+            if outcome is not None:
+                raise outcome
+
+        with mock.patch("sys.stdout"), mock.patch("sys.stderr"):
+            code = run_trials(make, 4, run)
+        self.assertEqual(len({id(d) for d in made}), 4)
+        # An invalid trial means the run cannot be trusted as a whole.
+        self.assertEqual(code, 2)
+
+    def test_all_passing_trials_exit_zero_and_a_failure_exits_one(self) -> None:
+        with mock.patch("sys.stdout"), mock.patch("sys.stderr"):
+            self.assertEqual(
+                run_trials(lambda: FakeDefinition(self.root), 3, lambda _d: None), 0
+            )
+
+            def fail(_definition: EvalDefinition) -> None:
+                raise AgentFailure("reward 0")
+
+            self.assertEqual(run_trials(lambda: FakeDefinition(self.root), 2, fail), 1)
 
 
 class HyperliquidDefinitionTests(unittest.TestCase):

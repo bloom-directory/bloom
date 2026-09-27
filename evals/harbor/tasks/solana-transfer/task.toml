@@ -13,9 +13,8 @@ tags = ["trading", "cleanup-required", "sealed-approval"]
 
 [agent]
 # The agent stages, hits the fail-closed approval boundary, waits for an
-# out-of-band owner approval, retries, then waits for finalization. The waiting
-# dominates: Solana finalization is roughly 13 seconds on mainnet-beta, and the
-# owner approval is driven by the host on its own schedule.
+# out-of-band owner approval, retries, then waits for finalization. Discovery
+# and any blockhash-expiry restages dominate.
 timeout_sec = 1200.0
 
 [verifier]

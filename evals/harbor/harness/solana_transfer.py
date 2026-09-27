@@ -1,41 +1,31 @@
-"""Host-side lifecycle for the bounded Solana native-transfer evaluation.
+"""Host-side lifecycle for the native SOL transfer evaluation.
 
 The Hyperliquid eval is safe because its primitive is reversible: place, then
-cancel, where the undo is also the proof. A SOL transfer has no undo, so three
-parts of that safety model are replaced here.
+cancel, where the undo is also the proof. A SOL transfer has no undo, so the
+bound is the host approval contract instead. For each trial the harness picks
+a fresh random destination, allows only it in the wallet policy, and completes
+an owner ceremony only for a staged intent that matches the exact transfer:
+destination, lamports, fee payer, fee ceiling, signing account, and genesis. A
+restaged replacement is approved only when the outbox's own
+`restage_advice.json` chain leads to it. The verifier then requires exactly one
+finalized payment on chain.
 
-* The bound is the host approval contract rather than a bounded venue session.
-  The background approver completes a ceremony only after checking the staged
-  intent against the exact configured transfer: destination, exact lamports,
-  fee payer, fee ceiling, and the pinned signing account. Nothing else is ever
-  approved, and a restaged replacement is approved only when the outbox's own
-  `restage_advice.json` lineage says it replaces the approved entry.
-* The binding between the chain record and this trial is a fresh
-  host-controlled destination plus that exact amount, rather than a
-  host-generated client order id.
-* On mainnet, cleanup sweeps the destination back to the source with a
-  host-held key, so only the fee is actually spent. The container never sees
-  the sweep key. The local lane's validator funds are worthless and its
-  disposal belongs to whoever started the validator; the runner never touches
-  an externally supplied triad.
-
-Both lanes use the ordinary transfer and approval semantics of the service
-stack. `--lane local` runs against a disposable local validator; `--lane
-mainnet` requires the explicit network selection and acknowledgement and is
-bounded by the same exact-match approval.
+It runs against a disposable local validator only; the endpoint's genesis is
+checked, and mainnet-beta is refused.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import re
 import secrets
 import shutil
-import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -45,8 +35,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from collections.abc import Callable
-
 from .core import (
     CEREMONY_URL,
     CeremonyDriver,
@@ -55,15 +43,12 @@ from .core import (
     EvalRunContext,
     MountedTree,
     SignCountStore,
-    poll_until,
     resolve_sign_count,
 )
 
-MAINNET_ACK = "TRANSFER_SOL_MAINNET_EXACTLY_AS_CONFIGURED"
-MAINNET_NETWORK = "mainnet-beta"
-# The cluster identity the mainnet lane requires and the local lane refuses.
-# This is the chain's own answer to `getGenesisHash`, not a configuration
-# label, so pointing the "local" lane at a mainnet endpoint fails here.
+# The cluster identity this eval refuses. This is the chain's own answer to
+# `getGenesisHash`, not a configuration label, so pointing the eval at a
+# mainnet endpoint fails here.
 MAINNET_GENESIS_HASH = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d"
 
 BASE58 = "[1-9A-HJ-NP-Za-km-z]"
@@ -72,6 +57,7 @@ WALLET_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
 CHAIN_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
 FINGERPRINT = re.compile(r"[0-9a-f]{16,64}")
 DERIVATION = re.compile(r"m/44'/501'/\d+'/0'")
+BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
 # A ceiling the harness enforces on the transfer and fee independently of
 # anything the operator configures, so a fat-fingered parameter cannot widen
@@ -108,10 +94,6 @@ MAX_RESTAGE_HOPS = 10
 LOCAL_HISTORY_MIN_SLOTS = 4500
 
 RPC_TIMEOUT_SECONDS = 30
-SWEEP_TIMEOUT_SECONDS = 180
-SWEEP_SETTLE_ATTEMPTS = 20
-SWEEP_SETTLE_DELAY_SECONDS = 3.0
-
 PENDING_DRAIN_ATTEMPTS = 30
 PENDING_DRAIN_DELAY_SECONDS = 2.0
 RECEIPT_SETTLE_ATTEMPTS = 45
@@ -123,145 +105,6 @@ SMOKE_RESTAGE_ENV = "BLOOM_EVAL_SOLANA_SMOKE_RESTAGE"
 SMOKE_RESTAGE_WAIT_ATTEMPTS = 600
 SMOKE_RESTAGE_WAIT_DELAY_SECONDS = 1.0
 
-# Transport for mounted reads and route writes. "mount" is the agent-facing
-# kernel NFS mount; "vfs" drives the same VFS handlers through `bloom vfs`
-# over the Machine IPC socket, so the deterministic smoke can run as a
-# regression gate wherever the Machine is reachable, without a kernel mount
-# or the sudo rule it requires.
-TRANSPORT_ENV = "BLOOM_EVAL_SOLANA_TRANSPORT"
-VFS_BIN_ENV = "BLOOM_EVAL_SOLANA_VFS_BIN"
-TRANSPORTS = ("mount", "vfs")
-
-
-
-class VfsTree:
-    """Mount-free transport: the same VFS handlers, driven via `bloom vfs`.
-
-    Reads, listings, and route writes go through the CLI's IPC client, so
-    paths arriving here are host-mount style (under the configured mount
-    prefix) and are mapped to VFS-root paths by stripping that prefix. The
-    parent-listing existence rule is preserved: `vfs ls` is the boundary for
-    "does this entry exist", exactly as `os.listdir` is for the mount.
-    """
-
-    def __init__(
-        self,
-        root: Path,
-        binary: str,
-        *,
-        read_timeout: int = CHAIN_READ_TIMEOUT_SECONDS,
-        read_attempts: int = CHAIN_READ_ATTEMPTS,
-    ) -> None:
-        self.root = root
-        self.binary = binary
-        self.read_timeout = read_timeout
-        self.read_attempts = read_attempts
-
-    def _vfs_path(self, path: Path) -> str:
-        try:
-            relative = path.relative_to(self.root)
-        except ValueError as error:
-            raise EvalError(f"vfs path {path} is outside {self.root}") from error
-        return "/" + relative.as_posix()
-
-    def _run(
-        self,
-        arguments: list[str],
-        timeout: int,
-        input: bytes | None = None,  # noqa: A002 - mirror subprocess spelling
-    ) -> subprocess.CompletedProcess[bytes]:
-        try:
-            return subprocess.run(
-                [self.binary, "-q", "vfs", *arguments],
-                input=input,
-                capture_output=True,
-                check=False,
-                timeout=timeout,
-            )
-        except (OSError, subprocess.SubprocessError) as error:
-            raise EvalError(f"vfs transport failed: {error}") from error
-
-    def reachable(self) -> str | None:
-        """None when the Machine answers over IPC, else a usable error."""
-        try:
-            completed = subprocess.run(
-                [self.binary, "-q", "vfs", "stat", "/"],
-                capture_output=True,
-                check=False,
-                timeout=self.read_timeout,
-            )
-        except (OSError, subprocess.SubprocessError) as error:
-            return f"vfs transport cannot run {self.binary!r}: {error}"
-        if completed.returncode != 0:
-            detail = completed.stderr.decode(errors="replace").strip()
-            return (
-                "vfs transport cannot reach the Machine over "
-                f"BLOOM_RPC_ENDPOINT: {detail}"
-            )
-        return None
-
-    def read_bytes(self, path: Path, timeout: int | None = None) -> bytes:
-        budget = self.read_timeout if timeout is None else timeout
-        completed = self._run(["cat", self._vfs_path(path)], budget)
-        if completed.returncode != 0:
-            detail = completed.stderr.decode(errors="replace").strip()
-            raise EvalError(f"vfs cat {path} failed: {detail}")
-        return completed.stdout
-
-    def read_text(self, path: Path, timeout: int | None = None) -> str:
-        return self.read_bytes(path, timeout).decode(errors="strict")
-
-    def read_json(self, path: Path, timeout: int | None = None) -> Any:
-        """Read and parse JSON, retrying timeouts and torn snapshots."""
-        budget = self.read_timeout if timeout is None else timeout
-        last_error: BaseException | None = None
-        for attempt in range(self.read_attempts):
-            try:
-                return json.loads(self.read_bytes(path, budget))
-            except json.JSONDecodeError as error:
-                last_error = error
-                if attempt + 1 < self.read_attempts:
-                    time.sleep(0.2)
-        raise EvalError(
-            f"could not read {path} as JSON after {self.read_attempts} "
-            f"attempts: {last_error}"
-        ) from last_error
-
-    def list_dir(self, path: Path) -> list[str]:
-        # A missing directory means "not there (or not yet)": the smoke polls
-        # state that the engine is creating concurrently, so absence is a
-        # poll outcome, not an error. Any other failure — an unreachable
-        # Machine above all — is fail-loud, like the mount transport's.
-        completed = self._run(["ls", self._vfs_path(path)], self.read_timeout)
-        if completed.returncode != 0:
-            detail = completed.stderr.decode(errors="replace").strip()
-            if "not found:" in detail:
-                return []
-            raise EvalError(f"vfs ls {path} failed: {detail}")
-        names = []
-        for line in completed.stdout.decode(errors="replace").splitlines():
-            if line.strip():
-                names.append(line.split("\t")[0])
-        return names
-
-    def read_json_if_listed(
-        self, path: Path, listing_dir: Path, name: str
-    ) -> Any | None:
-        if name not in self.list_dir(listing_dir):
-            return None
-        return self.read_json(path)
-
-    def write_route(
-        self, path: Path, body: bytes, timeout: int
-    ) -> subprocess.CompletedProcess[bytes]:
-        return self._run(["write", self._vfs_path(path)], timeout, input=body)
-
-    @staticmethod
-    def poll_until(
-        predicate: Callable[[], bool], attempts: int, delay: float
-    ) -> bool:
-        return poll_until(predicate, attempts, delay)
-
 class SolanaTransferEval(EvalDefinition):
     name = "solana-transfer"
     # Discovery, owner approval, possible blockhash restaging, and finality
@@ -271,31 +114,18 @@ class SolanaTransferEval(EvalDefinition):
     def __init__(self, repo_root: Path, environ: dict[str, str] | None = None) -> None:
         self.repo_root = repo_root.resolve()
         self.env = dict(os.environ if environ is None else environ)
-        self.lane = self.env.get("BLOOM_EVAL_SOLANA_LANE", "local")
         self.wallet_id = self.env.get("BLOOM_EVAL_SOLANA_WALLET_ID", "")
         self.chain = self.env.get("BLOOM_EVAL_SOLANA_CHAIN", "")
-        self.network = self.env.get("BLOOM_EVAL_SOLANA_NETWORK", "")
         self.rpc_url = self.env.get("BLOOM_EVAL_SOLANA_RPC_URL", "")
-        self.transport = self.env.get(TRANSPORT_ENV, "mount")
-        if self.transport not in TRANSPORTS:
-            raise EvalError(
-                f"{TRANSPORT_ENV} must be one of {', '.join(TRANSPORTS)}; "
-                f"got {self.transport!r}"
-            )
         self.bloom_mount_value = self.env.get("BLOOM_EVAL_BLOOM_MOUNT", "").strip()
-        if not self.bloom_mount_value and self.transport == "vfs":
-            # The vfs transport only uses the mount path as a prefix it
-            # strips; a triad launched without --mount has none to give.
-            self.bloom_mount_value = "/bloom"
         self.bloom_mount = Path(self.bloom_mount_value)
         # The Machine's home root, on the host filesystem. The approver reads
         # the canonical approval challenge here so its decision is unaffected
         # by mount latency or a projection changing during a read.
         self.home_root = Path(self.env.get("BLOOM_EVAL_SOLANA_HOME_ROOT", ""))
-        self.solana_cli = self.env.get("BLOOM_EVAL_SOLANA_CLI", "solana")
-        self.sweep_keypair = Path(
-            self.env.get("BLOOM_EVAL_SOLANA_SWEEP_KEYPAIR_FILE", "")
-        )
+        # The bloom CLI stages each trial's policy change; triad.env puts the
+        # evaluation triad's build first on PATH and names its Machine socket.
+        self.bloom_bin = self.env.get("BLOOM_EVAL_BLOOM_BIN", "bloom")
         self.driver = Path(
             self.env.get(
                 "BLOOM_EVAL_DEBUG_DRIVER_BIN",
@@ -327,39 +157,33 @@ class SolanaTransferEval(EvalDefinition):
         self.derivation_path = ""
         # Set by _require_chain_identity; empty matches no staged intent.
         self.genesis_hash = ""
-        # Local lane: the slot preflight saw, from which history must survive.
+        # The slot preflight saw, from which the validator's history must survive.
         self.history_start_slot: int | None = None
         # Numbered account directory the vfs projects the wallet under
         # (`wallets/<wallet>/<n>/...`); resolved from the authenticated
         # account projection in _load_local_account_identity.
         self.account_dir = ""
         self.trial_id: str | None = None
-        self.vfs_bin = self.env.get(VFS_BIN_ENV, "bloom")
-        # The smoke-only escape that admits the vfs transport; agent trials
-        # require the mounted transport and never set it.
-        self.smoke_only = False
-        self.mount: MountedTree | VfsTree
-        if self.transport == "vfs":
-            self.mount = VfsTree(
-                self.bloom_mount,
-                self.vfs_bin,
-                read_timeout=CHAIN_READ_TIMEOUT_SECONDS,
-                read_attempts=CHAIN_READ_ATTEMPTS,
-            )
-        else:
-            self.mount = MountedTree(
-                read_timeout=CHAIN_READ_TIMEOUT_SECONDS,
-                read_attempts=CHAIN_READ_ATTEMPTS,
-            )
+        self.mount = MountedTree(
+            read_timeout=CHAIN_READ_TIMEOUT_SECONDS,
+            read_attempts=CHAIN_READ_ATTEMPTS,
+        )
         self._approver: threading.Thread | None = None
         self._approver_stop = threading.Event()
+        # A harness fault (driver, IO): the trial cannot be judged.
         self._approver_error: str | None = None
+        # A staging the approver refused (wrong transfer, not a restage, past
+        # the cap): the agent's outcome, not a fault.
+        self._approver_refusal: str | None = None
         self._approver_completed = 0
         # The approved replacement lineage, oldest first. Entries are outbox
         # ids whose staged intent matched the configured transfer and whose
         # succession is documented by the outbox's own restage advice.
         self._approved_lineage: list[str] = []
         self._baseline_sent: set[str] = set()
+        # Every host outbox entry that existed at preflight, so the trial
+        # summary counts only this trial's stagings.
+        self._baseline_entries: set[str] = set()
 
     # ---- paths ---------------------------------------------------------
 
@@ -487,74 +311,11 @@ class SolanaTransferEval(EvalDefinition):
             raise EvalError(f"could not read Solana account address: {error}") from error
         if ADDRESS.fullmatch(address) is None:
             raise EvalError("Solana account projection has a malformed address")
-        # An operator-pinned identity (the mainnet lane configures all three;
-        # BLOOM_EVAL_SOLANA_SOURCE may pin the local lane) must agree with
-        # what the wallet actually projects, or the trial would spend from a
-        # different account than the one that was authorized.
-        projected = {
-            "BLOOM_EVAL_SOLANA_SOURCE": address,
-            "BLOOM_EVAL_SOLANA_KEY_FINGERPRINT": fingerprint,
-            "BLOOM_EVAL_SOLANA_DERIVATION_PATH": path,
-        }
-        for variable, value in projected.items():
-            pinned = self.env.get(variable, "")
-            if pinned and pinned != value:
-                raise EvalError(
-                    f"{variable} is pinned to {pinned} but the wallet's active "
-                    f"Solana account projects {value}"
-                )
         self.source_address = address
         self.key_fingerprint = fingerprint
         self.derivation_path = path
 
-    def _require_sweep_keypair(self) -> None:
-        """Prove the host controls the configured cleanup destination."""
-        # `Path("")` is `.`, whose lstat succeeds as a directory and would
-        # report the wrong problem.
-        if not str(self.sweep_keypair) or str(self.sweep_keypair) == ".":
-            raise EvalError("BLOOM_EVAL_SOLANA_SWEEP_KEYPAIR_FILE is required")
-        try:
-            keypair_stat = self.sweep_keypair.lstat()
-        except OSError as error:
-            raise EvalError(f"sweep keypair is unavailable: {error}") from error
-        if not stat.S_ISREG(keypair_stat.st_mode) or self.sweep_keypair.is_symlink():
-            raise EvalError("sweep keypair must be a regular non-symlink file")
-        if stat.S_IMODE(keypair_stat.st_mode) != 0o600:
-            raise EvalError("sweep keypair must have mode 0600")
-        try:
-            completed = subprocess.run(
-                [self.solana_cli, "address", "--keypair", str(self.sweep_keypair)],
-                capture_output=True,
-                check=False,
-                text=True,
-                timeout=20,
-            )
-        except (OSError, subprocess.SubprocessError) as error:
-            raise EvalError(f"could not inspect sweep keypair address: {error}") from error
-        if completed.returncode != 0:
-            raise EvalError(
-                "could not inspect sweep keypair address: "
-                + (completed.stderr or completed.stdout).strip()
-            )
-        if completed.stdout.strip() != self.destination:
-            raise EvalError(
-                "BLOOM_EVAL_SOLANA_DESTINATION is not controlled by the configured "
-                "sweep keypair"
-            )
-
     # ---- transfer parameters and chain identity ------------------------
-
-    def _require_mainnet_ack(self) -> None:
-        if self.env.get("BLOOM_EVAL_SOLANA_MAINNET_ACK") != MAINNET_ACK:
-            raise EvalError(
-                f"set BLOOM_EVAL_SOLANA_MAINNET_ACK={MAINNET_ACK} to confirm "
-                "this mainnet trial"
-            )
-
-    def _require_destination(self) -> None:
-        self.destination = self.env.get("BLOOM_EVAL_SOLANA_DESTINATION", "")
-        if ADDRESS.fullmatch(self.destination) is None:
-            raise EvalError("BLOOM_EVAL_SOLANA_DESTINATION must be a base58 address")
 
     @staticmethod
     def _positive_lamports(name: str, value: str) -> int:
@@ -563,60 +324,11 @@ class SolanaTransferEval(EvalDefinition):
             raise EvalError(f"{name} must be a positive integer number of lamports")
         return amount
 
-    def _require_mainnet_transfer_parameters(self) -> None:
-        """Take the whole transfer contract from explicit operator input.
-
-        There is no authorization file to parse: the operator configures the
-        exact source, account, amount, and fee ceiling here, the harness
-        ceilings cap them independently, and the approver refuses any staged
-        intent that deviates. A missing field is an error, never a silent
-        bypass.
-        """
-        source = self.env.get("BLOOM_EVAL_SOLANA_SOURCE", "")
-        if ADDRESS.fullmatch(source) is None:
-            raise EvalError("BLOOM_EVAL_SOLANA_SOURCE must be a base58 address")
-        self.source_address = source
-        fingerprint = self.env.get("BLOOM_EVAL_SOLANA_KEY_FINGERPRINT", "")
-        if FINGERPRINT.fullmatch(fingerprint) is None:
-            raise EvalError(
-                "BLOOM_EVAL_SOLANA_KEY_FINGERPRINT must be the source account's "
-                "hex public-key fingerprint"
-            )
-        self.key_fingerprint = fingerprint
-        derivation = self.env.get("BLOOM_EVAL_SOLANA_DERIVATION_PATH", "")
-        if DERIVATION.fullmatch(derivation) is None:
-            raise EvalError(
-                "BLOOM_EVAL_SOLANA_DERIVATION_PATH must be the account's canonical "
-                "BIP-44 Solana derivation path"
-            )
-        self.derivation_path = derivation
-        lamports = self._positive_lamports(
-            "BLOOM_EVAL_SOLANA_LAMPORTS",
-            self.env.get("BLOOM_EVAL_SOLANA_LAMPORTS", ""),
-        )
-        if lamports > HARNESS_MAX_TRANSFER_LAMPORTS:
-            raise EvalError(
-                f"configured transfer {lamports} exceeds the harness ceiling "
-                f"{HARNESS_MAX_TRANSFER_LAMPORTS}"
-            )
-        self.lamports = lamports
-        max_fee = self._positive_lamports(
-            "BLOOM_EVAL_SOLANA_MAX_FEE_LAMPORTS",
-            self.env.get("BLOOM_EVAL_SOLANA_MAX_FEE_LAMPORTS", ""),
-        )
-        if max_fee > HARNESS_MAX_TRANSFER_LAMPORTS:
-            raise EvalError(
-                f"configured fee ceiling {max_fee} exceeds the harness ceiling "
-                f"{HARNESS_MAX_TRANSFER_LAMPORTS}"
-            )
-        self.max_fee_lamports = max_fee
-
     def _require_chain_identity(self) -> None:
         """Check the configured endpoint's actual cluster identity.
 
-        A network label is operator input, not evidence. Mainnet requires the
-        pinned mainnet-beta genesis; the local lane refuses it, so a mainnet
-        endpoint can never masquerade as a disposable local validator.
+        A network label is operator input, not evidence: a mainnet endpoint
+        must never masquerade as the disposable local validator.
         """
         observed = self._rpc("getGenesisHash", [])
         if not isinstance(observed, str) or not observed:
@@ -624,16 +336,10 @@ class SolanaTransferEval(EvalDefinition):
         # The approver requires every staged intent to carry this same
         # genesis, so the identity checked here is the one approved.
         self.genesis_hash = observed
-        if self.lane == "mainnet":
-            if observed != MAINNET_GENESIS_HASH:
-                raise EvalError(
-                    "the mainnet lane requires a mainnet-beta endpoint; its "
-                    f"genesis hash is {observed}, expected {MAINNET_GENESIS_HASH}"
-                )
-        elif observed == MAINNET_GENESIS_HASH:
+        if observed == MAINNET_GENESIS_HASH:
             raise EvalError(
-                "the local lane refuses mainnet-beta endpoints; the configured "
-                "RPC serves the mainnet-beta genesis"
+                "the eval runs against a disposable local validator; the "
+                "configured RPC serves the mainnet-beta genesis"
             )
 
     def _require_local_history_window(self) -> None:
@@ -656,110 +362,41 @@ class SolanaTransferEval(EvalDefinition):
             )
         self.history_start_slot = slot
 
-    def _require_fresh_destination(self) -> None:
-        """The verifier grades exactly one signature on the destination, so
-        a destination with any history would score zero after a real
-        transfer and ceremony. Refuse it before anything moves."""
-        history = self._rpc(
-            "getSignaturesForAddress",
-            [self.destination, {"limit": 1, "commitment": "confirmed"}],
-        )
-        if not isinstance(history, list):
-            raise EvalError("could not read the destination's signature history")
-        if history:
-            raise EvalError(
-                "the destination already has on-chain history; each trial "
-                "needs a fresh host-controlled destination"
-            )
-
-    # ---- preflight -----------------------------------------------------
-
-    def _require_vfs_transport(self) -> None:
-        """Connection checks for the mount-free transport, fail-fast.
-
-        These run before seed-file and driver validation so an operator
-        wiring the regression gate learns about a missing endpoint or CLI
-        before anything about credentials.
-        """
-        if not self.env.get("BLOOM_RPC_ENDPOINT"):
-            raise EvalError(
-                "the vfs transport requires BLOOM_RPC_ENDPOINT; source the "
-                "triad env file so the CLI can reach the Machine"
-            )
-        if shutil.which(self.vfs_bin) is None:
-            raise EvalError(
-                f"the vfs transport requires the bloom CLI ({self.vfs_bin!r}) "
-                "on PATH or set via " + VFS_BIN_ENV
-            )
-        unreachable = self.mount.reachable()
-        if unreachable is not None:
-            raise EvalError(unreachable)
-
     def preflight(self) -> None:
         if not self.bloom_mount_value:
-            raise EvalError("BLOOM_EVAL_BLOOM_MOUNT is required for a full eval")
-        if self.lane not in ("local", "mainnet"):
-            raise EvalError(f"unknown lane {self.lane!r}; use local or mainnet")
+            raise EvalError("BLOOM_EVAL_BLOOM_MOUNT is required")
         if WALLET_ID.fullmatch(self.wallet_id) is None:
             raise EvalError("BLOOM_EVAL_SOLANA_WALLET_ID is required and must be a token")
         if CHAIN_NAME.fullmatch(self.chain) is None:
             raise EvalError("BLOOM_EVAL_SOLANA_CHAIN is required and must be a token")
         if not self.rpc_url:
             raise EvalError("BLOOM_EVAL_SOLANA_RPC_URL is required")
-        if self.transport == "vfs":
-            self._require_vfs_transport()
-
-        # Lane and network are checked before anything else. They are the
-        # "did the operator mean this" gates, and burying them behind a seed
-        # file or driver check would answer a dangerous misconfiguration with
-        # an unrelated error message.
-        self._require_destination()
-        if self.lane == "mainnet":
-            self._require_mainnet_ack()
-            if self.network != MAINNET_NETWORK:
+        lamports = self._positive_lamports(
+            "BLOOM_EVAL_SOLANA_LAMPORTS",
+            self.env.get("BLOOM_EVAL_SOLANA_LAMPORTS", "1000000"),
+        )
+        max_fee = self._positive_lamports(
+            "BLOOM_EVAL_SOLANA_MAX_FEE_LAMPORTS",
+            self.env.get("BLOOM_EVAL_SOLANA_MAX_FEE_LAMPORTS", "10000"),
+        )
+        for name, value in (("transfer", lamports), ("fee ceiling", max_fee)):
+            if value > HARNESS_MAX_TRANSFER_LAMPORTS:
                 raise EvalError(
-                    f"the mainnet lane requires network {MAINNET_NETWORK}"
+                    f"configured {name} {value} exceeds the harness ceiling "
+                    f"{HARNESS_MAX_TRANSFER_LAMPORTS}"
                 )
-            self._require_mainnet_transfer_parameters()
-            self._require_sweep_keypair()
-            self._require_sweep_tool()
-        else:
-            # Local funds are worthless and disappear with the validator's
-            # disposable ledger, whose disposal belongs to whoever started
-            # the validator.
-            if self.network == MAINNET_NETWORK:
-                raise EvalError(
-                    "the local lane must not be pointed at mainnet-beta; use the "
-                    "mainnet lane"
-                )
-            base = self._positive_lamports(
-                "BLOOM_EVAL_SOLANA_BASE_LAMPORTS",
-                self.env.get("BLOOM_EVAL_SOLANA_BASE_LAMPORTS", "1000000"),
-            )
-            if base > HARNESS_MAX_TRANSFER_LAMPORTS:
-                raise EvalError(
-                    f"BLOOM_EVAL_SOLANA_BASE_LAMPORTS {base} exceeds the harness "
-                    f"ceiling {HARNESS_MAX_TRANSFER_LAMPORTS}"
-                )
-            # Preflight is the single place the local amount is decided, so
-            # the ceiling above covers the exact on-chain value: no tail or
-            # second parse may widen it later.
-            self.lamports = base
-            self.max_fee_lamports = self._positive_lamports(
-                "BLOOM_EVAL_SOLANA_MAX_FEE_LAMPORTS",
-                self.env.get("BLOOM_EVAL_SOLANA_MAX_FEE_LAMPORTS", "10000"),
-            )
+        # Preflight is the single place the amount is decided, so the ceiling
+        # above covers the exact on-chain value.
+        self.lamports = lamports
+        self.max_fee_lamports = max_fee
 
         # Chain identity is checked from the chain itself, not from labels.
         self._require_chain_identity()
-        if self.lane == "local":
-            self._require_local_history_window()
-        self._require_fresh_destination()
+        self._require_local_history_window()
 
         # The approver reads the canonical host-side approval challenge the
-        # confirm route stages. Current outboxes also project a sanitized copy
-        # to the owner filesystem; the host copy remains the stable boundary
-        # for matching the exact configured intent before approval.
+        # confirm route stages; the host copy is the stable boundary for
+        # matching the exact configured intent before approval.
         if not str(self.home_root):
             raise EvalError(
                 "BLOOM_EVAL_SOLANA_HOME_ROOT is required so the host approver "
@@ -767,39 +404,30 @@ class SolanaTransferEval(EvalDefinition):
             )
         if not self.home_root.is_dir():
             raise EvalError(f"Machine home root is not a directory: {self.home_root}")
+        if shutil.which(self.bloom_bin) is None:
+            raise EvalError(
+                f"the bloom CLI ({self.bloom_bin!r}) is required to allow each "
+                "trial's destination; source triad.env or set BLOOM_EVAL_BLOOM_BIN"
+            )
 
         self.sign_count = self._require_sign_count()
         CeremonyDriver(self.driver, self.seed_file, self.sign_count).preflight()
 
-        # Both transports resolve the account through the same mount
-        # abstraction (the vfs tree for transport=vfs), so the numbered
-        # account directory and the projected identity are known before any
-        # outbox path is used.
+        if not os.path.ismount(self.bloom_mount):
+            raise EvalError(f"Bloom is not mounted at {self.bloom_mount}")
         self._load_local_account_identity()
-        if self.transport == "vfs":
-            listing = self.mount.list_dir(self.outbox_root)
-            if "new.tx" not in listing:
-                raise EvalError(
-                    f"wallet outbox is not reachable over vfs at "
-                    f"{self.outbox_root} (listing: {listing!r}); the wallet "
-                    "may not have this Solana chain configured"
-                )
-
-        if self.transport != "vfs":
-            if not os.path.ismount(self.bloom_mount):
-                raise EvalError(f"Bloom is not mounted at {self.bloom_mount}")
-            # Docker silently creates an empty directory at a missing bind
-            # source, which would mask the real outbox and fail bafflingly
-            # inside the container. Refuse before constructing the mount.
-            if not self.outbox_root.is_dir():
-                raise EvalError(
-                    f"wallet outbox is not present at {self.outbox_root}; the "
-                    "wallet may not have this Solana chain configured"
-                )
-            if not (self.outbox_root / "new.tx").exists():
-                raise EvalError(
-                    f"{self.outbox_root}/new.tx is missing; the chain is not writable"
-                )
+        # Docker silently creates an empty directory at a missing bind source,
+        # which would mask the real outbox and fail bafflingly inside the
+        # container. Refuse before constructing the mount.
+        if not self.outbox_root.is_dir():
+            raise EvalError(
+                f"wallet outbox is not present at {self.outbox_root}; the "
+                "wallet may not have this Solana chain configured"
+            )
+        if not (self.outbox_root / "new.tx").exists():
+            raise EvalError(
+                f"{self.outbox_root}/new.tx is missing; the chain is not writable"
+            )
 
         pending = self._list_state("pending")
         if pending:
@@ -821,13 +449,18 @@ class SolanaTransferEval(EvalDefinition):
                 raise EvalError(
                     f"historical sent entry {sent_id} has not reconciled to a receipt"
                 )
+        self._baseline_entries = {
+            entry
+            for state in ("pending", "sent", "failed")
+            for entry in self._list_host_state(state)
+        }
 
     def preauthorization_preflight(self) -> None:
         """Read-only validation, for use before any authority exists.
 
         Preflight performs no ceremony, no mounted write, no Docker job, and
-        no state change; its only network traffic is the RPC genesis identity
-        read. This mode runs it without constructing an agent or a Harbor job.
+        no state change; its only network traffic is the RPC identity and
+        history reads.
         """
         self.preflight()
 
@@ -965,7 +598,7 @@ class SolanaTransferEval(EvalDefinition):
                     if pending_id in self._approved_lineage:
                         continue
                     if not self._ceremony_matches_authorized_transfer(pending_id):
-                        self._approver_error = (
+                        self._approver_refusal = (
                             f"staged entry {pending_id} does not match the configured "
                             "transfer; refusing to approve it"
                         )
@@ -986,7 +619,7 @@ class SolanaTransferEval(EvalDefinition):
                                 continue
                             lineage_decision = False
                         if not lineage_decision:
-                            self._approver_error = (
+                            self._approver_refusal = (
                                 f"staged entry {pending_id} does not continue the approved "
                                 "replacement lineage (no restage advice names it); "
                                 "refusing to approve it"
@@ -995,7 +628,7 @@ class SolanaTransferEval(EvalDefinition):
                     if self._approver_completed >= MAX_TRANSFER_CEREMONIES:
                         # Say why the agent's next approval never comes; a
                         # silent stop reads as an approver that hung.
-                        self._approver_error = (
+                        self._approver_refusal = (
                             f"staged entry {pending_id} needs a ceremony past the "
                             f"cap of {MAX_TRANSFER_CEREMONIES}; each restaged "
                             "entry expired before its confirm was retried"
@@ -1018,7 +651,11 @@ class SolanaTransferEval(EvalDefinition):
                 )
                 return
             self._approver_stop.wait(APPROVER_POLL_SECONDS)
-        if self._approver_error is None and not self._approver_stop.is_set():
+        if (
+            self._approver_error is None
+            and self._approver_refusal is None
+            and not self._approver_stop.is_set()
+        ):
             # The budget ran out on its own. Record it only when entries went
             # unapproved, so a trial the agent never staged stays silent and a
             # slow staging reads as a budget expiry, never as agent failure.
@@ -1036,10 +673,7 @@ class SolanaTransferEval(EvalDefinition):
                     f"{len(unapproved)} pending entries unapproved"
                 )
 
-    def _start_approver(self, sign_count: int) -> None:
-        ceremonies = CeremonyDriver(
-            self.driver, self.seed_file, sign_count, store=self.sign_counts
-        )
+    def _start_approver(self, ceremonies: CeremonyDriver) -> None:
         self.next_sign_count = ceremonies.next_sign_count
         self._approver = threading.Thread(
             target=self._approve_loop,
@@ -1055,27 +689,7 @@ class SolanaTransferEval(EvalDefinition):
             self._approver.join(timeout=30)
             self._approver = None
 
-    # ---- host sweep ----------------------------------------------------
-
-    def _require_sweep_tool(self) -> None:
-        try:
-            version = subprocess.run(
-                [self.solana_cli, "--version"],
-                capture_output=True,
-                check=False,
-                text=True,
-                timeout=20,
-            )
-        except (OSError, subprocess.SubprocessError) as error:
-            raise EvalError(
-                f"the Solana CLI ({self.solana_cli}) is required for host cleanup "
-                f"but could not be run: {error}"
-            ) from error
-        if version.returncode != 0:
-            raise EvalError(
-                f"the Solana CLI ({self.solana_cli}) is required for host cleanup "
-                f"but failed: {version.stderr.strip()}"
-            )
+    # ---- chain RPC and per-trial destination ----------------------------
 
     def _rpc(self, method: str, params: list[Any]) -> Any:
         body = json.dumps(
@@ -1097,93 +711,90 @@ class SolanaTransferEval(EvalDefinition):
             raise EvalError(f"Solana {method} returned an error: {payload['error']}")
         return payload.get("result")
 
-    def _balance(self, address: str) -> int:
-        result = self._rpc("getBalance", [address, {"commitment": "finalized"}])
-        if not isinstance(result, dict) or not isinstance(result.get("value"), int):
-            raise EvalError(f"could not read the finalized balance of {address}")
-        return result["value"]
+    @staticmethod
+    def _fresh_destination() -> str:
+        """A random 32-byte address. No one holds its key and nothing has ever
+        paid it, so it is fresh by construction and ties the chain record to
+        this trial alone."""
+        raw = secrets.token_bytes(32)
+        number = int.from_bytes(raw, "big")
+        encoded = ""
+        while number:
+            number, digit = divmod(number, 58)
+            encoded = BASE58_ALPHABET[digit] + encoded
+        leading_zeros = len(raw) - len(raw.lstrip(b"\0"))
+        return "1" * leading_zeros + encoded
 
-    def sweep_destination(self) -> str | None:
-        """Return the destination's lamports to the source.
-
-        This is what makes the mainnet eval economically reversible: the
-        transfer itself cannot be undone, but the destination is
-        host-controlled, so the lamports come back and only the fees are
-        actually spent. The sweep leaves history on the destination, so the
-        next trial needs a fresh one (preflight refuses a used destination).
-        The container never sees this key.
-
-        Returns the sweep signature, or None when there was nothing to sweep.
-        """
-        if self._balance(self.destination) == 0:
-            return None
-        # `ALL` drains the account and lets the CLI compute the fee, which
-        # avoids leaving dust behind or over-spending on a hand-computed
-        # amount. The destination is a plain system account with no rent-exempt
-        # reserve to preserve, so draining it fully is correct.
-        command = [
-            self.solana_cli,
-            "transfer",
-            self.source_address,
-            "ALL",
-            "--from",
-            str(self.sweep_keypair),
-            "--fee-payer",
-            str(self.sweep_keypair),
-            "--keypair",
-            str(self.sweep_keypair),
-            "--url",
-            self.rpc_url,
-            "--commitment",
-            "finalized",
-            "--allow-unfunded-recipient",
-            "--output",
-            "json",
-        ]
+    def _bloom(self, *args: str) -> str:
         try:
             completed = subprocess.run(
-                command, capture_output=True, check=False, text=True, timeout=SWEEP_TIMEOUT_SECONDS
+                [self.bloom_bin, "-q", *args],
+                env=self.env,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=120,
             )
         except (OSError, subprocess.SubprocessError) as error:
-            raise EvalError(f"host sweep failed to run: {error}") from error
+            raise EvalError(f"bloom {' '.join(args[:2])} failed: {error}") from error
         if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout).strip()
             raise EvalError(
-                "host sweep failed: " + (completed.stderr or completed.stdout).strip()
+                f"bloom {' '.join(args[:2])} failed: {CeremonyDriver.redact(detail)}"
             )
-        signature = None
-        try:
-            parsed = json.loads(completed.stdout)
-            if isinstance(parsed, dict):
-                signature = parsed.get("signature")
-        except json.JSONDecodeError:
-            signature = completed.stdout.strip() or None
+        return completed.stdout
 
-        # Confirm from the chain rather than trusting the CLI's exit code.
-        if not self.mount.poll_until(
-            lambda: self._balance(self.destination) == 0,
-            SWEEP_SETTLE_ATTEMPTS,
-            SWEEP_SETTLE_DELAY_SECONDS,
-        ):
-            raise EvalError(
-                f"host sweep did not drain {self.destination}; "
-                f"{self._balance(self.destination)} lamports remain"
+    def _allowed_destinations(self) -> Any:
+        projection = json.loads(self._bloom("wallet", "projection", self.wallet_id))
+        canonical = projection.get("policy", {}).get("canonical_policy")
+        if not isinstance(canonical, str):
+            raise EvalError("wallet projection has no canonical policy")
+        return json.loads(base64.b64decode(canonical))
+
+    def _allow_only_destination(self, ceremonies: CeremonyDriver) -> None:
+        """Allow this trial's destination, and only it, in the wallet policy.
+
+        Policy is deny-by-default and the eval wallet is dedicated, so the
+        previous trial's allowance is dropped rather than accumulated. The
+        owner ceremony runs through the same counter sequence the approver
+        continues, so no counter is ever tracked by hand.
+        """
+        policy = self._allowed_destinations()
+        policy["allowed_destinations"] = [
+            {"chain": "solana", "destination": self.destination}
+        ]
+        with tempfile.TemporaryDirectory() as scratch:
+            proposal = Path(scratch) / "policy.json"
+            proposal.write_text(json.dumps(policy))
+            staged = self._bloom(
+                "wallet", "update-policy", self.wallet_id, "--file", str(proposal)
             )
-        return signature
+        fields = dict(
+            line.split(": ", 1) for line in staged.splitlines() if ": " in line
+        )
+        url = fields.get("ceremony_url", "").strip()
+        operation = fields.get("operation_id", "").strip()
+        if CEREMONY_URL.fullmatch(url) is None or re.fullmatch("[0-9a-f]{64}", operation) is None:
+            raise EvalError("bloom wallet update-policy did not stage a ceremony")
+        ceremonies.complete(url)
+        self._bloom("wallet", "commit-policy", operation)
+        allowed = self._allowed_destinations().get("allowed_destinations")
+        if allowed != policy["allowed_destinations"]:
+            raise EvalError("the committed wallet policy does not allow this trial's destination")
 
     # ---- provision -----------------------------------------------------
 
     def provision(self, agent_name: str) -> EvalRunContext:
-        if self.transport == "vfs" and not self.smoke_only:
-            raise EvalError(
-                "the vfs transport supports --smoke-only; agent trials require "
-                "the mounted transport so the container sees /bloom"
-            )
         sign_count = self.sign_count or self._require_sign_count()
         stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
         self.trial_id = f"bloom-eval-{agent_name}-{stamp}-{secrets.token_hex(8)}"
+        ceremonies = CeremonyDriver(
+            self.driver, self.seed_file, sign_count, store=self.sign_counts
+        )
+        self.destination = self._fresh_destination()
+        self._allow_only_destination(ceremonies)
 
-        # The local amount was fixed by preflight and the mainnet amount by
-        # operator configuration; provision must not re-derive either.
+        # The amount was fixed by preflight; provision must not re-derive it.
         mounts: list[dict[str, Any]] = [
             {
                 "type": "bind",
@@ -1224,7 +835,7 @@ class SolanaTransferEval(EvalDefinition):
                 self.history_start_slot
             )
 
-        self._start_approver(sign_count)
+        self._start_approver(ceremonies)
         self.jobs_dir.mkdir(parents=True, exist_ok=True)
         # Trial task copies live under the ignored jobs dir, never under the
         # repo's tasks/ tree: each run litters a README copy plus an
@@ -1245,16 +856,12 @@ class SolanaTransferEval(EvalDefinition):
             "any passkey prompt myself; don't wait for my reply — retry once "
             "it's approved.\n"
         )
-        extra_docker_compose: list[Path] = []
-        if self.lane == "local":
-            # The local validator deliberately listens on host loopback. Harbor's
-            # verifier otherwise sees its container's loopback and cannot inspect
-            # the transfer it is grading. Keep this override local-only: the
-            # mainnet lane neither needs nor receives host networking.
-            extra_docker_compose.append(
-                self.repo_root
-                / "evals/harbor/tasks/solana-transfer/docker-compose.local.yaml"
-            )
+        # The local validator listens on host loopback. Harbor's verifier
+        # otherwise sees its container's loopback and cannot inspect the
+        # transfer it is grading.
+        extra_docker_compose = [
+            self.repo_root / "evals/harbor/tasks/solana-transfer/docker-compose.local.yaml"
+        ]
         return EvalRunContext(
             eval_name=self.name,
             task_dir=task_dir,
@@ -1396,8 +1003,9 @@ class SolanaTransferEval(EvalDefinition):
             )
             if attempt.returncode == 0:
                 return True
-            if self._approver_error is not None:
-                raise EvalError(f"smoke approver failed: {self._approver_error}")
+            reason = self._approver_error or self._approver_refusal
+            if reason is not None:
+                raise EvalError(f"smoke approver failed: {reason}")
             await asyncio.sleep(0.5)
         return False
 
@@ -1487,9 +1095,9 @@ class SolanaTransferEval(EvalDefinition):
     def cleanup(self) -> None:
         """Host-owned, ordered, and fail-closed.
 
-        Only the host moves funds. There is no post-broadcast undo to hand a
-        container, and giving one a path to move funds would defeat the bound
-        this eval rests on.
+        Pending entries are cancelled and must drain, and at most one new
+        entry may be sent and reconciled. There is no post-broadcast undo; the
+        local validator's funds are worthless.
         """
         self._stop_approver()
         failures: list[str] = []
@@ -1549,23 +1157,8 @@ class SolanaTransferEval(EvalDefinition):
                     failures.append(
                         f"sent entry {sent_id} never reconciled to a receipt"
                     )
-        except BaseException as error:  # noqa: BLE001 -- sweep must survive interrupts
+        except BaseException as error:  # noqa: BLE001 -- report after the checks
             mounted_error = error
-        finally:
-            # 3. Sweep the mainnet destination back to the source.
-            #
-            # This is the independent recovery boundary. It must run even if a
-            # mounted cancel, listing, or receipt read fails or is interrupted.
-            if self.lane == "mainnet":
-                if self.source_address and self.destination:
-                    try:
-                        self.sweep_destination()
-                    except EvalError as error:
-                        failures.append(f"host sweep: {error}")
-                else:
-                    failures.append(
-                        "cannot sweep: the source or destination address is unknown"
-                    )
 
         if mounted_error is not None:
             if isinstance(mounted_error, EvalError):
@@ -1578,3 +1171,33 @@ class SolanaTransferEval(EvalDefinition):
                 f"residual-state cleanup failed for {self.trial_id}: "
                 + "; ".join(failures)
             )
+
+    def trial_note(self) -> str:
+        """One line on what the trial did, read from host outbox state.
+
+        The reward says whether one correct payment landed; this says why not:
+        stagings, approvals, entries that expired or were cancelled unsent,
+        and any staging the approver refused.
+        """
+        created: dict[str, int] = {}
+        expired = cancelled = 0
+        for state in ("pending", "sent", "failed"):
+            for entry in self._list_host_state(state):
+                if entry in self._baseline_entries:
+                    continue
+                created[state] = created.get(state, 0) + 1
+                if state == "failed":
+                    intent = self._read_host_json(self._host_entry(state, entry) / "intent.json")
+                    status = intent.get("status") if isinstance(intent, dict) else None
+                    expired += status == "expired"
+                    cancelled += status == "cancelled"
+        parts = [
+            f"{sum(created.values())} staged",
+            f"{self._approver_completed} approved",
+            f"{created.get('sent', 0)} sent",
+            f"{expired} expired unsent",
+            f"{cancelled} cancelled",
+        ]
+        if self._approver_refusal is not None:
+            parts.append(f"refused: {self._approver_refusal}")
+        return ", ".join(parts)
