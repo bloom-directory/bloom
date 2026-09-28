@@ -79,9 +79,11 @@ copy the previous release's private `bloom:store/kv` bytes into the new
 package's store on first use. A successor must read its predecessor's stored
 format or tolerate and replace it. Test the new release against a fixture
 store written by the previous release, including settings and secrets. Bloom
-does not interpret those bytes or run a migration hook. Account 0 remains
-shared by wallets; each account above 0 has a separate store per wallet and
-account number.
+does not interpret those bytes or run a migration hook. Every numbered account,
+including 0, has a separate store keyed by package, wallet and account number.
+The first explicit-account release does not import legacy package-level settings
+into account 0; configure credentials again and reconcile funded work with the
+old package before upgrading.
 
 Imports, route metadata, and the top-level manifest must agree. Metadata may
 narrow installed authority at runtime but may not widen it. A package declaring
@@ -95,11 +97,11 @@ the exact route pattern that imports `bloom:key/derive@0.1.0`:
 
 ```toml
 [[key.derive]]
-route = "[network]/agent_sessions/[wallet]/new.json"
+route = "[network]/agent_sessions/[wallet]/[index]/new.json"
 operation_classes = ["venue.agent_action"]
 allowed_routes = [
-  "[network]/agent_sessions/[wallet]/cancel.json",
-  "[network]/orders/[wallet]/new.json",
+  "[network]/agent_sessions/[wallet]/[index]/cancel.json",
+  "[network]/orders/[wallet]/[index]/new.json",
 ]
 allowed_crypto_suites = ["secp256k1-keccak256-recoverable"]
 maximum_lifetime_ms = 86400000
