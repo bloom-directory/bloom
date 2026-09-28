@@ -257,7 +257,7 @@ fn default_chains() -> BTreeMap<String, ChainSpec> {
             1,
             &[
                 "https://ethereum-rpc.publicnode.com",
-                "https://eth.llamarpc.com",
+                "https://ethereum.drpc.org",
             ],
             "Ethereum Mainnet",
             "ETH",
@@ -265,7 +265,12 @@ fn default_chains() -> BTreeMap<String, ChainSpec> {
         evm_chain(
             "base",
             8453,
-            &["https://mainnet.base.org", "https://base.llamarpc.com"],
+            &[
+                "https://base-rpc.publicnode.com",
+                "https://base.drpc.org",
+                "https://base.gateway.tenderly.co",
+                "https://mainnet.base.org",
+            ],
             "Base Mainnet",
             "ETH",
         )
@@ -682,6 +687,26 @@ mod tests {
         assert!(!ethereum.rpc_urls.is_empty());
         let base = cfg.chains.get("base").expect("base entry");
         assert_eq!(base.chain_id, 8453);
+        // Base carried one reachable endpoint and it rate-limits: 11 of 25
+        // sequential `eth_call`s to `mainnet.base.org` return -32016, which
+        // reads as a broken Petal rather than a thin endpoint list. Keep it
+        // last, behind spares that survive the same burst, and pin the list so
+        // a revert is caught here.
+        assert_eq!(
+            base.rpc_urls,
+            vec![
+                "https://base-rpc.publicnode.com",
+                "https://base.drpc.org",
+                "https://base.gateway.tenderly.co",
+                "https://mainnet.base.org",
+            ]
+        );
+        assert!(
+            !cfg.chains
+                .values()
+                .any(|spec| spec.rpc_urls.iter().any(|url| url.contains("llamarpc"))),
+            "llamarpc endpoints stopped resolving; no default chain should depend on one"
+        );
         let tempo = cfg.chains.get("tempo").expect("tempo entry");
         assert_eq!(tempo.chain_id, 4217);
         assert_eq!(tempo.rpc_urls, vec!["https://rpc.tempo.xyz"]);
