@@ -8,7 +8,15 @@ import sys
 from collections.abc import Callable
 from pathlib import Path
 
-from .core import AGENTS, AgentFailure, AgentSpec, EvalDefinition, EvalError, run_eval
+from .core import (
+    AGENTS,
+    AgentFailure,
+    AgentSpec,
+    EvalDefinition,
+    EvalError,
+    TokenUsage,
+    run_eval,
+)
 from .hyperliquid_order_cancel import HyperliquidOrderCancelEval
 from .solana_transfer import SolanaTransferEval
 
@@ -64,6 +72,7 @@ def run_trials(
     of the pass rate.
     """
     counts = {"PASS": 0, "FAIL": 0, "INVALID": 0}
+    usages: list[TokenUsage] = []
     for number in range(1, trials + 1):
         definition = make()
         detail = ""
@@ -75,6 +84,9 @@ def run_trials(
         except EvalError as error:
             verdict, detail = "INVALID", str(error)
         counts[verdict] += 1
+        usage = TokenUsage.from_result(getattr(definition, "last_harbor_result", None))
+        if usage is not None and verdict != "INVALID":
+            usages.append(usage)
         note = getattr(definition, "trial_note", None)
         if callable(note):
             try:
@@ -83,6 +95,8 @@ def run_trials(
                 text = ""
             if text:
                 detail = f"{detail} [{text}]" if detail else f"[{text}]"
+        if usage is not None:
+            detail = f"{detail} [tokens: {usage}]" if detail else f"[tokens: {usage}]"
         print(
             f"trial {number}/{trials}: {verdict}" + (f": {detail}" if detail else ""),
             file=sys.stderr if verdict != "PASS" else sys.stdout,
@@ -92,6 +106,15 @@ def run_trials(
         f"{definition.name}: passed {counts['PASS']} of {judged} judged trials"
         + (f"; {counts['INVALID']} invalid" if counts["INVALID"] else "")
     )
+    if usages:
+        # Judged trials only: an invalid trial's spend says nothing about the
+        # agent's efficiency.
+        mean = TokenUsage(
+            sum(u.input for u in usages) // len(usages),
+            sum(u.cached for u in usages) // len(usages),
+            sum(u.output for u in usages) // len(usages),
+        )
+        print(f"{definition.name}: tokens per judged trial: {mean}")
     if counts["INVALID"]:
         return 2
     return 0 if counts["FAIL"] == 0 else 1

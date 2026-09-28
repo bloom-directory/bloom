@@ -158,8 +158,10 @@ scripts/evals/run-harbor-solana-local.sh codex --trials 5  # a model, five times
     trial says nothing about the agent.
 
   A bracketed note gives stagings, approvals, sends, expirations,
-  cancellations, and any refusal. The last line is the pass rate over judged
-  trials. The exit status is 0 when all pass, 1 when any fail, and 2 when any
+  cancellations, and any refusal, followed by the agent's token usage (input,
+  of which cached, and output). The summary gives the pass rate and mean tokens
+  over judged trials. Adapter cost estimates are omitted: for non-Anthropic
+  models they are priced at Anthropic rates. The exit status is 0 when all pass, 1 when any fail, and 2 when any
   is invalid.
 
 The agent's request names the wallet, destination, chain, and amount. It also

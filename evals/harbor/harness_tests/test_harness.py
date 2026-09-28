@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import copy
 import hashlib
+import io
 import json
 import os
 import subprocess
@@ -17,6 +19,7 @@ from harness.core import (
     AGENTS,
     AgentFailure,
     AgentSpec,
+    TokenUsage,
     EvalDefinition,
     EvalError,
     EvalRunContext,
@@ -367,6 +370,48 @@ class VerdictTests(unittest.TestCase):
         self.assertEqual(len({id(d) for d in made}), 4)
         # An invalid trial means the run cannot be trusted as a whole.
         self.assertEqual(code, 2)
+
+    def usage_result(self, tokens_in: int, cached: int, tokens_out: int) -> SimpleNamespace:
+        agent = SimpleNamespace(
+            n_input_tokens=tokens_in, n_cache_tokens=cached, n_output_tokens=tokens_out
+        )
+        return SimpleNamespace(trial_results=[SimpleNamespace(agent_result=agent)])
+
+    def test_usage_is_read_from_the_harbor_trial(self) -> None:
+        usage = TokenUsage.from_result(self.usage_result(600_000, 550_000, 4_500))
+        self.assertEqual(usage, TokenUsage(600_000, 550_000, 4_500))
+        self.assertEqual(str(usage), "600k in (550k cached), 4.5k out")
+        # A smoke or crashed run carries no agent usage.
+        self.assertIsNone(TokenUsage.from_result(None))
+        self.assertIsNone(
+            TokenUsage.from_result(SimpleNamespace(trial_results=[SimpleNamespace()]))
+        )
+
+    def test_usage_is_reported_per_trial_and_averaged_over_judged_trials(self) -> None:
+        plan = [
+            (None, (400_000, 300_000, 4_000)),
+            (AgentFailure("reward 0"), (800_000, 700_000, 8_000)),
+            (EvalError("provider 403"), (5_000, 0, 100)),
+        ]
+        made: list[FakeDefinition] = []
+
+        def make() -> FakeDefinition:
+            made.append(FakeDefinition(self.root))
+            return made[-1]
+
+        def run(definition: EvalDefinition) -> None:
+            outcome, usage = plan[len(made) - 1]
+            definition.last_harbor_result = self.usage_result(*usage)
+            if outcome is not None:
+                raise outcome
+
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            run_trials(make, 3, run)
+        self.assertIn("[tokens: 400k in (300k cached), 4.0k out]", out.getvalue())
+        self.assertIn("[tokens: 800k in (700k cached), 8.0k out]", err.getvalue())
+        # The invalid trial is left out of the mean.
+        self.assertIn("tokens per judged trial: 600k in (500k cached), 6.0k out", out.getvalue())
 
     def test_all_passing_trials_exit_zero_and_a_failure_exits_one(self) -> None:
         with mock.patch("sys.stdout"), mock.patch("sys.stderr"):

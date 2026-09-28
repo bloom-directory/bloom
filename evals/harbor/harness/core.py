@@ -490,6 +490,8 @@ class EvalDefinition(ABC):
     # codex/opencode use their adapter defaults. An eval whose lifecycle
     # needs more turns (approval waits, restage, finality) overrides this.
     default_max_turns: str = "20"
+    # The last Harbor result run_eval received, graded or not.
+    last_harbor_result: Any = None
 
     @property
     @abstractmethod
@@ -550,6 +552,35 @@ class EvalDefinition(ABC):
             raise AgentFailure(
                 f"Harbor verifier did not award a passing reward: {rewards}"
             )
+
+
+@dataclass(frozen=True)
+class TokenUsage:
+    """What the agent consumed, as Harbor's adapter reports it. Cached input is
+    part of input. Adapter cost estimates are left out: for non-Anthropic
+    models they are priced at Anthropic rates, not the provider's."""
+
+    input: int
+    cached: int
+    output: int
+
+    @classmethod
+    def from_result(cls, result: Any) -> "TokenUsage | None":
+        trials = getattr(result, "trial_results", None) or []
+        agent = getattr(trials[0], "agent_result", None) if trials else None
+        values = [
+            getattr(agent, name, None)
+            for name in ("n_input_tokens", "n_cache_tokens", "n_output_tokens")
+        ]
+        if not isinstance(values[0], int) or not isinstance(values[2], int):
+            return None
+        return cls(values[0], values[1] if isinstance(values[1], int) else 0, values[2])
+
+    def __str__(self) -> str:
+        return (
+            f"{self.input / 1000:.0f}k in ({self.cached / 1000:.0f}k cached), "
+            f"{self.output / 1000:.1f}k out"
+        )
 
 
 def _ran_out_of_turns(trial: Any) -> bool:
@@ -732,6 +763,9 @@ def run_eval(
             timings["authority_provisioning_seconds"] = time.monotonic() - started
             started = time.monotonic()
             result = asyncio.run(harbor_runner(context, agent))
+            # Kept even when grading fails, so a failed trial's token usage
+            # is still reported.
+            definition.last_harbor_result = result
             timings["harbor_seconds"] = time.monotonic() - started
             definition.validate_result(result)
         except BaseException as error:  # noqa: BLE001 -- cleanup must cover interrupts
