@@ -146,7 +146,7 @@ The HD-account spec adds per-account stores keyed by package hash, wallet and
 account number. Lay them out so that one package's accounts form one directory:
 
 ```text
-~/.bloom/petals/data/<package hash>/                            public package namespace / retained legacy data
+~/.bloom/petals/data/<package hash>/                            Petal-wide settings and retained unscoped data
 ~/.bloom/petals/data-accounts/<package hash>/<account digest>/  every numbered account, including 0
 ```
 
@@ -225,3 +225,12 @@ release assets themselves do not supply the catalog.
    uniform stores for accounts 0 and 1.
 9. **Hot path:** after first use, invocations do no extra filesystem or catalog
    work beyond today's.
+
+### Petal-wide service settings
+
+The explicit-route host also supports exact `[store].shared_keys` declarations.
+Those keys remain in the package-level store for every invocation; they are not
+account-zero records. Compatible signed succession carries that package-level
+store through the existing mechanism, alongside the separate numbered account
+stores. No account-store credential is copied into the shared store, and no
+legacy account state becomes visible merely because a service key is shared.

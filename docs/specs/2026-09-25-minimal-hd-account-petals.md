@@ -26,12 +26,15 @@ Representative paths (wallet `alice`, index `1`):
 | Enso | `intents/alice/1/new` | `meta/` |
 | Near Intents | `swaps/alice/1/new` | `tokens.json` |
 | Polymarket | `obligations/alice/1/status.json` | public market data |
-| Hyperliquid | `testnet/wallets/alice/1/agent_sessions/new.json` | `testnet/mids.json` |
+| Hyperliquid | `testnet/agent_sessions/alice/1/new.json` | `testnet/mids.json` |
 | Tolly | `wallets/alice/1/buy.json` | `markets.json` |
 
-Each path is below `/petals/<petal>/`. Enso venue preferences and account-specific
-credentials share `settings/alice/1/`, including `venue.toml`, `api-key`, and
-`status.json`. Other existing wallet-dependent Petal routes insert
+Each path is below `/petals/<petal>/`. Account-specific venue preferences remain
+under `settings/alice/1/venue.toml`. Service credentials are Petal-wide:
+Enso and Near Intents expose `settings/api-key` and `settings/status.json`;
+Polymarket exposes `settings/enso-api-key` for its Enso key and router address.
+Hyperliquid uses `<network>/{exchange,agent_sessions}/<wallet>/<index>/`.
+Other existing wallet-dependent Petal routes insert
 `[index]` immediately after `[wallet]`. Captures named `[account]` that represent
 public on-chain addresses retain their existing meaning; they do not select an HD
 account. Public address queries do not acquire signing authority.
@@ -65,9 +68,16 @@ within the same account; this avoids reentrant router locks and unbounded recurs
 For every selected account, the private store is keyed by package hash, wallet
 name and account number. Index zero follows the same rule as every other index.
 There is no shared-account-zero store, fallback read, overlay, or schema migration
-adapter. The store is selected once per invocation; no additional authority call
-is introduced per KV access. Public routes use a separate package-level namespace;
-that namespace is not an account store or a signing selector.
+adapter. No additional authority call is introduced per KV access.
+
+Petal-wide service settings use explicit `[store].shared_keys` declarations, with
+exact fully namespaced keys such as `secrets/credentials/enso-api-key`. These keys
+resolve to the same package-level store from both account-selected and public
+routes. Namespace permissions and secret classification still apply. All other
+keys retain their normal invocation scope; account credentials, sessions and
+trading state are not shared. There is no search or fallback between stores and
+no copying of previously account-scoped settings. Public routes do not gain
+account or signing authority by accessing shared settings.
 
 Existing signed same-lineage package succession remains the mechanism for carrying
 forward these new stores between compatible future package releases. It does not
@@ -100,9 +110,9 @@ Signer and the SDK ABI do not need changes. Explicit route components can use th
 existing SDK parameter accessors. This change does not introduce a new release
 process or require deploying the future filesystem from bloom#255.
 
-These PRs remain drafts until validation and release pinning are complete. Local
-candidate builds and package artifacts are permitted; public releases and merging
-remain separate actions. The installed acceptance environment is not reset by a
+The PRs are ready for review. Release pinning must be completed before rollout.
+Local candidate builds and package artifacts are permitted; public releases and
+merging remain separate actions. The installed acceptance environment is not reset by a
 source-code update.
 
 ## Validation
@@ -113,6 +123,8 @@ source-code update.
   reject malformed/unallocated selectors and the removed synthetic layout.
 - Verify account-zero/account-one/other-wallet storage isolation and no legacy
   account-zero fallback; retain signed successor-store isolation checks.
+- Write service settings once and verify access from multiple accounts; verify
+  their public read surfaces redact secrets and other private keys remain isolated.
 - Reject body-selected authority on public routes, cross-account VFS/outbox
   actions, mismatched persisted sessions and nested Petal calls.
 - Run Machine formatting, workspace lint/tests, affected daemon/VFS tests,

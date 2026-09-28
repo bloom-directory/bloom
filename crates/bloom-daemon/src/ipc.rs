@@ -1908,6 +1908,12 @@ fn petal_consent_lines(summary: &bloom_petals::package::PetalConsentSummary) -> 
             lines.push(format!("    - {} {visibility}", namespace.namespace));
         }
     }
+    if !summary.store_shared_keys.is_empty() {
+        lines.push(format!(
+            "  shared_store_keys: {}",
+            summary.store_shared_keys.join(", ")
+        ));
+    }
     if !summary.routes.is_empty() {
         lines.push("  routes:".to_owned());
         for route in &summary.routes {

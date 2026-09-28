@@ -153,8 +153,8 @@ const PACKAGES: &[Package] = &[
         name: "hyperliquid",
         repository: "bloom-petal-hyperliquid",
         public: "asset_ids.md",
-        parent: "testnet/wallets/alice",
-        listing: "testnet/wallets/alice/{index}/agent_sessions",
+        parent: "testnet/agent_sessions/alice",
+        listing: "testnet/agent_sessions/alice/{index}",
         marker_key: "state/state/sessions/testnet/alice/{marker}/session.json",
     },
     Package {
@@ -189,12 +189,9 @@ async fn names(vfs: &Vfs, name: &str, path: &str) -> Vec<String> {
         .collect()
 }
 
-async fn credential_status(vfs: &Vfs, name: &str, index: u32) -> serde_json::Value {
+async fn credential_status(vfs: &Vfs, name: &str) -> serde_json::Value {
     let bytes = vfs
-        .read(&mounted(
-            name,
-            &format!("settings/alice/{index}/status.json"),
-        ))
+        .read(&mounted(name, "settings/status.json"))
         .await
         .unwrap();
     let document: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -379,58 +376,59 @@ async fn installed_packages_keep_explicit_account_routes_and_private_state() {
         } else {
             "secrets/credentials/partner-jwt"
         };
-        PrivateStore::open(store.private_data_root())
-            .unwrap()
-            .put(hash, logical_key, b"synthetic-old-layout-secret", true)
-            .unwrap();
-        assert_ne!(
-            credential_status(&vfs, name, 0).await["source"],
-            "private_store",
-            "legacy index-zero fallback"
-        );
-        for index in [0, 1] {
-            let token = format!("synthetic.{name}.account-{index}");
-            vfs.write(
-                &mounted(name, &format!("settings/alice/{index}/api-key")),
-                token.as_bytes(),
-            )
+        let token = format!("synthetic.{name}.petal-wide");
+        vfs.write(&mounted(name, "settings/api-key"), token.as_bytes())
             .await
             .unwrap();
-            let status = credential_status(&vfs, name, index).await;
-            assert_eq!(status["configured"], true);
-            assert_eq!(status["source"], "private_store");
-            assert_eq!(
-                status["storage"],
-                if name == "enso" {
-                    "petal secret store"
-                } else {
-                    "persistent_private_store"
-                }
-            );
-            assert!(!status.to_string().contains(&token));
-            let api_read = vfs
-                .read(&mounted(name, &format!("settings/alice/{index}/api-key")))
-                .await
-                .unwrap();
-            assert!(!String::from_utf8_lossy(&api_read).contains(&token));
-            if name == "near-intents" {
-                let api_status: serde_json::Value = serde_json::from_slice(&api_read).unwrap();
-                assert_eq!(api_status["configured"], true);
-            }
+        let status = credential_status(&vfs, name).await;
+        assert_eq!(status["configured"], true);
+        assert_eq!(status["source"], "private_store");
+        assert!(!status.to_string().contains(&token));
+        let api_read = vfs.read(&mounted(name, "settings/api-key")).await.unwrap();
+        assert!(!String::from_utf8_lossy(&api_read).contains(&token));
+        let shared = PrivateStore::open(store.private_data_root()).unwrap();
+        assert_eq!(shared.get(hash, logical_key).unwrap(), token.as_bytes());
+        for index in [0, 1] {
             let private =
                 PrivateStore::open_account(store.private_account_data_root(), "alice", index)
                     .unwrap();
-            assert_eq!(private.get(hash, logical_key).unwrap(), token.as_bytes());
-            if index == 0 {
-                assert_ne!(
-                    credential_status(&vfs, name, 1).await["source"],
-                    "private_store"
-                );
-            }
+            assert!(
+                private.get(hash, logical_key).is_err(),
+                "credential copied into account store"
+            );
+            assert!(
+                vfs.read(&mounted(name, &format!("settings/alice/{index}/api-key")))
+                    .await
+                    .is_err()
+            );
         }
-        assert!(vfs.read(&mounted(name, "settings/api-key")).await.is_err());
     }
+
     if hashes.contains_key("polymarket") {
+        let key = b"synthetic-polymarket-service-key";
+        let router = "0x1111111111111111111111111111111111111111";
+        let body = serde_json::to_vec(&serde_json::json!({
+            "api_key": std::str::from_utf8(key).unwrap(), "router": router
+        }))
+        .unwrap();
+        vfs.write(&mounted("polymarket", "settings/enso-api-key"), &body)
+            .await
+            .unwrap();
+        let global = PrivateStore::open(store.private_data_root()).unwrap();
+        let hash = &hashes["polymarket"];
+        assert_eq!(global.get(hash, "secrets/creds/enso-api-key").unwrap(), key);
+        assert_eq!(
+            global.get(hash, "state/settings/enso-router").unwrap(),
+            router.as_bytes()
+        );
+        assert!(
+            !String::from_utf8_lossy(
+                &vfs.read(&mounted("polymarket", "settings/enso-api-key"))
+                    .await
+                    .unwrap()
+            )
+            .contains(std::str::from_utf8(key).unwrap())
+        );
         for (index, body) in [
             (0, b"enabled = false\n".as_slice()),
             (1, b"enabled = true\n".as_slice()),
@@ -446,7 +444,7 @@ async fn installed_packages_keep_explicit_account_routes_and_private_state() {
                 vfs.write(
                     &mounted(
                         "hyperliquid",
-                        &format!("testnet/wallets/alice/{index}/agent_sessions/new.json")
+                        &format!("testnet/agent_sessions/alice/{index}/new.json")
                     ),
                     b"{broken"
                 )
@@ -472,12 +470,10 @@ async fn installed_packages_keep_explicit_account_routes_and_private_state() {
             );
         }
         if matches!(package.name, "enso" | "near-intents") {
-            for index in [0, 1] {
-                assert_eq!(
-                    credential_status(&restarted, package.name, index).await["source"],
-                    "private_store"
-                );
-            }
+            assert_eq!(
+                credential_status(&restarted, package.name).await["source"],
+                "private_store"
+            );
         }
     }
     if hashes.contains_key("polymarket") {
@@ -502,6 +498,7 @@ async fn installed_packages_keep_explicit_account_routes_and_private_state() {
         use std::os::unix::fs::PermissionsExt;
         for path in files_under(&store.private_account_data_root())
             .into_iter()
+            .chain(files_under(&store.private_data_root()))
             .filter(|path| path.components().any(|part| part.as_os_str() == "secrets"))
         {
             assert_eq!(

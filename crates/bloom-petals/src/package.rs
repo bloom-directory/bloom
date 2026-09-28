@@ -172,6 +172,8 @@ struct StorePolicyToml {
     namespaces: Vec<String>,
     #[serde(default)]
     secret_namespaces: Vec<String>,
+    #[serde(default)]
+    shared_keys: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -284,6 +286,7 @@ pub struct PetalConsentSummary {
     pub network: Vec<PetalConsentNetRule>,
     pub sign_intents: Vec<String>,
     pub store_namespaces: Vec<PetalConsentStoreNamespace>,
+    pub store_shared_keys: Vec<String>,
     pub routes: Vec<PetalConsentRoute>,
 }
 
@@ -1203,6 +1206,7 @@ pub fn petal_consent_summary(
         network,
         sign_intents,
         store_namespaces,
+        store_shared_keys: manifest.store.shared_keys.clone(),
         routes,
     })
 }
@@ -4097,6 +4101,7 @@ fn store_policy_from_manifest(manifest: &PetalToml) -> StoreNamespacePolicy {
         manifest.store.namespaces.iter().cloned(),
         manifest.store.secret_namespaces.iter().cloned(),
     )
+    .with_shared_keys(manifest.store.shared_keys.iter().cloned())
 }
 
 fn validate_store_policy(
@@ -4108,6 +4113,22 @@ fn validate_store_policy(
             "Petal package cap bloom:store requires [store].namespaces or [store].secret_namespaces"
                 .into(),
         ));
+    }
+    for key in policy.shared_keys() {
+        crate::private_store::validate_key(key)
+            .map_err(|e| PetalError::InvalidWasm(format!("Petal store shared key {key:?}: {e}")))?;
+        let (namespace, _) = key.split_once('/').ok_or_else(|| {
+            PetalError::InvalidWasm(format!(
+                "Petal store shared key {key:?} must be fully namespaced"
+            ))
+        })?;
+        if key.split('/').any(|part| part.starts_with('.'))
+            || !policy.namespaces().contains(namespace)
+        {
+            return Err(PetalError::InvalidWasm(format!(
+                "Petal store shared key {key:?} must use a declared namespace and visible canonical path segments"
+            )));
+        }
     }
     for namespace in policy.namespaces() {
         validate_store_namespace(namespace)?;
@@ -7215,6 +7236,53 @@ secret_namespaces = ["credentials"]
         assert!(policy.namespaces().contains("credentials"));
         assert!(policy.secret_namespaces().contains("credentials"));
         PreparedPetalPackage::from_dir(allowed.path()).unwrap();
+    }
+
+    #[test]
+    fn petal_store_shared_keys_require_exact_declared_canonical_keys() {
+        let manifest = |key: &str| {
+            format!(
+                r#"schema = "bloom.petal.package.v1"
+name = "echo"
+[caps]
+allowed = ["bloom:store"]
+[store]
+namespaces = ["state"]
+secret_namespaces = ["secrets"]
+shared_keys = [{key:?}]
+"#
+            )
+        };
+        let policy =
+            store_policy_from_manifest_toml(manifest("secrets/credentials/api-key").as_bytes())
+                .unwrap();
+        assert!(policy.shared_keys().contains("secrets/credentials/api-key"));
+        assert!(policy.check_put("secrets", false).is_err());
+        for key in [
+            "state",
+            "state/",
+            "state//key",
+            "state/../key",
+            "state/.hidden/key",
+            "/state/key",
+            "unknown/key",
+            "state\\key",
+        ] {
+            assert!(
+                store_policy_from_manifest_toml(manifest(key).as_bytes()).is_err(),
+                "accepted {key}"
+            );
+        }
+        let masked = policy.intersect(&StoreNamespacePolicy::from_namespaces(
+            ["state".to_owned()],
+            [],
+        ));
+        assert!(masked.shared_keys().is_empty());
+        let masked = policy.intersect(&StoreNamespacePolicy::from_namespaces(
+            [],
+            ["secrets".to_owned()],
+        ));
+        assert_eq!(masked.shared_keys(), policy.shared_keys());
     }
 
     #[test]

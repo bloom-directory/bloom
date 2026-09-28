@@ -57,11 +57,22 @@ use crate::private_store::PrivateStore;
 fn open_selected_private_store(
     root: PathBuf,
     account: Option<&(String, u32)>,
+    policy: Option<&StoreNamespacePolicy>,
+    shared_root: Option<&PathBuf>,
 ) -> Result<PrivateStore, crate::host::HostError> {
-    match account {
+    let store = match account {
         Some((wallet, number)) => PrivateStore::open_account(root, wallet, *number),
         None => PrivateStore::open(root),
-    }
+    }?;
+    let store = match shared_root {
+        Some(root) => store.with_shared_root(root.clone()),
+        None => store,
+    };
+    Ok(store.with_shared_keys(
+        policy
+            .into_iter()
+            .flat_map(|p| p.shared_keys().iter().cloned()),
+    ))
 }
 
 const DEFAULT_FUEL: u64 = 100_000_000;
@@ -145,7 +156,9 @@ pub struct RunOptions {
     pub key_derive_maximum_lifetime_ms: Option<u64>,
     pub http_response_cap: usize,
     pub private_store_root: Option<PathBuf>,
-    /// Selected wallet account for a per-account private store (n > 0).
+    /// Package-wide root used only for explicitly declared shared keys.
+    pub private_store_shared_root: Option<PathBuf>,
+    /// Selected wallet account for a per-account private store.
     pub private_store_account: Option<(String, u32)>,
     /// Force mediated env helpers to deterministic values for install-time checks.
     pub deterministic_env: bool,
@@ -170,6 +183,7 @@ impl Default for RunOptions {
             key_derive_maximum_lifetime_ms: None,
             http_response_cap: DEFAULT_HTTP_RESPONSE_CAP,
             private_store_root: None,
+            private_store_shared_root: None,
             private_store_account: None,
             deterministic_env: false,
             runtime_settings: BTreeMap::new(),
@@ -309,8 +323,13 @@ impl PetalVm {
                 limiter: MemLimiter::new(opts.memory_pages),
                 private_store: match opts.private_store_root.clone() {
                     Some(root) => Some(
-                        open_selected_private_store(root, opts.private_store_account.as_ref())
-                            .map_err(|e| PetalError::vm(format!("private store open: {e}")))?,
+                        open_selected_private_store(
+                            root,
+                            opts.private_store_account.as_ref(),
+                            opts.store_namespaces.as_ref(),
+                            opts.private_store_shared_root.as_ref(),
+                        )
+                        .map_err(|e| PetalError::vm(format!("private store open: {e}")))?,
                     ),
                     None => None,
                 },
@@ -388,8 +407,13 @@ impl PetalVm {
                 limiter: MemLimiter::new(opts.memory_pages),
                 private_store: match opts.private_store_root.clone() {
                     Some(root) => Some(
-                        open_selected_private_store(root, opts.private_store_account.as_ref())
-                            .map_err(|e| PetalError::vm(format!("private store open: {e}")))?,
+                        open_selected_private_store(
+                            root,
+                            opts.private_store_account.as_ref(),
+                            opts.store_namespaces.as_ref(),
+                            opts.private_store_shared_root.as_ref(),
+                        )
+                        .map_err(|e| PetalError::vm(format!("private store open: {e}")))?,
                     ),
                     None => None,
                 },
@@ -466,8 +490,13 @@ impl PetalVm {
                 limiter: MemLimiter::new(opts.memory_pages),
                 private_store: match opts.private_store_root.clone() {
                     Some(root) => Some(
-                        open_selected_private_store(root, opts.private_store_account.as_ref())
-                            .map_err(|e| PetalError::vm(format!("private store open: {e}")))?,
+                        open_selected_private_store(
+                            root,
+                            opts.private_store_account.as_ref(),
+                            opts.store_namespaces.as_ref(),
+                            opts.private_store_shared_root.as_ref(),
+                        )
+                        .map_err(|e| PetalError::vm(format!("private store open: {e}")))?,
                     ),
                     None => None,
                 },
@@ -3923,6 +3952,80 @@ mod tests {
         .await
         .unwrap();
         assert_component_ok_optional_bytes(&missing[0], None);
+    }
+
+    #[tokio::test]
+    async fn component_store_shared_keys_cross_accounts_with_isolated_state() {
+        let tmp = TempDir::new().unwrap();
+        let policy = StoreNamespacePolicy::from_namespaces(["state".to_owned()], [])
+            .with_shared_keys(["state/settings/enso-router".to_owned()]);
+        let contexts = [
+            None,
+            Some(("alice".to_owned(), 0)),
+            Some(("alice".to_owned(), 1)),
+            Some(("bob".to_owned(), 0)),
+        ];
+        for (index, account) in contexts.iter().enumerate() {
+            let private = open_selected_private_store(
+                if account.is_some() {
+                    tmp.path().join("data-accounts")
+                } else {
+                    tmp.path().join("data")
+                },
+                account.as_ref(),
+                Some(&policy),
+                Some(&tmp.path().join("data")),
+            )
+            .unwrap();
+            let mut store = component_test_store(
+                BTreeSet::from([Capability::Store]),
+                Some(private),
+                Arc::new(DenyHost),
+            );
+            store.data_mut().store_namespaces = Some(policy.clone());
+            if index == 0 {
+                for key in ["settings/enso-router", "orders/item"] {
+                    let mut result = vec![ComponentVal::Bool(false)];
+                    component_store_put(
+                        store.as_context_mut(),
+                        &[
+                            ComponentVal::String("state".into()),
+                            ComponentVal::String(key.into()),
+                            component_bytes(b"global".to_vec()),
+                            ComponentVal::Bool(false),
+                        ],
+                        &mut result,
+                    )
+                    .await
+                    .unwrap();
+                    assert_component_ok_none(&result[0]);
+                }
+            }
+            for (key, expected) in [
+                ("settings/enso-router", Some(b"global".as_slice())),
+                (
+                    "orders/item",
+                    if index == 0 {
+                        Some(b"global".as_slice())
+                    } else {
+                        None
+                    },
+                ),
+            ] {
+                let mut result = vec![ComponentVal::Bool(false)];
+                component_store_get(
+                    store.as_context_mut(),
+                    &[
+                        ComponentVal::String("state".into()),
+                        ComponentVal::String(key.into()),
+                    ],
+                    &mut result,
+                )
+                .await
+                .unwrap();
+                assert_component_ok_optional_bytes(&result[0], expected);
+            }
+        }
     }
 
     #[tokio::test]

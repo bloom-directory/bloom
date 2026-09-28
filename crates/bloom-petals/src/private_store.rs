@@ -1,5 +1,6 @@
 //! Per-petal private key/value storage for component routes.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
@@ -10,6 +11,8 @@ use crate::store::is_valid_hex_hash;
 pub struct PrivateStore {
     root: PathBuf,
     account_digest: Option<String>,
+    shared_keys: BTreeSet<String>,
+    shared_root: Option<PathBuf>,
 }
 
 impl PrivateStore {
@@ -19,6 +22,8 @@ impl PrivateStore {
         Ok(Self {
             root,
             account_digest: None,
+            shared_keys: BTreeSet::new(),
+            shared_root: None,
         })
     }
 
@@ -30,6 +35,16 @@ impl PrivateStore {
         let mut store = Self::open(root)?;
         store.account_digest = Some(account_digest(wallet, account));
         Ok(store)
+    }
+
+    pub fn with_shared_keys(mut self, keys: impl IntoIterator<Item = String>) -> Self {
+        self.shared_keys = keys.into_iter().collect();
+        self
+    }
+
+    pub fn with_shared_root(mut self, root: PathBuf) -> Self {
+        self.shared_root = Some(root);
+        self
     }
 
     pub fn root(&self) -> &Path {
@@ -94,10 +109,17 @@ impl PrivateStore {
         let dir = self.petal_dir(petal_hash)?;
         let _guard = store_op_guard()?;
         let mut out = Vec::new();
-        if !dir.exists() {
-            return Ok(out);
+        if dir.exists() {
+            collect_files(&dir, &dir, prefix, &mut out)?;
         }
-        collect_files(&dir, &dir, prefix, &mut out)?;
+        if self.account_digest.is_some() {
+            out.retain(|key| !self.shared_keys.contains(key));
+            for key in &self.shared_keys {
+                if key.starts_with(prefix) && self.key_path(petal_hash, key)?.is_file() {
+                    out.push(key.clone());
+                }
+            }
+        }
         out.sort();
         Ok(out)
     }
@@ -152,7 +174,17 @@ impl PrivateStore {
 
     fn key_path(&self, petal_hash: &str, key: &str) -> Result<PathBuf, HostError> {
         validate_key(key)?;
-        Ok(self.petal_dir(petal_hash)?.join(key))
+        let dir = self.petal_dir(petal_hash)?;
+        if self.account_digest.is_some() && self.shared_keys.contains(key) {
+            Ok(self
+                .shared_root
+                .as_ref()
+                .unwrap_or(&self.root)
+                .join(petal_hash)
+                .join(key))
+        } else {
+            Ok(dir.join(key))
+        }
     }
 }
 
@@ -377,6 +409,55 @@ mod tests {
     use tempfile::TempDir;
 
     const HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn declared_shared_keys_use_global_store_without_account_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let hash = "a".repeat(64);
+        let key = "secrets/credentials/api-key";
+        let global_root = dir.path().join("data");
+        let account_root = dir.path().join("data-accounts");
+        let global = PrivateStore::open(&global_root).unwrap();
+        global.put(&hash, key, b"global", true).unwrap();
+        global
+            .put(&hash, "state/orders/legacy", b"legacy", false)
+            .unwrap();
+        let accounts = [("alice", 0), ("alice", 1), ("bob", 0)].map(|(wallet, account)| {
+            PrivateStore::open_account(&account_root, wallet, account)
+                .unwrap()
+                .with_shared_keys([key.to_owned()])
+                .with_shared_root(global_root.clone())
+        });
+        // A stale scoped copy must neither shadow nor appear as the declared shared key.
+        PrivateStore::open_account(&account_root, "alice", 0)
+            .unwrap()
+            .put(&hash, key, b"stale", true)
+            .unwrap();
+        for (index, store) in accounts.iter().enumerate() {
+            assert_eq!(store.get(&hash, key).unwrap(), b"global");
+            assert!(store.get(&hash, "state/orders/legacy").is_err());
+            store
+                .put(&hash, "state/orders/item", &[index as u8], false)
+                .unwrap();
+            assert!(store.put_new(&hash, key, b"duplicate", true).is_err());
+            assert_eq!(store.list(&hash, "secrets/").unwrap(), [key]);
+        }
+        for (index, store) in accounts.iter().enumerate() {
+            assert_eq!(
+                store.get(&hash, "state/orders/item").unwrap(),
+                [index as u8]
+            );
+        }
+        accounts[1].put(&hash, key, b"updated", true).unwrap();
+        assert_eq!(global.get(&hash, key).unwrap(), b"updated");
+        assert!(accounts[2].del_if_value(&hash, key, b"wrong").is_err());
+        accounts[2].del_if_value(&hash, key, b"updated").unwrap();
+        assert!(accounts[0].get(&hash, key).is_err());
+        assert!(accounts[0].list(&hash, "secrets/").unwrap().is_empty());
+        accounts[0].put_new(&hash, key, b"new", true).unwrap();
+        accounts[1].del(&hash, key).unwrap();
+        assert!(global.get(&hash, key).is_err());
+    }
 
     #[test]
     fn key_validation_rejects_escapes() {

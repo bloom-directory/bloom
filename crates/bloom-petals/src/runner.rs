@@ -796,6 +796,9 @@ impl PetalRunner {
             runtime_metadata.sign_intent.as_deref(),
             opts.sign_intents,
         ));
+        if opts.private_store_shared_root.is_none() {
+            opts.private_store_shared_root = Some(self.store.private_data_root());
+        }
         let declared_store_policy = self.petal_store_policy(&matched.hash)?;
         opts.store_namespaces = Some(match opts.store_namespaces {
             Some(mask) => declared_store_policy.intersect(&mask),
