@@ -78,11 +78,11 @@ require_compat_value() {
   }
 }
 require_compat_value protocols.machine_broker major 1
-require_compat_value protocols.machine_broker minor_min 4
-require_compat_value protocols.machine_broker minor_max 4
+require_compat_value protocols.machine_broker minor_min 6
+require_compat_value protocols.machine_broker minor_max 6
 require_compat_value protocols.broker_signer major 1
-require_compat_value protocols.broker_signer minor_min 4
-require_compat_value protocols.broker_signer minor_max 4
+require_compat_value protocols.broker_signer minor_min 5
+require_compat_value protocols.broker_signer minor_max 5
 for support_edge in signer_control session; do
   require_compat_value "protocols.$support_edge" major 1
   require_compat_value "protocols.$support_edge" minor_min 0
@@ -112,8 +112,8 @@ signer_revision="$(source_revision BLOOM_SIGNER_SHA)"
   echo "bundle compatibility revision does not match SOURCE_REVISIONS" >&2
   exit 65
 }
-require_compat_value revisions service_runtime_commit '"bc88cc6760b00bbff0c6a6e5f56d42bb03004436"'
-require_compat_value revisions petal_contract_commit '"61938d0c127cfe03c7e3e55baed0ba1439bc5ca2"'
+require_compat_value revisions service_runtime_commit '"5db670e1b7507deabfdcf451be8b5d315c1c9d91"'
+require_compat_value revisions petal_contract_commit '"73c5b06a77599368fbc79fb7947a629b5b4c630e"'
 for state_owner in machine broker signer; do
   require_compat_value "state.$state_owner" current 1
   require_compat_value "state.$state_owner" downgrade_floor 1

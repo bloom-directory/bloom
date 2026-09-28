@@ -31,6 +31,8 @@ bloom-mempool.workspace = true
 bloom-machine-client.workspace = true
 bloom-broker-api.workspace = true
 bloom-tx.workspace = true
+bloom-solana.workspace = true
+bloom-solana-tx.workspace = true
 bloom-tools.workspace = true
 bloom-vfs.workspace = true
 bloom-watch.workspace = true
@@ -66,3 +68,4 @@ tempfile.workspace = true
 
 [dev-dependencies]
 bloom-proto = { workspace = true, features = ["audit-test-seam"] }
+bs58.workspace = true

@@ -1,5 +1,6 @@
 target/
-target-docker/
+# Root-level Cargo targets used for isolated candidate builds.
+/target-*/
 cache/
 out/
 /evals/harbor/jobs/
@@ -23,6 +24,8 @@ test.env
 .bloom-local/
 .bloom-play/
 .worktrees/
+# Workspace-local editing helper; not a Bloom executable.
+/bin/edit
 # Downloaded CI log bundles dropped in the repo root during triage.
 /logs_*/
 .claude/worktrees/
@@ -35,10 +38,8 @@ test.env
 # synthesized markdown under lit/ stays tracked. See lit/RESEARCH.md.
 docs/research/formal-verification/lit/data/
 
-# Local-only agent/PR docs — kept on disk, deliberately never committed.
-AGENTS.md
-!examples/local-petal-apps/**/AGENTS.md
-!tests/fixtures/triad-authority-petal/AGENTS.md
+# Project AGENTS.md files are tracked operating contracts. Use AGENTS.local.md
+# for private per-worktree instructions.
 CLAUDE.md
 DIRECTION.md
 PR.md

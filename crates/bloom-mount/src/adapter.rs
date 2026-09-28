@@ -145,12 +145,21 @@ fn blake3_like_hash(bytes: &[u8]) -> u64 {
 fn mount_write_path_uses_wallet_signer(path: &VfsPath) -> bool {
     let segs = path.segments();
     match segs {
-        [root, _wallet, chains, _chain, outbox, pending, _id, action]
-            if root == "wallets"
-                && chains == "chains"
-                && outbox == "outbox"
-                && pending == "pending"
-                && matches!(action.as_str(), "cancel" | "replace") =>
+        [
+            root,
+            _wallet,
+            _account,
+            chains,
+            _chain,
+            outbox,
+            pending,
+            _id,
+            action,
+        ] if root == "wallets"
+            && chains == "chains"
+            && outbox == "outbox"
+            && pending == "pending"
+            && matches!(action.as_str(), "cancel" | "replace") =>
         {
             true
         }
@@ -167,6 +176,24 @@ fn mount_write_path_uses_wallet_signer(path: &VfsPath) -> bool {
         // must forward them to `vfs.write` rather than deny on flush.
         _ => false,
     }
+}
+
+/// The name a VFS segment is listed under. LOOKUP, CREATE and the other
+/// name-taking operations percent-decode what the kernel sends, so READDIR
+/// must escape the bytes decoding would otherwise change (`%`) or that cannot
+/// appear in a directory entry name (`/`, NUL). Everything else is listed
+/// verbatim, so `percent_decode_segment(listed_name(s)) == s`.
+fn listed_name(segment: &str) -> String {
+    let mut listed = String::with_capacity(segment.len());
+    for character in segment.chars() {
+        match character {
+            '%' => listed.push_str("%25"),
+            '/' => listed.push_str("%2F"),
+            '\0' => listed.push_str("%00"),
+            other => listed.push(other),
+        }
+    }
+    listed
 }
 
 /// Convert a `HandlerError` from the VFS into the matching NFS error.
@@ -1172,8 +1199,7 @@ impl FileSystem for BloomFs {
                 if segs.len() <= 1 {
                     Ok(Some(BloomHandle::Root))
                 } else {
-                    let parent_str = format!("/{}", segs[..segs.len() - 1].join("/"));
-                    let parent = VfsPath::parse(&parent_str).map_err(|_| FsError::InvalidInput)?;
+                    let parent = Self::parent_path(path).expect("non-root path has a parent");
                     let name = parent
                         .segments()
                         .last()
@@ -1256,7 +1282,7 @@ impl FileSystem for BloomFs {
                 None
             };
             out.push(DirEntry {
-                name: e.name.clone(),
+                name: listed_name(&e.name),
                 handle,
                 cookie: (start + idx + 3) as u64,
                 attrs,
@@ -2033,12 +2059,125 @@ mod tests {
             "/wallets/minnow/sign/message",
             "/wallets/minnow/sign/hash",
             "/wallets/minnow/sign/typed_data",
-            "/wallets/minnow/chains/polygon/outbox/pending/0001/cancel",
-            "/wallets/minnow/chains/polygon/outbox/pending/0001/replace",
+            "/wallets/minnow/0/chains/polygon/outbox/pending/0001/cancel",
+            "/wallets/minnow/0/chains/polygon/outbox/pending/0001/replace",
         ] {
             let p = VfsPath::parse(path).unwrap();
             assert!(mount_write_path_uses_wallet_signer(&p), "{path}");
         }
+    }
+
+    /// Models a chain directory whose listing and lookup disagree — the
+    /// shape of the `accounts.json` and Solana chain-directory defects.
+    /// `advertised` is returned by `list`; only `resolvable` is accepted by
+    /// `lookup`. Used to pin the failure mode the NFS layer actually shows a
+    /// user, and to prove the adapter neither masks nor invents entries.
+    struct DriftingHandler {
+        advertised: Vec<&'static str>,
+        resolvable: Vec<&'static str>,
+    }
+
+    #[async_trait]
+    impl Handler for DriftingHandler {
+        async fn lookup(&self, p: &VfsPath) -> Result<Entry, HandlerError> {
+            if p.is_root() {
+                return Ok(Entry::dir(""));
+            }
+            match p.first() {
+                Some(name) if self.resolvable.contains(&name) => Ok(Entry::file(name)),
+                Some(name) => Err(HandlerError::NotFound(name.to_string())),
+                None => Err(HandlerError::NotFound(p.to_string_path())),
+            }
+        }
+        async fn read(&self, p: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+            match p.first() {
+                Some(name) if self.resolvable.contains(&name) => {
+                    Ok(format!("{name}\n").into_bytes())
+                }
+                _ => Err(HandlerError::NotFound(p.to_string_path())),
+            }
+        }
+        async fn list(&self, p: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+            if p.is_root() {
+                Ok(self.advertised.iter().map(|n| Entry::file(n)).collect())
+            } else {
+                Err(HandlerError::NotADir(p.to_string_path()))
+            }
+        }
+    }
+
+    /// Every name a directory advertises must resolve and read through the
+    /// mount. This is the NFS-layer half of the VFS contract: `readdir`
+    /// alone is not evidence a file is reachable, because NFS resolves each
+    /// name with a separate LOOKUP before any READ.
+    #[tokio::test]
+    async fn readdir_lookup_and_read_agree_through_the_mount() {
+        let names = vec!["address", "balance", "balance.json", "accounts.json"];
+        let vfs = Vfs::builder()
+            .mount(
+                "chain",
+                Arc::new(DriftingHandler {
+                    advertised: names.clone(),
+                    resolvable: names.clone(),
+                }),
+            )
+            .build();
+        let fs = BloomFs::new(vfs);
+        let ctx = fake_ctx();
+        let dir = fs.lookup(&ctx, &BloomHandle::Root, "chain").await.unwrap();
+
+        let page = fs.readdir(&ctx, &dir, 0, 100, true).await.unwrap();
+        let listed: Vec<String> = page.entries.iter().map(|e| e.name.to_string()).collect();
+        assert_eq!(listed, names);
+
+        for name in &listed {
+            let h = fs
+                .lookup(&ctx, &dir, name)
+                .await
+                .unwrap_or_else(|e| panic!("listed {name} failed LOOKUP through the mount: {e:?}"));
+            let r = fs.read(&ctx, &h, 0, 1024).await.unwrap();
+            assert_eq!(
+                String::from_utf8(r.data.to_vec()).unwrap(),
+                format!("{name}\n")
+            );
+        }
+    }
+
+    /// The regression this pins: a leaf present in `readdir` but missing
+    /// from `lookup` reaches the user as a file that `ls` shows and `stat`
+    /// rejects. The adapter must surface that faithfully rather than hiding
+    /// it, so a handler-level drift stays observable at the mount.
+    #[tokio::test]
+    async fn a_listed_but_unresolvable_leaf_fails_lookup_through_the_mount() {
+        let vfs = Vfs::builder()
+            .mount(
+                "chain",
+                Arc::new(DriftingHandler {
+                    advertised: vec!["address", "accounts.json"],
+                    // `accounts.json` is advertised but not resolvable.
+                    resolvable: vec!["address"],
+                }),
+            )
+            .build();
+        let fs = BloomFs::new(vfs);
+        let ctx = fake_ctx();
+        let dir = fs.lookup(&ctx, &BloomHandle::Root, "chain").await.unwrap();
+
+        let page = fs.readdir(&ctx, &dir, 0, 100, true).await.unwrap();
+        let listed: Vec<String> = page.entries.iter().map(|e| e.name.to_string()).collect();
+        assert!(
+            listed.iter().any(|n| n == "accounts.json"),
+            "readdir should still advertise it: {listed:?}"
+        );
+
+        fs.lookup(&ctx, &dir, "address")
+            .await
+            .expect("resolvable leaf must stat");
+        assert!(
+            fs.lookup(&ctx, &dir, "accounts.json").await.is_err(),
+            "an advertised-but-unresolvable leaf must fail LOOKUP, which is \
+             exactly how the defect reached users: visible to ls, ENOENT on cat"
+        );
     }
 
     #[tokio::test]
@@ -3650,6 +3789,62 @@ mod tests {
         let leaf = fs.lookup(&ctx, &dir, "100%25done").await.unwrap();
         let r = fs.read(&ctx, &leaf, 0, 1024).await.unwrap();
         assert_eq!(&r.data[..], b"100%done");
+    }
+
+    #[test]
+    fn listed_names_decode_to_their_segment() {
+        for segment in ["plain", "100%done", "%25", "a/b", "nul\0byte", "é%/"] {
+            let listed = listed_name(segment);
+            assert!(!listed.contains(['/', '\0']), "{listed}");
+            assert_eq!(percent_decode_segment(&listed).unwrap(), segment);
+        }
+    }
+
+    #[tokio::test]
+    async fn listed_directory_parent_preserves_encoded_segments() {
+        struct NestedHandler;
+        #[async_trait]
+        impl Handler for NestedHandler {
+            async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
+                match path.segments() {
+                    [] => Ok(Entry::dir("")),
+                    [name] if name == "a/b%" => Ok(Entry::dir(name)),
+                    [name, child] if name == "a/b%" && child == "child" => Ok(Entry::dir(child)),
+                    _ => Err(HandlerError::not_found(path.to_string_path())),
+                }
+            }
+            async fn list(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+                match path.segments() {
+                    [] => Ok(vec![Entry::dir("a/b%")]),
+                    [name] if name == "a/b%" => Ok(vec![Entry::dir("child")]),
+                    _ => Err(HandlerError::not_found(path.to_string_path())),
+                }
+            }
+        }
+        let vfs = Vfs::builder()
+            .mount("nested", Arc::new(NestedHandler))
+            .build();
+        let fs = BloomFs::new(vfs);
+        let ctx = fake_ctx();
+        let root = fs.lookup(&ctx, &BloomHandle::Root, "nested").await.unwrap();
+        let entries = fs.readdir(&ctx, &root, 0, 100, true).await.unwrap();
+        assert_eq!(entries.entries[0].name, "a%2Fb%25");
+        let directory = fs
+            .lookup(&ctx, &root, &entries.entries[0].name)
+            .await
+            .unwrap();
+        assert_eq!(directory, entries.entries[0].handle);
+        let children = fs.readdir(&ctx, &directory, 0, 100, true).await.unwrap();
+        let child = fs
+            .lookup(&ctx, &directory, &children.entries[0].name)
+            .await
+            .unwrap();
+        let parent = fs.parent(&ctx, &child).await.unwrap().unwrap();
+        assert_eq!(parent, directory);
+        // The returned parent must still address the same handler directory.
+        let again = fs.lookup(&ctx, &parent, "child").await.unwrap();
+        assert_eq!(again, child);
+        assert_eq!(fs.parent(&ctx, &parent).await.unwrap(), Some(root));
     }
 
     #[tokio::test]

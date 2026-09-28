@@ -9,6 +9,8 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 # repositories that a rejected invocation never touches.
 broker_repo=""
 signer_repo=""
+ceremony_port_arg=""
+ceremony_port_arg_set=0
 developer_root=""
 machine_home=""
 mount_dir=""
@@ -30,6 +32,7 @@ while [ "$#" -gt 0 ]; do
     --machine-socket) need_value "$@"; machine_socket="$2"; shift 2 ;;
     --log-dir) need_value "$@"; log_dir="$2"; shift 2 ;;
     --ready-file) need_value "$@"; ready_file="$2"; shift 2 ;;
+    --ceremony-port) need_value "$@"; ceremony_port_arg="$2"; ceremony_port_arg_set=1; shift 2 ;;
     --services-only) services_only=1; shift ;;
     *) die "unknown argument: $1" ;;
   esac
@@ -42,6 +45,34 @@ done
 if [ "$services_only" -eq 1 ] && [ -n "$mount_dir" ]; then
   die "--services-only cannot be combined with --mount"
 fi
+# Ceremony-port selection is explicit flag, otherwise the existing developer
+# environment override, otherwise the custody default. Validate here, before
+# any build or config mutation, so a malformed value never touches state.
+ceremony_port_raw="18734"
+if [ "$ceremony_port_arg_set" -eq 1 ]; then
+  ceremony_port_raw="$ceremony_port_arg"
+elif [ -n "${BLOOM_TRIAD_DEV_CEREMONY_PORT:-}" ]; then
+  ceremony_port_raw="$BLOOM_TRIAD_DEV_CEREMONY_PORT"
+fi
+case "$ceremony_port_raw" in
+  ''|*[!0-9]*) die "--ceremony-port (or BLOOM_TRIAD_DEV_CEREMONY_PORT) must be an integer 1 through 65535" ;;
+esac
+# Strip leading zeros so ordinary zero-padded input (0028735) keeps
+# selecting 28735; an all-zeros value collapses and fails the range check.
+stripped_port=$ceremony_port_raw
+while [ -n "$stripped_port" ] && [ "${stripped_port#0}" != "$stripped_port" ]; do
+  stripped_port=${stripped_port#0}
+done
+[ -n "$stripped_port" ] || stripped_port=0
+# Bound the digit count before arithmetic: Bash integer arithmetic wraps on
+# overflow, so an oversized decimal could otherwise wrap into the valid range
+# (or onto the custody port). Six or more significant digits always exceed
+# 65535, while five digits can never overflow the arithmetic.
+[ "${#stripped_port}" -le 5 ] ||
+  die "--ceremony-port (or BLOOM_TRIAD_DEV_CEREMONY_PORT) must be an integer 1 through 65535"
+ceremony_port="$((10#$stripped_port))"
+[ "$ceremony_port" -ge 1 ] && [ "$ceremony_port" -le 65535 ] ||
+  die "--ceremony-port (or BLOOM_TRIAD_DEV_CEREMONY_PORT) must be an integer 1 through 65535"
 case "$install_authority_fixture" in
   0|1) ;;
   *) die "BLOOM_TRIAD_DEV_AUTHORITY_FIXTURE must be 0 or 1" ;;
@@ -63,15 +94,28 @@ case "$host_os" in
 esac
 
 # Arguments and environment are valid, so this invocation will actually build
-# and launch the triad and genuinely needs the sibling checkouts.
+# and launch the triad. Each sibling checkout is resolved only when that
+# service's binary override is absent and the launcher needs its default
+# build/path, so supplying all binaries never requires sibling checkouts.
 resolve_sibling_repo() {
   local name="$1" path
   path="$(cd "${repo_root}/../${name}" 2>/dev/null && pwd -P)" ||
-    die "sibling repository '${name}' not found next to ${repo_root}; the developer harness expects bloom, bloom-broker, and bloom-signer to be checked out side by side"
+    die "sibling repository '${name}' not found next to ${repo_root}; the developer harness expects bloom, bloom-broker, and bloom-signer to be checked out side by side unless that service's BLOOM_INTEGRATION_*_BIN override is supplied"
   printf '%s' "$path"
 }
-broker_repo="$(resolve_sibling_repo bloom-broker)"
-signer_repo="$(resolve_sibling_repo bloom-signer)"
+if [ -z "${BLOOM_INTEGRATION_BROKER_BIN:-}" ]; then
+  broker_repo="$(resolve_sibling_repo bloom-broker)"
+fi
+if [ -z "${BLOOM_INTEGRATION_SIGNER_BIN:-}" ]; then
+  signer_repo="$(resolve_sibling_repo bloom-signer)"
+fi
+# Serialize the public ceremony origin the way browsers do: HTTP port 80
+# omits the port, every other port keeps it.
+if [ "$ceremony_port" -eq 80 ]; then
+  ceremony_origin="http://localhost"
+else
+  ceremony_origin="http://localhost:${ceremony_port}"
+fi
 
 command -v jq >/dev/null 2>&1 || die "jq is required"
 user_unit_dir=""
@@ -133,6 +177,22 @@ if [ -n "$mount_dir" ]; then
   fi
 fi
 log_dir="$(cd "$log_dir" && pwd -P)"
+if [ "$host_os" = Darwin ]; then
+  # macOS Broker requires a pre-created 0640 log with explicit ownership.
+  # Keep developer output in --log-dir, including when the shell inherited
+  # logging settings from an installed service or another developer triad.
+  export BLOOM_BROKER_LOG_PATH="${log_dir}/broker.log"
+  export BLOOM_BROKER_LOG_OWNER_UID="$(id -u)"
+  [ ! -L "$BLOOM_BROKER_LOG_PATH" ] || die "Broker log must not be a symlink"
+  if [ -e "$BLOOM_BROKER_LOG_PATH" ]; then
+    [ -f "$BLOOM_BROKER_LOG_PATH" ] &&
+      [ "$(stat -f %u "$BLOOM_BROKER_LOG_PATH")" = "$BLOOM_BROKER_LOG_OWNER_UID" ] ||
+      die "Broker log must be a regular file owned by the current user"
+  fi
+  : >> "$BLOOM_BROKER_LOG_PATH"
+  chmod 0640 "$BLOOM_BROKER_LOG_PATH"
+  export BLOOM_BROKER_LOG_READER_GID="$(stat -f %g "$BLOOM_BROKER_LOG_PATH")"
+fi
 machine_socket="$(cd "$(dirname "$machine_socket")" && pwd -P)/$(basename "$machine_socket")"
 ready_file="$(cd "$(dirname "$ready_file")" && pwd -P)/$(basename "$ready_file")"
 if [ -e "$machine_socket" ] || [ -L "$machine_socket" ]; then
@@ -198,6 +258,15 @@ if [ ! -f "${config_dir}/edge-manifest.json" ]; then
     cp "$template_source" "${template_dir}/${name}"
     chmod 0600 "${template_dir}/${name}"
   done
+  case "$(uname -s)" in
+    Darwin) developer_trusted_time_source="macos-managed-timed" ;;
+    Linux) developer_trusted_time_source="linux-chrony-nts" ;;
+    *) die "developer triad launcher supports only Darwin and Linux" ;;
+  esac
+  sed "s/\"trusted_time_source\": \"macos-managed-timed\"/\"trusted_time_source\": \"${developer_trusted_time_source}\"/" \
+    "${template_dir}/edge-manifest.json.in" > "${template_dir}/edge-manifest.json.in.new"
+  chmod 0600 "${template_dir}/edge-manifest.json.in.new"
+  mv -f "${template_dir}/edge-manifest.json.in.new" "${template_dir}/edge-manifest.json.in"
   if [ "$install_authority_fixture" -eq 1 ]; then
     catalog="${template_dir}/provenance-catalog.unsigned.json"
     catalog_new="${catalog}.new"
@@ -277,7 +346,8 @@ unit_token="$(basename "$runtime_dir")"
 unit_prefix="bloom-triad-dev-$(id -u)-${unit_token}"
 signer_service_unit="${unit_prefix}-signer.service"
 broker_service_unit="${unit_prefix}-broker.service"
-broker_ceremony_socket_unit="${unit_prefix}-broker-ceremony.socket"
+broker_ceremony_v4_socket_unit="${unit_prefix}-broker-ceremony-ipv4.socket"
+broker_ceremony_v6_socket_unit="${unit_prefix}-broker-ceremony-ipv6.socket"
 broker_checkpoint_dir="${developer_root}/audit-checkpoints/broker"
 signer_checkpoint_dir="${developer_root}/audit-checkpoints/signer"
 machine_checkpoint_dir="${machine_home}/audit-checkpoints/machine"
@@ -289,7 +359,9 @@ rewrite_broker_config() {
   source="${config_dir}/broker.json"
   temporary="${source}.new.$$"
   jq --arg signer_socket "$signer_socket" --arg digest "$release_digest" \
+    --argjson ceremony_port "$ceremony_port" \
     '.signer_socket_path = $signer_socket | .build_digest = $digest |
+     .ceremony_port = $ceremony_port |
      .network_containment = null | .maximum_requests_per_window = 10000' \
     "$source" > "$temporary"
   chmod 0600 "$temporary"
@@ -299,7 +371,9 @@ rewrite_signer_config() {
   source="${config_dir}/signer.json"
   temporary="${source}.new.$$"
   jq --arg digest "$release_digest" \
-    '.build_digest = $digest | .network_containment = null |
+    --argjson ceremony_port "$ceremony_port" \
+    '.build_digest = $digest | .ceremony_port = $ceremony_port |
+     .network_containment = null |
      .maximum_requests_per_window = 10000' "$source" > "$temporary"
   chmod 0600 "$temporary"
   mv -f "$temporary" "$source"
@@ -320,6 +394,8 @@ env_file="${log_dir}/triad.env"
   printf 'export BLOOM_BROKER_AUDIT_CHECKPOINT_DIR=%q\n' "$broker_checkpoint_dir"
   printf 'export BLOOM_SIGNER_AUDIT_CHECKPOINT_DIR=%q\n' "$signer_checkpoint_dir"
   printf 'export BLOOM_MACHINE_AUDIT_CHECKPOINT_DIR=%q\n' "$machine_checkpoint_dir"
+  printf 'export BLOOM_TRIAD_DEV_CEREMONY_PORT=%q\n' "$ceremony_port"
+  printf 'export BLOOM_TRIAD_DEV_CEREMONY_ORIGIN=%q\n' "$ceremony_origin"
   printf 'export BLOOM_AUTHORITY_EDGE_HISTORY=%q\n' "$authority_edge_history"
   printf 'export BLOOM_MACHINE_IDENTITY=%q\n' "${config_dir}/machine-identity.json"
   printf 'export BLOOM_EDGE_MANIFEST=%q\n' "${config_dir}/edge-manifest.json"
@@ -331,10 +407,11 @@ systemd_units_installed=0
 stop_linux_authority_units() {
   [ "$host_os" = Linux ] || return 0
   systemctl --user stop "$broker_service_unit" "$signer_service_unit" >/dev/null 2>&1 || true
-  systemctl --user stop "$broker_ceremony_socket_unit" >/dev/null 2>&1 || true
+  systemctl --user stop "$broker_ceremony_v4_socket_unit" "$broker_ceremony_v6_socket_unit" >/dev/null 2>&1 || true
   if [ "$systemd_units_installed" -eq 1 ]; then
     rm -f -- \
-      "${user_unit_dir}/${broker_ceremony_socket_unit}" \
+      "${user_unit_dir}/${broker_ceremony_v4_socket_unit}" \
+      "${user_unit_dir}/${broker_ceremony_v6_socket_unit}" \
       "${user_unit_dir}/${broker_service_unit}" \
       "${user_unit_dir}/${signer_service_unit}"
     systemctl --user daemon-reload >/dev/null 2>&1 || true
@@ -445,6 +522,10 @@ supervise_services() {
   done
 }
 
+# One socket unit per listener. systemd's FileDescriptorName= names every
+# fd a unit passes, so a unit with two ListenStream= lines hands the
+# Broker two fds under one name and the activation crate rejects the
+# duplicate. The Broker takes each family by its own name.
 write_linux_socket_unit() {
   unit="$1"; description="$2"; path="$3"; descriptor="$4"; service="$5"
   {
@@ -461,8 +542,12 @@ start_linux_authority_services() {
   # Mark ownership before the first write so the EXIT trap removes even a
   # partially rendered unit set.
   systemd_units_installed=1
-  write_linux_socket_unit "$broker_ceremony_socket_unit" \
-    'Bloom developer Broker ceremony listener' '127.0.0.1:18734' broker-ceremony "$broker_service_unit"
+  write_linux_socket_unit "$broker_ceremony_v4_socket_unit" \
+    'Bloom developer Broker IPv4 ceremony listener' \
+    "127.0.0.1:${ceremony_port}" broker-ceremony-ipv4 "$broker_service_unit"
+  write_linux_socket_unit "$broker_ceremony_v6_socket_unit" \
+    'Bloom developer Broker IPv6 ceremony listener' \
+    "[::1]:${ceremony_port}" broker-ceremony-ipv6 "$broker_service_unit"
 
   : > "${log_dir}/signer.log"
   {
@@ -487,7 +572,7 @@ start_linux_authority_services() {
   : > "${log_dir}/broker.log"
   {
     printf '%s\n' '[Unit]' 'Description=Bloom developer Broker' \
-      "Requires=$broker_ceremony_socket_unit" \
+      "Requires=$broker_ceremony_v4_socket_unit $broker_ceremony_v6_socket_unit" \
       "After=$signer_service_unit" '' \
       '[Service]' 'Type=simple' 'UMask=0077'
     printf 'ExecStart=%s\n' "$broker_bin"
@@ -503,13 +588,14 @@ start_linux_authority_services() {
       "BLOOM_SESSION_SOCKET=$session_socket" \
       "BLOOM_BROKER_SOCKET=$broker_socket" \
       "BLOOM_BROKER_CONTROL_SOCKET=$broker_control_socket" \
-      'BLOOM_BROKER_CEREMONY_ACTIVATION_NAME=broker-ceremony'
-    printf 'Sockets=%s\n' "$broker_ceremony_socket_unit"
+      'BLOOM_BROKER_CEREMONY_ACTIVATION_NAME_IPV4=broker-ceremony-ipv4' \
+      'BLOOM_BROKER_CEREMONY_ACTIVATION_NAME_IPV6=broker-ceremony-ipv6'
+    printf 'Sockets=%s %s\n' "$broker_ceremony_v4_socket_unit" "$broker_ceremony_v6_socket_unit"
   } > "${user_unit_dir}/${broker_service_unit}"
   chmod 0600 "${user_unit_dir}/${broker_service_unit}"
 
   systemctl --user daemon-reload
-  systemctl --user start "$broker_ceremony_socket_unit"
+  systemctl --user start "$broker_ceremony_v4_socket_unit" "$broker_ceremony_v6_socket_unit"
   systemctl --user start "$signer_service_unit"
   signer_pid="$(systemctl --user show "$signer_service_unit" -p MainPID --value)"
   [ "$signer_pid" -gt 0 ] ||
@@ -572,49 +658,11 @@ if [ ! -e "$machine_config" ]; then
   chmod 0600 "$machine_config"
 fi
 
-# Developer Petals are installed through the launched Machine below. Do not
-# download or advertise a stale production release merely to make this isolated
-# harness ready.
-[ -f "$machine_config" ] || die "Machine did not create its configuration"
-machine_config_new="${machine_config}.new.$$"
-awk '
-  $0 == "[petals]" {
-    saw_petals = 1
-    in_petals = 1
-    print
-    next
-  }
-  in_petals && $0 ~ /^preinstalled = \[/ {
-    print "preinstalled = []"
-    replaced_preinstalled = 1
-    if ($0 !~ /\]/) skipping = 1
-    next
-  }
-  skipping {
-    if ($0 == "]") skipping = 0
-    next
-  }
-  in_petals && $0 ~ /^\[/ {
-    if (!replaced_preinstalled) print "preinstalled = []"
-    in_petals = 0
-  }
-  { print }
-  END {
-    if (in_petals && !replaced_preinstalled) print "preinstalled = []"
-    if (!saw_petals) {
-      print ""
-      print "[petals]"
-      print "preinstalled = []"
-    }
-  }
-' "$machine_config" > "$machine_config_new"
-chmod 0600 "$machine_config_new"
-mv -f "$machine_config_new" "$machine_config"
-
 if [ "$services_only" -eq 1 ]; then
   printf 'ready\n' > "$ready_file"
   printf '%s\n' \
     'Bloom triad services are ready; Machine is developer-managed.' \
+    "Public ceremony origin: ${ceremony_origin}" \
     'Source triad.env to put the selected debug bloom binary first on PATH;' \
     'then use bloom directly in that terminal:' \
     "  source ${env_file}" \
@@ -702,6 +750,7 @@ printf 'ready\n' > "$ready_file"
 if [ -z "$mount_dir" ]; then
   printf '%s\n' \
     'Bloom is ready without a kernel mount.' \
+    "Public ceremony origin: ${ceremony_origin}" \
     'Source triad.env to put the selected debug bloom binary first on PATH;' \
     'then use bloom directly in that terminal:' \
     "  source ${env_file}" \

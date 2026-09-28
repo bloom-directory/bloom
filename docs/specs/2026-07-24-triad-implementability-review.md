@@ -174,7 +174,6 @@ The current handler's complete public categories route as follows:
 | `unlock-passkey` | daemon returns keystore trusted UI from `wallet.unlock_prepare`; PRF never returns through VFS |
 | `sign/{message,hash,typed_data}` | remains rejected; it is not restored as an opaque signing bypass |
 | `policy-session/new`, `active.json`, `<id>/use`, `<id>/revoke` | standing `prepare/list/status/budget_state/revoke`; `use` becomes an ordinary semantic sign operation under the authority |
-| `capabilities/active.json` and `.md` | daemon projection from signing authority status plus keystore capability receipts |
 | chain `balance*`, `nonce`, `pending_external.jsonl`, `nonce_conflicts.json` | daemon-owned read-only network/outbox projections |
 | `outbox/new.tx`, state files, `confirm`, `confirm.override`, `replace`, `cancel` | daemon stages and owns execution state; confirmation creates a separate signing operation and later idempotent execution per D-024 |
 

@@ -127,8 +127,8 @@ impl PendingTxIndex {
     }
 
     /// Full snapshot of all currently-indexed pending txs. Used by the
-    /// VFS `wallets/<w>/chains/<c>/pending_external.jsonl` handler to
-    /// filter txs that look like they were sent from a managed wallet.
+    /// VFS `wallets/<w>/<n>/chains/<c>/pending_external.jsonl` handler to
+    /// filter txs that look like they were sent from a managed account.
     pub fn snapshot(&self) -> Vec<PendingTx> {
         self.inner
             .read()

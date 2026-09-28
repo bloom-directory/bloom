@@ -34,5 +34,5 @@ pub use requests::RequestsHandler;
 pub use simulate::SimulateHandler;
 pub use status::StatusHandler;
 pub use tools::ToolsHandler;
-pub use wallets::WalletsHandler;
+pub use wallets::{WalletsHandler, accounts_json_with_numbers, derivation_path_number};
 pub use watch::WatchHandler;

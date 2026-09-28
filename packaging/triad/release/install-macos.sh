@@ -952,15 +952,23 @@ restore_macos_upgrade_state() {
     # Do not enable tar's global symlink-traversal override. Restore those exact
     # legacy entries via /private; new snapshots already use private/etc/....
     local entry listing
-    local -a legacy_etc=()
+    local -a legacy_etc=() regular_entries=()
     listing="$(tar -tf "$archive")" || die "cannot list rollback archive"
     while IFS= read -r entry; do
-      [[ "$entry" == etc/* ]] || continue
-      [[ "$entry" =~ ^etc/(newsyslog\.d/bloom-[1-9][0-9]*\.conf|pf\.anchors/com\.bloom\.triad\.[1-9][0-9]*)$ ]] ||
-        die "unexpected legacy etc entry in rollback archive"
-      legacy_etc+=("$entry")
+      if [[ "$entry" == etc/* ]]; then
+        [[ "$entry" =~ ^etc/(newsyslog\.d/bloom-[1-9][0-9]*\.conf|pf\.anchors/com\.bloom\.triad\.[1-9][0-9]*)$ ]] ||
+          die "unexpected legacy etc entry in rollback archive"
+        legacy_etc+=("$entry")
+      else
+        regular_entries+=("$entry")
+      fi
     done <<<"$listing"
-    (cd "${root_prefix:-/}" && tar -xpf "$archive" --exclude 'etc/*')
+    # Extract named entries instead of using an unanchored exclusion pattern:
+    # GNU tar also matches `etc/*` below `private/`, silently skipping current
+    # `private/etc/...` snapshots.
+    if ((${#regular_entries[@]})); then
+      (cd "${root_prefix:-/}" && tar -xpf "$archive" --no-recursion "${regular_entries[@]}")
+    fi
     if ((${#legacy_etc[@]})); then
       (cd "$root_prefix/private" && tar -xpf "$archive" "${legacy_etc[@]}")
     fi

@@ -8,7 +8,8 @@ use bloom_broker_api::{
     CredentialPublic, CryptoSuite, CustodyResult, DecimalU64, Digest32, KeyPublic, KeyRef, KeySpec,
     MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService, OperationId,
     PolicyCommitReceipt, PolicyUpdatePrepareResponse, ProtocolError, ProtocolErrorCode,
-    ServiceFuture, SignedPolicySnapshot, Token, WalletPublic, WalletRequest,
+    ServiceFuture, SignedPolicySnapshot, Token, WalletAccountsPublic, WalletPublic, WalletRequest,
+    WalletSeedProfile,
 };
 use bloom_machine_client::{
     CachedWalletProjectionReader, FileProjectionStore, MachineBrokerClient, PetalEligibility,
@@ -82,7 +83,7 @@ impl BrokerFixture {
         WalletPublic {
             wallet_id: Token::new("alice").unwrap(),
             wallet_kind: Token::new("passkey").unwrap(),
-            root_key_ref: self.key_ref(),
+            root_key_ref: Some(self.key_ref()),
             key_refs: vec![self.key_ref()],
             policy_version: policy.version,
             policy_digest: policy.policy_digest,
@@ -134,6 +135,17 @@ impl MachineBrokerService for BrokerFixture {
                         CredentialPublic,
                     >::new(
                     )))
+                }
+                MachineBrokerRequest::WalletAccounts(WalletRequest { wallet_id })
+                    if wallet_id.as_str() == "alice" =>
+                {
+                    Ok(MachineBrokerResponse::WalletAccounts(
+                        WalletAccountsPublic {
+                            wallet_id,
+                            seed_profile: WalletSeedProfile::Bip39MulticurveV1,
+                            accounts: Vec::new(),
+                        },
+                    ))
                 }
                 MachineBrokerRequest::PolicyRead(_) => {
                     let snapshot = if self.complete.load(Ordering::SeqCst)
@@ -311,7 +323,7 @@ async fn signer_wallet_is_visible_in_vfs_without_a_legacy_keystore_record() {
     assert!(root.iter().any(|entry| entry.name == "alice"));
     assert_eq!(
         handler
-            .read(&VfsPath::parse("/alice/address").unwrap())
+            .read(&VfsPath::parse("/alice/0/address.evm").unwrap())
             .await
             .unwrap(),
         b"0x0000000000000000000000000000000000000001\n"
@@ -363,17 +375,29 @@ async fn signer_wallet_is_visible_in_vfs_without_a_legacy_keystore_record() {
         stale_projections,
         temp.path().join("stale-machine-policy-projections"),
     );
-    let addresses: serde_json::Value = serde_json::from_slice(
+    let account: serde_json::Value = serde_json::from_slice(
         &stale_handler
-            .read(&VfsPath::parse("/alice/addresses.json").unwrap())
+            .read(&VfsPath::parse("/alice/0/account.json").unwrap())
             .await
             .unwrap(),
     )
     .unwrap();
-    assert_eq!(addresses["freshness"], "stale");
-    assert_eq!(addresses["policy_version"], "1");
-    assert_eq!(addresses["policy_digest"], expected_policy_digest.as_str());
-    assert_eq!(addresses["wallet_revocation_epoch"], "0");
+    assert_eq!(account["number"], 0);
+    assert_eq!(account["freshness"], "stale");
+    let projection: serde_json::Value = serde_json::from_slice(
+        &stale_handler
+            .read(&VfsPath::parse("/alice/projection.json").unwrap())
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(projection["freshness"], "stale");
+    assert_eq!(projection["wallet"]["policy_version"], "1");
+    assert_eq!(
+        projection["wallet"]["policy_digest"],
+        expected_policy_digest.as_str()
+    );
+    assert_eq!(projection["wallet"]["wallet_revocation_epoch"], "0");
     assert_eq!(
         stale_handler
             .read(&VfsPath::parse("/alice/policy.json").unwrap())
@@ -554,7 +578,8 @@ async fn vfs_policy_write_prepares_then_commits_only_with_completed_custody_rece
             MachineBrokerRequest::WalletListPublic(_),
             MachineBrokerRequest::KeyListPublic(_),
             MachineBrokerRequest::CredentialListPublic(_),
-            MachineBrokerRequest::PolicyRead(_)
+            MachineBrokerRequest::PolicyRead(_),
+            MachineBrokerRequest::WalletAccounts(_)
         ]
     ));
 }

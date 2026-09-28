@@ -90,6 +90,8 @@ struct PetalToml {
     #[serde(default)]
     key: KeyPolicyToml,
     #[serde(default)]
+    account: AccountToml,
+    #[serde(default)]
     store: StorePolicyToml,
     #[serde(default, rename = "source")]
     _source: Option<SourcePolicyToml>,
@@ -134,6 +136,16 @@ struct NetAllowToml {
 struct SignPolicy {
     #[serde(default)]
     allowed_intents: Vec<String>,
+}
+
+/// `[account]`: whether the Petal understands host-injected account
+/// context. Unaware Petals never run under accounts other than 0, where the
+/// wallet-level paths have always been the whole surface.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AccountToml {
+    #[serde(default, rename = "aware")]
+    aware: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -969,6 +981,14 @@ fn validate_component_metadata_policy(
         validate_sign_intent(intent)?;
     }
     Ok(())
+}
+
+/// Whether the manifest declares `[account] aware = true`.
+pub fn account_aware_from_manifest_toml(bytes: &[u8]) -> Result<bool, PetalError> {
+    let manifest_toml = std::str::from_utf8(bytes)
+        .map_err(|_| PetalError::InvalidWasm("petal.toml is not utf-8".into()))?;
+    let manifest: PetalToml = toml::from_str(manifest_toml)?;
+    Ok(manifest.account.aware)
 }
 
 pub fn sign_intents_from_manifest_toml(bytes: &[u8]) -> Result<BTreeSet<String>, PetalError> {
