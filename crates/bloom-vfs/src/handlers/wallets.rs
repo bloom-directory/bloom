@@ -2258,6 +2258,13 @@ impl WalletsHandler {
                 "Broker policy baseline is noncanonical or names another wallet",
             ));
         }
+        // Rewriting the current policy changes nothing, so there is nothing
+        // to approve. Staging it anyway would open a passkey ceremony that
+        // holds the wallet's only live ceremony slot until it expires,
+        // refusing every other approval for the wallet in the meantime.
+        if proposed_policy_digest == baseline.policy_digest {
+            return Ok(());
+        }
         let authority_diff_digest =
             bloom_machine_client::claimed_policy_authority_diff_digest(&baseline_policy, &proposed)
                 .map_err(|error| HandlerError::invalid(error.to_string()))?;

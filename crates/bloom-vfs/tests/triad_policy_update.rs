@@ -480,6 +480,44 @@ async fn vfs_policy_prepare_response_loss_reconciles_the_persisted_operation_id(
 }
 
 #[tokio::test]
+async fn vfs_policy_write_of_the_current_policy_stages_nothing() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = broker_fixture(false);
+    let service: Arc<dyn MachineBrokerService> = fixture.clone();
+    let home = HomeDir::at(temp.path().join("home"));
+    let handler = WalletsHandler::new(
+        bloom_evm::ChainRegistry::default(),
+        TxEngine::new(Outbox::new(temp.path().join("outbox")).unwrap(), 60_000),
+        AddressBook::default(),
+        projection_reader(
+            temp.path().join("cache/no-op-wallets.json"),
+            Some(MachineBrokerClient::new(service.clone())),
+        ),
+        temp.path().join("machine-policy-projections"),
+    )
+    .with_broker(Some(MachineBrokerClient::new(service)))
+    .with_home_write_permit(Arc::new(HomeWritePermit::acquire(&home).unwrap()));
+    let current = serde_json::to_vec_pretty(&policy(60_000)).unwrap();
+
+    handler
+        .write(&VfsPath::parse("alice/policy.json").unwrap(), &current)
+        .await
+        .unwrap();
+
+    assert!(fixture.state.lock().operation_id.is_none());
+    assert!(matches!(
+        fixture.requests.lock().as_slice(),
+        [MachineBrokerRequest::PolicyRead(_)]
+    ));
+    assert!(
+        !temp
+            .path()
+            .join("machine-policy-projections/alice/policy-updates/pending")
+            .exists()
+    );
+}
+
+#[tokio::test]
 async fn vfs_policy_write_prepares_then_commits_only_with_completed_custody_receipt() {
     let temp = tempfile::tempdir().unwrap();
     let outbox = Outbox::new(temp.path().join("outbox")).unwrap();
