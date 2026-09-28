@@ -357,10 +357,10 @@ impl DaemonPetalHost {
         suite: bloom_broker_api::CryptoSuite,
         named: Option<&bloom_broker_api::KeyRef>,
     ) -> Result<Option<bloom_broker_api::KeyRef>, HostError> {
-        let account = context.trusted_account();
-        if let Some(account) = &account
-            && account.wallet != wallet
-        {
+        let account = context.trusted_account().ok_or_else(|| {
+            HostError::Denied("Petal authority requires an explicit wallet/index route".into())
+        })?;
+        if account.wallet != wallet {
             return Err(HostError::Denied(
                 "wallet differs from mounted account".into(),
             ));
@@ -375,10 +375,8 @@ impl DaemonPetalHost {
             .wallet(wallet_id.clone())
             .await
             .map_err(|error| HostError::Denied(error.to_string()))?;
-        let number = account.as_ref().map_or(0, |account| account.number);
-        let fingerprint = account
-            .as_ref()
-            .and_then(|account| account.owner_key_fingerprint.as_deref());
+        let number = account.number;
+        let fingerprint = account.owner_key_fingerprint.as_deref();
         if let Some(root) = descriptor.root_key_ref {
             if number != 0
                 || root.key_spec != suite.key_spec()
@@ -8419,7 +8417,7 @@ ws_url = "wss://example.invalid"
         file.write_all(bytes).unwrap();
     }
 
-    /// Install an account-aware "echo" petal and an unaware "plain" petal
+    /// Install two Petals with public and explicit numbered-account routes
     /// into the daemon home before the daemon is built. Returns the echo
     /// package hash so tests can build session states against an installed
     /// package.
@@ -8429,7 +8427,7 @@ ws_url = "wss://example.invalid"
         let registry = Arc::new(bloom_petals::NameRegistry::open(root.join("registry")).unwrap());
         let mut echo_hash = String::new();
 
-        for (mount, aware) in [("echo", true), ("plain", false)] {
+        for mount in ["echo", "plain"] {
             let package = root.join(format!("{mount}-package"));
             write_isolation_package_file(
                 &package,
@@ -8443,13 +8441,7 @@ summary = "Isolation fixture."
 
 [caps]
 allowed = ["bloom:vfs.read"]
-{account}
-"#,
-                    account = if aware {
-                        "\n[account]\naware = true\n"
-                    } else {
-                        ""
-                    }
+"#
                 )
                 .as_bytes(),
             );
@@ -8458,6 +8450,11 @@ allowed = ["bloom:vfs.read"]
             write_isolation_package_file(
                 &package,
                 &format!("petal/{mount}/message.txt.wasm"),
+                include_bytes!("../../bloom-petals/tests/fixtures/route_component_no_imports.wasm"),
+            );
+            write_isolation_package_file(
+                &package,
+                &format!("petal/{mount}/intents/[wallet]/[index]/message.txt.wasm"),
                 include_bytes!("../../bloom-petals/tests/fixtures/route_component_no_imports.wasm"),
             );
             let (installed, _, _) = store.install_petal_package_dir(&package).unwrap();
@@ -8953,7 +8950,7 @@ allowed = ["bloom:vfs.read"]
         );
     }
 
-    /// 7. Installed Petals, account-aware or not, are served only from the
+    /// 7. Installed Petals are served only from the
     ///    root `petals/` mount: no numbered account lists, resolves, or
     ///    dispatches a `petals/` subtree, while `sessions/` stays mounted.
     #[tokio::test]
@@ -8991,10 +8988,10 @@ allowed = ["bloom:vfs.read"]
         }
         for mount in ["echo", "plain"] {
             let legacy = VfsPath::parse(&format!("/petals/{mount}/message.txt")).unwrap();
-            assert!(daemon.vfs.read(&legacy).await.is_err());
+            assert_eq!(daemon.vfs.read(&legacy).await.unwrap(), b"component");
             let scoped = daemon
                 .vfs
-                .read(&VfsPath::parse(&format!("/petals/{mount}/wallets/w/0/message.txt")).unwrap())
+                .read(&VfsPath::parse(&format!("/petals/{mount}/intents/w/0/message.txt")).unwrap())
                 .await
                 .unwrap();
             assert_eq!(scoped, b"component", "{mount}");
@@ -9002,36 +8999,33 @@ allowed = ["bloom:vfs.read"]
         assert!(
             daemon
                 .vfs
-                .read(&VfsPath::parse("/petals/echo/wallets/w/1/message.txt").unwrap())
+                .read(&VfsPath::parse("/petals/echo/intents/w/1/message.txt").unwrap())
                 .await
                 .is_ok()
         );
         assert!(
             daemon
                 .vfs
-                .read(&VfsPath::parse("/petals/plain/wallets/w/1/message.txt").unwrap())
+                .read(&VfsPath::parse("/petals/plain/intents/w/1/message.txt").unwrap())
                 .await
-                .is_err()
+                .is_ok()
         );
     }
 
-    /// 8. Legacy flat dispatch on a two-child wallet signs with account 0
-    ///    (gist §10 scenario 6: the `account == None` branch).
+    /// Public routes never acquire account-zero signing authority from the body.
     #[tokio::test]
-    async fn flat_petal_dispatch_signs_with_account_zero_on_a_two_child_wallet() {
+    async fn unscoped_petal_dispatch_cannot_select_account_zero() {
         let (_dir, daemon, broker) = isolation_daemon().await;
-        let evm0 = broker.child(true, 0);
         let host = isolation_host(&daemon, broker.clone());
-        let outcome = host
+        let error = host
             .sign_payload_outcome(isolation_sign_request(
                 account_route_context("w", None, None),
                 None,
             ))
             .await
-            .unwrap();
-        assert!(matches!(outcome, SignOutcome::Signature(_)));
-        let calls = broker.sign_calls.lock();
-        assert_eq!(calls.as_slice(), std::slice::from_ref(&evm0.key_ref));
+            .unwrap_err();
+        assert!(error.to_string().contains("explicit wallet/index"));
+        assert!(broker.sign_calls.lock().is_empty());
     }
 
     // ----- sessions inventory and core stop -----

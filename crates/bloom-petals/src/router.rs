@@ -15,17 +15,12 @@ use bloom_proto::{AuditLog, AuditRecord};
 use bloom_vfs::handler::{Entry, EntryKind, Handler, HandlerError};
 use bloom_vfs::handlers::wallets::AccountPetalContext;
 use bloom_vfs::path::VfsPath;
-use parking_lot::RwLock;
 
 use crate::abi::{DispatchEntry, DispatchEntryKind, DispatchOp, DispatchRequest, DispatchResponse};
 use crate::error::PetalError;
 use crate::host::PetalHost;
-use crate::package::{RouteIndex, scoped_original_path, scoped_route_index};
 use crate::runner::{PETAL_DOCUMENT_NAMES, PetalRunner};
 use crate::vm::{COMPONENT_NOT_A_DIR_CODE, COMPONENT_UNSUPPORTED_CODE, RunOptions};
-
-type ScopedRouteIndexes = Arc<(RouteIndex, RouteIndex)>;
-type ScopedRouteCache = Arc<RwLock<BTreeMap<String, ScopedRouteIndexes>>>;
 
 #[derive(Clone)]
 pub struct PetalRouter {
@@ -34,8 +29,6 @@ pub struct PetalRouter {
     runtime_petals: BTreeMap<String, PetalRuntimeConfig>,
     audit: Option<Arc<AuditLog>>,
     audit_effect_lock: Arc<tokio::sync::Mutex<()>>,
-    account: Option<AccountPetalContext>,
-    scoped_routes: ScopedRouteCache,
 }
 
 impl PetalRouter {
@@ -46,8 +39,6 @@ impl PetalRouter {
             runtime_petals: BTreeMap::new(),
             audit: None,
             audit_effect_lock: Arc::new(tokio::sync::Mutex::new(())),
-            account: None,
-            scoped_routes: Arc::new(RwLock::new(BTreeMap::new())),
         }
     }
 
@@ -109,25 +100,6 @@ impl PetalRouter {
 
     fn is_petal(&self, mount: &str) -> bool {
         self.runner.resolve_petal_mount(mount).is_ok()
-            && self.account.as_ref().is_none_or(|account| {
-                account.number == 0 || self.runner.petal_account_aware(mount).unwrap_or(false)
-            })
-    }
-
-    fn require_account_mount(&self, path: &VfsPath) -> Result<(), HandlerError> {
-        if let (Some(account), Some(mount)) = (&self.account, path.segments().first())
-            && account.number != 0
-            && !self
-                .runner
-                .petal_account_aware(mount)
-                .map_err(map_petal_err)?
-        {
-            return Err(HandlerError::not_found(format!(
-                "petal '{mount}' does not declare [account] aware = true; it cannot run under account {}",
-                account.number
-            )));
-        }
-        Ok(())
     }
 
     fn is_petal_document(path: &str) -> bool {
@@ -138,77 +110,6 @@ impl PetalRouter {
         entries.retain(|entry| !Self::is_petal_document(&entry.name));
         entries.extend(PETAL_DOCUMENT_NAMES.map(Entry::read_only_file));
         entries
-    }
-
-    fn scoped_indexes(&self, mount: &str) -> Result<ScopedRouteIndexes, HandlerError> {
-        let hash = self
-            .runner
-            .resolve_petal_mount(mount)
-            .map_err(map_petal_err)?;
-        if let Some(indexes) = self.scoped_routes.read().get(&hash) {
-            return Ok(indexes.clone());
-        }
-        let original = self
-            .runner
-            .load_petal_route_index(mount)
-            .map_err(map_petal_err)?;
-        let scoped = scoped_route_index(&original).map_err(map_petal_err)?;
-        let indexes = Arc::new((original, scoped));
-        self.scoped_routes.write().insert(hash, indexes.clone());
-        Ok(indexes)
-    }
-
-    fn scoped_path(
-        &self,
-        mount: &str,
-        op: DispatchOp,
-        path: &str,
-        wallet: &str,
-    ) -> Result<String, HandlerError> {
-        let indexes = self.scoped_indexes(mount)?;
-        let (original, scoped) = indexes.as_ref();
-        let direct = scoped_original_path(original, scoped, path, None, wallet);
-        let special = match op {
-            DispatchOp::Lookup => Some("$lookup"),
-            DispatchOp::List => Some("$index"),
-            _ => None,
-        };
-        direct
-            .or_else(|| {
-                special.and_then(|special| {
-                    scoped_original_path(original, scoped, path, Some(special), wallet)
-                })
-            })
-            .ok_or_else(|| {
-                HandlerError::not_found(format!("petals/{mount}/wallets/{wallet}/{path}"))
-            })
-    }
-
-    async fn wallet_entries(&self) -> Result<Vec<Entry>, HandlerError> {
-        let entries = self.host.vfs_list("wallets").await.map_err(map_host_err)?;
-        Ok(entries
-            .into_iter()
-            .filter(|entry| {
-                entry.kind == crate::host::HostVfsEntryKind::Dir && entry.name != "registrations"
-            })
-            .map(|entry| Entry::dir(&entry.name))
-            .collect())
-    }
-
-    async fn account_entries(&self, wallet: &str) -> Result<Vec<Entry>, HandlerError> {
-        let entries = self
-            .host
-            .vfs_list(&format!("wallets/{wallet}"))
-            .await
-            .map_err(map_host_err)?;
-        Ok(entries
-            .into_iter()
-            .filter(|entry| {
-                entry.kind == crate::host::HostVfsEntryKind::Dir
-                    && canonical_account(&entry.name).is_some()
-            })
-            .map(|entry| Entry::dir(&entry.name))
-            .collect())
     }
 
     async fn account_context(
@@ -262,100 +163,134 @@ impl PetalRouter {
         Ok(context)
     }
 
-    async fn scoped_account<'a>(
-        &self,
-        path: &'a VfsPath,
-    ) -> Result<(&'a str, String, AccountPetalContext), HandlerError> {
-        let [mount, wallets, wallet, number, rest @ ..] = path.segments() else {
-            return Err(HandlerError::not_found(path.to_string_path()));
-        };
-        if wallets != "wallets" || !self.is_petal(mount) {
-            return Err(HandlerError::not_found(path.to_string_path()));
-        }
-        let account = self.account_context(wallet, number).await?;
-        if account.number != 0
-            && !self
-                .runner
-                .petal_account_aware(mount)
-                .map_err(map_petal_err)?
-        {
-            return Err(HandlerError::not_found(format!(
-                "petal '{mount}' does not declare [account] aware = true"
-            )));
-        }
-        Ok((mount, rest.join("/"), account))
+    fn metadata_route_path(&self, path: &VfsPath, _op: DispatchOp) -> Option<(String, String)> {
+        let (mount, rest) = Self::mount_path(path).ok()?;
+        (self.is_petal(mount) && !Self::is_petal_document(&rest)).then(|| (mount.to_owned(), rest))
     }
 
-    fn metadata_route_path(&self, path: &VfsPath, op: DispatchOp) -> Option<(String, String)> {
-        let [mount, wallets, wallet, number, rest @ ..] = path.segments() else {
-            return None;
-        };
-        if wallets != "wallets" || canonical_account(number).is_none() || !self.is_petal(mount) {
-            return None;
-        }
-        let original = self.scoped_path(mount, op, &rest.join("/"), wallet).ok()?;
-        Some((mount.clone(), original))
-    }
-
-    fn project_scoped_list(
-        original: &RouteIndex,
-        scoped: &RouteIndex,
-        path: &str,
-        entries: Vec<DispatchEntry>,
-    ) -> Result<Vec<Entry>, HandlerError> {
-        let mut visible = BTreeMap::new();
-        for entry in entries {
-            let child = if path.is_empty() {
-                entry.name.clone()
-            } else {
-                format!("{path}/{}", entry.name)
-            };
-            if scoped.match_route(&child).is_some()
-                || scoped
-                    .routes
-                    .iter()
-                    .any(|route| crate::runner::route_has_descendant(&route.pattern, &child))
-            {
-                let entry = entry_to_vfs(entry)?;
-                visible.insert(entry.name.clone(), entry);
-            }
-        }
-        // Filename captures collapse their parent directory into one file.
-        // The guest still lists the old directory, so supply that file from
-        // the immutable projected index and omit the now-unreachable parent.
-        for route in &original.routes {
-            if !route
-                .pattern
-                .split('/')
-                .next_back()
-                .is_some_and(|last| last.starts_with("[wallet]."))
-            {
+    async fn validate_ancestor(&self, mount: &str, path: &str) -> Result<(), HandlerError> {
+        let index = self
+            .runner
+            .load_petal_route_index(mount)
+            .map_err(map_petal_err)?;
+        let values = path
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>();
+        for route in &index.routes {
+            if !crate::runner::route_has_descendant(&route.pattern, path) {
                 continue;
             }
-            let Some(projected) = scoped
-                .routes
+            let captures = route.pattern.split('/').zip(&values).collect::<Vec<_>>();
+            let wallet = captures
                 .iter()
-                .find(|candidate| candidate.route_id == route.route_id)
-            else {
-                continue;
-            };
-            let Some((parent, name)) = projected.pattern.rsplit_once('/') else {
-                if !path.is_empty() {
-                    continue;
-                }
-                let name = projected.pattern.as_str();
-                visible
-                    .entry(name.to_owned())
-                    .or_insert_with(|| Entry::read_only_file(name));
-                continue;
-            };
-            if parent == path && !name.starts_with('[') {
-                visible
-                    .entry(name.to_owned())
-                    .or_insert_with(|| Entry::read_only_file(name));
+                .find(|(name, _)| *name == "[wallet]")
+                .map(|(_, value)| **value);
+            let number = captures
+                .iter()
+                .find(|(name, _)| *name == "[index]")
+                .map(|(_, value)| **value);
+            if let (Some(wallet), Some(number)) = (wallet, number) {
+                self.account_context(wallet, number).await?;
+            } else if let Some(wallet) = wallet
+                && !self
+                    .host
+                    .vfs_list("wallets")
+                    .await
+                    .map_err(map_host_err)?
+                    .iter()
+                    .any(|entry| {
+                        entry.name == wallet && entry.kind == crate::host::HostVfsEntryKind::Dir
+                    })
+            {
+                return Err(HandlerError::not_found(format!("wallets/{wallet}")));
             }
         }
-        Ok(visible.into_values().collect())
+        Ok(())
+    }
+
+    async fn discovered_entries(
+        &self,
+        mount: &str,
+        path: &str,
+    ) -> Result<Vec<Entry>, HandlerError> {
+        let index = self
+            .runner
+            .load_petal_route_index(mount)
+            .map_err(map_petal_err)?;
+        let values = path
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>();
+        let mut entries = BTreeMap::new();
+        for route in &index.routes {
+            if !crate::runner::route_has_descendant(&route.pattern, path) {
+                continue;
+            }
+            let pattern = route.pattern.split('/').collect::<Vec<_>>();
+            let core = match pattern.get(values.len()).copied() {
+                Some("[wallet]") if pattern.get(values.len() + 1) == Some(&"[index]") => {
+                    "wallets".to_owned()
+                }
+                Some("[index]")
+                    if !values.is_empty() && pattern[values.len() - 1] == "[wallet]" =>
+                {
+                    format!("wallets/{}", values[values.len() - 1])
+                }
+                _ => continue,
+            };
+            for entry in self.host.vfs_list(&core).await.map_err(map_host_err)? {
+                if entry.kind == crate::host::HostVfsEntryKind::Dir
+                    && (core == "wallets" && entry.name != "registrations"
+                        || core != "wallets" && canonical_account(&entry.name).is_some())
+                {
+                    entries.insert(entry.name.clone(), Entry::dir(&entry.name));
+                }
+            }
+        }
+        Ok(entries.into_values().collect())
+    }
+
+    async fn dispatch(
+        &self,
+        mount: &str,
+        op: DispatchOp,
+        path: String,
+        body: Vec<u8>,
+    ) -> Result<DispatchResponse, HandlerError> {
+        let matched = self
+            .runner
+            .petal_route(mount, op, &path)
+            .map_err(map_petal_err)?;
+        let wallet = matched
+            .params
+            .iter()
+            .find(|(name, _)| name == "wallet")
+            .map(|(_, value)| value.as_str());
+        let index = matched
+            .params
+            .iter()
+            .find(|(name, _)| name == "index")
+            .map(|(_, value)| value.as_str());
+        match (wallet, index) {
+            (Some(wallet), Some(index)) => {
+                let pattern = matched.route.pattern.split('/').collect::<Vec<_>>();
+                if !pattern
+                    .windows(2)
+                    .any(|pair| pair == ["[wallet]", "[index]"])
+                {
+                    return Err(HandlerError::PermissionDenied);
+                }
+                let account = self.account_context(wallet, index).await?;
+                self.dispatch_for_account(mount, op, path, body, &account)
+                    .await
+            }
+            (_, None) => {
+                self.dispatch_with_params(mount, op, path, body, &[], None, None)
+                    .await
+            }
+            (None, Some(_)) => Err(HandlerError::PermissionDenied),
+        }
     }
 }
 
@@ -379,20 +314,7 @@ fn map_host_err(error: crate::host::HostError) -> HandlerError {
 }
 
 impl PetalRouter {
-    /// A router preselected for one numbered account. The public Petal mount
-    /// resolves the same context from the authenticated wallet projection.
-    pub fn for_account(&self, account: AccountPetalContext) -> Arc<dyn Handler> {
-        let mut router = self.clone();
-        router.account = Some(account);
-        Arc::new(router)
-    }
-}
-
-impl PetalRouter {
-    /// Dispatch an installed Petal route on behalf of one numbered account.
-    /// Accounts other than 0 run only account-aware Petals: an unaware
-    /// package is not found here, with a message naming the Petal and the
-    /// missing declaration.
+    /// Dispatch using the account identity resolved by the host from live core state.
     pub async fn dispatch_for_account(
         &self,
         mount: &str,
@@ -401,26 +323,9 @@ impl PetalRouter {
         body: Vec<u8>,
         account: &AccountPetalContext,
     ) -> Result<DispatchResponse, HandlerError> {
-        if account.number != 0 {
-            let aware = self
-                .runner
-                .petal_account_aware(mount)
-                .map_err(map_petal_err)?;
-            if !aware {
-                return Err(HandlerError::not_found(format!(
-                    "petal '{mount}' does not declare [account] aware = true; it cannot run \
-                     under account {}",
-                    account.number
-                )));
-            }
-        }
         let trusted = vec![
             ("bloom.wallet".to_owned(), account.wallet.clone()),
             ("bloom.account".to_owned(), account.number.to_string()),
-            (
-                "bloom.route_prefix".to_owned(),
-                format!("wallets/{}/{}/", account.wallet, account.number),
-            ),
         ];
         self.dispatch_with_params(
             mount,
@@ -467,7 +372,6 @@ impl PetalRouter {
         let operation = format!("petal.execute.{op:?}").to_ascii_lowercase();
         let payload_digest = blake3::hash(&body).to_hex().to_string();
         let account_identity = account
-            .filter(|account| account.number != 0)
             .map(|account| format!("\0{}\0{}", account.wallet, account.number))
             .unwrap_or_default();
         let operation_id = blake3::hash(
@@ -571,119 +475,57 @@ impl PetalRouter {
 #[async_trait]
 impl Handler for PetalRouter {
     async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
-        self.require_account_mount(path)?;
-        match path.segments() {
-            [] => Ok(Entry::dir("")),
-            [mount] => {
-                if !self.is_petal(mount) {
-                    return Err(HandlerError::NotFound(path.to_string_path()));
-                }
-                Ok(Entry::dir(mount))
+        if path.segments().is_empty() {
+            return Ok(Entry::dir(""));
+        }
+        let (mount, rest) = Self::mount_path(path)?;
+        if !self.is_petal(mount) {
+            return Err(HandlerError::not_found(path.to_string_path()));
+        }
+        if rest.is_empty() {
+            return Ok(Entry::dir(mount));
+        }
+        if Self::is_petal_document(&rest) {
+            let bytes = self
+                .runner
+                .petal_document(mount, &rest)
+                .map_err(map_petal_err)?;
+            let mut entry = Entry::read_only_file(&rest);
+            entry.size = bytes.len() as u64;
+            return Ok(entry);
+        }
+        match self
+            .dispatch(mount, DispatchOp::Lookup, rest.clone(), Vec::new())
+            .await
+        {
+            Ok(DispatchResponse::Lookup(entry)) => entry_to_vfs(entry),
+            Ok(DispatchResponse::Error { code, message }) => {
+                Err(dispatch_error(code, message, path.to_string_path()))
             }
-            [mount, name] if Self::is_petal_document(name) => {
-                let bytes = self
-                    .runner
-                    .petal_document(mount, name)
-                    .map_err(map_petal_err)?;
-                let mut entry = Entry::read_only_file(name);
-                entry.size = bytes.len() as u64;
-                Ok(entry)
-            }
-            [mount, wallets] if wallets == "wallets" && self.is_petal(mount) => {
-                Ok(Entry::dir("wallets"))
-            }
-            [mount, wallets, wallet] if wallets == "wallets" && self.is_petal(mount) => {
+            Ok(other) => Err(unexpected_response("lookup", other)),
+            Err(HandlerError::NotFound(_))
                 if self
-                    .wallet_entries()
-                    .await?
-                    .iter()
-                    .any(|entry| entry.name == *wallet)
-                {
-                    Ok(Entry::dir(wallet))
-                } else {
-                    Err(HandlerError::not_found(path.to_string_path()))
-                }
+                    .runner
+                    .petal_has_descendant(mount, &rest)
+                    .map_err(map_petal_err)? =>
+            {
+                self.validate_ancestor(mount, &rest).await?;
+                Ok(Entry::dir(path.segments().last().expect("non-root")))
             }
-            [mount, wallets, wallet, number] if wallets == "wallets" && self.is_petal(mount) => {
-                let account = self.account_context(wallet, number).await?;
-                if account.number != 0
-                    && !self
-                        .runner
-                        .petal_account_aware(mount)
-                        .map_err(map_petal_err)?
-                {
-                    return Err(HandlerError::not_found(path.to_string_path()));
-                }
-                Ok(Entry::dir(number))
-            }
-            _ => {
-                let (mount, rest, account) = self.scoped_account(path).await?;
-                let original = self.scoped_path(mount, DispatchOp::Lookup, &rest, &account.wallet);
-                let original =
-                    match original {
-                        Ok(original) => original,
-                        Err(HandlerError::NotFound(_)) => {
-                            let indexes = self.scoped_indexes(mount)?;
-                            let scoped = &indexes.1;
-                            if scoped.routes.iter().any(|route| {
-                                crate::runner::route_has_descendant(&route.pattern, &rest)
-                            }) {
-                                return Ok(Entry::dir(path.segments().last().expect("non-root")));
-                            }
-                            return Err(HandlerError::not_found(path.to_string_path()));
-                        }
-                        Err(error) => return Err(error),
-                    };
-                match self
-                    .dispatch_for_account(
-                        mount,
-                        DispatchOp::Lookup,
-                        original.clone(),
-                        Vec::new(),
-                        &account,
-                    )
-                    .await
-                {
-                    Ok(DispatchResponse::Lookup(entry)) => entry_to_vfs(entry),
-                    Ok(DispatchResponse::Error { code, message }) => {
-                        Err(dispatch_error(code, message, path.to_string_path()))
-                    }
-                    Ok(other) => Err(unexpected_response("lookup", other)),
-                    Err(HandlerError::NotFound(_))
-                        if self
-                            .runner
-                            .petal_has_descendant(mount, &original)
-                            .map_err(map_petal_err)? =>
-                    {
-                        let name = path
-                            .segments()
-                            .last()
-                            .map(String::as_str)
-                            .unwrap_or_default();
-                        Ok(Entry::dir(name))
-                    }
-                    Err(e) => Err(e),
-                }
-            }
+            Err(error) => Err(error),
         }
     }
 
     async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
-        self.require_account_mount(path)?;
         let (mount, rest) = Self::mount_path(path)?;
-        if !self.is_petal(mount) {
-            return Err(HandlerError::NotFound(path.to_string_path()));
-        }
         if Self::is_petal_document(&rest) {
             return self
                 .runner
                 .petal_document(mount, &rest)
                 .map_err(map_petal_err);
         }
-        let (mount, rest, account) = self.scoped_account(path).await?;
-        let original = self.scoped_path(mount, DispatchOp::Read, &rest, &account.wallet)?;
         match self
-            .dispatch_for_account(mount, DispatchOp::Read, original, Vec::new(), &account)
+            .dispatch(mount, DispatchOp::Read, rest, Vec::new())
             .await?
         {
             DispatchResponse::Read(bytes) => Ok(bytes),
@@ -695,31 +537,16 @@ impl Handler for PetalRouter {
     }
 
     async fn write(&self, path: &VfsPath, data: &[u8]) -> Result<(), HandlerError> {
-        self.require_account_mount(path)?;
         let (mount, rest) = Self::mount_path(path)?;
-        if rest.is_empty() {
+        if rest.is_empty() || Self::is_petal_document(&rest) {
             return Err(HandlerError::PermissionDenied);
         }
-        if !self.is_petal(mount) {
-            return Err(HandlerError::NotFound(path.to_string_path()));
-        }
-        if Self::is_petal_document(&rest) {
-            return Err(HandlerError::PermissionDenied);
-        }
-        let (mount, rest, account) = self.scoped_account(path).await?;
-        let original = self.scoped_path(mount, DispatchOp::Write, &rest, &account.wallet)?;
         match self
-            .dispatch_for_account(mount, DispatchOp::Write, original, data.to_vec(), &account)
+            .dispatch(mount, DispatchOp::Write, rest, data.to_vec())
             .await?
         {
             DispatchResponse::Write => Ok(()),
             DispatchResponse::Error { code, message } => {
-                tracing::debug!(
-                    path = %path.to_string_path(),
-                    code,
-                    message = %message,
-                    "petal.write_rejected"
-                );
                 Err(dispatch_error(code, message, path.to_string_path()))
             }
             other => Err(unexpected_response("write", other)),
@@ -727,84 +554,52 @@ impl Handler for PetalRouter {
     }
 
     async fn list(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
-        self.require_account_mount(path)?;
-        match path.segments() {
-            [] => {
-                let mut mounts = BTreeMap::new();
-                for (mount, _hash) in self.runner.local_petal_mounts().map_err(map_petal_err)? {
-                    if self.is_petal(&mount) {
-                        mounts.insert(mount, ());
-                    }
-                }
-                Ok(mounts.into_keys().map(|mount| Entry::dir(&mount)).collect())
+        if path.segments().is_empty() {
+            return Ok(self
+                .runner
+                .local_petal_mounts()
+                .map_err(map_petal_err)?
+                .into_iter()
+                .map(|(mount, _)| Entry::dir(&mount))
+                .collect());
+        }
+        let (mount, rest) = Self::mount_path(path)?;
+        if !self.is_petal(mount) {
+            return Err(HandlerError::not_found(path.to_string_path()));
+        }
+        self.validate_ancestor(mount, &rest).await?;
+        let entries = match self
+            .dispatch(mount, DispatchOp::List, rest.clone(), Vec::new())
+            .await
+        {
+            Ok(DispatchResponse::List(entries)) => entries
+                .into_iter()
+                .map(entry_to_vfs)
+                .collect::<Result<Vec<_>, _>>()?,
+            Ok(DispatchResponse::Error { code, message }) => {
+                return Err(dispatch_error(code, message, path.to_string_path()));
             }
-            [mount] if self.is_petal(mount) => {
-                Ok(Self::add_petal_documents(vec![Entry::dir("wallets")]))
-            }
-            [mount] => Err(HandlerError::NotFound(mount.to_string())),
-            [mount, wallets] if wallets == "wallets" && self.is_petal(mount) => {
-                self.wallet_entries().await
-            }
-            [mount, wallets, wallet] if wallets == "wallets" && self.is_petal(mount) => {
-                if !self
-                    .wallet_entries()
-                    .await?
-                    .iter()
-                    .any(|entry| entry.name == *wallet)
-                {
-                    return Err(HandlerError::not_found(path.to_string_path()));
-                }
-                self.account_entries(wallet).await.map(|entries| {
-                    entries
-                        .into_iter()
-                        .filter(|entry| {
-                            entry.name == "0"
-                                || self.runner.petal_account_aware(mount).unwrap_or(false)
-                        })
-                        .collect()
-                })
-            }
-            _ => {
-                let (mount, rest, account) = self.scoped_account(path).await?;
-                let indexes = self.scoped_indexes(mount)?;
-                let (original_index, scoped) = indexes.as_ref();
-                let original = self.scoped_path(mount, DispatchOp::List, &rest, &account.wallet);
-                match original {
-                    Ok(original) => match self
-                        .dispatch_for_account(
-                            mount,
-                            DispatchOp::List,
-                            original,
-                            Vec::new(),
-                            &account,
-                        )
-                        .await
-                    {
-                        Ok(DispatchResponse::List(entries)) => {
-                            Self::project_scoped_list(original_index, scoped, &rest, entries)
-                        }
-                        Ok(DispatchResponse::Error { code, message }) => {
-                            Err(dispatch_error(code, message, path.to_string_path()))
-                        }
-                        Ok(other) => Err(unexpected_response("list", other)),
-                        Err(HandlerError::NotFound(_)) => {
-                            crate::runner::static_list_entries(scoped, &rest)
-                                .into_iter()
-                                .map(entry_to_vfs)
-                                .collect()
-                        }
-                        Err(e) => Err(e),
-                    },
-                    Err(HandlerError::NotFound(_)) => {
-                        crate::runner::static_list_entries(scoped, &rest)
-                            .into_iter()
-                            .map(entry_to_vfs)
-                            .collect()
-                    }
-                    Err(error) => Err(error),
-                }
+            Ok(other) => return Err(unexpected_response("list", other)),
+            Err(HandlerError::NotFound(_)) => self
+                .runner
+                .petal_static_list(mount, &rest)
+                .map_err(map_petal_err)?
+                .into_iter()
+                .map(entry_to_vfs)
+                .collect::<Result<Vec<_>, _>>()?,
+            Err(error) => return Err(error),
+        };
+        let mut entries = entries;
+        for entry in self.discovered_entries(mount, &rest).await? {
+            if !entries.iter().any(|existing| existing.name == entry.name) {
+                entries.push(entry);
             }
         }
+        Ok(if rest.is_empty() {
+            Self::add_petal_documents(entries)
+        } else {
+            entries
+        })
     }
 
     // Repository documents are served by the host, never by a matching guest
@@ -1077,7 +872,11 @@ namespaces = ["wallets"]
                 None,
             )
         };
-        write_package_file(root, "petal/example/[wallet]/$index.wasm", &route);
+        write_package_file(
+            root,
+            "petal/example/intents/[wallet]/[index]/$index.wasm",
+            &route,
+        );
     }
 
     fn write_async_failing_package(root: &std::path::Path) {
@@ -1092,20 +891,20 @@ name = "example"
         write_package_file(root, "AGENTS.md", b"# example agents");
         write_package_file(
             root,
-            "petal/example/operations/[wallet]/submit.wasm",
+            "petal/example/operations/[wallet]/[index]/submit.wasm",
             &crate::package::route_fixtures::async_failing_write_route_component(),
         );
     }
 
     #[tokio::test]
-    async fn scoped_account_directory_is_synthetic() {
+    async fn explicit_account_directory_uses_guest_metadata() {
         let (dir, runner) = runner();
         let package = dir.path().join("example-app");
         write_dynamic_dir_package(&package, false);
         runner.store().install_petal_package_dir(&package).unwrap();
 
         let router = PetalRouter::new(runner, Arc::new(AccountHost));
-        let route_path = VfsPath::parse("/example/wallets/alice/0").unwrap();
+        let route_path = VfsPath::parse("/example/intents/alice/0").unwrap();
         assert!(router.is_read_side_effecting(&route_path));
         assert_eq!(router.cache_ttl(&route_path), None);
         let vfs = Vfs::builder()
@@ -1113,15 +912,15 @@ name = "example"
             .build();
 
         let entry = vfs
-            .lookup(&VfsPath::parse("/petals/example/wallets/alice/0").unwrap())
+            .lookup(&VfsPath::parse("/petals/example/intents/alice/0").unwrap())
             .await
             .unwrap();
-        assert_eq!(entry.name, "0");
+        assert_eq!(entry.name, "alice");
         assert_eq!(entry.kind, bloom_vfs::EntryKind::Dir);
         assert_eq!(entry.mode, 0o755);
-        assert_eq!(entry.size, 0);
-        assert!(router.is_read_side_effecting(&route_path));
-        assert_eq!(router.cache_ttl(&route_path), None);
+        assert_eq!(entry.size, 7);
+        assert!(!router.is_read_side_effecting(&route_path));
+        assert_eq!(router.cache_ttl(&route_path), Some(Duration::from_secs(30)));
     }
 
     #[tokio::test]
@@ -1132,13 +931,13 @@ name = "example"
         runner.store().install_petal_package_dir(&package).unwrap();
 
         let router = PetalRouter::new(runner, Arc::new(AccountHost));
-        let route_path = VfsPath::parse("/example/wallets/alice/0").unwrap();
+        let route_path = VfsPath::parse("/example/intents/alice/0").unwrap();
         assert!(router.is_read_side_effecting(&route_path));
         let vfs = Vfs::builder()
             .mount("petals", Arc::new(router.clone()))
             .build();
 
-        vfs.lookup(&VfsPath::parse("/petals/example/wallets/alice/0").unwrap())
+        vfs.lookup(&VfsPath::parse("/petals/example/intents/alice/0").unwrap())
             .await
             .unwrap();
 
@@ -1158,7 +957,7 @@ name = "example"
             .mount("petals", Arc::new(router.clone()))
             .build();
         assert!(
-            vfs.is_read_side_effecting(&VfsPath::parse("/petals/example/wallets/alice/0").unwrap())
+            vfs.is_read_side_effecting(&VfsPath::parse("/petals/example/intents/alice/0").unwrap())
         );
         for (name, contents) in [
             ("README.md", b"# example".as_slice()),
@@ -1177,9 +976,9 @@ name = "example"
                 Err(HandlerError::PermissionDenied)
             ));
         }
-        // The synthetic account directory has no guest TTL to leak to docs.
+        // Unresolved runtime route metadata cannot leak to repository documents.
         assert_eq!(
-            router.cache_ttl(&VfsPath::parse("/example/wallets/alice/0").unwrap()),
+            router.cache_ttl(&VfsPath::parse("/example/intents/alice/0").unwrap()),
             None
         );
         for name in PETAL_DOCUMENT_NAMES {
@@ -1196,8 +995,8 @@ name = "example"
         let package = dir.path().join("example-app");
         write_async_failing_package(&package);
         std::fs::rename(
-            package.join("petal/example/operations/[wallet]/submit.wasm"),
-            package.join("petal/example/operations/[wallet]/submit-old.wasm"),
+            package.join("petal/example/operations/[wallet]/[index]/submit.wasm"),
+            package.join("petal/example/operations/[wallet]/[index]/submit-old.wasm"),
         )
         .unwrap();
         // Even explicit guest documentation routes cannot override the host's
@@ -1212,7 +1011,7 @@ name = "example"
         runner.store().install_petal_package_dir(&package).unwrap();
         let router = PetalRouter::new(runner, Arc::new(DenyHost));
         assert!(router.is_async_write_command(
-            &VfsPath::parse("/example/wallets/alice/0/operations/submit-old").unwrap()
+            &VfsPath::parse("/example/operations/alice/0/submit-old").unwrap()
         ));
         for name in PETAL_DOCUMENT_NAMES {
             let path = VfsPath::parse(&format!("/example/{name}")).unwrap();
@@ -1238,23 +1037,7 @@ name = "example"
             .list(&VfsPath::parse("/petals/demo").unwrap())
             .await
             .unwrap();
-        assert!(app_entries.iter().any(|entry| entry.name == "wallets"));
-        let accounts = vfs
-            .list(&VfsPath::parse("/petals/demo/wallets/alice").unwrap())
-            .await
-            .unwrap();
-        assert_eq!(
-            accounts
-                .iter()
-                .map(|entry| entry.name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["0"]
-        );
-        assert!(matches!(
-            vfs.lookup(&VfsPath::parse("/petals/demo/wallets/alice/1").unwrap())
-                .await,
-            Err(HandlerError::NotFound(_))
-        ));
+        assert!(app_entries.iter().any(|entry| entry.name == "hello.txt"));
         assert!(app_entries.iter().any(|entry| entry.name == "README.md"));
         assert!(app_entries.iter().any(|entry| entry.name == "AGENTS.md"));
 
@@ -1288,7 +1071,7 @@ name = "example"
         assert!(matches!(write_error, HandlerError::PermissionDenied));
 
         let bytes = vfs
-            .read(&VfsPath::parse("/petals/demo/wallets/alice/0/hello.txt").unwrap())
+            .read(&VfsPath::parse("/petals/demo/hello.txt").unwrap())
             .await
             .unwrap();
         assert_eq!(bytes, b"component");
@@ -1299,6 +1082,11 @@ name = "example"
         let (dir, runner) = runner();
         let package = dir.path().join("demo-app");
         write_demo_package(&package);
+        write_package_file(
+            &package,
+            "petal/demo/intents/[wallet]/[index]/hello.txt.wasm",
+            include_bytes!("../tests/fixtures/route_component_no_imports.wasm"),
+        );
         runner.store().install_petal_package_dir(&package).unwrap();
         let vfs = Vfs::builder()
             .mount(
@@ -1308,10 +1096,10 @@ name = "example"
             .build();
 
         for path in [
-            "/petals/demo/wallets/unknown",
-            "/petals/demo/wallets/unknown/0",
-            "/petals/demo/wallets/alice/01",
-            "/petals/demo/wallets/alice/4294967296",
+            "/petals/demo/intents/unknown/0/hello.txt",
+            "/petals/demo/intents/unknown/0",
+            "/petals/demo/intents/alice/01/hello.txt",
+            "/petals/demo/intents/alice/4294967296/hello.txt",
         ] {
             assert!(
                 matches!(
@@ -1328,40 +1116,59 @@ name = "example"
         assert_eq!(canonical_account("1"), Some(1));
     }
 
-    #[test]
-    fn guest_listing_projects_wallet_filename_to_parent_file() {
+    #[tokio::test]
+    async fn explicit_routes_discover_live_wallets_and_all_allocated_indexes() {
         let (dir, runner) = runner();
         let package = dir.path().join("demo-app");
         write_demo_package(&package);
-        runner.store().install_petal_package_dir(&package).unwrap();
-        let mut original = runner.load_petal_route_index("demo").unwrap();
-        let mut projected_file = original.routes[0].clone();
-        projected_file.route_id = "projected-filename".into();
-        projected_file.pattern = "obligations/[wallet].json".into();
-        original.routes.push(projected_file);
-        let scoped = scoped_route_index(&original).unwrap();
-        let listing = PetalRouter::project_scoped_list(
-            &original,
-            &scoped,
-            "",
-            vec![DispatchEntry {
-                name: "obligations".into(),
-                kind: DispatchEntryKind::Dir,
-                size: 0,
-                mode: 0o755,
-                ttl_hint_ms: None,
-                link_target: None,
-            }],
-        )
-        .unwrap();
-        assert_eq!(
-            listing
-                .iter()
-                .map(|entry| entry.name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["obligations.json"]
+        write_package_file(
+            &package,
+            "petal/demo/intents/[wallet]/[index]/hello.txt.wasm",
+            include_bytes!("../tests/fixtures/route_component_no_imports.wasm"),
         );
-        assert_eq!(listing[0].kind, EntryKind::File);
+        runner.store().install_petal_package_dir(&package).unwrap();
+        let router = PetalRouter::new(runner, Arc::new(AccountHost));
+        let names = |entries: Vec<Entry>| {
+            entries
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            names(
+                router
+                    .list(&VfsPath::parse("demo/intents").unwrap())
+                    .await
+                    .unwrap()
+            ),
+            ["alice"]
+        );
+        assert_eq!(
+            names(
+                router
+                    .list(&VfsPath::parse("demo/intents/alice").unwrap())
+                    .await
+                    .unwrap()
+            ),
+            ["0", "1"]
+        );
+        for index in [0, 1] {
+            assert_eq!(
+                router
+                    .read(
+                        &VfsPath::parse(&format!("demo/intents/alice/{index}/hello.txt")).unwrap()
+                    )
+                    .await
+                    .unwrap(),
+                b"component"
+            );
+        }
+        assert!(
+            router
+                .read(&VfsPath::parse("demo/wallets/alice/0/hello.txt").unwrap())
+                .await
+                .is_err()
+        );
     }
 
     #[test]
@@ -1406,7 +1213,7 @@ name = "example"
         let router = PetalRouter::new(runner, Arc::new(AccountHost))
             .with_async_write_switch(Arc::new(AtomicBool::new(true)));
         let vfs = Vfs::builder().mount("petals", Arc::new(router)).build();
-        let path = VfsPath::parse("/petals/example/wallets/alice/0/operations/submit").unwrap();
+        let path = VfsPath::parse("/petals/example/operations/alice/0/submit").unwrap();
         assert!(
             vfs.is_async_write_command(&path),
             "mounted component writes must not return handler failures through macOS NFS"

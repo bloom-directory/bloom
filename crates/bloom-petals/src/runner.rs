@@ -684,9 +684,9 @@ impl PetalRunner {
     }
 
     /// [`Self::dispatch_petal_route`] with host-trusted parameters appended
-    /// next to `bloom.route_id`. An account-scoped router
-    /// ([`crate::PetalRouter::for_account`]) is the one caller that appends
-    /// them: its routes run with the host provenance facts `bloom.wallet`,
+    /// next to `bloom.route_id`. The Petal router resolves explicit route
+    /// captures through the live core account projection and appends the
+    /// host provenance facts `bloom.wallet`,
     /// `bloom.account` and `bloom.owner_key_fingerprint`, which guest and
     /// host both read. A
     /// caller-supplied context entry whose name starts with `bloom.` is
@@ -859,14 +859,6 @@ impl PetalRunner {
     fn petal_net_policy(&self, hash: &str) -> Result<NetPolicy, PetalError> {
         let manifest = std::fs::read(self.store.package_path(hash)?.join("source/petal.toml"))?;
         NetPolicy::from_manifest_toml(&manifest)
-    }
-
-    /// Whether the package installed at `mount` declares
-    /// `[account] aware = true` in its manifest.
-    pub fn petal_account_aware(&self, mount: &str) -> Result<bool, PetalError> {
-        let hash = self.resolve_petal_mount(mount)?;
-        let manifest = std::fs::read(self.store.package_path(&hash)?.join("source/petal.toml"))?;
-        crate::package::account_aware_from_manifest_toml(&manifest)
     }
 
     fn petal_sign_intents(&self, hash: &str) -> Result<BTreeSet<String>, PetalError> {
@@ -1188,43 +1180,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn installed_manifest_declares_account_awareness() {
-        let (dir, r) = runner();
-        install_echo_app(&dir, &r);
-        assert!(
-            !r.petal_account_aware("echo").unwrap(),
-            "absence of [account] means unaware"
-        );
-
-        let package = dir.path().join("aware-app");
-        write_package_file(
-            &package,
-            "petal.toml",
-            br#"schema = "bloom.petal.package.v1"
-name = "aware"
-
-[consent]
-summary = "Account-aware echo."
-
-[caps]
-allowed = ["bloom:vfs.read"]
-
-[account]
-aware = true
-"#,
-        );
-        write_package_file(&package, "README.md", b"# aware");
-        write_package_file(&package, "AGENTS.md", b"# aware agents");
-        write_package_file(
-            &package,
-            "petal/aware/message.txt.wasm",
-            include_bytes!("../tests/fixtures/route_component_no_imports.wasm"),
-        );
-        let (result, _, _) = r.store().install_petal_package_dir(&package).unwrap();
-        assert!(r.petal_account_aware("aware").unwrap());
-        assert_eq!(r.resolve("aware").unwrap(), result.hash);
-    }
     /// A host the dispatch must never reach in the rejection tests.
     struct RejectingHost;
 

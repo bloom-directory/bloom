@@ -1555,16 +1555,8 @@ async fn component_petal_key_request(
     if let Err(error) = apply_manifest_key_scope(store.data(), &mut request) {
         return set_component_result(results, component_host_err(error));
     }
-    if let Some(account) = trusted_account(store.data())
-        && request.wallet_id != account.wallet
-    {
-        return set_component_result(
-            results,
-            component_host_err(HostError::Denied(format!(
-                "key request wallet {:?} does not match the trusted account wallet",
-                request.wallet_id
-            ))),
-        );
+    if let Err(error) = require_trusted_wallet(store.data(), &request.wallet_id) {
+        return set_component_result(results, component_host_err(error));
     }
     request.context = store.data().sign_context.clone();
     let host = store.data().host.clone();
@@ -1627,13 +1619,12 @@ fn authorize_guest_vfs_path(
     }
 }
 
-/// Reject petal-supplied wallets that do not match the mounted account's
-/// trusted wallet, including account 0. Internal legacy invocations without
-/// trusted context retain their existing behavior.
+/// Authority operations require a host-resolved numbered account.
 fn require_trusted_wallet(data: &StoreData, wallet: &str) -> Result<(), HostError> {
-    if let Some(account) = trusted_account(data)
-        && wallet != account.wallet
-    {
+    let account = trusted_account(data).ok_or_else(|| {
+        HostError::Denied("signing and staging require a trusted account route".into())
+    })?;
+    if wallet != account.wallet {
         return Err(HostError::Denied(format!(
             "payload signing wallet {wallet:?} does not match the trusted account wallet"
         )));
@@ -1983,6 +1974,9 @@ async fn component_evm_tx_stage(
         Ok(request) => request,
         Err(err) => return set_component_result(results, component_host_err(err)),
     };
+    if let Err(error) = require_trusted_wallet(store.data(), &request.wallet) {
+        return set_component_result(results, component_host_err(error));
+    }
     let host = store.data().host.clone();
     match host.evm_tx_stage(request).await {
         Ok(outcome) => set_component_result(results, component_evm_outbox_outcome(outcome)),
@@ -2030,6 +2024,9 @@ async fn component_evm_tx_confirm(
             )),
         );
     };
+    if let Err(error) = require_trusted_wallet(store.data(), &wallet) {
+        return set_component_result(results, component_host_err(error));
+    }
     let host = store.data().host.clone();
     match host
         .evm_tx_confirm(
@@ -2078,6 +2075,9 @@ async fn component_evm_tx_inspect(
         Ok(value) => value,
         Err(err) => return set_component_result(results, component_host_err(err)),
     };
+    if let Err(error) = require_trusted_wallet(store.data(), &wallet) {
+        return set_component_result(results, component_host_err(error));
+    }
     let host = store.data().host.clone();
     match host
         .evm_tx_inspect(wallet, chain, outbox_id, store.data().sign_context.clone())
@@ -4047,6 +4047,7 @@ paths = ["/status"]
         )
         .unwrap();
         let mut store = component_test_store_with_policy(caps, None, host.clone(), policy);
+        store.data_mut().sign_context = Some(account_context("alice", 0, None));
 
         let mut http = vec![ComponentVal::Bool(false)];
         component_http_fetch(
@@ -4324,7 +4325,7 @@ paths = ["/status"]
             route_id: "r000007".into(),
             op: "write".into(),
             path: "orders/new".into(),
-            params: Vec::new(),
+            params: account_context("primary", 0, None).params,
             actor: None,
         };
         store.data_mut().sign_context = Some(context.clone());
@@ -4586,6 +4587,7 @@ paths = ["/status"]
             None,
             host.clone(),
         );
+        store.data_mut().sign_context = Some(account_context("primary", 0, None));
         store.set_fuel(DEFAULT_FUEL).unwrap();
         let mut linker = ComponentLinker::<StoreData>::new(&vm.engine);
         linker.define_unknown_imports_as_traps(&component).unwrap();
@@ -4663,6 +4665,7 @@ paths = ["/status"]
         let host = Arc::new(MockHost::default());
         let mut store =
             component_test_store(BTreeSet::from([Capability::Sign]), None, host.clone());
+        store.data_mut().sign_context = Some(account_context("primary", 0, None));
         let key_ref = bloom_broker_api::KeyRef {
             backend: bloom_broker_api::Token::new("local").unwrap(),
             backend_instance: bloom_broker_api::Token::new("default").unwrap(),
@@ -4763,6 +4766,7 @@ paths = ["/status"]
         let mut caps = BTreeSet::new();
         caps.insert(Capability::Sign);
         let mut store = component_test_store(caps, None, host.clone());
+        store.data_mut().sign_context = Some(account_context("alice", 0, None));
         let mut result = vec![ComponentVal::Bool(false)];
 
         component_sign_payload(
@@ -4787,6 +4791,7 @@ paths = ["/status"]
                 expires_ms: 444,
             }));
         let mut store = component_test_store(BTreeSet::from([Capability::Sign]), None, host);
+        store.data_mut().sign_context = Some(account_context("primary", 0, None));
         let mut result = vec![ComponentVal::Bool(false)];
         component_sign_payload_current(
             store.as_context_mut(),
@@ -4826,7 +4831,7 @@ paths = ["/status"]
             route_id: "r000001".into(),
             op: "write".into(),
             path: "orders/new".into(),
-            params: Vec::new(),
+            params: account_context("primary", 0, None).params,
             actor: None,
         };
         store.data_mut().sign_context = Some(context.clone());
@@ -4978,6 +4983,7 @@ paths = ["/status"]
         let mut caps = BTreeSet::new();
         caps.insert(Capability::Sign);
         let mut store = component_test_store(caps, None, host.clone());
+        store.data_mut().sign_context = Some(account_context("alice", 0, None));
         let params = [component_payload_request("alice", 3, "orders.place")];
         let mut result = vec![ComponentVal::Bool(false)];
         component_sign_payload(store.as_context_mut(), &params, &mut result)
@@ -5014,6 +5020,7 @@ paths = ["/status"]
         let mut caps = BTreeSet::new();
         caps.insert(Capability::Sign);
         let mut store = component_test_store(caps, None, host);
+        store.data_mut().sign_context = Some(account_context("alice", 0, None));
         let mut request = component_payload_request("alice", 3, "message.sign");
         let ComponentVal::Record(fields) = &mut request else {
             unreachable!();
@@ -5117,7 +5124,7 @@ paths = ["/status"]
             route_id: "r000001".into(),
             op: "write".into(),
             path: "/fund/alice/one/confirm".into(),
-            params: vec![("id".into(), "one".into())],
+            params: account_context("alice", 0, None).params,
             actor: Some("agent-1".into()),
         };
         *host.tx_outcome.lock() = Some(EvmOutboxOutcome {
@@ -5393,11 +5400,45 @@ paths = ["/status"]
     }
 
     #[tokio::test]
-    async fn legacy_mount_without_account_context_keeps_unconstrained_signing() {
+    async fn public_route_without_account_context_denies_signing_and_staging() {
         let host = Arc::new(MockHost::default());
-        let store = component_test_store(BTreeSet::from([Capability::Sign]), None, host);
-        assert!(store.data().sign_context.is_none());
-        require_trusted_wallet(store.data(), "any").unwrap();
+        let mut store = component_test_store(
+            BTreeSet::from([Capability::Sign, Capability::TxOutbox]),
+            None,
+            host.clone(),
+        );
+        let mut signed = vec![ComponentVal::Bool(false)];
+        component_sign_payload(
+            store.as_context_mut(),
+            &[component_payload_request("alice", 3, "orders.place")],
+            &mut signed,
+        )
+        .await
+        .unwrap();
+        assert_component_err_contains(&signed[0], "trusted account route");
+        let transaction = ComponentVal::Record(vec![
+            ("wallet".into(), ComponentVal::String("alice".into())),
+            ("chain".into(), ComponentVal::String("ethereum".into())),
+            (
+                "to".into(),
+                ComponentVal::String("0x0000000000000000000000000000000000000001".into()),
+            ),
+            ("value-wei".into(), ComponentVal::String("1".into())),
+            ("data-hex".into(), ComponentVal::String("0x".into())),
+            ("nonce".into(), ComponentVal::Option(None)),
+            ("max-fee-per-gas".into(), ComponentVal::Option(None)),
+            (
+                "max-priority-fee-per-gas".into(),
+                ComponentVal::Option(None),
+            ),
+        ]);
+        let mut staged = vec![ComponentVal::Bool(false)];
+        component_evm_tx_stage(store.as_context_mut(), &[transaction], &mut staged)
+            .await
+            .unwrap();
+        assert_component_err_contains(&staged[0], "trusted account route");
+        assert!(host.sign_calls.lock().is_empty());
+        assert!(host.tx_stage_calls.lock().is_empty());
     }
 
     fn component_test_store(
