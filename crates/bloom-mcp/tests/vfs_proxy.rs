@@ -788,19 +788,31 @@ async fn a_stdio_session_answers_framed_requests_in_order() {
     .join("\n")
         + "\n";
 
-    let mut output = Vec::new();
-    harness
-        .server
-        .serve(tokio::io::BufReader::new(input.as_bytes()), &mut output)
+    // Keep stdin open until replies arrive; EOF is a session shutdown, not
+    // permission to execute remaining queued writes without a client.
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let (client, transport) = tokio::io::duplex(65536);
+    let (read, write) = tokio::io::split(transport);
+    let server = harness.server.clone();
+    let task =
+        tokio::spawn(async move { server.serve(tokio::io::BufReader::new(read), write).await });
+    let (read, mut write) = tokio::io::split(client);
+    write.write_all(input.as_bytes()).await.unwrap();
+    let mut reader = tokio::io::BufReader::new(read);
+    let mut responses = Vec::<Value>::new();
+    for _ in 0..2 {
+        let mut line = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            reader.read_line(&mut line),
+        )
         .await
-        .expect("stdio session");
-
-    let responses: Vec<Value> = String::from_utf8(output)
         .unwrap()
-        .lines()
-        .filter(|line| !line.is_empty())
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect();
+        .unwrap();
+        responses.push(serde_json::from_str(&line).unwrap());
+    }
+    write.shutdown().await.unwrap();
+    task.await.unwrap().unwrap();
     assert_eq!(responses.len(), 2, "the notification is not answered");
     assert_eq!(responses[0]["id"], 1);
     assert_eq!(responses[1]["id"], 2);

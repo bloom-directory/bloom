@@ -138,3 +138,21 @@ The daemon also exposes `machine.execute`, `petals.*`, `confirm_batch`, and
 `shutdown` on the same socket. None of them are tools here and there is no
 generic pass-through, so an MCP client cannot name them — the proxy models the
 five VFS methods as a closed enum rather than forwarding a method string.
+
+### Scheduling and cancellation
+
+Each MCP connection executes VFS operations sequentially, in arrival order.
+Ping and static discovery stay responsive while an operation waits for the
+daemon. Up to 32 requests and 8 MiB of serialized request data may wait in the
+queue; excess requests receive a queue-full error without being dispatched.
+
+`notifications/cancelled` removes work that is still queued. For work already
+dispatched, the proxy suppresses its reply but waits for completion before
+starting the next VFS operation. Cancellation cannot undo a daemon action,
+and a timed-out write must not be blindly retried. A hung daemon operation
+still blocks later VFS work, but not ping or cancellation handling.
+
+Closing stdin ends the MCP session and discards queued work. It does not roll
+back operations already dispatched. Clients must keep stdin open while waiting
+for replies. Older-protocol batches retain one aggregate response, excluding
+notifications and cancelled requests.

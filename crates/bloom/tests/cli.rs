@@ -2309,8 +2309,8 @@ fn mcp_is_disabled_until_the_config_flag_is_set() {
 /// lands on the same daemon IPC surface `bloom vfs` uses. The in-process server
 /// mounts a subtree the production daemon never has, so a correct answer proves
 /// the request really travelled the canonical path.
-#[test]
-fn mcp_serve_proxies_vfs_commands_over_stdio_when_enabled() {
+#[tokio::test]
+async fn mcp_serve_proxies_vfs_commands_over_stdio_when_enabled() {
     let home = fresh_home();
     let home_dir = bloom_proto::HomeDir::at(home.path());
     let mut config = bloom_proto::Config::local_default();
@@ -2333,17 +2333,47 @@ fn mcp_serve_proxies_vfs_commands_over_stdio_when_enabled() {
     .join("\n")
         + "\n";
 
-    let assertion = bloom_cmd(home.path())
+    // A stdio client keeps its input open while waiting for operations.
+    // Closing it first now correctly discards undispatched work.
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let template = bloom_cmd(home.path());
+    let mut command = tokio::process::Command::new(template.get_program());
+    for (key, value) in template.get_envs() {
+        if let Some(value) = value {
+            command.env(key, value);
+        } else {
+            command.env_remove(key);
+        }
+    }
+    let mut child = command
         .args(["mcp", "serve"])
-        .write_stdin(session)
-        .assert()
-        .success();
-    let stdout = String::from_utf8(assertion.get_output().stdout.clone()).unwrap();
-    let responses: Vec<serde_json::Value> = stdout
-        .lines()
-        .filter(|line| !line.is_empty())
-        .map(|line| serde_json::from_str(line).expect("each frame is one JSON document"))
-        .collect();
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    input.write_all(session.as_bytes()).await.unwrap();
+    let mut output = tokio::io::BufReader::new(child.stdout.take().unwrap());
+    let mut responses = Vec::<serde_json::Value>::new();
+    for _ in 0..4 {
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(5), output.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        responses.push(serde_json::from_str(&line).expect("each frame is one JSON document"));
+    }
+    input.shutdown().await.unwrap();
+    drop(input);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), child.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
 
     assert_eq!(responses.len(), 4, "the notification is not answered");
     assert_eq!(responses[0]["result"]["serverInfo"]["name"], "bloom-vfs");

@@ -6,11 +6,16 @@
 //! nothing is listening when no client is attached. Diagnostics go to stderr;
 //! stdout carries protocol frames exclusively.
 
-use std::sync::Arc;
+use std::{
+    collections::{HashMap, VecDeque},
+    future::Future,
+    pin::Pin,
+    sync::Arc,
+};
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::backend::{
     DAEMON_NOT_FOUND_CODE, DAEMON_UNREACHABLE_CODE, VfsCommandError, VfsCommands, VfsMethod,
@@ -84,30 +89,98 @@ impl McpServer {
         R: AsyncBufRead + Unpin,
         W: AsyncWrite + Unpin,
     {
-        while let Some(frame) = read_bounded_line(&mut reader).await? {
-            let frame = String::from_utf8_lossy(&frame);
-            let frame = frame.trim();
-            if frame.is_empty() {
-                continue;
+        // Keep framing state outside the selected future: losing the select
+        // race to a completed operation must not discard a partial input line.
+        let mut frame = Vec::new();
+        let mut queue = VecDeque::<QueuedRequest>::new();
+        let mut queued_bytes = 0;
+        let mut batches = HashMap::<usize, BatchReply>::new();
+        let mut next_batch = 0;
+        let mut active: Option<(QueuedRequest, PendingReply<'_>, bool)> = None;
+        loop {
+            if active.is_none()
+                && let Some(work) = queue.pop_front()
+            {
+                queued_bytes -= work.bytes;
+                let request = work.request.clone();
+                active = Some((work, Box::pin(self.handle(request)), false));
             }
-            let response = match serde_json::from_str::<Value>(frame) {
-                Ok(message) => self.handle_message(message).await,
-                Err(error) => {
-                    warn!(%error, "mcp.parse_error");
-                    Some(error_response(
-                        Value::Null,
-                        -32700,
-                        format!("parse error: {error}"),
-                    ))
+            tokio::select! {
+                response = async { active.as_mut().unwrap().1.as_mut().await }, if active.is_some() => {
+                    let (work, _, cancelled) = active.take().unwrap();
+                    send_reply(&mut writer, &mut batches, work.batch,
+                        response.filter(|_| !cancelled)).await?;
                 }
-            };
-            let Some(response) = response else { continue };
-            let mut line = serde_json::to_vec(&response).map_err(std::io::Error::other)?;
-            line.push(b'\n');
-            writer.write_all(&line).await?;
-            writer.flush().await?;
+                incoming = read_bounded_line_into(&mut reader, &mut frame) => {
+                    let Some(frame) = incoming? else {
+                        // Closing stdin ends this session. Never start queued
+                        // effects after the client has gone. Dropping an IPC
+                        // waiter does not roll back work already in the daemon.
+                        return Ok(());
+                    };
+                    let frame = String::from_utf8_lossy(&frame);
+                    let frame = frame.trim();
+                    if frame.is_empty() { continue; }
+                    let message = match serde_json::from_str::<Value>(frame) {
+                        Ok(message) => message,
+                        Err(error) => {
+                            send_reply(&mut writer, &mut batches, None,
+                                Some(error_response(Value::Null, -32700, format!("parse error: {error}")))).await?;
+                            continue;
+                        }
+                    };
+                    let (messages, batch) = match message {
+                        Value::Array(messages) if !messages.is_empty() => {
+                            let batch = next_batch;
+                            next_batch += 1;
+                            batches.insert(batch, BatchReply { remaining: messages.len(), replies: Vec::new() });
+                            (messages, Some(batch))
+                        }
+                        message => (vec![message], None),
+                    };
+                    for request in messages {
+                        if batch.is_some() && !request.is_object() {
+                            send_reply(&mut writer, &mut batches, batch, Some(invalid_request(
+                                Value::Null, "batch member must be an object"
+                            ))).await?;
+                            continue;
+                        }
+                        if let Some(id) = cancellation_id(&request) {
+                            if let Some((work, _, cancelled)) = &mut active
+                                && work.request.get("id") == Some(id) {
+                                // Retain the execution slot until the daemon
+                                // finishes: cancellation is not a rollback.
+                                *cancelled = true;
+                            }
+                            let mut index = 0;
+                            while index < queue.len() {
+                                if queue[index].request.get("id") == Some(id) {
+                                    let work = queue.remove(index).unwrap();
+                                    queued_bytes -= work.bytes;
+                                    send_reply(&mut writer, &mut batches, work.batch, None).await?;
+                                } else { index += 1; }
+                            }
+                        }
+                        if needs_backend(&request) {
+                            let bytes = request.to_string().len();
+                            if queue.len() >= MAX_QUEUED_REQUESTS || queued_bytes + bytes > MAX_MESSAGE_BYTES {
+                                send_reply(&mut writer, &mut batches, batch, Some(error_response(
+                                    request["id"].clone(), -32000, "MCP request queue is full; request was not dispatched"
+                                ))).await?;
+                            } else {
+                                queued_bytes += bytes;
+                                queue.push_back(QueuedRequest { request, batch, bytes });
+                            }
+                        } else {
+                            // Ping, discovery and notifications never wait for
+                            // a backend slot. Only this loop writes stdout.
+                            send_reply(&mut writer, &mut batches, batch,
+                                self.handle_message(request).await).await?;
+                        }
+                    }
+                }
+            }
         }
-        Ok(())
     }
 
     /// Handle one decoded JSON-RPC message of any shape: a single request or
@@ -329,6 +402,72 @@ impl McpServer {
     }
 }
 
+const MAX_QUEUED_REQUESTS: usize = 32;
+type PendingReply<'a> = Pin<Box<dyn Future<Output = Option<Value>> + Send + 'a>>;
+
+struct QueuedRequest {
+    request: Value,
+    batch: Option<usize>,
+    bytes: usize,
+}
+
+struct BatchReply {
+    remaining: usize,
+    replies: Vec<Value>,
+}
+
+fn cancellation_id(request: &Value) -> Option<&Value> {
+    if request.get("jsonrpc")?.as_str()? != "2.0"
+        || request.get("method")?.as_str()? != "notifications/cancelled"
+        || request.get("id").is_some()
+    {
+        return None;
+    }
+    request
+        .get("params")?
+        .get("requestId")
+        .filter(|id| id.is_string() || id.is_number())
+}
+
+fn needs_backend(request: &Value) -> bool {
+    // Invalid requests stay on the existing validation/error path.
+    request
+        .get("id")
+        .is_some_and(|id| id.is_string() || id.is_number())
+        && request
+            .get("jsonrpc")
+            .is_none_or(|version| version == "2.0")
+        && matches!(
+            request.get("method").and_then(Value::as_str),
+            Some("tools/call" | "resources/list" | "resources/read")
+        )
+}
+
+async fn send_reply<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    batches: &mut HashMap<usize, BatchReply>,
+    batch: Option<usize>,
+    mut reply: Option<Value>,
+) -> std::io::Result<()> {
+    if let Some(id) = batch {
+        let batch = batches.get_mut(&id).unwrap();
+        batch.replies.extend(reply);
+        batch.remaining -= 1;
+        if batch.remaining != 0 {
+            return Ok(());
+        }
+        let batch = batches.remove(&id).unwrap();
+        reply = (!batch.replies.is_empty()).then_some(Value::Array(batch.replies));
+    }
+    if let Some(reply) = reply {
+        let mut line = serde_json::to_vec(&reply).map_err(std::io::Error::other)?;
+        line.push(b'\n');
+        writer.write_all(&line).await?;
+        writer.flush().await?;
+    }
+    Ok(())
+}
+
 fn tool_descriptors() -> Vec<Value> {
     tools::TOOLS.iter().map(|tool| tool.descriptor()).collect()
 }
@@ -413,15 +552,22 @@ fn vfs_error_response(id: Value, error: &VfsCommandError) -> Value {
 
 /// Read one newline-terminated frame, refusing to buffer past
 /// [`MAX_MESSAGE_BYTES`]. Mirrors the daemon's bounded IPC framing.
+#[cfg(test)]
 async fn read_bounded_line<R>(reader: &mut R) -> std::io::Result<Option<Vec<u8>>>
 where
     R: AsyncBufRead + Unpin,
 {
-    let mut frame = Vec::new();
+    read_bounded_line_into(reader, &mut Vec::new()).await
+}
+
+async fn read_bounded_line_into<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    frame: &mut Vec<u8>,
+) -> std::io::Result<Option<Vec<u8>>> {
     loop {
         let available = reader.fill_buf().await?;
         if available.is_empty() {
-            return Ok((!frame.is_empty()).then_some(frame));
+            return Ok((!frame.is_empty()).then(|| std::mem::take(frame)));
         }
         let newline = available.iter().position(|byte| *byte == b'\n');
         let take = newline.map(|index| index + 1).unwrap_or(available.len());
@@ -434,7 +580,7 @@ where
         frame.extend_from_slice(&available[..take]);
         reader.consume(take);
         if newline.is_some() {
-            return Ok(Some(frame));
+            return Ok(Some(std::mem::take(frame)));
         }
     }
 }
