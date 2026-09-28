@@ -135,6 +135,19 @@ class HarnessLifecycleTests(unittest.TestCase):
         )
         self.assertEqual(spec.kwargs["max_turns"], 15)
 
+    def test_minimax_uses_its_anthropic_compatible_endpoint(self) -> None:
+        with mock.patch.dict(os.environ, {"MINIMAX_API_KEY": "test-minimax-key"}, clear=True):
+            spec = _agent_spec("minimax")
+        self.assertEqual(spec.harbor_name, "claude-code")
+        self.assertEqual(spec.model, "MiniMax-M3")
+        self.assertEqual(spec.env["ANTHROPIC_AUTH_TOKEN"], "test-minimax-key")
+        self.assertEqual(spec.env["ANTHROPIC_BASE_URL"], "https://api.minimax.io/anthropic")
+
+    def test_minimax_requires_its_api_key(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(EvalError, "MINIMAX_API_KEY"):
+                _agent_spec("minimax")
+
     def test_deepseek_requires_its_api_key(self) -> None:
         with mock.patch.dict(os.environ, {}, clear=True):
             with self.assertRaisesRegex(EvalError, "DeepSeek auth is missing"):

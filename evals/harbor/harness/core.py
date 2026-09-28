@@ -461,6 +461,8 @@ AGENTS: dict[str, AgentSpec] = {
     # Z.AI exposes GLM Coding Plan through an Anthropic-compatible endpoint,
     # so Harbor can run it with its existing Claude Code adapter.
     "glm": AgentSpec("claude-code", "glm-5.2"),
+    # MiniMax also serves an Anthropic-compatible endpoint.
+    "minimax": AgentSpec("claude-code", "MiniMax-M3"),
 }
 
 
@@ -647,6 +649,15 @@ def _agent_spec(name: str, default_max_turns: str = "20") -> AgentSpec:
         agent_env.update(
             ANTHROPIC_API_KEY=api_key,
             ANTHROPIC_BASE_URL="https://api.deepseek.com/anthropic",
+            API_TIMEOUT_MS="3000000",
+        )
+    if name == "minimax":
+        api_key = os.getenv("MINIMAX_API_KEY")
+        if not api_key:
+            raise EvalError("MiniMax auth is missing; set MINIMAX_API_KEY")
+        agent_env.update(
+            ANTHROPIC_AUTH_TOKEN=api_key,
+            ANTHROPIC_BASE_URL="https://api.minimax.io/anthropic",
             API_TIMEOUT_MS="3000000",
         )
     if name == "opencode":

@@ -145,11 +145,11 @@ scripts/evals/run-harbor-solana-local.sh codex --trials 5  # a model, five times
 - **Smoke.** Stages, confirms, approves, broadcasts, and verifies without an
   LLM. With `BLOOM_EVAL_SOLANA_SMOKE_RESTAGE=1` it waits out the real blockhash
   window, restages, and requires exactly one payment. That takes a few minutes.
-- **Agents.** Choose `claude`, `codex`, `glm`, `deepseek`, or `opencode`. Set
+- **Agents.** Choose `claude`, `codex`, `glm`, `deepseek`, `minimax`, or `opencode`. Set
   `BLOOM_EVAL_MODEL` for another model and `BLOOM_EVAL_MAX_TURNS` for Claude
   Code's turn cap (default 24 here). The GLM adapter accepts `GLM_API_KEY`,
   `ZAI_API_KEY`, or `ANTHROPIC_AUTH_TOKEN`. `deepseek` and `opencode` need
-  `DEEPSEEK_API_KEY`.
+  `DEEPSEEK_API_KEY`, and `minimax` (MiniMax-M3) needs `MINIMAX_API_KEY`.
 - **Trials.** Each trial is independent: its own destination, policy ceremony,
   approver, and cleanup. Each reports one of:
   - `PASS`;

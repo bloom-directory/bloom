@@ -13,7 +13,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 
 usage() {
   printf '%s\n' \
-    'Usage: scripts/evals/run-harbor-solana-local.sh [claude|codex|glm|deepseek|opencode|smoke] [--trials N]' \
+    'Usage: scripts/evals/run-harbor-solana-local.sh [claude|codex|glm|deepseek|minimax|opencode|smoke] [--trials N]' \
     'Prepare the evaluation triad and local validator first; see' \
     'evals/harbor/tasks/solana-transfer/README.md.' >&2
   exit 2
@@ -23,7 +23,7 @@ mode="${1:-glm}"
 [ "$#" -eq 0 ] || shift
 case "$mode" in
   smoke) harness_args=(--smoke-only) ;;
-  claude|codex|glm|deepseek|opencode) harness_args=("$mode") ;;
+  claude|codex|glm|deepseek|minimax|opencode) harness_args=("$mode") ;;
   *) usage ;;
 esac
 case "$#" in
