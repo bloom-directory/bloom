@@ -2556,13 +2556,16 @@ fn github_source_install_polymarket_dispatches_route_contract() {
     bloom_cmd(home.path())
         .args(["vfs", "cat", "/petals/polymarket/meta/route-contract.json"])
         .assert()
-        .failure(); // Legacy operation paths are removed.
+        .success()
+        .stdout(predicate::str::contains(
+            "bloom.polymarket.petal-route-contract.v1",
+        ));
 
     bloom_cmd(home.path())
         .args(["vfs", "ls", "/petals/polymarket"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("wallets"));
+        .stdout(predicate::str::contains("meta"));
 
     bloom_cmd(home.path())
         .args(["vfs", "cat", "/petals/polymarket/README.md"])
