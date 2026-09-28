@@ -10,6 +10,7 @@
 //! | ---------- | ------------------------------------- | ------------------------- |
 //! | `lookup`   | `{ "path": "/..." }`                  | `{ "name", "kind", ... }` |
 //! | `read`     | `{ "path": "/..." }`                  | `{ "bytes_b64": "..." }`  |
+//! | `read_inert` | `{ "path": "/..." }` | read bytes after atomic safety check |
 //! | `write`    | `{ "path": "/...", "bytes_b64": "" }` | `null`                    |
 //! | `write_with_lookup` | write params plus `projection_path` | identity entry           |
 //! | `list`     | `{ "path": "/..." }`                  | `[ entry, ... ]`          |
@@ -1081,6 +1082,23 @@ impl IpcServer {
                 Ok(v) => Response::ok(id, v),
                 Err(e) => map_handler_err(id, e),
             },
+            "read_inert" => {
+                // Installation and removal use this same guard. Keep route safety
+                // classification and execution bound to the same installed package.
+                let _mutation = self.petal_mutation.lock().await;
+                match parse_path(&req.params) {
+                    Ok(path) if self.vfs.is_read_side_effecting(&path) => Response::err(
+                        id,
+                        -32010,
+                        "path is not an inert resource; use vfs_read deliberately",
+                    ),
+                    Ok(_) => match self.do_read(&req.params, &context).await {
+                        Ok(value) => Response::ok(id, value),
+                        Err(error) => map_handler_err(id, error),
+                    },
+                    Err(error) => map_handler_err(id, error),
+                }
+            }
             "read" => match self.do_read(&req.params, &context).await {
                 Ok(v) => Response::ok(id, v),
                 Err(e) => map_handler_err(id, e),
@@ -2511,6 +2529,84 @@ mod tests {
 
         let inert = lookup("/outbox/status.json").await;
         assert_eq!(inert["read_side_effecting"], false, "{inert}");
+    }
+
+    struct GuardedReadHandler {
+        side_effecting: AtomicBool,
+        reads: AtomicUsize,
+        started: Notify,
+        release: Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl Handler for GuardedReadHandler {
+        async fn lookup(&self, _: &VfsPath) -> Result<Entry, HandlerError> {
+            Ok(Entry::read_only_file("value"))
+        }
+        fn is_read_side_effecting(&self, _: &VfsPath) -> bool {
+            self.side_effecting.load(Ordering::SeqCst)
+        }
+        async fn read(&self, _: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            self.started.notify_one();
+            self.release.notified().await;
+            Ok(b"safe".to_vec())
+        }
+    }
+
+    #[tokio::test]
+    async fn inert_read_serializes_safety_check_and_execution_with_package_mutation() {
+        let handler = Arc::new(GuardedReadHandler {
+            side_effecting: AtomicBool::new(false),
+            reads: AtomicUsize::new(0),
+            started: Notify::new(),
+            release: Notify::new(),
+        });
+        let server = IpcServer::new(
+            Vfs::builder().mount("petals", handler.clone()).build(),
+            "0",
+            vec![],
+        );
+        let read = |server: IpcServer| {
+            tokio::spawn(async move {
+                server
+                    .dispatch(Request {
+                        jsonrpc: "2.0".into(),
+                        id: json!(1),
+                        method: "read_inert".into(),
+                        params: json!({"path":"/petals/demo/value"}),
+                    })
+                    .await
+            })
+        };
+        let pending = read(server.clone());
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            handler.started.notified(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            server.petal_mutation.try_lock().is_err(),
+            "package replacement must wait through execution"
+        );
+        handler.release.notify_one();
+        assert!(pending.await.unwrap().error.is_none());
+
+        // A queued resource request must inspect the successor's safety, not
+        // the outgoing package's flag sampled before acquiring the guard.
+        let mutation = server.petal_mutation.lock().await;
+        let mut pending = read(server.clone());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), &mut pending)
+                .await
+                .is_err()
+        );
+        handler.side_effecting.store(true, Ordering::SeqCst);
+        drop(mutation);
+        let refused = pending.await.unwrap();
+        assert_eq!(refused.error.unwrap().code, -32010);
+        assert_eq!(handler.reads.load(Ordering::SeqCst), 1);
     }
 
     struct AtomicProjectionHandler {

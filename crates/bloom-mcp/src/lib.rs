@@ -1,6 +1,6 @@
 //! Model Context Protocol proxy over the Bloom VFS command surface.
 //!
-//! This crate adds no wallet semantics of its own. Every MCP tool and resource
+//! This crate adds no wallet semantics of its own. Each MCP tool
 //! is a thin adapter over one of the five canonical VFS commands the daemon
 //! already exposes over its Unix-socket JSON-RPC endpoint — the same commands
 //! `bloom vfs cat|ls|stat|write` use:
@@ -13,9 +13,9 @@
 //! | `vfs_write`           | `write`             | `bloom vfs write` |
 //! | `vfs_write_then_stat` | `write_with_lookup` | (staging flows)   |
 //!
-//! `resources/read` maps `bloom:///<path>` onto the same `read` command,
-//! except for the few paths whose read *is* the action — those stay tool-only,
-//! because MCP clients fetch resources without asking.
+//! `resources/read` maps `bloom:///<path>` onto daemon `read_inert`, which
+//! checks safety and reads under the package-mutation guard. Side-effecting
+//! reads and write-only controls remain tool-only.
 //!
 //! Because the proxy delegates, path parsing, authorization, policy gates,
 //! audit journalling, caching, and error codes all keep happening in

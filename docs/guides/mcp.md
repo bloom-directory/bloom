@@ -2,8 +2,8 @@
 
 `bloom mcp serve` exposes Bloom's virtual filesystem to Model Context Protocol
 clients over stdio. It is a proxy, not a second API: every tool and resource
-forwards to one of the five VFS commands the daemon already serves on its Unix
-socket — the same commands `bloom vfs ls|cat|stat|write` use. Path parsing,
+uses the daemon VFS surface on its Unix socket. The five tools use the same
+commands as `bloom vfs ls|cat|stat|write`; resource reads use `read_inert`. Path parsing,
 authorization, policy gates, confirmation, audit journalling, and error codes
 all stay in `bloom-vfs`.
 
@@ -70,7 +70,7 @@ is implemented, so the claim holds for every revision listed.
 | `vfs_write`           | `write`             | `bloom vfs write` | false          |
 | `vfs_write_then_stat` | `write_with_lookup` | (staging flows)   | false          |
 
-`vfs_read` is not marked read-only on purpose. Most of the VFS is inert data,
+`vfs_read` advertises `readOnlyHint=false` and `destructiveHint=true` on purpose. Most of the VFS is inert data,
 but a handler may declare a path's read side-effecting (a Petal route can).
 `vfs_stat` reports this per path as `read_side_effecting`, and is itself always
 inert, so a client can stat before it reads and prompt when the answer is
@@ -80,7 +80,12 @@ reading one does not act, and only a `vfs_write` confirms, replaces, or
 cancels.
 
 Reads return UTF-8 as text and anything else as a base64 blob, so binary
-artifacts survive byte-for-byte. Writes take either `text` or `bytes_b64`.
+artifacts survive byte-for-byte. Writes require exactly one of `text` or `bytes_b64`, including for an empty
+payload. Both write tools accept at most 1 MiB of UTF-8/decoded bytes and reject
+invalid payloads before calling the daemon. Input JSON-RPC frames are limited
+to 8 MiB including framing: larger frames are discarded through the next newline,
+answered with an error, and subsequent requests remain usable. Invalid UTF-8
+and messages missing `jsonrpc: "2.0"` are also rejected without dispatch.
 
 Each tool forwards a fixed set of arguments (`path`, plus `text`/`bytes_b64`
 and `projection_path` where they apply) and rejects anything else before the
@@ -109,11 +114,14 @@ separator, is rejected rather than read as some other path.
 
 MCP clients treat resources as inert context and commonly fetch them without
 asking a human. Bloom therefore refuses to serve a side-effecting path as a
-resource: `resources/read` stats the path first and answers `-32010` if it is
-flagged `read_side_effecting`, naming `vfs_read` as the way to read it
+resource: `resources/read` calls daemon `read_inert`, which checks the
+`read_side_effecting` flag and reads while holding the package-mutation guard.
+Package replacement cannot race between those steps. Flagged paths return
+`-32010`, naming `vfs_read` as the way to read them
 deliberately. The same refusal keeps the write-only outbox controls from being
 served as readable resources. No VFS functionality is lost — the tool still
-performs the read.
+performs the read. Run the matching daemon: an older daemon without `read_inert`
+returns method-not-found; the proxy never falls back to an ordinary read.
 
 ## Error codes
 
@@ -137,7 +145,8 @@ it. The daemon's code is always preserved in `error.data.daemonCode`.
 The daemon also exposes `machine.execute`, `petals.*`, `confirm_batch`, and
 `shutdown` on the same socket. None of them are tools here and there is no
 generic pass-through, so an MCP client cannot name them — the proxy models the
-five VFS methods as a closed enum rather than forwarding a method string.
+five tool methods plus guarded resource reads as a closed enum rather than
+forwarding an arbitrary method string.
 
 ### Scheduling and cancellation
 

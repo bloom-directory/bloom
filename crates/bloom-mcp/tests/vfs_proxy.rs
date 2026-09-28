@@ -436,12 +436,13 @@ async fn write_then_stat_returns_the_projection_the_write_produced() {
         "/probe/latest"
     );
 
-    // A missing projection_path is the daemon's error to report, not ours.
-    let (code, message) = harness
-        .tool_error("vfs_write", json!({"path": "/probe/new"}))
+    let refused = harness
+        .request(
+            "tools/call",
+            json!({"name": "vfs_write", "arguments": {"path":"/probe/new"}}),
+        )
         .await;
-    assert_eq!(code, -32602);
-    assert!(message.contains("bytes_b64 or text"), "{message}");
+    assert_eq!(refused["error"]["code"], -32602);
 
     harness.stop().await;
 }
@@ -724,10 +725,13 @@ async fn every_advertised_argument_reaches_the_daemon() {
             .collect::<serde_json::Map<_, _>>()
             .into();
 
-        // Every advertised argument is forwarded (no `unexpected argument`
-        // rejection) and the daemon accepts the whole set.
-        let result = harness.tool(name, arguments.clone()).await;
-        assert_eq!(result["isError"], false, "{name}: {result} for {arguments}");
+        // Exercise each mutually exclusive payload separately.
+        for omitted in ["text", "bytes_b64"] {
+            let mut arguments = arguments.clone();
+            arguments.as_object_mut().unwrap().remove(omitted);
+            let result = harness.tool(name, arguments.clone()).await;
+            assert_eq!(result["isError"], false, "{name}: {result} for {arguments}");
+        }
     }
 
     harness.stop().await;

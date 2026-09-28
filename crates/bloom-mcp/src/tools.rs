@@ -2,8 +2,10 @@
 //!
 //! Each tool is a thin adapter — it copies the caller's arguments into the
 //! daemon's JSON-RPC params and shapes the reply into MCP content. Argument
-//! validation beyond "is this JSON the right shape" is deliberately left to the
-//! daemon so MCP callers see exactly the errors `bloom vfs …` sees.
+//! validation enforces the advertised payload shape and size limits. VFS
+//! authorization and domain errors remain the daemon's responsibility.
+
+pub const MAX_WRITE_BYTES: usize = 1024 * 1024;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
@@ -76,7 +78,7 @@ pub const TOOLS: [ToolSpec; 5] = [
         description: "Read the bytes of a Bloom VFS file. Equivalent to `bloom vfs cat <path>`. UTF-8 content is returned as text; anything else is returned as a base64 blob. Most paths are inert data, but a handler may declare a path's read side-effecting. Call `vfs_stat` first — it reports `read_side_effecting` — and treat a true there as an action needing confirmation, not a fetch. Wallet outbox controls (`confirm`, `confirm.override`, `replace`, `cancel`) carry that flag too but are write-only sinks: reading one does not act, and only `vfs_write` confirms, replaces, or cancels.",
         method: VfsMethod::Read,
         read_only: false,
-        destructive: false,
+        destructive: true,
     },
     ToolSpec {
         name: "vfs_stat",
@@ -134,11 +136,13 @@ impl ToolSpec {
         });
         let text = json!({
             "type": "string",
-            "description": "UTF-8 payload to write. Mutually exclusive with `bytes_b64`.",
+            "maxLength": MAX_WRITE_BYTES,
+            "description": "UTF-8 payload to write (at most 1 MiB encoded bytes). Mutually exclusive with `bytes_b64`.",
         });
         let bytes_b64 = json!({
             "type": "string",
-            "description": "Standard base64 payload, for writing arbitrary (non-UTF-8) bytes. Takes precedence over `text`.",
+            "maxLength": MAX_WRITE_BYTES.div_ceil(3) * 4,
+            "description": "Standard base64 payload (at most 1 MiB decoded bytes). Mutually exclusive with `text`.",
         });
         match self.method {
             VfsMethod::List => json!({
@@ -152,7 +156,7 @@ impl ToolSpec {
                 },
                 "additionalProperties": false,
             }),
-            VfsMethod::Read | VfsMethod::Lookup => json!({
+            VfsMethod::Read | VfsMethod::ReadInert | VfsMethod::Lookup => json!({
                 "type": "object",
                 "properties": { "path": path },
                 "required": ["path"],
@@ -162,6 +166,7 @@ impl ToolSpec {
                 "type": "object",
                 "properties": { "path": path, "text": text, "bytes_b64": bytes_b64 },
                 "required": ["path"],
+                "oneOf": [{"required": ["text"]}, {"required": ["bytes_b64"]}],
                 "additionalProperties": false,
             }),
             VfsMethod::WriteWithLookup => json!({
@@ -176,6 +181,7 @@ impl ToolSpec {
                     },
                 },
                 "required": ["path", "projection_path"],
+                "oneOf": [{"required": ["text"]}, {"required": ["bytes_b64"]}],
                 "additionalProperties": false,
             }),
         }
@@ -229,14 +235,16 @@ impl ToolSpec {
     /// The arguments this tool accepts, matching its advertised schema.
     fn accepted_arguments(&self) -> &'static [&'static str] {
         match self.method {
-            VfsMethod::List | VfsMethod::Read | VfsMethod::Lookup => &["path"],
+            VfsMethod::List | VfsMethod::Read | VfsMethod::ReadInert | VfsMethod::Lookup => {
+                &["path"]
+            }
             VfsMethod::Write => &["path", "text", "bytes_b64"],
             VfsMethod::WriteWithLookup => &["path", "text", "bytes_b64", "projection_path"],
         }
     }
 
-    /// Build the daemon params. Accepted keys are forwarded verbatim so the
-    /// daemon — not this proxy — decides what is missing or malformed.
+    /// Validate MCP payload constraints, then forward accepted keys verbatim.
+    /// Path semantics and authorization remain the daemon's responsibility.
     fn params(&self, arguments: &Map<String, Value>) -> Result<Value, ToolError> {
         let accepted = self.accepted_arguments();
         let mut params = Map::new();
@@ -257,6 +265,27 @@ impl ToolSpec {
         // tools let the daemon report a missing path in its own words.
         if self.method == VfsMethod::List && !params.contains_key("path") {
             params.insert("path".into(), Value::String("/".into()));
+        }
+        if matches!(self.method, VfsMethod::Write | VfsMethod::WriteWithLookup) {
+            let text = params.get("text").and_then(Value::as_str);
+            let encoded = params.get("bytes_b64").and_then(Value::as_str);
+            let len = match (text, encoded) {
+                (Some(text), None) => text.len(),
+                (None, Some(encoded)) => B64
+                    .decode(encoded)
+                    .map_err(|_| ToolError::InvalidArguments("invalid base64 payload".into()))?
+                    .len(),
+                _ => {
+                    return Err(ToolError::InvalidArguments(
+                        "supply exactly one of text or bytes_b64".into(),
+                    ));
+                }
+            };
+            if len > MAX_WRITE_BYTES {
+                return Err(ToolError::InvalidArguments(
+                    "write payload exceeds 1 MiB".into(),
+                ));
+            }
         }
         Ok(Value::Object(params))
     }
@@ -282,7 +311,7 @@ impl ToolSpec {
                 vec![json!({"type": "text", "text": pretty(&result)})],
                 json!({ "path": path, "entry": result }),
             ),
-            VfsMethod::Read => match read_bytes(&result) {
+            VfsMethod::Read | VfsMethod::ReadInert => match read_bytes(&result) {
                 Ok(bytes) => {
                     let (content, structured) = bytes_payload(&path, &bytes);
                     ok_result(content, structured)
@@ -436,18 +465,6 @@ pub fn path_from_uri(uri: &str) -> Result<String, String> {
     Ok(path)
 }
 
-/// Whether the daemon's `lookup` reply carries the handler's
-/// `read_side_effecting` flag: the path must not be read speculatively,
-/// either because its read acts or because it is a write-only control. A
-/// reply from a daemon predating the field reads as `false`, matching the VFS
-/// default for unknown paths.
-pub fn read_is_side_effecting(entry: &Value) -> bool {
-    entry
-        .get("read_side_effecting")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-}
-
 fn payload_len(arguments: &Map<String, Value>) -> usize {
     if let Some(encoded) = arguments.get("bytes_b64").and_then(Value::as_str) {
         return B64.decode(encoded).map(|bytes| bytes.len()).unwrap_or(0);
@@ -527,6 +544,32 @@ mod tests {
         let spec = find("vfs_list").unwrap();
         let params = spec.params(&Map::new()).unwrap();
         assert_eq!(params, json!({"path": "/"}));
+    }
+
+    #[test]
+    fn writes_require_one_bounded_payload_in_schema_and_validation() {
+        for name in ["vfs_write", "vfs_write_then_stat"] {
+            let tool = find(name).unwrap();
+            assert_eq!(
+                tool.input_schema()["oneOf"],
+                json!([{"required":["text"]},{"required":["bytes_b64"]}])
+            );
+            for payload in [
+                json!({}),
+                json!({"text":"", "bytes_b64":""}),
+                json!({"bytes_b64":B64.encode(vec![0; MAX_WRITE_BYTES + 1])}),
+            ] {
+                assert!(tool.params(payload.as_object().unwrap()).is_err());
+            }
+            for payload in [
+                json!({"text":""}),
+                json!({"bytes_b64":""}),
+                json!({"text":"x".repeat(MAX_WRITE_BYTES)}),
+                json!({"bytes_b64":B64.encode(vec![0; MAX_WRITE_BYTES])}),
+            ] {
+                assert!(tool.params(payload.as_object().unwrap()).is_ok());
+            }
+        }
     }
 
     #[test]
@@ -636,20 +679,9 @@ mod tests {
         assert_eq!(hints("vfs_list"), (true, false));
         // A handler may declare a read side-effecting, so a read cannot claim
         // to leave the environment alone.
-        assert_eq!(hints("vfs_read"), (false, false));
+        assert_eq!(hints("vfs_read"), (false, true));
         assert_eq!(hints("vfs_write"), (false, true));
         assert_eq!(hints("vfs_write_then_stat"), (false, true));
-    }
-
-    #[test]
-    fn a_lookup_reply_without_the_flag_reads_as_inert() {
-        assert!(read_is_side_effecting(
-            &json!({"name": "confirm", "read_side_effecting": true})
-        ));
-        assert!(!read_is_side_effecting(
-            &json!({"name": "confirm", "read_side_effecting": false})
-        ));
-        assert!(!read_is_side_effecting(&json!({"name": "greet"})));
     }
 
     /// Wallet outbox controls are write-only sinks: only a write confirms,

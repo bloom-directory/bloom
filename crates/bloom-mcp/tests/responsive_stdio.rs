@@ -217,7 +217,7 @@ async fn byte_limit_rejects_large_queued_work_and_cancellation_frees_capacity() 
     let mut s = Session::new();
     s.block().await;
     let mut large = call(2, "/large");
-    large["params"]["arguments"]["text"] = Value::String("x".repeat(4 * 1024 * 1024));
+    large["params"]["arguments"]["text"] = Value::String("\0".repeat(768 * 1024));
     s.send(large.clone()).await;
     large["id"] = json!(3);
     s.send(large.clone()).await;
@@ -233,4 +233,67 @@ async fn byte_limit_rejects_large_queued_work_and_cancellation_frees_capacity() 
     assert_eq!(s.recv().await["id"], 4);
     assert_eq!(*s.backend.calls.lock().unwrap(), ["/slow", "/large"]);
     s.close().await;
+}
+
+#[tokio::test]
+async fn malformed_frames_never_dispatch_and_session_survives() {
+    let mut session = Session::new();
+    let mut invalid = serde_json::to_vec(&call(1, "/bad")).unwrap();
+    let at = invalid
+        .windows(4)
+        .position(|bytes| bytes == b"/bad")
+        .unwrap();
+    invalid[at + 1] = 0xff;
+    invalid.push(b'\n');
+    session.input.write_all(&invalid).await.unwrap();
+    assert_eq!(session.recv().await["error"]["code"], -32700);
+    let mut missing_version = call(2, "/bad");
+    missing_version.as_object_mut().unwrap().remove("jsonrpc");
+    session.send(missing_version).await;
+    assert_eq!(session.recv().await["error"]["code"], -32600);
+    session.ping().await;
+    assert!(session.backend.calls.lock().unwrap().is_empty());
+    session.close().await;
+}
+
+#[tokio::test]
+async fn oversized_frame_is_drained_even_when_an_operation_completes_mid_frame() {
+    let mut session = Session::new();
+    session.block().await;
+    session
+        .input
+        .write_all(&vec![b'x'; 8 * 1024 * 1024 + 1])
+        .await
+        .unwrap();
+    session.backend.release.add_permits(1);
+    assert_eq!(session.recv().await["id"], 1);
+    // This suffix would be a valid write if draining state were lost.
+    session.send(call(2, "/must-not-run")).await;
+    assert_eq!(session.recv().await["error"]["code"], -32600);
+    session.ping().await;
+    assert_eq!(*session.backend.calls.lock().unwrap(), ["/slow"]);
+    session.close().await;
+}
+
+#[tokio::test]
+async fn write_payload_validation_precedes_backend_dispatch() {
+    let mut session = Session::new();
+    for (name, payload) in [
+        ("vfs_write", json!({})),
+        ("vfs_write", json!({"text":"", "bytes_b64":""})),
+        ("vfs_write_then_stat", json!({})),
+        ("vfs_write_then_stat", json!({"text":"", "bytes_b64":""})),
+        ("vfs_write", json!({"text":"x".repeat(1024 * 1024 + 1)})),
+    ] {
+        let mut arguments = payload;
+        arguments["path"] = json!("/never");
+        if name == "vfs_write_then_stat" {
+            arguments["projection_path"] = json!("/latest");
+        }
+        session.send(json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":name,"arguments":arguments}})).await;
+        assert_eq!(session.recv().await["error"]["code"], -32602);
+    }
+    assert!(session.backend.calls.lock().unwrap().is_empty());
+    session.ping().await;
+    session.close().await;
 }

@@ -43,8 +43,7 @@ pub const RESOURCE_NOT_FOUND_CODE: i32 = -32002;
 
 /// `resources/read` refused because the path's handler flags it
 /// `read_side_effecting`: a read that acts, or a write-only control such as a
-/// wallet outbox `confirm`. Deliberately outside the daemon's code space: no
-/// VFS command failed, the proxy declined to issue one.
+/// wallet outbox `confirm`. Returned by daemon `read_inert` without reading.
 pub const RESOURCE_IS_AN_ACTION_CODE: i32 = -32010;
 
 /// Largest accepted inbound frame. MCP requests are small; the cap stops a
@@ -91,7 +90,7 @@ impl McpServer {
     {
         // Keep framing state outside the selected future: losing the select
         // race to a completed operation must not discard a partial input line.
-        let mut frame = Vec::new();
+        let mut frame = FrameBuffer::default();
         let mut queue = VecDeque::<QueuedRequest>::new();
         let mut queued_bytes = 0;
         let mut batches = HashMap::<usize, BatchReply>::new();
@@ -118,7 +117,21 @@ impl McpServer {
                         // waiter does not roll back work already in the daemon.
                         return Ok(());
                     };
-                    let frame = String::from_utf8_lossy(&frame);
+                    let Frame::Message(frame) = frame else {
+                        send_reply(&mut writer, &mut batches, None, Some(error_response(
+                            Value::Null, -32600, "MCP frame exceeds 8 MiB"
+                        ))).await?;
+                        continue;
+                    };
+                    let frame = match std::str::from_utf8(&frame) {
+                        Ok(frame) => frame,
+                        Err(_) => {
+                            send_reply(&mut writer, &mut batches, None, Some(error_response(
+                                Value::Null, -32700, "frame is not valid UTF-8"
+                            ))).await?;
+                            continue;
+                        }
+                    };
                     let frame = frame.trim();
                     if frame.is_empty() { continue; }
                     let message = match serde_json::from_str::<Value>(frame) {
@@ -229,9 +242,7 @@ impl McpServer {
         // Structural validity first: a message that is not a well-formed
         // request *or* notification is an invalid request, and JSON-RPC wants
         // that answered with `id: null` rather than silently dropped.
-        if let Some(version) = request.get("jsonrpc")
-            && version.as_str() != Some("2.0")
-        {
+        if request.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
             return Some(invalid_request(Value::Null, "jsonrpc must be \"2.0\""));
         }
         let id = match id {
@@ -342,7 +353,7 @@ impl McpServer {
     /// Read a VFS path as an MCP resource.
     ///
     /// Clients treat resources as inert context and fetch them without asking,
-    /// so this refuses every path the daemon's `lookup` flags
+    /// so daemon `read_inert` atomically refuses every path its handler flags
     /// `read_side_effecting`, which keeps the judgement in the VFS instead of
     /// in a path list maintained here. That covers reads that act (a Petal
     /// route can declare one) and the wallet outbox controls (`confirm`,
@@ -358,32 +369,20 @@ impl McpServer {
             Ok(path) => path,
             Err(message) => return error_response(id, -32602, message),
         };
-        match self
-            .commands
-            .call(VfsMethod::Lookup, json!({ "path": path }))
-            .await
-        {
-            Ok(entry) if tools::read_is_side_effecting(&entry) => {
-                return error_response_with_data(
-                    id,
-                    RESOURCE_IS_AN_ACTION_CODE,
-                    format!(
-                        "{path} is flagged `read_side_effecting` by its handler, so it is not \
-                         served as a resource; call the `vfs_read` tool to read it deliberately"
-                    ),
-                    json!({ "uri": uri, "path": path, "tool": "vfs_read" }),
-                );
-            }
-            Ok(_) => {}
-            Err(error) => return resource_error_response(id, uri, &error),
-        }
         let read = self
             .commands
-            .call(VfsMethod::Read, json!({ "path": path }))
+            .call(VfsMethod::ReadInert, json!({ "path": path }))
             .await;
         let bytes = match read.and_then(|result| tools::read_bytes(&result)) {
             Ok(bytes) => bytes,
-            Err(error) => return resource_error_response(id, uri, &error),
+            Err(error) => {
+                let mut response = resource_error_response(id, uri, &error);
+                if error.code == RESOURCE_IS_AN_ACTION_CODE {
+                    response["error"]["data"]["tool"] = json!("vfs_read");
+                    response["error"]["data"]["path"] = json!(path);
+                }
+                return response;
+            }
         };
         let content = match std::str::from_utf8(&bytes) {
             Ok(text) => json!({
@@ -436,7 +435,7 @@ fn needs_backend(request: &Value) -> bool {
         .is_some_and(|id| id.is_string() || id.is_number())
         && request
             .get("jsonrpc")
-            .is_none_or(|version| version == "2.0")
+            .is_some_and(|version| version == "2.0")
         && matches!(
             request.get("method").and_then(Value::as_str),
             Some("tools/call" | "resources/list" | "resources/read")
@@ -557,30 +556,52 @@ async fn read_bounded_line<R>(reader: &mut R) -> std::io::Result<Option<Vec<u8>>
 where
     R: AsyncBufRead + Unpin,
 {
-    read_bounded_line_into(reader, &mut Vec::new()).await
+    match read_bounded_line_into(reader, &mut FrameBuffer::default()).await? {
+        Some(Frame::Message(bytes)) => Ok(Some(bytes)),
+        Some(Frame::TooLarge) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "MCP frame exceeds limit",
+        )),
+        None => Ok(None),
+    }
+}
+
+#[derive(Default)]
+struct FrameBuffer {
+    bytes: Vec<u8>,
+    oversized: bool,
+}
+
+enum Frame {
+    Message(Vec<u8>),
+    TooLarge,
 }
 
 async fn read_bounded_line_into<R: AsyncBufRead + Unpin>(
     reader: &mut R,
-    frame: &mut Vec<u8>,
-) -> std::io::Result<Option<Vec<u8>>> {
+    frame: &mut FrameBuffer,
+) -> std::io::Result<Option<Frame>> {
     loop {
         let available = reader.fill_buf().await?;
-        if available.is_empty() {
-            return Ok((!frame.is_empty()).then(|| std::mem::take(frame)));
-        }
+        let eof = available.is_empty();
         let newline = available.iter().position(|byte| *byte == b'\n');
         let take = newline.map(|index| index + 1).unwrap_or(available.len());
-        if frame.len().saturating_add(take) > MAX_MESSAGE_BYTES {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("MCP message exceeds {MAX_MESSAGE_BYTES} bytes"),
-            ));
+        if frame.bytes.len().saturating_add(take) > MAX_MESSAGE_BYTES {
+            frame.oversized = true;
+            frame.bytes.clear();
         }
-        frame.extend_from_slice(&available[..take]);
+        if !frame.oversized {
+            frame.bytes.extend_from_slice(&available[..take]);
+        }
         reader.consume(take);
-        if newline.is_some() {
-            return Ok(Some(std::mem::take(frame)));
+        if eof || newline.is_some() {
+            return Ok(if std::mem::take(&mut frame.oversized) {
+                Some(Frame::TooLarge)
+            } else if eof && frame.bytes.is_empty() {
+                None
+            } else {
+                Some(Frame::Message(std::mem::take(&mut frame.bytes)))
+            });
         }
     }
 }
@@ -797,9 +818,10 @@ mod tests {
     /// as one, and the refusal must not claim that reading it acts.
     #[tokio::test]
     async fn a_side_effecting_read_is_refused_as_a_resource_and_never_issued() {
-        let (server, commands) = server(Ok(json!({
-            "name": "confirm", "kind": "file", "read_side_effecting": true,
-        })));
+        let (server, commands) = server(Err(VfsCommandError::new(
+            RESOURCE_IS_AN_ACTION_CODE,
+            "read_side_effecting; use vfs_read",
+        )));
         let response = server
             .handle(json!({
                 "jsonrpc": "2.0", "id": 1, "method": "resources/read",
@@ -808,22 +830,21 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response["error"]["code"], RESOURCE_IS_AN_ACTION_CODE);
-        assert_eq!(response["error"]["data"]["tool"], "vfs_read");
         let message = response["error"]["message"].as_str().unwrap();
         assert!(message.contains("read_side_effecting"), "{message}");
         for false_claim in ["sign", "broadcast", "performs"] {
             assert!(!message.contains(false_claim), "{message}");
         }
 
-        // Only the (inert) lookup was issued; the read never happened.
+        // Only the guarded read was issued; never fall back to an ordinary read.
         let calls = commands.calls.lock().unwrap();
         assert_eq!(calls.len(), 1, "{calls:?}");
-        assert_eq!(calls[0].0, VfsMethod::Lookup);
+        assert_eq!(calls[0].0, VfsMethod::ReadInert);
     }
 
     #[tokio::test]
     async fn an_inert_path_is_still_served_as_a_resource() {
-        // The lookup reply says inert; the read reply follows it.
+        // The guarded daemon read returns bytes directly.
         let (server, commands) = server(Ok(json!({
             "name": "health", "kind": "file", "read_side_effecting": false,
             "bytes_b64": "aGk=", "len": 2,
@@ -843,7 +864,27 @@ mod tests {
         let calls = commands.calls.lock().unwrap();
         assert_eq!(
             calls.iter().map(|call| call.0).collect::<Vec<_>>(),
-            [VfsMethod::Lookup, VfsMethod::Read]
+            [VfsMethod::ReadInert]
+        );
+    }
+
+    #[tokio::test]
+    async fn old_daemon_cannot_trigger_an_unguarded_resource_read() {
+        let (server, commands) = server(Err(VfsCommandError::new(
+            -32601,
+            "method not found: read_inert",
+        )));
+        let response = server.handle(json!({"jsonrpc":"2.0", "id":1, "method":"resources/read", "params":{"uri":"bloom:///petals/demo/value"}})).await.unwrap();
+        assert_eq!(response["error"]["code"], -32601);
+        assert_eq!(
+            commands
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|c| c.0)
+                .collect::<Vec<_>>(),
+            [VfsMethod::ReadInert]
         );
     }
 

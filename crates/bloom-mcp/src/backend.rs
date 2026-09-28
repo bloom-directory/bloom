@@ -31,8 +31,8 @@ pub const DAEMON_UNREACHABLE_CODE: i32 = -32603;
 /// surface passes it through untouched.
 pub const DAEMON_NOT_FOUND_CODE: i32 = -32004;
 
-/// The five VFS commands `bloom vfs …` uses, and the only methods this proxy
-/// can name. Modelling them as an enum keeps non-VFS IPC methods
+/// The five VFS commands `bloom vfs …` uses plus guarded resource reads.
+/// Modelling them as an enum keeps non-VFS IPC methods
 /// (`machine.execute`, `petals.*`, `confirm_batch`, `shutdown`) unreachable
 /// from MCP by construction rather than by review.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,6 +41,8 @@ pub enum VfsMethod {
     Lookup,
     /// `bloom vfs cat` — file bytes.
     Read,
+    /// Check read safety and read under the daemon package-mutation guard.
+    ReadInert,
     /// `bloom vfs write` — bytes into a writable path.
     Write,
     /// Write, then look up the identity projection it produced, under the
@@ -55,6 +57,7 @@ impl VfsMethod {
         match self {
             VfsMethod::Lookup => "lookup",
             VfsMethod::Read => "read",
+            VfsMethod::ReadInert => "read_inert",
             VfsMethod::Write => "write",
             VfsMethod::WriteWithLookup => "write_with_lookup",
             VfsMethod::List => "list",
