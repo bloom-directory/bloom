@@ -27,9 +27,6 @@ impl PrivateStore {
         wallet: &str,
         account: u32,
     ) -> Result<Self, HostError> {
-        if account == 0 {
-            return Err(HostError::Invalid("account store requires n > 0".into()));
-        }
         let mut store = Self::open(root)?;
         store.account_digest = Some(account_digest(wallet, account));
         Ok(store)
@@ -182,9 +179,9 @@ pub fn carry_forward(
         return Err(HostError::Invalid("invalid carry-forward hashes".into()));
     }
     let _guard = store_op_guard()?;
-    let account_zero = copy_partition(data_root, predecessor, successor)?;
+    let public = copy_partition(data_root, predecessor, successor)?;
     let accounts = copy_partition(accounts_root, predecessor, successor)?;
-    Ok(account_zero || accounts)
+    Ok(public || accounts)
 }
 
 fn copy_partition(root: &Path, predecessor: &str, successor: &str) -> Result<bool, HostError> {
@@ -528,6 +525,30 @@ mod tests {
                 .join(account_digest("alice", 1))
                 .is_dir()
         );
+    }
+
+    #[test]
+    fn account_zero_is_isolated_from_other_wallets_and_legacy_state() {
+        let dir = TempDir::new().unwrap();
+        let legacy = PrivateStore::open(dir.path()).unwrap();
+        legacy.put(HASH, "setting", b"legacy", false).unwrap();
+        let alice = PrivateStore::open_account(dir.path(), "alice", 0).unwrap();
+        let bob = PrivateStore::open_account(dir.path(), "bob", 0).unwrap();
+        let next = PrivateStore::open_account(dir.path(), "alice", 1).unwrap();
+        assert!(matches!(
+            alice.get(HASH, "setting"),
+            Err(HostError::NotFound(_))
+        ));
+        alice.put(HASH, "setting", b"alice-zero", false).unwrap();
+        assert!(matches!(
+            bob.get(HASH, "setting"),
+            Err(HostError::NotFound(_))
+        ));
+        assert!(matches!(
+            next.get(HASH, "setting"),
+            Err(HostError::NotFound(_))
+        ));
+        assert_eq!(legacy.get(HASH, "setting").unwrap(), b"legacy");
     }
 
     #[test]

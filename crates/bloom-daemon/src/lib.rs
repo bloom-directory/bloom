@@ -445,11 +445,6 @@ impl DaemonPetalHost {
         wallet: &str,
         staged: &bloom_proto::StagedTx,
     ) -> Result<(), HostError> {
-        if context.trusted_account().is_none() {
-            // Retain the existing internal unscoped host contract. Mounted
-            // Petal routes always supply a trusted numbered account context.
-            return Ok(());
-        }
         let owner = self
             .account_owner(
                 context,
@@ -6406,7 +6401,10 @@ mod tests {
             route_id: "r000007".into(),
             op: "write".into(),
             path: "orders/new".into(),
-            params: Vec::new(),
+            params: vec![
+                ("bloom.wallet".into(), "primary".into()),
+                ("bloom.account".into(), "0".into()),
+            ],
             actor: None,
         };
         let request = bloom_petals::PetalKeyRequest {
@@ -6578,7 +6576,10 @@ mod tests {
             route_id: "r000009".into(),
             op: "write".into(),
             path: "orders/new".into(),
-            params: Vec::new(),
+            params: vec![
+                ("bloom.wallet".into(), "primary".into()),
+                ("bloom.account".into(), "0".into()),
+            ],
             actor: None,
         };
         let payload = b"exact owner order".to_vec();
@@ -6734,7 +6735,10 @@ mod tests {
             route_id: "r000010".into(),
             op: "write".into(),
             path: "orders/batch".into(),
-            params: Vec::new(),
+            params: vec![
+                ("bloom.wallet".into(), "primary".into()),
+                ("bloom.account".into(), "0".into()),
+            ],
             actor: None,
         };
         let preimages = [b"first exact payload".to_vec(), b"second".to_vec()];
@@ -7088,25 +7092,28 @@ mod tests {
 
     #[tokio::test]
     async fn daemon_petal_outbox_inspection_is_read_only_and_origin_bound() {
-        let dir = tempfile::tempdir().unwrap();
-        let daemon = Daemon::from_home(HomeDir::at(dir.path())).unwrap();
-        let host = test_petal_host(&daemon);
+        let (_dir, daemon, broker) = isolation_daemon().await;
+        let host =
+            test_petal_host(&daemon).with_broker(Some(MachineBrokerClient::new(broker.clone())));
         let context = PetalRouteContext {
             petal_root: "funding".into(),
             package_hash: "b".repeat(64),
             route_id: "r000002".into(),
             op: "read".into(),
-            path: "/fund/alice/one/status.json".into(),
-            params: vec![],
+            path: "/fund/w/0/one/status.json".into(),
+            params: vec![
+                ("bloom.wallet".into(), "w".into()),
+                ("bloom.account".into(), "0".into()),
+            ],
             actor: Some("agent-1".into()),
         };
         let tx_hash = format!("0x{}", "ab".repeat(32));
         let staged = bloom_proto::StagedTx {
             id: "petal-inspect".into(),
-            wallet: "alice".into(),
+            wallet: "w".into(),
             chain: "anvil".into(),
             chain_id: 31337,
-            from: "0x0000000000000000000000000000000000000001".into(),
+            from: broker.child(true, 0).address.clone(),
             to: "0x0000000000000000000000000000000000000002".into(),
             value_wei: "0".into(),
             data_hex: "0x".into(),
@@ -7130,7 +7137,7 @@ mod tests {
             execution_origin: Some(DaemonPetalHost::petal_execution_origin(&context).unwrap()),
         };
         let request = EvmTransactionRequest {
-            wallet: "alice".into(),
+            wallet: "w".into(),
             chain: "anvil".into(),
             to: staged.to.clone(),
             value_wei: staged.value_wei.clone(),
@@ -7206,7 +7213,7 @@ mod tests {
 
         let inspection = host
             .evm_tx_inspect(
-                "alice".into(),
+                "w".into(),
                 "anvil".into(),
                 staged.id.clone(),
                 Some(context.clone()),
@@ -7225,10 +7232,10 @@ mod tests {
         // A different route of the same package (a status route reconciling
         // what the execute route staged) may inspect.
         let mut other_route = context.clone();
-        other_route.path = "/fund/alice/two/status".into();
+        other_route.path = "/fund/w/0/two/status".into();
         other_route.route_id = "r000099".into();
         host.evm_tx_inspect(
-            "alice".into(),
+            "w".into(),
             "anvil".into(),
             staged.id.clone(),
             Some(other_route),
@@ -7240,7 +7247,7 @@ mod tests {
         other_app.petal_root = "other".into();
         let denied = host
             .evm_tx_inspect(
-                "alice".into(),
+                "w".into(),
                 "anvil".into(),
                 staged.id.clone(),
                 Some(other_app),
@@ -7252,12 +7259,7 @@ mod tests {
         let mut other_context = context;
         other_context.package_hash = "c".repeat(64);
         let denied = host
-            .evm_tx_inspect(
-                "alice".into(),
-                "anvil".into(),
-                staged.id,
-                Some(other_context),
-            )
+            .evm_tx_inspect("w".into(), "anvil".into(), staged.id, Some(other_context))
             .await
             .unwrap_err();
         assert!(matches!(denied, HostError::Denied(_)));

@@ -337,7 +337,7 @@ impl PetalRunner {
         // A new partition for a replaced package must not be created while
         // its predecessor relationship cannot be checked. Probe the exact
         // partition selected by this invocation, including numbered accounts.
-        let partition = match account.filter(|account| account.number > 0) {
+        let partition = match account {
             Some(account) => self.store.private_account_data_root().join(hash).join(
                 crate::private_store::account_digest(&account.wallet, account.number),
             ),
@@ -777,7 +777,7 @@ impl PetalRunner {
             self.prepare_private_store(&matched.hash, account)?;
         }
         if opts.private_store_root.is_none() {
-            if let Some(account) = account.filter(|account| account.number > 0) {
+            if let Some(account) = account {
                 opts.private_store_root = Some(self.store.private_account_data_root());
                 opts.private_store_account = Some((account.wallet.clone(), account.number));
             } else {

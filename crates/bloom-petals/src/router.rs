@@ -4,7 +4,7 @@
 //! an installed Petal package; the remaining path is passed to the matched
 //! Petal route artifact.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
@@ -177,6 +177,8 @@ impl PetalRouter {
             .split('/')
             .filter(|part| !part.is_empty())
             .collect::<Vec<_>>();
+        let mut checked_accounts = BTreeSet::new();
+        let mut checked_wallets = BTreeSet::new();
         for route in &index.routes {
             if !crate::runner::route_has_descendant(&route.pattern, path) {
                 continue;
@@ -191,8 +193,11 @@ impl PetalRouter {
                 .find(|(name, _)| *name == "[index]")
                 .map(|(_, value)| **value);
             if let (Some(wallet), Some(number)) = (wallet, number) {
-                self.account_context(wallet, number).await?;
+                if checked_accounts.insert((wallet, number)) {
+                    self.account_context(wallet, number).await?;
+                }
             } else if let Some(wallet) = wallet
+                && checked_wallets.insert(wallet)
                 && !self
                     .host
                     .vfs_list("wallets")
@@ -223,6 +228,7 @@ impl PetalRouter {
             .filter(|part| !part.is_empty())
             .collect::<Vec<_>>();
         let mut entries = BTreeMap::new();
+        let mut listed_paths = BTreeSet::new();
         for route in &index.routes {
             if !crate::runner::route_has_descendant(&route.pattern, path) {
                 continue;
@@ -239,6 +245,9 @@ impl PetalRouter {
                 }
                 _ => continue,
             };
+            if !listed_paths.insert(core.clone()) {
+                continue;
+            }
             for entry in self.host.vfs_list(&core).await.map_err(map_host_err)? {
                 if entry.kind == crate::host::HostVfsEntryKind::Dir
                     && (core == "wallets" && entry.name != "registrations"
@@ -1168,6 +1177,71 @@ name = "example"
                 .read(&VfsPath::parse("demo/wallets/alice/0/hello.txt").unwrap())
                 .await
                 .is_err()
+        );
+    }
+
+    #[derive(Default)]
+    struct CountingAccountHost {
+        reads: std::sync::atomic::AtomicUsize,
+        lists: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl PetalHost for CountingAccountHost {
+        async fn vfs_lookup(&self, path: &str) -> Result<HostVfsEntry, HostError> {
+            AccountHost.vfs_lookup(path).await
+        }
+        async fn vfs_read(&self, path: &str) -> Result<Vec<u8>, HostError> {
+            self.reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            AccountHost.vfs_read(path).await
+        }
+        async fn vfs_list(&self, path: &str) -> Result<Vec<HostVfsEntry>, HostError> {
+            self.lists
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            AccountHost.vfs_list(path).await
+        }
+        async fn vfs_write(&self, path: &str, bytes: &[u8]) -> Result<(), HostError> {
+            AccountHost.vfs_write(path, bytes).await
+        }
+    }
+
+    #[tokio::test]
+    async fn ancestor_inventory_reads_are_deduplicated_per_invocation() {
+        use std::sync::atomic::Ordering;
+        let (dir, runner) = runner();
+        let package = dir.path().join("demo-app");
+        write_demo_package(&package);
+        for route in 0..32 {
+            write_package_file(
+                &package,
+                &format!("petal/demo/intents/[wallet]/[index]/file-{route}.txt.wasm"),
+                include_bytes!("../tests/fixtures/route_component_no_imports.wasm"),
+            );
+        }
+        runner.store().install_petal_package_dir(&package).unwrap();
+        let host = Arc::new(CountingAccountHost::default());
+        let router = PetalRouter::new(runner, host.clone());
+        router
+            .list(&VfsPath::parse("demo/intents").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(host.lists.swap(0, Ordering::Relaxed), 1);
+        router
+            .list(&VfsPath::parse("demo/intents/alice").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(host.lists.load(Ordering::Relaxed), 2);
+        for _ in 0..2 {
+            router
+                .lookup(&VfsPath::parse("demo/intents/alice/0").unwrap())
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            host.reads.load(Ordering::Relaxed),
+            2,
+            "each invocation rechecks live account state exactly once"
         );
     }
 

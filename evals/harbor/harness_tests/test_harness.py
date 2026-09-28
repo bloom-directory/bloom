@@ -722,7 +722,7 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         # the agent needs both identifiers to address sessions and account reads.
         for mount in context.mounts[1:]:
             self.assertIn(
-                f"/wallets/{self.definition.wallet_id}/0/mainnet/agent_sessions/", mount["target"]
+                f"/mainnet/wallets/{self.definition.wallet_id}/0/agent_sessions/", mount["target"]
             )
         self.assertEqual(
             context.agent_env["BLOOM_EVAL_WALLET_ID"], self.definition.wallet_id

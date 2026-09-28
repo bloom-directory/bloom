@@ -51,7 +51,7 @@ wallet = "test-passkey"
 address = "0x0000000000000000000000000000000000000001"
 session = "manual-mainnet-integration"
 pm_signing_abi = os.environ.get("BLOOM_FAKE_PM_SIGNING_ABI", "0.2.0")
-fixture_package_hash = "2f11ee17f612fbc43f34f81771c53760f56768959624d29fd63b8e4285f5a9ac"
+fixture_package_hash = "a323d0070207aa75b7d211565b6040136077c398b74ed1e97eddabf7d5e6a814"
 fixture_provenance_digest = "66" * 32
 mutate_approval_policy_digest = (
     os.environ.get("BLOOM_FAKE_MUTATE_APPROVAL_POLICY_DIGEST", "0") == "1"
@@ -133,7 +133,7 @@ projection_path = write_json(
     },
 )
 write_json(
-    f"petals/polymarket/wallets/{wallet}/0/meta/route-contract.json",
+    f"petals/polymarket/meta/route-contract.json",
     {
         "schema": "fake.route-contract.v1",
         "abi": "0.1",
@@ -141,15 +141,15 @@ write_json(
     },
 )
 write_json(
-    f"petals/polymarket/wallets/{wallet}/0/onboard/status.json",
+    f"petals/polymarket/onboard/{wallet}/0/status.json",
     {"stage": "complete", "tradeable": True},
 )
 write_json(
-    f"petals/polymarket/wallets/{wallet}/0/account/status.json",
+    f"petals/polymarket/account/{wallet}/0/status.json",
     {"status": "ready", "tradeable": True},
 )
 write_json(
-    f"petals/polymarket/wallets/{wallet}/0/account/buying_power.json",
+    f"petals/polymarket/account/{wallet}/0/buying_power.json",
     {
         "spendable": {"asset": "pUSD", "raw": "20000000"},
         "can_trade_now": True,
@@ -157,15 +157,15 @@ write_json(
     },
 )
 write_json(
-    f"petals/polymarket/wallets/{wallet}/0/markets/fixture/market.json",
+    f"petals/polymarket/markets/fixture/market.json",
     {"slug": "fixture", "question": "Fixture?", "outcomes": ["Yes", "No"]},
 )
 write_json(
-    f"petals/polymarket/wallets/{wallet}/0/markets/fixture/prices.json",
+    f"petals/polymarket/markets/fixture/prices.json",
     {"Yes": "0.5", "No": "0.5"},
 )
-(mount / f"petals/polymarket/wallets/{wallet}/0/trade/drafts").mkdir(parents=True)
-(mount / f"petals/polymarket/wallets/{wallet}/0/trade/receipts").mkdir(parents=True)
+(mount / f"petals/polymarket/trade/{wallet}/0/drafts").mkdir(parents=True)
+(mount / f"petals/polymarket/trade/{wallet}/0/receipts").mkdir(parents=True)
 
 policy_committed = threading.Event()
 committed_policy_digest = None
@@ -476,7 +476,7 @@ threading.Thread(target=fixture_loop, daemon=True).start()
 
 def handle_pm_new(_payload):
     state.joinpath("pm-draft-staged").touch()
-    root = f"petals/polymarket/wallets/{wallet}/0/trade/drafts/draft-1"
+    root = f"petals/polymarket/trade/{wallet}/0/drafts/draft-1"
     Path(mount / root).mkdir(parents=True, exist_ok=True)
     write(f"{root}/plan.md", "# Fixture Polymarket plan\n")
     write_json(f"{root}/policy_check.json", {"policy_deny": False, "policy_status": "pass"})
@@ -505,7 +505,7 @@ def handle_pm_new(_payload):
         else:
             state.joinpath("pm-posted").touch()
             write_json(
-                f"petals/polymarket/wallets/{wallet}/0/trade/receipts/draft-1/receipt.json",
+                f"petals/polymarket/trade/{wallet}/0/receipts/draft-1/receipt.json",
                 {
                     "draft_id": "draft-1",
                     "clob_status": "matched",
@@ -517,7 +517,7 @@ def handle_pm_new(_payload):
     fifo(f"{root}/post", handle_post)
 
 
-fifo(f"petals/polymarket/wallets/{wallet}/0/trade/new", handle_pm_new)
+fifo(f"petals/polymarket/trade/{wallet}/0/new", handle_pm_new)
 
 time.sleep(float(os.environ.get("BLOOM_FAKE_STARTUP_DELAY_SECS", "0")))
 try:

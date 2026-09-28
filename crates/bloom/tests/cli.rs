@@ -2491,13 +2491,14 @@ fn petal_cli_build_install_list_and_vfs_read_happy_path() {
     bloom_cmd(home.path())
         .args(["vfs", "cat", "/petals/demo/hello.txt"])
         .assert()
-        .failure(); // Operations require an existing wallet/account selector.
+        .success()
+        .stdout(predicate::str::contains("component")); // Public routes stay unscoped.
 
     bloom_cmd(home.path())
         .args(["vfs", "ls", "/petals/demo"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("wallets"));
+        .stdout(predicate::str::contains("hello.txt"));
 
     bloom_cmd(home.path())
         .args(["vfs", "cat", "/petals/demo/README.md"])

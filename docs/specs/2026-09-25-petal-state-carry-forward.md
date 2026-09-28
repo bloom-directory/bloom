@@ -2,8 +2,8 @@
 
 Date: 2026-09-25
 
-Status: proposal
-Related: [Minimal HD-account support for Petals](2026-09-25-minimal-hd-account-petals.md) §6.1
+Status: implemented continuity contract; updated 2026-09-28
+Related: [Minimal HD-account support for Petals](2026-09-25-minimal-hd-account-petals.md)
 
 ## 1. Problem
 
@@ -15,8 +15,11 @@ Any new release has a new hash and so starts with an empty partition. The
 records: "No automatic state migration exists."
 
 Every Petal release therefore makes users re-enter settings and API keys and
-loses Petal-side records of in-flight work. The HD-account feature ships a
-release of every bundled Petal, so it would do this to every user at once.
+loses Petal-side records of in-flight work. Compatible future releases should preserve these stores. The first explicit-route
+HD release deliberately starts fresh numbered stores, including account zero;
+it does not migrate legacy wallet-wide settings or disposable sessions. Pending
+funded operations must be reconciled before that upgrade, and their recovery
+records retained, as required by the HD-account spec.
 
 ## 2. Decision
 
@@ -137,20 +140,21 @@ is outside this implementation.
 - **Skipping releases (P → J):** this works if J lists P as a predecessor. The
   release tooling decides how far back predecessor lists reach.
 
-## 5. Account-n partitions
+## 5. Uniform numbered-account partitions
 
 The HD-account spec adds per-account stores keyed by package hash, wallet and
 account number. Lay them out so that one package's accounts form one directory:
 
 ```text
-~/.bloom/petals/data/<package hash>/                            account 0 (existing)
-~/.bloom/petals/data-accounts/<package hash>/<account digest>/  account n > 0
+~/.bloom/petals/data/<package hash>/                            public package namespace / retained legacy data
+~/.bloom/petals/data-accounts/<package hash>/<account digest>/  every numbered account, including 0
 ```
 
 Carry-forward copies `data-accounts/<P>/` to `data-accounts/<H>/` in the same
 step and under the same rules. `<account digest>` (of wallet and account
 number) does not depend on the package hash, so each account finds its own
-copied store.
+copied store. Legacy package-level records are never translated into these
+numbered partitions; a copied public namespace does not become account-zero state.
 
 ## 6. Delegated-key sessions
 
@@ -165,14 +169,15 @@ keyed by wallet, lineage and slot and remain visible and stoppable through
 
 A successor must read state written by its predecessors, or tolerate and
 replace it. Bloom copies bytes; it does not interpret or migrate them. Document
-this in the Petal author docs. Bundled Petals must add a test that loads a
-fixture store from the previous release.
+this in the Petal author docs. Compatible successor releases must test predecessor store fixtures. The first
+explicit-route release instead tests empty uniform account-zero state without
+legacy fallback, and documents recovery prerequisites for outstanding funded work.
 
 ## 8. Release
 
-The copying and activation changes live in Machine. They must ship in the same Machine release as the
-HD-account change, or earlier, so that the bundled Petal releases pinned there
-are carried forward. It requires those Petal releases' catalog records to list
+The copying and activation changes live in Machine and ship with the HD-account
+change. They preserve compatible partitions during subsequent package updates;
+they do not migrate the legacy account-zero layout. It requires those Petal releases' catalog records to list
 the currently pinned hashes in `predecessor_package_hashes`. Verify that the
 existing release tooling fills this in; do not add a new provenance scheme.
 Load and verify the successor catalog records before activating the new
@@ -214,8 +219,9 @@ release assets themselves do not supply the catalog.
    resumes H's state without copying.
 7. **Account-n:** account 1 state for two wallets carries forward to the
    matching account stores.
-8. **Bundled Petals:** upgrading each bundled Petal from its currently pinned
-   release to the HD-account release keeps its settings, API keys and records
-   on accounts 0 and 1.
+8. **Bundled Petals:** the first explicit-route release uses empty uniform stores
+   when only legacy state exists, leaves old data untouched, and requires funded
+   work to be reconciled before upgrade. Compatible later successors preserve
+   uniform stores for accounts 0 and 1.
 9. **Hot path:** after first use, invocations do no extra filesystem or catalog
    work beyond today's.

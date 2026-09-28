@@ -25,13 +25,13 @@ side effects, approval steps, idempotency, and how to recognize completion.
 
 The `name` in `petal.toml` must equal the sole directory under `petal/`. It may
 contain ASCII letters, digits, `-`, and `_`; it may not contain dots or Unicode.
-Bloom exposes its operations at `/petals/example/wallets/<wallet>/<n>/`.
-The root `/petals/example/` contains wallet discovery and package documents.
-The selected wallet is supplied for each `[wallet]` capture, which is removed
-from the visible operation path. Trusted `bloom.wallet`, `bloom.account`, and
-`bloom.route_prefix` parameters identify the invocation. Set `[account] aware =
-true` to support accounts above 0, use numbered core wallet paths, and emit
-follow-up links beneath the supplied route prefix.
+Bloom exposes the package's own route tree at `/petals/example/`. Account-bound
+routes use adjacent `[wallet]/[index]` captures, for example
+`intents/[wallet]/[index]/new`. Public data and documentation stay unscoped.
+The host validates the selected account and supplies trusted `bloom.wallet` and
+`bloom.account` parameters. There is no awareness flag, root prefix rewrite, or
+implicit account-zero selection. Construct links using the explicit captures.
+All accounts, including zero, have separate wallet/index private stores.
 
 ## Manifest
 
@@ -147,10 +147,10 @@ The canonical [`route.wit`](https://github.com/bloom-directory/petal/blob/main/w
 
 The route tree is the public VFS declaration:
 
-- `status.json.wasm` creates the file `/petals/example/wallets/<wallet>/<n>/status.json`;
+- `status.json.wasm` creates the file `/petals/example/status.json`;
 - `$index.wasm` handles the containing directory;
 - `$lookup.wasm` refines lookup for dynamic entries;
-- `[wallet]/balance.json.wasm` binds a dynamic `wallet` parameter; and
+- `[wallet]/[index]/balance.json.wasm` selects a wallet and numbered account; and
 - static segments take precedence over dynamic segments.
 
 Reserved `$...` names are only valid as recognized special route leaves. A

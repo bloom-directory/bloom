@@ -8,7 +8,7 @@
 set -euo pipefail
 
 readonly MAX_USD="25"
-readonly FIXTURE_PACKAGE_HASH="2f11ee17f612fbc43f34f81771c53760f56768959624d29fd63b8e4285f5a9ac"
+readonly FIXTURE_PACKAGE_HASH="a323d0070207aa75b7d211565b6040136077c398b74ed1e97eddabf7d5e6a814"
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # Broker, Signer, and Machine developer state remain persistent so existing
@@ -485,12 +485,12 @@ printf '%s' "$fixture_result" | jq -e '
 printf 'Fixture Petal: Signer-owned sub-key derived and payload signed through mounted files\n'
 
 if [ "$live" -eq 0 ] || [ "$execute_pm" -eq 1 ]; then
-  route_contract="$(vcat "/petals/polymarket/wallets/${wallet}/0/meta/route-contract.json")"
+  route_contract="$(vcat "/petals/polymarket/meta/route-contract.json")"
   printf '%s' "$route_contract" | jq -e . >/dev/null ||
     die "Polymarket Petal route contract is unavailable"
-  vls_names "/petals/polymarket/wallets/${wallet}/0/onboard" >/dev/null
-  vls_names "/petals/polymarket/wallets/${wallet}/0/account" >/dev/null
-  vls_names "/petals/polymarket/wallets/${wallet}/0/trade" >/dev/null
+  vls_names "/petals/polymarket/onboard/${wallet}/0" >/dev/null
+  vls_names "/petals/polymarket/account/${wallet}/0" >/dev/null
+  vls_names "/petals/polymarket/trade/${wallet}/0" >/dev/null
   printf 'Polymarket Petal: mounted and route contract loaded\n'
   pm_triad_compatible="$(printf '%s' "$route_contract" | jq -r '
     [.. | strings] | any(contains("bloom:sign/signing@0.2.0"))
@@ -529,17 +529,17 @@ if [ "$execute_pm" -eq 1 ]; then
     --argjson bound "$pm_price_json" \
     '{slug:$slug,outcome:$outcome,side:$side,amount:$amount,order_type:$order_type} + $bound')"
   printf '\nCreating the unsigned Polymarket draft for review...\n'
-  drafts_before="$(vls_names "/petals/polymarket/wallets/${wallet}/0/trade/drafts" 2>/dev/null || true)"
-  if ! vwrite "/petals/polymarket/wallets/${wallet}/0/trade/new" "$pm_request"; then
+  drafts_before="$(vls_names "/petals/polymarket/trade/${wallet}/0/drafts" 2>/dev/null || true)"
+  if ! vwrite "/petals/polymarket/trade/${wallet}/0/new" "$pm_request"; then
     die "mounted Polymarket draft creation failed; verify onboarding, funding, market, and policy"
   fi
-  drafts_after="$(vls_names "/petals/polymarket/wallets/${wallet}/0/trade/drafts")"
+  drafts_after="$(vls_names "/petals/polymarket/trade/${wallet}/0/drafts")"
   draft_id="$(comm -13 \
     <(printf '%s\n' "$drafts_before" | sed '/^$/d' | sort) \
     <(printf '%s\n' "$drafts_after" | sed '/^$/d' | sort) | tail -n 1)"
   [ -n "$draft_id" ] ||
     die "mounted Polymarket draft was not created; verify onboarding, funding, market, and policy"
-  draft_path="/petals/polymarket/wallets/${wallet}/0/trade/drafts/${draft_id}"
+  draft_path="/petals/polymarket/trade/${wallet}/0/drafts/${draft_id}"
   vwrite "${draft_path}/revalidate" '{"revalidate":true}'
   printf '\nPolymarket draft plan:\n'
   vcat "${draft_path}/plan.md"
@@ -565,7 +565,7 @@ if [ "$execute_pm" -eq 1 ]; then
   vwrite_staging "${draft_path}/post" "$post_request"
   open_approval "${draft_path}/approval.json"
   vwrite "${draft_path}/post" "$post_request"
-  pm_receipt="$(vcat "/petals/polymarket/wallets/${wallet}/0/trade/receipts/${draft_id}/receipt.json")"
+  pm_receipt="$(vcat "/petals/polymarket/trade/${wallet}/0/receipts/${draft_id}/receipt.json")"
   printf '\nPolymarket receipt:\n'
   printf '%s\n' "$pm_receipt" | jq .
   printf '%s' "$pm_receipt" | jq -e '

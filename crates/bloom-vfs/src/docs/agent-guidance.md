@@ -279,12 +279,14 @@ walkthrough in `docs/examples.md`.
 
 ## Petals and paid requests
 
-Installed application documents and wallet discovery live under `petals/<name>/`.
-Operations live under `petals/<name>/wallets/<wallet>/<n>/`; select an existing
-wallet and numbered account, then follow the installed package instructions.
-Legacy unprefixed operation paths are removed. Account 0 retains existing
-settings; configure additional accounts separately. Keep every follow-up in
-the selected account, including core outbox confirmation paths.
+Installed application documents and public routes live under `petals/<name>/`.
+Account-dependent routes explicitly select a wallet and index, for example
+`petals/enso/intents/<wallet>/<index>/new`. Follow each package's route tree;
+there is no common synthetic wallet root. Every account has separate settings.
+Older wallet-only routes and packages are incompatible until updated. Complete
+pending funded work before upgrading a package whose legacy settings/sessions
+will reset. Keep every follow-up in the selected account, including core outbox
+confirmation paths. Wallet custody and core transaction history are retained.
 
 Paid HTTP operations live under `requests/`. They are actions, not ordinary
 reads: inspect the request plan, selected payment protocol, maximum amount,

@@ -194,8 +194,9 @@ cat "$BLOOM/petals/<name>/AGENTS.md"
 
 # 2. Follow that package's staging grammar. Correlate any resulting Petal
 #    action with its exact central outbox action before confirmation.
-ls "$BLOOM/petals/<name>/wallets/"
-ls "$BLOOM/petals/<name>/wallets/<wallet>/0/"
+ls "$BLOOM/petals/<name>/"
+# Example: Enso selects wallet and index under intents.
+ls "$BLOOM/petals/enso/intents/<wallet>/0/"
 ls "$BLOOM/wallets/<wallet>/0/chains/<chain>/outbox/"
 ```
 
