@@ -168,12 +168,8 @@ if [ -n "$mount_dir" ]; then
     umount_bin="$(command -v umount || true)"
     [ -n "$mount_nfs_bin" ] || die "Linux developer mounts require mount.nfs4"
     [ -n "$umount_bin" ] || die "Linux developer mounts require umount"
-    # `sudo -l` only asks whether a command is allowed, not whether it runs
-    # without a password, so it passes for anyone with ordinary sudo. Run
-    # the real unmount instead: on an unmounted path it exits 32 ("not
-    # mounted") when the rule is installed, and sudo exits 1 when it wants
-    # a password. A live mount is left alone for Machine to refuse. The mount
-    # rule cannot be checked without mounting; Machine reports it missing.
+    # `sudo -l` passes for any sudoer, so run the real unmount: sudo exits 1
+    # when it wants a password. A live mount is left for Machine to refuse.
     if ! mountpoint -q "$mount_dir"; then
       probe_status=0
       sudo -n -- "$umount_bin" -l -f "$mount_dir" >/dev/null 2>&1 || probe_status=$?
