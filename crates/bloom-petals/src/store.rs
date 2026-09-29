@@ -343,10 +343,11 @@ impl PetalStore {
         meta.source = source;
         // A reinstall of the same content hash must keep its original
         // predecessor: replacing it with itself would break first-use copy.
-        if meta.replaced.is_none() {
-            meta.replaced = self
-                .resolve_petal_owner(&package.name)?
-                .filter(|owner| owner != &hash);
+        let current_owner = self.resolve_petal_owner(&package.name)?;
+        if current_owner.as_deref() != Some(hash.as_str()) {
+            // A failed activation may have left metadata behind. On retry,
+            // record the owner actually being replaced, not that stale value.
+            meta.replaced = current_owner;
         }
         commit_guard()?;
         self.write_meta(&meta)?;
@@ -1118,6 +1119,53 @@ name = "echo"
         assert!(error.to_string().contains("cancelled before commit"));
         assert_eq!(store.resolve_petal_owner("echo").unwrap(), None);
         assert!(store.list_package_hashes().unwrap().is_empty());
+    }
+
+    #[test]
+    fn retried_activation_records_the_current_predecessor() {
+        let (d, store) = store();
+        let make_package = |name: &str| {
+            let path = d.path().join(name);
+            write_file(
+                &path,
+                "petal.toml",
+                b"schema = \"bloom.petal.package.v1\"\nname = \"echo\"\n",
+            );
+            write_file(&path, "README.md", name.as_bytes());
+            write_file(&path, "AGENTS.md", b"# echo agents");
+            write_file(&path, "petal/echo/one.txt.wasm", route_component_wasm());
+            path
+        };
+        let first = make_package("first");
+        let retry = make_package("retry");
+        let intervening = make_package("intervening");
+        let (first_install, _, _) = store.install_petal_package_dir(&first).unwrap();
+        let calls = std::cell::Cell::new(0);
+        let package = PreparedPetalPackage::from_dir(&retry).unwrap();
+        let retry_hash = package.hash.clone();
+        let result =
+            store.install_prepared_petal_package_with_source_guarded(package, None, || {
+                calls.set(calls.get() + 1);
+                if calls.get() == 3 {
+                    Err(PetalError::vm("cancel before owner commit"))
+                } else {
+                    Ok(())
+                }
+            });
+        assert!(result.is_err());
+        assert_eq!(
+            store.resolve_petal_owner("echo").unwrap(),
+            Some(first_install.hash.clone())
+        );
+        assert_eq!(
+            store.load_meta(&retry_hash).unwrap().replaced,
+            Some(first_install.hash)
+        );
+        let (current, _, _) = store.install_petal_package_dir(&intervening).unwrap();
+        let (_, meta, _) = store.install_petal_package_dir(&retry).unwrap();
+        assert_eq!(meta.replaced, Some(current.hash.clone()));
+        let (_, reinstalled, _) = store.install_petal_package_dir(&retry).unwrap();
+        assert_eq!(reinstalled.replaced, Some(current.hash));
     }
 
     #[test]
