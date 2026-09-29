@@ -8,9 +8,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bloom_broker_api::{
-    AssetId, CryptoSuite, DecimalU64, DecimalU256, DeclaredFee, Digest32, OperationId,
-    PetalUseClaim, ProtocolErrorCode, ProvenanceCatalog, ProvenanceSubject, RequestNonce, Token,
-    ValueLimit,
+    ApprovalLifecycleState, AssetId, CryptoSuite, DecimalU64, DecimalU256, DeclaredFee, Digest32,
+    OperationId, PetalUseClaim, ProtocolErrorCode, ProvenanceCatalog, ProvenanceSubject,
+    RequestNonce, Token, ValueLimit,
 };
 use bloom_machine_client::{
     ExactPayloadBatchSignRequest, ExactPayloadSignOutcome, ExactPayloadSignRequest,
@@ -689,6 +689,23 @@ impl BrokerExactPayloadSigner {
             state.approval_id = None;
         }
         write_state(state_path, &state)?;
+        // A write made while the owner's ceremony is still open cannot sign.
+        // Recording an attempt for its bytes would make the rebuild after the
+        // ceremony look like a different request and set the approval aside,
+        // so the owner would have to approve again. Report the open ceremony
+        // instead, and record nothing.
+        if let Some(approval_id) = state.approval_id.clone()
+            && let Ok(status) = self.broker.approval_status(approval_id.clone()).await
+            && status.state == ApprovalLifecycleState::AwaitingCeremony
+            && let (Some(ceremony_url), Some(expires)) =
+                (status.ceremony_url, status.ceremony_expires_at_ms)
+        {
+            return Ok(ExactPayloadBatchOutcome::ApprovalRequired {
+                approval_id,
+                ceremony_url,
+                ceremony_expires_at_ms: expires.get(),
+            });
+        }
         if state.approval_id.is_some() {
             write_state(
                 &attempt_path,
@@ -972,10 +989,10 @@ mod tests {
     };
 
     use bloom_broker_api::{
-        ApprovalPrepareState, Base64UrlBytes, KeyPublic, KeyRef, KeyRole, KeySpec,
-        MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService, NormalizedSignature,
-        OperationPublicStatus, OperationState, PROVENANCE_CATALOG_SCHEMA, ProtocolError,
-        ProtocolErrorCode, ProvenanceOperationClass, ProvenanceRecord,
+        ApprovalPrepareState, ApprovalPublicStatus, Base64UrlBytes, KeyPublic, KeyRef, KeyRole,
+        KeySpec, MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService,
+        NormalizedSignature, OperationPublicStatus, OperationState, PROVENANCE_CATALOG_SCHEMA,
+        ProtocolError, ProtocolErrorCode, ProvenanceOperationClass, ProvenanceRecord,
         SealedApprovalPrepareResponse, ServiceFuture, SigningResult, WalletPublic,
     };
 
@@ -995,6 +1012,9 @@ mod tests {
         /// Like the Broker, one approval admits one signing operation, and a
         /// signing operation id is bound to its digest.
         batch_signings: Mutex<Vec<(Digest32, OperationId, Digest32)>>,
+        /// While set, every prepared approval is still awaiting the owner's
+        /// ceremony: it reports so, and the Broker refuses to sign under it.
+        ceremony_open: AtomicBool,
     }
 
     impl MockBroker {
@@ -1176,7 +1196,27 @@ mod tests {
                             broker_receipt_digest: digest(10),
                         }))
                     }
+                    MachineBrokerRequest::SealedApprovalStatus(request) => Ok(
+                        MachineBrokerResponse::SealedApprovalStatus(ApprovalPublicStatus {
+                            approval_id: request.id,
+                            wallet_id: token("wallet"),
+                            state: if self.ceremony_open.load(Ordering::SeqCst) {
+                                ApprovalLifecycleState::AwaitingCeremony
+                            } else {
+                                ApprovalLifecycleState::Active
+                            },
+                            effective_claim_assurance: None,
+                            ceremony_url: Some("http://localhost:18734/ceremony/test".into()),
+                            ceremony_expires_at_ms: Some(DecimalU64::new(u64::MAX / 2)),
+                        }),
+                    ),
                     MachineBrokerRequest::SigningSignBatch(request) => {
+                        if self.ceremony_open.load(Ordering::SeqCst) {
+                            return Err(ProtocolError::new(
+                                ProtocolErrorCode::ClaimInvalid,
+                                "approval is not active",
+                            ));
+                        }
                         let mut signings = self.batch_signings.lock().unwrap();
                         for (approval, operation, operation_digest) in signings.iter() {
                             if *operation == request.operation_id {
@@ -1854,6 +1894,57 @@ mod tests {
                 .await
                 .unwrap(),
             ExactPayloadBatchOutcome::Signed(vec![vec![7_u8; 65]])
+        );
+    }
+
+    /// A Petal that writes again while the owner's ceremony is still open,
+    /// each time with rebuilt bytes, is told the approval is pending and
+    /// nothing is recorded; the rebuild after the ceremony signs under the
+    /// approval the owner completed instead of asking for another.
+    #[tokio::test]
+    async fn writes_during_an_open_ceremony_keep_the_approval_for_the_rebuild() {
+        let broker = Arc::new(MockBroker {
+            ceremony_open: AtomicBool::new(true),
+            ..MockBroker::default()
+        });
+        let (signer, home, claim, _) = debiting_claim_fixture(&broker, None);
+
+        let approval = approval_of(
+            &reusable_once(&signer, &home, &claim, b"build-1")
+                .await
+                .unwrap(),
+        );
+        for rebuild in [&b"build-2"[..], b"build-3"] {
+            assert_eq!(
+                approval_of(
+                    &reusable_once(&signer, &home, &claim, rebuild)
+                        .await
+                        .unwrap()
+                ),
+                approval,
+                "a write during the ceremony reports the same pending approval"
+            );
+        }
+        broker.ceremony_open.store(false, Ordering::SeqCst);
+        assert_eq!(
+            reusable_once(&signer, &home, &claim, b"build-4")
+                .await
+                .unwrap(),
+            ExactPayloadBatchOutcome::Signed(vec![vec![7_u8; 65]])
+        );
+        let requests = broker.requests.lock().unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| matches!(r, MachineBrokerRequest::SealedApprovalPrepare(_)))
+                .count(),
+            1,
+            "the owner approves once"
+        );
+        assert!(
+            !requests
+                .iter()
+                .any(|r| matches!(r, MachineBrokerRequest::SigningSignBatch(req) if req.approval_id != approval)),
         );
     }
 
