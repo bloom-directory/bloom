@@ -295,6 +295,24 @@ impl PetalRouter {
                 self.dispatch_for_account(mount, op, path, body, &account, &execution)
                     .await
             }
+            (Some(_), None) if matches!(op, DispatchOp::Lookup | DispatchOp::List) => {
+                // Generated wallet directories precede the account capture.
+                // Let host-owned discovery handle them without running a guest.
+                let prefix = format!("{}/[index]", matched.route.pattern);
+                let index = self
+                    .runner
+                    .load_petal_route_index(mount)
+                    .map_err(map_petal_err)?;
+                if matched.route.pattern.split('/').next_back() == Some("[wallet]")
+                    && index.routes.iter().any(|route| {
+                        route.pattern == prefix || route.pattern.starts_with(&format!("{prefix}/"))
+                    })
+                {
+                    Err(HandlerError::not_found(path))
+                } else {
+                    Err(HandlerError::PermissionDenied)
+                }
+            }
             (None, None) => {
                 self.dispatch_with_params(mount, op, path, body, &[], None, None, &execution)
                     .await
@@ -1104,8 +1122,35 @@ name = "example"
                 include_bytes!("../tests/fixtures/route_component_no_imports.wasm"),
             );
         }
+        for route in [
+            "accounts/[wallet]/$index",
+            "accounts/[wallet]/[index]/hello.txt",
+        ] {
+            write_package_file(
+                &package,
+                &format!("petal/demo/{route}.wasm"),
+                include_bytes!("../tests/fixtures/route_component_no_imports.wasm"),
+            );
+        }
         runner.store().install_petal_package_dir(&package).unwrap();
         let router = PetalRouter::new(runner, Arc::new(AccountHost));
+        let directory = VfsPath::parse("/demo/accounts/alice").unwrap();
+        assert_eq!(
+            router.lookup(&directory).await.unwrap().kind,
+            bloom_vfs::EntryKind::Dir
+        );
+        let names: Vec<_> = router
+            .list(&directory)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        assert_eq!(names, ["0", "1"]);
+        assert!(matches!(
+            router.read(&directory).await,
+            Err(HandlerError::PermissionDenied)
+        ));
         for path in ["/demo/wallet/alice/hello.txt", "/demo/index/0/hello.txt"] {
             assert!(matches!(
                 router.read(&VfsPath::parse(path).unwrap()).await,

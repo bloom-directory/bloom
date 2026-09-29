@@ -250,12 +250,7 @@ async fn installed_packages_keep_explicit_account_routes_and_private_state() {
         })
         .collect();
     assert!(!packages.is_empty(), "no known packages selected");
-    let scratch = root.join(".hd-work/explicit-account-package-tests");
-    std::fs::create_dir_all(&scratch).unwrap();
-    let temporary = tempfile::Builder::new()
-        .prefix("vm-")
-        .tempdir_in(&scratch)
-        .unwrap();
+    let temporary = tempfile::Builder::new().prefix("vm-").tempdir().unwrap();
     let home = temporary.path();
     let store = PetalStore::open(home.join("petals/store")).unwrap();
     let mut hashes = BTreeMap::new();
