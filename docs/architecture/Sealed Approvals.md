@@ -101,9 +101,12 @@ covers reusable Petal signing too, since it funnels through the same batch
 request. Broker independently rebuilds the Safe transaction hash from the
 envelope and rejects a malformed envelope or one whose reconstruction does not
 equal the exact selector. It fixes all refund fields to zero, constrains a
-delegatecall to an official Safe library address, rejects Safe
-self-administration both at the top level and inside a call-only batch, and
-decodes the supported call before constructing approval text.
+delegatecall to an official Safe library address on a chain whose deployments of
+those libraries were verified, and decodes the supported call before
+constructing approval text. Of the Safe's calls to itself it accepts a rejection
+and the four owner and threshold changes, which it shows decoded; every other
+one, such as enabling a module or setting a guard, is rejected, as is any
+self-call inside a call-only batch.
 
 Only the EIP-712 members are bound that way, and Broker checks nothing else.
 The envelope's account of the Safe's own configuration — owner set, threshold,
