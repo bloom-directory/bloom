@@ -655,9 +655,11 @@ fn triad_developer_launcher_supports_linux_without_weakening_root_boundary() {
     assert!(launcher.contains("developer harness refuses root"));
     assert!(launcher.contains("Darwin|Linux)"));
     assert!(launcher.contains("Linux developer mounts require mount.nfs4"));
-    assert!(launcher.contains("sudo -n -l -- \"$mount_nfs_bin\""));
-    assert!(launcher.contains("sudo -n -l -- \"$umount_bin\" -l -f \"$mount_dir\""));
-    assert!(launcher.contains("Linux developer mount privilege is not installed"));
+    // `sudo -l` passes for any sudoer; only a real noninteractive run proves
+    // the passwordless rule.
+    assert!(!launcher.contains("sudo -n -l"));
+    assert!(launcher.contains("sudo -n -- \"$umount_bin\" -l -f \"$mount_dir\""));
+    assert!(launcher.contains("Linux developer unmount needs a passwordless sudo rule"));
     assert!(launcher.contains("packaging/triad/linux/config/${name}"));
     assert!(launcher.contains("systemctl --user"));
     assert!(launcher.contains("export LC_ALL=C"));

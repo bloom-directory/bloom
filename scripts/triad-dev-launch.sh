@@ -168,12 +168,18 @@ if [ -n "$mount_dir" ]; then
     umount_bin="$(command -v umount || true)"
     [ -n "$mount_nfs_bin" ] || die "Linux developer mounts require mount.nfs4"
     [ -n "$umount_bin" ] || die "Linux developer mounts require umount"
-    mount_probe_opts="actimeo=0,vers=4.1,proto=tcp,port=1,rsize=65536,wsize=65536,timeo=10"
-    sudo -n -l -- "$mount_nfs_bin" -o "$mount_probe_opts" \
-      "127.0.0.1:/" "$mount_dir" >/dev/null 2>&1 ||
-      die "Linux developer mount privilege is not installed for $mount_dir"
-    sudo -n -l -- "$umount_bin" -l -f "$mount_dir" >/dev/null 2>&1 ||
-      die "Linux developer unmount privilege is not installed for $mount_dir"
+    # `sudo -l` only asks whether a command is allowed, not whether it runs
+    # without a password, so it passes for anyone with ordinary sudo. Run
+    # the real unmount instead: on an unmounted path it exits 32 ("not
+    # mounted") when the rule is installed, and sudo exits 1 when it wants
+    # a password. A live mount is left alone for Machine to refuse. The mount
+    # rule cannot be checked without mounting; Machine reports it missing.
+    if ! mountpoint -q "$mount_dir"; then
+      probe_status=0
+      sudo -n -- "$umount_bin" -l -f "$mount_dir" >/dev/null 2>&1 || probe_status=$?
+      [ "$probe_status" -ne 1 ] ||
+        die "Linux developer unmount needs a passwordless sudo rule for $mount_dir"
+    fi
   fi
 fi
 log_dir="$(cd "$log_dir" && pwd -P)"
