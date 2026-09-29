@@ -459,32 +459,48 @@ fn developer_route_operation_classes(
         .into_iter()
         .map(|operation_class| {
             Ok(ProvenanceOperationClass {
+                fee_asset: catalogued_fee_asset(&operation_class)?,
                 operation_class: Token::new(operation_class)?,
-                fee_asset: NO_FEE_ASSET,
             })
         })
         .collect()
 }
 
-/// Every catalogued operation class is enrolled without a fee asset.
+/// The one Hyperliquid operation class whose every claim declares a fee:
+/// builder-bearing orders, owner- or session-signed, sign under it and
+/// nothing else does (bloom-petal-hyperliquid's `BUILDER_ORDER_INTENT`).
+const HYPERLIQUID_BUILDER_ORDER_CLASS: &str = "hyperliquid.builder_order";
+
+/// The fee asset a catalogued operation class is enrolled with, on both the
+/// developer-harness and the release-pins path.
 ///
 /// Broker treats `fee_asset: Some(_)` as "every claim in this class MUST
 /// declare `DeclaredFee::Fee`" and denies `DeclaredFee::None` with
-/// `FEE_REQUIRED` (see `account_claim_values` in bloom-broker's
-/// `authority.rs`). Today's classes are too coarse for that: Hyperliquid
-/// signs cancels, leverage updates, and plain orders under the same
-/// `hyperliquid.agent_action` class as builder-fee orders, and emits
-/// `{"kind":"none"}` for all but the last (see `order_claim_effects` in
-/// bloom-petal-hyperliquid's `workflow.rs`). Marking that shared class
-/// fee-bearing would therefore reject the majority of existing session
-/// actions rather than only pricing the fee-bearing ones.
+/// `FEE_REQUIRED`; a class without one denies any fee-declaring claim with
+/// `FEE_NOT_ALLOWED` (see `account_declared_values` in bloom-broker's
+/// `authority.rs`). A class therefore has to be uniformly fee-bearing or
+/// uniformly fee-free, and a fee asset is only correct on a class whose
+/// every claim carries an exact declared fee.
 ///
-/// A fee asset belongs here only once a Petal emits a *distinct* operation
-/// class whose every claim carries an exact declared fee. Until then this
+/// Hyperliquid's shared classes are not that: cancels, leverage updates, and
+/// plain orders sign under `hyperliquid.agent_action` (sessions) and
+/// `hyperliquid.order` (owner) with `{"kind":"none"}`, so those stay
+/// fee-free. Builder-bearing orders, the only Hyperliquid claims that declare
+/// a fee, sign under their own `hyperliquid.builder_order` class, which is
+/// enrolled with the usdc fee the Petal declares so Broker counts it against
+/// the approval's value limits instead of refusing it. Every other class
 /// stays `None` so enrollment cannot outrun what the Petals actually
 /// declare. See "Operation-class granularity and `fee_asset`" in
 /// `docs/architecture/Sealed Approvals.md`.
-const NO_FEE_ASSET: Option<ProvenanceFeeAsset> = None;
+fn catalogued_fee_asset(operation_class: &str) -> Result<Option<ProvenanceFeeAsset>> {
+    if operation_class == HYPERLIQUID_BUILDER_ORDER_CLASS {
+        return Ok(Some(ProvenanceFeeAsset {
+            chain: Token::new("hyperliquid")?,
+            asset: "usdc".to_owned(),
+        }));
+    }
+    Ok(None)
+}
 
 #[cfg(feature = "triad-dev-harness")]
 fn require_private_developer_file(path: &Path, expected_owner: u32, label: &str) -> Result<()> {
@@ -971,7 +987,12 @@ fn sign_provenance_catalog(
     source_bytes.zeroize();
     catalog.validate_shape()?;
     let installer_key_id = Token::new(installer_key_id)?;
-    append_release_petal_provenance(&mut catalog, &installer_key_id, &installer.signing_key())?;
+    append_release_petal_provenance(
+        &mut catalog,
+        crate::github_source::release_authority_petals(),
+        &installer_key_id,
+        &installer.signing_key(),
+    )?;
     for record in &mut catalog.records {
         record.installer_key_id = installer_key_id.clone();
         record.installer_signature = Base64UrlBytes::from_bytes(&[]);
@@ -988,8 +1009,12 @@ fn sign_provenance_catalog(
     result
 }
 
-fn append_release_petal_provenance(
+/// Appends one provenance record per authority route of every pinned
+/// release Petal in `entries`, cataloguing each route's operation classes
+/// with the fee asset `catalogued_fee_asset` assigns them.
+fn append_release_petal_provenance<'a>(
     catalog: &mut ProvenanceCatalog,
+    entries: impl IntoIterator<Item = &'a crate::github_source::PreinstalledPetal>,
     installer_key_id: &Token,
     signing_key: &SigningKey,
 ) -> Result<()> {
@@ -1008,7 +1033,7 @@ fn append_release_petal_provenance(
     let publisher = Token::new("bloom-release-pins")?;
     let mut package_hashes = std::collections::BTreeSet::new();
     let mut lineage_ids = std::collections::BTreeSet::new();
-    for entry in crate::github_source::release_authority_petals() {
+    for entry in entries {
         let package_hash = Digest32::new(
             entry
                 .expected_hash
@@ -1058,7 +1083,7 @@ fn append_release_petal_provenance(
                 .map(|class| {
                     Ok(ProvenanceOperationClass {
                         operation_class: Token::new(*class)?,
-                        fee_asset: NO_FEE_ASSET,
+                        fee_asset: catalogued_fee_asset(class)?,
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -1270,20 +1295,147 @@ mod tests {
         assert!(records.iter().all(|class| class.fee_asset.is_none()));
     }
 
-    /// Broker denies a `DeclaredFee::None` claim with `FEE_REQUIRED` whenever
-    /// its class is catalogued with a fee asset. Hyperliquid signs cancels,
-    /// leverage updates, and plain orders under `hyperliquid.agent_action`
-    /// with `{"kind":"none"}`, so enrolling that shared class as fee-bearing
-    /// would deny all of them. Pin it to `None` here so the coarse class can
-    /// never be marked fee-bearing again without this failing first.
-    #[cfg(feature = "triad-dev-harness")]
     #[test]
-    fn developer_route_provenance_leaves_the_shared_agent_action_class_fee_free() {
-        let route = bloom_petals::package::RouteIndexRecord {
-            route_id: "r000025".into(),
+    fn only_the_builder_order_class_is_catalogued_with_a_fee_asset() {
+        for class in [
+            "hyperliquid.agent_action",
+            "hyperliquid.order",
+            "hyperliquid.approve_builder_fee",
+            "polymarket.relayer_batch",
+        ] {
+            assert!(
+                catalogued_fee_asset(class).unwrap().is_none(),
+                "{class} must stay fee-free"
+            );
+        }
+        let fee = catalogued_fee_asset("hyperliquid.builder_order")
+            .unwrap()
+            .expect("builder orders declare a fee on every claim");
+        assert_eq!(fee.chain.as_str(), "hyperliquid");
+        assert_eq!(fee.asset, "usdc");
+    }
+
+    fn release_catalog_for(
+        entries: &'static [crate::github_source::PreinstalledPetal],
+    ) -> ProvenanceCatalog {
+        let mut catalog = ProvenanceCatalog {
+            schema: bloom_broker_api::PROVENANCE_CATALOG_SCHEMA.to_owned(),
+            records: Vec::new(),
+        };
+        append_release_petal_provenance(
+            &mut catalog,
+            entries.iter(),
+            &Token::new("installer").unwrap(),
+            &SigningKey::from_bytes(&[7; 32]),
+        )
+        .unwrap();
+        catalog
+    }
+
+    /// The release path catalogues a pinned builder-order route fee-bearing.
+    ///
+    /// The real Hyperliquid pin cannot carry `hyperliquid.builder_order`
+    /// until bloom-petal-hyperliquid#19 is released, so this proves the code
+    /// path with a synthetic pin: the moment the pin lists the route, its
+    /// class is enrolled with the usdc fee asset, and the shared class it is
+    /// pinned alongside stays fee-free.
+    #[test]
+    fn release_enrollment_catalogues_a_pinned_builder_order_route_fee_bearing() {
+        use crate::github_source::{PetalAuthorityRoute, PreinstalledPetal};
+        static ROUTES: &[PetalAuthorityRoute] = &[
+            PetalAuthorityRoute {
+                route_id: "r000008",
+                operation_classes: &["hyperliquid.builder_order"],
+            },
+            PetalAuthorityRoute {
+                route_id: "r000014",
+                operation_classes: &["hyperliquid.agent_action"],
+            },
+        ];
+        static PINS: &[PreinstalledPetal] = &[PreinstalledPetal {
+            name: "hyperliquid",
+            repository: "https://github.com/bloom-directory/bloom-petal-hyperliquid",
+            commit: "0000000000000000000000000000000000000000",
+            release_tag: "v0.0.0-test",
+            archive: "hyperliquid-v0.0.0-test.petal.tar.gz",
+            expected_hash: Some("abababababababababababababababababababababababababababababababab"),
+            archive_sha256: "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+            tooling_commit: "0000000000000000000000000000000000000000",
+            petal_abi: "bloom.petal-host/payload-signing-v1",
+            default_eligible: false,
+            lineage_id: Some("pln1_gyksmg4h5sqeu4pic5cg5xuwhhh3pokli3vc62btxjvi3lkwaykq"),
+            release_sequence: 1,
+            predecessor_package_hashes: &[],
+            authority_routes: ROUTES,
+        }];
+
+        let catalog = release_catalog_for(PINS);
+        let by_route = catalog
+            .records
+            .iter()
+            .map(|record| {
+                let ProvenanceSubject::Petal { route, .. } = &record.subject else {
+                    panic!("release pins only enroll Petal subjects");
+                };
+                (route.as_str(), &record.operation_classes)
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(by_route.len(), 2);
+
+        let builder = &by_route["r000008"];
+        assert_eq!(builder.len(), 1);
+        assert_eq!(
+            builder[0].operation_class.as_str(),
+            "hyperliquid.builder_order"
+        );
+        let fee = builder[0]
+            .fee_asset
+            .as_ref()
+            .expect("builder orders are catalogued fee-bearing on the release path");
+        assert_eq!(fee.chain.as_str(), "hyperliquid");
+        assert_eq!(fee.asset, "usdc");
+
+        let shared = &by_route["r000014"];
+        assert_eq!(
+            shared[0].operation_class.as_str(),
+            "hyperliquid.agent_action"
+        );
+        assert!(shared[0].fee_asset.is_none());
+    }
+
+    /// The real pins do not carry the builder-order class yet, so no release
+    /// record is fee-bearing today. This fails the moment the Hyperliquid pin
+    /// is updated for bloom-petal-hyperliquid#19, which is the reminder to
+    /// flip it to asserting the class is present with the usdc fee asset.
+    #[test]
+    fn current_release_pins_carry_no_fee_bearing_class_yet() {
+        let pins = crate::github_source::release_authority_petals()
+            .copied()
+            .collect::<Vec<_>>()
+            .leak();
+        let catalog = release_catalog_for(pins);
+        let classes = catalog
+            .records
+            .iter()
+            .flat_map(|record| record.operation_classes.iter())
+            .collect::<Vec<_>>();
+        assert!(!classes.is_empty());
+        assert!(classes.iter().all(|class| class.fee_asset.is_none()));
+        assert!(
+            classes
+                .iter()
+                .all(|class| class.operation_class.as_str() != HYPERLIQUID_BUILDER_ORDER_CLASS),
+            "the Hyperliquid pin now lists hyperliquid.builder_order: assert it fee-bearing here"
+        );
+    }
+
+    #[cfg(feature = "triad-dev-harness")]
+    fn hyperliquid_derivation_route(classes: &[&str]) -> bloom_petals::package::RouteIndexRecord {
+        bloom_petals::package::RouteIndexRecord {
+            route_id: "r000026".into(),
             pattern: "agent_sessions/[wallet]/new.json".into(),
             source_path: "petal/fixture/new.json.wasm".into(),
-            artifact_path: "artifacts/routes/r000025.wasm".into(),
+            artifact_path: "artifacts/routes/r000026.wasm".into(),
             artifact_hash: "00".repeat(32),
             abi: bloom_petals::package::RouteAbi::ComponentBloomRoute010,
             kind: bloom_petals::package::RouteEntryKind::File,
@@ -1299,13 +1451,24 @@ mod tests {
                 required_caps: vec!["bloom:key.derive".into()],
                 sign_intent: None,
             },
-            key_derive_operation_classes: vec!["hyperliquid.agent_action".into()],
-            key_derive_allowed_routes: vec!["r000025".into()],
+            key_derive_operation_classes: classes.iter().map(|c| (*c).to_owned()).collect(),
+            key_derive_allowed_routes: vec!["r000026".into()],
             key_derive_scope_declared: true,
             key_derive_allowed_crypto_suites: vec!["secp256k1-keccak256-recoverable".into()],
             key_derive_maximum_lifetime_ms: Some(1_800_000),
-        };
+        }
+    }
 
+    /// Broker denies a `DeclaredFee::None` claim with `FEE_REQUIRED` whenever
+    /// its class is catalogued with a fee asset. Hyperliquid signs cancels,
+    /// leverage updates, and plain orders under `hyperliquid.agent_action`
+    /// with `{"kind":"none"}`, so enrolling that shared class as fee-bearing
+    /// would deny all of them. Pin it to `None` here so the coarse class can
+    /// never be marked fee-bearing again without this failing first.
+    #[cfg(feature = "triad-dev-harness")]
+    #[test]
+    fn developer_route_provenance_leaves_the_shared_agent_action_class_fee_free() {
+        let route = hyperliquid_derivation_route(&["hyperliquid.agent_action"]);
         let records = developer_route_operation_classes(&route).unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(
@@ -1313,6 +1476,30 @@ mod tests {
             "hyperliquid.agent_action"
         );
         assert!(records[0].fee_asset.is_none());
+    }
+
+    /// Builder-bearing orders are the one Hyperliquid claim that declares a
+    /// fee, and they sign under their own class. Broker refuses a
+    /// fee-declaring claim in a fee-free class with `FEE_NOT_ALLOWED`, so
+    /// that class must be enrolled with the usdc fee asset the Petal
+    /// declares, while the shared class it is derived alongside stays free.
+    #[cfg(feature = "triad-dev-harness")]
+    #[test]
+    fn developer_route_provenance_marks_only_the_builder_order_class_fee_bearing() {
+        let route = hyperliquid_derivation_route(&[
+            "hyperliquid.agent_action",
+            "hyperliquid.builder_order",
+        ]);
+        let records = developer_route_operation_classes(&route).unwrap();
+        let by_class = records
+            .iter()
+            .map(|class| (class.operation_class.as_str(), class.fee_asset.as_ref()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(by_class.len(), 2);
+        assert!(by_class["hyperliquid.agent_action"].is_none());
+        let fee = by_class["hyperliquid.builder_order"].expect("builder orders are fee-bearing");
+        assert_eq!(fee.chain.as_str(), "hyperliquid");
+        assert_eq!(fee.asset, "usdc");
     }
 
     #[cfg(feature = "triad-dev-harness")]
@@ -1528,12 +1715,15 @@ mod tests {
             );
         }
         // The release-pins path must agree with the developer-harness path:
-        // no enrolled Petal class is fee-bearing, because Broker would then
-        // deny every `DeclaredFee::None` claim in it with `FEE_REQUIRED`.
-        // Assert it over the shared Hyperliquid class and Polymarket's
-        // relayer class explicitly, then over every Petal record. System
-        // records are out of scope: a native Solana transfer always pays a
-        // network fee, so its template class names one.
+        // the shared classes stay fee-free, because Broker denies every
+        // `DeclaredFee::None` claim in a fee-bearing class with
+        // `FEE_REQUIRED`. Assert it over the shared Hyperliquid class and
+        // Polymarket's relayer class explicitly. The fee-bearing
+        // `hyperliquid.builder_order` class is asserted here only once the
+        // Hyperliquid release pin carries its routes; until then the catalog
+        // cannot contain it and an assertion would be vacuous. System records
+        // are out of scope: a native Solana transfer always pays a network
+        // fee, so its template class names one.
         let all_classes = catalog
             .records
             .iter()
@@ -1547,14 +1737,6 @@ mod tests {
             assert!(!matching.is_empty(), "{class} is absent from the catalog");
             assert!(matching.iter().all(|entry| entry.fee_asset.is_none()));
         }
-        assert!(
-            catalog
-                .records
-                .iter()
-                .filter(|record| matches!(record.subject, ProvenanceSubject::Petal { .. }))
-                .flat_map(|record| record.operation_classes.iter())
-                .all(|class| class.fee_asset.is_none())
-        );
         for record in catalog.records {
             let mut unsigned = record.clone();
             let signature: [u8; 64] = unsigned.installer_signature.decode().try_into().unwrap();

@@ -139,6 +139,9 @@ class HyperliquidApproveBuilderFeeEval(EvalDefinition):
         # The staged grant's request id, so cleanup can tell "the agent
         # consumed it" from "it is still an executable approval".
         self.staged_request_id: str | None = None
+        # Every approved request this run's staging write created, so cleanup
+        # can retire all of them even if more than one appeared.
+        self.staged_request_ids: list[str] = []
         self.counter_committed = counter_committed
         self.phase_timings: dict[str, float] = {}
 
@@ -330,20 +333,21 @@ class HyperliquidApproveBuilderFeeEval(EvalDefinition):
                 return status if isinstance(status, str) else None
         return None
 
-    def _newly_staged_request_id(self) -> str | None:
-        """The id of the one request now approved and awaiting its write."""
-        staged = [
-            record.get("request_id")
+    def _approved_request_ids(self) -> frozenset[str]:
+        """Ids of every request approved by the owner but not yet submitted.
+
+        Each one is a durable, exact-payload grant that a matching write would
+        execute. Staging identifies this run's own grant as the difference
+        between this set before and after its write, so a grant left behind by
+        an earlier run can neither be mistaken for ours nor make ours
+        unidentifiable to cleanup.
+        """
+        return frozenset(
+            record["request_id"]
             for record in self._builder_fee_requests()
             if record.get("status") == "approved_retry_required"
             and isinstance(record.get("request_id"), str)
-        ]
-        if len(staged) > 1:
-            raise EvalError(
-                "multiple approve_builder_fee approvals are staged for this wallet; "
-                "resolve them before running an eval"
-            )
-        return staged[0] if staged else None
+        )
 
     def _require_local_json(self, path: Path, label: str) -> Any:
         try:
@@ -596,6 +600,17 @@ class HyperliquidApproveBuilderFeeEval(EvalDefinition):
             raise EvalError(
                 "a prior approve_builder_fee ceremony is still awaiting owner action"
             )
+        # Likewise refuse an approval an earlier run staged and never
+        # submitted: it is an executable grant this run did not create and
+        # must not consume, and it belongs to whoever left it, so it has to
+        # be resolved by hand rather than silently spent here.
+        stale = self._approved_request_ids()
+        if stale:
+            raise EvalError(
+                f"{len(stale)} prior approve_builder_fee approval(s) are still "
+                "staged and unsubmitted for this wallet; resolve them before "
+                "running an eval"
+            )
         # Last, immediately before provision() can create authority: claim
         # both counters this run may spend -- the grant and its mandatory
         # revoke -- atomically, so a concurrent eval on the same passkey
@@ -741,12 +756,23 @@ class HyperliquidApproveBuilderFeeEval(EvalDefinition):
         # may already be usable by the time any later step fails.
         self.cleanup_needed = True
         counter = self.sign_count or self._require_sign_count()
+        # Identify this run's grant by difference, and record it before
+        # anything else can fail: once the ceremony completes the grant is
+        # live, and cleanup must be able to retire it whatever happens next.
+        approved_before = self._approved_request_ids()
         counter, output = self._drive_action(route, body, counter, submit=False)
-        self.staged_request_id = self._newly_staged_request_id()
-        if self.staged_request_id is None:
+        staged = sorted(self._approved_request_ids() - approved_before)
+        self.staged_request_ids = staged
+        self.staged_request_id = staged[0] if staged else None
+        if not staged:
             raise EvalError(
                 "approve_builder_fee approval was not staged for the agent to "
                 "consume: " + self._redact_ceremony_urls(output)
+            )
+        if len(staged) > 1:
+            raise EvalError(
+                "one staging write produced several approve_builder_fee approvals; "
+                "cleanup will retire all of them, but this run cannot continue"
             )
 
     def _grant_or_revoke(self, max_fee_tenths_bps: int, nonce: int) -> dict[str, Any]:
@@ -873,23 +899,28 @@ class HyperliquidApproveBuilderFeeEval(EvalDefinition):
         so submitting it once spends it for good. The revoke that follows
         returns the venue to zero.
         """
-        if self.staged_request_id is None:
-            return
-        if self._request_status(self.staged_request_id) != "approved_retry_required":
-            return
-        route = self.exchange_root / "approve_builder_fee.json"
-        body = self._request_body(int(self.max_fee_tenths_bps_value), self.nonce)
-        self._write_route(route, body, WRITE_TIMEOUT_SECONDS)
-        for attempt in range(VENUE_SETTLE_ATTEMPTS):
-            if self._request_status(self.staged_request_id) != "approved_retry_required":
-                return
-            if attempt + 1 < VENUE_SETTLE_ATTEMPTS:
-                time.sleep(VENUE_SETTLE_DELAY_SECONDS)
-        raise EvalError(
-            "staged approve_builder_fee approval is still unconsumed after "
-            "cleanup tried to spend it; it remains an executable grant for "
-            f"builder {self.builder} and must be resolved before another run"
-        )
+        grants = list(dict.fromkeys(
+            [self.staged_request_id, *self.staged_request_ids]
+        ))
+        for request_id in grants:
+            if request_id is None:
+                continue
+            if self._request_status(request_id) != "approved_retry_required":
+                continue
+            route = self.exchange_root / "approve_builder_fee.json"
+            body = self._request_body(int(self.max_fee_tenths_bps_value), self.nonce)
+            self._write_route(route, body, WRITE_TIMEOUT_SECONDS)
+            for attempt in range(VENUE_SETTLE_ATTEMPTS):
+                if self._request_status(request_id) != "approved_retry_required":
+                    break
+                if attempt + 1 < VENUE_SETTLE_ATTEMPTS:
+                    time.sleep(VENUE_SETTLE_DELAY_SECONDS)
+            else:
+                raise EvalError(
+                    "staged approve_builder_fee approval is still unconsumed after "
+                    "cleanup tried to spend it; it remains an executable grant for "
+                    f"builder {self.builder} and must be resolved before another run"
+                )
 
     def cleanup(self) -> None:
         if not self.cleanup_needed or self.nonce is None:

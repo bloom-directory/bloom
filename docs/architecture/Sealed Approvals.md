@@ -108,17 +108,20 @@ without one denies a claim declaring a fee (`FEE_NOT_ALLOWED`), and a
 declared asset other than the named one is `FEE_ASSET_MISMATCH`.
 
 So a `fee_asset` is only correct on a class whose every operation is
-fee-bearing. Classes today are deliberately coarse — Hyperliquid signs
-cancels, leverage updates, and plain orders under the same
-`hyperliquid.agent_action` class as builder-fee orders, and the Petal emits
-a fee declaration only for the last of those — so naming a `fee_asset` on
-such a class denies most of its legitimate traffic. Enrollment therefore
-leaves shared classes fee-free, and the fee a builder order does declare is
-bound as a declared-value limit rather than through the class.
+fee-bearing, and a class has to be uniformly one or the other. Hyperliquid's
+shared classes are fee-free: cancels, leverage updates, and plain orders sign
+under `hyperliquid.agent_action` (sessions) and `hyperliquid.order` (owner)
+with no fee declared, so naming a `fee_asset` on either would deny most of
+its legitimate traffic. A builder-bearing order is the one Hyperliquid claim
+that declares a fee, and it signs under its own `hyperliquid.builder_order`
+class through a dedicated route. Enrollment catalogues that class, and only
+that class, with the usdc fee asset the Petal declares; Broker then counts
+the declared fee against the approval's value limits instead of refusing it.
 
 Splitting a fee-bearing operation into its own operation class is what makes
 a `fee_asset` safe to assert. Adding one to a shared class is a breaking
-change to every non-fee route that signs under it.
+change to every non-fee route that signs under it, and leaving it off a class
+whose claims declare a fee refuses every one of them.
 
 ## Ceremony and public projection
 

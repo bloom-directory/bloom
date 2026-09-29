@@ -519,6 +519,31 @@ class CounterBlockReservationTests(BuilderFeeFixture, unittest.TestCase):
         self.assertEqual(cancel.sign_count, 4)
         self.assertEqual(self.sidecar().read(), 4 + MAX_SESSION_CEREMONIES)
 
+    def test_builder_fee_preflight_refuses_a_stale_staged_approval(self) -> None:
+        # An approval an earlier run staged and never submitted is a live
+        # grant this run did not create; it must be resolved by hand, not
+        # spent or shadowed by a new one.
+        (self.mount / "petals/hyperliquid/testnet").mkdir(parents=True)
+        (self.mount / "petals/hyperliquid/README.md").write_text("installed")
+        self.driver.write_text("#!/bin/sh\n")
+        self.driver.chmod(0o755)
+        fee = self.fee()
+        fee.preauthorization_preflight = mock.Mock()
+        fee._require_exact_wallet_policy = mock.Mock()
+        fee._pull_eval_image = mock.Mock()
+        fee._pending_builder_fee_ceremony = mock.Mock(return_value=None)
+        fee._approved_request_ids = mock.Mock(return_value=frozenset({"a" * 64}))
+        fee.reserve_run_counters = mock.Mock(
+            side_effect=AssertionError("must refuse before reserving counters")
+        )
+        with (
+            mock.patch.object(
+                subprocess, "run", return_value=subprocess.CompletedProcess([], 0, b"", b"")
+            ),
+            self.assertRaisesRegex(EvalError, "still staged and unsubmitted"),
+        ):
+            fee.preflight()
+
     def test_builder_fee_preflight_claims_the_budget_as_its_last_step(self) -> None:
         # Wiring: preflight() itself must reserve, after every other check
         # and immediately before provision() can create authority.
@@ -880,15 +905,20 @@ class BuilderFeeCeremonyLifecycleTests(BuilderFeeFixture, unittest.TestCase):
             return_value=subprocess.CompletedProcess([], 0, b"", b"")
         )
         definition._pending_builder_fee_ceremony = mock.Mock(return_value=ceremony)
-        # The pre-write snapshot must not consume a scripted status below.
+        # The pre-write ceremony snapshot must not consume a scripted status
+        # below: nothing is pending before the staging write.
         definition._pending_request_ids = mock.Mock(return_value=frozenset())
-        pending = list(statuses or ["approved_retry_required"])
-        # One staged request, whose status walks `statuses` and then settles
-        # on "signed" -- the state a grant the agent consumed ends in.
+        # The listing is empty before the staging write (the pre-write
+        # approved-grant snapshot sees no request), then holds one request
+        # whose status walks `statuses` and settles on "signed" -- the state
+        # a grant the agent consumed ends in.
+        pending: list[str | None] = [None, *(statuses or ["approved_retry_required"])]
         request_id = "b" * 64
 
         def requests() -> list[dict[str, object]]:
             status = pending.pop(0) if pending else "signed"
+            if status is None:
+                return []
             return [{"request_id": request_id, "status": status}]
 
         definition._builder_fee_requests = mock.Mock(side_effect=requests)
@@ -1020,6 +1050,53 @@ class BuilderFeeCeremonyLifecycleTests(BuilderFeeFixture, unittest.TestCase):
             0,
             "a consumed single-use approval cannot be replayed to re-grant",
         )
+
+    def test_a_grant_staged_before_a_failed_provision_is_still_retired(self) -> None:
+        """Cleanup must retire this run's grant even when provisioning fails.
+
+        A grant an earlier run left approved but unsubmitted must neither be
+        mistaken for ours nor make ours unidentifiable: the staged id is
+        recorded by difference the moment the ceremony completes, so the
+        retire step consumes it however provisioning fails afterwards, and
+        the stale grant is left for its owner to resolve.
+        """
+        definition = self.definition
+        venue = self.venue()
+        venue.install(self)
+        definition._observed_max_builder_fee = mock.Mock(
+            side_effect=lambda: venue.max_builder_fee
+        )
+        max_fee = int(definition.max_fee_tenths_bps_value)
+        stale = venue.stage_approval(definition._request_body(max_fee, 1111))
+
+        real_stage = definition._stage_grant
+
+        def stage_then_fail(fee: int, nonce: int) -> None:
+            real_stage(fee, nonce)
+            raise EvalError("simulated failure after the ceremony completed")
+
+        definition._stage_grant = stage_then_fail
+        with self.assertRaisesRegex(EvalError, "simulated failure"):
+            definition.provision("codex")
+
+        new_grant = definition.staged_request_id
+        self.assertIsNotNone(new_grant, "the new grant must be recorded before the failure")
+        self.assertNotEqual(new_grant, stale)
+        self.assertEqual(definition._request_status(new_grant), "approved_retry_required")
+
+        definition.cleanup()
+
+        self.assertEqual(
+            definition._request_status(new_grant),
+            "signed",
+            "the grant this run created must be consumed, not left executable",
+        )
+        self.assertEqual(
+            definition._request_status(stale),
+            "approved_retry_required",
+            "another run's grant is not ours to spend",
+        )
+        self.assertEqual(venue.max_builder_fee, 0, "venue ends revoked")
 
     def test_cleanup_revokes_despite_a_stray_ceremony_the_agent_staged(self) -> None:
         """A mismatched agent write must not block the revoke.
