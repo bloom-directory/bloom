@@ -182,6 +182,13 @@ pub trait WalletProjectionReader: Send + Sync {
         self.list_wallets().await
     }
     async fn get_wallet(&self, wallet_id: &Token) -> Result<WalletProjection, ProtocolError>;
+    /// Read account authority from Broker without a cached success or fallback.
+    async fn get_wallet_authority(
+        &self,
+        wallet_id: &Token,
+    ) -> Result<WalletProjection, ProtocolError> {
+        self.get_wallet(wallet_id).await
+    }
     async fn get_wallet_navigation(
         &self,
         wallet_id: &Token,
@@ -610,6 +617,17 @@ impl WalletProjectionReader for CachedWalletProjectionReader {
                 wallet_id.as_str()
             ))),
         }
+    }
+
+    async fn get_wallet_authority(
+        &self,
+        wallet_id: &Token,
+    ) -> Result<WalletProjection, ProtocolError> {
+        self.refresh()
+            .await?
+            .into_iter()
+            .find(|projection| projection.wallet_id() == wallet_id)
+            .ok_or_else(|| invalid_projection(format!("wallet {} not found", wallet_id.as_str())))
     }
 
     async fn get_wallet_navigation(
@@ -1364,6 +1382,36 @@ mod tests {
                 }
             })
         }
+    }
+
+    #[tokio::test]
+    async fn authority_reads_bypass_recent_cache_and_never_fall_back() {
+        let directory = tempfile::tempdir().unwrap();
+        let broker = Arc::new(FakeBroker::new(fixture(1)));
+        let reader = CachedWalletProjectionReader::new(
+            Some(MachineBrokerClient::new(broker.clone())),
+            FileProjectionStore::new(directory.path().join("wallets.json")),
+        )
+        .unwrap();
+        reader.get_wallet_navigation(&token("alice")).await.unwrap();
+        let reads = broker.wallet_list_reads.load(Ordering::SeqCst);
+        reader.get_wallet_authority(&token("alice")).await.unwrap();
+        assert_eq!(broker.wallet_list_reads.load(Ordering::SeqCst), reads + 1);
+
+        broker.set_available(false);
+        let error = reader
+            .get_wallet_authority(&token("alice"))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::ServiceUnavailable);
+
+        broker.set_available(true);
+        broker.wallets.lock().unwrap().clear();
+        let error = reader
+            .get_wallet_authority(&token("alice"))
+            .await
+            .unwrap_err();
+        assert!(error.message.contains("not found"), "{error:?}");
     }
 
     #[tokio::test]

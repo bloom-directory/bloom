@@ -59,7 +59,7 @@ impl PetalHost for AccountFixture {
                 }
                 return Ok(serde_json::to_vec(&serde_json::json!({
                     "schema":"bloom.account.v1", "wallet":"alice", "number":index,
-                    "freshness":"fresh", "evm":{"public_key_fingerprint":format!("{:064x}",index+1)},
+                    "freshness":"fresh", "evm":{"state":"active","public_key_fingerprint":format!("{:064x}",index+1)},
                     "solana":{"state":"missing"}
                 })).unwrap());
             }

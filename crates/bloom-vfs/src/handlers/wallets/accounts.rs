@@ -181,11 +181,11 @@ impl WalletsHandler {
         let projection = if navigation {
             self.wallet_projection_navigation(wallet).await?
         } else {
-            self.wallet_projection(wallet).await?
+            self.wallet_projection_authority(wallet).await?
         };
-        // get_wallet may return an authenticated stale snapshot when the
-        // Broker is unavailable. It remains useful for navigation, but must
-        // not become trusted Petal context or select an account for a write.
+        // Authority reads bypass the production cache. Also reject stale
+        // results from any other projection-reader implementation before
+        // constructing Petal context or selecting an account for a write.
         if !navigation && projection.freshness == bloom_machine_client::ProjectionFreshness::Stale {
             return Err(HandlerError::backend(
                 "SERVICE_UNAVAILABLE: account authority requires a fresh Broker wallet projection",

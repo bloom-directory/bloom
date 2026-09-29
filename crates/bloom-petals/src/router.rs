@@ -137,6 +137,7 @@ impl PetalRouter {
         let fingerprint = |family: &str| {
             value
                 .get(family)
+                .filter(|v| v.get("state").and_then(|state| state.as_str()) == Some("active"))
                 .and_then(|v| v.get("public_key_fingerprint"))
                 .and_then(|v| v.as_str())
                 .map(str::to_owned)
@@ -814,9 +815,9 @@ mod tests {
         }
         async fn vfs_read(&self, path: &str) -> Result<Vec<u8>, HostError> {
             if path == "wallets/alice/0/account.json" {
-                Ok(br#"{"schema":"bloom.account.v1","wallet":"alice","number":0,"freshness":"fresh","evm":{"public_key_fingerprint":"aa"},"solana":{"state":"missing"}}"#.to_vec())
+                Ok(br#"{"schema":"bloom.account.v1","wallet":"alice","number":0,"freshness":"fresh","evm":{"state":"active","public_key_fingerprint":"aa"},"solana":{"state":"missing"}}"#.to_vec())
             } else if path == "wallets/alice/1/account.json" {
-                Ok(br#"{"schema":"bloom.account.v1","wallet":"alice","number":1,"freshness":"fresh","evm":{"public_key_fingerprint":"bb"},"solana":{"state":"missing"}}"#.to_vec())
+                Ok(br#"{"schema":"bloom.account.v1","wallet":"alice","number":1,"freshness":"fresh","evm":{"state":"active","public_key_fingerprint":"bb"},"solana":{"state":"missing"}}"#.to_vec())
             } else {
                 Err(HostError::NotFound(path.into()))
             }
@@ -840,6 +841,51 @@ mod tests {
         }
         async fn vfs_write(&self, path: &str, _bytes: &[u8]) -> Result<(), HostError> {
             Err(HostError::Denied(path.into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn account_context_accepts_only_active_families() {
+        struct LifecycleHost {
+            evm: &'static str,
+            solana: &'static str,
+        }
+        #[async_trait]
+        impl PetalHost for LifecycleHost {
+            async fn vfs_lookup(&self, path: &str) -> Result<HostVfsEntry, HostError> {
+                AccountHost.vfs_lookup(path).await
+            }
+            async fn vfs_list(&self, path: &str) -> Result<Vec<HostVfsEntry>, HostError> {
+                AccountHost.vfs_list(path).await
+            }
+            async fn vfs_write(&self, path: &str, bytes: &[u8]) -> Result<(), HostError> {
+                AccountHost.vfs_write(path, bytes).await
+            }
+            async fn vfs_read(&self, path: &str) -> Result<Vec<u8>, HostError> {
+                let mut value: serde_json::Value =
+                    serde_json::from_slice(&AccountHost.vfs_read(path).await?).unwrap();
+                value["evm"]["state"] = self.evm.into();
+                value["solana"] =
+                    serde_json::json!({"state": self.solana, "public_key_fingerprint": "cc"});
+                Ok(serde_json::to_vec(&value).unwrap())
+            }
+        }
+        for (evm, solana) in [
+            ("retired", "retired"),
+            ("retired", "active"),
+            ("active", "retired"),
+            ("missing", "missing"),
+        ] {
+            let (_dir, runner) = runner();
+            let router = PetalRouter::new(runner, Arc::new(LifecycleHost { evm, solana }));
+            let result = router.account_context("alice", "0").await;
+            if evm != "active" && solana != "active" {
+                assert!(matches!(result, Err(HandlerError::NotFound(_))));
+            } else {
+                let context = result.unwrap();
+                assert_eq!(context.evm_fingerprint.is_some(), evm == "active");
+                assert_eq!(context.solana_fingerprint.is_some(), solana == "active");
+            }
         }
     }
 

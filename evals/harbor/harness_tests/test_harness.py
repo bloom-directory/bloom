@@ -142,12 +142,12 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         route_dir.mkdir(parents=True)
         self.route_index = route_dir / "route-index.json"
         action_routes = (
-            "[network]/agent_sessions/[wallet]/[session]/cancel.json",
-            "[network]/agent_sessions/[wallet]/[session]/cancel_all",
-            "[network]/agent_sessions/[wallet]/[session]/close_all",
-            "[network]/agent_sessions/[wallet]/[session]/order.json",
-            "[network]/agent_sessions/[wallet]/[session]/schedule_cancel.json",
-            "[network]/agent_sessions/[wallet]/[session]/update_leverage.json",
+            "[network]/agent_sessions/[wallet]/[index]/[session]/cancel.json",
+            "[network]/agent_sessions/[wallet]/[index]/[session]/cancel_all",
+            "[network]/agent_sessions/[wallet]/[index]/[session]/close_all",
+            "[network]/agent_sessions/[wallet]/[index]/[session]/order.json",
+            "[network]/agent_sessions/[wallet]/[index]/[session]/schedule_cancel.json",
+            "[network]/agent_sessions/[wallet]/[index]/[session]/update_leverage.json",
         )
         self.route_index.write_text(
             json.dumps(
@@ -157,7 +157,7 @@ class HyperliquidDefinitionTests(unittest.TestCase):
                     "routes": [
                         {
                             "route_id": "r000021",
-                            "pattern": "[network]/agent_sessions/[wallet]/new.json",
+                            "pattern": "[network]/agent_sessions/[wallet]/[index]/new.json",
                             "install_metadata": {
                                 "required_caps": [
                                     "bloom:http",
@@ -708,7 +708,7 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         # lowercase letter. An on-chain address begins with a digit, so passing
         # one here fails inside Broker as an unqualified permission error.
         route_parts = written[0][0].parts
-        segment = route_parts[route_parts.index("wallets") + 1]
+        segment = route_parts[route_parts.index("agent_sessions") + 1]
         self.assertEqual(segment, self.definition.wallet_id)
         self.assertNotEqual(segment, self.definition.wallet)
         self.assertRegex(segment, r"^[a-z][a-z0-9._/-]{0,63}$")
@@ -722,7 +722,7 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         # the agent needs both identifiers to address sessions and account reads.
         for mount in context.mounts[1:]:
             self.assertIn(
-                f"/mainnet/wallets/{self.definition.wallet_id}/0/agent_sessions/", mount["target"]
+                f"/mainnet/agent_sessions/{self.definition.wallet_id}/0/", mount["target"]
             )
         self.assertEqual(
             context.agent_env["BLOOM_EVAL_WALLET_ID"], self.definition.wallet_id

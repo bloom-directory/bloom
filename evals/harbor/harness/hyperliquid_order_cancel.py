@@ -28,15 +28,15 @@ WALLET_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
 PACKAGE_HASH = re.compile(r"[0-9a-f]{64}")
 LINEAGE_ID = re.compile(r"pln1_[a-z2-7]{52}")
 BASE64URL = re.compile(r"[A-Za-z0-9_-]+")
-HYPERLIQUID_SESSION_ROUTE = "[network]/agent_sessions/[wallet]/new.json"
+HYPERLIQUID_SESSION_ROUTE = "[network]/agent_sessions/[wallet]/[index]/new.json"
 HYPERLIQUID_AGENT_ACTION = "hyperliquid.agent_action"
 HYPERLIQUID_SESSION_ACTION_ROUTES = (
-    "[network]/agent_sessions/[wallet]/[session]/cancel.json",
-    "[network]/agent_sessions/[wallet]/[session]/cancel_all",
-    "[network]/agent_sessions/[wallet]/[session]/close_all",
-    "[network]/agent_sessions/[wallet]/[session]/order.json",
-    "[network]/agent_sessions/[wallet]/[session]/schedule_cancel.json",
-    "[network]/agent_sessions/[wallet]/[session]/update_leverage.json",
+    "[network]/agent_sessions/[wallet]/[index]/[session]/cancel.json",
+    "[network]/agent_sessions/[wallet]/[index]/[session]/cancel_all",
+    "[network]/agent_sessions/[wallet]/[index]/[session]/close_all",
+    "[network]/agent_sessions/[wallet]/[index]/[session]/order.json",
+    "[network]/agent_sessions/[wallet]/[index]/[session]/schedule_cancel.json",
+    "[network]/agent_sessions/[wallet]/[index]/[session]/update_leverage.json",
 )
 ACTION_FILES = ("order.json", "cancel.json", "update_leverage.json", "cancel_all")
 # Session creation currently stages three owner ceremonies: key derivation, a
@@ -844,7 +844,7 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         # Broker token, which must start with a lowercase letter, so a `0x…`
         # address fails deep inside signing as an unqualified permission error.
         self.session_base = (
-            self.network_root / "wallets" / self.wallet_id / "0/agent_sessions" / self.session_id
+            self.network_root / "agent_sessions" / self.wallet_id / "0" / self.session_id
         )
         request = {
             "id": self.session_id,
@@ -859,7 +859,7 @@ class HyperliquidOrderCancelEval(EvalDefinition):
             "assets": ["0"],
         }
         body = json.dumps(request, separators=(",", ":")).encode()
-        new_route = self.network_root / "wallets" / self.wallet_id / "0/agent_sessions" / "new.json"
+        new_route = self.network_root / "agent_sessions" / self.wallet_id / "0" / "new.json"
 
         first = self._write_route(new_route, body, SESSION_WRITE_TIMEOUT_SECONDS)
         output = (first.stdout + first.stderr).decode(errors="replace")
@@ -1003,7 +1003,7 @@ class HyperliquidOrderCancelEval(EvalDefinition):
             }
         ]
         container_base = (
-            f"/bloom/petals/hyperliquid/mainnet/wallets/{self.wallet_id}/0/agent_sessions/"
+            f"/bloom/petals/hyperliquid/mainnet/agent_sessions/{self.wallet_id}/0/"
             f"{self.session_id}"
         )
         mounts.extend(

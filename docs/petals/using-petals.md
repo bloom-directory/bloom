@@ -77,7 +77,9 @@ package directory before operating it. The host exposes `README.md` and
 `AGENTS.md` directly beneath `/petals/<name>/`. Select an existing wallet and
 account number in the package-defined feature path before using operation routes.
 Replace `FEATURE` and `PATH` in the example with a documented operation route.
-Every wallet/account pair, including account 0, has separate settings and API keys.
+Every wallet/account pair, including account 0, has separate account settings.
+Service credentials explicitly declared in `[store].shared_keys`, such as Enso
+and Near API keys, are shared across the Petal’s accounts and public routes.
 Upgrading from the legacy package-level store starts with empty account-0 settings;
 reconfigure credentials, and finish or reconcile pending funded operations with
 the old package before upgrading. Retain any records needed to recover funds.

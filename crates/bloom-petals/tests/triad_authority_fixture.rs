@@ -33,7 +33,7 @@ impl PetalHost for AuthorityHost {
 
     async fn vfs_read(&self, path: &str) -> Result<Vec<u8>, HostError> {
         if path == "wallets/wallet/0/account.json" {
-            return Ok(format!(r#"{{"schema":"bloom.account.v1","wallet":"wallet","number":0,"freshness":"fresh","evm":{{"public_key_fingerprint":"{}"}},"solana":{{"state":"missing"}}}}"#, "44".repeat(32)).into_bytes());
+            return Ok(format!(r#"{{"schema":"bloom.account.v1","wallet":"wallet","number":0,"freshness":"fresh","evm":{{"state":"active","public_key_fingerprint":"{}"}},"solana":{{"state":"missing"}}}}"#, "44".repeat(32)).into_bytes());
         }
         Err(HostError::Denied(
             "fixture does not import VFS authority".into(),

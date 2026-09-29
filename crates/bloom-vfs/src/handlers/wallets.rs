@@ -442,6 +442,27 @@ impl WalletsHandler {
         } else {
             projections.get_wallet_navigation(&wallet_id).await
         };
+        Self::map_wallet_projection(wallet, result)
+    }
+
+    async fn wallet_projection_authority(
+        &self,
+        wallet: &str,
+    ) -> Result<WalletProjection, HandlerError> {
+        let wallet_id = bloom_broker_api::Token::new(wallet.to_owned())
+            .map_err(|error| HandlerError::invalid(error.to_string()))?;
+        let projections = self.wallet_projections.as_ref().ok_or_else(|| {
+            HandlerError::backend(
+                "SERVICE_UNAVAILABLE: Machine wallet projection reader is not configured",
+            )
+        })?;
+        Self::map_wallet_projection(wallet, projections.get_wallet_authority(&wallet_id).await)
+    }
+
+    fn map_wallet_projection(
+        wallet: &str,
+        result: Result<WalletProjection, bloom_broker_api::ProtocolError>,
+    ) -> Result<WalletProjection, HandlerError> {
         result.map_err(|error| {
             // A wallet that is not registered is absent, not broken. The
             // projection reader reports it as an invalid request; to a
@@ -3933,7 +3954,7 @@ mod tests {
             Ok(vec![self.0.clone()])
         }
 
-        async fn get_wallet(
+        async fn get_wallet_authority(
             &self,
             _wallet_id: &Token,
         ) -> Result<WalletProjection, bloom_broker_api::ProtocolError> {
@@ -3941,6 +3962,13 @@ mod tests {
                 ProtocolErrorCode::ServiceUnavailable,
                 "live account authority unavailable",
             ))
+        }
+
+        async fn get_wallet(
+            &self,
+            _wallet_id: &Token,
+        ) -> Result<WalletProjection, bloom_broker_api::ProtocolError> {
+            Ok(self.0.clone())
         }
 
         async fn get_wallet_navigation(

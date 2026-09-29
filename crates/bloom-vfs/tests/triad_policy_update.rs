@@ -380,7 +380,7 @@ async fn signer_wallet_is_visible_in_vfs_without_a_legacy_keystore_record() {
         .await
         .unwrap_err();
     assert!(
-        matches!(error, HandlerError::Backend(message) if message.contains("fresh Broker wallet projection"))
+        matches!(error, HandlerError::Backend(message) if message.contains("SERVICE_UNAVAILABLE"))
     );
     stale_handler
         .lookup(&VfsPath::parse("/alice/0/account.json").unwrap())
