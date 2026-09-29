@@ -166,9 +166,13 @@ state. Their installed package documentation defines their mounted routes.
 - EVM transactions stage unsigned bytes, obtain approval when policy requires
   it, and use Broker/Signer for the final payload signature. For Petal-originated
   canonical ERC-20 `transfer(address,uint256)` calls with zero native value,
-  Machine decodes the recipient and amount, reconstructs the calldata through
-  the typed send path, and evaluates token and recipient policy against those
-  verified fields. Other calldata remains a generic contract call.
+  addressed to a token in Machine's curated registry, Machine decodes the
+  recipient and amount, reconstructs the calldata through the typed send path,
+  and evaluates token and recipient policy against those verified fields.
+  Other calldata remains a generic contract call — including a transfer-shaped
+  call to a contract the registry does not list. The selector proves the call's
+  shape, not the contract's behaviour; only the registry establishes that the
+  target is a token, so it is the condition for vouching that the call is one.
 
   Because Machine rebuilds the calldata from the decoded fields rather than
   forwarding the supplied bytes, that shape is held to an exact encoding.
@@ -183,9 +187,9 @@ state. Their installed package documentation defines their mounted routes.
   This applies only to that shape. A call the classifier does not recognise is
   untouched and still stages as a generic contract call with its bytes intact,
   including one carrying nonzero native value, one whose calldata is any other
-  length, and one bearing another selector — even when such a call contains the
-  same noncanonical padding. Those never reach the decoder, because Machine
-  never rebuilds their calldata.
+  length, one bearing another selector, and one addressed to a contract outside
+  the registry — even when such a call contains the same noncanonical padding.
+  Those never reach the decoder, because Machine never rebuilds their calldata.
 - Paid HTTP stages the selected challenge and payment payload, then obtains any
   required signature through Broker/Signer.
 - Installed Polymarket or Hyperliquid Petals use their package-defined mounted

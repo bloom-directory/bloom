@@ -38,6 +38,19 @@ pub fn resolve_symbol(chain_id: u64, symbol: &str) -> Option<&'static KnownToken
         .find(|t| t.symbol.eq_ignore_ascii_case(symbol))
 }
 
+/// Whether `address` (0x-prefixed hex, any case) is a curated token on
+/// `chain_id`.
+///
+/// This is the only non-spoofable answer to "is this contract a token". A
+/// contract can return whatever `decimals()` and `symbol()` it likes, but it
+/// cannot put itself in this table.
+pub fn is_known_address(chain_id: u64, address: &str) -> bool {
+    let address = address.trim();
+    for_chain(chain_id)
+        .iter()
+        .any(|t| t.address.eq_ignore_ascii_case(address))
+}
+
 const ETHEREUM: &[KnownToken] = &[
     KnownToken {
         address: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",

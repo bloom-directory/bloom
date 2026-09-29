@@ -302,13 +302,18 @@ spending.
 A Petal that stages an EVM transaction usually produces a generic contract
 call: Bloom cannot check what the calldata does, so it always needs a fresh
 owner approval. One shape is different. A canonical ERC-20
-`transfer(address,uint256)` call with no native value is decoded to its
-recipient and amount, and Bloom rebuilds the calldata from those two fields
-instead of forwarding the Petal's bytes. It is then classified as a token
-transfer, checked against wallet policy, and eligible for policy-bounded
-autonomy. Extra trailing calldata, a different selector, or any nonzero native
-value keeps it generic. Eligible does not mean automatic: the wallet's policy
-still decides, so handle the ordinary approval challenge either way.
+`transfer(address,uint256)` call with no native value, **addressed to a token
+in Bloom's curated registry**, is decoded to its recipient and amount, and
+Bloom rebuilds the calldata from those two fields instead of forwarding the
+Petal's bytes. It is then classified as a token transfer, checked against
+wallet policy, and eligible for policy-bounded autonomy. Extra trailing
+calldata, a different selector, any nonzero native value, or a target contract
+the registry does not list keeps it generic. The registry condition is what
+makes the classification mean anything: matching the selector only proves what
+the call looks like, and any contract can answer `decimals()` and `symbol()`
+while doing something else under that selector. Eligible does not mean
+automatic: the wallet's policy still decides, so handle the ordinary approval
+challenge either way.
 
 Because Bloom rebuilds that one shape, it must encode exactly. Calldata that
 is already ERC-20 transfer shaped — the `transfer` selector, exactly 68 bytes,
@@ -324,6 +329,6 @@ the same bytes fails the same way.
 
 This is not a general rule about padding. A call Bloom leaves generic keeps
 the bytes you gave it and stages normally, even with that padding — including
-a call carrying nonzero native value, one of any other calldata length, and
-one bearing another selector. Bloom only rejects what it would otherwise
-rewrite.
+a call carrying nonzero native value, one of any other calldata length, one
+bearing another selector, and one addressed to a contract the registry does
+not list. Bloom only rejects what it would otherwise rewrite.
