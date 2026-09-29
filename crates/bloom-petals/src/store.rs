@@ -15,6 +15,7 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -38,6 +39,7 @@ const ROUTE_INDEX: &str = "route-index.json";
 #[derive(Debug, Clone)]
 pub struct PetalStore {
     base: PathBuf,
+    execution_gate: Arc<tokio::sync::RwLock<()>>,
 }
 
 /// Verified package materialized privately before taking the install mutation lock.
@@ -65,6 +67,18 @@ struct AppOwner {
 }
 
 impl PetalStore {
+    /// Hold from before route selection through guest completion. Ordinary
+    /// invocations share this permit; package activation never waits on a guest.
+    pub(crate) async fn execution_guard(&self) -> tokio::sync::RwLockReadGuard<'_, ()> {
+        self.execution_gate.read().await
+    }
+
+    fn mutation_guard(&self) -> Result<tokio::sync::RwLockWriteGuard<'_, ()>, PetalError> {
+        self.execution_gate.try_write().map_err(|_| {
+            PetalError::vm("Petal execution is in progress; retry the package change when idle")
+        })
+    }
+
     /// Open (or create) a store rooted at `base`. Creates the
     /// `objects/` and `meta/` subdirectories if missing.
     pub fn open(base: impl Into<PathBuf>) -> Result<Self, PetalError> {
@@ -73,7 +87,10 @@ impl PetalStore {
         std::fs::create_dir_all(base.join(META))?;
         std::fs::create_dir_all(base.join(PACKAGES))?;
         std::fs::create_dir_all(base.join(OWNERS))?;
-        let store = Self { base };
+        let store = Self {
+            base,
+            execution_gate: Arc::new(tokio::sync::RwLock::new(())),
+        };
         store.reconcile_petal_owners()?;
         Ok(store)
     }
@@ -270,6 +287,7 @@ impl PetalStore {
     where
         F: Fn() -> Result<(), PetalError>,
     {
+        let _execution = self.mutation_guard()?;
         let StagedPetalPackage { package, directory } = staged;
         let hash = package.hash.clone();
         let package_path = self.package_path_unchecked(&hash);
@@ -646,6 +664,7 @@ impl PetalStore {
     /// before the removes, and a non-NotFound IO error between the two
     /// unlinks can leave the store with only one of the two files.
     pub fn uninstall(&self, hash: &str) -> Result<bool, PetalError> {
+        let _execution = self.mutation_guard()?;
         validate_hash_arg(hash)?;
         self.remove_petal_owner_for_hash(hash)?;
         self.remove_package_data(hash)

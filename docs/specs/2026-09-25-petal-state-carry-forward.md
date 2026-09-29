@@ -234,3 +234,12 @@ account-zero records. Compatible signed succession carries that package-level
 store through the existing mechanism, alongside the separate numbered account
 stores. No account-store credential is copied into the shared store, and no
 legacy account state becomes visible merely because a service key is shared.
+
+### In-flight calls during replacement
+
+Route execution holds a shared store permit from route selection through guest
+completion. Package activation and uninstall require an exclusive permit and
+return a retryable busy message while any Petal is executing. This keeps normal
+invocations concurrent and prevents an outgoing guest from writing after the
+successor becomes active and copies its state. The gate is shared by the daemon's
+store clones; no per-KV locking, drain queue, or background migration is added.

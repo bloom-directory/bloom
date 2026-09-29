@@ -8757,6 +8757,62 @@ value = "0""#,
         );
     }
 
+    #[tokio::test]
+    async fn stale_account_projection_cannot_become_trusted_petal_context() {
+        let f = make_handler();
+        for derived in [false, true] {
+            let mut projection = if derived {
+                let profile = bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1;
+                bip39_projection_value(
+                    f.wallet_addr,
+                    vec![derived_account(
+                        profile,
+                        "m/44'/60'/0'/0/0",
+                        72,
+                        &format!("{:#x}", f.wallet_addr),
+                    )],
+                )
+            } else {
+                static_projection_value(f.wallet_addr)
+            };
+            projection.freshness = bloom_machine_client::ProjectionFreshness::Stale;
+            let handler = make_handler()
+                .handler
+                .with_projection_reader(Arc::new(StaticProjection(projection)));
+            let account = VfsPath::parse("/alice/0/account.json").unwrap();
+            handler.lookup(&account).await.unwrap();
+            assert!(
+                handler
+                    .list(&VfsPath::parse("/alice/0").unwrap())
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|entry| entry.name == "account.json")
+            );
+            handler
+                .read(&VfsPath::parse("/alice/0/address.evm").unwrap())
+                .await
+                .unwrap();
+            let error = handler.read(&account).await.unwrap_err();
+            assert!(
+                matches!(&error, HandlerError::Backend(message) if message.contains("fresh Broker wallet projection")),
+                "{error:?}"
+            );
+            // The same boundary guards account writes, including session stop.
+            let error = handler
+                .write(
+                    &VfsPath::parse("/alice/0/sessions/enso/router/stop").unwrap(),
+                    b"y",
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&error, HandlerError::Backend(message) if message.contains("fresh Broker wallet projection")),
+                "{error:?}"
+            );
+        }
+    }
+
     /// A wallet the Broker refused to characterise (the retired-out legacy
     /// shape: no root key, no derived keys) still mounts. Its numbered tree
     /// is empty and `accounts.json` names the refusal instead of presenting

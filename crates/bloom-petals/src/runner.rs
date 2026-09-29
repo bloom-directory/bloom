@@ -719,6 +719,7 @@ impl PetalRunner {
                 )));
             }
         }
+        let _execution = self.store.execution_guard().await;
         let matched = self.petal_route(mount, request.op, &request.path)?;
         let mut route_params = matched.params.clone();
         // Components need the host-selected route identity to construct
@@ -1479,6 +1480,69 @@ namespaces = ["settings"]
         )])));
         assert!(runner.prepare_private_store(&successor, None).is_err());
         assert!(!runner.store().private_data_root().join(&successor).exists());
+    }
+
+    #[tokio::test]
+    async fn upgrade_refuses_active_predecessor_then_carries_its_final_write() {
+        let (dir, runner) = runner();
+        let predecessor = install_echo_app(&dir, &runner);
+        let data =
+            crate::private_store::PrivateStore::open(runner.store().private_data_root()).unwrap();
+        // This is the same shared permit dispatch holds for the guest lifetime.
+        let active = runner.store().execution_guard().await;
+        let concurrent = runner.store().execution_guard().await;
+        data.put(&predecessor, "settings/value", b"before", false)
+            .unwrap();
+        assert!(
+            runner
+                .store()
+                .uninstall(&predecessor)
+                .unwrap_err()
+                .to_string()
+                .contains("retry")
+        );
+        let package =
+            crate::package::PreparedPetalPackage::from_dir(dir.path().join("echo-app")).unwrap();
+        let clone = runner.store().clone();
+        assert!(
+            clone
+                .install_prepared_petal_package(package)
+                .unwrap_err()
+                .to_string()
+                .contains("retry")
+        );
+        assert_eq!(
+            runner
+                .store()
+                .resolve_petal_owner("echo")
+                .unwrap()
+                .as_deref(),
+            Some(predecessor.as_str())
+        );
+        // A late write is still in the predecessor while replacement is refused.
+        data.put(&predecessor, "settings/value", b"final", false)
+            .unwrap();
+        drop(concurrent);
+        drop(active);
+        let successor = install_echo_successor(&dir, &runner);
+        let runner = runner.with_provenance_catalog(Some(catalog(vec![
+            lineage_record(
+                &predecessor,
+                "pln1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "publisher",
+                false,
+                &[],
+            ),
+            lineage_record(
+                &successor,
+                "pln1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "publisher",
+                true,
+                &[&predecessor],
+            ),
+        ])));
+        runner.prepare_private_store(&successor, None).unwrap();
+        assert_eq!(data.get(&successor, "settings/value").unwrap(), b"final");
     }
 
     #[test]

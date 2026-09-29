@@ -183,6 +183,14 @@ impl WalletsHandler {
         } else {
             self.wallet_projection(wallet).await?
         };
+        // get_wallet may return an authenticated stale snapshot when the
+        // Broker is unavailable. It remains useful for navigation, but must
+        // not become trusted Petal context or select an account for a write.
+        if !navigation && projection.freshness == bloom_machine_client::ProjectionFreshness::Stale {
+            return Err(HandlerError::backend(
+                "SERVICE_UNAVAILABLE: account authority requires a fresh Broker wallet projection",
+            ));
+        }
         if let Some(root) = &projection.wallet.root_key_ref {
             // A root-key wallet is account 0 in the root key's own family:
             // an imported Secp256k1 root renders as EVM, an Ed25519 root as
