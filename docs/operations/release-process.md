@@ -94,16 +94,6 @@ not create commits or tags. Installing a candidate additionally requires a
 trusted root-owned pin of its ephemeral key and the explicit
 `BLOOM_ALLOW_TEST_UNCLAIMED=true` installer opt-in.
 
-For a local candidate that includes revised default Petals, set
-`BLOOM_PETAL_RELEASE_MIRROR` in Machine's environment to an absolute directory.
-For each pinned Petal, place `petal-release.json`, `SHA256SUMS`, and the exact
-catalogued archive name under `<mirror>/<GitHub owner>/<GitHub repo>/<release tag>/`.
-When this variable is set, a missing local asset fails installation without
-falling back to GitHub. Machine still checks the manifest's source commit,
-release tag, tooling commit, archive checksum, and package hash against its
-compiled release catalog and validates the extracted package and route authority.
-The mirror is a candidate input, not a way to bypass release pins.
-
 ## Sign and publish
 
 A `vX.Y.Z` tag push runs `release.yml`. A manual dispatch with `dry_run=false`
