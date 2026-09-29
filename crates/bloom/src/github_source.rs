@@ -21,8 +21,14 @@ const NEAR_INTENTS_RELEASE_COMMIT: &str = "ab0a2de1044cb4f31b80080859d6fc01d0824
 const ENSO_RELEASE_COMMIT: &str = "8968988c0f03fd3dbd3eb290fcd178066804de6e";
 
 /// Canonical defaults for every Bloom home, independent of persisted config.
-pub(crate) const DEFAULT_PETALS: &[&str] =
-    &["polymarket", "hyperliquid", "enso", "near-intents", "tolly"];
+pub(crate) const DEFAULT_PETALS: &[&str] = &[
+    "polymarket",
+    "hyperliquid",
+    "enso",
+    "near-intents",
+    "tolly",
+    "feedback",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PreinstalledPetal {
@@ -180,6 +186,23 @@ const PREINSTALLED_NEAR_INTENTS: PreinstalledPetal = PreinstalledPetal {
     archive: "near-intents-v0.1.3.petal.tar.gz",
     expected_hash: Some("ac2ccab59f36ee863843f92aaf0c975c00dbf32b246df5ccbb79757093785921"),
     archive_sha256: "2f9c6b5f246017b0ad29708b528f2f4232a3eaa4d641c8ba9a196d1562a15993",
+    tooling_commit: "2beed2ff344ce2b0c112e07096027e1ae0404007",
+    petal_abi: "bloom.petal-host/triad-compatible-nonauthority-v1",
+    default_eligible: true,
+    lineage_id: None,
+    release_sequence: 0,
+    predecessor_package_hashes: &[],
+    authority_routes: &[],
+};
+
+const PREINSTALLED_FEEDBACK: PreinstalledPetal = PreinstalledPetal {
+    name: "feedback",
+    repository: "https://github.com/bloom-directory/bloom-petal-feedback",
+    commit: "b6aa2b64598a3cc7172e8136b34e3edddcddf2d4",
+    release_tag: "v0.1.0",
+    archive: "feedback-v0.1.0.petal.tar.gz",
+    expected_hash: Some("5f26e7bbf7f507cfcf4c13645cf9f4f0c903d769c201e3e9d1f5c914b14fa2a3"),
+    archive_sha256: "6129e14894868d12c06bd2549fd1eeecf36e1ee353a55bc139e011253347cb39",
     tooling_commit: "2beed2ff344ce2b0c112e07096027e1ae0404007",
     petal_abi: "bloom.petal-host/triad-compatible-nonauthority-v1",
     default_eligible: true,
@@ -1071,6 +1094,7 @@ pub(crate) fn preinstalled_petal(name: &str) -> Option<&'static PreinstalledPeta
         "polymarket" => Some(&PREINSTALLED_POLYMARKET),
         "hyperliquid" => Some(&PREINSTALLED_HYPERLIQUID),
         "near-intents" => Some(&PREINSTALLED_NEAR_INTENTS),
+        "feedback" => Some(&PREINSTALLED_FEEDBACK),
         "enso" => Some(&PREINSTALLED_ENSO),
         "gasless" => Some(&PREINSTALLED_GASLESS),
         "privacy-pools" => Some(&PREINSTALLED_PRIVACY_POOLS),
@@ -1774,6 +1798,7 @@ mod tests {
             "polymarket",
             "hyperliquid",
             "near-intents",
+            "feedback",
             "enso",
             "gasless",
             "privacy-pools",
@@ -1788,7 +1813,7 @@ mod tests {
                 entry.default_eligible,
                 matches!(
                     name,
-                    "polymarket" | "hyperliquid" | "enso" | "near-intents" | "tolly"
+                    "polymarket" | "hyperliquid" | "enso" | "near-intents" | "tolly" | "feedback"
                 )
             );
         }
