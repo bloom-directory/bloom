@@ -177,9 +177,9 @@ A fresh Bloom VFS root exposes these default entries:
 - `petals/` — installed local Petal app surfaces. `bloom init` provisions the
   pinned [Polymarket](https://github.com/bloom-directory/bloom-petal-polymarket),
   [Hyperliquid](https://github.com/bloom-directory/bloom-petal-hyperliquid),
-  [Enso](https://github.com/bloom-directory/bloom-petal-enso),
-  [Near Intents](https://github.com/bloom-directory/bloom-petal-near), and
-  [Tolly](https://github.com/TollyLabs/bloom-petal-tolly) releases.
+  [Enso](https://github.com/bloom-directory/bloom-petal-enso), and
+  [Near Intents](https://github.com/bloom-directory/bloom-petal-near) releases.
+  Tolly is excluded until its explicit-account release is available.
   Read `docs/petals.md` in the VFS for the exact installed set, mount
   directories, summaries, and declared capabilities.
 - `requests/` — free and paid HTTP requests. Paid HTTP 402 challenges are

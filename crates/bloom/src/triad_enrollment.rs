@@ -1629,8 +1629,8 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(petal_hashes.len(), 24);
-        for name in ["polymarket", "hyperliquid", "enso", "near-intents", "tolly"] {
+        assert_eq!(petal_hashes.len(), 46);
+        for name in crate::github_source::DEFAULT_PETALS {
             let expected = crate::github_source::preinstalled_petal(name)
                 .unwrap()
                 .expected_hash

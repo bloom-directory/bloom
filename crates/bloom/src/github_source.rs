@@ -17,12 +17,11 @@ use url::Url;
 const TRUSTED_GITHUB_OWNER: &str = "bloom-directory";
 // Retain a bounded diagnostic tail for reconciliation after streamed output.
 const SOURCE_BUILD_STREAM_LIMIT: usize = 256 * 1024;
-const NEAR_INTENTS_RELEASE_COMMIT: &str = "ab0a2de1044cb4f31b80080859d6fc01d0824e00";
-const ENSO_RELEASE_COMMIT: &str = "8968988c0f03fd3dbd3eb290fcd178066804de6e";
+const NEAR_INTENTS_RELEASE_COMMIT: &str = "4dc28dbe7a6d48435ff16dab7e24b33bd3d0b413";
+const ENSO_RELEASE_COMMIT: &str = "7bbe03770721c7cfdbe6c7c34a9b1665ae2eec9f";
 
 /// Canonical defaults for every Bloom home, independent of persisted config.
-pub(crate) const DEFAULT_PETALS: &[&str] =
-    &["polymarket", "hyperliquid", "enso", "near-intents", "tolly"];
+pub(crate) const DEFAULT_PETALS: &[&str] = &["polymarket", "hyperliquid", "enso", "near-intents"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PreinstalledPetal {
@@ -140,8 +139,94 @@ const BASELINE_HYPERLIQUID_AUTHORITY_ROUTES: &[PetalAuthorityRoute] = &[
 
 // Keep baseline declarations when successor pins change so the executing
 // daemon can still verify the outgoing release until activation completes.
-const POLYMARKET_AUTHORITY_ROUTES: &[PetalAuthorityRoute] = BASELINE_POLYMARKET_AUTHORITY_ROUTES;
-const HYPERLIQUID_AUTHORITY_ROUTES: &[PetalAuthorityRoute] = BASELINE_HYPERLIQUID_AUTHORITY_ROUTES;
+const POLYMARKET_AUTHORITY_ROUTES: &[PetalAuthorityRoute] = &[
+    PetalAuthorityRoute {
+        route_id: "r000042",
+        operation_classes: &["polymarket.onboard"],
+    },
+    PetalAuthorityRoute {
+        route_id: "r000058",
+        operation_classes: &["polymarket.relayer_batch"],
+    },
+    PetalAuthorityRoute {
+        route_id: "r000067",
+        operation_classes: &["polymarket.relayer_batch"],
+    },
+    PetalAuthorityRoute {
+        route_id: "r000088",
+        operation_classes: &["polymarket.order.poly1271"],
+    },
+    PetalAuthorityRoute {
+        route_id: "r000106",
+        operation_classes: &["polymarket.relayer_batch"],
+    },
+];
+const HYPERLIQUID_AUTHORITY_ROUTES: &[PetalAuthorityRoute] = &[
+    PetalAuthorityRoute {
+        route_id: "r000008",
+        operation_classes: &["hyperliquid.agent_action"],
+    },
+    PetalAuthorityRoute {
+        route_id: "r000009",
+        operation_classes: &["hyperliquid.agent_action"],
+    },
+    PetalAuthorityRoute {
+        route_id: "r000010",
+        operation_classes: &["hyperliquid.agent_action"],
+    },
+    PetalAuthorityRoute {
+        route_id: "r000013",
+        operation_classes: &["hyperliquid.agent_action"],
+    },
+    PetalAuthorityRoute {
+        route_id: "r000019",
+        operation_classes: &["hyperliquid.agent_action"],
+    },
+    PetalAuthorityRoute {
+        route_id: "r000023",
+        operation_classes: &["hyperliquid.agent_action"],
+    },
+    PetalAuthorityRoute {
+        route_id: "r000025",
+        operation_classes: &["hyperliquid.agent_action", "hyperliquid.approve_agent"],
+    },
+    PetalAuthorityRoute {
+        route_id: "r000036",
+        operation_classes: &["hyperliquid.cancel"],
+    },
+    PetalAuthorityRoute {
+        route_id: "r000037",
+        operation_classes: &["hyperliquid.cancel_by_cloid"],
+    },
+    PetalAuthorityRoute {
+        route_id: "r000039",
+        operation_classes: &["hyperliquid.order"],
+    },
+    PetalAuthorityRoute {
+        route_id: "r000041",
+        operation_classes: &["hyperliquid.schedule_cancel"],
+    },
+    PetalAuthorityRoute {
+        route_id: "r000042",
+        operation_classes: &["hyperliquid.usd_send"],
+    },
+    PetalAuthorityRoute {
+        route_id: "r000043",
+        operation_classes: &["hyperliquid.update_leverage"],
+    },
+    PetalAuthorityRoute {
+        route_id: "r000044",
+        operation_classes: &["hyperliquid.usd_class_transfer"],
+    },
+    PetalAuthorityRoute {
+        route_id: "r000045",
+        operation_classes: &["hyperliquid.usd_send"],
+    },
+    PetalAuthorityRoute {
+        route_id: "r000046",
+        operation_classes: &["hyperliquid.withdraw"],
+    },
+];
 
 pub(crate) struct ReleaseLineagePredecessor {
     pub hash: &'static str,
@@ -181,34 +266,38 @@ pub(crate) fn release_lineage_predecessor(name: &str) -> Option<ReleaseLineagePr
 const PREINSTALLED_POLYMARKET: PreinstalledPetal = PreinstalledPetal {
     name: "polymarket",
     repository: "https://github.com/bloom-directory/bloom-petal-polymarket",
-    commit: "cb6259f6458fc9a27708b8c4c4e35d28a69d24fc",
-    release_tag: "v0.1.5",
-    archive: "polymarket-v0.1.5.petal.tar.gz",
-    expected_hash: Some("5df5a1377dc4d70c71e47ffe6827e691e1f5868543b752dc8d19a500284e5fa6"),
-    archive_sha256: "eb2cfc9c254649ce5e5ed6073925803b206ce5e4615942eff3e9492e3b705cd4",
-    tooling_commit: "1af3ba971e8b494b58bb85d0c0fcf2ad15cd3b4c",
+    commit: "a0177ae4e68f4a043df4db727fb3212e23ab7395",
+    release_tag: "v0.1.6",
+    archive: "polymarket-v0.1.6.petal.tar.gz",
+    expected_hash: Some("0f365cd7f613129f73ce66fb07256c8a42c4e70abbb77721804dbd6df85b96b5"),
+    archive_sha256: "e02d300af67875a625eb633299f7782ce30a02be79dde3c813cda1db5a116d9f",
+    tooling_commit: "2beed2ff344ce2b0c112e07096027e1ae0404007",
     petal_abi: "bloom.petal-host/payload-signing-v1",
     default_eligible: true,
     lineage_id: Some("pln1_6etojfshqyk6bzm257kzv7noj3perfz4siioiuhj74xosznyzhka"),
-    release_sequence: 1,
-    predecessor_package_hashes: &[],
+    release_sequence: 2,
+    predecessor_package_hashes: &[
+        "5df5a1377dc4d70c71e47ffe6827e691e1f5868543b752dc8d19a500284e5fa6",
+    ],
     authority_routes: POLYMARKET_AUTHORITY_ROUTES,
 };
 
 const PREINSTALLED_HYPERLIQUID: PreinstalledPetal = PreinstalledPetal {
     name: "hyperliquid",
     repository: "https://github.com/bloom-directory/bloom-petal-hyperliquid",
-    commit: "1d44a1c3586849afe735866c6b54057590f91147",
-    release_tag: "v0.1.6",
-    archive: "hyperliquid-v0.1.6.petal.tar.gz",
-    expected_hash: Some("b29c7afb88ec9d2df774b18dad2699ec169100eeeedbcefca02ea0cc3712a188"),
-    archive_sha256: "2dae21cb207563caea508842f9ad72754acc2bcfb9ba97952520a5fc3f3841ad",
+    commit: "b91901befd8f7a98c859c1166117a5c35fddbf87",
+    release_tag: "v0.1.7",
+    archive: "hyperliquid-v0.1.7.petal.tar.gz",
+    expected_hash: Some("07fdcc9841c88de8fe1d0b4526bc01deac004c1c7dec202e2c8d7443300f22af"),
+    archive_sha256: "b42e501422c8e737dfa9f9ae1ab89ea9c8071edee1243f02b5db8bc5b19c3645",
     tooling_commit: "864a80b407387871bae06aabe77b91865e55f7bc",
     petal_abi: "bloom.petal-host/payload-signing-v1",
     default_eligible: true,
     lineage_id: Some("pln1_gyksmg4h5sqeu4pic5cg5xuwhhh3pokli3vc62btxjvi3lkwaykq"),
-    release_sequence: 1,
-    predecessor_package_hashes: &[],
+    release_sequence: 2,
+    predecessor_package_hashes: &[
+        "b29c7afb88ec9d2df774b18dad2699ec169100eeeedbcefca02ea0cc3712a188",
+    ],
     authority_routes: HYPERLIQUID_AUTHORITY_ROUTES,
 };
 
@@ -216,16 +305,18 @@ const PREINSTALLED_NEAR_INTENTS: PreinstalledPetal = PreinstalledPetal {
     name: "near-intents",
     repository: "https://github.com/bloom-directory/bloom-petal-near",
     commit: NEAR_INTENTS_RELEASE_COMMIT,
-    release_tag: "v0.1.3",
-    archive: "near-intents-v0.1.3.petal.tar.gz",
-    expected_hash: Some("ac2ccab59f36ee863843f92aaf0c975c00dbf32b246df5ccbb79757093785921"),
-    archive_sha256: "2f9c6b5f246017b0ad29708b528f2f4232a3eaa4d641c8ba9a196d1562a15993",
+    release_tag: "v0.1.4",
+    archive: "near-intents-v0.1.4.petal.tar.gz",
+    expected_hash: Some("a498727c1e9ba6f4385ca7514c2ef59236b6234b234b6e1920cb21358ea3b057"),
+    archive_sha256: "b7724456cf96331900bd2667e0dc7bfc0bb7eb639ae6123833bcfd1c501719e8",
     tooling_commit: "2beed2ff344ce2b0c112e07096027e1ae0404007",
     petal_abi: "bloom.petal-host/triad-compatible-nonauthority-v1",
     default_eligible: true,
     lineage_id: None,
-    release_sequence: 1,
-    predecessor_package_hashes: &[],
+    release_sequence: 2,
+    predecessor_package_hashes: &[
+        "ac2ccab59f36ee863843f92aaf0c975c00dbf32b246df5ccbb79757093785921",
+    ],
     authority_routes: &[],
 };
 
@@ -233,16 +324,18 @@ const PREINSTALLED_ENSO: PreinstalledPetal = PreinstalledPetal {
     name: "enso",
     repository: "https://github.com/bloom-directory/bloom-petal-enso",
     commit: ENSO_RELEASE_COMMIT,
-    release_tag: "v0.1.5",
-    archive: "enso-v0.1.5.petal.tar.gz",
-    expected_hash: Some("97650f327691f01bc4591cde25253d1e20010643e700674cc9759cd1366876b9"),
-    archive_sha256: "910683c8ea64bdd91f3edcbe1da82ab511267257f0be7ab7093466cd097a976f",
-    tooling_commit: "1af3ba971e8b494b58bb85d0c0fcf2ad15cd3b4c",
+    release_tag: "v0.1.6",
+    archive: "enso-v0.1.6.petal.tar.gz",
+    expected_hash: Some("e6ffbfdc96c5fa9b5fe5b62dc0c373b2522fb31d216a5a33ea2e1dab21c082a0"),
+    archive_sha256: "1dfe18aeb3646b3edbed56e80a33da205aed36b9651b95f4fc0fb12da1a10f4e",
+    tooling_commit: "2beed2ff344ce2b0c112e07096027e1ae0404007",
     petal_abi: "bloom.petal-host/triad-compatible-nonauthority-v1",
     default_eligible: true,
     lineage_id: None,
-    release_sequence: 1,
-    predecessor_package_hashes: &[],
+    release_sequence: 2,
+    predecessor_package_hashes: &[
+        "97650f327691f01bc4591cde25253d1e20010643e700674cc9759cd1366876b9",
+    ],
     authority_routes: &[],
 };
 
@@ -307,7 +400,7 @@ const PREINSTALLED_TOLLY: PreinstalledPetal = PreinstalledPetal {
     archive_sha256: "3a2407e3b9b519ce2be98bfb6f447cd6a6c84607c75c90308af506d3c2237d51",
     tooling_commit: "73c5b06a77599368fbc79fb7947a629b5b4c630e",
     petal_abi: "bloom.petal-host/triad-compatible-nonauthority-v1",
-    default_eligible: true,
+    default_eligible: false,
     lineage_id: None,
     release_sequence: 1,
     predecessor_package_hashes: &[],
@@ -1130,13 +1223,12 @@ pub(crate) fn preinstalled_petal(name: &str) -> Option<&'static PreinstalledPeta
 
 /// Bundled releases whose signed lineage also controls private-state
 /// carry-forward. Non-authority Petals receive a lineage-only catalog record.
-pub(crate) fn release_lineage_petals() -> [&'static PreinstalledPetal; 5] {
+pub(crate) fn release_lineage_petals() -> [&'static PreinstalledPetal; 4] {
     [
         &PREINSTALLED_POLYMARKET,
         &PREINSTALLED_HYPERLIQUID,
         &PREINSTALLED_ENSO,
         &PREINSTALLED_NEAR_INTENTS,
-        &PREINSTALLED_TOLLY,
     ]
 }
 
@@ -1815,16 +1907,40 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires downloaded release assets in BLOOM_PETAL_RELEASE_ASSETS"]
+    fn published_release_assets_match_pins_and_authority() {
+        let root = PathBuf::from(std::env::var_os("BLOOM_PETAL_RELEASE_ASSETS").unwrap());
+        let home = tempfile::tempdir().unwrap();
+        let daemon = Daemon::from_home(HomeDir::at(home.path())).unwrap();
+        for name in DEFAULT_PETALS {
+            let entry = preinstalled_petal(name).unwrap();
+            let dir = root.join(name);
+            let manifest: PetalReleaseManifest =
+                serde_json::from_slice(&std::fs::read(dir.join("petal-release.json")).unwrap())
+                    .unwrap();
+            let repo = built_in_github_repo(entry.repository).unwrap();
+            validate_release_manifest(entry, &repo, &manifest).unwrap();
+            let archive = dir.join(entry.archive);
+            assert_eq!(
+                verify_release_checksum(&archive, entry.archive, &dir.join("SHA256SUMS")).unwrap(),
+                entry.archive_sha256
+            );
+            prepare_prebuilt_petal_archive(&daemon, entry, &manifest, &archive)
+                .unwrap_or_else(|error| panic!("{name}: {error:#}"));
+        }
+    }
+
+    #[test]
     fn built_in_entries_are_immutable_and_incompatible_petals_are_absent() {
         let near = preinstalled_petal("near-intents").unwrap();
-        assert_eq!(near.release_tag, "v0.1.3");
+        assert_eq!(near.release_tag, "v0.1.4");
         assert_eq!(near.commit.len(), 40);
-        assert_eq!(near.archive, "near-intents-v0.1.3.petal.tar.gz");
+        assert_eq!(near.archive, "near-intents-v0.1.4.petal.tar.gz");
         assert!(near.repository.ends_with("/bloom-petal-near"));
         let enso = preinstalled_petal("enso").unwrap();
-        assert_eq!(enso.release_tag, "v0.1.5");
+        assert_eq!(enso.release_tag, "v0.1.6");
         assert_eq!(enso.commit, ENSO_RELEASE_COMMIT);
-        assert_eq!(enso.archive, "enso-v0.1.5.petal.tar.gz");
+        assert_eq!(enso.archive, "enso-v0.1.6.petal.tar.gz");
         assert!(enso.repository.ends_with("/bloom-petal-enso"));
         for name in [
             "polymarket",
@@ -1842,10 +1958,7 @@ mod tests {
             assert!(entry.expected_hash.is_some());
             assert_eq!(
                 entry.default_eligible,
-                matches!(
-                    name,
-                    "polymarket" | "hyperliquid" | "enso" | "near-intents" | "tolly"
-                )
+                matches!(name, "polymarket" | "hyperliquid" | "enso" | "near-intents")
             );
         }
         let tolly = preinstalled_petal("tolly").unwrap();
