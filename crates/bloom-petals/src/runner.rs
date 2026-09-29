@@ -696,12 +696,39 @@ impl PetalRunner {
     pub async fn dispatch_petal_route_with_trusted_params(
         &self,
         mount: &str,
+        request: DispatchRequest,
+        host: Arc<dyn PetalHost>,
+        cap_mask: Option<BTreeSet<Capability>>,
+        opts: RunOptions,
+        trusted_params: &[(String, String)],
+        account: Option<&AccountPetalContext>,
+    ) -> Result<DispatchOutput, PetalError> {
+        let execution = self.store.execution_guard().await;
+        self.dispatch_petal_route_with_execution_permit(
+            mount,
+            request,
+            host,
+            cap_mask,
+            opts,
+            trusted_params,
+            account,
+            &execution,
+        )
+        .await
+    }
+
+    // The router takes this permit before resolving the route and account.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn dispatch_petal_route_with_execution_permit(
+        &self,
+        mount: &str,
         mut request: DispatchRequest,
         host: Arc<dyn PetalHost>,
         cap_mask: Option<BTreeSet<Capability>>,
         opts: RunOptions,
         trusted_params: &[(String, String)],
         account: Option<&AccountPetalContext>,
+        _execution: &tokio::sync::RwLockReadGuard<'_, ()>,
     ) -> Result<DispatchOutput, PetalError> {
         if let Some((name, _)) = request
             .ctx
@@ -719,7 +746,6 @@ impl PetalRunner {
                 )));
             }
         }
-        let _execution = self.store.execution_guard().await;
         let matched = self.petal_route(mount, request.op, &request.path)?;
         let mut route_params = matched.params.clone();
         // Components need the host-selected route identity to construct

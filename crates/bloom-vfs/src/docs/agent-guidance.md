@@ -282,11 +282,9 @@ walkthrough in `docs/examples.md`.
 Installed application documents and public routes live under `petals/<name>/`.
 Account-dependent routes explicitly select a wallet and index, for example
 `petals/enso/intents/<wallet>/<index>/new`. Follow each package's route tree;
-there is no common synthetic wallet root. Every account has separate settings.
-Older wallet-only routes and packages are incompatible until updated. Complete
-pending funded work before upgrading a package whose legacy settings/sessions
-will reset. Keep every follow-up in the selected account, including core outbox
-confirmation paths. Wallet custody and core transaction history are retained.
+there is no common synthetic wallet root. Account state is isolated; explicitly
+declared service settings are shared across accounts. Keep every follow-up in
+the selected account, including core outbox confirmation paths.
 
 Paid HTTP operations live under `requests/`. They are actions, not ordinary
 reads: inspect the request plan, selected payment protocol, maximum amount,

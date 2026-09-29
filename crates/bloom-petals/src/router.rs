@@ -267,6 +267,7 @@ impl PetalRouter {
         path: String,
         body: Vec<u8>,
     ) -> Result<DispatchResponse, HandlerError> {
+        let execution = self.runner.store().execution_guard().await;
         let matched = self
             .runner
             .petal_route(mount, op, &path)
@@ -291,14 +292,14 @@ impl PetalRouter {
                     return Err(HandlerError::PermissionDenied);
                 }
                 let account = self.account_context(wallet, index).await?;
-                self.dispatch_for_account(mount, op, path, body, &account)
+                self.dispatch_for_account(mount, op, path, body, &account, &execution)
                     .await
             }
-            (_, None) => {
-                self.dispatch_with_params(mount, op, path, body, &[], None, None)
+            (None, None) => {
+                self.dispatch_with_params(mount, op, path, body, &[], None, None, &execution)
                     .await
             }
-            (None, Some(_)) => Err(HandlerError::PermissionDenied),
+            _ => Err(HandlerError::PermissionDenied),
         }
     }
 }
@@ -324,13 +325,15 @@ fn map_host_err(error: crate::host::HostError) -> HandlerError {
 
 impl PetalRouter {
     /// Dispatch using the account identity resolved by the host from live core state.
-    pub async fn dispatch_for_account(
+    #[allow(clippy::too_many_arguments)]
+    async fn dispatch_for_account(
         &self,
         mount: &str,
         op: DispatchOp,
         path: String,
         body: Vec<u8>,
         account: &AccountPetalContext,
+        execution: &tokio::sync::RwLockReadGuard<'_, ()>,
     ) -> Result<DispatchResponse, HandlerError> {
         let trusted = vec![
             ("bloom.wallet".to_owned(), account.wallet.clone()),
@@ -344,6 +347,7 @@ impl PetalRouter {
             &trusted,
             Some(account.wallet.clone()),
             Some(account),
+            execution,
         )
         .await
     }
@@ -358,6 +362,7 @@ impl PetalRouter {
         trusted_params: &[(String, String)],
         account_wallet: Option<String>,
         account: Option<&AccountPetalContext>,
+        execution: &tokio::sync::RwLockReadGuard<'_, ()>,
     ) -> Result<DispatchResponse, HandlerError> {
         // Lookup, list, and ordinary reads are filesystem observations, not
         // security effects. Auditing them both misstates the event stream and
@@ -426,7 +431,7 @@ impl PetalRouter {
         }
         let executed = self
             .runner
-            .dispatch_petal_route_with_trusted_params(
+            .dispatch_petal_route_with_execution_permit(
                 mount,
                 DispatchRequest {
                     op,
@@ -439,6 +444,7 @@ impl PetalRouter {
                 self.run_options(mount),
                 trusted_params,
                 account,
+                execution,
             )
             .await;
         let (outcome, result_digest) = match &executed {
@@ -1084,6 +1090,101 @@ name = "example"
             .await
             .unwrap();
         assert_eq!(bytes, b"component");
+    }
+
+    #[tokio::test]
+    async fn incomplete_account_routes_are_denied_before_guest_execution() {
+        let (dir, runner) = runner();
+        let package = dir.path().join("demo-app");
+        write_demo_package(&package);
+        for capture in ["wallet", "index"] {
+            write_package_file(
+                &package,
+                &format!("petal/demo/{capture}/[{capture}]/hello.txt.wasm"),
+                include_bytes!("../tests/fixtures/route_component_no_imports.wasm"),
+            );
+        }
+        runner.store().install_petal_package_dir(&package).unwrap();
+        let router = PetalRouter::new(runner, Arc::new(AccountHost));
+        for path in ["/demo/wallet/alice/hello.txt", "/demo/index/0/hello.txt"] {
+            assert!(matches!(
+                router.read(&VfsPath::parse(path).unwrap()).await,
+                Err(HandlerError::PermissionDenied)
+            ));
+        }
+        assert_eq!(
+            router
+                .read(&VfsPath::parse("/demo/hello.txt").unwrap())
+                .await
+                .unwrap(),
+            b"component"
+        );
+    }
+
+    #[tokio::test]
+    async fn account_resolution_prevents_replacement_until_dispatch_finishes() {
+        struct ReplacingHost {
+            store: PetalStore,
+            successor: std::path::PathBuf,
+            attempted: std::sync::atomic::AtomicBool,
+        }
+        #[async_trait]
+        impl PetalHost for ReplacingHost {
+            async fn vfs_lookup(&self, path: &str) -> Result<HostVfsEntry, HostError> {
+                AccountHost.vfs_lookup(path).await
+            }
+            async fn vfs_list(&self, path: &str) -> Result<Vec<HostVfsEntry>, HostError> {
+                AccountHost.vfs_list(path).await
+            }
+            async fn vfs_write(&self, path: &str, bytes: &[u8]) -> Result<(), HostError> {
+                AccountHost.vfs_write(path, bytes).await
+            }
+            async fn vfs_read(&self, path: &str) -> Result<Vec<u8>, HostError> {
+                // This await boundary used to allow replacement before the
+                // runner acquired its permit and matched the route again.
+                let error = self
+                    .store
+                    .install_petal_package_dir(&self.successor)
+                    .unwrap_err();
+                assert!(error.to_string().contains("retry"), "{error}");
+                self.attempted
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                AccountHost.vfs_read(path).await
+            }
+        }
+        let (dir, runner) = runner();
+        let package = dir.path().join("predecessor");
+        write_demo_package(&package);
+        write_package_file(
+            &package,
+            "petal/demo/intents/[wallet]/[index]/hello.txt.wasm",
+            include_bytes!("../tests/fixtures/route_component_no_imports.wasm"),
+        );
+        runner.store().install_petal_package_dir(&package).unwrap();
+        let successor = dir.path().join("successor");
+        write_demo_package(&successor);
+        write_package_file(
+            &successor,
+            "petal/demo/intents/alice/0/hello.txt.wasm",
+            include_bytes!("../tests/fixtures/route_component_no_imports.wasm"),
+        );
+        let host = Arc::new(ReplacingHost {
+            store: runner.store().clone(),
+            successor,
+            attempted: std::sync::atomic::AtomicBool::new(false),
+        });
+        let router = PetalRouter::new(runner, host.clone());
+        assert_eq!(
+            router
+                .read(&VfsPath::parse("/demo/intents/alice/0/hello.txt").unwrap())
+                .await
+                .unwrap(),
+            b"component"
+        );
+        assert!(host.attempted.load(std::sync::atomic::Ordering::SeqCst));
+        host.store
+            .install_petal_package_dir(&host.successor)
+            .unwrap();
     }
 
     #[tokio::test]
