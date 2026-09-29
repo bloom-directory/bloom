@@ -49,11 +49,12 @@ def fetch_max_builder_fee(user: str, builder: str, network: str) -> object:
     )
     try:
         with urllib.request.urlopen(request, timeout=VENUE_TIMEOUT_SECONDS) as response:
-            if response.status != 200:
-                raise InvalidReport(
-                    f"Hyperliquid maxBuilderFee query returned HTTP {response.status}"
-                )
             return json.loads(response.read())
+    except urllib.error.HTTPError as error:
+        # urlopen raises for every non-2xx status rather than returning it.
+        raise InvalidReport(
+            f"Hyperliquid maxBuilderFee query returned HTTP {error.code}"
+        ) from error
     except (OSError, urllib.error.URLError, json.JSONDecodeError) as error:
         raise InvalidReport(f"could not read Hyperliquid maxBuilderFee: {error}") from error
 

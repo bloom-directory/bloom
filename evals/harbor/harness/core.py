@@ -118,9 +118,19 @@ class CounterSidecar:
 
     @contextmanager
     def locked(self) -> Iterator[None]:
-        """Hold the exclusive per-credential reservation lock."""
-        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        descriptor = os.open(self.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        """Hold the exclusive per-credential reservation lock.
+
+        Raises EvalError, not a bare OSError, when the lock cannot be taken:
+        every caller (direct runs, the operator's policy ceremonies) treats
+        EvalError as the refusal it can record and report.
+        """
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            descriptor = os.open(self.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        except OSError as error:
+            raise EvalError(
+                f"counter sidecar lock is unavailable: {error}"
+            ) from error
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX)
             try:
@@ -167,24 +177,29 @@ class CounterSidecar:
             sort_keys=True,
             separators=(",", ":"),
         ).encode() + b"\n"
-        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         temporary = self.path.with_name(f".{self.path.name}.new-{os.getpid()}")
-        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
-            with os.fdopen(descriptor, "wb") as handle:
-                handle.write(body)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary, self.path)
-            os.chmod(self.path, 0o600)
-            directory = os.open(self.path.parent, os.O_RDONLY)
+            self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             try:
-                os.fsync(directory)
+                with os.fdopen(descriptor, "wb") as handle:
+                    handle.write(body)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary, self.path)
+                os.chmod(self.path, 0o600)
+                directory = os.open(self.path.parent, os.O_RDONLY)
+                try:
+                    os.fsync(directory)
+                finally:
+                    os.close(directory)
             finally:
-                os.close(directory)
-        finally:
-            if temporary.exists():
-                temporary.unlink()
+                if temporary.exists():
+                    temporary.unlink()
+        except OSError as error:
+            raise EvalError(
+                f"counter sidecar could not be written: {error}"
+            ) from error
 
     def write(self, next_counter: int) -> None:
         """Record `next_counter`, strictly advancing, under the lock."""

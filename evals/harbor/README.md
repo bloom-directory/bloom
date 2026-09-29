@@ -203,28 +203,28 @@ cleared only after the deny-by-default policy is visible again.
 
 ### The authenticator counter sidecar
 
-`next_sign_count` in the operator state file is the only durable record of
-which WebAuthn counters have been spent. Broker rejects a reused counter as
-a replay, so the harness treats a counter as spent from the moment the debug
-driver could reach Broker, not once it returns: `EvalDefinition.reserve_counter`
-commits the advanced value through `StateStore.update_counter` *before*
-invoking the driver. A run interrupted mid-assertion therefore leaves the
-counter recorded as consumed, which is the safe direction — a skipped
-counter is valid, a reused one is not.
+The per-credential counter sidecar is the durable record of which WebAuthn
+counters have been spent. Broker rejects a reused counter as a replay, so the
+harness treats a counter as spent from the moment the debug driver could reach
+Broker, not once it returns: every counter a run may sign with is recorded in
+the sidecar *before* the driver is invoked. A run interrupted mid-assertion
+therefore leaves the counter recorded as consumed, which is the safe direction
+— a skipped counter is valid, a reused one is not.
 
-That guarantee depends entirely on the sidecar being writable. If the state
-file is read-only, its parent directory is not writable, or the filesystem is
-full, the commit raises *after* the assertion may already have reached Broker:
-the counter is spent at Broker but absent from the file, and the next run
-starts from a counter Broker will reject. Preflight therefore calls
-`EvalDefinition.require_counter_durability`, which exercises
-`StateStore.verify_writable` — a rewrite of the validated state as its own
-canonical bytes through the same atomic path a real commit uses. It proves the
-write can land while leaving `next_sign_count` untouched, so the check itself
-can never make a run skip a counter. A run driven without an operator state
-file has no sidecar and skips the check.
+That guarantee depends entirely on the sidecar being writable. If its file is
+read-only, its directory is not writable, or the filesystem is full, a write
+that fails *after* an assertion has reached Broker leaves the counter spent at
+Broker but absent from the record, and the next run starts from a counter
+Broker will reject. Preflight therefore calls
+`EvalDefinition.require_counter_durability`, which takes the same lock a
+reservation takes and rewrites the recorded value as its own bytes (or, for a
+fresh record, creates and removes the temporary a real write would use). It
+proves the write can land while leaving the counter untouched, so the check
+itself can never make a run skip a counter. Under the operator lifecycle the
+same check also rewrites the operator state file through `StateStore.verify_writable`,
+because that file mirrors the record and must be writable too.
 
-Both live Hyperliquid evals share these two methods, so the reservation and
+Both live Hyperliquid evals share these methods, so the reservation and
 durability rules have a single definition rather than one copy per eval.
 
 A run started directly with `python -m harness <eval> <agent>` has no
@@ -287,6 +287,15 @@ a run from any nonzero baseline would erase that approval, and one at or above
 the target would also stop the venue-side check from attributing the change to
 the agent. Provision therefore refuses a nonzero baseline before staging
 anything.
+
+The harness completes only the ceremonies its own writes stage. An agent
+write whose body does not match the staged approval stages a second owner
+ceremony that nothing completes; cleanup ignores it when driving the revoke,
+so the venue still ends at zero, but the pending request remains and the next
+run refuses at preflight (`a prior approve_builder_fee ceremony is still
+awaiting owner action`) until that ceremony expires. A signing-request record
+that cannot be read is treated as an error rather than skipped, so neither
+guard can pass by overlooking a request.
 
 Each run writes a mode-`0600` JSON summary beside the operator state, under
 `harbor-summaries/`. It includes source lineage, installed package hash,

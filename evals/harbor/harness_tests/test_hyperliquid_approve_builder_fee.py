@@ -830,11 +830,16 @@ class FakeVenue:
             for rid, entry in self.requests.items()
         ]
 
-    def pending_ceremony(self) -> str | None:
-        awaiting = any(
-            entry["status"] == "awaiting_owner_approval"
-            for entry in self.requests.values()
-        )
+    def pending_ceremony(
+        self, *, exclude: frozenset[str] = frozenset()
+    ) -> str | None:
+        awaiting = [
+            rid
+            for rid, entry in self.requests.items()
+            if entry["status"] == "awaiting_owner_approval" and rid not in exclude
+        ]
+        if len(awaiting) > 1:
+            raise EvalError("multiple approve_builder_fee ceremonies match the exact wallet")
         return self.CEREMONY if awaiting else None
 
     def install(self, test: unittest.TestCase) -> None:
@@ -875,6 +880,8 @@ class BuilderFeeCeremonyLifecycleTests(BuilderFeeFixture, unittest.TestCase):
             return_value=subprocess.CompletedProcess([], 0, b"", b"")
         )
         definition._pending_builder_fee_ceremony = mock.Mock(return_value=ceremony)
+        # The pre-write snapshot must not consume a scripted status below.
+        definition._pending_request_ids = mock.Mock(return_value=frozenset())
         pending = list(statuses or ["approved_retry_required"])
         # One staged request, whose status walks `statuses` and then settles
         # on "signed" -- the state a grant the agent consumed ends in.
@@ -1013,6 +1020,58 @@ class BuilderFeeCeremonyLifecycleTests(BuilderFeeFixture, unittest.TestCase):
             0,
             "a consumed single-use approval cannot be replayed to re-grant",
         )
+
+    def test_cleanup_revokes_despite_a_stray_ceremony_the_agent_staged(self) -> None:
+        """A mismatched agent write must not block the revoke.
+
+        Such a write stages its own owner ceremony that nothing completes.
+        Cleanup's revoke discovers only the ceremony its own write staged,
+        so the venue still ends at zero instead of cleanup refusing on
+        "multiple ceremonies" and leaving the consumed grant live.
+        """
+        definition = self.definition
+        venue = self.venue()
+        venue.install(self)
+        # Discovery must go through the pending-request listing, as it does
+        # when the write's output carries no ceremony URL.
+        definition._write_route = mock.Mock(
+            side_effect=lambda route, body, timeout: subprocess.CompletedProcess(
+                [], venue.write(route, body, timeout).returncode, b"", b""
+            )
+        )
+
+        max_fee = int(definition.max_fee_tenths_bps_value)
+        definition.nonce = 4242
+        grant_body = definition._request_body(max_fee, definition.nonce)
+        definition.staged_request_id = venue.stage_approval(grant_body)
+        definition.cleanup_needed = True
+        # The agent consumed the grant, then wrote a body with its own nonce.
+        venue.write(None, grant_body, None)
+        self.assertEqual(venue.max_builder_fee, max_fee)
+        stray = venue.stage_approval(
+            definition._request_body(max_fee, 9999), "awaiting_owner_approval"
+        )
+
+        definition.cleanup()
+
+        self.assertEqual(venue.max_builder_fee, 0, "venue ends revoked")
+        self.assertIn(stray, venue.requests, "the stray request is left for the operator")
+
+    def test_an_unreadable_signing_request_record_is_an_error(self) -> None:
+        """A record that cannot be read must fail the guard, not be skipped.
+
+        Skipping it would let preflight overlook a stale pending ceremony and
+        let staging overlook the grant it just created.
+        """
+        from harness import hyperliquid_approve_builder_fee as module
+
+        definition = self.definition
+        definition._read_json = mock.Mock(side_effect=EvalError("could not read"))
+        with (
+            mock.patch.object(module.os, "listdir", return_value=["a" * 64 + ".json"]),
+            self.assertRaisesRegex(EvalError, "could not read"),
+        ):
+            definition._pending_builder_fee_ceremony()
 
 
 if __name__ == "__main__":

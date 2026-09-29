@@ -247,6 +247,10 @@ class HyperliquidApproveBuilderFeeEval(EvalDefinition):
         revoke are indistinguishable at this layer (both are
         hyperliquid.approve_builder_fee); the caller only ever has one in
         flight, so callers refuse to act rather than guess on more than one.
+
+        A record that cannot be read is an error, not a skip: the guards built
+        on this listing (no stale ceremony pending, the grant really staged)
+        fail closed rather than silently overlooking a request.
         """
         root = self.bloom_mount / "petal-signing-requests"
         try:
@@ -261,10 +265,7 @@ class HyperliquidApproveBuilderFeeEval(EvalDefinition):
         for name in names:
             if re.fullmatch(r"[0-9a-f]{64}\.json", name) is None:
                 continue
-            try:
-                record = self._read_json(root / name)
-            except EvalError:
-                continue
+            record = self._read_json(root / name)
             if not isinstance(record, dict):
                 continue
             if (
@@ -277,10 +278,30 @@ class HyperliquidApproveBuilderFeeEval(EvalDefinition):
             matches.append(record)
         return matches
 
-    def _pending_builder_fee_ceremony(self) -> str | None:
+    def _pending_request_ids(self) -> frozenset[str]:
+        """Ids of every request currently awaiting owner action."""
+        return frozenset(
+            record["request_id"]
+            for record in self._builder_fee_requests()
+            if record.get("status") == "awaiting_owner_approval"
+            and isinstance(record.get("request_id"), str)
+        )
+
+    def _pending_builder_fee_ceremony(
+        self, *, exclude: frozenset[str] = frozenset()
+    ) -> str | None:
+        """The one pending ceremony URL, ignoring requests in `exclude`.
+
+        `exclude` lets a write bind discovery to the ceremony it staged: an
+        agent write with a mismatched body stages its own ceremony that no
+        one can complete, and without the exclusion cleanup's revoke would
+        see two pending ceremonies and refuse, leaving the venue granted.
+        """
         matches: list[str] = []
         for record in self._builder_fee_requests():
             if record.get("status") != "awaiting_owner_approval":
+                continue
+            if record.get("request_id") in exclude:
                 continue
             ceremony_url = record.get("ceremony_url")
             if not isinstance(ceremony_url, str):
@@ -608,6 +629,11 @@ class HyperliquidApproveBuilderFeeEval(EvalDefinition):
         persisted to `self.sign_count` before the driver runs, so a later
         action on this instance can never reuse a counter this one attempted.
         """
+        # Ceremonies pending before this write are not ours to complete: a
+        # stray one (an agent write whose body did not match the staged
+        # approval) must neither be signed with this run's counter nor make
+        # discovery refuse on "multiple ceremonies".
+        stale = self._pending_request_ids()
         first = self._write_route(route, body, WRITE_TIMEOUT_SECONDS)
         output = (first.stdout + first.stderr).decode(errors="replace")
         last_output = output
@@ -619,7 +645,7 @@ class HyperliquidApproveBuilderFeeEval(EvalDefinition):
                 ceremony_url = (
                     match.group(0)
                     if match is not None
-                    else self._pending_builder_fee_ceremony()
+                    else self._pending_builder_fee_ceremony(exclude=stale)
                 )
                 if ceremony_url is not None:
                     break

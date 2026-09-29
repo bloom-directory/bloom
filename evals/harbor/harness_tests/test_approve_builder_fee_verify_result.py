@@ -166,8 +166,10 @@ class ApproveBuilderFeeVerifierTests(unittest.TestCase):
         )
 
     def test_main_fails_closed_on_a_non_ok_venue_http_status(self) -> None:
-        class ErrorResponse(Response):
-            status = 500
+        # urlopen raises for every non-2xx status instead of returning it.
+        http_error = verify_result.urllib.error.HTTPError(
+            "https://api.hyperliquid-testnet.xyz/info", 500, "Internal Server Error", None, None
+        )
 
         with tempfile.TemporaryDirectory() as directory:
             report_path = Path(directory) / "result.json"
@@ -176,7 +178,7 @@ class ApproveBuilderFeeVerifierTests(unittest.TestCase):
                 mock.patch.object(
                     verify_result.urllib.request,
                     "urlopen",
-                    return_value=ErrorResponse(self.max_fee_tenths_bps),
+                    side_effect=http_error,
                 ),
                 mock.patch.object(
                     verify_result.sys, "argv", ["verify_result.py", str(report_path)]
