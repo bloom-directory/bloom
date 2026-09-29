@@ -2692,10 +2692,11 @@ impl PetalHost for DaemonPetalHost {
             .outbox
             .read_receipt(&wallet, &chain_name, &outbox_id)
             .map_err(|e| HostError::Backend(format!("read EVM outbox receipt: {e}")))?;
-        let state = receipt
-            .as_ref()
-            .map(|receipt| receipt.outcome.clone())
-            .unwrap_or_else(|| entry.staged.status.to_string());
+        let state = petal_outbox_state(
+            entry.state,
+            &entry.staged.status,
+            receipt.as_ref().map(|receipt| receipt.outcome.as_str()),
+        );
         let receipt_json = receipt
             .map(|receipt| serde_json::to_string(&receipt))
             .transpose()
@@ -2723,6 +2724,29 @@ impl PetalHost for DaemonPetalHost {
             .ok_or_else(|| HostError::NotFound(format!("chain {}", req.chain)))?;
         let result_json = daemon_petal_chain_read(&chain, &req.method, &req.params_json).await?;
         Ok(ChainResponse { result_json })
+    }
+}
+
+/// The state a Petal sees for an outbox entry it staged.
+///
+/// A mined receipt decides the outcome. Without one, an entry that was never
+/// broadcast and has been moved out of the pending queue was cancelled: its
+/// account nonce went to the replacement, so it can no longer be sent. Its
+/// stored status stays `pending`, which would otherwise leave the Petal
+/// waiting for a transaction that cannot happen.
+fn petal_outbox_state(
+    entry_state: bloom_tx::outbox::OutboxState,
+    status: &bloom_proto::TxStatus,
+    receipt_outcome: Option<&str>,
+) -> String {
+    match receipt_outcome {
+        Some(outcome) => outcome.to_owned(),
+        None if entry_state == bloom_tx::outbox::OutboxState::Failed
+            && *status == bloom_proto::TxStatus::Pending =>
+        {
+            bloom_proto::TxStatus::Cancelled.to_string()
+        }
+        None => status.to_string(),
     }
 }
 
@@ -7091,6 +7115,28 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(denied, HostError::Denied(_)));
+    }
+
+    #[test]
+    fn a_petal_sees_a_never_broadcast_entry_that_left_the_queue_as_cancelled() {
+        use bloom_proto::TxStatus;
+        use bloom_tx::outbox::OutboxState;
+        let state = |entry, status: TxStatus, receipt| petal_outbox_state(entry, &status, receipt);
+        assert_eq!(
+            state(OutboxState::Pending, TxStatus::Pending, None),
+            "pending"
+        );
+        assert_eq!(
+            state(OutboxState::Failed, TxStatus::Pending, None),
+            "cancelled"
+        );
+        // A broadcast original can still be mined; only a receipt settles it.
+        assert_eq!(state(OutboxState::Failed, TxStatus::Sent, None), "sent");
+        assert_eq!(state(OutboxState::Failed, TxStatus::Failed, None), "failed");
+        assert_eq!(
+            state(OutboxState::Failed, TxStatus::Pending, Some("success")),
+            "success"
+        );
     }
 
     /// A pre-existing watch spec on disk should be loaded into the
