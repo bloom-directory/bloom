@@ -2693,7 +2693,6 @@ impl PetalHost for DaemonPetalHost {
             .read_receipt(&wallet, &chain_name, &outbox_id)
             .map_err(|e| HostError::Backend(format!("read EVM outbox receipt: {e}")))?;
         let state = petal_outbox_state(
-            entry.state,
             &entry.staged.status,
             receipt.as_ref().map(|receipt| receipt.outcome.as_str()),
         );
@@ -2729,23 +2728,17 @@ impl PetalHost for DaemonPetalHost {
 
 /// The state a Petal sees for an outbox entry it staged.
 ///
-/// A mined receipt decides the outcome. Without one, an entry that was never
-/// broadcast and has been moved out of the pending queue was cancelled: its
-/// account nonce went to the replacement, so it can no longer be sent. Its
-/// stored status stays `pending`, which would otherwise leave the Petal
-/// waiting for a transaction that cannot happen.
-fn petal_outbox_state(
-    entry_state: bloom_tx::outbox::OutboxState,
-    status: &bloom_proto::TxStatus,
-    receipt_outcome: Option<&str>,
-) -> String {
+/// A mined receipt decides the outcome; otherwise the stored status does.
+///
+/// The status is enough because every producer that moves an entry out of the
+/// pending queue now persists the status it means: `cancelled` when a
+/// replacement took the account nonce, `failed` when policy denied it or it
+/// expired before approval. Inferring "cancelled" from a `(Failed, Pending)`
+/// entry instead would tell a Petal that a policy-denied transaction is safe
+/// to restage, which loops it against the same denial.
+fn petal_outbox_state(status: &bloom_proto::TxStatus, receipt_outcome: Option<&str>) -> String {
     match receipt_outcome {
         Some(outcome) => outcome.to_owned(),
-        None if entry_state == bloom_tx::outbox::OutboxState::Failed
-            && *status == bloom_proto::TxStatus::Pending =>
-        {
-            bloom_proto::TxStatus::Cancelled.to_string()
-        }
         None => status.to_string(),
     }
 }
@@ -7117,26 +7110,27 @@ mod tests {
         assert!(matches!(denied, HostError::Denied(_)));
     }
 
+    /// A Petal was left waiting on an entry that could never be sent: the
+    /// cancel path moved the original out of the pending queue but wrote the
+    /// `Cancelled` status only into a separate `cancel_intent.json`, so the
+    /// entry the Petal reads still said `pending`. The producers now record
+    /// what they mean, which is why this reports the stored status rather
+    /// than inferring a reason from the directory the entry landed in --
+    /// inferring "cancelled" would tell a Petal that a policy-denied
+    /// transaction is safe to restage.
     #[test]
-    fn a_petal_sees_a_never_broadcast_entry_that_left_the_queue_as_cancelled() {
+    fn a_petal_sees_the_reason_an_entry_left_the_queue_not_a_guess() {
         use bloom_proto::TxStatus;
-        use bloom_tx::outbox::OutboxState;
-        let state = |entry, status: TxStatus, receipt| petal_outbox_state(entry, &status, receipt);
-        assert_eq!(
-            state(OutboxState::Pending, TxStatus::Pending, None),
-            "pending"
-        );
-        assert_eq!(
-            state(OutboxState::Failed, TxStatus::Pending, None),
-            "cancelled"
-        );
+        let state = |status: TxStatus, receipt| petal_outbox_state(&status, receipt);
+        assert_eq!(state(TxStatus::Pending, None), "pending");
+        assert_eq!(state(TxStatus::Cancelled, None), "cancelled");
+        // Policy denial and expiry are failures, not cancellations: a Petal
+        // told "cancelled" restages, and would loop against the same denial.
+        assert_eq!(state(TxStatus::Failed, None), "failed");
         // A broadcast original can still be mined; only a receipt settles it.
-        assert_eq!(state(OutboxState::Failed, TxStatus::Sent, None), "sent");
-        assert_eq!(state(OutboxState::Failed, TxStatus::Failed, None), "failed");
-        assert_eq!(
-            state(OutboxState::Failed, TxStatus::Pending, Some("success")),
-            "success"
-        );
+        assert_eq!(state(TxStatus::Sent, None), "sent");
+        assert_eq!(state(TxStatus::Pending, Some("success")), "success");
+        assert_eq!(state(TxStatus::Cancelled, Some("success")), "success");
     }
 
     /// A pre-existing watch spec on disk should be loaded into the
