@@ -271,7 +271,7 @@ account 0.
 
 Build with the project's normal tools. Stage a JSON/TOML intent using
 `kind: "deploy"`, complete hex initcode in `data`, and optional native `value`
-at `wallets/<wallet>/chains/<chain>/outbox/new.tx`. Append ABI-encoded constructor
+at `wallets/<wallet>/<n>/chains/<chain>/outbox/new.tx`. Append ABI-encoded constructor
 arguments and link libraries before staging; do not supply `to`. Read the
 pending entry's `plan.md` and complete its usual Broker approval flow.
 

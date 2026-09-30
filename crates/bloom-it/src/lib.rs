@@ -110,6 +110,12 @@ impl ExactSigningBrokerFixture {
         self.active.store(true, Ordering::SeqCst);
     }
 
+    /// Put the owner back in the loop, so the next signing request reports
+    /// approval_required again.
+    pub fn deactivate(&self) {
+        self.active.store(false, Ordering::SeqCst);
+    }
+
     pub fn requests(&self) -> Vec<MachineBrokerRequest> {
         self.requests.lock().clone()
     }

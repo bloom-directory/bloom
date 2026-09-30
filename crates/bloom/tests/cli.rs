@@ -2303,7 +2303,10 @@ fn wallet_confirm_uses_plain_ipc_write_when_socket_exists() {
             "y",
         ])
         .assert()
-        .success();
+        // Confirmed, but no broadcast result is recorded yet, so the outcome
+        // is unknown rather than done. Exit 0 would tell a script the
+        // transaction went out.
+        .code(4);
 
     stop_ipc_server(server, server_thread);
 
@@ -2354,7 +2357,9 @@ fn wallet_confirm_reports_the_pending_ceremony_url() {
             "y",
         ])
         .assert()
-        .success()
+        // Nothing is signed or broadcast: an owner still has to complete the
+        // ceremony. Distinct from 0 (broadcast recorded) and 1 (failed).
+        .code(3)
         .stdout(predicate::str::contains(
             "Approval required: open http://localhost:18734/c/secret",
         ))

@@ -23,7 +23,23 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicI32;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-static UPDATE_EXIT_CODE: AtomicI32 = AtomicI32::new(0);
+/// A non-failure exit code a command wants `main` to return.
+///
+/// `run` reports success or an error, but some commands finish correctly
+/// without the thing the caller was waiting for having happened -- a confirm
+/// whose approval ceremony is still open, or a self-update that asks to be
+/// re-run. A script needs to tell those from a completed action, and both are
+/// wrong to report as a failure.
+static EXIT_CODE_OVERRIDE: AtomicI32 = AtomicI32::new(0);
+
+/// `bloom wallet confirm` ran, and the transaction is not signed or broadcast:
+/// an owner still has to complete the ceremony. Distinct from 0 (broadcast
+/// recorded, or cancel accepted) and from 1 (the command failed).
+const EXIT_APPROVAL_PENDING: i32 = 3;
+
+/// `bloom wallet confirm` ran and no broadcast result is recorded yet, so the
+/// outcome is genuinely unknown rather than pending on a person.
+const EXIT_RESULT_UNKNOWN: i32 = 4;
 
 use anyhow::{Context, Result, bail};
 use base64::Engine as _;
@@ -2698,6 +2714,12 @@ enum WalletCmd {
         intent: Option<String>,
     },
     /// Submit confirmation of a staged transaction through the Machine VFS.
+    ///
+    /// Exit codes: 0 the broadcast is recorded, or a cancel was accepted;
+    /// 3 an owner still has to complete the approval ceremony, so nothing is
+    /// signed; 4 confirmed with no broadcast result recorded yet; 1 the
+    /// command failed. A script must not read 0 as "the transaction went out"
+    /// without checking which.
     Confirm {
         wallet: String,
         chain: String,
@@ -2804,7 +2826,7 @@ async fn main() -> ExitCode {
 
     match run(cli).await {
         Ok(()) => {
-            let code = UPDATE_EXIT_CODE.load(std::sync::atomic::Ordering::SeqCst);
+            let code = EXIT_CODE_OVERRIDE.load(std::sync::atomic::Ordering::SeqCst);
             if code != 0 {
                 return ExitCode::from(code as u8);
             }
@@ -3243,7 +3265,7 @@ async fn call_machine_command(endpoint: &ResolvedEndpoint, command: MachineComma
     std::io::Write::write_all(&mut std::io::stdout(), output.stdout.as_bytes())?;
     std::io::Write::write_all(&mut std::io::stderr(), output.stderr.as_bytes())?;
     if output.exit_code != 0 {
-        UPDATE_EXIT_CODE.store(output.exit_code, std::sync::atomic::Ordering::SeqCst);
+        EXIT_CODE_OVERRIDE.store(output.exit_code, std::sync::atomic::Ordering::SeqCst);
     }
     Ok(())
 }
@@ -3825,6 +3847,10 @@ async fn run(cli: Cli) -> Result<()> {
                         "Ceremony expires in {}s; re-run this confirm after approving.",
                         remaining / 1000
                     );
+                    // Nothing is signed or broadcast yet, so exit 0 would tell
+                    // a script the transaction went out.
+                    EXIT_CODE_OVERRIDE
+                        .store(EXIT_APPROVAL_PENDING, std::sync::atomic::Ordering::SeqCst);
                     Ok(())
                 }
                 (Err((code, _)), Some(ConfirmProjection::Broadcast { tx_hash }))
@@ -3854,6 +3880,8 @@ async fn run(cli: Cli) -> Result<()> {
                         "Ceremony expires in {}s; re-run this confirm after approving.",
                         remaining / 1000
                     );
+                    EXIT_CODE_OVERRIDE
+                        .store(EXIT_APPROVAL_PENDING, std::sync::atomic::Ordering::SeqCst);
                     Ok(())
                 }
                 (Ok(_), Some(ConfirmProjection::Broadcast { tx_hash })) => {
@@ -3868,6 +3896,10 @@ async fn run(cli: Cli) -> Result<()> {
                         println!(
                             "Confirmed; no broadcast result recorded yet. Inspect wallets/{wallet}/0/chains/{chain}/outbox/"
                         );
+                        // An accepted cancel is done; an unrecorded broadcast
+                        // is not, and a script must be able to tell.
+                        EXIT_CODE_OVERRIDE
+                            .store(EXIT_RESULT_UNKNOWN, std::sync::atomic::Ordering::SeqCst);
                     }
                     Ok(())
                 }

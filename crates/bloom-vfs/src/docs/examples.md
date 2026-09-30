@@ -71,8 +71,8 @@ field; sending to the zero address is an ordinary call, not deployment.
 # Build with the project's normal tools, then prepare a JSON intent:
 # {"kind":"deploy","data":"0x<complete-initcode>","value":"0","chain":"anvil"}
 # The placeholder above must be replaced with actual compiled initcode.
-cp deployment.json "$BLOOM/wallets/alice/chains/anvil/outbox/new.tx"
-ls "$BLOOM/wallets/alice/chains/anvil/outbox/pending/"
+cp deployment.json "$BLOOM/wallets/alice/0/chains/anvil/outbox/new.tx"
+ls "$BLOOM/wallets/alice/0/chains/anvil/outbox/pending/"
 ```
 
 Read the selected pending entry's `plan.md`, then use its usual `confirm`

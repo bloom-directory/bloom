@@ -1452,6 +1452,20 @@ impl TxEngine {
         // the same nonce.
         let nonce_mutex = self.nonce_lock_for(wallet, &spec.name, from);
         let _nonce_guard = nonce_mutex.lock().await;
+        // Sweep before anything reads the queue. An expired pending row is
+        // not holding its nonce -- it can never be sent -- so scanning first
+        // reported it as a reservation and refused a deployment that the very
+        // next statement would have freed.
+        let now_ms = now_ms();
+        let swept = self.outbox.sweep_expired(now_ms)?;
+        if swept > 0 {
+            tracing::info!(
+                wallet,
+                chain = %spec.name,
+                swept,
+                "tx.outbox_swept_expired_before_stage"
+            );
+        }
         if let Some((id, _)) = deployment {
             match self.outbox.read(wallet, &spec.name, id) {
                 // A failed row is terminal: fall through and restage the
@@ -1475,9 +1489,18 @@ impl TxEngine {
                 }
                 for state in [OutboxState::Pending, OutboxState::Sent] {
                     for existing in self.outbox.list(wallet, &spec.name, state)? {
-                        let entry = self
+                        // A row whose intent.json is missing or unreadable
+                        // reserves no nonce, so it is skipped rather than
+                        // propagated -- every other outbox walker does the
+                        // same. Propagating meant one such directory
+                        // permanently refused every explicit-nonce deployment
+                        // for this wallet and chain.
+                        let Ok(entry) = self
                             .outbox
-                            .read_in_state(wallet, &spec.name, &existing, state)?;
+                            .read_in_state(wallet, &spec.name, &existing, state)
+                        else {
+                            continue;
+                        };
                         if entry.staged.nonce == nonce
                             && entry.staged.from.parse::<Address>().ok() == Some(from)
                         {
@@ -1489,16 +1512,6 @@ impl TxEngine {
                     }
                 }
             }
-        }
-        let now_ms = now_ms();
-        let swept = self.outbox.sweep_expired(now_ms)?;
-        if swept > 0 {
-            tracing::info!(
-                wallet,
-                chain = %spec.name,
-                swept,
-                "tx.outbox_swept_expired_before_stage"
-            );
         }
         let nonce = match intent.nonce {
             Some(n) => n,
@@ -1562,10 +1575,25 @@ impl TxEngine {
                 // Use the hint from the external estimator (e.g. Enso) when
                 // available, applying the same 25% buffer. Fall back to 500k
                 // only if no hint was provided.
-                let fallback = intent
+                let hinted = intent
                     .gas_limit_hint
-                    .map(|h| (h.saturating_mul(125) / 100).min(30_000_000))
-                    .unwrap_or(500_000);
+                    .map(|h| (h.saturating_mul(125) / 100).min(30_000_000));
+                // 500k is a transfer-scale default. A creation runs a
+                // constructor and stores a whole contract, so applying it
+                // blind stages a deployment that reverts out of gas, and the
+                // native `deploy` intent has no field to raise it. The
+                // estimator's own error is more use than a guess. A
+                // `bloom deploy` submission is unaffected: it carries an
+                // explicit `gas`, applied just below.
+                if hinted.is_none()
+                    && deployment.is_none()
+                    && matches!(intent.body, RawIntentBody::Deploy { .. })
+                {
+                    return Err(TxEngineError::Amount(format!(
+                        "cannot estimate gas for this contract creation ({e}); the default is                          sized for a transfer and would revert out of gas"
+                    )));
+                }
+                let fallback = hinted.unwrap_or(500_000);
                 tracing::warn!(error = %e, fallback, "estimate_gas failed");
                 fallback
             }
@@ -1764,11 +1792,22 @@ impl TxEngine {
                 asset_decimals: target.asset_decimals,
             })
             .or_else(|| match action_kind {
-                TxActionKind::NativeTransfer if value_wei > U256::ZERO => Some(ValuationTarget {
-                    asset_id: format!("native:{}", spec.name),
-                    amount_base_units: value_wei.to_string(),
-                    asset_decimals: spec.native_decimals,
-                }),
+                // A creation's constructor endowment is native value leaving
+                // the wallet, exactly as a transfer's is. Without a target
+                // there is no quote, so `caps.per_tx_usd` and
+                // `caps.per_day_usd` degraded to a soft "rule skipped" warning
+                // instead of being evaluated, the approval subject carried a
+                // null USD value, and the spend never entered the rolling
+                // 24-hour window that constrains later transactions.
+                TxActionKind::NativeTransfer | TxActionKind::ContractCreation
+                    if value_wei > U256::ZERO =>
+                {
+                    Some(ValuationTarget {
+                        asset_id: format!("native:{}", spec.name),
+                        amount_base_units: value_wei.to_string(),
+                        asset_decimals: spec.native_decimals,
+                    })
+                }
                 TxActionKind::Erc20Transfer => token_for_plan.as_ref().and_then(|token| {
                     token
                         .amount_base_units
@@ -5830,6 +5869,57 @@ mod tests {
         }
     }
 
+    /// The VFS outbox is the surface the deployment docs point an agent at,
+    /// and it staged every `kind: "deploy"` with a hard policy violation --
+    /// refused at confirm -- because the advisory policy it was handed always
+    /// carries a recipient allowlist and a creation has no recipient. The
+    /// numeric-chain opt-in is what clears that allowlist, and the fix is that
+    /// the stage path now reads it. This is the engine half: an empty
+    /// allowlist has to leave a creation clean.
+    #[tokio::test]
+    async fn a_creation_under_the_exact_opt_in_stages_without_a_policy_violation() {
+        let url = spawn_stage_rpc(false).await;
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        let engine = TxEngine::new(outbox, 60_000);
+        let chain = stage_chain(&url);
+        let permit = permit_for(&directory);
+        let intent = crate::intent_parser::parse(
+            r#"{"kind":"deploy","data":"0x60006000f3","value":"123 wei"}"#,
+        )
+        .unwrap();
+        // What `advisory_exact_evm_policy` produces once the wallet has
+        // approved `{"chain":"evm-31337","destination":"exact"}`.
+        let staged = engine
+            .stage(
+                &permit,
+                "alice",
+                TEST_SIGNER_ADDRESS.parse().unwrap(),
+                intent,
+                &chain,
+                &Policy::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(staged.action_kind, TxActionKind::ContractCreation);
+        assert!(
+            !policy_engine::has_hard_violation(&staged.policy_checks),
+            "a creation under the opt-in must be confirmable: {:?}",
+            staged.policy_checks
+        );
+        // Still gated: the exact owner approval is what authorizes creation,
+        // and the plan says so.
+        assert!(
+            staged
+                .policy_checks
+                .iter()
+                .any(|check| check.rule == "deployment.review"),
+            "{:?}",
+            staged.policy_checks
+        );
+    }
+
     #[tokio::test]
     async fn creation_stages_encodes_and_preserves_kind_on_fee_bump() {
         use alloy::consensus::Transaction;
@@ -6113,6 +6203,78 @@ mod tests {
         );
     }
 
+    /// A payable constructor moves native value, and the valuation selector
+    /// only built a target for `NativeTransfer` and `Erc20Transfer`. So a
+    /// creation carrying value produced no quote: `caps.per_tx_usd` and
+    /// `caps.per_day_usd` degraded to a soft "rule skipped" warning instead
+    /// of being evaluated, the approval subject carried a null USD value, and
+    /// the spend never entered the rolling window that constrains later
+    /// transactions -- while the identical amount sent as a transfer was
+    /// valued and capped.
+    #[tokio::test]
+    async fn stage_values_a_contract_creation_that_carries_native_value() {
+        let url = spawn_stage_rpc(true).await;
+        let oracle = RecordingOracle {
+            calls: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            usd_micro: 42_000_000,
+            age_ms: 0,
+            max_age_ms: 60_000,
+        };
+        let calls = oracle.calls.clone();
+        let (engine, _dir, permit, chain) = stage_fixture(&url, oracle);
+        let intent = crate::intent_parser::parse(
+            r#"{"kind":"deploy","data":"0x60006000f3","value":"1 eth"}"#,
+        )
+        .unwrap();
+        let staged = engine
+            .stage(
+                &permit,
+                "alice",
+                "0x1111111111111111111111111111111111111111"
+                    .parse()
+                    .unwrap(),
+                intent,
+                &chain,
+                &policy_with_usd_cap(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(staged.action_kind, TxActionKind::ContractCreation);
+        assert_eq!(staged.value_wei, "1000000000000000000");
+        // Quoted on the same asset and base units a transfer of the same
+        // amount would use.
+        assert_eq!(
+            calls.lock().as_slice(),
+            &[("native:anvil".into(), "1000000000000000000".into())]
+        );
+        assert_eq!(staged.usd_value, Some(42.0));
+        assert_eq!(staged.valuation.as_ref().unwrap().usd_micro, 42_000_000);
+        // Carried into the approval subject and the rolling window.
+        assert_eq!(
+            engine.authorization_subject(&staged).total_value_usd_micro,
+            Some(42_000_000)
+        );
+        // The cap was evaluated, not skipped.
+        assert!(
+            staged
+                .policy_checks
+                .iter()
+                .any(|check| check.rule == "caps.per_tx_usd"),
+            "{:?}",
+            staged.policy_checks
+        );
+        assert!(
+            !staged
+                .policy_checks
+                .iter()
+                .any(|check| check.rule == "caps.usd"),
+            "no rule-skipped warning: {:?}",
+            staged.policy_checks
+        );
+    }
+
     #[tokio::test]
     async fn stage_erc20_transfer_uses_exact_base_units_for_oracle() {
         let url = spawn_stage_rpc(false).await;
@@ -6383,6 +6545,116 @@ mod tests {
         assert_eq!(second.id, first.id);
         let live = engine.outbox.read("alice", "anvil", &first.id).unwrap();
         assert_eq!(live.state, OutboxState::Pending);
+    }
+
+    /// Two faults in the explicit-nonce reservation scan.
+    ///
+    /// It propagated `NotFound`, so one outbox directory without an
+    /// `intent.json` -- a partial write, an interrupted transition -- refused
+    /// every explicit-nonce deployment for that wallet and chain, permanently.
+    /// A row that cannot be read reserves no nonce.
+    ///
+    /// And it ran before `sweep_expired`, so an already-expired pending row
+    /// was reported as holding the nonce that the very next statement would
+    /// have freed.
+    #[tokio::test]
+    async fn the_nonce_reservation_scan_skips_unreadable_rows_and_sweeps_first() {
+        let mut responses = stage_rpc_responses(true);
+        for queue in responses.values_mut() {
+            queue.extend(queue.clone());
+            queue.extend(queue.clone());
+        }
+        let url = spawn_queued_rpc(responses).await;
+        let oracle = RecordingOracle {
+            calls: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            usd_micro: 42_000_000,
+            age_ms: 0,
+            max_age_ms: 60_000,
+        };
+        let (engine, _dir, permit, chain) = stage_fixture(&url, oracle);
+        let from: Address = TEST_SIGNER_ADDRESS.parse().unwrap();
+        let policy = Policy::default();
+
+        // An expired pending entry holding nonce 0. It can never be sent, so
+        // it is not a reservation.
+        let mut expiring = fake_staged_1559("expired-holder");
+        expiring.from = bloom_proto::checksum_address(&from);
+        expiring.nonce = 0;
+        expiring.expires_ms = 1;
+        engine.outbox.write_pending(&expiring, "p").unwrap();
+
+        // A directory with no intent.json at all: unreadable, reserves nothing.
+        let orphan = engine
+            .outbox
+            .wallet_chain_dir("alice", "anvil")
+            .unwrap()
+            .join("pending")
+            .join("orphan");
+        std::fs::create_dir_all(&orphan).unwrap();
+
+        let request = crate::deployment::DeploymentTransaction {
+            chain_id: 31337,
+            from,
+            to: None,
+            data: "0x60006000f3".into(),
+            value: U256::ZERO,
+            nonce: Some(0),
+            gas: None,
+            gas_price: None,
+            max_fee_per_gas: None,
+            max_priority_fee_per_gas: None,
+        };
+        let staged = engine
+            .stage_deployment(&permit, "alice", &request, &chain, &policy)
+            .await
+            .expect("an expired row and an unreadable row reserve no nonce");
+        assert_eq!(staged.nonce, 0);
+
+        // A live entry on the same nonce is still a reservation.
+        let mut live = fake_staged_1559("live-holder");
+        live.from = bloom_proto::checksum_address(&from);
+        live.nonce = 7;
+        live.expires_ms = 0;
+        engine.outbox.write_pending(&live, "p").unwrap();
+        let mut request = request;
+        request.nonce = Some(7);
+        let error = engine
+            .stage_deployment(&permit, "alice", &request, &chain, &policy)
+            .await
+            .expect_err("a live entry still reserves its nonce");
+        assert!(error.to_string().contains("live-holder"), "{error}");
+    }
+
+    /// 500k gas is a transfer-scale default. A creation runs a constructor and
+    /// stores a whole contract, and the native `deploy` intent has no field to
+    /// raise the limit, so applying the default blind staged a deployment that
+    /// reverts out of gas with no way for the caller to correct it. The
+    /// estimator's own error is more use than a guess.
+    #[tokio::test]
+    async fn a_creation_refuses_the_transfer_sized_gas_fallback() {
+        let mut responses = stage_rpc_responses(false);
+        // No `eth_estimateGas` response: the estimator fails, as it does when
+        // a constructor reverts under simulation or the node refuses.
+        responses.remove("eth_estimateGas");
+        let url = spawn_queued_rpc(responses).await;
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        let engine = TxEngine::new(outbox, 60_000);
+        let chain = stage_chain(&url);
+        let permit = permit_for(&directory);
+        let error = engine
+            .stage(
+                &permit,
+                "alice",
+                TEST_SIGNER_ADDRESS.parse().unwrap(),
+                crate::intent_parser::parse(r#"{"kind":"deploy","data":"0x60006000f3"}"#).unwrap(),
+                &chain,
+                &Policy::default(),
+                None,
+            )
+            .await
+            .expect_err("a creation must not be staged on a blind default");
+        assert!(error.to_string().contains("cannot estimate gas"), "{error}");
     }
 
     #[tokio::test]

@@ -137,14 +137,18 @@ impl Bridge {
             {
                 return json!({"jsonrpc":"2.0","id":id,"result":hash});
             }
+            // Only a terminal outbox state ends the caller's transaction, and
+            // only a transport-level `error` ends the poll. A persisted
+            // `/result/error` is the last continuation attempt's message,
+            // which an out-of-band `bloom deploy resume` records on a
+            // transient failure it will retry -- treating that as terminal
+            // aborted the caller's script while the submission was still
+            // alive. It stays visible through `status` and `list`.
             if status
                 .pointer("/result/status")
                 .and_then(Value::as_str)
                 .is_some_and(|s| matches!(s, "failed" | "blocked" | "reverted"))
                 || status.get("error").is_some()
-                || status
-                    .pointer("/result/error")
-                    .is_some_and(|e| !e.is_null())
             {
                 return error(
                     -32000,

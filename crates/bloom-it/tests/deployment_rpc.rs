@@ -337,6 +337,113 @@ async fn deployment_tools_and_recovery() -> Result<()> {
         .transition(&unsigned, bloom_tx::OutboxState::Failed)?;
     rpc(&anvil.rpc_url(), "evm_setAutomine", json!([true])).await?;
     rpc(&anvil.rpc_url(), "evm_mine", json!([])).await?;
+
+    // One transaction through the sequence production actually has: an HTTP
+    // request from a build tool held open while an owner approves out of band,
+    // and `bloom deploy resume` releasing it. Every tool invocation below runs
+    // under the auto-continue driver, which no real deployment has, so without
+    // this the human-in-the-loop path the bridge exists for is never executed.
+    fixture.deactivate();
+    let ids_before: Vec<String> = daemon
+        .deployment_rpc("alice", "anvil", "bloom_deploymentList", json!([]))
+        .await["result"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| row.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    let held_url = url.to_owned();
+    let held_request = json!({"from":sender,"data":"0x60006000f3","gas":"0x186a0","nonce":"0x2"});
+    let held =
+        tokio::spawn(
+            async move { rpc(&held_url, "eth_sendTransaction", json!([held_request])).await },
+        );
+    let mut held_id = None;
+    for _ in 0..200 {
+        let rows = daemon
+            .deployment_rpc("alice", "anvil", "bloom_deploymentList", json!([]))
+            .await;
+        held_id = rows["result"].as_array().and_then(|rows| {
+            rows.iter()
+                .filter_map(|row| row.as_str())
+                .find(|id| !ids_before.iter().any(|seen| seen == id))
+                .map(str::to_owned)
+        });
+        if held_id.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let held_id = held_id.context("the held request never staged an entry")?;
+    // While the owner has not approved, the bridge must keep the caller's
+    // request open rather than abort it.
+    if held.is_finished() {
+        let early = held.await;
+        anyhow::bail!("the bridge gave up before approval: {early:?}");
+    }
+    let waiting = daemon
+        .deployment_rpc(
+            "alice",
+            "anvil",
+            "bloom_deploymentStatus",
+            json!([held_id.clone()]),
+        )
+        .await;
+    ensure!(
+        waiting["result"]["status"] == "approval_required",
+        "{waiting}"
+    );
+    ensure!(
+        waiting["result"]["approval"]["ceremony_url"]
+            .as_str()
+            .is_some_and(|url| !url.is_empty()),
+        "the owner needs somewhere to go: {waiting}"
+    );
+    // An out-of-band `resume` before the owner has approved records its
+    // outcome on the entry. That is the last attempt's message, not a
+    // terminal state, and the caller's request must survive it -- treating a
+    // persisted `/result/error` as terminal aborted a build tool while the
+    // submission was still perfectly alive.
+    let early = daemon
+        .deployment_rpc(
+            "alice",
+            "anvil",
+            "bloom_deploymentContinue",
+            json!([held_id.clone()]),
+        )
+        .await;
+    ensure!(early["result"]["status"] == "approval_required", "{early}");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    if held.is_finished() {
+        let early = held.await;
+        anyhow::bail!("a resume before approval must not abort the caller: {early:?}");
+    }
+
+    // The owner approves, then `resume` runs out of band, exactly as the
+    // printed hint tells them to.
+    fixture.activate();
+    let resumed = daemon
+        .deployment_rpc(
+            "alice",
+            "anvil",
+            "bloom_deploymentContinue",
+            json!([held_id.clone()]),
+        )
+        .await;
+    ensure!(resumed["result"]["error"].is_null(), "{resumed}");
+    // The request the build tool is still blocked on now returns the hash.
+    let released = tokio::time::timeout(Duration::from_secs(30), held)
+        .await
+        .context("the held request was never released")???;
+    ensure!(
+        released["result"]
+            .as_str()
+            .is_some_and(|hash| hash.starts_with("0x")),
+        "the held request must return the transaction hash: {released}"
+    );
+
     let drive = daemon.clone();
     let driver = tokio::spawn(async move {
         loop {
