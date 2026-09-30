@@ -197,7 +197,6 @@ struct DeveloperPetalLineageInput<'a> {
     active: bool,
 }
 
-#[cfg(feature = "triad-dev-harness")]
 fn base32_lower_no_pad(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
     let mut output = String::with_capacity(bytes.len().div_ceil(5) * 8);
@@ -987,12 +986,7 @@ fn sign_provenance_catalog(
     source_bytes.zeroize();
     catalog.validate_shape()?;
     let installer_key_id = Token::new(installer_key_id)?;
-    append_release_petal_provenance(
-        &mut catalog,
-        crate::github_source::release_authority_petals(),
-        &installer_key_id,
-        &installer.signing_key(),
-    )?;
+    append_release_petal_provenance(&mut catalog, &installer_key_id, &installer.signing_key())?;
     for record in &mut catalog.records {
         record.installer_key_id = installer_key_id.clone();
         record.installer_signature = Base64UrlBytes::from_bytes(&[]);
@@ -1009,14 +1003,120 @@ fn sign_provenance_catalog(
     result
 }
 
-/// Appends one provenance record per authority route of every pinned
-/// release Petal in `entries`, cataloguing each route's operation classes
-/// with the fee asset `catalogued_fee_asset` assigns them.
-fn append_release_petal_provenance<'a>(
+fn append_release_petal_provenance(
     catalog: &mut ProvenanceCatalog,
-    entries: impl IntoIterator<Item = &'a crate::github_source::PreinstalledPetal>,
     installer_key_id: &Token,
     signing_key: &SigningKey,
+) -> Result<()> {
+    append_release_petal_provenance_for_entries(
+        catalog,
+        installer_key_id,
+        signing_key,
+        &crate::github_source::release_lineage_petals(),
+    )
+}
+
+/// Appends the lineage record, and one provenance record per authority
+/// route, of every pinned release Petal in `entries`, cataloguing each
+/// route's operation classes with the fee asset `catalogued_fee_asset`
+/// assigns them.
+fn append_release_petal_provenance_for_entries(
+    catalog: &mut ProvenanceCatalog,
+    installer_key_id: &Token,
+    signing_key: &SigningKey,
+    entries: &[&crate::github_source::PreinstalledPetal],
+) -> Result<()> {
+    let publisher = Token::new("bloom-release-pins")?;
+    let mut package_hashes = std::collections::BTreeSet::new();
+    let mut lineage_ids = std::collections::BTreeSet::new();
+    for entry in entries {
+        let package_hash = Digest32::new(
+            entry
+                .expected_hash
+                .context("release Petal has no package hash")?,
+        )?;
+        let lineage_id = entry
+            .lineage_id
+            .map(str::to_owned)
+            .unwrap_or_else(|| release_petal_lineage_id(&publisher, entry.name));
+        bloom_broker_api::validate_lineage_id(&lineage_id)?;
+        if entry.release_sequence == 0
+            || !package_hashes.insert(package_hash.as_str().to_owned())
+            || !lineage_ids.insert(lineage_id.clone())
+        {
+            bail!("release Petal contains an invalid or duplicate lineage");
+        }
+        let predecessors = entry
+            .predecessor_package_hashes
+            .iter()
+            .map(|hash| Digest32::new(*hash))
+            .collect::<Result<Vec<_>, _>>()?;
+        let baseline = crate::github_source::release_lineage_predecessor(entry.name)
+            .context("bundled Petal has no baseline release hash")?;
+        if package_hash.as_str() != baseline.hash {
+            if entry.release_sequence <= 1
+                || !predecessors
+                    .iter()
+                    .any(|hash| hash.as_str() == baseline.hash)
+            {
+                bail!(
+                    "successor {} must advance its release sequence and list its baseline hash",
+                    entry.name
+                );
+            }
+            let old_hash = Digest32::new(baseline.hash)?;
+            append_release_lineage_record(
+                catalog,
+                signing_key,
+                installer_key_id,
+                &publisher,
+                &lineage_id,
+                &old_hash,
+                1,
+                &[],
+                false,
+                baseline.authority_routes,
+            )?;
+        }
+        append_release_lineage_record(
+            catalog,
+            signing_key,
+            installer_key_id,
+            &publisher,
+            &lineage_id,
+            &package_hash,
+            entry.release_sequence,
+            &predecessors,
+            true,
+            entry.authority_routes,
+        )?;
+    }
+    catalog.validate_shape()?;
+    Ok(())
+}
+
+fn release_petal_lineage_id(publisher: &Token, package_name: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"bloom-release-petal-lineage-id/v1");
+    hasher.update(&[0]);
+    hasher.update(publisher.as_str().as_bytes());
+    hasher.update(&[0]);
+    hasher.update(package_name.as_bytes());
+    format!("pln1_{}", base32_lower_no_pad(hasher.finalize().as_bytes()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_release_lineage_record(
+    catalog: &mut ProvenanceCatalog,
+    signing_key: &SigningKey,
+    installer_key_id: &Token,
+    publisher: &Token,
+    lineage_id: &str,
+    package_hash: &Digest32,
+    release_sequence: u64,
+    predecessors: &[Digest32],
+    active: bool,
+    authority_routes: &[crate::github_source::PetalAuthorityRoute],
 ) -> Result<()> {
     #[derive(Serialize)]
     struct LineageStatement<'a> {
@@ -1029,54 +1129,42 @@ fn append_release_petal_provenance<'a>(
         publisher: &'a Token,
         active: bool,
     }
-
-    let publisher = Token::new("bloom-release-pins")?;
-    let mut package_hashes = std::collections::BTreeSet::new();
-    let mut lineage_ids = std::collections::BTreeSet::new();
-    for entry in entries {
-        let package_hash = Digest32::new(
-            entry
-                .expected_hash
-                .context("release Petal has no package hash")?,
-        )?;
-        let lineage_id = entry
-            .lineage_id
-            .context("release Petal has no lineage ID")?;
-        bloom_broker_api::validate_lineage_id(lineage_id)?;
-        if entry.release_sequence == 0
-            || !package_hashes.insert(package_hash.as_str().to_owned())
-            || !lineage_ids.insert(lineage_id.to_owned())
-        {
-            bail!("release Petal authority contains an invalid or duplicate lineage");
-        }
-        let predecessors = entry
-            .predecessor_package_hashes
-            .iter()
-            .map(|hash| Digest32::new(*hash))
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut lineage_message = b"bloom-release-petal-lineage/v1".to_vec();
-        lineage_message.extend_from_slice(&serde_jcs::to_vec(&LineageStatement {
-            schema: "bloom.release-petal-lineage.1",
-            lineage_id,
-            package_hash: &package_hash,
-            release_sequence: DecimalU64::new(entry.release_sequence),
-            predecessor_package_hashes: &predecessors,
-            controller_key_id: installer_key_id,
-            publisher: &publisher,
-            active: true,
-        })?);
-        let lineage = PetalLineageMembership {
-            lineage_id: lineage_id.to_owned(),
-            release_sequence: DecimalU64::new(entry.release_sequence),
-            predecessor_package_hashes: predecessors,
-            controller_key_id: installer_key_id.clone(),
-            controller_signature: Base64UrlBytes::from_bytes(
-                &signing_key.sign(&lineage_message).to_bytes(),
-            ),
-            active: true,
-        };
-        lineage_message.zeroize();
-        for route in entry.authority_routes {
+    let mut message = b"bloom-release-petal-lineage/v1".to_vec();
+    message.extend_from_slice(&serde_jcs::to_vec(&LineageStatement {
+        schema: "bloom.release-petal-lineage.1",
+        lineage_id,
+        package_hash,
+        release_sequence: DecimalU64::new(release_sequence),
+        predecessor_package_hashes: predecessors,
+        controller_key_id: installer_key_id,
+        publisher,
+        active,
+    })?);
+    let lineage = PetalLineageMembership {
+        lineage_id: lineage_id.to_owned(),
+        release_sequence: DecimalU64::new(release_sequence),
+        predecessor_package_hashes: predecessors.to_vec(),
+        controller_key_id: installer_key_id.clone(),
+        controller_signature: Base64UrlBytes::from_bytes(&signing_key.sign(&message).to_bytes()),
+        active,
+    };
+    message.zeroize();
+    // No authority class is assigned to these metadata-only records. The
+    // Broker accepts their shape for lineage but rejects them for approvals.
+    if authority_routes.is_empty() {
+        catalog.records.push(ProvenanceRecord {
+            subject: ProvenanceSubject::Petal {
+                package_hash: package_hash.clone(),
+                route: "__lineage__".into(),
+            },
+            publisher: publisher.clone(),
+            petal_lineage: Some(lineage),
+            operation_classes: vec![],
+            installer_key_id: installer_key_id.clone(),
+            installer_signature: Base64UrlBytes::from_bytes(&[]),
+        });
+    } else {
+        for route in authority_routes {
             let operation_classes = route
                 .operation_classes
                 .iter()
@@ -1100,7 +1188,6 @@ fn append_release_petal_provenance<'a>(
             });
         }
     }
-    catalog.validate_shape()?;
     Ok(())
 }
 
@@ -1316,17 +1403,17 @@ mod tests {
     }
 
     fn release_catalog_for(
-        entries: &'static [crate::github_source::PreinstalledPetal],
+        entries: &[&crate::github_source::PreinstalledPetal],
     ) -> ProvenanceCatalog {
         let mut catalog = ProvenanceCatalog {
             schema: bloom_broker_api::PROVENANCE_CATALOG_SCHEMA.to_owned(),
             records: Vec::new(),
         };
-        append_release_petal_provenance(
+        append_release_petal_provenance_for_entries(
             &mut catalog,
-            entries.iter(),
             &Token::new("installer").unwrap(),
             &SigningKey::from_bytes(&[7; 32]),
+            entries,
         )
         .unwrap();
         catalog
@@ -1352,32 +1439,39 @@ mod tests {
                 operation_classes: &["hyperliquid.agent_action"],
             },
         ];
-        static PINS: &[PreinstalledPetal] = &[PreinstalledPetal {
-            name: "hyperliquid",
-            repository: "https://github.com/bloom-directory/bloom-petal-hyperliquid",
-            commit: "0000000000000000000000000000000000000000",
-            release_tag: "v0.0.0-test",
-            archive: "hyperliquid-v0.0.0-test.petal.tar.gz",
-            expected_hash: Some("abababababababababababababababababababababababababababababababab"),
-            archive_sha256: "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
-            tooling_commit: "0000000000000000000000000000000000000000",
-            petal_abi: "bloom.petal-host/payload-signing-v1",
-            default_eligible: false,
-            lineage_id: Some("pln1_gyksmg4h5sqeu4pic5cg5xuwhhh3pokli3vc62btxjvi3lkwaykq"),
-            release_sequence: 1,
-            predecessor_package_hashes: &[],
+        // A successor of the real pin: enrollment refuses a package whose
+        // hash is not the lineage baseline unless it advances the sequence
+        // and lists that baseline, and then records the baseline inactive
+        // beside it. Only the synthetic package carries the routes above.
+        const SYNTHETIC_HASH: &str =
+            "abababababababababababababababababababababababababababababababab";
+        let baseline = crate::github_source::release_lineage_predecessor("hyperliquid").unwrap();
+        let current = crate::github_source::preinstalled_petal("hyperliquid").unwrap();
+        let pin = PreinstalledPetal {
+            expected_hash: Some(SYNTHETIC_HASH),
+            release_sequence: 2,
+            predecessor_package_hashes: &[
+                "b29c7afb88ec9d2df774b18dad2699ec169100eeeedbcefca02ea0cc3712a188",
+            ],
             authority_routes: ROUTES,
-        }];
+            ..*current
+        };
+        assert_eq!(pin.predecessor_package_hashes, &[baseline.hash][..]);
 
-        let catalog = release_catalog_for(PINS);
+        let catalog = release_catalog_for(&[&pin]);
         let by_route = catalog
             .records
             .iter()
-            .map(|record| {
-                let ProvenanceSubject::Petal { route, .. } = &record.subject else {
+            .filter_map(|record| {
+                let ProvenanceSubject::Petal {
+                    package_hash,
+                    route,
+                } = &record.subject
+                else {
                     panic!("release pins only enroll Petal subjects");
                 };
-                (route.as_str(), &record.operation_classes)
+                (package_hash.as_str() == SYNTHETIC_HASH)
+                    .then_some((route.as_str(), &record.operation_classes))
             })
             .collect::<std::collections::BTreeMap<_, _>>();
         assert_eq!(by_route.len(), 2);
@@ -1409,11 +1503,7 @@ mod tests {
     /// flip it to asserting the class is present with the usdc fee asset.
     #[test]
     fn current_release_pins_carry_no_fee_bearing_class_yet() {
-        let pins = crate::github_source::release_authority_petals()
-            .copied()
-            .collect::<Vec<_>>()
-            .leak();
-        let catalog = release_catalog_for(pins);
+        let catalog = release_catalog_for(&crate::github_source::release_lineage_petals());
         let classes = catalog
             .records
             .iter()
@@ -1628,6 +1718,93 @@ mod tests {
     }
 
     #[test]
+    fn bundled_successor_retains_inactive_baseline_for_state_carry_forward() {
+        let signing = SigningKey::from_bytes(&[17; 32]);
+        let key_id = Token::new("installer-key").unwrap();
+        for (name, baseline_hash) in [
+            (
+                "enso",
+                "97650f327691f01bc4591cde25253d1e20010643e700674cc9759cd1366876b9",
+            ),
+            (
+                "near-intents",
+                "ac2ccab59f36ee863843f92aaf0c975c00dbf32b246df5ccbb79757093785921",
+            ),
+            (
+                "polymarket",
+                "5df5a1377dc4d70c71e47ffe6827e691e1f5868543b752dc8d19a500284e5fa6",
+            ),
+            (
+                "hyperliquid",
+                "b29c7afb88ec9d2df774b18dad2699ec169100eeeedbcefca02ea0cc3712a188",
+            ),
+            (
+                "tolly",
+                "f50f9f6f55eca103c11ed40d424311c6e5863ff5046231f57f58822d1aac6709",
+            ),
+        ] {
+            let current = crate::github_source::preinstalled_petal(name).unwrap();
+            let successor = crate::github_source::PreinstalledPetal {
+                expected_hash: Some(
+                    "1111111111111111111111111111111111111111111111111111111111111111",
+                ),
+                release_sequence: 2,
+                predecessor_package_hashes: match name {
+                    "enso" => &["97650f327691f01bc4591cde25253d1e20010643e700674cc9759cd1366876b9"],
+                    "near-intents" => {
+                        &["ac2ccab59f36ee863843f92aaf0c975c00dbf32b246df5ccbb79757093785921"]
+                    }
+                    "polymarket" => {
+                        &["5df5a1377dc4d70c71e47ffe6827e691e1f5868543b752dc8d19a500284e5fa6"]
+                    }
+                    "hyperliquid" => {
+                        &["b29c7afb88ec9d2df774b18dad2699ec169100eeeedbcefca02ea0cc3712a188"]
+                    }
+                    _ => &["f50f9f6f55eca103c11ed40d424311c6e5863ff5046231f57f58822d1aac6709"],
+                },
+                ..*current
+            };
+            let mut catalog = ProvenanceCatalog {
+                schema: bloom_broker_api::PROVENANCE_CATALOG_SCHEMA.into(),
+                records: vec![],
+            };
+            append_release_petal_provenance_for_entries(
+                &mut catalog,
+                &key_id,
+                &signing,
+                &[&successor],
+            )
+            .unwrap();
+            let old = catalog.records.iter().find(|record| matches!(
+                &record.subject,
+                ProvenanceSubject::Petal { package_hash, .. } if package_hash.as_str() == baseline_hash
+            )).unwrap();
+            let new = catalog.records.iter().find(|record| matches!(
+                &record.subject,
+                ProvenanceSubject::Petal { package_hash, .. } if package_hash.as_str() == successor.expected_hash.unwrap()
+            )).unwrap();
+            let old_lineage = old.petal_lineage.as_ref().unwrap();
+            let new_lineage = new.petal_lineage.as_ref().unwrap();
+            assert!(!old_lineage.active);
+            assert_eq!(old_lineage.release_sequence.get(), 1);
+            assert!(new_lineage.active);
+            assert_eq!(new_lineage.release_sequence.get(), 2);
+            assert_eq!(old_lineage.lineage_id, new_lineage.lineage_id);
+            assert_eq!(old.publisher, new.publisher);
+            assert!(
+                new_lineage
+                    .predecessor_package_hashes
+                    .iter()
+                    .any(|hash| hash.as_str() == baseline_hash)
+            );
+            if !matches!(name, "polymarket" | "hyperliquid") {
+                assert!(old.operation_classes.is_empty());
+                assert!(new.operation_classes.is_empty());
+            }
+        }
+    }
+
+    #[test]
     fn generated_material_is_fresh_cross_pinned_and_provenance_signed() {
         let directory = tempfile::tempdir().unwrap();
         let output = directory.path().join("output");
@@ -1703,8 +1880,8 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(petal_hashes.len(), 21);
-        for name in ["polymarket", "hyperliquid"] {
+        assert_eq!(petal_hashes.len(), 47);
+        for name in crate::github_source::DEFAULT_PETALS {
             let expected = crate::github_source::preinstalled_petal(name)
                 .unwrap()
                 .expected_hash

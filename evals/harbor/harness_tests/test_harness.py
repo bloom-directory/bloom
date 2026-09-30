@@ -152,12 +152,12 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         route_dir.mkdir(parents=True)
         self.route_index = route_dir / "route-index.json"
         action_routes = (
-            "[network]/agent_sessions/[wallet]/[session]/cancel.json",
-            "[network]/agent_sessions/[wallet]/[session]/cancel_all",
-            "[network]/agent_sessions/[wallet]/[session]/close_all",
-            "[network]/agent_sessions/[wallet]/[session]/order.json",
-            "[network]/agent_sessions/[wallet]/[session]/schedule_cancel.json",
-            "[network]/agent_sessions/[wallet]/[session]/update_leverage.json",
+            "[network]/agent_sessions/[wallet]/[index]/[session]/cancel.json",
+            "[network]/agent_sessions/[wallet]/[index]/[session]/cancel_all",
+            "[network]/agent_sessions/[wallet]/[index]/[session]/close_all",
+            "[network]/agent_sessions/[wallet]/[index]/[session]/order.json",
+            "[network]/agent_sessions/[wallet]/[index]/[session]/schedule_cancel.json",
+            "[network]/agent_sessions/[wallet]/[index]/[session]/update_leverage.json",
         )
         self.route_index.write_text(
             json.dumps(
@@ -167,7 +167,7 @@ class HyperliquidDefinitionTests(unittest.TestCase):
                     "routes": [
                         {
                             "route_id": "r000021",
-                            "pattern": "[network]/agent_sessions/[wallet]/new.json",
+                            "pattern": "[network]/agent_sessions/[wallet]/[index]/new.json",
                             "install_metadata": {
                                 "required_caps": [
                                     "bloom:http",
@@ -810,7 +810,7 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         # the agent needs both identifiers to address sessions and account reads.
         for mount in context.mounts[1:]:
             self.assertIn(
-                f"/agent_sessions/{self.definition.wallet_id}/", mount["target"]
+                f"/mainnet/agent_sessions/{self.definition.wallet_id}/0/", mount["target"]
             )
         self.assertEqual(
             context.agent_env["BLOOM_EVAL_WALLET_ID"], self.definition.wallet_id
