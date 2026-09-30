@@ -371,6 +371,19 @@ pub struct BoundValuationTarget {
     pub expected_calldata: Bytes,
 }
 
+/// A token the staging Petal's own package declares, supplied by the daemon
+/// once it has resolved the declaration for the reported chain and target. It
+/// is the package author's word, pinned by the package hash the owner
+/// approved, so for this one call the engine treats it as the token's
+/// identity: the declared symbol labels the plan and meets symbol rules, and
+/// the contract's `decimals()` must agree with the declaration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredToken {
+    pub address: Address,
+    pub symbol: String,
+    pub decimals: u8,
+}
+
 #[derive(Debug, Clone)]
 struct ValuationTarget {
     asset_id: String,
@@ -818,6 +831,38 @@ impl TxEngine {
         Ok(meta)
     }
 
+    /// Metadata for a token the staging package declared. The declaration is
+    /// trusted for the symbol, which is what the plan prints and what a
+    /// symbol rule matches. It is not trusted for decimals, which scale the
+    /// amount the owner approves: those are read from the contract exactly as
+    /// for any token and must agree with the declaration, so a package cannot
+    /// declare a six-decimal contract as eighteen and shrink the figure shown
+    /// a million-fold. The declared symbol is not cached: it belongs to this
+    /// package's calls, not to the contract.
+    async fn declared_token_meta(
+        &self,
+        chain: &ChainClient,
+        declared: &DeclaredToken,
+    ) -> Result<TokenMeta, TxEngineError> {
+        let onchain = self
+            .token_meta(chain, declared.address, &format!("{:#x}", declared.address))
+            .await?;
+        if onchain.decimals != declared.decimals {
+            return Err(TxEngineError::Token(format!(
+                "declared token {} at {}: decimals() is {}, the package declared {}",
+                declared.symbol,
+                bloom_proto::checksum_address(&declared.address),
+                onchain.decimals,
+                declared.decimals
+            )));
+        }
+        Ok(TokenMeta {
+            address: declared.address,
+            symbol: declared.symbol.clone(),
+            decimals: onchain.decimals,
+        })
+    }
+
     /// Resolve a parsed intent body into the on-wire fields a staged tx
     /// needs: destination, value, calldata, and optional ERC-20 metadata
     /// for plan rendering. Shared by [`Self::stage`] and
@@ -830,6 +875,7 @@ impl TxEngine {
         chain_id: u64,
         address_book: Option<&AddressBook>,
         from: Address,
+        declared_token: Option<&DeclaredToken>,
     ) -> Result<(Address, U256, String, Option<TokenRef>, Option<NftRef>), TxEngineError> {
         match body {
             RawIntentBody::Send {
@@ -862,7 +908,11 @@ impl TxEngine {
                     }
                     let token_str = token.as_deref().unwrap_or("");
                     let (token_addr, sym_hint) = Self::resolve_token_address(token_str, chain_id)?;
-                    let meta = self.token_meta(chain, token_addr, &sym_hint).await?;
+                    let meta =
+                        match declared_token.filter(|declared| declared.address == token_addr) {
+                            Some(declared) => self.declared_token_meta(chain, declared).await?,
+                            None => self.token_meta(chain, token_addr, &sym_hint).await?,
+                        };
                     let parsed =
                         parse_amount(amount).map_err(|e| TxEngineError::Amount(e.to_string()))?;
                     // A native metric unit (wei/gwei/eth) on an ERC-20 amount is
@@ -1209,6 +1259,39 @@ impl TxEngine {
             execution_origin,
             fee_overrides,
             None,
+            None,
+        )
+        .await
+    }
+
+    /// Stage a Petal transfer to a token the Petal's own package declares.
+    /// `declared_token` is trusted for this call only; see [`DeclaredToken`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn stage_with_execution_origin_fee_overrides_and_declared_token(
+        &self,
+        permit: &HomeWritePermit,
+        wallet: &str,
+        from: Address,
+        intent: RawIntent,
+        chain: &ChainClient,
+        policy: &Policy,
+        address_book: Option<&AddressBook>,
+        execution_origin: Option<ExecutionOrigin>,
+        fee_overrides: Option<Eip1559FeeOverrides>,
+        declared_token: Option<DeclaredToken>,
+    ) -> Result<StagedTx, TxEngineError> {
+        self.stage_with_execution_origin_and_fee_overrides_and_valuation_target(
+            permit,
+            wallet,
+            from,
+            intent,
+            chain,
+            policy,
+            address_book,
+            execution_origin,
+            fee_overrides,
+            None,
+            declared_token,
         )
         .await
     }
@@ -1240,6 +1323,7 @@ impl TxEngine {
             None,
             None,
             Some(valuation_target),
+            None,
         )
         .await
     }
@@ -1257,6 +1341,7 @@ impl TxEngine {
         execution_origin: Option<ExecutionOrigin>,
         fee_overrides: Option<Eip1559FeeOverrides>,
         trusted_valuation_target: Option<BoundValuationTarget>,
+        declared_token: Option<DeclaredToken>,
     ) -> Result<StagedTx, TxEngineError> {
         if let Some(origin) = &execution_origin {
             origin
@@ -1280,7 +1365,14 @@ impl TxEngine {
             Option<TokenRef>,
             Option<NftRef>,
         ) = self
-            .resolve_intent_body(&intent.body, chain, chain_id, address_book, from)
+            .resolve_intent_body(
+                &intent.body,
+                chain,
+                chain_id,
+                address_book,
+                from,
+                declared_token.as_ref(),
+            )
             .await?;
 
         // Build a request to estimate gas; choose 1559 vs legacy fields.
@@ -1486,7 +1578,8 @@ impl TxEngine {
                     policy_ctx.contract = Some(to);
                     policy_ctx.destination_is_contract = true;
                     // A symbol rule matches the symbol the curated registry
-                    // gives this contract, and nothing else. A symbol read
+                    // gives this contract, or the one the staging package
+                    // declared for it, and nothing else. A symbol read
                     // off the contract is its own claim about itself - any
                     // contract can return "USDC" - so it never satisfies a
                     // rule, and a Petal always names a token by address, so
@@ -1498,7 +1591,13 @@ impl TxEngine {
                         bloom_proto::tokens::for_chain(registry_chain(chain_id))
                             .iter()
                             .find(|known| known.address.eq_ignore_ascii_case(&format!("{to:#x}")))
-                            .map(|known| known.symbol.to_string());
+                            .map(|known| known.symbol.to_string())
+                            .or_else(|| {
+                                declared_token
+                                    .as_ref()
+                                    .filter(|declared| declared.address == to)
+                                    .map(|declared| declared.symbol.clone())
+                            });
                     if let Ok(rec) = t.recipient.parse::<Address>() {
                         policy_ctx.recipient = Some(rec);
                     }
@@ -3791,7 +3890,7 @@ impl TxEngine {
                 .parse()
                 .map_err(|e: alloy::hex::FromHexError| TxEngineError::Address(e.to_string()))?;
             let (to, value_wei, data_hex, token, nft) = self
-                .resolve_intent_body(&intent.body, chain, chain_id, address_book, from)
+                .resolve_intent_body(&intent.body, chain, chain_id, address_book, from, None)
                 .await?;
             bumped.to = bloom_proto::checksum_address(&to);
             bumped.value_wei = value_wei.to_string();
@@ -5787,6 +5886,144 @@ mod tests {
         );
     }
 
+    /// A token the staging package declared is typed with the declared
+    /// symbol: it labels the plan and meets symbol rules exactly as a curated
+    /// symbol does. The contract's decimals are still read and must agree
+    /// with the declaration, and a declaration for some other contract
+    /// changes nothing.
+    #[tokio::test]
+    async fn a_declared_token_is_typed_with_its_symbol_and_checked_decimals() {
+        use bloom_proto::policy::PolicyOutcome;
+        let token_addr: Address = "0x1111111111111111111111111111111111111111"
+            .parse()
+            .unwrap();
+        let from: Address = "0x3333333333333333333333333333333333333333"
+            .parse()
+            .unwrap();
+        let oracle = || RecordingOracle {
+            calls: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            usd_micro: 1_250_000,
+            age_ms: 0,
+            max_age_ms: 60_000,
+        };
+        // The contract calls itself something else; the declaration labels it.
+        let seed = |engine: &TxEngine| {
+            engine.token_cache.write().insert(
+                (31337, token_addr),
+                TokenMeta {
+                    address: token_addr,
+                    symbol: "WHATEVER".into(),
+                    decimals: 6,
+                },
+            );
+        };
+        let intent = || RawIntent {
+            body: RawIntentBody::Send {
+                to: "0x2222222222222222222222222222222222222222".into(),
+                value: "0".into(),
+                token: Some(format!("{token_addr:#x}")),
+                amount: "1250000 base".into(),
+                data: None,
+            },
+            chain: Some("anvil".into()),
+            gas: bloom_proto::intent::GasStrategy::Auto,
+            nonce: None,
+            gas_limit_hint: None,
+            usd_value_hint: None,
+        };
+        let declared = |address: Address, decimals: u8| DeclaredToken {
+            address,
+            symbol: "TSLA".into(),
+            decimals,
+        };
+
+        // Declared for this contract with the right width: typed as TSLA.
+        let url = spawn_stage_rpc(false).await;
+        let (engine, _dir, permit, chain) = stage_fixture(&url, oracle());
+        seed(&engine);
+        let mut policy = policy_with_usd_cap();
+        policy.tokens.allow.insert("TSLA".into());
+        let staged = engine
+            .stage_with_execution_origin_fee_overrides_and_declared_token(
+                &permit,
+                "alice",
+                from,
+                intent(),
+                &chain,
+                &policy,
+                None,
+                None,
+                None,
+                Some(declared(token_addr, 6)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(staged.action_kind, TxActionKind::Erc20Transfer);
+        assert_eq!(staged.token.as_ref().unwrap().symbol, "TSLA");
+        let plan = bloom_proto::PlanRender::render(&staged, "ETH", 18);
+        assert!(plan.contains("Transfer 1.25 TSLA to"), "{plan}");
+        let allow: Vec<PolicyOutcome> = staged
+            .policy_checks
+            .iter()
+            .filter(|c| c.rule == "tokens.allow")
+            .map(|c| c.outcome)
+            .collect();
+        assert_eq!(
+            allow,
+            vec![PolicyOutcome::Pass],
+            "the declared symbol meets the rule"
+        );
+
+        // Declared with the wrong width: refused, not rescaled.
+        let url = spawn_stage_rpc(false).await;
+        let (engine, _dir, permit, chain) = stage_fixture(&url, oracle());
+        seed(&engine);
+        let err = engine
+            .stage_with_execution_origin_fee_overrides_and_declared_token(
+                &permit,
+                "alice",
+                from,
+                intent(),
+                &chain,
+                &policy_with_usd_cap(),
+                None,
+                None,
+                None,
+                Some(declared(token_addr, 18)),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("decimals() is 6, the package declared 18"),
+            "{err}"
+        );
+
+        // Declared for another contract: this one is labelled by the chain.
+        let url = spawn_stage_rpc(false).await;
+        let (engine, _dir, permit, chain) = stage_fixture(&url, oracle());
+        seed(&engine);
+        let other: Address = "0x4444444444444444444444444444444444444444"
+            .parse()
+            .unwrap();
+        let staged = engine
+            .stage_with_execution_origin_fee_overrides_and_declared_token(
+                &permit,
+                "alice",
+                from,
+                intent(),
+                &chain,
+                &policy_with_usd_cap(),
+                None,
+                None,
+                None,
+                Some(declared(other, 6)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(staged.token.as_ref().unwrap().symbol, "WHATEVER");
+    }
+
     #[tokio::test]
     async fn fresh_native_valuation_can_satisfy_under_policy_authorization() {
         let url = spawn_stage_rpc(true).await;
@@ -7588,7 +7825,7 @@ mod tests {
             data: None,
         };
         let (to, value, data, token, nft) = engine
-            .resolve_intent_body(&body, &chain, 31337, None, from)
+            .resolve_intent_body(&body, &chain, 31337, None, from, None)
             .await
             .unwrap();
         assert_eq!(
@@ -7628,7 +7865,7 @@ mod tests {
             data: None,
         };
         let (_to, _v, data, _t, nft) = engine
-            .resolve_intent_body(&body, &chain, 31337, None, from)
+            .resolve_intent_body(&body, &chain, 31337, None, from, None)
             .await
             .unwrap();
         assert!(data.starts_with("0xf242432a"), "calldata: {data}");
@@ -7663,7 +7900,7 @@ mod tests {
         };
         // Unreachable RPC -> Chain error from nft_detect.
         let r = engine
-            .resolve_intent_body(&body, &chain, 31337, None, from)
+            .resolve_intent_body(&body, &chain, 31337, None, from, None)
             .await;
         assert!(r.is_err(), "expected chain error, got {r:?}");
     }
@@ -7691,7 +7928,7 @@ mod tests {
             data: None,
         };
         let err = engine
-            .resolve_intent_body(&body, &chain, 31337, None, from)
+            .resolve_intent_body(&body, &chain, 31337, None, from, None)
             .await
             .unwrap_err();
         assert!(matches!(err, TxEngineError::Token(_)), "got {err:?}");

@@ -166,13 +166,18 @@ state. Their installed package documentation defines their mounted routes.
 - EVM transactions stage unsigned bytes, obtain approval when policy requires
   it, and use Broker/Signer for the final payload signature. For Petal-originated
   canonical ERC-20 `transfer(address,uint256)` calls with zero native value,
-  addressed to a token in Machine's curated registry, Machine decodes the
-  recipient and amount, reconstructs the calldata through the typed send path,
-  and evaluates token and recipient policy against those verified fields.
-  Other calldata remains a generic contract call — including a transfer-shaped
-  call to a contract the registry does not list. The selector proves the call's
-  shape, not the contract's behaviour; only the registry establishes that the
-  target is a token, so it is the condition for vouching that the call is one.
+  addressed to a token Machine can vouch for, Machine decodes the recipient
+  and amount, reconstructs the calldata through the typed send path, and
+  evaluates token and recipient policy against those verified fields. A token
+  Machine can vouch for is one in its curated registry, or one the staging
+  Petal's own package declares in its manifest: that declaration is pinned by
+  the package hash the owner approved, counts only for calls that package
+  stages, labels the plan with the declared symbol, and is cross-checked
+  against the contract's `decimals()`. Other calldata remains a generic
+  contract call — including a transfer-shaped call to a contract neither
+  lists. The selector proves the call's shape, not the contract's behaviour;
+  only a registry entry or an approved declaration establishes that the target
+  is a token, so one of them is the condition for vouching that the call is one.
   The registry is read for the chain the node reports, and only when that is
   the configured chain: a node reporting another id leaves every call generic,
   since a transfer typed for one chain would otherwise be signed for another.

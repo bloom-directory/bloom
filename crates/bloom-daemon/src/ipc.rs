@@ -1891,6 +1891,30 @@ fn petal_consent_lines(summary: &bloom_petals::package::PetalConsentSummary) -> 
             summary.sign_intents.join(", ")
         ));
     }
+    if !summary.declared_tokens.is_empty() {
+        // One line per chain: the count is what an owner weighs, the first
+        // few tickers say what kind of tokens these are.
+        let mut by_chain = std::collections::BTreeMap::<u64, Vec<&str>>::new();
+        for token in &summary.declared_tokens {
+            by_chain
+                .entry(token.chain_id)
+                .or_default()
+                .push(token.symbol.as_str());
+        }
+        for (chain_id, symbols) in by_chain {
+            let shown = symbols
+                .iter()
+                .take(6)
+                .copied()
+                .collect::<Vec<_>>()
+                .join(", ");
+            let more = if symbols.len() > 6 { ", ..." } else { "" };
+            lines.push(format!(
+                "  declared_tokens: chain {chain_id}: {} ({shown}{more})",
+                symbols.len()
+            ));
+        }
+    }
     if !summary.store_namespaces.is_empty() {
         lines.push("  private_store:".to_owned());
         for namespace in &summary.store_namespaces {
