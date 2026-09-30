@@ -96,17 +96,29 @@ The `safe.transaction.confirm` operation has an additional review contract. The
 Petal supplies one canonical Safe review envelope alongside the exact EIP-712
 preimage. Machine accepts and forwards that envelope only for this operation
 class, requires it for that class on the single-payload exact path, and refuses
-the class on every batch path, which carries no envelope field — that refusal
-covers reusable Petal signing too, since it funnels through the same batch
-request. Broker independently rebuilds the Safe transaction hash from the
-envelope and rejects a malformed envelope or one whose reconstruction does not
-equal the exact selector. It fixes all refund fields to zero, constrains a
-delegatecall to an official Safe library address on a chain whose deployments of
-those libraries were verified, and decodes the supported call before
-constructing approval text. Of the Safe's calls to itself it accepts a rejection
-and the four owner and threshold changes, which it shows decoded; every other
-one, such as enabling a module or setting a guard, is rejected, as is any
-self-call inside a call-only batch.
+the class on every other path — the batch request and the reusable
+single-payload request both carry no envelope field, so each refuses it in its
+own validation rather than relying on the other. Broker independently rebuilds
+the Safe transaction hash from the envelope and rejects a malformed envelope or
+one whose reconstruction does not equal the exact selector. It fixes all refund
+fields to zero and decodes the supported call before constructing approval
+text. A delegatecall is constrained to an official Safe library address, and
+Safe creation to an official singleton and fallback handler, on a chain whose
+deployments of those addresses were read and matched against their recorded
+runtime code hashes; an unrecognised address falls back to the reading that
+says Bloom cannot describe the call. Of the Safe's calls to itself it accepts a
+rejection and the four owner and threshold changes, which it shows decoded
+against the reported current threshold; every other one, such as enabling a
+module or setting a guard, is rejected, as is any self-call inside a call-only
+batch. The wallet's clear-signing settings apply here as they do to a native
+transaction: a Safe transaction whose inner call Bloom cannot read needs the
+same explicit opt-in that an undescribable payload sent directly does.
+
+A Safe-declaring route is limited to that one operation class for now. Machine
+keys the envelope requirement on the claim's class and Broker keys it on the
+classes the route's installer provenance declares, so a route that declared the
+Safe class alongside a second exact-signing class could not sign the second
+one.
 
 Only the EIP-712 members are bound that way, and Broker checks nothing else.
 The envelope's account of the Safe's own configuration — owner set, threshold,
