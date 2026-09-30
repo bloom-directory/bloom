@@ -628,7 +628,22 @@ impl WalletsHandler {
             )));
         }
         let projection = self.wallet_projection(wallet).await?;
-        let policy = crate::advisory_evm_policy(&projection, chain).map_err(err_be)?;
+        // The numeric-chain opt-in has to be read here, not only on the
+        // `bloom deploy` RPC path. This is the outbox the docs tell an agent
+        // to stage through, and `advisory_evm_policy` always returns a
+        // non-empty recipient allowlist -- the canonical destinations, or a
+        // fail-closed sentinel when none match the chain name. A contract
+        // creation has no recipient to satisfy one, so every `kind: "deploy"`
+        // staged here carried a hard policy violation and was refused at
+        // confirm, no matter what policy the owner had approved.
+        let chain_id = self
+            .chains
+            .get(chain)
+            .ok_or_else(|| HandlerError::invalid(format!("chain '{chain}' is not configured")))?
+            .spec()
+            .chain_id;
+        let policy =
+            crate::advisory_exact_evm_policy(&projection, chain, chain_id).map_err(err_be)?;
         self.write_outbox_from(wallet, chain, from, &policy, chain_rest, data)
             .await
     }
