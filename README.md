@@ -179,7 +179,8 @@ A fresh Bloom VFS root exposes these default entries:
   [Hyperliquid](https://github.com/bloom-directory/bloom-petal-hyperliquid),
   [Enso](https://github.com/bloom-directory/bloom-petal-enso),
   [Near Intents](https://github.com/bloom-directory/bloom-petal-near), and
-  [Tolly](https://github.com/TollyLabs/bloom-petal-tolly) releases.
+  [Feedback](https://github.com/bloom-directory/bloom-petal-feedback) releases.
+  Tolly is excluded until its explicit-account release is available.
   Read `docs/petals.md` in the VFS for the exact installed set, mount
   directories, summaries, and declared capabilities.
 - `requests/` — free and paid HTTP requests. Paid HTTP 402 challenges are
@@ -191,7 +192,7 @@ A fresh Bloom VFS root exposes these default entries:
 
 Application-specific surfaces live under `petals/`, not in Bloom core. For
 example, the Enso Petal accepts swap intents at
-`petals/enso/intents/<wallet>/new`, exposes a reviewable `plan.md`, and stages
+`petals/enso/intents/<wallet>/<index>/new`, exposes a reviewable `plan.md`, and stages
 confirmed transactions into the standard wallet outbox.
 
 See [QUICKSTART.md](./QUICKSTART.md) for an Anvil-backed walkthrough.

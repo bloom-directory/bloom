@@ -512,7 +512,7 @@ impl IpcOperationContext {
     /// and the optional expected owner are checked again at the atomic commit.
     pub fn commit_petal_package(
         &self,
-        store: &bloom_petals::PetalStore,
+        runner: &PetalRunner,
         package: bloom_petals::package::PreparedPetalPackage,
         source: Option<bloom_petals::meta::PetalSourceProvenance>,
         expected_owner: Option<Option<String>>,
@@ -524,7 +524,9 @@ impl IpcOperationContext {
         ),
         PetalError,
     > {
+        let store = runner.store();
         let name = package.name.clone();
+        let hash = package.hash.clone();
         let check = || {
             if self.is_cancelled() {
                 return Err(PetalError::vm("Petal install cancelled"));
@@ -536,6 +538,7 @@ impl IpcOperationContext {
                     "Petal {name} owner changed during acquisition; refusing stale install"
                 )));
             }
+            runner.check_activation(&hash, &name)?;
             // Replacing a package strands the sessions scoped to it: their
             // routes and keys stop matching any installed code, so their
             // stop and Exact recovery must still be reachable first. An
@@ -573,7 +576,7 @@ impl IpcOperationContext {
             None
         };
         check()?;
-        store.install_staged_petal_package_with_source_guarded(staged, source, check)
+        runner.install_staged_petal_package(staged, source, check)
     }
 
     pub fn emit(&self, stream: IpcOutputStream, bytes: impl Into<Vec<u8>>) -> bool {
@@ -1335,7 +1338,7 @@ impl IpcServer {
                 ));
             }
             let (result, meta, index) =
-                context.commit_petal_package(runner.store(), package, None, None)?;
+                context.commit_petal_package(&runner, package, None, None)?;
             Ok(json!({
                 "hash": result.hash,
                 "mode": "petal",
@@ -1898,6 +1901,12 @@ fn petal_consent_lines(summary: &bloom_petals::package::PetalConsentSummary) -> 
             };
             lines.push(format!("    - {} {visibility}", namespace.namespace));
         }
+    }
+    if !summary.store_shared_keys.is_empty() {
+        lines.push(format!(
+            "  shared_store_keys: {}",
+            summary.store_shared_keys.join(", ")
+        ));
     }
     if !summary.routes.is_empty() {
         lines.push("  routes:".to_owned());

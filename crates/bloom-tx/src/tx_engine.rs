@@ -1480,20 +1480,25 @@ impl TxEngine {
             native_destination_is_contract,
         );
         match &intent.body {
-            RawIntentBody::Send { token, .. } => {
+            RawIntentBody::Send { .. } => {
                 if let Some(t) = &token_for_plan {
                     policy_ctx.token = Some(to);
                     policy_ctx.contract = Some(to);
                     policy_ctx.destination_is_contract = true;
-                    // A symbol the caller wrote is theirs, and a symbol rule
-                    // may match it. A symbol read off the contract is the
-                    // contract's claim about itself and must not satisfy
-                    // one: any contract can return "USDC". Address rules
+                    // A symbol rule matches the symbol the curated registry
+                    // gives this contract, and nothing else. A symbol read
+                    // off the contract is its own claim about itself - any
+                    // contract can return "USDC" - so it never satisfies a
+                    // rule, and a Petal always names a token by address, so
+                    // its hint carries no symbol either. A caller's symbol
+                    // hint only ever resolves through the same registry, so
+                    // this is the one source for all three. Address rules
                     // still see the token through `policy_ctx.token`.
-                    policy_ctx.token_symbol = token
-                        .as_deref()
-                        .filter(|hint| !hint.starts_with("0x") && !hint.starts_with("0X"))
-                        .map(|_| t.symbol.clone());
+                    policy_ctx.token_symbol =
+                        bloom_proto::tokens::for_chain(registry_chain(chain_id))
+                            .iter()
+                            .find(|known| known.address.eq_ignore_ascii_case(&format!("{to:#x}")))
+                            .map(|known| known.symbol.to_string());
                     if let Ok(rec) = t.recipient.parse::<Address>() {
                         policy_ctx.recipient = Some(rec);
                     }
@@ -5662,6 +5667,123 @@ mod tests {
         assert!(
             outcomes(&staged).contains(&bloom_proto::policy::PolicyOutcome::Pass),
             "an address entry names the token and passes"
+        );
+    }
+
+    /// A Petal names a token by address, and the registry is the only word
+    /// for what that contract is. A curated token named by address must meet
+    /// a symbol rule exactly as if the owner had written the symbol: a deny
+    /// list naming it is a hard deny, an allow list naming it passes. The
+    /// same deny stays silent for a contract outside the registry, whatever
+    /// symbol it claims - the rule has nothing verified to match against.
+    #[tokio::test]
+    async fn a_registered_token_named_by_address_meets_symbol_rules() {
+        use bloom_proto::policy::PolicyOutcome;
+        let usdc: Address = bloom_proto::tokens::resolve_symbol(1, "USDC")
+            .expect("mainnet USDC is curated, and anvil reads mainnet's list")
+            .address
+            .parse()
+            .unwrap();
+        let unknown: Address = "0x1111111111111111111111111111111111111111"
+            .parse()
+            .unwrap();
+        let from: Address = "0x3333333333333333333333333333333333333333"
+            .parse()
+            .unwrap();
+        let oracle = || RecordingOracle {
+            calls: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            usd_micro: 1_250_000,
+            age_ms: 0,
+            max_age_ms: 60_000,
+        };
+        // Address-shaped hints, as a classified Petal transfer stages them.
+        let intent = |token: Address| RawIntent {
+            body: RawIntentBody::Send {
+                to: "0x2222222222222222222222222222222222222222".into(),
+                value: "0".into(),
+                token: Some(format!("{token:#x}")),
+                amount: "1250000 base".into(),
+                data: None,
+            },
+            chain: Some("anvil".into()),
+            gas: bloom_proto::intent::GasStrategy::Auto,
+            nonce: None,
+            gas_limit_hint: None,
+            usd_value_hint: None,
+        };
+        // Both contracts call themselves USDC; only one is curated.
+        let seed = |engine: &TxEngine, token: Address| {
+            engine.token_cache.write().insert(
+                (31337, token),
+                TokenMeta {
+                    address: token,
+                    symbol: "USDC".into(),
+                    decimals: 6,
+                },
+            );
+        };
+        let outcomes = |staged: &bloom_proto::StagedTx, rule: &str| -> Vec<PolicyOutcome> {
+            staged
+                .policy_checks
+                .iter()
+                .filter(|c| c.rule == rule)
+                .map(|c| c.outcome)
+                .collect()
+        };
+
+        // Curated token, denied by symbol: a hard deny.
+        let url = spawn_stage_rpc(false).await;
+        let (engine, _dir, permit, chain) = stage_fixture(&url, oracle());
+        seed(&engine, usdc);
+        let mut policy = policy_with_usd_cap();
+        policy.tokens.deny.insert("USDC".into());
+        let staged = engine
+            .stage(&permit, "alice", from, intent(usdc), &chain, &policy, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcomes(&staged, "tokens.deny"),
+            vec![PolicyOutcome::Deny],
+            "a symbol deny must catch the curated token named by address"
+        );
+
+        // Curated token, allowed by symbol: passes.
+        let url = spawn_stage_rpc(false).await;
+        let (engine, _dir, permit, chain) = stage_fixture(&url, oracle());
+        seed(&engine, usdc);
+        let mut policy = policy_with_usd_cap();
+        policy.tokens.allow.insert("USDC".into());
+        let staged = engine
+            .stage(&permit, "alice", from, intent(usdc), &chain, &policy, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcomes(&staged, "tokens.allow"),
+            vec![PolicyOutcome::Pass],
+            "a symbol allow must admit the curated token named by address"
+        );
+
+        // A contract outside the registry claiming USDC: the deny is silent.
+        let url = spawn_stage_rpc(false).await;
+        let (engine, _dir, permit, chain) = stage_fixture(&url, oracle());
+        seed(&engine, unknown);
+        let mut policy = policy_with_usd_cap();
+        policy.tokens.deny.insert("USDC".into());
+        let staged = engine
+            .stage(
+                &permit,
+                "alice",
+                from,
+                intent(unknown),
+                &chain,
+                &policy,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            outcomes(&staged, "tokens.deny").is_empty(),
+            "a contract's own symbol must not be what a deny matches"
         );
     }
 

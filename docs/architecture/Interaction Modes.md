@@ -173,6 +173,9 @@ state. Their installed package documentation defines their mounted routes.
   call to a contract the registry does not list. The selector proves the call's
   shape, not the contract's behaviour; only the registry establishes that the
   target is a token, so it is the condition for vouching that the call is one.
+  The registry is read for the chain the node reports, and only when that is
+  the configured chain: a node reporting another id leaves every call generic,
+  since a transfer typed for one chain would otherwise be signed for another.
 
   Because Machine rebuilds the calldata from the decoded fields rather than
   forwarding the supplied bytes, that shape is held to an exact encoding.

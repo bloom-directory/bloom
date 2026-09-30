@@ -68,6 +68,27 @@ was lost. Listing the wallet's outbox states is cheaper than re-issuing the
 write, and re-issuing a broadened version of it is how a correct action becomes
 an incorrect one.
 
+## Reporting Bloom problems
+
+If the Feedback Petal is installed, read `petals/feedback/README.md` for its
+submission format and receipt paths. You may proactively submit one concise,
+sanitized report for a distinct Bloom failure, misleading documentation, or
+missing capability that blocked the task, unless the user has disabled
+reporting. Mention a submitted report briefly when relevant; do not report
+every retry or successful operation.
+
+Write a minimal description and reproduction with placeholders. Never attach
+logs, transcripts, credentials, raw configuration, identifying local paths,
+wallet addresses, balances, transaction details, or other private user content
+automatically. Include contact details only when supplied for feedback. If the
+problem cannot be described without sensitive material, omit that material or
+ask before including it. Installation and discovery do not send feedback.
+
+Submit using `petals/feedback/submit.json`, then inspect
+`petals/feedback/receipts/<submission_id>.json`. A timeout has an unknown
+outcome: retry the same submission ID and payload rather than generating a new
+report. A received receipt confirms storage, not staff review or resolution.
+
 ## Wallet and account identity
 
 Read `wallets/<wallet>/projection.json` and `accounts.json` to select the
@@ -279,8 +300,12 @@ walkthrough in `docs/examples.md`.
 
 ## Petals and paid requests
 
-Installed applications live under `petals/<name>/`. Discover the installed
-package and follow its local instructions.
+Installed application documents and public routes live under `petals/<name>/`.
+Account-dependent routes explicitly select a wallet and index, for example
+`petals/enso/intents/<wallet>/<index>/new`. Follow each package's route tree;
+there is no common synthetic wallet root. Account state is isolated; explicitly
+declared service settings are shared across accounts. Keep every follow-up in
+the selected account, including core outbox confirmation paths.
 
 Paid HTTP operations live under `requests/`. They are actions, not ordinary
 reads: inspect the request plan, selected payment protocol, maximum amount,
@@ -308,7 +333,9 @@ Bloom rebuilds the calldata from those two fields instead of forwarding the
 Petal's bytes. It is then classified as a token transfer, checked against
 wallet policy, and eligible for policy-bounded autonomy. Extra trailing
 calldata, a different selector, any nonzero native value, or a target contract
-the registry does not list keeps it generic. The registry condition is what
+the registry does not list keeps it generic, and so does a node whose reported
+chain id differs from the configured chain, since the registry is read by chain
+and the signature is for the reported id. The registry condition is what
 makes the classification mean anything: matching the selector only proves what
 the call looks like, and any contract can answer `decimals()` and `symbol()`
 while doing something else under that selector. Eligible does not mean
