@@ -294,7 +294,7 @@ if [ "$install_authority_fixture" -eq 1 ]; then
   # The catalog must be signed before Machine starts, while package building is
   # intentionally daemon-only. Pin the fixture's reviewed package hash here,
   # then prove it against the daemon build before installing the fixture.
-  fixture_hash="2f11ee17f612fbc43f34f81771c53760f56768959624d29fd63b8e4285f5a9ac"
+  fixture_hash="a323d0070207aa75b7d211565b6040136077c398b74ed1e97eddabf7d5e6a814"
 fi
 if [ ! -f "${config_dir}/edge-manifest.json" ]; then
   [ ! -e "$config_dir" ] || die "incomplete developer config already exists: $config_dir"

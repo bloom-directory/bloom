@@ -1,5 +1,6 @@
 //! Per-petal private key/value storage for component routes.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
@@ -9,13 +10,41 @@ use crate::store::is_valid_hex_hash;
 #[derive(Debug, Clone)]
 pub struct PrivateStore {
     root: PathBuf,
+    account_digest: Option<String>,
+    shared_keys: BTreeSet<String>,
+    shared_root: Option<PathBuf>,
 }
 
 impl PrivateStore {
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, HostError> {
         let root = root.into();
         std::fs::create_dir_all(&root).map_err(|e| HostError::Backend(format!("store: {e}")))?;
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            account_digest: None,
+            shared_keys: BTreeSet::new(),
+            shared_root: None,
+        })
+    }
+
+    pub fn open_account(
+        root: impl Into<PathBuf>,
+        wallet: &str,
+        account: u32,
+    ) -> Result<Self, HostError> {
+        let mut store = Self::open(root)?;
+        store.account_digest = Some(account_digest(wallet, account));
+        Ok(store)
+    }
+
+    pub fn with_shared_keys(mut self, keys: impl IntoIterator<Item = String>) -> Self {
+        self.shared_keys = keys.into_iter().collect();
+        self
+    }
+
+    pub fn with_shared_root(mut self, root: PathBuf) -> Self {
+        self.shared_root = Some(root);
+        self
     }
 
     pub fn root(&self) -> &Path {
@@ -80,10 +109,17 @@ impl PrivateStore {
         let dir = self.petal_dir(petal_hash)?;
         let _guard = store_op_guard()?;
         let mut out = Vec::new();
-        if !dir.exists() {
-            return Ok(out);
+        if dir.exists() {
+            collect_files(&dir, &dir, prefix, &mut out)?;
         }
-        collect_files(&dir, &dir, prefix, &mut out)?;
+        if self.account_digest.is_some() {
+            out.retain(|key| !self.shared_keys.contains(key));
+            for key in &self.shared_keys {
+                if key.starts_with(prefix) && self.key_path(petal_hash, key)?.is_file() {
+                    out.push(key.clone());
+                }
+            }
+        }
         out.sort();
         Ok(out)
     }
@@ -129,13 +165,103 @@ impl PrivateStore {
         if !is_valid_hex_hash(petal_hash) {
             return Err(HostError::Invalid("invalid petal hash".into()));
         }
-        Ok(self.root.join(petal_hash))
+        let package_root = self.root.join(petal_hash);
+        Ok(match &self.account_digest {
+            Some(digest) => package_root.join(digest),
+            None => package_root,
+        })
     }
 
     fn key_path(&self, petal_hash: &str, key: &str) -> Result<PathBuf, HostError> {
         validate_key(key)?;
-        Ok(self.petal_dir(petal_hash)?.join(key))
+        let dir = self.petal_dir(petal_hash)?;
+        if self.account_digest.is_some() && self.shared_keys.contains(key) {
+            Ok(self
+                .shared_root
+                .as_ref()
+                .unwrap_or(&self.root)
+                .join(petal_hash)
+                .join(key))
+        } else {
+            Ok(dir.join(key))
+        }
     }
+}
+
+/// Stable across package releases and independent of their content hash.
+pub fn account_digest(wallet: &str, account: u32) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"bloom-petal-store-account/v1\0");
+    hasher.update(&(wallet.len() as u64).to_be_bytes());
+    hasher.update(wallet.as_bytes());
+    hasher.update(&account.to_be_bytes());
+    format!("v1-{}", hasher.finalize().to_hex())
+}
+
+/// Copy both package partitions before activating a compatible successor.
+/// The lock also serializes this with all KV operations in this process.
+pub fn carry_forward(
+    data_root: &Path,
+    accounts_root: &Path,
+    predecessor: &str,
+    successor: &str,
+) -> Result<bool, HostError> {
+    if !is_valid_hex_hash(predecessor) || !is_valid_hex_hash(successor) || predecessor == successor
+    {
+        return Err(HostError::Invalid("invalid carry-forward hashes".into()));
+    }
+    let _guard = store_op_guard()?;
+    let public = copy_partition(data_root, predecessor, successor)?;
+    let accounts = copy_partition(accounts_root, predecessor, successor)?;
+    Ok(public || accounts)
+}
+
+fn copy_partition(root: &Path, predecessor: &str, successor: &str) -> Result<bool, HostError> {
+    let source = root.join(predecessor);
+    let destination = root.join(successor);
+    if destination.exists() || !source.exists() {
+        return Ok(false);
+    }
+    let temporary = root.join(format!(".{successor}.carry.tmp"));
+    if temporary.exists() {
+        std::fs::remove_dir_all(&temporary)
+            .map_err(|e| HostError::Backend(format!("store carry cleanup: {e}")))?;
+    }
+    std::fs::create_dir_all(root)
+        .map_err(|e| HostError::Backend(format!("store carry mkdir: {e}")))?;
+    if let Err(error) = copy_directory(&source, &temporary) {
+        let _ = std::fs::remove_dir_all(&temporary);
+        return Err(HostError::Backend(format!("store carry copy: {error}")));
+    }
+    std::fs::rename(&temporary, &destination)
+        .map_err(|e| HostError::Backend(format!("store carry rename: {e}")))?;
+    Ok(true)
+}
+
+fn copy_directory(source: &Path, destination: &Path) -> std::io::Result<()> {
+    let meta = std::fs::symlink_metadata(source)?;
+    if !meta.file_type().is_dir() {
+        return Err(std::io::Error::other("store partition is not a directory"));
+    }
+    std::fs::create_dir(destination)?;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let meta = std::fs::symlink_metadata(&source_path)?;
+        if meta.file_type().is_dir() {
+            copy_directory(&source_path, &destination_path)?;
+        } else if meta.file_type().is_file() {
+            std::fs::copy(&source_path, &destination_path)?;
+            std::fs::set_permissions(&destination_path, meta.permissions())?;
+        } else {
+            return Err(std::io::Error::other(
+                "store partition contains a special file",
+            ));
+        }
+    }
+    std::fs::set_permissions(destination, meta.permissions())?;
+    Ok(())
 }
 
 fn store_op_guard() -> Result<MutexGuard<'static, ()>, HostError> {
@@ -285,6 +411,55 @@ mod tests {
     const HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     #[test]
+    fn declared_shared_keys_use_global_store_without_account_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let hash = "a".repeat(64);
+        let key = "secrets/credentials/api-key";
+        let global_root = dir.path().join("data");
+        let account_root = dir.path().join("data-accounts");
+        let global = PrivateStore::open(&global_root).unwrap();
+        global.put(&hash, key, b"global", true).unwrap();
+        global
+            .put(&hash, "state/orders/legacy", b"legacy", false)
+            .unwrap();
+        let accounts = [("alice", 0), ("alice", 1), ("bob", 0)].map(|(wallet, account)| {
+            PrivateStore::open_account(&account_root, wallet, account)
+                .unwrap()
+                .with_shared_keys([key.to_owned()])
+                .with_shared_root(global_root.clone())
+        });
+        // A stale scoped copy must neither shadow nor appear as the declared shared key.
+        PrivateStore::open_account(&account_root, "alice", 0)
+            .unwrap()
+            .put(&hash, key, b"stale", true)
+            .unwrap();
+        for (index, store) in accounts.iter().enumerate() {
+            assert_eq!(store.get(&hash, key).unwrap(), b"global");
+            assert!(store.get(&hash, "state/orders/legacy").is_err());
+            store
+                .put(&hash, "state/orders/item", &[index as u8], false)
+                .unwrap();
+            assert!(store.put_new(&hash, key, b"duplicate", true).is_err());
+            assert_eq!(store.list(&hash, "secrets/").unwrap(), [key]);
+        }
+        for (index, store) in accounts.iter().enumerate() {
+            assert_eq!(
+                store.get(&hash, "state/orders/item").unwrap(),
+                [index as u8]
+            );
+        }
+        accounts[1].put(&hash, key, b"updated", true).unwrap();
+        assert_eq!(global.get(&hash, key).unwrap(), b"updated");
+        assert!(accounts[2].del_if_value(&hash, key, b"wrong").is_err());
+        accounts[2].del_if_value(&hash, key, b"updated").unwrap();
+        assert!(accounts[0].get(&hash, key).is_err());
+        assert!(accounts[0].list(&hash, "secrets/").unwrap().is_empty());
+        accounts[0].put_new(&hash, key, b"new", true).unwrap();
+        accounts[1].del(&hash, key).unwrap();
+        assert!(global.get(&hash, key).is_err());
+    }
+
+    #[test]
     fn key_validation_rejects_escapes() {
         for key in ["", "../x", "a/../b", "/abs", "a//b", ".", "a\\b"] {
             assert!(validate_key(key).is_err(), "{key:?}");
@@ -407,5 +582,158 @@ mod tests {
         let path = store.root().join(HASH).join("creds/api.json");
         let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn account_stores_are_wallet_and_number_scoped() {
+        let dir = TempDir::new().unwrap();
+        let first = PrivateStore::open_account(dir.path(), "alice", 1).unwrap();
+        let second = PrivateStore::open_account(dir.path(), "bob", 1).unwrap();
+        let third = PrivateStore::open_account(dir.path(), "alice", 2).unwrap();
+        first.put(HASH, "setting", b"alice-one", false).unwrap();
+        assert!(matches!(
+            second.get(HASH, "setting"),
+            Err(HostError::NotFound(_))
+        ));
+        assert!(matches!(
+            third.get(HASH, "setting"),
+            Err(HostError::NotFound(_))
+        ));
+        assert_eq!(first.get(HASH, "setting").unwrap(), b"alice-one");
+        assert!(
+            dir.path()
+                .join(HASH)
+                .join(account_digest("alice", 1))
+                .is_dir()
+        );
+    }
+
+    #[test]
+    fn account_zero_is_isolated_from_other_wallets_and_legacy_state() {
+        let dir = TempDir::new().unwrap();
+        let legacy = PrivateStore::open(dir.path()).unwrap();
+        legacy.put(HASH, "setting", b"legacy", false).unwrap();
+        let alice = PrivateStore::open_account(dir.path(), "alice", 0).unwrap();
+        let bob = PrivateStore::open_account(dir.path(), "bob", 0).unwrap();
+        let next = PrivateStore::open_account(dir.path(), "alice", 1).unwrap();
+        assert!(matches!(
+            alice.get(HASH, "setting"),
+            Err(HostError::NotFound(_))
+        ));
+        alice.put(HASH, "setting", b"alice-zero", false).unwrap();
+        assert!(matches!(
+            bob.get(HASH, "setting"),
+            Err(HostError::NotFound(_))
+        ));
+        assert!(matches!(
+            next.get(HASH, "setting"),
+            Err(HostError::NotFound(_))
+        ));
+        assert_eq!(legacy.get(HASH, "setting").unwrap(), b"legacy");
+    }
+
+    #[test]
+    fn carry_forward_copies_both_roots_and_preserves_predecessor() {
+        let dir = TempDir::new().unwrap();
+        let data = dir.path().join("data");
+        let accounts = dir.path().join("data-accounts");
+        let successor = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let original = PrivateStore::open(&data).unwrap();
+        original
+            .put(HASH, "settings/value", b"original", false)
+            .unwrap();
+        original.put(HASH, "secrets/api", b"secret", true).unwrap();
+        let account_one = PrivateStore::open_account(&accounts, "alice", 1).unwrap();
+        account_one
+            .put(HASH, "settings/value", b"account", false)
+            .unwrap();
+        let other_wallet = PrivateStore::open_account(&accounts, "bob", 1).unwrap();
+        other_wallet
+            .put(HASH, "settings/value", b"other-wallet", false)
+            .unwrap();
+        assert!(carry_forward(&data, &accounts, HASH, successor).unwrap());
+        assert_eq!(
+            original.get(successor, "settings/value").unwrap(),
+            b"original"
+        );
+        assert_eq!(
+            PrivateStore::open_account(&accounts, "alice", 1)
+                .unwrap()
+                .get(successor, "settings/value")
+                .unwrap(),
+            b"account"
+        );
+        assert_eq!(
+            other_wallet.get(successor, "settings/value").unwrap(),
+            b"other-wallet"
+        );
+        original
+            .put(successor, "settings/value", b"changed", false)
+            .unwrap();
+        assert!(!carry_forward(&data, &accounts, HASH, successor).unwrap());
+        assert_eq!(original.get(HASH, "settings/value").unwrap(), b"original");
+        assert_eq!(
+            original.get(successor, "settings/value").unwrap(),
+            b"changed"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(data.join(successor).join("secrets/api"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
+
+    #[test]
+    fn concurrent_carry_forward_publishes_one_complete_copy() {
+        let dir = TempDir::new().unwrap();
+        let data = dir.path().join("data");
+        let accounts = dir.path().join("data-accounts");
+        let successor = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let original = PrivateStore::open(&data).unwrap();
+        original
+            .put(HASH, "settings/value", b"complete", false)
+            .unwrap();
+        let barrier = std::sync::Barrier::new(4);
+        let copied = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..4)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        carry_forward(&data, &accounts, HASH, successor).unwrap()
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|worker| usize::from(worker.join().unwrap()))
+                .sum::<usize>()
+        });
+        assert_eq!(copied, 1);
+        assert_eq!(
+            original.get(successor, "settings/value").unwrap(),
+            b"complete"
+        );
+        assert_eq!(original.get(HASH, "settings/value").unwrap(), b"complete");
+    }
+
+    #[test]
+    fn carry_forward_recovers_stale_temporary_partition() {
+        let dir = TempDir::new().unwrap();
+        let data = dir.path().join("data");
+        let accounts = dir.path().join("data-accounts");
+        let successor = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let original = PrivateStore::open(&data).unwrap();
+        original.put(HASH, "value", b"complete", false).unwrap();
+        let stale = data.join(format!(".{successor}.carry.tmp"));
+        std::fs::create_dir(&stale).unwrap();
+        std::fs::write(stale.join("value"), b"partial").unwrap();
+        assert!(carry_forward(&data, &accounts, HASH, successor).unwrap());
+        assert_eq!(original.get(successor, "value").unwrap(), b"complete");
+        assert!(!stale.exists());
     }
 }

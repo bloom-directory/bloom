@@ -2510,7 +2510,13 @@ fn petal_cli_build_install_list_and_vfs_read_happy_path() {
         .args(["vfs", "cat", "/petals/demo/hello.txt"])
         .assert()
         .success()
-        .stdout(predicate::eq("component"));
+        .stdout(predicate::str::contains("component")); // Public routes stay unscoped.
+
+    bloom_cmd(home.path())
+        .args(["vfs", "ls", "/petals/demo"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hello.txt"));
 
     bloom_cmd(home.path())
         .args(["vfs", "cat", "/petals/demo/README.md"])
@@ -2525,7 +2531,7 @@ fn github_source_install_polymarket_dispatches_route_contract() {
         return;
     }
     // Exercise source installation of the current pinned Polymarket release.
-    let petal_ref = "cb6259f6458fc9a27708b8c4c4e35d28a69d24fc";
+    let petal_ref = "a0177ae4e68f4a043df4db727fb3212e23ab7395";
     let home = fresh_home();
     let home_dir = bloom_proto::HomeDir::at(home.path());
     let config = bloom_proto::Config::local_default();
@@ -2554,8 +2560,8 @@ fn github_source_install_polymarket_dispatches_route_contract() {
         )))
         .stdout(predicate::str::contains("Building source package..."))
         .stdout(predicate::str::contains("Validating Petal package..."))
-        .stdout(predicate::str::contains("\"routes\": 97"))
-        .stdout(predicate::str::contains("routes: 97"));
+        .stdout(predicate::str::contains("\"routes\": 109"))
+        .stdout(predicate::str::contains("routes: 109"));
 
     bloom_cmd(home.path())
         .args(["petals", "ls"])
@@ -2572,6 +2578,12 @@ fn github_source_install_polymarket_dispatches_route_contract() {
         .stdout(predicate::str::contains(
             "bloom.polymarket.petal-route-contract.v1",
         ));
+
+    bloom_cmd(home.path())
+        .args(["vfs", "ls", "/petals/polymarket"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("meta"));
 
     bloom_cmd(home.path())
         .args(["vfs", "cat", "/petals/polymarket/README.md"])

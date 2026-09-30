@@ -390,15 +390,24 @@ async fn signer_wallet_is_visible_in_vfs_without_a_legacy_keystore_record() {
         stale_projections,
         temp.path().join("stale-machine-policy-projections"),
     );
-    let account: serde_json::Value = serde_json::from_slice(
-        &stale_handler
-            .read(&VfsPath::parse("/alice/0/account.json").unwrap())
+    let error = stale_handler
+        .read(&VfsPath::parse("/alice/0/account.json").unwrap())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, HandlerError::Backend(message) if message.contains("SERVICE_UNAVAILABLE"))
+    );
+    stale_handler
+        .lookup(&VfsPath::parse("/alice/0/account.json").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        stale_handler
+            .read(&VfsPath::parse("/alice/0/address.evm").unwrap())
             .await
             .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(account["number"], 0);
-    assert_eq!(account["freshness"], "stale");
+        b"0x0000000000000000000000000000000000000001\n"
+    );
     let projection: serde_json::Value = serde_json::from_slice(
         &stale_handler
             .read(&VfsPath::parse("/alice/projection.json").unwrap())
