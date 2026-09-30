@@ -198,7 +198,7 @@ pub fn account_digest(wallet: &str, account: u32) -> String {
     format!("v1-{}", hasher.finalize().to_hex())
 }
 
-/// Copy both package partitions before a successor's first guest invocation.
+/// Copy both package partitions before activating a compatible successor.
 /// The lock also serializes this with all KV operations in this process.
 pub fn carry_forward(
     data_root: &Path,

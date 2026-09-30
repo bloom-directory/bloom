@@ -287,6 +287,20 @@ impl PetalStore {
     where
         F: Fn() -> Result<(), PetalError>,
     {
+        self.install_staged_petal_package_with_activation(staged, source, commit_guard, |_| Ok(()))
+    }
+
+    pub(crate) fn install_staged_petal_package_with_activation<F, G>(
+        &self,
+        staged: StagedPetalPackage,
+        source: Option<PetalSourceProvenance>,
+        commit_guard: F,
+        prepare_state: G,
+    ) -> Result<(InstallResult, PetalMeta, RouteIndex), PetalError>
+    where
+        F: Fn() -> Result<(), PetalError>,
+        G: Fn(&PetalMeta) -> Result<(), PetalError>,
+    {
         let _execution = self.mutation_guard()?;
         let StagedPetalPackage { package, directory } = staged;
         let hash = package.hash.clone();
@@ -351,6 +365,9 @@ impl PetalStore {
         }
         commit_guard()?;
         self.write_meta(&meta)?;
+        // Prepare compatible state while guest calls are excluded, before
+        // making the successor visible (even if it is never invoked).
+        prepare_state(&meta)?;
 
         // This atomic rename is the installation commit point. Before it,
         // readers continue to resolve the previous package; after it, they

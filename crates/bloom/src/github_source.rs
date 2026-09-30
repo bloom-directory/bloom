@@ -257,6 +257,10 @@ pub(crate) fn release_lineage_predecessor(name: &str) -> Option<ReleaseLineagePr
             "ac2ccab59f36ee863843f92aaf0c975c00dbf32b246df5ccbb79757093785921",
             &[][..],
         ),
+        "feedback" => (
+            "5f26e7bbf7f507cfcf4c13645cf9f4f0c903d769c201e3e9d1f5c914b14fa2a3",
+            &[][..],
+        ),
         "tolly" => (
             "f50f9f6f55eca103c11ed40d424311c6e5863ff5046231f57f58822d1aac6709",
             &[][..],
@@ -338,7 +342,7 @@ const PREINSTALLED_FEEDBACK: PreinstalledPetal = PreinstalledPetal {
     petal_abi: "bloom.petal-host/triad-compatible-nonauthority-v1",
     default_eligible: true,
     lineage_id: None,
-    release_sequence: 0,
+    release_sequence: 1,
     predecessor_package_hashes: &[],
     authority_routes: &[],
 };
@@ -742,12 +746,7 @@ fn install_github_source_with_expectation(
             .context("verify loaded Petal successor release information")?;
         let (result, meta, index) = context
             .unwrap_or(&detached)
-            .commit_petal_package(
-                daemon.petals.store(),
-                package,
-                Some(provenance.clone()),
-                None,
-            )
+            .commit_petal_package(&daemon.petals, package, Some(provenance.clone()), None)
             .context("install generated Petal package")?;
         Ok((result, meta, index, consent, provenance))
     })();
@@ -914,7 +913,7 @@ impl PreparedReleasePetal {
             .context("verify loaded bundled Petal release information")?;
         let (result, meta, index) = context
             .commit_petal_package(
-                daemon.petals.store(),
+                &daemon.petals,
                 self.package,
                 Some(self.provenance.clone()),
                 expected_owner,
@@ -1247,12 +1246,13 @@ pub(crate) fn preinstalled_petal(name: &str) -> Option<&'static PreinstalledPeta
 
 /// Bundled releases whose signed lineage also controls private-state
 /// carry-forward. Non-authority Petals receive a lineage-only catalog record.
-pub(crate) fn release_lineage_petals() -> [&'static PreinstalledPetal; 4] {
+pub(crate) fn release_lineage_petals() -> [&'static PreinstalledPetal; 5] {
     [
         &PREINSTALLED_POLYMARKET,
         &PREINSTALLED_HYPERLIQUID,
         &PREINSTALLED_ENSO,
         &PREINSTALLED_NEAR_INTENTS,
+        &PREINSTALLED_FEEDBACK,
     ]
 }
 

@@ -314,6 +314,34 @@ impl PetalRunner {
         self.check_activation(hash, name)
     }
 
+    pub fn install_staged_petal_package<F>(
+        &self,
+        staged: crate::store::StagedPetalPackage,
+        source: Option<crate::meta::PetalSourceProvenance>,
+        commit_guard: F,
+    ) -> Result<
+        (
+            crate::store::InstallResult,
+            crate::meta::PetalMeta,
+            RouteIndex,
+        ),
+        PetalError,
+    >
+    where
+        F: Fn() -> Result<(), PetalError>,
+    {
+        self.store.install_staged_petal_package_with_activation(
+            staged,
+            source,
+            commit_guard,
+            |meta| {
+                let name = meta.name.as_deref().expect("staged package name");
+                self.check_activation(&meta.hash, name)?;
+                self.carry_private_store(meta, None).map(|_| ())
+            },
+        )
+    }
+
     fn prepare_private_store(
         &self,
         hash: &str,
@@ -324,14 +352,26 @@ impl PetalRunner {
             return Ok(());
         }
         let meta = self.store.load_meta(hash)?;
+        if self.carry_private_store(&meta, account)? {
+            prepared.insert(hash.to_string());
+        }
+        Ok(())
+    }
+
+    // False permits only the existing partition; do not cache it as package-wide readiness.
+    fn carry_private_store(
+        &self,
+        meta: &crate::meta::PetalMeta,
+        account: Option<&AccountPetalContext>,
+    ) -> Result<bool, PetalError> {
+        let hash = meta.hash.as_str();
         let Some(predecessor) = meta.replaced.as_deref() else {
             tracing::info!(
                 event = "petal_state.not_carried",
                 hash,
                 reason = "no_replaced_owner"
             );
-            prepared.insert(hash.to_string());
-            return Ok(());
+            return Ok(true);
         };
         // Existing partitions remain usable after a catalog-load failure.
         // A new partition for a replaced package must not be created while
@@ -345,13 +385,13 @@ impl PetalRunner {
         };
         if self.catalog_shape_error.is_some() {
             if partition.is_dir() {
-                return Ok(());
+                return Ok(false);
             }
             self.ensure_catalog_shape()?;
         }
         if self.lineage_record(predecessor).is_some() && self.lineage_record(hash).is_none() {
             if partition.is_dir() {
-                return Ok(());
+                return Ok(false);
             }
             return Err(PetalError::vm(format!(
                 "Petal successor {hash} release information is missing from the loaded installer catalog"
@@ -364,8 +404,7 @@ impl PetalRunner {
                 predecessor,
                 reason = "no_lineage"
             );
-            prepared.insert(hash.to_string());
-            return Ok(());
+            return Ok(true);
         };
         let lineage = record
             .petal_lineage
@@ -378,7 +417,7 @@ impl PetalRunner {
             .any(|listed| listed.to_string() == predecessor);
         if lineage.active && predecessor_listed && predecessor_record.is_none() {
             if partition.is_dir() {
-                return Ok(());
+                return Ok(false);
             }
             return Err(PetalError::vm(format!(
                 "Petal predecessor {predecessor} release information is missing from the loaded installer catalog"
@@ -401,8 +440,7 @@ impl PetalRunner {
                 "unlisted_predecessor"
             };
             tracing::info!(event = "petal_state.not_carried", hash, predecessor, lineage = %lineage.lineage_id, reason);
-            prepared.insert(hash.to_string());
-            return Ok(());
+            return Ok(true);
         }
         let copied = crate::private_store::carry_forward(
             &self.store.private_data_root(),
@@ -414,8 +452,7 @@ impl PetalRunner {
             PetalError::vm(format!("Petal private-state carry-forward failed: {error}"))
         })?;
         tracing::info!(event = if copied { "petal_state.carried_forward" } else { "petal_state.not_carried" }, hash, predecessor, lineage = %lineage.lineage_id, reason = if copied { "copied" } else { "predecessor_store_absent_or_successor_exists" });
-        prepared.insert(hash.to_string());
-        Ok(())
+        Ok(true)
     }
 
     fn runtime_metadata_key(matched: &PetalRouteMatch, path: &str) -> RuntimeMetadataCacheKey {
@@ -1053,13 +1090,41 @@ pub(crate) fn route_has_descendant(pattern: &str, path: &str) -> bool {
         .all(|(value, pattern)| route_segment_matches(pattern, value))
 }
 
+/// More-specific static ancestors shadow parameterized branches for discovery.
+/// Compare only the consumed prefix, not unrelated descendant leaf names.
+pub(crate) fn ancestor_routes<'a>(
+    index: &'a RouteIndex,
+    path: &str,
+) -> Vec<&'a crate::package::RouteIndexRecord> {
+    let depth = route_segments(path).len();
+    let candidates: Vec<_> = index
+        .routes
+        .iter()
+        .filter(|route| route_has_descendant(&route.pattern, path))
+        .map(|route| {
+            let score = route
+                .pattern
+                .split('/')
+                .take(depth)
+                .filter(|part| !part.starts_with('[') && !part.starts_with('$'))
+                .count();
+            (score, route)
+        })
+        .collect();
+    let best = candidates.iter().map(|(score, _)| *score).max();
+    candidates
+        .into_iter()
+        .filter_map(|(score, route)| (Some(score) == best).then_some(route))
+        .collect()
+}
+
 pub(crate) fn static_list_entries(index: &RouteIndex, path: &str) -> Vec<crate::DispatchEntry> {
     use crate::{DispatchEntry, DispatchEntryKind};
     use std::collections::BTreeMap;
 
     let path_segments = route_segments(path);
     let mut entries = BTreeMap::<String, DispatchEntryKind>::new();
-    for route in &index.routes {
+    for route in ancestor_routes(index, path) {
         let pattern_segments = route_segments(&route.pattern);
         if path_segments.len() >= pattern_segments.len() {
             continue;
@@ -1569,6 +1634,120 @@ namespaces = ["settings"]
         ])));
         runner.prepare_private_store(&successor, None).unwrap();
         assert_eq!(data.get(&successor, "settings/value").unwrap(), b"final");
+    }
+
+    #[test]
+    fn activation_carries_state_through_unused_release_and_restart() {
+        use crate::private_store::PrivateStore;
+        let (dir, runner) = runner();
+        let first = install_echo_app(&dir, &runner);
+        let package_dir = dir.path().join("echo-app");
+        write_package_file(&package_dir, "README.md", b"# intermediate");
+        let middle = crate::package::PreparedPetalPackage::from_dir(&package_dir).unwrap();
+        write_package_file(&package_dir, "README.md", b"# final");
+        let last = crate::package::PreparedPetalPackage::from_dir(&package_dir).unwrap();
+        let middle_hash = middle.hash.clone();
+        let last_hash = last.hash.clone();
+        let lineage = "pln1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let records = |active: &str| {
+            [
+                (&first, None),
+                (&middle_hash, Some(&first)),
+                (&last_hash, Some(&middle_hash)),
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(i, (hash, previous))| {
+                let mut record = lineage_record(
+                    hash,
+                    lineage,
+                    "publisher",
+                    hash == active,
+                    &previous.map(String::as_str).into_iter().collect::<Vec<_>>(),
+                );
+                record.petal_lineage.as_mut().unwrap().release_sequence =
+                    bloom_broker_api::DecimalU64::new(i as u64 + 1);
+                record
+            })
+            .collect()
+        };
+        let shared = PrivateStore::open(runner.store().private_data_root()).unwrap();
+        shared
+            .put(&first, "settings/value", b"shared", false)
+            .unwrap();
+        for number in [0, 1] {
+            let account = PrivateStore::open_account(
+                runner.store().private_account_data_root(),
+                "alice",
+                number,
+            )
+            .unwrap();
+            account
+                .put(&first, "settings/value", &[number as u8], false)
+                .unwrap();
+        }
+        let runner = runner.with_provenance_catalog(Some(catalog(records(&middle_hash))));
+        let staged = runner.store().stage_petal_package(middle).unwrap();
+        runner
+            .install_staged_petal_package(staged, None, || Ok(()))
+            .unwrap();
+        // Reopen the store: reconciliation removes the first package metadata.
+        // No invocation or lazy preparation of the intermediate release occurs.
+        let runner = PetalRunner::new(
+            PetalStore::open(dir.path().join("store")).unwrap(),
+            Arc::new(NameRegistry::open(dir.path().join("reg")).unwrap()),
+            PetalVm::new().unwrap(),
+        )
+        .with_provenance_catalog(Some(catalog(records(&last_hash))));
+        assert!(runner.store().load_meta(&first).is_err());
+        let staged = runner.store().stage_petal_package(last).unwrap();
+        // A cancelled activation must leave the previous owner selected.
+        assert!(
+            runner
+                .install_staged_petal_package(staged, None, || Err(PetalError::vm("cancelled")))
+                .is_err()
+        );
+        assert_eq!(
+            runner.store().resolve_petal_owner("echo").unwrap(),
+            Some(middle_hash.clone())
+        );
+        // A state-copy error also leaves a reopenable store and its old owner.
+        let last = crate::package::PreparedPetalPackage::from_dir(&package_dir).unwrap();
+        let staged = runner.store().stage_petal_package(last).unwrap();
+        assert!(
+            runner
+                .store()
+                .install_staged_petal_package_with_activation(
+                    staged,
+                    None,
+                    || Ok(()),
+                    |_| Err(PetalError::vm("copy failed")),
+                )
+                .is_err()
+        );
+        let reopened = PetalStore::open(dir.path().join("store")).unwrap();
+        assert_eq!(
+            reopened.resolve_petal_owner("echo").unwrap(),
+            Some(middle_hash.clone())
+        );
+        let last = crate::package::PreparedPetalPackage::from_dir(&package_dir).unwrap();
+        let staged = runner.store().stage_petal_package(last).unwrap();
+        runner
+            .install_staged_petal_package(staged, None, || Ok(()))
+            .unwrap();
+        assert_eq!(shared.get(&last_hash, "settings/value").unwrap(), b"shared");
+        for number in [0, 1] {
+            let account = PrivateStore::open_account(
+                runner.store().private_account_data_root(),
+                "alice",
+                number,
+            )
+            .unwrap();
+            assert_eq!(
+                account.get(&last_hash, "settings/value").unwrap(),
+                [number as u8]
+            );
+        }
     }
 
     #[test]

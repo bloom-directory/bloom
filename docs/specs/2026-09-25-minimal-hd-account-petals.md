@@ -80,7 +80,10 @@ no copying of previously account-scoped settings. Public routes do not gain
 account or signing authority by accessing shared settings.
 
 Existing signed same-lineage package succession remains the mechanism for carrying
-forward these new stores between compatible future package releases. It does not
+forward these new stores between compatible future package releases. Copy both
+shared and account partitions before activating the successor, under the existing
+execution guard, so an unused intermediate release cannot lose the predecessor’s
+state. It does not
 translate legacy wallet-wide records into account-zero records. Legacy files are
 left untouched; no automatic cleanup deletes old state. Uniform account-zero
 partitions start empty when only legacy package-level settings exist.

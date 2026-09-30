@@ -2,7 +2,7 @@
 
 Date: 2026-09-25
 
-Status: implemented continuity contract; updated 2026-09-28
+Status: implemented continuity contract; updated 2026-09-30
 Related: [Minimal HD-account support for Petals](2026-09-25-minimal-hd-account-petals.md)
 
 ## 1. Problem
@@ -23,9 +23,8 @@ records retained, as required by the HD-account spec.
 
 ## 2. Decision
 
-When an authenticated successor release of the same Petal lineage is first
-used, copy its predecessor's private state into the successor's (empty)
-partition. The predecessor partition is never modified.
+Before activating an authenticated successor release of the same Petal lineage,
+copy its predecessor's private state into the successor's empty partitions. The predecessor partition is never modified.
 
 Not included:
 - Petal-declared migration hooks or schema versions.
@@ -85,8 +84,7 @@ Likewise, a successor that lists its replaced package must not start a fresh
 store while the predecessor's required lineage record is missing. A verified
 different lineage is a known refusal; missing proof is not.
 
-`install_staged_petal_package_with_source_guarded`
-(`crates/bloom-petals/src/store.rs:256`) knows the outgoing owner hash just
+The guarded package activation in `crates/bloom-petals/src/store.rs` knows the outgoing owner hash just
 before its commit point (`write_petal_owner`). Record it in the incoming
 package's `PetalMeta` as a new optional field:
 
@@ -99,29 +97,27 @@ pub replaced: Option<String>,   // outgoing owner hash for this Petal name
 after a rollback ignores it. Re-installing an already-present hash keeps an
 existing `replaced` value rather than overwriting it with itself.
 
-### 4.2 Copy on first use
+### 4.2 Copy before activation
 
-The copy happens when H's private store is first needed, not at install time.
-The provenance catalog is installer-owned. H's verified lineage record must
-already be loaded before activation (§4.1), so first use cannot race a later
-catalog refresh.
+The common local/source/default installation path uses the runner's loaded
+catalog to prepare state under the existing package-mutation execution guard,
+before `write_petal_owner` makes H visible. No guest code runs during copying.
 
-Before running a guest invocation of H with the store capability, the runner
-ensures H's partition exists:
+1. Check §3 against the loaded catalog.
+2. If authorised, use the existing `store_op_guard` to copy `data/<P>/` to
+   `data/.<H>.carry.tmp/`, then rename it to `data/<H>/`. Do the same for the
+   numbered-account root (§5). Existing successor partitions are preserved.
+   Preserve file modes; secrets are written `0600`.
+3. A copy failure leaves P active. A known ineligible relationship creates
+   nothing; first writes still create empty partitions as before. Missing or
+   invalid required release information remains an activation error (§4.1).
+4. Log `petal_state.carried_forward` or `petal_state.not_carried` with the
+   hashes, lineage and reason, then commit the new owner.
 
-1. If it exists, continue. Cache this per hash in memory, so the steady-state
-   cost is zero after the first check.
-2. Otherwise take the private-store lock (the existing `store_op_guard`) and
-   check §3 against the loaded catalog.
-3. If authorised: copy `data/<P>/` to `data/.<H>.carry.tmp/`, then rename it to
-   `data/<H>/`. Do the same for account-n partitions (§5). Preserve file modes;
-   secrets are written `0600`.
-4. If not authorised for a known reason (for example, H does not list P as a
-   predecessor): create nothing and proceed. The store creates the partition
-   on first write, as today. Missing or invalid release information for a
-   lineage-backed upgrade is instead an activation error under §4.1.
-5. Log `petal_state.carried_forward` or `petal_state.not_carried` with the
-   hashes, lineage and reason.
+This preserves P's state through P → H → J even when H is never invoked and
+startup reconciliation removes P's package metadata. No ancestry traversal is
+needed. The existing first-use check remains defensive for packages installed
+outside the common activation path; it caches completed decisions per hash.
 
 Each directory rename is its commit point. A crash before a rename leaves a
 temporary directory that the next attempt deletes and redoes. The two store
@@ -206,7 +202,7 @@ release assets themselves do not supply the catalog.
 3. **Activation ordering:** stage a lineage-backed H while its catalog record
    is missing, invalid, or present on disk but not loaded. Activation fails,
    P stays active, and H cannot create a fresh store. Load and verify the
-   record (restart if required), then activate H. First use carries P's state
+   record (restart if required), then activate H. Activation carries P's state
    forward. Exercise the same ordering for the bundled default-Petal update.
    A malformed catalog must leave existing initialized stores and unrelated
    development packages usable while blocking fresh replacements that need
@@ -214,7 +210,11 @@ release assets themselves do not supply the catalog.
 4. **Single-partition crash safety:** kill before a partition rename. The next
    use cleans its temporary directory and retries. Recovery across the two
    store-root renames is not required (accepted limitation in §4.2).
-5. **Concurrency:** parallel first invocations of H copy exactly once.
+5. **Concurrency:** active predecessor invocations exclude activation; state is
+   copied before the successor becomes visible. Parallel first invocations
+   preserve the already prepared state.
+   **Unused intermediate:** P → H → J, without invoking H and with a restart
+   after installing H, preserves shared and numbered-account state.
 6. **Rollback and re-upgrade:** H → P resumes P's pre-upgrade state; P → H
    resumes H's state without copying.
 7. **Account-n:** account 1 state for two wallets carries forward to the

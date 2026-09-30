@@ -180,10 +180,7 @@ impl PetalRouter {
             .collect::<Vec<_>>();
         let mut checked_accounts = BTreeSet::new();
         let mut checked_wallets = BTreeSet::new();
-        for route in &index.routes {
-            if !crate::runner::route_has_descendant(&route.pattern, path) {
-                continue;
-            }
+        for route in crate::runner::ancestor_routes(&index, path) {
             let captures = route.pattern.split('/').zip(&values).collect::<Vec<_>>();
             let wallet = captures
                 .iter()
@@ -230,10 +227,7 @@ impl PetalRouter {
             .collect::<Vec<_>>();
         let mut entries = BTreeMap::new();
         let mut listed_paths = BTreeSet::new();
-        for route in &index.routes {
-            if !crate::runner::route_has_descendant(&route.pattern, path) {
-                continue;
-            }
+        for route in crate::runner::ancestor_routes(&index, path) {
             let pattern = route.pattern.split('/').collect::<Vec<_>>();
             let core = match pattern.get(values.len()).copied() {
                 Some("[wallet]") if pattern.get(values.len() + 1) == Some(&"[index]") => {
@@ -1097,6 +1091,62 @@ name = "example"
             assert!(!router.is_async_write_command(&path));
             assert_eq!(router.cache_ttl(&path), None);
         }
+    }
+
+    #[tokio::test]
+    async fn static_ancestors_shadow_dynamic_accounts_without_granting_authority() {
+        let (dir, runner) = runner();
+        let package = dir.path().join("static-and-account");
+        write_demo_package(&package);
+        for route in ["accounts/admin/0/help", "accounts/[wallet]/[index]/task"] {
+            write_package_file(
+                &package,
+                &format!("petal/demo/{route}.wasm"),
+                include_bytes!("../tests/fixtures/route_component_no_imports.wasm"),
+            );
+        }
+        runner.store().install_petal_package_dir(&package).unwrap();
+        let router = PetalRouter::new(runner, Arc::new(AccountHost));
+        for path in ["/demo/accounts/admin", "/demo/accounts/admin/0"] {
+            let path = VfsPath::parse(path).unwrap();
+            router.lookup(&path).await.unwrap();
+            assert!(!router.list(&path).await.unwrap().is_empty());
+        }
+        let entries = router
+            .list(&VfsPath::parse("/demo/accounts/admin/0").unwrap())
+            .await
+            .unwrap();
+        assert!(entries.iter().any(|entry| entry.name == "help"));
+        assert!(!entries.iter().any(|entry| entry.name == "task"));
+        assert_eq!(
+            router
+                .read(&VfsPath::parse("/demo/accounts/admin/0/help").unwrap())
+                .await
+                .unwrap(),
+            b"component"
+        );
+        assert!(
+            router
+                .read(&VfsPath::parse("/demo/accounts/admin/0/task").unwrap())
+                .await
+                .is_err()
+        );
+        assert!(
+            router
+                .write(
+                    &VfsPath::parse("/demo/accounts/admin/0/task").unwrap(),
+                    b"effect"
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            router
+                .read(&VfsPath::parse("/demo/accounts/alice/1/task").unwrap())
+                .await
+                .unwrap(),
+            b"component"
+        );
     }
 
     #[tokio::test]
