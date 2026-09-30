@@ -1098,6 +1098,118 @@ class BuilderFeeCeremonyLifecycleTests(BuilderFeeFixture, unittest.TestCase):
         )
         self.assertEqual(venue.max_builder_fee, 0, "venue ends revoked")
 
+    def provision_with_unreadable_listing(
+        self, venue: FakeVenue, *, failing_reads: int
+    ) -> str:
+        """Provision against `venue` with the signing-request listing failing.
+
+        The pre-write snapshot succeeds and the ceremony completes, so the
+        grant is live. The next `failing_reads` listing reads raise: the
+        first is the post-ceremony read that would have named the grant, and
+        any further ones are cleanup's own attempts to identify it.
+
+        Returns the live grant's id, found through the venue rather than the
+        harness, because the harness never learned it.
+        """
+        definition = self.definition
+        definition._observed_max_builder_fee = mock.Mock(
+            side_effect=lambda: venue.max_builder_fee
+        )
+        real_listing = definition._approved_request_ids
+        reads = [0]
+
+        def listing() -> frozenset[str]:
+            reads[0] += 1
+            if 1 < reads[0] <= 1 + failing_reads:
+                raise EvalError("could not read a signing request record")
+            return real_listing()
+
+        definition._approved_request_ids = listing
+        with self.assertRaisesRegex(EvalError, "could not read"):
+            definition.provision("codex")
+        # The failure mode under test: the approval is live and nothing
+        # names it.
+        self.assertIsNone(definition.staged_request_id)
+        self.assertEqual(definition.staged_request_ids, [])
+        self.assertTrue(definition.cleanup_needed)
+        grant_body = definition._request_body(
+            int(definition.max_fee_tenths_bps_value), definition.nonce
+        )
+        (grant,) = [
+            rid for rid, entry in venue.requests.items() if entry["body"] == grant_body
+        ]
+        self.assertEqual(venue.requests[grant]["status"], "approved_retry_required")
+        return grant
+
+    def assert_grant_is_spent(self, venue: FakeVenue, grant: str) -> None:
+        self.assertEqual(
+            venue.requests[grant]["status"],
+            "signed",
+            "the grant must be consumed, not left executable",
+        )
+        self.assertEqual(venue.max_builder_fee, 0, "venue ends revoked")
+        venue.write(None, venue.requests[grant]["body"], None)
+        self.assertEqual(
+            venue.max_builder_fee, 0, "a consumed approval cannot re-grant"
+        )
+
+    def test_cleanup_retires_a_grant_the_post_ceremony_listing_failed_to_name(
+        self,
+    ) -> None:
+        """The listing read after the ceremony fails; cleanup still retires.
+
+        Before this, cleanup had no id to act on and only submitted the
+        revoke, which does not consume the original exact-payload approval.
+        The grant is now identified at cleanup time against the pre-write
+        snapshot, which was taken while nothing was live.
+        """
+        venue = self.venue()
+        venue.install(self)
+        grant = self.provision_with_unreadable_listing(venue, failing_reads=1)
+
+        self.definition.cleanup()
+
+        self.assert_grant_is_spent(venue, grant)
+
+    def test_cleanup_retires_the_grant_blind_when_the_listing_stays_unreadable(
+        self,
+    ) -> None:
+        """Cleanup cannot identify the grant either; it submits the body once.
+
+        The body is known exactly, and one submission consumes a live grant
+        while being a Petal no-op otherwise, so it is the safe move. The
+        result is then proven by reading.
+        """
+        venue = self.venue()
+        venue.install(self)
+        grant = self.provision_with_unreadable_listing(venue, failing_reads=2)
+        self.definition._write_route.reset_mock()
+
+        self.definition.cleanup()
+
+        self.assert_grant_is_spent(venue, grant)
+        grant_writes = [
+            call
+            for call in self.definition._write_route.call_args_list
+            if call.args[1] == venue.requests[grant]["body"]
+        ]
+        self.assertEqual(len(grant_writes), 1, "exactly one blind submission")
+
+    def test_cleanup_reports_a_grant_it_could_not_prove_retired(self) -> None:
+        """Unreadable through cleanup: the body is still submitted, then it raises.
+
+        The blind submission spends the grant at the venue, and the revoke
+        still runs, but cleanup must not report success it could not read.
+        """
+        venue = self.venue()
+        venue.install(self)
+        grant = self.provision_with_unreadable_listing(venue, failing_reads=99)
+
+        with self.assertRaisesRegex(EvalError, "could not prove"):
+            self.definition.cleanup()
+
+        self.assert_grant_is_spent(venue, grant)
+
     def test_cleanup_revokes_despite_a_stray_ceremony_the_agent_staged(self) -> None:
         """A mismatched agent write must not block the revoke.
 

@@ -142,6 +142,11 @@ class HyperliquidApproveBuilderFeeEval(EvalDefinition):
         # Every approved request this run's staging write created, so cleanup
         # can retire all of them even if more than one appeared.
         self.staged_request_ids: list[str] = []
+        # The approvals in scope before this run's staging write, taken while
+        # nothing is live yet. Cleanup identifies this run's grant as whatever
+        # approval appeared after it, so the grant is found even when the
+        # post-ceremony listing that would have named it could not be read.
+        self.approved_before: frozenset[str] = frozenset()
         self.counter_committed = counter_committed
         self.phase_timings: dict[str, float] = {}
 
@@ -756,10 +761,12 @@ class HyperliquidApproveBuilderFeeEval(EvalDefinition):
         # may already be usable by the time any later step fails.
         self.cleanup_needed = True
         counter = self.sign_count or self._require_sign_count()
-        # Identify this run's grant by difference, and record it before
-        # anything else can fail: once the ceremony completes the grant is
-        # live, and cleanup must be able to retire it whatever happens next.
+        # Identify this run's grant by difference. The snapshot is kept on the
+        # instance before the ceremony runs: once it completes the grant is
+        # live, and the listing read below can fail after that point, so
+        # cleanup must be able to make the same identification on its own.
         approved_before = self._approved_request_ids()
+        self.approved_before = approved_before
         counter, output = self._drive_action(route, body, counter, submit=False)
         staged = sorted(self._approved_request_ids() - approved_before)
         self.staged_request_ids = staged
@@ -884,6 +891,24 @@ class HyperliquidApproveBuilderFeeEval(EvalDefinition):
             verifier_env=runtime_env,
         )
 
+    def _live_grants(self) -> list[str]:
+        """Ids of this run's approved, unsubmitted grants, as of now.
+
+        Two sources, so the grant is found even when staging never learned
+        its id: the ids staging recorded, and every approval that appeared
+        after the pre-write snapshot. Preflight refused to start with any
+        foreign approval staged, so one that appeared since is ours. Raises
+        when the listing cannot be read; the caller decides what that means.
+        """
+        approved = self._approved_request_ids()
+        recorded = [self.staged_request_id, *self.staged_request_ids]
+        appeared = sorted(approved - self.approved_before)
+        return [
+            request_id
+            for request_id in dict.fromkeys([*recorded, *appeared])
+            if request_id is not None and request_id in approved
+        ]
+
     def _retire_unconsumed_grant(self) -> None:
         """Spend a staged grant the agent never submitted.
 
@@ -898,29 +923,45 @@ class HyperliquidApproveBuilderFeeEval(EvalDefinition):
         consuming it. It carries `max_operations: 1` / `max_signatures: 1`,
         so submitting it once spends it for good. The revoke that follows
         returns the venue to zero.
+
+        The grant is identified here, not only at staging time. The listing
+        read that names it can fail after the ceremony has already made the
+        approval live, and staging then records nothing. When the listing
+        cannot be read now either, the exact body is submitted once anyway:
+        it consumes the grant if one is live and is a Petal no-op otherwise.
+        The outcome is then proven by reading. A result that cannot be read,
+        or still shows a grant, raises rather than reporting a clean cleanup.
         """
-        grants = list(dict.fromkeys(
-            [self.staged_request_id, *self.staged_request_ids]
-        ))
-        for request_id in grants:
-            if request_id is None:
-                continue
-            if self._request_status(request_id) != "approved_retry_required":
-                continue
-            route = self.exchange_root / "approve_builder_fee.json"
-            body = self._request_body(int(self.max_fee_tenths_bps_value), self.nonce)
+        route = self.exchange_root / "approve_builder_fee.json"
+        body = self._request_body(int(self.max_fee_tenths_bps_value), self.nonce)
+        try:
+            grants: list[str] | None = self._live_grants()
+        except EvalError:
+            # Assume the grant is live. One submission of the exact bytes
+            # spends it, and nothing else can.
+            grants = None
+        for _ in range(1 if grants is None else len(grants)):
             self._write_route(route, body, WRITE_TIMEOUT_SECONDS)
-            for attempt in range(VENUE_SETTLE_ATTEMPTS):
-                if self._request_status(request_id) != "approved_retry_required":
-                    break
-                if attempt + 1 < VENUE_SETTLE_ATTEMPTS:
-                    time.sleep(VENUE_SETTLE_DELAY_SECONDS)
-            else:
+        if grants == []:
+            return
+        for attempt in range(VENUE_SETTLE_ATTEMPTS):
+            try:
+                remaining = self._live_grants()
+            except EvalError as error:
                 raise EvalError(
-                    "staged approve_builder_fee approval is still unconsumed after "
-                    "cleanup tried to spend it; it remains an executable grant for "
-                    f"builder {self.builder} and must be resolved before another run"
-                )
+                    "could not prove the staged approve_builder_fee approval was "
+                    f"retired: {error}. It may remain an executable grant for "
+                    f"builder {self.builder}; resolve it before another run"
+                ) from error
+            if not remaining:
+                return
+            if attempt + 1 < VENUE_SETTLE_ATTEMPTS:
+                time.sleep(VENUE_SETTLE_DELAY_SECONDS)
+        raise EvalError(
+            "staged approve_builder_fee approval is still unconsumed after "
+            "cleanup tried to spend it; it remains an executable grant for "
+            f"builder {self.builder} and must be resolved before another run"
+        )
 
     def cleanup(self) -> None:
         if not self.cleanup_needed or self.nonce is None:
