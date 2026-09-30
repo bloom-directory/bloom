@@ -131,7 +131,7 @@ bloom-petals   = { path = "crates/bloom-petals" }
 bloom-petal-contract = { git = "https://github.com/bloom-directory/petal", rev = "73c5b06a77599368fbc79fb7947a629b5b4c630e" }
 bloom-daemon   = { path = "crates/bloom-daemon" }
 bloom-update   = { path = "crates/bloom-update" }
-bloom-broker-api = { git = "https://github.com/bloom-directory/bloom-broker.git", rev = "df089761e1248036afb6a86b032b9276425f74b7" }
+bloom-broker-api = { git = "https://github.com/bloom-directory/bloom-broker.git", rev = "66313732e4489fe9024632df9a2efebde720306b" }
 bloom-rpc-wire = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "a046fd6075853e8591f295983b572c6e1d65d12d" }
 bloom-triad-local-transport = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "a046fd6075853e8591f295983b572c6e1d65d12d" }
 bloom-service-activation = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "a046fd6075853e8591f295983b572c6e1d65d12d" }
