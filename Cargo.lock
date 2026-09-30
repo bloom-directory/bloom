@@ -2153,6 +2153,7 @@ dependencies = [
  "bloom-daemon",
  "bloom-evm",
  "bloom-machine-client",
+ "bloom-mcp",
  "bloom-mount",
  "bloom-petals",
  "bloom-proto",
@@ -2388,6 +2389,24 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber 0.3.23",
+]
+
+[[package]]
+name = "bloom-mcp"
+version = "0.3.2"
+dependencies = [
+ "async-trait",
+ "base64",
+ "bloom-daemon",
+ "bloom-proto",
+ "bloom-vfs",
+ "percent-encoding",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
