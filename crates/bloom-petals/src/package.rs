@@ -91,6 +91,8 @@ struct PetalToml {
     key: KeyPolicyToml,
     #[serde(default)]
     store: StorePolicyToml,
+    #[serde(default)]
+    tokens: Vec<TokenDeclToml>,
     #[serde(default, rename = "source")]
     _source: Option<SourcePolicyToml>,
     #[serde(default, rename = "build")]
@@ -174,6 +176,15 @@ struct StorePolicyToml {
     secret_namespaces: Vec<String>,
     #[serde(default)]
     shared_keys: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TokenDeclToml {
+    chain_id: u64,
+    address: String,
+    symbol: String,
+    decimals: u8,
 }
 
 #[derive(Debug, Deserialize)]
@@ -288,6 +299,8 @@ pub struct PetalConsentSummary {
     pub store_namespaces: Vec<PetalConsentStoreNamespace>,
     pub store_shared_keys: Vec<String>,
     pub routes: Vec<PetalConsentRoute>,
+    /// From `[[tokens]]`: the contracts the package vouches for as tokens.
+    pub declared_tokens: Vec<DeclaredToken>,
 }
 
 /// Agent-facing identity and capability metadata retained in an installed
@@ -327,6 +340,21 @@ pub struct PetalConsentRoute {
     pub write_async: bool,
 }
 
+/// An ERC-20 the package declares it transfers, from `[[tokens]]` in its
+/// manifest. Machine gives a Petal's `transfer(address,uint256)` call typed
+/// treatment only for a token it can vouch for: Bloom's curated registry, or
+/// a declaration like this one made by the very package that staged the
+/// call. The declaration is the author's word, pinned by the package hash the
+/// owner approved, and it cannot change after install.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeclaredToken {
+    pub chain_id: u64,
+    /// Lowercase `0x` hex, so one contract has exactly one spelling here.
+    pub address: String,
+    pub symbol: String,
+    pub decimals: u8,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouteIndex {
     pub schema: String,
@@ -335,6 +363,10 @@ pub struct RouteIndex {
     pub petal_root: String,
     pub policy_hash: String,
     pub routes: Vec<RouteIndexRecord>,
+    /// Absent from indexes installed before declarations existed, which is
+    /// the same as declaring nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tokens: Vec<DeclaredToken>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -517,6 +549,7 @@ impl PreparedPetalPackage {
         let store_policy = store_policy_from_manifest(&manifest);
         validate_store_policy(&allowed_caps, &store_policy)?;
         validate_net_policy(&allowed_caps, &manifest.net)?;
+        let tokens = validate_declared_tokens(&allowed_caps, &manifest.tokens)?;
         let route_files = route_records_from_files(&files, &petal_root)?;
         if route_files.is_empty() {
             return Err(PetalError::InvalidWasm(format!(
@@ -534,6 +567,7 @@ impl PreparedPetalPackage {
             petal_root: manifest.name.clone(),
             policy_hash,
             routes: Vec::with_capacity(route_files.len()),
+            tokens,
         };
         for route in route_files {
             let source_path = route.source_path.to_string_lossy().replace('\\', "/");
@@ -1208,6 +1242,7 @@ pub fn petal_consent_summary(
         store_namespaces,
         store_shared_keys: manifest.store.shared_keys.clone(),
         routes,
+        declared_tokens: package.route_index.tokens.clone(),
     })
 }
 
@@ -4173,6 +4208,96 @@ fn validate_net_policy(
         }
     }
     Ok(())
+}
+
+/// The bound a declared symbol has to fit to be shown as a label at all:
+/// the same rule the transaction engine applies to a `symbol()` read off a
+/// contract before printing it in a plan.
+fn is_declarable_symbol(symbol: &str) -> bool {
+    !symbol.is_empty()
+        && symbol.len() <= 16
+        && symbol
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() && !matches!(byte, b'<' | b'>' | b'&'))
+}
+
+/// `[[tokens]]` is the package vouching for contracts, so it is held to the
+/// registry's own standard: one canonical spelling per contract, one symbol
+/// per contract per chain, a displayable symbol, and no overlap with what
+/// Bloom already curates. A declaration that collides with a curated token
+/// is either redundant or an attempt to relabel it, and both are refused.
+/// Declaring tokens without the outbox capability is refused too: nothing
+/// else in the package could transfer them.
+fn validate_declared_tokens(
+    allowed_caps: &BTreeSet<String>,
+    declared: &[TokenDeclToml],
+) -> Result<Vec<DeclaredToken>, PetalError> {
+    if declared.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !allowed_caps.contains("bloom:tx.outbox") {
+        return Err(PetalError::InvalidWasm(
+            "Petal [[tokens]] requires the bloom:tx.outbox capability".into(),
+        ));
+    }
+    let mut addresses = BTreeSet::new();
+    let mut symbols = BTreeSet::new();
+    let mut tokens = Vec::with_capacity(declared.len());
+    for token in declared {
+        if token.chain_id == 0 {
+            return Err(PetalError::InvalidWasm(
+                "Petal [[tokens]] chain_id must be a nonzero EIP-155 chain id".into(),
+            ));
+        }
+        let hex = token.address.strip_prefix("0x").unwrap_or_default();
+        if hex.len() != 40
+            || !hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(PetalError::InvalidWasm(format!(
+                "Petal [[tokens]] address {:?} must be lowercase 0x-prefixed hex of 20 bytes",
+                token.address
+            )));
+        }
+        if !is_declarable_symbol(&token.symbol) {
+            return Err(PetalError::InvalidWasm(format!(
+                "Petal [[tokens]] symbol {:?} must be 1-16 printable ASCII characters without <, >, or &",
+                token.symbol
+            )));
+        }
+        if !addresses.insert((token.chain_id, token.address.clone())) {
+            return Err(PetalError::InvalidWasm(format!(
+                "Petal [[tokens]] declares {} on chain {} more than once",
+                token.address, token.chain_id
+            )));
+        }
+        if !symbols.insert((token.chain_id, token.symbol.to_ascii_uppercase())) {
+            return Err(PetalError::InvalidWasm(format!(
+                "Petal [[tokens]] declares symbol {} on chain {} for more than one contract",
+                token.symbol, token.chain_id
+            )));
+        }
+        if let Some(curated) = bloom_proto::tokens::for_chain(token.chain_id)
+            .iter()
+            .find(|known| {
+                known.address.eq_ignore_ascii_case(&token.address)
+                    || known.symbol.eq_ignore_ascii_case(&token.symbol)
+            })
+        {
+            return Err(PetalError::InvalidWasm(format!(
+                "Petal [[tokens]] {} on chain {} collides with Bloom's curated {} at {}; curated tokens need no declaration",
+                token.symbol, token.chain_id, curated.symbol, curated.address
+            )));
+        }
+        tokens.push(DeclaredToken {
+            chain_id: token.chain_id,
+            address: token.address.clone(),
+            symbol: token.symbol.clone(),
+            decimals: token.decimals,
+        });
+    }
+    Ok(tokens)
 }
 
 fn validate_store_namespace(namespace: &str) -> Result<(), PetalError> {
@@ -7339,6 +7464,179 @@ namespaces = ["C:"]
 name = "echo"
 "#,
             route,
+        );
+    }
+
+    #[test]
+    fn petal_declared_tokens_are_validated_and_carried_in_the_route_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_petal_package_with_manifest_and_route(
+            tmp.path(),
+            br#"schema = "bloom.petal.package.v1"
+name = "echo"
+[caps]
+allowed = ["bloom:tx.outbox"]
+
+[[tokens]]
+chain_id = 4663
+address = "0xaf3d76f1834a1d425780943c99ea8a608f8a93f9"
+symbol = "AAPL"
+decimals = 18
+
+[[tokens]]
+chain_id = 4663
+address = "0x36046893810a7e7fce501229d57dc3fc8c8716d0"
+symbol = "AMAT"
+decimals = 18
+"#,
+            route_component_no_imports(),
+        );
+        let package = PreparedPetalPackage::from_dir(tmp.path()).unwrap();
+        assert_eq!(
+            package.route_index.tokens,
+            vec![
+                DeclaredToken {
+                    chain_id: 4663,
+                    address: "0xaf3d76f1834a1d425780943c99ea8a608f8a93f9".into(),
+                    symbol: "AAPL".into(),
+                    decimals: 18,
+                },
+                DeclaredToken {
+                    chain_id: 4663,
+                    address: "0x36046893810a7e7fce501229d57dc3fc8c8716d0".into(),
+                    symbol: "AMAT".into(),
+                    decimals: 18,
+                },
+            ]
+        );
+        // The installed index carries the declaration verbatim, and one
+        // written before declarations existed still loads as declaring
+        // nothing.
+        let json = serde_json::to_vec(&package.route_index).unwrap();
+        let loaded: RouteIndex = serde_json::from_slice(&json).unwrap();
+        assert_eq!(loaded, package.route_index);
+        let mut legacy: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        legacy.as_object_mut().unwrap().remove("tokens");
+        let legacy: RouteIndex = serde_json::from_value(legacy).unwrap();
+        assert!(legacy.tokens.is_empty());
+        // A declaration is a policy structure, so it rejects unknown fields.
+        let err = toml::from_str::<PetalToml>(
+            "name = \"echo\"\n[[tokens]]\nchain = 1\naddress = \"0x\"\nsymbol = \"X\"\ndecimals = 1\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown field"), "{err}");
+    }
+
+    /// Every way a declaration could vouch for the wrong thing is refused at
+    /// install, where the owner has not yet approved anything.
+    #[test]
+    fn petal_declared_tokens_reject_spoofing_or_ambiguous_declarations() {
+        let declaration = |chain_id: u64, address: &str, symbol: &str| {
+            format!(
+                "[[tokens]]\nchain_id = {chain_id}\naddress = \"{address}\"\nsymbol = \"{symbol}\"\ndecimals = 18\n"
+            )
+        };
+        let aapl = "0xaf3d76f1834a1d425780943c99ea8a608f8a93f9";
+        let amat = "0x36046893810a7e7fce501229d57dc3fc8c8716d0";
+        let usdc = bloom_proto::tokens::resolve_symbol(1, "USDC")
+            .unwrap()
+            .address;
+        for (case, caps, body, expected) in [
+            (
+                "no outbox capability",
+                "[\"bloom:store\"]\n[store]\nnamespaces = [\"s\"]",
+                declaration(4663, aapl, "AAPL"),
+                "bloom:tx.outbox",
+            ),
+            (
+                "zero chain id",
+                "[\"bloom:tx.outbox\"]",
+                declaration(0, aapl, "AAPL"),
+                "chain_id",
+            ),
+            (
+                "checksummed address",
+                "[\"bloom:tx.outbox\"]",
+                declaration(4663, "0xAF3D76f1834a1D425780943c99EA8a608f8a93F9", "AAPL"),
+                "lowercase",
+            ),
+            (
+                "short address",
+                "[\"bloom:tx.outbox\"]",
+                declaration(4663, "0xaf3d76f1", "AAPL"),
+                "lowercase",
+            ),
+            (
+                "symbol with markup",
+                "[\"bloom:tx.outbox\"]",
+                declaration(4663, aapl, "<AAPL>"),
+                "symbol",
+            ),
+            (
+                "symbol too long",
+                "[\"bloom:tx.outbox\"]",
+                declaration(4663, aapl, "AAAAAAAAAAAAAAAAA"),
+                "symbol",
+            ),
+            (
+                "one contract twice",
+                "[\"bloom:tx.outbox\"]",
+                declaration(4663, aapl, "AAPL") + &declaration(4663, aapl, "AAPL2"),
+                "more than once",
+            ),
+            (
+                "one symbol for two contracts",
+                "[\"bloom:tx.outbox\"]",
+                declaration(4663, aapl, "AAPL") + &declaration(4663, amat, "aapl"),
+                "more than one contract",
+            ),
+            (
+                "relabels a curated address",
+                "[\"bloom:tx.outbox\"]",
+                declaration(1, usdc, "MYUSD"),
+                "collides",
+            ),
+            (
+                "takes a curated symbol",
+                "[\"bloom:tx.outbox\"]",
+                declaration(1, aapl, "usdc"),
+                "collides",
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            write_petal_package_with_manifest_and_route(
+                tmp.path(),
+                format!(
+                    "schema = \"bloom.petal.package.v1\"\nname = \"echo\"\n[caps]\nallowed = {caps}\n\n{body}"
+                )
+                .as_bytes(),
+                route_component_no_imports(),
+            );
+            let err = PreparedPetalPackage::from_dir(tmp.path()).unwrap_err();
+            assert!(
+                err.to_string().contains(expected),
+                "{case}: expected {expected:?} in {err}"
+            );
+        }
+        // The same declarations on a chain Bloom does not curate are fine.
+        let tmp = tempfile::tempdir().unwrap();
+        write_petal_package_with_manifest_and_route(
+            tmp.path(),
+            format!(
+                "schema = \"bloom.petal.package.v1\"\nname = \"echo\"\n[caps]\nallowed = [\"bloom:tx.outbox\"]\n\n{}{}",
+                declaration(4663, aapl, "AAPL"),
+                declaration(4663, amat, "AMAT")
+            )
+            .as_bytes(),
+            route_component_no_imports(),
+        );
+        assert_eq!(
+            PreparedPetalPackage::from_dir(tmp.path())
+                .unwrap()
+                .route_index
+                .tokens
+                .len(),
+            2
         );
     }
 

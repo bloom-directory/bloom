@@ -139,6 +139,33 @@ packages created before this manifest contract. New Petals should always
 declare the complete scope. Other package-level signing intents are not
 inherited.
 
+A Petal that transfers ERC-20 tokens Bloom does not curate can declare them,
+so Bloom can classify its `transfer(address,uint256)` calls to those contracts
+as token transfers rather than opaque contract calls. Each declaration names
+one contract on one chain:
+
+```toml
+[[tokens]]
+chain_id = 4663
+address = "0xaf3d76f1834a1d425780943c99ea8a608f8a93f9"
+symbol = "AAPL"
+decimals = 18
+```
+
+The declaration is the package vouching for a contract, so it is held to the
+standard of Bloom's own registry and rejected at install otherwise: the
+address must be lowercase `0x` hex, the symbol 1-16 printable ASCII characters
+without `<`, `>`, or `&`, one contract may be declared once per chain and one
+symbol for one contract per chain, and a declaration that collides with a
+token Bloom already curates on that chain (by address or by symbol) is refused,
+since curated tokens need no declaration. Declaring tokens requires
+`bloom:tx.outbox`. The list is part of the package hash the owner approves and
+cannot change after install; at staging time Bloom applies it only to calls
+this package makes, cross-checks the contract's `decimals()` against the
+declaration, and uses the declared symbol as the token's label in plans and in
+wallet-policy symbol rules. An undeclared, uncurated contract stays a generic
+contract call, which always needs a fresh owner approval.
+
 ## Routes and ABI
 
 Every route artifact is a WebAssembly component implementing
@@ -242,6 +269,7 @@ commit but intentionally does not sandbox the source build in this iteration.
 - Keep `petal.toml`, `README.md`, and operational `AGENTS.md` current.
 - Declare only host capabilities the component actually imports.
 - Make network paths, store namespaces, and signing intents explicit.
+- Declare the tokens the Petal transfers unless Bloom already curates them.
 - Make writes idempotent where retry is possible and expose inspectable status.
 - Never imply that a staged or approval-required action has completed.
 - Build from a clean tree and install the resulting directory and archive.

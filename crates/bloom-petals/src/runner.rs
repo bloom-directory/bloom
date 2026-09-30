@@ -940,6 +940,27 @@ impl PetalRunner {
         let manifest = std::fs::read(self.store.package_path(hash)?.join("source/petal.toml"))?;
         store_policy_from_manifest_toml(&manifest)
     }
+
+    /// The token at `address` on `chain_id` that the installed package `hash`
+    /// declares it transfers, if any. Read from the installed route index, so
+    /// it is the declaration validated at install and pinned by the hash the
+    /// owner approved; any spelling of the address matches its one canonical
+    /// declaration.
+    pub fn petal_declared_token(
+        &self,
+        hash: &str,
+        chain_id: u64,
+        address: &str,
+    ) -> Result<Option<crate::package::DeclaredToken>, PetalError> {
+        Ok(self
+            .store
+            .load_route_index(hash)?
+            .tokens
+            .into_iter()
+            .find(|token| {
+                token.chain_id == chain_id && token.address.eq_ignore_ascii_case(address)
+            }))
+    }
 }
 
 /// Match `prefix` against installed hashes: `None` when nothing

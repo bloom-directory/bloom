@@ -742,6 +742,30 @@ impl DaemonPetalHost {
 
     /// The installed mount name for a package hash, if that exact package is
     /// installed under a name.
+    /// The token at `address` on `chain_id` that the staging package declares
+    /// in its manifest, if any. Read through the runner from the installed
+    /// route index, so it is the declaration validated at install and pinned
+    /// by the hash the owner approved. A host without a Petal runner has no
+    /// packages to consult; an installed package whose index cannot be read
+    /// fails the stage, because that same index is what lets it run at all.
+    fn petal_declared_token(
+        &self,
+        package_hash: &str,
+        chain_id: u64,
+        address: Address,
+    ) -> Result<Option<bloom_petals::package::DeclaredToken>, HostError> {
+        let Some(runner) = self.petal_runner.as_ref() else {
+            return Ok(None);
+        };
+        runner
+            .petal_declared_token(package_hash, chain_id, &format!("{address:#x}"))
+            .map_err(|error| {
+                HostError::Backend(format!(
+                    "declared tokens for package {package_hash}: {error}"
+                ))
+            })
+    }
+
     fn petal_mount_for_hash(&self, package_hash: &str) -> Option<String> {
         let runner = self.petal_runner.as_ref()?;
         match runner.local_petal_mounts() {
@@ -2633,16 +2657,21 @@ impl PetalHost for DaemonPetalHost {
             .chain_id()
             .await
             .map_err(|error| HostError::Backend(format!("chain id for {}: {error}", req.chain)))?;
+        // A token this package declared in its manifest counts as known for
+        // this package's own calls, on the reported chain only.
+        let declared_token =
+            self.petal_declared_token(&origin.petal_digest, reported_chain_id, requested_to)?;
         let typed_erc20_transfer = decode_petal_erc20_transfer(
             &req,
             chain.spec().chain_id,
             reported_chain_id,
             requested_to,
             requested_value,
+            declared_token.is_some(),
         )?;
         let staged = service
             .tx_engine
-            .stage_with_execution_origin_and_fee_overrides(
+            .stage_with_execution_origin_fee_overrides_and_declared_token(
                 permit,
                 &req.wallet,
                 wallet_address,
@@ -2672,6 +2701,11 @@ impl PetalHost for DaemonPetalHost {
                 Some(service.address_book.as_ref()),
                 Some(origin),
                 fee_overrides,
+                declared_token.map(|declared| bloom_tx::tx_engine::DeclaredToken {
+                    address: requested_to,
+                    symbol: declared.symbol,
+                    decimals: declared.decimals,
+                }),
             )
             .await
             .map_err(|e| HostError::Backend(format!("stage EVM outbox: {e}")))?;
@@ -3008,13 +3042,16 @@ fn parse_petal_hex_bytes(value: &str, field: &str) -> Result<Vec<u8>, HostError>
 /// calldata from these decoded fields and reads token metadata onchain before
 /// classifying it as an ERC-20 transfer. Everything else remains a generic
 /// contract call, as does any call when the node reports a chain id other
-/// than the configured one.
+/// than the configured one. A token is known when Bloom curates it or when
+/// the staging package declares it in its manifest; the caller resolves the
+/// declaration and passes only whether one exists for this chain and target.
 fn decode_petal_erc20_transfer(
     request: &EvmTransactionRequest,
     spec_chain_id: u64,
     reported_chain_id: u64,
     requested_to: Address,
     requested_value: U256,
+    declared_by_package: bool,
 ) -> Result<Option<(Address, U256)>, HostError> {
     if !requested_value.is_zero() {
         return Ok(None);
@@ -3031,10 +3068,13 @@ fn decode_petal_erc20_transfer(
     // contract at `to` does with it. Any contract can answer `decimals()`,
     // return "USDC" from `symbol()`, and run something else entirely under
     // 0xa9059cbb. Typed treatment vouches for semantics, so it is only given
-    // to a contract Bloom already knows is a token. Anything else stays a
+    // to a contract Bloom already knows is a token, or one the staging
+    // package vouched for in its hash-pinned manifest. Anything else stays a
     // generic call with its bytes intact - and is not validated below either,
     // because Bloom will not be rebuilding it.
-    if !bloom_tx::tx_engine::is_known_token_address(reported_chain_id, requested_to) {
+    if !declared_by_package
+        && !bloom_tx::tx_engine::is_known_token_address(reported_chain_id, requested_to)
+    {
         return Ok(None);
     }
     let calldata = parse_petal_hex_bytes(&request.data_hex, "data-hex")?;
@@ -5766,7 +5806,14 @@ mod tests {
         request: &EvmTransactionRequest,
         value: U256,
     ) -> Result<Option<(Address, U256)>, HostError> {
-        decode_petal_erc20_transfer(request, ANVIL, ANVIL, request.to.parse().unwrap(), value)
+        decode_petal_erc20_transfer(
+            request,
+            ANVIL,
+            ANVIL,
+            request.to.parse().unwrap(),
+            value,
+            false,
+        )
     }
 
     fn canonical_transfer(recipient: Address, amount: u64) -> Vec<u8> {
@@ -5779,6 +5826,119 @@ mod tests {
 
     fn hex0x(bytes: &[u8]) -> String {
         format!("0x{}", hex::encode(bytes))
+    }
+
+    /// A contract outside Bloom's registry is typed when the staging package
+    /// declares it, and only then. The declaration does not override the
+    /// chain-id rule.
+    #[test]
+    fn a_transfer_to_a_token_the_package_declares_is_typed() {
+        let recipient: Address = "0x0000000000000000000000000000000000000020"
+            .parse()
+            .unwrap();
+        let request = petal_evm_request(
+            UNKNOWN_CONTRACT,
+            "0",
+            hex0x(&canonical_transfer(recipient, 5)),
+        );
+        let to: Address = UNKNOWN_CONTRACT.parse().unwrap();
+        let classify = |reported: u64, declared: bool| {
+            decode_petal_erc20_transfer(&request, ANVIL, reported, to, U256::ZERO, declared)
+                .unwrap()
+        };
+        assert!(
+            classify(ANVIL, false).is_none(),
+            "undeclared and uncurated: generic"
+        );
+        assert_eq!(classify(ANVIL, true), Some((recipient, U256::from(5))));
+        assert!(
+            classify(1, true).is_none(),
+            "a declaration does not excuse a chain mismatch"
+        );
+    }
+
+    /// The declaration reaches the daemon from the installed package's route
+    /// index, keyed by the package hash the route context carries, for the
+    /// declared chain and contract only.
+    #[tokio::test]
+    async fn the_daemon_resolves_a_declared_token_from_the_installed_package() {
+        let (dir, daemon, _broker) = isolation_daemon().await;
+        let home = bloom_proto::HomeDir::at(dir.path());
+        let root = home.root().join("petals");
+        let store = bloom_petals::PetalStore::open(root.join("store")).unwrap();
+        let package = root.join("stock-package");
+        write_isolation_package_file(
+            &package,
+            "petal.toml",
+            format!(
+                r#"schema = "bloom.petal.package.v1"
+name = "stock"
+
+[consent]
+summary = "Declares one token."
+
+[caps]
+allowed = ["bloom:tx.outbox"]
+
+[[tokens]]
+chain_id = {ANVIL}
+address = "{UNKNOWN_CONTRACT}"
+symbol = "TSLA"
+decimals = 6
+"#
+            )
+            .as_bytes(),
+        );
+        write_isolation_package_file(&package, "README.md", b"# stock");
+        write_isolation_package_file(&package, "AGENTS.md", b"# stock agents");
+        write_isolation_package_file(
+            &package,
+            "petal/stock/message.txt.wasm",
+            include_bytes!("../../bloom-petals/tests/fixtures/route_component_no_imports.wasm"),
+        );
+        let (installed, _, _) = store.install_petal_package_dir(&package).unwrap();
+        let host = test_petal_host(&daemon).with_petal_runner(daemon.petals.clone());
+        let to: Address = UNKNOWN_CONTRACT.parse().unwrap();
+
+        let declared = host
+            .petal_declared_token(&installed.hash, ANVIL, to)
+            .unwrap()
+            .expect("the package declares this contract on this chain");
+        assert_eq!((declared.symbol.as_str(), declared.decimals), ("TSLA", 6));
+        // Any spelling of the address finds its one canonical declaration.
+        let checksummed = bloom_proto::checksum_address(&to).parse().unwrap();
+        assert!(
+            host.petal_declared_token(&installed.hash, ANVIL, checksummed)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            host.petal_declared_token(&installed.hash, 1, to)
+                .unwrap()
+                .is_none(),
+            "other chain"
+        );
+        let other: Address = "0x0000000000000000000000000000000000000030"
+            .parse()
+            .unwrap();
+        assert!(
+            host.petal_declared_token(&installed.hash, ANVIL, other)
+                .unwrap()
+                .is_none(),
+            "other contract"
+        );
+        // A package that cannot be read fails the stage rather than staging blind.
+        assert!(
+            host.petal_declared_token(&"ab".repeat(32), ANVIL, to)
+                .is_err()
+        );
+        // A host without a runner consults nothing.
+        assert!(
+            test_petal_host(&daemon)
+                .petal_declared_token(&installed.hash, ANVIL, to)
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// The registry is read by chain and the signature is for the id the node
@@ -5794,7 +5954,7 @@ mod tests {
         let request = petal_evm_request(KNOWN_TOKEN, "0", hex0x(&canonical_transfer(recipient, 1)));
         let to: Address = KNOWN_TOKEN.parse().unwrap();
         let classify = |spec: u64, reported: u64| {
-            decode_petal_erc20_transfer(&request, spec, reported, to, U256::ZERO).unwrap()
+            decode_petal_erc20_transfer(&request, spec, reported, to, U256::ZERO, false).unwrap()
         };
         assert!(classify(ANVIL, ANVIL).is_some(), "agreeing ids: typed");
         assert!(

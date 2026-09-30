@@ -328,12 +328,14 @@ A Petal that stages an EVM transaction usually produces a generic contract
 call: Bloom cannot check what the calldata does, so it always needs a fresh
 owner approval. One shape is different. A canonical ERC-20
 `transfer(address,uint256)` call with no native value, **addressed to a token
-in Bloom's curated registry**, is decoded to its recipient and amount, and
+in Bloom's curated registry or declared in the Petal's own manifest**, is
+decoded to its recipient and amount, and
 Bloom rebuilds the calldata from those two fields instead of forwarding the
 Petal's bytes. It is then classified as a token transfer, checked against
 wallet policy, and eligible for policy-bounded autonomy. Extra trailing
 calldata, a different selector, any nonzero native value, or a target contract
-the registry does not list keeps it generic, and so does a node whose reported
+that neither the registry nor the staging package's manifest lists keeps it
+generic, and so does a node whose reported
 chain id differs from the configured chain, since the registry is read by chain
 and the signature is for the reported id. The registry condition is what
 makes the classification mean anything: matching the selector only proves what
