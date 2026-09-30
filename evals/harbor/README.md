@@ -293,9 +293,12 @@ write whose body does not match the staged approval stages a second owner
 ceremony that nothing completes; cleanup ignores it when driving the revoke,
 so the venue still ends at zero, but the pending request remains and the next
 run refuses at preflight (`a prior approve_builder_fee ceremony is still
-awaiting owner action`) until that ceremony expires. A signing-request record
-that cannot be read is treated as an error rather than skipped, so neither
-guard can pass by overlooking a request.
+awaiting owner action`) until that ceremony expires. Cleanup can leave the
+same kind of stray itself: when the signing-request listing is unreadable it
+submits the exact grant body once rather than risk leaving a grant live, and
+if no grant was live that write stages a ceremony nothing completes. A
+signing-request record that cannot be read is treated as an error rather than
+skipped, so neither guard can pass by overlooking a request.
 
 Each run writes a mode-`0600` JSON summary beside the operator state, under
 `harbor-summaries/`. It includes source lineage, installed package hash,

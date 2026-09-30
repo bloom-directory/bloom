@@ -7,13 +7,14 @@ requires. So this harness completes the one ceremony itself, in provision(),
 before the agent starts — exactly like session creation completes its
 ceremonies before handing control to the agent in hyperliquid-order-cancel.
 
-It deliberately stops there. The Petal short-circuits an already-completed
-nonce, so a harness that also performed the submitting write would leave the
-agent's replay an unobservable no-op — and an agent that never touched
-/bloom could still be graded as passing against venue state the harness had
-established itself. Staging only the approval means the agent's own mounted
-write is what reaches Hyperliquid, and the verifier's independent
-maxBuilderFee query is real evidence that it did.
+It deliberately stops there. Had the harness also performed the submitting
+write, the single-use approval would be spent and the venue already granted
+before the agent ran, so the agent's write could no longer be what moves the
+venue — and an agent that never touched /bloom could still be graded as
+passing against venue state the harness had established itself. Staging only
+the approval means the agent's own mounted write is what reaches
+Hyperliquid, and the verifier's independent maxBuilderFee query is real
+evidence that it did.
 
 cleanup() revokes through the full path (ceremony plus submitting write),
 using the max_fee_tenths_bps=0 revocation path, and runs whenever staging
@@ -27,7 +28,6 @@ from __future__ import annotations
 
 import base64
 import binascii
-import hashlib
 import json
 import os
 import re
@@ -745,14 +745,13 @@ class HyperliquidApproveBuilderFeeEval(EvalDefinition):
     def _stage_grant(self, max_fee_tenths_bps: int, nonce: int) -> None:
         """Complete the owner ceremony but leave the venue write to the agent.
 
-        The Petal short-circuits a completed nonce (`owner_nonce` returns
-        `completed`, and the route returns success without contacting the
-        venue), so if this harness submitted the grant itself the agent's
-        replay would be an unobservable no-op: it could skip `/bloom`
-        entirely, synthesise a report, and still be graded against venue
-        state this harness established. Staging only the approval makes the
-        verifier's independent maxBuilderFee query the proof that the
-        agent's own mounted write reached Hyperliquid.
+        Had this harness submitted the grant itself, the single-use approval
+        would be spent and the venue already granted before the agent ran,
+        so the agent's write could no longer be what moves the venue: it
+        could skip `/bloom` entirely, synthesise a report, and still be
+        graded against venue state this harness established. Staging only
+        the approval makes the verifier's independent maxBuilderFee query
+        the proof that the agent's own mounted write reached Hyperliquid.
         """
         route = self.exchange_root / "approve_builder_fee.json"
         body = self._request_body(max_fee_tenths_bps, nonce)
@@ -829,16 +828,17 @@ class HyperliquidApproveBuilderFeeEval(EvalDefinition):
     def provision(self, agent_name: str) -> EvalRunContext:
         max_fee = int(self.max_fee_tenths_bps_value)
         stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-        # A deterministic, run-scoped nonce. The agent writes this exact body,
-        # which the staged owner approval already covers, so its write signs
-        # and submits rather than staging a second ceremony it has no way to
-        # complete.
-        self.nonce = int(
-            hashlib.sha256(
-                f"bloom-eval-approve-builder-fee/{self.wallet_id}/{stamp}".encode()
-            ).hexdigest()[:12],
-            16,
-        )
+        # A run-scoped nonce fixed before the agent starts. The agent writes
+        # this exact body, which the staged owner approval already covers, so
+        # its write signs and submits rather than staging a second ceremony
+        # it has no way to complete.
+        #
+        # Hyperliquid accepts a nonce only within (T - 2 days, T + 1 day) of
+        # the block's unix millisecond time, and only above the smallest of
+        # the address's hundred highest used nonces, so it is the provisioning
+        # time in milliseconds: the agent's write and cleanup's revoke at
+        # nonce + 1 both land inside the window and above every earlier run.
+        self.nonce = time.time_ns() // 1_000_000
         # Fail closed if the venue already grants this builder at least the
         # target: the verifier proves the agent worked by finding the venue
         # changed, which proves nothing if it was already true beforehand.
@@ -928,9 +928,12 @@ class HyperliquidApproveBuilderFeeEval(EvalDefinition):
         read that names it can fail after the ceremony has already made the
         approval live, and staging then records nothing. When the listing
         cannot be read now either, the exact body is submitted once anyway:
-        it consumes the grant if one is live and is a Petal no-op otherwise.
-        The outcome is then proven by reading. A result that cannot be read,
-        or still shows a grant, raises rather than reporting a clean cleanup.
+        it consumes the grant if one is live. If none is, the write stages a
+        fresh owner ceremony that nothing completes — no authority, and it
+        expires, but the next run's preflight refuses until it does. That is
+        the price of never leaving a grant live. The outcome is then proven
+        by reading. A result that cannot be read, or still shows a grant,
+        raises rather than reporting a clean cleanup.
         """
         route = self.exchange_root / "approve_builder_fee.json"
         body = self._request_body(int(self.max_fee_tenths_bps_value), self.nonce)
