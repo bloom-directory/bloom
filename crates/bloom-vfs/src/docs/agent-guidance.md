@@ -300,8 +300,12 @@ walkthrough in `docs/examples.md`.
 
 ## Petals and paid requests
 
-Installed applications live under `petals/<name>/`. Discover the installed
-package and follow its local instructions.
+Installed application documents and public routes live under `petals/<name>/`.
+Account-dependent routes explicitly select a wallet and index, for example
+`petals/enso/intents/<wallet>/<index>/new`. Follow each package's route tree;
+there is no common synthetic wallet root. Account state is isolated; explicitly
+declared service settings are shared across accounts. Keep every follow-up in
+the selected account, including core outbox confirmation paths.
 
 Paid HTTP operations live under `requests/`. They are actions, not ordinary
 reads: inspect the request plan, selected payment protocol, maximum amount,

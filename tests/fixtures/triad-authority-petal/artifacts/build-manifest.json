@@ -1,11 +1,11 @@
 {
   "schema": "bloom.petal.build-manifest.v1",
-  "source_package_hash": "7412b1da24e02dee288e2975ddf05fdbcefa22635f471336d3a930ed4199799c",
+  "source_package_hash": "c3c40df972edfaf00b9f62cbfd791eecd4b200778f8eae792923350f60140cf5",
   "routes": [
     {
       "route_id": "r000001",
-      "pattern": "session.json",
-      "source_path": "petal/triad-authority-fixture/session.json.wasm",
+      "pattern": "wallets/[wallet]/[index]/session.json",
+      "source_path": "petal/triad-authority-fixture/wallets/[wallet]/[index]/session.json.wasm",
       "source_hash": "85db4013d35ae49e04a3f41dc2536bdeb03c16ac7fa0f3efac549520a0305be6",
       "artifact_path": "artifacts/routes/r000001.wasm",
       "artifact_hash": "85db4013d35ae49e04a3f41dc2536bdeb03c16ac7fa0f3efac549520a0305be6",

@@ -111,11 +111,10 @@ mod tests {
                     "hyperliquid",
                     "enso",
                     "near-intents",
-                    "tolly",
                     "feedback"
                 ]
             );
-            assert_eq!(results.len(), 6);
+            assert_eq!(results.len(), 5);
             assert!(results.iter().all(|result| matches!(&result.outcome,
                 ProvisioningOutcome::Failed(message) if message.contains("acquire default"))));
         }
