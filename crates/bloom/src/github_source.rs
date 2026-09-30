@@ -21,7 +21,13 @@ const NEAR_INTENTS_RELEASE_COMMIT: &str = "4dc28dbe7a6d48435ff16dab7e24b33bd3d0b
 const ENSO_RELEASE_COMMIT: &str = "7bbe03770721c7cfdbe6c7c34a9b1665ae2eec9f";
 
 /// Canonical defaults for every Bloom home, independent of persisted config.
-pub(crate) const DEFAULT_PETALS: &[&str] = &["polymarket", "hyperliquid", "enso", "near-intents"];
+pub(crate) const DEFAULT_PETALS: &[&str] = &[
+    "polymarket",
+    "hyperliquid",
+    "enso",
+    "near-intents",
+    "feedback",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PreinstalledPetal {
@@ -317,6 +323,23 @@ const PREINSTALLED_NEAR_INTENTS: PreinstalledPetal = PreinstalledPetal {
     predecessor_package_hashes: &[
         "ac2ccab59f36ee863843f92aaf0c975c00dbf32b246df5ccbb79757093785921",
     ],
+    authority_routes: &[],
+};
+
+const PREINSTALLED_FEEDBACK: PreinstalledPetal = PreinstalledPetal {
+    name: "feedback",
+    repository: "https://github.com/bloom-directory/bloom-petal-feedback",
+    commit: "b6aa2b64598a3cc7172e8136b34e3edddcddf2d4",
+    release_tag: "v0.1.0",
+    archive: "feedback-v0.1.0.petal.tar.gz",
+    expected_hash: Some("5f26e7bbf7f507cfcf4c13645cf9f4f0c903d769c201e3e9d1f5c914b14fa2a3"),
+    archive_sha256: "6129e14894868d12c06bd2549fd1eeecf36e1ee353a55bc139e011253347cb39",
+    tooling_commit: "2beed2ff344ce2b0c112e07096027e1ae0404007",
+    petal_abi: "bloom.petal-host/triad-compatible-nonauthority-v1",
+    default_eligible: true,
+    lineage_id: None,
+    release_sequence: 0,
+    predecessor_package_hashes: &[],
     authority_routes: &[],
 };
 
@@ -1212,6 +1235,7 @@ pub(crate) fn preinstalled_petal(name: &str) -> Option<&'static PreinstalledPeta
         "polymarket" => Some(&PREINSTALLED_POLYMARKET),
         "hyperliquid" => Some(&PREINSTALLED_HYPERLIQUID),
         "near-intents" => Some(&PREINSTALLED_NEAR_INTENTS),
+        "feedback" => Some(&PREINSTALLED_FEEDBACK),
         "enso" => Some(&PREINSTALLED_ENSO),
         "gasless" => Some(&PREINSTALLED_GASLESS),
         "privacy-pools" => Some(&PREINSTALLED_PRIVACY_POOLS),
@@ -1946,6 +1970,7 @@ mod tests {
             "polymarket",
             "hyperliquid",
             "near-intents",
+            "feedback",
             "enso",
             "gasless",
             "privacy-pools",
@@ -1958,7 +1983,10 @@ mod tests {
             assert!(entry.expected_hash.is_some());
             assert_eq!(
                 entry.default_eligible,
-                matches!(name, "polymarket" | "hyperliquid" | "enso" | "near-intents")
+                matches!(
+                    name,
+                    "polymarket" | "hyperliquid" | "enso" | "near-intents" | "feedback"
+                )
             );
         }
         let tolly = preinstalled_petal("tolly").unwrap();

@@ -106,9 +106,15 @@ mod tests {
             );
             assert_eq!(
                 *acquired.borrow(),
-                ["polymarket", "hyperliquid", "enso", "near-intents"]
+                [
+                    "polymarket",
+                    "hyperliquid",
+                    "enso",
+                    "near-intents",
+                    "feedback"
+                ]
             );
-            assert_eq!(results.len(), 4);
+            assert_eq!(results.len(), 5);
             assert!(results.iter().all(|result| matches!(&result.outcome,
                 ProvisioningOutcome::Failed(message) if message.contains("acquire default"))));
         }
