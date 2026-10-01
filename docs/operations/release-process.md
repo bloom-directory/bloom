@@ -116,7 +116,9 @@ The publish job rechecks that the tag still names the built SHA, then publishes
 all targets together as a normal GitHub Release. A retry compares existing
 assets byte for byte, rejects unexpected or changed assets, and uploads only
 missing assets. The current retry path marks the release latest; maintainers
-should account for that when retrying an older tag. GitHub's
+should account for that when retrying an older tag. It also replaces the release
+body with generic artifact notes, so restore curated notes after a successful
+retry. GitHub's
 `/releases/latest/download/...` routes follow the release marked latest and do
 not need a floating `latest` Git tag.
 

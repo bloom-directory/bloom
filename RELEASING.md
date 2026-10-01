@@ -1,128 +1,62 @@
-# Releasing bloom
+# Releasing Bloom
 
-How to cut a release. This document describes what the release machinery
-**actually enforces** (the contract) and the **procedure** to follow. When the
-two disagree, the contract wins — it is what runs in CI.
+The maintained contract is [the release process](docs/operations/release-process.md).
+Use it together with the [triad package contract](packaging/triad/release/README.md)
+and the workflow and release driver checked into the commit being released.
 
-## TL;DR — the contract
+## Procedure
 
-A `vX.Y.Z` tag push starts the initial `Release` workflow run. An existing tag
-can also be retried with the workflow's manual `workflow_dispatch` trigger by
-entering the tag name in the Actions UI (`.github/workflows/release.yml:23-32`).
-Both triggers run the complete `prepare`, `test`, `build` (4 native binaries),
-and `publish` pipeline.
+1. Prepare and review the version-bump PR. Update the workspace version in
+   `Cargo.toml`, workspace package records in `Cargo.lock`, and the Machine
+   version in `packaging/triad/release/compatibility-v1.toml`. The optional
+   **Propose Release** workflow creates this PR; it never tags or publishes.
+   Keep reviewed source and Petal pins unless a separate change validates them.
+2. Require normal PR CI and acceptance evidence appropriate to the changes.
+   Dispatch **Release** on the proposed branch with `dry_run=true` to build
+   candidates for Linux x86_64, Linux aarch64, and macOS aarch64. Candidate
+   signatures use ephemeral keys; production signing and publication are skipped.
+3. Merge the reviewed release PR into the default branch. Record its exact merge
+   SHA. Tag that SHA, rather than a moving branch ref, and push the tag:
 
-The `prepare` job enforces these hard gates
-(`.github/workflows/release.yml:65-92`):
+   ```sh
+   git fetch origin
+   git tag vX.Y.Z <reviewed-merge-sha>
+   git push origin vX.Y.Z
+   ```
 
-1. The tag name strictly matches `vX.Y.Z`, with numeric SemVer components.
-2. The tag already exists in the repository and resolves to a commit. Manual
-   dispatch does not create a missing tag.
-3. The tagged commit is reachable from `master` (i.e. it is an ancestor of
-   `origin/master`).
-4. The workspace `version` in `Cargo.toml` at that commit equals the tag
-   (`X.Y.Z`).
+   Use the release-maintainer permissions allowed by the repository's tag
+   rules. Do not disable tag protections or move/delete a published version tag.
+4. Watch **Release**. It requires an existing `vX.Y.Z` tag whose commit is
+   reachable from the default branch, matching workspace and matrix versions,
+   and locked Broker/Signer source revisions. It rebuilds all three candidates
+   from the tagged source; earlier dry-run artifacts are not promoted.
+5. Approve the protected `production-release` environment when GitHub requests
+   review. The isolated signing job uses `TRIAD_RELEASE_SIGNING_KEY`, checks it
+   against the reviewed public key, replaces candidate signatures, and verifies
+   the final archives before publishing.
+6. Verify the published assets independently using
+   `packaging/triad/release/bloom-release-v1.pub`. Expect three triad archives,
+   each with `.sha256`, `.sig`, and `.pub` sidecars (12 assets). Verify both the
+   outer archive checksum signature and the internal payload manifest. Include
+   feature changes, upgrade caveats, and known issues in the public release
+   notes; the workflow supplies only generic artifact/verification notes.
+7. Coordinate website guide updates and verify the live setup script selects
+   the new stable release and uses the reviewed key. It discovers the release
+   tag dynamically; do not add a floating `latest` Git tag.
 
-**No other release-eligibility policy is checked by the workflow.** In
-particular, `release.yml` does **not** verify that:
+The previous v0.3.0 and v0.3.1 releases used lightweight version tags on their
+reviewed merge commits. Artifact authentication uses SSHSIG, with namespaces
+`bloom-release-archive-v1` and `bloom-release-payload-v1`; this does not imply
+an independently signed Git tag or Apple code signing/notarization.
 
-- the bump arrived via a pull request,
-- the new version is greater than the previous one (monotonicity),
-- the release notes are non-empty.
+## Retrying a release
 
-Branch protection on `master` is what forces the version-bump to land via a
-merged pull request — that requirement comes from GitHub, not from the workflow.
-Direct pushes to `master` are not permitted.
+A manual dispatch with `dry_run=false` retries an **existing** tag. Select that
+same tag as the workflow ref and provide it as the `tag` input. Retries execute
+that tag's workflow and driver, recheck its SHA, reject changed/unexpected assets,
+and upload only missing assets. Never replace an immutable tag to incorporate a
+fix; prepare a new version instead.
 
-## Procedure (only path)
-
-The version bump must land on `master` via a merged PR, then the merge commit is
-tagged.
-
-The repository's `v*` tag rules must allow new tag creation while preventing
-updates, deletion, and non-fast-forward changes. This permits each release tag
-to be created once and keeps it immutable afterward. If **Restrict creations**
-is enabled for `v*`, a repository administrator must disable it before the tag
-can be pushed.
-
-```sh
-# 1. Branch off latest master and bump the workspace version.
-git checkout master && git pull
-git checkout -b release/v0.1.1          # use the version you are cutting
-$EDITOR Cargo.toml                       # edit the single line under [workspace.package]
-cargo check --workspace                  # refresh Cargo.lock so it matches
-git add Cargo.toml Cargo.lock
-git commit -m "release: v0.1.1"
-
-# 2. Open the PR (branch protection requires a PR to land on master).
-git push -u origin release/v0.1.1
-gh pr create --title "release: v0.1.1" --body "Version bump for release."
-
-# 3. Get the PR reviewed and merged.
-
-# 4. After merge, tag the merge commit and push the tag.
-git fetch origin
-git tag v0.1.1 <merge-sha>               # pin the exact SHA, do not tag a moving ref
-git push origin v0.1.1                   # this triggers the Release workflow
-```
-
-Prefer tagging an explicit `<merge-sha>` over `origin/master`. The
-remote-tracking ref does not move between `git fetch` and `git tag`, but a fetch
-can advance it past the release PR if other changes have already landed. Pinning
-the reviewed merge SHA avoids accidentally tagging a later commit. (`prepare`
-may not catch that mistake if the later commit retains the same workspace
-version.)
-
-## Alternative: the Propose Release workflow
-
-`.github/workflows/propose-release.yml` automates step 1–2. Run it from the
-Actions UI (workflow_dispatch) with the next version, and it opens the bump PR
-for you. Two caveats:
-
-- It requires the `RELEASE_PR_TOKEN` repository secret containing a
-  fine-grained PAT with **Contents: read/write** and **Pull requests:
-  read/write** access to this repository. PRs opened with the default
-  `GITHUB_TOKEN` receive approval-required CI runs; the separate token lets CI
-  run normally. Without it the workflow hard-fails
-  (`.github/workflows/propose-release.yml:43-47`). A GitHub App requires a
-  workflow change to mint a short-lived installation token rather than storing
-  an installation token directly as this secret.
-- Unlike the publish workflow, the **propose** workflow does enforce two extra
-  rules:
-  - the proposed version must be strictly greater than the current one
-    (`.github/workflows/propose-release.yml:84-87`), and
-  - the PR may change only `Cargo.toml` and `Cargo.lock`
-    (`.github/workflows/propose-release.yml:118-123`).
-
-Because these rules live only in the propose workflow, anyone who bypasses it
-(e.g. by opening the bump PR by hand) can ship a version that is not monotonic.
-The publish workflow will not catch it.
-
-## Watching the release
-
-- Actions → **Release**, or `gh run watch`.
-- `prepare` prints the resolved tag, version, SHA, and workspace version.
-- `build` asserts `bloom --version` matches the tag before staging artifacts
-  (`.github/workflows/release.yml:169-179`).
-- `publish` generates `SHA256SUMS` and marks the release `latest` only if its
-  version is `>=` the current latest (`.github/workflows/release.yml:283-291`).
-  The floating `latest` git tag in this repo is legacy and is **not** managed by
-  the workflow.
-
-## Gotchas
-
-- **Tests run only after the tag is public.** The `test` job
-  (`.github/workflows/release.yml:105`) runs on the tagged commit. If it fails,
-  a public `vX.Y.Z` tag already exists with no (or partial) release. For a
-  transient failure, rerun the failed Actions jobs or manually dispatch the
-  `Release` workflow for the same tag. Do not delete or move a public release
-  tag. If the failure requires a code change, merge the fix and cut a new
-  version. To de-risk, let CI pass on the bump PR before tagging.
-- **The release version has one source of truth.** Edit only the `version` under
-  `[workspace.package]` in `Cargo.toml` (line 33). Dependency version
-  constraints elsewhere in the file are unrelated to the bloom release
-  version.
-- **Versioning scheme.** This project follows semver. While `0.x`, a bump in the
-  second component (`0.1.0` → `0.2.0`) is a minor/breaking-ish release; a bump
-  in the third (`0.1.0` → `0.1.1`) is a patch. The propose workflow enforces
-  strict increase; the publish workflow does not enforce monotonicity at all.
+The current retry path also marks the release latest and overwrites its body
+with generic notes. Avoid inadvertently promoting an older release, and restore
+curated release notes after a successful retry.
