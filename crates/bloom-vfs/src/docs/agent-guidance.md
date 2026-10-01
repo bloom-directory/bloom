@@ -58,9 +58,13 @@ whether an earlier operation completed or whether retrying a write is safe.
   operation. Inspect `policy_check.json` where exposed and the chain's status.
   Repeating the write does not remove the gate.
 - **Input/output error** — a backend or I/O operation failed. Inspect action
-  state and diagnostics before considering a retry. For a possibly submitted
-  transaction, reconcile by its recorded hash or signature; never blindly
-  restage or rebroadcast.
+  state and diagnostics before considering a retry. On an EVM outbox confirm,
+  read `last_error.json` beside the pending entry: it gives the refusal and the
+  next step. `kind: policy_approval_required` means the wallet policy must
+  first allow the Petal that staged the transaction; give the owner the
+  ceremony link in `error`, then confirm again once they approve. For a
+  possibly submitted transaction, reconcile by its recorded hash or signature;
+  never blindly restage or rebroadcast.
 
 If you write to a control file and then cannot find what you wrote, check
 whether the transfer moved to `sent/` or `failed/` before assuming the write

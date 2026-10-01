@@ -2854,6 +2854,65 @@ fn write_atomic_file(path: &Path, bytes: &[u8]) -> Result<(), HandlerError> {
     Ok(())
 }
 
+/// Why the last `confirm` of an outbox entry was refused. A mount reports a
+/// refusal only as an errno, so the reason is kept beside the entry, at
+/// `outbox/pending/<id>/last_error.json`.
+const CONFIRM_ERROR_FILE: &str = "last_error.json";
+
+fn clear_confirm_error(entry_dir: &Path) {
+    let _ = std::fs::remove_file(entry_dir.join(CONFIRM_ERROR_FILE));
+}
+
+/// Best effort, and never recreates an entry directory that has moved on:
+/// the temporary file is created inside the existing directory only.
+fn record_confirm_error(entry_dir: &Path, wallet: &str, id: &str, error: &HandlerError) {
+    use std::io::Write as _;
+
+    let message = error.to_string();
+    let (kind, next) = if message.contains("POLICY_APPROVAL_REQUIRED") {
+        (
+            "policy_approval_required",
+            format!(
+                "The wallet policy does not yet allow the Petal that staged this transaction. Give the owner the ceremony link in error (pending updates are under wallets/{wallet}/policy-updates/pending/); once they approve, write confirm again."
+            ),
+        )
+    } else {
+        (
+            "refused",
+            "Read this entry before retrying: if it is still pending, resolve the cause in error and write confirm again.".to_owned(),
+        )
+    };
+    let record = serde_json::json!({
+        "schema": "bloom.outbox-confirm-error/1",
+        "tx_id": id,
+        "at_ms": now_ms_u128() as u64,
+        "kind": kind,
+        "error": message,
+        "next": next,
+    });
+    let Ok(bytes) = serde_json::to_vec_pretty(&record) else {
+        return;
+    };
+    let mut nonce = [0_u8; 16];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
+    let tmp = entry_dir.join(format!(".{CONFIRM_ERROR_FILE}.tmp-{}", hex::encode(nonce)));
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let written = options.open(&tmp).and_then(|mut file| {
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, entry_dir.join(CONFIRM_ERROR_FILE))
+    });
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
 fn write_atomic_json(path: &Path, value: &impl serde::Serialize) -> Result<(), HandlerError> {
     let bytes = serde_json::to_vec_pretty(value)
         .map_err(|error| HandlerError::backend(error.to_string()))?;
@@ -4363,25 +4422,43 @@ impl WalletsHandler {
                 } else {
                     first_confirm_line(confirm_text)
                 };
-                self.require_outbox_petal_eligibility(wallet, chain, id)
-                    .await?;
-                let _staged = self
+                let entry_dir = self
                     .tx_engine
-                    .confirm(
-                        self.write_permit()?,
-                        wallet,
-                        chain,
-                        id,
-                        &client,
-                        policy,
-                        confirm_text,
-                    )
-                    .await
-                    .map_err(|e| match e {
-                        TxEngineError::ApprovalRequired(_) => HandlerError::PermissionDenied,
-                        other => err_be(other),
-                    })?;
-                Ok(())
+                    .outbox
+                    .read(wallet, chain, id)
+                    .map_err(err_be)?
+                    .dir;
+                clear_confirm_error(&entry_dir);
+                let result = async {
+                    self.require_outbox_petal_eligibility(wallet, chain, id)
+                        .await?;
+                    self.tx_engine
+                        .confirm(
+                            self.write_permit()?,
+                            wallet,
+                            chain,
+                            id,
+                            &client,
+                            policy,
+                            confirm_text,
+                        )
+                        .await
+                        .map_err(|e| match e {
+                            TxEngineError::ApprovalRequired(_) => HandlerError::PermissionDenied,
+                            other => err_be(other),
+                        })
+                }
+                .await;
+                match result {
+                    Ok(_staged) => Ok(()),
+                    // A pending owner approval has its own projection,
+                    // approval_challenge.json; anything else is recorded.
+                    Err(HandlerError::PermissionDenied) => Err(HandlerError::PermissionDenied),
+                    Err(error) => {
+                        record_confirm_error(&entry_dir, wallet, id, &error);
+                        Err(error)
+                    }
+                }
             }
             // outbox/pending/<id>/cancel — fire a self-send replacement.
             // Same content rules as confirm (fix #9 / #10).
@@ -9623,6 +9700,95 @@ value = "0""#,
         // Whitespace-only is also rejected.
         let r = f.handler.write(&p, b"   \n\t").await;
         assert!(matches!(r, Err(HandlerError::Invalid(_))), "got: {r:?}");
+    }
+
+    /// A refused confirm reaches a mount only as an errno, so its reason is
+    /// kept beside the entry; the next attempt starts from a clean slate.
+    #[tokio::test]
+    async fn refused_confirm_is_recorded_beside_the_entry() {
+        let f = make_handler_with_chain(true);
+        seed_pending(&f, "0001-test");
+        let dir = format!("/{}/0/chains/anvil/outbox/pending/0001-test", f.wallet_name);
+        let confirm = VfsPath::parse(&format!("{dir}/confirm")).unwrap();
+        let error = f.handler.write(&confirm, b"y").await.unwrap_err();
+        assert!(
+            !matches!(error, HandlerError::PermissionDenied),
+            "{error:?}"
+        );
+
+        let names: Vec<String> = f
+            .handler
+            .list(&VfsPath::parse(&dir).unwrap())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        assert!(
+            names.iter().any(|name| name == CONFIRM_ERROR_FILE),
+            "{names:?}"
+        );
+        let record: serde_json::Value = serde_json::from_slice(
+            &f.handler
+                .read(&VfsPath::parse(&format!("{dir}/{CONFIRM_ERROR_FILE}")).unwrap())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record["schema"], "bloom.outbox-confirm-error/1");
+        assert_eq!(record["tx_id"], "0001-test");
+        assert_eq!(record["kind"], "refused");
+        assert_eq!(record["error"], error.to_string());
+
+        let entry_dir = f
+            .handler
+            .tx_engine
+            .outbox
+            .read(&f.wallet_name, "anvil", "0001-test")
+            .unwrap()
+            .dir;
+        clear_confirm_error(&entry_dir);
+        assert!(!entry_dir.join(CONFIRM_ERROR_FILE).exists());
+    }
+
+    #[test]
+    fn confirm_error_record_names_policy_approval_and_never_recreates_an_entry() {
+        let directory = tempfile::tempdir().unwrap();
+        record_confirm_error(
+            directory.path(),
+            "alice",
+            "0001-test",
+            &HandlerError::backend(
+                "POLICY_APPROVAL_REQUIRED: complete the owner ceremony at https://example.invalid/c then retry this operation; status: /wallets/alice/policy-updates/pending/x/status.json",
+            ),
+        );
+        let record: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(directory.path().join(CONFIRM_ERROR_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record["kind"], "policy_approval_required");
+        assert!(
+            record["next"]
+                .as_str()
+                .unwrap()
+                .contains("wallets/alice/policy-updates/pending/")
+        );
+        assert!(
+            record["error"]
+                .as_str()
+                .unwrap()
+                .contains("https://example.invalid/c")
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(directory.path())
+            .unwrap()
+            .flatten()
+            .map(|item| item.file_name())
+            .collect();
+        assert_eq!(leftovers.len(), 1, "{leftovers:?}");
+
+        let moved = directory.path().join("moved-to-sent");
+        record_confirm_error(&moved, "alice", "0001-test", &HandlerError::backend("late"));
+        assert!(!moved.exists());
     }
 
     #[tokio::test]
