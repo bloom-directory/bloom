@@ -10,6 +10,7 @@ mod commands {
     pub mod qr;
 }
 mod github_source;
+mod macos_runtime;
 mod petal_provisioning;
 mod pf_monitor;
 mod session_sentinel;
