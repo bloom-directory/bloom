@@ -35,7 +35,8 @@ for required in \
   compatibility-v1.toml \
   installer/release/install-linux.sh \
   installer/relay/control-ca.pem \
-  installer/relay/receipt-public-key.hex \
+  installer/relay/receipt-public-keys.hex \
+  installer/relay/superseded-pins \
   installer/linux/bin/bloom-uninstall \
   installer/linux/systemd-user/bloom-machine.service \
   installer/macos/launchagents/com.bloom.machine.plist.in \

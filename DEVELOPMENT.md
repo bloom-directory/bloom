@@ -208,7 +208,7 @@ Record the actual checkout revisions and dirty state as described under
 On macOS, a `triad-dev-harness` build can provision a disposable hosted relay
 installation without elevating the test services. By default the launcher
 trusts the same public pins the signed release payload ships,
-`packaging/triad/relay/control-ca.pem` and `receipt-public-key.hex` (see
+`packaging/triad/relay/control-ca.pem` and `receipt-public-keys.hex` (see
 [hosted relay trust](./packaging/triad/relay/README.md)). They are public, so
 they live in the repository. To target another relay, set both
 `BLOOM_TRIAD_DEV_RELAY_CONTROL_CA_FILE` and
@@ -228,7 +228,8 @@ scripts/triad-dev-launch.sh \
   --hosted-relay
 ```
 
-The receipt pin is 64 lowercase hexadecimal characters. The launcher creates
+The receipt pin file holds one to four keys, one per line, each 64 lowercase
+hexadecimal characters. The launcher creates
 owner-private relay configuration and a separate private administrative socket;
 Signer creates the administrator identity and scoped Broker credentials. The
 development exception requires the compiled harness feature and validated
@@ -263,7 +264,8 @@ the same binary and UID while enrollment is open, then poll `admin status`.
 A certificate-pending response is not readiness. The hostname and administrator
 operation survive retry/restart; do not delete their state to work around an
 error. Restarts reject changed public trust pins for an existing relay
-configuration. If an administrator has selected `localhost_only`, the hosted
+configuration, except that the packaged pins replace values listed in
+`packaging/triad/relay/superseded-pins`, as the installer does. If an administrator has selected `localhost_only`, the hosted
 launcher stops with an actionable error and does not change that choice.
 
 The opt-in `scripts/test-remote-relay-approval.sh TRIAD_ENV ANVIL_RPC RUN_DIR`

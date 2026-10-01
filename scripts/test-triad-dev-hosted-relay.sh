@@ -12,7 +12,7 @@ launcher_args=(
 )
 # Omitting both pins selects the packaged ones; supplying only one fails.
 if env -u BLOOM_TRIAD_DEV_RELAY_CONTROL_CA_FILE \
-  BLOOM_TRIAD_DEV_RELAY_RECEIPT_KEY_FILE="$repo_root/packaging/triad/relay/receipt-public-key.hex" \
+  BLOOM_TRIAD_DEV_RELAY_RECEIPT_KEY_FILE="$repo_root/packaging/triad/relay/receipt-public-keys.hex" \
   "$repo_root/scripts/triad-dev-launch.sh" \
     "${launcher_args[@]}" --hosted-relay \
     > "$test_root/missing-pins.out" 2>&1; then

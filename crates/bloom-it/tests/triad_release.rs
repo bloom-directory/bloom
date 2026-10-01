@@ -1445,7 +1445,11 @@ fn triad_bundle_is_reproducible_signed_and_self_verifying() {
     );
     assert_eq!(fs::read(&first).unwrap(), fs::read(&second).unwrap());
 
-    for name in ["control-ca.pem", "receipt-public-key.hex"] {
+    for name in [
+        "control-ca.pem",
+        "receipt-public-keys.hex",
+        "superseded-pins",
+    ] {
         let packaged = Command::new("tar")
             .arg("-xOzf")
             .arg(&first)

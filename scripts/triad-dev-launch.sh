@@ -125,7 +125,10 @@ if [ "$hosted_relay" -eq 1 ]; then
   if [ -z "${BLOOM_TRIAD_DEV_RELAY_CONTROL_CA_FILE:-}" ] &&
      [ -z "${BLOOM_TRIAD_DEV_RELAY_RECEIPT_KEY_FILE:-}" ]; then
     export BLOOM_TRIAD_DEV_RELAY_CONTROL_CA_FILE="${repo_root}/packaging/triad/relay/control-ca.pem"
-    export BLOOM_TRIAD_DEV_RELAY_RECEIPT_KEY_FILE="${repo_root}/packaging/triad/relay/receipt-public-key.hex"
+    export BLOOM_TRIAD_DEV_RELAY_RECEIPT_KEY_FILE="${repo_root}/packaging/triad/relay/receipt-public-keys.hex"
+    # Packaged pins may replace the pins earlier releases installed, exactly
+    # as the installer does; custom pins never replace anything.
+    relay_superseded="${repo_root}/packaging/triad/relay/superseded-pins"
   fi
   [ -n "${BLOOM_TRIAD_DEV_RELAY_CONTROL_CA_FILE:-}" ] &&
     [ -n "${BLOOM_TRIAD_DEV_RELAY_RECEIPT_KEY_FILE:-}" ] ||
@@ -447,29 +450,48 @@ if [ -n "$relay_ca" ] || [ -n "$relay_receipt" ]; then
   for public_pin in "$relay_ca" "$relay_receipt"; do
     [ -f "$public_pin" ] && [ ! -L "$public_pin" ] || die "relay public trust pins must be regular files"
   done
-  receipt_hex="$(tr -d '\r\n' < "$relay_receipt")"
-  [[ "$receipt_hex" =~ ^[0-9a-f]{64}$ ]] || die "relay receipt pin must contain 64 lowercase hexadecimal characters"
+  # One pinned receipt key per line: the current key, then its successor.
+  ! grep -Evq '^[0-9a-f]{64}$' "$relay_receipt" ||
+    die "relay receipt pins must be lines of 64 lowercase hexadecimal characters"
+  receipt_keys="$(jq -Rsc 'split("\n") | map(select(length > 0))' "$relay_receipt")"
+  jq -e 'length >= 1 and length <= 4 and (unique | length) == length' <<<"$receipt_keys" >/dev/null ||
+    die "relay receipt pins must hold one to four distinct keys"
+  superseded_ca=""
+  superseded_receipts="[]"
+  if [ -n "${relay_superseded:-}" ]; then
+    superseded_ca="$(awk '$1 == "ca" { print $2 }' "$relay_superseded")"
+    superseded_receipts="$(awk '$1 == "receipt" { $1 = ""; print }' "$relay_superseded" |
+      jq -Rsc 'split("\n") | map(select(length > 0) | split(" ") | map(select(length > 0)))')"
+  fi
   if [ -e "${config_dir}/relay.json" ]; then
     for persisted_pin in "${config_dir}/relay.json" "${config_dir}/relay-control-ca.pem"; do
       [ -f "$persisted_pin" ] && [ ! -L "$persisted_pin" ] || die "persisted relay trust pins must be regular files"
     done
-    cmp -s "$relay_ca" "${config_dir}/relay-control-ca.pem" || die "relay control CA changed; refusing to alter enrolled developer trust"
-    jq -e --arg ca "${config_dir}/relay-control-ca.pem" --arg receipt "$receipt_hex" \
-      '.control_ca_pem_path == $ca and .receipt_public_key_hex == $receipt' \
-      "${config_dir}/relay.json" >/dev/null || die "relay trust configuration changed; refusing to alter enrolled developer trust"
+    persisted_ca_sha="$(shasum -a 256 "${config_dir}/relay-control-ca.pem" | cut -d' ' -f1)"
+    cmp -s "$relay_ca" "${config_dir}/relay-control-ca.pem" ||
+      grep -Fxq "$persisted_ca_sha" <<<"$superseded_ca" ||
+      die "relay control CA changed; refusing to alter enrolled developer trust"
+    jq -e --arg ca "${config_dir}/relay-control-ca.pem" --argjson current "$receipt_keys" \
+      --argjson superseded "$superseded_receipts" \
+      '(keys == ["control_ca_pem_path", "receipt_public_key_hex"])
+       and .control_ca_pem_path == $ca
+       and (([.receipt_public_key_hex] | flatten) as $pinned
+            | ($pinned == $current or ($superseded | index([$pinned]) != null)))' \
+      "${config_dir}/relay.json" >/dev/null ||
+      die "relay trust configuration changed; refusing to alter enrolled developer trust"
   else
     [ ! -e "${developer_root}/state/admin/relay-admin-seed.hex" ] && \
       [ ! -e "${developer_root}/state/admin/allocation-operation.json" ] ||
       die "enrolled developer relay trust configuration is missing"
-    cp "$relay_ca" "${config_dir}/relay-control-ca.pem.new"
-    chmod 0600 "${config_dir}/relay-control-ca.pem.new"
-    mv "${config_dir}/relay-control-ca.pem.new" "${config_dir}/relay-control-ca.pem"
-    jq -n --arg ca "${config_dir}/relay-control-ca.pem" --arg receipt "$receipt_hex" \
-      '{control_ca_pem_path:$ca,receipt_public_key_hex:$receipt}' > "${config_dir}/relay.json.new"
-    chmod 0600 "${config_dir}/relay.json.new"
-    mv "${config_dir}/relay.json.new" "${config_dir}/relay.json"
   fi
-  jq --arg receipt "$receipt_hex" '.relay_receipt_public_key_hex = $receipt' \
+  cp "$relay_ca" "${config_dir}/relay-control-ca.pem.new"
+  chmod 0600 "${config_dir}/relay-control-ca.pem.new"
+  mv "${config_dir}/relay-control-ca.pem.new" "${config_dir}/relay-control-ca.pem"
+  jq -n --arg ca "${config_dir}/relay-control-ca.pem" --argjson receipt "$receipt_keys" \
+    '{control_ca_pem_path:$ca,receipt_public_key_hex:$receipt}' > "${config_dir}/relay.json.new"
+  chmod 0600 "${config_dir}/relay.json.new"
+  mv "${config_dir}/relay.json.new" "${config_dir}/relay.json"
+  jq --argjson receipt "$receipt_keys" '.relay_receipt_public_key_hex = $receipt' \
     "${config_dir}/signer.json" > "${config_dir}/signer.json.new"
   chmod 0600 "${config_dir}/signer.json.new"
   mv -f "${config_dir}/signer.json.new" "${config_dir}/signer.json"
