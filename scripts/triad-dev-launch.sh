@@ -359,6 +359,13 @@ do
   [ ! -L "${config_dir}/${name}" ] || die "developer config contains a symlink: ${name}"
   chmod 0600 "${config_dir}/${name}"
 done
+# Re-sign the provenance catalog for this build, as packaged upgrades do, so
+# newer bundled Petal releases can replace their predecessors. Developer-owned
+# records are kept; an unchanged catalog is left alone.
+"$bloom_bin" init triad-refresh-developer-provenance-catalog \
+  "${repo_root}/packaging/triad/macos/config/provenance-catalog.unsigned.json" \
+  "$config_dir" ||
+  die "could not refresh the developer provenance catalog"
 if [ "$install_authority_fixture" -eq 1 ]; then
   jq -e --arg package_hash "$fixture_hash" '
     any(.records[]; .subject.kind == "petal" and

@@ -474,6 +474,16 @@ The `PREINSTALLED_*` entries in that file define each Petal's pinned repository,
 commit, release archive, and verification hashes. Both init and background
 startup provisioning use `DEFAULT_PETALS`.
 
+In a triad, Machine replaces an installed release only when the signed
+provenance catalog lists the new release as the active successor. Packaged
+upgrades re-sign that catalog with the new binary's release pins; the
+developer launcher does the same on every launch
+(`init triad-refresh-developer-provenance-catalog`), keeping developer-owned
+records such as locally enrolled Petals. A long-lived developer root therefore
+picks up new pinned releases on its next launch. An installation without
+source provenance (a manual local install of a default Petal) is never
+replaced: uninstall it first, then relaunch.
+
 ## General local operation
 
 An already running Machine may continue without Broker for cached public reads,

@@ -2414,6 +2414,12 @@ enum InitInternal {
         release_digest: String,
     },
     #[cfg(feature = "triad-dev-harness")]
+    #[command(name = "triad-refresh-developer-provenance-catalog", hide = true)]
+    RefreshDeveloperProvenanceCatalog {
+        template: PathBuf,
+        config_dir: PathBuf,
+    },
+    #[cfg(feature = "triad-dev-harness")]
     #[command(name = "triad-enroll-developer-petal-provenance", hide = true)]
     EnrollDeveloperPetalProvenance {
         config_dir: PathBuf,
@@ -3416,6 +3422,12 @@ async fn run(cli: Cli) -> Result<()> {
                         triad_enrollment::run_developer(&template_dir, &output_dir, release_digest)
                             .context("Bloom developer triad enrollment generation failed")
                     }
+                    #[cfg(feature = "triad-dev-harness")]
+                    InitInternal::RefreshDeveloperProvenanceCatalog {
+                        template,
+                        config_dir,
+                    } => triad_enrollment::run_developer_provenance_refresh(&template, &config_dir)
+                        .context("Bloom developer provenance catalog refresh failed"),
                     #[cfg(feature = "triad-dev-harness")]
                     InitInternal::EnrollDeveloperPetalProvenance {
                         config_dir,
