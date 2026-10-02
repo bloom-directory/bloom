@@ -57,6 +57,11 @@ whether an earlier operation completed or whether retrying a write is safe.
 - **Operation not permitted** — policy or a transaction safety check refused the
   operation. Inspect `policy_check.json` where exposed and the chain's status.
   Repeating the write does not remove the gate.
+- **"signing outcome unknown; it may already be signed"** — a signing request
+  failed in a way that does not prove no signature exists. Retry the identical
+  request (same bytes, same operation id) to reconcile it; never rebuild the
+  operation under a new identifier, and never rebroadcast, until the earlier
+  attempt is confirmed not to have landed.
 - **Input/output error** — a backend or I/O operation failed. Inspect action
   state and diagnostics before considering a retry. For a possibly submitted
   transaction, reconcile by its recorded hash or signature; never blindly
