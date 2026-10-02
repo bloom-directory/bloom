@@ -209,7 +209,8 @@ On macOS or Linux, a `triad-dev-harness` build can provision a disposable hosted
 relay installation without elevating the test services. Linux requires an
 active systemd user manager and an owned `XDG_RUNTIME_DIR`, as for the regular
 developer triad. The Signer systemd user unit receives the separate dev-mode
-administrator socket when `--hosted-relay` is selected. By default the launcher
+administrator socket whenever relay trust pins are configured, with or without
+`--hosted-relay`. By default the launcher
 trusts the same public pins the signed release payload ships,
 `packaging/triad/relay/control-ca.pem` and `receipt-public-keys.hex` (see
 [hosted relay trust](./packaging/triad/relay/README.md)). They are public, so
