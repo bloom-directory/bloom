@@ -713,7 +713,7 @@ start_linux_authority_services() {
       "BLOOM_SESSION_SOCKET=$session_socket" \
       "BLOOM_SIGNER_SOCKET=$signer_socket" \
       "BLOOM_SIGNER_CONTROL_SOCKET=$signer_control_socket"
-    if [ -n "${BLOOM_SIGNER_ADMIN_SOCKET:-}" ]; then
+    if [ -n "$relay_ca" ]; then
       # The Linux systemd unit does not inherit the launcher's environment.
       # Signer needs this separate socket for dev-mode relay administration
       # whenever relay pins are configured, with or without --hosted-relay.
