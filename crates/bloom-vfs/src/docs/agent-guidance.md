@@ -248,6 +248,14 @@ reason to restage. After human approval, retry only its exact `retry_path`;
 `plan_path` and `retry_path` name the outbox the confirm was written through
 (`wallets/<wallet>/<n>/chains/...`, including `n = 0` for account 0).
 
+A Solana transfer's blockhash lives about a minute from staging. Stage and
+inspect in one command and confirm in the next. When the owner approves out
+of band, keep retrying the exact `retry_path` every few seconds in that same
+command until the action leaves `pending/`: a repeated confirm reuses the
+pending approval, and a redirect's exit status does not show a refusal. If the
+blockhash still expires, restage through the action's own `restage` file,
+never by staging again. See the Solana walkthrough in `docs/examples.md`.
+
 `confirm.override` is not a general escape hatch. Use it only when the
 inspected policy projection explicitly permits that control and the human has
 explicitly accepted the displayed warning.

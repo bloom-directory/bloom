@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Developer wrapper for the native SOL transfer evaluation.
+#
+# It drives the prepared, dedicated evaluation triad from the task README: one
+# triad on its own ceremony port with the kernel mount, plus a disposable local
+# validator. This wrapper never launches, restarts, or stops services;
+# lifecycle belongs to scripts/triad-dev-launch.sh and to whoever started the
+# validator.
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
+
+usage() {
+  printf '%s\n' \
+    'Usage: scripts/evals/run-harbor-solana-local.sh [claude|codex|glm|deepseek|minimax|opencode|smoke] [--trials N]' \
+    'Prepare the evaluation triad and local validator first; see' \
+    'evals/harbor/tasks/solana-transfer/README.md.' >&2
+  exit 2
+}
+
+mode="${1:-glm}"
+[ "$#" -eq 0 ] || shift
+case "$mode" in
+  smoke) harness_args=(--smoke-only) ;;
+  claude|codex|glm|deepseek|minimax|opencode) harness_args=("$mode") ;;
+  *) usage ;;
+esac
+case "$#" in
+  0) ;;
+  2) [ "$1" = --trials ] || usage; harness_args+=(--trials "$2") ;;
+  *) usage ;;
+esac
+
+# Pull the prepared triad's connection settings when they are not already
+# exported. triad.env holds public settings only; sourcing it here supplies
+# defaults, and explicit environment always wins.
+if [ -z "${BLOOM_HOME:-}" ]; then
+  triad_env="${BLOOM_TRIAD_ENV:-${BLOOM_EVAL_TRIAD_ROOT:-/tmp/bloom-triad-logs}/logs/triad.env}"
+  if [ -f "$triad_env" ]; then
+    # shellcheck disable=SC1090
+    source "$triad_env"
+  fi
+fi
+
+if [ -z "${BLOOM_EVAL_BLOOM_MOUNT:-}" ]; then
+  printf '%s\n' \
+    'error: BLOOM_EVAL_BLOOM_MOUNT is not set; launch the triad with --mount and' \
+    'point BLOOM_TRIAD_ENV at its triad.env.' >&2
+  exit 1
+fi
+if ! mount | grep -F " on ${BLOOM_EVAL_BLOOM_MOUNT} " >/dev/null 2>&1; then
+  printf '%s\n' \
+    "error: no mount is live at ${BLOOM_EVAL_BLOOM_MOUNT}; start the prepared" \
+    'evaluation triad with scripts/triad-dev-launch.sh --mount ... (README).' >&2
+  exit 1
+fi
+
+# The evaluation triad's ceremony port must be serving. triad.env records it;
+# 18734 is the launcher default. This wrapper never kills or stops an owner.
+ceremony_port="${BLOOM_TRIAD_DEV_CEREMONY_PORT:-18734}"
+if ! (exec 3<>"/dev/tcp/127.0.0.1/${ceremony_port}") 2>/dev/null; then
+  printf '%s\n' \
+    "error: nothing is listening on ceremony port ${ceremony_port}; start the" \
+    'dedicated evaluation triad with scripts/triad-dev-launch.sh (README).' >&2
+  exit 1
+fi
+export BLOOM_TRIAD_DEV_CEREMONY_ORIGIN="${BLOOM_TRIAD_DEV_CEREMONY_ORIGIN:-http://localhost:${ceremony_port}}"
+
+export BLOOM_EVAL_SOLANA_CHAIN="${BLOOM_EVAL_SOLANA_CHAIN:-solana-local}"
+export BLOOM_EVAL_SOLANA_WALLET_ID="${BLOOM_EVAL_SOLANA_WALLET_ID:-solana-eval}"
+export BLOOM_EVAL_SOLANA_RPC_URL="${BLOOM_EVAL_SOLANA_RPC_URL:-http://127.0.0.1:8899}"
+export BLOOM_EVAL_SOLANA_HOME_ROOT="${BLOOM_EVAL_SOLANA_HOME_ROOT:-${BLOOM_HOME:-}}"
+
+exec "$repo_root/scripts/evals/run-harbor.sh" solana-transfer "${harness_args[@]}"
