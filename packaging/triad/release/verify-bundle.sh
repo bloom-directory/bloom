@@ -115,7 +115,7 @@ signer_revision="$(source_revision BLOOM_SIGNER_SHA)"
   echo "bundle compatibility revision does not match SOURCE_REVISIONS" >&2
   exit 65
 }
-require_compat_value revisions service_runtime_commit '"a046fd6075853e8591f295983b572c6e1d65d12d"'
+require_compat_value revisions service_runtime_commit '"ad0072512bb97fb4eb68d249ce785ea3ea4a49ab"'
 require_compat_value revisions petal_contract_commit '"73c5b06a77599368fbc79fb7947a629b5b4c630e"'
 for state_owner in machine broker signer; do
   require_compat_value "state.$state_owner" current 2
