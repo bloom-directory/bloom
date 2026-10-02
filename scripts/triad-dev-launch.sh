@@ -142,9 +142,6 @@ case "$host_os" in
   Darwin|Linux) ;;
   *) die "developer harness requires Linux or macOS" ;;
 esac
-if [ "$hosted_relay" -eq 1 ] && [ "$host_os" != Darwin ]; then
-  die "--hosted-relay currently requires macOS"
-fi
 
 # Arguments and environment are valid, so this invocation will actually build
 # and launch the triad. Each sibling checkout is resolved only when that
@@ -449,7 +446,6 @@ rewrite_signer_config
 relay_ca="${BLOOM_TRIAD_DEV_RELAY_CONTROL_CA_FILE:-}"
 relay_receipt="${BLOOM_TRIAD_DEV_RELAY_RECEIPT_KEY_FILE:-}"
 if [ -n "$relay_ca" ] || [ -n "$relay_receipt" ]; then
-  [ "$host_os" = Darwin ] || die "developer relay setup currently requires macOS"
   # macOS temporary directories can inherit wheel; scoped credentials require
   # the actual Broker principal's primary group even with owner-only access.
   chgrp "$(id -g)" "$config_dir"
@@ -717,6 +713,12 @@ start_linux_authority_services() {
       "BLOOM_SESSION_SOCKET=$session_socket" \
       "BLOOM_SIGNER_SOCKET=$signer_socket" \
       "BLOOM_SIGNER_CONTROL_SOCKET=$signer_control_socket"
+    if [ -n "$relay_ca" ]; then
+      # The Linux systemd unit does not inherit the launcher's environment.
+      # Signer needs this separate socket for dev-mode relay administration
+      # whenever relay pins are configured, with or without --hosted-relay.
+      printf 'Environment=%s\n' "BLOOM_SIGNER_ADMIN_SOCKET=$BLOOM_SIGNER_ADMIN_SOCKET"
+    fi
   } > "${user_unit_dir}/${signer_service_unit}"
   chmod 0600 "${user_unit_dir}/${signer_service_unit}"
 
