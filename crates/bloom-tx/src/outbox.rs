@@ -909,20 +909,40 @@ impl Outbox {
         Ok(Some(serde_json::from_slice(&fs::read(&path)?)?))
     }
 
-    pub fn cancel(&self, wallet: &str, chain: &str, id: &str) -> Result<(), OutboxError> {
-        let entry = self.read_in_state(wallet, chain, id, OutboxState::Pending)?;
+    /// Move an entry between states and persist the status that says why.
+    ///
+    /// `transition` renames the directory and nothing else, so an entry moved
+    /// out of `pending` kept whatever status it was staged with. A reader then
+    /// had to infer the reason from the (state, status) pair, and several
+    /// different outcomes -- a user cancellation, a hard policy denial, an
+    /// expiry sweep -- all left the identical `(Failed, Pending)` shape. They
+    /// are not the same thing to anyone downstream, so each producer records
+    /// what it meant and the pair always agrees.
+    pub fn transition_with_status(
+        &self,
+        entry: &OutboxEntry,
+        new_state: OutboxState,
+        status: TxStatus,
+    ) -> Result<PathBuf, OutboxError> {
         let mut staged = entry.staged.clone();
-        staged.status = TxStatus::Cancelled;
+        staged.status = status;
         let entry = OutboxEntry {
             state: entry.state,
             staged: staged.clone(),
             dir: entry.dir.clone(),
         };
-        let new_dir = self.transition(&entry, OutboxState::Failed)?;
+        let new_dir = self.transition(&entry, new_state)?;
         fs::write(
             new_dir.join("intent.json"),
             serde_json::to_vec_pretty(&staged)?,
         )?;
+        Ok(new_dir)
+    }
+
+    pub fn cancel(&self, wallet: &str, chain: &str, id: &str) -> Result<(), OutboxError> {
+        let entry = self.read_in_state(wallet, chain, id, OutboxState::Pending)?;
+        let new_dir =
+            self.transition_with_status(&entry, OutboxState::Failed, TxStatus::Cancelled)?;
         fs::write(new_dir.join("cancel.txt"), b"cancelled by user")?;
         Ok(())
     }
@@ -968,7 +988,16 @@ impl Outbox {
                             staged: staged.clone(),
                             dir: ent.path(),
                         };
-                        match self.transition(&entry, OutboxState::Failed) {
+                        // Expiry is its own outcome: the entry was never
+                        // broadcast and now never will be. `Failed` with an
+                        // `expired.txt` beside it says that without claiming
+                        // someone cancelled it.
+                        match self
+                            .transition_with_status(&entry, OutboxState::Failed, TxStatus::Failed)
+                            .and_then(|dir| {
+                                fs::write(dir.join("expired.txt"), b"expired before approval")?;
+                                Ok(dir)
+                            }) {
                             Ok(_) => {
                                 tracing::debug!(
                                     id = %staged.id,
@@ -1441,6 +1470,67 @@ mod tests {
         assert_eq!(n, 1);
         let entry = ob.read("alice", "anvil", "x").unwrap();
         assert_eq!(entry.state, OutboxState::Failed);
+        // The status has to move with the directory, or a reader cannot tell
+        // an expired entry from one still waiting for approval.
+        assert_eq!(entry.staged.status, TxStatus::Failed);
+        assert!(entry.dir.join("expired.txt").exists());
+    }
+
+    /// Leaving the queue is not one outcome. A user cancellation, a hard
+    /// policy denial and an expiry sweep all land in `failed/`, and before
+    /// each producer recorded its own status they were indistinguishable: all
+    /// three read back as `(Failed, Pending)`, so anything downstream had to
+    /// guess, and guessing "cancelled" tells a Petal a policy-denied
+    /// transaction is safe to restage.
+    #[test]
+    fn every_producer_that_leaves_the_pending_queue_records_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let ob = Outbox::new(dir.path()).unwrap();
+
+        ob.write_pending(&fake_staged("cancelled"), "p").unwrap();
+        ob.cancel("alice", "anvil", "cancelled").unwrap();
+
+        let mut expired = fake_staged("expired");
+        expired.expires_ms = 100;
+        ob.write_pending(&expired, "p").unwrap();
+        assert_eq!(ob.sweep_expired(200).unwrap(), 1);
+
+        // What the policy-denial paths in TxEngine do.
+        ob.write_pending(&fake_staged("denied"), "p").unwrap();
+        let entry = ob.read("alice", "anvil", "denied").unwrap();
+        ob.transition_with_status(&entry, OutboxState::Failed, TxStatus::Failed)
+            .unwrap();
+
+        for (id, expected) in [
+            ("cancelled", TxStatus::Cancelled),
+            ("expired", TxStatus::Failed),
+            ("denied", TxStatus::Failed),
+        ] {
+            let entry = ob.read("alice", "anvil", id).unwrap();
+            assert_eq!(entry.state, OutboxState::Failed, "{id}");
+            assert_eq!(entry.staged.status, expected, "{id}");
+            assert_ne!(
+                entry.staged.status,
+                TxStatus::Pending,
+                "{id} left the queue still marked pending"
+            );
+        }
+
+        // Only the cancellation claims someone cancelled it.
+        assert!(
+            ob.read("alice", "anvil", "cancelled")
+                .unwrap()
+                .dir
+                .join("cancel.txt")
+                .exists()
+        );
+        assert!(
+            !ob.read("alice", "anvil", "denied")
+                .unwrap()
+                .dir
+                .join("cancel.txt")
+                .exists()
+        );
     }
 
     /// Fix #8: `read_in_state` must NotFound an id that exists in a
