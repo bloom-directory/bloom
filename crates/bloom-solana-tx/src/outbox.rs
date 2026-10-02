@@ -755,9 +755,10 @@ impl SolanaOutbox {
                     }
                     let staged: StagedSolanaTransfer =
                         serde_json::from_slice(&fs::read(&intent_path)?)?;
-                    // A signed pending entry may represent a broadcast whose
-                    // RPC response was lost. Keep it retryable and visible;
-                    // expiry alone must not turn it into a false failure.
+                    // Broadcast moves an entry to `sent` before it submits, so
+                    // a pending entry was never sent, signed or not. The one
+                    // exception is a crash between the broadcast marker and
+                    // that move; like cancel, leave a marked entry alone.
                     let entry = SolanaOutboxEntry {
                         state: SolanaOutboxState::Pending,
                         staged,
@@ -766,7 +767,7 @@ impl SolanaOutbox {
                     let cluster_past_window = live_block_heights
                         .get(&entry.staged.chain)
                         .is_some_and(|height| *height > entry.staged.last_valid_block_height);
-                    if self.recorded_signature(&entry)?.is_none()
+                    if !entry.dir.join(BROADCAST_ATTEMPT_FILE).exists()
                         && entry.staged.expires_ms != 0
                         && now_ms >= entry.staged.expires_ms
                         && cluster_past_window
