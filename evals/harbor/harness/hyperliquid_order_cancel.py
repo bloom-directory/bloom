@@ -80,6 +80,9 @@ def session_key_slot(session_id: str) -> str:
 
 class HyperliquidOrderCancelEval(EvalDefinition):
     name = "hyperliquid-order-cancel"
+    # Session creation can publish up to MAX_SESSION_CEREMONIES; cleanup
+    # signs nothing.
+    CEREMONY_BUDGET = MAX_SESSION_CEREMONIES
 
     def __init__(
         self,
@@ -149,7 +152,11 @@ class HyperliquidOrderCancelEval(EvalDefinition):
             raise EvalError(
                 "BLOOM_EVAL_AUTHENTICATOR_SIGN_COUNT must be between 1 and 4294967295"
             )
-        return sign_count
+        # A counter recorded by a previous process is the record of
+        # what it already spent; starting below it replays. Capacity is
+        # checked on the resumed value, so every ceremony this run may
+        # need -- cleanup included -- still has a valid counter.
+        return self.require_counter_capacity(self.resume_counter(sign_count))
 
     @property
     def network_root(self) -> Path:
@@ -625,13 +632,7 @@ class HyperliquidOrderCancelEval(EvalDefinition):
             )
 
         addresses = self._read_json(self.wallet_root / "addresses.json")
-        owner = addresses.get("owner") if isinstance(addresses, dict) else None
-        if not isinstance(owner, str) or owner.lower() != self.wallet:
-            raise EvalError("BLOOM_EVAL_WALLET_ID does not own BLOOM_EVAL_WALLET")
-        if addresses.get("policy_status") != "broker_verified":
-            raise EvalError("eval wallet policy is not Broker-verified")
-        if addresses.get("freshness") != "fresh":
-            raise EvalError("eval wallet policy projection is stale")
+        self.require_wallet_binding(addresses, self.wallet)
 
         policy = self._read_json(self.wallet_root / "policy.json")
         if not isinstance(policy, dict):
@@ -647,12 +648,7 @@ class HyperliquidOrderCancelEval(EvalDefinition):
             raise EvalError(
                 "eval wallet policy does not match the exact bounded policy"
             )
-        canonical = json.dumps(policy, sort_keys=True, separators=(",", ":")).encode()
-        digest = hashlib.sha256(canonical).hexdigest()
-        if addresses.get("policy_digest") != digest:
-            raise EvalError(
-                "eval wallet policy digest does not match its public projection"
-            )
+        self.require_policy_digest(addresses, policy)
 
     def _nonzero_positions(self) -> list[dict[str, Any]]:
         clearinghouse = self._read_json(self.user_root / "clearinghouse.json")
@@ -778,6 +774,10 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         if not self.seed_file_value:
             raise EvalError("BLOOM_EVAL_AUTHENTICATOR_SEED_FILE is required")
         self.sign_count = self._require_sign_count()
+        # Before any ceremony spends a counter, prove the spend can be
+        # recorded. A sidecar that cannot be written turns an ordinary
+        # run into a counter Broker will later reject as a replay.
+        self.require_counter_durability()
         try:
             seed_stat = self.seed_file.lstat()
         except OSError as error:
@@ -832,6 +832,10 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         self._pull_eval_image()
         self.phase_timings["image_pull_seconds"] = time.monotonic() - image_started
         self._require_empty_wallet()
+        # Last, immediately before provision() creates the session: claim
+        # every counter session creation may spend, atomically, so a
+        # concurrent eval on the same passkey cannot take any of them.
+        self.sign_count = self.reserve_run_counters(self.sign_count)
 
     def provision(self, agent_name: str) -> EvalRunContext:
         sign_count = self.sign_count or self._require_sign_count()
@@ -916,15 +920,11 @@ class HyperliquidOrderCancelEval(EvalDefinition):
             # revision retried here on the theory that a freshly published
             # ceremony URL might not yet resolve; that theory was wrong, and the
             # retries turned one failure into three.
-            # Reserve the next counter durably before invoking the driver. The
-            # assertion may reach Broker even when the local process times out
-            # or is interrupted, so persistence after subprocess completion is
-            # too late to guarantee that this counter will never be reused.
-            attempted_counter = counter
-            counter = attempted_counter + 1
-            if self.counter_committed is not None:
-                self.counter_committed(counter)
-            self.next_sign_count = counter
+            # Sign with the counter the reservation hands out, not the local
+            # candidate: under the shared per-authenticator lock it can be
+            # higher, because another eval or process already spent this one.
+            counter = self.reserve_counter(counter)
+            attempted_counter = counter - 1
             try:
                 completed = subprocess.run(
                     [
