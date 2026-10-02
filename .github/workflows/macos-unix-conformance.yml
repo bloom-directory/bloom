@@ -7,22 +7,22 @@ on:
         description: Public bloom-broker ref
         required: false
         type: string
-        default: 7d01ea478a1bc5990201ce336e6bcd42bff980ea
+        default: 31524da583a0945bc38f32e1bfb0270136a3d6f7
       signer_ref:
         description: Public bloom-signer ref
         required: false
         type: string
-        default: 4415b6c2bf9ab40a4c33f2104f6bfa359184cbac
+        default: 9ea31cc8de4429accc839327d47419544a79de09
   workflow_dispatch:
     inputs:
       broker_ref:
         description: Public bloom-broker ref
         required: true
-        default: 7d01ea478a1bc5990201ce336e6bcd42bff980ea
+        default: 31524da583a0945bc38f32e1bfb0270136a3d6f7
       signer_ref:
         description: Public bloom-signer ref
         required: true
-        default: 4415b6c2bf9ab40a4c33f2104f6bfa359184cbac
+        default: 9ea31cc8de4429accc839327d47419544a79de09
 
 permissions:
   contents: read
@@ -42,8 +42,8 @@ jobs:
       - name: Reject mutable sibling refs
         shell: bash
         env:
-          BROKER_REF: ${{ inputs.broker_ref || '7d01ea478a1bc5990201ce336e6bcd42bff980ea' }}
-          SIGNER_REF: ${{ inputs.signer_ref || '4415b6c2bf9ab40a4c33f2104f6bfa359184cbac' }}
+          BROKER_REF: ${{ inputs.broker_ref || '31524da583a0945bc38f32e1bfb0270136a3d6f7' }}
+          SIGNER_REF: ${{ inputs.signer_ref || '9ea31cc8de4429accc839327d47419544a79de09' }}
         run: |
           [[ "$BROKER_REF" =~ ^[0-9a-f]{40}$ ]]
           [[ "$SIGNER_REF" =~ ^[0-9a-f]{40}$ ]]
@@ -51,13 +51,13 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           repository: bloom-directory/bloom-broker
-          ref: ${{ inputs.broker_ref || '7d01ea478a1bc5990201ce336e6bcd42bff980ea' }}
+          ref: ${{ inputs.broker_ref || '31524da583a0945bc38f32e1bfb0270136a3d6f7' }}
           path: bloom-broker
       - name: Check out Signer
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           repository: bloom-directory/bloom-signer
-          ref: ${{ inputs.signer_ref || '4415b6c2bf9ab40a4c33f2104f6bfa359184cbac' }}
+          ref: ${{ inputs.signer_ref || '9ea31cc8de4429accc839327d47419544a79de09' }}
           path: bloom-signer
       - name: Install Rust toolchain
         run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
@@ -148,8 +148,8 @@ jobs:
       - name: Reject mutable sibling refs
         shell: bash
         env:
-          BROKER_REF: ${{ inputs.broker_ref || '7d01ea478a1bc5990201ce336e6bcd42bff980ea' }}
-          SIGNER_REF: ${{ inputs.signer_ref || '4415b6c2bf9ab40a4c33f2104f6bfa359184cbac' }}
+          BROKER_REF: ${{ inputs.broker_ref || '31524da583a0945bc38f32e1bfb0270136a3d6f7' }}
+          SIGNER_REF: ${{ inputs.signer_ref || '9ea31cc8de4429accc839327d47419544a79de09' }}
         run: |
           [[ "$BROKER_REF" =~ ^[0-9a-f]{40}$ ]]
           [[ "$SIGNER_REF" =~ ^[0-9a-f]{40}$ ]]
@@ -157,13 +157,13 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           repository: bloom-directory/bloom-broker
-          ref: ${{ inputs.broker_ref || '7d01ea478a1bc5990201ce336e6bcd42bff980ea' }}
+          ref: ${{ inputs.broker_ref || '31524da583a0945bc38f32e1bfb0270136a3d6f7' }}
           path: bloom-broker
       - name: Check out Signer
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           repository: bloom-directory/bloom-signer
-          ref: ${{ inputs.signer_ref || '4415b6c2bf9ab40a4c33f2104f6bfa359184cbac' }}
+          ref: ${{ inputs.signer_ref || '9ea31cc8de4429accc839327d47419544a79de09' }}
           path: bloom-signer
       - name: Install Rust toolchain
         run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
