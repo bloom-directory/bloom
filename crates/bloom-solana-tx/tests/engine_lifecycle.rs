@@ -1875,9 +1875,7 @@ async fn a_swept_transfer_fails_over_and_restages_onto_a_fresh_approval() {
         staged.last_valid_block_height + 1,
     );
     assert_eq!(
-        outbox
-            .sweep_expired(staged.expires_ms, &heights)
-            .unwrap(),
+        outbox.sweep_expired(staged.expires_ms, &heights).unwrap(),
         1,
         "exactly the stale entry must be swept at its own deadline"
     );
