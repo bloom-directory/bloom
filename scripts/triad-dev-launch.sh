@@ -307,9 +307,14 @@ do
   chmod 0600 "${config_dir}/${name}"
 done
 if [ "$install_authority_fixture" -eq 1 ]; then
+  # Use the same installer-signed lineage enrollment as other local Petals.
+  # A route-only provenance record cannot authorize scoped key derivation.
+  "$bloom_bin" init triad-enroll-developer-petal-provenance \
+    "$config_dir" "$fixture_root"
   jq -e --arg package_hash "$fixture_hash" '
     any(.records[]; .subject.kind == "petal" and
-        .subject.package_hash == $package_hash and .subject.route == "r000001")
+        .subject.package_hash == $package_hash and .subject.route == "r000001" and
+        .petal_lineage.active == true)
   ' "${config_dir}/provenance-catalog.json" >/dev/null ||
     die "developer enrollment predates the current fixture; create a fresh developer root"
 fi
