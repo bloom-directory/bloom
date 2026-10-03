@@ -2282,6 +2282,173 @@ fn vfs_routes_via_ipc_when_socket_exists() {
     server_thread.join().expect("ipc server thread panicked");
 }
 
+/// The MCP proxy must be inert until an operator turns it on: a fresh home has
+/// no config at all, and `mcp serve` has to refuse before it reads a single
+/// client byte or touches the daemon socket.
+#[test]
+fn mcp_is_disabled_until_the_config_flag_is_set() {
+    let home = fresh_home();
+    assert!(
+        !bloom_proto::HomeDir::at(home.path()).config_path().exists(),
+        "this test starts from a home with no config at all"
+    );
+
+    bloom_cmd(home.path())
+        .args(["mcp", "status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("enabled: false"))
+        .stdout(predicate::str::contains("transport: stdio"))
+        .stdout(predicate::str::contains("vfs_read"))
+        .stdout(predicate::str::contains(
+            "set `enabled = true` under `[mcp]`",
+        ));
+
+    // Even handed a complete, valid MCP session on stdin, a disabled server
+    // must answer nothing and exit non-zero.
+    let assertion = bloom_cmd(home.path())
+        .args(["mcp", "serve"])
+        .write_stdin(
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n\
+             {\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n",
+        )
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("disabled"));
+    assert_eq!(
+        assertion.get_output().stdout,
+        b"",
+        "a disabled MCP server must not emit protocol frames"
+    );
+
+    // An explicit `enabled = false` is still disabled.
+    let home_dir = bloom_proto::HomeDir::at(home.path());
+    let mut config = bloom_proto::Config::local_default();
+    config.mcp.enabled = false;
+    config.save(&home_dir.config_path()).unwrap();
+    bloom_cmd(home.path())
+        .args(["mcp", "status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("enabled: false"));
+}
+
+/// With the flag set, `bloom mcp serve` speaks MCP on stdio and every tool call
+/// lands on the same daemon IPC surface `bloom vfs` uses. The in-process server
+/// mounts a subtree the production daemon never has, so a correct answer proves
+/// the request really travelled the canonical path.
+#[tokio::test]
+async fn mcp_serve_proxies_vfs_commands_over_stdio_when_enabled() {
+    let home = fresh_home();
+    let home_dir = bloom_proto::HomeDir::at(home.path());
+    let mut config = bloom_proto::Config::local_default();
+    config.mcp.enabled = true;
+    config.save(&home_dir.config_path()).unwrap();
+
+    let handler = RecordingWriteHandler::new();
+    let vfs = bloom_vfs::Vfs::builder()
+        .mount("wallets", handler.clone())
+        .build();
+    let (server, server_thread) = spawn_ipc_server(home.path(), vfs);
+
+    let session = [
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"cli-test","version":"1"}}}"#,
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"vfs_write","arguments":{"path":"/wallets/alice/chains/base/outbox/pending/0001/confirm","text":"y"}}}"#,
+        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"vfs_read","arguments":{"path":"/absent-subtree/x"}}}"#,
+    ]
+    .join("\n")
+        + "\n";
+
+    // A stdio client keeps its input open while waiting for operations.
+    // Closing it first now correctly discards undispatched work.
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let template = bloom_cmd(home.path());
+    let mut command = tokio::process::Command::new(template.get_program());
+    for (key, value) in template.get_envs() {
+        if let Some(value) = value {
+            command.env(key, value);
+        } else {
+            command.env_remove(key);
+        }
+    }
+    let mut child = command
+        .args(["mcp", "serve"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    input.write_all(session.as_bytes()).await.unwrap();
+    let mut output = tokio::io::BufReader::new(child.stdout.take().unwrap());
+    let mut responses = Vec::<serde_json::Value>::new();
+    for _ in 0..4 {
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(5), output.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        responses.push(serde_json::from_str(&line).expect("each frame is one JSON document"));
+    }
+    input.shutdown().await.unwrap();
+    drop(input);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), child.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+
+    assert_eq!(responses.len(), 4, "the notification is not answered");
+    assert_eq!(responses[0]["result"]["serverInfo"]["name"], "bloom-vfs");
+    assert_eq!(responses[0]["result"]["protocolVersion"], "2025-06-18");
+
+    let tool_names: Vec<&str> = responses[1]["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        tool_names,
+        [
+            "vfs_list",
+            "vfs_read",
+            "vfs_stat",
+            "vfs_write",
+            "vfs_write_then_stat"
+        ]
+    );
+
+    assert_eq!(responses[2]["result"]["isError"], false);
+    assert_eq!(
+        responses[2]["result"]["structuredContent"]["bytes_written"],
+        1
+    );
+
+    // A daemon-side failure is reported as an MCP tool error carrying the
+    // daemon's own JSON-RPC code.
+    assert_eq!(responses[3]["result"]["isError"], true);
+    assert_eq!(
+        responses[3]["result"]["structuredContent"]["error"]["code"],
+        -32004
+    );
+
+    stop_ipc_server(server, server_thread);
+
+    let writes = handler.writes();
+    assert_eq!(writes.len(), 1, "expected one VFS write, got {writes:?}");
+    assert_eq!(
+        writes[0].0,
+        "/alice/chains/base/outbox/pending/0001/confirm"
+    );
+    assert_eq!(writes[0].1, b"y");
+}
+
 #[test]
 fn wallet_confirm_uses_plain_ipc_write_when_socket_exists() {
     let home = fresh_home();
@@ -2492,7 +2659,13 @@ fn petal_cli_build_install_list_and_vfs_read_happy_path() {
         .args(["vfs", "cat", "/petals/demo/hello.txt"])
         .assert()
         .success()
-        .stdout(predicate::eq("component"));
+        .stdout(predicate::str::contains("component")); // Public routes stay unscoped.
+
+    bloom_cmd(home.path())
+        .args(["vfs", "ls", "/petals/demo"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hello.txt"));
 
     bloom_cmd(home.path())
         .args(["vfs", "cat", "/petals/demo/README.md"])
@@ -2507,7 +2680,7 @@ fn github_source_install_polymarket_dispatches_route_contract() {
         return;
     }
     // Exercise source installation of the current pinned Polymarket release.
-    let petal_ref = "cb6259f6458fc9a27708b8c4c4e35d28a69d24fc";
+    let petal_ref = "a0177ae4e68f4a043df4db727fb3212e23ab7395";
     let home = fresh_home();
     let home_dir = bloom_proto::HomeDir::at(home.path());
     let config = bloom_proto::Config::local_default();
@@ -2536,8 +2709,8 @@ fn github_source_install_polymarket_dispatches_route_contract() {
         )))
         .stdout(predicate::str::contains("Building source package..."))
         .stdout(predicate::str::contains("Validating Petal package..."))
-        .stdout(predicate::str::contains("\"routes\": 97"))
-        .stdout(predicate::str::contains("routes: 97"));
+        .stdout(predicate::str::contains("\"routes\": 109"))
+        .stdout(predicate::str::contains("routes: 109"));
 
     bloom_cmd(home.path())
         .args(["petals", "ls"])
@@ -2554,6 +2727,12 @@ fn github_source_install_polymarket_dispatches_route_contract() {
         .stdout(predicate::str::contains(
             "bloom.polymarket.petal-route-contract.v1",
         ));
+
+    bloom_cmd(home.path())
+        .args(["vfs", "ls", "/petals/polymarket"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("meta"));
 
     bloom_cmd(home.path())
         .args(["vfs", "cat", "/petals/polymarket/README.md"])

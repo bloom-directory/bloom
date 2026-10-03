@@ -90,8 +90,6 @@ struct PetalToml {
     #[serde(default)]
     key: KeyPolicyToml,
     #[serde(default)]
-    account: AccountToml,
-    #[serde(default)]
     store: StorePolicyToml,
     #[serde(default, rename = "source")]
     _source: Option<SourcePolicyToml>,
@@ -140,16 +138,6 @@ struct SignPolicy {
     fee_asset: Option<bloom_broker_api::ProvenanceFeeAsset>,
 }
 
-/// `[account]`: whether the Petal understands host-injected account
-/// context. Unaware Petals never run under accounts other than 0, where the
-/// wallet-level paths have always been the whole surface.
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AccountToml {
-    #[serde(default, rename = "aware")]
-    aware: bool,
-}
-
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct KeyPolicyToml {
@@ -186,6 +174,8 @@ struct StorePolicyToml {
     namespaces: Vec<String>,
     #[serde(default)]
     secret_namespaces: Vec<String>,
+    #[serde(default)]
+    shared_keys: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -298,6 +288,7 @@ pub struct PetalConsentSummary {
     pub network: Vec<PetalConsentNetRule>,
     pub sign_intents: Vec<String>,
     pub store_namespaces: Vec<PetalConsentStoreNamespace>,
+    pub store_shared_keys: Vec<String>,
     pub routes: Vec<PetalConsentRoute>,
 }
 
@@ -993,14 +984,6 @@ fn validate_component_metadata_policy(
     Ok(())
 }
 
-/// Whether the manifest declares `[account] aware = true`.
-pub fn account_aware_from_manifest_toml(bytes: &[u8]) -> Result<bool, PetalError> {
-    let manifest_toml = std::str::from_utf8(bytes)
-        .map_err(|_| PetalError::InvalidWasm("petal.toml is not utf-8".into()))?;
-    let manifest: PetalToml = toml::from_str(manifest_toml)?;
-    Ok(manifest.account.aware)
-}
-
 pub fn sign_intents_from_manifest_toml(bytes: &[u8]) -> Result<BTreeSet<String>, PetalError> {
     let manifest_toml = std::str::from_utf8(bytes)
         .map_err(|_| PetalError::InvalidWasm("petal.toml is not utf-8".into()))?;
@@ -1237,6 +1220,7 @@ pub fn petal_consent_summary(
         network,
         sign_intents,
         store_namespaces,
+        store_shared_keys: manifest.store.shared_keys.clone(),
         routes,
     })
 }
@@ -4137,6 +4121,7 @@ fn store_policy_from_manifest(manifest: &PetalToml) -> StoreNamespacePolicy {
         manifest.store.namespaces.iter().cloned(),
         manifest.store.secret_namespaces.iter().cloned(),
     )
+    .with_shared_keys(manifest.store.shared_keys.iter().cloned())
 }
 
 fn validate_store_policy(
@@ -4148,6 +4133,22 @@ fn validate_store_policy(
             "Petal package cap bloom:store requires [store].namespaces or [store].secret_namespaces"
                 .into(),
         ));
+    }
+    for key in policy.shared_keys() {
+        crate::private_store::validate_key(key)
+            .map_err(|e| PetalError::InvalidWasm(format!("Petal store shared key {key:?}: {e}")))?;
+        let (namespace, _) = key.split_once('/').ok_or_else(|| {
+            PetalError::InvalidWasm(format!(
+                "Petal store shared key {key:?} must be fully namespaced"
+            ))
+        })?;
+        if key.split('/').any(|part| part.starts_with('.'))
+            || !policy.namespaces().contains(namespace)
+        {
+            return Err(PetalError::InvalidWasm(format!(
+                "Petal store shared key {key:?} must use a declared namespace and visible canonical path segments"
+            )));
+        }
     }
     for namespace in policy.namespaces() {
         validate_store_namespace(namespace)?;
@@ -6884,9 +6885,9 @@ allowed_intents = ["fixture.unrelated", "fixture.secondary", "fixture.payload"]
 namespaces = ["fixture-public"]
 
 [[key.derive]]
-route = "session.json"
+route = "wallets/[wallet]/[index]/session.json"
 operation_classes = ["fixture.secondary", "fixture.payload"]
-allowed_routes = ["session.json"]
+allowed_routes = ["wallets/[wallet]/[index]/session.json"]
 allowed_crypto_suites = ["secp256k1-keccak256-recoverable"]
 maximum_lifetime_ms = 60000
 "#,
@@ -6894,7 +6895,7 @@ maximum_lifetime_ms = 60000
         .unwrap();
 
         let route = &package.route_index.routes[0];
-        assert_eq!(route.pattern, "session.json");
+        assert_eq!(route.pattern, "wallets/[wallet]/[index]/session.json");
         assert_eq!(
             route.key_derive_operation_classes,
             vec![
@@ -7023,9 +7024,9 @@ allowed_intents = ["fixture.payload"]
 namespaces = ["fixture-public"]
 
 [[key.derive]]
-route = "session.json"
+route = "wallets/[wallet]/[index]/session.json"
 operation_classes = ["fixture.payload"]
-allowed_routes = ["session.json"]
+allowed_routes = ["wallets/[wallet]/[index]/session.json"]
 allowed_crypto_suites = ["secp256k1-keccak256-recoverable"]
 maximum_lifetime_ms = 60000
 "#;
@@ -7050,13 +7051,13 @@ maximum_lifetime_ms = 60000
             .route_index
             .routes
             .iter()
-            .find(|route| route.pattern == "session.json")
+            .find(|route| route.pattern == "wallets/[wallet]/[index]/session.json")
             .unwrap();
         let inserted_route = inserted
             .route_index
             .routes
             .iter()
-            .find(|route| route.pattern == "session.json")
+            .find(|route| route.pattern == "wallets/[wallet]/[index]/session.json")
             .unwrap();
         assert_ne!(original_route.route_id, inserted_route.route_id);
         for (package, origin) in [(&original, original_route), (&inserted, inserted_route)] {
@@ -7074,7 +7075,7 @@ maximum_lifetime_ms = 60000
                         .as_str()
                 })
                 .collect::<Vec<_>>();
-            assert_eq!(patterns, ["session.json"]);
+            assert_eq!(patterns, ["wallets/[wallet]/[index]/session.json"]);
         }
     }
 
@@ -7092,11 +7093,11 @@ operation_classes = ["fixture.payload"]
             (
                 "duplicate route",
                 r#"[[key.derive]]
-route = "session.json"
+route = "wallets/[wallet]/[index]/session.json"
 operation_classes = ["fixture.payload"]
 
 [[key.derive]]
-route = "session.json"
+route = "wallets/[wallet]/[index]/session.json"
 operation_classes = ["fixture.payload"]
 "#,
                 "duplicate declaration",
@@ -7104,7 +7105,7 @@ operation_classes = ["fixture.payload"]
             (
                 "empty classes",
                 r#"[[key.derive]]
-route = "session.json"
+route = "wallets/[wallet]/[index]/session.json"
 operation_classes = []
 "#,
                 "operation_classes must be non-empty",
@@ -7112,7 +7113,7 @@ operation_classes = []
             (
                 "duplicate classes",
                 r#"[[key.derive]]
-route = "session.json"
+route = "wallets/[wallet]/[index]/session.json"
 operation_classes = ["fixture.payload", "fixture.payload"]
 "#,
                 "duplicate operation class",
@@ -7120,7 +7121,7 @@ operation_classes = ["fixture.payload", "fixture.payload"]
             (
                 "invalid class",
                 r#"[[key.derive]]
-route = "session.json"
+route = "wallets/[wallet]/[index]/session.json"
 operation_classes = ["fixture/payload"]
 "#,
                 "unsupported byte",
@@ -7128,7 +7129,7 @@ operation_classes = ["fixture/payload"]
             (
                 "undeclared class",
                 r#"[[key.derive]]
-route = "session.json"
+route = "wallets/[wallet]/[index]/session.json"
 operation_classes = ["fixture.undeclared"]
 "#,
                 "is not declared in [sign].allowed_intents",
@@ -7136,7 +7137,7 @@ operation_classes = ["fixture.undeclared"]
             (
                 "unknown declaration field",
                 r#"[[key.derive]]
-route = "session.json"
+route = "wallets/[wallet]/[index]/session.json"
 operation_class = ["fixture.payload"]
 operation_classes = ["fixture.payload"]
 "#,
@@ -7145,7 +7146,7 @@ operation_classes = ["fixture.payload"]
             (
                 "unknown allowed route",
                 r#"[[key.derive]]
-route = "session.json"
+route = "wallets/[wallet]/[index]/session.json"
 operation_classes = ["fixture.payload"]
 allowed_routes = ["missing.json"]
 allowed_crypto_suites = ["secp256k1-keccak256-recoverable"]
@@ -7156,9 +7157,9 @@ maximum_lifetime_ms = 60000
             (
                 "duplicate allowed route",
                 r#"[[key.derive]]
-route = "session.json"
+route = "wallets/[wallet]/[index]/session.json"
 operation_classes = ["fixture.payload"]
-allowed_routes = ["session.json", "session.json"]
+allowed_routes = ["wallets/[wallet]/[index]/session.json", "wallets/[wallet]/[index]/session.json"]
 allowed_crypto_suites = ["secp256k1-keccak256-recoverable"]
 maximum_lifetime_ms = 60000
 "#,
@@ -7167,9 +7168,9 @@ maximum_lifetime_ms = 60000
             (
                 "scope requires suites",
                 r#"[[key.derive]]
-route = "session.json"
+route = "wallets/[wallet]/[index]/session.json"
 operation_classes = ["fixture.payload"]
-allowed_routes = ["session.json"]
+allowed_routes = ["wallets/[wallet]/[index]/session.json"]
 maximum_lifetime_ms = 60000
 "#,
                 "requires non-empty allowed_crypto_suites",
@@ -7177,9 +7178,9 @@ maximum_lifetime_ms = 60000
             (
                 "scope requires lifetime",
                 r#"[[key.derive]]
-route = "session.json"
+route = "wallets/[wallet]/[index]/session.json"
 operation_classes = ["fixture.payload"]
-allowed_routes = ["session.json"]
+allowed_routes = ["wallets/[wallet]/[index]/session.json"]
 allowed_crypto_suites = ["secp256k1-keccak256-recoverable"]
 "#,
                 "requires maximum_lifetime_ms",
@@ -7187,9 +7188,9 @@ allowed_crypto_suites = ["secp256k1-keccak256-recoverable"]
             (
                 "unsupported suite",
                 r#"[[key.derive]]
-route = "session.json"
+route = "wallets/[wallet]/[index]/session.json"
 operation_classes = ["fixture.payload"]
-allowed_routes = ["session.json"]
+allowed_routes = ["wallets/[wallet]/[index]/session.json"]
 allowed_crypto_suites = ["unknown-suite"]
 maximum_lifetime_ms = 60000
 "#,
@@ -7198,9 +7199,9 @@ maximum_lifetime_ms = 60000
             (
                 "duplicate suite",
                 r#"[[key.derive]]
-route = "session.json"
+route = "wallets/[wallet]/[index]/session.json"
 operation_classes = ["fixture.payload"]
-allowed_routes = ["session.json"]
+allowed_routes = ["wallets/[wallet]/[index]/session.json"]
 allowed_crypto_suites = ["ed25519-message", "ed25519-message"]
 maximum_lifetime_ms = 60000
 "#,
@@ -7209,9 +7210,9 @@ maximum_lifetime_ms = 60000
             (
                 "zero lifetime",
                 r#"[[key.derive]]
-route = "session.json"
+route = "wallets/[wallet]/[index]/session.json"
 operation_classes = ["fixture.payload"]
-allowed_routes = ["session.json"]
+allowed_routes = ["wallets/[wallet]/[index]/session.json"]
 allowed_crypto_suites = ["ed25519-message"]
 maximum_lifetime_ms = 0
 "#,
@@ -7310,6 +7311,53 @@ secret_namespaces = ["credentials"]
         assert!(policy.namespaces().contains("credentials"));
         assert!(policy.secret_namespaces().contains("credentials"));
         PreparedPetalPackage::from_dir(allowed.path()).unwrap();
+    }
+
+    #[test]
+    fn petal_store_shared_keys_require_exact_declared_canonical_keys() {
+        let manifest = |key: &str| {
+            format!(
+                r#"schema = "bloom.petal.package.v1"
+name = "echo"
+[caps]
+allowed = ["bloom:store"]
+[store]
+namespaces = ["state"]
+secret_namespaces = ["secrets"]
+shared_keys = [{key:?}]
+"#
+            )
+        };
+        let policy =
+            store_policy_from_manifest_toml(manifest("secrets/credentials/api-key").as_bytes())
+                .unwrap();
+        assert!(policy.shared_keys().contains("secrets/credentials/api-key"));
+        assert!(policy.check_put("secrets", false).is_err());
+        for key in [
+            "state",
+            "state/",
+            "state//key",
+            "state/../key",
+            "state/.hidden/key",
+            "/state/key",
+            "unknown/key",
+            "state\\key",
+        ] {
+            assert!(
+                store_policy_from_manifest_toml(manifest(key).as_bytes()).is_err(),
+                "accepted {key}"
+            );
+        }
+        let masked = policy.intersect(&StoreNamespacePolicy::from_namespaces(
+            ["state".to_owned()],
+            [],
+        ));
+        assert!(masked.shared_keys().is_empty());
+        let masked = policy.intersect(&StoreNamespacePolicy::from_namespaces(
+            [],
+            ["secrets".to_owned()],
+        ));
+        assert_eq!(masked.shared_keys(), policy.shared_keys());
     }
 
     #[test]
