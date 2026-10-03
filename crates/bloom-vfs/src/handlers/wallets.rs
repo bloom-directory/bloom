@@ -415,38 +415,75 @@ impl WalletsHandler {
     }
 
     async fn wallet_projection(&self, wallet: &str) -> Result<WalletProjection, HandlerError> {
+        self.wallet_projection_with_refresh(wallet, true).await
+    }
+
+    async fn wallet_projection_navigation(
+        &self,
+        wallet: &str,
+    ) -> Result<WalletProjection, HandlerError> {
+        self.wallet_projection_with_refresh(wallet, false).await
+    }
+
+    async fn wallet_projection_with_refresh(
+        &self,
+        wallet: &str,
+        live: bool,
+    ) -> Result<WalletProjection, HandlerError> {
         let wallet_id = bloom_broker_api::Token::new(wallet.to_owned())
             .map_err(|error| HandlerError::invalid(error.to_string()))?;
-        self.wallet_projections
-            .as_ref()
-            .ok_or_else(|| {
-                HandlerError::backend(
-                    "SERVICE_UNAVAILABLE: Machine wallet projection reader is not configured",
-                )
-            })?
-            .get_wallet(&wallet_id)
-            .await
-            .map_err(|error| {
-                // A wallet that is not registered is absent, not broken. The
-                // projection reader reports it as an invalid request; to a
-                // filesystem client that must be ENOENT, or `ls` of a mistyped
-                // wallet name looks like the machine is failing.
-                let absent = error.code == ProtocolErrorCode::BackendInvalidRequest
-                    && (error.message == format!("wallet {wallet} not found")
-                        || error.message == format!("wallet {wallet} was deleted"));
-                if absent {
-                    HandlerError::not_found(wallet.to_owned())
-                } else {
-                    HandlerError::backend(error.to_string())
-                }
-            })
+        let projections = self.wallet_projections.as_ref().ok_or_else(|| {
+            HandlerError::backend(
+                "SERVICE_UNAVAILABLE: Machine wallet projection reader is not configured",
+            )
+        })?;
+        let result = if live {
+            projections.get_wallet(&wallet_id).await
+        } else {
+            projections.get_wallet_navigation(&wallet_id).await
+        };
+        Self::map_wallet_projection(wallet, result)
+    }
+
+    async fn wallet_projection_authority(
+        &self,
+        wallet: &str,
+    ) -> Result<WalletProjection, HandlerError> {
+        let wallet_id = bloom_broker_api::Token::new(wallet.to_owned())
+            .map_err(|error| HandlerError::invalid(error.to_string()))?;
+        let projections = self.wallet_projections.as_ref().ok_or_else(|| {
+            HandlerError::backend(
+                "SERVICE_UNAVAILABLE: Machine wallet projection reader is not configured",
+            )
+        })?;
+        Self::map_wallet_projection(wallet, projections.get_wallet_authority(&wallet_id).await)
+    }
+
+    fn map_wallet_projection(
+        wallet: &str,
+        result: Result<WalletProjection, bloom_broker_api::ProtocolError>,
+    ) -> Result<WalletProjection, HandlerError> {
+        result.map_err(|error| {
+            // A wallet that is not registered is absent, not broken. The
+            // projection reader reports it as an invalid request; to a
+            // filesystem client that must be ENOENT, or `ls` of a mistyped
+            // wallet name looks like the machine is failing.
+            let absent = error.code == ProtocolErrorCode::BackendInvalidRequest
+                && (error.message == format!("wallet {wallet} not found")
+                    || error.message == format!("wallet {wallet} was deleted"));
+            if absent {
+                HandlerError::not_found(wallet.to_owned())
+            } else {
+                HandlerError::backend(error.to_string())
+            }
+        })
     }
 
     async fn wallet_projection_list(&self) -> Result<Vec<WalletProjection>, HandlerError> {
         let Some(projections) = &self.wallet_projections else {
             return Ok(Vec::new());
         };
-        match projections.list_wallets().await {
+        match projections.list_wallets_navigation().await {
             Ok(wallets) => Ok(wallets),
             // Root directory enumeration is navigation, not an authority
             // decision. Prefer a previously authenticated cache when the live
@@ -2105,9 +2142,7 @@ fn validate_policy_action_id(id: &str) -> Result<(), HandlerError> {
 fn tx_open_err(e: TxEngineError) -> HandlerError {
     match e {
         TxEngineError::ApprovalRequired(_) => HandlerError::PermissionDenied,
-        TxEngineError::PolicyDenied | TxEngineError::BroadcastDisabled(_) => {
-            HandlerError::OperationNotPermitted
-        }
+        TxEngineError::PolicyDenied => HandlerError::OperationNotPermitted,
         TxEngineError::EnsoQuoteStale { .. }
         | TxEngineError::DependencyNotSatisfied { .. }
         | TxEngineError::SimulationReverted { .. }
@@ -2767,7 +2802,7 @@ impl WalletsHandler {
             };
         }
         let wallet = &segs[0];
-        let _projection = self.wallet_projection(wallet).await?;
+        let _projection = self.wallet_projection_navigation(wallet).await?;
         if segs.len() == 1 {
             return Ok(Entry::dir(wallet));
         }
@@ -3129,7 +3164,7 @@ impl WalletsHandler {
             };
         }
         let wallet = &segs[0];
-        let _projection = self.wallet_projection(wallet).await?;
+        let _projection = self.wallet_projection_navigation(wallet).await?;
         if let Some(number) = segs
             .get(1)
             .and_then(|segment| parse_account_segment(segment))
@@ -3908,6 +3943,52 @@ mod tests {
     struct StaticProjection(WalletProjection);
 
     struct UnavailableProjection;
+
+    struct NavigationOnlyProjection(WalletProjection);
+
+    #[async_trait]
+    impl WalletProjectionReader for NavigationOnlyProjection {
+        async fn list_wallets(
+            &self,
+        ) -> Result<Vec<WalletProjection>, bloom_broker_api::ProtocolError> {
+            Ok(vec![self.0.clone()])
+        }
+
+        async fn get_wallet_authority(
+            &self,
+            _wallet_id: &Token,
+        ) -> Result<WalletProjection, bloom_broker_api::ProtocolError> {
+            Err(ProtocolError::new(
+                ProtocolErrorCode::ServiceUnavailable,
+                "live account authority unavailable",
+            ))
+        }
+
+        async fn get_wallet(
+            &self,
+            _wallet_id: &Token,
+        ) -> Result<WalletProjection, bloom_broker_api::ProtocolError> {
+            Ok(self.0.clone())
+        }
+
+        async fn get_wallet_navigation(
+            &self,
+            wallet_id: &Token,
+        ) -> Result<WalletProjection, bloom_broker_api::ProtocolError> {
+            if self.0.wallet.wallet_id == *wallet_id {
+                Ok(self.0.clone())
+            } else {
+                Err(ProtocolError::new(
+                    ProtocolErrorCode::BackendInvalidRequest,
+                    format!("wallet {} not found", wallet_id.as_str()),
+                ))
+            }
+        }
+
+        fn cached_wallets(&self) -> Result<Vec<WalletProjection>, bloom_broker_api::ProtocolError> {
+            Ok(vec![self.0.clone()])
+        }
+    }
 
     struct FailedProjection {
         code: ProtocolErrorCode,
@@ -6004,7 +6085,6 @@ value = "0""#,
                 chain_id: 31337,
                 rpc_urls: vec!["http://127.0.0.1:1".into()],
                 rpc_endpoints: Vec::new(),
-                allow_broadcast: true,
                 etherscan_api_url: None,
                 display_name: None,
                 native_symbol: "ETH".into(),
@@ -6275,7 +6355,6 @@ value = "0""#,
                 http_only: false,
             }],
             expected_genesis_base58: Some("test-genesis".into()),
-            allow_broadcast: true,
         })
         .unwrap();
         let broker =
@@ -6333,7 +6412,6 @@ value = "0""#,
                 http_only: false,
             }],
             expected_genesis_base58: Some("test-genesis".into()),
-            allow_broadcast: true,
         })
         .unwrap();
         let catalog = bloom_broker_api::ProvenanceCatalog {
@@ -8690,6 +8768,79 @@ value = "0""#,
         assert!(parsed.accounts.is_empty());
     }
 
+    #[tokio::test]
+    async fn account_context_read_requires_live_authority_after_navigation() {
+        let f = make_handler();
+        let handler = f
+            .handler
+            .with_projection_reader(Arc::new(NavigationOnlyProjection(static_projection_value(
+                f.wallet_addr,
+            ))));
+        let path = VfsPath::parse(&format!("/{}/0/account.json", f.wallet_name)).unwrap();
+        handler.lookup(&path).await.unwrap();
+        let error = handler.read(&path).await.unwrap_err();
+        assert!(
+            matches!(error, HandlerError::Backend(_)),
+            "Petal account context must not use the navigation snapshot: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_account_projection_cannot_become_trusted_petal_context() {
+        let f = make_handler();
+        for derived in [false, true] {
+            let mut projection = if derived {
+                let profile = bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1;
+                bip39_projection_value(
+                    f.wallet_addr,
+                    vec![derived_account(
+                        profile,
+                        "m/44'/60'/0'/0/0",
+                        72,
+                        &format!("{:#x}", f.wallet_addr),
+                    )],
+                )
+            } else {
+                static_projection_value(f.wallet_addr)
+            };
+            projection.freshness = bloom_machine_client::ProjectionFreshness::Stale;
+            let handler = make_handler()
+                .handler
+                .with_projection_reader(Arc::new(StaticProjection(projection)));
+            let account = VfsPath::parse("/alice/0/account.json").unwrap();
+            handler.lookup(&account).await.unwrap();
+            assert!(
+                handler
+                    .list(&VfsPath::parse("/alice/0").unwrap())
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|entry| entry.name == "account.json")
+            );
+            handler
+                .read(&VfsPath::parse("/alice/0/address.evm").unwrap())
+                .await
+                .unwrap();
+            let error = handler.read(&account).await.unwrap_err();
+            assert!(
+                matches!(&error, HandlerError::Backend(message) if message.contains("fresh Broker wallet projection")),
+                "{error:?}"
+            );
+            // The same boundary guards account writes, including session stop.
+            let error = handler
+                .write(
+                    &VfsPath::parse("/alice/0/sessions/enso/router/stop").unwrap(),
+                    b"y",
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&error, HandlerError::Backend(message) if message.contains("fresh Broker wallet projection")),
+                "{error:?}"
+            );
+        }
+    }
+
     /// A wallet the Broker refused to characterise (the retired-out legacy
     /// shape: no root key, no derived keys) still mounts. Its numbered tree
     /// is empty and `accounts.json` names the refusal instead of presenting
@@ -8977,7 +9128,6 @@ value = "0""#,
                     http_only: false,
                 }],
                 expected_genesis_base58: Some("test-genesis".into()),
-                allow_broadcast: false,
             })
             .unwrap(),
         );

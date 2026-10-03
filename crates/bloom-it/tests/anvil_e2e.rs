@@ -33,12 +33,11 @@ async fn fund_via_cast(rpc_url: &str, to_addr: &str, value_eth: u64) -> Result<(
 }
 
 /// Build a config.toml under `home` that points the anvil chain at our spawned
-/// node and enables broadcast.
+/// node.
 fn write_config(home_root: &std::path::Path, rpc_url: &str) -> Result<()> {
     let mut cfg = Config::local_default();
     let mut spec = ChainSpec::anvil_default();
     spec.rpc_urls = vec![rpc_url.to_string()];
-    spec.allow_broadcast = true;
     cfg.chains.insert("anvil".to_string(), spec);
     let path = home_root.join("config.toml");
     if let Some(parent) = path.parent() {

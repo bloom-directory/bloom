@@ -4,7 +4,7 @@
 # Brings up a containerized anvil and drops the user into a subshell
 # wired up to a fresh, read-only bloom home with two chains:
 #   - anvil (chain_id 31337, read-only, points at the docker anvil)
-#   - base  (chain_id 8453, broadcast disabled — read-only mainnet)
+#   - base  (chain_id 8453, mainnet reads without signing authority)
 #
 # The play home defaults to ~/.bloom-play. Set BLOOM_PLAY_HOME to
 # override. Each invocation wipes and recreates the home so previous
@@ -81,7 +81,6 @@ default_chain = "anvil"
 name = "anvil"
 chain_id = 31337
 rpc_urls = ["http://127.0.0.1:8545"]
-allow_broadcast = false
 display_name = "Anvil (local docker)"
 native_symbol = "ETH"
 native_decimals = 18
@@ -91,7 +90,6 @@ legacy_tx = false
 name = "base"
 chain_id = 8453
 rpc_urls = ["https://mainnet.base.org"]
-allow_broadcast = false
 display_name = "Base (read-only)"
 native_symbol = "ETH"
 native_decimals = 18

@@ -449,7 +449,6 @@ async fn two_active_solana_children_select_sign_and_reconcile_independently() ->
                 http_only: false,
             }],
             expected_genesis_base58: Some(genesis.clone()),
-            allow_broadcast: true,
         },
     );
     let config_path = tmp.path().join("config.toml");

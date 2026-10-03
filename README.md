@@ -66,9 +66,8 @@ Bloom gives an agent a safe wallet workspace:
 
 Bloom ships read-ready RPC defaults for major EVM networks — Ethereum,
 Base, Tempo, Robinhood Chain, Arbitrum, Optimism, Polygon, BNB Smart Chain,
-Avalanche, Gnosis, Linea, HyperEVM, and Arc — plus local Anvil. Per-chain
-broadcasting is enabled by default; set `allow_broadcast = false` on a chain to
-disable it.
+Avalanche, Gnosis, Linea, HyperEVM, and Arc — plus local Anvil.
+Broadcasting is available on every configured chain.
 Public reads, simulations, and planning work without adding API keys;
 local devnet sends require a running Anvil node.
 
@@ -137,6 +136,28 @@ For the full wallet walkthrough, read
 [`docs/AGENTIC_WALLET.md`](./docs/AGENTIC_WALLET.md) and
 [`QUICKSTART.md`](./QUICKSTART.md).
 
+## MCP server
+
+Agent clients that speak the Model Context Protocol can reach the same VFS
+commands over stdio, without a mount. It is **off by default**; enabling it is
+an explicit edit to `~/.bloom/config.toml`:
+
+```toml
+[mcp]
+enabled = true
+```
+
+```sh
+cargo run -p bloom -- mcp status   # is it on, and which socket would it use
+cargo run -p bloom -- mcp serve    # stdio; an MCP client spawns this
+```
+
+`mcp serve` adds no permissions of its own: it forwards `list`, `read`,
+`lookup`, `write`, and `write_with_lookup` to the daemon a mount would have
+used, so policy, confirmation, and audit gates apply unchanged. There is no
+network listener. See [`docs/guides/mcp.md`](./docs/guides/mcp.md) for the tool
+catalog, resource URI rules, and error codes.
+
 ## Development commands
 
 For a focused Machine change, use the package-manager-native checks:
@@ -178,8 +199,10 @@ A fresh Bloom VFS root exposes these default entries:
 - `petals/` — installed local Petal app surfaces. `bloom init` provisions the
   pinned [Polymarket](https://github.com/bloom-directory/bloom-petal-polymarket),
   [Hyperliquid](https://github.com/bloom-directory/bloom-petal-hyperliquid),
+  [Enso](https://github.com/bloom-directory/bloom-petal-enso),
   [Near Intents](https://github.com/bloom-directory/bloom-petal-near), and
-  [Tolly](https://github.com/TollyLabs/bloom-petal-tolly) releases.
+  [Feedback](https://github.com/bloom-directory/bloom-petal-feedback) releases.
+  Tolly is excluded until its explicit-account release is available.
   Read `docs/petals.md` in the VFS for the exact installed set, mount
   directories, summaries, and declared capabilities.
 - `requests/` — free and paid HTTP requests. Paid HTTP 402 challenges are
@@ -191,7 +214,7 @@ A fresh Bloom VFS root exposes these default entries:
 
 Application-specific surfaces live under `petals/`, not in Bloom core. For
 example, the Enso Petal accepts swap intents at
-`petals/enso/intents/<wallet>/new`, exposes a reviewable `plan.md`, and stages
+`petals/enso/intents/<wallet>/<index>/new`, exposes a reviewable `plan.md`, and stages
 confirmed transactions into the standard wallet outbox.
 
 See [QUICKSTART.md](./QUICKSTART.md) for an Anvil-backed walkthrough.
@@ -228,9 +251,8 @@ and example crates used by the broader Bloom runtime and examples.
 
 ## Security defaults
 
-- **Broadcast routing enabled by default.** Per-chain `allow_broadcast`
-  defaults to `true`. Signing, policy, confirmation, and Sealed Approval
-  gates still apply.
+- **Broadcast routing available on every chain.** Signing, policy, confirmation,
+  and Sealed Approval gates apply.
 - **Machine contains no wallet keys.** Custody and signing cross Machine's
   authenticated Broker edge; Signer alone owns private keys and delegated
   Petal sub-keys. The mount exposes only public projections and signatures
@@ -252,9 +274,8 @@ and example crates used by the broader Bloom runtime and examples.
 - **Per-login Machine surface.** Production Broker and Signer run as isolated
   service principals and authenticate local RPC peers. The mounted Machine
   surface remains scoped to its enrolled login.
-- **Broadcast config is not an approval boundary.** Set a chain's
-  `allow_broadcast = false` to disable broadcast on that chain. Value-moving
-  actions still pass Bloom's signing, policy, and confirmation controls.
+- **Broadcast requires authorization.** Value-moving actions pass Bloom's
+  signing, policy, and confirmation controls.
 - **Embedded indexer deferred.** Address activity, ERC-20 / ERC-721
   history, and contract source / ABI are served via Etherscan; no
   local block-by-block index yet. The selected backend is visible under

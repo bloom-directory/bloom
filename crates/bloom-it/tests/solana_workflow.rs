@@ -291,7 +291,7 @@ async fn solana_full_stage_confirm_flow() -> Result<()> {
         sign_calls: parking_lot::Mutex::new(Vec::new()),
     });
 
-    // `allow_broadcast` requires a pinned genesis hash — the config-level
+    // Broadcasting requires a pinned genesis hash — the transaction-level
     // half of the mainnet guard. Discover the local cluster's identity.
     let genesis = rpc("getGenesisHash", serde_json::json!([]))?["result"]
         .as_str()
@@ -313,7 +313,6 @@ async fn solana_full_stage_confirm_flow() -> Result<()> {
                 http_only: false,
             }],
             expected_genesis_base58: Some(genesis.clone()),
-            allow_broadcast: true,
         },
     );
     cfg.save(&tmp.path().join("config.toml"))

@@ -350,7 +350,6 @@ async fn solana_expired_blockhash_fails_closed_then_restages() -> Result<()> {
                 http_only: false,
             }],
             expected_genesis_base58: Some(genesis.clone()),
-            allow_broadcast: true,
         },
     );
     cfg.save(&tmp.path().join("config.toml"))

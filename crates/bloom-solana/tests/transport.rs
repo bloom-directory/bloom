@@ -161,7 +161,6 @@ fn spec(endpoint: &str) -> SolanaSpec {
             http_only: false,
         }],
         expected_genesis_base58: Some("G".repeat(32)),
-        allow_broadcast: false,
     }
 }
 
@@ -205,14 +204,16 @@ async fn genesis_mismatch_is_refused() {
 }
 
 #[tokio::test]
-async fn pinned_mainnet_uses_the_standard_broadcast_path() {
+async fn legacy_broadcast_false_does_not_block_pinned_mainnet_send() {
     let send_calls = Arc::new(AtomicU64::new(0));
     let genesis = bloom_proto::SOLANA_MAINNET_BETA_GENESIS_HASH;
     let endpoint = spawn_write_stub(genesis.into(), 200, send_calls.clone()).await;
     let mut spec = spec(&endpoint);
     spec.name = "solana-mainnet".into();
     spec.expected_genesis_base58 = Some(genesis.into());
-    spec.allow_broadcast = true;
+    let mut legacy = serde_json::to_value(&spec).unwrap();
+    legacy["allow_broadcast"] = serde_json::json!(false);
+    let spec: SolanaSpec = serde_json::from_value(legacy).unwrap();
 
     let client = SolanaClient::build(&spec).unwrap();
     assert_eq!(client.verify_genesis().await.unwrap(), genesis);
@@ -230,7 +231,7 @@ async fn mixed_genesis_endpoints_are_refused_before_any_send() {
     let primary = spawn_write_stub("G".repeat(32), 200, primary_sends.clone()).await;
     let backup = spawn_write_stub("X".repeat(32), 200, backup_sends.clone()).await;
     let mut spec = spec(&primary);
-    spec.allow_broadcast = true;
+
     spec.endpoints.push(bloom_proto::EndpointSpec {
         url: backup,
         weight: 50,
@@ -256,7 +257,7 @@ async fn ambiguous_send_is_attempted_once_without_failover() {
     let primary = spawn_write_stub("G".repeat(32), 503, primary_sends.clone()).await;
     let backup = spawn_write_stub("G".repeat(32), 200, backup_sends.clone()).await;
     let mut spec = spec(&primary);
-    spec.allow_broadcast = true;
+
     spec.endpoints.push(bloom_proto::EndpointSpec {
         url: backup,
         weight: 50,
@@ -447,7 +448,6 @@ fn empty_endpoint_list_is_refused() {
         name: "solana-test".into(),
         endpoints: vec![],
         expected_genesis_base58: None,
-        allow_broadcast: false,
     };
     assert!(matches!(
         SolanaClient::build(&spec),
@@ -455,12 +455,16 @@ fn empty_endpoint_list_is_refused() {
     ));
 }
 
-#[test]
-fn broadcast_requires_an_expected_genesis_hash() {
+#[tokio::test]
+async fn broadcast_requires_an_expected_genesis_hash() {
     let mut spec = spec("http://127.0.0.1:1");
     spec.expected_genesis_base58 = None;
-    spec.allow_broadcast = true;
-    let error = SolanaClient::build(&spec).err().unwrap();
+
+    let error = SolanaClient::build(&spec)
+        .unwrap()
+        .send_transaction("AA==")
+        .await
+        .unwrap_err();
     assert!(
         error
             .to_string()

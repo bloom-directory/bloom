@@ -221,7 +221,7 @@ wait_for_fixture_stage() {
   attempts=0
   while [ "$attempts" -lt 200 ]; do
     fixture_body="$(bounded_mounted_read \
-      "$(mounted /petals/triad-authority-fixture/session.json)" \
+      "$(mounted /petals/triad-authority-fixture/wallets/${registered_wallet}/0/session.json)" \
       "fixture Petal session read")"
     fixture_stage="$(printf '%s' "$fixture_body" | jq -r '
       if .stage == "key" then "key:" + (.outcome.state // "")
@@ -454,13 +454,13 @@ fixture_request="$(jq -nc \
   '{request_id:$request_id,wallet_id:$wallet_id,purpose:"fixture.payload",
     maximum_lifetime_ms:300000,preimage_hex:"6d613033",
     nonce_hex:"11111111111111111111111111111111",approval_hint:null}')"
-printf '%s\n' "$fixture_request" > "$(mounted /petals/triad-authority-fixture/session.json)" 2>/dev/null || true
+printf '%s\n' "$fixture_request" > "$(mounted /petals/triad-authority-fixture/wallets/${registered_wallet}/0/session.json)" 2>/dev/null || true
 key_record="$(wait_for_fixture_record "$request_id")"
 key_ceremony_url="$(printf '%s' "$key_record" | jq -er '.ceremony_url')"
 "$driver_bin" complete "$key_ceremony_url" replacement-auth --sign-count 3 >/dev/null
 # Custody completion is reconciled on the next identical request. It stages a
 # separate reusable signing approval; possession of a derived key is not consent.
-printf '%s\n' "$fixture_request" > "$(mounted /petals/triad-authority-fixture/session.json)" 2>/dev/null || true
+printf '%s\n' "$fixture_request" > "$(mounted /petals/triad-authority-fixture/wallets/${registered_wallet}/0/session.json)" 2>/dev/null || true
 approval_key_record="$(wait_for_fixture_record "$request_id")"
 # The old custody record can remain visible briefly through NFS.
 for attempt in $(seq 1 100); do
@@ -491,7 +491,7 @@ printf 'MA-08: signing with the scoped child through the mounted fixture Petal..
 fixture_request="$(printf '%s' "$fixture_request" | jq -cS '
   .approval_hint = ("0" * 64)
 ')"
-printf '%s\n' "$fixture_request" > "$(mounted /petals/triad-authority-fixture/session.json)" 2>/dev/null || true
+printf '%s\n' "$fixture_request" > "$(mounted /petals/triad-authority-fixture/wallets/${registered_wallet}/0/session.json)" 2>/dev/null || true
 fixture_missing_approval="$(wait_for_fixture_stage signing_failed)"
 printf '%s' "$fixture_missing_approval" | jq -e '
   .stage == "signing_failed" and (.error | contains("APPROVAL_NOT_FOUND"))
@@ -531,7 +531,7 @@ printf '%s' "$fixture_key_record_body" | jq -e \
 # Use the already accepted reusable approval after proving an explicit wrong
 # hint cannot silently fall back to it. No additional authority is minted here.
 fixture_request="$(printf '%s' "$fixture_request" | jq -cS '.approval_hint = null')"
-printf '%s\n' "$fixture_request" > "$(mounted /petals/triad-authority-fixture/session.json)"
+printf '%s\n' "$fixture_request" > "$(mounted /petals/triad-authority-fixture/wallets/${registered_wallet}/0/session.json)"
 fixture_signed="$(wait_for_fixture_stage complete)"
 printf '%s' "$fixture_signed" | jq -e '
   .stage == "complete" and

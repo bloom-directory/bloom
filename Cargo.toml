@@ -4,6 +4,7 @@ members = [
   "crates/bloom-machine",
   "crates/bloom-daemon",
   "crates/bloom-vfs",
+  "crates/bloom-mcp",
   "crates/bloom-paid-mpp",
   "crates/bloom-paid-x402",
   "crates/bloom-paid-http",
@@ -30,7 +31,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.3.0"
+version = "0.3.2"
 edition = "2024"
 rust-version = "1.86"
 license = "MIT"
@@ -73,6 +74,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 flate2 = "1"
 mpp = { version = "0.10.4", default-features = false, features = ["client", "tempo", "reqwest-rustls-tls"] }
 url = "2"
+percent-encoding = "2"
 humantime = "2"
 humantime-serde = "1"
 tempfile = "3"
@@ -117,6 +119,7 @@ bloom-solana   = { path = "crates/bloom-solana" }
 bloom-solana-tx = { path = "crates/bloom-solana-tx" }
 bloom-tx       = { path = "crates/bloom-tx" }
 bloom-vfs      = { path = "crates/bloom-vfs" }
+bloom-mcp      = { path = "crates/bloom-mcp" }
 bloom-paid-mpp = { path = "crates/bloom-paid-mpp" }
 bloom-paid-x402 = { path = "crates/bloom-paid-x402" }
 bloom-paid-http = { path = "crates/bloom-paid-http" }
@@ -131,7 +134,7 @@ bloom-petals   = { path = "crates/bloom-petals" }
 bloom-petal-contract = { git = "https://github.com/bloom-directory/petal", rev = "73c5b06a77599368fbc79fb7947a629b5b4c630e" }
 bloom-daemon   = { path = "crates/bloom-daemon" }
 bloom-update   = { path = "crates/bloom-update" }
-bloom-broker-api = { git = "https://github.com/bloom-directory/bloom-broker.git", rev = "dd2add2b9d41540521d08c77d19fb467a2d8029e" }
+bloom-broker-api = { git = "https://github.com/bloom-directory/bloom-broker.git", rev = "85e9a99985b2d103a084fb2720015f2d61220093" }
 bloom-rpc-wire = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "5db670e1b7507deabfdcf451be8b5d315c1c9d91" }
 bloom-triad-local-transport = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "5db670e1b7507deabfdcf451be8b5d315c1c9d91" }
 bloom-service-activation = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "5db670e1b7507deabfdcf451be8b5d315c1c9d91" }

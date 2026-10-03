@@ -96,29 +96,16 @@ pub struct SolanaClient {
 struct Inner {
     rpc: Arc<SolanaRpcClient>,
     expected_genesis_base58: Option<String>,
-    allow_broadcast: bool,
 }
 
 impl SolanaClient {
     /// Build a client over `spec`. Fails on an empty endpoint list.
     pub fn build(spec: &SolanaSpec) -> Result<Self, SolanaRpcError> {
-        if spec.allow_broadcast
-            && spec
-                .expected_genesis_base58
-                .as_deref()
-                .is_none_or(str::is_empty)
-        {
-            return Err(SolanaRpcError::Invalid(format!(
-                "chain '{}' enables broadcast without an expected genesis hash",
-                spec.name
-            )));
-        }
         let rpc = Arc::new(SolanaRpcClient::build(spec)?);
         Ok(Self {
             inner: Arc::new(Inner {
                 rpc,
                 expected_genesis_base58: spec.expected_genesis_base58.clone(),
-                allow_broadcast: spec.allow_broadcast,
             }),
         })
     }
@@ -128,12 +115,6 @@ impl SolanaClient {
     /// only reported.
     pub fn configured_genesis(&self) -> Option<&str> {
         self.inner.expected_genesis_base58.as_deref()
-    }
-
-    /// Whether broadcasting is enabled for this cluster (the operator's
-    /// release posture). The transaction engine refuses to submit without it.
-    pub fn allow_broadcast(&self) -> bool {
-        self.inner.allow_broadcast
     }
 
     /// The underlying transport's endpoint-health snapshot.
@@ -272,12 +253,6 @@ impl SolanaClient {
     /// endpoint; an ambiguous response is reconciled by signature and is never
     /// retried by the transport.
     pub async fn send_transaction(&self, tx_b64: &str) -> Result<String, SolanaRpcError> {
-        if !self.inner.allow_broadcast {
-            return Err(SolanaRpcError::Invalid(format!(
-                "broadcast is disabled for chain '{}'",
-                self.chain_name()
-            )));
-        }
         let expected = self
             .inner
             .expected_genesis_base58

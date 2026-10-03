@@ -280,8 +280,7 @@ echo y > /bloom/wallets/alice/0/chains/anvil/outbox/pending/$ID/cancel
 ### Mainnet broadcast
 
 The same paths work for `chain = "ethereum"`. Signing, policy, review, and
-confirmation checks still apply. Set the chain entry's
-`allow_broadcast = false` to make `confirm` fail before broadcast.
+confirmation checks apply on every configured chain.
 
 ## 3. Simulate
 
@@ -390,7 +389,7 @@ cat /bloom/simulate/$ID/simulation.json   # return_data_hex carries the balance
 NFT intents are not simulated through `/simulate` — they go through
 the wallet outbox stage path. Enso routes are not simulated through
 `/simulate` either; the installed Enso Petal exposes its own simulation under
-`/petals/enso/intents/<wallet>/<session>/simulation.json`.
+`/petals/enso/intents/<wallet>/0/<session>/simulation.json`.
 
 ## 4. Watch
 

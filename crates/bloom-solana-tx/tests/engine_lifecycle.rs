@@ -385,7 +385,6 @@ fn client(endpoint: &str) -> SolanaClient {
             http_only: false,
         }],
         expected_genesis_base58: Some("test-genesis".into()),
-        allow_broadcast: true,
     })
     .unwrap()
 }
@@ -1252,7 +1251,7 @@ async fn tampered_private_signature_is_reverified_before_rpc_submission() {
 }
 
 #[tokio::test]
-async fn broadcast_refuses_when_operator_disables_it() {
+async fn broadcast_requires_genesis_before_outbox_or_network_effects() {
     let endpoint = spawn_node().await;
     let dir = tempfile::tempdir().unwrap();
     let outbox = SolanaOutbox::new(dir.path().join("outbox")).unwrap();
@@ -1260,7 +1259,7 @@ async fn broadcast_refuses_when_operator_disables_it() {
     let signer =
         SolanaTransferSigner::from_catalog(MachineBrokerClient::new(broker.clone()), &catalog())
             .unwrap();
-    let mut spec = SolanaSpec {
+    let spec = SolanaSpec {
         name: "solana-devnet".into(),
         endpoints: vec![EndpointSpec {
             url: endpoint,
@@ -1270,23 +1269,17 @@ async fn broadcast_refuses_when_operator_disables_it() {
             http_only: false,
         }],
         expected_genesis_base58: None,
-        allow_broadcast: false,
     };
-    spec.allow_broadcast = false;
     let client = SolanaClient::build(&spec).unwrap();
     let engine = SolanaTransferEngine::new(outbox, client, signer, "solana-devnet");
 
-    // The broadcast gate is the operator's release posture: it fires before
-    // any outbox lookup, so even a valid path is refused.
+    // Missing cluster identity is rejected before touching the outbox.
     let err = engine
         .broadcast("wallet", "0001-00001", 1_000)
         .await
         .unwrap_err();
     assert!(
-        matches!(
-            err,
-            bloom_solana_tx::engine::EngineError::BroadcastDisabled(_)
-        ),
+        err.to_string().contains("without an expected genesis hash"),
         "{err}"
     );
 }

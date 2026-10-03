@@ -134,7 +134,6 @@ async fn spawn_anvil(no_mining: bool) -> Result<AnvilGuard> {
 fn anvil_chain_spec(rpc_url: &str) -> ChainSpec {
     let mut spec = ChainSpec::anvil_default();
     spec.rpc_urls = vec![rpc_url.to_string()];
-    spec.allow_broadcast = true;
     spec
 }
 

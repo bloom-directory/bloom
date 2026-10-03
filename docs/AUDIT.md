@@ -153,7 +153,7 @@ Verified end-to-end via `tests/docker/run.sh --mempool`.
 
 | Requirement | Status | Artifact |
 |---|---|---|
-| Per-chain `allow_broadcast` gate | shipped | Defaults to `true`; the daemon refuses to send when explicitly set to false. |
+| Broadcast authorization | shipped | Every chain supports broadcast; signing, policy, confirmation, and Sealed Approval checks govern sends. |
 | Machine-local encrypted keystore | removed | Signer owns encrypted custody; Machine stores authenticated public wallet projections only. |
 | Hash-chained audit log | shipped | `crates/bloom-proto/src/audit.rs::AuditLog`; wired into the VFS router. |
 | Stage-confirm only write mode for txs | shipped | `tx_engine.rs::confirm` requires non-empty body. |

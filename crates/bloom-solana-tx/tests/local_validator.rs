@@ -189,7 +189,6 @@ async fn request_airdrop(
         name: "solana-test-airdrop".into(),
         endpoints: vec![endpoint.clone()],
         expected_genesis_base58: None,
-        allow_broadcast: false,
     })?;
     rpc.call("requestAirdrop", &serde_json::json!([account, lamports]))
         .await
@@ -211,7 +210,6 @@ async fn local_validator_lifecycle_stage_sign_broadcast_reconcile() {
         name: "solana-local-discovery".into(),
         endpoints: vec![endpoint_spec.clone()],
         expected_genesis_base58: None,
-        allow_broadcast: false,
     })
     .unwrap();
     let genesis = discovery_client
@@ -223,7 +221,6 @@ async fn local_validator_lifecycle_stage_sign_broadcast_reconcile() {
         name: "solana-local".into(),
         endpoints: vec![endpoint_spec],
         expected_genesis_base58: Some(genesis),
-        allow_broadcast: true,
     })
     .unwrap();
     client.get_health().await.expect("validator is healthy");

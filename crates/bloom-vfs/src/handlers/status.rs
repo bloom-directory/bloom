@@ -455,11 +455,10 @@ impl StatusHandler {
             None
         };
 
-        // Eligibility means an attempt is permitted — configuration allows
-        // broadcast and the live cluster identity checked out on every
+        // Eligibility means an attempt is permitted — the live cluster
+        // identity checked out on every
         // endpoint. It is never a prediction that a transaction will land.
-        let broadcast_enabled = client.allow_broadcast();
-        let broadcast_eligible = broadcast_enabled && all_verified == Some(true);
+        let broadcast_eligible = all_verified == Some(true);
 
         Ok(serde_json::json!({
             "schema": "bloom.solana_chain_status.v1",
@@ -473,7 +472,7 @@ impl StatusHandler {
                 "all_endpoints_verified": all_verified,
             },
             "broadcast": {
-                "enabled": broadcast_enabled,
+                "enabled": true,
                 "eligible": broadcast_eligible,
             },
             "endpoints": client
@@ -2251,7 +2250,6 @@ mod tests {
                     http_only: false,
                 }],
                 expected_genesis_base58: pin.map(str::to_owned),
-                allow_broadcast: pin.is_some(),
             })
             .unwrap(),
         );
@@ -2326,7 +2324,7 @@ mod tests {
             v["genesis"]["all_endpoints_verified"].is_null(),
             "unpinned genesis must be null, not true"
         );
-        assert_eq!(v["broadcast"]["enabled"], false);
+        assert_eq!(v["broadcast"]["enabled"], true);
         assert_eq!(v["broadcast"]["eligible"], false);
     }
 

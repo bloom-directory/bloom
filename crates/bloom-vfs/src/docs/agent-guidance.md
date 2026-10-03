@@ -54,9 +54,9 @@ whether an earlier operation completed or whether retrying a write is safe.
   mean fresh owner approval is required; look for `approval_challenge.json` in
   the same action directory. Read-only or unsupported write targets can also
   deny access, so do not assume every denial starts a ceremony.
-- **Operation not permitted** — policy or a broadcast gate refused the
-  operation. Inspect `policy_check.json` where exposed and the chain's broadcast
-  configuration and status. Repeating the write does not remove the gate.
+- **Operation not permitted** — policy or a transaction safety check refused the
+  operation. Inspect `policy_check.json` where exposed and the chain's status.
+  Repeating the write does not remove the gate.
 - **Input/output error** — a backend or I/O operation failed. Inspect action
   state and diagnostics before considering a retry. For a possibly submitted
   transaction, reconcile by its recorded hash or signature; never blindly
@@ -67,6 +67,27 @@ whether the transfer moved to `sent/` or `failed/` before assuming the write
 was lost. Listing the wallet's outbox states is cheaper than re-issuing the
 write, and re-issuing a broadened version of it is how a correct action becomes
 an incorrect one.
+
+## Reporting Bloom problems
+
+If the Feedback Petal is installed, read `petals/feedback/README.md` for its
+submission format and receipt paths. You may proactively submit one concise,
+sanitized report for a distinct Bloom failure, misleading documentation, or
+missing capability that blocked the task, unless the user has disabled
+reporting. Mention a submitted report briefly when relevant; do not report
+every retry or successful operation.
+
+Write a minimal description and reproduction with placeholders. Never attach
+logs, transcripts, credentials, raw configuration, identifying local paths,
+wallet addresses, balances, transaction details, or other private user content
+automatically. Include contact details only when supplied for feedback. If the
+problem cannot be described without sensitive material, omit that material or
+ask before including it. Installation and discovery do not send feedback.
+
+Submit using `petals/feedback/submit.json`, then inspect
+`petals/feedback/receipts/<submission_id>.json`. A timeout has an unknown
+outcome: retry the same submission ID and payload rather than generating a new
+report. A received receipt confirms storage, not staff review or resolution.
 
 ## Wallet and account identity
 
@@ -87,7 +108,7 @@ is that account: `account.json` shows its EVM and Solana keys (path, address,
 fingerprint, lifecycle), and `wallets/<wallet>/<n>/chains/<chain>/...` is that
 account's chain view. A number is the derivation path itself (EVM
 `m/44'/60'/0'/0/<n>`, Solana `m/44'/501'/<n>'/0'`), so it is stable across
-restarts and reorderings. A legacy or imported single-key wallet is account 0.
+restarts and reorderings. A single-key wallet is account 0.
 Outbox entries under an account are only the ones its key staged; another
 account's entry is not found there. Staging works through the numbered path
 (`wallets/<wallet>/<n>/chains/<chain>/outbox/new.tx`), which fixes the sender
@@ -145,11 +166,11 @@ for account 0, use `ls wallets/<wallet>/0/chains`. Solana chains use the
 inspect `outbox/{pending,sent,failed}/<id>/`) — there is no separate
 Solana-specific surface to look for.
 
-Newly generated Bloom configuration includes `solana-mainnet` for reads, with
-broadcasting disabled. Existing configurations keep their configured networks;
-devnet and local validators are opt-in. If an owner enables mainnet broadcasting,
-wallet policy and the approval ceremony still apply. Discover the available
-networks with `ls wallets/<wallet>/0/chains` rather than assuming a network exists.
+Broadcasting is available on every configured EVM and Solana chain. Devnet and
+local validators are opt-in. The default `solana-mainnet` configuration includes
+the mainnet genesis pin; Solana transaction submission requires a valid pinned
+genesis. Wallet policy and the approval ceremony apply. Discover networks with
+`ls wallets/<wallet>/0/chains`.
 
 ### Reading Solana balances
 
@@ -189,7 +210,7 @@ cat status/chains/<solana-chain>/connected
 
 `status.json` still renders when calls fail — the failed fields are `null`
 and `errors` says why. `broadcast.eligible` means an attempt is *permitted*
-(broadcast enabled, genesis verified on every endpoint); it does not promise
+(genesis verified on every endpoint); it does not promise
 a transaction will land.
 
 ## Creating a wallet
@@ -279,8 +300,12 @@ walkthrough in `docs/examples.md`.
 
 ## Petals and paid requests
 
-Installed applications live under `petals/<name>/`. Discover the installed
-package and follow its local instructions.
+Installed application documents and public routes live under `petals/<name>/`.
+Account-dependent routes explicitly select a wallet and index, for example
+`petals/enso/intents/<wallet>/<index>/new`. Follow each package's route tree;
+there is no common synthetic wallet root. Account state is isolated; explicitly
+declared service settings are shared across accounts. Keep every follow-up in
+the selected account, including core outbox confirmation paths.
 
 Paid HTTP operations live under `requests/`. They are actions, not ordinary
 reads: inspect the request plan, selected payment protocol, maximum amount,
