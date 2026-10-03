@@ -38,6 +38,7 @@ pub const FUNDER_PRIV_KEY: &str =
 /// it does not expose or emulate the retired hash-only PetalHost path.
 pub struct ExactSigningBrokerFixture {
     active: AtomicBool,
+    unrestricted_test_destinations: AtomicBool,
     signer: alloy_signer_local::PrivateKeySigner,
     key_ref: KeyRef,
     requests: parking_lot::Mutex<Vec<MachineBrokerRequest>>,
@@ -49,11 +50,19 @@ impl ExactSigningBrokerFixture {
             wallet_id: wallet_id.clone(),
             maximum_approval_lifetime_ms: 3_600_000,
             allowed_petal_packages: Vec::new(),
-            allowed_destinations: vec![PolicyDestination {
-                chain: Token::new("anvil").unwrap(),
-                destination: "0x70997970C51812dc3A010C7d01b50e0d17dc79C8".into(),
-            }],
+            allowed_destinations: if self.unrestricted_test_destinations.load(Ordering::SeqCst) {
+                vec![PolicyDestination {
+                    chain: Token::new("evm-31337").unwrap(),
+                    destination: "exact".into(),
+                }]
+            } else {
+                vec![PolicyDestination {
+                    chain: Token::new("anvil").unwrap(),
+                    destination: "0x70997970C51812dc3A010C7d01b50e0d17dc79C8".into(),
+                }]
+            },
             required_verifiers: Vec::new(),
+            clear_signing: None,
         })
         .unwrap();
         let policy_digest = Digest32::from_bytes(Sha256::digest(&canonical_policy).into());
@@ -91,8 +100,20 @@ impl ExactSigningBrokerFixture {
         }
     }
 
+    /// Test-only policy fixture for arbitrary local-chain deployment destinations.
+    pub fn allow_test_deployments(&self) {
+        self.unrestricted_test_destinations
+            .store(true, Ordering::SeqCst);
+    }
+
     pub fn activate(&self) {
         self.active.store(true, Ordering::SeqCst);
+    }
+
+    /// Put the owner back in the loop, so the next signing request reports
+    /// approval_required again.
+    pub fn deactivate(&self) {
+        self.active.store(false, Ordering::SeqCst);
     }
 
     pub fn requests(&self) -> Vec<MachineBrokerRequest> {
@@ -211,6 +232,7 @@ pub fn exact_signing_broker(
         .map_err(|error| anyhow!("parse exact-signing fixture key: {error}"))?;
     let fixture = Arc::new(ExactSigningBrokerFixture {
         active: AtomicBool::new(false),
+        unrestricted_test_destinations: AtomicBool::new(false),
         signer,
         key_ref: KeyRef {
             backend: Token::new("local").unwrap(),

@@ -9,6 +9,7 @@
 mod commands {
     pub mod qr;
 }
+mod deploy;
 mod github_source;
 mod macos_runtime;
 mod petal_provisioning;
@@ -23,7 +24,23 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicI32;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-static UPDATE_EXIT_CODE: AtomicI32 = AtomicI32::new(0);
+/// A non-failure exit code a command wants `main` to return.
+///
+/// `run` reports success or an error, but some commands finish correctly
+/// without the thing the caller was waiting for having happened -- a confirm
+/// whose approval ceremony is still open, or a self-update that asks to be
+/// re-run. A script needs to tell those from a completed action, and both are
+/// wrong to report as a failure.
+static EXIT_CODE_OVERRIDE: AtomicI32 = AtomicI32::new(0);
+
+/// `bloom wallet confirm` ran, and the transaction is not signed or broadcast:
+/// an owner still has to complete the ceremony. Distinct from 0 (broadcast
+/// recorded, or cancel accepted) and from 1 (the command failed).
+const EXIT_APPROVAL_PENDING: i32 = 3;
+
+/// `bloom wallet confirm` ran and no broadcast result is recorded yet, so the
+/// outcome is genuinely unknown rather than pending on a person.
+const EXIT_RESULT_UNKNOWN: i32 = 4;
 
 use anyhow::{Context, Result, bail};
 use base64::Engine as _;
@@ -1385,6 +1402,16 @@ async fn execute_machine_command(
             emit_machine_mutation("audit_reconcile", Some(&correlation_id), "committed");
             format!("{output}\n")
         }
+        MachineCommand::DeploymentRpc {
+            wallet,
+            chain,
+            method,
+            params,
+        } => serde_json::to_string(
+            &daemon
+                .deployment_rpc(&wallet, &chain, &method, params)
+                .await,
+        )?,
         MachineCommand::WalletList => {
             let mut output = String::new();
             for projection in daemon.wallet_projections.list_wallets().await? {
@@ -2385,6 +2412,8 @@ enum ServeInternal {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
+    /// Deploy EVM contracts through Foundry or Hardhat using a Bloom wallet.
+    Deploy(deploy::DeployArgs),
     /// Show daemon status (chains configured, version, uptime).
     Status,
     /// Inspect or explicitly reconcile the Machine-owned audit journal.
@@ -2703,6 +2732,12 @@ enum WalletCmd {
         intent: Option<String>,
     },
     /// Submit confirmation of a staged transaction through the Machine VFS.
+    ///
+    /// Exit codes: 0 the broadcast is recorded, or a cancel was accepted;
+    /// 3 an owner still has to complete the approval ceremony, so nothing is
+    /// signed; 4 confirmed with no broadcast result recorded yet; 1 the
+    /// command failed. A script must not read 0 as "the transaction went out"
+    /// without checking which.
     Confirm {
         wallet: String,
         chain: String,
@@ -2809,7 +2844,7 @@ async fn main() -> ExitCode {
 
     match run(cli).await {
         Ok(()) => {
-            let code = UPDATE_EXIT_CODE.load(std::sync::atomic::Ordering::SeqCst);
+            let code = EXIT_CODE_OVERRIDE.load(std::sync::atomic::Ordering::SeqCst);
             if code != 0 {
                 return ExitCode::from(code as u8);
             }
@@ -3084,6 +3119,102 @@ fn print_vfs_stat_json(path: &str, entry: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
+enum ConfirmProjection {
+    Ceremony { url: String, expires_at_ms: u128 },
+    Broadcast { tx_hash: String },
+}
+
+fn unix_now_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+/// Read what a wallet confirm achieved from the durable outbox entry: a
+/// pending approval ceremony (with its URL) or an already-broadcast
+/// transaction hash. Returns None when neither projection is readable.
+async fn confirm_projection(
+    endpoint: &ResolvedEndpoint,
+    wallet: &str,
+    chain: &str,
+    id: &str,
+) -> Option<ConfirmProjection> {
+    let ceremony_path =
+        format!("/wallets/{wallet}/0/chains/{chain}/outbox/pending/{id}/ceremony.json");
+    if let Ok(bytes) = ipc_read(endpoint, &ceremony_path).await {
+        let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+        let url = value
+            .get("ceremony_url")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let expires_at_ms = value
+            .get("ceremony_expires_at_ms")
+            .and_then(|field| {
+                field
+                    .as_u64()
+                    .or_else(|| field.as_str().and_then(|s| s.parse::<u64>().ok()))
+            })
+            .map(u128::from);
+        if let Some(url) = url
+            && !url.trim().is_empty()
+            && expires_at_ms.is_some_and(|expires| expires > unix_now_ms())
+        {
+            return Some(ConfirmProjection::Ceremony {
+                url,
+                expires_at_ms: expires_at_ms.unwrap_or(0),
+            });
+        }
+    }
+    let sent_path = format!("/wallets/{wallet}/0/chains/{chain}/outbox/sent/{id}/intent.json");
+    if let Ok(bytes) = ipc_read(endpoint, &sent_path).await {
+        let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+        if let Some(tx_hash) = value.get("tx_hash").and_then(serde_json::Value::as_str)
+            && !tx_hash.trim().is_empty()
+        {
+            return Some(ConfirmProjection::Broadcast {
+                tx_hash: tx_hash.to_string(),
+            });
+        }
+    }
+    None
+}
+
+const IPC_ERR_NOT_FOUND: i32 = -32004;
+const IPC_ERR_PERMISSION_DENIED: i32 = -32007;
+
+/// Like [`try_ipc`] but preserves the JSON-RPC error code so callers can
+/// distinguish expected states (approval pending, already broadcast) from
+/// unrelated backend failures.
+async fn try_ipc_coded(
+    client: &IpcClient,
+    endpoint: &ResolvedEndpoint,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, (i32, std::io::Error)> {
+    match client.call(method, params).await {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            let code = match &error {
+                IpcClientError::Rpc(rpc) => rpc.rpc_code,
+                _ => 0,
+            };
+            Err((code, map_ipc_client_error(endpoint, error)))
+        }
+    }
+}
+
+fn confirm_context_note(projection: &ConfirmProjection) -> Option<String> {
+    match projection {
+        ConfirmProjection::Ceremony { url, .. } => Some(format!(
+            "an unexpired approval ceremony exists at {url}; it belongs to this entry"
+        )),
+        ConfirmProjection::Broadcast { tx_hash } => Some(format!(
+            "this entry was already broadcast as {tx_hash}; the failed request may be a repeat"
+        )),
+    }
+}
+
 async fn ipc_read(endpoint: &ResolvedEndpoint, path: &str) -> Result<Vec<u8>> {
     let mut streamed = Vec::new();
     let reply = try_ipc_streaming(
@@ -3152,7 +3283,7 @@ async fn call_machine_command(endpoint: &ResolvedEndpoint, command: MachineComma
     std::io::Write::write_all(&mut std::io::stdout(), output.stdout.as_bytes())?;
     std::io::Write::write_all(&mut std::io::stderr(), output.stderr.as_bytes())?;
     if output.exit_code != 0 {
-        UPDATE_EXIT_CODE.store(output.exit_code, std::sync::atomic::Ordering::SeqCst);
+        EXIT_CODE_OVERRIDE.store(output.exit_code, std::sync::atomic::Ordering::SeqCst);
     }
     Ok(())
 }
@@ -3372,6 +3503,7 @@ async fn run(cli: Cli) -> Result<()> {
             println!("agent setup: https://bloom.directory/SKILL.md");
             Ok(())
         }
+        Cmd::Deploy(args) => deploy::run(client_endpoint, args).await,
         Cmd::Status => call_machine_command(&client_endpoint, MachineCommand::Status).await,
         Cmd::Audit(command) => {
             let command = match command {
@@ -3754,9 +3886,10 @@ async fn run(cli: Cli) -> Result<()> {
             text,
         }) => {
             let path = format!("/wallets/{wallet}/0/chains/{chain}/outbox/pending/{id}/confirm");
+            let is_cancel = text.trim().eq_ignore_ascii_case("cancel");
             let body = text.into_bytes();
             let client = IpcClient::new(&client_endpoint.socket);
-            try_ipc(
+            let outcome = try_ipc_coded(
                 &client,
                 &client_endpoint,
                 "write",
@@ -3765,10 +3898,81 @@ async fn run(cli: Cli) -> Result<()> {
                     "bytes_b64": B64.encode(&body),
                 }),
             )
-            .await
-            .with_context(|| format!("ipc wallet confirm via {}", client_endpoint.display))?;
+            .await;
             debug!(endpoint = %client_endpoint.display, "cli.wallet.confirm.via_ipc");
-            Ok(())
+            // The write's RPC status alone misleads: an approval ceremony
+            // surfaces as "permission denied" and a repeat after broadcast as
+            // "not found". Only those two expected outcomes are translated
+            // into the durable entry's truth; every other failure surfaces,
+            // with the entry's projection offered as context only.
+            let projection = confirm_projection(&client_endpoint, &wallet, &chain, &id).await;
+            match (outcome, &projection) {
+                (Err((code, _)), Some(ConfirmProjection::Ceremony { url, expires_at_ms }))
+                    if code == IPC_ERR_PERMISSION_DENIED =>
+                {
+                    let remaining = expires_at_ms.saturating_sub(unix_now_ms());
+                    println!("Approval required: open {url}");
+                    println!(
+                        "Ceremony expires in {}s; re-run this confirm after approving.",
+                        remaining / 1000
+                    );
+                    // Nothing is signed or broadcast yet, so exit 0 would tell
+                    // a script the transaction went out.
+                    EXIT_CODE_OVERRIDE
+                        .store(EXIT_APPROVAL_PENDING, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                }
+                (Err((code, _)), Some(ConfirmProjection::Broadcast { tx_hash }))
+                    if code == IPC_ERR_NOT_FOUND =>
+                {
+                    println!("Already broadcast: {tx_hash}");
+                    println!("Entry: wallets/{wallet}/0/chains/{chain}/outbox/sent/{id}");
+                    Ok(())
+                }
+                (Err((_, error)), Some(context)) => {
+                    if let Some(note) = confirm_context_note(context) {
+                        eprintln!("Note: {note}");
+                    }
+                    Err(anyhow::Error::new(error).context(format!(
+                        "ipc wallet confirm via {}",
+                        client_endpoint.display
+                    )))
+                }
+                (Err((_, error)), None) => Err(anyhow::Error::new(error).context(format!(
+                    "ipc wallet confirm via {}",
+                    client_endpoint.display
+                ))),
+                (Ok(_), Some(ConfirmProjection::Ceremony { url, expires_at_ms })) => {
+                    let remaining = expires_at_ms.saturating_sub(unix_now_ms());
+                    println!("Approval required: open {url}");
+                    println!(
+                        "Ceremony expires in {}s; re-run this confirm after approving.",
+                        remaining / 1000
+                    );
+                    EXIT_CODE_OVERRIDE
+                        .store(EXIT_APPROVAL_PENDING, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                }
+                (Ok(_), Some(ConfirmProjection::Broadcast { tx_hash })) => {
+                    println!("Broadcast: {tx_hash}");
+                    println!("Entry: wallets/{wallet}/0/chains/{chain}/outbox/sent/{id}");
+                    Ok(())
+                }
+                (Ok(_), None) => {
+                    if is_cancel {
+                        println!("Discarded entry {id}.");
+                    } else {
+                        println!(
+                            "Confirmed; no broadcast result recorded yet. Inspect wallets/{wallet}/0/chains/{chain}/outbox/"
+                        );
+                        // An accepted cancel is done; an unrecorded broadcast
+                        // is not, and a script must be able to tell.
+                        EXIT_CODE_OVERRIDE
+                            .store(EXIT_RESULT_UNKNOWN, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    Ok(())
+                }
+            }
         }
         Cmd::Wallet(WalletCmd::Cancel {
             wallet,
