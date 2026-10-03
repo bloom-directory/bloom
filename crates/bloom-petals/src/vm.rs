@@ -156,6 +156,9 @@ pub struct RunOptions {
     pub key_derive_maximum_lifetime_ms: Option<u64>,
     pub http_response_cap: usize,
     pub private_store_root: Option<PathBuf>,
+    /// Do not provision a private-store root even when dispatching an installed
+    /// package. Used for remotely triggered, zero-authority evaluators.
+    pub disable_private_store: bool,
     /// Package-wide root used only for explicitly declared shared keys.
     pub private_store_shared_root: Option<PathBuf>,
     /// Selected wallet account for a per-account private store.
@@ -183,6 +186,7 @@ impl Default for RunOptions {
             key_derive_maximum_lifetime_ms: None,
             http_response_cap: DEFAULT_HTTP_RESPONSE_CAP,
             private_store_root: None,
+            disable_private_store: false,
             private_store_shared_root: None,
             private_store_account: None,
             deterministic_env: false,

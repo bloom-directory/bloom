@@ -13,7 +13,7 @@ For the bounded mounted passkey workflow, see
 
 | Tool | Use |
 |---|---|
-| [Rust via rustup](./rust-toolchain.toml) | Workspace builds and tests |
+| Rust 1.94 or newer | Workspace builds and tests; Iroh 1.1 requires 1.91 and the resolved OP/Tempo stack requires 1.94 |
 | Foundry (`anvil`, `cast`, `forge`) | Local EVM integration tests |
 | `jq` | Developer harnesses and shell tests |
 | Agave `solana-test-validator` v3.0.0 | Optional validator-backed Solana tests |

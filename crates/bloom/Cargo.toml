@@ -43,6 +43,7 @@ bloom-vfs.workspace = true
 bloom-mcp.workspace = true
 bloom-update.workspace = true
 bloom-petals.workspace = true
+bloom-peer.workspace = true
 ed25519-dalek.workspace = true
 anyhow.workspace = true
 clap.workspace = true

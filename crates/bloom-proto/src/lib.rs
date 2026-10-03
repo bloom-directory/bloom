@@ -35,7 +35,8 @@ pub use chain::{
     default_endpoint_weight,
 };
 pub use config::{
-    Backend, BackendsConfig, Config, ConfigError, EtherscanConfig, McpConfig, MempoolChainConfig,
+    Backend, BackendsConfig, Config, ConfigError, CoordinationConfig, CoordinationEvaluatorConfig,
+    CoordinationIrohConfig, CoordinationIrohMode, EtherscanConfig, McpConfig, MempoolChainConfig,
     PrivateRpcChainConfig,
 };
 pub use defi_policy::{DefiPolicy, DefiRouteCtx, ReceiverClass, evaluate_defi_route};
