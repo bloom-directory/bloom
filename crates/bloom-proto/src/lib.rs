@@ -16,6 +16,7 @@ pub mod config;
 pub mod defi_policy;
 pub mod home;
 pub mod intent;
+pub mod petal_destinations;
 pub mod petal_identity;
 pub mod plan;
 pub mod policy;
