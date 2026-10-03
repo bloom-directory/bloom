@@ -1,0 +1,10 @@
+# Relay pins earlier signed releases installed. The installer replaces an
+# installed pin only when it is the current release's value or listed here;
+# anything else (an edited pin, or a newer release's pin) fails installation.
+#
+#   ca <SHA-256 of the installed relay-control-ca.pem bytes>
+#   receipt <key hex> [<key hex> ...]   (one pinned set, in order)
+
+# Until 2026-10: ISRG Root X1 only, and the relay's local receipt key.
+ca 22b557a27055b33606b6559f37703928d3e4ad79f110b407d04986e1843543d1
+receipt 8ec0159f9c4afface3cf3889ee106973bf0ce43063ca1a39ab745f7de1a32a5d

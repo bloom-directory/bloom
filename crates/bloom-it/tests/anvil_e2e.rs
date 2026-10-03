@@ -175,63 +175,82 @@ async fn anvil_full_stage_confirm_flow() -> Result<()> {
         "initial confirm unexpectedly succeeded without Sealed Approval"
     );
 
-    let ceremony_path = VfsPath::parse(&format!(
-        "/wallets/alice/0/chains/anvil/outbox/pending/{pending_id}/ceremony.json"
+    let challenge_path = VfsPath::parse(&format!(
+        "/wallets/alice/0/chains/anvil/outbox/pending/{pending_id}/approval_challenge.json"
     ))
     .unwrap();
-    let ceremony_bytes = daemon
+    let challenge_bytes = daemon
         .vfs
-        .read(&ceremony_path)
+        .read(&challenge_path)
         .await
-        .map_err(|e| anyhow!("read ceremony.json: {e}"))?;
-    let ceremony: serde_json::Value =
-        serde_json::from_slice(&ceremony_bytes).context("ceremony.json must be valid JSON")?;
+        .map_err(|e| anyhow!("read approval_challenge.json: {e}"))?;
+    let challenge: serde_json::Value = serde_json::from_slice(&challenge_bytes)
+        .context("approval_challenge.json must be valid JSON")?;
     assert!(
-        ceremony
+        challenge
             .get("ceremony_url")
             .and_then(|v| v.as_str())
             .is_some_and(|url| url == "http://localhost:18734/ceremony/exact-signing-test-secret"),
-        "ceremony.json omitted the Broker launch URL: {ceremony}"
+        "approval_challenge.json omitted the Broker launch URL: {challenge}"
     );
     assert!(
-        ceremony
-            .get("approval_operation_id")
+        challenge
+            .get("approval_id")
             .and_then(|v| v.as_str())
             .is_some_and(|id| id.len() == 64),
-        "ceremony.json omitted durable operation identity: {ceremony}"
+        "approval_challenge.json omitted the approval identity: {challenge}"
+    );
+    assert_eq!(
+        challenge.get("retry_path").and_then(|v| v.as_str()),
+        Some(format!("wallets/alice/0/chains/anvil/outbox/pending/{pending_id}/confirm").as_str()),
+        "approval_challenge.json must name the exact retry path: {challenge}"
+    );
+    // The engine's private signing state is not part of the mount.
+    let private_path = VfsPath::parse(&format!(
+        "/wallets/alice/0/chains/anvil/outbox/pending/{pending_id}/ceremony.json"
+    ))
+    .unwrap();
+    assert!(
+        daemon.vfs.read(&private_path).await.is_err(),
+        "private signing state must not be mounted"
     );
 
     fixture.activate();
+    // The owner's approval shows up on the next read, before any retry.
+    let approved: serde_json::Value = serde_json::from_slice(
+        &daemon
+            .vfs
+            .read(&challenge_path)
+            .await
+            .map_err(|e| anyhow!("re-read approval_challenge.json: {e}"))?,
+    )?;
+    assert_eq!(
+        approved.get("state").and_then(|v| v.as_str()),
+        Some("active"),
+        "approval_challenge.json did not report the completed approval: {approved}"
+    );
+    assert!(
+        approved
+            .get("ceremony_url")
+            .is_some_and(serde_json::Value::is_null),
+        "an active approval must not advertise its spent launch URL: {approved}"
+    );
     daemon
         .vfs
         .write(&confirm_path, confirm_body.as_bytes())
         .await
         .map_err(|e| anyhow!("Broker-backed confirm retry write: {e}"))?;
-    let terminal: serde_json::Value = serde_json::from_slice(
-        &daemon
-            .vfs
-            .read(
-                &VfsPath::parse(&format!(
-                    "/wallets/alice/0/chains/anvil/outbox/sent/{pending_id}/ceremony.json"
-                ))
-                .unwrap(),
-            )
-            .await
-            .map_err(|e| anyhow!("read terminal ceremony.json: {e}"))?,
-    )?;
-    assert!(
-        terminal
-            .get("ceremony_url")
-            .is_some_and(serde_json::Value::is_null),
-        "terminal signing projection retained launch URL: {terminal}"
-    );
-    assert!(
-        terminal
-            .get("sign_dispatched")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
-        "terminal signing projection omitted durable dispatch marker: {terminal}"
-    );
+    // A sent entry advertises no challenge and never a spent launch URL.
+    for name in ["approval_challenge.json", "ceremony.json"] {
+        let sent_path = VfsPath::parse(&format!(
+            "/wallets/alice/0/chains/anvil/outbox/sent/{pending_id}/{name}"
+        ))
+        .unwrap();
+        assert!(
+            daemon.vfs.read(&sent_path).await.is_err(),
+            "sent entry must not project {name}"
+        );
+    }
 
     // 9. Verify the entry now lives in `sent/` with a tx_hash artefact.
     let sent_dir = VfsPath::parse("/wallets/alice/0/chains/anvil/outbox/sent").unwrap();
@@ -362,12 +381,12 @@ async fn anvil_confirm_refuses_nonce_gap() -> Result<()> {
         err.contains("nonce gap"),
         "expected a nonce-gap refusal, got: {err}"
     );
-    let ceremony_path = VfsPath::parse(&format!(
-        "/wallets/alice/0/chains/anvil/outbox/pending/{pending_id}/ceremony.json"
+    let challenge_path = VfsPath::parse(&format!(
+        "/wallets/alice/0/chains/anvil/outbox/pending/{pending_id}/approval_challenge.json"
     ))
     .unwrap();
     assert!(
-        daemon.vfs.read(&ceremony_path).await.is_err(),
+        daemon.vfs.read(&challenge_path).await.is_err(),
         "nonce-gap denial must not create a signing ceremony"
     );
 

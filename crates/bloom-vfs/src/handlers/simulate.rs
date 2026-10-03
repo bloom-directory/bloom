@@ -330,11 +330,6 @@ fn build_tx_request(
                 "NFT intents are simulated via the selected account's outbox stage path (see wallets/<w>/<n>/chains/<c>/outbox/new.tx)".into(),
             ));
         }
-        RawIntentBody::Enso { .. } => {
-            return Err(HandlerError::Unsupported(
-                "Enso intents are not simulated through /simulate (use defi/intents/)".into(),
-            ));
-        }
     };
 
     let data_bytes = decode_hex(&data_hex)?;
@@ -480,10 +475,6 @@ fn render_sim_plan(session: &SimSession) -> String {
                 s.push_str(&format!("Contract:{}\n", contract));
                 s.push_str(&format!("Operator:{}\n", operator));
                 s.push_str(&format!("Approved:{}\n", approved));
-            }
-            RawIntentBody::Enso { intent } => {
-                s.push_str("Kind:   enso\n");
-                s.push_str(&format!("Intent: {}\n", intent));
             }
         }
     }

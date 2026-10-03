@@ -272,23 +272,28 @@ confirm_path="${pending_dir}/${pending_id}/confirm"
 if vwrite "$confirm_path" "y" >/dev/null 2>&1; then
   die "confirm succeeded before the approval ceremony completed"
 fi
-ceremony="$(wait_for_file "pending ceremony projection" "${pending_dir}/${pending_id}/ceremony.json")"
-approval_ceremony_url="$(printf '%s' "$ceremony" | jq -er '.ceremony_url')"
-printf '%s' "$ceremony" | jq -e '.approval_operation_id | test("^[0-9a-f]{64}$")' >/dev/null ||
-  die "pending ceremony.json omitted a durable approval operation id: $ceremony"
+challenge="$(wait_for_file "pending approval challenge" "${pending_dir}/${pending_id}/approval_challenge.json")"
+approval_ceremony_url="$(printf '%s' "$challenge" | jq -er '.ceremony_url')"
+printf '%s' "$challenge" | jq -e '(.approval_id | test("^[0-9a-f]{64}$")) and .state == "awaiting_ceremony"' >/dev/null ||
+  die "pending approval challenge omitted its approval id or live state: $challenge"
 
 # 10. Complete the approval ceremony and confirm on the exact retry.
 "$driver_bin" complete "$approval_ceremony_url" "$AUTH_SEED" --sign-count 3 >/dev/null ||
   die "completing the Sealed Approval ceremony failed"
+challenge_now="$(vcat "${pending_dir}/${pending_id}/approval_challenge.json")"
+printf '%s' "$challenge_now" | jq -e '.state == "active" and .ceremony_url == null' >/dev/null ||
+  die "approval_challenge.json did not report the completed approval before the retry: $challenge_now"
 vwrite "$confirm_path" "y" || die "post-ceremony confirm retry failed"
 
 # 11. The entry must reconcile into sent/ with a transaction hash.
 sent_dir="/wallets/${wallet_id}/0/chains/anvil/outbox/sent"
 tx_hash="$(wait_for_file "broadcast transaction hash" "${sent_dir}/${pending_id}/tx_hash" | tr -d '[:space:]')"
 printf '%s' "$tx_hash" | grep -Eq '^0x[0-9a-f]{64}$' || die "malformed tx_hash: $tx_hash"
-terminal_ceremony="$(vcat "${sent_dir}/${pending_id}/ceremony.json")"
-printf '%s' "$terminal_ceremony" | jq -e '.sign_dispatched == true and .ceremony_url == null' >/dev/null ||
-  die "terminal signing projection is not terminal: $terminal_ceremony"
+for name in approval_challenge.json ceremony.json; do
+  if vcat "${sent_dir}/${pending_id}/${name}" >/dev/null 2>&1; then
+    die "sent entry must not project ${name}"
+  fi
+done
 sent_intent="$(vcat "${sent_dir}/${pending_id}/intent.json")"
 printf '%s' "$sent_intent" | jq -e --arg hash "$tx_hash" '
   .status == "sent" and .tx_hash == $hash
