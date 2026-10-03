@@ -8,10 +8,12 @@ use bloom_broker_api::{
     CredentialPublic, CryptoSuite, CustodyResult, DecimalU64, Digest32, KeyPublic, KeyRef, KeySpec,
     MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService, OperationId,
     PolicyCommitReceipt, PolicyUpdatePrepareResponse, ProtocolError, ProtocolErrorCode,
-    ServiceFuture, SignedPolicySnapshot, Token, WalletPublic, WalletRequest,
+    ServiceFuture, SignedPolicySnapshot, Token, WalletAccountsPublic, WalletPublic, WalletRequest,
+    WalletSeedProfile,
 };
 use bloom_machine_client::{
-    CachedWalletProjectionReader, FileProjectionStore, MachineBrokerClient, WalletProjectionReader,
+    CachedWalletProjectionReader, FileProjectionStore, MachineBrokerClient, PetalEligibility,
+    WalletProjectionReader, policy_with_package,
 };
 use bloom_proto::{AddressBook, HomeDir, HomeWritePermit};
 use bloom_tx::{outbox::Outbox, tx_engine::TxEngine};
@@ -81,7 +83,7 @@ impl BrokerFixture {
         WalletPublic {
             wallet_id: Token::new("alice").unwrap(),
             wallet_kind: Token::new("passkey").unwrap(),
-            root_key_ref: self.key_ref(),
+            root_key_ref: Some(self.key_ref()),
             key_refs: vec![self.key_ref()],
             policy_version: policy.version,
             policy_digest: policy.policy_digest,
@@ -133,6 +135,17 @@ impl MachineBrokerService for BrokerFixture {
                         CredentialPublic,
                     >::new(
                     )))
+                }
+                MachineBrokerRequest::WalletAccounts(WalletRequest { wallet_id })
+                    if wallet_id.as_str() == "alice" =>
+                {
+                    Ok(MachineBrokerResponse::WalletAccounts(
+                        WalletAccountsPublic {
+                            wallet_id,
+                            seed_profile: WalletSeedProfile::Bip39MulticurveV1,
+                            accounts: Vec::new(),
+                        },
+                    ))
                 }
                 MachineBrokerRequest::PolicyRead(_) => {
                     let snapshot = if self.complete.load(Ordering::SeqCst)
@@ -190,6 +203,20 @@ impl MachineBrokerService for BrokerFixture {
                         },
                     ))
                 }
+                MachineBrokerRequest::CeremonyCancel(request) => {
+                    *self.ceremony_state_override.lock() = Some(CeremonyState::Cancelled);
+                    Ok(MachineBrokerResponse::CeremonyCancel(
+                        CeremonyPublicStatus {
+                            ceremony_id: Digest32::from_bytes([7; 32]),
+                            ceremony_kind: CeremonyKind::PolicyUpdate,
+                            operation_id: OperationId::new(request.id.as_str().to_owned()).unwrap(),
+                            state: CeremonyState::Cancelled,
+                            expires_at_ms: DecimalU64::new(u64::MAX),
+                            ceremony_url: None,
+                            receipt_digest: None,
+                        },
+                    ))
+                }
                 MachineBrokerRequest::CustodyResult(request) => {
                     Ok(MachineBrokerResponse::CustodyResult(CustodyResult {
                         ceremony_kind: CeremonyKind::PolicyUpdate,
@@ -232,8 +259,14 @@ fn policy(maximum_approval_lifetime_ms: u64) -> CanonicalWalletPolicy {
         wallet_id: Token::new("alice").unwrap(),
         maximum_approval_lifetime_ms,
         allowed_petal_packages: Vec::new(),
-        allowed_destinations: Vec::new(),
-        required_verifiers: Vec::new(),
+        allowed_destinations: vec![bloom_broker_api::PolicyDestination {
+            chain: Token::new("ethereum").unwrap(),
+            destination: "0x0000000000000000000000000000000000000001".into(),
+        }],
+        required_verifiers: vec![bloom_broker_api::RequiredVerifier {
+            verifier_id: Token::new("human").unwrap(),
+            verifier_digest: Digest32::from_bytes([4; 32]),
+        }],
     }
 }
 
@@ -290,7 +323,7 @@ async fn signer_wallet_is_visible_in_vfs_without_a_legacy_keystore_record() {
     assert!(root.iter().any(|entry| entry.name == "alice"));
     assert_eq!(
         handler
-            .read(&VfsPath::parse("/alice/address").unwrap())
+            .read(&VfsPath::parse("/alice/0/address.evm").unwrap())
             .await
             .unwrap(),
         b"0x0000000000000000000000000000000000000001\n"
@@ -342,17 +375,38 @@ async fn signer_wallet_is_visible_in_vfs_without_a_legacy_keystore_record() {
         stale_projections,
         temp.path().join("stale-machine-policy-projections"),
     );
-    let addresses: serde_json::Value = serde_json::from_slice(
+    let error = stale_handler
+        .read(&VfsPath::parse("/alice/0/account.json").unwrap())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, HandlerError::Backend(message) if message.contains("SERVICE_UNAVAILABLE"))
+    );
+    stale_handler
+        .lookup(&VfsPath::parse("/alice/0/account.json").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        stale_handler
+            .read(&VfsPath::parse("/alice/0/address.evm").unwrap())
+            .await
+            .unwrap(),
+        b"0x0000000000000000000000000000000000000001\n"
+    );
+    let projection: serde_json::Value = serde_json::from_slice(
         &stale_handler
-            .read(&VfsPath::parse("/alice/addresses.json").unwrap())
+            .read(&VfsPath::parse("/alice/projection.json").unwrap())
             .await
             .unwrap(),
     )
     .unwrap();
-    assert_eq!(addresses["freshness"], "stale");
-    assert_eq!(addresses["policy_version"], "1");
-    assert_eq!(addresses["policy_digest"], expected_policy_digest.as_str());
-    assert_eq!(addresses["wallet_revocation_epoch"], "0");
+    assert_eq!(projection["freshness"], "stale");
+    assert_eq!(projection["wallet"]["policy_version"], "1");
+    assert_eq!(
+        projection["wallet"]["policy_digest"],
+        expected_policy_digest.as_str()
+    );
+    assert_eq!(projection["wallet"]["wallet_revocation_epoch"], "0");
     assert_eq!(
         stale_handler
             .read(&VfsPath::parse("/alice/policy.json").unwrap())
@@ -533,9 +587,85 @@ async fn vfs_policy_write_prepares_then_commits_only_with_completed_custody_rece
             MachineBrokerRequest::WalletListPublic(_),
             MachineBrokerRequest::KeyListPublic(_),
             MachineBrokerRequest::CredentialListPublic(_),
-            MachineBrokerRequest::PolicyRead(_)
+            MachineBrokerRequest::PolicyRead(_),
+            MachineBrokerRequest::WalletAccounts(_)
         ]
     ));
+}
+
+#[tokio::test]
+async fn vfs_policy_cancel_terminates_staged_ceremony_before_recovery_clears_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = broker_fixture(false);
+    let service: Arc<dyn MachineBrokerService> = fixture.clone();
+    let home = HomeDir::at(temp.path().join("home"));
+    let handler = WalletsHandler::new(
+        bloom_evm::ChainRegistry::default(),
+        TxEngine::new(Outbox::new(temp.path().join("outbox")).unwrap(), 60_000),
+        AddressBook::default(),
+        projection_reader(
+            temp.path().join("cache/cancel-wallets.json"),
+            Some(MachineBrokerClient::new(service.clone())),
+        ),
+        temp.path().join("machine-policy-projections"),
+    )
+    .with_broker(Some(MachineBrokerClient::new(service)))
+    .with_home_write_permit(Arc::new(HomeWritePermit::acquire(&home).unwrap()));
+    let proposed = serde_json::to_vec_pretty(&policy(120_000)).unwrap();
+
+    assert!(matches!(
+        handler
+            .write(&VfsPath::parse("alice/policy.json").unwrap(), &proposed)
+            .await,
+        Err(HandlerError::PermissionDenied)
+    ));
+    let operation_id = fixture.state.lock().operation_id.clone().unwrap();
+    let action_path = format!("alice/policy-updates/pending/{operation_id}");
+    let entries = handler
+        .list(&VfsPath::parse(&action_path).unwrap())
+        .await
+        .unwrap();
+    assert!(entries.iter().any(|entry| entry.name == "cancel"));
+    handler
+        .write(
+            &VfsPath::parse(&format!("{action_path}/cancel")).unwrap(),
+            b"cancel\n",
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        handler.lookup(&VfsPath::parse(&action_path).unwrap()).await,
+        Err(HandlerError::NotFound(_))
+    ));
+    let failed: serde_json::Value = serde_json::from_slice(
+        &handler
+            .read(
+                &VfsPath::parse(&format!(
+                    "alice/policy-updates/failed/{operation_id}/status.json"
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(failed["status"], "failed");
+    assert_eq!(failed["ceremony_state"], "CANCELLED");
+    assert_eq!(
+        handler
+            .read(&VfsPath::parse("alice/policy.json").unwrap())
+            .await
+            .unwrap(),
+        fixture.baseline.canonical_policy.decode()
+    );
+    assert!(
+        fixture
+            .requests
+            .lock()
+            .iter()
+            .any(|request| matches!(request, MachineBrokerRequest::CeremonyCancel(_)))
+    );
 }
 
 #[tokio::test]
@@ -647,4 +777,90 @@ async fn vfs_policy_non_actionable_ceremony_states_never_expose_launch_data() {
         assert!(projection["ceremony_url"].is_null(), "{state:?}");
         assert!(projection["ceremony_expires_at_ms"].is_null(), "{state:?}");
     }
+}
+
+#[test]
+fn package_eligibility_preserves_all_existing_policy_restrictions() {
+    let before = policy(60_000);
+    let hash = Digest32::from_bytes([7; 32]);
+    let after = policy_with_package(&before, &hash);
+    let mut expected = before.clone();
+    expected.allowed_petal_packages.push(hash.clone());
+    assert_eq!(after, expected);
+    assert_eq!(policy_with_package(&after, &hash), after);
+}
+
+fn eligibility_handler(temp: &std::path::Path, fixture: Arc<BrokerFixture>) -> WalletsHandler {
+    let broker = MachineBrokerClient::new(fixture);
+    WalletsHandler::new(
+        bloom_evm::ChainRegistry::default(),
+        TxEngine::new(Outbox::new(temp.join("outbox")).unwrap(), 60_000),
+        AddressBook::default(),
+        projection_reader(temp.join("wallets.json"), Some(broker.clone())),
+        temp.join("machine-policy-projections"),
+    )
+    .with_broker(Some(broker))
+    .with_home_write_permit(Arc::new(
+        HomeWritePermit::acquire(&HomeDir::at(temp.join("home"))).unwrap(),
+    ))
+}
+
+#[tokio::test]
+async fn petal_eligibility_recovers_lost_prepare_and_commits_after_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = broker_fixture(true);
+    let hash = Digest32::from_bytes([7; 32]);
+    let handler = eligibility_handler(temp.path(), fixture.clone());
+    assert!(
+        matches!(handler.ensure_petal_eligibility("alice", &hash).await,
+        Err(HandlerError::Backend(message)) if message.contains("SERVICE_UNAVAILABLE"))
+    );
+    let operation = fixture.state.lock().operation_id.clone().unwrap();
+    let PetalEligibility::AwaitingPolicyApproval(pending) = handler
+        .ensure_petal_eligibility("alice", &hash)
+        .await
+        .unwrap()
+    else {
+        panic!("owner approval must be required");
+    };
+    assert_eq!(pending.operation_id, operation);
+    assert!(pending.includes_requested_package);
+    assert!(pending.prepare.is_some());
+    drop(handler);
+    fixture.complete.store(true, Ordering::SeqCst);
+    let restarted = eligibility_handler(temp.path(), fixture.clone());
+    let PetalEligibility::Allowed(snapshot) = restarted
+        .ensure_petal_eligibility("alice", &hash)
+        .await
+        .unwrap()
+    else {
+        panic!("completed ceremony must commit automatically");
+    };
+    assert_eq!(
+        snapshot.canonical_policy.decode(),
+        serde_jcs::to_vec(&policy_with_package(&policy(60_000), &hash)).unwrap()
+    );
+    assert!(
+        temp.path()
+            .join("machine-policy-projections/alice/policy-updates/confirmed")
+            .join(operation.as_str())
+            .exists()
+    );
+    let requests = fixture.requests.lock();
+    let prepares: Vec<_> = requests
+        .iter()
+        .filter_map(|r| match r {
+            MachineBrokerRequest::PolicyValidateUpdate(r) => Some(r),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(prepares.len(), 2);
+    assert_eq!(prepares[0], prepares[1]);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| matches!(r, MachineBrokerRequest::PolicyCommitUpdate(_)))
+            .count(),
+        1
+    );
 }

@@ -6,6 +6,7 @@ import asyncio
 import fcntl
 import os
 import signal
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Coroutine, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -169,23 +170,21 @@ def run_eval(
     agent_name: str,
     *,
     harbor_runner: HarborRunner = run_harbor_job,
-) -> None:
+    acquire_lock: bool = True,
+    phase_timings: dict[str, float] | None = None,
+) -> Any:
     """Execute one provisioned eval and guarantee outer cleanup."""
     agent = _agent_spec(agent_name)
     definition.lock_path.parent.mkdir(parents=True, exist_ok=True)
+    timings = phase_timings if phase_timings is not None else {}
 
-    with definition.lock_path.open("a+") as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as error:
-            raise EvalError(
-                f"another {definition.name} eval holds {definition.lock_path}"
-            ) from error
-
+    def execute() -> Any:
+        started = time.monotonic()
         definition.preflight()
-        context: EvalRunContext | None = None
+        timings["preflight_seconds"] = time.monotonic() - started
         provision_started = False
         run_error: BaseException | None = None
+        result: Any | None = None
         previous_term_handler = signal.getsignal(signal.SIGTERM)
 
         def terminate(_signum: int, _frame: object) -> None:
@@ -194,17 +193,24 @@ def run_eval(
         signal.signal(signal.SIGTERM, terminate)
         try:
             provision_started = True
+            started = time.monotonic()
             context = definition.provision(agent_name)
+            timings["authority_provisioning_seconds"] = time.monotonic() - started
+            started = time.monotonic()
             result = asyncio.run(harbor_runner(context, agent))
+            timings["harbor_seconds"] = time.monotonic() - started
             definition.validate_result(result)
         except BaseException as error:  # noqa: BLE001 -- cleanup must cover interrupts
             run_error = error
         finally:
             signal.signal(signal.SIGTERM, previous_term_handler)
             if provision_started:
+                started = time.monotonic()
                 try:
                     definition.cleanup()
+                    timings["session_cleanup_seconds"] = time.monotonic() - started
                 except BaseException as cleanup_error:
+                    timings["session_cleanup_seconds"] = time.monotonic() - started
                     if run_error is not None:
                         raise EvalError(
                             f"evaluation failed ({run_error}); cleanup also failed: "
@@ -214,3 +220,17 @@ def run_eval(
 
         if run_error is not None:
             raise run_error
+        return result
+
+    if not acquire_lock:
+        return execute()
+
+    with definition.lock_path.open("a+") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise EvalError(
+                f"another {definition.name} eval holds {definition.lock_path}"
+            ) from error
+
+        return execute()

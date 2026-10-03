@@ -1,0 +1,9 @@
+[Unit]
+Description=Start Bloom security services for login UID %i when its session is authenticated
+
+[Path]
+PathExists=/run/bloom/%i/session/session.sock
+Unit=bloom-broker@%i.service
+
+[Install]
+WantedBy=multi-user.target

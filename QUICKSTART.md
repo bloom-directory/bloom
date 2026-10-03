@@ -21,6 +21,18 @@ This launcher runs the real Machine, Broker, and Signer protocols separately.
 It does not claim production UID isolation, but it preserves the authority
 boundaries and genuine passkey flow.
 
+Check out `bloom`, `bloom-broker`, and `bloom-signer` side by side. Create the
+canonical Machine config once; the launcher copies it into the isolated
+developer root:
+
+```sh
+cargo run -p bloom -- init
+```
+
+For a no-mount or fast Machine edit loop, use the services-only workflow in
+[`DEVELOPMENT.md`](./DEVELOPMENT.md). The mounted workflow below additionally
+requires the platform mount prerequisites described there.
+
 ```sh
 mkdir -p ~/.bloom/triad-dev/machine-home \
   /tmp/bloom-triad-mount /tmp/bloom-triad-logs
@@ -60,8 +72,8 @@ the passkey ceremony and wait for `ceremony_state` to become `COMPLETED`, then
 inspect the public wallet projection:
 
 ```sh
-cat wallets/alice/address
-cat wallets/alice/public_key
+cat wallets/alice/0/address.evm
+cat wallets/alice/0/public_key
 cat wallets/alice/policy.json
 ```
 
@@ -76,12 +88,12 @@ For an Anvil example, first run `anvil --port 8545` in another terminal.
 ```sh
 printf '%s\n' \
   'send 0.01 eth to 0x70997970C51812dc3A010C7d01b50e0d17dc79C8 on anvil' \
-  > wallets/alice/chains/anvil/outbox/new.tx
+  > wallets/alice/0/chains/anvil/outbox/new.tx
 
-ls wallets/alice/chains/anvil/outbox/pending
-cat wallets/alice/chains/anvil/outbox/pending/<id>/plan.md
+ls wallets/alice/0/chains/anvil/outbox/pending
+cat wallets/alice/0/chains/anvil/outbox/pending/<id>/plan.md
 printf 'confirm\n' \
-  > wallets/alice/chains/anvil/outbox/pending/<id>/confirm
+  > wallets/alice/0/chains/anvil/outbox/pending/<id>/confirm
 ```
 
 When fresh owner approval is required, the confirm returns permission denied
@@ -91,7 +103,7 @@ review, and expiry, complete the Broker ceremony, then retry the same confirm:
 ```sh
 cat outbox/pending/<action_id>/approval_challenge.json
 printf 'confirm\n' \
-  > wallets/alice/chains/anvil/outbox/pending/<id>/confirm
+  > wallets/alice/0/chains/anvil/outbox/pending/<id>/confirm
 ```
 
 Broker authorizes the sealed payload and asks Signer to sign. Machine receives

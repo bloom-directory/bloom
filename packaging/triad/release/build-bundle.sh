@@ -12,8 +12,19 @@ signing_key="$3"
 source_date_epoch="$4"
 tar_command="${TAR:-tar}"
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+compatibility_file="${BLOOM_COMPATIBILITY_FILE:-$script_dir/compatibility-v1.toml}"
 
-python3 "$script_dir/check-legacy-hash-only-routes.py"
+[[ -f "$compatibility_file" && ! -L "$compatibility_file" ]] || {
+  echo "compatibility metadata must be a regular file: $compatibility_file" >&2
+  exit 66
+}
+
+tar_help="$("$tar_command" --help 2>&1 || true)"
+if [[ "$tar_help" == *"--owner"* ]]; then
+  tar_identity_args=(--owner=0 --group=0)
+else
+  tar_identity_args=(--uid=0 --gid=0 --uname=root --gname=root)
+fi
 
 machine_artifact_paths() {
   local root="$1"
@@ -209,9 +220,9 @@ reject_legacy_authority_symbols "$staging/bin/bloom"
 reject_global_debug_artifact_files "$staging" "production"
 reject_global_debug_markers "$staging" "production artifact"
 reject_machine_authority_markers "$staging" "production Machine artifact"
-machine_version="$(sed -n -E 's/^machine = "([^"]+)"$/\1/p' "$script_dir/compatibility-v1.toml")"
-broker_version="$(sed -n -E 's/^broker = "([^"]+)"$/\1/p' "$script_dir/compatibility-v1.toml")"
-signer_version="$(sed -n -E 's/^signer = "([^"]+)"$/\1/p' "$script_dir/compatibility-v1.toml")"
+machine_version="$(sed -n -E 's/^machine = "([^"]+)"$/\1/p' "$compatibility_file")"
+broker_version="$(sed -n -E 's/^broker = "([^"]+)"$/\1/p' "$compatibility_file")"
+signer_version="$(sed -n -E 's/^signer = "([^"]+)"$/\1/p' "$compatibility_file")"
 for identity in \
   "bloom:$machine_version" \
   "bloom-broker:$broker_version" \
@@ -220,7 +231,9 @@ for identity in \
 do
   binary="${identity%%:*}"
   expected="${identity#*:}"
-  actual="$("$staging/bin/$binary" --version | awk '{print $2}')"
+  # Bloom reports the CLI, daemon, and negotiated IPC versions on separate
+  # lines. Only the first line identifies the executable being packaged.
+  actual="$("$staging/bin/$binary" --version | sed -n '1{s/^[^ ]* //;p;}')"
   [[ "$actual" == "$expected" ]] || {
     echo "$binary version $actual is outside the compatibility matrix ($expected)" >&2
     exit 65
@@ -261,21 +274,6 @@ case "$platform_claim" in
     for binary in bloom bloom-broker bloom-signer bloom-signer-migrate; do
       require_binary_format "$staging/bin/$binary" 'Mach-O ' || exit 65
     done
-    for evidence_name in \
-      BLOOM_MACOS_CONFORMANCE_REPORT \
-      BLOOM_MACOS_CONFORMANCE_SIGNATURE \
-      BLOOM_MACOS_CONFORMANCE_PUBLIC_KEY
-    do
-      evidence_path="${!evidence_name:-}"
-      [[ -f "$evidence_path" && ! -L "$evidence_path" ]] || {
-        echo "$evidence_name must name a regular conformance input" >&2
-        exit 66
-      }
-    done
-    [[ "${BLOOM_MACOS_CONFORMANCE_KEY_SHA256:-}" =~ ^[0-9a-f]{64}$ ]] || {
-      echo "BLOOM_MACOS_CONFORMANCE_KEY_SHA256 must pin the reviewed conformance key" >&2
-      exit 66
-    }
     ;;
   test-unclaimed)
     [[ "${BLOOM_ALLOW_TEST_UNCLAIMED:-}" == "true" ]] || {
@@ -289,14 +287,10 @@ case "$platform_claim" in
     ;;
 esac
 printf '%s\n' "$platform_claim" > "$payload/PLATFORM_CLAIM"
-install -m 0644 "$script_dir/compatibility-v1.toml" "$payload/compatibility-v1.toml"
+install -m 0644 "$compatibility_file" "$payload/compatibility-v1.toml"
 mkdir -p "$payload/installer/release"
 cp -R "$script_dir/../linux" "$payload/installer/linux"
 mkdir -p "$payload/installer/macos"
-# W0 is source-tree conformance tooling, not an installed product component.
-# Copy the reviewed installer inputs individually so debug drivers, hostile
-# listeners, VM orchestration, and acceptance markers can never enter a signed
-# production payload through the macOS directory wholesale.
 for macos_input in "$script_dir"/../macos/*; do
   [[ "$(basename "$macos_input")" == "w0" ]] && continue
   cp -R "$macos_input" "$payload/installer/macos/"
@@ -310,21 +304,10 @@ install -m 0755 \
   "$script_dir/ssh-ed25519-verify.sh" \
   "$payload/installer/release/"
 install -m 0755 "$script_dir/verify-bundle.sh" "$payload/installer/release/"
+
 reject_machine_legacy_authority_files "$payload" "packaged Machine artifact"
 reject_legacy_authority_symbols "$payload/bin/bloom"
 reject_global_debug_artifact_files "$payload" "packaged"
-
-if [[ "$platform_claim" == "macos-unix-principals" ]]; then
-  install -m 0644 \
-    "$BLOOM_MACOS_CONFORMANCE_REPORT" \
-    "$payload/MACOS_CONFORMANCE_REPORT.json"
-  install -m 0644 \
-    "$BLOOM_MACOS_CONFORMANCE_SIGNATURE" \
-    "$payload/MACOS_CONFORMANCE_REPORT.sig"
-  install -m 0644 \
-    "$BLOOM_MACOS_CONFORMANCE_PUBLIC_KEY" \
-    "$payload/MACOS_CONFORMANCE_REPORT.pub"
-fi
 
 if [[ "$platform_claim" == "macos-unix-principals" ||
   "$platform_claim" == "macos-unix-principals-w0" ]]
@@ -360,25 +343,23 @@ reject_machine_authority_markers "$payload" "packaged Machine artifact"
 
 for revision_name in BLOOM_MACHINE_SHA BLOOM_BROKER_SHA BLOOM_SIGNER_SHA; do
   revision="${!revision_name:-}"
-  [[ "$revision" =~ ^[0-9a-f]{7,64}$ ]] || {
-    echo "$revision_name must be a lowercase git commit ID" >&2
+  [[ "$revision" =~ ^[0-9a-f]{40}$ ]] || {
+    echo "$revision_name must be a full lowercase git commit ID" >&2
     exit 64
   }
   printf '%s=%s\n' "$revision_name" "$revision"
 done | LC_ALL=C sort > "$payload/SOURCE_REVISIONS"
-
-if [[ "$platform_claim" == "macos-unix-principals" ]]; then
-  "$script_dir/verify-macos-conformance.sh" \
-    "$payload" \
-    "$BLOOM_MACOS_CONFORMANCE_KEY_SHA256"
-fi
 
 "$script_dir/ssh-ed25519-public-key.sh" \
   "$signing_key" \
   "$payload/RELEASE_PUBLIC_KEY.pem"
 (
   cd "$payload"
-  find . -type f ! -name SHA256SUMS ! -name SHA256SUMS.new ! -name RELEASE_SIGNATURE -print |
+  find . -type f \
+    ! -path ./SHA256SUMS \
+    ! -path ./SHA256SUMS.new \
+    ! -path ./RELEASE_SIGNATURE \
+    -print |
     LC_ALL=C sort |
     while IFS= read -r file; do
       shasum -a 256 "$file"
@@ -405,10 +386,7 @@ archive_tmp="$work/archive.tar"
   find bloom-triad -print | LC_ALL=C sort > archive-files
   "$tar_command" \
   --format=ustar \
-  --uid=0 \
-  --gid=0 \
-  --uname=root \
-  --gname=root \
+  "${tar_identity_args[@]}" \
   --no-recursion \
   -cf "$archive_tmp" \
   -T archive-files

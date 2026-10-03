@@ -54,6 +54,27 @@ use crate::meta::Capability;
 use crate::policy::{NetPolicy, StoreNamespacePolicy};
 use crate::private_store::PrivateStore;
 
+fn open_selected_private_store(
+    root: PathBuf,
+    account: Option<&(String, u32)>,
+    policy: Option<&StoreNamespacePolicy>,
+    shared_root: Option<&PathBuf>,
+) -> Result<PrivateStore, crate::host::HostError> {
+    let store = match account {
+        Some((wallet, number)) => PrivateStore::open_account(root, wallet, *number),
+        None => PrivateStore::open(root),
+    }?;
+    let store = match shared_root {
+        Some(root) => store.with_shared_root(root.clone()),
+        None => store,
+    };
+    Ok(store.with_shared_keys(
+        policy
+            .into_iter()
+            .flat_map(|p| p.shared_keys().iter().cloned()),
+    ))
+}
+
 const DEFAULT_FUEL: u64 = 100_000_000;
 const DEFAULT_MEMORY_PAGES: u32 = 256; // 16 MiB (64 KiB pages).
 const STDOUT_CAP: usize = 1 << 20; // 1 MiB.
@@ -74,6 +95,11 @@ pub struct StoreData {
     petal_hash: String,
     net_policy: NetPolicy,
     sign_context: Option<PetalRouteContext>,
+    key_derive_scope_declared: bool,
+    key_derive_allowed_routes: Vec<String>,
+    key_derive_operation_classes: Vec<String>,
+    key_derive_allowed_crypto_suites: Vec<String>,
+    key_derive_maximum_lifetime_ms: Option<u64>,
     sign_intents: Option<BTreeSet<String>>,
     store_namespaces: Option<StoreNamespacePolicy>,
     http_response_cap: usize,
@@ -116,11 +142,27 @@ pub struct RunOptions {
     /// Optional private-store namespace policy. `None` preserves legacy/direct
     /// VM behavior; Petal package dispatch sets this from `[store]`.
     pub store_namespaces: Option<StoreNamespacePolicy>,
+    /// Whether this route has a complete manifest-declared key scope. False
+    /// preserves the compatibility path for packages created before scopes.
+    pub key_derive_scope_declared: bool,
+    /// Manifest-declared route IDs resolved from canonical patterns at package
+    /// validation time.
+    pub key_derive_allowed_routes: Vec<String>,
+    /// Manifest-declared upper bound for delegated operation classes.
+    pub key_derive_operation_classes: Vec<String>,
+    /// Manifest-declared upper bound for derived-key crypto suites.
+    pub key_derive_allowed_crypto_suites: Vec<String>,
+    /// Manifest-declared upper bound for derived-key lifetime.
+    pub key_derive_maximum_lifetime_ms: Option<u64>,
     pub http_response_cap: usize,
     pub private_store_root: Option<PathBuf>,
     /// Do not provision a private-store root even when dispatching an installed
     /// package. Used for remotely triggered, zero-authority evaluators.
     pub disable_private_store: bool,
+    /// Package-wide root used only for explicitly declared shared keys.
+    pub private_store_shared_root: Option<PathBuf>,
+    /// Selected wallet account for a per-account private store.
+    pub private_store_account: Option<(String, u32)>,
     /// Force mediated env helpers to deterministic values for install-time checks.
     pub deterministic_env: bool,
     /// Daemon-owned settings exposed read-only through `bloom:env`.
@@ -137,9 +179,16 @@ impl Default for RunOptions {
             net_policy: None,
             sign_intents: None,
             store_namespaces: None,
+            key_derive_scope_declared: false,
+            key_derive_allowed_routes: Vec::new(),
+            key_derive_operation_classes: Vec::new(),
+            key_derive_allowed_crypto_suites: Vec::new(),
+            key_derive_maximum_lifetime_ms: None,
             http_response_cap: DEFAULT_HTTP_RESPONSE_CAP,
             private_store_root: None,
             disable_private_store: false,
+            private_store_shared_root: None,
+            private_store_account: None,
             deterministic_env: false,
             runtime_settings: BTreeMap::new(),
             endpoint_bindings: BTreeMap::new(),
@@ -265,6 +314,11 @@ impl PetalVm {
                 petal_hash: petal_hash.to_string(),
                 net_policy: opts.net_policy.clone().unwrap_or_else(NetPolicy::deny_all),
                 sign_context: None,
+                key_derive_scope_declared: opts.key_derive_scope_declared,
+                key_derive_allowed_routes: opts.key_derive_allowed_routes.clone(),
+                key_derive_operation_classes: opts.key_derive_operation_classes.clone(),
+                key_derive_allowed_crypto_suites: opts.key_derive_allowed_crypto_suites.clone(),
+                key_derive_maximum_lifetime_ms: opts.key_derive_maximum_lifetime_ms,
                 sign_intents: opts.sign_intents.clone(),
                 store_namespaces: opts.store_namespaces.clone(),
                 http_response_cap: opts.http_response_cap,
@@ -273,8 +327,13 @@ impl PetalVm {
                 limiter: MemLimiter::new(opts.memory_pages),
                 private_store: match opts.private_store_root.clone() {
                     Some(root) => Some(
-                        PrivateStore::open(root)
-                            .map_err(|e| PetalError::vm(format!("private store open: {e}")))?,
+                        open_selected_private_store(
+                            root,
+                            opts.private_store_account.as_ref(),
+                            opts.store_namespaces.as_ref(),
+                            opts.private_store_shared_root.as_ref(),
+                        )
+                        .map_err(|e| PetalError::vm(format!("private store open: {e}")))?,
                     ),
                     None => None,
                 },
@@ -339,6 +398,11 @@ impl PetalVm {
                         .iter()
                         .find_map(|(name, value)| (name == "actor").then(|| value.clone())),
                 }),
+                key_derive_scope_declared: opts.key_derive_scope_declared,
+                key_derive_allowed_routes: opts.key_derive_allowed_routes.clone(),
+                key_derive_operation_classes: opts.key_derive_operation_classes.clone(),
+                key_derive_allowed_crypto_suites: opts.key_derive_allowed_crypto_suites.clone(),
+                key_derive_maximum_lifetime_ms: opts.key_derive_maximum_lifetime_ms,
                 sign_intents: opts.sign_intents.clone(),
                 store_namespaces: opts.store_namespaces.clone(),
                 http_response_cap: opts.http_response_cap,
@@ -347,8 +411,13 @@ impl PetalVm {
                 limiter: MemLimiter::new(opts.memory_pages),
                 private_store: match opts.private_store_root.clone() {
                     Some(root) => Some(
-                        PrivateStore::open(root)
-                            .map_err(|e| PetalError::vm(format!("private store open: {e}")))?,
+                        open_selected_private_store(
+                            root,
+                            opts.private_store_account.as_ref(),
+                            opts.store_namespaces.as_ref(),
+                            opts.private_store_shared_root.as_ref(),
+                        )
+                        .map_err(|e| PetalError::vm(format!("private store open: {e}")))?,
                     ),
                     None => None,
                 },
@@ -412,6 +481,11 @@ impl PetalVm {
                 petal_hash: petal_hash.to_string(),
                 net_policy: opts.net_policy.clone().unwrap_or_else(NetPolicy::deny_all),
                 sign_context: None,
+                key_derive_scope_declared: opts.key_derive_scope_declared,
+                key_derive_allowed_routes: opts.key_derive_allowed_routes.clone(),
+                key_derive_operation_classes: opts.key_derive_operation_classes.clone(),
+                key_derive_allowed_crypto_suites: opts.key_derive_allowed_crypto_suites.clone(),
+                key_derive_maximum_lifetime_ms: opts.key_derive_maximum_lifetime_ms,
                 sign_intents: opts.sign_intents.clone(),
                 store_namespaces: opts.store_namespaces.clone(),
                 http_response_cap: opts.http_response_cap,
@@ -420,8 +494,13 @@ impl PetalVm {
                 limiter: MemLimiter::new(opts.memory_pages),
                 private_store: match opts.private_store_root.clone() {
                     Some(root) => Some(
-                        PrivateStore::open(root)
-                            .map_err(|e| PetalError::vm(format!("private store open: {e}")))?,
+                        open_selected_private_store(
+                            root,
+                            opts.private_store_account.as_ref(),
+                            opts.store_namespaces.as_ref(),
+                            opts.private_store_shared_root.as_ref(),
+                        )
+                        .map_err(|e| PetalError::vm(format!("private store open: {e}")))?,
                     ),
                     None => None,
                 },
@@ -1406,6 +1485,61 @@ async fn component_sign_hashes(
     set_component_result(results, component_host_err(legacy_signing_unsupported()))
 }
 
+fn apply_manifest_key_scope(
+    data: &StoreData,
+    request: &mut PetalKeyRequest,
+) -> Result<(), HostError> {
+    if !data.key_derive_scope_declared {
+        return Ok(());
+    }
+    let maximum_lifetime_ms = data.key_derive_maximum_lifetime_ms.ok_or_else(|| {
+        HostError::Invalid("installed Petal key scope has no lifetime bound".into())
+    })?;
+    if data.key_derive_allowed_routes.is_empty()
+        || data.key_derive_operation_classes.is_empty()
+        || data.key_derive_allowed_crypto_suites.is_empty()
+    {
+        return Err(HostError::Invalid(
+            "installed Petal key scope is incomplete".into(),
+        ));
+    }
+    let requested_classes = request
+        .allowed_operation_classes
+        .iter()
+        .collect::<BTreeSet<_>>();
+    if requested_classes.is_empty()
+        || requested_classes.len() != request.allowed_operation_classes.len()
+        || requested_classes
+            .iter()
+            .any(|class| !data.key_derive_operation_classes.contains(class))
+    {
+        return Err(HostError::Invalid(
+            "Petal key operation classes must be a non-empty subset of the manifest scope".into(),
+        ));
+    }
+    let requested_suites = request
+        .allowed_crypto_suites
+        .iter()
+        .collect::<BTreeSet<_>>();
+    if requested_suites.is_empty()
+        || requested_suites.len() != request.allowed_crypto_suites.len()
+        || requested_suites
+            .iter()
+            .any(|suite| !data.key_derive_allowed_crypto_suites.contains(suite))
+    {
+        return Err(HostError::Invalid(
+            "Petal key crypto suites must be a non-empty subset of the manifest scope".into(),
+        ));
+    }
+    if request.maximum_lifetime_ms == 0 || request.maximum_lifetime_ms > maximum_lifetime_ms {
+        return Err(HostError::Invalid(format!(
+            "Petal key lifetime must be between 1 and {maximum_lifetime_ms} ms"
+        )));
+    }
+    request.allowed_routes = data.key_derive_allowed_routes.clone();
+    Ok(())
+}
+
 async fn component_petal_key_request(
     store: StoreContextMut<'_, StoreData>,
     params: &[ComponentVal],
@@ -1451,6 +1585,12 @@ async fn component_petal_key_request(
         }
     };
     let mut request = PetalKeyRequest::from(guest);
+    if let Err(error) = apply_manifest_key_scope(store.data(), &mut request) {
+        return set_component_result(results, component_host_err(error));
+    }
+    if let Err(error) = require_trusted_wallet(store.data(), &request.wallet_id) {
+        return set_component_result(results, component_host_err(error));
+    }
     request.context = store.data().sign_context.clone();
     let host = store.data().host.clone();
     match host.petal_key_request(request).await {
@@ -1471,6 +1611,58 @@ async fn component_petal_key_request(
             set_component_result(results, component_host_err(error))
         }
     }
+}
+
+/// The trusted account identity carried by the host into this
+/// instantiation, if the route was dispatched under a numbered account.
+fn trusted_account(data: &StoreData) -> Option<crate::abi::TrustedAccountContext> {
+    data.sign_context.as_ref().and_then(|c| c.trusted_account())
+}
+
+/// Constrain nested VFS access to the account selected by the outer route,
+/// and never dispatch a nested Petal route. Parse first so dot segments cannot
+/// make a path appear to be in scope while the VFS host resolves it elsewhere.
+fn authorize_guest_vfs_account(data: &StoreData, path: &str) -> Result<(), HostError> {
+    let account = trusted_account(data);
+    authorize_guest_vfs_path(account.as_ref(), path)
+}
+
+fn authorize_guest_vfs_path(
+    account: Option<&crate::abi::TrustedAccountContext>,
+    path: &str,
+) -> Result<(), HostError> {
+    let parsed = bloom_vfs::path::VfsPath::parse(path)
+        .map_err(|error| HostError::Invalid(format!("path: {error}")))?;
+    let segments = parsed.segments();
+    let selected = |wallet: &str, number: &str| {
+        account
+            .is_some_and(|account| wallet == account.wallet && number == account.number.to_string())
+    };
+    let allowed = match segments {
+        [root, wallet, number, ..] if root == "wallets" => selected(wallet, number),
+        [root, ..] if root == "wallets" || root == "petals" => false,
+        _ => true,
+    };
+    if allowed {
+        Ok(())
+    } else {
+        Err(HostError::Denied(
+            "guest VFS path is outside the selected account or targets a Petal".into(),
+        ))
+    }
+}
+
+/// Authority operations require a host-resolved numbered account.
+fn require_trusted_wallet(data: &StoreData, wallet: &str) -> Result<(), HostError> {
+    let account = trusted_account(data).ok_or_else(|| {
+        HostError::Denied("signing and staging require a trusted account route".into())
+    })?;
+    if wallet != account.wallet {
+        return Err(HostError::Denied(format!(
+            "payload signing wallet {wallet:?} does not match the trusted account wallet"
+        )));
+    }
+    Ok(())
 }
 
 fn legacy_signing_unsupported() -> HostError {
@@ -1595,6 +1787,7 @@ fn component_payload_sign_record(
     } else {
         bloom_broker_api::PetalSignSelector::Reusable
     };
+    require_trusted_wallet(data, &wallet)?;
     Ok(PayloadSignRequest {
         wallet,
         preimage,
@@ -1730,6 +1923,7 @@ fn component_payload_batch_sign_request(
         }
     };
 
+    require_trusted_wallet(data, &wallet)?;
     Ok(PayloadBatchSignRequest {
         wallet,
         payloads,
@@ -1813,6 +2007,9 @@ async fn component_evm_tx_stage(
         Ok(request) => request,
         Err(err) => return set_component_result(results, component_host_err(err)),
     };
+    if let Err(error) = require_trusted_wallet(store.data(), &request.wallet) {
+        return set_component_result(results, component_host_err(error));
+    }
     let host = store.data().host.clone();
     match host.evm_tx_stage(request).await {
         Ok(outcome) => set_component_result(results, component_evm_outbox_outcome(outcome)),
@@ -1860,6 +2057,9 @@ async fn component_evm_tx_confirm(
             )),
         );
     };
+    if let Err(error) = require_trusted_wallet(store.data(), &wallet) {
+        return set_component_result(results, component_host_err(error));
+    }
     let host = store.data().host.clone();
     match host
         .evm_tx_confirm(
@@ -1908,6 +2108,9 @@ async fn component_evm_tx_inspect(
         Ok(value) => value,
         Err(err) => return set_component_result(results, component_host_err(err)),
     };
+    if let Err(error) = require_trusted_wallet(store.data(), &wallet) {
+        return set_component_result(results, component_host_err(error));
+    }
     let host = store.data().host.clone();
     match host
         .evm_tx_inspect(wallet, chain, outbox_id, store.data().sign_context.clone())
@@ -2037,6 +2240,9 @@ async fn component_vfs_lookup(
         Ok(path) => path,
         Err(e) => return set_component_result(results, component_host_err(e)),
     };
+    if let Err(e) = authorize_guest_vfs_account(store.data(), &path) {
+        return set_component_result(results, component_host_err(e));
+    }
     let host = store.data().host.clone();
     match host.vfs_lookup(&path).await {
         Ok(entry) => set_component_result(results, component_ok(Some(component_vfs_entry(entry)))),
@@ -2060,6 +2266,9 @@ async fn component_vfs_list(
         Ok(path) => path,
         Err(e) => return set_component_result(results, component_host_err(e)),
     };
+    if let Err(e) = authorize_guest_vfs_account(store.data(), &path) {
+        return set_component_result(results, component_host_err(e));
+    }
     let host = store.data().host.clone();
     match host.vfs_list(&path).await {
         Ok(names) => {
@@ -2086,6 +2295,9 @@ async fn component_vfs_read(
         Ok(path) => path,
         Err(e) => return set_component_result(results, component_host_err(e)),
     };
+    if let Err(e) = authorize_guest_vfs_account(store.data(), &path) {
+        return set_component_result(results, component_host_err(e));
+    }
     let host = store.data().host.clone();
     match host.vfs_read(&path).await {
         Ok(bytes) => set_component_result(results, component_ok(Some(component_bytes(bytes)))),
@@ -2115,6 +2327,9 @@ async fn component_vfs_write(
         Ok(path) => path,
         Err(e) => return set_component_result(results, component_host_err(e)),
     };
+    if let Err(e) = authorize_guest_vfs_account(store.data(), &path) {
+        return set_component_result(results, component_host_err(e));
+    }
     let body = match component_byte_list(body, "body") {
         Ok(body) => body,
         Err(e) => return set_component_result(results, component_host_err(e)),
@@ -2585,6 +2800,9 @@ fn link_vfs_imports(linker: &mut Linker<StoreData>, module: &'static str) -> any
                     Ok(s) => s,
                     Err(c) => return c,
                 };
+                if let Err(e) = authorize_guest_vfs_account(caller.data(), &path) {
+                    return e.as_wasm_code();
+                }
                 let host = caller.data().host.clone();
                 match host.vfs_read(&path).await {
                     Ok(bytes) => {
@@ -2627,6 +2845,9 @@ fn link_vfs_imports(linker: &mut Linker<StoreData>, module: &'static str) -> any
                     Ok(s) => s,
                     Err(c) => return c,
                 };
+                if let Err(e) = authorize_guest_vfs_account(caller.data(), &path) {
+                    return e.as_wasm_code();
+                }
                 let bytes = match read_bytes(&mem, &mut caller, src_ptr, src_len) {
                     Ok(b) => b,
                     Err(c) => return c,
@@ -3341,6 +3562,56 @@ mod tests {
         assert_eq!(out.stdout, vec![5u8]); // "VALUE".len()
     }
 
+    #[tokio::test]
+    async fn core_wasm_guest_cannot_read_or_write_wallet_or_petal_paths_without_route_context() {
+        let vm = PetalVm::new().unwrap();
+        let host = Arc::new(MockHost::default());
+        for private_path in [
+            "wallets/alice/1/address.evm",
+            "petals/enso/wallets/alice/1/status.json",
+        ] {
+            host.store
+                .lock()
+                .insert(private_path.into(), b"SECRET".to_vec());
+            for (import, capability) in [
+                ("vfs_read", Capability::VfsRead),
+                ("vfs_write", Capability::VfsWrite),
+            ] {
+                let module = format!(
+                    r#"(module
+                    (import "bloom" "{import}" (func $vfs (param i32 i32 i32 i32) (result i32)))
+                    (import "wasi_snapshot_preview1" "fd_write"
+                      (func $fd_write (param i32 i32 i32 i32) (result i32)))
+                    (memory (export "memory") 1)
+                    (data (i32.const 0) "{private_path}")
+                    (data (i32.const 400) "\9c\01\00\00\01\00\00\00")
+                    (func (export "_start")
+                      (i32.store8 (i32.const 412)
+                        (call $vfs (i32.const 0) (i32.const {path_len})
+                          (i32.const 64) (i32.const 1)))
+                      (drop (call $fd_write (i32.const 1) (i32.const 400)
+                        (i32.const 1) (i32.const 420))))
+                  )"#,
+                    path_len = private_path.len()
+                );
+                let out = vm
+                    .run(
+                        &wat(&module),
+                        Vec::new(),
+                        BTreeSet::from([capability]),
+                        host.clone(),
+                        "h",
+                        PetalMode::Local,
+                        RunOptions::default(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(out.stdout, vec![denied_byte()], "{import}: {private_path}");
+            }
+            assert_eq!(host.store.lock()[private_path], b"SECRET");
+        }
+    }
+
     #[test]
     fn component_route_response_maps_read_lookup_and_errors() {
         let params = route_component_params(
@@ -3688,6 +3959,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn component_store_shared_keys_cross_accounts_with_isolated_state() {
+        let tmp = TempDir::new().unwrap();
+        let policy = StoreNamespacePolicy::from_namespaces(["state".to_owned()], [])
+            .with_shared_keys(["state/settings/enso-router".to_owned()]);
+        let contexts = [
+            None,
+            Some(("alice".to_owned(), 0)),
+            Some(("alice".to_owned(), 1)),
+            Some(("bob".to_owned(), 0)),
+        ];
+        for (index, account) in contexts.iter().enumerate() {
+            let private = open_selected_private_store(
+                if account.is_some() {
+                    tmp.path().join("data-accounts")
+                } else {
+                    tmp.path().join("data")
+                },
+                account.as_ref(),
+                Some(&policy),
+                Some(&tmp.path().join("data")),
+            )
+            .unwrap();
+            let mut store = component_test_store(
+                BTreeSet::from([Capability::Store]),
+                Some(private),
+                Arc::new(DenyHost),
+            );
+            store.data_mut().store_namespaces = Some(policy.clone());
+            if index == 0 {
+                for key in ["settings/enso-router", "orders/item"] {
+                    let mut result = vec![ComponentVal::Bool(false)];
+                    component_store_put(
+                        store.as_context_mut(),
+                        &[
+                            ComponentVal::String("state".into()),
+                            ComponentVal::String(key.into()),
+                            component_bytes(b"global".to_vec()),
+                            ComponentVal::Bool(false),
+                        ],
+                        &mut result,
+                    )
+                    .await
+                    .unwrap();
+                    assert_component_ok_none(&result[0]);
+                }
+            }
+            for (key, expected) in [
+                ("settings/enso-router", Some(b"global".as_slice())),
+                (
+                    "orders/item",
+                    if index == 0 {
+                        Some(b"global".as_slice())
+                    } else {
+                        None
+                    },
+                ),
+            ] {
+                let mut result = vec![ComponentVal::Bool(false)];
+                component_store_get(
+                    store.as_context_mut(),
+                    &[
+                        ComponentVal::String("state".into()),
+                        ComponentVal::String(key.into()),
+                    ],
+                    &mut result,
+                )
+                .await
+                .unwrap();
+                assert_component_ok_optional_bytes(&result[0], expected);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn component_store_get_reads_legacy_sdk_credential_keys_from_secrets() {
         let tmp = TempDir::new().unwrap();
         let private_store = PrivateStore::open(tmp.path()).unwrap();
@@ -3778,9 +4123,9 @@ mod tests {
         let host = Arc::new(MockHost::default());
         host.store
             .lock()
-            .insert("wallets/alice.txt".into(), b"alice".to_vec());
+            .insert("public/alice.txt".into(), b"alice".to_vec());
         host.lists.lock().insert(
-            "wallets".into(),
+            "public".into(),
             vec![HostVfsEntry {
                 name: "alice.txt".into(),
                 kind: HostVfsEntryKind::File,
@@ -3809,6 +4154,7 @@ paths = ["/status"]
         )
         .unwrap();
         let mut store = component_test_store_with_policy(caps, None, host.clone(), policy);
+        store.data_mut().sign_context = Some(account_context("alice", 0, None));
 
         let mut http = vec![ComponentVal::Bool(false)];
         component_http_fetch(
@@ -3870,7 +4216,7 @@ paths = ["/status"]
         let mut read = vec![ComponentVal::Bool(false)];
         component_vfs_read(
             store.as_context_mut(),
-            &[ComponentVal::String("wallets/alice.txt".into())],
+            &[ComponentVal::String("public/alice.txt".into())],
             &mut read,
         )
         .await
@@ -3880,7 +4226,7 @@ paths = ["/status"]
         let mut list = vec![ComponentVal::Bool(false)];
         component_vfs_list(
             store.as_context_mut(),
-            &[ComponentVal::String("wallets".into())],
+            &[ComponentVal::String("public".into())],
             &mut list,
         )
         .await
@@ -3891,7 +4237,7 @@ paths = ["/status"]
         let mut lookup = vec![ComponentVal::Bool(false)];
         component_vfs_lookup(
             store.as_context_mut(),
-            &[ComponentVal::String("wallets/alice.txt".into())],
+            &[ComponentVal::String("public/alice.txt".into())],
             &mut lookup,
         )
         .await
@@ -3906,7 +4252,7 @@ paths = ["/status"]
         component_vfs_write(
             store.as_context_mut(),
             &[
-                ComponentVal::String("wallets/bob.txt".into()),
+                ComponentVal::String("public/bob.txt".into()),
                 component_bytes(b"bob".to_vec()),
             ],
             &mut write,
@@ -3915,9 +4261,164 @@ paths = ["/status"]
         .unwrap();
         assert_component_ok_none(&write[0]);
         assert_eq!(
-            host.store.lock().get("wallets/bob.txt").cloned().unwrap(),
+            host.store.lock().get("public/bob.txt").cloned().unwrap(),
             b"bob"
         );
+    }
+
+    #[tokio::test]
+    async fn component_vfs_operations_enforce_selected_account_before_host() {
+        let host = Arc::new(MockHost::default());
+        host.store
+            .lock()
+            .insert("wallets/alice/1/status.json".into(), b"ok".to_vec());
+        let nested_petal = "petals/enso/wallets/alice/1/status.json";
+        host.store
+            .lock()
+            .insert(nested_petal.into(), b"must-stay-unchanged".to_vec());
+        host.lists
+            .lock()
+            .insert("wallets/alice/1".into(), Vec::new());
+        host.lists.lock().insert(nested_petal.into(), Vec::new());
+        let mut store = component_test_store(
+            BTreeSet::from([Capability::VfsRead, Capability::VfsWrite]),
+            None,
+            host.clone(),
+        );
+        store.data_mut().sign_context = Some(account_context("alice", 1, None));
+
+        for forbidden in [
+            "wallets/bob/1/status.json",
+            "wallets/alice/0/status.json",
+            "petals/enso/wallets/alice/0/status.json",
+            nested_petal,
+        ] {
+            let mut result = vec![ComponentVal::Bool(false)];
+            component_vfs_lookup(
+                store.as_context_mut(),
+                &[ComponentVal::String(forbidden.into())],
+                &mut result,
+            )
+            .await
+            .unwrap();
+            assert_component_err_contains(&result[0], "outside the selected account");
+            component_vfs_read(
+                store.as_context_mut(),
+                &[ComponentVal::String(forbidden.into())],
+                &mut result,
+            )
+            .await
+            .unwrap();
+            assert_component_err_contains(&result[0], "outside the selected account");
+            component_vfs_list(
+                store.as_context_mut(),
+                &[ComponentVal::String(forbidden.into())],
+                &mut result,
+            )
+            .await
+            .unwrap();
+            assert_component_err_contains(&result[0], "outside the selected account");
+            component_vfs_write(
+                store.as_context_mut(),
+                &[
+                    ComponentVal::String(forbidden.into()),
+                    component_bytes(b"bad".to_vec()),
+                ],
+                &mut result,
+            )
+            .await
+            .unwrap();
+            assert_component_err_contains(&result[0], "outside the selected account");
+        }
+        assert!(host.vfs_reads.lock().is_empty());
+        assert!(host.store.lock().get("wallets/bob/1/status.json").is_none());
+        assert_eq!(host.store.lock()[nested_petal], b"must-stay-unchanged");
+
+        let mut result = vec![ComponentVal::Bool(false)];
+        component_vfs_lookup(
+            store.as_context_mut(),
+            &[ComponentVal::String("wallets/alice/1/status.json".into())],
+            &mut result,
+        )
+        .await
+        .unwrap();
+        assert_component_ok_entry(&result[0], "status.json", "file", 0o644);
+        component_vfs_read(
+            store.as_context_mut(),
+            &[ComponentVal::String("wallets/alice/1/status.json".into())],
+            &mut result,
+        )
+        .await
+        .unwrap();
+        assert_component_ok_bytes(&result[0], b"ok");
+        component_vfs_list(
+            store.as_context_mut(),
+            &[ComponentVal::String("wallets/alice/1".into())],
+            &mut result,
+        )
+        .await
+        .unwrap();
+        assert_component_ok_entry_names(&result[0], &[]);
+        component_vfs_write(
+            store.as_context_mut(),
+            &[
+                ComponentVal::String("wallets/alice/1/updated.json".into()),
+                component_bytes(b"yes".to_vec()),
+            ],
+            &mut result,
+        )
+        .await
+        .unwrap();
+        assert_component_ok_none(&result[0]);
+        assert_eq!(
+            host.store
+                .lock()
+                .get("wallets/alice/1/updated.json")
+                .unwrap(),
+            b"yes"
+        );
+
+        store.data_mut().sign_context = None;
+        for path in [
+            "wallets/alice/1/status.json",
+            "petals/enso/wallets/alice/1/status.json",
+        ] {
+            component_vfs_lookup(
+                store.as_context_mut(),
+                &[ComponentVal::String(path.into())],
+                &mut result,
+            )
+            .await
+            .unwrap();
+            assert_component_err_contains(&result[0], "outside the selected account");
+            component_vfs_read(
+                store.as_context_mut(),
+                &[ComponentVal::String(path.into())],
+                &mut result,
+            )
+            .await
+            .unwrap();
+            assert_component_err_contains(&result[0], "outside the selected account");
+            component_vfs_list(
+                store.as_context_mut(),
+                &[ComponentVal::String(path.into())],
+                &mut result,
+            )
+            .await
+            .unwrap();
+            assert_component_err_contains(&result[0], "outside the selected account");
+            component_vfs_write(
+                store.as_context_mut(),
+                &[
+                    ComponentVal::String(path.into()),
+                    component_bytes(b"bad".to_vec()),
+                ],
+                &mut result,
+            )
+            .await
+            .unwrap();
+            assert_component_err_contains(&result[0], "outside the selected account");
+        }
     }
 
     #[tokio::test]
@@ -3931,10 +4432,16 @@ paths = ["/status"]
             route_id: "r000007".into(),
             op: "write".into(),
             path: "orders/new".into(),
-            params: Vec::new(),
+            params: account_context("primary", 0, None).params,
             actor: None,
         };
         store.data_mut().sign_context = Some(context.clone());
+        store.data_mut().key_derive_scope_declared = true;
+        store.data_mut().key_derive_allowed_routes = vec!["r000007".into(), "r000008".into()];
+        store.data_mut().key_derive_operation_classes = vec!["order.place".into()];
+        store.data_mut().key_derive_allowed_crypto_suites =
+            vec!["secp256k1-keccak256-recoverable".into()];
+        store.data_mut().key_derive_maximum_lifetime_ms = Some(60_000);
 
         let attempted_override = serde_json::to_vec(&serde_json::json!({
             "request_id": "agent-a",
@@ -3957,10 +4464,30 @@ paths = ["/status"]
         assert_component_err_contains(&denied[0], "unknown field");
         assert!(host.petal_key_calls.lock().is_empty());
 
+        let widened = serde_json::to_vec(&serde_json::json!({
+            "wallet_id": "primary",
+            "key_slot": "desk-a",
+            "allowed_routes": [],
+            "allowed_operation_classes": ["order.cancel"],
+            "allowed_crypto_suites": ["secp256k1-keccak256-recoverable"],
+            "maximum_lifetime_ms": 60_000
+        }))
+        .unwrap();
+        let mut denied = vec![ComponentVal::Bool(false)];
+        component_petal_key_request(
+            store.as_context_mut(),
+            &[component_bytes(widened)],
+            &mut denied,
+        )
+        .await
+        .unwrap();
+        assert_component_err_contains(&denied[0], "subset of the manifest scope");
+        assert!(host.petal_key_calls.lock().is_empty());
+
         let request = serde_json::to_vec(&serde_json::json!({
             "wallet_id": "primary",
             "key_slot": "desk-a",
-            "allowed_routes": ["r000007"],
+            "allowed_routes": ["r999999"],
             "allowed_operation_classes": ["order.place"],
             "allowed_crypto_suites": ["secp256k1-keccak256-recoverable"],
             "maximum_lifetime_ms": 60_000
@@ -3983,6 +4510,7 @@ paths = ["/status"]
         let calls = host.petal_key_calls.lock();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].context, Some(context));
+        assert_eq!(calls[0].allowed_routes, ["r000007", "r000008"]);
     }
 
     #[tokio::test]
@@ -4166,6 +4694,7 @@ paths = ["/status"]
             None,
             host.clone(),
         );
+        store.data_mut().sign_context = Some(account_context("primary", 0, None));
         store.set_fuel(DEFAULT_FUEL).unwrap();
         let mut linker = ComponentLinker::<StoreData>::new(&vm.engine);
         linker.define_unknown_imports_as_traps(&component).unwrap();
@@ -4243,6 +4772,7 @@ paths = ["/status"]
         let host = Arc::new(MockHost::default());
         let mut store =
             component_test_store(BTreeSet::from([Capability::Sign]), None, host.clone());
+        store.data_mut().sign_context = Some(account_context("primary", 0, None));
         let key_ref = bloom_broker_api::KeyRef {
             backend: bloom_broker_api::Token::new("local").unwrap(),
             backend_instance: bloom_broker_api::Token::new("default").unwrap(),
@@ -4343,6 +4873,7 @@ paths = ["/status"]
         let mut caps = BTreeSet::new();
         caps.insert(Capability::Sign);
         let mut store = component_test_store(caps, None, host.clone());
+        store.data_mut().sign_context = Some(account_context("alice", 0, None));
         let mut result = vec![ComponentVal::Bool(false)];
 
         component_sign_payload(
@@ -4367,6 +4898,7 @@ paths = ["/status"]
                 expires_ms: 444,
             }));
         let mut store = component_test_store(BTreeSet::from([Capability::Sign]), None, host);
+        store.data_mut().sign_context = Some(account_context("primary", 0, None));
         let mut result = vec![ComponentVal::Bool(false)];
         component_sign_payload_current(
             store.as_context_mut(),
@@ -4406,7 +4938,7 @@ paths = ["/status"]
             route_id: "r000001".into(),
             op: "write".into(),
             path: "orders/new".into(),
-            params: Vec::new(),
+            params: account_context("primary", 0, None).params,
             actor: None,
         };
         store.data_mut().sign_context = Some(context.clone());
@@ -4558,6 +5090,7 @@ paths = ["/status"]
         let mut caps = BTreeSet::new();
         caps.insert(Capability::Sign);
         let mut store = component_test_store(caps, None, host.clone());
+        store.data_mut().sign_context = Some(account_context("alice", 0, None));
         let params = [component_payload_request("alice", 3, "orders.place")];
         let mut result = vec![ComponentVal::Bool(false)];
         component_sign_payload(store.as_context_mut(), &params, &mut result)
@@ -4594,6 +5127,7 @@ paths = ["/status"]
         let mut caps = BTreeSet::new();
         caps.insert(Capability::Sign);
         let mut store = component_test_store(caps, None, host);
+        store.data_mut().sign_context = Some(account_context("alice", 0, None));
         let mut request = component_payload_request("alice", 3, "message.sign");
         let ComponentVal::Record(fields) = &mut request else {
             unreachable!();
@@ -4697,7 +5231,7 @@ paths = ["/status"]
             route_id: "r000001".into(),
             op: "write".into(),
             path: "/fund/alice/one/confirm".into(),
-            params: vec![("id".into(), "one".into())],
+            params: account_context("alice", 0, None).params,
             actor: Some("agent-1".into()),
         };
         *host.tx_outcome.lock() = Some(EvmOutboxOutcome {
@@ -4862,6 +5396,158 @@ paths = ["/status"]
         assert!(denied_host.http_calls.lock().is_empty());
     }
 
+    fn account_context(
+        wallet: &str,
+        number: u32,
+        fingerprint: Option<&str>,
+    ) -> crate::abi::PetalRouteContext {
+        let mut params = vec![
+            ("bloom.wallet".to_string(), wallet.to_string()),
+            ("bloom.account".to_string(), number.to_string()),
+        ];
+        if let Some(fp) = fingerprint {
+            params.push(("bloom.owner_key_fingerprint".to_string(), fp.to_string()));
+        }
+        crate::abi::PetalRouteContext {
+            petal_root: "/petals/demo".into(),
+            package_hash: "pkg".into(),
+            route_id: "route".into(),
+            op: "write".into(),
+            path: "/x".into(),
+            params,
+            actor: None,
+        }
+    }
+
+    #[test]
+    fn trusted_account_context_parses_host_params() {
+        let ctx = account_context("w", 2, Some("aa"));
+        let parsed = ctx.trusted_account().unwrap();
+        assert_eq!(parsed.wallet, "w");
+        assert_eq!(parsed.number, 2);
+        assert_eq!(parsed.owner_key_fingerprint.as_deref(), Some("aa"));
+        assert!(
+            account_context("w", 2, None)
+                .trusted_account()
+                .unwrap()
+                .owner_key_fingerprint
+                .is_none()
+        );
+        let mut broken = account_context("w", 2, None);
+        broken.params[1].1 = "x".into();
+        assert!(broken.trusted_account().is_none());
+        let mut missing = account_context("w", 2, None);
+        missing.params.clear();
+        assert!(missing.trusted_account().is_none());
+    }
+
+    #[test]
+    fn nested_guest_vfs_is_bound_to_selected_account() {
+        let account = crate::abi::TrustedAccountContext {
+            wallet: "alice".into(),
+            number: 1,
+            owner_key_fingerprint: None,
+        };
+        assert!(authorize_guest_vfs_path(Some(&account), "wallets/alice/1/address.evm").is_ok());
+        for path in [
+            "wallets/bob/1/address.evm",
+            "wallets/alice/0/address.evm",
+            "petals/enso/wallets/alice/1/status.json",
+            "petals/enso/wallets/alice/0/status.json",
+            "petals/enso/wallets/bob/1/status.json",
+            "wallets",
+            "petals",
+            "wallets/alice/1/../../bob/1/address.evm",
+        ] {
+            assert!(
+                matches!(
+                    authorize_guest_vfs_path(Some(&account), path),
+                    Err(HostError::Denied(_))
+                ),
+                "{path}"
+            );
+        }
+        for path in [
+            "wallets/alice/1/address.evm",
+            "petals/enso/wallets/alice/1/status.json",
+        ] {
+            assert!(
+                matches!(
+                    authorize_guest_vfs_path(None, path),
+                    Err(HostError::Denied(_))
+                ),
+                "{path}"
+            );
+        }
+        assert!(authorize_guest_vfs_path(None, "chains/ethereum/status.json").is_ok());
+    }
+
+    #[tokio::test]
+    async fn account_scoped_signing_rejects_foreign_wallet_and_key() {
+        let host = Arc::new(MockHost::default());
+        let mut store = component_test_store(BTreeSet::from([Capability::Sign]), None, host);
+        store.data_mut().sign_context = Some(account_context(
+            "w",
+            2,
+            Some(hex::encode([7u8; 32]).as_str()),
+        ));
+
+        require_trusted_wallet(store.data(), "w").unwrap();
+        assert!(require_trusted_wallet(store.data(), "other").is_err());
+    }
+
+    #[tokio::test]
+    async fn account_without_trusted_fingerprint_defers_explicit_keys_to_the_host() {
+        let host = Arc::new(MockHost::default());
+        let mut store = component_test_store(BTreeSet::from([Capability::Sign]), None, host);
+        store.data_mut().sign_context = Some(account_context("w", 2, None));
+        // Explicit key membership is decided by the signing seam, which can
+        // see the delegated session keys this layer cannot.
+        require_trusted_wallet(store.data(), "w").unwrap();
+    }
+
+    #[tokio::test]
+    async fn public_route_without_account_context_denies_signing_and_staging() {
+        let host = Arc::new(MockHost::default());
+        let mut store = component_test_store(
+            BTreeSet::from([Capability::Sign, Capability::TxOutbox]),
+            None,
+            host.clone(),
+        );
+        let mut signed = vec![ComponentVal::Bool(false)];
+        component_sign_payload(
+            store.as_context_mut(),
+            &[component_payload_request("alice", 3, "orders.place")],
+            &mut signed,
+        )
+        .await
+        .unwrap();
+        assert_component_err_contains(&signed[0], "trusted account route");
+        let transaction = ComponentVal::Record(vec![
+            ("wallet".into(), ComponentVal::String("alice".into())),
+            ("chain".into(), ComponentVal::String("ethereum".into())),
+            (
+                "to".into(),
+                ComponentVal::String("0x0000000000000000000000000000000000000001".into()),
+            ),
+            ("value-wei".into(), ComponentVal::String("1".into())),
+            ("data-hex".into(), ComponentVal::String("0x".into())),
+            ("nonce".into(), ComponentVal::Option(None)),
+            ("max-fee-per-gas".into(), ComponentVal::Option(None)),
+            (
+                "max-priority-fee-per-gas".into(),
+                ComponentVal::Option(None),
+            ),
+        ]);
+        let mut staged = vec![ComponentVal::Bool(false)];
+        component_evm_tx_stage(store.as_context_mut(), &[transaction], &mut staged)
+            .await
+            .unwrap();
+        assert_component_err_contains(&staged[0], "trusted account route");
+        assert!(host.sign_calls.lock().is_empty());
+        assert!(host.tx_stage_calls.lock().is_empty());
+    }
+
     fn component_test_store(
         caps: BTreeSet<Capability>,
         private_store: Option<PrivateStore>,
@@ -4917,6 +5603,11 @@ paths = ["/status"]
                 petal_hash: VALID_HASH.into(),
                 net_policy,
                 sign_context: None,
+                key_derive_scope_declared: false,
+                key_derive_allowed_routes: Vec::new(),
+                key_derive_operation_classes: Vec::new(),
+                key_derive_allowed_crypto_suites: Vec::new(),
+                key_derive_maximum_lifetime_ms: None,
                 sign_intents: None,
                 store_namespaces: None,
                 http_response_cap: DEFAULT_HTTP_RESPONSE_CAP,

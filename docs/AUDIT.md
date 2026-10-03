@@ -10,11 +10,9 @@
 **Spec audited:** `docs/specs/2026-05-08-bloom-design.md`
 **Workspace:** 15 crates · `cargo build --workspace` clean ·
 `cargo clippy --workspace --all-targets -- -D warnings` clean.
-**Acceptance:** `scripts/acceptance.sh` passes scenarios 1 (native
-send) + 2 (ERC-20 transfer) through the mounted Sealed Approval gate
-against Anvil: initial confirm is denied and the central
-`approval_challenge.json` includes a local `ceremony_url`. Scenarios 3 + 4
-(Uniswap V2 + Enso on a mainnet fork) auto-skip without `BLOOM_MAINNET_RPC`.
+**Historical acceptance:** the original `scripts/acceptance.sh` exercised the
+retired in-process wallet. The current entrypoint runs the separate-process
+triad projection-fidelity suite; custody never enters Machine.
 **Historical live evidence:** the native implementation exercised Enso + Aave
 on Base mainnet before the Petal extraction. Current validation lives in the
 Enso Petal repository.
@@ -80,8 +78,8 @@ data or rely on their own internal caches, e.g. the etherscan client).
 | Tx lookups | `chains/<chain>/tx/<hash>/{receipt.json,status,block_number,gas_used,logs.json,full.json}` | shipped | `chains.rs` (eth_getTransactionByHash + receipt) |
 | Etherscan history (txs, internal, ERC-20, ERC-721, source, abi) | `chains/<chain>/addresses/<a>/{txs,internal_txs,erc20_txs,erc721_txs}` and `chains/<chain>/contracts/<a>/{source,abi}` | shipped | `chains_history.rs` + `crates/bloom-etherscan/src/lib.rs` (TTL cache in `cache.rs`) |
 | Wallets: VFS-driven creation (local / import / watch) | `wallets/new` (writable) | shipped | `wallets.rs::write_new_wallet` + `parse_new_wallet_spec` |
-| Wallets: metadata, balance, nonce, policy round-trip | `wallets/<w>/{address,public_key,kind,policy.json,chains/<c>/{balance,balance.raw,balance.json,nonce}}` | shipped | `wallets.rs`; covered by outbox tests + `acceptance.sh` |
-| Wallets: outbox stage / confirm | `wallets/<w>/chains/<c>/outbox/{new.tx,pending/<id>/{plan.md,policy_check.json,confirm},sent/<id>/*,failed/<id>/*}` | shipped | `wallets.rs::write_outbox` → `crates/bloom-tx/src/tx_engine.rs`. Intents: `send` (native + ERC-20), `approve`, `call`, `raw`, plus NFT writes — `nft_transfer` (auto-detects ERC-721 vs ERC-1155, optional `safe`/`amount`/`data`), `nft_approve` (per-token, ERC-721 only), `nft_approve_all` (`setApprovalForAll`, policy-warned). |
+| Wallets: metadata, balance, nonce, policy round-trip | `wallets/<w>/{kind,policy.json}`, `wallets/<w>/0/{address,public_key,chains/<c>/{balance,balance.raw,balance.json,nonce}}` | shipped | `wallets.rs`; covered by outbox tests + `acceptance.sh` |
+| Wallets: outbox stage / confirm | `wallets/<w>/0/chains/<c>/outbox/{new.tx,pending/<id>/{plan.md,policy_check.json,confirm},sent/<id>/*,failed/<id>/*}` | shipped | `wallets.rs::write_outbox` → `crates/bloom-tx/src/tx_engine.rs`. Intents: `send` (native + ERC-20), `approve`, `call`, `raw`, plus NFT writes — `nft_transfer` (auto-detects ERC-721 vs ERC-1155, optional `safe`/`amount`/`data`), `nft_approve` (per-token, ERC-721 only), `nft_approve_all` (`setApprovalForAll`, policy-warned). |
 | Wallets: sign — EIP-191 + raw hash + EIP-712 | `wallets/<w>/sign/{message,hash,typed_data}` (+ `.sig`) | shipped | `wallets.rs::write_sign` |
 | DeFi (Enso intents, route quoting, stage-confirm) | `petals/enso/intents/<wallet>/{new,<sess>/{intent.txt,route.json,plan.md,tx.json,simulation.json,confirm}}` | extracted to Petal | [`bloom-petal-enso`](https://github.com/bloom-directory/bloom-petal-enso); installed applications mount through `crates/bloom-petals` |
 | Watch (subscriptions, executor task, events tail) | `watch/{new,<id>/{spec.toml,live,history.jsonl[.n],delete}}` | shipped | `crates/bloom-vfs/src/handlers/watch.rs` + `crates/bloom-watch/src/{lib.rs,executor.rs}`; executor started by `Daemon::from_home` |
@@ -106,9 +104,9 @@ data or rely on their own internal caches, e.g. the etherscan client).
 | `chains/<c>/mempool/by_address/<a>/...` | rpc | `chains_mempool::by_address` |
 | `chains/<c>/mempool/by_pool/<a>/recent.jsonl` | rpc | `chains_mempool::by_pool` |
 | `chains/<c>/mempool/<hash>/{tx,decoded,status}` | rpc | `chains_mempool::tx_hash_subtree` |
-| `wallets/<w>/chains/<c>/pending_external.jsonl` | rpc | `bloom-vfs/src/handlers/wallets.rs` |
-| `wallets/<w>/outbox/sent/<h>/{bump.tx,cancel.tx,bump_advice.json}` | local | `bloom-tx::bump_scanner` |
-| `wallets/<w>/outbox/pending/<id>/{mev_risk.json,nonce_conflict.json}` | local | `bloom-tx::tx_engine::stage` |
+| `wallets/<w>/<n>/chains/<c>/{pending_external.jsonl,nonce_conflicts.json}` | rpc | `bloom-vfs/src/handlers/wallets/accounts.rs` |
+| `wallets/<w>/<n>/chains/<c>/outbox/sent/<h>/{bump.tx,cancel.tx,bump_advice.json}` | local | `bloom-tx::bump_scanner` |
+| `wallets/<w>/<n>/chains/<c>/outbox/pending/<id>/{mev_risk.json,nonce_conflict.json}` | local | `bloom-tx::tx_engine::stage` |
 | `status/backends/{mempool,private_rpc}` | local | `bloom-vfs/src/handlers/status.rs` |
 
 Verified end-to-end via `tests/docker/run.sh --mempool`.
@@ -155,7 +153,7 @@ Verified end-to-end via `tests/docker/run.sh --mempool`.
 
 | Requirement | Status | Artifact |
 |---|---|---|
-| Per-chain `allow_broadcast` gate | shipped | Defaults to `true`; the daemon refuses to send when explicitly set to false. |
+| Broadcast authorization | shipped | Every chain supports broadcast; signing, policy, confirmation, and Sealed Approval checks govern sends. |
 | Machine-local encrypted keystore | removed | Signer owns encrypted custody; Machine stores authenticated public wallet projections only. |
 | Hash-chained audit log | shipped | `crates/bloom-proto/src/audit.rs::AuditLog`; wired into the VFS router. |
 | Stage-confirm only write mode for txs | shipped | `tx_engine.rs::confirm` requires non-empty body. |
@@ -168,12 +166,12 @@ Verified end-to-end via `tests/docker/run.sh --mempool`.
 | `cargo fmt` clean | passing |
 | `cargo clippy --workspace --all-targets -- -D warnings` | passing |
 | `cargo test --workspace --lib` | passing |
-| Anvil-backed tests (RPC, no mocks) | passing — `simulate::tests::anvil_*`, `acceptance.sh` |
-| Acceptance demo (native + ERC-20 on Anvil) | passing — `scripts/acceptance.sh` |
+| Anvil-backed tests (RPC, no mocks) | passing — `simulate::tests::anvil_*` and the triad integration suites |
+| Triad custody acceptance | passing — `scripts/acceptance.sh` delegates to the projection-fidelity suite |
 | Historical acceptance demo (Uniswap V2 + native Enso on mainnet fork) | retired with the native Enso integration; retained here as historical evidence. |
 | Dockerized NFS kernel-mount test | harness at `tests/docker/{Dockerfile,docker-compose.yml,lib.sh,run.sh,test*.sh}`. Native suite `cargo test -p bloom-mount --features mount` passing. |
 | Dockerized workspace tests | passing — `tests/docker/run.sh --workspace`. |
-| Dockerized fork-mode end-to-end | passing — `tests/docker/run.sh --fork` (compose profile `fork`) drives a native send + chain reads through the mount against an anvil fork of Base; no Enso key needed. |
+| Dockerized fork-mode chain reads | passing — `tests/docker/run.sh --fork` (compose profile `fork`) is custody-free; signing is covered by triad acceptance. |
 | Enso Petal route and package checks | maintained in `bloom-petal-enso`: route architecture, route crate tests, package build, and `petal check`. |
 | Historical live Enso broadcast evidence | retained below as provenance; the removed core `--enso-live` harness is not a current verification command. |
 
@@ -186,7 +184,7 @@ Verified end-to-end via `tests/docker/run.sh --mempool`.
 | DefiLlama keyless price oracle | `coins.llama.fi` | `vfs cat /prices/spot/eth.usd` |
 | Etherscan multichain (txlist) | `api.etherscan.io/v2` chainid=1 | `vfs cat /chains/ethereum/addresses/0xd8dA…6045/txs` |
 | ENS canonical-registry forward resolution | mainnet via tx-engine resolver | staged `send 0.0001 eth to vitalik.eth on ethereum` → `plan.md` shows `To: 0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045` |
-| VFS-based wallet creation (round-trip) | local | `vfs write /wallets/new --data 'bob'` → `vfs cat /wallets/bob/address` |
+| VFS-based wallet creation (round-trip) | local | `vfs write /wallets/new --data 'bob'` → `vfs cat /wallets/bob/0/address.evm` |
 | Native ETH send (live) | Base, chain_id 8453 | `0xd4a496fb…3c40` — 0.001 ETH dest1→dest2 |
 | Enso swap (live) | Base, ETH → USDC via Enso router | `0x016fc370…9fc3` — 0.001 ETH → 2.306996 USDC |
 | Enso swap + Aave V3 deposit (live) | Base, ETH → aBaseUSDC | `0xab687461…e3ce` — 0.001 ETH → 2.308456 aBaseUSDC |
@@ -249,11 +247,10 @@ cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --lib
 cargo build --release -p bloom
-scripts/acceptance.sh                              # native + ERC-20 on Anvil
-BLOOM_MAINNET_RPC=... scripts/acceptance.sh          # enables applicable live-network scenarios
+scripts/acceptance.sh                              # real triad custody/projection acceptance
 tests/docker/run.sh                                 # NFS kernel-mount harness (default)
 tests/docker/run.sh --workspace                     # workspace tests inside container
-tests/docker/run.sh --fork                          # native send + chain reads via anvil-fork
+tests/docker/run.sh --fork                          # custody-free chain reads via anvil-fork
 # In a bloom-petal-enso checkout:
 scripts/check-route-architecture.sh
 cargo test --manifest-path route/Cargo.toml

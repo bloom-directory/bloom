@@ -224,9 +224,13 @@ fn ceremony_listener_diagnostic(owner: CeremonyListenerOwner) -> String {
 }
 
 async fn probe_ceremony_listener_owner() -> CeremonyListenerOwner {
+    probe_ceremony_listener_owner_at(CEREMONY_DIAGNOSTIC_ADDR).await
+}
+
+async fn probe_ceremony_listener_owner_at(address: &str) -> CeremonyListenerOwner {
     let Ok(Ok(mut stream)) = tokio::time::timeout(
         Duration::from_millis(500),
-        tokio::net::TcpStream::connect(CEREMONY_DIAGNOSTIC_ADDR),
+        tokio::net::TcpStream::connect(address),
     )
     .await
     else {
@@ -856,10 +860,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn listener_diagnostic_is_bounded_and_uses_the_canonical_port() {
-        let listener = tokio::net::TcpListener::bind(CEREMONY_DIAGNOSTIC_ADDR)
+    async fn listener_diagnostic_is_bounded_without_claiming_the_production_port() {
+        assert_eq!(CEREMONY_DIAGNOSTIC_ADDR, "127.0.0.1:18734");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
-            .expect("canonical listener must be free for the focused diagnostic test");
+            .expect("ephemeral listener must be available for the focused diagnostic test");
+        let test_address = listener.local_addr().unwrap().to_string();
         let server = tokio::spawn(async move {
             let (mut bloom, _) = listener.accept().await.unwrap();
             let mut request = [0_u8; 128];
@@ -872,15 +878,15 @@ mod tests {
                 .unwrap();
         });
         assert_eq!(
-            probe_ceremony_listener_owner().await,
+            probe_ceremony_listener_owner_at(&test_address).await,
             CeremonyListenerOwner::BloomBroker
         );
         server.await.unwrap();
 
         assert_eq!(
-            probe_ceremony_listener_owner().await,
+            probe_ceremony_listener_owner_at(&test_address).await,
             CeremonyListenerOwner::Unbound,
-            "a freed canonical listener is not misreported as a foreign owner"
+            "a freed listener is not misreported as a foreign owner"
         );
     }
 

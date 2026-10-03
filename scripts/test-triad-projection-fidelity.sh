@@ -221,7 +221,7 @@ wait_for_fixture_stage() {
   attempts=0
   while [ "$attempts" -lt 200 ]; do
     fixture_body="$(bounded_mounted_read \
-      "$(mounted /petals/triad-authority-fixture/session.json)" \
+      "$(mounted /petals/triad-authority-fixture/wallets/${registered_wallet}/0/session.json)" \
       "fixture Petal session read")"
     fixture_stage="$(printf '%s' "$fixture_body" | jq -r '
       if .stage == "key" then "key:" + (.outcome.state // "")
@@ -386,12 +386,34 @@ if printf '%s\n' "$wallet_entries" | grep -Eiq '(credential|passkey|authenticato
 fi
 
 printf 'MA-03: importing wallet through Broker/Signer...\n'
+mnemonic_file="${run_root}/import-mnemonic"
+printf '%s\n' \
+  'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art' \
+  > "$mnemonic_file"
+chmod 0600 "$mnemonic_file"
 import_launch="$(cli wallet import ma03-import)"
 import_result="$(complete_launch "$import_launch" import-auth \
-  --sign-count 1 --raw-private-key ERERERERERERERERERERERERERERERERERERERERERE)"
+  --sign-count 1 --mnemonic-file "$mnemonic_file")"
 imported_wallet="$(printf '%s' "$import_result" | jq -er '.wallet_id')"
 [ "$imported_wallet" != "$registered_wallet" ] || die "registration and import returned one wallet"
 assert_projection_pair "$imported_wallet" import >/dev/null
+imported_accounts="$(cli wallet accounts "$imported_wallet")"
+printf '%s' "$imported_accounts" | jq -e \
+  --arg wallet "$imported_wallet" --arg evm_path "m/44'/60'/0'/0/0" '
+    .wallet_id == $wallet and
+    .seed_profile == "bip39-multicurve-v1" and
+    any(.accounts[];
+      .wallet_seed_profile == "bip39-multicurve-v1" and
+      .derivation_profile == "bip44-evm-secp256k1-v1" and
+      .path == $evm_path and
+      .lifecycle == "ACTIVE")
+  ' >/dev/null || die "mnemonic import omitted its canonical BIP-39 EVM account"
+mounted_accounts="$(bounded_mounted_read \
+  "$(mounted "/wallets/${imported_wallet}/accounts.json")" \
+  "imported BIP-39 account projection read")"
+[ "$(printf '%s' "$imported_accounts" | jq -cS .)" = \
+  "$(printf '%s' "$mounted_accounts" | jq -cS .)" ] ||
+  die "CLI and mounted BIP-39 account projections disagree"
 assert_no_legacy_record "$registered_wallet" "$imported_wallet"
 
 printf 'MA-03: replacing the registered wallet credential...\n'
@@ -455,7 +477,7 @@ fixture_request="$(jq -nc \
   '{request_id:$request_id,wallet_id:$wallet_id,purpose:"fixture.payload",
     maximum_lifetime_ms:900000,preimage_hex:"6d613033",
     nonce_hex:"11111111111111111111111111111111",approval_hint:null}')"
-printf '%s\n' "$fixture_request" > "$(mounted /petals/triad-authority-fixture/session.json)" 2>/dev/null || true
+printf '%s\n' "$fixture_request" > "$(mounted /petals/triad-authority-fixture/wallets/${registered_wallet}/0/session.json)" 2>/dev/null || true
 key_record="$(wait_for_fixture_record "$request_id")"
 key_ceremony_url="$(printf '%s' "$key_record" | jq -er '.ceremony_url')"
 before_key_count="$(printf '%s' "$policy_projection" | jq -er '.keys | length')"
@@ -476,7 +498,7 @@ printf 'MA-08: signing with the scoped child through the mounted fixture Petal..
 # Re-run the exact mounted request after custody completion.  The Petal must
 # now reach the canonical missing-approval boundary rather than receiving any
 # child secret or a Machine-minted capability.
-printf '%s\n' "$fixture_request" > "$(mounted /petals/triad-authority-fixture/session.json)" 2>/dev/null || true
+printf '%s\n' "$fixture_request" > "$(mounted /petals/triad-authority-fixture/wallets/${registered_wallet}/0/session.json)" 2>/dev/null || true
 fixture_missing_approval="$(wait_for_fixture_stage signing_failed)"
 printf '%s' "$fixture_missing_approval" | jq -e '
   .stage == "signing_failed" and (.error | contains("APPROVAL_NOT_FOUND"))
@@ -503,12 +525,12 @@ done < <(bounded_mounted_list "$(mounted /petal-key-requests)" \
 fixture_key_ref="$(printf '%s' "$fixture_key_record_body" | jq -ec '.public_key.key_ref')"
 fixture_provenance_digest="$(printf '%s' "$fixture_key_record_body" | jq -er '.provenance_digest')"
 fixture_agent_id="$(printf '%s' "$fixture_key_record_body" | jq -c '.scope.agent_id')"
-wallet_authority="$(bounded_mounted_read \
-  "$(mounted "/wallets/${registered_wallet}/addresses.json")" \
-  "wallet authority projection read")"
-policy_version="$(printf '%s' "$wallet_authority" | jq -er '.policy_version')"
-policy_digest="$(printf '%s' "$wallet_authority" | jq -er '.policy_digest')"
-wallet_revocation_epoch="$(printf '%s' "$wallet_authority" | jq -er '.wallet_revocation_epoch')"
+wallet_projection="$(bounded_mounted_read \
+  "$(mounted "/wallets/${registered_wallet}/projection.json")" \
+  "wallet projection read")"
+policy_version="$(printf '%s' "$wallet_projection" | jq -er '.wallet.policy_version')"
+policy_digest="$(printf '%s' "$wallet_projection" | jq -er '.wallet.policy_digest')"
+wallet_revocation_epoch="$(printf '%s' "$wallet_projection" | jq -er '.wallet.wallet_revocation_epoch')"
 approval_now_ms="$(( $(date +%s) * 1000 ))"
 # The approval must outlive Broker's custody ceremony so the completed
 # activation cannot already exceed immutable terms. It remains strictly
@@ -554,7 +576,7 @@ approval_ceremony_url="$(printf '%s' "$approval_projection" | jq -er '.ceremony_
 wait_for_approval_active "$registered_wallet" "$fixture_approval_id"
 fixture_request="$(printf '%s' "$fixture_request" | jq -cS --arg approval_id "$fixture_approval_id" \
   '.approval_hint = $approval_id')"
-printf '%s\n' "$fixture_request" > "$(mounted /petals/triad-authority-fixture/session.json)"
+printf '%s\n' "$fixture_request" > "$(mounted /petals/triad-authority-fixture/wallets/${registered_wallet}/0/session.json)"
 fixture_signed="$(wait_for_fixture_stage complete)"
 printf '%s' "$fixture_signed" | jq -e '
   .stage == "complete" and

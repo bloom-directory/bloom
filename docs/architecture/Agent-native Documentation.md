@@ -45,11 +45,24 @@ from the release it ships with.
 - paid HTTP under `/requests` (staging, `plan.md`, `confirm`, spend caps);
 - optional private peer reviews under `/coordination`, including their strictly
   advisory status and separation from trading authority;
-- the mounted Sealed Approval lifecycle for the EVM slice: permission-denied
-  confirm writes, `approval_challenge.json`, `ceremony_url`, completed Broker
-  approval, and retrying the bound action;
+- the mounted Sealed Approval lifecycle for the outbox confirm flow —
+  permission-denied confirm writes, `approval_challenge.json`,
+  `ceremony_url`, completed Broker approval, and retrying the bound action.
+  Solana chains dispatch through the identical
+  `wallets/<wallet>/0/chains/<chain>/outbox/...` mechanism (see
+  [`Solana Native Integration.md`](./Solana%20Native%20Integration.md)), so
+  this is no longer EVM-only;
 - discovery of installed Petal docs and route contracts;
+- optional feedback reporting through the Feedback Petal, including user opt-outs,
+  sanitization, and same-ID retries after an uncertain submission;
 - passkey policy-update custody and advisory `under_policy` semantics.
+
+The Feedback Petal is part of the canonical default installation set. Root
+guidance allows an agent to submit one sanitized report for a distinct problem
+that blocked a task, unless the user has disabled reporting. Discovery and
+reading Petal documentation do not submit reports. The packaged Feedback
+README defines the submission and receipt paths and the retry contract; root
+guidance only states the cross-cutting reporting policy.
 
 As additional Petals adopt the mounted Sealed Approval flow described in
 [`Interaction Modes.md`](./Interaction%20Modes.md), the guidance must stay the

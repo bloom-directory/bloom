@@ -8,7 +8,7 @@
 set -euo pipefail
 
 readonly MAX_USD="25"
-readonly FIXTURE_PACKAGE_HASH="2f11ee17f612fbc43f34f81771c53760f56768959624d29fd63b8e4285f5a9ac"
+readonly FIXTURE_PACKAGE_HASH="a323d0070207aa75b7d211565b6040136077c398b74ed1e97eddabf7d5e6a814"
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # Broker, Signer, and Machine developer state remain persistent so existing
@@ -178,7 +178,7 @@ wait_for_fixture_stage() {
   expected="$1"
   attempts=0
   while [ "$attempts" -lt 100 ]; do
-    fixture_body="$(cat "$(mounted_path "/petals/triad-authority-fixture/session.json")" 2>/dev/null || true)"
+    fixture_body="$(cat "$(mounted_path "/petals/triad-authority-fixture/wallets/${wallet}/0/session.json")" 2>/dev/null || true)"
     fixture_stage="$(printf '%s' "$fixture_body" | jq -r '
       if .stage == "key" then "key:" + (.outcome.state // "")
       else .stage // ""
@@ -333,7 +333,7 @@ printf '  mode:   %s\n\n' "$([ "$live" -eq 1 ] && printf LIVE || printf NON-SPEN
 
 wallet_kind="$(vcat "/wallets/${wallet}/kind" | tr -d '[:space:]')"
 [ "$wallet_kind" = "passkey" ] || die "VFS reports wallet kind '$wallet_kind', expected passkey"
-wallet_address="$(vcat "/wallets/${wallet}/address" | tr -d '[:space:]')"
+wallet_address="$(vcat "/wallets/${wallet}/0/address.evm" | tr -d '[:space:]')"
 printf 'Passkey wallet: %s (%s)\n' "$wallet" "$wallet_address"
 
 # A freshly registered wallet has no allowed Petal packages. Add only the
@@ -375,7 +375,7 @@ fi
 # Prove the generic Petal authority path before checking venue compatibility:
 # ordinary mounted write -> owner-mounted key ceremony -> exact retry ->
 # payload-signing ceremony -> exact retry. No CLI or RPC shortcut is used.
-fixture_path="/petals/triad-authority-fixture/session.json"
+fixture_path="/petals/triad-authority-fixture/wallets/${wallet}/0/session.json"
 fixture_request_id="manual-fixture-$(date +%s)-$$"
 fixture_nonce="$(printf '%s' "$fixture_request_id" | shasum -a 256 | awk '{print substr($1, 1, 32)}')"
 fixture_request="$(jq -nc \
@@ -425,10 +425,10 @@ fixture_key_record_body="$(vcat "$fixture_key_record")"
 fixture_key_ref="$(printf '%s' "$fixture_key_record_body" | jq -ec '.public_key.key_ref')"
 fixture_provenance_digest="$(printf '%s' "$fixture_key_record_body" | jq -er '.provenance_digest')"
 fixture_agent_id="$(printf '%s' "$fixture_key_record_body" | jq -c '.scope.agent_id')"
-wallet_authority="$(vcat "/wallets/${wallet}/addresses.json")"
-policy_version="$(printf '%s' "$wallet_authority" | jq -er '.policy_version')"
-policy_digest="$(printf '%s' "$wallet_authority" | jq -er '.policy_digest')"
-wallet_revocation_epoch="$(printf '%s' "$wallet_authority" | jq -er '.wallet_revocation_epoch')"
+wallet_projection="$(vcat "/wallets/${wallet}/projection.json")"
+policy_version="$(printf '%s' "$wallet_projection" | jq -er '.wallet.policy_version')"
+policy_digest="$(printf '%s' "$wallet_projection" | jq -er '.wallet.policy_digest')"
+wallet_revocation_epoch="$(printf '%s' "$wallet_projection" | jq -er '.wallet.wallet_revocation_epoch')"
 for digest_value in "$fixture_provenance_digest" "$policy_digest"; do
   printf '%s' "$digest_value" | jq -R -e 'test("^[0-9a-f]{64}$")' >/dev/null ||
     die "mounted approval authority metadata contains a malformed digest"
@@ -488,9 +488,9 @@ if [ "$live" -eq 0 ] || [ "$execute_pm" -eq 1 ]; then
   route_contract="$(vcat "/petals/polymarket/meta/route-contract.json")"
   printf '%s' "$route_contract" | jq -e . >/dev/null ||
     die "Polymarket Petal route contract is unavailable"
-  vls_names "/petals/polymarket/onboard" >/dev/null
-  vls_names "/petals/polymarket/account" >/dev/null
-  vls_names "/petals/polymarket/trade" >/dev/null
+  vls_names "/petals/polymarket/onboard/${wallet}/0" >/dev/null
+  vls_names "/petals/polymarket/account/${wallet}/0" >/dev/null
+  vls_names "/petals/polymarket/trade/${wallet}/0" >/dev/null
   printf 'Polymarket Petal: mounted and route contract loaded\n'
   pm_triad_compatible="$(printf '%s' "$route_contract" | jq -r '
     [.. | strings] | any(contains("bloom:sign/signing@0.2.0"))
@@ -529,17 +529,17 @@ if [ "$execute_pm" -eq 1 ]; then
     --argjson bound "$pm_price_json" \
     '{slug:$slug,outcome:$outcome,side:$side,amount:$amount,order_type:$order_type} + $bound')"
   printf '\nCreating the unsigned Polymarket draft for review...\n'
-  drafts_before="$(vls_names "/petals/polymarket/trade/${wallet}/drafts" 2>/dev/null || true)"
-  if ! vwrite "/petals/polymarket/trade/${wallet}/new" "$pm_request"; then
+  drafts_before="$(vls_names "/petals/polymarket/trade/${wallet}/0/drafts" 2>/dev/null || true)"
+  if ! vwrite "/petals/polymarket/trade/${wallet}/0/new" "$pm_request"; then
     die "mounted Polymarket draft creation failed; verify onboarding, funding, market, and policy"
   fi
-  drafts_after="$(vls_names "/petals/polymarket/trade/${wallet}/drafts")"
+  drafts_after="$(vls_names "/petals/polymarket/trade/${wallet}/0/drafts")"
   draft_id="$(comm -13 \
     <(printf '%s\n' "$drafts_before" | sed '/^$/d' | sort) \
     <(printf '%s\n' "$drafts_after" | sed '/^$/d' | sort) | tail -n 1)"
   [ -n "$draft_id" ] ||
     die "mounted Polymarket draft was not created; verify onboarding, funding, market, and policy"
-  draft_path="/petals/polymarket/trade/${wallet}/drafts/${draft_id}"
+  draft_path="/petals/polymarket/trade/${wallet}/0/drafts/${draft_id}"
   vwrite "${draft_path}/revalidate" '{"revalidate":true}'
   printf '\nPolymarket draft plan:\n'
   vcat "${draft_path}/plan.md"
@@ -565,7 +565,7 @@ if [ "$execute_pm" -eq 1 ]; then
   vwrite_staging "${draft_path}/post" "$post_request"
   open_approval "${draft_path}/approval.json"
   vwrite "${draft_path}/post" "$post_request"
-  pm_receipt="$(vcat "/petals/polymarket/trade/${wallet}/receipts/${draft_id}/receipt.json")"
+  pm_receipt="$(vcat "/petals/polymarket/trade/${wallet}/0/receipts/${draft_id}/receipt.json")"
   printf '\nPolymarket receipt:\n'
   printf '%s\n' "$pm_receipt" | jq .
   printf '%s' "$pm_receipt" | jq -e '

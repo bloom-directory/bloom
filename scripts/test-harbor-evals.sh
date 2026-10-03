@@ -6,6 +6,7 @@ task="${repo_root}/evals/harbor/tasks/hyperliquid-order-cancel"
 verifier="${task}/tests/verify_result.py"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
+python_cmd=(uv run --isolated --no-project --python 3.12 python)
 
 wallet="0x1111111111111111111111111111111111111111"
 session="bloom-eval-test"
@@ -80,7 +81,7 @@ pathlib.Path(os.environ["FAKE_HYPERLIQUID_PORT_FILE"]).write_text(
 server.serve_forever()
 PY
 port_file="$tmp/fake-hyperliquid.port"
-FAKE_HYPERLIQUID_PORT_FILE="$port_file" python3 "$tmp/fake_hyperliquid.py" &
+FAKE_HYPERLIQUID_PORT_FILE="$port_file" "${python_cmd[@]}" "$tmp/fake_hyperliquid.py" &
 fake_hyperliquid_pid=$!
 trap 'kill "$fake_hyperliquid_pid" 2>/dev/null || true; rm -rf "$tmp"' EXIT
 for _ in $(seq 1 50); do
@@ -93,9 +94,9 @@ export BLOOM_EVAL_HYPERLIQUID_INFO_URL="http://127.0.0.1:$(cat "$port_file")/inf
 cat >"$tmp/good.json" <<EOF
 {"schema":"bloom.eval.hyperliquid_order_cancel.v1","status":"complete","network":"mainnet","wallet":"$wallet","session_id":"$session","asset":"BTC","asset_id":0,"side":"buy","leverage":1,"post_only":true,"mark_price":"100000","limit_price":"95000","size":"0.00011","notional_usd":"10.45","cloid":"$cloid","order_status":"resting","order_id":123,"cancel_status":"success","matching_open_orders_after_cancel":0,"session_left_active_for_harness_cleanup":true}
 EOF
-python3 "$verifier" "$tmp/good.json"
+"${python_cmd[@]}" "$verifier" "$tmp/good.json"
 
-python3 - "$tmp/good.json" "$tmp" "$verifier" <<'PY'
+"${python_cmd[@]}" - "$tmp/good.json" "$tmp" "$verifier" <<'PY'
 import json, os, pathlib, subprocess, sys
 source = json.loads(pathlib.Path(sys.argv[1]).read_text())
 root = pathlib.Path(sys.argv[2])
@@ -121,7 +122,7 @@ for name, values in mutations.items():
         raise SystemExit(f"invalid fixture passed: {name}")
 PY
 
-python3 - <<PY
+"${python_cmd[@]}" - <<PY
 import sys
 import tomllib
 from pathlib import Path
@@ -137,8 +138,14 @@ assert task["agent"]["timeout_sec"] == 900.0
 PY
 
 bash -n "${repo_root}/scripts/evals/run-harbor-hyperliquid.sh"
+bash -n "${repo_root}/scripts/evals/operate-harbor-hyperliquid.sh"
+git -C "$repo_root" check-ignore -q evals/harbor/operator-state.json
+! grep -En 'BLOOM_EVAL_VFS_|VfsTransport|bloom vfs' \
+  "${repo_root}/evals/harbor/harness"/*.py
+grep -Fq '`bloom vfs`, the `bloom` executable' \
+  "${task}/instruction.md"
 bash -n "${task}/tests/test.sh"
-PYTHONPATH="${repo_root}/evals/harbor" python3 -m unittest discover \
+PYTHONPATH="${repo_root}/evals/harbor" "${python_cmd[@]}" -m unittest discover \
   -s "${repo_root}/evals/harbor/harness_tests" -v
 
 # Validate our programmatic configuration against the exact Harbor API version

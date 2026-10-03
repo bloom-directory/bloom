@@ -7,6 +7,7 @@ description = "Layered RPC engine (retry + fallback + throttle) for bloom"
 
 [dependencies]
 bloom-proto.workspace = true
+bloom-rpc-common.workspace = true
 parking_lot.workspace = true
 serde.workspace = true
 thiserror.workspace = true

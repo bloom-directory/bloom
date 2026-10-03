@@ -1,5 +1,10 @@
 # macOS Unix-principal isolation profile
 
+> September 2026 amendment: the PF network-containment portions of this original
+> profile are retired to preserve iCloud Private Relay. The current release
+> retains Unix principal separation but does not satisfy the original MUI-07
+> network boundary. See [the current contract and follow-up plan](../operations/macos-private-relay.md).
+
 **Status:** Proposed implementation profile
 
 **Applies to:** Bloom triad architecture, local macOS placement
@@ -266,33 +271,23 @@ The macOS Unix-principal profile uses Broker direct ownership rather than
 launchd TCP handover. This is the section 22 construction for a platform lane
 where reliable conflict handover has not been proven.
 
-Broker binds exactly `127.0.0.1:18734` with:
+Broker binds exactly `127.0.0.1:18734` and `[::1]:18734`, and requires both,
+because Chromium resolves `localhost` to `::1` before `127.0.0.1`. Each bind
+uses:
 
-- no address or port reuse;
-- no wildcard, IPv6, alternate-address, or fallback-port bind;
+- `SO_REUSEADDR`, so a restarted Broker can reacquire a port still held in
+  `TIME_WAIT`, and never `SO_REUSEPORT`;
+- no wildcard, alternate-address, or fallback-port bind;
 - close-on-exec;
 - an exact post-bind local-address check.
 
 Bind conflict is a fatal startup failure. Before exiting, Broker atomically
-writes bounded `broker-startup.json` status distinguishing:
-
-- another enrolled Bloom login owns the listener;
-- a foreign or unverifiable process owns the listener.
-
-Machine reports that status rather than waiting indefinitely.
-
-The incident distinction is an operational diagnostic, not an authorization
-decision: Broker recognizes the fixed Bloom ceremony-owner HTTP marker, while
-an absent, malformed, or unresponsive marker is foreign or unverifiable. A
-foreign process can imitate that public marker, so both incidents have the
-same fatal, fail-closed consequence and neither grants authority.
-
-Because the Broker packet-filter profile deliberately denies initiated SYNs,
-the root packet-filter monitor performs this diagnostic-only loopback probe and
-includes its bounded result in the same fresh, root-owned platform-status
-record Broker already verifies. Broker never opens a diagnostic network
-exception, and a false or unavailable observation remains
-`foreign_or_unverifiable_process`.
+writes bounded `broker-startup.json` status with incident
+`ceremony_listeners_unavailable` and address `localhost:18734`.
+Machine reports that status rather than waiting indefinitely. The Broker
+service log identifies the failing address or descriptor and its error.
+Acquisition failure alone does not establish that another process owns a
+listener: IPv6 may be unavailable, or activation may be misconfigured.
 
 Failure-only KeepAlive retries a waiting Broker. When the owning login sentinel
 disconnects and its Broker closes the listener, a waiting Broker may acquire

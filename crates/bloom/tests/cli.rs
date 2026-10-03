@@ -9,6 +9,7 @@
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::sync::{
     Arc, Mutex,
@@ -36,6 +37,29 @@ use tempfile::TempDir;
 fn bloom_cmd(home: &Path) -> Command {
     let mut cmd = Command::cargo_bin("bloom").expect("locate bloom binary");
     cmd.env("BLOOM_HOME", home);
+    cmd.env(
+        "BLOOM_ENROLLMENT_ROOT",
+        home.join("config/test-enrollments"),
+    );
+    cmd.env("BLOOM_CONFIG_ROOT", home.join("config/test-triad-config"));
+    cmd.env("BLOOM_RUNTIME_ROOT", home.join("run/test-triad-runtime"));
+    cmd.env_remove("BLOOM_BROKER_SOCKET");
+    cmd.env(
+        "BLOOM_MACHINE_IDENTITY",
+        home.join("config/test-missing-machine-identity.json"),
+    );
+    cmd.env(
+        "BLOOM_EDGE_MANIFEST",
+        home.join("config/test-missing-edge-manifest.json"),
+    );
+    cmd.env(
+        "BLOOM_PROVENANCE_CATALOG",
+        home.join("config/test-missing-provenance-catalog.json"),
+    );
+    cmd.env(
+        "BLOOM_MACHINE_AUDIT_CHECKPOINT_DIR",
+        home.join("cache/test-machine-audit-checkpoints"),
+    );
     // Quiet logging keeps stdout/stderr predictable for assertions.
     cmd.env("RUST_LOG", "error");
     cmd
@@ -49,6 +73,14 @@ fn fresh_home() -> TempDir {
         .expect("create temp home");
     #[cfg(not(target_os = "macos"))]
     tempfile::tempdir().expect("create temp home")
+}
+
+fn prepare_hermetic_machine_state(home: &Path) {
+    let checkpoint_dir = home.join("cache/test-machine-audit-checkpoints");
+    std::fs::create_dir_all(&checkpoint_dir)
+        .expect("create hermetic Machine audit checkpoint directory");
+    std::fs::set_permissions(&checkpoint_dir, std::fs::Permissions::from_mode(0o700))
+        .expect("secure hermetic Machine audit checkpoint directory");
 }
 
 fn ipc_endpoint_accepting(socket: &Path) -> bool {
@@ -67,18 +99,51 @@ impl RunningBloom {
     }
 
     fn start_with_automatic_update_checks(home: &Path, automatic_update_checks: bool) -> Self {
+        prepare_hermetic_machine_state(home);
         let home_dir = bloom_proto::HomeDir::at(home);
-        let mut config = if home_dir.config_path().is_file() {
+        let config = if home_dir.config_path().is_file() {
             bloom_proto::Config::load(&home_dir.config_path()).unwrap()
         } else {
             bloom_proto::Config::local_default()
         };
-        config.petals.preinstalled.clear();
         config.save(&home_dir.config_path()).unwrap();
         let binary = Command::cargo_bin("bloom").expect("locate bloom binary");
         let mut command = std::process::Command::new(binary.get_program());
+        // Exercise normal provisioning while keeping CLI fixtures offline.
+        if std::env::var_os("BLOOM_RUN_NETWORK_TESTS").as_deref() != Some(std::ffi::OsStr::new("1"))
+        {
+            command
+                .env("HTTPS_PROXY", "http://127.0.0.1:1")
+                .env("https_proxy", "http://127.0.0.1:1")
+                .env("NO_PROXY", "")
+                .env("no_proxy", "");
+        }
+
         command
             .env("BLOOM_HOME", home)
+            .env(
+                "BLOOM_ENROLLMENT_ROOT",
+                home.join("config/test-enrollments"),
+            )
+            .env("BLOOM_CONFIG_ROOT", home.join("config/test-triad-config"))
+            .env("BLOOM_RUNTIME_ROOT", home.join("run/test-triad-runtime"))
+            .env_remove("BLOOM_BROKER_SOCKET")
+            .env(
+                "BLOOM_MACHINE_IDENTITY",
+                home.join("config/test-missing-machine-identity.json"),
+            )
+            .env(
+                "BLOOM_EDGE_MANIFEST",
+                home.join("config/test-missing-edge-manifest.json"),
+            )
+            .env(
+                "BLOOM_PROVENANCE_CATALOG",
+                home.join("config/test-missing-provenance-catalog.json"),
+            )
+            .env(
+                "BLOOM_MACHINE_AUDIT_CHECKPOINT_DIR",
+                home.join("cache/test-machine-audit-checkpoints"),
+            )
             .env("RUST_LOG", "error")
             .arg("serve")
             .stdout(std::process::Stdio::null())
@@ -277,7 +342,7 @@ fn seed_wallet_projection_fixture(home: &Path, name: &str) {
     let wallet = WalletPublic {
         wallet_id: wallet_id.clone(),
         wallet_kind: Token::new("passkey").unwrap(),
-        root_key_ref: key_ref.clone(),
+        root_key_ref: Some(key_ref.clone()),
         key_refs: vec![key_ref.clone()],
         policy_version: DecimalU64::new(1),
         policy_digest: policy_digest.clone(),
@@ -318,6 +383,10 @@ fn seed_wallet_projection_fixture(home: &Path, name: &str) {
         keys,
         credentials,
         policy,
+        accounts: bloom_machine_client::empty_wallet_accounts(
+            bloom_broker_api::Token::new(name.to_owned()).expect("valid fixture wallet ID"),
+        ),
+        accounts_unavailable: None,
         source_protocol: "bloom.machine-broker.v1".into(),
         response_digest,
         observed_at_ms: 1,
@@ -699,26 +768,58 @@ fn stop_ipc_server(
 }
 
 fn spawn_bloom_serve(home: &Path) -> std::process::Child {
+    prepare_hermetic_machine_state(home);
     let binary = Command::cargo_bin("bloom")
         .expect("locate bloom binary")
         .get_program()
         .to_owned();
     let mut child = std::process::Command::new(binary)
         .env("BLOOM_HOME", home)
+        .env(
+            "BLOOM_ENROLLMENT_ROOT",
+            home.join("config/test-enrollments"),
+        )
+        .env("BLOOM_CONFIG_ROOT", home.join("config/test-triad-config"))
+        .env("BLOOM_RUNTIME_ROOT", home.join("run/test-triad-runtime"))
+        .env_remove("BLOOM_BROKER_SOCKET")
+        .env(
+            "BLOOM_MACHINE_IDENTITY",
+            home.join("config/test-missing-machine-identity.json"),
+        )
+        .env(
+            "BLOOM_EDGE_MANIFEST",
+            home.join("config/test-missing-edge-manifest.json"),
+        )
+        .env(
+            "BLOOM_PROVENANCE_CATALOG",
+            home.join("config/test-missing-provenance-catalog.json"),
+        )
+        .env(
+            "BLOOM_MACHINE_AUDIT_CHECKPOINT_DIR",
+            home.join("cache/test-machine-audit-checkpoints"),
+        )
         .env("RUST_LOG", "error")
         .arg("serve")
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn bloom serve");
     let socket = bloom_daemon::ipc::default_socket_path(home);
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while !ipc_endpoint_accepting(&socket) {
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "bloom serve exited before binding {}",
-            socket.display()
-        );
+        if child.try_wait().unwrap().is_some() {
+            let mut stderr = String::new();
+            child
+                .stderr
+                .take()
+                .unwrap()
+                .read_to_string(&mut stderr)
+                .unwrap();
+            panic!(
+                "bloom serve exited before binding {}: {stderr}",
+                socket.display()
+            );
+        }
         assert!(
             std::time::Instant::now() < deadline,
             "bloom serve did not bind {}",
@@ -801,26 +902,35 @@ fn help_lists_all_subcommands() {
 }
 
 #[test]
-fn init_respects_persistent_preinstalled_petal_opt_out_without_network() {
+fn init_ignores_legacy_preinstalled_opt_out() {
     let home = fresh_home();
     let home_dir = bloom_proto::HomeDir::at(home.path());
-    let mut config = bloom_proto::Config::local_default();
-    config.petals.preinstalled.clear();
-    config.save(&home_dir.config_path()).unwrap();
+    home_dir.ensure().unwrap();
+    let mut config = toml::Value::try_from(bloom_proto::Config::local_default()).unwrap();
+    config["petals"]
+        .as_table_mut()
+        .unwrap()
+        .insert("preinstalled".into(), toml::Value::Array(vec![]));
+    std::fs::write(
+        home_dir.config_path(),
+        toml::to_string_pretty(&config).unwrap(),
+    )
+    .unwrap();
 
     bloom_cmd(home.path())
+        .env("HTTPS_PROXY", "http://127.0.0.1:1")
+        .env("https_proxy", "http://127.0.0.1:1")
+        .env("NO_PROXY", "")
+        .env("no_proxy", "")
         .arg("init")
         .assert()
-        .success()
-        .stdout(predicate::str::contains("preinstalled_petals: []"));
-
-    let (server, server_thread) = spawn_petals_ipc_server(home.path());
-    bloom_cmd(home.path())
-        .args(["petals", "ls"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("(no petals installed)"));
-    stop_ipc_server(server, server_thread);
+        .failure()
+        .stdout(predicate::str::contains(
+            "preinstalled_petal: installing polymarket",
+        ))
+        .stderr(predicate::str::contains(
+            "provision canonical pre-installed Petals",
+        ));
 }
 
 #[test]
@@ -935,6 +1045,12 @@ fn docs_petals_discovers_installed_package_from_manifest() {
         .success();
     stop_ipc_server(server, server_thread);
     let _daemon = RunningBloom::start(home.path());
+
+    bloom_cmd(home.path())
+        .args(["petals", "ls"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("app=petals/demo/"));
 
     bloom_cmd(home.path())
         .args(["vfs", "cat", "/docs/petals.md"])
@@ -1316,15 +1432,20 @@ fn vfs_cat_status_update_when_no_cache_reports_unknown() {
 
 #[test]
 fn vfs_cat_status_update_with_seed_cache_reports_behind() {
+    let installed = env!("CARGO_PKG_VERSION");
+    let major: u64 = installed.split('.').next().unwrap().parse().unwrap();
+    let latest = format!("{}.0.0", major + 1);
     let home = fresh_home();
     let cache_dir = home.path().join("cache");
     std::fs::create_dir_all(&cache_dir).unwrap();
     bloom_update::cache::write(
         &cache_dir,
         &bloom_update::UpdateSnapshot::ok(
-            "0.1.0".into(),
-            Some("0.2.0".into()),
-            Some("https://github.com/bloom-directory/bloom/releases/tag/v0.2.0".into()),
+            installed.into(),
+            Some(latest.clone()),
+            Some(format!(
+                "https://github.com/bloom-directory/bloom/releases/tag/v{latest}"
+            )),
         ),
     )
     .unwrap();
@@ -1336,27 +1457,23 @@ fn vfs_cat_status_update_with_seed_cache_reports_behind() {
         .args(["vfs", "cat", "/status/update/latest"])
         .assert()
         .success()
-        .stdout(predicate::eq("0.2.0\n"));
+        .stdout(predicate::eq(format!("{latest}\n")));
     bloom_cmd(home.path())
         .args(["vfs", "cat", "/status/update/available"])
         .assert()
         .success()
-        .stdout(predicate::eq(
-            if bloom_update::compare_semver(env!("CARGO_PKG_VERSION"), "0.2.0")
-                == std::cmp::Ordering::Less
-            {
-                "out_of_date\n"
-            } else {
-                "up_to_date\n"
-            },
-        ));
+        .stdout(predicate::eq("out_of_date\n"));
     bloom_cmd(home.path())
         .arg("status")
         .assert()
         .success()
-        .stdout(predicate::str::contains("latest_release: 0.2.0"))
+        .stdout(predicate::str::contains(format!(
+            "latest_release: {latest}"
+        )))
         .stdout(predicate::str::contains("update_available: out_of_date"))
-        .stderr(predicate::str::contains("hint: bloom v0.2.0 is available"));
+        .stderr(predicate::str::contains(format!(
+            "hint: bloom v{latest} is available"
+        )));
 }
 
 #[test]
@@ -1473,19 +1590,57 @@ fn connect_flag_beats_rpc_endpoint_env() {
 #[test]
 fn lifecycle_commands_ignore_invalid_client_endpoint_configuration() {
     let home = fresh_home();
+    prepare_hermetic_machine_state(home.path());
     let home_dir = bloom_proto::HomeDir::at(home.path());
-    let mut config = bloom_proto::Config::local_default();
-    config.petals.preinstalled.clear();
+    let config = bloom_proto::Config::local_default();
     config.save(&home_dir.config_path()).unwrap();
     bloom_cmd(home.path())
         .env("BLOOM_RPC_ENDPOINT", "tcp:invalid")
+        .env("HTTPS_PROXY", "http://127.0.0.1:1")
+        .env("https_proxy", "http://127.0.0.1:1")
+        .env("NO_PROXY", "")
+        .env("no_proxy", "")
         .arg("init")
         .assert()
-        .success();
+        .failure()
+        .stderr(predicate::str::contains(
+            "provision canonical pre-installed Petals",
+        ));
 
     let binary = Command::cargo_bin("bloom").expect("locate bloom binary");
     let mut child = std::process::Command::new(binary.get_program())
         .env("BLOOM_HOME", home.path())
+        .env(
+            "BLOOM_ENROLLMENT_ROOT",
+            home.path().join("config/test-enrollments"),
+        )
+        .env(
+            "BLOOM_CONFIG_ROOT",
+            home.path().join("config/test-triad-config"),
+        )
+        .env(
+            "BLOOM_RUNTIME_ROOT",
+            home.path().join("run/test-triad-runtime"),
+        )
+        .env_remove("BLOOM_BROKER_SOCKET")
+        .env(
+            "BLOOM_MACHINE_IDENTITY",
+            home.path()
+                .join("config/test-missing-machine-identity.json"),
+        )
+        .env(
+            "BLOOM_EDGE_MANIFEST",
+            home.path().join("config/test-missing-edge-manifest.json"),
+        )
+        .env(
+            "BLOOM_PROVENANCE_CATALOG",
+            home.path()
+                .join("config/test-missing-provenance-catalog.json"),
+        )
+        .env(
+            "BLOOM_MACHINE_AUDIT_CHECKPOINT_DIR",
+            home.path().join("cache/test-machine-audit-checkpoints"),
+        )
         .env("BLOOM_RPC_ENDPOINT", "tcp:invalid")
         .env("RUST_LOG", "error")
         .env(bloom_update::DISABLE_AUTO_CHECK_ENV, "1")
@@ -1539,6 +1694,23 @@ fn ipc_socket_flag_beats_rpc_endpoint_env() {
 }
 
 #[test]
+fn serve_remains_available_with_unavailable_defaults_on_repeated_starts() {
+    let home = fresh_home();
+    let home_dir = bloom_proto::HomeDir::at(home.path());
+    home_dir.ensure().unwrap();
+    let config = bloom_proto::Config::local_default();
+    config.save(&home_dir.config_path()).unwrap();
+    for _ in 0..2 {
+        let daemon = spawn_bloom_serve(home.path());
+        bloom_cmd(home.path())
+            .args(["ipc", "call", "version"])
+            .assert()
+            .success();
+        stop_bloom_serve(home.path(), daemon);
+    }
+}
+
+#[test]
 fn serve_refuses_when_home_write_lock_is_live() {
     let home = fresh_home();
     let _permit = bloom_proto::HomeWritePermit::acquire(&bloom_proto::HomeDir::at(home.path()))
@@ -1546,9 +1718,10 @@ fn serve_refuses_when_home_write_lock_is_live() {
     let lock = home.path().join("run").join(".daemon.lock");
 
     let mut command = bloom_cmd(home.path());
-    command.arg("serve");
+    command.env("BLOOM_LOG_OUTPUT", "json-stderr").arg("serve");
     command.assert().failure().stderr(
-        predicate::str::contains("already open for writing")
+        predicate::str::contains("Bloom service exited after a runtime failure")
+            .and(predicate::str::contains("service.fatal_exit"))
             .and(predicate::str::contains(lock.display().to_string())),
     );
 }
@@ -1699,7 +1872,7 @@ fn wallet_stage_routes_via_ipc_when_home_write_lock_is_live() {
     stop_ipc_server(server, server_thread);
     let writes = wallets.writes();
     assert_eq!(writes.len(), 1, "writes={writes:?}");
-    assert_eq!(writes[0].0, "/alice/chains/anvil/outbox/new.tx");
+    assert_eq!(writes[0].0, "/alice/0/chains/anvil/outbox/new.tx");
     assert_eq!(String::from_utf8_lossy(&writes[0].1), intent);
 }
 
@@ -2109,6 +2282,173 @@ fn vfs_routes_via_ipc_when_socket_exists() {
     server_thread.join().expect("ipc server thread panicked");
 }
 
+/// The MCP proxy must be inert until an operator turns it on: a fresh home has
+/// no config at all, and `mcp serve` has to refuse before it reads a single
+/// client byte or touches the daemon socket.
+#[test]
+fn mcp_is_disabled_until_the_config_flag_is_set() {
+    let home = fresh_home();
+    assert!(
+        !bloom_proto::HomeDir::at(home.path()).config_path().exists(),
+        "this test starts from a home with no config at all"
+    );
+
+    bloom_cmd(home.path())
+        .args(["mcp", "status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("enabled: false"))
+        .stdout(predicate::str::contains("transport: stdio"))
+        .stdout(predicate::str::contains("vfs_read"))
+        .stdout(predicate::str::contains(
+            "set `enabled = true` under `[mcp]`",
+        ));
+
+    // Even handed a complete, valid MCP session on stdin, a disabled server
+    // must answer nothing and exit non-zero.
+    let assertion = bloom_cmd(home.path())
+        .args(["mcp", "serve"])
+        .write_stdin(
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n\
+             {\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n",
+        )
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("disabled"));
+    assert_eq!(
+        assertion.get_output().stdout,
+        b"",
+        "a disabled MCP server must not emit protocol frames"
+    );
+
+    // An explicit `enabled = false` is still disabled.
+    let home_dir = bloom_proto::HomeDir::at(home.path());
+    let mut config = bloom_proto::Config::local_default();
+    config.mcp.enabled = false;
+    config.save(&home_dir.config_path()).unwrap();
+    bloom_cmd(home.path())
+        .args(["mcp", "status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("enabled: false"));
+}
+
+/// With the flag set, `bloom mcp serve` speaks MCP on stdio and every tool call
+/// lands on the same daemon IPC surface `bloom vfs` uses. The in-process server
+/// mounts a subtree the production daemon never has, so a correct answer proves
+/// the request really travelled the canonical path.
+#[tokio::test]
+async fn mcp_serve_proxies_vfs_commands_over_stdio_when_enabled() {
+    let home = fresh_home();
+    let home_dir = bloom_proto::HomeDir::at(home.path());
+    let mut config = bloom_proto::Config::local_default();
+    config.mcp.enabled = true;
+    config.save(&home_dir.config_path()).unwrap();
+
+    let handler = RecordingWriteHandler::new();
+    let vfs = bloom_vfs::Vfs::builder()
+        .mount("wallets", handler.clone())
+        .build();
+    let (server, server_thread) = spawn_ipc_server(home.path(), vfs);
+
+    let session = [
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"cli-test","version":"1"}}}"#,
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"vfs_write","arguments":{"path":"/wallets/alice/chains/base/outbox/pending/0001/confirm","text":"y"}}}"#,
+        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"vfs_read","arguments":{"path":"/absent-subtree/x"}}}"#,
+    ]
+    .join("\n")
+        + "\n";
+
+    // A stdio client keeps its input open while waiting for operations.
+    // Closing it first now correctly discards undispatched work.
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let template = bloom_cmd(home.path());
+    let mut command = tokio::process::Command::new(template.get_program());
+    for (key, value) in template.get_envs() {
+        if let Some(value) = value {
+            command.env(key, value);
+        } else {
+            command.env_remove(key);
+        }
+    }
+    let mut child = command
+        .args(["mcp", "serve"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    input.write_all(session.as_bytes()).await.unwrap();
+    let mut output = tokio::io::BufReader::new(child.stdout.take().unwrap());
+    let mut responses = Vec::<serde_json::Value>::new();
+    for _ in 0..4 {
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(5), output.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        responses.push(serde_json::from_str(&line).expect("each frame is one JSON document"));
+    }
+    input.shutdown().await.unwrap();
+    drop(input);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), child.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+
+    assert_eq!(responses.len(), 4, "the notification is not answered");
+    assert_eq!(responses[0]["result"]["serverInfo"]["name"], "bloom-vfs");
+    assert_eq!(responses[0]["result"]["protocolVersion"], "2025-06-18");
+
+    let tool_names: Vec<&str> = responses[1]["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        tool_names,
+        [
+            "vfs_list",
+            "vfs_read",
+            "vfs_stat",
+            "vfs_write",
+            "vfs_write_then_stat"
+        ]
+    );
+
+    assert_eq!(responses[2]["result"]["isError"], false);
+    assert_eq!(
+        responses[2]["result"]["structuredContent"]["bytes_written"],
+        1
+    );
+
+    // A daemon-side failure is reported as an MCP tool error carrying the
+    // daemon's own JSON-RPC code.
+    assert_eq!(responses[3]["result"]["isError"], true);
+    assert_eq!(
+        responses[3]["result"]["structuredContent"]["error"]["code"],
+        -32004
+    );
+
+    stop_ipc_server(server, server_thread);
+
+    let writes = handler.writes();
+    assert_eq!(writes.len(), 1, "expected one VFS write, got {writes:?}");
+    assert_eq!(
+        writes[0].0,
+        "/alice/chains/base/outbox/pending/0001/confirm"
+    );
+    assert_eq!(writes[0].1, b"y");
+}
+
 #[test]
 fn wallet_confirm_uses_plain_ipc_write_when_socket_exists() {
     let home = fresh_home();
@@ -2137,7 +2477,7 @@ fn wallet_confirm_uses_plain_ipc_write_when_socket_exists() {
     assert_eq!(writes.len(), 1, "expected one VFS write, got {writes:?}");
     assert_eq!(
         writes[0].0,
-        "/alice/chains/base/outbox/pending/0001-deadbeef/confirm"
+        "/alice/0/chains/base/outbox/pending/0001-deadbeef/confirm"
     );
     assert_eq!(writes[0].1, b"y");
 }
@@ -2319,7 +2659,13 @@ fn petal_cli_build_install_list_and_vfs_read_happy_path() {
         .args(["vfs", "cat", "/petals/demo/hello.txt"])
         .assert()
         .success()
-        .stdout(predicate::eq("component"));
+        .stdout(predicate::str::contains("component")); // Public routes stay unscoped.
+
+    bloom_cmd(home.path())
+        .args(["vfs", "ls", "/petals/demo"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hello.txt"));
 
     bloom_cmd(home.path())
         .args(["vfs", "cat", "/petals/demo/README.md"])
@@ -2333,19 +2679,18 @@ fn github_source_install_polymarket_dispatches_route_contract() {
     if std::env::var_os("BLOOM_RUN_NETWORK_TESTS").as_deref() != Some(std::ffi::OsStr::new("1")) {
         return;
     }
-    // This commit uses the same canonical Petal contract revision as Bloom.
-    let petal_ref = "a47e7e462c2be117d497a3edd2399fb1f4acfe8d";
+    // Exercise source installation of the current pinned Polymarket release.
+    let petal_ref = "a0177ae4e68f4a043df4db727fb3212e23ab7395";
     let home = fresh_home();
     let home_dir = bloom_proto::HomeDir::at(home.path());
-    let mut config = bloom_proto::Config::local_default();
-    config.petals.preinstalled.clear();
+    let config = bloom_proto::Config::local_default();
     config.save(&home_dir.config_path()).unwrap();
 
     bloom_cmd(home.path())
         .arg("init")
         .assert()
         .success()
-        .stdout(predicate::str::contains("preinstalled_petals: []"));
+        .stdout(predicate::str::contains("preinstalled_petals:"));
 
     let daemon = spawn_bloom_serve(home.path());
 
@@ -2364,8 +2709,8 @@ fn github_source_install_polymarket_dispatches_route_contract() {
         )))
         .stdout(predicate::str::contains("Building source package..."))
         .stdout(predicate::str::contains("Validating Petal package..."))
-        .stdout(predicate::str::contains("\"routes\": 97"))
-        .stdout(predicate::str::contains("routes: 97"));
+        .stdout(predicate::str::contains("\"routes\": 109"))
+        .stdout(predicate::str::contains("routes: 109"));
 
     bloom_cmd(home.path())
         .args(["petals", "ls"])
@@ -2382,6 +2727,12 @@ fn github_source_install_polymarket_dispatches_route_contract() {
         .stdout(predicate::str::contains(
             "bloom.polymarket.petal-route-contract.v1",
         ));
+
+    bloom_cmd(home.path())
+        .args(["vfs", "ls", "/petals/polymarket"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("meta"));
 
     bloom_cmd(home.path())
         .args(["vfs", "cat", "/petals/polymarket/README.md"])

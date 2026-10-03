@@ -224,7 +224,7 @@ echo '{
   "contract": "0xBC4CA0EdA7647A8aB7C2061c2E118A18a936f13D",
   "to":       "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
   "token_id": "1"
-}' > /bloom/wallets/alice/chains/ethereum/outbox/new.tx
+}' > /bloom/wallets/alice/0/chains/ethereum/outbox/new.tx
 ```
 
 Legacy unsafe transfer (skips `onERC721Received` callback):
@@ -236,7 +236,7 @@ echo '{
   "to":       "vitalik.eth",
   "token_id": "1234",
   "safe":     false
-}' > /bloom/wallets/alice/chains/ethereum/outbox/new.tx
+}' > /bloom/wallets/alice/0/chains/ethereum/outbox/new.tx
 ```
 
 ### `nft_transfer` — ERC-721, shell shorthand
@@ -247,11 +247,11 @@ The shell parser accepts `nft transfer <contract> <token_id> to <addr>
 ```sh
 # Same as the JSON BAYC #1 transfer above.
 echo 'nft transfer 0xBC4CA0EdA7647A8aB7C2061c2E118A18a936f13D 1 to 0x70997970C51812dc3A010C7d01b50e0d17dc79C8 on ethereum' \
-  > /bloom/wallets/alice/chains/ethereum/outbox/new.tx
+  > /bloom/wallets/alice/0/chains/ethereum/outbox/new.tx
 
 # Pudgy Penguins #6873 to vitalik.eth.
 echo 'nft transfer 0xBd3531dA5CF5857e7CfAA92426877b022e612cf8 6873 to vitalik.eth on ethereum' \
-  > /bloom/wallets/alice/chains/ethereum/outbox/new.tx
+  > /bloom/wallets/alice/0/chains/ethereum/outbox/new.tx
 ```
 
 ### `nft_transfer` — ERC-1155 with amount and optional data
@@ -270,7 +270,7 @@ echo '{
   "token_id": "10",
   "standard": "erc1155",
   "amount":   "3"
-}' > /bloom/wallets/alice/chains/ethereum/outbox/new.tx
+}' > /bloom/wallets/alice/0/chains/ethereum/outbox/new.tx
 
 # Same with optional `data` payload (forwarded to onERC1155Received).
 echo '{
@@ -281,7 +281,7 @@ echo '{
   "standard": "erc1155",
   "amount":   "1",
   "data":     "0xdeadbeef"
-}' > /bloom/wallets/alice/chains/ethereum/outbox/new.tx
+}' > /bloom/wallets/alice/0/chains/ethereum/outbox/new.tx
 ```
 
 Shell shorthand for ERC-1155 (the `amount <n>` clause flips the
@@ -289,7 +289,7 @@ standard hint to erc1155, so no JSON is needed):
 
 ```sh
 echo 'nft transfer 0x495f947276749Ce646f68AC8c248420045cb7b5e 10 amount 3 to 0x70997970C51812dc3A010C7d01b50e0d17dc79C8 on ethereum' \
-  > /bloom/wallets/alice/chains/ethereum/outbox/new.tx
+  > /bloom/wallets/alice/0/chains/ethereum/outbox/new.tx
 ```
 
 ### `nft_approve` — ERC-721 per-token
@@ -309,11 +309,11 @@ echo '{
   "contract": "0x8a90CAb2b38dba80c64b7734e58Ee1dB38B8992e",
   "operator": "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
   "token_id": "1234"
-}' > /bloom/wallets/alice/chains/ethereum/outbox/new.tx
+}' > /bloom/wallets/alice/0/chains/ethereum/outbox/new.tx
 
 # Equivalent shell shorthand:
 echo 'nft approve 0x8a90CAb2b38dba80c64b7734e58Ee1dB38B8992e 1234 to 0x70997970C51812dc3A010C7d01b50e0d17dc79C8 on ethereum' \
-  > /bloom/wallets/alice/chains/ethereum/outbox/new.tx
+  > /bloom/wallets/alice/0/chains/ethereum/outbox/new.tx
 
 # Revoke: pass the zero address as operator.
 echo '{
@@ -321,7 +321,7 @@ echo '{
   "contract": "0x8a90CAb2b38dba80c64b7734e58Ee1dB38B8992e",
   "operator": "0x0000000000000000000000000000000000000000",
   "token_id": "1234"
-}' > /bloom/wallets/alice/chains/ethereum/outbox/new.tx
+}' > /bloom/wallets/alice/0/chains/ethereum/outbox/new.tx
 ```
 
 Rejection example — the OpenSea Shared Storefront is ERC-1155, so a
@@ -333,12 +333,12 @@ echo '{
   "contract": "0x495f947276749Ce646f68AC8c248420045cb7b5e",
   "operator": "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
   "token_id": "10"
-}' > /bloom/wallets/alice/chains/ethereum/outbox/new.tx
+}' > /bloom/wallets/alice/0/chains/ethereum/outbox/new.tx
 
 # Inspect the failure: the failed/ slot will hold the rejected intent
 # with the engine error. Nothing lands in pending/.
-ls /bloom/wallets/alice/chains/ethereum/outbox/failed/
-cat /bloom/wallets/alice/chains/ethereum/outbox/failed/0001-*/error
+ls /bloom/wallets/alice/0/chains/ethereum/outbox/failed/
+cat /bloom/wallets/alice/0/chains/ethereum/outbox/failed/0001-*/error
 # => ERC-1155 has no per-token approval; use nft_approve_all
 ```
 
@@ -362,12 +362,12 @@ echo '{
   "contract": "0xBC4CA0EdA7647A8aB7C2061c2E118A18a936f13D",
   "operator": "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
   "approved": true
-}' > /bloom/wallets/alice/chains/ethereum/outbox/new.tx
+}' > /bloom/wallets/alice/0/chains/ethereum/outbox/new.tx
 
 # Shell shorthand (note: verb is `set_approval_for_all`, with operator
 # before the boolean):
 echo 'nft set_approval_for_all 0xBC4CA0EdA7647A8aB7C2061c2E118A18a936f13D 0x70997970C51812dc3A010C7d01b50e0d17dc79C8 true on ethereum' \
-  > /bloom/wallets/alice/chains/ethereum/outbox/new.tx
+  > /bloom/wallets/alice/0/chains/ethereum/outbox/new.tx
 
 # Revoke a previously-granted operator-wide approval (no WARN).
 echo '{
@@ -375,7 +375,7 @@ echo '{
   "contract": "0xBC4CA0EdA7647A8aB7C2061c2E118A18a936f13D",
   "operator": "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
   "approved": false
-}' > /bloom/wallets/alice/chains/ethereum/outbox/new.tx
+}' > /bloom/wallets/alice/0/chains/ethereum/outbox/new.tx
 ```
 
 ### Inspect the plan, then confirm
@@ -386,16 +386,16 @@ counterparty, token id, ERC-1155 amount when set, and any policy
 checks (including the `nft.approve_all` WARN):
 
 ```sh
-ls /bloom/wallets/alice/chains/ethereum/outbox/pending/
+ls /bloom/wallets/alice/0/chains/ethereum/outbox/pending/
 # 0001-7f3c.../
 
-cat /bloom/wallets/alice/chains/ethereum/outbox/pending/0001-*/plan.md
+cat /bloom/wallets/alice/0/chains/ethereum/outbox/pending/0001-*/plan.md
 
 # Confirm.
-echo y > /bloom/wallets/alice/chains/ethereum/outbox/pending/0001-*/confirm
+echo y > /bloom/wallets/alice/0/chains/ethereum/outbox/pending/0001-*/confirm
 
 # Receipt lands under sent/.
-ls /bloom/wallets/alice/chains/ethereum/outbox/sent/
+ls /bloom/wallets/alice/0/chains/ethereum/outbox/sent/
 ```
 
 If a policy WARN surfaced a write-override requirement, the daemon

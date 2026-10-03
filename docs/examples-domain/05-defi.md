@@ -28,15 +28,15 @@ a compatibility fallback and is reported as unencrypted configuration.
 ## Create and review a swap
 
 ```sh
-bloom vfs write /petals/enso/intents/alice/new \
+bloom vfs write /petals/enso/intents/alice/0/new \
   --data 'swap 100 usdc to eth on base'
-bloom vfs ls /petals/enso/intents/alice
+bloom vfs ls /petals/enso/intents/alice/0
 
 session='<session-id-from-the-list>'
-bloom vfs cat "/petals/enso/intents/alice/$session/plan.md"
-bloom vfs cat "/petals/enso/intents/alice/$session/route.json"
-bloom vfs cat "/petals/enso/intents/alice/$session/tx.json"
-bloom vfs cat "/petals/enso/intents/alice/$session/simulation.json"
+bloom vfs cat "/petals/enso/intents/alice/0/$session/plan.md"
+bloom vfs cat "/petals/enso/intents/alice/0/$session/route.json"
+bloom vfs cat "/petals/enso/intents/alice/0/$session/tx.json"
+bloom vfs cat "/petals/enso/intents/alice/0/$session/simulation.json"
 ```
 
 Treat `plan.md` and the simulation as review material. Route discovery does
@@ -48,7 +48,7 @@ The first confirmation asks the Petal to stage the reviewed transaction into
 Bloom's standard wallet outbox:
 
 ```sh
-bloom vfs write "/petals/enso/intents/alice/$session/confirm" \
+bloom vfs write "/petals/enso/intents/alice/0/$session/confirm" \
   --data confirm
 ```
 
@@ -62,9 +62,9 @@ The outbox still owns the final broadcast ceremony:
 
 ```sh
 bloom vfs cat \
-  /wallets/alice/chains/base/outbox/pending/<id>/plan.md
+  /wallets/alice/0/chains/base/outbox/pending/<id>/plan.md
 bloom vfs write \
-  /wallets/alice/chains/base/outbox/pending/<id>/confirm \
+  /wallets/alice/0/chains/base/outbox/pending/<id>/confirm \
   --data confirm
 ```
 
@@ -72,11 +72,11 @@ Inspect the receipt and the Petal's settlement state after broadcast:
 
 ```sh
 bloom vfs cat \
-  /wallets/alice/chains/base/outbox/sent/<id>/receipt.json
+  /wallets/alice/0/chains/base/outbox/sent/<id>/receipt.json
 bloom vfs cat \
-  "/petals/enso/intents/alice/$session/settlement.json"
+  "/petals/enso/intents/alice/0/$session/settlement.json"
 bloom vfs cat \
-  "/petals/enso/intents/alice/$session/status.json"
+  "/petals/enso/intents/alice/0/$session/status.json"
 ```
 
 ## Safety properties

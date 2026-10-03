@@ -21,14 +21,18 @@
 
 pub mod endpoint;
 pub mod error;
-pub mod health;
 pub mod policy;
 pub mod session;
 pub mod transport;
 
 pub use endpoint::{EndpointScheme, is_subscription_capable};
 pub use error::BloomRpcError;
-pub use health::EndpointHealthSnapshot;
 pub use policy::BloomRetryPolicy;
 pub use session::Session;
 pub use transport::RpcEngine;
+
+// Endpoint-health registry lives in the chain-neutral `bloom-rpc-common`
+// crate (shared with `bloom-solana`); re-export so existing `bloom_rpc::health`
+// and `bloom_rpc::EndpointHealthSnapshot` references keep compiling unchanged.
+pub use bloom_rpc_common::EndpointHealthSnapshot;
+pub use bloom_rpc_common::health;

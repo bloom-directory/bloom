@@ -1,9 +1,9 @@
 [Unit]
-Description=Bloom canonical ceremony listener for login UID %i
+Description=Bloom canonical IPv4 ceremony listener for login UID %i
 
 [Socket]
 ListenStream=127.0.0.1:18734
-FileDescriptorName=broker-ceremony
+FileDescriptorName=broker-ceremony-ipv4
 Service=bloom-broker@%i.service
 Accept=no
 FreeBind=no
