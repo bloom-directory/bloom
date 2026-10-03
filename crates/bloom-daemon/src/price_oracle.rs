@@ -217,6 +217,16 @@ mod tests {
         assert!(PricesOracle::amount_to_usd_micro("1", 0, 0.0).is_err());
     }
 
+    /// RUSTSEC-2026-0220: ruint before 1.20 reported no overflow when a left
+    /// shift discarded whole high limbs, so this valuation wrapped to
+    /// `Ok(83076749736557242056488)` instead of exceeding `i128::MAX`.
+    #[test]
+    fn valuation_rejects_overflow_from_a_multi_limb_shift() {
+        let amount = (U256::from(1u8) << 160usize) + U256::from(1u8);
+        let result = PricesOracle::amount_to_usd_micro(&amount.to_string(), 18, 2.0_f64.powi(116));
+        assert!(result.is_err(), "{result:?}");
+    }
+
     #[test]
     fn positive_dust_rounds_up_to_one_micro_usd() {
         assert_eq!(
