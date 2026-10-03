@@ -134,6 +134,8 @@ struct NetAllowToml {
 struct SignPolicy {
     #[serde(default)]
     allowed_intents: Vec<String>,
+    #[serde(default)]
+    fee_asset: Option<bloom_broker_api::ProvenanceFeeAsset>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -335,6 +337,9 @@ pub struct RouteIndex {
     pub petal_root: String,
     pub policy_hash: String,
     pub routes: Vec<RouteIndexRecord>,
+    /// Native fee every signing intent in the package pays, from `[sign].fee_asset`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sign_fee_asset: Option<bloom_broker_api::ProvenanceFeeAsset>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -513,7 +518,11 @@ impl PreparedPetalPackage {
             .iter()
             .cloned()
             .collect::<BTreeSet<_>>();
-        validate_sign_policy(&allowed_caps, &allowed_sign_intents)?;
+        validate_sign_policy(
+            &allowed_caps,
+            &allowed_sign_intents,
+            manifest.sign.fee_asset.as_ref(),
+        )?;
         let store_policy = store_policy_from_manifest(&manifest);
         validate_store_policy(&allowed_caps, &store_policy)?;
         validate_net_policy(&allowed_caps, &manifest.net)?;
@@ -534,6 +543,7 @@ impl PreparedPetalPackage {
             petal_root: manifest.name.clone(),
             policy_hash,
             routes: Vec::with_capacity(route_files.len()),
+            sign_fee_asset: manifest.sign.fee_asset.clone(),
         };
         for route in route_files {
             let source_path = route.source_path.to_string_lossy().replace('\\', "/");
@@ -990,7 +1000,11 @@ pub fn sign_intents_from_manifest_toml(bytes: &[u8]) -> Result<BTreeSet<String>,
         .iter()
         .cloned()
         .collect::<BTreeSet<_>>();
-    validate_sign_policy(&allowed_caps, &allowed_sign_intents)?;
+    validate_sign_policy(
+        &allowed_caps,
+        &allowed_sign_intents,
+        manifest.sign.fee_asset.as_ref(),
+    )?;
     Ok(allowed_sign_intents)
 }
 
@@ -3885,6 +3899,7 @@ fn validate_petal_name(name: &str) -> Result<(), PetalError> {
 fn validate_sign_policy(
     allowed_caps: &BTreeSet<String>,
     allowed_sign_intents: &BTreeSet<String>,
+    fee_asset: Option<&bloom_broker_api::ProvenanceFeeAsset>,
 ) -> Result<(), PetalError> {
     if allowed_caps.contains("bloom:sign") && allowed_sign_intents.is_empty() {
         return Err(PetalError::InvalidWasm(
@@ -3893,6 +3908,11 @@ fn validate_sign_policy(
     }
     for intent in allowed_sign_intents {
         validate_sign_intent(intent)?;
+    }
+    if fee_asset.is_some_and(|fee| fee.asset.is_empty()) {
+        return Err(PetalError::InvalidWasm(
+            "Petal package [sign].fee_asset asset must be non-empty".into(),
+        ));
     }
     Ok(())
 }
@@ -6933,6 +6953,61 @@ maximum_lifetime_ms = 60000
         assert!(!legacy.key_derive_scope_declared);
         assert!(legacy.key_derive_allowed_crypto_suites.is_empty());
         assert_eq!(legacy.key_derive_maximum_lifetime_ms, None);
+    }
+
+    #[test]
+    fn petal_sign_fee_asset_is_recorded_in_the_route_index() {
+        let manifest = |sign: &str| {
+            format!(
+                r#"schema = "bloom.petal.package.v1"
+name = "triad-authority-fixture"
+[caps]
+allowed = ["bloom:key.derive", "bloom:sign", "bloom:store"]
+
+[sign]
+allowed_intents = ["fixture.payload"]
+{sign}
+
+[store]
+namespaces = ["fixture-public"]
+"#
+            )
+        };
+        let fee_free = prepared_triad_fixture_with_manifest(manifest("").as_bytes()).unwrap();
+        assert_eq!(fee_free.route_index.sign_fee_asset, None);
+        assert!(
+            serde_json::to_value(&fee_free.route_index)
+                .unwrap()
+                .get("sign_fee_asset")
+                .is_none()
+        );
+
+        let fee_bearing = prepared_triad_fixture_with_manifest(
+            manifest(r#"fee_asset = { chain = "solana", asset = "native" }"#).as_bytes(),
+        )
+        .unwrap();
+        let fee = fee_bearing.route_index.sign_fee_asset.unwrap();
+        assert_eq!(
+            (fee.chain.as_str(), fee.asset.as_str()),
+            ("solana", "native")
+        );
+
+        assert!(
+            prepared_triad_fixture_with_manifest(
+                manifest(r#"fee_asset = { chain = "Solana!", asset = "native" }"#).as_bytes(),
+            )
+            .is_err()
+        );
+        let error = prepared_triad_fixture_with_manifest(
+            manifest(r#"fee_asset = { chain = "solana", asset = "" }"#).as_bytes(),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("[sign].fee_asset asset must be non-empty"),
+            "{error}"
+        );
     }
 
     #[test]
