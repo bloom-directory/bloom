@@ -961,6 +961,10 @@ impl MachineBrokerClient {
             } else {
                 Vec::new()
             },
+            safe_review_payloads: request
+                .safe_review_payload
+                .map(|payload| vec![Base64UrlBytes::from_bytes(&payload)])
+                .unwrap_or_default(),
             operation_id: request.approval_operation_id,
             terms,
             canonical_plan_facts_digest: request.canonical_plan_facts_digest,
@@ -1142,6 +1146,7 @@ impl MachineBrokerClient {
             } else {
                 Vec::new()
             },
+            safe_review_payloads: Vec::new(),
             operation_id: request.approval_operation_id,
             terms,
             canonical_plan_facts_digest: request.canonical_plan_facts_digest,
@@ -1298,6 +1303,7 @@ impl MachineBrokerClient {
         terms.validate()?;
         self.prepare_approval(ApprovalPrepareRequest {
             evm_review_payloads: Vec::new(),
+            safe_review_payloads: Vec::new(),
             operation_id: request.approval_operation_id,
             terms,
             canonical_plan_facts_digest: request.canonical_plan_facts_digest,
@@ -1997,6 +2003,7 @@ pub struct ExactPayloadSignRequest {
     pub petal_use_claim: Option<PetalUseClaim>,
     pub system_use_claim: Option<SystemUseClaim>,
     pub claim_assurance_evidence: Option<Vec<u8>>,
+    pub safe_review_payload: Option<Vec<u8>>,
     /// Value movement authorized by the reviewed exact claim. System callers
     /// must supply an exact per-asset ceiling; non-value signing leaves this
     /// empty.
@@ -2065,6 +2072,16 @@ impl ExactPayloadBatchSignRequest {
                 "exact batch payload and claimed-hash counts differ",
             ));
         }
+        // Batches carry no Safe envelope, so a Safe confirmation here would be
+        // signed unreviewed. Broker also refuses it; this keeps the error local.
+        if self.petal_use_claim.as_ref().is_some_and(|claim| {
+            claim.operation_class.as_str() == bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS
+        }) {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::MalformedFrame,
+                "Safe confirmations require the single-payload exact path with a Safe review envelope",
+            ));
+        }
         SigningPayloads::Batch {
             children: self
                 .preimages
@@ -2082,6 +2099,43 @@ impl ExactPayloadSignRequest {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::MalformedFrame,
                 "exact approval validity interval is invalid",
+            ));
+        }
+        if self
+            .safe_review_payload
+            .as_ref()
+            .is_some_and(|payload| payload.len() > 256 * 1024)
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::MalformedFrame,
+                "Safe review payload is too large",
+            ));
+        }
+        // Keyed on the claim's class: this request either is a Safe
+        // confirmation and carries its envelope, or is not and carries none.
+        //
+        // Broker keys the same requirement on the *subject* instead -- it
+        // demands an envelope whenever the route's installer provenance
+        // declares the Safe class anywhere in its list. The two agree for a
+        // route that declares only `safe.transaction.confirm`, which is what
+        // `bloom-petal-safe` declares and the only shape that exists today.
+        // They disagree the moment such a route gains a second exact-signing
+        // class: an approval for that second class must omit the envelope to
+        // pass here and must include one to pass Broker, so it is
+        // unsignable, and the failure surfaces as an opaque SelectorMismatch.
+        //
+        // So a Safe-declaring route is constrained to that one class until
+        // both sides key on the same thing. Broker is the side to change --
+        // requiring the envelope when the approval's claim class is the Safe
+        // class, rather than when the subject merely declares it -- and that
+        // is a change to the Broker gate, not to this check.
+        let safe_operation = self.petal_use_claim.as_ref().is_some_and(|claim| {
+            claim.operation_class.as_str() == bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS
+        });
+        if safe_operation != self.safe_review_payload.is_some() {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::MalformedFrame,
+                "Safe confirmation requires exactly one Safe review payload",
             ));
         }
         SigningPayloads::Single {
@@ -2546,6 +2600,20 @@ impl TrustedPetalSignRequest {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::MalformedFrame,
                 "payload and trusted route must be non-empty",
+            ));
+        }
+        // This request has no Safe envelope field at all, and `frozen_action`
+        // feeds only the operation id -- it never reaches Broker. So a Safe
+        // confirmation on this path would be signed with nothing reviewed.
+        // The batch path refuses the class for the same reason; refusing it
+        // here too makes that true of every Machine path that carries no
+        // envelope, rather than of one of the two.
+        if self.claim.operation_class.as_str() == bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS
+            || self.operation_class.as_str() == bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::MalformedFrame,
+                "Safe confirmations require the single-payload exact path with a Safe review envelope",
             ));
         }
         SigningPayloads::Single {
@@ -3928,10 +3996,127 @@ mod tests {
             petal_use_claim: None,
             system_use_claim: None,
             claim_assurance_evidence: None,
+            safe_review_payload: None,
             approval_value_limits: Vec::new(),
             account_key_ref: None,
             requested_review_mode: None,
         }
+    }
+
+    #[test]
+    fn safe_exact_request_requires_a_bounded_semantic_review_envelope() {
+        let mut request = exact_request(vec![0x19, 0x01], None);
+        request.petal_use_claim = Some(PetalUseClaim {
+            package_hash: digest(70),
+            route: "transactions/wallet/one/confirm.json".into(),
+            operation_class: token("safe.transaction.confirm"),
+            crypto_suite: CryptoSuite::Secp256k1Keccak256Recoverable,
+            payload_digest: digest(71),
+            ordered_hashes: vec![request.claimed_hash.clone()],
+            declared_debits: vec![],
+            declared_destinations: vec![],
+            declared_fee: DeclaredFee::None,
+            nonce: RequestNonce::from_bytes([72; 16]),
+            claim_assurance: bloom_broker_api::ClaimAssurance::MachineAsserted,
+        });
+        assert_eq!(
+            request.validate().unwrap_err().code,
+            ProtocolErrorCode::MalformedFrame
+        );
+        request.safe_review_payload = Some(br#"{"schema":"bloom.safe.review.v1"}"#.to_vec());
+        request.validate().unwrap();
+        request.safe_review_payload = Some(vec![0; 256 * 1024 + 1]);
+        assert_eq!(
+            request.validate().unwrap_err().code,
+            ProtocolErrorCode::MalformedFrame
+        );
+    }
+
+    #[test]
+    fn safe_confirmations_cannot_take_the_unreviewed_batch_path() {
+        let mut request = exact_batch_request(vec![vec![0x19, 0x01], vec![0x19, 0x02]], None);
+        request.validate().unwrap();
+        // The batch request has no Safe review envelope and its approval is
+        // prepared with an empty safe_review_payloads, so a Safe confirmation
+        // here would reach the owner with no Safe decoding at all.
+        request.petal_use_claim = Some(PetalUseClaim {
+            package_hash: digest(80),
+            route: "transactions/wallet/one/confirm.json".into(),
+            operation_class: token("safe.transaction.confirm"),
+            crypto_suite: CryptoSuite::Secp256k1Keccak256Recoverable,
+            payload_digest: digest(81),
+            ordered_hashes: request.claimed_hashes.clone(),
+            declared_debits: vec![],
+            declared_destinations: vec![],
+            declared_fee: DeclaredFee::None,
+            nonce: RequestNonce::from_bytes([82; 16]),
+            claim_assurance: bloom_broker_api::ClaimAssurance::MachineAsserted,
+        });
+        assert_eq!(
+            request.validate().unwrap_err().code,
+            ProtocolErrorCode::MalformedFrame
+        );
+    }
+
+    /// The batch path refused the Safe class; the reusable single-payload
+    /// path did not, and it is the one a Petal reaches for any selector that
+    /// is not `Exact`. That request has no Safe envelope field at all, and
+    /// its `frozen_action` feeds only the operation id -- it never reaches
+    /// Broker -- so a Safe confirmation here would be signed with nothing
+    /// reviewed. Broker refused it for want of an approval, which is one
+    /// barrier and not the one the architecture doc describes.
+    #[test]
+    fn safe_confirmations_cannot_take_the_unreviewed_reusable_path() {
+        let payload = b"\x19\x01safe preimage".to_vec();
+        let payload_digest = Digest32::from_bytes(Keccak256::digest(&payload).into());
+        let build = |class: &str| TrustedPetalSignRequest {
+            wallet_id: token("wallet"),
+            preimage: payload.clone(),
+            claimed_hash: payload_digest.clone(),
+            crypto_suite: CryptoSuite::Secp256k1Keccak256Recoverable,
+            operation_class: token(class),
+            selector: bloom_broker_api::PetalSignSelector::Reusable,
+            claim: PetalUseClaim {
+                package_hash: digest(40),
+                route: "transactions/wallet/one/confirm.json".into(),
+                operation_class: token(class),
+                crypto_suite: CryptoSuite::Secp256k1Keccak256Recoverable,
+                payload_digest: petal_batch_payload_digest(std::slice::from_ref(&payload)),
+                ordered_hashes: vec![payload_digest.clone()],
+                declared_debits: vec![],
+                declared_destinations: vec![],
+                declared_fee: DeclaredFee::None,
+                nonce: RequestNonce::from_bytes([5; 16]),
+                claim_assurance: bloom_broker_api::ClaimAssurance::MachineAsserted,
+            },
+            claim_assurance_evidence: None,
+            approval_id: Some(digest(50)),
+            trusted_provenance: ProvenanceSubject::Petal {
+                package_hash: digest(40),
+                route: "transactions/wallet/one/confirm.json".into(),
+            },
+            frozen_action: Some(b"safe envelope that never reaches Broker".to_vec()),
+            frozen_advisory: None,
+        };
+
+        // An ordinary class still signs on this path.
+        build("order.cancel").validate().unwrap();
+
+        // The Safe class is refused before any wire call, on the claim and on
+        // the request, so neither half can be the one that carries it.
+        assert_eq!(
+            build("safe.transaction.confirm")
+                .validate()
+                .unwrap_err()
+                .code,
+            ProtocolErrorCode::MalformedFrame
+        );
+        let mut mismatched = build("order.cancel");
+        mismatched.operation_class = token("safe.transaction.confirm");
+        assert_eq!(
+            mismatched.validate().unwrap_err().code,
+            ProtocolErrorCode::MalformedFrame
+        );
     }
 
     fn exact_batch_request(
@@ -4518,6 +4703,7 @@ mod tests {
 
         let approval = ApprovalPrepareRequest {
             evm_review_payloads: Vec::new(),
+            safe_review_payloads: Vec::new(),
             operation_id: OperationId::from_bytes([94; 32]),
             terms: approval_terms("wallet", None),
             canonical_plan_facts_digest: digest(95),
