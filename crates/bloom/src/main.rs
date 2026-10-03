@@ -11,6 +11,7 @@ mod commands {
 }
 mod default_policy;
 mod github_source;
+mod macos_runtime;
 mod petal_provisioning;
 mod pf_monitor;
 mod session_sentinel;
@@ -2406,6 +2407,10 @@ enum Cmd {
     /// VFS path operations (no NFS mount required).
     #[command(subcommand)]
     Vfs(VfsCmd),
+    /// Model Context Protocol proxy over the VFS command surface
+    /// (disabled by default).
+    #[command(subcommand)]
+    Mcp(McpCmd),
     /// Wallet management.
     #[command(subcommand)]
     Wallet(WalletCmd),
@@ -2535,6 +2540,19 @@ enum VfsCmd {
         #[arg(long)]
         data: Option<String>,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum McpCmd {
+    /// Serve MCP over stdio for one client, proxying `lookup`/`read`/`write`/
+    /// `write_with_lookup`/`list` to the daemon.
+    ///
+    /// Refuses to start unless `[mcp] enabled = true` in the Bloom config.
+    /// There is no network listener: an MCP client spawns this as a child
+    /// process and owns its lifetime.
+    Serve,
+    /// Report whether the MCP proxy is enabled, and how to enable it.
+    Status,
 }
 
 #[derive(Subcommand, Debug)]
@@ -3160,6 +3178,56 @@ fn print_machine_command_output(output: &MachineCommandOutput) -> Result<()> {
     Ok(())
 }
 
+/// Read the MCP gate without initialising or migrating anything. A home that
+/// has never been initialised reads as the disabled default, so `bloom mcp
+/// serve` cannot start by creating its own permission.
+fn mcp_config(home: &HomeDir) -> Result<(bloom_proto::McpConfig, PathBuf)> {
+    let path = home.config_path();
+    if !path.exists() {
+        return Ok((bloom_proto::McpConfig::default(), path));
+    }
+    let config = bloom_proto::Config::load(&path)
+        .with_context(|| format!("load Bloom config from {}", path.display()))?;
+    Ok((config.mcp, path))
+}
+
+async fn run_mcp(home: &HomeDir, endpoint: &ResolvedEndpoint, command: McpCmd) -> Result<()> {
+    let (config, config_path) = mcp_config(home)?;
+    let tools = bloom_mcp::TOOLS
+        .iter()
+        .map(|tool| tool.name)
+        .collect::<Vec<_>>()
+        .join(", ");
+    match command {
+        McpCmd::Status => {
+            println!("enabled: {}", config.enabled);
+            println!("config: {}", config_path.display());
+            println!("transport: stdio");
+            println!("endpoint: {}", endpoint.display);
+            println!("protocol: {}", bloom_mcp::PROTOCOL_VERSION);
+            println!("tools: {tools}");
+            if !config.enabled {
+                println!(
+                    "enable: set `enabled = true` under `[mcp]` in {}",
+                    config_path.display()
+                );
+            }
+            Ok(())
+        }
+        McpCmd::Serve => {
+            // The gate runs before any client bytes are read and before the
+            // daemon socket is touched.
+            bloom_mcp::ensure_enabled(&config, &config_path)?;
+            debug!(endpoint = %endpoint.display, "cli.mcp.serve.stdio");
+            let commands = Arc::new(bloom_mcp::IpcVfsCommands::new(endpoint.socket.clone()));
+            bloom_mcp::McpServer::new(commands, env!("CARGO_PKG_VERSION"))
+                .serve_stdio()
+                .await
+                .context("serve MCP over stdio")
+        }
+    }
+}
+
 async fn run(cli: Cli) -> Result<()> {
     anyhow::ensure!(
         !cli.version || cli.cmd.is_none(),
@@ -3441,6 +3509,7 @@ async fn run(cli: Cli) -> Result<()> {
             debug!(endpoint = %client_endpoint.display, "cli.vfs.write.via_ipc");
             Ok(())
         }
+        Cmd::Mcp(command) => run_mcp(&home, &client_endpoint, command).await,
         Cmd::Request(RequestCmd::New {
             request,
             wallet,
@@ -4429,6 +4498,12 @@ fn petal_consent_lines(summary: &bloom_petals::package::PetalConsentSummary) -> 
             let visibility = if ns.secret { "secret" } else { "private" };
             lines.push(format!("    - {} {}", ns.namespace, visibility));
         }
+    }
+    if !summary.store_shared_keys.is_empty() {
+        lines.push(format!(
+            "  shared_store_keys: {}",
+            summary.store_shared_keys.join(", ")
+        ));
     }
     if !summary.routes.is_empty() {
         lines.push("  routes:".to_owned());

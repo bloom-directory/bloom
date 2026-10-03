@@ -34,6 +34,7 @@ pub(crate) fn petal_label(name: &str) -> &str {
         "enso" => "Enso",
         "near-intents" => "NEAR Intents",
         "tolly" => "Tolly",
+        "feedback" => "Feedback",
         other => other,
     }
 }
@@ -759,8 +760,8 @@ mod tests {
     fn every_canonical_petal_has_destinations_or_is_known_to_need_none() {
         // Hyperliquid declares no `bloom:tx.outbox` capability: it signs venue
         // payloads and never stages an on-chain transaction.
-        // Tolly's destinations are not listed yet; see the PR discussion.
-        const NO_DESTINATIONS: &[&str] = &["hyperliquid", "tolly"];
+        // Feedback declares only HTTP/store capabilities and never stages transactions.
+        const NO_DESTINATIONS: &[&str] = &["hyperliquid", "feedback"];
         for name in menu_petals() {
             let listed = !bloom_proto::petal_destinations::for_petal(&name).is_empty();
             let exempt = NO_DESTINATIONS.contains(&name.as_str());
@@ -803,17 +804,35 @@ mod tests {
         let (petals, output) = menu("\n\n\n\n\n\n");
         assert_eq!(
             menu_petals(),
-            ["polymarket", "hyperliquid", "enso", "near-intents", "tolly"]
+            [
+                "polymarket",
+                "hyperliquid",
+                "enso",
+                "near-intents",
+                "feedback"
+            ]
         );
         assert!(petals.preinstalled.is_empty());
         assert_eq!(
             chosen(&petals),
-            ["enso", "hyperliquid", "near-intents", "polymarket", "tolly"]
+            [
+                "enso",
+                "feedback",
+                "hyperliquid",
+                "near-intents",
+                "polymarket"
+            ]
         );
         assert!(petals.setup["hyperliquid"].values.is_empty());
         assert_eq!(polymarket_limit(&petals), Some("100"));
-        assert_eq!(tolly_writes(&petals), Some("enabled"));
-        for label in ["Polymarket", "Hyperliquid", "Enso", "NEAR Intents", "Tolly"] {
+        assert_eq!(tolly_writes(&petals), None);
+        for label in [
+            "Polymarket",
+            "Hyperliquid",
+            "Enso",
+            "NEAR Intents",
+            "Feedback",
+        ] {
             assert!(output.contains(&format!("Use {label}? [Y/n] ")), "{output}");
         }
         assert!(output.contains("Polymarket daily buy limit in pUSD [100]: "));
@@ -834,10 +853,10 @@ mod tests {
         let (petals, _) = menu("n\n");
         assert_eq!(
             chosen(&petals),
-            ["enso", "hyperliquid", "near-intents", "tolly"]
+            ["enso", "feedback", "hyperliquid", "near-intents"]
         );
         assert_eq!(polymarket_limit(&petals), None);
-        assert_eq!(tolly_writes(&petals), Some("enabled"));
+        assert_eq!(tolly_writes(&petals), None);
     }
 
     #[test]
@@ -846,10 +865,16 @@ mod tests {
         accept_setup_suggestions(&mut petals);
         assert_eq!(
             chosen(&petals),
-            ["enso", "hyperliquid", "near-intents", "polymarket", "tolly"]
+            [
+                "enso",
+                "feedback",
+                "hyperliquid",
+                "near-intents",
+                "polymarket"
+            ]
         );
         assert_eq!(polymarket_limit(&petals), Some("100"));
-        assert_eq!(tolly_writes(&petals), Some("enabled"));
+        assert_eq!(tolly_writes(&petals), None);
 
         let mut edited = PetalsConfig::default();
         edited.setup.insert(
@@ -882,10 +907,10 @@ mod tests {
             encoded.contains("[petals.setup.polymarket.values]\nmax_daily_usd = \"100\""),
             "{encoded}"
         );
-        assert!(encoded.contains("tolly_writes = \"enabled\""), "{encoded}");
+        assert!(!encoded.contains("tolly_writes"), "{encoded}");
         let decoded: bloom_proto::Config = toml::from_str(&encoded).unwrap();
         assert_eq!(decoded.petals.setup, config.petals.setup);
-        assert_eq!(tolly_writes(&decoded.petals), Some("enabled"));
+        assert_eq!(tolly_writes(&decoded.petals), None);
     }
 
     #[test]
@@ -918,7 +943,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             suggested.path,
-            "/petals/polymarket/settings/main/venue.toml"
+            "/petals/polymarket/settings/main/0/venue.toml"
         );
         assert_eq!(
             suggested.body,

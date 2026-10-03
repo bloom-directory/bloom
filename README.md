@@ -136,6 +136,28 @@ For the full wallet walkthrough, read
 [`docs/AGENTIC_WALLET.md`](./docs/AGENTIC_WALLET.md) and
 [`QUICKSTART.md`](./QUICKSTART.md).
 
+## MCP server
+
+Agent clients that speak the Model Context Protocol can reach the same VFS
+commands over stdio, without a mount. It is **off by default**; enabling it is
+an explicit edit to `~/.bloom/config.toml`:
+
+```toml
+[mcp]
+enabled = true
+```
+
+```sh
+cargo run -p bloom -- mcp status   # is it on, and which socket would it use
+cargo run -p bloom -- mcp serve    # stdio; an MCP client spawns this
+```
+
+`mcp serve` adds no permissions of its own: it forwards `list`, `read`,
+`lookup`, `write`, and `write_with_lookup` to the daemon a mount would have
+used, so policy, confirmation, and audit gates apply unchanged. There is no
+network listener. See [`docs/guides/mcp.md`](./docs/guides/mcp.md) for the tool
+catalog, resource URI rules, and error codes.
+
 ## Development commands
 
 For a focused Machine change, use the package-manager-native checks:
@@ -179,7 +201,8 @@ A fresh Bloom VFS root exposes these default entries:
   [Hyperliquid](https://github.com/bloom-directory/bloom-petal-hyperliquid),
   [Enso](https://github.com/bloom-directory/bloom-petal-enso),
   [Near Intents](https://github.com/bloom-directory/bloom-petal-near), and
-  [Tolly](https://github.com/TollyLabs/bloom-petal-tolly) releases.
+  [Feedback](https://github.com/bloom-directory/bloom-petal-feedback) releases.
+  Tolly is excluded until its explicit-account release is available.
   Read `docs/petals.md` in the VFS for the exact installed set, mount
   directories, summaries, and declared capabilities.
 - `requests/` — free and paid HTTP requests. Paid HTTP 402 challenges are
@@ -191,7 +214,7 @@ A fresh Bloom VFS root exposes these default entries:
 
 Application-specific surfaces live under `petals/`, not in Bloom core. For
 example, the Enso Petal accepts swap intents at
-`petals/enso/intents/<wallet>/new`, exposes a reviewable `plan.md`, and stages
+`petals/enso/intents/<wallet>/<index>/new`, exposes a reviewable `plan.md`, and stages
 confirmed transactions into the standard wallet outbox.
 
 See [QUICKSTART.md](./QUICKSTART.md) for an Anvil-backed walkthrough.

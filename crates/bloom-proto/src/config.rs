@@ -62,6 +62,25 @@ pub struct Config {
     /// reads.
     #[serde(default)]
     pub backends: BackendsConfig,
+    /// Local Model Context Protocol proxy over the VFS command surface.
+    /// Disabled by default; nothing starts an MCP server without an
+    /// explicit `[mcp] enabled = true`.
+    #[serde(default)]
+    pub mcp: McpConfig,
+}
+
+/// Gate for the `bloom mcp serve` stdio proxy.
+///
+/// The proxy exposes the same `lookup`/`read`/`write`/`write_with_lookup`/
+/// `list` command surface the CLI uses, so it is off unless an operator turns
+/// it on. Absent `[mcp]` block, absent `enabled` key, and a fresh
+/// [`Config::local_default`] all mean disabled.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpConfig {
+    /// Whether an MCP server may start at all. Disabled by default.
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -273,7 +292,7 @@ fn default_chains() -> BTreeMap<String, ChainSpec> {
             1,
             &[
                 "https://ethereum-rpc.publicnode.com",
-                "https://eth.llamarpc.com",
+                "https://ethereum.drpc.org",
             ],
             "Ethereum Mainnet",
             "ETH",
@@ -281,7 +300,12 @@ fn default_chains() -> BTreeMap<String, ChainSpec> {
         evm_chain(
             "base",
             8453,
-            &["https://mainnet.base.org", "https://base.llamarpc.com"],
+            &[
+                "https://base-rpc.publicnode.com",
+                "https://base.drpc.org",
+                "https://base.gateway.tenderly.co",
+                "https://mainnet.base.org",
+            ],
             "Base Mainnet",
             "ETH",
         )
@@ -422,6 +446,7 @@ impl Config {
             mempool: BTreeMap::new(),
             private_rpc: BTreeMap::new(),
             backends: BackendsConfig::default(),
+            mcp: McpConfig::default(),
         }
     }
 
@@ -698,6 +723,26 @@ mod tests {
         assert!(!ethereum.rpc_urls.is_empty());
         let base = cfg.chains.get("base").expect("base entry");
         assert_eq!(base.chain_id, 8453);
+        // Base carried one reachable endpoint and it rate-limits: 11 of 25
+        // sequential `eth_call`s to `mainnet.base.org` return -32016, which
+        // reads as a broken Petal rather than a thin endpoint list. Keep it
+        // last, behind spares that survive the same burst, and pin the list so
+        // a revert is caught here.
+        assert_eq!(
+            base.rpc_urls,
+            vec![
+                "https://base-rpc.publicnode.com",
+                "https://base.drpc.org",
+                "https://base.gateway.tenderly.co",
+                "https://mainnet.base.org",
+            ]
+        );
+        assert!(
+            !cfg.chains
+                .values()
+                .any(|spec| spec.rpc_urls.iter().any(|url| url.contains("llamarpc"))),
+            "llamarpc endpoints stopped resolving; no default chain should depend on one"
+        );
         let tempo = cfg.chains.get("tempo").expect("tempo entry");
         assert_eq!(tempo.chain_id, 4217);
         assert_eq!(tempo.rpc_urls, vec!["https://rpc.tempo.xyz"]);
@@ -950,6 +995,69 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("unknown field `apps`"), "{err}");
+    }
+
+    #[test]
+    fn mcp_is_disabled_by_default_and_on_configs_predating_the_block() {
+        assert!(!McpConfig::default().enabled);
+        assert!(!Config::local_default().mcp.enabled);
+
+        let td = tempdir().unwrap();
+        let path = td.path().join("config.toml");
+        // A config written before `[mcp]` existed must keep loading, disabled.
+        std::fs::write(
+            &path,
+            r#"
+default_chain = "ethereum"
+
+[chains.ethereum]
+name = "ethereum"
+chain_id = 1
+rpc_urls = ["https://ethereum-rpc.publicnode.com"]
+"#,
+        )
+        .unwrap();
+        assert!(!Config::load(&path).unwrap().mcp.enabled);
+
+        // An empty `[mcp]` block is still "off"; enabling has to be explicit.
+        std::fs::write(
+            &path,
+            r#"
+default_chain = "ethereum"
+
+[mcp]
+
+[chains.ethereum]
+name = "ethereum"
+chain_id = 1
+rpc_urls = ["https://ethereum-rpc.publicnode.com"]
+"#,
+        )
+        .unwrap();
+        assert!(!Config::load(&path).unwrap().mcp.enabled);
+    }
+
+    #[test]
+    fn mcp_enablement_is_explicit_and_survives_save_load() {
+        let td = tempdir().unwrap();
+        let path = td.path().join("config.toml");
+        let mut cfg = Config::local_default();
+        cfg.mcp.enabled = true;
+        cfg.save(&path).unwrap();
+        assert!(
+            std::fs::read_to_string(&path).unwrap().contains("enabled"),
+            "saved config must spell out the mcp flag"
+        );
+        assert!(Config::load(&path).unwrap().mcp.enabled);
+    }
+
+    #[test]
+    fn unknown_mcp_key_is_rejected() {
+        let err = toml::from_str::<McpConfig>("enabled = true\ntransport = \"tcp\"\n").unwrap_err();
+        assert!(
+            err.to_string().contains("unknown field `transport`"),
+            "{err}"
+        );
     }
 
     #[test]
