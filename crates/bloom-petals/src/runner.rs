@@ -4,11 +4,12 @@
 //! surrounding [`bloom_vfs::Vfs`] — petals reach VFS paths via the
 //! host imports we install on the runner's VM.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use bloom_broker_api::{ProvenanceCatalog, ProvenanceSubject};
 use bloom_vfs::handler::HandlerError;
 use bloom_vfs::handlers::wallets::AccountPetalContext;
 use bloom_vfs::path::VfsPath;
@@ -57,6 +58,19 @@ impl VfsHost {
     }
 }
 
+fn deny_apps_subtree(path: &VfsPath) -> Result<(), HostError> {
+    if path
+        .segments()
+        .first()
+        .is_some_and(|segment| segment == "petals")
+    {
+        return Err(HostError::Denied(
+            "Petal VFS calls cannot enter the Petal subtree".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl PetalHost for VfsHost {
     async fn vfs_lookup(&self, path: &str) -> Result<HostVfsEntry, HostError> {
@@ -93,15 +107,6 @@ impl PetalHost for VfsHost {
             .await
             .map_err(host_from_handler)
     }
-}
-
-fn deny_apps_subtree(path: &VfsPath) -> Result<(), HostError> {
-    if path.first() == Some("petals") {
-        return Err(HostError::Denied(
-            "petals may not call other apps through vfs imports".into(),
-        ));
-    }
-    Ok(())
 }
 
 /// A VFS host whose router is set after the daemon finishes building the VFS.
@@ -201,6 +206,9 @@ pub struct PetalRunner {
     registry: Arc<NameRegistry>,
     vm: PetalVm,
     runtime_metadata: Arc<Mutex<LruCache<RuntimeMetadataCacheKey, InstallRouteMetadata>>>,
+    provenance_catalog: Option<Arc<ProvenanceCatalog>>,
+    catalog_shape_error: Option<String>,
+    prepared_private_stores: Arc<Mutex<HashSet<String>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -220,7 +228,241 @@ impl PetalRunner {
                 NonZeroUsize::new(RUNTIME_METADATA_CACHE_CAPACITY)
                     .expect("runtime metadata cache capacity is non-zero"),
             ))),
+            provenance_catalog: None,
+            catalog_shape_error: None,
+            prepared_private_stores: Arc::new(Mutex::new(HashSet::new())),
         }
+    }
+
+    /// The caller supplies the installer-owned catalog loaded through the
+    /// Machine trust path. Broker independently verifies record signatures.
+    pub fn with_provenance_catalog(mut self, catalog: Option<ProvenanceCatalog>) -> Self {
+        self.catalog_shape_error = catalog.as_ref().and_then(|catalog| {
+            catalog
+                .validate_shape()
+                .err()
+                .map(|error| error.to_string())
+        });
+        if let Some(error) = &self.catalog_shape_error {
+            tracing::warn!(error, "loaded installer provenance catalog is invalid");
+        }
+        self.provenance_catalog = catalog.map(Arc::new);
+        self
+    }
+
+    fn ensure_catalog_shape(&self) -> Result<(), PetalError> {
+        if let Some(error) = &self.catalog_shape_error {
+            return Err(PetalError::vm(format!(
+                "loaded installer provenance catalog is invalid: {error}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn lineage_record(&self, hash: &str) -> Option<&bloom_broker_api::ProvenanceRecord> {
+        self.provenance_catalog.as_ref()?.records.iter().find(|record| {
+            matches!(&record.subject, ProvenanceSubject::Petal { package_hash, .. } if package_hash.to_string() == hash)
+                && record.petal_lineage.is_some()
+        })
+    }
+
+    /// Fail a lineage-backed replacement before owner activation when the
+    /// executing daemon has not loaded its successor release information.
+    pub fn check_activation(&self, hash: &str, name: &str) -> Result<(), PetalError> {
+        let Some(outgoing) = self.store.resolve_petal_owner(name)? else {
+            return Ok(());
+        };
+        if outgoing == hash {
+            return Ok(());
+        }
+        // An invalid catalog cannot tell us whether this replacement needs
+        // lineage state. Leave the outgoing owner active until it is repaired.
+        self.ensure_catalog_shape()?;
+        if self.lineage_record(&outgoing).is_some() && self.lineage_record(hash).is_none() {
+            return Err(PetalError::vm(format!(
+                "Petal {name} successor release information is missing from the loaded installer catalog"
+            )));
+        }
+        if self
+            .lineage_record(hash)
+            .and_then(|record| record.petal_lineage.as_ref())
+            .is_some_and(|lineage| {
+                lineage.active
+                    && lineage
+                        .predecessor_package_hashes
+                        .iter()
+                        .any(|listed| listed.to_string() == outgoing)
+            })
+            && self.lineage_record(&outgoing).is_none()
+        {
+            return Err(PetalError::vm(format!(
+                "Petal {name} predecessor release information is missing from the loaded installer catalog"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Bundled release pins are lineage-backed upgrades. Their new catalog
+    /// membership must be loaded before switching away from an installed pin.
+    pub fn check_default_activation(&self, hash: &str, name: &str) -> Result<(), PetalError> {
+        let Some(outgoing) = self.store.resolve_petal_owner(name)? else {
+            return Ok(());
+        };
+        if outgoing == hash {
+            return Ok(());
+        }
+        self.ensure_catalog_shape()?;
+        let active = self
+            .lineage_record(hash)
+            .and_then(|record| record.petal_lineage.as_ref())
+            .is_some_and(|lineage| lineage.active);
+        if !active {
+            return Err(PetalError::vm(format!(
+                "Bundled Petal {name} successor release information is missing or inactive in the loaded installer catalog"
+            )));
+        }
+        self.check_activation(hash, name)
+    }
+
+    pub fn install_staged_petal_package<F>(
+        &self,
+        staged: crate::store::StagedPetalPackage,
+        source: Option<crate::meta::PetalSourceProvenance>,
+        commit_guard: F,
+    ) -> Result<
+        (
+            crate::store::InstallResult,
+            crate::meta::PetalMeta,
+            RouteIndex,
+        ),
+        PetalError,
+    >
+    where
+        F: Fn() -> Result<(), PetalError>,
+    {
+        self.store.install_staged_petal_package_with_activation(
+            staged,
+            source,
+            commit_guard,
+            |meta| {
+                let name = meta.name.as_deref().expect("staged package name");
+                self.check_activation(&meta.hash, name)?;
+                self.carry_private_store(meta, None).map(|_| ())
+            },
+        )
+    }
+
+    fn prepare_private_store(
+        &self,
+        hash: &str,
+        account: Option<&AccountPetalContext>,
+    ) -> Result<(), PetalError> {
+        let mut prepared = self.prepared_private_stores.lock();
+        if prepared.contains(hash) {
+            return Ok(());
+        }
+        let meta = self.store.load_meta(hash)?;
+        if self.carry_private_store(&meta, account)? {
+            prepared.insert(hash.to_string());
+        }
+        Ok(())
+    }
+
+    // False permits only the existing partition; do not cache it as package-wide readiness.
+    fn carry_private_store(
+        &self,
+        meta: &crate::meta::PetalMeta,
+        account: Option<&AccountPetalContext>,
+    ) -> Result<bool, PetalError> {
+        let hash = meta.hash.as_str();
+        let Some(predecessor) = meta.replaced.as_deref() else {
+            tracing::info!(
+                event = "petal_state.not_carried",
+                hash,
+                reason = "no_replaced_owner"
+            );
+            return Ok(true);
+        };
+        // Existing partitions remain usable after a catalog-load failure.
+        // A new partition for a replaced package must not be created while
+        // its predecessor relationship cannot be checked. Probe the exact
+        // partition selected by this invocation, including numbered accounts.
+        let partition = match account {
+            Some(account) => self.store.private_account_data_root().join(hash).join(
+                crate::private_store::account_digest(&account.wallet, account.number),
+            ),
+            None => self.store.private_data_root().join(hash),
+        };
+        if self.catalog_shape_error.is_some() {
+            if partition.is_dir() {
+                return Ok(false);
+            }
+            self.ensure_catalog_shape()?;
+        }
+        if self.lineage_record(predecessor).is_some() && self.lineage_record(hash).is_none() {
+            if partition.is_dir() {
+                return Ok(false);
+            }
+            return Err(PetalError::vm(format!(
+                "Petal successor {hash} release information is missing from the loaded installer catalog"
+            )));
+        }
+        let Some(record) = self.lineage_record(hash) else {
+            tracing::info!(
+                event = "petal_state.not_carried",
+                hash,
+                predecessor,
+                reason = "no_lineage"
+            );
+            return Ok(true);
+        };
+        let lineage = record
+            .petal_lineage
+            .as_ref()
+            .expect("selected lineage record");
+        let predecessor_record = self.lineage_record(predecessor);
+        let predecessor_listed = lineage
+            .predecessor_package_hashes
+            .iter()
+            .any(|listed| listed.to_string() == predecessor);
+        if lineage.active && predecessor_listed && predecessor_record.is_none() {
+            if partition.is_dir() {
+                return Ok(false);
+            }
+            return Err(PetalError::vm(format!(
+                "Petal predecessor {predecessor} release information is missing from the loaded installer catalog"
+            )));
+        }
+        let predecessor_matches = predecessor_record.is_some_and(|previous| {
+            previous.publisher == record.publisher
+                && previous
+                    .petal_lineage
+                    .as_ref()
+                    .is_some_and(|membership| membership.lineage_id == lineage.lineage_id)
+        });
+        let authorised = lineage.active && predecessor_matches && predecessor_listed;
+        if !authorised {
+            let reason = if !lineage.active {
+                "inactive_lineage"
+            } else if !predecessor_matches {
+                "different_lineage"
+            } else {
+                "unlisted_predecessor"
+            };
+            tracing::info!(event = "petal_state.not_carried", hash, predecessor, lineage = %lineage.lineage_id, reason);
+            return Ok(true);
+        }
+        let copied = crate::private_store::carry_forward(
+            &self.store.private_data_root(),
+            &self.store.private_account_data_root(),
+            predecessor,
+            hash,
+        )
+        .map_err(|error| {
+            PetalError::vm(format!("Petal private-state carry-forward failed: {error}"))
+        })?;
+        tracing::info!(event = if copied { "petal_state.carried_forward" } else { "petal_state.not_carried" }, hash, predecessor, lineage = %lineage.lineage_id, reason = if copied { "copied" } else { "predecessor_store_absent_or_successor_exists" });
+        Ok(true)
     }
 
     fn runtime_metadata_key(matched: &PetalRouteMatch, path: &str) -> RuntimeMetadataCacheKey {
@@ -489,9 +731,9 @@ impl PetalRunner {
     }
 
     /// [`Self::dispatch_petal_route`] with host-trusted parameters appended
-    /// next to `bloom.route_id`. An account-scoped router
-    /// ([`crate::PetalRouter::for_account`]) is the one caller that appends
-    /// them: its routes run with the host provenance facts `bloom.wallet`,
+    /// next to `bloom.route_id`. The Petal router resolves explicit route
+    /// captures through the live core account projection and appends the
+    /// host provenance facts `bloom.wallet`,
     /// `bloom.account` and `bloom.owner_key_fingerprint`, which guest and
     /// host both read. A
     /// caller-supplied context entry whose name starts with `bloom.` is
@@ -501,12 +743,39 @@ impl PetalRunner {
     pub async fn dispatch_petal_route_with_trusted_params(
         &self,
         mount: &str,
+        request: DispatchRequest,
+        host: Arc<dyn PetalHost>,
+        cap_mask: Option<BTreeSet<Capability>>,
+        opts: RunOptions,
+        trusted_params: &[(String, String)],
+        account: Option<&AccountPetalContext>,
+    ) -> Result<DispatchOutput, PetalError> {
+        let execution = self.store.execution_guard().await;
+        self.dispatch_petal_route_with_execution_permit(
+            mount,
+            request,
+            host,
+            cap_mask,
+            opts,
+            trusted_params,
+            account,
+            &execution,
+        )
+        .await
+    }
+
+    // The router takes this permit before resolving the route and account.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn dispatch_petal_route_with_execution_permit(
+        &self,
+        mount: &str,
         mut request: DispatchRequest,
         host: Arc<dyn PetalHost>,
         cap_mask: Option<BTreeSet<Capability>>,
         opts: RunOptions,
         trusted_params: &[(String, String)],
         account: Option<&AccountPetalContext>,
+        _execution: &tokio::sync::RwLockReadGuard<'_, ()>,
     ) -> Result<DispatchOutput, PetalError> {
         if let Some((name, _)) = request
             .ctx
@@ -578,8 +847,16 @@ impl PetalRunner {
             caps = caps.intersection(&mask).copied().collect();
         }
         let mut opts = opts;
+        if caps.contains(&Capability::Store) && opts.private_store_root.is_none() {
+            self.prepare_private_store(&matched.hash, account)?;
+        }
         if opts.private_store_root.is_none() {
-            opts.private_store_root = Some(self.store.private_data_root());
+            if let Some(account) = account {
+                opts.private_store_root = Some(self.store.private_account_data_root());
+                opts.private_store_account = Some((account.wallet.clone(), account.number));
+            } else {
+                opts.private_store_root = Some(self.store.private_data_root());
+            }
         }
         let declared = self
             .petal_net_policy(&matched.hash)?
@@ -593,6 +870,9 @@ impl PetalRunner {
             runtime_metadata.sign_intent.as_deref(),
             opts.sign_intents,
         ));
+        if opts.private_store_shared_root.is_none() {
+            opts.private_store_shared_root = Some(self.store.private_data_root());
+        }
         let declared_store_policy = self.petal_store_policy(&matched.hash)?;
         opts.store_namespaces = Some(match opts.store_namespaces {
             Some(mask) => declared_store_policy.intersect(&mask),
@@ -656,14 +936,6 @@ impl PetalRunner {
     fn petal_net_policy(&self, hash: &str) -> Result<NetPolicy, PetalError> {
         let manifest = std::fs::read(self.store.package_path(hash)?.join("source/petal.toml"))?;
         NetPolicy::from_manifest_toml(&manifest)
-    }
-
-    /// Whether the package installed at `mount` declares
-    /// `[account] aware = true` in its manifest.
-    pub fn petal_account_aware(&self, mount: &str) -> Result<bool, PetalError> {
-        let hash = self.resolve_petal_mount(mount)?;
-        let manifest = std::fs::read(self.store.package_path(&hash)?.join("source/petal.toml"))?;
-        crate::package::account_aware_from_manifest_toml(&manifest)
     }
 
     fn petal_sign_intents(&self, hash: &str) -> Result<BTreeSet<String>, PetalError> {
@@ -816,7 +1088,7 @@ fn app_path(mount: &str, path: &str) -> String {
     }
 }
 
-fn route_has_descendant(pattern: &str, path: &str) -> bool {
+pub(crate) fn route_has_descendant(pattern: &str, path: &str) -> bool {
     let pattern_segments = route_segments(pattern);
     let path_segments = route_segments(path);
     if path_segments.len() >= pattern_segments.len() {
@@ -828,13 +1100,41 @@ fn route_has_descendant(pattern: &str, path: &str) -> bool {
         .all(|(value, pattern)| route_segment_matches(pattern, value))
 }
 
-fn static_list_entries(index: &RouteIndex, path: &str) -> Vec<crate::DispatchEntry> {
+/// More-specific static ancestors shadow parameterized branches for discovery.
+/// Compare only the consumed prefix, not unrelated descendant leaf names.
+pub(crate) fn ancestor_routes<'a>(
+    index: &'a RouteIndex,
+    path: &str,
+) -> Vec<&'a crate::package::RouteIndexRecord> {
+    let depth = route_segments(path).len();
+    let candidates: Vec<_> = index
+        .routes
+        .iter()
+        .filter(|route| route_has_descendant(&route.pattern, path))
+        .map(|route| {
+            let score = route
+                .pattern
+                .split('/')
+                .take(depth)
+                .filter(|part| !part.starts_with('[') && !part.starts_with('$'))
+                .count();
+            (score, route)
+        })
+        .collect();
+    let best = candidates.iter().map(|(score, _)| *score).max();
+    candidates
+        .into_iter()
+        .filter_map(|(score, route)| (Some(score) == best).then_some(route))
+        .collect()
+}
+
+pub(crate) fn static_list_entries(index: &RouteIndex, path: &str) -> Vec<crate::DispatchEntry> {
     use crate::{DispatchEntry, DispatchEntryKind};
     use std::collections::BTreeMap;
 
     let path_segments = route_segments(path);
     let mut entries = BTreeMap::<String, DispatchEntryKind>::new();
-    for route in &index.routes {
+    for route in ancestor_routes(index, path) {
         let pattern_segments = route_segments(&route.pattern);
         if path_segments.len() >= pattern_segments.len() {
             continue;
@@ -996,48 +1296,14 @@ mod tests {
             panic!("approval required must stay a denial category");
         };
         assert!(message.contains("act-1"), "{message}");
-        assert!(message.contains("policy requires owner approval"), "{message}");
+        assert!(
+            message.contains("policy requires owner approval"),
+            "{message}"
+        );
         assert!(!message.contains("approve.example"), "{message}");
         assert!(!message.contains("capability"), "{message}");
     }
 
-    #[test]
-    fn installed_manifest_declares_account_awareness() {
-        let (dir, r) = runner();
-        install_echo_app(&dir, &r);
-        assert!(
-            !r.petal_account_aware("echo").unwrap(),
-            "absence of [account] means unaware"
-        );
-
-        let package = dir.path().join("aware-app");
-        write_package_file(
-            &package,
-            "petal.toml",
-            br#"schema = "bloom.petal.package.v1"
-name = "aware"
-
-[consent]
-summary = "Account-aware echo."
-
-[caps]
-allowed = ["bloom:vfs.read"]
-
-[account]
-aware = true
-"#,
-        );
-        write_package_file(&package, "README.md", b"# aware");
-        write_package_file(&package, "AGENTS.md", b"# aware agents");
-        write_package_file(
-            &package,
-            "petal/aware/message.txt.wasm",
-            include_bytes!("../tests/fixtures/route_component_no_imports.wasm"),
-        );
-        let (result, _, _) = r.store().install_petal_package_dir(&package).unwrap();
-        assert!(r.petal_account_aware("aware").unwrap());
-        assert_eq!(r.resolve("aware").unwrap(), result.hash);
-    }
     /// A host the dispatch must never reach in the rejection tests.
     struct RejectingHost;
 
@@ -1089,6 +1355,526 @@ allowed = ["bloom:vfs.read"]
         );
         let (result, _, _) = r.store().install_petal_package_dir(&package).unwrap();
         result.hash
+    }
+
+    fn install_echo_successor(dir: &TempDir, r: &PetalRunner) -> String {
+        let package = dir.path().join("echo-successor");
+        write_package_file(
+            &package,
+            "petal.toml",
+            br#"schema = "bloom.petal.package.v1"
+name = "echo"
+[consent]
+summary = "Successor."
+[caps]
+allowed = ["bloom:store"]
+[store]
+namespaces = ["settings"]
+"#,
+        );
+        write_package_file(&package, "README.md", b"# successor");
+        write_package_file(&package, "AGENTS.md", b"# successor agents");
+        write_package_file(
+            &package,
+            "petal/echo/message.txt.wasm",
+            include_bytes!("../tests/fixtures/route_component_no_imports.wasm"),
+        );
+        r.store()
+            .install_petal_package_dir(&package)
+            .unwrap()
+            .0
+            .hash
+    }
+
+    fn lineage_record(
+        hash: &str,
+        lineage: &str,
+        publisher: &str,
+        active: bool,
+        predecessors: &[&str],
+    ) -> bloom_broker_api::ProvenanceRecord {
+        use bloom_broker_api::{
+            Base64UrlBytes, DecimalU64, Digest32, PetalLineageMembership, ProvenanceOperationClass,
+            Token,
+        };
+        bloom_broker_api::ProvenanceRecord {
+            subject: ProvenanceSubject::Petal {
+                package_hash: Digest32::new(hash.to_owned()).unwrap(),
+                route: "message".into(),
+            },
+            publisher: Token::new(publisher).unwrap(),
+            petal_lineage: Some(PetalLineageMembership {
+                lineage_id: lineage.into(),
+                release_sequence: DecimalU64::new(if active { 2 } else { 1 }),
+                predecessor_package_hashes: predecessors
+                    .iter()
+                    .map(|hash| Digest32::new((*hash).to_owned()).unwrap())
+                    .collect(),
+                controller_key_id: Token::new("controller").unwrap(),
+                controller_signature: Base64UrlBytes::from_bytes(&[1; 64]),
+                active,
+            }),
+            operation_classes: vec![ProvenanceOperationClass {
+                operation_class: Token::new("petal.run").unwrap(),
+                fee_asset: None,
+            }],
+            installer_key_id: Token::new("installer").unwrap(),
+            installer_signature: Base64UrlBytes::from_bytes(&[2; 64]),
+        }
+    }
+
+    fn catalog(records: Vec<bloom_broker_api::ProvenanceRecord>) -> ProvenanceCatalog {
+        ProvenanceCatalog {
+            schema: "bloom.provenance-catalog.1".into(),
+            records,
+        }
+    }
+
+    #[test]
+    fn lineage_activation_requires_loaded_successor_record() {
+        let (dir, runner) = runner();
+        let predecessor = install_echo_app(&dir, &runner);
+        let successor = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let lineage = "pln1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let runner = runner.with_provenance_catalog(Some(catalog(vec![lineage_record(
+            &predecessor,
+            lineage,
+            "publisher",
+            true,
+            &[],
+        )])));
+        assert!(runner.check_activation(successor, "echo").is_err());
+        assert_eq!(
+            runner
+                .store()
+                .resolve_petal_owner("echo")
+                .unwrap()
+                .as_deref(),
+            Some(predecessor.as_str())
+        );
+        assert!(!runner.store().private_data_root().join(successor).exists());
+    }
+
+    #[test]
+    fn lineage_activation_requires_loaded_predecessor_proof() {
+        let (dir, runner) = runner();
+        let predecessor = install_echo_app(&dir, &runner);
+        let successor = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let lineage = "pln1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let runner = runner.with_provenance_catalog(Some(catalog(vec![lineage_record(
+            successor,
+            lineage,
+            "publisher",
+            true,
+            &[predecessor.as_str()],
+        )])));
+        assert!(runner.check_activation(successor, "echo").is_err());
+        assert_eq!(
+            runner
+                .store()
+                .resolve_petal_owner("echo")
+                .unwrap()
+                .as_deref(),
+            Some(predecessor.as_str())
+        );
+    }
+
+    #[test]
+    fn bundled_default_replacement_requires_active_loaded_membership() {
+        let (dir, runner) = runner();
+        let predecessor = install_echo_app(&dir, &runner);
+        let successor = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        assert!(runner.check_default_activation(successor, "echo").is_err());
+        let lineage = "pln1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let inactive = runner.clone().with_provenance_catalog(Some(catalog(vec![
+            lineage_record(&predecessor, lineage, "publisher", false, &[]),
+            lineage_record(
+                successor,
+                lineage,
+                "publisher",
+                false,
+                &[predecessor.as_str()],
+            ),
+        ])));
+        assert!(
+            inactive
+                .check_default_activation(successor, "echo")
+                .is_err()
+        );
+        let active = runner.with_provenance_catalog(Some(catalog(vec![
+            lineage_record(&predecessor, lineage, "publisher", false, &[]),
+            lineage_record(
+                successor,
+                lineage,
+                "publisher",
+                true,
+                &[predecessor.as_str()],
+            ),
+        ])));
+        active.check_default_activation(successor, "echo").unwrap();
+    }
+
+    #[test]
+    fn loaded_catalog_shape_error_refuses_activation() {
+        let (dir, runner) = runner();
+        install_echo_app(&dir, &runner);
+        let invalid = ProvenanceCatalog {
+            schema: "invalid".into(),
+            records: vec![],
+        };
+        let runner = runner.with_provenance_catalog(Some(invalid));
+        assert!(
+            runner
+                .check_activation(
+                    "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+                    "echo"
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn malformed_catalog_preserves_existing_packages_but_refuses_fresh_replacement_state() {
+        let (dir, runner) = runner();
+        let predecessor = install_echo_app(&dir, &runner);
+        let invalid = ProvenanceCatalog {
+            schema: "invalid".into(),
+            records: vec![],
+        };
+        let runner = runner.with_provenance_catalog(Some(invalid));
+        runner.check_activation(&predecessor, "echo").unwrap();
+        runner.prepare_private_store(&predecessor, None).unwrap();
+        let successor = install_echo_successor(&dir, &runner);
+        let data =
+            crate::private_store::PrivateStore::open(runner.store().private_data_root()).unwrap();
+        assert!(runner.prepare_private_store(&successor, None).is_err());
+        assert!(!runner.store().private_data_root().join(&successor).exists());
+        // A daemon restart can encounter an already-initialized successor.
+        // Its usable partition must not be disabled by a later bad catalog.
+        data.put(&successor, "settings/value", b"existing", false)
+            .unwrap();
+        runner.prepare_private_store(&successor, None).unwrap();
+        assert_eq!(data.get(&successor, "settings/value").unwrap(), b"existing");
+        let account = AccountPetalContext {
+            wallet: "wallet-one".into(),
+            number: 1,
+            evm_fingerprint: None,
+            solana_fingerprint: None,
+            freshness: serde_json::from_str("\"fresh\"").unwrap(),
+        };
+        assert!(
+            runner
+                .prepare_private_store(&successor, Some(&account))
+                .is_err()
+        );
+        let account_data = crate::private_store::PrivateStore::open_account(
+            runner.store().private_account_data_root(),
+            &account.wallet,
+            account.number,
+        )
+        .unwrap();
+        account_data
+            .put(&successor, "settings/value", b"account-existing", false)
+            .unwrap();
+        runner
+            .prepare_private_store(&successor, Some(&account))
+            .unwrap();
+        assert_eq!(
+            account_data.get(&successor, "settings/value").unwrap(),
+            b"account-existing"
+        );
+    }
+
+    #[test]
+    fn missing_successor_release_refuses_fresh_store_even_after_activation_bypass() {
+        let (dir, runner) = runner();
+        let predecessor = install_echo_app(&dir, &runner);
+        let successor = install_echo_successor(&dir, &runner);
+        let lineage = "pln1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let runner = runner.with_provenance_catalog(Some(catalog(vec![lineage_record(
+            &predecessor,
+            lineage,
+            "publisher",
+            false,
+            &[],
+        )])));
+        assert!(runner.prepare_private_store(&successor, None).is_err());
+        assert!(!runner.store().private_data_root().join(&successor).exists());
+    }
+
+    #[tokio::test]
+    async fn upgrade_refuses_active_predecessor_then_carries_its_final_write() {
+        let (dir, runner) = runner();
+        let predecessor = install_echo_app(&dir, &runner);
+        let data =
+            crate::private_store::PrivateStore::open(runner.store().private_data_root()).unwrap();
+        // This is the same shared permit dispatch holds for the guest lifetime.
+        let active = runner.store().execution_guard().await;
+        let concurrent = runner.store().execution_guard().await;
+        data.put(&predecessor, "settings/value", b"before", false)
+            .unwrap();
+        assert!(
+            runner
+                .store()
+                .uninstall(&predecessor)
+                .unwrap_err()
+                .to_string()
+                .contains("retry")
+        );
+        let package =
+            crate::package::PreparedPetalPackage::from_dir(dir.path().join("echo-app")).unwrap();
+        let clone = runner.store().clone();
+        assert!(
+            clone
+                .install_prepared_petal_package(package)
+                .unwrap_err()
+                .to_string()
+                .contains("retry")
+        );
+        assert_eq!(
+            runner
+                .store()
+                .resolve_petal_owner("echo")
+                .unwrap()
+                .as_deref(),
+            Some(predecessor.as_str())
+        );
+        // A late write is still in the predecessor while replacement is refused.
+        data.put(&predecessor, "settings/value", b"final", false)
+            .unwrap();
+        drop(concurrent);
+        drop(active);
+        let successor = install_echo_successor(&dir, &runner);
+        let runner = runner.with_provenance_catalog(Some(catalog(vec![
+            lineage_record(
+                &predecessor,
+                "pln1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "publisher",
+                false,
+                &[],
+            ),
+            lineage_record(
+                &successor,
+                "pln1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "publisher",
+                true,
+                &[&predecessor],
+            ),
+        ])));
+        runner.prepare_private_store(&successor, None).unwrap();
+        assert_eq!(data.get(&successor, "settings/value").unwrap(), b"final");
+    }
+
+    #[test]
+    fn activation_carries_state_through_unused_release_and_restart() {
+        use crate::private_store::PrivateStore;
+        let (dir, runner) = runner();
+        let first = install_echo_app(&dir, &runner);
+        let package_dir = dir.path().join("echo-app");
+        write_package_file(&package_dir, "README.md", b"# intermediate");
+        let middle = crate::package::PreparedPetalPackage::from_dir(&package_dir).unwrap();
+        write_package_file(&package_dir, "README.md", b"# final");
+        let last = crate::package::PreparedPetalPackage::from_dir(&package_dir).unwrap();
+        let middle_hash = middle.hash.clone();
+        let last_hash = last.hash.clone();
+        let lineage = "pln1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let records = |active: &str| {
+            [
+                (&first, None),
+                (&middle_hash, Some(&first)),
+                (&last_hash, Some(&middle_hash)),
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(i, (hash, previous))| {
+                let mut record = lineage_record(
+                    hash,
+                    lineage,
+                    "publisher",
+                    hash == active,
+                    &previous.map(String::as_str).into_iter().collect::<Vec<_>>(),
+                );
+                record.petal_lineage.as_mut().unwrap().release_sequence =
+                    bloom_broker_api::DecimalU64::new(i as u64 + 1);
+                record
+            })
+            .collect()
+        };
+        let shared = PrivateStore::open(runner.store().private_data_root()).unwrap();
+        shared
+            .put(&first, "settings/value", b"shared", false)
+            .unwrap();
+        for number in [0, 1] {
+            let account = PrivateStore::open_account(
+                runner.store().private_account_data_root(),
+                "alice",
+                number,
+            )
+            .unwrap();
+            account
+                .put(&first, "settings/value", &[number as u8], false)
+                .unwrap();
+        }
+        let runner = runner.with_provenance_catalog(Some(catalog(records(&middle_hash))));
+        let staged = runner.store().stage_petal_package(middle).unwrap();
+        runner
+            .install_staged_petal_package(staged, None, || Ok(()))
+            .unwrap();
+        // Reopen the store: reconciliation removes the first package metadata.
+        // No invocation or lazy preparation of the intermediate release occurs.
+        let runner = PetalRunner::new(
+            PetalStore::open(dir.path().join("store")).unwrap(),
+            Arc::new(NameRegistry::open(dir.path().join("reg")).unwrap()),
+            PetalVm::new().unwrap(),
+        )
+        .with_provenance_catalog(Some(catalog(records(&last_hash))));
+        assert!(runner.store().load_meta(&first).is_err());
+        let staged = runner.store().stage_petal_package(last).unwrap();
+        // A cancelled activation must leave the previous owner selected.
+        assert!(
+            runner
+                .install_staged_petal_package(staged, None, || Err(PetalError::vm("cancelled")))
+                .is_err()
+        );
+        assert_eq!(
+            runner.store().resolve_petal_owner("echo").unwrap(),
+            Some(middle_hash.clone())
+        );
+        // A state-copy error also leaves a reopenable store and its old owner.
+        let last = crate::package::PreparedPetalPackage::from_dir(&package_dir).unwrap();
+        let staged = runner.store().stage_petal_package(last).unwrap();
+        assert!(
+            runner
+                .store()
+                .install_staged_petal_package_with_activation(
+                    staged,
+                    None,
+                    || Ok(()),
+                    |_| Err(PetalError::vm("copy failed")),
+                )
+                .is_err()
+        );
+        let reopened = PetalStore::open(dir.path().join("store")).unwrap();
+        assert_eq!(
+            reopened.resolve_petal_owner("echo").unwrap(),
+            Some(middle_hash.clone())
+        );
+        let last = crate::package::PreparedPetalPackage::from_dir(&package_dir).unwrap();
+        let staged = runner.store().stage_petal_package(last).unwrap();
+        runner
+            .install_staged_petal_package(staged, None, || Ok(()))
+            .unwrap();
+        assert_eq!(shared.get(&last_hash, "settings/value").unwrap(), b"shared");
+        for number in [0, 1] {
+            let account = PrivateStore::open_account(
+                runner.store().private_account_data_root(),
+                "alice",
+                number,
+            )
+            .unwrap();
+            assert_eq!(
+                account.get(&last_hash, "settings/value").unwrap(),
+                [number as u8]
+            );
+        }
+    }
+
+    #[test]
+    fn lineage_carry_forward_requires_same_lineage_and_predecessor_membership() {
+        let lineage = "pln1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let other_lineage = "pln1_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        for (case, previous_record, next_lineage, active, listed, should_copy) in [
+            ("authorised", true, lineage, true, true, true),
+            ("inactive", true, lineage, false, true, false),
+            ("unlisted", true, lineage, true, false, false),
+            ("foreign", true, other_lineage, true, true, false),
+            ("missing_previous_proof", false, lineage, true, true, false),
+        ] {
+            let (dir, runner) = runner();
+            let predecessor = install_echo_app(&dir, &runner);
+            let data = crate::private_store::PrivateStore::open(runner.store().private_data_root())
+                .unwrap();
+            data.put(&predecessor, "settings/value", b"old", false)
+                .unwrap();
+            let successor = install_echo_successor(&dir, &runner);
+            let mut records = Vec::new();
+            if previous_record {
+                records.push(lineage_record(
+                    &predecessor,
+                    lineage,
+                    "publisher",
+                    false,
+                    &[],
+                ));
+            }
+            let predecessors = if listed {
+                vec![predecessor.as_str()]
+            } else {
+                vec![]
+            };
+            records.push(lineage_record(
+                &successor,
+                next_lineage,
+                "publisher",
+                active,
+                &predecessors,
+            ));
+            let runner = runner.with_provenance_catalog(Some(catalog(records)));
+            if case == "missing_previous_proof" {
+                assert!(runner.prepare_private_store(&successor, None).is_err());
+                assert!(!runner.store().private_data_root().join(&successor).exists());
+                assert_eq!(data.get(&predecessor, "settings/value").unwrap(), b"old");
+                continue;
+            }
+            runner.prepare_private_store(&successor, None).unwrap();
+            assert_eq!(
+                runner.store().private_data_root().join(&successor).exists(),
+                should_copy,
+                "{case}"
+            );
+            if should_copy {
+                assert_eq!(data.get(&successor, "settings/value").unwrap(), b"old");
+                data.put(&successor, "settings/value", b"new", false)
+                    .unwrap();
+                runner.prepare_private_store(&successor, None).unwrap();
+                assert_eq!(
+                    data.get(&successor, "settings/value").unwrap(),
+                    b"new",
+                    "{case} repeated use"
+                );
+            }
+            assert_eq!(
+                data.get(&predecessor, "settings/value").unwrap(),
+                b"old",
+                "{case} predecessor unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn local_package_without_lineage_keeps_empty_successor_store() {
+        let (dir, runner) = runner();
+        let predecessor = install_echo_app(&dir, &runner);
+        let successor = install_echo_successor(&dir, &runner);
+        let runner = runner.with_provenance_catalog(Some(catalog(vec![lineage_record(
+            &"a".repeat(64),
+            "pln1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "other-publisher",
+            true,
+            &[],
+        )])));
+        runner.check_activation(&successor, "echo").unwrap();
+        runner.prepare_private_store(&successor, None).unwrap();
+        assert_eq!(
+            runner
+                .store()
+                .load_meta(&successor)
+                .unwrap()
+                .replaced
+                .as_deref(),
+            Some(predecessor.as_str())
+        );
+        assert!(!runner.store().private_data_root().join(successor).exists());
     }
 
     #[test]
@@ -1166,11 +1952,12 @@ allowed = ["bloom:vfs.read"]
         assert_eq!(resolve_hash_prefix("dddddddddddd", [c]).unwrap(), None);
     }
 
-    struct StaticHandler;
+    struct StaticHandler(std::sync::Arc<std::sync::atomic::AtomicUsize>);
 
     #[async_trait::async_trait]
     impl Handler for StaticHandler {
         async fn lookup(&self, path: &VfsPath) -> Result<bloom_vfs::Entry, HandlerError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if path.is_root() {
                 Ok(bloom_vfs::Entry::dir(""))
             } else {
@@ -1179,32 +1966,60 @@ allowed = ["bloom:vfs.read"]
         }
 
         async fn read(&self, _path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(b"reachable".to_vec())
         }
 
+        async fn list(&self, _path: &VfsPath) -> Result<Vec<bloom_vfs::Entry>, HandlerError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![])
+        }
+
         async fn write(&self, _path: &VfsPath, _data: &[u8]) -> Result<(), HandlerError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
     }
 
     #[tokio::test]
-    async fn vfs_host_denies_petals_subtree_to_prevent_petal_recursion() {
+    async fn vfs_host_denies_normalized_petal_subtree_before_dispatch() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
         let vfs = Vfs::builder()
-            .mount("petals", Arc::new(StaticHandler) as _)
+            .mount("petals", Arc::new(StaticHandler(calls.clone())) as _)
+            .mount("wallets", Arc::new(StaticHandler(calls.clone())) as _)
             .build();
         let host = VfsHost::new(Arc::new(vfs));
         assert!(matches!(
-            host.vfs_read("petals/demo/file").await,
+            host.vfs_lookup("/./petals/demo/wallets/w/1/file").await,
             Err(HostError::Denied(_))
         ));
         assert!(matches!(
-            host.vfs_write("petals/demo/file", b"x").await,
+            host.vfs_read("wallets/../petals/demo/wallets/w/1/file")
+                .await,
             Err(HostError::Denied(_))
         ));
         assert!(matches!(
             host.vfs_list("petals/demo").await,
             Err(HostError::Denied(_))
         ));
+        assert!(matches!(
+            host.vfs_write("petals/demo/file", b"x").await,
+            Err(HostError::Denied(_))
+        ));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "denial must happen before VFS dispatch"
+        );
+        assert_eq!(
+            host.vfs_read("petals/../wallets/w/1/account.json")
+                .await
+                .unwrap(),
+            b"reachable"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(matches!(
             host.vfs_list("../wallets").await,
             Err(HostError::Invalid(_))

@@ -10,6 +10,7 @@
 //! | ---------- | ------------------------------------- | ------------------------- |
 //! | `lookup`   | `{ "path": "/..." }`                  | `{ "name", "kind", ... }` |
 //! | `read`     | `{ "path": "/..." }`                  | `{ "bytes_b64": "..." }`  |
+//! | `read_inert` | `{ "path": "/..." }` | read bytes after atomic safety check |
 //! | `write`    | `{ "path": "/...", "bytes_b64": "" }` | `null`                    |
 //! | `write_with_lookup` | write params plus `projection_path` | identity entry           |
 //! | `list`     | `{ "path": "/..." }`                  | `[ entry, ... ]`          |
@@ -512,7 +513,7 @@ impl IpcOperationContext {
     /// and the optional expected owner are checked again at the atomic commit.
     pub fn commit_petal_package(
         &self,
-        store: &bloom_petals::PetalStore,
+        runner: &PetalRunner,
         package: bloom_petals::package::PreparedPetalPackage,
         source: Option<bloom_petals::meta::PetalSourceProvenance>,
         expected_owner: Option<Option<String>>,
@@ -524,7 +525,9 @@ impl IpcOperationContext {
         ),
         PetalError,
     > {
+        let store = runner.store();
         let name = package.name.clone();
+        let hash = package.hash.clone();
         let check = || {
             if self.is_cancelled() {
                 return Err(PetalError::vm("Petal install cancelled"));
@@ -536,6 +539,7 @@ impl IpcOperationContext {
                     "Petal {name} owner changed during acquisition; refusing stale install"
                 )));
             }
+            runner.check_activation(&hash, &name)?;
             // Replacing a package strands the sessions scoped to it: their
             // routes and keys stop matching any installed code, so their
             // stop and Exact recovery must still be reachable first. An
@@ -573,7 +577,7 @@ impl IpcOperationContext {
             None
         };
         check()?;
-        store.install_staged_petal_package_with_source_guarded(staged, source, check)
+        runner.install_staged_petal_package(staged, source, check)
     }
 
     pub fn emit(&self, stream: IpcOutputStream, bytes: impl Into<Vec<u8>>) -> bool {
@@ -1081,6 +1085,23 @@ impl IpcServer {
                 Ok(v) => Response::ok(id, v),
                 Err(e) => map_handler_err(id, e),
             },
+            "read_inert" => {
+                // Installation and removal use this same guard. Keep route safety
+                // classification and execution bound to the same installed package.
+                let _mutation = self.petal_mutation.lock().await;
+                match parse_path(&req.params) {
+                    Ok(path) if self.vfs.is_read_side_effecting(&path) => Response::err(
+                        id,
+                        -32010,
+                        "path is not an inert resource; use vfs_read deliberately",
+                    ),
+                    Ok(_) => match self.do_read(&req.params, &context).await {
+                        Ok(value) => Response::ok(id, value),
+                        Err(error) => map_handler_err(id, error),
+                    },
+                    Err(error) => map_handler_err(id, error),
+                }
+            }
             "read" => match self.do_read(&req.params, &context).await {
                 Ok(v) => Response::ok(id, v),
                 Err(e) => map_handler_err(id, e),
@@ -1184,7 +1205,18 @@ impl IpcServer {
     async fn do_lookup(&self, params: &Value) -> Result<Value, HandlerError> {
         let path = parse_path(params)?;
         let e = self.vfs.lookup(&path).await?;
-        Ok(entry_to_json(&e))
+        let mut entry = entry_to_json(&e);
+        // The mount layer already consults this before rendering content at
+        // GETATTR. Surfacing it on `lookup` lets non-mount clients make the
+        // same decision instead of discovering a signature or a broadcast by
+        // reading a path speculatively.
+        if let Value::Object(fields) = &mut entry {
+            fields.insert(
+                "read_side_effecting".into(),
+                Value::Bool(self.vfs.is_read_side_effecting(&path)),
+            );
+        }
+        Ok(entry)
     }
 
     async fn do_read(
@@ -1335,7 +1367,7 @@ impl IpcServer {
                 ));
             }
             let (result, meta, index) =
-                context.commit_petal_package(runner.store(), package, None, None)?;
+                context.commit_petal_package(&runner, package, None, None)?;
             Ok(json!({
                 "hash": result.hash,
                 "mode": "petal",
@@ -1899,6 +1931,12 @@ fn petal_consent_lines(summary: &bloom_petals::package::PetalConsentSummary) -> 
             lines.push(format!("    - {} {visibility}", namespace.namespace));
         }
     }
+    if !summary.store_shared_keys.is_empty() {
+        lines.push(format!(
+            "  shared_store_keys: {}",
+            summary.store_shared_keys.join(", ")
+        ));
+    }
     if !summary.routes.is_empty() {
         lines.push("  routes:".to_owned());
         for route in &summary.routes {
@@ -2446,6 +2484,140 @@ mod tests {
             *self.0.lock().await = data.to_vec();
             Ok(())
         }
+    }
+
+    /// Models a handler that flags `confirm` `read_side_effecting` while the
+    /// sibling status file is inert.
+    struct SideEffectingReadHandler;
+
+    #[async_trait::async_trait]
+    impl Handler for SideEffectingReadHandler {
+        async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
+            match path.segments().last().map(String::as_str) {
+                Some(name @ ("confirm" | "status.json")) => Ok(Entry::file(name)),
+                _ => Err(HandlerError::NotFound(path.to_string_path())),
+            }
+        }
+
+        fn is_read_side_effecting(&self, path: &VfsPath) -> bool {
+            path.segments().last().map(String::as_str) == Some("confirm")
+        }
+    }
+
+    /// `lookup` is the only pre-read probe a non-mount client has. It must
+    /// report whether reading the path would sign or broadcast, so the client
+    /// can refuse to fetch it speculatively.
+    #[tokio::test]
+    async fn lookup_reports_whether_reading_the_path_is_side_effecting() {
+        let server = IpcServer::new(
+            Vfs::builder()
+                .mount("outbox", Arc::new(SideEffectingReadHandler))
+                .build(),
+            "0",
+            vec![],
+        );
+        let lookup = |path: &'static str| {
+            let server = server.clone();
+            async move {
+                server
+                    .dispatch(Request {
+                        jsonrpc: "2.0".into(),
+                        id: json!(1),
+                        method: "lookup".into(),
+                        params: json!({ "path": path }),
+                    })
+                    .await
+                    .result
+                    .expect("lookup result")
+            }
+        };
+
+        let confirm = lookup("/outbox/confirm").await;
+        assert_eq!(confirm["read_side_effecting"], true, "{confirm}");
+        // The pre-existing entry projection is untouched by the new field.
+        assert_eq!(confirm["name"], "confirm");
+        assert_eq!(confirm["kind"], "file");
+
+        let inert = lookup("/outbox/status.json").await;
+        assert_eq!(inert["read_side_effecting"], false, "{inert}");
+    }
+
+    struct GuardedReadHandler {
+        side_effecting: AtomicBool,
+        reads: AtomicUsize,
+        started: Notify,
+        release: Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl Handler for GuardedReadHandler {
+        async fn lookup(&self, _: &VfsPath) -> Result<Entry, HandlerError> {
+            Ok(Entry::read_only_file("value"))
+        }
+        fn is_read_side_effecting(&self, _: &VfsPath) -> bool {
+            self.side_effecting.load(Ordering::SeqCst)
+        }
+        async fn read(&self, _: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            self.started.notify_one();
+            self.release.notified().await;
+            Ok(b"safe".to_vec())
+        }
+    }
+
+    #[tokio::test]
+    async fn inert_read_serializes_safety_check_and_execution_with_package_mutation() {
+        let handler = Arc::new(GuardedReadHandler {
+            side_effecting: AtomicBool::new(false),
+            reads: AtomicUsize::new(0),
+            started: Notify::new(),
+            release: Notify::new(),
+        });
+        let server = IpcServer::new(
+            Vfs::builder().mount("petals", handler.clone()).build(),
+            "0",
+            vec![],
+        );
+        let read = |server: IpcServer| {
+            tokio::spawn(async move {
+                server
+                    .dispatch(Request {
+                        jsonrpc: "2.0".into(),
+                        id: json!(1),
+                        method: "read_inert".into(),
+                        params: json!({"path":"/petals/demo/value"}),
+                    })
+                    .await
+            })
+        };
+        let pending = read(server.clone());
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            handler.started.notified(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            server.petal_mutation.try_lock().is_err(),
+            "package replacement must wait through execution"
+        );
+        handler.release.notify_one();
+        assert!(pending.await.unwrap().error.is_none());
+
+        // A queued resource request must inspect the successor's safety, not
+        // the outgoing package's flag sampled before acquiring the guard.
+        let mutation = server.petal_mutation.lock().await;
+        let mut pending = read(server.clone());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), &mut pending)
+                .await
+                .is_err()
+        );
+        handler.side_effecting.store(true, Ordering::SeqCst);
+        drop(mutation);
+        let refused = pending.await.unwrap();
+        assert_eq!(refused.error.unwrap().code, -32010);
+        assert_eq!(handler.reads.load(Ordering::SeqCst), 1);
     }
 
     struct AtomicProjectionHandler {
