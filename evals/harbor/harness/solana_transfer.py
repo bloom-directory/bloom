@@ -89,6 +89,10 @@ MAX_TRANSFER_CEREMONIES = 3
 # this grace, a confirmable entry with no advice was staged fresh, not
 # restaged, and is refused.
 RESTAGE_ADVICE_GRACE_SECONDS = 10.0
+# Slack past the ceremony driver's own timeout for the approver to notice a
+# stop: its other work is host-side file reads and a sign-count write. Its only
+# long call is one driver subprocess, which `CeremonyDriver.timeout` bounds.
+APPROVER_STOP_GRACE_SECONDS = 15.0
 # Bounds the restage chain the approver follows from its last approval.
 MAX_RESTAGE_HOPS = 10
 # Slots of history a local validator must retain to cover one trial: the
@@ -173,6 +177,9 @@ class SolanaTransferEval(EvalDefinition):
         )
         self._approver: threading.Thread | None = None
         self._approver_stop = threading.Event()
+        # How long a stopped approver may take to return: one in-flight
+        # ceremony plus the grace. Set when the approver starts.
+        self._approver_stop_bound = APPROVER_STOP_GRACE_SECONDS
         # A harness fault (driver, IO): the trial cannot be judged.
         self._approver_error: str | None = None
         # A staging the approver refused (wrong transfer, not a restage, past
@@ -594,6 +601,8 @@ class SolanaTransferEval(EvalDefinition):
         while not self._approver_stop.is_set() and time.monotonic() < deadline:
             try:
                 for pending_id in self._list_host_state("pending"):
+                    if self._approver_stop.is_set():
+                        return
                     url = self._pending_confirm_ceremony(pending_id)
                     if url is None:
                         continue
@@ -638,6 +647,11 @@ class SolanaTransferEval(EvalDefinition):
                             "entry expired before its confirm was retried"
                         )
                         return
+                    # Cleanup may have begun while this pass was matching.
+                    # A ceremony started after the stop would approve an
+                    # entry cleanup is already draining.
+                    if self._approver_stop.is_set():
+                        return
                     ceremonies.complete(url)
                     self._approved_lineage.append(pending_id)
                     self._approver_completed += 1
@@ -679,6 +693,7 @@ class SolanaTransferEval(EvalDefinition):
 
     def _start_approver(self, ceremonies: CeremonyDriver) -> None:
         self.next_sign_count = ceremonies.next_sign_count
+        self._approver_stop_bound = ceremonies.timeout + APPROVER_STOP_GRACE_SECONDS
         self._approver = threading.Thread(
             target=self._approve_loop,
             args=(ceremonies,),
@@ -687,11 +702,27 @@ class SolanaTransferEval(EvalDefinition):
         )
         self._approver.start()
 
-    def _stop_approver(self) -> None:
+    def _stop_approver(self) -> str | None:
+        """Stop the approver and return only once its thread has exited.
+
+        An in-flight ceremony cannot be recalled: the assertion may already
+        have reached the Broker. So cleanup waits it out rather than draining
+        while it can still approve, and the caller keeps the trial lock until
+        then. Returns a failure when the stop took longer than the bound,
+        since the bound is what the trial's isolation was reasoned from.
+        """
         self._approver_stop.set()
-        if self._approver is not None:
-            self._approver.join(timeout=30)
-            self._approver = None
+        worker = self._approver
+        if worker is None:
+            return None
+        bound = self._approver_stop_bound
+        worker.join(timeout=bound)
+        failure = None
+        if worker.is_alive():
+            failure = f"approver was still running {bound:g}s after it was stopped"
+            worker.join()
+        self._approver = None
+        return failure
 
     # ---- chain RPC and per-trial destination ----------------------------
 
@@ -1109,8 +1140,10 @@ class SolanaTransferEval(EvalDefinition):
         entry may be sent and reconciled. There is no post-broadcast undo; the
         local validator's funds are worthless.
         """
-        self._stop_approver()
+        stop_failure = self._stop_approver()
         failures: list[str] = []
+        if stop_failure is not None:
+            failures.append(stop_failure)
         if self._approver_error is not None:
             failures.append(f"approver: {self._approver_error}")
         mounted_error: BaseException | None = None

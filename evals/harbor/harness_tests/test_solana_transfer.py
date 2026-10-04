@@ -13,6 +13,8 @@ import json
 import os
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -526,6 +528,103 @@ class BudgetExpiryTests(ApproverMatchTests):
         self.assertIsNone(self.definition._approver_error)
 
 
+class ApproverStopTests(ApproverMatchTests):
+    """Cleanup drains outbox state, so it must not return while the approver
+    can still complete a ceremony: an approval landing after the drain would
+    broadcast outside the trial's isolation."""
+
+    URL = "http://localhost:18734/ceremony/" + "A" * 43
+
+    def slow_ceremonies(self, *, timeout: float, duration: float) -> SimpleNamespace:
+        started = threading.Event()
+        finished: list[float] = []
+
+        def complete(url: str) -> None:
+            started.set()
+            time.sleep(duration)
+            finished.append(time.monotonic())
+            ceremonies.completed.add(url)
+
+        ceremonies = SimpleNamespace(
+            completed=set(),
+            next_sign_count=3,
+            timeout=timeout,
+            complete=mock.Mock(side_effect=complete),
+            started=started,
+            finished=finished,
+        )
+        return ceremonies
+
+    def run_cleanup_mid_ceremony(self, ceremonies: SimpleNamespace) -> float:
+        self.stage()
+        (self.entry / "approval_challenge.json").write_text(
+            json.dumps({"ceremony_url": self.URL})
+        )
+        self.definition._start_approver(ceremonies)
+        self.assertTrue(ceremonies.started.wait(5))
+        try:
+            with mock.patch.object(self.definition, "_list_state", return_value=[]):
+                self.definition.cleanup()
+        finally:
+            returned = time.monotonic()
+        return returned
+
+    def assert_no_approval_after(self, ceremonies: SimpleNamespace, returned: float) -> None:
+        self.assertIsNone(self.definition._approver)
+        self.assertEqual(len(ceremonies.finished), 1)
+        self.assertLessEqual(ceremonies.finished[0], returned)
+        # Nothing approves once cleanup has returned.
+        time.sleep(0.3)
+        self.assertEqual(ceremonies.complete.call_count, 1)
+        self.assertEqual(len(ceremonies.finished), 1)
+
+    def test_cleanup_waits_out_an_in_flight_ceremony(self) -> None:
+        ceremonies = self.slow_ceremonies(timeout=2, duration=0.5)
+        with mock.patch("harness.solana_transfer.APPROVER_STOP_GRACE_SECONDS", 1.0):
+            returned = self.run_cleanup_mid_ceremony(ceremonies)
+        self.assert_no_approval_after(ceremonies, returned)
+
+    def test_a_ceremony_past_the_bound_fails_cleanup_after_it_stops(self) -> None:
+        # The old 30 s join on a 45 s driver: the worker outlives the bound.
+        # Cleanup still waits for it, then reports the trial as invalid.
+        ceremonies = self.slow_ceremonies(timeout=0.1, duration=0.8)
+        with mock.patch("harness.solana_transfer.APPROVER_STOP_GRACE_SECONDS", 0.1):
+            with self.assertRaisesRegex(EvalError, "still running"):
+                self.run_cleanup_mid_ceremony(ceremonies)
+            returned = time.monotonic()
+        self.assert_no_approval_after(ceremonies, returned)
+
+    def test_a_stop_during_matching_starts_no_ceremony(self) -> None:
+        self.stage()
+        (self.entry / "approval_challenge.json").write_text(
+            json.dumps({"ceremony_url": self.URL})
+        )
+        ceremonies = SimpleNamespace(completed=set(), next_sign_count=3, complete=mock.Mock())
+        definition = self.definition
+
+        def matched(_pending_id: str) -> bool:
+            definition._approver_stop.set()
+            return True
+
+        with mock.patch.object(
+            definition, "_ceremony_matches_authorized_transfer", side_effect=matched
+        ):
+            definition._approve_loop(ceremonies)
+
+        ceremonies.complete.assert_not_called()
+        self.assertEqual(definition._approved_lineage, [])
+
+    def test_the_stop_bound_covers_the_ceremony_driver_timeout(self) -> None:
+        from harness.core import CeremonyDriver
+
+        driver = CeremonyDriver(Path("/nonexistent"), Path("/nonexistent"), 1)
+        self.definition._start_approver(
+            SimpleNamespace(next_sign_count=1, timeout=driver.timeout, complete=mock.Mock(), completed=set())
+        )
+        self.definition._stop_approver()
+        self.assertGreater(self.definition._approver_stop_bound, driver.timeout)
+
+
 class CeremonyDiscoveryTests(ApproverMatchTests):
     """The host watches the canonical approval challenge in outbox state."""
 
@@ -768,7 +867,7 @@ class TrialNoteTests(SolanaEvalTestCase):
     def test_a_refusal_is_the_agents_outcome_not_a_cleanup_failure(self) -> None:
         definition = self.make()
         definition._approver_refusal = "staged entry x does not match"
-        with mock.patch.object(definition, "_stop_approver"):
+        with mock.patch.object(definition, "_stop_approver", return_value=None):
             with mock.patch.object(definition, "_list_state", return_value=[]):
                 definition.cleanup()
 
@@ -820,7 +919,7 @@ class ReusedWalletCleanupTests(SolanaEvalTestCase):
                 return ["expiring"] if pending_reads == 1 else []
             return []
 
-        with mock.patch.object(definition, "_stop_approver"):
+        with mock.patch.object(definition, "_stop_approver", return_value=None):
             with mock.patch.object(definition, "_list_state", side_effect=listing):
                 with mock.patch.object(
                     definition.mount,
@@ -843,7 +942,7 @@ class ReusedWalletCleanupTests(SolanaEvalTestCase):
                 return ["historical", "current"]
             return []
 
-        with mock.patch.object(definition, "_stop_approver"):
+        with mock.patch.object(definition, "_stop_approver", return_value=None):
             with mock.patch.object(definition, "_list_state", side_effect=listing):
                 with mock.patch.object(
                     definition.mount,
@@ -885,7 +984,7 @@ class StuckEntryCleanupTests(SolanaEvalTestCase):
             writes.append(path.name)
             return subprocess.CompletedProcess([], 0)
 
-        with mock.patch.object(definition, "_stop_approver"), mock.patch.object(
+        with mock.patch.object(definition, "_stop_approver", return_value=None), mock.patch.object(
             definition,
             "_list_state",
             side_effect=lambda state: next(listings, []) if state == "pending" else [],
