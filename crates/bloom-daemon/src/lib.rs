@@ -50,7 +50,9 @@ use bloom_revert::{
     OpenchainDecoder, boxed,
 };
 use bloom_tx::DynPriceOracle;
-use bloom_tx::outbox::{CentralActionIdentity, CentralOutboxProjection, Outbox, OutboxState};
+use bloom_tx::outbox::{
+    CentralActionIdentity, CentralOutboxProjection, Outbox, OutboxError, OutboxState,
+};
 use bloom_tx::tx_engine::{
     ConfirmBatchResult, ConfirmBatchTarget, Eip1559FeeOverrides, TxEngine, TxEngineError,
 };
@@ -2503,11 +2505,23 @@ impl PetalHost for DaemonPetalHost {
             .list(&req.wallet, &req.chain, OutboxState::Pending)
             .map_err(|error| HostError::Backend(format!("list pending EVM outbox: {error}")))?
         {
-            let entry = service
-                .tx_engine
-                .outbox
-                .read_in_state(&req.wallet, &req.chain, &pending_id, OutboxState::Pending)
-                .map_err(|error| HostError::Backend(format!("read pending EVM outbox: {error}")))?;
+            let entry = match service.tx_engine.outbox.read_in_state(
+                &req.wallet,
+                &req.chain,
+                &pending_id,
+                OutboxState::Pending,
+            ) {
+                Ok(entry) => entry,
+                // It left the queue after the listing, or was an interrupted
+                // transition the read just finished; either way it is no
+                // longer a pending request to reuse.
+                Err(OutboxError::StateMismatch { .. } | OutboxError::NotFound(_)) => continue,
+                Err(error) => {
+                    return Err(HostError::Backend(format!(
+                        "read pending EVM outbox: {error}"
+                    )));
+                }
+            };
             if petal_pending_request_matches(
                 &entry.staged,
                 &req,
