@@ -177,11 +177,16 @@ fn host_from_handler(e: HandlerError) -> HostError {
         HandlerError::PermissionDenied | HandlerError::OperationNotPermitted => {
             HostError::Denied("vfs".into())
         }
-        // A Petal can surface this to its caller, so pass the ceremony detail
-        // through rather than flattening it to a bare denial.
-        ref approval @ HandlerError::ApprovalRequired { .. } => {
-            HostError::Denied(approval.to_string())
-        }
+        // A Petal can surface this to its caller, so name the pending action
+        // rather than flattening it to a bare denial. The ceremony URL is an
+        // owner capability and never crosses into the guest, matching
+        // `ApprovalPending`; the owner finds it on the staged action.
+        HandlerError::ApprovalRequired {
+            action_id, reason, ..
+        } => HostError::Denied(format!(
+            "approval required: {reason}; the owner must approve action {action_id}, \
+             then retry this exact request"
+        )),
         HandlerError::Invalid(s) => HostError::Invalid(s),
         HandlerError::Unsupported(s) => HostError::Backend(format!("unsupported: {s}")),
         HandlerError::Backend(s) => HostError::Backend(s),
@@ -978,6 +983,22 @@ mod tests {
             matches!(&error, PetalError::InvalidWasm(message) if message.contains("host-owned")),
             "{error:?}"
         );
+    }
+
+    #[test]
+    fn approval_required_never_exposes_the_ceremony_url_to_a_petal() {
+        let HostError::Denied(message) = host_from_handler(HandlerError::ApprovalRequired {
+            action_id: "act-1".into(),
+            ceremony_url: "https://approve.example/c/secret#cap=capability".into(),
+            expires_ms: 1,
+            reason: "policy requires owner approval".into(),
+        }) else {
+            panic!("approval required must stay a denial category");
+        };
+        assert!(message.contains("act-1"), "{message}");
+        assert!(message.contains("policy requires owner approval"), "{message}");
+        assert!(!message.contains("approve.example"), "{message}");
+        assert!(!message.contains("capability"), "{message}");
     }
 
     #[test]
