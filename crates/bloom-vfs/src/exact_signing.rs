@@ -9,8 +9,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use bloom_broker_api::{
     ApprovalLifecycleState, AssetId, CryptoSuite, DecimalU64, DecimalU256, DeclaredFee, Digest32,
-    OperationId, PetalUseClaim, ProtocolErrorCode, ProvenanceCatalog, ProvenanceSubject,
-    RequestNonce, Token, ValueLimit,
+    DurableEffect, OperationId, OperationState, PetalUseClaim, ProtocolErrorCode,
+    ProvenanceCatalog, ProvenanceSubject, RequestNonce, Token, ValueLimit,
 };
 use bloom_machine_client::{
     ExactPayloadBatchSignRequest, ExactPayloadSignOutcome, ExactPayloadSignRequest,
@@ -167,6 +167,11 @@ struct ReusablePetalBatchSigningAttempt {
     schema: String,
     signing_operation_id: OperationId,
     request_digest: Digest32,
+    /// The signing call for this attempt returned an outcome that leaves
+    /// nothing in flight: a signature, or a refusal with no lasting effect.
+    /// Absent until then, including in attempts recorded before this field.
+    #[serde(default)]
+    settled: bool,
 }
 
 #[derive(Serialize)]
@@ -676,11 +681,23 @@ impl BrokerExactPayloadSigner {
             return Err("reusable signing attempt schema is unsupported".into());
         }
         let now = now_ms()?;
-        let attempted_different_request = previous_attempt.as_ref().is_some_and(|attempt| {
+        let expired = state.expires_at_ms.get() <= now;
+        let different_request = previous_attempt.as_ref().filter(|attempt| {
             attempt.signing_operation_id == state.signing_operation_id
                 && attempt.request_digest != request_digest
         });
-        if attempted_different_request || state.expires_at_ms.get() <= now {
+        if let Some(attempt) = different_request
+            && !attempt.settled
+            && !expired
+        {
+            // New bytes replace the attempt's identity, and with it the
+            // approval. Do that only once the earlier operation is final:
+            // while it may still sign, a fresh approval would put a second
+            // operation beside it.
+            self.require_attempt_final(&attempt.signing_operation_id)
+                .await?;
+        }
+        if different_request.is_some() || expired {
             state.approval_operation_id = random_operation_id();
             state.signing_operation_id = random_operation_id();
             state.request_nonce = random_request_nonce();
@@ -706,15 +723,17 @@ impl BrokerExactPayloadSigner {
                 ceremony_expires_at_ms: expires.get(),
             });
         }
-        if state.approval_id.is_some() {
-            write_state(
-                &attempt_path,
-                &ReusablePetalBatchSigningAttempt {
-                    schema: REUSABLE_ATTEMPT_SCHEMA.into(),
-                    signing_operation_id: state.signing_operation_id.clone(),
-                    request_digest,
-                },
-            )?;
+        let attempt = state
+            .approval_id
+            .is_some()
+            .then(|| ReusablePetalBatchSigningAttempt {
+                schema: REUSABLE_ATTEMPT_SCHEMA.into(),
+                signing_operation_id: state.signing_operation_id.clone(),
+                request_digest,
+                settled: false,
+            });
+        if let Some(attempt) = &attempt {
+            write_state(&attempt_path, attempt)?;
         }
         let request = ExactPayloadBatchSignRequest {
             wallet_id,
@@ -735,7 +754,21 @@ impl BrokerExactPayloadSigner {
             petal_use_claim: Some(claim.clone()),
             claim_assurance_evidence: claim_assurance_evidence.map(<[u8]>::to_vec),
         };
-        match self.broker.sign_reusable_petal_payload_batch(request).await {
+        let response = self.broker.sign_reusable_petal_payload_batch(request).await;
+        let settled = match &response {
+            Ok(_) => true,
+            Err(error) => matches!(
+                error.durable_effect,
+                DurableEffect::None | DurableEffect::ReservationReleased
+            ),
+        };
+        if let Some(mut attempt) = attempt
+            && settled
+        {
+            attempt.settled = true;
+            write_state(&attempt_path, &attempt)?;
+        }
+        match response {
             Ok(ExactPayloadSignOutcome::ApprovalRequired(prepared)) => {
                 state.approval_id = Some(prepared.approval_id.clone());
                 write_state(state_path, &state)?;
@@ -760,6 +793,34 @@ impl BrokerExactPayloadSigner {
                 ))
             }
             Err(error) => Err(error.to_string()),
+        }
+    }
+
+    /// Succeed only when Broker reports the signing operation in a final
+    /// state. A response that never arrived, an operation still moving, a
+    /// quarantined one, or a status Broker cannot give all leave it open.
+    async fn require_attempt_final(&self, operation_id: &OperationId) -> Result<(), String> {
+        let unsettled = "the previous reusable signing attempt has not settled";
+        match self.broker.operation_status(operation_id.clone()).await {
+            Ok(status)
+                if status.operation_id == *operation_id
+                    && matches!(
+                        status.state,
+                        OperationState::Succeeded
+                            | OperationState::Denied
+                            | OperationState::Cancelled
+                            | OperationState::Failed
+                    ) =>
+            {
+                Ok(())
+            }
+            Ok(status) => Err(format!(
+                "{unsettled} (Broker reports {:?}); retry the same request or wait for it to finish",
+                status.state
+            )),
+            Err(error) => Err(format!(
+                "{unsettled} and its outcome is unknown ({error}); retry the same request or wait for it to resolve"
+            )),
         }
     }
 
@@ -1015,6 +1076,10 @@ mod tests {
         /// While set, every prepared approval is still awaiting the owner's
         /// ceremony: it reports so, and the Broker refuses to sign under it.
         ceremony_open: AtomicBool,
+        /// While set, operation status cannot be read.
+        operation_status_unavailable: AtomicBool,
+        /// Reported in place of a retained operation's final state.
+        operation_state: Mutex<Option<OperationState>>,
     }
 
     impl MockBroker {
@@ -1261,16 +1326,28 @@ mod tests {
                         }))
                     }
                     MachineBrokerRequest::OperationStatus(request) => {
+                        if self.operation_status_unavailable.load(Ordering::SeqCst) {
+                            return Err(ProtocolError::new(
+                                ProtocolErrorCode::ServiceUnavailable,
+                                "simulated unavailable operation status",
+                            ));
+                        }
                         let signings = self.batch_signings.lock().unwrap();
+                        // Broker's own answer for an operation it never journaled.
                         let (_, operation_id, operation_digest) = signings
                             .iter()
                             .find(|(_, operation, _)| *operation == request.operation_id)
                             .ok_or_else(|| {
                                 ProtocolError::new(
-                                    ProtocolErrorCode::ServiceUnavailable,
-                                    "signing operation is not retained",
+                                    ProtocolErrorCode::ApprovalNotFound,
+                                    "operation not found",
                                 )
                             })?;
+                        let state = self
+                            .operation_state
+                            .lock()
+                            .unwrap()
+                            .unwrap_or(OperationState::Succeeded);
                         let result = SigningResult {
                             operation_id: operation_id.clone(),
                             operation_digest: operation_digest.clone(),
@@ -1285,8 +1362,8 @@ mod tests {
                             OperationPublicStatus {
                                 operation_id: operation_id.clone(),
                                 operation_digest: operation_digest.clone(),
-                                state: OperationState::Succeeded,
-                                result: Some(result),
+                                state,
+                                result: (state == OperationState::Succeeded).then_some(result),
                                 error: None,
                             },
                         ))
@@ -2051,6 +2128,149 @@ mod tests {
             ExactPayloadBatchOutcome::ApprovalRequired { .. }
         ));
         assert_eq!(broker.batch_signings.lock().unwrap().len(), 1);
+    }
+
+    fn prepares(broker: &MockBroker) -> usize {
+        broker
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| matches!(r, MachineBrokerRequest::SealedApprovalPrepare(_)))
+            .count()
+    }
+
+    fn reusable_state(home: &tempfile::TempDir) -> ReusablePetalBatchSigningState {
+        serde_json::from_slice(&fs::read(home.path().join("petal-reusable.json")).unwrap()).unwrap()
+    }
+
+    /// The response to a signing call is lost and Broker cannot yet say what
+    /// became of the operation. New bytes arriving now must not replace the
+    /// attempt and ask the owner for a second approval beside an operation
+    /// that may have signed; once Broker reports it final, they may.
+    #[tokio::test]
+    async fn new_bytes_wait_while_the_earlier_attempt_is_unresolved() {
+        let broker = Arc::new(MockBroker {
+            lose_batch_response_once: AtomicBool::new(true),
+            operation_status_unavailable: AtomicBool::new(true),
+            ..MockBroker::default()
+        });
+        let (signer, home, claim, _) = debiting_claim_fixture(&broker, None);
+
+        approval_of(
+            &reusable_once(&signer, &home, &claim, b"first")
+                .await
+                .unwrap(),
+        );
+        reusable_once(&signer, &home, &claim, b"first")
+            .await
+            .unwrap_err();
+        let before = reusable_state(&home);
+
+        for _ in 0..2 {
+            let error = reusable_once(&signer, &home, &claim, b"second")
+                .await
+                .unwrap_err();
+            assert!(error.contains("has not settled"), "{error}");
+        }
+        let after = reusable_state(&home);
+        assert_eq!(after.signing_operation_id, before.signing_operation_id);
+        assert_eq!(after.approval_id, before.approval_id);
+        assert_eq!(prepares(&broker), 1, "the owner is not asked again");
+        assert_eq!(broker.batch_signings.lock().unwrap().len(), 1);
+
+        // Broker can answer again: the earlier operation is final, so the new
+        // bytes get their own approval.
+        broker
+            .operation_status_unavailable
+            .store(false, Ordering::SeqCst);
+        let next = approval_of(
+            &reusable_once(&signer, &home, &claim, b"second")
+                .await
+                .unwrap(),
+        );
+        assert_ne!(Some(next), before.approval_id);
+        assert_ne!(
+            reusable_state(&home).signing_operation_id,
+            before.signing_operation_id
+        );
+    }
+
+    /// An operation Broker still reports in progress or quarantined is not
+    /// final, and one it never journaled may yet arrive.
+    #[tokio::test]
+    async fn new_bytes_wait_for_an_operation_broker_has_not_finished() {
+        for (state, journaled) in [
+            (Some(OperationState::Dispatched), true),
+            (Some(OperationState::Quarantined), true),
+            (None, false),
+        ] {
+            let broker = Arc::new(MockBroker {
+                lose_batch_response_once: AtomicBool::new(true),
+                operation_status_unavailable: AtomicBool::new(true),
+                ..MockBroker::default()
+            });
+            let (signer, home, claim, _) = debiting_claim_fixture(&broker, None);
+            approval_of(
+                &reusable_once(&signer, &home, &claim, b"first")
+                    .await
+                    .unwrap(),
+            );
+            reusable_once(&signer, &home, &claim, b"first")
+                .await
+                .unwrap_err();
+            if !journaled {
+                broker.batch_signings.lock().unwrap().clear();
+            }
+            *broker.operation_state.lock().unwrap() = state;
+            broker
+                .operation_status_unavailable
+                .store(false, Ordering::SeqCst);
+
+            let error = reusable_once(&signer, &home, &claim, b"second")
+                .await
+                .unwrap_err();
+            assert!(error.contains("has not settled"), "{state:?}: {error}");
+            assert_eq!(prepares(&broker), 1, "{state:?}");
+        }
+    }
+
+    /// A refusal with no lasting effect settles the attempt where it
+    /// happens, so new bytes move on without asking Broker about it.
+    #[tokio::test]
+    async fn a_refused_attempt_lets_new_bytes_move_on() {
+        let broker = Arc::new(MockBroker::default());
+        let (signer, home, claim, _) = debiting_claim_fixture(&broker, None);
+        approval_of(
+            &reusable_once(&signer, &home, &claim, b"first")
+                .await
+                .unwrap(),
+        );
+        // Another operation already spent the approval, so Broker refuses
+        // this one with its reservation released.
+        let attempt_path = home.path().join("petal-reusable.attempt.json");
+        broker.batch_signings.lock().unwrap().push((
+            reusable_state(&home).approval_id.unwrap(),
+            random_operation_id(),
+            digest(1),
+        ));
+        let refusal = reusable_once(&signer, &home, &claim, b"first")
+            .await
+            .unwrap_err();
+        assert!(refusal.contains("already used"), "{refusal}");
+        let attempt: ReusablePetalBatchSigningAttempt =
+            serde_json::from_slice(&fs::read(&attempt_path).unwrap()).unwrap();
+        assert!(attempt.settled);
+
+        broker
+            .operation_status_unavailable
+            .store(true, Ordering::SeqCst);
+        approval_of(
+            &reusable_once(&signer, &home, &claim, b"second")
+                .await
+                .unwrap(),
+        );
+        assert_eq!(prepares(&broker), 2);
     }
 
     fn token(value: &str) -> Token {
