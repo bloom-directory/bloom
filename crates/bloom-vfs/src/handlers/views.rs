@@ -101,6 +101,13 @@ const PAGE_TTL: Duration = Duration::from_secs(5);
 // Allow the transport's 200/400/800 ms backoffs plus actual network latency.
 const BALANCE_TIMEOUT: Duration = Duration::from_secs(8);
 
+/// All balance reads for one page share this budget. Accounts are read at
+/// most `PORTFOLIO_CONCURRENCY` at a time, so many HD accounts against a
+/// stalled endpoint cost one budget rather than one `BALANCE_TIMEOUT` each.
+/// An account still unread when it expires is reported, never shown as empty.
+const PORTFOLIO_BUDGET: Duration = Duration::from_secs(10);
+const PORTFOLIO_CONCURRENCY: usize = 8;
+
 /// Valuation is optional; the page is still useful unpriced.
 const PRICE_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -345,17 +352,19 @@ impl ViewsHandler {
     }
 
     /// Read every wallet's native balance on every configured chain, then
-    /// price what can be priced. Balance reads run concurrently per wallet so
-    /// one slow endpoint costs one budget, not the sum of them.
+    /// price what can be priced. Every account's reads run concurrently under
+    /// one shared budget, so a slow endpoint costs one budget per page rather
+    /// than one per account.
     async fn portfolio(&self) -> Portfolio {
         let (projections, projections_unavailable) = self.wallet_projections().await;
-        let chains = self.sorted_chains();
+        let evm_chains = self.distinct_evm_chains();
         let solana_chains = self.solana_chain_names();
         let mut portfolio = Portfolio {
             projections_unavailable,
             ..Portfolio::default()
         };
 
+        let mut jobs = Vec::new();
         for projection in &projections {
             let wallet = projection.wallet_id().as_str().to_owned();
             // Every address the projection reports: the primary EVM key plus
@@ -382,27 +391,27 @@ impl ViewsHandler {
             if inventory.evm.is_empty() && inventory.solana.is_empty() {
                 tracing::debug!(wallet = %wallet, "views.address_unavailable");
             }
-            for (account, address_text) in &inventory.evm {
+            for (account, address_text) in inventory.evm {
                 let Ok(address) = address_text.parse::<alloy::primitives::Address>() else {
                     tracing::debug!(wallet = %wallet, "views.address_unparsed");
                     continue;
                 };
-                let (mut holdings, unavailable) =
-                    self.read_balances(&wallet, address, &chains).await;
-                for holding in &mut holdings {
-                    holding.account = account.clone();
-                }
-                portfolio.holdings.extend(holdings);
-                portfolio.unavailable.extend(unavailable);
+                jobs.push(BalanceJob::Evm {
+                    wallet: wallet.clone(),
+                    account,
+                    address,
+                });
             }
-            for (account, address) in &inventory.solana {
-                let (holdings, unavailable) = self
-                    .read_solana_balances(&wallet, account, address, &solana_chains)
-                    .await;
-                portfolio.holdings.extend(holdings);
-                portfolio.unavailable.extend(unavailable);
+            for (account, address) in inventory.solana {
+                jobs.push(BalanceJob::Solana {
+                    wallet: wallet.clone(),
+                    account,
+                    address,
+                });
             }
         }
+        self.read_all_balances(&mut portfolio, jobs, &evm_chains, &solana_chains)
+            .await;
 
         self.price(&mut portfolio).await;
         // Funded rows first and most valuable at the top; the empty networks
@@ -415,9 +424,108 @@ impl ViewsHandler {
                         .partial_cmp(&a.value)
                         .unwrap_or(std::cmp::Ordering::Equal),
                 )
-                .then_with(|| (&a.wallet, &a.label).cmp(&(&b.wallet, &b.label)))
+                .then_with(|| {
+                    (&a.wallet, &a.label, &a.account).cmp(&(&b.wallet, &b.label, &b.account))
+                })
         });
         portfolio
+    }
+
+    /// Run every account's balance reads, `PORTFOLIO_CONCURRENCY` at a time,
+    /// within `PORTFOLIO_BUDGET`. Holdings arrive in completion order; the
+    /// caller sorts. An account that has not answered when the budget expires
+    /// has every network it would have read marked unavailable and is counted
+    /// in `accounts_unread`, so totals say they are partial.
+    async fn read_all_balances(
+        &self,
+        portfolio: &mut Portfolio,
+        jobs: Vec<BalanceJob>,
+        evm_chains: &[String],
+        solana_chains: &[String],
+    ) {
+        let deadline = tokio::time::Instant::now() + PORTFOLIO_BUDGET;
+        let slots = Arc::new(tokio::sync::Semaphore::new(PORTFOLIO_CONCURRENCY));
+        let this = Arc::new(self.clone());
+        let evm: Arc<[String]> = evm_chains.into();
+        let solana: Arc<[String]> = solana_chains.into();
+        let mut reads = tokio::task::JoinSet::new();
+        for (index, job) in jobs.iter().cloned().enumerate() {
+            let (this, slots, evm, solana) =
+                (this.clone(), slots.clone(), evm.clone(), solana.clone());
+            reads.spawn(async move {
+                let _slot = slots.acquire_owned().await.ok()?;
+                let read = match job {
+                    BalanceJob::Evm {
+                        wallet,
+                        account,
+                        address,
+                    } => {
+                        let (mut holdings, unavailable) =
+                            this.read_balances(&wallet, address, &evm).await;
+                        for holding in &mut holdings {
+                            holding.account = account.clone();
+                        }
+                        (holdings, unavailable)
+                    }
+                    BalanceJob::Solana {
+                        wallet,
+                        account,
+                        address,
+                    } => {
+                        this.read_solana_balances(&wallet, &account, &address, &solana)
+                            .await
+                    }
+                };
+                Some((index, read))
+            });
+        }
+
+        let mut answered = vec![false; jobs.len()];
+        loop {
+            match tokio::time::timeout_at(deadline, reads.join_next()).await {
+                Ok(Some(Ok(Some((index, (holdings, unavailable)))))) => {
+                    answered[index] = true;
+                    portfolio.holdings.extend(holdings);
+                    portfolio.unavailable.extend(unavailable);
+                }
+                // A failed read stays unanswered and is reported below.
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => {
+                    tracing::debug!("views.portfolio_budget_expired");
+                    reads.abort_all();
+                    break;
+                }
+            }
+        }
+        for (job, answered) in jobs.iter().zip(answered) {
+            if answered {
+                continue;
+            }
+            portfolio.accounts_unread += 1;
+            let (wallet, chains) = match job {
+                BalanceJob::Evm { wallet, .. } => (wallet, evm_chains),
+                BalanceJob::Solana { wallet, .. } => (wallet, solana_chains),
+            };
+            portfolio
+                .unavailable
+                .extend(chains.iter().map(|chain| (wallet.clone(), chain.clone())));
+        }
+    }
+
+    /// Configured EVM chain names, one per chain id, in name order. This is
+    /// the set `read_balances` reads, so an unread account can name exactly
+    /// the networks it is missing.
+    fn distinct_evm_chains(&self) -> Vec<String> {
+        let mut seen = BTreeSet::new();
+        self.sorted_chains()
+            .into_iter()
+            .filter(|chain| {
+                self.chains
+                    .get(chain)
+                    .is_some_and(|client| seen.insert(client.spec().chain_id))
+            })
+            .collect()
     }
 
     /// Native balance on every configured chain for one address. The reads
@@ -2928,8 +3036,26 @@ struct Portfolio {
     unavailable: Vec<(String, String)>,
     wallets: Vec<WalletSummary>,
     projections_unavailable: bool,
+    /// Accounts whose balance reads had not finished when the page's
+    /// `PORTFOLIO_BUDGET` expired.
+    accounts_unread: usize,
     price_coverage_gap: bool,
     stale: bool,
+}
+
+/// One account address whose native balances a page reads.
+#[derive(Clone)]
+enum BalanceJob {
+    Evm {
+        wallet: String,
+        account: String,
+        address: alloy::primitives::Address,
+    },
+    Solana {
+        wallet: String,
+        account: String,
+        address: String,
+    },
 }
 
 /// One table of holdings, with every cell labelled for a narrow screen.
@@ -3025,6 +3151,13 @@ impl Portfolio {
                 names = html_escape(&names.join(", ")),
             ));
         }
+        if self.accounts_unread > 0 {
+            out.push_str(&format!(
+                "<p class=\"coverage-notice\"><strong>Balance reads ran out of time</strong> · \
+                 {} not read and excluded from totals. Reload to try again.</p>",
+                html_escape(&count_noun(self.accounts_unread, "account", "accounts")),
+            ));
+        }
         if self.price_coverage_gap {
             out.push_str(
                 "<section class=\"callout\"><strong>Some prices are missing</strong>\
@@ -3059,6 +3192,13 @@ impl Portfolio {
             out.push(format!(
                 "Partial balance coverage: {} unavailable and excluded from totals.",
                 names.join(", ")
+            ));
+        }
+        if self.accounts_unread > 0 {
+            out.push(format!(
+                "Balance reads ran out of time: {} not read and excluded from totals. \
+                 Reload to try again.",
+                count_noun(self.accounts_unread, "account", "accounts")
             ));
         }
         if self.price_coverage_gap {
@@ -5396,6 +5536,99 @@ mod tests {
             }],
             lifecycle: bloom_broker_api::AccountLifecycleState::Active,
         }
+    }
+
+    fn evm_numbered_account(index: u8) -> bloom_broker_api::DerivedAccountPublic {
+        let address = alloy::primitives::Address::repeat_byte(index).to_string();
+        let mut account = solana_numbered_account("unused");
+        account.key_ref.locator = format!("alice/evm-{index}");
+        account.key_ref.key_spec = bloom_broker_api::KeySpec::Secp256k1;
+        account.derivation_profile = bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1;
+        account.path = format!("m/44'/60'/0'/0/{index}");
+        account.supported_crypto_suites =
+            vec![bloom_broker_api::CryptoSuite::Secp256k1Keccak256Recoverable];
+        account.chain_projections = vec![bloom_broker_api::ChainAccountProjection {
+            chain_family: bloom_broker_api::Token::new("evm").unwrap(),
+            caip2: "eip155:1".into(),
+            caip10: format!("eip155:1:{address}"),
+            address,
+            address_encoding: bloom_broker_api::AddressEncoding::Hex0x,
+        }];
+        account
+    }
+
+    /// An RPC endpoint that accepts connections and never answers.
+    async fn stalled_rpc() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn many_stalled_accounts_share_one_portfolio_budget() {
+        // More accounts than read slots, so a serial or per-account budget
+        // would take several BALANCE_TIMEOUTs.
+        let accounts = 2 * PORTFOLIO_CONCURRENCY as u8 + 1;
+        let fixture = fixture();
+        let mut projection = fixture
+            .handler
+            .projections
+            .list_wallets()
+            .await
+            .unwrap()
+            .remove(0);
+        projection.accounts = bloom_broker_api::WalletAccountsPublic {
+            wallet_id: bloom_broker_api::Token::new("alice").unwrap(),
+            seed_profile: bloom_broker_api::WalletSeedProfile::Bip39MulticurveV1,
+            accounts: (1..=accounts).map(evm_numbered_account).collect(),
+        };
+        assert_eq!(
+            super::wallet_addresses(&projection).evm.len(),
+            usize::from(accounts) + 1,
+            "primary key plus every numbered account"
+        );
+        let mut spec = bloom_proto::ChainSpec::anvil_default();
+        spec.rpc_urls = vec![stalled_rpc().await];
+        let chains = ChainRegistry::new();
+        chains.add(bloom_evm::ChainClient::new(spec).unwrap());
+        let handler = ViewsHandler::new(
+            crate::test_support::wallet_projection_reader_from(projection),
+            chains,
+            bloom_prices::PricesClient::with_base_url("http://127.0.0.1:1"),
+            fixture.handler.outbox,
+            MarketData::with_base_url("http://127.0.0.1:1"),
+        );
+
+        let started = std::time::Instant::now();
+        let portfolio = handler.portfolio().await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed <= PORTFOLIO_BUDGET + Duration::from_secs(2),
+            "portfolio took {elapsed:?}"
+        );
+        assert!(portfolio.holdings.is_empty(), "nothing answered");
+        // Every account is missing, whether its read timed out or never
+        // started before the budget ran out, and none is shown as empty.
+        assert_eq!(portfolio.unavailable.len(), usize::from(accounts) + 1);
+        assert!(portfolio.accounts_unread > 0, "the budget cut reads short");
+        let notices = portfolio.notices();
+        assert!(notices.contains("Partial balance coverage"), "{notices}");
+        assert!(
+            notices.contains("Balance reads ran out of time"),
+            "{notices}"
+        );
+        assert!(
+            portfolio
+                .coverage_lines()
+                .iter()
+                .any(|line| line.starts_with("Balance reads ran out of time"))
+        );
     }
 
     #[tokio::test]
