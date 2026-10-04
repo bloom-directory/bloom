@@ -118,6 +118,18 @@ pub fn run_once() -> Result<()> {
         }
         let revoke_gid = required_u32(&enrollment, "revoke_gid")?;
         let build_digest = required_digest(&enrollment, "release_digest")?;
+        // /var/run is cleared on boot. Recreate only missing, validated runtime
+        // directories before status publication or the login sentinel can start.
+        crate::macos_runtime::prepare(
+            Path::new("/private/var/run/bloom"),
+            login_uid,
+            required_u32(&enrollment, "broker_uid")?,
+            required_u32(&enrollment, "signer_uid")?,
+            required_u32(&enrollment, "machine_broker_gid")?,
+            required_u32(&enrollment, "broker_signer_gid")?,
+            revoke_gid,
+        )
+        .context("prepare macOS authority runtime")?;
         let status = Status {
             schema: STATUS_SCHEMA,
             login_uid,
