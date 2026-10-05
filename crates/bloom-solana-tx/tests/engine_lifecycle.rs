@@ -2038,3 +2038,52 @@ async fn corrupt_approval_attempt_state_fails_closed() {
         "no Broker preparation may run against unreadable terms"
     );
 }
+
+/// A confirm after the attempt window lapses carries the old challenge's
+/// approval id. That approval cannot sign the new attempt's terms, so the
+/// confirm must prepare the replacement ceremony itself rather than spend a
+/// round trip on a refusal.
+#[tokio::test]
+async fn a_confirm_after_the_window_lapses_prepares_the_next_attempt_directly() {
+    let (_dir, outbox, broker, engine) = retry_fixture().await;
+    let staged = stage_for_retry(&engine, &broker).await;
+    let fee_payer = broker.child_pubkey();
+
+    let first = approval_required(
+        engine
+            .sign("wallet", &staged.id, &fee_payer, None, None, 1_100)
+            .await
+            .unwrap(),
+    );
+    outbox
+        .write_approval_challenge(&pending(&outbox, &staged.id), br#"{"approval_id":"old"}"#)
+        .unwrap();
+
+    let lapsed = 1_100 + 60_000;
+    let second = approval_required(
+        engine
+            .sign(
+                "wallet",
+                &staged.id,
+                &fee_payer,
+                None,
+                Some(first.clone()),
+                lapsed,
+            )
+            .await
+            .expect("one confirm reaches the replacement ceremony"),
+    );
+
+    assert_ne!(second, first);
+    assert_eq!(broker.conflicts(), 0);
+    assert_eq!(broker.prepared_ids(), vec![first, second]);
+    let entry = pending(&outbox, &staged.id);
+    assert_eq!(outbox.approval_attempt(&entry).unwrap().unwrap().attempt, 1);
+    assert!(
+        !entry
+            .dir
+            .join(bloom_solana_tx::outbox::APPROVAL_CHALLENGE_FILE)
+            .exists(),
+        "the lapsed ceremony must stop being advertised"
+    );
+}

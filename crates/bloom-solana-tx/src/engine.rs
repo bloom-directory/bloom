@@ -479,16 +479,31 @@ impl SolanaTransferEngine {
         // unchanged operation id, which the Broker refuses as a conflict — so
         // an ordinary second confirm of the same transfer would otherwise be
         // rejected permanently and durably.
-        let attempt = match self.outbox.approval_attempt(&entry)? {
-            Some(recorded) if recorded.expires_at_ms > now_ms_u64 => recorded,
+        let (attempt, approval_id) = match self.outbox.approval_attempt(&entry)? {
+            Some(recorded) if recorded.expires_at_ms > now_ms_u64 => (recorded, approval_id),
             // No live attempt: the first confirm, or one whose window has
             // already passed. A lapsed window cannot be resumed, so this is a
             // genuinely new attempt and takes a new identity.
-            previous => ApprovalAttempt {
-                attempt: previous.map_or(0, |previous| previous.attempt.saturating_add(1)),
-                issued_at_ms: now_ms_u64,
-                expires_at_ms: now_ms_u64.saturating_add(SIGN_TTL_MS),
-            },
+            previous => {
+                // Any approval the caller holds belongs to the lapsed attempt
+                // and cannot authorize the new one's terms. Drop it and its
+                // ceremony so this confirm prepares the replacement directly.
+                // With no recorded attempt the id may predate attempt state,
+                // so it is still forwarded.
+                let approval_id = match previous {
+                    Some(_) => {
+                        self.outbox.clear_approval_challenge(&entry)?;
+                        None
+                    }
+                    None => approval_id,
+                };
+                let attempt = ApprovalAttempt {
+                    attempt: previous.map_or(0, |previous| previous.attempt.saturating_add(1)),
+                    issued_at_ms: now_ms_u64,
+                    expires_at_ms: now_ms_u64.saturating_add(SIGN_TTL_MS),
+                };
+                (attempt, approval_id)
+            }
         };
         // Persist before asking, so a crash between the two cannot lose the
         // terms the Broker has already seen.
