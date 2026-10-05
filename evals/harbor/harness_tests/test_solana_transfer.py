@@ -836,6 +836,64 @@ class AllowOnlyDestinationTests(SolanaEvalTestCase):
         with self.assertRaisesRegex(EvalError, "did not stage a ceremony"):
             self.run_allow([], staged="operation_id: nope\n")
 
+    def policy_store(self, original: list[dict[str, str]], *, commit_fails: bool = False):
+        """A fake `bloom` whose committed policy follows each proposal."""
+        state = {"allowed": original, "proposed": None, "commits": 0}
+
+        def bloom(*args: str) -> str:
+            if args[:2] == ("wallet", "projection"):
+                return self.projection(state["allowed"])
+            if args[:2] == ("wallet", "update-policy"):
+                state["proposed"] = json.loads(Path(args[-1]).read_text())[
+                    "allowed_destinations"
+                ]
+                return (
+                    f"operation_id: {self.OPERATION}\nceremony_kind: PolicyUpdate\n"
+                    f"ceremony_url: {self.URL}\n"
+                )
+            if args[:2] == ("wallet", "commit-policy"):
+                state["commits"] += 1
+                if commit_fails and state["commits"] == 1:
+                    state["allowed"] = state["proposed"]
+                    raise EvalError("bloom wallet commit-policy failed")
+                state["allowed"] = state["proposed"]
+                return ""
+            raise AssertionError(args)
+
+        return state, bloom
+
+    def test_cleanup_restores_the_policy_the_trial_replaced(self) -> None:
+        original = [{"chain": "solana", "destination": SOURCE}]
+        definition = self.make()
+        definition.destination = DESTINATION
+        state, bloom = self.policy_store(original)
+        ceremonies = SimpleNamespace(complete=mock.Mock())
+        with mock.patch.object(definition, "_bloom", side_effect=bloom):
+            definition._allow_only_destination(ceremonies)
+            self.assertNotEqual(state["allowed"], original)
+            definition._restore_allowed_destinations()
+            # A second cleanup has nothing left to restore.
+            definition._restore_allowed_destinations()
+        self.assertEqual(state["allowed"], original)
+        self.assertEqual(ceremonies.complete.call_count, 2)
+
+    def test_cleanup_restores_a_policy_whose_trial_commit_failed(self) -> None:
+        original = [{"chain": "solana", "destination": SOURCE}]
+        definition = self.make()
+        definition.destination = DESTINATION
+        state, bloom = self.policy_store(original, commit_fails=True)
+        ceremonies = SimpleNamespace(complete=mock.Mock())
+        with mock.patch.object(definition, "_bloom", side_effect=bloom):
+            with self.assertRaisesRegex(EvalError, "commit-policy failed"):
+                definition._allow_only_destination(ceremonies)
+            definition._restore_allowed_destinations()
+        self.assertEqual(state["allowed"], original)
+
+    def test_cleanup_without_a_policy_change_runs_no_ceremony(self) -> None:
+        definition = self.make()
+        with mock.patch.object(definition, "_bloom", side_effect=AssertionError):
+            definition._restore_allowed_destinations()
+
 
 class TrialNoteTests(SolanaEvalTestCase):
     def test_the_note_counts_only_this_trials_entries(self) -> None:

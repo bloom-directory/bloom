@@ -195,6 +195,12 @@ class SolanaTransferEval(EvalDefinition):
         # summary counts only this trial's stagings. None until preflight
         # completes; without it there is nothing to count against.
         self._baseline_entries: set[str] | None = None
+        # The wallet's allowed destinations before this trial replaced them,
+        # and the ceremony sequence that did it; cleanup restores the former
+        # through the latter. _ceremonies is None until the trial changes the
+        # policy.
+        self._original_allowed: Any = None
+        self._ceremonies: CeremonyDriver | None = None
 
     # ---- paths ---------------------------------------------------------
 
@@ -801,9 +807,38 @@ class SolanaTransferEval(EvalDefinition):
         continues, so no counter is ever tracked by hand.
         """
         policy = self._allowed_destinations()
-        policy["allowed_destinations"] = [
-            {"chain": "solana", "destination": self.destination}
-        ]
+        if self._ceremonies is None:
+            self._original_allowed = policy.get("allowed_destinations")
+            self._ceremonies = ceremonies
+        self._commit_allowed(
+            ceremonies,
+            policy,
+            [{"chain": "solana", "destination": self.destination}],
+            "does not allow this trial's destination",
+        )
+
+    def _restore_allowed_destinations(self) -> None:
+        """Put back the allowed destinations this trial replaced."""
+        if self._ceremonies is None:
+            return
+        policy = self._allowed_destinations()
+        if policy.get("allowed_destinations") != self._original_allowed:
+            self._commit_allowed(
+                self._ceremonies,
+                policy,
+                self._original_allowed,
+                "was not restored to its pre-trial destinations",
+            )
+        self._ceremonies = None
+
+    def _commit_allowed(
+        self,
+        ceremonies: CeremonyDriver,
+        policy: dict[str, Any],
+        allowed: Any,
+        refusal: str,
+    ) -> None:
+        policy["allowed_destinations"] = allowed
         with tempfile.TemporaryDirectory() as scratch:
             proposal = Path(scratch) / "policy.json"
             proposal.write_text(json.dumps(policy))
@@ -819,9 +854,8 @@ class SolanaTransferEval(EvalDefinition):
             raise EvalError("bloom wallet update-policy did not stage a ceremony")
         ceremonies.complete(url)
         self._bloom("wallet", "commit-policy", operation)
-        allowed = self._allowed_destinations().get("allowed_destinations")
-        if allowed != policy["allowed_destinations"]:
-            raise EvalError("the committed wallet policy does not allow this trial's destination")
+        if self._allowed_destinations().get("allowed_destinations") != allowed:
+            raise EvalError(f"the committed wallet policy {refusal}")
 
     # ---- provision -----------------------------------------------------
 
@@ -1211,6 +1245,13 @@ class SolanaTransferEval(EvalDefinition):
                     )
         except BaseException as error:  # noqa: BLE001 -- report after the checks
             mounted_error = error
+
+        # 3. Restore the policy last, once nothing can still spend under the
+        #    trial's allowance.
+        try:
+            self._restore_allowed_destinations()
+        except EvalError as error:
+            failures.append(f"policy restore: {error}")
 
         if mounted_error is not None:
             if isinstance(mounted_error, EvalError):
