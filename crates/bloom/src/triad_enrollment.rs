@@ -470,6 +470,42 @@ fn developer_route_operation_classes(
 /// nothing else does (bloom-petal-hyperliquid's `BUILDER_ORDER_INTENT`).
 const HYPERLIQUID_BUILDER_ORDER_CLASS: &str = "hyperliquid.builder_order";
 
+/// The Polymarket sibling of `HYPERLIQUID_BUILDER_ORDER_CLASS`: the CLOB
+/// order class a builder-coded order signs under, separate from the fee-free
+/// `polymarket.order.poly1271` that plain orders keep using.
+///
+/// The Petal must emit this exact string, and declare its fee in the matching
+/// asset below, before enrollment has any effect here: Broker compares the
+/// catalogued chain and asset against `DeclaredFee::Fee` and answers
+/// `FEE_ASSET_MISMATCH` when either differs. Until bloom-petal-polymarket
+/// splits the route, no claim carries this class and the row is inert.
+const POLYMARKET_BUILDER_ORDER_CLASS: &str = "polymarket.builder_order.poly1271";
+
+/// One row per operation class whose *every* claim declares an exact fee.
+///
+/// Adding a venue is one row here plus the Petal-side route split that makes
+/// the new class uniformly fee-bearing. Nothing else in enrollment needs to
+/// change, and a row for a class no installed Petal emits stays inert.
+const FEE_BEARING_OPERATION_CLASSES: &[CataloguedFeeAsset] = &[
+    CataloguedFeeAsset {
+        operation_class: HYPERLIQUID_BUILDER_ORDER_CLASS,
+        chain: "hyperliquid",
+        asset: "usdc",
+    },
+    CataloguedFeeAsset {
+        operation_class: POLYMARKET_BUILDER_ORDER_CLASS,
+        chain: "polygon",
+        asset: "pusd",
+    },
+];
+
+/// A fee-bearing operation class and the asset its declared fee must name.
+struct CataloguedFeeAsset {
+    operation_class: &'static str,
+    chain: &'static str,
+    asset: &'static str,
+}
+
 /// The fee asset a catalogued operation class is enrolled with, on both the
 /// developer-harness and the release-pins path.
 ///
@@ -481,21 +517,26 @@ const HYPERLIQUID_BUILDER_ORDER_CLASS: &str = "hyperliquid.builder_order";
 /// uniformly fee-free, and a fee asset is only correct on a class whose
 /// every claim carries an exact declared fee.
 ///
-/// Hyperliquid's shared classes are not that: cancels, leverage updates, and
-/// plain orders sign under `hyperliquid.agent_action` (sessions) and
-/// `hyperliquid.order` (owner) with `{"kind":"none"}`, so those stay
-/// fee-free. Builder-bearing orders, the only Hyperliquid claims that declare
-/// a fee, sign under their own `hyperliquid.builder_order` class, which is
-/// enrolled with the usdc fee the Petal declares so Broker counts it against
-/// the approval's value limits instead of refusing it. Every other class
-/// stays `None` so enrollment cannot outrun what the Petals actually
-/// declare. See "Operation-class granularity and `fee_asset`" in
+/// Venue classes that mix both are not that: Hyperliquid signs cancels,
+/// leverage updates, and plain orders under `hyperliquid.agent_action`
+/// (sessions) and `hyperliquid.order` (owner) with `{"kind":"none"}`, and
+/// Polymarket signs plain CLOB orders under `polymarket.order.poly1271` the
+/// same way, so those stay fee-free. A builder-bearing order is the one claim
+/// that declares a fee, and it signs under its own class through a dedicated
+/// route, which is what makes the fee asset safe to assert.
+///
+/// Every class absent from `FEE_BEARING_OPERATION_CLASSES` stays `None` so
+/// enrollment cannot outrun what the Petals actually declare. See
+/// "Operation-class granularity and `fee_asset`" in
 /// `docs/architecture/Sealed Approvals.md`.
 fn catalogued_fee_asset(operation_class: &str) -> Result<Option<ProvenanceFeeAsset>> {
-    if operation_class == HYPERLIQUID_BUILDER_ORDER_CLASS {
+    if let Some(catalogued) = FEE_BEARING_OPERATION_CLASSES
+        .iter()
+        .find(|candidate| candidate.operation_class == operation_class)
+    {
         return Ok(Some(ProvenanceFeeAsset {
-            chain: Token::new("hyperliquid")?,
-            asset: "usdc".to_owned(),
+            chain: Token::new(catalogued.chain)?,
+            asset: catalogued.asset.to_owned(),
         }));
     }
     Ok(None)
@@ -1383,11 +1424,13 @@ mod tests {
     }
 
     #[test]
-    fn only_the_builder_order_class_is_catalogued_with_a_fee_asset() {
+    fn only_builder_order_classes_are_catalogued_with_a_fee_asset() {
         for class in [
             "hyperliquid.agent_action",
             "hyperliquid.order",
             "hyperliquid.approve_builder_fee",
+            "polymarket.onboard",
+            "polymarket.order.poly1271",
             "polymarket.relayer_batch",
         ] {
             assert!(
@@ -1395,11 +1438,40 @@ mod tests {
                 "{class} must stay fee-free"
             );
         }
-        let fee = catalogued_fee_asset("hyperliquid.builder_order")
-            .unwrap()
-            .expect("builder orders declare a fee on every claim");
-        assert_eq!(fee.chain.as_str(), "hyperliquid");
-        assert_eq!(fee.asset, "usdc");
+
+        for (class, chain, asset) in [
+            ("hyperliquid.builder_order", "hyperliquid", "usdc"),
+            ("polymarket.builder_order.poly1271", "polygon", "pusd"),
+        ] {
+            let fee = catalogued_fee_asset(class)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{class} declares a fee on every claim"));
+            assert_eq!(fee.chain.as_str(), chain, "{class} fee chain");
+            assert_eq!(fee.asset, asset, "{class} fee asset");
+        }
+    }
+
+    /// A fee-bearing class is only safe when a dedicated route makes every one
+    /// of its claims declare a fee, so each row must name a class distinct
+    /// from the fee-free class it was split out of, and must resolve.
+    #[test]
+    fn every_catalogued_fee_bearing_row_is_distinct_and_resolvable() {
+        let classes = FEE_BEARING_OPERATION_CLASSES
+            .iter()
+            .map(|entry| entry.operation_class)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            classes.len(),
+            FEE_BEARING_OPERATION_CLASSES.len(),
+            "a class may be catalogued with only one fee asset"
+        );
+        for entry in FEE_BEARING_OPERATION_CLASSES {
+            Token::new(entry.operation_class)
+                .unwrap_or_else(|_| panic!("{} is not a valid class token", entry.operation_class));
+            Token::new(entry.chain)
+                .unwrap_or_else(|_| panic!("{} is not a valid chain token", entry.chain));
+            assert!(!entry.asset.is_empty(), "{} needs an asset", entry.chain);
+        }
     }
 
     fn release_catalog_for(
@@ -1497,10 +1569,11 @@ mod tests {
         assert!(shared[0].fee_asset.is_none());
     }
 
-    /// The real pins do not carry the builder-order class yet, so no release
-    /// record is fee-bearing today. This fails the moment the Hyperliquid pin
-    /// is updated for bloom-petal-hyperliquid#19, which is the reminder to
-    /// flip it to asserting the class is present with the usdc fee asset.
+    /// The real pins carry none of the catalogued builder-order classes yet,
+    /// so no release record is fee-bearing today. This fails the moment a pin
+    /// is updated for bloom-petal-hyperliquid#19 or the Polymarket route
+    /// split, which is the reminder to flip that venue over to asserting its
+    /// class is present with the fee asset catalogued above.
     #[test]
     fn current_release_pins_carry_no_fee_bearing_class_yet() {
         let catalog = release_catalog_for(&crate::github_source::release_lineage_petals());
@@ -1511,12 +1584,15 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(!classes.is_empty());
         assert!(classes.iter().all(|class| class.fee_asset.is_none()));
-        assert!(
-            classes
-                .iter()
-                .all(|class| class.operation_class.as_str() != HYPERLIQUID_BUILDER_ORDER_CLASS),
-            "the Hyperliquid pin now lists hyperliquid.builder_order: assert it fee-bearing here"
-        );
+        for catalogued in FEE_BEARING_OPERATION_CLASSES {
+            assert!(
+                classes
+                    .iter()
+                    .all(|class| class.operation_class.as_str() != catalogued.operation_class),
+                "the pins now list {}: assert it fee-bearing here",
+                catalogued.operation_class
+            );
+        }
     }
 
     #[cfg(feature = "triad-dev-harness")]

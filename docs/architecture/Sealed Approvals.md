@@ -108,20 +108,34 @@ without one denies a claim declaring a fee (`FEE_NOT_ALLOWED`), and a
 declared asset other than the named one is `FEE_ASSET_MISMATCH`.
 
 So a `fee_asset` is only correct on a class whose every operation is
-fee-bearing, and a class has to be uniformly one or the other. Hyperliquid's
-shared classes are fee-free: cancels, leverage updates, and plain orders sign
-under `hyperliquid.agent_action` (sessions) and `hyperliquid.order` (owner)
-with no fee declared, so naming a `fee_asset` on either would deny most of
-its legitimate traffic. A builder-bearing order is the one Hyperliquid claim
-that declares a fee, and it signs under its own `hyperliquid.builder_order`
-class through a dedicated route. Enrollment catalogues that class, and only
-that class, with the usdc fee asset the Petal declares; Broker then counts
-the declared fee against the approval's value limits instead of refusing it.
+fee-bearing, and a class has to be uniformly one or the other. A venue's
+ordinary classes are fee-free: Hyperliquid signs cancels, leverage updates,
+and plain orders under `hyperliquid.agent_action` (sessions) and
+`hyperliquid.order` (owner) with no fee declared, and Polymarket signs plain
+CLOB orders under `polymarket.order.poly1271` the same way. Naming a
+`fee_asset` on any of those would deny most of that venue's legitimate
+traffic.
+
+A builder-coded order is the one claim that declares a fee, so it signs under
+its own class through a dedicated route. Enrollment catalogues those classes,
+and only those, with the asset the Petal declares; Broker then counts the
+declared fee against the approval's value limits instead of refusing it.
+
+| Fee-bearing class | Fee asset | Fee-free sibling |
+|---|---|---|
+| `hyperliquid.builder_order` | `hyperliquid` / `usdc` | `hyperliquid.order`, `hyperliquid.agent_action` |
+| `polymarket.builder_order.poly1271` | `polygon` / `pusd` | `polymarket.order.poly1271` |
 
 Splitting a fee-bearing operation into its own operation class is what makes
 a `fee_asset` safe to assert. Adding one to a shared class is a breaking
 change to every non-fee route that signs under it, and leaving it off a class
 whose claims declare a fee refuses every one of them.
+
+Adding a venue is one row in `FEE_BEARING_OPERATION_CLASSES`
+(`crates/bloom/src/triad_enrollment.rs`) plus the Petal-side route split that
+makes the new class uniformly fee-bearing. The row is inert until a Petal
+emits that exact class, and the catalogued chain and asset must match the
+Petal's `DeclaredFee::Fee` exactly or Broker answers `FEE_ASSET_MISMATCH`.
 
 ## Ceremony and public projection
 
