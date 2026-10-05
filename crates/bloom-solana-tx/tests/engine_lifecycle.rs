@@ -1283,3 +1283,144 @@ async fn broadcast_requires_genesis_before_outbox_or_network_effects() {
         "{err}"
     );
 }
+
+/// A stub node whose `simulateTransaction` reports that it started and then
+/// waits for `release`, so a test can run the sweep in the middle of a
+/// broadcast.
+async fn spawn_node_with_held_simulation(
+    block_height: Arc<std::sync::atomic::AtomicU64>,
+    simulation_started: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+    requests: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let block_height = block_height.clone();
+            let simulation_started = simulation_started.clone();
+            let release = release.clone();
+            let requests = requests.clone();
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = vec![0u8; 8192];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
+                let request_json = serde_json::from_str::<serde_json::Value>(body)
+                    .unwrap_or(serde_json::Value::Null);
+                requests.lock().unwrap().push(request_json.clone());
+                let height = block_height.load(std::sync::atomic::Ordering::SeqCst);
+                let result = match request_json["method"].as_str().unwrap_or_default() {
+                    "getGenesisHash" => serde_json::json!("test-genesis"),
+                    "getLatestBlockhash" => serde_json::json!({
+                        "context": { "slot": height },
+                        "value": {
+                            "blockhash": bs58::encode([0x42u8; 32]).into_string(),
+                            "lastValidBlockHeight": height + 100
+                        }
+                    }),
+                    "getBlockHeight" => serde_json::json!(height),
+                    "getFeeForMessage" => serde_json::json!({
+                        "context": { "slot": 1 }, "value": 5_000
+                    }),
+                    "simulateTransaction" => {
+                        simulation_started.notify_one();
+                        release.notified().await;
+                        serde_json::json!({
+                            "context": { "slot": 1 },
+                            "value": { "err": null, "logs": [], "unitsConsumed": 150 }
+                        })
+                    }
+                    "sendTransaction" => {
+                        serde_json::json!(submitted_transaction_signature(&request_json))
+                    }
+                    _ => serde_json::Value::Null,
+                };
+                let payload = serde_json::json!({
+                    "jsonrpc": "2.0", "id": 1, "result": result
+                })
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    payload.len(),
+                    payload
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    format!("http://{addr}/")
+}
+
+#[tokio::test]
+async fn expiry_sweep_during_broadcast_leaves_one_state_and_no_send() {
+    let height = Arc::new(std::sync::atomic::AtomicU64::new(1));
+    let simulation_started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let endpoint = spawn_node_with_held_simulation(
+        height.clone(),
+        simulation_started.clone(),
+        release.clone(),
+        requests.clone(),
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let outbox = SolanaOutbox::new(dir.path().join("outbox")).unwrap();
+    let broker = Arc::new(BrokerFixture::new());
+    let signer =
+        SolanaTransferSigner::from_catalog(MachineBrokerClient::new(broker.clone()), &catalog())
+            .unwrap();
+    let engine =
+        SolanaTransferEngine::new(outbox.clone(), client(&endpoint), signer, "solana-devnet");
+    let staged = stage_and_sign(&engine, &broker).await;
+
+    // Broadcast passes its freshness check, then the cluster crosses the
+    // blockhash window while simulation is in flight and the sweep retires
+    // the still-pending entry.
+    let sweep = async {
+        simulation_started.notified().await;
+        height.store(
+            staged.last_valid_block_height + 1,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        let swept = outbox
+            .sweep_expired(
+                u128::MAX,
+                &std::collections::HashMap::from([(
+                    "solana-devnet".to_string(),
+                    staged.last_valid_block_height + 1,
+                )]),
+            )
+            .unwrap();
+        release.notify_one();
+        swept
+    };
+    let (broadcast, swept) = tokio::join!(engine.broadcast("wallet", &staged.id, 1_300), sweep);
+
+    assert_eq!(swept, 1);
+    assert!(broadcast.is_err(), "a retired entry must not be broadcast");
+    let state_root = dir.path().join("outbox/wallet/solana-devnet");
+    assert!(!state_root.join("pending").join(&staged.id).exists());
+    assert!(!state_root.join("sent").join(&staged.id).exists());
+    let expired = outbox
+        .read_in_state(
+            "wallet",
+            "solana-devnet",
+            &staged.id,
+            SolanaOutboxState::Failed,
+        )
+        .unwrap();
+    assert_eq!(expired.staged.status, SolanaTxStatus::Expired);
+    assert!(
+        !requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| r["method"] == "sendTransaction")
+    );
+}

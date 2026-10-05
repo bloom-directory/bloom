@@ -774,7 +774,18 @@ impl SolanaOutbox {
                     {
                         let mut expired = entry.clone();
                         expired.staged.status = SolanaTxStatus::Expired;
-                        let dir = self.transition(&expired, SolanaOutboxState::Failed)?;
+                        // A concurrent broadcast may have claimed the entry
+                        // for `sent` since it was read. The renames are
+                        // atomic, so exactly one of the two wins.
+                        let dir = match self.transition(&expired, SolanaOutboxState::Failed) {
+                            Ok(dir) => dir,
+                            Err(OutboxError::Io(error))
+                                if error.kind() == std::io::ErrorKind::NotFound =>
+                            {
+                                continue;
+                            }
+                            Err(error) => return Err(error),
+                        };
                         expired.state = SolanaOutboxState::Failed;
                         expired.dir = dir;
                         self.rewrite_intent(&expired)?;
@@ -800,10 +811,11 @@ fn write_private_atomic(path: &Path, body: &[u8]) -> Result<(), OutboxError> {
 }
 
 fn write_atomic_with_mode(path: &Path, body: &[u8], mode: u32) -> Result<(), OutboxError> {
+    // Never create the parent: an entry directory that vanished was moved to
+    // another state, and recreating it would split one transfer in two.
     let parent = path
         .parent()
         .ok_or_else(|| OutboxError::Other("outbox artifact has no parent".into()))?;
-    fs::create_dir_all(parent)?;
     let mut random = [0_u8; 8];
     rand::rngs::OsRng.fill_bytes(&mut random);
     let name = path
