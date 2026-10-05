@@ -470,16 +470,25 @@ fn developer_route_operation_classes(
 /// nothing else does (bloom-petal-hyperliquid's `BUILDER_ORDER_INTENT`).
 const HYPERLIQUID_BUILDER_ORDER_CLASS: &str = "hyperliquid.builder_order";
 
-/// The Polymarket sibling of `HYPERLIQUID_BUILDER_ORDER_CLASS`: the CLOB
-/// order class a builder-coded order signs under, separate from the fee-free
+/// Polymarket's fee-bearing CLOB order class, separate from the fee-free
 /// `polymarket.order.poly1271` that plain orders keep using.
+///
+/// Named for the *code*, not borrowed from Hyperliquid's class above, because
+/// the two venues charge a builder differently and the difference matters to
+/// an approval. Hyperliquid identifies a builder by address, takes the fee
+/// per order, and bounds it by a cap the user approved on-chain, so a
+/// declared fee can be checked against something the owner already agreed to.
+/// Polymarket identifies a builder by an opaque `bytes32` code whose maker and
+/// taker rates live on the builder's profile, with no per-user approval and no
+/// per-order fee field, so nothing at the venue bounds it and the approval
+/// claim is the only ceiling there is.
 ///
 /// The Petal must emit this exact string, and declare its fee in the matching
 /// asset below, before enrollment has any effect here: Broker compares the
 /// catalogued chain and asset against `DeclaredFee::Fee` and answers
 /// `FEE_ASSET_MISMATCH` when either differs. Until bloom-petal-polymarket
-/// splits the route, no claim carries this class and the row is inert.
-const POLYMARKET_BUILDER_ORDER_CLASS: &str = "polymarket.builder_order.poly1271";
+/// declares that fee, no claim carries this class and the row is inert.
+const POLYMARKET_BUILDER_CODE_ORDER_CLASS: &str = "polymarket.builder_code_order.poly1271";
 
 /// One row per operation class whose *every* claim declares an exact fee.
 ///
@@ -493,7 +502,7 @@ const FEE_BEARING_OPERATION_CLASSES: &[CataloguedFeeAsset] = &[
         asset: "usdc",
     },
     CataloguedFeeAsset {
-        operation_class: POLYMARKET_BUILDER_ORDER_CLASS,
+        operation_class: POLYMARKET_BUILDER_CODE_ORDER_CLASS,
         chain: "polygon",
         asset: "pusd",
     },
@@ -1441,7 +1450,7 @@ mod tests {
 
         for (class, chain, asset) in [
             ("hyperliquid.builder_order", "hyperliquid", "usdc"),
-            ("polymarket.builder_order.poly1271", "polygon", "pusd"),
+            ("polymarket.builder_code_order.poly1271", "polygon", "pusd"),
         ] {
             let fee = catalogued_fee_asset(class)
                 .unwrap()

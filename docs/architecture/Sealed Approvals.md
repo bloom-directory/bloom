@@ -124,12 +124,21 @@ declared fee against the approval's value limits instead of refusing it.
 | Fee-bearing class | Fee asset | Fee-free sibling |
 |---|---|---|
 | `hyperliquid.builder_order` | `hyperliquid` / `usdc` | `hyperliquid.order`, `hyperliquid.agent_action` |
-| `polymarket.builder_order.poly1271` | `polygon` / `pusd` | `polymarket.order.poly1271` |
+| `polymarket.builder_code_order.poly1271` | `polygon` / `pusd` | `polymarket.order.poly1271` |
 
 Splitting a fee-bearing operation into its own operation class is what makes
 a `fee_asset` safe to assert. Adding one to a shared class is a breaking
 change to every non-fee route that signs under it, and leaving it off a class
 whose claims declare a fee refuses every one of them.
+
+The class names are deliberately not uniform, because the venues are not.
+Hyperliquid identifies a builder by address, charges the fee per order, and
+bounds it by a cap the user approved on-chain, so a declared fee can be checked
+against something the owner already agreed to. Polymarket identifies a builder
+by an opaque `bytes32` code whose maker and taker rates live on the builder's
+profile, with no per-user approval and no per-order fee field, so nothing at the
+venue bounds it and the approval claim is the only ceiling. A reviewer should be
+able to tell which model a class belongs to from its name.
 
 Adding a venue is one row in `FEE_BEARING_OPERATION_CLASSES`
 (`crates/bloom/src/triad_enrollment.rs`) plus the Petal-side route split that
