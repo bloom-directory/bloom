@@ -6,8 +6,14 @@
 # 2. `bloom wallet new main`: the debug driver completes the wallet
 #    registration ceremony, then the default-policy ceremony the command opens.
 # 3. Verify main's policy allows exactly both installed package hashes, that
-#    `bloom wallet default-policy main` reports it applied, and that
-#    Polymarket's settings route round-trips the setup file.
+#    `bloom wallet default-policy main` reports it applied.
+# 4. Verify the Polymarket settings chosen during setup were applied to main's
+#    account 0 once the wallet existed. The triad starts with the pending
+#    marker `bloom init` leaves when its settings write is refused because the
+#    account does not exist yet (the marker is seeded here rather than produced
+#    by `bloom init`, which cannot run against a live triad). The settings must
+#    be absent before the wallet exists, present afterwards with the setup
+#    value rather than the catalog default, and the marker must be cleared.
 #
 # Binaries: BLOOM_INTEGRATION_BROKER_BIN, BLOOM_INTEGRATION_SIGNER_BIN and
 # BLOOM_INTEGRATION_DEBUG_DRIVER_BIN must point at builds of the Broker and
@@ -53,6 +59,10 @@ new_out="$run_root/wallet-new.out"
 launcher_pid=""
 new_pid=""
 mkdir -p "$machine_home" "$log_dir" "$(dirname "$machine_socket")"
+# What `bloom init` records when the setup settings write is refused because
+# the wallet's account does not exist yet.
+mkdir -p "$machine_home/pending-petal-settings"
+: > "$machine_home/pending-petal-settings/polymarket"
 
 cleanup() {
   status=$?
@@ -99,7 +109,7 @@ preinstalled = []
 [petals.setup.hyperliquid]
 
 [petals.setup.polymarket.values]
-max_daily_usd = "100"
+max_daily_usd = "73"
 EOF
 chmod 0600 "$machine_config"
 
@@ -132,6 +142,13 @@ owner_hash() { jq -er '.hash' "$machine_home/petals/store/owners/$1.json"; }
 hl_hash="$(owner_hash hyperliquid)" || die "hyperliquid is not installed"
 pm_hash="$(owner_hash polymarket)" || die "polymarket is not installed"
 say "installed hyperliquid ${hl_hash:0:12}, polymarket ${pm_hash:0:12}"
+
+settings_path="/petals/polymarket/settings/$WALLET/0/venue.toml"
+if cli vfs cat "$settings_path" >/dev/null 2>&1; then
+  die "Polymarket settings exist before wallet $WALLET does"
+fi
+[ -e "$machine_home/pending-petal-settings/polymarket" ] ||
+  die "the pending settings marker was removed before the wallet existed"
 
 # 2. Create main; the command waits between the two ceremonies.
 cli wallet new "$WALLET" >"$new_out" 2>&1 &
@@ -200,13 +217,14 @@ printf '%s\n' "$resume" | grep -q 'default_policy_url' &&
   die "default-policy resume opened another ceremony: $resume"
 say "bloom wallet default-policy main reports the policy applied without a new ceremony"
 
-# Polymarket's own settings route accepts and returns the setup file.
-settings_path="/petals/polymarket/settings/$WALLET/venue.toml"
-cli vfs write "$settings_path" --data "$(printf 'enabled = true\nmax_daily_usd = "100"\n')" ||
-  die "writing Polymarket settings failed"
-settings="$(cli vfs cat "$settings_path")"
+# 4. The pending settings were applied after main's account 0 appeared, with
+#    the value chosen in setup, and the marker is gone.
+settings="$(cli vfs cat "$settings_path")" ||
+  die "Polymarket settings were not applied after wallet $WALLET was created"
 printf '%s\n' "$settings" | grep -q '^enabled = true$' || die "settings not enabled: $settings"
-printf '%s\n' "$settings" | grep -q '^max_daily_usd = "100"$' || die "settings limit wrong: $settings"
-say "Polymarket settings route round-trips enabled = true and max_daily_usd = \"100\""
+printf '%s\n' "$settings" | grep -q '^max_daily_usd = "73"$' || die "settings limit is not the setup value: $settings"
+[ ! -e "$machine_home/pending-petal-settings/polymarket" ] ||
+  die "the pending settings marker was not cleared after the write succeeded"
+say "Polymarket settings for $WALLET/0 applied from setup: enabled = true, max_daily_usd = \"73\""
 
 say "passed"

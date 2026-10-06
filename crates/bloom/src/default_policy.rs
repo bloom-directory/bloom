@@ -287,6 +287,78 @@ pub(crate) async fn write_petal_settings(
     Ok(Some(settings.summary))
 }
 
+/// Setup settings that could not be written yet, one marker file per Petal.
+/// The settings route needs the wallet's account to exist, which on a first
+/// run is created after `bloom init`. A marker survives restarts so the write
+/// is retried once the account is there, without re-applying settings the
+/// owner has since edited.
+fn pending_settings_dir(home: &std::path::Path) -> std::path::PathBuf {
+    home.join("pending-petal-settings")
+}
+
+fn mark_settings_pending(home: &std::path::Path, name: &str) {
+    if setup_template(name).is_none() {
+        return;
+    }
+    let dir = pending_settings_dir(home);
+    let result = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(dir.join(name), b""));
+    if let Err(error) = result {
+        tracing::warn!(petal = %name, %error, "petal.setup_settings_pending_not_recorded");
+    }
+}
+
+fn clear_settings_pending(home: &std::path::Path, name: &str) {
+    if let Err(error) = std::fs::remove_file(pending_settings_dir(home).join(name))
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(petal = %name, %error, "petal.setup_settings_pending_not_cleared");
+    }
+}
+
+/// Chosen Petals whose setup settings are still waiting to be written. Only
+/// catalog Petals with a settings template are honoured, so an edited marker
+/// directory cannot name anything else.
+fn pending_settings(home: &std::path::Path, petals: &PetalsConfig) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(pending_settings_dir(home)) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| setup_template(name).is_some() && petals.setup.contains_key(name))
+        .collect();
+    names.sort();
+    names
+}
+
+/// Write the settings that an earlier attempt could not, now that the default
+/// wallet exists. A failed write keeps its marker for the next attempt.
+pub(crate) async fn apply_pending_settings(daemon: &Daemon) -> Vec<String> {
+    let owners = petal_owners(daemon).unwrap_or_default();
+    let mut messages = Vec::new();
+    for name in pending_settings(daemon.home.root(), &daemon.config.petals) {
+        if !owners.contains_key(&name) {
+            continue;
+        }
+        match write_petal_settings(&daemon.vfs, &daemon.config.petals, &name).await {
+            Ok(summary) => {
+                clear_settings_pending(daemon.home.root(), &name);
+                if let Some(summary) = summary {
+                    messages.push(settings_message(&name, &summary, false));
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    petal = %name,
+                    error = %format!("{error:#}"),
+                    "petal.setup_settings_retry_failed"
+                );
+            }
+        }
+    }
+    messages
+}
+
 /// Installed Petal owners by name.
 pub(crate) fn petal_owners(daemon: &Daemon) -> Result<BTreeMap<String, String>> {
     Ok(daemon
@@ -322,9 +394,17 @@ pub(crate) async fn apply_setup_settings(
             continue;
         }
         match write_petal_settings(&daemon.vfs, &daemon.config.petals, name).await {
-            Ok(Some(summary)) => messages.push(settings_message(name, &summary, updated)),
+            Ok(Some(summary)) => {
+                clear_settings_pending(daemon.home.root(), name);
+                messages.push(settings_message(name, &summary, updated));
+            }
             Ok(None) => {}
-            Err(error) => messages.push(format!("petal_settings_failed: {error:#}")),
+            Err(error) => {
+                mark_settings_pending(daemon.home.root(), name);
+                messages.push(format!(
+                    "petal_settings_failed: {error:#} (will retry once wallet {DEFAULT_POLICY_WALLET} exists)"
+                ));
+            }
         }
     }
     Ok(messages)
@@ -353,18 +433,24 @@ pub(crate) fn apply_provisioned_settings(
             &daemon.config.petals,
             &result.name,
         )) {
-            Ok(Some(summary)) => tracing::info!(
-                petal = %result.name,
-                updated,
-                message = %settings_message(&result.name, &summary, updated),
-                "petal.setup_settings_written"
-            ),
+            Ok(Some(summary)) => {
+                clear_settings_pending(daemon.home.root(), &result.name);
+                tracing::info!(
+                    petal = %result.name,
+                    updated,
+                    message = %settings_message(&result.name, &summary, updated),
+                    "petal.setup_settings_written"
+                );
+            }
             Ok(None) => {}
-            Err(error) => tracing::warn!(
-                petal = %result.name,
-                error = %format!("{error:#}"),
-                "petal.setup_settings_failed"
-            ),
+            Err(error) => {
+                mark_settings_pending(daemon.home.root(), &result.name);
+                tracing::warn!(
+                    petal = %result.name,
+                    error = %format!("{error:#}"),
+                    "petal.setup_settings_failed"
+                );
+            }
         }
     }
 }
@@ -456,6 +542,11 @@ pub(crate) async fn advance_default_policy(
             });
         }
         Err(error) => return Err(error.into()),
+    }
+    if wallet == DEFAULT_POLICY_WALLET {
+        for message in apply_pending_settings(daemon).await {
+            tracing::info!(%message, "petal.setup_settings_written");
+        }
     }
     let eligibility = match daemon
         .ensure_default_policy(wallet, &packages, &destinations)
@@ -750,6 +841,56 @@ pub(crate) fn ceremony_expiry_from_output(output: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+
+    fn chosen_setup(names: &[&str]) -> PetalsConfig {
+        let mut petals = PetalsConfig::default();
+        for name in names {
+            petals
+                .setup
+                .insert((*name).to_owned(), PetalSetupConfig::default());
+        }
+        petals
+    }
+
+    #[test]
+    fn failed_settings_stay_pending_until_written() {
+        let home = tempfile::tempdir().unwrap();
+        let petals = chosen_setup(&["polymarket"]);
+        assert!(pending_settings(home.path(), &petals).is_empty());
+
+        mark_settings_pending(home.path(), "polymarket");
+        assert_eq!(pending_settings(home.path(), &petals), ["polymarket"]);
+        // A second failed attempt leaves one marker, not two.
+        mark_settings_pending(home.path(), "polymarket");
+        assert_eq!(pending_settings(home.path(), &petals), ["polymarket"]);
+
+        clear_settings_pending(home.path(), "polymarket");
+        assert!(pending_settings(home.path(), &petals).is_empty());
+        // Clearing an absent marker is not an error.
+        clear_settings_pending(home.path(), "polymarket");
+    }
+
+    #[test]
+    fn pending_markers_cannot_name_anything_but_chosen_catalog_petals() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = pending_settings_dir(home.path());
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["polymarket", "../escape", "not-a-petal", "enso"] {
+            let _ = std::fs::write(dir.join(name), b"");
+        }
+        // Not chosen in setup: ignored. No settings template (enso): ignored.
+        assert!(pending_settings(home.path(), &chosen_setup(&["enso"])).is_empty());
+        assert_eq!(
+            pending_settings(
+                home.path(),
+                &chosen_setup(&["polymarket", "enso", "not-a-petal"])
+            ),
+            ["polymarket"]
+        );
+        let fresh = tempfile::tempdir().unwrap();
+        mark_settings_pending(fresh.path(), "not-a-petal");
+        assert!(!pending_settings_dir(fresh.path()).exists());
+    }
     use super::*;
 
     /// Machine refuses an outbox transaction whose destination the wallet
