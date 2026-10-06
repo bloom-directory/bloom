@@ -989,12 +989,11 @@ async fn revoking_every_petal_does_not_bring_the_setup_proposal_back() {
     let baseline = policy(60_000);
     let fixture = broker_fixture_with_policy(false, baseline.clone(), 2);
     let requested = Digest32::from_bytes([7; 32]);
-    let defaults: bloom_vfs::handlers::DefaultPolicyPackages = Arc::new(|_wallet: &str| {
-        bloom_vfs::handlers::DefaultPolicySetup {
+    let defaults: bloom_vfs::handlers::DefaultPolicyPackages =
+        Arc::new(|_wallet: &str| bloom_vfs::handlers::DefaultPolicySetup {
             packages: vec![Digest32::from_bytes([8; 32]), Digest32::from_bytes([9; 32])],
             destinations: vec![setup_destination()],
-        }
-    });
+        });
     let handler =
         eligibility_handler(temp.path(), fixture.clone()).with_default_policy_packages(defaults);
 
