@@ -121,6 +121,16 @@ impl MachineBrokerService for BrokerFixture {
                         self.wallet_public(),
                     ]))
                 }
+                MachineBrokerRequest::WalletGetPublic(WalletRequest { wallet_id }) => {
+                    if wallet_id.as_str() == "alice" {
+                        Ok(MachineBrokerResponse::WalletGetPublic(self.wallet_public()))
+                    } else {
+                        Err(ProtocolError::new(
+                            ProtocolErrorCode::ApprovalNotFound,
+                            "wallet policy not found",
+                        ))
+                    }
+                }
                 MachineBrokerRequest::KeyListPublic(WalletRequest { wallet_id })
                     if wallet_id.as_str() == "alice" =>
                 {
@@ -219,6 +229,11 @@ impl MachineBrokerService for BrokerFixture {
                 }
                 MachineBrokerRequest::CustodyResult(request) => {
                     Ok(MachineBrokerResponse::CustodyResult(CustodyResult {
+                        surface: Some(bloom_broker_api::CeremonySurfaceRef {
+                            surface_id: bloom_broker_api::Token::new("local").unwrap(),
+                            identity_digest: bloom_broker_api::Digest32::from_bytes([0; 32]),
+                        }),
+                        credential_authority_generation: Some(bloom_broker_api::DecimalU64::new(0)),
                         ceremony_kind: CeremonyKind::PolicyUpdate,
                         custody_operation_id: request.operation_id,
                         public_status: CeremonyState::Succeeded,
@@ -474,6 +489,44 @@ async fn vfs_policy_prepare_response_loss_reconciles_the_persisted_operation_id(
 }
 
 #[tokio::test]
+async fn vfs_policy_write_of_the_current_policy_stages_nothing() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = broker_fixture(false);
+    let service: Arc<dyn MachineBrokerService> = fixture.clone();
+    let home = HomeDir::at(temp.path().join("home"));
+    let handler = WalletsHandler::new(
+        bloom_evm::ChainRegistry::default(),
+        TxEngine::new(Outbox::new(temp.path().join("outbox")).unwrap(), 60_000),
+        AddressBook::default(),
+        projection_reader(
+            temp.path().join("cache/no-op-wallets.json"),
+            Some(MachineBrokerClient::new(service.clone())),
+        ),
+        temp.path().join("machine-policy-projections"),
+    )
+    .with_broker(Some(MachineBrokerClient::new(service)))
+    .with_home_write_permit(Arc::new(HomeWritePermit::acquire(&home).unwrap()));
+    let current = serde_json::to_vec_pretty(&policy(60_000)).unwrap();
+
+    handler
+        .write(&VfsPath::parse("alice/policy.json").unwrap(), &current)
+        .await
+        .unwrap();
+
+    assert!(fixture.state.lock().operation_id.is_none());
+    assert!(matches!(
+        fixture.requests.lock().as_slice(),
+        [MachineBrokerRequest::PolicyRead(_)]
+    ));
+    assert!(
+        !temp
+            .path()
+            .join("machine-policy-projections/alice/policy-updates/pending")
+            .exists()
+    );
+}
+
+#[tokio::test]
 async fn vfs_policy_write_prepares_then_commits_only_with_completed_custody_receipt() {
     let temp = tempfile::tempdir().unwrap();
     let outbox = Outbox::new(temp.path().join("outbox")).unwrap();
@@ -584,7 +637,7 @@ async fn vfs_policy_write_prepares_then_commits_only_with_completed_custody_rece
             MachineBrokerRequest::CeremonyStatus(_),
             MachineBrokerRequest::CustodyResult(_),
             MachineBrokerRequest::PolicyCommitUpdate(_),
-            MachineBrokerRequest::WalletListPublic(_),
+            MachineBrokerRequest::WalletGetPublic(_),
             MachineBrokerRequest::KeyListPublic(_),
             MachineBrokerRequest::CredentialListPublic(_),
             MachineBrokerRequest::PolicyRead(_),

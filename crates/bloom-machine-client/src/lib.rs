@@ -20,12 +20,58 @@ use std::{
     collections::BTreeSet,
     future::Future,
     path::{Path, PathBuf},
-    sync::{Arc, RwLock},
-    time::Duration,
+    sync::{Arc, Mutex, RwLock},
+    time::{Duration, Instant},
 };
 
 const AUTHORITY_HEAD_EXCHANGE_CADENCE: Duration = Duration::from_secs(45);
 const AUTHORITY_HEAD_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
+const QUOTA_BACKOFF_INITIAL: Duration = Duration::from_millis(250);
+const QUOTA_BACKOFF_MAXIMUM: Duration = Duration::from_secs(30);
+
+/// Exponential backoff after Broker reports its request quota exhausted.
+/// Broker admits requests over a sliding window, so callers that retry on
+/// rejection (such as VFS readers after a restart) keep that window saturated.
+/// While backing off, requests are refused locally without reaching Broker.
+#[derive(Default)]
+struct QuotaBackoff {
+    state: Mutex<Option<(Duration, Instant)>>,
+}
+
+impl QuotaBackoff {
+    fn admit(&self, now: Instant) -> Result<(), ProtocolError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| service_unavailable("Broker quota backoff lock poisoned"))?;
+        match *state {
+            Some((_, until)) if now < until => Err(ProtocolError::new(
+                ProtocolErrorCode::QuotaExceeded,
+                format!(
+                    "Broker request quota exhausted; retry in {} ms",
+                    (until - now).as_millis().max(1)
+                ),
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    fn record<T>(&self, result: &Result<T, ProtocolError>, now: Instant) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        match result {
+            Ok(_) => *state = None,
+            Err(error) if error.code == ProtocolErrorCode::QuotaExceeded => {
+                let delay = state.map_or(QUOTA_BACKOFF_INITIAL, |(delay, _)| {
+                    (delay * 2).min(QUOTA_BACKOFF_MAXIMUM)
+                });
+                *state = Some((delay, now + delay));
+            }
+            Err(_) => {}
+        }
+    }
+}
 
 async fn run_periodic_authority_head_exchange<F, Fut, T>(mut exchange: F)
 where
@@ -391,6 +437,7 @@ pub struct MachineBrokerClient {
     service: Arc<dyn MachineBrokerService>,
     local_identity: Option<LocalIdentity>,
     unix_service: Option<Arc<UnixMachineBrokerService>>,
+    quota_backoff: Arc<QuotaBackoff>,
 }
 
 impl MachineBrokerClient {
@@ -399,6 +446,7 @@ impl MachineBrokerClient {
             service,
             local_identity: None,
             unix_service: None,
+            quota_backoff: Arc::default(),
         }
     }
 
@@ -416,6 +464,7 @@ impl MachineBrokerClient {
             service: unix_service.clone(),
             local_identity: Some(identity),
             unix_service: Some(unix_service),
+            quota_backoff: Arc::default(),
         }
     }
 
@@ -539,7 +588,10 @@ impl MachineBrokerClient {
         &self,
         request: MachineBrokerRequest,
     ) -> Result<MachineBrokerResponse, ProtocolError> {
-        self.service.dispatch(request).await
+        self.quota_backoff.admit(Instant::now())?;
+        let result = self.service.dispatch(request).await;
+        self.quota_backoff.record(&result, Instant::now());
+        result
     }
 
     pub async fn sign(&self, request: MachineSignRequest) -> Result<SigningResult, ProtocolError> {
@@ -956,6 +1008,7 @@ impl MachineBrokerClient {
         };
         terms.validate()?;
         self.prepare_approval(ApprovalPrepareRequest {
+            surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             operation_id: request.approval_operation_id,
             terms,
             canonical_plan_facts_digest: request.canonical_plan_facts_digest,
@@ -1127,6 +1180,7 @@ impl MachineBrokerClient {
         };
         terms.validate()?;
         self.prepare_approval(ApprovalPrepareRequest {
+            surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             operation_id: request.approval_operation_id,
             terms,
             canonical_plan_facts_digest: request.canonical_plan_facts_digest,
@@ -1281,6 +1335,7 @@ impl MachineBrokerClient {
         };
         terms.validate()?;
         self.prepare_approval(ApprovalPrepareRequest {
+            surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             operation_id: request.approval_operation_id,
             terms,
             canonical_plan_facts_digest: request.canonical_plan_facts_digest,
@@ -1777,6 +1832,40 @@ impl MachineBrokerClient {
         Ok(key_ref)
     }
 
+    /// Start paired enrollment through Broker. Browser private keys stay in the browser.
+    pub async fn prepare_cross_surface_credential(
+        &self,
+        request: bloom_broker_api::CeremonyCrossSurfacePrepareRequest,
+    ) -> Result<bloom_broker_api::CeremonyCrossSurfacePrepareResponse, ProtocolError> {
+        let operation_id = request.operation_id.clone();
+        match self
+            .request(MachineBrokerRequest::CredentialCrossSurfacePrepare(request))
+            .await?
+        {
+            MachineBrokerResponse::CredentialCrossSurfacePrepare(response)
+                if response.operation_id == operation_id =>
+            {
+                Ok(response)
+            }
+            _ => Err(response_mismatch("credential.cross_surface_prepare")),
+        }
+    }
+
+    /// Read Signer-approved exposure through Broker; Machine cannot mutate it.
+    pub async fn ceremony_surfaces(
+        &self,
+    ) -> Result<bloom_broker_api::CeremonyExposureStatus, ProtocolError> {
+        match self
+            .request(MachineBrokerRequest::CeremonySurfaceStatus(
+                bloom_broker_api::Empty {},
+            ))
+            .await?
+        {
+            MachineBrokerResponse::CeremonySurfaceStatus(status) => Ok(status),
+            _ => Err(response_mismatch("ceremony.surface_status")),
+        }
+    }
+
     pub async fn credentials(
         &self,
         wallet_id: Token,
@@ -2134,6 +2223,28 @@ impl CeremonyProjection {
         )
     }
 
+    pub fn from_cross_surface_prepare(
+        response: &bloom_broker_api::CeremonyCrossSurfacePrepareResponse,
+        now_ms: u64,
+    ) -> Result<Self, ProtocolError> {
+        if response.state != CeremonyState::AwaitingUser {
+            return Err(projection_mismatch(
+                "paired enrollment is not awaiting user",
+            ));
+        }
+        Self::awaiting(
+            CeremonyProjectionIdentity::Custody {
+                operation_id: response.operation_id.clone(),
+                ceremony_kind: bloom_broker_api::CeremonyKind::CredentialAdd,
+            },
+            CeremonyProjectionState::Custody(CeremonyState::AwaitingUser),
+            response.destination_url.clone(),
+            response.expires_at_ms.clone(),
+            None,
+            now_ms,
+        )
+    }
+
     pub fn from_policy_prepare(
         response: &PolicyUpdatePrepareResponse,
         now_ms: u64,
@@ -2160,34 +2271,38 @@ impl CeremonyProjection {
         status: &CeremonyPublicStatus,
         now_ms: u64,
     ) -> Result<Self, ProtocolError> {
-        if status.state != CeremonyState::AwaitingUser {
-            return Ok(Self {
-                identity: Some(CeremonyProjectionIdentity::Custody {
+        if status.state == CeremonyState::AwaitingUser
+            && let Some(url) = status.ceremony_url.clone()
+            && status.expires_at_ms.get() > now_ms
+        {
+            return Self::awaiting(
+                CeremonyProjectionIdentity::Custody {
                     operation_id: status.operation_id.clone(),
                     ceremony_kind: status.ceremony_kind,
-                }),
-                ceremony_state: Some(CeremonyProjectionState::Custody(status.state)),
-                ceremony_url: None,
-                ceremony_expires_at_ms: None,
-                review_manifest_digest: None,
-                receipt_digest: status.receipt_digest.clone(),
-                last_error: None,
-            });
+                },
+                CeremonyProjectionState::Custody(status.state),
+                url,
+                status.expires_at_ms.clone(),
+                None,
+                now_ms,
+            );
         }
-        let url = status.ceremony_url.clone().ok_or_else(|| {
-            projection_mismatch("awaiting custody status is missing ceremony URL")
-        })?;
-        Self::awaiting(
-            CeremonyProjectionIdentity::Custody {
+        // Broker withholds the URL once a remote browser has exchanged its
+        // one-time capability, and a status can race the expiry sweep. Both
+        // leave the ceremony awaiting without a usable launch URL, which is the
+        // projection `reconcile_custody` reaches for an existing record.
+        Ok(Self {
+            identity: Some(CeremonyProjectionIdentity::Custody {
                 operation_id: status.operation_id.clone(),
                 ceremony_kind: status.ceremony_kind,
-            },
-            CeremonyProjectionState::Custody(status.state),
-            url,
-            status.expires_at_ms.clone(),
-            None,
-            now_ms,
-        )
+            }),
+            ceremony_state: Some(CeremonyProjectionState::Custody(status.state)),
+            ceremony_url: None,
+            ceremony_expires_at_ms: None,
+            review_manifest_digest: None,
+            receipt_digest: status.receipt_digest.clone(),
+            last_error: None,
+        })
     }
 
     pub fn from_custody_result(result: &CustodyResult) -> Self {
@@ -2809,6 +2924,26 @@ mod tests {
     };
     use ed25519_dalek::SigningKey;
     use tracing_subscriber::prelude::*;
+
+    #[test]
+    fn paired_enrollment_projection_preserves_opaque_destination_and_rejects_expiry() {
+        let response = bloom_broker_api::CeremonyCrossSurfacePrepareResponse {
+            operation_id: OperationId::from_bytes([71; 32]),
+            ceremony_id: Digest32::from_bytes([72; 32]),
+            state: CeremonyState::AwaitingUser,
+            destination_url:
+                "https://abcdefghijklmnopqrstuvwxyz.relay.bloom.directory/ceremony#cap=opaque"
+                    .into(),
+            expires_at_ms: DecimalU64::new(2_000),
+        };
+        let projection = CeremonyProjection::from_cross_surface_prepare(&response, 1_000).unwrap();
+        assert_eq!(projection.operation_id(), Some(&response.operation_id));
+        assert_eq!(
+            projection.ceremony_url(),
+            Some(response.destination_url.as_str())
+        );
+        assert!(CeremonyProjection::from_cross_surface_prepare(&response, 2_000).is_err());
+    }
 
     #[test]
     fn petal_claim_value_limits_sum_debits_and_fee_per_asset() {
@@ -4099,14 +4234,15 @@ mod tests {
             ceremony_kind: CeremonyKind::WalletImport,
             custody_operation_id: OperationId::from_bytes([4; 32]),
             state: CustodyPrepareState::AwaitingUser,
-            ceremony_url: "http://127.0.0.1:18734/c/opaque".into(),
+            ceremony_url:
+                "https://abcdefghijklmnopqrstuvwxyz.relay.bloom.directory/ceremony#opaque".into(),
             ceremony_expires_at_ms: DecimalU64::new(2_000),
             signer_contribution_digest: digest(6),
         };
         let mut projection = CeremonyProjection::from_custody_prepare(&prepare, 1_000).unwrap();
         assert_eq!(
             projection.ceremony_url(),
-            Some("http://127.0.0.1:18734/c/opaque")
+            Some("https://abcdefghijklmnopqrstuvwxyz.relay.bloom.directory/ceremony#opaque")
         );
         projection
             .reconcile_custody(
@@ -4116,7 +4252,10 @@ mod tests {
                     operation_id: OperationId::from_bytes([4; 32]),
                     state: CeremonyState::AwaitingUser,
                     expires_at_ms: DecimalU64::new(2_000),
-                    ceremony_url: Some("http://127.0.0.1:18734/c/opaque".into()),
+                    ceremony_url: Some(
+                        "https://abcdefghijklmnopqrstuvwxyz.relay.bloom.directory/ceremony#opaque"
+                            .into(),
+                    ),
                     receipt_digest: None,
                 },
                 1_999,
@@ -4156,7 +4295,8 @@ mod tests {
         let approval = SealedApprovalPrepareResponse {
             approval_id: digest(10),
             state: ApprovalPrepareState::AwaitingCeremony,
-            ceremony_url: "http://127.0.0.1:18734/c/approval".into(),
+            ceremony_url:
+                "https://abcdefghijklmnopqrstuvwxyz.relay.bloom.directory/ceremony#approval".into(),
             ceremony_expires_at_ms: DecimalU64::new(3_000),
             review_manifest_digest: digest(11),
         };
@@ -4207,6 +4347,25 @@ mod tests {
         assert!(status.ceremony_url.is_some());
         let rebuilt = CeremonyProjection::from_custody_status(&status, 8_000).unwrap();
         assert_eq!(rebuilt.ceremony_url(), status.ceremony_url.as_deref());
+
+        // A remote browser consumed the capability, or the status raced the
+        // expiry sweep: the ceremony stays awaiting with no launch URL.
+        let expiry = status.expires_at_ms.get();
+        let opened = CeremonyPublicStatus {
+            ceremony_url: None,
+            ..status.clone()
+        };
+        for (candidate, now_ms) in [(&opened, 8_000), (&status, expiry)] {
+            let rebuilt = CeremonyProjection::from_custody_status(candidate, now_ms).unwrap();
+            assert_eq!(
+                rebuilt.state(),
+                Some(CeremonyProjectionState::Custody(
+                    CeremonyState::AwaitingUser
+                ))
+            );
+            assert_eq!(rebuilt.ceremony_url(), None);
+            assert_eq!(rebuilt.expires_at_ms(), None);
+        }
 
         let cancelled = client.cancel_ceremony(operation_id.clone()).await.unwrap();
         assert_eq!(cancelled.operation_id, operation_id);
@@ -4331,6 +4490,7 @@ mod tests {
         let client = MachineBrokerClient::new(broker);
 
         let approval = ApprovalPrepareRequest {
+            surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             operation_id: OperationId::from_bytes([94; 32]),
             terms: approval_terms("wallet", None),
             canonical_plan_facts_digest: digest(95),
@@ -4373,6 +4533,7 @@ mod tests {
         );
 
         let custody = CustodyPrepareRequest {
+            surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             ceremony_kind: CeremonyKind::WalletImport,
             custody_operation_id: OperationId::from_bytes([97; 32]),
             wallet_id: None,
@@ -4521,6 +4682,73 @@ mod tests {
             requests[4],
             MachineBrokerRequest::SealedApprovalRevokeAll(revoke_all)
         );
+    }
+
+    struct QuotaBroker {
+        calls: std::sync::atomic::AtomicUsize,
+        exhausted: std::sync::atomic::AtomicBool,
+    }
+
+    impl MachineBrokerService for QuotaBroker {
+        fn dispatch<'a>(
+            &'a self,
+            _request: MachineBrokerRequest,
+        ) -> ServiceFuture<'a, MachineBrokerResponse> {
+            use std::sync::atomic::Ordering;
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let exhausted = self.exhausted.load(Ordering::SeqCst);
+            Box::pin(async move {
+                if exhausted {
+                    Err(ProtocolError::new(
+                        ProtocolErrorCode::QuotaExceeded,
+                        "request rate quota exhausted",
+                    ))
+                } else {
+                    Ok(MachineBrokerResponse::WalletListPublic(vec![]))
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn quota_rejections_back_off_locally_and_reset_on_success() {
+        use std::sync::atomic::Ordering;
+        let broker = Arc::new(QuotaBroker {
+            calls: 0.into(),
+            exhausted: true.into(),
+        });
+        let client = MachineBrokerClient::new(broker.clone());
+        let expire_backoff = |client: &MachineBrokerClient| {
+            let mut state = client.quota_backoff.state.lock().unwrap();
+            let (delay, _) = state.unwrap();
+            *state = Some((delay, Instant::now()));
+            delay
+        };
+
+        // A burst of readers after one rejection never reaches Broker.
+        for _ in 0..10 {
+            let error = client.wallets().await.unwrap_err();
+            assert_eq!(error.code, ProtocolErrorCode::QuotaExceeded);
+        }
+        assert_eq!(broker.calls.load(Ordering::SeqCst), 1);
+
+        // Each rejected probe doubles the backoff up to its ceiling.
+        let mut delays = vec![expire_backoff(&client)];
+        for _ in 0..10 {
+            client.wallets().await.unwrap_err();
+            delays.push(expire_backoff(&client));
+        }
+        assert_eq!(delays[0], QUOTA_BACKOFF_INITIAL);
+        assert_eq!(delays[1], QUOTA_BACKOFF_INITIAL * 2);
+        assert_eq!(delays.last(), Some(&QUOTA_BACKOFF_MAXIMUM));
+        assert_eq!(broker.calls.load(Ordering::SeqCst), 11);
+
+        // Clones share the backoff, and one success clears it.
+        broker.exhausted.store(false, Ordering::SeqCst);
+        client.clone().wallets().await.unwrap();
+        assert!(client.quota_backoff.state.lock().unwrap().is_none());
+        client.wallets().await.unwrap();
+        assert_eq!(broker.calls.load(Ordering::SeqCst), 13);
     }
 
     struct MismatchedApprovalBroker;
@@ -5146,6 +5374,7 @@ mod tests {
         Arc::get_mut(&mut broker).unwrap().corrupt_response = true;
         let client = MachineBrokerClient::new(broker);
         let request = CustodyPrepareRequest {
+            surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             ceremony_kind: CeremonyKind::AccountAllocate,
             custody_operation_id: OperationId::from_bytes([77; 32]),
             wallet_id: Some(token("wallet")),

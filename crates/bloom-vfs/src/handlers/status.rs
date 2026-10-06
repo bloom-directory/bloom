@@ -112,6 +112,7 @@ pub use bloom_update::UpdateAvailable;
 
 #[derive(Clone)]
 pub struct StatusHandler {
+    ceremony_broker: Option<bloom_machine_client::MachineBrokerClient>,
     pub chains: ChainRegistry,
     /// Read-only Solana clients. Chain status is chain-scoped, so it lives
     /// here rather than being repeated under every wallet.
@@ -199,6 +200,7 @@ impl StatusHandler {
         wallet_projections: Arc<dyn WalletProjectionReader>,
     ) -> Self {
         Self {
+            ceremony_broker: None,
             chains,
             solana_chains: None,
             wallet_projections: Some(wallet_projections),
@@ -216,6 +218,15 @@ impl StatusHandler {
             mempool_statuses: Arc::new(RwLock::new(BTreeMap::new())),
             private_rpc_healths: Arc::new(RwLock::new(BTreeMap::new())),
         }
+    }
+
+    /// Project public ceremony readiness through the existing authenticated Broker edge.
+    pub fn with_ceremony_broker(
+        mut self,
+        broker: Option<bloom_machine_client::MachineBrokerClient>,
+    ) -> Self {
+        self.ceremony_broker = broker;
+        self
     }
 
     /// Attach the read-only Solana chain registry. Chain status is
@@ -758,7 +769,12 @@ impl StatusHandler {
     async fn lookup_inner(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
         match path.segments() {
             [] => Ok(Entry::dir("")),
-            [s] if s == "daemon.json" || s == "version" || s == "uptime" || s == "started_at" => {
+            [s] if s == "ceremonies.json"
+                || s == "daemon.json"
+                || s == "version"
+                || s == "uptime"
+                || s == "started_at" =>
+            {
                 Ok(Entry::file(s))
             }
             [s] if s == "chains"
@@ -933,6 +949,17 @@ impl StatusHandler {
 
     async fn read_inner(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
         match path.segments() {
+            [s] if s == "ceremonies.json" => {
+                let broker = self.ceremony_broker.as_ref().ok_or_else(|| {
+                    HandlerError::backend("ceremony status requires the authenticated Broker edge")
+                })?;
+                let status = broker
+                    .ceremony_surfaces()
+                    .await
+                    .map_err(|error| HandlerError::backend(error.to_string()))?;
+                serde_json::to_vec_pretty(&status)
+                    .map_err(|error| HandlerError::backend(error.to_string()))
+            }
             [s] if s == "version" => Ok(format!("{}\n", self.version).into_bytes()),
             [s] if s == "uptime" => Ok(format!("{}\n", self.uptime_string()).into_bytes()),
             [s] if s == "started_at" => Ok(format!("{}\n", self.started_at_rfc3339()).into_bytes()),
@@ -1218,6 +1245,7 @@ impl StatusHandler {
         match path.segments() {
             [] => Ok(vec![
                 Entry::file("daemon.json"),
+                Entry::file("ceremonies.json"),
                 Entry::file("version"),
                 Entry::file("uptime"),
                 Entry::file("started_at"),
@@ -1437,7 +1465,7 @@ fn count_files_recursive(dir: &std::path::Path) -> u64 {
 
 /// Convert a Unix timestamp (seconds since 1970-01-01 UTC) to (Y, M, D, h, m, s).
 /// Algorithm from Howard Hinnant's date library (public domain).
-fn unix_to_civil(secs: u64) -> (i64, u32, u32, u32, u32, u32) {
+pub(crate) fn unix_to_civil(secs: u64) -> (i64, u32, u32, u32, u32, u32) {
     let z = (secs / 86_400) as i64; // days since epoch
     let secs_of_day = secs % 86_400;
     let h = (secs_of_day / 3600) as u32;
@@ -1632,6 +1660,54 @@ mod tests {
         let p = VfsPath::parse("wallets/count").unwrap();
         let body = h.read(&p).await.unwrap();
         assert_eq!(body, b"1\n");
+    }
+
+    #[tokio::test]
+    async fn ceremony_status_uses_only_the_broker_projection_and_fails_without_it() {
+        use bloom_broker_api::{
+            MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService, ServiceFuture,
+        };
+        struct Broker;
+        impl MachineBrokerService for Broker {
+            fn dispatch<'a>(
+                &'a self,
+                request: MachineBrokerRequest,
+            ) -> ServiceFuture<'a, MachineBrokerResponse> {
+                Box::pin(async move {
+                    assert!(matches!(
+                        request,
+                        MachineBrokerRequest::CeremonySurfaceStatus(_)
+                    ));
+                    Ok(MachineBrokerResponse::CeremonySurfaceStatus(
+                        bloom_broker_api::CeremonyExposureStatus {
+                            desired_mode: bloom_broker_api::CeremonyExposureMode::RemoteEnabled,
+                            desired_revision: bloom_broker_api::DecimalU64::new(3),
+                            effective_mode: bloom_broker_api::CeremonyExposureMode::LocalhostOnly,
+                            effective_revision: bloom_broker_api::DecimalU64::new(2),
+                            local_origin: "http://localhost:18734".into(),
+                            remote_origin: None,
+                            remote_tls_ready: false,
+                            remote_routing_ready: false,
+                            stage: bloom_broker_api::CeremonyExposureStage::Unprovisioned,
+                        },
+                    ))
+                })
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let h = make_handler(dir.path());
+        let path = VfsPath::parse("ceremonies.json").unwrap();
+        assert!(h.read(&path).await.is_err());
+        assert_eq!(h.cache_ttl(&path), None);
+        let h = h.with_ceremony_broker(Some(bloom_machine_client::MachineBrokerClient::new(
+            Arc::new(Broker),
+        )));
+        let status: serde_json::Value =
+            serde_json::from_slice(&h.read(&path).await.unwrap()).unwrap();
+        assert_eq!(status["desired_revision"], "3");
+        assert_eq!(status["effective_revision"], "2");
+        assert_eq!(status["remote_tls_ready"], false);
+        assert_eq!(status["remote_routing_ready"], false);
     }
 
     #[tokio::test]

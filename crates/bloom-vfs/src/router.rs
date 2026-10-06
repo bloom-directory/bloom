@@ -360,6 +360,61 @@ impl Vfs {
     }
 }
 
+/// Names that version control, shell prompts, file indexers and Finder probe
+/// for in every directory they visit. None is a Bloom entry, so answer them
+/// before any handler can render, or fetch from Broker or a chain, to report
+/// the miss. AppleDouble (`._*`) companions are rejected by prefix.
+const PROBE_NAMES: [&str; 20] = [
+    ".git",
+    ".hg",
+    ".svn",
+    ".bzr",
+    ".jj",
+    ".gitignore",
+    ".gitattributes",
+    ".gitmodules",
+    ".ignore",
+    ".rayignore",
+    ".fdignore",
+    ".rgignore",
+    "CACHEDIR.TAG",
+    ".DS_Store",
+    ".Spotlight-V100",
+    ".Trashes",
+    ".fseventsd",
+    ".metadata_never_index",
+    ".localized",
+    ".hidden",
+];
+
+/// Root files asking indexers not to crawl the mount: Raycast reads
+/// `.rayignore`, ripgrep and fd read `.ignore`, and Spotlight skips a volume
+/// with `.metadata_never_index`. They resolve by name but are not listed, so
+/// they stay out of `ls -a` and Finder.
+const ROOT_NO_INDEX_MARKERS: [(&str, &[u8]); 3] = [
+    (".rayignore", b"*\n"),
+    (".ignore", b"*\n"),
+    (".metadata_never_index", b""),
+];
+
+fn is_probe_name(name: &str) -> bool {
+    name.starts_with("._") || PROBE_NAMES.contains(&name)
+}
+
+fn root_no_index_marker(path: &VfsPath) -> Option<(&'static str, &'static [u8])> {
+    match path.segments() {
+        [name] => ROOT_NO_INDEX_MARKERS
+            .iter()
+            .copied()
+            .find(|(marker, _)| marker == name),
+        _ => None,
+    }
+}
+
+fn contains_probe_name(path: &VfsPath) -> bool {
+    path.segments().iter().any(|segment| is_probe_name(segment))
+}
+
 fn root_agent_guidance_entry(path: &VfsPath) -> Option<&'static str> {
     match path.segments() {
         [name] => AGENT_GUIDANCE_FILES
@@ -396,6 +451,14 @@ impl Handler for Vfs {
         if path.is_root() {
             return Ok(Entry::dir(""));
         }
+        if let Some((name, body)) = root_no_index_marker(path) {
+            let mut entry = Entry::file(name);
+            entry.size = body.len() as u64;
+            return Ok(entry);
+        }
+        if contains_probe_name(path) {
+            return Err(HandlerError::NotFound(path.to_string_path()));
+        }
         if let Some(name) = root_agent_guidance_entry(path) {
             let mut entry = Entry::file(name);
             entry.size = AGENT_GUIDANCE.len() as u64;
@@ -417,6 +480,12 @@ impl Handler for Vfs {
     }
 
     async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+        if let Some((_, body)) = root_no_index_marker(path) {
+            return Ok(body.to_vec());
+        }
+        if contains_probe_name(path) {
+            return Err(HandlerError::NotFound(path.to_string_path()));
+        }
         if root_agent_guidance_entry(path).is_some() {
             return Ok(AGENT_GUIDANCE.to_vec());
         }
@@ -522,6 +591,12 @@ impl Handler for Vfs {
                 out.push(Entry::file(name));
             }
             return Ok(out);
+        }
+        if root_no_index_marker(path).is_some() {
+            return Err(HandlerError::NotADir(path.to_string_path()));
+        }
+        if contains_probe_name(path) {
+            return Err(HandlerError::NotFound(path.to_string_path()));
         }
         let head = path.first().unwrap();
         let h = self
@@ -645,6 +720,84 @@ mod tests {
         }
     }
 
+    /// Fails the test if the router lets a request reach a handler.
+    struct UnreachableHandler;
+
+    #[async_trait]
+    impl Handler for UnreachableHandler {
+        async fn lookup(&self, p: &VfsPath) -> Result<Entry, HandlerError> {
+            panic!("lookup reached a handler: {}", p.to_string_path())
+        }
+        async fn read(&self, p: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+            panic!("read reached a handler: {}", p.to_string_path())
+        }
+        async fn list(&self, p: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+            panic!("list reached a handler: {}", p.to_string_path())
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_names_miss_without_reaching_a_handler() {
+        let vfs = Vfs::builder()
+            .mount("wallets", Arc::new(UnreachableHandler))
+            .build();
+        for path in [
+            "/.git",
+            "/.DS_Store",
+            "/wallets/.git",
+            "/wallets/gavin/.git",
+            "/wallets/gavin/.git/HEAD",
+            "/wallets/gavin/0/.rayignore",
+            "/wallets/gavin/CACHEDIR.TAG",
+            "/wallets/._policy.json",
+        ] {
+            let path = VfsPath::parse(path).unwrap();
+            assert!(
+                matches!(vfs.lookup(&path).await, Err(HandlerError::NotFound(_))),
+                "lookup {path:?}"
+            );
+            assert!(
+                matches!(vfs.read(&path).await, Err(HandlerError::NotFound(_))),
+                "read {path:?}"
+            );
+            assert!(
+                matches!(vfs.list(&path).await, Err(HandlerError::NotFound(_))),
+                "list {path:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn root_no_index_markers_resolve_but_are_not_listed() {
+        let vfs = Vfs::builder().mount("echo", Arc::new(EchoHandler)).build();
+        for (name, body) in [
+            (".rayignore", &b"*\n"[..]),
+            (".ignore", &b"*\n"[..]),
+            (".metadata_never_index", &b""[..]),
+        ] {
+            let path = VfsPath::parse(&format!("/{name}")).unwrap();
+            let entry = vfs.lookup(&path).await.unwrap();
+            assert_eq!(entry.kind, EntryKind::File);
+            assert_eq!(entry.size, body.len() as u64);
+            assert_eq!(vfs.read(&path).await.unwrap(), body);
+            assert!(matches!(
+                vfs.list(&path).await,
+                Err(HandlerError::NotADir(_))
+            ));
+        }
+        let listed = vfs.list(&VfsPath::root()).await.unwrap();
+        assert!(
+            listed.iter().all(|entry| !entry.name.starts_with('.')),
+            "markers must not be listed: {listed:?}"
+        );
+        // Below the root the same names are ordinary probes.
+        assert!(matches!(
+            vfs.lookup(&VfsPath::parse("/echo/.rayignore").unwrap())
+                .await,
+            Err(HandlerError::NotFound(_))
+        ));
+    }
+
     struct AtomicProjectionHandler {
         latest: Mutex<String>,
         lookup_started: Notify,
@@ -742,6 +895,23 @@ mod tests {
             assert_eq!(entry.kind, EntryKind::File);
             assert_eq!(entry.mode, 0o444);
         }
+    }
+
+    #[test]
+    fn agent_guidance_anvil_example_is_a_valid_chain_config() {
+        let guidance = std::str::from_utf8(AGENT_GUIDANCE).expect("guidance is utf-8");
+        let example = guidance
+            .split_once("```toml\n[chains.anvil]")
+            .and_then(|(_, rest)| rest.split_once("```"))
+            .map(|(body, _)| format!("[chains.anvil]{body}"))
+            .expect("guidance documents an opt-in Anvil chain");
+        // Operators add the documented entry to their existing configuration.
+        let fragment: bloom_proto::config::Config = toml::from_str(&example).unwrap();
+        let anvil = fragment.chains.get("anvil").unwrap().clone();
+        assert_eq!(anvil, bloom_proto::chain::ChainSpec::anvil_default());
+        let mut config = bloom_proto::config::Config::local_default();
+        config.chains.insert("anvil".to_owned(), anvil);
+        config.validate().unwrap();
     }
 
     #[tokio::test]

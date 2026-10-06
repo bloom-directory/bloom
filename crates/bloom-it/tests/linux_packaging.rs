@@ -253,7 +253,7 @@ fn login_session_sentinel_is_installed_with_persistent_machine_paths() {
 }
 
 #[test]
-fn service_sandboxes_remove_machine_and_network_authority() {
+fn service_sandboxes_preserve_signer_isolation_and_broker_relay_egress() {
     let broker = source("systemd/bloom-broker@.service.in");
     let signer = source("systemd/bloom-signer@.service.in");
     for (name, unit) in [("Broker", &broker), ("Signer", &signer)] {
@@ -280,8 +280,10 @@ fn service_sandboxes_remove_machine_and_network_authority() {
         );
     }
     assert!(broker.contains("User=bloom-broker-%i"));
-    assert!(broker.contains("RestrictAddressFamilies=AF_UNIX AF_INET"));
-    assert!(broker.contains("IPAddressAllow=localhost"));
+    assert!(broker.contains("RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6"));
+    // Broker owns outbound relay, ACME and DNS traffic. Signer remains isolated.
+    assert!(!broker.contains("IPAddressDeny=any"));
+    assert!(!broker.contains("PrivateNetwork=yes"));
     assert!(signer.contains("User=bloom-signer-%i"));
     assert!(signer.contains("PrivateNetwork=yes"));
     assert!(signer.contains("RestrictAddressFamilies=AF_UNIX"));
@@ -319,4 +321,28 @@ fn audit_checkpoint_roots_are_principal_private_and_explicitly_wired() {
     assert!(temporary_paths.contains(
         "d /var/lib/bloom/@LOGIN_UID@/machine/audit-checkpoints 0700 @LOGIN_UID@ @LOGIN_GID@ -"
     ));
+}
+
+#[test]
+fn relay_state_is_private_persistent_and_writable_by_its_owner() {
+    let layout = source("tmpfiles.d/bloom-login.conf.in");
+    for entry in [
+        "d /var/lib/bloom/@LOGIN_UID@/installer 0700 root root -",
+        "d /var/lib/bloom/@LOGIN_UID@/installer/admin 0700 root root -",
+        "d /var/lib/bloom/@LOGIN_UID@/broker/relay 0700 bloom-broker-@LOGIN_UID@ bloom-broker-@LOGIN_UID@ -",
+    ] {
+        assert!(layout.lines().any(|line| line == entry), "missing {entry}");
+    }
+    let broker = source("systemd/bloom-broker@.service.in");
+    assert!(
+        broker.contains("Environment=BLOOM_BROKER_RELAY_STATE_DIR=/var/lib/bloom/%i/broker/relay")
+    );
+    assert!(broker.contains("ReadWritePaths=/var/lib/bloom/%i/broker /run/bloom/%i/broker"));
+    assert!(
+        !broker
+            .lines()
+            .filter(|line| line.starts_with("ReadWritePaths="))
+            .any(|line| line.contains("/installer"))
+    );
+    assert!(!layout.contains("/etc/bloom/@LOGIN_UID@/installer/admin"));
 }

@@ -1,7 +1,6 @@
 //! First-class DeFi route policy (`[defi]`).
 //!
-//! The generic Enso/DeFi route surface (`defi/intents/...`) hands
-//! Enso-returned calldata to the tx engine. EVM caps gate value broadly, but
+//! A DeFi route surface hands route-provider calldata to the tx engine. EVM caps gate value broadly, but
 //! not *route shape*: which chains, which receiver, which router/protocols,
 //! and how much output is actually guaranteed. This section adds those gates.
 //!
@@ -25,9 +24,9 @@
 //!   is the single source of truth and a hand-typed address can't
 //!   silently disagree with what bloom resolved.
 //! - **S1 (no unit-unverified money knobs).** There is deliberately no
-//!   `max_price_impact_*` / `max_route_fee_*` field: Enso's `priceImpact` unit
-//!   is unverified (observed raw `291`, `15`), so it is display-only
-//!   ("Enso-reported") and never a threshold.
+//!   `max_price_impact_*` / `max_route_fee_*` field: a route provider's
+//!   reported price impact has an unverified unit (observed raw `291`, `15`),
+//!   so it is display-only and never a threshold.
 
 use std::collections::BTreeSet;
 
@@ -86,7 +85,7 @@ pub struct DefiPolicy {
     /// **Warn** (never silent Pass — the warnings always appear in `plan.md` /
     /// `policy_check.json`, naming that the receiver/min-output are quote-only
     /// and not calldata-verified). The accepted risk is concrete: **a stale
-    /// quote or a sandwich attack can defeat the Enso quote floor and deliver
+    /// quote or a sandwich attack can defeat the quoted output floor and deliver
     /// near-zero output with every other policy check still passing.**
     ///
     /// Boundaries:
@@ -214,7 +213,7 @@ pub struct DefiRouteCtx {
     pub min_out_enforced: bool,
     /// **B1**: true only when the destination receiver is *proven* (e.g. the
     /// route is same-chain and the simulated transfer credits `receiver`),
-    /// not merely the address bloom requested from Enso.
+    /// not merely the address bloom requested from the route provider.
     pub receiver_verified: bool,
 }
 
@@ -385,7 +384,7 @@ pub fn evaluate_defi_route(policy: &DefiPolicy, ctx: &DefiRouteCtx) -> Vec<Polic
              deliver near-zero output with every other check passing (set [defi] \
              require_calldata_verification = false to accept the quote floor)"
         } else {
-            "minimum-output is the Enso quote floor, not calldata-verified \
+            "minimum-output is the route quote floor, not calldata-verified \
              (require_calldata_verification = false)"
         };
         out.push(check("min_output", outcome, msg));
@@ -558,7 +557,7 @@ mod tests {
             token_out: "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb".into(),
             receiver_class: ReceiverClass::WalletEoa,
             router: "0xf75584ef6673ad213a685a1b58cc0330b8ea22cf".into(),
-            protocols: vec!["enso".into()],
+            protocols: vec!["uniswap-v3".into()],
             protocols_unknown: false,
             input_microusd: Some(4_000_000),
             native_value_wei: U256::ZERO,
