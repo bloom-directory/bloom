@@ -96,6 +96,12 @@ pub struct PetalsConfig {
     /// default wallet policy proposes exactly these. They grant no authority.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub setup: BTreeMap<String, PetalSetupConfig>,
+    /// Written together with `setup` when `bloom init` finished. This, not an
+    /// empty `setup`, is what tells a later run that setup already happened:
+    /// declining every Petal is a valid choice, and `bloom serve` or an
+    /// interrupted menu can leave a config with no choices in it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub setup_complete: bool,
 }
 
 /// Wallet whose default policy allows the Petals chosen during setup.
@@ -1114,6 +1120,28 @@ rpc_urls = ["https://ethereum-rpc.publicnode.com"]
         assert!(cfg.solana_chains.contains_key("solana-mainnet"));
         let cfg2 = Config::load_or_init(&path).unwrap();
         assert_configs_equivalent(&cfg, &cfg2);
+    }
+
+    #[test]
+    fn setup_completion_is_written_only_once_recorded() {
+        let mut cfg = Config::local_default();
+        assert!(!cfg.petals.setup_complete);
+        let encoded = toml::to_string_pretty(&cfg).unwrap();
+        assert!(!encoded.contains("setup_complete"), "{encoded}");
+
+        // Petal tables alone do not mean setup finished.
+        let mut with_tables = toml::Value::try_from(&cfg).unwrap();
+        with_tables["petals"]
+            .as_table_mut()
+            .unwrap()
+            .insert("setup".into(), toml::toml! { hyperliquid = {} }.into());
+        let decoded: Config = with_tables.try_into().unwrap();
+        assert!(decoded.petals.setup.contains_key("hyperliquid"));
+        assert!(!decoded.petals.setup_complete);
+
+        cfg.petals.setup_complete = true;
+        let decoded: Config = toml::from_str(&toml::to_string_pretty(&cfg).unwrap()).unwrap();
+        assert!(decoded.petals.setup_complete);
     }
 
     #[test]

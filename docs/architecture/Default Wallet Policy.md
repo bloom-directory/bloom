@@ -67,7 +67,9 @@ Agreed on 2026-09-14:
 9. **Petal settings do not survive an update.** Bloom keeps the setup choices
    in its config, writes them again after an update, and says so.
 10. **`bloom init` runs once.** Afterwards users add, update, or remove
-    Petals.
+    Petals. Setup is recorded when it finishes, so a run that was
+    interrupted, or a config `bloom serve` created first, still gets setup
+    on the next `bloom init`.
 11. **Enso owns its own route rules.** Bloom writes no Enso settings. The
     pinned Enso v0.1.5 keeps per-wallet rules at
     `settings/wallets/<wallet>/venue.toml` and ships defaults covering the 13
@@ -204,10 +206,15 @@ Bloom substitutes the saved values, falling back to the catalog's
 suggestions, and writes the result through the Petal's own settings route,
 so it never interprets a Petal's settings format.
 
-The menu runs only on first-time setup, when `bloom init` finds no config,
-and only in a terminal. Scripts, packaged installs, and later runs of
-`bloom init` skip it and use the config as it is, with the catalog's
-suggestions for any value not saved.
+The menu runs only on first-time setup and only in a terminal. Setup is
+recorded by `setup_complete = true` under `[petals]`, saved together with
+the choices once the menu finishes; a config file on its own proves nothing,
+because `bloom serve` creates one too, and an interrupted menu saves nothing.
+An empty `[petals.setup]` is not the marker either: declining every Petal is
+a valid choice. Scripts and packaged installs record the catalog's
+suggestions instead of asking. Later runs of `bloom init` see the marker and
+use the config as it is, with the catalog's suggestions for any value not
+saved.
 
 ### 2. The default policy
 
@@ -270,7 +277,11 @@ still exists:
   again on its next poll instead of failing.
 - **The first Petal operation on `main`** also proposes the whole default
   policy, not just its own package. `ensure_petal_eligibility` adds the
-  chosen Petals to its proposal for the default-policy wallet.
+  chosen Petals to its proposal for the default-policy wallet. "First" is
+  read from the Broker's policy version: wallet creation installs the
+  restrictive policy at version 1 and every committed change increments it,
+  so a policy the owner has changed, including one the owner emptied of every
+  Petal, is never treated as new and gets only the requested package.
 
 ### 4. Every transaction is approved
 

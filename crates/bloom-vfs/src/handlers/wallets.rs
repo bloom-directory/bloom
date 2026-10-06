@@ -1370,9 +1370,11 @@ impl WalletsHandler {
         package_hash: &bloom_broker_api::Digest32,
     ) -> Result<bloom_machine_client::PetalEligibility, HandlerError> {
         // A wallet's first proposal also allows the Petals chosen during setup,
-        // so the owner approves one policy rather than one per Petal. Later
-        // proposals add only the requested package: a Petal the owner removed
-        // from an existing policy must not be proposed again behind another.
+        // so the owner approves one policy rather than one per Petal. "First"
+        // is the Broker policy version, not the package list: once the owner
+        // has committed any change, later proposals add only the requested
+        // package, so a Petal the owner removed is never proposed again behind
+        // another.
         let setup = self
             .default_policy_packages
             .as_ref()
@@ -1416,8 +1418,9 @@ impl WalletsHandler {
         required: &[bloom_broker_api::Digest32],
         additions: &[bloom_broker_api::Digest32],
         destinations: &[bloom_broker_api::PolicyDestination],
-        // Added only when the wallet policy allows no Petal yet, so one
-        // ceremony makes every chosen Petal usable instead of gating each one.
+        // Added only while the policy is still the one wallet creation
+        // installed, so one ceremony makes every chosen Petal usable instead
+        // of gating each one.
         first_proposal: &DefaultPolicySetup,
     ) -> Result<bloom_machine_client::PetalEligibility, HandlerError> {
         use bloom_machine_client::{
@@ -1498,7 +1501,11 @@ impl WalletsHandler {
         // Kept apart from `destinations`, which stays what the caller asked
         // for so a pending change is judged against the request alone.
         let mut proposed_destinations = destinations.to_vec();
-        if policy.allowed_petal_packages.is_empty() {
+        // Wallet creation installs the restrictive policy at version 1 and
+        // every committed change increments it. An empty package list is not
+        // the same fact: the owner may have removed every Petal on purpose.
+        const CREATION_POLICY_VERSION: u64 = 1;
+        if current.version.get() == CREATION_POLICY_VERSION {
             additions.extend_from_slice(&first_proposal.packages);
             proposed_destinations.extend_from_slice(&first_proposal.destinations);
         }

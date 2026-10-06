@@ -274,12 +274,15 @@ fn policy(maximum_approval_lifetime_ms: u64) -> CanonicalWalletPolicy {
 }
 
 fn broker_fixture(lose_prepare_response_once: bool) -> Arc<BrokerFixture> {
-    broker_fixture_with_policy(lose_prepare_response_once, policy(60_000))
+    broker_fixture_with_policy(lose_prepare_response_once, policy(60_000), 1)
 }
 
+/// `version` is the Broker's policy version: 1 is the policy wallet creation
+/// installed, and every committed change increments it.
 fn broker_fixture_with_policy(
     lose_prepare_response_once: bool,
     baseline_policy: CanonicalWalletPolicy,
+    version: u64,
 ) -> Arc<BrokerFixture> {
     let baseline_bytes = serde_jcs::to_vec(&baseline_policy).unwrap();
     Arc::new(BrokerFixture {
@@ -297,7 +300,7 @@ fn broker_fixture_with_policy(
         }),
         baseline: SignedPolicySnapshot {
             wallet_id: Token::new("alice").unwrap(),
-            version: DecimalU64::new(1),
+            version: DecimalU64::new(version),
             canonical_policy: Base64UrlBytes::from_bytes(&baseline_bytes),
             policy_digest: Digest32::from_bytes(Sha256::digest(&baseline_bytes).into()),
             policy_signing_key_id: Token::new("policy-key").unwrap(),
@@ -934,7 +937,8 @@ async fn setup_packages_join_only_a_wallets_first_policy_proposal() {
     let existing = Digest32::from_bytes([5; 32]);
     let mut baseline = policy(60_000);
     baseline.allowed_petal_packages.push(existing.clone());
-    let fixture = broker_fixture_with_policy(false, baseline.clone());
+    // A policy with a Petal in it has been committed at least once.
+    let fixture = broker_fixture_with_policy(false, baseline.clone(), 2);
     let requested = Digest32::from_bytes([7; 32]);
     let chosen = Digest32::from_bytes([8; 32]);
     let defaults: bloom_vfs::handlers::DefaultPolicyPackages = {
@@ -974,6 +978,46 @@ async fn setup_packages_join_only_a_wallets_first_policy_proposal() {
         vec![existing, requested.clone()]
     );
     assert!(!proposed.allowed_petal_packages.contains(&chosen));
+}
+
+#[tokio::test]
+async fn revoking_every_petal_does_not_bring_the_setup_proposal_back() {
+    let temp = tempfile::tempdir().unwrap();
+    // The owner replaced the policy with one allowing no Petal at all. The
+    // package list is empty, as at creation, but the version says it was
+    // committed, so nothing removed may come back behind this request.
+    let baseline = policy(60_000);
+    let fixture = broker_fixture_with_policy(false, baseline.clone(), 2);
+    let requested = Digest32::from_bytes([7; 32]);
+    let defaults: bloom_vfs::handlers::DefaultPolicyPackages = Arc::new(|_wallet: &str| {
+        bloom_vfs::handlers::DefaultPolicySetup {
+            packages: vec![Digest32::from_bytes([8; 32]), Digest32::from_bytes([9; 32])],
+            destinations: vec![setup_destination()],
+        }
+    });
+    let handler =
+        eligibility_handler(temp.path(), fixture.clone()).with_default_policy_packages(defaults);
+
+    let PetalEligibility::AwaitingPolicyApproval(pending) = handler
+        .ensure_petal_eligibility("alice", &requested)
+        .await
+        .unwrap()
+    else {
+        panic!("owner approval must be required");
+    };
+    assert!(pending.includes_requested);
+
+    let proposed: CanonicalWalletPolicy = serde_json::from_slice(
+        fixture
+            .state
+            .lock()
+            .proposed_policy
+            .as_ref()
+            .expect("a policy was proposed"),
+    )
+    .unwrap();
+    assert_eq!(proposed.allowed_petal_packages, vec![requested]);
+    assert_eq!(proposed.allowed_destinations, baseline.allowed_destinations);
 }
 
 #[tokio::test]

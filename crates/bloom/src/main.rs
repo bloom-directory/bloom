@@ -3378,9 +3378,11 @@ async fn run(cli: Cli) -> Result<()> {
             if !structured_service_output() {
                 eprintln!("{ALPHA_DISCLOSURE}");
             }
-            // A missing config marks first-time setup, the only time the menu runs.
-            let first_setup = !home.config_path().exists();
             let (_home_permit, mut d) = build_write_daemon(home.clone()).context("init daemon")?;
+            // Building the daemon writes a default config when none exists, and
+            // `bloom serve` does the same, so the file's presence says nothing
+            // about setup. The marker is saved only together with the choices.
+            let first_setup = !d.config.petals.setup_complete;
             if first_setup {
                 if !structured_service_output() && default_policy::interactive_setup_available() {
                     default_policy::run_setup_menu(
@@ -3391,6 +3393,7 @@ async fn run(cli: Cli) -> Result<()> {
                 } else {
                     default_policy::accept_setup_suggestions(&mut d.config.petals);
                 }
+                d.config.petals.setup_complete = true;
                 d.config
                     .save(&d.home.config_path())
                     .context("save setup choices")?;

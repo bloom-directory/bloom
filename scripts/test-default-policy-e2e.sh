@@ -105,6 +105,7 @@ op_stack = false
 
 [petals]
 preinstalled = []
+setup_complete = true
 
 [petals.setup.hyperliquid]
 
