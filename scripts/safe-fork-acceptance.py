@@ -5,6 +5,7 @@ Only run against a local Anvil fork and an isolated developer triad. The wallet
 is imported from the public acceptance mnemonic, never a funded wallet.
 """
 import argparse
+import base64
 import json
 import re
 import subprocess
@@ -107,12 +108,12 @@ class Acceptance:
         self.save()
         self.result("two distinct Bloom accounts available", addresses=addresses)
 
-    def policy(self, destinations, clear_signing=None):
+    def policy(self, destinations, clear_signing=...):
         wallet = self.state["wallet"]
         policy = self.read(f"/wallets/{wallet}/policy.json")
         previous = json.dumps(policy, sort_keys=True)
         policy["allowed_destinations"] = destinations
-        if clear_signing is not None:
+        if clear_signing is not ...:
             policy["clear_signing"] = clear_signing
         # The package permission is added explicitly once the installed hash is known.
         if self.state.get("package_hash"):
@@ -174,6 +175,7 @@ class Acceptance:
     def refused(self, name, path, value=None):
         p = self.write(path, value, check=False)
         assert p.returncode != 0, name+' unexpectedly succeeded'
+        assert 'permission denied' in p.stderr.lower(), (name, p.stderr)
         self.result(name, error=p.stderr.strip())
 
     def transfer(self, account, name, safe, value='1000000000000', nonce=None):
@@ -234,6 +236,79 @@ class Acceptance:
         self.sign(0,'add-owner'); self.execute(0,'add-owner')
         self.refused('configuration change blocks old draft',self.txpath(0,'stale-config','confirm.json'))
         self.result('lifecycle matrix complete')
+
+    def opaque(self):
+        original = self.read(f"/wallets/{self.state['wallet']}/policy.json")
+        settings = {
+            'catalog_id': 'safe-acceptance',
+            'trusted_keys': [{'key_id': 'public-fixture-key', 'verifying_key': base64.urlsafe_b64encode(bytes([7])*32).decode().rstrip('=')}],
+            'signature_threshold': 1, 'maximum_observation_age_ms': 86400000,
+            'opaque_exact_allowed': False, 'unlimited_allowance_allowed': False,
+            'verifier': {'verifier_id': 'evm-clear-signing-v1', 'verifier_digest': 'b14d53a0783e835fc9c2ee06dbe4a597186ed75423f60562085012b80bef0272'},
+        }
+        self.policy(original['allowed_destinations'], settings)
+        recipient='0x4000000000000000000000000000000000000000'
+        for name, transaction in [('opaque-call',{'kind':'call','to':recipient,'value':'0','data':'0x12345678'}),('opaque-batch',{'kind':'batch','calls':[{'to':recipient,'value':'0','data':'0x12345678'}]})]:
+            self.draft(1,name,'safe1',transaction)
+            self.refused(name+' denied by policy',self.txpath(1,name,'confirm.json'))
+            assert self.status(1,name)['phase']=='draft'
+        self.policy(original['allowed_destinations'], original.get('clear_signing'))
+
+    def legacy_and_tokens(self):
+        zero='0x'+'0'*40
+        owner=self.state['addresses'][1]
+        factory='0x4e1dcf7ad4e460cfd30791ccc4f9c8a4f820ec67'
+        singleton='0x3e5c63644e683549055b9be8653de26e0b4cd36e'
+        setup=subprocess.check_output(['cast','calldata','setup(address[],uint256,address,bytes,address,address,uint256,address)',f'[{owner}]','1',zero,'0x',zero,zero,'0',zero],text=True).strip()
+        data=subprocess.check_output(['cast','calldata','createProxyWithNonce(address,bytes,uint256)',singleton,setup,'2026100713'],text=True).strip()
+        # Safe 1.3 creation is outside the Petal API: seed an existing Safe on
+        # the fork using its real canonical implementation, then bind it.
+        funder=self.rpc('eth_accounts',[])[0]
+        call={'from':funder,'to':factory,'data':data,'gas':hex(3000000)}
+        predicted='0x'+self.rpc('eth_call',[call,'latest'])[-40:]
+        txhash=self.rpc('eth_sendTransaction',[call])
+        assert int(self.rpc('eth_getTransactionReceipt',[txhash])['status'],16)==1
+        self.rpc('anvil_setBalance',[predicted,hex(10**19)])
+        self.state.setdefault('safes',{})['legacy']=predicted; self.save()
+        self.write(f"/petals/safe/safes/{self.state['wallet']}/1/legacy.json",{'chain':'base','safe_address':predicted})
+        self.permissions()
+        self.transfer(1,'safe130-transfer','legacy')
+        artifact=json.loads(Path(self.args.token_artifact).read_text())
+        initcode=artifact['bytecode']['object']; salt='0x'+'0'*62+'20'
+        self.draft(1,'deploy-token','safe1',{'kind':'create2','value':'0','initcode':initcode,'salt':salt})
+        self.sign(1,'deploy-token'); self.execute(1,'deploy-token')
+        token=subprocess.check_output(['cast','create2','--deployer',self.state['safes']['safe1'],'--salt',salt,'--init-code',initcode],text=True).strip()
+        assert self.rpc('eth_getCode',[token,'latest'])!='0x'
+        recipient='0x4000000000000000000000000000000000000000'
+        self.draft(1,'token-transfer','safe1',{'kind':'erc20_transfer','token':token,'to':recipient,'amount':'7'})
+        self.sign(1,'token-transfer'); self.execute(1,'token-transfer')
+        data=subprocess.check_output(['cast','calldata','balanceOf(address)',recipient],text=True).strip()
+        assert int(self.rpc('eth_call',[{'to':token,'data':data},'latest']),16)==7
+        self.result('token exact balance delta',token=token,base_units=7)
+
+    def restart_prepare(self):
+        self.draft(1,'restart-transfer','safe1',{'kind':'native_transfer','to':'0x4000000000000000000000000000000000000000','value':'1000000000000'})
+        self.sign(1,'restart-transfer')
+        self.write(self.txpath(1,'restart-transfer','execute.json'),{})
+        status=self.status(1,'restart-transfer')
+        self.state['restart_outbox']=status['outbox_id']
+        self.state['restart_balance']=self.rpc('eth_getBalance',['0x4000000000000000000000000000000000000000','latest'])
+        self.state['restart_tx_hash']=status['safe_tx_hash']
+        self.save()
+        self.result('signed transaction staged before service restart')
+
+    def restart_finish(self):
+        status=self.status(1,'restart-transfer')
+        assert status['outbox_id']==self.state['restart_outbox']
+        assert status['safe_tx_hash']==self.state['restart_tx_hash']
+        self.execute(1,'restart-transfer')
+        after=self.rpc('eth_getBalance',['0x4000000000000000000000000000000000000000','latest'])
+        assert int(after,16)-int(self.state['restart_balance'],16)==10**12
+        txhash=self.status(1,'restart-transfer')['execution_tx_hash']
+        self.write(self.txpath(1,'restart-transfer','execute.json'),{})
+        assert self.status(1,'restart-transfer')['execution_tx_hash']==txhash
+        assert self.rpc('eth_getBalance',['0x4000000000000000000000000000000000000000','latest'])==after
+        self.result('restart and repeated execution preserve one payment')
 
     def txpath(self, account, name, leaf):
         return f"/petals/safe/transactions/{self.state['wallet']}/{account}/{name}/{leaf}"
@@ -301,7 +376,8 @@ def main():
     parser.add_argument("--driver", required=True)
     parser.add_argument("--rpc", default="http://127.0.0.1:29546")
     parser.add_argument("--ceremony-port", type=int, default=29547)
-    parser.add_argument("phase", choices=["setup", "basic", "lifecycle"])
+    parser.add_argument("--token-artifact")
+    parser.add_argument("phase", choices=["setup", "basic", "lifecycle", "opaque", "legacy_and_tokens", "restart_prepare", "restart_finish"])
     args = parser.parse_args()
     getattr(Acceptance(args), args.phase)()
 
