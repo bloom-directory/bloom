@@ -655,9 +655,13 @@ fn triad_developer_launcher_supports_linux_without_weakening_root_boundary() {
     assert!(launcher.contains("developer harness refuses root"));
     assert!(launcher.contains("Darwin|Linux)"));
     assert!(launcher.contains("Linux developer mounts require mount.nfs4"));
-    assert!(launcher.contains("sudo -n -l -- \"$mount_nfs_bin\""));
-    assert!(launcher.contains("sudo -n -l -- \"$umount_bin\" -l -f \"$mount_dir\""));
-    assert!(launcher.contains("Linux developer mount privilege is not installed"));
+    assert!(launcher.contains("Linux developer mounts require sudo"));
+    assert!(launcher.contains("Linux developer mounts require umount"));
+    assert!(
+        !launcher.contains("sudo -n"),
+        "the launcher must leave privileged mount operations to Machine"
+    );
+    assert!(launcher.contains("Check the exact Linux developer mount sudo policy"));
     assert!(launcher.contains("packaging/triad/linux/config/${name}"));
     assert!(launcher.contains("systemctl --user"));
     assert!(launcher.contains("export LC_ALL=C"));
