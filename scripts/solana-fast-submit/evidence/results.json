@@ -1,0 +1,29 @@
+[
+  {
+    "trial": 1,
+    "entry": "wallets/pending/0/chains/solana-local/outbox/pending/sol-74b12e75a7ba39d96c108e9852604534",
+    "signature": "4bo721Cfbq6CyyatfxfMdNMJNxaLM71MNBeejBND2kuPQcCwjbB8bFK5j2sd1hEriuirhDuAmCwdT2SsBQKNayfS",
+    "balance_before": 0,
+    "balance_after": 1000000,
+    "helper_writes": 1,
+    "restart_exit": 2
+  },
+  {
+    "trial": 2,
+    "entry": "wallets/pending/0/chains/solana-local/outbox/pending/sol-3d2df3b2ba41b65c4d91ba9d3e459e09",
+    "signature": "3aKAcajP7ddBLdAAPaBvUrv7fK6jDG965tyhkWud2zg6C8EN3w7jCYyAAS1nEigNcrLJja9ApTcZco5cDfZaWRoa",
+    "balance_before": 1000000,
+    "balance_after": 2000000,
+    "helper_writes": 1,
+    "restart_exit": 2
+  },
+  {
+    "trial": 3,
+    "entry": "wallets/pending/0/chains/solana-local/outbox/pending/sol-dedcaa141cef84dd59d2cb8ee503a232",
+    "signature": "GcSLFFuv54zrDk6SeccoJHE63zrEFfsvE1t4TtFeekLi1FJmFHxJX6WgFF4fEedSK385QExWTSCuK7EwuMHS3ZV",
+    "balance_before": 2000000,
+    "balance_after": 3000000,
+    "helper_writes": 1,
+    "restart_exit": 2
+  }
+]
