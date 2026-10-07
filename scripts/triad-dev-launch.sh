@@ -168,14 +168,8 @@ if [ -n "$mount_dir" ]; then
     umount_bin="$(command -v umount || true)"
     [ -n "$mount_nfs_bin" ] || die "Linux developer mounts require mount.nfs4"
     [ -n "$umount_bin" ] || die "Linux developer mounts require umount"
-    # `sudo -l` passes for any sudoer, so run the real unmount: sudo exits 1
-    # when it wants a password. A live mount is left for Machine to refuse.
-    if ! mountpoint -q "$mount_dir"; then
-      probe_status=0
-      sudo -n -- "$umount_bin" -l -f "$mount_dir" >/dev/null 2>&1 || probe_status=$?
-      [ "$probe_status" -ne 1 ] ||
-        die "Linux developer unmount needs a passwordless sudo rule for $mount_dir"
-    fi
+    # Let Machine's mount attempt check permission. A preliminary unmount
+    # could detach a mount created by another process after the check.
   fi
 fi
 log_dir="$(cd "$log_dir" && pwd -P)"
