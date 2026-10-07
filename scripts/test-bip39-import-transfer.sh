@@ -2,8 +2,9 @@
 # End-to-end acceptance for the BIP-39 account lifecycle through the real
 # triad: a fixed throwaway mnemonic is delivered only to the Broker-hosted
 # ceremony, the imported wallet's canonical EVM child (m/44'/60'/0'/0/0) is
-# projected together with its canonical Solana sibling, and the EVM child then
-# spends on a local anvil chain through the canonical stage ->
+# projected together with its canonical Solana sibling. Signer then allocates
+# account 1 in both families. That account spends on local Anvil and Agave
+# validator chains through the canonical stage ->
 # Sealed Approval ceremony -> Signer signature -> broadcast -> reconciliation
 # lifecycle. The on-chain sender must equal the address independently derived
 # from the mnemonic by cast.
@@ -27,6 +28,10 @@ command -v jq >/dev/null 2>&1 || die "jq is required"
 command -v anvil >/dev/null 2>&1 || die "anvil (foundry) is required"
 command -v cast >/dev/null 2>&1 || die "cast (foundry) is required"
 command -v python3 >/dev/null 2>&1 || die "python3 is required"
+command -v solana-test-validator >/dev/null 2>&1 || die "solana-test-validator (Agave) is required for real Solana account-1 signing"
+command -v solana >/dev/null 2>&1 || die "solana CLI is required for validator setup and on-chain verification"
+command -v solana-keygen >/dev/null 2>&1 || die "solana-keygen is required for a disposable transfer recipient"
+command -v curl >/dev/null 2>&1 || die "curl is required for validator transaction verification"
 [ -x "$launcher" ] || die "triad developer launcher is not executable: $launcher"
 [ -x "$bloom_bin" ] || die "Machine binary is not executable: $bloom_bin"
 [ -x "$driver_bin" ] || die "debug driver binary is not executable: $driver_bin"
@@ -38,6 +43,8 @@ case "$startup_timeout_secs" in *[!0-9]*|'') die "startup timeout must be an int
 MNEMONIC="abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art"
 EVM_HD_PATH="m/44'/60'/0'/0/0"
 SOLANA_HD_PATH="m/44'/501'/0'/0'"
+EVM_ACCOUNT_ONE_PATH="m/44'/60'/0'/0/1"
+SOLANA_ACCOUNT_ONE_PATH="m/44'/501'/1'/0'"
 RECIPIENT="0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
 FUNDER_PRIV_KEY="0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
 AUTH_SEED="bip39-e2e-auth"
@@ -47,7 +54,16 @@ free_port() {
   python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()'
 }
 
-run_root="$(mktemp -d "${TMPDIR:-/tmp}/bloom-bip39.XXXXXX")"
+solana_lamports() {
+  curl --silent --show-error --fail "$solana_rpc" -H 'Content-Type: application/json' \
+    --data "$(jq -nc --arg address "$1" '{jsonrpc:"2.0",id:1,method:"getBalance",params:[$address]}')" |
+    jq -er '.result.value'
+}
+
+work_root="${BLOOM_INTEGRATION_WORK_ROOT:-${repo_root}/target/triad-account1}"
+mkdir -p "$work_root"
+run_root="$(mktemp -d "${work_root}/run.XXXXXX")"
+export TMPDIR="${run_root}/tmp"
 developer_root="${run_root}/developer"
 machine_home="${developer_root}/machine-home"
 log_dir="${run_root}/logs"
@@ -58,7 +74,8 @@ machine_config="${run_root}/machine-config.toml"
 mnemonic_file="${run_root}/mnemonic.txt"
 launcher_pid=""
 anvil_pid=""
-mkdir -p "$machine_home" "$log_dir" "$(dirname "$machine_socket")"
+validator_pid=""
+mkdir -p "$TMPDIR" "$machine_home" "$log_dir" "$(dirname "$machine_socket")"
 
 cleanup() {
   status=$?
@@ -71,17 +88,12 @@ cleanup() {
     kill "$anvil_pid" 2>/dev/null || true
     wait "$anvil_pid" 2>/dev/null || true
   fi
-  if [ "$status" -eq 0 ]; then
-    rm_attempts=0
-    while [ -e "$run_root" ] && [ "$rm_attempts" -lt 5 ]; do
-      rm -rf -- "$run_root" 2>/dev/null || true
-      rm_attempts=$((rm_attempts + 1))
-      [ -e "$run_root" ] || break
-      sleep 0.2
-    done
-  else
-    printf 'bip39 transfer e2e diagnostics retained at: %s\n' "$run_root" >&2
+  if [ -n "$validator_pid" ] && kill -0 "$validator_pid" 2>/dev/null; then
+    kill "$validator_pid" 2>/dev/null || true
+    wait "$validator_pid" 2>/dev/null || true
   fi
+  rm -f -- "$mnemonic_file"
+  printf 'bip39 transfer e2e run retained at: %s\n' "$run_root" >&2
   exit "$status"
 }
 trap cleanup EXIT INT TERM
@@ -128,6 +140,28 @@ while ! cast block-number --rpc-url "$rpc_url" >/dev/null 2>&1; do
 done
 recipient_balance_before="$(cast balance --rpc-url "$rpc_url" "$RECIPIENT")"
 
+# Pin the genesis of a real local validator before Machine starts. The
+# disposable recipient provides an independent on-chain balance check.
+solana_port="$(free_port)"
+solana_faucet_port="$(free_port)"
+solana_rpc="http://127.0.0.1:${solana_port}"
+validator_log="${run_root}/validator.log"
+solana-test-validator --ledger "${run_root}/solana-ledger" --rpc-port "$solana_port" \
+  --faucet-port "$solana_faucet_port" --bind-address 127.0.0.1 \
+  >"$validator_log" 2>&1 &
+validator_pid=$!
+attempts=0
+until solana_genesis="$(solana genesis-hash --url "$solana_rpc" 2>/dev/null)"; do
+  kill -0 "$validator_pid" 2>/dev/null || { cat "$validator_log" >&2; die "Solana validator exited before RPC became ready"; }
+  attempts=$((attempts + 1))
+  [ "$attempts" -lt 150 ] || die "Solana validator RPC did not become ready"
+  sleep 0.2
+done
+solana_recipient_keypair="${run_root}/solana-recipient.json"
+solana-keygen new --no-bip39-passphrase --silent --outfile "$solana_recipient_keypair" >/dev/null
+solana_recipient="$(solana-keygen pubkey "$solana_recipient_keypair")"
+solana_recipient_before="$(solana_lamports "$solana_recipient")"
+
 # Independent derivation of the canonical child address from the mnemonic.
 expected_addr="$(cast wallet address --mnemonic "$MNEMONIC" --hd-path "$EVM_HD_PATH" | tr '[:upper:]' '[:lower:]')"
 printf '%s' "$expected_addr" | grep -Eq '^0x[0-9a-f]{40}$' || die "cast derived a malformed child address: $expected_addr"
@@ -148,6 +182,12 @@ nfs_port="$(free_port)"
   printf 'native_decimals = 18\n'
   printf 'legacy_tx = false\n'
   printf 'op_stack = false\n'
+  printf '\n[solana_chains.solana-local]\n'
+  printf 'name = "solana-local"\n'
+  printf 'expected_genesis_base58 = "%s"\n' "$solana_genesis"
+  printf '[[solana_chains.solana-local.endpoints]]\n'
+  printf 'url = "%s"\n' "$solana_rpc"
+  printf 'weight = 100\n'
 } > "$machine_config"
 chmod 0600 "$machine_config"
 
@@ -205,13 +245,50 @@ case "$solana_address" in
 esac
 printf 'bip39 transfer e2e: import projected EVM and Solana children (Solana: %s)\n' "$solana_address"
 
-# 6. Allowlist the transfer recipient through the canonical policy-update
+# 6. Signer allocates both account-1 children in one real custody ceremony.
+#    The `new` projection must report Signer's number before either family
+#    can be used; Machine never guesses it from list position.
+vwrite "/wallets/${wallet_id}/new" '{"request_id":"account-one"}' ||
+  die "account-1 allocation request failed"
+creation="$(wait_for_file "account creation" "/wallets/${wallet_id}/new")"
+account_ceremony_url="$(printf '%s' "$creation" | jq -er '.requests[] | select(.request_id == "account-one") | .ceremony_url')"
+"$driver_bin" complete "$account_ceremony_url" "$AUTH_SEED" --sign-count 2 >/dev/null ||
+  die "account-1 custody ceremony failed"
+attempts=0
+while [ "$attempts" -lt 100 ]; do
+  creation="$(vcat "/wallets/${wallet_id}/new")"
+  if printf '%s' "$creation" | jq -e 'any(.requests[]; .request_id == "account-one" and .state == "created" and .number == 1)' >/dev/null; then
+    break
+  fi
+  attempts=$((attempts + 1))
+  sleep 0.1
+done
+[ "$attempts" -lt 100 ] || die "Signer did not allocate account 1: $creation"
+accounts="$(cli wallet accounts "$wallet_id")"
+printf '%s' "$accounts" | jq -e --arg evm "$EVM_ACCOUNT_ONE_PATH" --arg sol "$SOLANA_ACCOUNT_ONE_PATH" '
+  ([.accounts[] | select(.number == 1 and .path == $evm and .lifecycle == "ACTIVE")] | length) == 1 and
+  ([.accounts[] | select(.number == 1 and .path == $sol and .lifecycle == "ACTIVE")] | length) == 1
+' >/dev/null || die "account-1 projection lacks paired EVM/Solana children: $accounts"
+expected_addr="$(cast wallet address --mnemonic "$MNEMONIC" --hd-path "$EVM_ACCOUNT_ONE_PATH" | tr '[:upper:]' '[:lower:]')"
+projected_addr="$(vcat "/wallets/${wallet_id}/1/address.evm" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+[ "$projected_addr" = "$expected_addr" ] || die "account-1 EVM address disagrees with cast derivation: ${projected_addr} != ${expected_addr}"
+solana_address="$(vcat "/wallets/${wallet_id}/1/address.sol" | tr -d '[:space:]')"
+case "$solana_address" in
+  ''|*[!123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz]*)
+    die "account-1 Solana address is not Base58: $solana_address" ;;
+esac
+solana airdrop 2 "$solana_address" --url "$solana_rpc" >/dev/null ||
+  die "funding the account-1 Solana child failed"
+printf 'bip39 transfer e2e: Signer allocated account 1 (EVM %s, Solana %s)\n' "$expected_addr" "$solana_address"
+
+# 7. Allowlist both recipients through the canonical policy-update
 #    ceremony (a fresh wallet denies every destination).
 current_policy="$(vcat "/wallets/${wallet_id}/policy.json")"
 policy_file="${run_root}/proposed-policy.json"
 printf '%s' "$current_policy" | jq -cS \
   --arg chain "anvil" --arg dest "$RECIPIENT" \
-  '.allowed_destinations = ((.allowed_destinations // []) + [{chain:$chain, destination:$dest}] | unique | sort)' \
+  --arg sol_chain "solana" --arg sol_dest "$solana_recipient" \
+  '.allowed_destinations = ((.allowed_destinations // []) + [{chain:$chain, destination:$dest}, {chain:$sol_chain, destination:$sol_dest}] | unique | sort)' \
   > "$policy_file"
 policy_launch="$(cli wallet update-policy "$wallet_id" --file "$policy_file" 2>&1)" ||
   die "policy update launch failed: ${policy_launch:-<no diagnostic>}"
@@ -223,19 +300,18 @@ policy_operation="$(printf '%s\n' "$policy_launch" | sed -n 's/^operation_id: //
 cli wallet commit-policy "$policy_operation" >/dev/null ||
   die "policy commit failed"
 
-# 7. Fund the canonical child address and stage a native transfer. The wallet
-#    holds exactly one EVM child, so the derived-child signing path resolves
-#    implicitly and unambiguously.
+# 8. Fund account 1 and stage a native EVM transfer. The wallet now holds two
+#    EVM children; the numbered path pins the one that may sign this intent.
 cast send --rpc-url "$rpc_url" --private-key "$FUNDER_PRIV_KEY" \
   "$expected_addr" --value 10ether >/dev/null || die "funding the canonical child failed"
 sleep 0.25
-balance="$(wait_for_file "canonical child balance" "/wallets/${wallet_id}/0/chains/anvil/balance")"
+balance="$(wait_for_file "account-1 child balance" "/wallets/${wallet_id}/1/chains/anvil/balance")"
 printf '%s' "$balance" | grep -q '^10' || die "canonical child balance should start with 10: $balance"
 intent="$(jq -nc --arg to "$RECIPIENT" \
   '{kind:"send", to:$to, value:"1 eth", chain:"anvil", usd_value_hint:"1"}')"
-vwrite "/wallets/${wallet_id}/0/chains/anvil/outbox/new.tx" "$intent" ||
+vwrite "/wallets/${wallet_id}/1/chains/anvil/outbox/new.tx" "$intent" ||
   die "staging the send intent failed"
-pending_dir="/wallets/${wallet_id}/0/chains/anvil/outbox/pending"
+pending_dir="/wallets/${wallet_id}/1/chains/anvil/outbox/pending"
 pending_id=""
 attempts=0
 while [ "$attempts" -lt 100 ]; do
@@ -262,7 +338,7 @@ approval_ceremony_url="$(printf '%s' "$ceremony" | jq -er '.ceremony_url')"
 vwrite "$confirm_path" "y" || die "post-ceremony confirm retry failed"
 
 # 10. The entry must reconcile into sent/ with a transaction hash.
-sent_dir="/wallets/${wallet_id}/0/chains/anvil/outbox/sent"
+sent_dir="/wallets/${wallet_id}/1/chains/anvil/outbox/sent"
 tx_hash="$(wait_for_file "broadcast transaction hash" "${sent_dir}/${pending_id}/tx_hash" | tr -d '[:space:]')"
 printf '%s' "$tx_hash" | grep -Eq '^0x[0-9a-f]{64}$' || die "malformed tx_hash: $tx_hash"
 
@@ -285,11 +361,51 @@ print('ok' if after - before == 10**18 else 'bad')
 [ "$balance_delta_ok" = "ok" ] ||
   die "recipient balance did not advance by exactly 1 ETH: before=${recipient_balance_before} after=${recipient_balance_after}"
 
-# 12. Secret confinement: the mnemonic phrase must never appear in anything
+# 12. Account 1 signs a native Solana transfer through Broker approval and
+# Signer custody. The validator supplies independent transaction evidence.
+solana_intent="$(jq -nc --arg destination "$solana_recipient" '{destination:$destination,lamports:1000000}')"
+vwrite "/wallets/${wallet_id}/1/chains/solana-local/outbox/new.tx" "$solana_intent" ||
+  die "staging the account-1 Solana transfer failed"
+solana_pending="/wallets/${wallet_id}/1/chains/solana-local/outbox/pending"
+solana_id=""
+attempts=0
+while [ "$attempts" -lt 100 ]; do
+  listing="$(cli vfs ls "$solana_pending" 2>/dev/null || true)"
+  solana_id="$(printf '%s\n' "$listing" | awk -F '\t' '$2 == "Dir" { print $1; exit }')"
+  [ -n "$solana_id" ] && break
+  attempts=$((attempts + 1))
+  sleep 0.1
+done
+[ -n "$solana_id" ] || die "account-1 Solana intent never reached pending outbox"
+solana_confirm="${solana_pending}/${solana_id}/confirm"
+if vwrite "$solana_confirm" "y" >/dev/null 2>&1; then
+  die "Solana confirm succeeded before Broker approval"
+fi
+challenge="$(wait_for_file "Solana approval challenge" "${solana_pending}/${solana_id}/approval_challenge.json")"
+solana_ceremony_url="$(printf '%s' "$challenge" | jq -er '.ceremony_url')"
+printf '%s' "$challenge" | jq -e --arg payer "$solana_address" '.fee_payer == $payer and .lamports == 1000000' >/dev/null ||
+  die "Solana approval challenge did not bind the account-1 sender: $challenge"
+"$driver_bin" complete "$solana_ceremony_url" "$AUTH_SEED" --sign-count 5 >/dev/null ||
+  die "completing the Solana approval ceremony failed"
+vwrite "$solana_confirm" "y" || die "post-ceremony Solana confirm failed"
+solana_sent="/wallets/${wallet_id}/1/chains/solana-local/outbox/sent"
+solana_receipt="$(wait_for_file "Solana reconciled receipt" "${solana_sent}/${solana_id}/receipt.json")"
+solana_signature="$(printf '%s' "$solana_receipt" | jq -er 'select(.outcome == "success" and .err == null) | .signature')"
+transaction="$(curl --silent --show-error --fail "$solana_rpc" \
+  -H 'Content-Type: application/json' \
+  --data "$(jq -nc --arg signature "$solana_signature" '{jsonrpc:"2.0",id:1,method:"getTransaction",params:[$signature,{encoding:"json",maxSupportedTransactionVersion:0}]}')")"
+printf '%s' "$transaction" | jq -e --arg payer "$solana_address" \
+  '.result != null and .result.meta.err == null and .result.transaction.message.accountKeys[0] == $payer' >/dev/null ||
+  die "validator transaction does not show account 1 as fee payer: $transaction"
+solana_recipient_after="$(solana_lamports "$solana_recipient")"
+[ "$((solana_recipient_after - solana_recipient_before))" -eq 1000000 ] ||
+  die "Solana recipient did not receive exactly 1000000 lamports: before=${solana_recipient_before} after=${solana_recipient_after}"
+
+# 13. Secret confinement: the mnemonic phrase must never appear in anything
 #     Machine wrote.
 if grep -R -F -a -q -- "$MNEMONIC" "$machine_home" "$log_dir" "$launcher_log" 2>/dev/null; then
   die "mnemonic material leaked into Machine-owned artifacts"
 fi
 
-printf 'bip39 transfer e2e passed: wallet %s imported canonical EVM child %s and Solana child %s in one ceremony, then spent from the EVM child on anvil (%s) with the on-chain sender matching cast'\''s independent derivation.\n' \
-  "$wallet_id" "$expected_addr" "$solana_address" "$tx_hash"
+printf 'bip39 transfer e2e passed: wallet %s spent from account 1 on Anvil (%s, EVM %s) and Solana validator (%s, Solana %s), with on-chain senders bound to the authenticated account.\n' \
+  "$wallet_id" "$tx_hash" "$expected_addr" "$solana_signature" "$solana_address"

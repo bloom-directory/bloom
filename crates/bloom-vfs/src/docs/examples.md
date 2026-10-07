@@ -244,7 +244,9 @@ cat "$BLOOM/petals/<name>/AGENTS.md"
 # 2. Follow that package's staging grammar. Correlate any resulting Petal
 #    action with its exact central outbox action before confirmation.
 ls "$BLOOM/petals/<name>/"
-ls "$BLOOM/outbox/"
+# Example: Enso selects wallet and index under intents.
+ls "$BLOOM/petals/enso/intents/<wallet>/0/"
+ls "$BLOOM/wallets/<wallet>/0/chains/<chain>/outbox/"
 ```
 
 Enso, Hyperliquid, Polymarket, and other applications are Petals when installed.
