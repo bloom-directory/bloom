@@ -241,7 +241,7 @@ class Acceptance:
         original = self.read(f"/wallets/{self.state['wallet']}/policy.json")
         settings = {
             'catalog_id': 'safe-acceptance',
-            'trusted_keys': [{'key_id': 'public-fixture-key', 'verifying_key': base64.urlsafe_b64encode(bytes([7])*32).decode().rstrip('=')}],
+            'trusted_keys': [{'key_id': 'public-fixture-key', 'verifying_key': base64.urlsafe_b64encode(bytes.fromhex('d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a')).decode().rstrip('=')}],
             'signature_threshold': 1, 'maximum_observation_age_ms': 86400000,
             'opaque_exact_allowed': False, 'unlimited_allowance_allowed': False,
             'verifier': {'verifier_id': 'evm-clear-signing-v1', 'verifier_digest': 'b14d53a0783e835fc9c2ee06dbe4a597186ed75423f60562085012b80bef0272'},
@@ -276,9 +276,15 @@ class Acceptance:
         # the fork using its real canonical implementation, then bind it.
         funder=self.rpc('eth_accounts',[])[0]
         call={'from':funder,'to':factory,'data':data,'gas':hex(3000000)}
-        predicted='0x'+self.rpc('eth_call',[call,'latest'])[-40:]
-        txhash=self.rpc('eth_sendTransaction',[call])
-        assert int(self.rpc('eth_getTransactionReceipt',[txhash])['status'],16)==1
+        predicted='0x'+self.rpc('eth_call',[call,hex(self.state['fork_block'])])[-40:]
+        if self.rpc('eth_getCode',[predicted,'latest'])=='0x':
+            txhash=self.rpc('eth_sendTransaction',[call])
+            for _ in range(60):
+                receipt=self.rpc('eth_getTransactionReceipt',[txhash])
+                if receipt:
+                    break
+                time.sleep(1)
+            assert receipt and int(receipt['status'],16)==1
         self.rpc('anvil_setBalance',[predicted,hex(10**19)])
         self.state.setdefault('safes',{})['legacy']=predicted; self.save()
         self.write(f"/petals/safe/safes/{self.state['wallet']}/1/legacy.json",{'chain':'base','safe_address':predicted})
@@ -308,6 +314,20 @@ class Acceptance:
         self.save()
         self.result('signed transaction staged before service restart')
 
+    def unsupported_helper(self):
+        helper='0xa83c336b20401af773b6219ba5027174338d1836'
+        code=self.rpc('eth_getCode',[helper,'latest'])
+        assert len(code)>100
+        transaction={'kind':'batch','calls':[{'to':'0x4000000000000000000000000000000000000000','value':'0','data':'0x'}]}
+        try:
+            self.rpc('anvil_setCode',[helper,'0x00'])
+            self.refused('changed helper bytecode is refused',self.txpath(1,'bad-helper','draft.json'),{'safe_id':'safe1','transaction':transaction})
+        finally:
+            self.rpc('anvil_setCode',[helper,code])
+        self.draft(1,'restored-helper','safe1',transaction)
+        self.write(self.txpath(1,'restored-helper','discard.json'))
+        self.result('restoring canonical helper permits drafting')
+
     def restart_finish(self):
         status=self.status(1,'restart-transfer')
         assert status['outbox_id']==self.state['restart_outbox']
@@ -320,6 +340,19 @@ class Acceptance:
         assert self.status(1,'restart-transfer')['execution_tx_hash']==txhash
         assert self.rpc('eth_getBalance',['0x4000000000000000000000000000000000000000','latest'])==after
         self.result('restart and repeated execution preserve one payment')
+
+    def audit(self):
+        topic=subprocess.check_output(['cast','keccak','ExecutionSuccess(bytes32,uint256)'],text=True).strip().lower()
+        receipts=[]
+        for result in self.state['results']:
+            if 'safe_tx_hash' not in result or 'execution_tx_hash' not in result:
+                continue
+            receipt=self.rpc('eth_getTransactionReceipt',[result['execution_tx_hash']])
+            assert int(receipt['status'],16)==1
+            assert any(log['address'].lower()==receipt['to'].lower() and log['topics'][0].lower()==topic and log['data'][2:66].lower()==result['safe_tx_hash'][2:].lower() for log in receipt['logs'])
+            receipts.append({'test':result['test'],'safe_tx_hash':result['safe_tx_hash'],'execution_tx_hash':result['execution_tx_hash'],'from':receipt['from'],'safe':receipt['to'],'block':int(receipt['blockNumber'],16),'execution_success':True})
+        (self.root/'verified-safe-receipts.json').write_text(json.dumps(receipts,indent=2)+'\n')
+        self.result('every executed Safe hash has matching ExecutionSuccess',transactions=len(receipts))
 
     def txpath(self, account, name, leaf):
         return f"/petals/safe/transactions/{self.state['wallet']}/{account}/{name}/{leaf}"
@@ -388,7 +421,7 @@ def main():
     parser.add_argument("--rpc", default="http://127.0.0.1:29546")
     parser.add_argument("--ceremony-port", type=int, default=29547)
     parser.add_argument("--token-artifact")
-    parser.add_argument("phase", choices=["setup", "basic", "lifecycle", "opaque", "config_drift", "legacy_and_tokens", "restart_prepare", "restart_finish"])
+    parser.add_argument("phase", choices=["setup", "basic", "lifecycle", "opaque", "config_drift", "legacy_and_tokens", "unsupported_helper", "restart_prepare", "restart_finish", "audit"])
     args = parser.parse_args()
     getattr(Acceptance(args), args.phase)()
 
