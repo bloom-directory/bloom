@@ -254,6 +254,17 @@ class Acceptance:
             assert self.status(1,name)['phase']=='draft'
         self.policy(original['allowed_destinations'], original.get('clear_signing'))
 
+    def config_drift(self):
+        nonce=int(self.status(1,'batch')['current_safe_nonce'])
+        recipient='0x4000000000000000000000000000000000000000'
+        self.draft(1,'future-config','safe1',{'kind':'native_transfer','to':recipient,'value':'1000000000000'},nonce+1)
+        self.draft(1,'add-second-owner','safe1',{'kind':'add_owner','owner':self.state['addresses'][0],'threshold':'1'})
+        self.sign(1,'add-second-owner'); self.execute(1,'add-second-owner')
+        status=self.status(1,'future-config')
+        assert int(status['current_safe_nonce'])==int(status['safe_tx']['nonce'])
+        self.refused('changed owners reject draft even with current nonce',self.txpath(1,'future-config','confirm.json'))
+        self.write(f"/petals/safe/safes/{self.state['wallet']}/1/safe1.json",{'chain':'base','safe_address':self.state['safes']['safe1']})
+
     def legacy_and_tokens(self):
         zero='0x'+'0'*40
         owner=self.state['addresses'][1]
@@ -377,7 +388,7 @@ def main():
     parser.add_argument("--rpc", default="http://127.0.0.1:29546")
     parser.add_argument("--ceremony-port", type=int, default=29547)
     parser.add_argument("--token-artifact")
-    parser.add_argument("phase", choices=["setup", "basic", "lifecycle", "opaque", "legacy_and_tokens", "restart_prepare", "restart_finish"])
+    parser.add_argument("phase", choices=["setup", "basic", "lifecycle", "opaque", "config_drift", "legacy_and_tokens", "restart_prepare", "restart_finish"])
     args = parser.parse_args()
     getattr(Acceptance(args), args.phase)()
 
