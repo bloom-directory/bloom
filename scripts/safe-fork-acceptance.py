@@ -129,7 +129,8 @@ class Acceptance:
         self.cli("wallet", "commit-policy", operation)
 
     def permissions(self):
-        self.state['package_hash'] = re.search(r'^hash: ([0-9a-f]{64})', (self.root/'logs/petal-install.log').read_text()).group(1)
+        if not self.state.get('package_hash'):
+            self.state['package_hash'] = re.search(r'^hash: ([0-9a-f]{64})', (self.root/'logs/petal-install.log').read_text()).group(1)
         destinations = [{"chain": "evm-8453", "destination": "exact"}]
         for address in ['0x4e1dcf7ad4e460cfd30791ccc4f9c8a4f820ec67','0x14f2982d601c9458f93bd70b218933a6f8165e7b'] + list(self.state.get('safes', {}).values()):
             destinations.append({"chain": "base", "destination": address})
@@ -349,7 +350,7 @@ class Acceptance:
                 continue
             receipt=self.rpc('eth_getTransactionReceipt',[result['execution_tx_hash']])
             assert int(receipt['status'],16)==1
-            assert any(log['address'].lower()==receipt['to'].lower() and log['topics'][0].lower()==topic and log['data'][2:66].lower()==result['safe_tx_hash'][2:].lower() for log in receipt['logs'])
+            assert any(log['address'].lower()==receipt['to'].lower() and log['topics'][0].lower()==topic and (log['topics'][1][2:] if len(log['topics'])>1 else log['data'][2:66]).lower()==result['safe_tx_hash'][2:].lower() for log in receipt['logs']), result['test']
             receipts.append({'test':result['test'],'safe_tx_hash':result['safe_tx_hash'],'execution_tx_hash':result['execution_tx_hash'],'from':receipt['from'],'safe':receipt['to'],'block':int(receipt['blockNumber'],16),'execution_success':True})
         (self.root/'verified-safe-receipts.json').write_text(json.dumps(receipts,indent=2)+'\n')
         self.result('every executed Safe hash has matching ExecutionSuccess',transactions=len(receipts))
