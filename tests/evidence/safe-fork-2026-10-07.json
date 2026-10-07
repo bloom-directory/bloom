@@ -1,0 +1,410 @@
+{
+  "date": "2026-10-07",
+  "fixture": {
+    "rpc": "http://127.0.0.1:29546",
+    "chain_id": 8453,
+    "fork_block": 52295420,
+    "ceremony_port": 29547,
+    "kind": "local Base fork, debug harness ceremonies; no live funds"
+  },
+  "sources": {
+    "machine": {
+      "revision": "1bc6fe84516add061b596d289f309f072e7e2331",
+      "binary_sha256": "9ff67171d8220b70b3d18a2f7452c82f91ad520e239ea23d4b444d88a055bc2a"
+    },
+    "broker": {
+      "revision": "b1e4736936bef023029cc359d9efac59802fa0c3",
+      "binary_sha256": "0de5745de21e685e9f81909218d7f2c205705db163f672e2f35a39f0921e5065"
+    },
+    "signer": {
+      "revision": "97b9ac7e47ee682e59804d04f6288419f3598a58",
+      "binary_sha256": "8086c601521f2a87e24c166911c928857de76f006a8988bdb530955176344d5e"
+    },
+    "petal": {
+      "revision": "cfdf283dd74c7705f98c9e83d913671e05ae69cd",
+      "package_hash": "a35714929296d2789a724c7b0209db348ac7f6b333054c7560466cc43b07a9d7"
+    }
+  },
+  "checks": [
+    {
+      "test": "two distinct Bloom accounts available",
+      "status": "passed",
+      "addresses": [
+        "0xF278cF59F82eDcf871d630F28EcC8056f25C1cdb",
+        "0xf785bD075874b8423D3583728a981399f31e95aA"
+      ]
+    },
+    {
+      "test": "create and bind safe0",
+      "status": "passed",
+      "account": 0,
+      "version": "1.4.1",
+      "safe": "0xcb4a1b12a1c7e2c4cc7e6a441b1e2b6c6c1c5b61"
+    },
+    {
+      "test": "create and bind safe1",
+      "status": "passed",
+      "account": 1,
+      "version": "1.5.0",
+      "safe": "0xa8b97429c98aa94442487182ba8001808ac46a36"
+    },
+    {
+      "test": "account0-transfer",
+      "status": "passed",
+      "account": 0,
+      "safe_tx_hash": "0xde4ba8cd65ce52a387ff933ca37744ec80df1473a06726b3a5581bf58fbdc2ab",
+      "execution_tx_hash": "0xb382cb945c079cb4023a56aa82b853080e0e725ff7ff0c208db98040a12b7253",
+      "sender": "0xf278cf59f82edcf871d630f28ecc8056f25c1cdb"
+    },
+    {
+      "test": "account0-transfer exact balance delta",
+      "status": "passed"
+    },
+    {
+      "test": "account1-transfer",
+      "status": "passed",
+      "account": 1,
+      "safe_tx_hash": "0xde88d007e4d216b1e5bef15c04dd1ab3d8e2099f2404419ecd0a0d73cd3c2329",
+      "execution_tx_hash": "0xc1ce2fc3d6b5cafd997ea313054bfe33c985afa19e8ebe10fa47261ec0c5a60f",
+      "sender": "0xf785bd075874b8423d3583728a981399f31e95aa"
+    },
+    {
+      "test": "account1-transfer exact balance delta",
+      "status": "passed"
+    },
+    {
+      "test": "wrong account cannot bind Safe",
+      "status": "passed",
+      "error": "error: ipc write via unix:/data/safecheck-1007/m.sock: permission denied"
+    },
+    {
+      "test": "batch",
+      "status": "passed",
+      "account": 1,
+      "safe_tx_hash": "0x9eef3d9970e4f9d596a1c6f4f0a66a927dfeda84be91f4ceb0289e7794a12e56",
+      "execution_tx_hash": "0xa41f0b59dfc5bf2c5891eed9b1fe99fc1fcb7692bef6424a26b57a84f8fb60b3",
+      "sender": "0xf785bd075874b8423d3583728a981399f31e95aa"
+    },
+    {
+      "test": "batch exact balance delta",
+      "status": "passed"
+    },
+    {
+      "test": "deploy-contract",
+      "status": "passed",
+      "account": 1,
+      "safe_tx_hash": "0x9bb06d784238fd2e9ed8f4f5fbd9c1e8342cd00b2191c64f35dfa987dcc9e6f1",
+      "execution_tx_hash": "0xf3aeffad65e51c940f4f4e948c3cd02adce5dc49180532f8a9397cea8f2af301",
+      "sender": "0xf785bd075874b8423d3583728a981399f31e95aa"
+    },
+    {
+      "test": "deployed contract code",
+      "status": "passed",
+      "address": "0x539fE1B5ac919bbb1F82906b95Cd82f8993dB3c7"
+    },
+    {
+      "test": "future nonce cannot execute early",
+      "status": "passed",
+      "error": "error: ipc write via unix:/data/safecheck-1007/m.sock: permission denied"
+    },
+    {
+      "test": "queue-first",
+      "status": "passed",
+      "account": 0,
+      "safe_tx_hash": "0x5205750fdf6a71d2383537b8d97229ede3a67be94cf8de0b8db09fb7402444dd",
+      "execution_tx_hash": "0xacdc0d5c4d689bacaaeee2274d3f575a9bb227904a85679ad20b9b33094c07b1",
+      "sender": "0xf278cf59f82edcf871d630f28ecc8056f25c1cdb"
+    },
+    {
+      "test": "queue-second",
+      "status": "passed",
+      "account": 0,
+      "safe_tx_hash": "0xdf778d8be1f8465aaa61bd2c16267e001a29d953387b3b4866d314655da43b2c",
+      "execution_tx_hash": "0x828ed61ad3cccd8a5846a1da101c5828b5da189e115e2b4212908061bdaa7292",
+      "sender": "0xf278cf59f82edcf871d630f28ecc8056f25c1cdb"
+    },
+    {
+      "test": "cancel-replacement",
+      "status": "passed",
+      "account": 0,
+      "safe_tx_hash": "0x9ee1dd4ed0bc902f252865e7751903d3743ef52187fc05d909aa9a331c6f3530",
+      "execution_tx_hash": "0x249b63efea82be00dcf07db9038c3526dc039fa27b38e31179cf61cdad406dab",
+      "sender": "0xf278cf59f82edcf871d630f28ecc8056f25c1cdb"
+    },
+    {
+      "test": "cancelled payment cannot execute",
+      "status": "passed",
+      "error": "error: ipc write via unix:/data/safecheck-1007/m.sock: permission denied"
+    },
+    {
+      "test": "create and bind multisig",
+      "status": "passed",
+      "account": 0,
+      "version": "1.4.1",
+      "safe": "0x245240c3e86a50d174e9449d168077bdc2293956"
+    },
+    {
+      "test": "one signature cannot spend from two-owner Safe",
+      "status": "passed",
+      "error": "error: ipc write via unix:/data/safecheck-1007/m.sock: permission denied"
+    },
+    {
+      "test": "co-owner on-chain approval through Bloom",
+      "status": "passed",
+      "execution_tx_hash": "0xe6300eaf4c7ba04ddefa302ce9ce9f572d94b5b97b2c1ce01ca0bf46135eb92e"
+    },
+    {
+      "test": "two-owner",
+      "status": "passed",
+      "account": 0,
+      "safe_tx_hash": "0xa4abef6d9dc9c7a38024d900f8ad0f85e89e132f4d5f9fb66ec78069fd714447",
+      "execution_tx_hash": "0x938bd8de37898b7023721dd3e863b511ec852e81678192fb69a5cad8d26b8ce3",
+      "sender": "0xf278cf59f82edcf871d630f28ecc8056f25c1cdb"
+    },
+    {
+      "test": "add-owner",
+      "status": "passed",
+      "account": 0,
+      "safe_tx_hash": "0xf755fb16f887838add2f5ed4aca96ab30c9f5af8b478d1bfb265a0a397dba1cc",
+      "execution_tx_hash": "0x4eae29925560871f02ad2f20242badea91ac01a17f47f8f39bb109f4b8cf68e1",
+      "sender": "0xf278cf59f82edcf871d630f28ecc8056f25c1cdb"
+    },
+    {
+      "test": "configuration change blocks old draft",
+      "status": "passed",
+      "error": "error: ipc write via unix:/data/safecheck-1007/m.sock: permission denied"
+    },
+    {
+      "test": "lifecycle matrix complete",
+      "status": "passed"
+    },
+    {
+      "test": "add-second-owner",
+      "status": "passed",
+      "account": 1,
+      "safe_tx_hash": "0xd65d86a0d17d27d79bb977a92b172566b7a9a036f566d31ad1381b74644d596e",
+      "execution_tx_hash": "0x15022fa12c5ca452d9254d813c81ca27893cd261436c76ae4b265c8e5bbff771",
+      "sender": "0xf785bd075874b8423d3583728a981399f31e95aa"
+    },
+    {
+      "test": "changed owners reject draft even with current nonce",
+      "status": "passed",
+      "error": "error: ipc write via unix:/data/safecheck-1007/m.sock: permission denied"
+    },
+    {
+      "test": "opaque-call denied by policy",
+      "status": "passed",
+      "error": "error: ipc write via unix:/data/safecheck-1007/m.sock: permission denied"
+    },
+    {
+      "test": "opaque-batch denied by policy",
+      "status": "passed",
+      "error": "error: ipc write via unix:/data/safecheck-1007/m.sock: permission denied"
+    },
+    {
+      "test": "safe130-transfer",
+      "status": "passed",
+      "account": 1,
+      "safe_tx_hash": "0x896de5491a57a1b39e105a0ff254bceb1526e6b6dd10d14c0e431c75f36c5379",
+      "execution_tx_hash": "0xcb2845c0dfc9d1054d413763b9e85dd69e942227012dca3492d0874636fe490a",
+      "sender": "0xf785bd075874b8423d3583728a981399f31e95aa"
+    },
+    {
+      "test": "deploy-token",
+      "status": "passed",
+      "account": 1,
+      "safe_tx_hash": "0x67adfcbbfee7d36a01d53c4c3e9ce097a066cca9671e9c6a72ed62d64d2441bc",
+      "execution_tx_hash": "0x2b0c98a31bf65a1f42ccdd602e4c78401c70c88e1a2706b6cb25289f8f575957",
+      "sender": "0xf785bd075874b8423d3583728a981399f31e95aa"
+    },
+    {
+      "test": "token-transfer",
+      "status": "passed",
+      "account": 1,
+      "safe_tx_hash": "0xbaea9ee743bb9f15a5185902b6e84e2dc86253acb72495f067d1a974a17edba3",
+      "execution_tx_hash": "0x2834ed6fdbe6f73dcb6b456d7eb763a8257800c56bc3be87149f4c0fdda6e987",
+      "sender": "0xf785bd075874b8423d3583728a981399f31e95aa"
+    },
+    {
+      "test": "token exact balance delta",
+      "status": "passed",
+      "token": "0x1C7A158b19B84be41465501dac567B0e2479076f",
+      "base_units": 7
+    },
+    {
+      "test": "changed helper bytecode is refused",
+      "status": "passed",
+      "error": "error: ipc write via unix:/data/safecheck-1007/m.sock: permission denied"
+    },
+    {
+      "test": "restoring canonical helper permits drafting",
+      "status": "passed"
+    },
+    {
+      "test": "signed transaction staged before service restart",
+      "status": "passed"
+    },
+    {
+      "test": "restart-transfer",
+      "status": "passed",
+      "account": 1,
+      "safe_tx_hash": "0x4b304e4f4f703b211536bf58395b101b96eda5a8bde04ad58921f9028edb6f45",
+      "execution_tx_hash": "0x71986ff5298eed114c774e159121dc7a71bd67679a27e2bbaa7e902bbf1f0946",
+      "sender": "0xf785bd075874b8423d3583728a981399f31e95aa"
+    },
+    {
+      "test": "restart and repeated execution preserve one payment",
+      "status": "passed"
+    },
+    {
+      "test": "every executed Safe hash has matching ExecutionSuccess",
+      "status": "passed",
+      "transactions": 14
+    }
+  ],
+  "safe_receipts": [
+    {
+      "test": "account0-transfer",
+      "safe_tx_hash": "0xde4ba8cd65ce52a387ff933ca37744ec80df1473a06726b3a5581bf58fbdc2ab",
+      "execution_tx_hash": "0xb382cb945c079cb4023a56aa82b853080e0e725ff7ff0c208db98040a12b7253",
+      "from": "0xf278cf59f82edcf871d630f28ecc8056f25c1cdb",
+      "safe": "0xcb4a1b12a1c7e2c4cc7e6a441b1e2b6c6c1c5b61",
+      "block": 52295423,
+      "execution_success": true
+    },
+    {
+      "test": "account1-transfer",
+      "safe_tx_hash": "0xde88d007e4d216b1e5bef15c04dd1ab3d8e2099f2404419ecd0a0d73cd3c2329",
+      "execution_tx_hash": "0xc1ce2fc3d6b5cafd997ea313054bfe33c985afa19e8ebe10fa47261ec0c5a60f",
+      "from": "0xf785bd075874b8423d3583728a981399f31e95aa",
+      "safe": "0xa8b97429c98aa94442487182ba8001808ac46a36",
+      "block": 52295424,
+      "execution_success": true
+    },
+    {
+      "test": "batch",
+      "safe_tx_hash": "0x9eef3d9970e4f9d596a1c6f4f0a66a927dfeda84be91f4ceb0289e7794a12e56",
+      "execution_tx_hash": "0xa41f0b59dfc5bf2c5891eed9b1fe99fc1fcb7692bef6424a26b57a84f8fb60b3",
+      "from": "0xf785bd075874b8423d3583728a981399f31e95aa",
+      "safe": "0xa8b97429c98aa94442487182ba8001808ac46a36",
+      "block": 52295425,
+      "execution_success": true
+    },
+    {
+      "test": "deploy-contract",
+      "safe_tx_hash": "0x9bb06d784238fd2e9ed8f4f5fbd9c1e8342cd00b2191c64f35dfa987dcc9e6f1",
+      "execution_tx_hash": "0xf3aeffad65e51c940f4f4e948c3cd02adce5dc49180532f8a9397cea8f2af301",
+      "from": "0xf785bd075874b8423d3583728a981399f31e95aa",
+      "safe": "0xa8b97429c98aa94442487182ba8001808ac46a36",
+      "block": 52295426,
+      "execution_success": true
+    },
+    {
+      "test": "queue-first",
+      "safe_tx_hash": "0x5205750fdf6a71d2383537b8d97229ede3a67be94cf8de0b8db09fb7402444dd",
+      "execution_tx_hash": "0xacdc0d5c4d689bacaaeee2274d3f575a9bb227904a85679ad20b9b33094c07b1",
+      "from": "0xf278cf59f82edcf871d630f28ecc8056f25c1cdb",
+      "safe": "0xcb4a1b12a1c7e2c4cc7e6a441b1e2b6c6c1c5b61",
+      "block": 52295427,
+      "execution_success": true
+    },
+    {
+      "test": "queue-second",
+      "safe_tx_hash": "0xdf778d8be1f8465aaa61bd2c16267e001a29d953387b3b4866d314655da43b2c",
+      "execution_tx_hash": "0x828ed61ad3cccd8a5846a1da101c5828b5da189e115e2b4212908061bdaa7292",
+      "from": "0xf278cf59f82edcf871d630f28ecc8056f25c1cdb",
+      "safe": "0xcb4a1b12a1c7e2c4cc7e6a441b1e2b6c6c1c5b61",
+      "block": 52295428,
+      "execution_success": true
+    },
+    {
+      "test": "cancel-replacement",
+      "safe_tx_hash": "0x9ee1dd4ed0bc902f252865e7751903d3743ef52187fc05d909aa9a331c6f3530",
+      "execution_tx_hash": "0x249b63efea82be00dcf07db9038c3526dc039fa27b38e31179cf61cdad406dab",
+      "from": "0xf278cf59f82edcf871d630f28ecc8056f25c1cdb",
+      "safe": "0xcb4a1b12a1c7e2c4cc7e6a441b1e2b6c6c1c5b61",
+      "block": 52295429,
+      "execution_success": true
+    },
+    {
+      "test": "two-owner",
+      "safe_tx_hash": "0xa4abef6d9dc9c7a38024d900f8ad0f85e89e132f4d5f9fb66ec78069fd714447",
+      "execution_tx_hash": "0x938bd8de37898b7023721dd3e863b511ec852e81678192fb69a5cad8d26b8ce3",
+      "from": "0xf278cf59f82edcf871d630f28ecc8056f25c1cdb",
+      "safe": "0x245240c3e86a50d174e9449d168077bdc2293956",
+      "block": 52295432,
+      "execution_success": true
+    },
+    {
+      "test": "add-owner",
+      "safe_tx_hash": "0xf755fb16f887838add2f5ed4aca96ab30c9f5af8b478d1bfb265a0a397dba1cc",
+      "execution_tx_hash": "0x4eae29925560871f02ad2f20242badea91ac01a17f47f8f39bb109f4b8cf68e1",
+      "from": "0xf278cf59f82edcf871d630f28ecc8056f25c1cdb",
+      "safe": "0xcb4a1b12a1c7e2c4cc7e6a441b1e2b6c6c1c5b61",
+      "block": 52295433,
+      "execution_success": true
+    },
+    {
+      "test": "add-second-owner",
+      "safe_tx_hash": "0xd65d86a0d17d27d79bb977a92b172566b7a9a036f566d31ad1381b74644d596e",
+      "execution_tx_hash": "0x15022fa12c5ca452d9254d813c81ca27893cd261436c76ae4b265c8e5bbff771",
+      "from": "0xf785bd075874b8423d3583728a981399f31e95aa",
+      "safe": "0xa8b97429c98aa94442487182ba8001808ac46a36",
+      "block": 52295434,
+      "execution_success": true
+    },
+    {
+      "test": "safe130-transfer",
+      "safe_tx_hash": "0x896de5491a57a1b39e105a0ff254bceb1526e6b6dd10d14c0e431c75f36c5379",
+      "execution_tx_hash": "0xcb2845c0dfc9d1054d413763b9e85dd69e942227012dca3492d0874636fe490a",
+      "from": "0xf785bd075874b8423d3583728a981399f31e95aa",
+      "safe": "0x1fc64e984f4d3fdc958f4b47dc053fe0307f173a",
+      "block": 52295436,
+      "execution_success": true
+    },
+    {
+      "test": "deploy-token",
+      "safe_tx_hash": "0x67adfcbbfee7d36a01d53c4c3e9ce097a066cca9671e9c6a72ed62d64d2441bc",
+      "execution_tx_hash": "0x2b0c98a31bf65a1f42ccdd602e4c78401c70c88e1a2706b6cb25289f8f575957",
+      "from": "0xf785bd075874b8423d3583728a981399f31e95aa",
+      "safe": "0xa8b97429c98aa94442487182ba8001808ac46a36",
+      "block": 52295437,
+      "execution_success": true
+    },
+    {
+      "test": "token-transfer",
+      "safe_tx_hash": "0xbaea9ee743bb9f15a5185902b6e84e2dc86253acb72495f067d1a974a17edba3",
+      "execution_tx_hash": "0x2834ed6fdbe6f73dcb6b456d7eb763a8257800c56bc3be87149f4c0fdda6e987",
+      "from": "0xf785bd075874b8423d3583728a981399f31e95aa",
+      "safe": "0xa8b97429c98aa94442487182ba8001808ac46a36",
+      "block": 52295438,
+      "execution_success": true
+    },
+    {
+      "test": "restart-transfer",
+      "safe_tx_hash": "0x4b304e4f4f703b211536bf58395b101b96eda5a8bde04ad58921f9028edb6f45",
+      "execution_tx_hash": "0x71986ff5298eed114c774e159121dc7a71bd67679a27e2bbaa7e902bbf1f0946",
+      "from": "0xf785bd075874b8423d3583728a981399f31e95aa",
+      "safe": "0xa8b97429c98aa94442487182ba8001808ac46a36",
+      "block": 52295439,
+      "execution_success": true
+    }
+  ],
+  "unit_tests": {
+    "petal_passed": 25,
+    "broker_safe_review_passed": 20,
+    "broker_live_code_check": "not run (ignored)"
+  },
+  "limits": [
+    "Developer binaries and software-authenticator ceremonies, not a release build.",
+    "Base fork only; no live funds or hosted Safe Transaction Service.",
+    "Transfer path on all three Safe versions, not every feature on every version."
+  ],
+  "integration_notes": [
+    "Machine #224 merged forward with current #222 for explicit accounts.",
+    "Broker #82 merged forward with master for lineage-only catalog entries; Machine pins that combined Broker.",
+    "Account 1 outbox confirmation uses the explicit VFS path because wallet confirm targets account 0."
+  ],
+  "test_driver_revision": "186b0ec9dc75828ab9a821f1f1933a3086e6d620",
+  "source_note": "Machine runtime source is unchanged by subsequent test-driver and evidence commits; binary digests identify the tested artifacts."
+}
