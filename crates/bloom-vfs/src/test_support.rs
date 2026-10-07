@@ -13,28 +13,46 @@ use bloom_machine_client::{
 use sha2::Digest as _;
 
 #[derive(Clone)]
-struct StaticWalletProjection(WalletProjection);
+struct StaticWalletProjection(Vec<WalletProjection>);
 
 #[async_trait]
 impl WalletProjectionReader for StaticWalletProjection {
     async fn list_wallets(&self) -> Result<Vec<WalletProjection>, ProtocolError> {
-        Ok(vec![self.0.clone()])
+        Ok(self.0.clone())
     }
 
     async fn get_wallet(&self, wallet_id: &Token) -> Result<WalletProjection, ProtocolError> {
-        if self.0.wallet.wallet_id == *wallet_id {
-            Ok(self.0.clone())
-        } else {
-            Err(ProtocolError::new(
-                ProtocolErrorCode::BackendInvalidRequest,
-                "unknown test wallet",
-            ))
-        }
+        self.0
+            .iter()
+            .find(|projection| projection.wallet.wallet_id == *wallet_id)
+            .cloned()
+            .ok_or_else(|| {
+                ProtocolError::new(
+                    ProtocolErrorCode::BackendInvalidRequest,
+                    "unknown test wallet",
+                )
+            })
     }
 
     fn cached_wallets(&self) -> Result<Vec<WalletProjection>, ProtocolError> {
-        Ok(vec![self.0.clone()])
+        Ok(self.0.clone())
     }
+}
+
+/// A reader over a projection that was read from disk, so the pages can be
+/// rendered against a real Bloom home rather than a synthetic wallet.
+pub(crate) fn wallet_projection_reader_from(
+    projection: WalletProjection,
+) -> Arc<dyn WalletProjectionReader> {
+    wallet_projection_reader_from_many(vec![projection])
+}
+
+/// A complete static wallet listing. Visual dumps use this rather than
+/// silently reducing a Bloom home to whichever projection file was named.
+pub(crate) fn wallet_projection_reader_from_many(
+    projections: Vec<WalletProjection>,
+) -> Arc<dyn WalletProjectionReader> {
+    Arc::new(StaticWalletProjection(projections))
 }
 
 pub(crate) fn wallet_projection_reader(
@@ -59,7 +77,7 @@ pub(crate) fn wallet_projection_reader(
     })
     .unwrap();
     let policy_digest = Digest32::from_bytes(sha2::Sha256::digest(&canonical).into());
-    Arc::new(StaticWalletProjection(WalletProjection {
+    Arc::new(StaticWalletProjection(vec![WalletProjection {
         wallet: WalletPublic {
             wallet_id: wallet_id.clone(),
             wallet_kind: Token::new("passkey").unwrap(),
@@ -93,5 +111,5 @@ pub(crate) fn wallet_projection_reader(
         observed_at_ms: 1,
         freshness: ProjectionFreshness::Fresh,
         verification: ProjectionVerification::AuthenticatedBroker,
-    }))
+    }]))
 }
