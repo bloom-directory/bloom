@@ -221,10 +221,12 @@ upgraded from v0.3.x or one set up by an earlier build. Choices it already
 records are the suggestions: the menu suggests a Petal only if it was chosen
 and each value as saved, and the non-interactive form keeps them unchanged,
 so a declined Petal stays declined. With no recorded choices every Petal is
-suggested. Setup never replaces settings the owner may already hold: on a
-home whose `main` account already exists, a Petal that was already installed
-and is unchanged keeps its settings, and `bloom init` reports the setup
-choice and the route to write it instead.
+suggested. Setup never replaces settings the owner may already hold. For a
+Petal that was already installed and is unchanged, `bloom init` writes setup
+settings only when Machine reports that `main`'s account does not exist. If
+the account exists, or its existence cannot be read (for example because
+Broker is down), it writes nothing, clears any pending retry for that Petal,
+and prints the exact settings and the command that would apply them.
 
 ### 2. The default policy
 
@@ -423,9 +425,12 @@ Automated:
   keeps earlier choices (declines included) and values on an existing one,
   and enables Tolly's writes unless the owner already set that value.
 - `bloom init` on an existing config with a declined Petal and a custom cap
-  keeps both. Setup writes a Petal's settings only when it was just installed
-  or updated, or before `main`'s account exists, never over settings the
-  owner may hold.
+  keeps both.
+- The settings decision writes only for a Petal just installed or updated,
+  or when `main`'s account is reported absent. An existing account, or an
+  account read that fails for any reason other than "not found", keeps the
+  owner's settings. The integrated path (`init` against a live projection,
+  with Broker up and down) is checked on a developer triad, not in CI.
 - Chosen Petals round-trip through `config.toml`, and an edited value that
   is not a positive amount cannot change a Petal's settings file.
 - The wait announces each ceremony once, stops when the policy is applied,

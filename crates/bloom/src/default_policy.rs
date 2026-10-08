@@ -422,7 +422,7 @@ pub(crate) async fn apply_setup_settings(
     first_setup: bool,
 ) -> Result<Vec<String>> {
     let owners_after = petal_owners(daemon)?;
-    let account_exists = default_account_exists(&daemon.vfs).await;
+    let account = default_account_presence(&daemon.vfs).await;
     let mut messages = Vec::new();
     for name in daemon.config.petals.setup.keys() {
         let Some(installed) = owners_after.get(name) else {
@@ -430,22 +430,36 @@ pub(crate) async fn apply_setup_settings(
         };
         let previous = owners_before.get(name);
         let updated = previous.is_some_and(|previous| previous != installed);
-        match setup_settings_step(first_setup, previous.is_some(), updated, account_exists) {
+        let reason = match setup_settings_step(first_setup, previous.is_some(), updated, &account) {
             SetupSettingsStep::Leave => continue,
-            SetupSettingsStep::KeepOwners => {
-                if let Some(settings) =
-                    render_petal_settings(&daemon.config.petals, name, DEFAULT_POLICY_WALLET)?
-                {
-                    messages.push(format!(
-                        "petal_settings_kept: {} settings for wallet {DEFAULT_POLICY_WALLET} were left as they are; setup chose {}. Write {} to apply it.",
-                        petal_label(name),
-                        settings.summary,
-                        settings.path
-                    ));
+            SetupSettingsStep::Write => None,
+            SetupSettingsStep::KeepOwners => Some(format!(
+                "wallet {DEFAULT_POLICY_WALLET} already exists, so any settings the owner wrote stay as they are"
+            )),
+            SetupSettingsStep::Unverified => Some(format!(
+                "Bloom could not check whether wallet {DEFAULT_POLICY_WALLET} exists ({}), so it did not risk replacing settings the owner wrote",
+                match &account {
+                    AccountPresence::Unknown(error) => error.as_str(),
+                    _ => "unknown",
                 }
-                continue;
-            }
-            SetupSettingsStep::Write => {}
+            )),
+        };
+        if let Some(reason) = reason {
+            // Nothing deferred may later write what setup just declined to.
+            clear_settings_pending(daemon.home.root(), name);
+            messages.push(
+                match render_petal_settings(&daemon.config.petals, name, DEFAULT_POLICY_WALLET) {
+                    Ok(Some(settings)) => format!(
+                        "petal_settings_not_written: {} settings were not written: {reason}. To apply setup's choice, run: printf '{}' | bloom vfs write {}",
+                        petal_label(name),
+                        String::from_utf8_lossy(&settings.body).replace('\n', "\\n"),
+                        settings.path
+                    ),
+                    Ok(None) => continue,
+                    Err(error) => format!("petal_settings_failed: {error:#}"),
+                },
+            );
+            continue;
         }
         match write_petal_settings(&daemon.vfs, &daemon.config.petals, name).await {
             Ok(Some(summary)) => {
@@ -470,39 +484,66 @@ pub(crate) enum SetupSettingsStep {
     Leave,
     /// The owner may already hold settings for this Petal; do not replace them.
     KeepOwners,
+    /// Whether the owner may hold settings could not be established; do not
+    /// replace them.
+    Unverified,
     Write,
+}
+
+/// Whether the default wallet's account 0 exists.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum AccountPresence {
+    Exists,
+    /// Machine's projection says the wallet or account does not exist.
+    Absent,
+    /// The projection could not be read, for example because Broker is down.
+    Unknown(String),
+}
+
+impl AccountPresence {
+    /// Only a definite "not found" means absent: an unreachable Broker or a
+    /// stale projection says nothing about whether the wallet exists.
+    pub(crate) fn from_read<T>(read: &Result<T, bloom_vfs::HandlerError>) -> Self {
+        match read {
+            Ok(_) => Self::Exists,
+            Err(bloom_vfs::HandlerError::NotFound(_)) => Self::Absent,
+            Err(error) => Self::Unknown(error.to_string()),
+        }
+    }
 }
 
 /// Whether `bloom init` writes a chosen Petal's setup settings. A Petal that
 /// was just installed, or updated (which replaces its stored state), gets
 /// them. One already installed and unchanged gets them on first setup only
-/// while the default wallet's account does not exist yet, because until then
-/// the owner cannot have written settings of their own through its route.
+/// when the default wallet's account is known not to exist, because only
+/// then can the owner not have written settings of their own through its
+/// route; if the account exists, or its existence cannot be read, they are
+/// not written.
 pub(crate) fn setup_settings_step(
     first_setup: bool,
     was_installed: bool,
     updated: bool,
-    account_exists: bool,
+    account: &AccountPresence,
 ) -> SetupSettingsStep {
     if !was_installed || updated {
         SetupSettingsStep::Write
     } else if !first_setup {
         SetupSettingsStep::Leave
-    } else if account_exists {
-        SetupSettingsStep::KeepOwners
     } else {
-        SetupSettingsStep::Write
+        match account {
+            AccountPresence::Absent => SetupSettingsStep::Write,
+            AccountPresence::Exists => SetupSettingsStep::KeepOwners,
+            AccountPresence::Unknown(_) => SetupSettingsStep::Unverified,
+        }
     }
 }
 
-/// Whether the default wallet's account 0 exists in Machine's projection.
-async fn default_account_exists(vfs: &bloom_vfs::Vfs) -> bool {
-    let Ok(path) =
-        bloom_vfs::VfsPath::parse(&format!("/wallets/{DEFAULT_POLICY_WALLET}/0/account.json"))
-    else {
-        return false;
-    };
-    bloom_vfs::Handler::read(vfs, &path).await.is_ok()
+async fn default_account_presence(vfs: &bloom_vfs::Vfs) -> AccountPresence {
+    let path = format!("/wallets/{DEFAULT_POLICY_WALLET}/0/account.json");
+    match bloom_vfs::VfsPath::parse(&path) {
+        Ok(path) => AccountPresence::from_read(&bloom_vfs::Handler::read(vfs, &path).await),
+        Err(error) => AccountPresence::Unknown(format!("{error:#}")),
+    }
 }
 
 /// After `bloom serve` provisions catalog Petals, write setup settings for each
@@ -1132,19 +1173,46 @@ mod tests {
 
     #[test]
     fn setup_never_replaces_settings_the_owner_may_hold() {
+        use AccountPresence::*;
         use SetupSettingsStep::*;
-        // (first_setup, was_installed, updated, account_exists)
+        let down = Unknown("backend: SERVICE_UNAVAILABLE".into());
+        // (first_setup, was_installed, updated, account)
         // A Petal installed or updated by this run gets its settings.
-        assert_eq!(setup_settings_step(true, false, false, true), Write);
-        assert_eq!(setup_settings_step(false, true, true, true), Write);
-        // First setup on a home with no wallet yet: nothing to overwrite.
-        assert_eq!(setup_settings_step(true, true, false, false), Write);
+        assert_eq!(setup_settings_step(true, false, false, &Exists), Write);
+        assert_eq!(setup_settings_step(true, false, false, &down), Write);
+        assert_eq!(setup_settings_step(false, true, true, &Exists), Write);
+        // First setup on a home known to have no wallet: nothing to overwrite.
+        assert_eq!(setup_settings_step(true, true, false, &Absent), Write);
         // First setup on a home whose wallet exists (an upgraded home): the
         // owner may have written settings through the Petal; keep them.
-        assert_eq!(setup_settings_step(true, true, false, true), KeepOwners);
+        assert_eq!(setup_settings_step(true, true, false, &Exists), KeepOwners);
+        // If that cannot be checked (Broker down), do not risk it either.
+        assert_eq!(setup_settings_step(true, true, false, &down), Unverified);
         // A later init with nothing installed or updated leaves them alone.
-        assert_eq!(setup_settings_step(false, true, false, true), Leave);
-        assert_eq!(setup_settings_step(false, true, false, false), Leave);
+        assert_eq!(setup_settings_step(false, true, false, &Exists), Leave);
+        assert_eq!(setup_settings_step(false, true, false, &Absent), Leave);
+    }
+
+    #[test]
+    fn only_a_definite_not_found_counts_as_no_account() {
+        let found: Result<Vec<u8>, bloom_vfs::HandlerError> = Ok(Vec::new());
+        assert_eq!(AccountPresence::from_read(&found), AccountPresence::Exists);
+        let absent: Result<Vec<u8>, _> = Err(bloom_vfs::HandlerError::not_found("main"));
+        assert_eq!(AccountPresence::from_read(&absent), AccountPresence::Absent);
+        for error in [
+            bloom_vfs::HandlerError::backend("SERVICE_UNAVAILABLE: Broker is unreachable"),
+            bloom_vfs::HandlerError::PermissionDenied,
+            bloom_vfs::HandlerError::invalid("stale projection"),
+        ] {
+            let read: Result<Vec<u8>, _> = Err(error);
+            assert!(
+                matches!(
+                    AccountPresence::from_read(&read),
+                    AccountPresence::Unknown(_)
+                ),
+                "{read:?}"
+            );
+        }
     }
 
     #[test]
