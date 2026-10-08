@@ -90,6 +90,11 @@ pub(crate) fn interactive_setup_available() -> bool {
 /// Ask which Petals to use and the values each chosen Petal's settings need.
 /// An empty answer, or the end of input, accepts the suggestion.
 ///
+/// When the config already records choices (an earlier run of this setup),
+/// they are the suggestions: a Petal is suggested only if it was chosen, and
+/// a value suggests what was saved. Otherwise every Petal is suggested with
+/// the catalog's values.
+///
 /// Bloom installs every canonical Petal regardless. Each chosen Petal is
 /// recorded in `setup`, which the default policy proposes, along with any
 /// runtime values it needs to act.
@@ -102,9 +107,16 @@ pub(crate) fn run_setup_menu(
         output,
         "Choose the Petals your main wallet's policy allows. Each transaction still needs your approval."
     )?;
+    let earlier = std::mem::take(&mut petals.setup);
     let mut chosen = Vec::new();
     for name in menu_petals() {
-        if ask_yes_no(input, output, &format!("Use {}?", petal_label(&name)))? {
+        let suggested = earlier.is_empty() || earlier.contains_key(&name);
+        if ask_yes_no(
+            input,
+            output,
+            &format!("Use {}?", petal_label(&name)),
+            suggested,
+        )? {
             chosen.push(name);
         }
     }
@@ -113,7 +125,13 @@ pub(crate) fn run_setup_menu(
         let mut values = BTreeMap::new();
         if let Some(template) = setup_template(name) {
             for value in template.values {
-                let answer = ask_amount(input, output, value.prompt, value.default)?;
+                let suggestion = earlier
+                    .get(name)
+                    .and_then(|setup| setup.values.get(value.name))
+                    .map(String::as_str)
+                    .filter(|saved| is_setup_amount(saved))
+                    .unwrap_or(value.default);
+                let answer = ask_amount(input, output, value.prompt, suggestion)?;
                 values.insert(value.name.to_owned(), answer);
             }
         }
@@ -126,9 +144,18 @@ pub(crate) fn run_setup_menu(
     Ok(())
 }
 
-/// The non-interactive form of the setup menu: record every canonical Petal
-/// as chosen, with the catalog's suggested values. Existing choices are kept.
+/// The non-interactive form of the setup menu: accept every suggestion. With
+/// no earlier choices that records every canonical Petal with the catalog's
+/// values; earlier choices are kept as they are, so a declined Petal stays
+/// declined and a saved value stays saved.
 pub(crate) fn accept_setup_suggestions(petals: &mut PetalsConfig) {
+    if !petals.setup.is_empty() {
+        let chosen: Vec<String> = petals.setup.keys().cloned().collect();
+        for name in chosen {
+            record_runtime_values(petals, &name);
+        }
+        return;
+    }
     for name in menu_petals() {
         record_runtime_values(petals, &name);
         let values = setup_template(&name)
@@ -147,16 +174,23 @@ pub(crate) fn accept_setup_suggestions(petals: &mut PetalsConfig) {
     }
 }
 
-fn ask_yes_no(input: &mut impl BufRead, output: &mut impl Write, question: &str) -> Result<bool> {
+fn ask_yes_no(
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+    question: &str,
+    suggested: bool,
+) -> Result<bool> {
+    let hint = if suggested { "[Y/n]" } else { "[y/N]" };
     loop {
-        write!(output, "{question} [Y/n] ")?;
+        write!(output, "{question} {hint} ")?;
         output.flush()?;
         let Some(answer) = read_answer(input)? else {
             writeln!(output)?;
-            return Ok(true);
+            return Ok(suggested);
         };
         match answer.to_ascii_lowercase().as_str() {
-            "" | "y" | "yes" => return Ok(true),
+            "" => return Ok(suggested),
+            "y" | "yes" => return Ok(true),
             "n" | "no" => return Ok(false),
             _ => writeln!(output, "Answer y or n.")?,
         }
@@ -377,12 +411,18 @@ pub(crate) fn petal_owners(daemon: &Daemon) -> Result<BTreeMap<String, String>> 
 /// A failed write is reported and the rest continue, as in `bloom serve`. A
 /// Petal without its settings fails closed: Polymarket refuses buys and Enso
 /// refuses routes until the owner writes them.
+///
+/// Setup can run on a home that already has a wallet, such as one upgraded
+/// from before this setup existed. There a Petal that was already installed
+/// and is unchanged may hold settings the owner wrote through its own route,
+/// so they are left as they are and the setup choice is reported instead.
 pub(crate) async fn apply_setup_settings(
     daemon: &Daemon,
     owners_before: &BTreeMap<String, String>,
     first_setup: bool,
 ) -> Result<Vec<String>> {
     let owners_after = petal_owners(daemon)?;
+    let account_exists = default_account_exists(&daemon.vfs).await;
     let mut messages = Vec::new();
     for name in daemon.config.petals.setup.keys() {
         let Some(installed) = owners_after.get(name) else {
@@ -390,8 +430,22 @@ pub(crate) async fn apply_setup_settings(
         };
         let previous = owners_before.get(name);
         let updated = previous.is_some_and(|previous| previous != installed);
-        if !(first_setup || previous.is_none() || updated) {
-            continue;
+        match setup_settings_step(first_setup, previous.is_some(), updated, account_exists) {
+            SetupSettingsStep::Leave => continue,
+            SetupSettingsStep::KeepOwners => {
+                if let Some(settings) =
+                    render_petal_settings(&daemon.config.petals, name, DEFAULT_POLICY_WALLET)?
+                {
+                    messages.push(format!(
+                        "petal_settings_kept: {} settings for wallet {DEFAULT_POLICY_WALLET} were left as they are; setup chose {}. Write {} to apply it.",
+                        petal_label(name),
+                        settings.summary,
+                        settings.path
+                    ));
+                }
+                continue;
+            }
+            SetupSettingsStep::Write => {}
         }
         match write_petal_settings(&daemon.vfs, &daemon.config.petals, name).await {
             Ok(Some(summary)) => {
@@ -408,6 +462,47 @@ pub(crate) async fn apply_setup_settings(
         }
     }
     Ok(messages)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SetupSettingsStep {
+    /// Not a setup or install event for this Petal.
+    Leave,
+    /// The owner may already hold settings for this Petal; do not replace them.
+    KeepOwners,
+    Write,
+}
+
+/// Whether `bloom init` writes a chosen Petal's setup settings. A Petal that
+/// was just installed, or updated (which replaces its stored state), gets
+/// them. One already installed and unchanged gets them on first setup only
+/// while the default wallet's account does not exist yet, because until then
+/// the owner cannot have written settings of their own through its route.
+pub(crate) fn setup_settings_step(
+    first_setup: bool,
+    was_installed: bool,
+    updated: bool,
+    account_exists: bool,
+) -> SetupSettingsStep {
+    if !was_installed || updated {
+        SetupSettingsStep::Write
+    } else if !first_setup {
+        SetupSettingsStep::Leave
+    } else if account_exists {
+        SetupSettingsStep::KeepOwners
+    } else {
+        SetupSettingsStep::Write
+    }
+}
+
+/// Whether the default wallet's account 0 exists in Machine's projection.
+async fn default_account_exists(vfs: &bloom_vfs::Vfs) -> bool {
+    let Ok(path) =
+        bloom_vfs::VfsPath::parse(&format!("/wallets/{DEFAULT_POLICY_WALLET}/0/account.json"))
+    else {
+        return false;
+    };
+    bloom_vfs::Handler::read(vfs, &path).await.is_ok()
 }
 
 /// After `bloom serve` provisions catalog Petals, write setup settings for each
@@ -980,6 +1075,79 @@ mod tests {
     }
 
     #[test]
+    fn menu_suggests_earlier_choices_on_an_existing_config() {
+        // An earlier run chose Hyperliquid and Polymarket with a custom cap and
+        // declined the rest. Enter at every prompt keeps exactly that.
+        let mut petals = PetalsConfig::default();
+        petals
+            .setup
+            .insert("hyperliquid".into(), PetalSetupConfig::default());
+        petals.setup.insert(
+            "polymarket".into(),
+            PetalSetupConfig {
+                values: BTreeMap::from([("max_daily_usd".into(), "42.5".into())]),
+            },
+        );
+        let mut output = Vec::new();
+        run_setup_menu(&mut petals, &mut "\n\n\n\n\n\n".as_bytes(), &mut output).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(chosen(&petals), ["hyperliquid", "polymarket"]);
+        assert_eq!(polymarket_limit(&petals), Some("42.5"));
+        assert!(output.contains("Use Polymarket? [Y/n] "), "{output}");
+        assert!(output.contains("Use Enso? [y/N] "), "{output}");
+        assert!(
+            output.contains("Polymarket daily buy limit in pUSD [42.5]: "),
+            "{output}"
+        );
+
+        // The same at the end of input, and an explicit answer still wins.
+        let mut eof = petals.clone();
+        run_setup_menu(&mut eof, &mut "".as_bytes(), &mut Vec::new()).unwrap();
+        assert_eq!(chosen(&eof), ["hyperliquid", "polymarket"]);
+        assert_eq!(polymarket_limit(&eof), Some("42.5"));
+        let mut changed = petals.clone();
+        run_setup_menu(
+            &mut changed,
+            &mut "\n\ny\n\n\n60\n".as_bytes(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(chosen(&changed), ["enso", "hyperliquid", "polymarket"]);
+        assert_eq!(polymarket_limit(&changed), Some("60"));
+    }
+
+    #[test]
+    fn scripted_setup_keeps_earlier_declines() {
+        let mut petals = PetalsConfig::default();
+        petals.setup.insert(
+            "polymarket".into(),
+            PetalSetupConfig {
+                values: BTreeMap::from([("max_daily_usd".into(), "42.5".into())]),
+            },
+        );
+        accept_setup_suggestions(&mut petals);
+        assert_eq!(chosen(&petals), ["polymarket"]);
+        assert_eq!(polymarket_limit(&petals), Some("42.5"));
+    }
+
+    #[test]
+    fn setup_never_replaces_settings_the_owner_may_hold() {
+        use SetupSettingsStep::*;
+        // (first_setup, was_installed, updated, account_exists)
+        // A Petal installed or updated by this run gets its settings.
+        assert_eq!(setup_settings_step(true, false, false, true), Write);
+        assert_eq!(setup_settings_step(false, true, true, true), Write);
+        // First setup on a home with no wallet yet: nothing to overwrite.
+        assert_eq!(setup_settings_step(true, true, false, false), Write);
+        // First setup on a home whose wallet exists (an upgraded home): the
+        // owner may have written settings through the Petal; keep them.
+        assert_eq!(setup_settings_step(true, true, false, true), KeepOwners);
+        // A later init with nothing installed or updated leaves them alone.
+        assert_eq!(setup_settings_step(false, true, false, true), Leave);
+        assert_eq!(setup_settings_step(false, true, false, false), Leave);
+    }
+
+    #[test]
     fn menu_records_declines_and_rejects_invalid_limits() {
         let (petals, output) = menu("y\nmaybe\nno\nno\nY\nn\nabc\n25.5\n");
         assert_eq!(chosen(&petals), ["near-intents", "polymarket"]);
@@ -1026,6 +1194,7 @@ mod tests {
         );
         accept_setup_suggestions(&mut edited);
         assert_eq!(polymarket_limit(&edited), Some("5"));
+        assert_eq!(chosen(&edited), ["polymarket"]);
 
         let mut disabled = PetalsConfig::default();
         disabled

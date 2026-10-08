@@ -978,6 +978,51 @@ fn init_runs_setup_once_even_when_the_config_already_exists() {
     assert!(config.petals.setup.is_empty(), "{:?}", config.petals.setup);
 }
 
+/// A home that recorded choices before `setup_complete` existed (an earlier
+/// build of this setup) keeps them when `bloom init` runs setup again: a
+/// declined Petal stays declined and a custom value stays.
+#[test]
+fn init_setup_on_an_existing_config_keeps_earlier_choices() {
+    let home = fresh_home();
+    let home_dir = bloom_proto::HomeDir::at(home.path());
+    home_dir.ensure().unwrap();
+    let mut config = bloom_proto::Config::local_default();
+    config.petals.setup.insert(
+        "polymarket".into(),
+        bloom_proto::config::PetalSetupConfig {
+            values: std::collections::BTreeMap::from([("max_daily_usd".into(), "42.5".into())]),
+        },
+    );
+    assert!(!config.petals.setup_complete);
+    config.save(&home_dir.config_path()).unwrap();
+
+    bloom_cmd(home.path())
+        .env("HTTPS_PROXY", "http://127.0.0.1:1")
+        .env("https_proxy", "http://127.0.0.1:1")
+        .env("NO_PROXY", "")
+        .env("no_proxy", "")
+        .arg("init")
+        .assert()
+        // Setup is saved before Petal provisioning, which is offline here.
+        .failure()
+        .stderr(predicate::str::contains(
+            "provision canonical pre-installed Petals",
+        ));
+
+    let config = bloom_proto::Config::load(&home_dir.config_path()).unwrap();
+    assert!(config.petals.setup_complete);
+    assert_eq!(
+        config.petals.setup.keys().collect::<Vec<_>>(),
+        ["polymarket"],
+        "declined Petals were added back: {:?}",
+        config.petals.setup
+    );
+    assert_eq!(
+        config.petals.setup["polymarket"].values["max_daily_usd"],
+        "42.5"
+    );
+}
+
 #[test]
 fn vfs_write_help_exposes_no_unlock_or_secret_flags() {
     let home = fresh_home();

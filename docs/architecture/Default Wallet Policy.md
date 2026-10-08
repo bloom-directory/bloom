@@ -216,6 +216,16 @@ suggestions instead of asking. Later runs of `bloom init` see the marker and
 use the config as it is, with the catalog's suggestions for any value not
 saved.
 
+Setup also runs once on a config that predates the marker, such as a home
+upgraded from v0.3.x or one set up by an earlier build. Choices it already
+records are the suggestions: the menu suggests a Petal only if it was chosen
+and each value as saved, and the non-interactive form keeps them unchanged,
+so a declined Petal stays declined. With no recorded choices every Petal is
+suggested. Setup never replaces settings the owner may already hold: on a
+home whose `main` account already exists, a Petal that was already installed
+and is unchanged keeps its settings, and `bloom init` reports the setup
+choice and the route to write it instead.
+
 ### 2. The default policy
 
 The default policy uses today's wallet policy format. Setup fills in the
@@ -407,9 +417,15 @@ changes come next.
 Automated:
 
 - The menu offers Bloom's five canonical Petals, records declines, rejects
-  invalid limits, and accepts the suggestions at the end of input. The
-  scripted form chooses every canonical Petal, keeps existing values, and
-  enables Tolly's writes unless the owner already set that value.
+  invalid limits, and accepts the suggestions at the end of input. On a
+  config with earlier choices it suggests exactly those choices and saved
+  values. The scripted form chooses every canonical Petal on a fresh config,
+  keeps earlier choices (declines included) and values on an existing one,
+  and enables Tolly's writes unless the owner already set that value.
+- `bloom init` on an existing config with a declined Petal and a custom cap
+  keeps both. Setup writes a Petal's settings only when it was just installed
+  or updated, or before `main`'s account exists, never over settings the
+  owner may hold.
 - Chosen Petals round-trip through `config.toml`, and an edited value that
   is not a positive amount cannot change a Petal's settings file.
 - The wait announces each ceremony once, stops when the policy is applied,
