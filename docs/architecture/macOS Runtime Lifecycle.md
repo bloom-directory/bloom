@@ -17,3 +17,11 @@ requires a running login sentinel and validates its socket's enrolled owner,
 group, mode, and type before restarting that enrollment's Broker or Signer.
 Broker and Signer retain their authenticated session checks. An absent sentinel
 therefore leaves both service principals inactive even after runtime provisioning.
+
+The installer loads the sentinel into `user/<login_uid>`. The monitor checks
+that canonical job while also requiring the GUI login domain to exist. A
+stopped or absent sentinel, or a user-domain job left after the GUI login is
+gone, does not authorize a restart. Losing the authenticated sentinel connection
+still drains Broker and Signer. W0 verifies this by booting out the sentinel,
+observing both services exit, restoring the same user-domain job, and checking
+that authenticated service readiness returns.
