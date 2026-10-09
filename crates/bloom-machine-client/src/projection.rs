@@ -30,6 +30,10 @@ const LIVE_REFRESH_FRESHNESS_MS: u64 = 30_000;
 // then READ. Coalesce only that burst; authority changes remain observable on
 // the next ordinary interaction rather than waiting for the stale-read TTL.
 const LIVE_REFRESH_COALESCE_MS: u64 = 100;
+// Filesystem navigation may perform many LOOKUP/GETATTR/READ calls for one
+// directory traversal. Bound those read-only observations independently from
+// authority decisions, which continue to use `get_wallet`'s live refresh.
+const NAVIGATION_REFRESH_COALESCE_MS: u64 = 1_000;
 static TEMPORARY_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -174,7 +178,23 @@ impl WalletProjection {
 #[async_trait]
 pub trait WalletProjectionReader: Send + Sync {
     async fn list_wallets(&self) -> Result<Vec<WalletProjection>, ProtocolError>;
+    async fn list_wallets_navigation(&self) -> Result<Vec<WalletProjection>, ProtocolError> {
+        self.list_wallets().await
+    }
     async fn get_wallet(&self, wallet_id: &Token) -> Result<WalletProjection, ProtocolError>;
+    /// Read account authority from Broker without a cached success or fallback.
+    async fn get_wallet_authority(
+        &self,
+        wallet_id: &Token,
+    ) -> Result<WalletProjection, ProtocolError> {
+        self.get_wallet(wallet_id).await
+    }
+    async fn get_wallet_navigation(
+        &self,
+        wallet_id: &Token,
+    ) -> Result<WalletProjection, ProtocolError> {
+        self.get_wallet(wallet_id).await
+    }
     async fn begin_legacy_migration(
         &self,
         _operation_id: &OperationId,
@@ -549,6 +569,20 @@ impl WalletProjectionReader for CachedWalletProjectionReader {
         }
     }
 
+    async fn list_wallets_navigation(&self) -> Result<Vec<WalletProjection>, ProtocolError> {
+        let refreshed_at = self.last_live_refresh_ms.load(Ordering::SeqCst);
+        if refreshed_at != 0
+            && now_ms()?.saturating_sub(refreshed_at) <= NAVIGATION_REFRESH_COALESCE_MS
+        {
+            let cache = self
+                .cache
+                .lock()
+                .map_err(|_| unavailable("Machine projection cache mutex poisoned"))?;
+            return Ok(cache.live(false));
+        }
+        self.list_wallets().await
+    }
+
     async fn get_wallet(&self, wallet_id: &Token) -> Result<WalletProjection, ProtocolError> {
         let broker_error = match self.refresh_coalesced().await {
             Ok(projections) => {
@@ -585,6 +619,40 @@ impl WalletProjectionReader for CachedWalletProjectionReader {
         }
     }
 
+    async fn get_wallet_authority(
+        &self,
+        wallet_id: &Token,
+    ) -> Result<WalletProjection, ProtocolError> {
+        self.refresh()
+            .await?
+            .into_iter()
+            .find(|projection| projection.wallet_id() == wallet_id)
+            .ok_or_else(|| invalid_projection(format!("wallet {} not found", wallet_id.as_str())))
+    }
+
+    async fn get_wallet_navigation(
+        &self,
+        wallet_id: &Token,
+    ) -> Result<WalletProjection, ProtocolError> {
+        let refreshed_at = self.last_live_refresh_ms.load(Ordering::SeqCst);
+        if refreshed_at != 0
+            && now_ms()?.saturating_sub(refreshed_at) <= NAVIGATION_REFRESH_COALESCE_MS
+        {
+            let cache = self
+                .cache
+                .lock()
+                .map_err(|_| unavailable("Machine projection cache mutex poisoned"))?;
+            return cache
+                .live(false)
+                .into_iter()
+                .find(|projection| projection.wallet_id() == wallet_id)
+                .ok_or_else(|| {
+                    invalid_projection(format!("wallet {} not found", wallet_id.as_str()))
+                });
+        }
+        self.get_wallet(wallet_id).await
+    }
+
     async fn begin_legacy_migration(
         &self,
         operation_id: &OperationId,
@@ -607,6 +675,7 @@ impl WalletProjectionReader for CachedWalletProjectionReader {
             .cache
             .lock()
             .map_err(|_| unavailable("Machine projection cache mutex poisoned"))? = updated;
+        self.last_live_refresh_ms.store(0, Ordering::SeqCst);
         Ok(())
     }
 
@@ -1162,6 +1231,7 @@ mod tests {
 
     struct FakeBroker {
         available: Mutex<bool>,
+        wallet_list_reads: AtomicU64,
         wallets: Mutex<BTreeMap<String, ProjectionFixture>>,
         custody_results: Mutex<BTreeMap<String, CustodyResult>>,
         ceremony_states: Mutex<BTreeMap<String, CeremonyState>>,
@@ -1196,6 +1266,7 @@ mod tests {
         fn new(fixture: ProjectionFixture) -> Self {
             Self {
                 available: Mutex::new(true),
+                wallet_list_reads: AtomicU64::new(0),
                 wallets: Mutex::new(BTreeMap::from([(
                     fixture.wallet.wallet_id.as_str().to_owned(),
                     fixture,
@@ -1245,6 +1316,7 @@ mod tests {
                     .cloned();
                 match request {
                     MachineBrokerRequest::WalletListPublic(_) => {
+                        self.wallet_list_reads.fetch_add(1, Ordering::SeqCst);
                         Ok(MachineBrokerResponse::WalletListPublic(
                             wallets.values().map(|value| value.wallet.clone()).collect(),
                         ))
@@ -1310,6 +1382,36 @@ mod tests {
                 }
             })
         }
+    }
+
+    #[tokio::test]
+    async fn authority_reads_bypass_recent_cache_and_never_fall_back() {
+        let directory = tempfile::tempdir().unwrap();
+        let broker = Arc::new(FakeBroker::new(fixture(1)));
+        let reader = CachedWalletProjectionReader::new(
+            Some(MachineBrokerClient::new(broker.clone())),
+            FileProjectionStore::new(directory.path().join("wallets.json")),
+        )
+        .unwrap();
+        reader.get_wallet_navigation(&token("alice")).await.unwrap();
+        let reads = broker.wallet_list_reads.load(Ordering::SeqCst);
+        reader.get_wallet_authority(&token("alice")).await.unwrap();
+        assert_eq!(broker.wallet_list_reads.load(Ordering::SeqCst), reads + 1);
+
+        broker.set_available(false);
+        let error = reader
+            .get_wallet_authority(&token("alice"))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::ServiceUnavailable);
+
+        broker.set_available(true);
+        broker.wallets.lock().unwrap().clear();
+        let error = reader
+            .get_wallet_authority(&token("alice"))
+            .await
+            .unwrap_err();
+        assert!(error.message.contains("not found"), "{error:?}");
     }
 
     #[tokio::test]
@@ -1448,6 +1550,49 @@ mod tests {
         let error = projection.primary_key().unwrap_err();
         assert_eq!(error.code, ProtocolErrorCode::BackendInvalidRequest);
         assert!(error.message.contains("no derived EVM primary key"));
+    }
+
+    #[tokio::test]
+    async fn navigation_reuses_authenticated_snapshot_but_authority_and_expiry_refresh() {
+        let directory = tempfile::tempdir().unwrap();
+        let broker = Arc::new(FakeBroker::new(fixture(1)));
+        let reader = CachedWalletProjectionReader::new(
+            Some(MachineBrokerClient::new(broker.clone())),
+            FileProjectionStore::new(directory.path().join("wallets.json")),
+        )
+        .unwrap();
+
+        assert_eq!(reader.list_wallets_navigation().await.unwrap().len(), 1);
+        for _ in 0..20 {
+            assert_eq!(reader.list_wallets_navigation().await.unwrap().len(), 1);
+            assert_eq!(
+                reader
+                    .get_wallet_navigation(&token("alice"))
+                    .await
+                    .unwrap()
+                    .policy
+                    .version
+                    .get(),
+                1
+            );
+        }
+        assert_eq!(broker.wallet_list_reads.load(Ordering::SeqCst), 1);
+
+        // Authority callers keep their shorter live interval, even while a
+        // navigation snapshot is reusable.
+        reader.last_live_refresh_ms.store(
+            now_ms().unwrap() - LIVE_REFRESH_COALESCE_MS - 1,
+            Ordering::SeqCst,
+        );
+        reader.get_wallet(&token("alice")).await.unwrap();
+        assert_eq!(broker.wallet_list_reads.load(Ordering::SeqCst), 2);
+
+        reader.last_live_refresh_ms.store(
+            now_ms().unwrap() - NAVIGATION_REFRESH_COALESCE_MS - 1,
+            Ordering::SeqCst,
+        );
+        reader.get_wallet_navigation(&token("alice")).await.unwrap();
+        assert_eq!(broker.wallet_list_reads.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]

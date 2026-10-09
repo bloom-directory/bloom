@@ -106,7 +106,13 @@ mod tests {
             );
             assert_eq!(
                 *acquired.borrow(),
-                ["polymarket", "hyperliquid", "enso", "near-intents", "tolly"]
+                [
+                    "polymarket",
+                    "hyperliquid",
+                    "enso",
+                    "near-intents",
+                    "feedback"
+                ]
             );
             assert_eq!(results.len(), 5);
             assert!(results.iter().all(|result| matches!(&result.outcome,
