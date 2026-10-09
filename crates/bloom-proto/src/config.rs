@@ -88,6 +88,45 @@ pub struct CheckoutConfig {
     pub uid: u32,
 }
 
+impl CheckoutConfig {
+    /// Root-installed service environment supplies public endpoint coordinates.
+    pub fn from_environment() -> Result<Option<Self>, ConfigError> {
+        Self::from_endpoint_values(
+            std::env::var_os("BLOOM_CHECKOUT_SOCKET"),
+            std::env::var_os("BLOOM_CHECKOUT_UID"),
+        )
+    }
+    fn from_endpoint_values(
+        socket: Option<std::ffi::OsString>,
+        uid: Option<std::ffi::OsString>,
+    ) -> Result<Option<Self>, ConfigError> {
+        match (socket, uid) {
+            (None, None) => Ok(None),
+            (Some(socket), Some(uid)) => {
+                let socket = std::path::PathBuf::from(socket);
+                let uid = uid
+                    .to_str()
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .filter(|v| *v != 0)
+                    .ok_or_else(|| {
+                        ConfigError::Invalid(
+                            "Checkout UID must be a nonzero numeric service UID".into(),
+                        )
+                    })?;
+                if !socket.is_absolute() {
+                    return Err(ConfigError::Invalid(
+                        "Checkout socket must be absolute".into(),
+                    ));
+                }
+                Ok(Some(Self { socket, uid }))
+            }
+            _ => Err(ConfigError::Invalid(
+                "Checkout endpoint and UID must be configured together".into(),
+            )),
+        }
+    }
+}
+
 /// Gate for the `bloom mcp serve` stdio proxy.
 ///
 /// The proxy exposes the same `lookup`/`read`/`write`/`write_with_lookup`/
@@ -686,6 +725,29 @@ mod tests {
     use super::*;
     use crate::chain::EndpointSpec;
     use tempfile::tempdir;
+
+    #[test]
+    fn checkout_endpoint_requires_absolute_path_and_service_uid() {
+        let parse = CheckoutConfig::from_endpoint_values;
+        assert!(parse(None, None).unwrap().is_none());
+        assert!(parse(Some("/run/bloom/checkout.sock".into()), None).is_err());
+        assert!(parse(None, Some("31004".into())).is_err());
+        for uid in ["0", "bad", "4294967296"] {
+            assert!(parse(Some("/run/bloom/checkout.sock".into()), Some(uid.into())).is_err());
+        }
+        assert!(parse(Some("relative.sock".into()), Some("31004".into())).is_err());
+        let endpoint = parse(
+            Some("/run/bloom/checkout.sock".into()),
+            Some("31004".into()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(endpoint.uid, 31004);
+        assert_eq!(
+            endpoint.socket,
+            std::path::PathBuf::from("/run/bloom/checkout.sock")
+        );
+    }
 
     fn http_endpoint() -> EndpointSpec {
         EndpointSpec {

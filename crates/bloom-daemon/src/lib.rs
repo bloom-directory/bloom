@@ -4635,7 +4635,11 @@ impl Daemon {
                 ) as _,
             );
 
-        if let Some(checkout) = &config.checkout {
+        let checkout = config
+            .checkout
+            .clone()
+            .or(bloom_proto::config::CheckoutConfig::from_environment()?);
+        if let Some(checkout) = &checkout {
             let client = bloom_machine_client::checkout::CheckoutClient::new(
                 checkout.socket.clone(),
                 checkout.uid,

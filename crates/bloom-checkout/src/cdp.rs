@@ -24,17 +24,30 @@ pub(crate) struct FrameContext {
     pub world: i64,
     pub frame_id: String,
     pub url: String,
+    pub parent_id: Option<String>,
 }
 
-fn tree_frames(tree: &Value, session: &str, frames: &mut Vec<(String, String, String)>) {
+fn tree_frames(
+    tree: &Value,
+    session: &str,
+    parent: Option<&str>,
+    frames: &mut Vec<(String, String, String, Option<String>)>,
+) {
     if let (Some(id), Some(url)) = (tree["frame"]["id"].as_str(), tree["frame"]["url"].as_str()) {
-        if !frames.iter().any(|(known, _, _)| known == id) {
-            frames.push((id.into(), url.into(), session.into()));
+        if let Some(frame) = frames.iter_mut().find(|(known, _, _, _)| known == id) {
+            frame.2 = session.into();
+        } else {
+            frames.push((
+                id.into(),
+                url.into(),
+                session.into(),
+                parent.map(str::to_owned),
+            ));
         }
     }
     if let Some(children) = tree["childFrames"].as_array() {
         for child in children {
-            tree_frames(child, session, frames);
+            tree_frames(child, session, tree["frame"]["id"].as_str(), frames);
         }
     }
 }
@@ -86,7 +99,7 @@ impl Cdp {
             .as_array()
             .context("Missing browser targets")?;
         let mut frames = Vec::new();
-        tree_frames(&tree["frameTree"], root_session, &mut frames);
+        tree_frames(&tree["frameTree"], root_session, None, &mut frames);
         let mut attached = std::collections::HashSet::new();
         loop {
             let before = attached.len();
@@ -99,7 +112,12 @@ impl Cdp {
                 };
                 if target["type"] != "iframe"
                     || attached.contains(id)
-                    || !frames.iter().any(|(known, _, _)| known == parent)
+                    || !frames.iter().any(|(known, _, _, _)| known == parent)
+                    || infos.iter().any(|t| {
+                        t["type"] == "iframe"
+                            && t["targetId"] == parent
+                            && !attached.contains(parent)
+                    })
                 {
                     continue;
                 }
@@ -113,13 +131,13 @@ impl Cdp {
                 let session = attachment["sessionId"]
                     .as_str()
                     .context("Missing iframe session")?;
-                if let Some(frame) = frames.iter_mut().find(|(known, _, _)| known == id) {
+                if let Some(frame) = frames.iter_mut().find(|(known, _, _, _)| known == id) {
                     frame.2 = session.into();
                 }
                 let tree = self
                     .call(Some(session), "Page.getFrameTree", json!({}))
                     .await?;
-                tree_frames(&tree["frameTree"], session, &mut frames);
+                tree_frames(&tree["frameTree"], session, Some(parent), &mut frames);
                 attached.insert(id.to_owned());
             }
             if attached.len() == before {
@@ -127,7 +145,7 @@ impl Cdp {
             }
         }
         let mut contexts = Vec::new();
-        for (frame_id, url, session) in frames {
+        for (frame_id, url, session, parent_id) in frames {
             let isolated = self
                 .call(
                     Some(&session),
@@ -158,6 +176,7 @@ impl Cdp {
                 world,
                 frame_id,
                 url,
+                parent_id,
             });
         }
         Ok(contexts)
@@ -175,6 +194,8 @@ impl Cdp {
             "--disable-features=BackForwardCache,AutofillServerCommunication,AutofillEnableAccountWalletStorage",
             "--password-store=basic","--disable-save-password-bubble"])
             .arg(format!("--user-data-dir={}",profile.display()))
+            .env("XDG_CONFIG_HOME",profile.join("config"))
+            .env("XDG_CACHE_HOME",profile.join("cache"))
             .args(test_flags).arg("about:blank")
             .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
         let input = child_read.as_raw_fd();

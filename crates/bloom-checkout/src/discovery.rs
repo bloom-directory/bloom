@@ -25,6 +25,7 @@ pub(crate) struct Frame {
     pub world: i64,
     pub origin: String,
     pub fields: Vec<Field>,
+    owners: Vec<(String, String)>,
 }
 pub(crate) struct Discovery {
     pub facts: CheckoutFacts,
@@ -55,23 +56,33 @@ async fn evaluate(
     Ok(response["result"]["value"].clone())
 }
 
+async fn check_frame_owners(tab: &PrivateTab, owners: &[(String, String)]) -> Result<()> {
+    for (session, object) in owners {
+        let response=tab.cdp.call(Some(session),"Runtime.callFunctionOn",json!({"objectId":object,"returnByValue":true,"functionDeclaration":"function(){if(!this.isConnected || !this.getClientRects().length)return false;for(let n=this;n;n=n.parentElement){const s=getComputedStyle(n);if(s.visibility!=='visible'||s.display==='none'||Number(s.opacity)===0)return false;}return true;}"})).await?;
+        if response["result"]["value"] != true {
+            bail!("Receiving iframe is hidden or replaced");
+        }
+    }
+    Ok(())
+}
+
 impl Discovery {
     pub async fn read(tab: &PrivateTab) -> Result<Self> {
         let contexts = tab.cdp.contexts(&tab.session, "bloom-payment").await?;
         let mut frames = Vec::new();
         let mut candidates = Vec::new();
         let mut top_origin = None;
-        for (position, context) in contexts.into_iter().enumerate() {
-            let url = context.url;
-            let origin = url::Url::parse(&url)?.origin().ascii_serialization();
-            let session = context.session;
+        for (position, context) in contexts.iter().enumerate() {
+            let url = &context.url;
+            let origin = url::Url::parse(url)?.origin().ascii_serialization();
+            let session = context.session.clone();
             let world = context.world;
             if position == 0 {
                 top_origin = Some(origin.clone());
             }
             if position == 0
                 || (origin == "https://js.stripe.com"
-                    && url::Url::parse(&url)?.path() == "/v3/embedded-checkout-inner.html")
+                    && url::Url::parse(url)?.path() == "/v3/embedded-checkout-inner.html")
             {
                 let candidate =
                     evaluate(tab, &session, world, include_str!("facts.js").into()).await?;
@@ -83,11 +94,36 @@ impl Discovery {
             let fields: Vec<Field> =
                 serde_json::from_value(fields).context("Ambiguous payment fields")?;
             if !fields.is_empty() {
+                let mut owners = Vec::new();
+                let mut child = context;
+                while let Some(parent_id) = &child.parent_id {
+                    let parent = contexts
+                        .iter()
+                        .find(|c| &c.frame_id == parent_id)
+                        .context("Unbound payment frame parent")?;
+                    let owner = tab
+                        .cdp
+                        .call(
+                            Some(&parent.session),
+                            "DOM.getFrameOwner",
+                            json!({"frameId":child.frame_id}),
+                        )
+                        .await?;
+                    let node=tab.cdp.call(Some(&parent.session),"DOM.resolveNode",json!({"backendNodeId":owner["backendNodeId"],"executionContextId":parent.world})).await?;
+                    let object = node["object"]["objectId"]
+                        .as_str()
+                        .context("Unbound receiving iframe")?
+                        .to_owned();
+                    owners.push((parent.session.clone(), object));
+                    child = parent;
+                }
+                check_frame_owners(tab, &owners).await?;
                 frames.push(Frame {
                     session,
                     world,
                     origin,
                     fields,
+                    owners,
                 });
             }
         }
@@ -154,6 +190,7 @@ impl Discovery {
             bail!("Payment facts changed");
         }
         for frame in &self.frames {
+            check_frame_owners(tab, &frame.owners).await?;
             let current = evaluate(
                 tab,
                 &frame.session,
@@ -326,7 +363,10 @@ mod tests {
     async fn fixture_plain_installments_confirmation_and_decline() {
         let browser = browser().await;
         for (outcome, expected) in [
-            ("Order confirmed. Order ID FIXTURE-01", "paid"),
+            (
+                "Order confirmed. Order ID FIXTURE-01 Total USD 3.99",
+                "paid",
+            ),
             ("Your card was declined", "declined"),
         ] {
             let (url,server)=fixture(merchant(&inputs(),"<label>Installments<select name='installments'><option>6 x installments</option></select></label>",outcome)).await;
@@ -345,6 +385,10 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(outcome["state"], expected);
+            if expected == "paid" {
+                assert_eq!(outcome["merchant_reported_total_minor"], 399);
+                assert_eq!(outcome["currency"], "USD");
+            }
             browser.return_control().await.unwrap();
             server.abort();
         }
@@ -377,6 +421,44 @@ mod tests {
             .unwrap();
         assert!(discovery.recheck(&tab).await.is_err());
         assert!(discovery.submit(&tab).await.is_err());
+        browser.return_control().await.unwrap();
+        server.abort();
+        frame_server.abort();
+    }
+
+    #[tokio::test]
+    async fn fixture_hidden_payment_frame_and_replaced_owner_fail_closed() {
+        let browser = browser().await;
+        let (frame_url, frame_server) = fixture(inputs()).await;
+        let frame_url = frame_url.replace("localhost", "127.0.0.1");
+        for style in ["display:none", "opacity:0", "visibility:hidden"] {
+            let (url, server) = fixture(merchant(
+                &format!("<div style='{style}'><iframe src='{frame_url}'></iframe></div>"),
+                "",
+                "Order confirmed",
+            ))
+            .await;
+            let tab = open(&browser, url).await;
+            assert!(Discovery::read(&tab).await.is_err());
+            browser.return_control().await.unwrap();
+            server.abort();
+        }
+        let (url, server) = fixture(merchant(
+            &format!("<iframe src='{frame_url}'></iframe>"),
+            "",
+            "Order confirmed",
+        ))
+        .await;
+        let tab = open(&browser, url).await;
+        let discovery = Discovery::read(&tab).await.unwrap();
+        tab.cdp
+            .evaluate(
+                &tab.session,
+                "const f=document.querySelector('iframe');f.replaceWith(f.cloneNode(true))".into(),
+            )
+            .await
+            .unwrap();
+        assert!(discovery.recheck(&tab).await.is_err());
         browser.return_control().await.unwrap();
         server.abort();
         frame_server.abort();
