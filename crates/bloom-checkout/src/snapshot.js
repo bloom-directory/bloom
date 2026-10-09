@@ -10,5 +10,5 @@
     options: e.tagName === 'SELECT' ? [...e.options].map(o => ({value: o.value, label: o.text})) : undefined
   }));
   // Values and child frames are deliberately absent from the shopping projection.
-  return {url: location.origin + location.pathname, elements};
+  return {url: location.href === 'about:blank' ? 'about:blank' : location.origin + location.pathname, elements};
 })()

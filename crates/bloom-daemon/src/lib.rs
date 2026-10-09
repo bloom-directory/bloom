@@ -4635,6 +4635,28 @@ impl Daemon {
                 ) as _,
             );
 
+        if let Some(checkout) = &config.checkout {
+            let client = bloom_machine_client::checkout::CheckoutClient::new(
+                checkout.socket.clone(),
+                checkout.uid,
+            );
+            vfs_builder = vfs_builder
+                .mount(
+                    "cards",
+                    Arc::new(bloom_vfs::handlers::CardsHandler::new(
+                        broker.clone(),
+                        home.cache_dir().join("card-operations"),
+                    )) as _,
+                )
+                .mount(
+                    "checkout",
+                    Arc::new(bloom_vfs::handlers::CheckoutHandler::new(
+                        client,
+                        home.cache_dir().join("checkout-operations"),
+                    )) as _,
+                );
+        }
+
         vfs_builder = vfs_builder
             .mount("wallets", wallets_handler.clone() as _)
             .mount("tools", Arc::new(ToolsHandler::new()) as _)

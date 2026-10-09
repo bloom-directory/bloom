@@ -1,5 +1,5 @@
 use crate::{
-    browser::{BrowseRequest, Browser, PrivateTab},
+    browser::{Browser, PrivateTab},
     discovery::Discovery,
     hpke::Recipient,
 };
@@ -23,34 +23,7 @@ use tokio::{
     sync::Mutex as AsyncMutex,
 };
 
-#[derive(Deserialize, Serialize)]
-#[serde(tag = "method", rename_all = "snake_case", deny_unknown_fields)]
-pub enum Request {
-    Browse {
-        request: BrowseRequest,
-    },
-    Checkout {
-        operation_id: String,
-        card_id: String,
-        agent_description: String,
-    },
-    Status {
-        operation_id: String,
-    },
-    Cancel {
-        operation_id: String,
-    },
-}
-
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct Status {
-    pub operation_id: String,
-    pub state: String,
-    pub ceremony_url: Option<String>,
-    pub filled_fields: Vec<String>,
-    pub outcome: Option<Value>,
-}
+pub use bloom_checkout_api::{Request, Status};
 
 struct Store(Mutex<Connection>);
 impl Store {
@@ -134,12 +107,22 @@ struct PrivateCheckout {
     capability: String,
     claimed: bool,
     approved: bool,
+    view_target: String,
+    view_session: String,
+    seen_pages: std::collections::HashSet<String>,
+}
+
+struct CompletedView {
+    capability: String,
+    claimed: bool,
+    status: Status,
 }
 
 pub struct CheckoutService {
     pub browser: Arc<Browser>,
     store: Store,
     private: AsyncMutex<Option<PrivateCheckout>>,
+    completed: Mutex<Option<CompletedView>>,
     broker_socket: PathBuf,
     broker_uid: u32,
     pub view_port: u16,
@@ -177,6 +160,7 @@ impl CheckoutService {
             browser,
             store: Store::open(state)?,
             private: AsyncMutex::new(None),
+            completed: Mutex::new(None),
             broker_socket,
             broker_uid,
             view_port,
@@ -267,6 +251,9 @@ impl CheckoutService {
                         self.store.update(&status)?;
                         *private = Some(PrivateCheckout {
                             operation_id: operation_id.clone(),
+                            view_target: tab.target.clone(),
+                            view_session: tab.session.clone(),
+                            seen_pages: std::collections::HashSet::from([tab.target.clone()]),
                             tab,
                             discovery,
                             recipient,
@@ -334,15 +321,15 @@ impl CheckoutService {
             let Some(checkout) = private.as_mut().filter(|p| p.operation_id == operation_id) else {
                 return;
             };
-            match self
+            if let Ok(IntakeResponse::Result {
+                status,
+                receipt,
+                output_aad,
+            }) = self
                 .intake(json!({"method":"result","operation_id":operation_id}))
                 .await
             {
-                Ok(IntakeResponse::Result {
-                    status,
-                    receipt,
-                    output_aad,
-                }) => match status.state {
+                match status.state {
                     CardOperationState::Succeeded => {
                         checkout.approved = true;
                         let result = self.consume_and_fill(checkout, receipt, output_aad).await;
@@ -364,8 +351,7 @@ impl CheckoutService {
                         return;
                     }
                     _ => {}
-                },
-                _ => {}
+                }
             }
             if tokio::time::Instant::now() >= deadline {
                 self.set_state(&operation_id, "expired");
@@ -455,6 +441,8 @@ pub enum ViewAction {
     Click { x: f64, y: f64 },
     Type { text: String },
     Key { key: String },
+    Scroll { x: f64, y: f64, delta_y: f64 },
+    SelectPage { target: String },
     Finish,
 }
 
@@ -476,6 +464,97 @@ fn same_token(expected: &str, received: &str) -> bool {
 }
 
 impl CheckoutService {
+    fn retain_completed(&self, checkout: &PrivateCheckout, status: Status) {
+        *self.completed.lock() = Some(CompletedView {
+            capability: checkout.capability.clone(),
+            claimed: checkout.claimed,
+            status,
+        });
+    }
+
+    // Only pages descended from the held checkout belong to the private view.
+    // A bank may open a popup; never switch to unrelated browser targets.
+    async fn private_pages(checkout: &mut PrivateCheckout) -> Result<Vec<Value>> {
+        let targets = checkout
+            .tab
+            .cdp
+            .call(None, "Target.getTargets", json!({}))
+            .await?;
+        let infos = targets["targetInfos"]
+            .as_array()
+            .context("Missing private pages")?;
+        let mut owned = std::collections::HashSet::from([checkout.tab.target.clone()]);
+        loop {
+            let count = owned.len();
+            for info in infos {
+                if info["type"] == "page"
+                    && info["openerId"].as_str().is_some_and(|p| owned.contains(p))
+                {
+                    if let Some(id) = info["targetId"].as_str() {
+                        owned.insert(id.to_owned());
+                    }
+                }
+            }
+            if owned.len() == count {
+                break;
+            }
+        }
+        let mut pages = Vec::new();
+        let mut selected = None;
+        for info in infos {
+            let Some(id) = info["targetId"].as_str().filter(|id| owned.contains(*id)) else {
+                continue;
+            };
+            let origin = url::Url::parse(info["url"].as_str().unwrap_or(""))
+                .ok()
+                .map(|u| u.origin().ascii_serialization())
+                .unwrap_or_else(|| "Loading".into());
+            pages.push(json!({"target":id,"origin":origin}));
+            if checkout.seen_pages.insert(id.to_owned()) {
+                selected = Some(id.to_owned());
+            }
+        }
+        if !pages.iter().any(|p| p["target"] == checkout.view_target) {
+            selected = Some(checkout.tab.target.clone());
+        }
+        if let Some(target) = selected {
+            Self::select_private_page(checkout, target).await?;
+        }
+        Ok(pages)
+    }
+
+    async fn select_private_page(checkout: &mut PrivateCheckout, target: String) -> Result<()> {
+        let session = if target == checkout.tab.target {
+            checkout.tab.session.clone()
+        } else {
+            let attachment = checkout
+                .tab
+                .cdp
+                .call(
+                    None,
+                    "Target.attachToTarget",
+                    json!({"targetId":target,"flatten":true}),
+                )
+                .await?;
+            attachment["sessionId"]
+                .as_str()
+                .context("Private page closed")?
+                .to_owned()
+        };
+        checkout
+            .tab
+            .cdp
+            .call(
+                Some(&session),
+                "Emulation.setDeviceMetricsOverride",
+                json!({"width":1280,"height":900,"deviceScaleFactor":1,"mobile":false}),
+            )
+            .await?;
+        checkout.view_target = target;
+        checkout.view_session = session;
+        Ok(())
+    }
+
     async fn watch_outcome(&self, id: String) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
         loop {
@@ -488,19 +567,26 @@ impl CheckoutService {
                 return;
             };
             if status.state == "submitted" || status.state == "manual_required" {
-                if let Ok(outcome) = checkout
+                let contexts = checkout
                     .tab
                     .cdp
-                    .evaluate(&checkout.tab.session, include_str!("outcome.js").into())
+                    .contexts(&checkout.tab.session, "bloom-outcome")
                     .await
-                {
+                    .unwrap_or_default();
+                for context in contexts {
+                    let result=checkout.tab.cdp.call(Some(&context.session),"Runtime.evaluate",json!({"contextId":context.world,"expression":include_str!("outcome.js"),"returnByValue":true})).await;
+                    let Ok(result) = result else {
+                        continue;
+                    };
+                    let outcome = result["result"]["value"].clone();
                     if matches!(outcome["state"].as_str(), Some("paid" | "declined")) {
                         status.state = outcome["state"].as_str().unwrap().into();
-                        status.outcome = Some(outcome);
+                        status.outcome = serde_json::from_value(outcome).ok();
                         status.ceremony_url = None;
                         if self.store.update(&status).is_ok()
                             && self.browser.return_control().await.is_ok()
                         {
+                            self.retain_completed(checkout, status);
                             *private = None;
                         }
                         return;
@@ -510,6 +596,9 @@ impl CheckoutService {
             if tokio::time::Instant::now() >= deadline {
                 self.set_state(&id, "uncertain");
                 if self.browser.return_control().await.is_ok() {
+                    if let Ok(status) = self.store.get(&id) {
+                        self.retain_completed(checkout, status);
+                    }
                     *private = None;
                 }
                 return;
@@ -521,7 +610,15 @@ impl CheckoutService {
         for _ in 0..20 {
             {
                 let mut private = self.private.lock().await;
-                let checkout = private.as_mut().context("No private checkout")?;
+                let Some(checkout) = private.as_mut() else {
+                    let mut completed = self.completed.lock();
+                    let completed = completed.as_mut().context("No private checkout")?;
+                    if !same_token(&completed.capability, token) || completed.claimed {
+                        bail!("Private view capability rejected");
+                    }
+                    completed.claimed = true;
+                    return Ok(());
+                };
                 if !same_token(&checkout.capability, token) || checkout.claimed {
                     bail!("Private view capability rejected");
                 }
@@ -536,11 +633,23 @@ impl CheckoutService {
     }
 
     pub async fn private_state(&self, token: &str) -> Result<Value> {
-        let private = self.private.lock().await;
-        let checkout = private.as_ref().context("No active private checkout")?;
+        let mut private = self.private.lock().await;
+        let Some(checkout) = private.as_mut() else {
+            let completed = self.completed.lock();
+            let completed = completed
+                .as_ref()
+                .filter(|c| c.claimed && same_token(&c.capability, token))
+                .context("Private view rejected")?;
+            return Ok(
+                json!({"state":completed.status.state,"outcome":completed.status.outcome,"closed":true,"pages":[]}),
+            );
+        };
         authorize_view(checkout, token)?;
+        let pages = Self::private_pages(checkout).await?;
         let status = self.store.get(&checkout.operation_id)?;
-        Ok(json!({"state":status.state,"outcome":status.outcome}))
+        Ok(
+            json!({"state":status.state,"outcome":status.outcome,"pages":pages,"selected_page":checkout.view_target,"closed":false}),
+        )
     }
 
     pub async fn private_screenshot(&self, token: &str) -> Result<Vec<u8>> {
@@ -551,7 +660,7 @@ impl CheckoutService {
             .tab
             .cdp
             .call(
-                Some(&checkout.tab.session),
+                Some(&checkout.view_session),
                 "Page.captureScreenshot",
                 json!({"format":"png","captureBeyondViewport":false}),
             )
@@ -566,14 +675,14 @@ impl CheckoutService {
 
     pub async fn private_action(&self, token: &str, action: ViewAction) -> Result<()> {
         let mut private = self.private.lock().await;
-        let checkout = private.as_ref().context("No active private checkout")?;
+        let checkout = private.as_mut().context("No active private checkout")?;
         authorize_view(checkout, token)?;
         match action {
             ViewAction::Click { x, y } => {
                 if !x.is_finite()
                     || !y.is_finite()
-                    || !(0.0..=10000.0).contains(&x)
-                    || !(0.0..=10000.0).contains(&y)
+                    || !(0.0..=1280.0).contains(&x)
+                    || !(0.0..=900.0).contains(&y)
                 {
                     bail!("Invalid private pointer");
                 }
@@ -582,7 +691,7 @@ impl CheckoutService {
                         .tab
                         .cdp
                         .call(
-                            Some(&checkout.tab.session),
+                            Some(&checkout.view_session),
                             "Input.dispatchMouseEvent",
                             json!({"type":kind,"x":x,"y":y,"button":"left","clickCount":1}),
                         )
@@ -598,7 +707,7 @@ impl CheckoutService {
                     .tab
                     .cdp
                     .call(
-                        Some(&checkout.tab.session),
+                        Some(&checkout.view_session),
                         "Input.insertText",
                         json!({"text":text.as_str()}),
                     )
@@ -616,16 +725,44 @@ impl CheckoutService {
                         .tab
                         .cdp
                         .call(
-                            Some(&checkout.tab.session),
+                            Some(&checkout.view_session),
                             "Input.dispatchKeyEvent",
                             json!({"type":kind,"key":key}),
                         )
                         .await?;
                 }
             }
+            ViewAction::Scroll { x, y, delta_y } => {
+                if !x.is_finite()
+                    || !y.is_finite()
+                    || !delta_y.is_finite()
+                    || !(0.0..=1280.0).contains(&x)
+                    || !(0.0..=900.0).contains(&y)
+                    || delta_y.abs() > 3000.0
+                {
+                    bail!("Invalid private scroll");
+                }
+                checkout
+                    .tab
+                    .cdp
+                    .call(
+                        Some(&checkout.view_session),
+                        "Input.dispatchMouseEvent",
+                        json!({"type":"mouseWheel","x":x,"y":y,"deltaX":0,"deltaY":delta_y}),
+                    )
+                    .await?;
+            }
+            ViewAction::SelectPage { target } => {
+                let pages = Self::private_pages(checkout).await?;
+                if !pages.iter().any(|p| p["target"] == target) {
+                    bail!("Unknown private page");
+                }
+                Self::select_private_page(checkout, target).await?;
+            }
             ViewAction::Finish => {
                 self.set_state(&checkout.operation_id, "uncertain");
                 self.browser.return_control().await?;
+                self.retain_completed(checkout, self.store.get(&checkout.operation_id)?);
                 *private = None;
             }
         }

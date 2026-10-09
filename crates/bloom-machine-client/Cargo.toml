@@ -8,6 +8,7 @@ license.workspace = true
 triad-dev-harness = ["bloom-triad-local-transport/triad-dev-harness"]
 
 [dependencies]
+bloom-checkout-api.workspace = true
 async-trait.workspace = true
 bloom-audit-checkpoint.workspace = true
 bloom-triad-local-transport.workspace = true

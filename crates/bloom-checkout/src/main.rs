@@ -29,6 +29,14 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Checkout and its Chromium children must not write card-bearing core dumps.
+    let core_limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &core_limit) } != 0 {
+        anyhow::bail!("Cannot disable checkout core dumps");
+    }
     let args = Args::parse();
     let browser = Browser::launch(&args.chromium, &args.profile, &[]).await?;
     let service = CheckoutService::new(

@@ -1,6 +1,5 @@
 use crate::cdp::Cdp;
 use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     os::unix::fs::{MetadataExt, PermissionsExt},
@@ -12,21 +11,19 @@ use std::{
 };
 use tokio::sync::Mutex;
 
-#[derive(Deserialize, Serialize)]
-#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
-pub enum BrowseRequest {
-    Open { url: String },
-    Snapshot,
-    Click { element_ref: String },
-    Type { element_ref: String, text: String },
-    Select { element_ref: String, value: String },
-    Back,
+pub use bloom_checkout_api::BrowseRequest;
+
+#[derive(Clone)]
+struct ElementRef {
+    session: String,
+    world: i64,
+    index: usize,
 }
 
 struct Tab {
     target: String,
     session: String,
-    world: Option<i64>,
+    refs: Vec<ElementRef>,
     generation: u64,
 }
 
@@ -101,76 +98,65 @@ impl Browser {
                 self.cdp
                     .call(Some(&tab.session), "Page.navigate", json!({"url":url}))
                     .await?;
-                tab.world = None;
+                tab.refs.clear();
                 tab.generation += 1;
                 Ok(json!({"state":"opened"}))
             }
             BrowseRequest::Snapshot => {
-                let world = world(&self.cdp, &mut tab).await?;
                 tab.generation += 1;
-                let result=self.cdp.call(Some(&tab.session),"Runtime.evaluate",json!({
-                    "contextId":world,"returnByValue":true,"expression":include_str!("snapshot.js")
-                })).await?;
-                if result.get("exceptionDetails").is_some() {
-                    bail!("Shopping document changed; request a new snapshot");
-                }
-                let mut snapshot = result["result"]["value"].clone();
-                let tree = self
-                    .cdp
-                    .call(Some(&tab.session), "Accessibility.getFullAXTree", json!({}))
-                    .await?;
-                let nodes = tree["nodes"]
-                    .as_array()
-                    .context("Missing accessibility tree")?;
-                let mut hidden = std::collections::HashSet::new();
-                let mut queue = nodes
-                    .iter()
-                    .filter(|n| {
-                        matches!(
-                            n["role"]["value"].as_str(),
-                            Some("textbox" | "searchbox" | "Iframe" | "IframePresentational")
+                tab.refs.clear();
+                let contexts = self.cdp.contexts(&tab.session, "bloom-shopping").await?;
+                let mut elements = Vec::new();
+                let mut text = String::new();
+                let mut url = String::new();
+                for (position, frame) in contexts.into_iter().enumerate() {
+                    let parsed = url::Url::parse(&frame.url)?;
+                    if !matches!(parsed.scheme(), "http" | "https") && frame.url != "about:blank" {
+                        bail!("Only ordinary shopping documents can be observed");
+                    }
+                    let result=self.cdp.call(Some(&frame.session),"Runtime.evaluate",json!({
+                        "contextId":frame.world,"returnByValue":true,"expression":include_str!("snapshot.js")
+                    })).await?;
+                    if result.get("exceptionDetails").is_some() {
+                        bail!("Shopping document changed; request a new snapshot");
+                    }
+                    let snapshot = &result["result"]["value"];
+                    if position == 0 {
+                        url = snapshot["url"].as_str().unwrap_or("").into();
+                    }
+                    let tree = self
+                        .cdp
+                        .call(
+                            Some(&frame.session),
+                            "Accessibility.getFullAXTree",
+                            json!({"frameId":frame.frame_id}),
                         )
-                    })
-                    .filter_map(|n| n["nodeId"].as_str().map(str::to_owned))
-                    .collect::<Vec<_>>();
-                while let Some(id) = queue.pop() {
-                    if !hidden.insert(id.clone()) {
-                        continue;
-                    }
-                    if let Some(node) = nodes.iter().find(|n| n["nodeId"] == id) {
-                        if let Some(children) = node["childIds"].as_array() {
-                            queue.extend(
-                                children
-                                    .iter()
-                                    .filter_map(|v| v.as_str().map(str::to_owned)),
-                            );
+                        .await?;
+                    text.push_str(&accessibility_text(&tree)?);
+                    text.push('\n');
+                    for (index, element) in snapshot["elements"]
+                        .as_array()
+                        .context("Missing shopping elements")?
+                        .iter()
+                        .enumerate()
+                    {
+                        if elements.len() >= 300 {
+                            break;
                         }
+                        let mut element = element.clone();
+                        element["ref"] = json!(format!("{}:{}", tab.generation, tab.refs.len()));
+                        element["frame_origin"] = json!(parsed.origin().ascii_serialization());
+                        tab.refs.push(ElementRef {
+                            session: frame.session.clone(),
+                            world: frame.world,
+                            index,
+                        });
+                        elements.push(element);
                     }
                 }
-                let text = nodes
-                    .iter()
-                    .filter(|n| n["ignored"] != true)
-                    .filter(|n| !hidden.contains(n["nodeId"].as_str().unwrap_or("")))
-                    .filter_map(|n| {
-                        let role = n["role"]["value"].as_str()?;
-                        let name = n["name"]["value"].as_str()?;
-                        if name.is_empty()
-                            || matches!(role, "textbox" | "Iframe" | "IframePresentational")
-                        {
-                            None
-                        } else {
-                            Some(format!("{role}: {name}"))
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                snapshot["text"] = json!(text.chars().take(30000).collect::<String>());
-                if let Some(elements) = snapshot["elements"].as_array_mut() {
-                    for (index, element) in elements.iter_mut().enumerate() {
-                        element["ref"] = json!(format!("{}:{}", tab.generation, index));
-                    }
-                }
-                Ok(snapshot)
+                Ok(
+                    json!({"url":url,"text":text.chars().take(30000).collect::<String>(),"elements":elements}),
+                )
             }
             BrowseRequest::Back => {
                 let history = self
@@ -187,7 +173,7 @@ impl Browser {
                         )
                         .await?;
                 }
-                tab.world = None;
+                tab.refs.clear();
                 tab.generation += 1;
                 Ok(json!({"state":"navigated"}))
             }
@@ -214,14 +200,21 @@ impl Browser {
         if value.len() > 8192 {
             bail!("Input exceeds limit");
         }
-        let world = tab
-            .world
-            .context("Stale element reference; request a new snapshot")?;
+        let binding = tab
+            .refs
+            .get(index)
+            .context("Stale element reference; request a new snapshot")?
+            .clone();
+        let index = binding.index;
+        let world = binding.world;
         let expression = format!(
             r#"(()=>{{const e=globalThis.__bloomRefs?.[{index}];
             if(!e||!e.isConnected||e.disabled||!e.getClientRects().length)throw Error('stale');
             const kind={kind},value={value};
+            const label=(e.innerText||e.value||e.getAttribute('aria-label')||'').trim();
+            if(kind==='click' && /^(pay|place order|complete purchase|submit payment|pagar)\b/i.test(label))throw Error('payment requires approval');
             if(kind==='click')e.click();else{{
+                if((e.autocomplete||'').split(' ').some(s=>s.startsWith('cc-')))throw Error('private payment input');
                 if(kind==='select'&&e.tagName!=='SELECT')throw Error('wrong field');
                 if(kind==='type'&&!['INPUT','TEXTAREA'].includes(e.tagName))throw Error('wrong field');
                 const p=e.tagName==='TEXTAREA'?HTMLTextAreaElement.prototype:e.tagName==='SELECT'?HTMLSelectElement.prototype:HTMLInputElement.prototype;
@@ -234,7 +227,7 @@ impl Browser {
         let response = self
             .cdp
             .call(
-                Some(&tab.session),
+                Some(&binding.session),
                 "Runtime.evaluate",
                 json!({"contextId":world,"expression":expression,"returnByValue":true}),
             )
@@ -259,7 +252,7 @@ impl Browser {
             bail!("Checkout is already private");
         }
         let mut tab = self.tab.lock().await; // Drain the one in-flight command.
-        tab.world = None;
+        tab.refs.clear();
         tab.generation += 1;
         Ok(PrivateTab {
             cdp: self.cdp.clone(),
@@ -312,38 +305,67 @@ async fn new_tab(cdp: &Cdp, generation: u64) -> Result<Tab> {
         .context("Missing browser session")?
         .to_owned();
     cdp.call(Some(&session), "Page.enable", json!({})).await?;
+    cdp.call(
+        Some(&session),
+        "Emulation.setDeviceMetricsOverride",
+        json!({"width":1280,"height":900,"deviceScaleFactor":1,"mobile":false}),
+    )
+    .await?;
     cdp.call(Some(&session), "Runtime.enable", json!({}))
         .await?;
     Ok(Tab {
         target,
         session,
-        world: None,
+        refs: Vec::new(),
         generation,
     })
 }
 
-async fn world(cdp: &Cdp, tab: &mut Tab) -> Result<i64> {
-    if let Some(world) = tab.world {
-        return Ok(world);
+fn accessibility_text(tree: &Value) -> Result<String> {
+    let nodes = tree["nodes"]
+        .as_array()
+        .context("Missing accessibility tree")?;
+    let mut hidden = std::collections::HashSet::new();
+    let mut queue = nodes
+        .iter()
+        .filter(|n| {
+            matches!(
+                n["role"]["value"].as_str(),
+                Some("textbox" | "searchbox" | "Iframe" | "IframePresentational")
+            )
+        })
+        .filter_map(|n| n["nodeId"].as_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+    while let Some(id) = queue.pop() {
+        if !hidden.insert(id.clone()) {
+            continue;
+        }
+        if let Some(node) = nodes.iter().find(|n| n["nodeId"] == id) {
+            if let Some(children) = node["childIds"].as_array() {
+                queue.extend(
+                    children
+                        .iter()
+                        .filter_map(|v| v.as_str().map(str::to_owned)),
+                );
+            }
+        }
     }
-    let tree = cdp
-        .call(Some(&tab.session), "Page.getFrameTree", json!({}))
-        .await?;
-    let frame = &tree["frameTree"]["frame"]["id"];
-    let result = cdp
-        .call(
-            Some(&tab.session),
-            "Page.createIsolatedWorld",
-            json!({
-                "frameId":frame,"worldName":"bloom-shopping","grantUniveralAccess":false
-            }),
-        )
-        .await?;
-    let world = result["executionContextId"]
-        .as_i64()
-        .context("Missing shopping context")?;
-    tab.world = Some(world);
-    Ok(world)
+    let text = nodes
+        .iter()
+        .filter(|n| n["ignored"] != true)
+        .filter(|n| !hidden.contains(n["nodeId"].as_str().unwrap_or("")))
+        .filter_map(|n| {
+            let role = n["role"]["value"].as_str()?;
+            let name = n["name"]["value"].as_str()?;
+            if name.is_empty() || matches!(role, "textbox" | "Iframe" | "IframePresentational") {
+                None
+            } else {
+                Some(format!("{role}: {name}"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok(text)
 }
 
 #[cfg(test)]

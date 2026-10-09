@@ -76,6 +76,16 @@ pub struct Config {
     /// explicit `[mcp] enabled = true`.
     #[serde(default)]
     pub mcp: McpConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkout: Option<CheckoutConfig>,
+}
+
+/// A separate checkout principal. Its browser and private view never run in Machine.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckoutConfig {
+    pub socket: std::path::PathBuf,
+    pub uid: u32,
 }
 
 /// Gate for the `bloom mcp serve` stdio proxy.
@@ -445,6 +455,7 @@ impl Config {
             private_rpc: BTreeMap::new(),
             backends: BackendsConfig::default(),
             mcp: McpConfig::default(),
+            checkout: None,
         }
     }
 

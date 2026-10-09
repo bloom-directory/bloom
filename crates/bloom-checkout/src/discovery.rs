@@ -30,6 +30,7 @@ pub(crate) struct Discovery {
     pub facts: CheckoutFacts,
     pub frames: Vec<Frame>,
     pub main_world: i64,
+    pub facts_session: String,
 }
 
 async fn evaluate(
@@ -54,94 +55,29 @@ async fn evaluate(
     Ok(response["result"]["value"].clone())
 }
 
-fn flatten_frames(tree: &Value, frames: &mut Vec<(String, String)>) {
-    if let (Some(id), Some(url)) = (tree["frame"]["id"].as_str(), tree["frame"]["url"].as_str()) {
-        frames.push((id.to_owned(), url.to_owned()));
-    }
-    if let Some(children) = tree["childFrames"].as_array() {
-        for child in children {
-            flatten_frames(child, frames);
-        }
-    }
-}
-
 impl Discovery {
     pub async fn read(tab: &PrivateTab) -> Result<Self> {
-        let tree = tab
-            .cdp
-            .call(Some(&tab.session), "Page.getFrameTree", json!({}))
-            .await?;
-        let targets = tab.cdp.call(None, "Target.getTargets", json!({})).await?;
-        let mut frame_ids = Vec::new();
-        flatten_frames(&tree["frameTree"], &mut frame_ids);
-        // Chromium omits out-of-process child frames from the parent's tree.
-        // Include only targets whose parent chain belongs to this checkout tab.
-        let infos = targets["targetInfos"]
-            .as_array()
-            .context("Missing browser targets")?;
-        loop {
-            let before = frame_ids.len();
-            for target in infos {
-                let Some(id) = target["targetId"].as_str() else {
-                    continue;
-                };
-                let Some(parent) = target["parentId"].as_str() else {
-                    continue;
-                };
-                if target["type"] == "iframe"
-                    && !frame_ids.iter().any(|(known, _)| known == id)
-                    && frame_ids.iter().any(|(known, _)| known == parent)
-                {
-                    frame_ids.push((id.into(), target["url"].as_str().unwrap_or("").into()));
-                }
-            }
-            if before == frame_ids.len() {
-                break;
-            }
-        }
+        let contexts = tab.cdp.contexts(&tab.session, "bloom-payment").await?;
         let mut frames = Vec::new();
-        let mut main_world = None;
-        let mut main_facts = Value::Null;
-        for (position, (id, url)) in frame_ids.into_iter().enumerate() {
+        let mut candidates = Vec::new();
+        let mut top_origin = None;
+        for (position, context) in contexts.into_iter().enumerate() {
+            let url = context.url;
             let origin = url::Url::parse(&url)?.origin().ascii_serialization();
-            let remote = targets["targetInfos"]
-                .as_array()
-                .context("Missing browser targets")?
-                .iter()
-                .find(|t| t["targetId"] == id && t["type"] == "iframe");
-            let session = if remote.is_some() {
-                let result = tab
-                    .cdp
-                    .call(
-                        None,
-                        "Target.attachToTarget",
-                        json!({"targetId":id,"flatten":true}),
-                    )
-                    .await?;
-                result["sessionId"]
-                    .as_str()
-                    .context("Missing iframe session")?
-                    .to_owned()
-            } else {
-                tab.session.clone()
-            };
-            let isolated = tab
-                .cdp
-                .call(
-                    Some(&session),
-                    "Page.createIsolatedWorld",
-                    json!({
-                        "frameId":id,"worldName":"bloom-payment","grantUniveralAccess":false
-                    }),
-                )
-                .await?;
-            let world = isolated["executionContextId"]
-                .as_i64()
-                .context("Missing payment context")?;
+            let session = context.session;
+            let world = context.world;
             if position == 0 {
-                main_world = Some(world);
-                main_facts =
+                top_origin = Some(origin.clone());
+            }
+            if position == 0
+                || (origin == "https://js.stripe.com"
+                    && url::Url::parse(&url)?.path() == "/v3/embedded-checkout-inner.html")
+            {
+                let candidate =
                     evaluate(tab, &session, world, include_str!("facts.js").into()).await?;
+                if let Ok(facts) = serde_json::from_value::<CheckoutFacts>(candidate) {
+                    candidates.push((session.clone(), world, facts));
+                }
             }
             let fields = evaluate(tab, &session, world, include_str!("fields.js").into()).await?;
             let fields: Vec<Field> =
@@ -155,8 +91,11 @@ impl Discovery {
                 });
             }
         }
-        let mut facts: CheckoutFacts =
-            serde_json::from_value(main_facts).context("Payment facts require human review")?;
+        if candidates.len() != 1 {
+            bail!("Payment facts require human review");
+        }
+        let (facts_session, main_world, mut facts) = candidates.remove(0);
+        facts.origin = top_origin.context("Missing merchant origin")?;
         facts.payment_frame_origins = frames.iter().map(|f| f.origin.clone()).collect();
         facts.payment_frame_origins.sort();
         facts.payment_frame_origins.dedup();
@@ -181,7 +120,8 @@ impl Discovery {
         Ok(Self {
             facts,
             frames,
-            main_world: main_world.context("Missing payment document")?,
+            main_world,
+            facts_session,
         })
     }
 
@@ -199,13 +139,14 @@ impl Discovery {
         let mut current: CheckoutFacts = serde_json::from_value(
             evaluate(
                 tab,
-                &tab.session,
+                &self.facts_session,
                 self.main_world,
                 include_str!("facts.js").into(),
             )
             .await?,
         )
         .context("Payment facts changed")?;
+        current.origin = self.facts.origin.clone();
         current.payment_frame_origins = self.frames.iter().map(|f| f.origin.clone()).collect();
         current.payment_frame_origins.sort();
         current.payment_frame_origins.dedup();
@@ -234,9 +175,9 @@ impl Discovery {
         card: &CardInput,
         filled: &mut Vec<String>,
     ) -> Result<()> {
+        self.recheck(tab).await?;
         for frame in &self.frames {
             for field in &frame.fields {
-                self.recheck(tab).await?;
                 let value = zeroize::Zeroizing::new(match field.kind.as_str() {
                     "number" => card.number.clone(),
                     "cvc" => card.cvc.clone(),
@@ -246,14 +187,22 @@ impl Discovery {
                     "year" => card.expiry_year.to_string(),
                     _ => bail!("Unknown payment field"),
                 });
-                evaluate(tab,&frame.session,frame.world,format!("(()=>{{if(!__bloomPaymentValid())throw Error('changed');const e=__bloomPaymentNodes[{}];e.focus();e.select();return true}})()",field.index)).await?;
-                tab.cdp
-                    .call(
-                        Some(&frame.session),
-                        "Input.insertText",
-                        json!({"text":value.as_str()}),
-                    )
-                    .await?;
+                // One renderer call binds the insertion to the approved document.
+                // A focus-driven navigation cannot redirect a later Input.insertText.
+                let expression = zeroize::Zeroizing::new(format!(
+                    r#"(()=>{{
+                    if(location.origin!=={origin}||!__bloomPaymentValid())throw Error('changed');
+                    const e=__bloomPaymentNodes[{index}],value={value};
+                    e.focus();if(!e.isConnected||!__bloomPaymentValid())throw Error('changed');
+                    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(e,value);
+                    e.dispatchEvent(new Event('input',{{bubbles:true}}));
+                    e.dispatchEvent(new Event('change',{{bubbles:true}}));return true;
+                }})()"#,
+                    origin = serde_json::to_string(&frame.origin)?,
+                    index = field.index,
+                    value = serde_json::to_string(value.as_str())?
+                ));
+                evaluate(tab, &frame.session, frame.world, expression.to_string()).await?;
                 filled.push(field.kind.clone());
             }
         }
@@ -264,7 +213,7 @@ impl Discovery {
         self.recheck(tab).await?;
         let response = evaluate(
             tab,
-            &tab.session,
+            &self.facts_session,
             self.main_world,
             include_str!("submit.js").into(),
         )
@@ -344,6 +293,32 @@ mod tests {
             name: "Synthetic Card".into(),
             cvc: "937".into(),
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "real Stripe public test checkout; requires network"]
+    async fn stripe_public_demo_reads_real_fields_and_processor_facts() {
+        let browser = browser().await;
+        browser
+            .browse(BrowseRequest::Open {
+                url: "https://checkout.stripe.dev/checkout".into(),
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(12)).await;
+        let tab = browser.handoff().await.unwrap();
+        let discovery = Discovery::read(&tab).await.unwrap();
+        assert_eq!(discovery.facts.currency, "USD");
+        assert!(discovery.facts.total_minor > 0);
+        assert_eq!(discovery.facts.origin, "https://checkout.stripe.dev");
+        assert!(
+            discovery
+                .frames
+                .iter()
+                .any(|f| f.origin == "https://js.stripe.com")
+        );
+        discovery.recheck(&tab).await.unwrap();
+        browser.return_control().await.unwrap();
     }
 
     #[tokio::test]

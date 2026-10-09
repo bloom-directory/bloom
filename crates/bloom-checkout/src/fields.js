@@ -13,8 +13,14 @@
     return null;
   };
   const candidates = () => [...document.querySelectorAll('input')].filter(e => kind(e));
-  const visible = e => e.getClientRects().length && getComputedStyle(e).visibility === 'visible'
-    && !e.disabled && !e.readOnly && e.type !== 'hidden';
+  const visible = e => {
+    if (!e.getClientRects().length || e.disabled || e.readOnly || e.type === 'hidden') return false;
+    for (let node=e;node;node=node.parentElement) {
+      const style=getComputedStyle(node);
+      if (style.visibility !== 'visible' || style.display === 'none' || Number(style.opacity) === 0) return false;
+    }
+    return true;
+  };
   const nodes = candidates();
   if (nodes.some(e => !visible(e))) return null;
   const bindings = nodes.map(e => ({kind:kind(e),type:e.type,autocomplete:e.autocomplete,name:e.name,id:e.id}));

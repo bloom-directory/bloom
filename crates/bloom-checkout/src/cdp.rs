@@ -19,6 +19,26 @@ use tokio::sync::oneshot;
 
 type Replies = Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>;
 
+pub(crate) struct FrameContext {
+    pub session: String,
+    pub world: i64,
+    pub frame_id: String,
+    pub url: String,
+}
+
+fn tree_frames(tree: &Value, session: &str, frames: &mut Vec<(String, String, String)>) {
+    if let (Some(id), Some(url)) = (tree["frame"]["id"].as_str(), tree["frame"]["url"].as_str()) {
+        if !frames.iter().any(|(known, _, _)| known == id) {
+            frames.push((id.into(), url.into(), session.into()));
+        }
+    }
+    if let Some(children) = tree["childFrames"].as_array() {
+        for child in children {
+            tree_frames(child, session, frames);
+        }
+    }
+}
+
 /// Chrome's debugging channel is inherited pipe descriptors, never a TCP port.
 pub(crate) struct Cdp {
     child: Mutex<Child>,
@@ -52,6 +72,96 @@ fn child_fd(fd: &OwnedFd) -> Result<OwnedFd> {
 }
 
 impl Cdp {
+    /// Include only frames belonging to this tab, including Chromium's OOPIFs.
+    pub async fn contexts(
+        &self,
+        root_session: &str,
+        world_name: &str,
+    ) -> Result<Vec<FrameContext>> {
+        let tree = self
+            .call(Some(root_session), "Page.getFrameTree", json!({}))
+            .await?;
+        let targets = self.call(None, "Target.getTargets", json!({})).await?;
+        let infos = targets["targetInfos"]
+            .as_array()
+            .context("Missing browser targets")?;
+        let mut frames = Vec::new();
+        tree_frames(&tree["frameTree"], root_session, &mut frames);
+        let mut attached = std::collections::HashSet::new();
+        loop {
+            let before = attached.len();
+            for target in infos {
+                let Some(id) = target["targetId"].as_str() else {
+                    continue;
+                };
+                let Some(parent) = target["parentId"].as_str() else {
+                    continue;
+                };
+                if target["type"] != "iframe"
+                    || attached.contains(id)
+                    || !frames.iter().any(|(known, _, _)| known == parent)
+                {
+                    continue;
+                }
+                let attachment = self
+                    .call(
+                        None,
+                        "Target.attachToTarget",
+                        json!({"targetId":id,"flatten":true}),
+                    )
+                    .await?;
+                let session = attachment["sessionId"]
+                    .as_str()
+                    .context("Missing iframe session")?;
+                if let Some(frame) = frames.iter_mut().find(|(known, _, _)| known == id) {
+                    frame.2 = session.into();
+                }
+                let tree = self
+                    .call(Some(session), "Page.getFrameTree", json!({}))
+                    .await?;
+                tree_frames(&tree["frameTree"], session, &mut frames);
+                attached.insert(id.to_owned());
+            }
+            if attached.len() == before {
+                break;
+            }
+        }
+        let mut contexts = Vec::new();
+        for (frame_id, url, session) in frames {
+            let isolated = self
+                .call(
+                    Some(&session),
+                    "Page.createIsolatedWorld",
+                    json!({
+                        "frameId":frame_id,"worldName":world_name,"grantUniveralAccess":false
+                    }),
+                )
+                .await?;
+            let world = isolated["executionContextId"]
+                .as_i64()
+                .context("Missing frame context")?;
+            // Frame-tree URLs may be empty while an OOPIF is already loaded.
+            // Read identity from this exact isolated document, never guess its URL.
+            let identity = self
+                .call(
+                    Some(&session),
+                    "Runtime.evaluate",
+                    json!({"contextId":world,"expression":"location.href","returnByValue":true}),
+                )
+                .await?;
+            let url = identity["result"]["value"]
+                .as_str()
+                .unwrap_or(&url)
+                .to_owned();
+            contexts.push(FrameContext {
+                session,
+                world,
+                frame_id,
+                url,
+            });
+        }
+        Ok(contexts)
+    }
     pub fn launch(executable: &Path, profile: &Path, test_flags: &[String]) -> Result<Arc<Self>> {
         let (command_read, command_write) = pipe()?;
         let (event_read, event_write) = pipe()?;
@@ -60,7 +170,8 @@ impl Cdp {
         let mut command = Command::new(executable);
         command.args(["--headless=new","--remote-debugging-pipe","--no-first-run",
             "--no-default-browser-check","--disable-sync","--disable-breakpad",
-            "--disable-crash-reporter","--disable-extensions",
+            "--disable-crash-reporter","--disable-extensions","--disable-component-extensions-with-background-pages",
+            "--force-device-scale-factor=1","--window-size=1280,900",
             "--disable-features=BackForwardCache,AutofillServerCommunication,AutofillEnableAccountWalletStorage",
             "--password-store=basic","--disable-save-password-bubble"])
             .arg(format!("--user-data-dir={}",profile.display()))
@@ -146,6 +257,7 @@ impl Cdp {
         Ok(value["result"].clone())
     }
 
+    #[cfg(test)]
     pub async fn evaluate(&self, session: &str, expression: String) -> Result<Value> {
         let result = self
             .call(
