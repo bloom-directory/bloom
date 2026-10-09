@@ -823,6 +823,173 @@ pub async fn serve_api(service: Arc<CheckoutService>, path: &Path, machine_uid: 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn private_view_requires_one_shot_claim_and_handles_bank_popup() {
+        use axum::{Router, response::Html, routing::get};
+        let fixture = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://127.0.0.1:{}", fixture.local_addr().unwrap().port());
+        let fixture_task = tokio::spawn(async move {
+            axum::serve(fixture,Router::new()
+            .route("/",get(||async {Html("<button onclick=\"window.open('/bank')\">Pay</button>")}))
+            .route("/bank",get(||async {Html("<h1>Test bank authentication</h1><input id='otp'><button>Complete</button>")}))).await.unwrap();
+        });
+        let root = tempfile::tempdir().unwrap().keep();
+        let browser = Browser::launch(
+            &crate::test_chromium(),
+            &root.join("profile"),
+            &["--no-sandbox".into()],
+        )
+        .await
+        .unwrap();
+        browser
+            .browse(crate::browser::BrowseRequest::Open { url: origin })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let tab = browser.handoff().await.unwrap();
+        let view_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = view_listener.local_addr().unwrap().port();
+        let service = CheckoutService::new(
+            browser.clone(),
+            &root.join("state.db"),
+            root.join("unused.sock"),
+            unsafe { libc::geteuid() },
+            port,
+        )
+        .unwrap();
+        let status = Status {
+            operation_id: "private-fixture".into(),
+            state: "manual_required".into(),
+            ceremony_url: None,
+            filled_fields: Vec::new(),
+            outcome: None,
+        };
+        service.store.insert(&status).unwrap();
+        let token = hex_token(&[42; 32]);
+        *service.private.lock().await = Some(PrivateCheckout {
+            operation_id: status.operation_id,
+            view_target: tab.target.clone(),
+            view_session: tab.session.clone(),
+            seen_pages: std::collections::HashSet::from([tab.target.clone()]),
+            tab,
+            discovery: None,
+            recipient: None,
+            capability: token.clone(),
+            claimed: false,
+            approved: false,
+        });
+        let router = crate::view::router(service.clone());
+        let viewer = tokio::spawn(async move {
+            axum::serve(view_listener, router).await.unwrap();
+        });
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let base = format!("http://localhost:{port}");
+        assert!(service.private_claim(&hex_token(&[43; 32])).await.is_err());
+        assert!(service.private_state(&token).await.is_err());
+        service.private.lock().await.as_mut().unwrap().approved = true;
+        let claim = client
+            .get(format!("{base}/private?token={token}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(claim.status(), reqwest::StatusCode::SEE_OTHER);
+        let cookie = claim.headers()["set-cookie"]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        assert!(service.private_claim(&token).await.is_err());
+        assert_eq!(
+            client
+                .get(format!("{base}/frame"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            client
+                .post(format!("{base}/action"))
+                .header("cookie", &cookie)
+                .header("origin", "https://untrusted.invalid")
+                .json(&json!({"action":"finish"}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::FORBIDDEN
+        );
+        assert!(
+            browser
+                .browse(crate::browser::BrowseRequest::Snapshot)
+                .await
+                .is_err()
+        );
+        service
+            .private_action(&token, ViewAction::Click { x: 28., y: 20. })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let state = service.private_state(&token).await.unwrap();
+        assert_eq!(state["pages"].as_array().unwrap().len(), 2);
+        let root_target = service
+            .private
+            .lock()
+            .await
+            .as_ref()
+            .unwrap()
+            .tab
+            .target
+            .clone();
+        assert_ne!(state["selected_page"], root_target);
+        let screenshot = service.private_screenshot(&token).await.unwrap();
+        assert_eq!(&screenshot[..8], b"\x89PNG\r\n\x1a\n");
+        assert!(
+            service
+                .private_action(
+                    &token,
+                    ViewAction::SelectPage {
+                        target: "unrelated".into()
+                    }
+                )
+                .await
+                .is_err()
+        );
+        service
+            .private_action(
+                &token,
+                ViewAction::Scroll {
+                    x: 200.,
+                    y: 200.,
+                    delta_y: 450.,
+                },
+            )
+            .await
+            .unwrap();
+        service
+            .private_action(&token, ViewAction::Finish)
+            .await
+            .unwrap();
+        assert_eq!(
+            service.private_state(&token).await.unwrap()["state"],
+            "uncertain"
+        );
+        assert_eq!(
+            browser
+                .browse(crate::browser::BrowseRequest::Snapshot)
+                .await
+                .unwrap()["url"],
+            "about:blank"
+        );
+        viewer.abort();
+        fixture_task.abort();
+    }
     #[test]
     fn durable_consumption_has_one_winner_and_restart_preserves_uncertainty() {
         let root = tempfile::tempdir().unwrap().keep();

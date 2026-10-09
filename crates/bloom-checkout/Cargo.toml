@@ -5,6 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+triad-dev-harness = []
+
 [dependencies]
 bloom-checkout-api.workspace = true
 anyhow.workspace = true
@@ -24,6 +27,8 @@ hpke = { version = "0.14", default-features = false, features = ["alloc", "getra
 rusqlite.workspace = true
 
 [dev-dependencies]
+reqwest.workspace = true
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 tempfile.workspace = true
 axum-server = { version = "0.8", default-features = false, features = ["tls-rustls"] }
 rcgen = "0.14"

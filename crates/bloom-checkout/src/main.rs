@@ -25,6 +25,9 @@ struct Args {
     machine_uid: u32,
     #[arg(long)]
     view_port: u16,
+    #[cfg(feature = "triad-dev-harness")]
+    #[arg(long)]
+    fixture_allow_insecure_tls: bool,
 }
 
 #[tokio::main]
@@ -38,7 +41,15 @@ async fn main() -> Result<()> {
         anyhow::bail!("Cannot disable checkout core dumps");
     }
     let args = Args::parse();
-    let browser = Browser::launch(&args.chromium, &args.profile, &[]).await?;
+    #[cfg(feature = "triad-dev-harness")]
+    let flags = if args.fixture_allow_insecure_tls {
+        vec!["--ignore-certificate-errors".into()]
+    } else {
+        Vec::new()
+    };
+    #[cfg(not(feature = "triad-dev-harness"))]
+    let flags = Vec::new();
+    let browser = Browser::launch(&args.chromium, &args.profile, &flags).await?;
     let service = CheckoutService::new(
         browser,
         &args.state,

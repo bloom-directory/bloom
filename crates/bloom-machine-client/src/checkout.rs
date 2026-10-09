@@ -9,6 +9,7 @@ pub struct CheckoutClient {
     socket: PathBuf,
     checkout_uid: u32,
 }
+
 impl CheckoutClient {
     pub fn new(socket: PathBuf, checkout_uid: u32) -> Self {
         Self {
@@ -60,5 +61,49 @@ impl CheckoutClient {
                 .and_then(serde_json::to_value)
                 .map_err(|_| "Checkout request rejected; inspect status before retrying".into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    async fn response(value: &'static str, uid: u32) -> Result<Value, String> {
+        let root = tempfile::tempdir().unwrap().keep();
+        let socket = root.join("api.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut input = String::new();
+            let _ = BufReader::new(reader).read_line(&mut input).await;
+            let _ = writer.write_all(value.as_bytes()).await;
+        });
+        let result = CheckoutClient::new(socket, uid)
+            .call(&Request::Browse {
+                request: bloom_checkout_api::BrowseRequest::Snapshot,
+            })
+            .await;
+        task.abort();
+        result
+    }
+    #[tokio::test]
+    async fn unknown_private_projection_and_wrong_principal_are_rejected() {
+        use std::os::unix::fs::MetadataExt;
+        let uid = tempfile::tempdir()
+            .unwrap()
+            .path()
+            .metadata()
+            .unwrap()
+            .uid();
+        assert!(
+            response(
+                "{\"url\":\"https://shop.invalid\",\"text\":\"Shop\",\"elements\":[]}\n",
+                uid
+            )
+            .await
+            .is_ok()
+        );
+        assert!(response("{\"url\":\"https://shop.invalid\",\"text\":\"Shop\",\"elements\":[],\"challenge_url\":\"private capability\"}\n",uid).await.is_err());
+        assert!(response("{\"state\":\"opened\"}\n", uid + 1).await.is_err());
     }
 }

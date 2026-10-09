@@ -376,12 +376,9 @@ mod tests {
 
     #[tokio::test]
     async fn real_pipe_browser_revokes_drains_and_closes_popups() {
-        let executable = Path::new("/usr/lib/chromium/chromium");
-        if !executable.exists() {
-            return;
-        }
+        let executable = crate::test_chromium();
         let root = tempfile::tempdir().unwrap().keep();
-        let browser = Browser::launch(executable, &root.join("profile"), &["--no-sandbox".into()])
+        let browser = Browser::launch(&executable, &root.join("profile"), &["--no-sandbox".into()])
             .await
             .unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

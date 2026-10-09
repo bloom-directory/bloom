@@ -230,9 +230,10 @@ mod tests {
     use super::*;
     use crate::browser::{BrowseRequest, Browser};
     use axum::{Router, response::Html, routing::get};
-    use std::{path::Path, sync::Arc, time::Duration};
+    use std::{sync::Arc, time::Duration};
 
     async fn fixture(html: String) -> (String, tokio::task::JoinHandle<()>) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let certificate =
             rcgen::generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()])
                 .unwrap();
@@ -273,7 +274,7 @@ mod tests {
     async fn browser() -> Arc<Browser> {
         let root = tempfile::tempdir().unwrap().keep();
         Browser::launch(
-            Path::new("/usr/lib/chromium/chromium"),
+            &crate::test_chromium(),
             &root.join("profile"),
             &["--no-sandbox".into(), "--ignore-certificate-errors".into()],
         )
