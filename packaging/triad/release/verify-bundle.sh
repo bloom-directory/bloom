@@ -31,6 +31,7 @@ for required in \
   bin/bloom-broker \
   bin/bloom-signer \
   bin/bloom-signer-migrate \
+  bin/bloom-checkout \
   PLATFORM_CLAIM \
   compatibility-v1.toml \
   installer/release/install-linux.sh \
@@ -129,7 +130,7 @@ fi
 platform_claim="$(<"$payload/PLATFORM_CLAIM")"
 case "$platform_claim" in
   linux)
-    for binary in bloom bloom-broker bloom-signer bloom-signer-migrate; do
+    for binary in bloom bloom-broker bloom-signer bloom-signer-migrate bloom-checkout; do
       file -b "$payload/bin/$binary" | grep -F 'ELF ' >/dev/null || {
         echo "Linux bundle contains a non-ELF production binary" >&2
         exit 65
@@ -142,7 +143,7 @@ case "$platform_claim" in
       echo "macOS W0 bundle requires its disposable Darwin verification lane" >&2
       exit 65
     }
-    for binary in bloom bloom-broker bloom-signer bloom-signer-migrate; do
+    for binary in bloom bloom-broker bloom-signer bloom-signer-migrate bloom-checkout; do
       file -b "$payload/bin/$binary" | grep -F 'Mach-O ' >/dev/null || {
         echo "macOS W0 bundle contains a non-Mach-O production binary" >&2
         exit 65
@@ -150,7 +151,7 @@ case "$platform_claim" in
     done
     ;;
   macos-unix-principals)
-    for binary in bloom bloom-broker bloom-signer bloom-signer-migrate; do
+    for binary in bloom bloom-broker bloom-signer bloom-signer-migrate bloom-checkout; do
       file -b "$payload/bin/$binary" | grep -F 'Mach-O ' >/dev/null || {
         echo "production macOS bundle contains a non-Mach-O binary" >&2
         exit 65

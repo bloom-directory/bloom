@@ -2381,7 +2381,7 @@ dependencies = [
  "axum-server",
  "base64 0.22.1",
  "bloom-checkout-api",
- "bloom-signer-api 0.1.0 (git+https://github.com/bloom-directory/bloom-signer.git?rev=fb31fef6a8ab44d9dc69d4b6a9b456dc0ed5726c)",
+ "bloom-signer-api",
  "clap",
  "hpke",
  "libc",
@@ -2522,7 +2522,7 @@ dependencies = [
  "bloom-proto",
  "bloom-revert",
  "bloom-service-activation",
- "bloom-signer-api 0.1.0 (git+https://github.com/bloom-directory/bloom-signer.git?rev=bc88ad690757165ebf1978410ea5c7ec652215d3)",
+ "bloom-signer-api",
  "bloom-signer-derive",
  "bloom-solana-tx",
  "bloom-tx",
@@ -2871,21 +2871,6 @@ dependencies = [
 [[package]]
 name = "bloom-signer-api"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=bc88ad690757165ebf1978410ea5c7ec652215d3#bc88ad690757165ebf1978410ea5c7ec652215d3"
-dependencies = [
- "bloom-rpc-wire 0.1.3 (git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=ad0072512bb97fb4eb68d249ce785ea3ea4a49ab)",
- "ed25519-dalek",
- "hex",
- "serde",
- "serde_jcs",
- "serde_json",
- "sha2 0.11.0",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "bloom-signer-api"
-version = "0.1.0"
 source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=fb31fef6a8ab44d9dc69d4b6a9b456dc0ed5726c#fb31fef6a8ab44d9dc69d4b6a9b456dc0ed5726c"
 dependencies = [
  "bloom-rpc-wire 0.1.3 (git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=ad0072512bb97fb4eb68d249ce785ea3ea4a49ab)",
@@ -2902,7 +2887,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer-derive"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=bc88ad690757165ebf1978410ea5c7ec652215d3#bc88ad690757165ebf1978410ea5c7ec652215d3"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=fb31fef6a8ab44d9dc69d4b6a9b456dc0ed5726c#fb31fef6a8ab44d9dc69d4b6a9b456dc0ed5726c"
 dependencies = [
  "bip39",
  "ed25519-dalek",
