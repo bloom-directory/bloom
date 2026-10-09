@@ -30,7 +30,7 @@ if action == 'open':
 elif action == 'click':
     snapshot = browse({'action': 'snapshot'})
     matches = [element for element in snapshot['elements']
-               if element['label'].casefold() == sys.argv[3].casefold()]
+               if ' '.join(element['label'].split()).casefold() == ' '.join(sys.argv[3].split()).casefold()]
     if len(sys.argv) <= 4 and len(matches) != 1:
         raise SystemExit('Ambiguous or missing control; specify a matching index')
     browse({'action': 'click', 'element_ref': matches[int(sys.argv[4]) if len(sys.argv) > 4 else 0]['ref']})
