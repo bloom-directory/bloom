@@ -30,3 +30,13 @@ When the GUI login returns, the monitor can kickstart an already-loaded stopped
 user-domain sentinel. It waits until a later tick observes that job running,
 then checks the complete socket guards before restarting either service. A
 missing canonical job is not bootstrapped by this monitor.
+
+The required root lifecycle LaunchDaemon uses `KeepAlive` and checks every
+second. It terminates the running canonical sentinel with `SIGTERM` when its
+GUI domain disappears, for activating and active enrollments. Sentinel signal
+handling closes its listener and all owned authenticated channels, draining
+Broker and Signer. GUI inspection stays in this privileged monitor: the login
+sentinel does not spawn subprocesses under its shared-login process limit.
+This uses the existing platform status and authenticated session edges, with
+no new wire contract. W0 sentinel bootout and mocked domain transitions remain
+separate from physical GUI logout conformance.
