@@ -154,7 +154,11 @@ async fn serve_authenticated_services(
     peers: [PeerAcl; 2],
 ) -> Result<()> {
     let connections = Arc::new(Semaphore::new(8));
+    // Own the authenticated channels: cancelling the listener on logout must
+    // close existing service connections even before the runtime exits.
+    let mut tasks = tokio::task::JoinSet::new();
     loop {
+        while tasks.try_join_next().is_some() {}
         let (mut stream, _) = listener
             .accept()
             .await
@@ -169,7 +173,7 @@ async fn serve_authenticated_services(
         };
         let identity = identity.clone();
         let peers = peers.clone();
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             let _permit = permit;
             let authenticated = tokio::time::timeout(
                 Duration::from_secs(2),
@@ -424,6 +428,83 @@ impl Drop for SocketGuard {
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    #[tokio::test]
+    async fn sentinel_shutdown_closes_both_authenticated_service_channels() {
+        use bloom_broker_api::{BootEpoch, Token};
+        use bloom_triad_local_transport::{LocalIdentity, PeerAcl, authenticate_client};
+        use std::sync::Arc;
+        use tokio::io::AsyncReadExt as _;
+
+        fn identity(service: &str, seed: u8) -> LocalIdentity {
+            LocalIdentity {
+                service_id: Token::new(service).unwrap(),
+                boot_epoch: BootEpoch::from_bytes([seed; 16]),
+                application_key_id: Token::new(format!("{service}-app")).unwrap(),
+                signing_key: Arc::new(ed25519_dalek::SigningKey::from_bytes(&[seed; 32])),
+            }
+        }
+        fn acl(identity: &LocalIdentity) -> PeerAcl {
+            PeerAcl {
+                effective_uid: rustix::process::geteuid().as_raw(),
+                service_id: identity.service_id.clone(),
+                boot_epoch: identity.boot_epoch.clone(),
+                application_key_id: identity.application_key_id.clone(),
+                application_public_key: identity.signing_key.verifying_key().to_bytes(),
+            }
+        }
+
+        let temporary = tempfile::tempdir().unwrap();
+        let socket = temporary.path().join("session.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let session = identity("bloom-session", 1);
+        let broker = identity("bloom-broker", 2);
+        let signer = identity("bloom-signer", 3);
+        let peers = [acl(&broker), acl(&signer)];
+        let session_acl = acl(&session);
+        let (shutdown, termination) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            tokio::select! {
+                result = super::serve_authenticated_services(listener, session, peers) => result,
+                _ = termination => Ok(()),
+            }
+        });
+        let mut connections = Vec::new();
+        for service in [&broker, &signer] {
+            let mut stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+            authenticate_client(
+                &mut stream,
+                service,
+                &session_acl,
+                bloom_service_activation::SESSION_PROTOCOL_CURRENT,
+                bloom_service_activation::SESSION_PROTOCOL_RANGE,
+            )
+            .await
+            .unwrap();
+            connections.push(stream);
+        }
+        assert!(!server.is_finished(), "sentinel stopped before termination");
+        shutdown.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        for mut stream in connections {
+            assert_eq!(
+                tokio::time::timeout(std::time::Duration::from_secs(1), stream.read(&mut [0; 1]))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                0,
+                "logout retained an authenticated channel"
+            );
+        }
+        assert!(
+            tokio::net::UnixStream::connect(&socket).await.is_err(),
+            "logout retained the listener"
+        );
+    }
 
     #[test]
     fn plain_directory_is_accepted_regardless_of_link_count() {
