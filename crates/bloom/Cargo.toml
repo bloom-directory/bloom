@@ -40,6 +40,7 @@ bloom-solana-tx.workspace = true
 bloom-tx.workspace = true
 url.workspace = true
 bloom-vfs.workspace = true
+bloom-mcp.workspace = true
 bloom-update.workspace = true
 bloom-petals.workspace = true
 ed25519-dalek.workspace = true
