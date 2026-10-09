@@ -180,10 +180,10 @@ does not deserialize in older Machines, so do not downgrade a Machine with
 staged or sent deployments in its outbox — re-upgrade before confirming them.
 
 Creation requires exact payload approval and an explicit canonical policy entry
-`{"chain":"evm-<numeric-chain-id>","destination":"exact"}`. On that chain the
-entry replaces Machine's advisory recipient allowlist with exact owner review for
-every native transaction, not only creation; Broker never enforced destinations
-on exact approvals. Broker verifies the
+`{"chain":"evm-<numeric-chain-id>","destination":"exact"}`. The entry exempts
+contract creation from Machine's recipient allowlist; sends, calls and token
+allowances retain their recipient restrictions. Every transaction still needs
+its own exact owner approval. Broker verifies the
 unsigned transaction preimage against the exact selector, derives the sender
 from Signer's authenticated public key, and commits decoded creation/call
 fields to the owner review. Machine and Broker require protocol 1.6; Signer
