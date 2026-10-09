@@ -66,7 +66,14 @@ try {
   await approve(awaiting.ceremony_url,'checkout');
   const paid=await poll(`/checkout/requests/${checkout}/status.json`,['paid','declined','uncertain','manual_required','disclosure_unknown','partially_filled']);
   assert.equal(paid.state,'paid');assert.equal(paid.outcome.source,'merchant-reported');assert.equal(paid.outcome.merchant_reported_total_minor,399);assert.equal(submits,1);
-  assert.equal((await browse({action:'snapshot'})).url,'about:blank');
+  // The durable payment result precedes closing the private tabs. Observation
+  // stays revoked during that cleanup; wait only for the fresh browsing tab.
+  let returned;
+  for(let i=0;i<30;i++) {
+    try {returned=await browse({action:'snapshot'});break;} catch (_) {}
+    await new Promise(r=>setTimeout(r,100));
+  }
+  assert.equal(returned?.url,'about:blank');
   const del=id();await vfs('write','/cards/delete.json',{operation_id:del,card_id:'stack-card'});
   await approve((await vfs('cat',`/cards/operations/${del}/ceremony.json`)).ceremony_url,'delete');
   await poll(`/cards/operations/${del}/status.json`,['succeeded']);assert.equal((await vfs('cat','/cards/index.json')).length,0);
