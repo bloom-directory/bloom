@@ -1170,7 +1170,7 @@ fn triad_developer_launcher_owns_only_its_service_processes() {
     assert!(launcher.contains("trap '' INT TERM HUP"));
     assert!(
         launcher.contains(
-            "for pid in \"$machine_pid\" \"$broker_pid\" \"$signer_pid\" \"$session_pid\""
+            "for pid in \"$checkout_pid\" \"$machine_pid\" \"$broker_pid\" \"$signer_pid\" \"$session_pid\""
         )
     );
     assert!(launcher.contains("rm -f -- \"$ready_file\""));
@@ -2372,14 +2372,18 @@ fn linux_installer_allocates_distinct_ports_and_rejects_mixed_release_sets() {
     assert_eq!(
         fs::read_to_string(root.join("etc/bloom/1000/machine.env")).unwrap(),
         format!(
-            "BLOOM_NFS_LISTEN=127.0.0.1:20000\nBLOOM_RELEASE_DIGEST={}\n",
+            "BLOOM_NFS_LISTEN=127.0.0.1:20000\nBLOOM_RELEASE_DIGEST={}\n\
+             BLOOM_CHECKOUT_SOCKET=/run/bloom/1000/checkout/rpc/checkout.sock\n\
+             BLOOM_CHECKOUT_UID=65533\n",
             release_digest
         )
     );
     assert_eq!(
         fs::read_to_string(root.join("etc/bloom/2000/machine.env")).unwrap(),
         format!(
-            "BLOOM_NFS_LISTEN=127.0.0.1:20001\nBLOOM_RELEASE_DIGEST={}\n",
+            "BLOOM_NFS_LISTEN=127.0.0.1:20001\nBLOOM_RELEASE_DIGEST={}\n\
+             BLOOM_CHECKOUT_SOCKET=/run/bloom/2000/checkout/rpc/checkout.sock\n\
+             BLOOM_CHECKOUT_UID=65533\n",
             release_digest
         )
     );
@@ -2667,6 +2671,7 @@ fn linux_installer_materializes_and_checks_service_directories_at_activation() {
             "d /run/bloom/1000/broker/control 0710 bloom-broker-1000 bloom-revoke-1000 -\n",
             "d /run/bloom/1000/signer/rpc 0710 bloom-signer-1000 bloom-broker-signer-1000 -\n",
             "d /run/bloom/1000/session 0710 1000 bloom-session-1000 -\n",
+            "d /run/bloom/1000/checkout/rpc 0710 bloom-checkout-1000 bloom-machine-checkout-1000 -\n",
         ),
     )
     .unwrap();
@@ -2680,6 +2685,8 @@ id() {
     -g:bloom-broker-1000) echo 2101 ;;
     -u:bloom-signer-1000) echo 2002 ;;
     -g:bloom-signer-1000) echo 2102 ;;
+    -u:bloom-checkout-1000) echo 2003 ;;
+    -g:bloom-checkout-1000) echo 2103 ;;
     *) return 1 ;;
   esac
 }
@@ -2689,6 +2696,8 @@ getent() {
     bloom-broker-signer-1000) echo "$2:x:2202:" ;;
     bloom-revoke-1000) echo "$2:x:2203:" ;;
     bloom-session-1000) echo "$2:x:2204:" ;;
+    bloom-machine-checkout-1000) echo "$2:x:2205:" ;;
+    bloom-broker-checkout-1000) echo "$2:x:2206:" ;;
     *) return 1 ;;
   esac
 }
@@ -2712,6 +2721,7 @@ numericize_linux_tmpfiles_ownership "$2" 1000
         "broker/control 0710 2001 2203",
         "signer/rpc 0710 2002 2202",
         "session 0710 1000 2204",
+        "checkout/rpc 0710 2003 2205",
     ] {
         assert!(config.contains(expected), "missing {expected} in {config}");
     }
@@ -5004,6 +5014,10 @@ fn linux_legacy_interrupted_upgrade_recovers_without_operator_intervention() {
     );
     assert_eq!(
         fs::read_to_string(root.join("etc/bloom/1000/machine.env")).unwrap(),
-        format!("BLOOM_NFS_LISTEN=127.0.0.1:20000\nBLOOM_RELEASE_DIGEST={new_digest}\n")
+        format!(
+            "BLOOM_CHECKOUT_SOCKET=/run/bloom/1000/checkout/rpc/checkout.sock\n\
+             BLOOM_CHECKOUT_UID=65533\n\
+             BLOOM_NFS_LISTEN=127.0.0.1:20000\nBLOOM_RELEASE_DIGEST={new_digest}\n"
+        )
     );
 }

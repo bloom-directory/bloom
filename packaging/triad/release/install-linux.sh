@@ -653,6 +653,10 @@ install_linux_release() {
       echo "installed Linux release is unsafe" >&2
       return 65
     }
+    # Installers older than checkout staged releases without bloom-checkout.
+    if [[ ! -e "$release/bloom-checkout" && ! -L "$release/bloom-checkout" ]]; then
+      install -m 0755 "$payload/bin/bloom-checkout" "$release/bloom-checkout"
+    fi
     for binary in bloom bloom-broker bloom-signer bloom-signer-migrate bloom-checkout; do
       [[ -f "$release/$binary" && ! -L "$release/$binary" ]] && \
         cmp -s "$payload/bin/$binary" "$release/$binary" || {
