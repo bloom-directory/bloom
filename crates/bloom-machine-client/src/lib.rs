@@ -2104,31 +2104,15 @@ impl ExactPayloadSignRequest {
         if self
             .safe_review_payload
             .as_ref()
-            .is_some_and(|payload| payload.len() > 256 * 1024)
+            .is_some_and(|payload| payload.len() > bloom_broker_api::SINGLE_PAYLOAD_MAX_BYTES)
         {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::MalformedFrame,
                 "Safe review payload is too large",
             ));
         }
-        // Keyed on the claim's class: this request either is a Safe
-        // confirmation and carries its envelope, or is not and carries none.
-        //
-        // Broker keys the same requirement on the *subject* instead -- it
-        // demands an envelope whenever the route's installer provenance
-        // declares the Safe class anywhere in its list. The two agree for a
-        // route that declares only `safe.transaction.confirm`, which is what
-        // `bloom-petal-safe` declares and the only shape that exists today.
-        // They disagree the moment such a route gains a second exact-signing
-        // class: an approval for that second class must omit the envelope to
-        // pass here and must include one to pass Broker, so it is
-        // unsignable, and the failure surfaces as an opaque SelectorMismatch.
-        //
-        // So a Safe-declaring route is constrained to that one class until
-        // both sides key on the same thing. Broker is the side to change --
-        // requiring the envelope when the approval's claim class is the Safe
-        // class, rather than when the subject merely declares it -- and that
-        // is a change to the Broker gate, not to this check.
+        // The Safe route declares only this class. Its review contract and
+        // Broker gate are defined in bloom-broker#37.
         let safe_operation = self.petal_use_claim.as_ref().is_some_and(|claim| {
             claim.operation_class.as_str() == bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS
         });
@@ -4025,7 +4009,7 @@ mod tests {
         );
         request.safe_review_payload = Some(br#"{"schema":"bloom.safe.review.v1"}"#.to_vec());
         request.validate().unwrap();
-        request.safe_review_payload = Some(vec![0; 256 * 1024 + 1]);
+        request.safe_review_payload = Some(vec![0; bloom_broker_api::SINGLE_PAYLOAD_MAX_BYTES + 1]);
         assert_eq!(
             request.validate().unwrap_err().code,
             ProtocolErrorCode::MalformedFrame

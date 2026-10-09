@@ -93,7 +93,11 @@ model. Exact selectors prevent payload substitution; reusable selectors rely
 on the documented claim assurance.
 
 The `safe.transaction.confirm` operation has an additional review contract. The
-Petal supplies one canonical Safe review envelope alongside the exact EIP-712
+trusted signing registration must declare that class to trigger Safe review.
+An arbitrary EIP-712 preimage under another signing class receives that class's
+ordinary exact review; Machine cannot identify a Safe transaction from its
+hash alone. Correctly registering the Safe Petal is part of this boundary.
+The Petal supplies one canonical Safe review envelope alongside the exact EIP-712
 preimage. Machine accepts and forwards that envelope only for this operation
 class, requires it for that class on the single-payload exact path, and refuses
 the class on every other path — the batch request and the reusable

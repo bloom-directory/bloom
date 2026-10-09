@@ -342,6 +342,25 @@ struct PetalTxOutbox {
     write_permit: Option<Arc<HomeWritePermit>>,
 }
 
+fn petal_review_payload<'a>(
+    operation_class: &str,
+    claimed_class: &str,
+    action: Option<&'a [u8]>,
+) -> Result<Option<&'a [u8]>, HostError> {
+    if operation_class != claimed_class {
+        return Err(HostError::Invalid(
+            "Petal operation class does not match its claim".into(),
+        ));
+    }
+    Ok(
+        if operation_class == bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS {
+            action
+        } else {
+            None
+        },
+    )
+}
+
 impl DaemonPetalHost {
     /// Resolve the path-selected owner against fresh Broker membership before
     /// preparing any approval, custody ceremony, or signature. The path
@@ -1985,6 +2004,11 @@ impl PetalHost for DaemonPetalHost {
                 "PetalUseClaim must use exact RFC 8785 canonical JSON".into(),
             ));
         }
+        let review_payload = petal_review_payload(
+            &req.operation_class,
+            claim.operation_class.as_str(),
+            req.action.as_deref(),
+        )?;
         let trusted_package_hash = bloom_broker_api::Digest32::new(context.package_hash.clone())
             .map_err(|error| HostError::Invalid(error.to_string()))?;
         if let Some(pending) = self
@@ -2084,14 +2108,7 @@ impl PetalHost for DaemonPetalHost {
                     &trusted_subject,
                     &claim,
                     req.claim_assurance_evidence.as_deref(),
-                    // `action` is a generic guest blob, so it becomes a Safe
-                    // review envelope only for the one class that owes one.
-                    // Every other Petal's `action` stays uninterpreted.
-                    if req.operation_class == bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS {
-                        req.action.as_deref()
-                    } else {
-                        None
-                    },
+                    review_payload,
                 )
                 .await
                 .map_err(|reason| {
@@ -5634,6 +5651,28 @@ mod tests {
     use bloom_vfs::VfsPath;
     use bloom_vfs::handler::Entry;
     use bloom_vfs::handler::Handler;
+
+    #[test]
+    fn safe_petal_review_mapping_rejects_class_substitution() {
+        let safe = bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS;
+        let envelope = b"safe review".as_slice();
+        assert_eq!(
+            petal_review_payload(safe, safe, Some(envelope)).unwrap(),
+            Some(envelope)
+        );
+        assert_eq!(petal_review_payload(safe, safe, None).unwrap(), None);
+        assert_eq!(
+            petal_review_payload("transaction.confirm", "transaction.confirm", Some(envelope))
+                .unwrap(),
+            None
+        );
+        for (operation, claim) in [(safe, "transaction.confirm"), ("transaction.confirm", safe)] {
+            assert!(matches!(
+                petal_review_payload(operation, claim, Some(envelope)),
+                Err(HostError::Invalid(message)) if message.contains("does not match")
+            ));
+        }
+    }
 
     #[cfg(feature = "mount")]
     #[test]
