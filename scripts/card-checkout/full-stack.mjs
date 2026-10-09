@@ -32,6 +32,7 @@ const cert=spawnSync('openssl',['req','-x509','-newkey','rsa:2048','-nodes','-ke
 let submits=0;
 const server=https.createServer({key:readFileSync(join(root,'key.pem')),cert:readFileSync(join(root,'cert.pem'))},(request,response)=>{
   response.setHeader('content-type','text/html');
+  if(new URL(request.url,'https://localhost').pathname==='/manual'){response.end('<h1>Manual fixture</h1><p>Total is unavailable</p><button>Continue</button>');return;}
   if(new URL(request.url,'https://localhost').pathname==='/done'){submits++;response.end('<h1>Order confirmed</h1><p>Order ID: FIXTURE-ONE</p><p>Total USD 3.99</p>');return;}
   response.end(`<!doctype html><h1>Digital fixture</h1><p data-bloom-total-minor="399" data-bloom-currency="USD">Total USD 3.99</p>
     <form action="/done"><input autocomplete="cc-number"><input autocomplete="cc-exp"><input autocomplete="cc-csc"><button type="submit">Pay</button></form>`);
@@ -54,11 +55,31 @@ async function approve(url,kind) {
   try {await page.waitForFunction(()=>/Completed\.|Approved\.|Private view authorized/.test(document.getElementById('status').textContent),null,{timeout:20000});}
   catch (_) {throw new Error(`Ceremony ${kind}: ${await page.locator('#status').innerText()}`);}
 }
+async function returnedToShopping() {
+  for(let i=0;i<50;i++) {
+    try {const snapshot=await browse({action:'snapshot'});assert.equal(snapshot.url,'about:blank');return;}
+    catch (_) {await new Promise(r=>setTimeout(r,100));}
+  }
+  throw new Error('Private pages did not close before shopping returned');
+}
 try {
   const add=id();await vfs('write','/cards/add.json',{operation_id:add,card_id:'stack-card',label:'Full-stack fixture'});
   await approve((await vfs('cat',`/cards/operations/${add}/ceremony.json`)).ceremony_url,'add');
   assert.equal((await poll(`/cards/operations/${add}/status.json`,['succeeded'])).state,'succeeded');
   const cards=await vfs('cat','/cards/index.json');assert.equal(cards.length,1);assert.deepEqual(Object.keys(cards[0]).sort(),['brand','card_id','label','last4']);
+  // Unreadable facts authorize only a private human view. The same real
+  // Broker JS/passkey path must not silently release the saved card.
+  await browse({action:'open',url:merchant+'manual'});await new Promise(r=>setTimeout(r,400));
+  const manual=id();await vfs('write',`/checkout/requests/${manual}/in.json`,{card_id:'stack-card',agent_description:'Unverified manual fixture'});
+  const manualAwaiting=await vfs('cat',`/checkout/requests/${manual}/status.json`);
+  const privatePagePromise=context.waitForEvent('page');
+  await approve(manualAwaiting.ceremony_url,'manual');
+  const privatePage=await privatePagePromise;
+  const manualStatus=await poll(`/checkout/requests/${manual}/status.json`,['manual_required']);
+  assert.deepEqual(manualStatus.filled_fields,[]);assert.equal(submits,0);
+  await privatePage.locator('#finish').click();
+  assert.equal((await poll(`/checkout/requests/${manual}/status.json`,['uncertain'])).state,'uncertain');
+  await returnedToShopping();await privatePage.close();
   await browse({action:'open',url:merchant});await new Promise(r=>setTimeout(r,400));await browse({action:'snapshot'});
   const checkout=id();await vfs('write',`/checkout/requests/${checkout}/in.json`,{card_id:'stack-card',agent_description:'One fixture digital item (unverified agent text)'});
   const awaiting=await vfs('cat',`/checkout/requests/${checkout}/status.json`);assert.equal(awaiting.state,'awaiting_approval');
@@ -68,16 +89,11 @@ try {
   assert.equal(paid.state,'paid');assert.equal(paid.outcome.source,'merchant-reported');assert.equal(paid.outcome.merchant_reported_total_minor,399);assert.equal(submits,1);
   // The durable payment result precedes closing the private tabs. Observation
   // stays revoked during that cleanup; wait only for the fresh browsing tab.
-  let returned;
-  for(let i=0;i<30;i++) {
-    try {returned=await browse({action:'snapshot'});break;} catch (_) {}
-    await new Promise(r=>setTimeout(r,100));
-  }
-  assert.equal(returned?.url,'about:blank');
+  await returnedToShopping();
   const del=id();await vfs('write','/cards/delete.json',{operation_id:del,card_id:'stack-card'});
   await approve((await vfs('cat',`/cards/operations/${del}/ceremony.json`)).ceremony_url,'delete');
   await poll(`/cards/operations/${del}/status.json`,['succeeded']);assert.equal((await vfs('cat','/cards/index.json')).length,0);
   const encoded=JSON.stringify(transcript);assert(!encoded.includes('4242424242424242'));assert(!encoded.includes('Bloom Synthetic Cardholder'));assert(!encoded.includes('private?token='));assert(!/"cvc"\s*:\s*"?937/.test(encoded));
-  writeFileSync(output,JSON.stringify({result:'passed',actual_broker_js:true,virtual_authenticator_prf:true,submission_count:submits,transcript,retained_fixture_directory:root},null,2));
+  writeFileSync(output,JSON.stringify({result:'passed',actual_broker_js:true,virtual_authenticator_prf:true,manual_fallback_without_release:true,submission_count:submits,transcript,retained_fixture_directory:root},null,2));
   console.log('Full-stack card add, approval, fill, single submission, merchant-reported result, fresh-tab return and delete passed.');
 } finally {await browser.close();server.closeAllConnections();await new Promise(r=>server.close(r));}

@@ -267,12 +267,25 @@ impl Browser {
     pub(crate) async fn return_control(&self) -> Result<()> {
         let mut tab = self.tab.lock().await;
         // The entire browser belongs to checkout, including script-opened popups.
-        let targets = self.cdp.call(None, "Target.getTargets", json!({})).await?;
-        for target in targets["targetInfos"]
-            .as_array()
-            .context("Missing browser targets")?
-        {
-            if target["type"] == "page" {
+        // closeTarget acknowledges a request, not destruction. Keep shopping
+        // revoked until every private page has disappeared, including popups
+        // created while the initial pages were closing.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let targets = self.cdp.call(None, "Target.getTargets", json!({})).await?;
+            let pages = targets["targetInfos"]
+                .as_array()
+                .context("Missing browser targets")?
+                .iter()
+                .filter(|target| target["type"] == "page")
+                .collect::<Vec<_>>();
+            if pages.is_empty() {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                bail!("Private pages did not close; shopping remains revoked");
+            }
+            for target in pages {
                 self.cdp
                     .call(
                         None,
@@ -281,6 +294,7 @@ impl Browser {
                     )
                     .await?;
             }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         *tab = new_tab(&self.cdp, tab.generation + 1).await?;
         self.revoked.store(false, Ordering::SeqCst);
