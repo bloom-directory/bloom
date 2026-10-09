@@ -721,12 +721,15 @@ impl CheckoutService {
                     .await?;
             }
             ViewAction::Key { key } => {
-                if !matches!(
-                    key.as_str(),
-                    "Tab" | "Enter" | "Backspace" | "Escape" | "ArrowDown" | "ArrowUp"
-                ) {
-                    bail!("Unsupported private key");
-                }
+                let key_code = match key.as_str() {
+                    "Tab" => 9,
+                    "Enter" => 13,
+                    "Backspace" => 8,
+                    "Escape" => 27,
+                    "ArrowDown" => 40,
+                    "ArrowUp" => 38,
+                    _ => bail!("Unsupported private key"),
+                };
                 for kind in ["keyDown", "keyUp"] {
                     checkout
                         .tab
@@ -734,7 +737,9 @@ impl CheckoutService {
                         .call(
                             Some(&checkout.view_session),
                             "Input.dispatchKeyEvent",
-                            json!({"type":kind,"key":key}),
+                            json!({"type":kind,"key":key,"code":key,
+                                "windowsVirtualKeyCode":key_code,
+                                "text":if key == "Enter" && kind == "keyDown" {"\r"} else {""}}),
                         )
                         .await?;
                 }
