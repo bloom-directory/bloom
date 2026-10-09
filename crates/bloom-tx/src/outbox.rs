@@ -1775,6 +1775,11 @@ mod tests {
         let transitions = projection.transitions.lock().unwrap();
         assert_eq!(transitions.len(), 2);
         assert_ne!(transitions[0].0, transitions[1].0);
+        let allocated = projection.allocated.lock().unwrap();
+        assert_ne!(
+            allocated[0].1, allocated[1].1,
+            "the central index must receive a fresh attempt identity"
+        );
     }
 
     #[test]

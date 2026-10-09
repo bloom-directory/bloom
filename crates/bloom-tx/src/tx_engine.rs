@@ -182,7 +182,7 @@ pub enum TxEngineError {
     #[error("pre-broadcast simulation reverted: {reason} — write 'override' to broadcast anyway")]
     SimulationReverted { reason: String },
     #[error(
-        "nonce gap: tx for {from} uses nonce {staged} but the account's next on-chain nonce is {chain_next} — the node would queue it behind the missing nonce(s) and it could never mine.{blocking} Broadcast or discard the earlier transaction first, or restage with an explicit `nonce` to fill the gap deliberately."
+        "nonce gap: tx for {from} uses nonce {staged} but the account's next on-chain nonce is {chain_next} — the node would queue it behind the missing nonce(s) and it could never mine.{blocking} Broadcast the earlier transaction, or discard it and restage with the explicit missing `nonce`. Discarding alone does not renumber this transaction."
     )]
     NonceGap {
         from: String,
@@ -5989,6 +5989,56 @@ mod tests {
                 .any(|check| check.rule == "deployment.review"),
             "{:?}",
             staged.policy_checks
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_an_unsigned_pending_entry_releases_it_without_signing() {
+        let url = spawn_stage_rpc(false).await;
+        let directory = tempfile::tempdir().unwrap();
+        let engine = TxEngine::new(
+            Outbox::new(directory.path().join("outbox")).unwrap(),
+            60_000,
+        );
+        let chain = stage_chain(&url);
+        let permit = permit_for(&directory);
+        let intent = crate::intent_parser::parse(
+            r#"{"kind":"deploy","data":"0x60006000f3","value":"0 wei"}"#,
+        )
+        .unwrap();
+        let policy = Policy::default();
+        let staged = engine
+            .stage(
+                &permit,
+                "alice",
+                TEST_SIGNER_ADDRESS.parse().unwrap(),
+                intent,
+                &chain,
+                &policy,
+                None,
+            )
+            .await
+            .unwrap();
+        let cancelled = engine
+            .cancel(&permit, "alice", "anvil", &staged.id, &chain, 15, &policy)
+            .await
+            .unwrap();
+        assert_eq!(cancelled.status, TxStatus::Cancelled);
+        assert!(cancelled.tx_hash.is_none());
+        assert_eq!(
+            engine
+                .outbox
+                .read("alice", "anvil", &staged.id)
+                .unwrap()
+                .state,
+            OutboxState::Failed
+        );
+        assert!(
+            engine
+                .outbox
+                .highest_pending_nonce("alice", "anvil", TEST_SIGNER_ADDRESS.parse().unwrap())
+                .unwrap()
+                .is_none()
         );
     }
 
