@@ -1050,12 +1050,14 @@ else
   /usr/bin/python3 - \
     "$work/approval-after.log" \
     "$work/approval-after-ipc.log" \
-    "$mount_dir/wallets/$wallet_id/sealed-approvals/new.json" <<'PY' || \
+    "$mount_dir/wallets/$wallet_id/sealed-approvals/new.json" \
+    "$approval_ipc_status" <<'PY' || \
     echo "sealed approval read diagnostic helper failed" >&2
 import errno
 import json
 import os
 import pathlib
+import re
 import shutil
 import sys
 import tempfile
@@ -1074,14 +1076,34 @@ except OSError:
 for error in sorted(errors):
     print(f"/bin/cat: sealed approval template: {error}", file=sys.stderr)
 print(f"sealed approval standard cat error found={bool(errors)}", file=sys.stderr)
+ipc_text = ""
 try:
-    matches = json.loads(ipc_output.read_text()) == {
+    ipc_text = ipc_output.read_text()
+    matches = json.loads(ipc_text) == {
         "schema": "bloom.approval_prepare_request.v1",
         "write": "complete ApprovalPrepareRequest JSON",
     }
 except (OSError, UnicodeError, ValueError):
     matches = False
 print(f"sealed approval IPC template matches={matches}", file=sys.stderr)
+if not matches:
+    category = "unclassified"
+    if sys.argv[4] == "124":
+        category = "timeout"
+    elif sys.argv[4] == "0":
+        category = "invalid-projection"
+    else:
+        for pattern, label in (
+            (r"\bservice[ _-]?unavailable\b", "SERVICE_UNAVAILABLE"),
+            (r"\bpermission[ _-]?denied\b", "permission-denied"),
+            (r"\bnot[ _-]?found\b", "not-found"),
+            (r"\binvalid[ _-]?projection\b", "invalid-projection"),
+            (r"\b(?:timeout|timed out)\b", "timeout"),
+        ):
+            if re.search(pattern, ipc_text, re.IGNORECASE):
+                category = label
+                break
+    print(f"sealed approval IPC error category={category}", file=sys.stderr)
 
 # Keep only these two private outputs beyond the fixture's normal cleanup.
 # They may contain unexpected capability fields and must not be uploaded.
