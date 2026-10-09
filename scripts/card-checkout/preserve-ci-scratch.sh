@@ -1,6 +1,8 @@
 # BASH_ENV for explicitly disposable card-checkout conformance runs.
 # Preserve recursive cleanup by renaming its target beside the original path.
 # No production service uses this file or environment variable.
+# macOS mktemp otherwise uses /var/folders, outside the disposable runner root.
+export TMPDIR="${RUNNER_TEMP:?}"
 card_preserve_path() {
   local path="$1" destination
   [[ -e "$path" || -L "$path" ]] || return 0
