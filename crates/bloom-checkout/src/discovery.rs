@@ -544,8 +544,22 @@ mod tests {
     }
     async fn open(browser: &Browser, url: String) -> PrivateTab {
         browser.browse(BrowseRequest::Open { url }).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(250)).await;
-        browser.handoff().await.unwrap()
+        let tab = browser.handoff().await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while tab
+            .cdp
+            .evaluate(&tab.session, "document.readyState".into())
+            .await
+            .unwrap()
+            != "complete"
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "fixture did not load"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        tab
     }
     async fn initialized_processor(tab: &PrivateTab) -> Discovery {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
