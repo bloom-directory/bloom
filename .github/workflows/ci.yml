@@ -188,6 +188,8 @@ jobs:
       # argument, so the whole Linux-capable set runs here.
       - name: Install bsdtar for reproducible bundle packaging
         run: sudo apt-get update && sudo apt-get install -y libarchive-tools
+      - name: Check native macOS mount preflight
+        run: bash tests/packaging/macos-native-mount-preflight.sh
       - name: Run triad release packaging tests from archive
         # build-bundle.sh pins ownership with `--uid`/`--gid`, which is bsdtar
         # syntax; GNU tar rejects it. TAR must therefore be explicit rather
