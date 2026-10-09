@@ -29,6 +29,7 @@ permissions:
 
 env:
   RUSTUP_TOOLCHAIN: 1.96.0
+  BASH_ENV: ${{ github.workspace }}/bloom/scripts/card-checkout/preserve-ci-scratch.sh
 
 jobs:
   build-candidate:
@@ -227,6 +228,7 @@ jobs:
           login_user="$(id -un)"
           mkdir "$RUNNER_TEMP/macos-w0-evidence"
           sudo env \
+            BASH_ENV="$BASH_ENV" RUNNER_TEMP="$RUNNER_TEMP" \
             BLOOM_RUN_MACOS_UNIX_W0=true \
             BLOOM_RELEASE_PUBLIC_KEY=/private/var/db/bloom-w0-release-key.pem \
             BLOOM_MACOS_INSTALLED_ACCEPTANCE_MAIN_ROOT="$GITHUB_WORKSPACE/bloom" \
