@@ -547,6 +547,18 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(250)).await;
         browser.handoff().await.unwrap()
     }
+    async fn initialized_processor(tab: &PrivateTab) -> Discovery {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            match Discovery::read(tab).await {
+                Ok(discovery) => return discovery,
+                Err(error) if tokio::time::Instant::now() >= deadline => {
+                    panic!("Processor did not initialize: {error}")
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(500)).await,
+            }
+        }
+    }
     fn card() -> CardInput {
         CardInput {
             number: "4242424242424242".into(),
@@ -638,7 +650,7 @@ mod tests {
             let browser = browser().await;
             let tab = open(&browser, url).await;
             tokio::time::sleep(Duration::from_secs(8)).await;
-            let discovery = Discovery::read(&tab).await.unwrap();
+            let discovery = initialized_processor(&tab).await;
             let mut filled = Vec::new();
             let mut test_card = card();
             test_card.number = number.into();
