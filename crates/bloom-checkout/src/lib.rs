@@ -22,3 +22,4 @@ fn test_chromium() -> std::path::PathBuf {
     .find(|p| p.is_file())
     .expect("Checkout fixtures require Chromium; set BLOOM_CHECKOUT_TEST_CHROMIUM")
 }
+mod crash_protection;

@@ -374,6 +374,62 @@ mod tests {
     use axum::{Router, response::Html, routing::get};
     use std::time::Duration;
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn renderer_and_browser_crashes_leave_no_memory_dumps() {
+        fn assert_no_dump(path: &Path) {
+            for entry in std::fs::read_dir(path).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    assert_no_dump(&entry.path());
+                } else {
+                    assert_ne!(
+                        entry.path().extension().and_then(|v| v.to_str()),
+                        Some("dmp")
+                    );
+                    assert!(!entry.file_name().to_string_lossy().starts_with("core."));
+                }
+            }
+        }
+        for method in ["Page.crash", "Browser.crash"] {
+            let root = tempfile::tempdir().unwrap().keep();
+            let browser = Browser::launch(
+                &crate::test_chromium(),
+                &root.join("profile"),
+                &["--no-sandbox".into()],
+            )
+            .await
+            .unwrap();
+            let tab = browser.handoff().await.unwrap();
+            tab.cdp.evaluate(&tab.session,
+                "document.body.innerHTML='<input autocomplete=cc-number>';document.querySelector('input').value='4242424242424242'".into(),
+            ).await.unwrap();
+            let session = if method == "Browser.crash" {
+                None
+            } else {
+                Some(tab.session.as_str())
+            };
+            let _ = tokio::time::timeout(
+                Duration::from_secs(2),
+                tab.cdp.call(session, method, json!({})),
+            )
+            .await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            if method == "Browser.crash" {
+                assert!(
+                    tab.cdp.exited(),
+                    "Browser crash command must terminate the browser"
+                );
+            } else {
+                assert!(
+                    tab.cdp.evaluate(&tab.session, "1".into()).await.is_err(),
+                    "Renderer crash command must terminate the renderer"
+                );
+            }
+            assert_no_dump(&root);
+        }
+    }
+
     #[tokio::test]
     async fn real_pipe_browser_revokes_drains_and_closes_popups() {
         let executable = crate::test_chromium();

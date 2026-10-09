@@ -203,6 +203,14 @@ impl Cdp {
         // The child executes only dup2 before exec; no allocation or logging here.
         unsafe {
             command.pre_exec(move || {
+                crate::crash_protection::install()?;
+                let limit = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                if libc::setrlimit(libc::RLIMIT_CORE, &limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
                 if libc::dup2(input, 3) < 0 || libc::dup2(output, 4) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
@@ -276,6 +284,11 @@ impl Cdp {
             bail!("Checkout browser command failed");
         }
         Ok(value["result"].clone())
+    }
+
+    #[cfg(test)]
+    pub fn exited(&self) -> bool {
+        self.child.lock().try_wait().unwrap().is_some()
     }
 
     #[cfg(test)]
