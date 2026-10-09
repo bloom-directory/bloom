@@ -33,7 +33,6 @@ pub(crate) fn petal_label(name: &str) -> &str {
         "hyperliquid" => "Hyperliquid",
         "enso" => "Enso",
         "near-intents" => "NEAR Intents",
-        "tolly" => "Tolly",
         "feedback" => "Feedback",
         other => other,
     }
@@ -56,31 +55,6 @@ pub(crate) fn menu_petals() -> Vec<String> {
         .collect()
 }
 
-/// Runtime values a chosen Petal needs before it can act, recorded in
-/// `[petals.runtime.<name>.values]`. Tolly refuses buys, sells, and launches
-/// until writes are enabled; each one still waits for the owner's approval.
-fn setup_runtime_values(name: &str) -> &'static [(&'static str, &'static str)] {
-    match name {
-        "tolly" => &[("tolly_writes", "enabled")],
-        _ => &[],
-    }
-}
-
-/// Record a chosen Petal's runtime values, keeping any the owner already set.
-fn record_runtime_values(petals: &mut PetalsConfig, name: &str) {
-    let values = setup_runtime_values(name);
-    if values.is_empty() {
-        return;
-    }
-    let runtime = petals.runtime.entry(name.to_owned()).or_default();
-    for (key, value) in values {
-        runtime
-            .values
-            .entry((*key).to_owned())
-            .or_insert_with(|| (*value).to_owned());
-    }
-}
-
 /// Whether `bloom init` can ask the setup questions.
 pub(crate) fn interactive_setup_available() -> bool {
     use std::io::IsTerminal as _;
@@ -96,8 +70,7 @@ pub(crate) fn interactive_setup_available() -> bool {
 /// the catalog's values.
 ///
 /// Bloom installs every canonical Petal regardless. Each chosen Petal is
-/// recorded in `setup`, which the default policy proposes, along with any
-/// runtime values it needs to act.
+/// recorded in `setup`, which the default policy proposes.
 pub(crate) fn run_setup_menu(
     petals: &mut PetalsConfig,
     input: &mut impl BufRead,
@@ -138,9 +111,6 @@ pub(crate) fn run_setup_menu(
         setup.insert(name.clone(), PetalSetupConfig { values });
     }
     petals.setup = setup;
-    for name in &chosen {
-        record_runtime_values(petals, name);
-    }
     Ok(())
 }
 
@@ -150,14 +120,9 @@ pub(crate) fn run_setup_menu(
 /// declined and a saved value stays saved.
 pub(crate) fn accept_setup_suggestions(petals: &mut PetalsConfig) {
     if !petals.setup.is_empty() {
-        let chosen: Vec<String> = petals.setup.keys().cloned().collect();
-        for name in chosen {
-            record_runtime_values(petals, &name);
-        }
         return;
     }
     for name in menu_petals() {
-        record_runtime_values(petals, &name);
         let values = setup_template(&name)
             .map(|template| {
                 template

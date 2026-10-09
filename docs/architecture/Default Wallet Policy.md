@@ -1,6 +1,6 @@
 # Default Wallet Policy
 
-**Status:** design proposal based on the implementation as of 2026-09-14
+**Status:** design proposal, updated for the implementation on 2026-10-09
 **Audience:** Bloom engineers, Petal authors, and implementation agents
 
 A new Bloom user should go from installing Bloom to using their Petals by
@@ -18,7 +18,7 @@ The normative security and wire contracts remain
 ```text
 bloom init  (once)
   -> setup menu        choose which Petals main's policy allows: Polymarket,
-                       Hyperliquid, Enso, NEAR Intents, Tolly
+                       Hyperliquid, Enso, NEAR Intents, Feedback
                        review Polymarket's daily buy limit
   -> saves             the choices in Bloom's config
   -> installs          Bloom's canonical Petals, pinned by its catalog
@@ -48,7 +48,7 @@ Agreed on 2026-09-14:
    repositories are untouched.
 2. **`bloom init` opens a setup menu** where the user chooses their Petals.
    It offers Bloom's canonical Petals: Polymarket, Hyperliquid, Enso, NEAR
-   Intents, and Tolly. Bloom installs all of them for every home; the menu
+   Intents, and Feedback. Bloom installs all of them for every home; the menu
    chooses which ones `main`'s policy allows.
 3. **Bloom's setup decides the defaults.** The menu suggests each Petal's
    settings, and the user can change them.
@@ -85,10 +85,9 @@ Agreed on 2026-09-14:
     routes until Enso accepts Bloom's name, and its token-symbol table covers
     only Ethereum, Polygon, Base, Optimism, Arbitrum, BNB Chain, and
     Avalanche; on the other chains an intent needs `0x` token addresses.
-12. **Tolly needs writes enabled.** Choosing Tolly sets
-    `[petals.runtime.tolly.values] tolly_writes = "enabled"`, keeping a value
-    the owner already set. Each buy, sell, or launch is still confirmed by the
-    owner.
+12. **Feedback needs no setup settings or destination allowance.** It is the
+    fifth canonical Petal, replacing retired Tolly. Setup does not enable any
+    Petal's runtime writes.
 13. **Chosen Petals' fixed contracts become allowed destinations.** Machine
     refuses any outbox transaction whose `to` address is not in the wallet
     policy's `allowed_destinations`, and an empty list refuses all of them, so
@@ -115,17 +114,23 @@ Agreed on 2026-09-14:
     list. Those still need a policy update. A transaction staged before such a
     change keeps its denial, because policy is evaluated once at staging, so
     create a fresh request afterwards rather than confirming the old one.
-14. **A Petal may be trusted with its own destinations.** NEAR Intents deposits
+14. **A Petal may be trusted with every destination it calls.** NEAR Intents deposits
     go to a fresh address for every quote, signed by the 1Click API, so no
     address can be listed in advance. Its catalog entries are
     `petal:near-intents` on the chains it supports, and Machine accepts the
     destination of a transaction that Petal staged, matching the entry against
-    the `petal_id` recorded on the outbox entry.
+    the `petal_id` recorded on the outbox entry. This is a broad grant for any
+    transaction that Petal stages on those chains, including arbitrary
+    calldata and token approvals. It is not restricted to deposits or
+    verified quotes. Petals stage raw transactions: for an ERC-20 transfer,
+    Machine checks the token contract's `to` address, not the recipient
+    encoded in its calldata. This entry does not decode or restrict that
+    recipient.
 
     What that does not do: it covers only that Petal, only on the chains
     listed, and only for transactions it staged. A different Petal, or a
     transaction the owner stages by hand, still matches the listed addresses.
-    Every deposit is still an approval the owner signs, and deleting the entry
+    Every transaction is still an approval the owner signs, and deleting the entry
     gates the Petal again.
 
     What it does not change: whether the Petal's package is allowed at all.
@@ -139,12 +144,14 @@ Agreed on 2026-09-14:
     and nothing is signed or broadcast. This decision neither adds that check
     nor relaxes it.
 
-    What backs it: the Petal's own venue policy, at
+    What the shipped Petal enforces: its own venue policy, at
     `settings/wallets/<wallet>/venue.toml`, caps the input, caps slippage, and
     pays out only to the wallet's own address unless the owner lists other
     recipients; and the deposit address comes from a quote whose signature the
-    Petal verifies. The trade-off is that for that Petal, on those chains, the
-    destination check moves from Bloom's list to the Petal's own logic.
+    Petal verifies. Machine does not independently enforce those quote or
+    deposit constraints. The owner is trusting that Petal's logic for every
+    destination it calls on those chains; all other applicable policy checks
+    and each transaction's owner approval remain required.
 
 ## Why it does not work today
 
@@ -163,7 +170,7 @@ Agreed on 2026-09-14:
 
 `bloom init` shows a menu when run in a terminal:
 
-1. **Choose Petals.** Polymarket, Hyperliquid, Enso, NEAR Intents, and Tolly,
+1. **Choose Petals.** Polymarket, Hyperliquid, Enso, NEAR Intents, and Feedback,
    all selected by default.
 2. **Review settings.** Show Polymarket's suggested daily buy limit, 100
    pUSD, and let the user change it. Only positive amounts are accepted.
@@ -176,13 +183,10 @@ Bloom installs its canonical Petals (`DEFAULT_PETALS` in
 `crates/bloom/src/github_source.rs`) for every home and ignores the legacy
 `[petals] preinstalled` setting. Setup records each chosen Petal under
 `[petals.setup]`, with the values the menu asked about, and the default
-policy proposes exactly these Petals. A chosen Petal that needs a runtime
-value before it can act gets it under `[petals.runtime]`:
+policy proposes exactly these Petals. Canonical setup does not add runtime
+write switches:
 
 ```toml
-[petals.runtime.tolly.values]
-tolly_writes = "enabled"
-
 [petals.setup.enso]
 
 [petals.setup.hyperliquid]
@@ -192,7 +196,7 @@ tolly_writes = "enabled"
 [petals.setup.polymarket.values]
 max_daily_usd = "100"
 
-[petals.setup.tolly]
+[petals.setup.feedback]
 ```
 
 The policy uses the installed package hash for each chosen name, so a Petal
@@ -422,7 +426,7 @@ Automated:
   config with earlier choices it suggests exactly those choices and saved
   values. The scripted form chooses every canonical Petal on a fresh config,
   keeps earlier choices (declines included) and values on an existing one,
-  and enables Tolly's writes unless the owner already set that value.
+  and leaves runtime values unchanged.
 - `bloom init` on an existing config with a declined Petal and a custom cap
   keeps both.
 - The settings decision writes only for a Petal just installed or updated,
