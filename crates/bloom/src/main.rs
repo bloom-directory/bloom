@@ -3923,7 +3923,7 @@ async fn run(cli: Cli) -> Result<()> {
                     Ok(())
                 }
                 (Err((code, _)), Some(ConfirmProjection::Broadcast { tx_hash }))
-                    if code == IPC_ERR_NOT_FOUND =>
+                    if code == IPC_ERR_NOT_FOUND && !is_cancel =>
                 {
                     println!("Already broadcast: {tx_hash}");
                     println!("Entry: wallets/{wallet}/0/chains/{chain}/outbox/sent/{id}");
@@ -3954,6 +3954,10 @@ async fn run(cli: Cli) -> Result<()> {
                     Ok(())
                 }
                 (Ok(_), Some(ConfirmProjection::Broadcast { tx_hash })) => {
+                    anyhow::ensure!(
+                        !is_cancel,
+                        "entry already broadcast; use wallet cancel for an on-chain replacement"
+                    );
                     println!("Broadcast: {tx_hash}");
                     println!("Entry: wallets/{wallet}/0/chains/{chain}/outbox/sent/{id}");
                     Ok(())

@@ -40,7 +40,9 @@ The JSON contains the selected public address and an ephemeral submission URL.
 Keep `rpc.json` private and out of Git. The URL stops working when the adapter
 exits; starting it again creates a new URL while durable submissions remain in
 Machine's outbox. With a nondefault Machine endpoint, add `--connect unix:/path`
-to all Bloom commands.
+before the subcommand on all Bloom commands: `bloom --connect unix:/path deploy ...`.
+The bridge uses the wallet's primary key (account 0). For calls on a wallet
+requiring clear signing, start it with `bloom deploy --wallet <wallet> --chain <chain> --review-mode clear rpc`.
 
 ## Foundry
 
@@ -48,10 +50,12 @@ In another terminal:
 
 ```sh
 forge script script/Deploy.s.sol:Deploy \
-  --rpc-url "$(jq -r .rpc_url rpc.json)" \
   --sender "$(jq -r .from rpc.json)" \
   --unlocked --broadcast --slow
 ```
+Set `ETH_RPC_URL` from `rpc.json` in the command's environment so the
+submission token does not appear in forge's process arguments:
+`ETH_RPC_URL="$(jq -r .rpc_url rpc.json)" forge script ...`.
 
 The adapter prints the transaction plan, a durable `deploy-…` ID, and the
 Broker ceremony URL to its terminal. The owner reviews and completes that
@@ -124,6 +128,11 @@ expired ceremony prepares a fresh approval.
 To cancel or bump, use the existing native wallet outbox controls for the same
 ID (`bloom wallet cancel --help` and `bloom wallet replace --help`). Cancellation after signing/broadcast may need
 its own exact approval. A client disconnect never releases a reserved nonce.
+For an unsigned pending entry, release its local reservation with
+`bloom wallet confirm --wallet <wallet> --chain <chain> --id <id> --text cancel`.
+This discard does not replace an already broadcast transaction. `status` and
+`resume` exit 3 while approval is required, 4 while a result is unknown, and
+nonzero for failed or reverted deployments.
 
 The adapter binds only to `127.0.0.1`, rejects browser Origin headers and incorrect
 Host headers, and accepts a bounded, authenticated RPC surface. It does not

@@ -6,6 +6,8 @@ use serde_json::Value;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeploymentTransaction {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_mode: Option<String>,
     pub chain_id: u64,
     pub from: Address,
     pub to: Option<Address>,
@@ -53,6 +55,7 @@ impl DeploymentTransaction {
                 "chainId",
                 "type",
                 "accessList",
+                "reviewMode",
             ]
             .contains(&key.as_str())
             {
@@ -152,6 +155,13 @@ impl DeploymentTransaction {
             return Err("gas must be positive".into());
         }
         Ok(Self {
+            review_mode: match o.get("reviewMode") {
+                None => None,
+                Some(Value::String(mode)) if mode == "clear" || mode == "opaque_exact" => {
+                    Some(mode.clone())
+                }
+                _ => return Err("reviewMode must be clear or opaque_exact".into()),
+            },
             chain_id,
             from,
             to,

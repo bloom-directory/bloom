@@ -41,11 +41,9 @@ pub fn advisory_evm_policy(projection: &WalletProjection, chain: &str) -> Result
 /// Broker still checks the policy and decodes the exact payload for owner review.
 /// Reusable Petal planning must continue using `advisory_evm_policy`.
 ///
-/// The opt-in lifts exactly one rule: the local recipient allowlist, which a
-/// contract creation has no address to satisfy. It is derived from
-/// `advisory_evm_policy` and then clears that one field, rather than returning
-/// a bare `Policy::default()`, so nothing else the canonical projection
-/// carries -- now or after it grows a field -- is discarded by construction.
+/// The opt-in permits contract creation, which has no recipient address.
+/// The engine applies that exemption only to creation. All addressed
+/// transactions keep the canonical recipient allowlist.
 pub fn advisory_exact_evm_policy(
     projection: &WalletProjection,
     chain: &str,
@@ -62,7 +60,7 @@ pub fn advisory_exact_evm_policy(
         destination.chain.as_str() == format!("evm-{chain_id}")
             && destination.destination == "exact"
     }) {
-        policy.allowlists.recipients.clear();
+        policy.allow_contract_creation = true;
     }
     Ok(policy)
 }
@@ -155,9 +153,7 @@ mod tests {
         assert!(
             advisory_exact_evm_policy(&projection, "anvil", 31337)
                 .unwrap()
-                .allowlists
-                .recipients
-                .is_empty()
+                .allow_contract_creation
         );
         assert!(
             !advisory_exact_evm_policy(&projection, "anvil", 1)
@@ -196,7 +192,8 @@ mod tests {
         ]);
 
         let lifted = advisory_exact_evm_policy(&opted_in, "anvil", 31337).unwrap();
-        assert!(lifted.allowlists.recipients.is_empty());
+        assert!(lifted.allow_contract_creation);
+        assert!(lifted.allowlists.recipients.contains(allowed));
 
         // Everything else is whatever `advisory_evm_policy` produced, field
         // for field, so the two cannot drift apart.
@@ -218,6 +215,7 @@ mod tests {
 
         // Without the opt-in for this chain, nothing is lifted.
         let other = advisory_exact_evm_policy(&opted_in, "anvil", 1).unwrap();
+        assert!(!other.allow_contract_creation);
         assert!(other.allowlists.recipients.contains(allowed));
     }
 

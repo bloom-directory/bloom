@@ -170,6 +170,19 @@ impl MachineBrokerService for ExactSigningBrokerFixture {
                     ))
                 }
                 MachineBrokerRequest::SealedApprovalPrepare(request) => {
+                    let native = match &request.terms.subject {
+                        bloom_broker_api::ApprovalSubject::Cli { command_class, .. } => matches!(
+                            command_class.as_str(),
+                            "transaction.confirm" | "transaction.replace" | "transaction.cancel"
+                        ),
+                        _ => false,
+                    };
+                    if native && request.evm_review_payloads.is_empty() {
+                        return Err(bloom_broker_api::ProtocolError::new(
+                            bloom_broker_api::ProtocolErrorCode::BackendInvalidRequest,
+                            "native EVM approval requires review payloads",
+                        ));
+                    }
                     Ok(MachineBrokerResponse::SealedApprovalPrepare(
                         bloom_broker_api::SealedApprovalPrepareResponse {
                             approval_id: request.terms.approval_id()?,

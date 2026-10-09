@@ -20,6 +20,9 @@ pub struct DeployArgs {
     wallet: String,
     #[arg(long)]
     chain: String,
+    /// Review for contract calls; use clear on a clear-signing wallet.
+    #[arg(long, value_parser = ["clear", "opaque_exact"])]
+    review_mode: Option<String>,
     #[command(subcommand)]
     command: DeployCommand,
 }
@@ -40,6 +43,7 @@ struct Bridge {
     endpoint: ResolvedEndpoint,
     wallet: String,
     chain: String,
+    review_mode: Option<String>,
     host: String,
     slots: Arc<tokio::sync::Semaphore>,
 }
@@ -73,7 +77,13 @@ impl Bridge {
         let Some(method) = req.get("method").and_then(Value::as_str) else {
             return error(-32600, "method is required", Value::Null);
         };
-        let params = req.get("params").cloned().unwrap_or_else(|| json!([]));
+        let mut params = req.get("params").cloned().unwrap_or_else(|| json!([]));
+        if method == "eth_sendTransaction"
+            && let Some(mode) = &self.review_mode
+            && let Some(transaction) = params.get_mut(0).and_then(Value::as_object_mut)
+        {
+            transaction.insert("reviewMode".into(), json!(mode));
+        }
         // HTTP clients may observe and submit. Execution after an approval wait
         // is an explicit local `bloom deploy resume` operation, not background work.
         if method == "bloom_deploymentContinue" {
@@ -249,6 +259,7 @@ pub async fn run(endpoint: ResolvedEndpoint, args: DeployArgs) -> Result<()> {
         endpoint,
         wallet: args.wallet,
         chain: args.chain,
+        review_mode: args.review_mode,
         host: String::new(),
         slots: Arc::new(tokio::sync::Semaphore::new(32)),
     };
@@ -298,6 +309,18 @@ pub async fn run(endpoint: ResolvedEndpoint, args: DeployArgs) -> Result<()> {
                 && result.pointer("/result/error").is_none_or(Value::is_null),
             "deployment requires attention"
         );
+        match result.pointer("/result/status").and_then(Value::as_str) {
+            Some("approval_required") => super::EXIT_CODE_OVERRIDE.store(
+                super::EXIT_APPROVAL_PENDING,
+                std::sync::atomic::Ordering::SeqCst,
+            ),
+            Some("failed" | "reverted") => anyhow::bail!("deployment failed"),
+            Some("staged") => super::EXIT_CODE_OVERRIDE.store(
+                super::EXIT_RESULT_UNKNOWN,
+                std::sync::atomic::Ordering::SeqCst,
+            ),
+            _ => {}
+        }
     }
     Ok(())
 }
@@ -316,6 +339,7 @@ mod tests {
             },
             wallet: "alice".into(),
             chain: "anvil".into(),
+            review_mode: None,
             host: "127.0.0.1:1234".into(),
             slots: Arc::new(tokio::sync::Semaphore::new(32)),
         }
