@@ -816,12 +816,25 @@ pub async fn serve_api(service: Arc<CheckoutService>, path: &Path, machine_uid: 
                 return;
             }
             let response = match serde_json::from_str(&line) {
-                Ok(request) => match service.request(request).await {
-                    Ok(value) => value,
-                    Err(_) => {
-                        json!({"error":"Checkout request rejected or unavailable. Check status before retrying."})
+                Ok(request) => {
+                    let browse = matches!(request, Request::Browse { .. });
+                    match service.request(request).await {
+                        Ok(value) => value,
+                        // Browse errors are Bloom's own guidance strings; anything else
+                        // (CDP or page-derived text) stays generic.
+                        Err(error) if browse => {
+                            let message = error.to_string();
+                            json!({"error": if BROWSE_ERRORS.contains(&message.as_str()) {
+                                message
+                            } else {
+                                "The page could not be read or changed; open it again or request a new snapshot".into()
+                            }})
+                        }
+                        Err(_) => {
+                            json!({"error":"Checkout request rejected or unavailable. Check status before retrying."})
+                        }
                     }
-                },
+                }
                 Err(_) => json!({"error":"Invalid checkout request"}),
             };
             if let Ok(mut bytes) = serde_json::to_vec(&response) {
@@ -831,6 +844,17 @@ pub async fn serve_api(service: Arc<CheckoutService>, path: &Path, machine_uid: 
         });
     }
 }
+
+const BROWSE_ERRORS: &[&str] = &[
+    "Invalid browsing URL",
+    "Only ordinary HTTP(S) shopping URLs are supported",
+    "Only ordinary shopping documents can be observed",
+    "Shopping document changed; request a new snapshot",
+    "Invalid element reference",
+    "Stale element reference; request a new snapshot",
+    "Input exceeds limit",
+    "Checkout has private control; shopping is paused",
+];
 
 #[cfg(test)]
 mod tests {

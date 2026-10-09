@@ -54,14 +54,26 @@ impl CheckoutClient {
         }
         // Re-serialize closed public projections. Unknown fields never reach VFS.
         match request {
-            Request::Browse { .. } => serde_json::from_str::<BrowseResponse>(&line)
-                .and_then(serde_json::to_value)
-                .map_err(|_| "Checkout browsing is paused or unavailable".into()),
+            Request::Browse { .. } => match serde_json::from_str::<BrowseResponse>(&line) {
+                Ok(response) => {
+                    serde_json::to_value(response).map_err(|_| "Invalid browse response".into())
+                }
+                Err(_) => Err(serde_json::from_str::<BrowseError>(&line)
+                    .ok()
+                    .map(|e| e.error.chars().take(200).collect())
+                    .unwrap_or_else(|| "Checkout browsing is unavailable".into())),
+            },
             _ => serde_json::from_str::<Status>(&line)
                 .and_then(serde_json::to_value)
                 .map_err(|_| "Checkout request rejected; inspect status before retrying".into()),
         }
     }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BrowseError {
+    error: String,
 }
 
 #[cfg(test)]
@@ -104,6 +116,14 @@ mod tests {
             .is_ok()
         );
         assert!(response("{\"url\":\"https://shop.invalid\",\"text\":\"Shop\",\"elements\":[],\"challenge_url\":\"private capability\"}\n",uid).await.is_err());
-        assert!(response("{\"state\":\"opened\"}\n", uid + 1).await.is_err());
+        assert!(response("{\"state\":\"opened\"}\n", uid + 1).await.is_err());        assert_eq!(
+            response(
+                "{\"error\":\"Stale element reference; request a new snapshot\"}\n",
+                uid
+            )
+            .await
+            .unwrap_err(),
+            "Stale element reference; request a new snapshot"
+        );
     }
 }
