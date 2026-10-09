@@ -803,7 +803,21 @@ run_login_with_deadline \
   echo "packaged Machine did not preserve cached reads through its kernel mount" >&2
   exit 1
 }
-grep -Fx "$wallet_address" "$work/cached-wallet-address.log" >/dev/null
+# Signer projects lowercase hex; the mounted address uses EIP-55 casing.
+# Validate one complete address and compare its bytes, preserving the real
+# kernel-read check while refusing malformed output or a different wallet.
+/usr/bin/python3 - "$wallet_address" "$work/cached-wallet-address.log" <<'PY'
+import pathlib
+import re
+import sys
+
+expected = sys.argv[1]
+actual = pathlib.Path(sys.argv[2]).read_text().removesuffix("\n")
+if not all(re.fullmatch(r"0x[0-9a-fA-F]{40}", value) for value in (expected, actual)):
+    raise SystemExit("cached wallet read must contain exactly one EVM address")
+if actual.lower() != expected.lower():
+    raise SystemExit(f"cached wallet address differs: expected {expected}, received {actual}")
+PY
 
 degraded_intent="send 0.000000000000000001 eth to $wallet_address on anvil"
 mounted_write_with_deadline \
