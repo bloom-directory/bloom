@@ -7159,6 +7159,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn daemon_petal_chain_read_returns_receipt_object_and_null() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let hash = format!("0x{}", "ab".repeat(32));
+        let receipt = serde_json::json!({
+            "transactionHash": hash, "transactionIndex":"0x0", "blockHash":format!("0x{}", "cd".repeat(32)),
+            "blockNumber":"0x1", "from":format!("0x{}", "11".repeat(20)), "to":format!("0x{}", "22".repeat(20)),
+            "cumulativeGasUsed":"0x5208", "gasUsed":"0x5208", "effectiveGasPrice":"0x1",
+            "contractAddress":null, "status":"0x1", "type":"0x2", "logsBloom":format!("0x{}", "00".repeat(256)),
+            "logs":[{"address":format!("0x{}", "22".repeat(20)),"topics":[format!("0x{}", "33".repeat(32))],"data":"0x1234", "logIndex":"0x0","transactionIndex":"0x0","transactionHash":hash,"blockHash":format!("0x{}", "cd".repeat(32)),"blockNumber":"0x1","removed":false}]
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let expected_hash = hash.clone();
+        let expected_receipt = receipt.clone();
+        let rpc = tokio::spawn(async move {
+            for result in [receipt, serde_json::Value::Null] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let (header_end, length) = loop {
+                    let mut chunk = [0; 1024];
+                    let count = socket.read(&mut chunk).await.unwrap();
+                    assert!(count > 0 && bytes.len() < 16_384);
+                    bytes.extend_from_slice(&chunk[..count]);
+                    if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&bytes[..end]);
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap();
+                        break (end + 4, length);
+                    }
+                };
+                assert!(length < 16_384);
+                while bytes.len() < header_end + length {
+                    let mut chunk = [0; 1024];
+                    let count = socket.read(&mut chunk).await.unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&chunk[..count]);
+                }
+                let request: serde_json::Value =
+                    serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap();
+                assert_eq!(request["method"], "eth_getTransactionReceipt");
+                assert_eq!(request["params"], serde_json::json!([expected_hash]));
+                let body =
+                    serde_json::json!({"jsonrpc":"2.0", "id":request["id"], "result":result})
+                        .to_string();
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            }
+        });
+        let mut spec = bloom_proto::ChainSpec::anvil_default();
+        spec.rpc_urls = vec![format!("http://{address}")];
+        let chain = ChainClient::new(spec).unwrap();
+        let params = serde_json::json!([hash]).to_string();
+        for expected in [expected_receipt, serde_json::Value::Null] {
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                daemon_petal_chain_read(&chain, "eth_getTransactionReceipt", &params),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let returned: serde_json::Value = serde_json::from_str(&result).unwrap();
+            assert_eq!(returned.is_null(), expected.is_null());
+            if !expected.is_null() {
+                assert_eq!(returned["logs"], expected["logs"]);
+                assert_eq!(returned["transactionHash"], expected["transactionHash"]);
+            }
+        }
+        rpc.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn daemon_petal_outbox_inspection_is_read_only_and_origin_bound() {
         let (_dir, daemon, broker) = isolation_daemon().await;
         let host =
