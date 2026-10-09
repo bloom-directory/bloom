@@ -154,16 +154,9 @@ pub fn run_once() -> Result<()> {
 }
 
 fn restart_services_for_live_session(login_uid: u32, revoke_gid: u32) -> Result<()> {
-    let session_target = format!("gui/{login_uid}/com.bloom.session");
-    let Ok(session_state) = command_output("/bin/launchctl", &["print", &session_target]) else {
-        // An absent login job means this is a stale socket or a logged-out
-        // session. Either case must not restart the service principals.
-        return Ok(());
-    };
-    if !session_state
-        .lines()
-        .any(|line| line.trim() == "state = running")
-    {
+    if !login_sentinel_is_running(login_uid, |target| {
+        command_output("/bin/launchctl", &["print", target])
+    }) {
         return Ok(());
     }
 
@@ -199,6 +192,17 @@ fn restart_services_for_live_session(login_uid: u32, revoke_gid: u32) -> Result<
         }
     }
     Ok(())
+}
+
+fn login_sentinel_is_running(
+    login_uid: u32,
+    mut inspect: impl FnMut(&str) -> Result<String>,
+) -> bool {
+    // Keep the GUI-login requirement, but inspect the sentinel where the
+    // installer actually loads it. A user-domain job can outlive a GUI login.
+    inspect(&format!("gui/{login_uid}")).is_ok()
+        && inspect(&format!("user/{login_uid}/com.bloom.session"))
+            .is_ok_and(|state| state.lines().any(|line| line.trim() == "state = running"))
 }
 
 fn macos_managed_time_status() -> (bool, bool) {
@@ -380,6 +384,36 @@ fn require_service_directory(path: &Path, uid: u32, gid: u32, mode: u32) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_gui_login_uses_the_installed_user_domain_sentinel() {
+        assert!(login_sentinel_is_running(501, |target| match target {
+            "gui/501" => Ok("GUI domain exists".into()),
+            "user/501/com.bloom.session" => Ok("\tstate = running\n".into()),
+            _ => anyhow::bail!("job does not exist"),
+        }));
+    }
+
+    #[test]
+    fn logged_out_user_job_does_not_authorize_a_service_restart() {
+        assert!(!login_sentinel_is_running(501, |target| match target {
+            "user/501/com.bloom.session" => Ok("state = running".into()),
+            _ => anyhow::bail!("GUI login is absent"),
+        }));
+    }
+
+    #[test]
+    fn absent_or_stopped_user_sentinel_cannot_be_replaced_by_a_gui_job() {
+        for user_state in [None, Some("state = not running")] {
+            assert!(!login_sentinel_is_running(501, |target| match target {
+                "gui/501" | "gui/501/com.bloom.session" => Ok("state = running".into()),
+                "user/501/com.bloom.session" => user_state
+                    .map(str::to_owned)
+                    .ok_or_else(|| anyhow::anyhow!("sentinel is absent")),
+                _ => anyhow::bail!("unexpected target"),
+            }));
+        }
+    }
 
     #[test]
     fn ceremony_owner_marker_is_case_insensitive_but_exact() {
