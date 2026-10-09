@@ -3,13 +3,24 @@
 # No production service uses this file or environment variable.
 # macOS mktemp otherwise uses /var/folders, outside the disposable runner root.
 export TMPDIR="${RUNNER_TEMP:?}"
+mktemp() {
+  # Darwin's no-template mode prefers confstr over TMPDIR. An explicit
+  # absolute template is portable and keeps these disposable files scoped.
+  if [[ "$#" == 0 ]]; then
+    command mktemp "$RUNNER_TEMP/card-scratch.XXXXXXXXXX"
+  elif [[ "$#" == 1 && "$1" == -d ]]; then
+    command mktemp -d "$RUNNER_TEMP/card-scratch.XXXXXXXXXX"
+  else
+    command mktemp "$@"
+  fi
+}
 card_preserve_path() {
   local path="$1" destination
   [[ -e "$path" || -L "$path" ]] || return 0
   case "$path" in
-    "${RUNNER_TEMP:?}"/*|/private/tmp/bloom-*|/private/var/tmp/bloom-*|/private/var/db/bloom/*|/private/var/run/bloom/*|/var/db/bloom/*|/var/run/bloom/*|/Library/Application\ Support/BloomTriad/*|/usr/local/libexec/bloom)
+    "${RUNNER_TEMP:?}"/*|/private/tmp/bloom-*|/private/var/tmp/bloom-*|/private/etc/.bloom-pf-cleanup.*|/private/var/db/bloom/*|/private/var/run/bloom/*|/var/db/bloom/*|/var/run/bloom/*|/Library/Application\ Support/BloomTriad/*|/usr/local/libexec/bloom)
       ;;
-    *) echo "Refused recursive cleanup outside disposable conformance paths" >&2; return 65 ;;
+    *) printf 'Refused recursive cleanup outside disposable conformance paths: %q (runner root %q)\n' "$path" "$RUNNER_TEMP" >&2; return 65 ;;
   esac
   destination="$path.card-retained-$$-${RANDOM}"
   [[ ! -e "$destination" && ! -L "$destination" ]] || return 65

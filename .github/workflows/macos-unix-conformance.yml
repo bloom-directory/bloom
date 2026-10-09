@@ -66,6 +66,7 @@ jobs:
         shell: bash
         run: echo "CARGO_TARGET_DIR=$RUNNER_TEMP/bloom-release-target" >> "$GITHUB_ENV"
       - name: Restore release build cache
+        if: always()
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ${{ runner.temp }}/bloom-release-target
