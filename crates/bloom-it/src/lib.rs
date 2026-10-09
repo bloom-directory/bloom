@@ -38,7 +38,7 @@ pub const FUNDER_PRIV_KEY: &str =
 /// it does not expose or emulate the retired hash-only PetalHost path.
 pub struct ExactSigningBrokerFixture {
     active: AtomicBool,
-    unrestricted_test_destinations: AtomicBool,
+    test_deployments: AtomicBool,
     signer: alloy_signer_local::PrivateKeySigner,
     key_ref: KeyRef,
     requests: parking_lot::Mutex<Vec<MachineBrokerRequest>>,
@@ -50,11 +50,23 @@ impl ExactSigningBrokerFixture {
             wallet_id: wallet_id.clone(),
             maximum_approval_lifetime_ms: 3_600_000,
             allowed_petal_packages: Vec::new(),
-            allowed_destinations: if self.unrestricted_test_destinations.load(Ordering::SeqCst) {
-                vec![PolicyDestination {
+            allowed_destinations: if self.test_deployments.load(Ordering::SeqCst) {
+                let mut destinations = vec![PolicyDestination {
                     chain: Token::new("evm-31337").unwrap(),
                     destination: "exact".into(),
-                }]
+                }];
+                // Creation opt-in preserves recipient restrictions. Grant the
+                // fixture's mempool target and its first 64 CREATE addresses
+                // explicitly so deployment tools can initialize their contracts.
+                destinations.extend(
+                    std::iter::once(alloy_primitives::Address::ZERO)
+                        .chain((0..64).map(|nonce| self.signer.address().create(nonce)))
+                        .map(|address| PolicyDestination {
+                            chain: Token::new("anvil").unwrap(),
+                            destination: format!("{address:#x}"),
+                        }),
+                );
+                destinations
             } else {
                 vec![PolicyDestination {
                     chain: Token::new("anvil").unwrap(),
@@ -100,10 +112,9 @@ impl ExactSigningBrokerFixture {
         }
     }
 
-    /// Test-only policy fixture for arbitrary local-chain deployment destinations.
+    /// Grant creation and the deployment tool fixture's explicit local targets.
     pub fn allow_test_deployments(&self) {
-        self.unrestricted_test_destinations
-            .store(true, Ordering::SeqCst);
+        self.test_deployments.store(true, Ordering::SeqCst);
     }
 
     pub fn activate(&self) {
@@ -245,7 +256,7 @@ pub fn exact_signing_broker(
         .map_err(|error| anyhow!("parse exact-signing fixture key: {error}"))?;
     let fixture = Arc::new(ExactSigningBrokerFixture {
         active: AtomicBool::new(false),
-        unrestricted_test_destinations: AtomicBool::new(false),
+        test_deployments: AtomicBool::new(false),
         signer,
         key_ref: KeyRef {
             backend: Token::new("local").unwrap(),
