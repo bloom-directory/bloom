@@ -96,7 +96,7 @@ try {
   await recoveryPage.locator('#screen').waitFor();
   async function privateAction(button) {
     const response=recoveryPage.waitForResponse(r=>new URL(r.url()).pathname==='/action');
-    await button.click();assert.equal((await response).status(),200);
+    await button.click();assert.equal((await response).status(),204);
   }
   for(let i=0;i<4;i++)await privateAction(recoveryPage.getByRole('button',{name:'Tab',exact:true}));
   await recoveryPage.locator('#text').fill('12345');
