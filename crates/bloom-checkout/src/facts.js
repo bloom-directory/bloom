@@ -32,7 +32,7 @@
     const amounts = [];
     for (let i = 0; i < lines.length; i++) {
       if (!/^(total|order total|amount due|total due)\b/i.test(lines[i])) continue;
-      const nearby = lines.slice(i, i + 2).join(' ');
+      const nearby = lines.slice(i, i + 3).join(' ');
       const match = nearby.match(/\b(USD|CAD|EUR|GBP|BRL|MXN|ARS|CLP|COP|JPY)\s*[$€£R]*\s*([\d,]+(?:\.\d{1,2})?)\b/)
         || nearby.match(/[$€£R]*\s*([\d,]+(?:\.\d{1,2})?)\s*(USD|CAD|EUR|GBP|BRL|MXN|ARS|CLP|COP|JPY)\b/);
       if (!match) return null;

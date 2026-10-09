@@ -17,7 +17,7 @@ card_preserve_path() {
 rm() {
   local recursive=false argument
   for argument in "$@"; do
-    case "$argument" in --recursive|-*r*|-*R*) recursive=true;; esac
+    case "$argument" in --recursive) recursive=true;; --*) ;; -*r*|-*R*) recursive=true;; esac
   done
   if ! $recursive; then command rm "$@"; return; fi
   for argument in "$@"; do

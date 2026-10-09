@@ -521,6 +521,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fixture_total_currency_amount_on_separate_lines() {
+        let browser = browser().await;
+        let (url, server) = fixture(format!(
+            "<!doctype html><p>Total</p><p>USD</p><p>$1.00</p>{}<button>Buy Now</button>",
+            inputs()
+        ))
+        .await;
+        let tab = open(&browser, url).await;
+        let discovery = Discovery::read(&tab).await.unwrap();
+        assert_eq!(discovery.facts.total_minor, 100);
+        assert_eq!(discovery.facts.currency, "USD");
+        browser.return_control().await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn fixture_ambiguous_decimal_comma_requires_manual_review() {
         let browser = browser().await;
         let (url, server) = fixture(format!(
