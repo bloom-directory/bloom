@@ -328,6 +328,7 @@ if [[ "${BLOOM_MACOS_ACCEPTANCE_EXCLUSIVE_LISTENER_TESTED:-}" == 1 ]]; then
   broker_test_args+=(-- --skip paired_loopback_servers_validate_serve_both_families_and_shutdown)
 fi
 run_as_login test "${broker_test_args[@]}"
+run_as_login test --manifest-path "$main_root/Cargo.toml" -p bloom-checkout --lib --locked
 run_as_login test \
   --manifest-path "$signer_root/Cargo.toml" \
   --workspace \

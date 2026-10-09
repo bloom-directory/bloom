@@ -99,6 +99,7 @@ jobs:
             "$RUNNER_TEMP/verified/bloom-triad/bin/bloom-broker" \
             "$RUNNER_TEMP/verified/bloom-triad/bin/bloom-signer" \
             "$RUNNER_TEMP/verified/bloom-triad/bin/bloom-signer-migrate" \
+            "$RUNNER_TEMP/verified/bloom-triad/bin/bloom-checkout" \
             "$RUNNER_TEMP/w0-staging/bin/"
           cp -p \
             "$RUNNER_TEMP/verified/bloom-triad/compatibility-v1.toml" \
@@ -123,6 +124,9 @@ jobs:
       # port 18734. Installed acceptance repeats the other tests below.
       - name: Run complete Broker suite before installation
         run: cargo test --manifest-path bloom-broker/Cargo.toml --workspace --locked
+
+      - name: Verify checkout browser and crash protection on macOS
+        run: cargo test --manifest-path bloom/Cargo.toml -p bloom-checkout --lib --locked
 
       - name: Upload verified macOS candidate
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

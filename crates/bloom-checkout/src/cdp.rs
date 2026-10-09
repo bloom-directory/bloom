@@ -150,7 +150,24 @@ impl Cdp {
                 }
                 let tree = self
                     .call(Some(&session), "Page.getFrameTree", json!({}))
-                    .await?;
+                    .await;
+                let tree = match tree {
+                    Ok(tree) => tree,
+                    Err(error) => {
+                        // A navigation can detach the cached OOPIF session while
+                        // retaining its target. Fail this observation closed and
+                        // attach anew on the caller's next observation.
+                        self.iframe_sessions.lock().remove(id);
+                        let _ = self
+                            .call(
+                                None,
+                                "Target.detachFromTarget",
+                                json!({"sessionId":session}),
+                            )
+                            .await;
+                        return Err(error);
+                    }
+                };
                 tree_frames(&tree["frameTree"], &session, Some(parent), &mut frames);
                 attached.insert(id.to_owned());
             }
@@ -293,10 +310,10 @@ impl Cdp {
         let response = tokio::time::timeout(Duration::from_secs(30), receiver).await;
         self.replies.lock().remove(&id);
         let value = response
-            .context("Checkout browser timed out")?
+            .with_context(|| format!("Checkout browser timed out during {method}"))?
             .context("Checkout browser disconnected")?;
         if value.get("error").is_some() {
-            bail!("Checkout browser command failed");
+            bail!("Checkout browser command failed during {method}");
         }
         Ok(value["result"].clone())
     }

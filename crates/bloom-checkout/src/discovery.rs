@@ -521,6 +521,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fixture_ambiguous_decimal_comma_requires_manual_review() {
+        let browser = browser().await;
+        let (url, server) = fixture(format!(
+            "<!doctype html><p>Total BRL 57,00</p>{}<button>Pay</button>",
+            inputs()
+        ))
+        .await;
+        let tab = open(&browser, url).await;
+        assert!(Discovery::read(&tab).await.is_err());
+        browser.return_control().await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn fixture_plain_installments_confirmation_and_decline() {
         let browser = browser().await;
         for (outcome, expected) in [

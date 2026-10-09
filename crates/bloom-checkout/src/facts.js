@@ -38,7 +38,11 @@
       if (!match) return null;
       const code = /^[A-Z]{3}$/.test(match[1]) ? match[1] : match[2];
       const amount = code === match[1] ? match[2] : match[1];
+      // This generic path supports decimal points and unambiguous thousands
+      // grouping. Decimal commas need a named locale adapter, otherwise review.
+      if (!/^(?:\d+|\d{1,3}(?:,\d{3})+)(?:\.\d{1,2})?$/.test(amount)) return null;
       const scale = new Intl.NumberFormat('en', {style:'currency',currency:code}).resolvedOptions().maximumFractionDigits;
+      if ((amount.split('.')[1]?.length || 0) > scale) return null;
       amounts.push({total:Math.round(Number(amount.replaceAll(',', '')) * 10 ** scale),currency:code});
     }
     if (amounts.length !== 1) return null;

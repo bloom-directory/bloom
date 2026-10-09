@@ -112,7 +112,10 @@ impl Browser {
                 for (position, frame) in contexts.into_iter().enumerate() {
                     let parsed = url::Url::parse(&frame.url)?;
                     if !matches!(parsed.scheme(), "http" | "https") && frame.url != "about:blank" {
-                        bail!("Only ordinary shopping documents can be observed");
+                        if position == 0 {
+                            bail!("Only ordinary shopping documents can be observed");
+                        }
+                        continue;
                     }
                     let result=self.cdp.call(Some(&frame.session),"Runtime.evaluate",json!({
                         "contextId":frame.world,"returnByValue":true,"expression":include_str!("snapshot.js")
@@ -372,6 +375,41 @@ fn accessibility_text(tree: &Value) -> Result<String> {
 mod tests {
     use super::*;
     use axum::{Router, response::Html, routing::get};
+
+    #[tokio::test]
+    #[ignore = "real public Shopify cart, no card or purchase; requires network"]
+    async fn shopify_public_cart_remains_browsable() {
+        let root = tempfile::tempdir().unwrap().keep();
+        let browser = Browser::launch(
+            &crate::test_chromium(),
+            &root.join("profile"),
+            &["--no-sandbox".into()],
+        )
+        .await
+        .unwrap();
+        browser
+            .browse(BrowseRequest::Open {
+                url: "https://shop.simplyonpurpose.org/products/story-starters".into(),
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+        let button = snapshot["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|element| element["label"] == "Add to Cart")
+            .unwrap();
+        browser
+            .browse(BrowseRequest::Click {
+                element_ref: button["ref"].as_str().unwrap().into(),
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        browser.browse(BrowseRequest::Snapshot).await.unwrap();
+    }
     use std::time::Duration;
 
     #[tokio::test]
