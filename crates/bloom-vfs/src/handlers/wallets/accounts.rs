@@ -601,7 +601,15 @@ impl WalletsHandler {
         rest: &[String],
         data: &[u8],
     ) -> Result<(), HandlerError> {
-        let view = self.account_view(wallet, number).await?;
+        // Unsigned construction can use an authenticated cached account while
+        // Broker is unavailable. Every other write still resolves live authority.
+        let unsigned_stage = matches!(rest, [dir, _, sub, leaf]
+            if dir == "chains" && sub == "outbox" && leaf == "new.tx");
+        let view = if unsigned_stage {
+            self.account_view_navigation(wallet, number).await?
+        } else {
+            self.account_view(wallet, number).await?
+        };
         if let [dir, mount, slot, leaf] = rest
             && dir == "sessions"
             && leaf == "stop"
@@ -665,7 +673,11 @@ impl WalletsHandler {
                 family.fingerprint
             )));
         }
-        let projection = self.wallet_projection(wallet).await?;
+        let projection = if unsigned_stage {
+            self.wallet_projection_navigation(wallet).await?
+        } else {
+            self.wallet_projection(wallet).await?
+        };
         // The numeric-chain opt-in has to be read here, not only on the
         // `bloom deploy` RPC path. This is the outbox the docs tell an agent
         // to stage through, and `advisory_evm_policy` always returns a
