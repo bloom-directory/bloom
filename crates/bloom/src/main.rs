@@ -2747,7 +2747,8 @@ enum WalletCmd {
         #[arg(long, default_value = "y")]
         text: String,
     },
-    /// Submit a same-nonce self-send replacement request for a staged tx.
+    /// Discard an unsigned pending tx locally, or replace a broadcast tx
+    /// with an approved same-nonce self-send.
     Cancel {
         wallet: String,
         chain: String,

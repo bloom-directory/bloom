@@ -127,7 +127,7 @@ To cancel or bump, use the existing native wallet outbox controls for the same
 ID (`bloom wallet cancel --help` and `bloom wallet replace --help`). Cancellation after signing/broadcast may need
 its own exact approval. A client disconnect never releases a reserved nonce.
 For an unsigned pending entry, release its local reservation with
-`bloom wallet confirm --wallet <wallet> --chain <chain> --id <id> --text cancel`.
+`bloom wallet confirm <wallet> <chain> <id> --text cancel`.
 This discard does not replace an already broadcast transaction. `status` and
 `resume` exit 3 while approval is required, 4 while a result is unknown, and
 nonzero for failed or reverted deployments.
