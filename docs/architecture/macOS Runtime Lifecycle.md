@@ -25,3 +25,8 @@ gone, does not authorize a restart. Losing the authenticated sentinel connection
 still drains Broker and Signer. W0 verifies this by booting out the sentinel,
 observing both services exit, restoring the same user-domain job, and checking
 that authenticated service readiness returns.
+
+When the GUI login returns, the monitor can kickstart an already-loaded stopped
+user-domain sentinel. It waits until a later tick observes that job running,
+then checks the complete socket guards before restarting either service. A
+missing canonical job is not bootstrapped by this monitor.
