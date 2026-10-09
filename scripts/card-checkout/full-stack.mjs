@@ -98,7 +98,8 @@ try {
     const response=recoveryPage.waitForResponse(r=>new URL(r.url()).pathname==='/action');
     await button.click();assert.equal((await response).status(),204);
   }
-  for(let i=0;i<4;i++)await privateAction(recoveryPage.getByRole('button',{name:'Tab',exact:true}));
+  // Secure filling leaves focus on CVC; the next field is billing postal code.
+  await privateAction(recoveryPage.getByRole('button',{name:'Tab',exact:true}));
   await recoveryPage.locator('#text').fill('12345');
   await privateAction(recoveryPage.getByRole('button',{name:'Send text',exact:true}));
   await privateAction(recoveryPage.getByRole('button',{name:'Tab',exact:true}));

@@ -960,6 +960,35 @@ mod tests {
             .target
             .clone();
         assert_ne!(state["selected_page"], root_target);
+        service
+            .private_action(&token, ViewAction::Key { key: "Tab".into() })
+            .await
+            .unwrap();
+        service
+            .private_action(
+                &token,
+                ViewAction::Type {
+                    text: "12345".into(),
+                },
+            )
+            .await
+            .unwrap();
+        {
+            let private = service.private.lock().await;
+            let checkout = private.as_ref().unwrap();
+            assert_eq!(
+                checkout
+                    .tab
+                    .cdp
+                    .evaluate(
+                        &checkout.view_session,
+                        "document.getElementById('otp').value === '12345'".into()
+                    )
+                    .await
+                    .unwrap(),
+                json!(true)
+            );
+        }
         let screenshot = service.private_screenshot(&token).await.unwrap();
         assert_eq!(&screenshot[..8], b"\x89PNG\r\n\x1a\n");
         assert!(
