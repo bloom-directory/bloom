@@ -10,6 +10,7 @@ triad-dev-harness = []
 
 [dependencies]
 bloom-checkout-api.workspace = true
+bloom-service-activation.workspace = true
 anyhow.workspace = true
 axum = { workspace = true, features = ["query"] }
 base64.workspace = true

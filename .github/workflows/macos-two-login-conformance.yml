@@ -7,7 +7,7 @@ on:
         description: Public bloom-broker ref
         required: false
         type: string
-        default: 9cecd3b6727d025105cf8524a9bd59aa703141b3
+        default: 86a9d52a78a65436d2cb623ccd92c86a794f6256
       signer_ref:
         description: Public bloom-signer ref
         required: false
@@ -34,7 +34,7 @@ on:
       broker_ref:
         description: Public bloom-broker ref
         required: true
-        default: 9cecd3b6727d025105cf8524a9bd59aa703141b3
+        default: 86a9d52a78a65436d2cb623ccd92c86a794f6256
       signer_ref:
         description: Public bloom-signer ref
         required: true
@@ -75,7 +75,7 @@ jobs:
       - name: Reject mutable sibling refs
         shell: bash
         env:
-          BROKER_REF: ${{ inputs.broker_ref || '9cecd3b6727d025105cf8524a9bd59aa703141b3' }}
+          BROKER_REF: ${{ inputs.broker_ref || '86a9d52a78a65436d2cb623ccd92c86a794f6256' }}
           SIGNER_REF: ${{ inputs.signer_ref || 'fb31fef6a8ab44d9dc69d4b6a9b456dc0ed5726c' }}
         run: |
           [[ "$BROKER_REF" =~ ^[0-9a-f]{40}$ ]]
@@ -84,7 +84,7 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           repository: bloom-directory/bloom-broker
-          ref: ${{ inputs.broker_ref || '9cecd3b6727d025105cf8524a9bd59aa703141b3' }}
+          ref: ${{ inputs.broker_ref || '86a9d52a78a65436d2cb623ccd92c86a794f6256' }}
           path: bloom-broker
       - name: Check out Signer
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
@@ -128,6 +128,8 @@ jobs:
           cp "$RUNNER_TEMP/candidate-target/release/bloom-broker" \
             "$RUNNER_TEMP/baseline-staging/bin/bloom-broker"
           for name in baseline failing; do
+            cp "$RUNNER_TEMP/candidate-target/release/bloom-checkout" \
+              "$RUNNER_TEMP/$name-staging/bin/bloom-checkout"
             cp "$RUNNER_TEMP/candidate-target/release/bloom-signer" \
               "$RUNNER_TEMP/$name-staging/bin/bloom-signer"
             cp "$RUNNER_TEMP/candidate-target/release/bloom-signer-migrate" \

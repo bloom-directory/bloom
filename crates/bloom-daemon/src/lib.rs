@@ -4635,10 +4635,19 @@ impl Daemon {
                 ) as _,
             );
 
-        let checkout = config
+        let mut checkout = config
             .checkout
             .clone()
             .or(bloom_proto::config::CheckoutConfig::from_environment()?);
+        #[cfg(unix)]
+        if checkout.is_none()
+            && let Some(root) = std::env::var_os("BLOOM_CHECKOUT_CONFIG_ROOT")
+        {
+            checkout = Some(bloom_proto::config::CheckoutConfig::from_installed_root(
+                std::path::Path::new(&root),
+                rustix::process::geteuid().as_raw(),
+            )?);
+        }
         if let Some(checkout) = &checkout {
             let client = bloom_machine_client::checkout::CheckoutClient::new(
                 checkout.socket.clone(),

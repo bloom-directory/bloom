@@ -17,6 +17,8 @@
     <string>/Library/Application Support/BloomTriad/enrollments</string>
     <key>BLOOM_CONFIG_ROOT</key>
     <string>/Library/Application Support/BloomTriad/config</string>
+    <key>BLOOM_CHECKOUT_CONFIG_ROOT</key>
+    <string>/Library/Application Support/BloomTriad/config</string>
     <key>BLOOM_RUNTIME_ROOT</key>
     <string>/private/var/run/bloom</string>
     <key>BLOOM_LOG_OUTPUT</key>

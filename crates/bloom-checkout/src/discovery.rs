@@ -335,6 +335,167 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "real Stripe public test checkout; requires network"]
+    async fn stripe_elements_public_backend_test_purchase() {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(20))
+            .build()
+            .unwrap();
+        let base = "https://stripe-payments-demo.appspot.com";
+        let config: Value = client
+            .get(format!("{base}/config"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let key = config["stripePublishableKey"].as_str().unwrap();
+        assert!(
+            key.starts_with("pk_test_"),
+            "Only a public test-mode demo may back this fixture"
+        );
+        let products: Value = client
+            .get(format!("{base}/products"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let sku = &products["data"][0]["skus"]["data"][0];
+        for (case, (number, bank_action, expected)) in [
+            ("4242424242424242", None, "paid"),
+            ("4000000000000002", None, "declined"),
+            ("4000000000003220", Some("complete"), "paid"),
+            ("4000002760003184", Some("fail"), "declined"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if std::env::var("BLOOM_CHECKOUT_TEST_CASE")
+                .ok()
+                .is_some_and(|value| value != case.to_string())
+            {
+                continue;
+            }
+            let response: Value = client.post(format!("{base}/payment_intents"))
+            .json(&json!({"currency":config["currency"],"items":[{"type":"sku","parent":sku["id"],"quantity":1}]}))
+            .send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+            let intent = &response["paymentIntent"];
+            assert_eq!(intent["livemode"], false);
+            let amount = intent["amount"].as_u64().unwrap();
+            let currency = intent["currency"].as_str().unwrap().to_uppercase();
+            let secret = intent["client_secret"]
+                .as_str()
+                .expect("Public demo must return its test client secret");
+            // No account, secret API key, or production checkout. The public demo's
+            // documented backend creates this test intent for its existing sample SKU.
+            let html = format!(
+                r#"<!doctype html><h1>Stripe test fixture</h1>
+          <div data-bloom-total-minor='{amount}' data-bloom-currency='{currency}'>Total {currency} {major}.{minor:02}</div>
+          <form><div id='card'></div><button type='submit'>Pay</button></form>
+          <script src='https://js.stripe.com/v3/'></script><script>
+          const stripe=Stripe({key}),element=stripe.elements().create('card',{{hidePostalCode:true}});element.mount('#card');
+          document.querySelector('form').onsubmit=async event=>{{event.preventDefault();
+            const result=await stripe.confirmCardPayment({secret},{{payment_method:{{card:element,billing_details:{{name:'Fixture Buyer'}}}}}});
+            globalThis.__fixtureDiagnostic={{error_code:['card_declined','payment_intent_authentication_failure','incomplete_number','incomplete_expiry','incomplete_cvc','invalid_request_error'].includes(result.error?.code)?result.error.code:result.error?'other':null,status:result.paymentIntent?.status==='succeeded'?'succeeded':'other'}};
+            document.body.innerText=result.error?['card_declined','payment_intent_authentication_failure'].includes(result.error.code)?'Payment failed':'Test input rejected':result.paymentIntent.status==='succeeded'?'Payment successful':'Payment outcome uncertain';
+          }};</script>"#,
+                major = amount / 100,
+                minor = amount % 100,
+                key = serde_json::to_string(key).unwrap(),
+                secret = serde_json::to_string(secret).unwrap()
+            );
+            let (url, server) = fixture(html).await;
+            let browser = browser().await;
+            let tab = open(&browser, url).await;
+            tokio::time::sleep(Duration::from_secs(8)).await;
+            let discovery = Discovery::read(&tab).await.unwrap();
+            let mut filled = Vec::new();
+            let mut test_card = card();
+            test_card.number = number.into();
+            discovery.fill(&tab, &test_card, &mut filled).await.unwrap();
+            discovery.submit(&tab).await.unwrap();
+            let mut confirmed = false;
+            let mut bank_handled = false;
+            for attempt in 0..60 {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                if let Some(action) = bank_action {
+                    if !bank_handled {
+                        for frame in tab
+                            .cdp
+                            .contexts(&tab.session, "bloom-test-bank")
+                            .await
+                            .unwrap_or_default()
+                        {
+                            let origin = url::Url::parse(&frame.url)
+                                .unwrap()
+                                .origin()
+                                .ascii_serialization();
+                            if !origin.ends_with(".stripe.com") {
+                                continue;
+                            }
+                            if attempt == 5 {
+                                let diagnostic = evaluate(&tab, &frame.session, frame.world, "({buttons:document.querySelectorAll('button,input[type=submit]').length,iframes:document.querySelectorAll('iframe').length,complete:[...document.querySelectorAll('button,input[type=submit]')].some(e=>/complete|authorize/i.test(e.innerText||e.value)),fail:[...document.querySelectorAll('button,input[type=submit]')].some(e=>/fail/i.test(e.innerText||e.value))})".into()).await.unwrap();
+                                eprintln!("Bank frame {origin}: {diagnostic}");
+                            }
+                            let expression = format!(
+                                r#"(()=>{{
+                          const button=[...document.querySelectorAll('button,input[type=submit]')].find(e=>/^{action}|^{alternate}/i.test((e.innerText||e.value).trim()));
+                          if(!button)return false;button.click();return true;
+                        }})()"#,
+                                alternate = if action == "complete" {
+                                    "authorize"
+                                } else {
+                                    "fail"
+                                }
+                            );
+                            if evaluate(&tab, &frame.session, frame.world, expression)
+                                .await
+                                .is_ok_and(|value| value == true)
+                            {
+                                bank_handled = true;
+                            }
+                        }
+                    }
+                }
+                let Ok(result) = tab
+                    .cdp
+                    .evaluate(&tab.session, include_str!("outcome.js").into())
+                    .await
+                else {
+                    continue;
+                };
+                if result["state"] == expected {
+                    confirmed = true;
+                    break;
+                }
+            }
+            let diagnostic = tab
+                .cdp
+                .evaluate(
+                    &tab.session,
+                    "globalThis.__fixtureDiagnostic || null".into(),
+                )
+                .await
+                .unwrap_or(Value::Null);
+            browser.return_control().await.unwrap();
+            server.abort();
+            assert!(
+                confirmed,
+                "Stripe fixture case {case}, bank handled {bank_handled}, diagnostic {diagnostic}"
+            );
+            assert_eq!(bank_handled, bank_action.is_some());
+            eprintln!("Stripe fixture case {case}: {expected}, bank interaction {bank_handled}");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "real Stripe public test checkout; requires network"]
     async fn stripe_public_demo_reads_real_fields_and_processor_facts() {
         let browser = browser().await;
         browser

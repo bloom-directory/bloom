@@ -57,6 +57,7 @@ pub(crate) struct Cdp {
     child: Mutex<Child>,
     writer: Mutex<File>,
     replies: Replies,
+    iframe_sessions: Mutex<HashMap<String, String>>,
     sequence: AtomicU64,
 }
 
@@ -98,6 +99,9 @@ impl Cdp {
         let infos = targets["targetInfos"]
             .as_array()
             .context("Missing browser targets")?;
+        self.iframe_sessions
+            .lock()
+            .retain(|id, _| infos.iter().any(|t| t["targetId"] == id.as_str()));
         let mut frames = Vec::new();
         tree_frames(&tree["frameTree"], root_session, None, &mut frames);
         let mut attached = std::collections::HashSet::new();
@@ -121,23 +125,33 @@ impl Cdp {
                 {
                     continue;
                 }
-                let attachment = self
-                    .call(
-                        None,
-                        "Target.attachToTarget",
-                        json!({"targetId":id,"flatten":true}),
-                    )
-                    .await?;
-                let session = attachment["sessionId"]
-                    .as_str()
-                    .context("Missing iframe session")?;
+                let cached = self.iframe_sessions.lock().get(id).cloned();
+                let session = if let Some(session) = cached {
+                    session
+                } else {
+                    let attachment = self
+                        .call(
+                            None,
+                            "Target.attachToTarget",
+                            json!({"targetId":id,"flatten":true}),
+                        )
+                        .await?;
+                    let session = attachment["sessionId"]
+                        .as_str()
+                        .context("Missing iframe session")?
+                        .to_owned();
+                    self.iframe_sessions
+                        .lock()
+                        .insert(id.to_owned(), session.clone());
+                    session
+                };
                 if let Some(frame) = frames.iter_mut().find(|(known, _, _, _)| known == id) {
-                    frame.2 = session.into();
+                    frame.2 = session.clone();
                 }
                 let tree = self
-                    .call(Some(session), "Page.getFrameTree", json!({}))
+                    .call(Some(&session), "Page.getFrameTree", json!({}))
                     .await?;
-                tree_frames(&tree["frameTree"], session, Some(parent), &mut frames);
+                tree_frames(&tree["frameTree"], &session, Some(parent), &mut frames);
                 attached.insert(id.to_owned());
             }
             if attached.len() == before {
@@ -227,6 +241,7 @@ impl Cdp {
             child: Mutex::new(child),
             writer: Mutex::new(File::from(command_write)),
             replies: replies.clone(),
+            iframe_sessions: Mutex::new(HashMap::new()),
             sequence: AtomicU64::new(1),
         });
         let mut reader = File::from(event_read);

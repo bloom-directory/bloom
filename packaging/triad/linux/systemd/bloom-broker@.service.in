@@ -10,7 +10,6 @@ User=bloom-broker-%i
 Group=bloom-broker-%i
 UMask=0077
 EnvironmentFile=/etc/bloom/%i/checkout.env
-ExecStartPre=/usr/bin/rm -f /run/bloom/%i/broker/checkout/intake.sock
 ExecStart=@BLOOM_BROKER_BINARY@
 StandardOutput=journal
 StandardError=journal

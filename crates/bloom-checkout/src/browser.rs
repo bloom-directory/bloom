@@ -374,7 +374,6 @@ mod tests {
     use axum::{Router, response::Html, routing::get};
     use std::time::Duration;
 
-    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn renderer_and_browser_crashes_leave_no_memory_dumps() {
         fn assert_no_dump(path: &Path) {

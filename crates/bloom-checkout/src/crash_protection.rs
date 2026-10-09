@@ -34,6 +34,13 @@ pub(crate) fn install() -> std::io::Result<()> {
             jf: 0,
             k: 0,
         },
+        // x86's x32 ABI uses the same audit architecture and a syscall bit.
+        libc::sock_filter {
+            code: 0x54,
+            jt: 0,
+            jf: 0,
+            k: !0x40000000,
+        },
         libc::sock_filter {
             code: EQUAL,
             jt: 1,
@@ -67,7 +74,29 @@ pub(crate) fn install() -> std::io::Result<()> {
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
 pub(crate) fn install() -> std::io::Result<()> {
+    unsafe extern "C" {
+        fn sandbox_init(
+            profile: *const libc::c_char,
+            flags: u64,
+            error: *mut *mut libc::c_char,
+        ) -> libc::c_int;
+        fn sandbox_free_error(error: *mut libc::c_char);
+    }
+    // Crashpad's database initializes normally, but its UUID.dmp report files
+    // cannot be written. Cookies and Chromium's own renderer sandbox remain
+    // subject to their existing policies. The crash fixture is the platform gate.
+    let policy = c"(version 1)(allow default)(deny file-write* (regex #\"\\\\.dmp$\"))";
+    let mut error = std::ptr::null_mut();
+    let result = unsafe { sandbox_init(policy.as_ptr(), 0, &mut error) };
+    if !error.is_null() {
+        unsafe { sandbox_free_error(error) };
+    }
+    if result != 0 {
+        return Err(std::io::Error::other(
+            "Cannot prevent browser crash report writes",
+        ));
+    }
     Ok(())
 }

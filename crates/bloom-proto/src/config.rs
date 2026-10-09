@@ -89,6 +89,28 @@ pub struct CheckoutConfig {
 }
 
 impl CheckoutConfig {
+    #[cfg(unix)]
+    pub fn from_installed_root(root: &Path, login_uid: u32) -> Result<Self, ConfigError> {
+        use std::os::unix::fs::MetadataExt;
+        let path = root.join(login_uid.to_string()).join("checkout.json");
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if !metadata.is_file()
+            || metadata.uid() != 0
+            || metadata.nlink() != 1
+            || metadata.mode() & 0o022 != 0
+        {
+            return Err(ConfigError::Invalid("Checkout endpoint must be a root-owned regular file without group or other write access".into()));
+        }
+        let endpoint: Self = serde_json::from_slice(&std::fs::read(path)?)
+            .map_err(|_| ConfigError::Invalid("Invalid installed checkout endpoint".into()))?;
+        if !endpoint.socket.is_absolute() || endpoint.uid == 0 {
+            return Err(ConfigError::Invalid(
+                "Invalid installed checkout principal".into(),
+            ));
+        }
+        Ok(endpoint)
+    }
+
     /// Root-installed service environment supplies public endpoint coordinates.
     pub fn from_environment() -> Result<Option<Self>, ConfigError> {
         Self::from_endpoint_values(
@@ -550,6 +572,15 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if self
+            .checkout
+            .as_ref()
+            .is_some_and(|endpoint| !endpoint.socket.is_absolute() || endpoint.uid == 0)
+        {
+            return Err(ConfigError::Invalid(
+                "Checkout requires an absolute socket and nonzero service UID".into(),
+            ));
+        }
         if self.chains.is_empty() {
             return Err(ConfigError::Invalid(
                 "config.chains must contain at least one entry".into(),
@@ -747,6 +778,14 @@ mod tests {
             endpoint.socket,
             std::path::PathBuf::from("/run/bloom/checkout.sock")
         );
+        let mut config = Config::local_default();
+        config.checkout = Some(endpoint);
+        assert!(config.validate().is_ok());
+        config.checkout.as_mut().unwrap().uid = 0;
+        assert!(config.validate().is_err());
+        config.checkout.as_mut().unwrap().uid = 31004;
+        config.checkout.as_mut().unwrap().socket = "relative.sock".into();
+        assert!(config.validate().is_err());
     }
 
     fn http_endpoint() -> EndpointSpec {

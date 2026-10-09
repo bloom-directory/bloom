@@ -46,6 +46,30 @@ pub fn prepare(
     Ok(())
 }
 
+pub fn prepare_checkout(
+    root: &Path,
+    login_uid: u32,
+    broker_uid: u32,
+    checkout_uid: u32,
+    machine_checkout_gid: u32,
+    broker_checkout_gid: u32,
+) -> io::Result<()> {
+    let runtime = root.join(login_uid.to_string());
+    ensure_directory(&runtime, 0, 0, 0o711)?;
+    ensure_directory(
+        &runtime.join("machine-checkout"),
+        checkout_uid,
+        machine_checkout_gid,
+        0o710,
+    )?;
+    ensure_directory(
+        &runtime.join("broker-checkout"),
+        broker_uid,
+        broker_checkout_gid,
+        0o710,
+    )
+}
+
 fn unsafe_directory(path: &Path) -> io::Error {
     io::Error::new(
         io::ErrorKind::PermissionDenied,

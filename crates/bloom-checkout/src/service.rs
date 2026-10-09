@@ -13,7 +13,7 @@ use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    os::unix::fs::{MetadataExt, PermissionsExt},
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -776,8 +776,8 @@ fn hex_token(bytes: &[u8]) -> String {
 
 /// The login principal has this narrow API, never the private browser channel.
 pub async fn serve_api(service: Arc<CheckoutService>, path: &Path, machine_uid: u32) -> Result<()> {
-    let listener = tokio::net::UnixListener::bind(path)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666))?;
+    let listener = bloom_service_activation::bind_owned_unix_listener(path)?;
+    let listener = tokio::net::UnixListener::from_std(listener)?;
     let quota = Arc::new(tokio::sync::Semaphore::new(16));
     loop {
         let (stream, _) = listener.accept().await?;

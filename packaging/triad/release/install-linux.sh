@@ -1275,6 +1275,10 @@ case "$action" in
     validate_root_uid "$1" "$2"
     login_user="$3"
     payload="$(cd "$4" && pwd -P)"
+    if [[ "$root" == "/" ]] && ! command -v chromium >/dev/null && ! command -v chromium-browser >/dev/null && ! command -v google-chrome >/dev/null; then
+      echo "Bloom checkout requires installed Chromium or Google Chrome" >&2
+      exit 65
+    fi
     if [[ "$root" == "/" && "$(id -u)" -ne 0 ]]; then
       echo "Linux installation requires root" >&2
       exit 77

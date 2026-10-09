@@ -98,7 +98,7 @@ try:
     directory(runtime / str(login), mode=0o711)
     directory(runtime / str(login) / 'session', login, 0o710)
     for role, uid in [('broker', broker), ('signer', signer), ('checkout', checkout)]:
-        directory(runtime / role, uid, 0o711 if role == 'checkout' else 0o710)
+        directory(runtime / role, uid, 0o710)
     session_socket = runtime / str(login) / 'session' / 'session.sock'
     broker_socket = runtime / 'broker' / 'rpc.sock'
     signer_socket = runtime / 'signer' / 'rpc.sock'
