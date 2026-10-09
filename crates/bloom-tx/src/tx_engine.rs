@@ -5312,6 +5312,12 @@ mod tests {
                         }))
                     }
                     MachineBrokerRequest::SealedApprovalPrepare(request) => {
+                        if request.evm_review_payloads.is_empty() {
+                            return Err(bloom_broker_api::ProtocolError::new(
+                                ProtocolErrorCode::BackendInvalidRequest,
+                                "native EVM approval requires review payloads",
+                            ));
+                        }
                         Ok(MachineBrokerResponse::SealedApprovalPrepare(
                             bloom_broker_api::SealedApprovalPrepareResponse {
                                 approval_id: request.terms.approval_id()?,
@@ -5969,7 +5975,7 @@ mod tests {
                 "alice",
                 TEST_SIGNER_ADDRESS.parse().unwrap(),
                 transfer,
-                &chain,
+                &stage_chain(&spawn_stage_rpc(false).await),
                 &policy,
                 None,
             )
