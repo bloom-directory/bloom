@@ -683,11 +683,23 @@ impl Outbox {
         let intent = dir.join("intent.json");
         if intent.exists() {
             let staged: StagedTx = serde_json::from_slice(&fs::read(&intent)?)?;
-            return Ok(OutboxEntry {
+            let entry = OutboxEntry {
                 state: expected,
                 staged,
                 dir,
-            });
+            };
+            if expected == OutboxState::Pending && is_interrupted_transition(&entry) {
+                // Its status already says it left the queue; never let a
+                // caller confirm or cancel it as though it were pending.
+                let actual = OutboxState::from_status(&entry.staged.status);
+                self.finish_interrupted_transition(&entry)?;
+                return Err(OutboxError::StateMismatch {
+                    id: id.to_string(),
+                    expected: expected.dirname(),
+                    actual: actual.dirname(),
+                });
+            }
+            return Ok(entry);
         }
         // Differentiate "exists in another state" vs "totally absent" so
         // callers (and humans reading errors) can tell which case it is.
@@ -909,20 +921,92 @@ impl Outbox {
         Ok(Some(serde_json::from_slice(&fs::read(&path)?)?))
     }
 
+    /// Move an entry between states and persist the status that says why.
+    ///
+    /// `transition` renames the directory and nothing else, so an entry moved
+    /// out of `pending` kept whatever status it was staged with. A reader then
+    /// had to infer the reason from the (state, status) pair, and several
+    /// different outcomes -- a user cancellation, a hard policy denial, an
+    /// expiry sweep -- all left the identical `(Failed, Pending)` shape. They
+    /// are not the same thing to anyone downstream, so each producer records
+    /// what it meant and the pair always agrees.
+    ///
+    /// The status is written durably before the directory moves. A crash
+    /// between the two leaves a `pending/` entry whose intent already carries
+    /// its terminal status, which [`Self::read_in_state`] and
+    /// [`Self::sweep_expired`] finish moving rather than hand out as still
+    /// pending. The reverse order could leave a terminal directory saying
+    /// `pending`, which a Petal would poll forever.
+    pub fn transition_with_status(
+        &self,
+        entry: &OutboxEntry,
+        new_state: OutboxState,
+        status: TxStatus,
+    ) -> Result<PathBuf, OutboxError> {
+        let moving = self.persist_status(entry, status)?;
+        match self.transition(&moving, new_state) {
+            Ok(new_dir) => {
+                if let Some(parent) = entry.dir.parent() {
+                    sync_dir(parent)?;
+                }
+                if let Some(parent) = new_dir.parent() {
+                    sync_dir(parent)?;
+                }
+                Ok(new_dir)
+            }
+            Err(error) => {
+                // The move did not happen or was rolled back, so the entry
+                // is still pending and must say so again.
+                if entry.dir.join("intent.json").exists() {
+                    let _ = write_intent_durably(&entry.dir, &entry.staged);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// First half of [`Self::transition_with_status`]: record the terminal
+    /// status in the entry where it currently lives.
+    fn persist_status(
+        &self,
+        entry: &OutboxEntry,
+        status: TxStatus,
+    ) -> Result<OutboxEntry, OutboxError> {
+        let mut staged = entry.staged.clone();
+        staged.status = status;
+        write_intent_durably(&entry.dir, &staged)?;
+        Ok(OutboxEntry {
+            state: entry.state,
+            staged,
+            dir: entry.dir.clone(),
+        })
+    }
+
+    /// Finish a [`Self::transition_with_status`] that a crash interrupted
+    /// after the status was written but before the directory moved.
+    fn finish_interrupted_transition(&self, entry: &OutboxEntry) -> Result<PathBuf, OutboxError> {
+        let target = OutboxState::from_status(&entry.staged.status);
+        tracing::warn!(
+            id = %entry.staged.id,
+            wallet = %entry.staged.wallet,
+            chain = %entry.staged.chain,
+            status = %entry.staged.status,
+            "outbox.finish_interrupted_transition"
+        );
+        let new_dir = self.transition(entry, target)?;
+        if let Some(parent) = entry.dir.parent() {
+            sync_dir(parent)?;
+        }
+        if let Some(parent) = new_dir.parent() {
+            sync_dir(parent)?;
+        }
+        Ok(new_dir)
+    }
+
     pub fn cancel(&self, wallet: &str, chain: &str, id: &str) -> Result<(), OutboxError> {
         let entry = self.read_in_state(wallet, chain, id, OutboxState::Pending)?;
-        let mut staged = entry.staged.clone();
-        staged.status = TxStatus::Cancelled;
-        let entry = OutboxEntry {
-            state: entry.state,
-            staged: staged.clone(),
-            dir: entry.dir.clone(),
-        };
-        let new_dir = self.transition(&entry, OutboxState::Failed)?;
-        fs::write(
-            new_dir.join("intent.json"),
-            serde_json::to_vec_pretty(&staged)?,
-        )?;
+        let new_dir =
+            self.transition_with_status(&entry, OutboxState::Failed, TxStatus::Cancelled)?;
         fs::write(new_dir.join("cancel.txt"), b"cancelled by user")?;
         Ok(())
     }
@@ -962,13 +1046,34 @@ impl Outbox {
                         continue;
                     }
                     let staged: StagedTx = serde_json::from_slice(&fs::read(&intent_path)?)?;
+                    let entry = OutboxEntry {
+                        state: OutboxState::Pending,
+                        staged: staged.clone(),
+                        dir: ent.path(),
+                    };
+                    if is_interrupted_transition(&entry) {
+                        if let Err(e) = self.finish_interrupted_transition(&entry) {
+                            tracing::warn!(
+                                id = %staged.id,
+                                wallet = %staged.wallet,
+                                chain = %staged.chain,
+                                error = %e,
+                                "outbox.finish_interrupted_transition_failed"
+                            );
+                        }
+                        continue;
+                    }
                     if staged.expires_ms != 0 && now_ms >= staged.expires_ms {
-                        let entry = OutboxEntry {
-                            state: OutboxState::Pending,
-                            staged: staged.clone(),
-                            dir: ent.path(),
-                        };
-                        match self.transition(&entry, OutboxState::Failed) {
+                        // Expiry is its own outcome: the entry was never
+                        // broadcast and now never will be. `Failed` with an
+                        // `expired.txt` beside it says that without claiming
+                        // someone cancelled it.
+                        match self
+                            .transition_with_status(&entry, OutboxState::Failed, TxStatus::Failed)
+                            .and_then(|dir| {
+                                fs::write(dir.join("expired.txt"), b"expired before approval")?;
+                                Ok(dir)
+                            }) {
                             Ok(_) => {
                                 tracing::debug!(
                                     id = %staged.id,
@@ -1070,6 +1175,44 @@ impl Outbox {
         }
         Ok(total)
     }
+}
+
+/// A `pending/` entry whose intent already records a terminal status: a
+/// [`Outbox::transition_with_status`] that stopped between writing the status
+/// and moving the directory.
+fn is_interrupted_transition(entry: &OutboxEntry) -> bool {
+    entry.state == OutboxState::Pending
+        && OutboxState::from_status(&entry.staged.status) == OutboxState::Failed
+}
+
+/// Replace `dir/intent.json` so a reader sees the old intent or the new one,
+/// never a torn file, and the new one survives a crash once this returns.
+fn write_intent_durably(dir: &Path, staged: &StagedTx) -> Result<(), OutboxError> {
+    let body = serde_json::to_vec_pretty(staged)?;
+    let mut random = [0_u8; 8];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut random);
+    let temporary = dir.join(format!(".intent.json.{}.tmp", hex::encode(random)));
+    let mut file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)?;
+    if let Err(error) = (|| -> Result<(), std::io::Error> {
+        file.write_all(&body)?;
+        file.sync_all()?;
+        fs::rename(&temporary, dir.join("intent.json"))
+    })() {
+        let _ = fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    sync_dir(dir)
+}
+
+fn sync_dir(dir: &Path) -> Result<(), OutboxError> {
+    #[cfg(unix)]
+    fs::File::open(dir)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
 }
 
 /// Parse a single `<root>/<wallet>/<chain>/sent/<id>/intent.json` into a
@@ -1441,6 +1584,152 @@ mod tests {
         assert_eq!(n, 1);
         let entry = ob.read("alice", "anvil", "x").unwrap();
         assert_eq!(entry.state, OutboxState::Failed);
+        // The status has to move with the directory, or a reader cannot tell
+        // an expired entry from one still waiting for approval.
+        assert_eq!(entry.staged.status, TxStatus::Failed);
+        assert!(entry.dir.join("expired.txt").exists());
+    }
+
+    /// Leaving the queue is not one outcome. A user cancellation, a hard
+    /// policy denial and an expiry sweep all land in `failed/`, and before
+    /// each producer recorded its own status they were indistinguishable: all
+    /// three read back as `(Failed, Pending)`, so anything downstream had to
+    /// guess, and guessing "cancelled" tells a Petal a policy-denied
+    /// transaction is safe to restage.
+    #[test]
+    fn every_producer_that_leaves_the_pending_queue_records_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let ob = Outbox::new(dir.path()).unwrap();
+
+        ob.write_pending(&fake_staged("cancelled"), "p").unwrap();
+        ob.cancel("alice", "anvil", "cancelled").unwrap();
+
+        let mut expired = fake_staged("expired");
+        expired.expires_ms = 100;
+        ob.write_pending(&expired, "p").unwrap();
+        assert_eq!(ob.sweep_expired(200).unwrap(), 1);
+
+        // What the policy-denial paths in TxEngine do.
+        ob.write_pending(&fake_staged("denied"), "p").unwrap();
+        let entry = ob.read("alice", "anvil", "denied").unwrap();
+        ob.transition_with_status(&entry, OutboxState::Failed, TxStatus::Failed)
+            .unwrap();
+
+        for (id, expected) in [
+            ("cancelled", TxStatus::Cancelled),
+            ("expired", TxStatus::Failed),
+            ("denied", TxStatus::Failed),
+        ] {
+            let entry = ob.read("alice", "anvil", id).unwrap();
+            assert_eq!(entry.state, OutboxState::Failed, "{id}");
+            assert_eq!(entry.staged.status, expected, "{id}");
+            assert_ne!(
+                entry.staged.status,
+                TxStatus::Pending,
+                "{id} left the queue still marked pending"
+            );
+        }
+
+        // Only the cancellation claims someone cancelled it.
+        assert!(
+            ob.read("alice", "anvil", "cancelled")
+                .unwrap()
+                .dir
+                .join("cancel.txt")
+                .exists()
+        );
+        assert!(
+            !ob.read("alice", "anvil", "denied")
+                .unwrap()
+                .dir
+                .join("cancel.txt")
+                .exists()
+        );
+    }
+
+    /// A crash inside `transition_with_status` after the status is written
+    /// but before the directory moves leaves exactly what `persist_status`
+    /// leaves. That entry must never be handed out as pending -- a cancelled
+    /// one could otherwise still be confirmed and broadcast -- and must not
+    /// sit in `pending/` forever.
+    #[test]
+    fn a_crash_between_status_and_move_is_finished_not_confirmed() {
+        let dir = tempfile::tempdir().unwrap();
+        let ob = Outbox::new(dir.path()).unwrap();
+
+        ob.write_pending(&fake_staged("cancelled"), "p").unwrap();
+        let entry = ob.read("alice", "anvil", "cancelled").unwrap();
+        ob.persist_status(&entry, TxStatus::Cancelled).unwrap();
+
+        let err = ob
+            .read_in_state("alice", "anvil", "cancelled", OutboxState::Pending)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                OutboxError::StateMismatch {
+                    expected: "pending",
+                    actual: "failed",
+                    ..
+                }
+            ),
+            "{err}"
+        );
+        let entry = ob.read("alice", "anvil", "cancelled").unwrap();
+        assert_eq!(entry.state, OutboxState::Failed);
+        assert_eq!(entry.staged.status, TxStatus::Cancelled);
+        assert!(ob.cancel("alice", "anvil", "cancelled").is_err());
+
+        // The periodic sweep finishes one nobody reads first.
+        ob.write_pending(&fake_staged("denied"), "p").unwrap();
+        let entry = ob.read("alice", "anvil", "denied").unwrap();
+        ob.persist_status(&entry, TxStatus::Failed).unwrap();
+        assert_eq!(ob.sweep_expired(0).unwrap(), 0);
+        let entry = ob.read("alice", "anvil", "denied").unwrap();
+        assert_eq!(entry.state, OutboxState::Failed);
+        assert_eq!(entry.staged.status, TxStatus::Failed);
+        assert!(
+            ob.list("alice", "anvil", OutboxState::Pending)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// If the move itself fails, the entry stays pending and says so again,
+    /// with no temporary file left beside the intent.
+    #[test]
+    fn a_failed_move_restores_the_pending_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let mock = Arc::new(MockProjection::new());
+        let ob = Outbox::new_with_projection(dir.path(), mock.clone()).unwrap();
+        ob.write_pending(&fake_staged("0001-evm"), "# plan")
+            .unwrap();
+        *mock.fail_transition.lock().unwrap() = Some("projection store offline".into());
+
+        let entry = ob.read("alice", "anvil", "0001-evm").unwrap();
+        ob.transition_with_status(&entry, OutboxState::Failed, TxStatus::Cancelled)
+            .unwrap_err();
+
+        let entry = ob
+            .read_in_state("alice", "anvil", "0001-evm", OutboxState::Pending)
+            .unwrap();
+        assert_eq!(entry.staged.status, TxStatus::Pending);
+        let leftovers: Vec<_> = fs::read_dir(&entry.dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+
+        // And once the projection recovers, the same call completes.
+        *mock.fail_transition.lock().unwrap() = None;
+        ob.transition_with_status(&entry, OutboxState::Failed, TxStatus::Cancelled)
+            .unwrap();
+        let entry = ob.read("alice", "anvil", "0001-evm").unwrap();
+        assert_eq!(
+            (entry.state, entry.staged.status),
+            (OutboxState::Failed, TxStatus::Cancelled)
+        );
     }
 
     /// Fix #8: `read_in_state` must NotFound an id that exists in a

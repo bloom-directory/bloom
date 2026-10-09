@@ -50,7 +50,9 @@ use bloom_revert::{
     OpenchainDecoder, boxed,
 };
 use bloom_tx::DynPriceOracle;
-use bloom_tx::outbox::{CentralActionIdentity, CentralOutboxProjection, Outbox, OutboxState};
+use bloom_tx::outbox::{
+    CentralActionIdentity, CentralOutboxProjection, Outbox, OutboxError, OutboxState,
+};
 use bloom_tx::tx_engine::{
     ConfirmBatchResult, ConfirmBatchTarget, Eip1559FeeOverrides, TxEngine, TxEngineError,
 };
@@ -2600,11 +2602,23 @@ impl PetalHost for DaemonPetalHost {
             .list(&req.wallet, &req.chain, OutboxState::Pending)
             .map_err(|error| HostError::Backend(format!("list pending EVM outbox: {error}")))?
         {
-            let entry = service
-                .tx_engine
-                .outbox
-                .read_in_state(&req.wallet, &req.chain, &pending_id, OutboxState::Pending)
-                .map_err(|error| HostError::Backend(format!("read pending EVM outbox: {error}")))?;
+            let entry = match service.tx_engine.outbox.read_in_state(
+                &req.wallet,
+                &req.chain,
+                &pending_id,
+                OutboxState::Pending,
+            ) {
+                Ok(entry) => entry,
+                // It left the queue after the listing, or was an interrupted
+                // transition the read just finished; either way it is no
+                // longer a pending request to reuse.
+                Err(OutboxError::StateMismatch { .. } | OutboxError::NotFound(_)) => continue,
+                Err(error) => {
+                    return Err(HostError::Backend(format!(
+                        "read pending EVM outbox: {error}"
+                    )));
+                }
+            };
             if petal_pending_request_matches(
                 &entry.staged,
                 &req,
@@ -2794,10 +2808,10 @@ impl PetalHost for DaemonPetalHost {
             .outbox
             .read_receipt(&wallet, &chain_name, &outbox_id)
             .map_err(|e| HostError::Backend(format!("read EVM outbox receipt: {e}")))?;
-        let state = receipt
-            .as_ref()
-            .map(|receipt| receipt.outcome.clone())
-            .unwrap_or_else(|| entry.staged.status.to_string());
+        let state = petal_outbox_state(
+            &entry.staged.status,
+            receipt.as_ref().map(|receipt| receipt.outcome.as_str()),
+        );
         let receipt_json = receipt
             .map(|receipt| serde_json::to_string(&receipt))
             .transpose()
@@ -2825,6 +2839,23 @@ impl PetalHost for DaemonPetalHost {
             .ok_or_else(|| HostError::NotFound(format!("chain {}", req.chain)))?;
         let result_json = daemon_petal_chain_read(&chain, &req.method, &req.params_json).await?;
         Ok(ChainResponse { result_json })
+    }
+}
+
+/// The state a Petal sees for an outbox entry it staged.
+///
+/// A mined receipt decides the outcome; otherwise the stored status does.
+///
+/// The status is enough because every producer that moves an entry out of the
+/// pending queue now persists the status it means: `cancelled` when a
+/// replacement took the account nonce, `failed` when policy denied it or it
+/// expired before approval. Inferring "cancelled" from a `(Failed, Pending)`
+/// entry instead would tell a Petal that a policy-denied transaction is safe
+/// to restage, which loops it against the same denial.
+fn petal_outbox_state(status: &bloom_proto::TxStatus, receipt_outcome: Option<&str>) -> String {
+    match receipt_outcome {
+        Some(outcome) => outcome.to_owned(),
+        None => status.to_string(),
     }
 }
 
@@ -7263,6 +7294,29 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(denied, HostError::Denied(_)));
+    }
+
+    /// A Petal was left waiting on an entry that could never be sent: the
+    /// cancel path moved the original out of the pending queue but wrote the
+    /// `Cancelled` status only into a separate `cancel_intent.json`, so the
+    /// entry the Petal reads still said `pending`. The producers now record
+    /// what they mean, which is why this reports the stored status rather
+    /// than inferring a reason from the directory the entry landed in --
+    /// inferring "cancelled" would tell a Petal that a policy-denied
+    /// transaction is safe to restage.
+    #[test]
+    fn a_petal_sees_the_reason_an_entry_left_the_queue_not_a_guess() {
+        use bloom_proto::TxStatus;
+        let state = |status: TxStatus, receipt| petal_outbox_state(&status, receipt);
+        assert_eq!(state(TxStatus::Pending, None), "pending");
+        assert_eq!(state(TxStatus::Cancelled, None), "cancelled");
+        // Policy denial and expiry are failures, not cancellations: a Petal
+        // told "cancelled" restages, and would loop against the same denial.
+        assert_eq!(state(TxStatus::Failed, None), "failed");
+        // A broadcast original can still be mined; only a receipt settles it.
+        assert_eq!(state(TxStatus::Sent, None), "sent");
+        assert_eq!(state(TxStatus::Pending, Some("success")), "success");
+        assert_eq!(state(TxStatus::Cancelled, Some("success")), "success");
     }
 
     /// A pre-existing watch spec on disk should be loaded into the
