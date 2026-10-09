@@ -39,6 +39,9 @@ def selected_account_owner(account: Any, projection: Any, wallet_id: str) -> str
         projection.get("verification") != "authenticated_broker"
         or not isinstance(wallet, dict)
         or wallet.get("wallet_id") != wallet_id
+        or not isinstance(wallet.get("policy_digest"), str)
+        or len(wallet["policy_digest"]) != 64
+        or any(char not in "0123456789abcdef" for char in wallet["policy_digest"])
         or not isinstance(policy, dict)
         or policy.get("wallet_id") != wallet_id
         or policy.get("policy_digest") != wallet.get("policy_digest")

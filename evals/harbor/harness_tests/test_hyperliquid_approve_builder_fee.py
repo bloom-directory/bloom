@@ -716,6 +716,8 @@ class WalletBindingTests(BuilderFeeFixture, unittest.TestCase):
             {"verification":"unverified"},
             {"policy":{"wallet_id":"another", "policy_digest":"0"*64}},
             {"policy":{"wallet_id":self.wallet_id, "policy_digest":"1"*64}},
+            {"wallet":{"wallet_id":self.wallet_id}, "policy":{"wallet_id":self.wallet_id}},
+            {"wallet":{"wallet_id":self.wallet_id, "policy_digest":"bad"}, "policy":{"wallet_id":self.wallet_id, "policy_digest":"bad"}},
         ):
             projection = {"freshness":"fresh", "verification":"authenticated_broker",
                 "wallet":{"wallet_id":self.wallet_id,"policy_digest":"0"*64},
