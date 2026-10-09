@@ -126,6 +126,7 @@ impl MachineBrokerService for BrokerFixture {
                     }))
                 }
                 MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
+                    surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
                     terms,
                     ..
                 }) => Ok(MachineBrokerResponse::SealedApprovalPrepare(
