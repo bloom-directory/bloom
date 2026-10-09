@@ -352,8 +352,44 @@ if [[ ! -s "$work/live-projection.log" ]]; then
   cat "$work/live-projection.stderr" >&2
   exit 1
 fi
-wallet_address="$(jq -r '.keys[0].addresses[0] // empty' "$work/live-projection.log")"
-[[ "$wallet_address" =~ ^0x[0-9a-fA-F]{40}$ ]] || exit 1
+# Key inventories can put another curve first. Select the same primary EVM
+# descriptor as WalletProjection, without assuming an inventory order.
+/usr/bin/python3 - "$work/live-projection.log" "$wallet_id" >"$work/primary-key.json" <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+projection = json.loads(pathlib.Path(sys.argv[1]).read_text())
+if (projection["verification"] != "authenticated_broker"
+        or projection["freshness"] != "fresh"
+        or projection["wallet"]["wallet_id"] != sys.argv[2]):
+    raise SystemExit("primary EVM key requires the fresh authenticated fixture wallet")
+root = projection["wallet"].get("root_key_ref")
+keys = []
+for key in projection["keys"]:
+    ref = key["key_ref"]
+    if root is not None:
+        selected = key["role"] == "wallet_root" and ref == root
+    else:
+        derivation = ref.get("derivation") or {}
+        selected = (key["role"] == "derived"
+                    and ref["key_spec"] == "secp256k1"
+                    and derivation.get("scheme") == "bip39-multicurve"
+                    and derivation.get("path") == "m/44'/60'/0'/0/0")
+    if selected:
+        keys.append(key)
+if len(keys) != 1:
+    raise SystemExit(f"expected one primary EVM key; found {len(keys)}")
+key = keys[0]
+address = next(iter(key["addresses"]), "")
+if (key["key_ref"]["key_spec"] != "secp256k1"
+        or not re.fullmatch(r"0x[0-9a-fA-F]{40}", address)
+        or "secp256k1-keccak256-recoverable" not in key["supported_crypto_suites"]):
+    raise SystemExit("primary EVM descriptor lacks a valid address or signing suite")
+print(json.dumps(key))
+PY
+wallet_address="$(jq -r '.addresses[0]' "$work/primary-key.json")"
 
 # Install one explicit destination so the later confirm reaches the Broker
 # signing boundary rather than stopping at Machine's advisory deny-all view.
@@ -370,7 +406,11 @@ sudo -H -u "$login_user" env \
   BLOOM_EDGE_MANIFEST="$edge_manifest" \
   "$machine_binary" --home "$clean_home" --connect "unix:$machine_socket" \
     wallet update-policy "$wallet_id" \
-    --file "$work/live-policy.json" >"$work/policy-prepare-live.log" 2>&1
+    --file "$work/live-policy.json" >"$work/policy-prepare-live.log" 2>&1 || {
+  cat "$work/policy-prepare-live.log" >&2
+  echo "fixture policy prepare was refused" >&2
+  exit 1
+}
 policy_operation_id="$(sed -n 's/^operation_id: //p' "$work/policy-prepare-live.log")"
 policy_ceremony_url="$(sed -n 's/^ceremony_url: //p' "$work/policy-prepare-live.log")"
 [[ "$policy_operation_id" =~ ^[0-9a-f]{64}$ ]]
@@ -466,7 +506,8 @@ sudo -H -u "$login_user" env \
 jq -e \
   --arg address "$wallet_address" \
   --arg wallet "$wallet_id" \
-  '.verification == "authenticated_broker" and .freshness == "fresh" and .wallet.wallet_id == $wallet and .keys[0].addresses[0] == $address' \
+  --slurpfile primary "$work/primary-key.json" \
+  '.verification == "authenticated_broker" and .freshness == "fresh" and .wallet.wallet_id == $wallet and any(.keys[]; .key_ref == $primary[0].key_ref and .addresses[0] == $address)' \
   "$work/live-projection.log" >/dev/null
 /usr/bin/python3 - "$work/live-projection.log" "$wallet_address" <<'PY'
 import base64
@@ -493,13 +534,14 @@ approval_expires_ms="$((approval_issued_ms + 600000))"
 jq -c \
   --arg issued "$approval_issued_ms" \
   --arg expires "$approval_expires_ms" \
+  --slurpfile primary "$work/primary-key.json" \
   '{
     operation_id:"1111111111111111111111111111111111111111111111111111111111111111",
     terms:{
       subject:{kind:"cli",client_id:"bloom-cli",command_class:"ma05.degraded"},
       wallet_id:.wallet.wallet_id,
-      key_ref:.keys[0].key_ref,
-      allowed_crypto_suites:[.keys[0].supported_crypto_suites[0]],
+      key_ref:$primary[0].key_ref,
+      allowed_crypto_suites:["secp256k1-keccak256-recoverable"],
       selector:{kind:"exact",ordered_payload_digests:["2222222222222222222222222222222222222222222222222222222222222222"],ordered_hashes:["3333333333333333333333333333333333333333333333333333333333333333"]},
       limits:{max_operations:"1",max_signatures:"1",operation_rate_limits:[],signature_rate_limits:[],value_limits:[]},
       activation_mode:{kind:"boot_bound"},
@@ -803,7 +845,21 @@ run_login_with_deadline \
   echo "packaged Machine did not preserve cached reads through its kernel mount" >&2
   exit 1
 }
-grep -Fx "$wallet_address" "$work/cached-wallet-address.log" >/dev/null
+# Signer projects lowercase hex; the mounted address uses EIP-55 casing.
+# Validate one complete address and compare its bytes, preserving the real
+# kernel-read check while refusing malformed output or a different wallet.
+/usr/bin/python3 - "$wallet_address" "$work/cached-wallet-address.log" <<'PY'
+import pathlib
+import re
+import sys
+
+expected = sys.argv[1]
+actual = pathlib.Path(sys.argv[2]).read_text().removesuffix("\n")
+if not all(re.fullmatch(r"0x[0-9a-fA-F]{40}", value) for value in (expected, actual)):
+    raise SystemExit("cached wallet read must contain exactly one EVM address")
+if actual.lower() != expected.lower():
+    raise SystemExit(f"cached wallet address differs: expected {expected}, received {actual}")
+PY
 
 degraded_intent="send 0.000000000000000001 eth to $wallet_address on anvil"
 mounted_write_with_deadline \
@@ -966,9 +1022,103 @@ assert_mounted_effect_denied \
   "/wallets/$wallet_id/sealed-approvals/new.json" \
   "$approval_request" \
   "$approval_audit_start"
-run_login_with_deadline \
-  "$work/approval-after.log" \
-  /bin/cat "$mount_dir/wallets/$wallet_id/sealed-approvals/new.json"
+if (
+  umask 077
+  run_login_with_deadline \
+    "$work/approval-after.log" \
+    /bin/cat "$mount_dir/wallets/$wallet_id/sealed-approvals/new.json"
+)
+then
+  :
+else
+  approval_read_status=$?
+  echo "sealed approval mounted read status=$approval_read_status" >&2
+  # Compare transports for diagnosis only. Never turn a failed mounted read
+  # into acceptance, and never print mixed projection/error output.
+  if (
+    umask 077
+    run_machine_with_deadline \
+      "$work/approval-after-ipc.log" \
+      vfs cat "/wallets/$wallet_id/sealed-approvals/new.json"
+  )
+  then
+    approval_ipc_status=0
+  else
+    approval_ipc_status=$?
+  fi
+  echo "sealed approval IPC read status=$approval_ipc_status" >&2
+  /usr/bin/python3 - \
+    "$work/approval-after.log" \
+    "$work/approval-after-ipc.log" \
+    "$mount_dir/wallets/$wallet_id/sealed-approvals/new.json" \
+    "$approval_ipc_status" <<'PY' || \
+    echo "sealed approval read diagnostic helper failed" >&2
+import errno
+import json
+import os
+import pathlib
+import re
+import shutil
+import sys
+import tempfile
+
+mounted_output, ipc_output = map(pathlib.Path, sys.argv[1:3])
+prefix = f"cat: {sys.argv[3]}: "
+standard_errors = {os.strerror(code) for code in errno.errorcode}
+try:
+    errors = {
+        line[len(prefix):]
+        for line in mounted_output.read_text(errors="replace").splitlines()
+        if line.startswith(prefix) and line[len(prefix):] in standard_errors
+    }
+except OSError:
+    errors = set()
+for error in sorted(errors):
+    print(f"/bin/cat: sealed approval template: {error}", file=sys.stderr)
+print(f"sealed approval standard cat error found={bool(errors)}", file=sys.stderr)
+ipc_text = ""
+try:
+    ipc_text = ipc_output.read_text()
+    matches = json.loads(ipc_text) == {
+        "schema": "bloom.approval_prepare_request.v1",
+        "write": "complete ApprovalPrepareRequest JSON",
+    }
+except (OSError, UnicodeError, ValueError):
+    matches = False
+print(f"sealed approval IPC template matches={matches}", file=sys.stderr)
+if not matches:
+    category = "unclassified"
+    if sys.argv[4] == "124":
+        category = "timeout"
+    elif sys.argv[4] == "0":
+        category = "invalid-projection"
+    else:
+        for pattern, label in (
+            (r"\bservice[ _-]?unavailable\b", "SERVICE_UNAVAILABLE"),
+            (r"\bpermission[ _-]?denied\b", "permission-denied"),
+            (r"\bnot[ _-]?found\b", "not-found"),
+            (r"\binvalid[ _-]?projection\b", "invalid-projection"),
+            (r"\b(?:timeout|timed out)\b", "timeout"),
+        ):
+            if re.search(pattern, ipc_text, re.IGNORECASE):
+                category = label
+                break
+    print(f"sealed approval IPC error category={category}", file=sys.stderr)
+
+# Keep only these two private outputs beyond the fixture's normal cleanup.
+# They may contain unexpected capability fields and must not be uploaded.
+try:
+    os.umask(0o077)
+    retained = pathlib.Path(tempfile.mkdtemp(prefix="bloom-approval-read.", dir="/private/tmp"))
+    for source in (mounted_output, ipc_output):
+        shutil.copyfile(source, retained / source.name)
+    private_outputs_retained = True
+except OSError:
+    private_outputs_retained = False
+print(f"sealed approval private outputs retained={private_outputs_retained}", file=sys.stderr)
+PY
+  exit "$approval_read_status"
+fi
 /usr/bin/python3 - "$work/approval-after.log" <<'PY'
 import json
 import pathlib
