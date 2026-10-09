@@ -1022,9 +1022,81 @@ assert_mounted_effect_denied \
   "/wallets/$wallet_id/sealed-approvals/new.json" \
   "$approval_request" \
   "$approval_audit_start"
-run_login_with_deadline \
-  "$work/approval-after.log" \
-  /bin/cat "$mount_dir/wallets/$wallet_id/sealed-approvals/new.json"
+if (
+  umask 077
+  run_login_with_deadline \
+    "$work/approval-after.log" \
+    /bin/cat "$mount_dir/wallets/$wallet_id/sealed-approvals/new.json"
+)
+then
+  :
+else
+  approval_read_status=$?
+  echo "sealed approval mounted read status=$approval_read_status" >&2
+  # Compare transports for diagnosis only. Never turn a failed mounted read
+  # into acceptance, and never print mixed projection/error output.
+  if (
+    umask 077
+    run_machine_with_deadline \
+      "$work/approval-after-ipc.log" \
+      vfs cat "/wallets/$wallet_id/sealed-approvals/new.json"
+  )
+  then
+    approval_ipc_status=0
+  else
+    approval_ipc_status=$?
+  fi
+  echo "sealed approval IPC read status=$approval_ipc_status" >&2
+  /usr/bin/python3 - \
+    "$work/approval-after.log" \
+    "$work/approval-after-ipc.log" \
+    "$mount_dir/wallets/$wallet_id/sealed-approvals/new.json" <<'PY' || \
+    echo "sealed approval read diagnostic helper failed" >&2
+import errno
+import json
+import os
+import pathlib
+import shutil
+import sys
+import tempfile
+
+mounted_output, ipc_output = map(pathlib.Path, sys.argv[1:3])
+prefix = f"cat: {sys.argv[3]}: "
+standard_errors = {os.strerror(code) for code in errno.errorcode}
+try:
+    errors = {
+        line[len(prefix):]
+        for line in mounted_output.read_text(errors="replace").splitlines()
+        if line.startswith(prefix) and line[len(prefix):] in standard_errors
+    }
+except OSError:
+    errors = set()
+for error in sorted(errors):
+    print(f"/bin/cat: sealed approval template: {error}", file=sys.stderr)
+print(f"sealed approval standard cat error found={bool(errors)}", file=sys.stderr)
+try:
+    matches = json.loads(ipc_output.read_text()) == {
+        "schema": "bloom.approval_prepare_request.v1",
+        "write": "complete ApprovalPrepareRequest JSON",
+    }
+except (OSError, UnicodeError, ValueError):
+    matches = False
+print(f"sealed approval IPC template matches={matches}", file=sys.stderr)
+
+# Keep only these two private outputs beyond the fixture's normal cleanup.
+# They may contain unexpected capability fields and must not be uploaded.
+try:
+    os.umask(0o077)
+    retained = pathlib.Path(tempfile.mkdtemp(prefix="bloom-approval-read.", dir="/private/tmp"))
+    for source in (mounted_output, ipc_output):
+        shutil.copyfile(source, retained / source.name)
+    private_outputs_retained = True
+except OSError:
+    private_outputs_retained = False
+print(f"sealed approval private outputs retained={private_outputs_retained}", file=sys.stderr)
+PY
+  exit "$approval_read_status"
+fi
 /usr/bin/python3 - "$work/approval-after.log" <<'PY'
 import json
 import pathlib
