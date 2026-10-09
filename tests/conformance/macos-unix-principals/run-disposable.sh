@@ -61,6 +61,12 @@ edge_backup=""
 capture_failure_evidence() {
   evidence_dir="${BLOOM_MACOS_W0_EVIDENCE_DIR:-}"
   [[ -n "$evidence_dir" && -d "$evidence_dir" ]] || return 0
+  # Native lifecycle events contain static event names and numeric probe errors,
+  # and survive the installer's rollback of service jobs and runtime files.
+  /usr/bin/log show --last 5m --style json \
+    --predicate 'subsystem == "com.bloom.triad"' \
+    > "$evidence_dir/native-lifecycle.json" 2>&1 || true
+  chmod 0644 "$evidence_dir/native-lifecycle.json" 2>/dev/null || true
   for service in broker signer; do
     source_log="/private/var/log/bloom/$login_uid/$service.jsonl"
     if [[ -f "$source_log" && ! -L "$source_log" ]]; then
