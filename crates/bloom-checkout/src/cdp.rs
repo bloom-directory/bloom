@@ -19,6 +19,14 @@ use tokio::sync::oneshot;
 
 type Replies = Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>;
 
+struct ProcessorResponse {
+    session: String,
+    request: String,
+    frame: String,
+    loader: String,
+    link: String,
+}
+
 pub(crate) struct FrameContext {
     pub session: String,
     pub world: i64,
@@ -54,6 +62,7 @@ fn tree_frames(
 
 /// Chrome's debugging channel is inherited pipe descriptors, never a TCP port.
 pub(crate) struct Cdp {
+    processor_responses: Arc<Mutex<Vec<ProcessorResponse>>>,
     child: Mutex<Child>,
     writer: Mutex<File>,
     replies: Replies,
@@ -86,6 +95,64 @@ fn child_fd(fd: &OwnedFd) -> Result<OwnedFd> {
 }
 
 impl Cdp {
+    /// Read the already-received Stripe bootstrap, never initialize a second
+    /// Checkout Session. Bind it to this exact frame and document loader.
+    pub async fn hosted_stripe_facts(
+        &self,
+        session: &str,
+        frame: &str,
+        url: &str,
+    ) -> Result<Value> {
+        let url = url::Url::parse(url)?;
+        if url.origin().ascii_serialization() != "https://buy.stripe.com" {
+            bail!("Not a Stripe Payment Link");
+        }
+        let link = url.path().trim_start_matches('/');
+        let tree = self
+            .call(Some(session), "Page.getFrameTree", json!({}))
+            .await?;
+        let loader = tree["frameTree"]["frame"]["loaderId"]
+            .as_str()
+            .context("Missing checkout document identity")?;
+        let request = self
+            .processor_responses
+            .lock()
+            .iter()
+            .rev()
+            .find(|response| {
+                response.session == session
+                    && response.frame == frame
+                    && response.loader == loader
+                    && response.link == link
+            })
+            .map(|response| response.request.clone())
+            .context("Missing current Stripe bootstrap")?;
+        let response = self
+            .call(
+                Some(session),
+                "Network.getResponseBody",
+                json!({"requestId":request}),
+            )
+            .await?;
+        if response["base64Encoded"] == true {
+            bail!("Unsupported Stripe bootstrap encoding");
+        }
+        let page: Value = serde_json::from_str(
+            response["body"]
+                .as_str()
+                .context("Missing Stripe bootstrap body")?,
+        )?;
+        if !matches!(page["mode"].as_str(), Some("payment" | "subscription"))
+            || !page["session_id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("cs_"))
+        {
+            bail!("Unbound Stripe checkout facts");
+        }
+        Ok(
+            json!({"total_minor":page["total_summary"]["due"],"currency":page["currency"].as_str().map(str::to_uppercase),"recurring":page["mode"]=="subscription","livemode":page["livemode"]}),
+        )
+    }
     /// Include only frames belonging to this tab, including Chromium's OOPIFs.
     pub async fn contexts(
         &self,
@@ -254,10 +321,12 @@ impl Cdp {
         drop(command_read);
         drop(event_write);
         let replies: Replies = Arc::new(Mutex::new(HashMap::new()));
+        let processor_responses = Arc::new(Mutex::new(Vec::<ProcessorResponse>::new()));
         let browser = Arc::new(Self {
             child: Mutex::new(child),
             writer: Mutex::new(File::from(command_write)),
             replies: replies.clone(),
+            processor_responses: processor_responses.clone(),
             iframe_sessions: Mutex::new(HashMap::new()),
             sequence: AtomicU64::new(1),
         });
@@ -274,6 +343,49 @@ impl Cdp {
                     for &byte in &bytes[..size] {
                         if byte == 0 {
                             if let Ok(value) = serde_json::from_slice::<Value>(&frame) {
+                                if value["method"] == "Network.responseReceived" {
+                                    let params = &value["params"];
+                                    if params["response"]["status"] == 200
+                                        && let Some(url) = params["response"]["url"]
+                                            .as_str()
+                                            .and_then(|url| url::Url::parse(url).ok())
+                                        && url.origin().ascii_serialization()
+                                            == "https://merchant-ui-api.stripe.com"
+                                        && url.query().is_none()
+                                        && let Some(link) = url
+                                            .path()
+                                            .strip_prefix("/payment-links/")
+                                            .filter(|link| {
+                                                !link.is_empty()
+                                                    && link.bytes().all(|b| {
+                                                        b.is_ascii_alphanumeric() || b == b'_'
+                                                    })
+                                            })
+                                        && let (
+                                            Some(session),
+                                            Some(request),
+                                            Some(frame),
+                                            Some(loader),
+                                        ) = (
+                                            value["sessionId"].as_str(),
+                                            params["requestId"].as_str(),
+                                            params["frameId"].as_str(),
+                                            params["loaderId"].as_str(),
+                                        )
+                                    {
+                                        let mut responses = processor_responses.lock();
+                                        if responses.len() == 16 {
+                                            responses.remove(0);
+                                        }
+                                        responses.push(ProcessorResponse {
+                                            session: session.into(),
+                                            request: request.into(),
+                                            frame: frame.into(),
+                                            loader: loader.into(),
+                                            link: link.into(),
+                                        });
+                                    }
+                                }
                                 if let Some(id) = value["id"].as_u64() {
                                     if let Some(reply) = replies.lock().remove(&id) {
                                         let _ = reply.send(value);

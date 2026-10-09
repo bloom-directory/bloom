@@ -308,6 +308,8 @@ async fn new_tab(cdp: &Cdp, generation: u64) -> Result<Tab> {
         .context("Missing browser session")?
         .to_owned();
     cdp.call(Some(&session), "Page.enable", json!({})).await?;
+    cdp.call(Some(&session), "Network.enable", json!({}))
+        .await?;
     cdp.call(
         Some(&session),
         "Emulation.setDeviceMetricsOverride",

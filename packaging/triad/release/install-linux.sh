@@ -447,6 +447,7 @@ migrate_legacy_linux_records() {
           "$install_root/etc/bloom/$uid/machine.env" \
           0644
         rm -f -- "$machine_environment"
+        write_linux_checkout_environment "$install_root" "$uid" || return 65
       fi
     done
   done

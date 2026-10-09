@@ -7,7 +7,12 @@
   const explicit = [...document.querySelectorAll('[data-bloom-total-minor][data-bloom-currency]')].filter(visible);
   let total, currency;
   let processorRecurring = null;
-  if (location.origin === 'https://js.stripe.com' && location.pathname === '/v3/embedded-checkout-inner.html') {
+  if (location.origin === 'https://buy.stripe.com') {
+    const processor = globalThis.__bloomHostedStripeFacts;
+    const displayed = [...document.querySelectorAll('.CurrencyAmount')].filter(visible);
+    if (!processor || displayed.length !== 1 || displayed[0].textContent.replace(/\D/g,'').replace(/^0+(?=\d)/,'') !== String(processor.total_minor)) return null;
+    total=processor.total_minor;currency=processor.currency;processorRecurring=processor.recurring;
+  } else if (location.origin === 'https://js.stripe.com' && location.pathname === '/v3/embedded-checkout-inner.html') {
     // Observed bootstrap: read facts without submitting card data or a payment.
     const url = new URL(location.href);
     const session = url.searchParams.get('checkoutSessionId');
@@ -49,13 +54,19 @@
     ({total,currency} = amounts[0]);
   }
   const selectors = [...document.querySelectorAll('select')].filter(e => visible(e) && /installment|cuotas|parcelas/i.test([e.name,e.id,e.labels?.[0]?.innerText].join(' ')));
+  const shopifyCard = /^\/checkouts\/cn\/[A-Za-z0-9]+\//.test(location.pathname)
+    && [...document.querySelectorAll('iframe')].some(e => {
+      try {return new URL(e.src).origin === 'https://checkout.pci.shopifyinc.com';} catch {return false;}
+    })
+    && document.querySelector('input#basic-creditCards[name=basic]')?.checked === true
+    && [...document.querySelectorAll('input[name=basic]:checked')].length === 1;
   let installments = 1;
   if (selectors.length > 1) return null;
   if (selectors.length === 1) {
     const match = selectors[0].selectedOptions[0]?.text.match(/^(\d+)\s*(?:x|installments?|cuotas|parcelas)\b/i);
     if (!match) return null;
     installments = Number(match[1]);
-  } else if (/installments?|cuotas|parcelas/i.test(text)) return null;
+  } else if (/installments?|cuotas|parcelas/i.test(text) && !shopifyCard) return null;
   const recurring = processorRecurring ?? /\b(subscription|recurring|auto.?renew|monthly|annually|suscripci[oó]n)\b/i.test(text);
   globalThis.__bloomPayButton = pay[0];
   return {origin:location.origin,payment_frame_origins:[],total_minor:total,currency,installments,recurring};

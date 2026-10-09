@@ -68,6 +68,18 @@ async fn check_frame_owners(tab: &PrivateTab, owners: &[(String, String)]) -> Re
 
 impl Discovery {
     pub async fn read(tab: &PrivateTab) -> Result<Self> {
+        let mut last_error = None;
+        for _ in 0..3 {
+            match Self::read_once(tab).await {
+                Ok(discovery) => return Ok(discovery),
+                Err(error) => last_error = Some(error),
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+        Err(last_error.unwrap())
+    }
+
+    async fn read_once(tab: &PrivateTab) -> Result<Self> {
         let contexts = tab.cdp.contexts(&tab.session, "bloom-payment").await?;
         let mut frames = Vec::new();
         let mut candidates = Vec::new();
@@ -79,6 +91,13 @@ impl Discovery {
             let world = context.world;
             if position == 0 {
                 top_origin = Some(origin.clone());
+                if origin == "https://buy.stripe.com" {
+                    let facts = tab
+                        .cdp
+                        .hosted_stripe_facts(&session, &context.frame_id, url)
+                        .await?;
+                    evaluate(tab,&session,world,format!("(()=>{{const facts={facts};if(globalThis.__bloomHostedStripeFacts){{if(JSON.stringify(globalThis.__bloomHostedStripeFacts)!==JSON.stringify(facts))throw Error('Facts changed');}}else Object.defineProperty(globalThis,'__bloomHostedStripeFacts',{{value:Object.freeze(facts),writable:false,configurable:false}});return true;}})()")).await?;
+                }
             }
             if position == 0
                 || (origin == "https://js.stripe.com"
@@ -268,6 +287,211 @@ mod tests {
     use crate::browser::{BrowseRequest, Browser};
     use axum::{Router, response::Html, routing::get};
     use std::{sync::Arc, time::Duration};
+
+    #[tokio::test]
+    #[ignore = "real public hosted Stripe sandbox discovery; requires network"]
+    async fn stripe_hosted_public_sandbox_discovery() {
+        let browser = browser().await;
+        browser
+            .browse(BrowseRequest::Open {
+                url: "https://buy.stripe.com/test_28o7u4eQMcaUgWk8ww".into(),
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(8)).await;
+        let tab = browser.handoff().await.unwrap();
+        let discovery = Discovery::read(&tab).await.unwrap();
+        assert_eq!(discovery.facts.currency, "USD");
+        assert_eq!(discovery.facts.total_minor, 2000);
+        assert!(discovery.facts.recurring);
+        discovery.recheck(&tab).await.unwrap();
+        browser.return_control().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "real hosted Stripe test payments, no money; requires network"]
+    async fn stripe_hosted_public_sandbox_payments() {
+        for (case, (number, bank_action, expected)) in [
+            ("4242424242424242", None, "paid"),
+            ("4000000000000002", None, "declined"),
+            ("4000000000003220", Some("complete"), "paid"),
+            ("4000002760003184", Some("fail"), "declined"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if std::env::var("BLOOM_CHECKOUT_TEST_CASE")
+                .ok()
+                .is_some_and(|v| v != case.to_string())
+            {
+                continue;
+            }
+            let browser = browser().await;
+            browser
+                .browse(BrowseRequest::Open {
+                    url: "https://buy.stripe.com/test_28o7u4eQMcaUgWk8ww".into(),
+                })
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            let tab = browser.handoff().await.unwrap();
+            let tree = tab
+                .cdp
+                .call(Some(&tab.session), "Page.getFrameTree", json!({}))
+                .await
+                .unwrap();
+            let facts = tab
+                .cdp
+                .hosted_stripe_facts(
+                    &tab.session,
+                    tree["frameTree"]["frame"]["id"].as_str().unwrap(),
+                    "https://buy.stripe.com/test_28o7u4eQMcaUgWk8ww",
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                facts["livemode"], false,
+                "Never fill or submit a live checkout in this test"
+            );
+            // Synthetic non-card billing fields through the private test driver.
+            tab.cdp.evaluate(&tab.session,r#"(()=>{
+                const set=(selector,value)=>{const e=document.querySelector(selector);if(!e)throw Error('Missing fixture field');Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(e,value);e.dispatchEvent(new Event('input',{bubbles:true}));e.dispatchEvent(new Event('change',{bubbles:true}));};
+                set('input[name=email]','fixture-buyer@example.com');
+                set('input[name=billingPostalCode]','12345');
+                const save=document.querySelector('input[type=checkbox]');if(save?.checked)save.click();return true;
+            })()"#.into()).await.unwrap();
+            let discovery = Discovery::read(&tab).await.unwrap();
+            let mut test_card = card();
+            test_card.number = number.into();
+            discovery
+                .fill(&tab, &test_card, &mut Vec::new())
+                .await
+                .unwrap();
+            discovery.submit(&tab).await.unwrap();
+            let mut confirmed = false;
+            let mut bank_handled = false;
+            for attempt in 0..60 {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                if let Some(action) = bank_action {
+                    if !bank_handled {
+                        for frame in tab
+                            .cdp
+                            .contexts(&tab.session, "bloom-test-bank")
+                            .await
+                            .unwrap_or_default()
+                        {
+                            if !url::Url::parse(&frame.url).is_ok_and(|url| {
+                                url.host_str()
+                                    .is_some_and(|host| host.ends_with(".stripe.com"))
+                            }) {
+                                continue;
+                            }
+                            let expression = format!(
+                                "(()=>{{const b=[...document.querySelectorAll('button,input[type=submit]')].find(e=>/^{action}|^{alternate}/i.test((e.innerText||e.value).trim()));if(!b)return false;b.click();return true;}})()",
+                                alternate = if action == "complete" {
+                                    "authorize"
+                                } else {
+                                    "fail"
+                                }
+                            );
+                            if evaluate(&tab, &frame.session, frame.world, expression)
+                                .await
+                                .is_ok_and(|v| v == true)
+                            {
+                                bank_handled = true;
+                            }
+                        }
+                    }
+                }
+                let Ok(result) = tab
+                    .cdp
+                    .evaluate(&tab.session, include_str!("outcome.js").into())
+                    .await
+                else {
+                    continue;
+                };
+                if result["state"] == expected {
+                    confirmed = true;
+                    break;
+                }
+                if attempt == 15 || attempt == 59 {
+                    // Fixed diagnostic flags, never field values or response bodies.
+                    let diagnostic = tab
+                        .cdp
+                        .evaluate(&tab.session, "({subscriptionConfirmed:/Thanks for subscribing/.test(document.body.innerText),authenticationFailed:/We are unable to authenticate your payment method/.test(document.body.innerText),cardDeclined:/card.*declined/i.test(document.body.innerText)})".into())
+                        .await
+                        .unwrap_or(Value::Null);
+                    eprintln!("Hosted fixture case {case}: {diagnostic}");
+                }
+            }
+            browser.return_control().await.unwrap();
+            assert!(
+                confirmed,
+                "Hosted Stripe case {case}, bank handled {bank_handled}"
+            );
+            assert_eq!(bank_handled, bank_action.is_some());
+            eprintln!("Hosted Stripe case {case}: {expected}, bank interaction {bank_handled}");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "real Shopify checkout discovery, no card or purchase; requires network"]
+    async fn shopify_public_checkout_discovery() {
+        let browser = browser().await;
+        browser
+            .browse(BrowseRequest::Open {
+                url: "https://shop.simplyonpurpose.org/products/story-starters".into(),
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(12)).await;
+        let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+        let button = snapshot["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|element| {
+                element["label"]
+                    .as_str()
+                    .is_some_and(|label| label.eq_ignore_ascii_case("Add to Cart"))
+            })
+            .unwrap();
+        browser
+            .browse(BrowseRequest::Click {
+                element_ref: button["ref"].as_str().unwrap().into(),
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        browser
+            .browse(BrowseRequest::Open {
+                url: "https://shop.simplyonpurpose.org/cart".into(),
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+        let button = snapshot["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|element| element["label"] == "Checkout")
+            .unwrap();
+        browser
+            .browse(BrowseRequest::Click {
+                element_ref: button["ref"].as_str().unwrap().into(),
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        let tab = browser.handoff().await.unwrap();
+        let discovery = Discovery::read(&tab).await.unwrap();
+        assert_eq!(discovery.facts.currency, "USD");
+        assert!((100..=200).contains(&discovery.facts.total_minor));
+        assert_eq!(discovery.facts.installments, 1);
+        discovery.recheck(&tab).await.unwrap();
+        browser.return_control().await.unwrap();
+    }
 
     async fn fixture(html: String) -> (String, tokio::task::JoinHandle<()>) {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -518,6 +742,48 @@ mod tests {
         );
         discovery.recheck(&tab).await.unwrap();
         browser.return_control().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fixture_shopify_proxy_fields_are_narrow_and_rechecked() {
+        let html = "<!doctype html><style>input{width:200px;height:40px}.proxy{position:absolute;left:-2px;width:2px;height:2px;border:0;padding:0}</style><input id=number autocomplete=cc-number><input id=name class=proxy autocomplete=cc-name><input id=expiry class=proxy autocomplete=cc-exp><input id=verification_value class=proxy autocomplete=cc-csc>";
+        let (url, server) = fixture(html.into()).await;
+        let browser = browser().await;
+        let tab = open(&browser, url).await;
+        // An ordinary merchant cannot opt into the PCI exception by copying ids.
+        assert!(
+            tab.cdp
+                .evaluate(&tab.session, include_str!("fields.js").into())
+                .await
+                .unwrap()
+                .is_null()
+        );
+        let expression=include_str!("fields.js").replacen("(() => {", "(() => { const location={origin:'https://checkout.pci.shopifyinc.com',pathname:'/build/09497de/number-ltr.html'};",1);
+        let fields = tab.cdp.evaluate(&tab.session, expression).await.unwrap();
+        assert_eq!(fields, json!([{"kind":"number","index":0}]));
+        assert_eq!(
+            tab.cdp
+                .evaluate(&tab.session, "__bloomPaymentValid()".into())
+                .await
+                .unwrap(),
+            true
+        );
+        tab.cdp
+            .evaluate(
+                &tab.session,
+                "document.querySelector('#name').className='';true".into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            tab.cdp
+                .evaluate(&tab.session, "!!__bloomPaymentValid()".into())
+                .await
+                .unwrap(),
+            false
+        );
+        browser.return_control().await.unwrap();
+        server.abort();
     }
 
     #[tokio::test]
