@@ -24,7 +24,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 petals_root="$(cd "${BLOOM_PETALS_ROOT:-$repo_root/..}" && pwd -P)"
 launcher="$repo_root/scripts/triad-dev-launch.sh"
-bloom_bin="$repo_root/target/debug/bloom"
+bloom_bin="${BLOOM_INTEGRATION_MACHINE_BIN:-$repo_root/target/debug/bloom}"
 driver_bin="${BLOOM_INTEGRATION_DEBUG_DRIVER_BIN:?set to the pinned bloom-broker-debug-driver}"
 : "${BLOOM_INTEGRATION_BROKER_BIN:?set to the pinned bloom-broker}"
 : "${BLOOM_INTEGRATION_SIGNER_BIN:?set to the pinned bloom-signer}"
@@ -87,6 +87,7 @@ cli() { "$bloom_bin" --home "$machine_home" "$@"; }
 # 1. Machine config: a placeholder chain (nothing here reads chain state) and
 #    the setup choices. The launcher forces preinstalled = [] but keeps these.
 nfs_port="$(free_port)"
+ceremony_port="$(free_port)"
 cat > "$machine_config" <<EOF
 default_chain = "anvil"
 nfs_listen_addr = "127.0.0.1:${nfs_port}"
@@ -120,6 +121,7 @@ BLOOM_TRIAD_DEV_BUILD_PETALS=0 \
 BLOOM_TRIAD_DEV_HYPERLIQUID_PACKAGE="$petals_root/bloom-petal-hyperliquid" \
 BLOOM_TRIAD_DEV_POLYMARKET_PACKAGE="$petals_root/bloom-petal-polymarket" \
   "$launcher" \
+    --ceremony-port "$ceremony_port" \
     --developer-root "$developer_root" \
     --machine-home "$machine_home" \
     --machine-socket "$machine_socket" \

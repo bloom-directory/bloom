@@ -405,16 +405,17 @@ pub(crate) fn petal_owners(daemon: &Daemon) -> Result<BTreeMap<String, String>> 
 }
 
 /// After `bloom init` provisions Petals, write settings for each chosen Petal
-/// that setup just configured, installed, or updated. An update replaces the
-/// Petal's stored state, so its saved settings are written again.
+/// that setup just configured or installed. Signed package lineage carries
+/// private settings through updates, so an update must preserve settings the
+/// owner may already have written.
 ///
 /// A failed write is reported and the rest continue, as in `bloom serve`. A
 /// Petal without its settings fails closed: Polymarket refuses buys and Enso
 /// refuses routes until the owner writes them.
 ///
 /// Setup can run on a home that already has a wallet, such as one upgraded
-/// from before this setup existed. There a Petal that was already installed
-/// and is unchanged may hold settings the owner wrote through its own route,
+/// from before this setup existed. There an already installed Petal may hold
+/// settings the owner wrote through its own route, even after an update,
 /// so they are left as they are and the setup choice is reported instead.
 pub(crate) async fn apply_setup_settings(
     daemon: &Daemon,
@@ -513,21 +514,19 @@ impl AccountPresence {
 }
 
 /// Whether `bloom init` writes a chosen Petal's setup settings. A Petal that
-/// was just installed, or updated (which replaces its stored state), gets
-/// them. One already installed and unchanged gets them on first setup only
-/// when the default wallet's account is known not to exist, because only
-/// then can the owner not have written settings of their own through its
-/// route; if the account exists, or its existence cannot be read, they are
-/// not written.
+/// was just installed gets them. An already installed Petal gets them on
+/// first setup or update only when the default wallet's account is known not
+/// to exist. Otherwise its carried settings may belong to the owner and are
+/// preserved, including when account presence cannot be checked.
 pub(crate) fn setup_settings_step(
     first_setup: bool,
     was_installed: bool,
     updated: bool,
     account: &AccountPresence,
 ) -> SetupSettingsStep {
-    if !was_installed || updated {
+    if !was_installed {
         SetupSettingsStep::Write
-    } else if !first_setup {
+    } else if !first_setup && !updated {
         SetupSettingsStep::Leave
     } else {
         match account {
@@ -547,7 +546,8 @@ async fn default_account_presence(vfs: &bloom_vfs::Vfs) -> AccountPresence {
 }
 
 /// After `bloom serve` provisions catalog Petals, write setup settings for each
-/// chosen Petal it installed or updated. Runs on a blocking provisioning thread.
+/// chosen Petal it installed. Updates preserve carried owner settings.
+/// Runs on a blocking provisioning thread.
 pub(crate) fn apply_provisioned_settings(
     daemon: &Daemon,
     results: &[crate::petal_provisioning::ProvisioningResult],
@@ -564,6 +564,17 @@ pub(crate) fn apply_provisioned_settings(
             ProvisioningOutcome::Updated => true,
             ProvisioningOutcome::Current | ProvisioningOutcome::Failed(_) => continue,
         };
+        if updated {
+            let account = runtime.block_on(default_account_presence(&daemon.vfs));
+            if setup_settings_step(false, true, true, &account) != SetupSettingsStep::Write {
+                clear_settings_pending(daemon.home.root(), &result.name);
+                tracing::info!(
+                    petal = %result.name,
+                    "petal.setup_settings_preserved"
+                );
+                continue;
+            }
+        }
         match runtime.block_on(write_petal_settings(
             &daemon.vfs,
             &daemon.config.petals,
@@ -594,7 +605,7 @@ pub(crate) fn apply_provisioned_settings(
 pub(crate) fn settings_message(name: &str, summary: &str, updated: bool) -> String {
     if updated {
         format!(
-            "petal_settings: {} was updated, which reset its settings; re-applied {summary}",
+            "petal_settings: {} was updated; set {summary}",
             petal_label(name)
         )
     } else {
@@ -1177,10 +1188,12 @@ mod tests {
         use SetupSettingsStep::*;
         let down = Unknown("backend: SERVICE_UNAVAILABLE".into());
         // (first_setup, was_installed, updated, account)
-        // A Petal installed or updated by this run gets its settings.
+        // A fresh install gets setup settings. Updates keep carried owner settings.
         assert_eq!(setup_settings_step(true, false, false, &Exists), Write);
         assert_eq!(setup_settings_step(true, false, false, &down), Write);
-        assert_eq!(setup_settings_step(false, true, true, &Exists), Write);
+        assert_eq!(setup_settings_step(false, true, true, &Exists), KeepOwners);
+        assert_eq!(setup_settings_step(false, true, true, &down), Unverified);
+        assert_eq!(setup_settings_step(false, true, true, &Absent), Write);
         // First setup on a home known to have no wallet: nothing to overwrite.
         assert_eq!(setup_settings_step(true, true, false, &Absent), Write);
         // First setup on a home whose wallet exists (an upgraded home): the
@@ -1713,10 +1726,10 @@ mod tests {
     }
 
     #[test]
-    fn updated_petal_messages_say_settings_were_reapplied() {
+    fn updated_petal_messages_describe_only_the_settings_written() {
         assert_eq!(
             settings_message("polymarket", "max_daily_usd = 100", true),
-            "petal_settings: Polymarket was updated, which reset its settings; re-applied max_daily_usd = 100"
+            "petal_settings: Polymarket was updated; set max_daily_usd = 100"
         );
         assert_eq!(
             settings_message("polymarket", "max_daily_usd = 100", false),

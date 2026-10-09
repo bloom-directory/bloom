@@ -34,7 +34,7 @@ using a Petal
 
 later: add, update, or remove a Petal
   -> one policy update ceremony
-  -> an update resets that Petal's settings, and Bloom says so
+  -> an update preserves that Petal's settings and trade receipts
 ```
 
 Today the same setup takes a creation ceremony plus one policy ceremony for
@@ -313,22 +313,21 @@ the last 24 hours. It does not count sells, and it has no total limit.
 | User action | Policy change proposed for `main` | Petal settings |
 |---|---|---|
 | Add a Petal with `bloom petals install` | Allow its package hash | Write Bloom's suggested settings, if it is a catalog Petal |
-| Update a Petal by installing a newer release | Replace the old package hash with the new one | Written again from the saved choices, and Bloom says so |
+| Update a Petal by installing a newer release | Replace the old package hash with the new one | Preserved through the signed package lineage; initial settings are written only when the wallet is known not to exist |
 | Remove a Petal with `bloom petals uninstall` | Remove its package hash | Removed with the package |
 
-An update resets a Petal's settings because its stored state, including its
-settings and trade receipts, is kept under its package hash
-(`crates/bloom-petals/src/private_store.rs`). Bloom still has the owner's
-choices in its config, so it writes them again and says so, for example:
-"Polymarket was updated, which reset its settings; re-applied max_daily_usd
-= 100". Trade receipts are not restored, so Polymarket's daily count starts
-again after an update.
+An update carries settings and trade receipts forward through the signed
+package lineage (`crates/bloom-petals/src/private_store.rs`). Bloom preserves
+these values when the wallet already exists, including settings written
+through the Petal after setup. If Broker cannot establish whether the wallet
+exists, Bloom leaves the settings untouched. Setup choices remain in Bloom's
+config; the owner can explicitly apply them later.
 
 Catalog Petals are installed and updated in two places: `bloom init`
 (`ensure_preinstalled_petals`) and every `bloom serve` start
-(`petal_provisioning::provision`). Both write the saved settings for a
-Petal they install or update. `bloom init` prints the message, and
-`bloom serve` logs it as `petal.setup_settings_written`.
+(`petal_provisioning::provision`). A fresh install receives the saved settings.
+An update receives them only when the default wallet is known not to exist.
+`bloom init` prints the outcome, and `bloom serve` logs it.
 
 Each change is one policy update ceremony. Changes waiting at the same time
 merge into one proposal, as Machine already reconciles pending proposals.
