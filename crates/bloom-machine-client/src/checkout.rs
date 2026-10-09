@@ -116,7 +116,8 @@ mod tests {
             .is_ok()
         );
         assert!(response("{\"url\":\"https://shop.invalid\",\"text\":\"Shop\",\"elements\":[],\"challenge_url\":\"private capability\"}\n",uid).await.is_err());
-        assert!(response("{\"state\":\"opened\"}\n", uid + 1).await.is_err());        assert_eq!(
+        assert!(response("{\"state\":\"opened\"}\n", uid + 1).await.is_err());
+        assert_eq!(
             response(
                 "{\"error\":\"Stale element reference; request a new snapshot\"}\n",
                 uid
