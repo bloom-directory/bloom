@@ -25,7 +25,6 @@ use tokio::{io::AsyncReadExt as _, net::UnixListener, sync::Semaphore};
 
 const SESSION_SERVICE_ID: &str = "bloom-session";
 const BROKER_SERVICE_ID: &str = "bloom-broker";
-const GUI_LOGIN_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 pub async fn run() -> Result<()> {
     let effective_uid = geteuid().as_raw();
@@ -37,11 +36,6 @@ pub async fn run() -> Result<()> {
     let developer_root = std::env::var_os("BLOOM_TRIAD_DEVELOPER_ROOT").map(PathBuf::from);
     #[cfg(not(feature = "triad-dev-harness"))]
     let developer_root: Option<PathBuf> = None;
-    let require_gui_login =
-        gui_login_is_required(cfg!(target_os = "macos"), developer_root.is_some());
-    if require_gui_login && !gui_domain_is_present(effective_uid).await {
-        return Ok(());
-    }
     let config_root = if let Some(root) = developer_root.as_ref() {
         root.join("config")
     } else {
@@ -150,64 +144,6 @@ pub async fn run() -> Result<()> {
             tracing::info!(event = "service.shutdown", reason = "signal");
             crate::native_lifecycle("session-sentinel", "shutdown");
             Ok(())
-        }
-        _ = wait_for_gui_logout(require_gui_login, GUI_LOGIN_POLL_INTERVAL, || gui_domain_is_present(effective_uid)) => {
-            tracing::info!(event = "service.shutdown", reason = "gui_login_ended");
-            crate::native_lifecycle("session-sentinel", "shutdown");
-            Ok(())
-        }
-    }
-}
-
-fn gui_login_is_required(is_macos: bool, is_developer: bool) -> bool {
-    is_macos && !is_developer
-}
-
-async fn gui_domain_is_present(login_uid: u32) -> bool {
-    let mut command = tokio::process::Command::new("/bin/launchctl");
-    command
-        .args(["print", &format!("gui/{login_uid}")])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true);
-    match tokio::time::timeout(Duration::from_secs(1), command.status()).await {
-        Ok(Ok(status)) if status.success() => true,
-        Ok(Ok(status)) => {
-            crate::native_lifecycle(
-                "session-sentinel",
-                &format!("gui_probe_exit_{:?}", status.code()),
-            );
-            false
-        }
-        Ok(Err(error)) => {
-            crate::native_lifecycle(
-                "session-sentinel",
-                &format!("gui_probe_spawn_errno_{:?}", error.raw_os_error()),
-            );
-            false
-        }
-        Err(_) => {
-            crate::native_lifecycle("session-sentinel", "gui_probe_timeout");
-            false
-        }
-    }
-}
-
-async fn wait_for_gui_logout<F, Fut>(required: bool, poll_interval: Duration, mut is_present: F)
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = bool>,
-{
-    if !required {
-        std::future::pending::<()>().await;
-    }
-    let mut interval = tokio::time::interval(poll_interval);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    loop {
-        interval.tick().await;
-        if !is_present().await {
-            return;
         }
     }
 }
@@ -493,37 +429,11 @@ impl Drop for SocketGuard {
 mod tests {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
-    #[test]
-    fn gui_lifetime_is_required_only_for_installed_macos() {
-        assert!(super::gui_login_is_required(true, false));
-        assert!(!super::gui_login_is_required(true, true));
-        assert!(!super::gui_login_is_required(false, false));
-        assert!(!super::gui_login_is_required(false, true));
-    }
-
     #[tokio::test]
-    async fn headless_profiles_do_not_inspect_the_gui_domain() {
-        let inspected = std::sync::atomic::AtomicBool::new(false);
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(10),
-            super::wait_for_gui_logout(false, std::time::Duration::from_millis(1), || {
-                inspected.store(true, std::sync::atomic::Ordering::SeqCst);
-                std::future::ready(false)
-            }),
-        )
-        .await;
-        assert!(result.is_err());
-        assert!(!inspected.load(std::sync::atomic::Ordering::SeqCst));
-    }
-
-    #[tokio::test]
-    async fn gui_logout_closes_both_authenticated_service_channels() {
+    async fn sentinel_shutdown_closes_both_authenticated_service_channels() {
         use bloom_broker_api::{BootEpoch, Token};
         use bloom_triad_local_transport::{LocalIdentity, PeerAcl, authenticate_client};
-        use std::sync::{
-            Arc,
-            atomic::{AtomicBool, Ordering},
-        };
+        use std::sync::Arc;
         use tokio::io::AsyncReadExt as _;
 
         fn identity(service: &str, seed: u8) -> LocalIdentity {
@@ -552,14 +462,11 @@ mod tests {
         let signer = identity("bloom-signer", 3);
         let peers = [acl(&broker), acl(&signer)];
         let session_acl = acl(&session);
-        let gui_present = Arc::new(AtomicBool::new(true));
-        let observed_gui = gui_present.clone();
+        let (shutdown, termination) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
             tokio::select! {
                 result = super::serve_authenticated_services(listener, session, peers) => result,
-                _ = super::wait_for_gui_logout(true, std::time::Duration::from_millis(5), || {
-                    std::future::ready(observed_gui.load(Ordering::SeqCst))
-                }) => Ok(()),
+                _ = termination => Ok(()),
             }
         });
         let mut connections = Vec::new();
@@ -576,8 +483,8 @@ mod tests {
             .unwrap();
             connections.push(stream);
         }
-        assert!(!server.is_finished(), "live GUI login ended the sentinel");
-        gui_present.store(false, Ordering::SeqCst);
+        assert!(!server.is_finished(), "sentinel stopped before termination");
+        shutdown.send(()).unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(1), server)
             .await
             .unwrap()

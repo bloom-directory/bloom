@@ -130,6 +130,11 @@ pub fn run_once() -> Result<()> {
             revoke_gid,
         )
         .context("prepare macOS authority runtime")?;
+        stop_sentinel_if_gui_ended(
+            login_uid,
+            |target| command_output("/bin/launchctl", &["print", target]),
+            |target| command_output("/bin/launchctl", &["kill", "SIGTERM", target]).map(|_| ()),
+        )?;
         let status = Status {
             schema: STATUS_SCHEMA,
             login_uid,
@@ -192,6 +197,23 @@ fn restart_services_for_live_session(login_uid: u32, revoke_gid: u32) -> Result<
             command_output("/bin/launchctl", &["kickstart", &target])
                 .with_context(|| format!("restart {service} for live login {login_uid}"))?;
         }
+    }
+    Ok(())
+}
+
+fn stop_sentinel_if_gui_ended(
+    login_uid: u32,
+    mut inspect: impl FnMut(&str) -> Result<String>,
+    mut terminate: impl FnMut(&str) -> Result<()>,
+) -> Result<()> {
+    if inspect(&format!("gui/{login_uid}")).is_ok() {
+        return Ok(());
+    }
+    let target = format!("user/{login_uid}/com.bloom.session");
+    if inspect(&target)
+        .is_ok_and(|state| state.lines().any(|line| line.trim() == "state = running"))
+    {
+        terminate(&target).context("stop the installed sentinel after GUI logout")?;
     }
     Ok(())
 }
@@ -398,6 +420,57 @@ fn require_service_directory(path: &Path, uid: u32, gid: u32, mode: u32) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gui_logout_terminates_only_the_running_canonical_sentinel() {
+        let terminated = std::cell::Cell::new(false);
+        stop_sentinel_if_gui_ended(
+            501,
+            |target| match target {
+                "gui/501" => anyhow::bail!("GUI domain is absent"),
+                "user/501/com.bloom.session" => Ok("state = running".into()),
+                _ => panic!("unexpected target {target}"),
+            },
+            |target| {
+                assert_eq!(target, "user/501/com.bloom.session");
+                terminated.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(terminated.get());
+    }
+
+    #[test]
+    fn live_gui_login_does_not_terminate_the_sentinel() {
+        stop_sentinel_if_gui_ended(
+            501,
+            |target| {
+                assert_eq!(target, "gui/501");
+                Ok("GUI domain exists".into())
+            },
+            |_| panic!("live session must not be terminated"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn missing_or_stopped_sentinel_needs_no_logout_signal() {
+        for state in [None, Some("state = not running")] {
+            stop_sentinel_if_gui_ended(
+                501,
+                |target| match target {
+                    "gui/501" => anyhow::bail!("GUI domain absent"),
+                    "user/501/com.bloom.session" => state
+                        .map(str::to_owned)
+                        .ok_or_else(|| anyhow::anyhow!("sentinel absent")),
+                    _ => panic!("unexpected target"),
+                },
+                |_| panic!("no running sentinel to terminate"),
+            )
+            .unwrap();
+        }
+    }
 
     #[test]
     fn live_gui_login_uses_the_installed_user_domain_sentinel() {
