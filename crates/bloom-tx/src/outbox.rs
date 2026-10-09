@@ -1177,9 +1177,6 @@ impl Outbox {
     }
 }
 
-/// Parse a single `<root>/<wallet>/<chain>/sent/<id>/intent.json` into a
-/// [`SentEntry`]. Returns `None` if the file can't be parsed or is missing
-/// required fields (no `tx_hash`, unparseable addresses, no fee fields).
 /// A `pending/` entry whose intent already records a terminal status: a
 /// [`Outbox::transition_with_status`] that stopped between writing the status
 /// and moving the directory.
@@ -1218,6 +1215,9 @@ fn sync_dir(dir: &Path) -> Result<(), OutboxError> {
     Ok(())
 }
 
+/// Parse a single `<root>/<wallet>/<chain>/sent/<id>/intent.json` into a
+/// [`SentEntry`]. Returns `None` if the file can't be parsed or is missing
+/// required fields (no `tx_hash`, unparseable addresses, no fee fields).
 fn parse_sent_entry(
     wallet: &str,
     chain: &str,
