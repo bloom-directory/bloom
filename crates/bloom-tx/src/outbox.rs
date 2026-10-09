@@ -413,8 +413,21 @@ impl Outbox {
 
         // Project to central outbox if a projection is wired.
         if let Some(proj) = &self.inner.projection {
+            // A failed deployment can be submitted again with the same local
+            // content ID. Give its new attempt a separate central history.
+            let previous = self.read(&staged.wallet, &staged.chain, &staged.id).ok();
+            let local_id = match previous.as_ref() {
+                Some(entry) if entry.state == OutboxState::Failed => {
+                    format!(
+                        "{}-retry-{}",
+                        staged.id,
+                        entry.staged.action_id.as_deref().unwrap_or("legacy")
+                    )
+                }
+                _ => staged.id.clone(),
+            };
             let action_id = proj
-                .allocate_action_id("evm", &staged.id, &staged.wallet, staged.created_ms as u64)
+                .allocate_action_id("evm", &local_id, &staged.wallet, staged.created_ms as u64)
                 .map_err(OutboxError::Other)?;
             staged.action_id = Some(action_id.clone());
 
@@ -1740,6 +1753,28 @@ mod tests {
         ) -> Result<Vec<u8>, String> {
             Err("not found".into())
         }
+    }
+
+    #[test]
+    fn discarded_identical_resubmission_has_a_fresh_central_action() {
+        let dir = tempfile::tempdir().unwrap();
+        let projection = Arc::new(MockProjection::new());
+        let outbox = Outbox::new_with_projection(dir.path(), projection.clone()).unwrap();
+        let staged = fake_staged("deploy-identical");
+        outbox.write_pending(&staged, "first attempt").unwrap();
+        let first = outbox
+            .read(&staged.wallet, &staged.chain, &staged.id)
+            .unwrap();
+        outbox.transition(&first, OutboxState::Failed).unwrap();
+        outbox.write_pending(&staged, "second attempt").unwrap();
+        let second = outbox
+            .read(&staged.wallet, &staged.chain, &staged.id)
+            .unwrap();
+        assert_ne!(first.staged.action_id, second.staged.action_id);
+        outbox.transition(&second, OutboxState::Failed).unwrap();
+        let transitions = projection.transitions.lock().unwrap();
+        assert_eq!(transitions.len(), 2);
+        assert_ne!(transitions[0].0, transitions[1].0);
     }
 
     #[test]

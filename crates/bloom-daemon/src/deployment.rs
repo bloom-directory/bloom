@@ -120,7 +120,12 @@ impl Daemon {
                     .tx_engine
                     .stage_deployment(permit, wallet, &tx, &chain, &policy)
                     .await
-                    .map_err(|e| (-32000, e.to_string()))?;
+                    .map_err(|_| {
+                        (
+                            -32000,
+                            "deployment staging failed; inspect Machine diagnostics".to_owned(),
+                        )
+                    })?;
                 // Submission only stages. Execution requires an explicit continue
                 // operation from the live client after the plan has been exposed.
                 Ok(json!({"id":staged.id,"status":"staged"}))
@@ -170,13 +175,11 @@ impl Daemon {
                     ));
                 }
                 let mut approval = Value::Null;
-                let mut error = if inspection {
+                let mut error = {
                     std::fs::read(entry.dir.join("deployment-status.json"))
                         .ok()
                         .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
                         .unwrap_or(Value::Null)
-                } else {
-                    Value::Null
                 };
                 if inspection
                     && entry.state == OutboxState::Pending
@@ -203,11 +206,14 @@ impl Daemon {
                         .confirm(permit, wallet, chain_name, id, &chain, &policy, "y")
                         .await
                     {
-                        Ok(_) => {}
+                        Ok(_) => error = Value::Null,
                         Err(TxEngineError::ApprovalRequired(a)) => {
                             approval = json!({"ceremony_url":a.ceremony_url,"expires_ms":a.expires_ms,"reason":a.reason})
                         }
-                        Err(e) => error = json!(e.to_string()),
+                        Err(_) => {
+                            error =
+                                json!("deployment continuation failed; inspect Machine diagnostics")
+                        }
                     }
                 }
                 let entry = self

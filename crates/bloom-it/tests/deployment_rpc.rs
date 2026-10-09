@@ -383,7 +383,7 @@ async fn deployment_tools_and_recovery() -> Result<()> {
         let early = held.await;
         anyhow::bail!("the bridge gave up before approval: {early:?}");
     }
-    let waiting = daemon
+    let mut waiting = daemon
         .deployment_rpc(
             "alice",
             "anvil",
@@ -392,7 +392,23 @@ async fn deployment_tools_and_recovery() -> Result<()> {
         )
         .await;
     ensure!(
-        waiting["result"]["status"] == "approval_required",
+        {
+            for _ in 0..100 {
+                if waiting["result"]["status"] == "approval_required" {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                waiting = daemon
+                    .deployment_rpc(
+                        "alice",
+                        "anvil",
+                        "bloom_deploymentStatus",
+                        json!([held_id.clone()]),
+                    )
+                    .await;
+            }
+            waiting["result"]["status"] == "approval_required"
+        },
         "{waiting}"
     );
     ensure!(

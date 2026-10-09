@@ -1249,7 +1249,7 @@ impl TxEngine {
                 // Contract creation carries initcode, not a call to an
                 // existing described contract, so it keeps the exact
                 // envelope review either way.
-                review_mode: None,
+                review_mode: request.review_mode.clone(),
             },
             &selected_chain,
             policy,
@@ -1378,6 +1378,18 @@ impl TxEngine {
         // a pending entry; signing-time validation would otherwise fail the
         // row only after staging side effects.
         parse_review_mode(intent.review_mode.as_deref())?;
+        // Only creation lacks a recipient. A deployment grant must leave
+        // sends, calls, spenders and operators under the ordinary allowlist.
+        let mut creation_policy;
+        let policy = if matches!(intent.body, RawIntentBody::Deploy { .. })
+            && policy.allow_contract_creation
+        {
+            creation_policy = policy.clone();
+            creation_policy.allowlists.recipients.clear();
+            &creation_policy
+        } else {
+            policy
+        };
         self.assert_write_permit(permit)?;
         let spec: &ChainSpec = chain.spec();
         if spec.legacy_tx && fee_overrides.is_some() {
@@ -1586,7 +1598,7 @@ impl TxEngine {
                 // `bloom deploy` submission is unaffected: it carries an
                 // explicit `gas`, applied just below.
                 if hinted.is_none()
-                    && deployment.is_none()
+                    && deployment.and_then(|(_, tx)| tx.gas).is_none()
                     && matches!(intent.body, RawIntentBody::Deploy { .. })
                 {
                     return Err(TxEngineError::Amount(format!(
@@ -2483,6 +2495,15 @@ impl TxEngine {
             .await
         {
             Ok(h) => h,
+            Err(e @ TxEngineError::ApprovalDenied(_)) => {
+                let state = read_triad_signing_state(&entry.dir.join(TRIAD_SIGNING_STATE_FILE))?;
+                if state.is_none_or(|state| !state.sign_dispatched) {
+                    // A terminal refusal before signing cannot yield a
+                    // transaction. Release the local nonce reservation.
+                    self.outbox.cancel(wallet, chain_name, id)?;
+                }
+                return Err(e);
+            }
             Err(e) => return Err(e),
         };
         info!(id=%staged.id, hash=%format!("{:#x}", tx_hash), "tx.broadcast");
@@ -3291,6 +3312,16 @@ impl TxEngine {
             None => new_state()?,
         };
         write_triad_signing_state(&state_path, &state)?;
+
+        // A lost prepare response may omit the approval ID. Retry its terms
+        // until expiry, then begin a fresh lineage before any dispatch.
+        if !state.sign_dispatched
+            && state.approval_id.is_none()
+            && now_ms() as u64 >= state.expires_at_ms.get()
+        {
+            state = new_state()?;
+            write_triad_signing_state(&state_path, &state)?;
+        }
 
         if state.sign_dispatched {
             match service
@@ -4296,6 +4327,18 @@ impl TxEngine {
         self.assert_write_permit(permit)?;
         let bump = bump_pct.max(10);
         let entry = self.read_replaceable_entry(wallet, chain_name, original_id)?;
+        if entry.state == OutboxState::Pending
+            && entry.staged.tx_hash.is_none()
+            && self
+                .outbox
+                .read_broadcast_attempt(&entry, BroadcastAttemptKind::Confirm)?
+                .is_none()
+            && read_triad_signing_state(&entry.dir.join(TRIAD_SIGNING_STATE_FILE))?
+                .is_none_or(|state| !state.sign_dispatched)
+        {
+            self.outbox.cancel(wallet, chain_name, original_id)?;
+            return Ok(self.outbox.read(wallet, chain_name, original_id)?.staged);
+        }
         let original = &entry.staged;
         self.assert_nonce_still_replaceable(
             chain,
@@ -5889,6 +5932,14 @@ mod tests {
             r#"{"kind":"deploy","data":"0x60006000f3","value":"123 wei"}"#,
         )
         .unwrap();
+        let mut policy = Policy {
+            allow_contract_creation: true,
+            ..Policy::default()
+        };
+        policy
+            .allowlists
+            .recipients
+            .insert("__broker_policy_denies_all_destinations__".into());
         // What `advisory_exact_evm_policy` produces once the wallet has
         // approved `{"chain":"evm-31337","destination":"exact"}`.
         let staged = engine
@@ -5898,7 +5949,7 @@ mod tests {
                 TEST_SIGNER_ADDRESS.parse().unwrap(),
                 intent,
                 &chain,
-                &Policy::default(),
+                &policy,
                 None,
             )
             .await
@@ -5908,6 +5959,26 @@ mod tests {
             !policy_engine::has_hard_violation(&staged.policy_checks),
             "a creation under the opt-in must be confirmable: {:?}",
             staged.policy_checks
+        );
+        let transfer = crate::intent_parser::parse(
+            r#"{"kind":"send","to":"0x0000000000000000000000000000000000000001","value":"1 wei"}"#,
+        )
+        .unwrap();
+        let staged_transfer = engine
+            .stage(
+                &permit,
+                "alice",
+                TEST_SIGNER_ADDRESS.parse().unwrap(),
+                transfer,
+                &chain,
+                &policy,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            policy_engine::has_hard_violation(&staged_transfer.policy_checks),
+            "the deployment grant must not exempt native sends"
         );
         // Still gated: the exact owner approval is what authorizes creation,
         // and the plan says so.
@@ -6510,6 +6581,7 @@ mod tests {
         let (engine, _dir, permit, chain) = stage_fixture(&url, oracle);
         let from: Address = TEST_SIGNER_ADDRESS.parse().unwrap();
         let request = crate::deployment::DeploymentTransaction {
+            review_mode: None,
             chain_id: 31337,
             from,
             to: None,
@@ -6594,6 +6666,7 @@ mod tests {
         std::fs::create_dir_all(&orphan).unwrap();
 
         let request = crate::deployment::DeploymentTransaction {
+            review_mode: None,
             chain_id: 31337,
             from,
             to: None,

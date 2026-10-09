@@ -133,6 +133,7 @@ impl NetPolicy {
 pub struct StoreNamespacePolicy {
     private: BTreeSet<String>,
     secret: BTreeSet<String>,
+    shared_keys: BTreeSet<String>,
 }
 
 impl StoreNamespacePolicy {
@@ -143,7 +144,21 @@ impl StoreNamespacePolicy {
         let secret = secret.into_iter().collect::<BTreeSet<_>>();
         let mut private = private.into_iter().collect::<BTreeSet<_>>();
         private.extend(secret.iter().cloned());
-        Self { private, secret }
+        Self {
+            private,
+            secret,
+            shared_keys: BTreeSet::new(),
+        }
+    }
+
+    /// Exact fully namespaced keys stored once for the package across accounts.
+    pub fn with_shared_keys(mut self, keys: impl IntoIterator<Item = String>) -> Self {
+        self.shared_keys = keys.into_iter().collect();
+        self
+    }
+
+    pub fn shared_keys(&self) -> &BTreeSet<String> {
+        &self.shared_keys
     }
 
     pub fn namespaces(&self) -> &BTreeSet<String> {
@@ -161,6 +176,8 @@ impl StoreNamespacePolicy {
     /// Intersect a manifest policy with a runtime mask. Namespaces must be
     /// present in both policies; secret classification is preserved if either
     /// side marks the namespace secret so a mask cannot downgrade secret writes.
+    /// Manifest shared keys survive only within retained namespaces; runtime masks
+    /// cannot introduce additional package-wide keys.
     pub fn intersect(&self, mask: &StoreNamespacePolicy) -> Self {
         let private = self
             .private
@@ -176,7 +193,20 @@ impl StoreNamespacePolicy {
             .intersection(&secret_union)
             .cloned()
             .collect::<BTreeSet<_>>();
-        Self { private, secret }
+        let shared_keys = self
+            .shared_keys
+            .iter()
+            .filter(|key| {
+                key.split_once('/')
+                    .is_some_and(|(namespace, _)| private.contains(namespace))
+            })
+            .cloned()
+            .collect();
+        Self {
+            private,
+            secret,
+            shared_keys,
+        }
     }
 
     pub fn check_namespace(&self, namespace: &str) -> Result<(), HostError> {

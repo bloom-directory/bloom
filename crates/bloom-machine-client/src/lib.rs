@@ -4134,7 +4134,7 @@ mod tests {
             crypto_suite: CryptoSuite::Secp256k1Keccak256Recoverable,
             provenance: ProvenanceSubject::Cli {
                 client_id: token("bloom-cli"),
-                command_class: token("transaction.confirm_batch"),
+                command_class: token("transaction.confirm"),
             },
             provenance_digest: digest(60),
             activation_mode: Some(ActivationMode::BootBound),
@@ -4196,6 +4196,10 @@ mod tests {
                 }
             );
             assert_eq!(request.terms.provenance_digest, digest(60));
+            assert_eq!(
+                request.evm_review_payloads,
+                vec![Base64UrlBytes::from_bytes(&payload)]
+            );
             assert_eq!(request.terms.key_ref, root_key_ref);
             assert_eq!(request.terms.limits.max_operations.get(), 1);
             assert_eq!(request.terms.limits.max_signatures.get(), 1);
@@ -4270,6 +4274,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_confirm_replace_cancel_forward_payload_and_review_mode() {
+        let broker = Arc::new(MockBroker {
+            wallet: WalletPublic {
+                wallet_id: token("wallet"),
+                wallet_kind: token("local"),
+                root_key_ref: Some(key_ref()),
+                key_refs: vec![key_ref()],
+                policy_version: DecimalU64::new(7),
+                policy_digest: digest(7),
+                wallet_revocation_epoch: DecimalU64::new(2),
+            },
+            accounts: empty_accounts(),
+            requests: Mutex::new(Vec::new()),
+            corrupt_response: false,
+        });
+        let client = MachineBrokerClient::new(broker.clone());
+        for class in [
+            "transaction.confirm",
+            "transaction.replace",
+            "transaction.cancel",
+        ] {
+            for mode in [ReviewMode::Clear, ReviewMode::OpaqueExact] {
+                broker.requests.lock().unwrap().clear();
+                let payload = format!("unsigned {class}").into_bytes();
+                let mut request = exact_request(payload.clone(), None);
+                request.provenance = ProvenanceSubject::Cli {
+                    client_id: token("bloom-cli"),
+                    command_class: token(class),
+                };
+                request.requested_review_mode = Some(mode);
+                client.sign_exact_payload(request).await.unwrap();
+                let requests = broker.requests.lock().unwrap();
+                let prepare = requests
+                    .iter()
+                    .find_map(|request| match request {
+                        MachineBrokerRequest::SealedApprovalPrepare(prepare) => Some(prepare),
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(
+                    prepare.evm_review_payloads,
+                    vec![Base64UrlBytes::from_bytes(&payload)]
+                );
+                assert_eq!(prepare.requested_review_mode, Some(mode));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn exact_payload_batch_prepares_then_uses_sign_batch_with_receipts() {
         let broker = Arc::new(MockBroker {
             wallet: WalletPublic {
@@ -4290,10 +4343,9 @@ mod tests {
             b"unsigned EVM child 1".to_vec(),
             b"unsigned EVM child 2".to_vec(),
         ];
-        let prepared = client
-            .sign_exact_payload_batch(exact_batch_request(payloads.clone(), None))
-            .await
-            .unwrap();
+        let mut native_batch = exact_batch_request(payloads.clone(), None);
+        native_batch.requested_review_mode = Some(ReviewMode::OpaqueExact);
+        let prepared = client.sign_exact_payload_batch(native_batch).await.unwrap();
         let ExactPayloadSignOutcome::ApprovalRequired(prepared) = prepared else {
             panic!("first call must prepare one exact batch approval");
         };
@@ -4305,6 +4357,14 @@ mod tests {
             };
             assert_eq!(request.terms.limits.max_operations.get(), 1);
             assert_eq!(request.terms.limits.max_signatures.get(), 2);
+            assert_eq!(request.requested_review_mode, Some(ReviewMode::OpaqueExact));
+            assert_eq!(
+                request.evm_review_payloads,
+                payloads
+                    .iter()
+                    .map(|payload| Base64UrlBytes::from_bytes(payload))
+                    .collect::<Vec<_>>()
+            );
             assert_eq!(
                 request.terms.selector,
                 ApprovalSelector::Exact {

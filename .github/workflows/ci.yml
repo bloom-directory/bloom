@@ -8,6 +8,7 @@ on:
       - "Cargo.lock"
       - "rust-toolchain.toml"
       - "crates/**"
+      - "examples/**"
       - "evals/harbor/**"
       - "packaging/**"
       - "scripts/**"
@@ -162,7 +163,7 @@ jobs:
           name: nextest-archive
           path: target
       - name: Run library unit tests from archive
-        run: cargo nextest run --archive-file target/nextest-archive.tar.zst -E 'kind(lib)' --no-fail-fast
+        run: cargo nextest run --archive-file target/nextest-archive.tar.zst -E 'kind(lib) or (package(bloom) and kind(bin))' --no-fail-fast
 
   integration_test:
     name: local integration tests
@@ -178,16 +179,16 @@ jobs:
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@v1
         with:
-          version: stable
+          version: v1.7.1
       # The Hardhat half of the deployment compatibility test installs and
       # runs a project with npm, so the Node version is pinned rather than
       # inherited from whatever the runner image ships this month. Hardhat
       # refuses to start below 22.13, so this floor is the tool's, not a
       # preference.
       - name: Install Node.js for the Hardhat compatibility project
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: "22"
+          node-version: "22.14.0"
       - name: Download nextest archive
         uses: actions/download-artifact@v4
         with:
