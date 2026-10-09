@@ -821,6 +821,26 @@ require_triad_health() {
   for ((attempt=0; attempt<240; attempt++)); do launchctl asuser "$uid" /usr/bin/sudo -u "$user" -H "$release_base/current/bloom" --home "$home/.bloom" serve triad-health-check "$digest" >/dev/null 2>&1 && return 0; sleep 0.5; done
   launchctl asuser "$uid" /usr/bin/sudo -u "$user" -H "$release_base/current/bloom" --home "$home/.bloom" serve triad-health-check "$digest"
 }
+capture_activation_failure() {
+  local evidence="${BLOOM_MACOS_W0_EVIDENCE_DIR:-}" service source_log
+  [[ -n "$evidence" && -d "$evidence" && ! -L "$evidence" ]] || return 0
+  # W0-only evidence must survive rollback. Never copy identity/config files.
+  for service in broker signer; do
+    for source_log in "$log_root/$service.jsonl" "$log_root/$service-bootstrap.log"; do
+      [[ -f "$source_log" && ! -L "$source_log" ]] || continue
+      install -m 0644 "$source_log" "$evidence/activation-$(basename "$source_log")" || true
+    done
+    launchctl print "system/com.bloom.$service.$login_uid" \
+      > "$evidence/activation-$service-launchctl.txt" 2>&1 || true
+  done
+  for service in session machine; do
+    launchctl print "user/$login_uid/com.bloom.$service" \
+      > "$evidence/activation-$service-launchctl.txt" 2>&1 || true
+  done
+  launchctl print system/com.bloom.containment \
+    > "$evidence/activation-lifecycle-launchctl.txt" 2>&1 || true
+  chmod 0644 "$evidence/"activation-*-launchctl.txt 2>/dev/null || true
+}
 reload_current_enrollment() {
   plutil -lint "$broker_plist" "$signer_plist" "$containment_plist" "$session_plist" "$machine_plist" >/dev/null
   reload_launchd_job system com.bloom.containment "$containment_plist"
@@ -1092,8 +1112,8 @@ case "$action" in
     fi
     switch_release "$BLOOM_RELEASE_DIGEST"; install_config; disable_legacy_network_guard; write_enrollment activating; install_assets
     if $live; then
-      secure_ownership; reload_current_enrollment || { $fresh && rollback_failed_fresh; die "Bloom failed authenticated activation"; }
-      activate_current_enrollment || { $fresh && rollback_failed_fresh; die "Bloom failed full activation"; }
+      secure_ownership; reload_current_enrollment || { capture_activation_failure; $fresh && rollback_failed_fresh; die "Bloom failed authenticated activation"; }
+      activate_current_enrollment || { capture_activation_failure; $fresh && rollback_failed_fresh; die "Bloom failed full activation"; }
       created_users=""; created_groups=""
     fi
     cleanup_legacy_pf
