@@ -59,7 +59,7 @@ impl ExactSigningBrokerFixture {
                 // fixture's mempool target and its first 64 CREATE addresses
                 // explicitly so deployment tools can initialize their contracts.
                 destinations.extend(
-                    std::iter::once(alloy_primitives::Address::ZERO)
+                    std::iter::once(alloy::primitives::Address::ZERO)
                         .chain((0..64).map(|nonce| self.signer.address().create(nonce)))
                         .map(|address| PolicyDestination {
                             chain: Token::new("anvil").unwrap(),
