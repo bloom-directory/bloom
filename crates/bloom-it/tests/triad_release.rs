@@ -159,9 +159,10 @@ fn release_compatibility_declares_each_edge_without_a_global_protocol_range() {
     ] {
         assert!(compatibility.contains(&format!("{revision} = \"")));
     }
-    for component in ["machine", "broker", "signer"] {
-        assert!(compatibility.contains(&format!("[state.{component}]")));
-        assert!(compatibility.contains("downgrade_floor = 1"));
+    for (component, version) in [("machine", 1), ("broker", 2), ("signer", 1)] {
+        assert!(compatibility.contains(&format!(
+            "[state.{component}]\ncurrent = {version}\ndowngrade_floor = {version}"
+        )));
     }
 }
 
