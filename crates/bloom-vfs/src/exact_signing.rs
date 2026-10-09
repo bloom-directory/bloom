@@ -686,14 +686,16 @@ impl BrokerExactPayloadSigner {
             attempt.signing_operation_id == state.signing_operation_id
                 && attempt.request_digest != request_digest
         });
-        if let Some(attempt) = different_request
-            && !attempt.settled
-            && !expired
+        if let Some(attempt) = previous_attempt.as_ref().filter(|attempt| {
+            attempt.signing_operation_id == state.signing_operation_id
+                && (different_request.is_some() || expired)
+        }) && !attempt.settled
         {
             // New bytes replace the attempt's identity, and with it the
             // approval. Do that only once the earlier operation is final:
             // while it may still sign, a fresh approval would put a second
-            // operation beside it.
+            // operation beside it. Approval expiry does not prove that an
+            // operation accepted before expiry has finished signing.
             self.require_attempt_final(&attempt.signing_operation_id)
                 .await?;
         }
@@ -2233,6 +2235,39 @@ mod tests {
             assert!(error.contains("has not settled"), "{state:?}: {error}");
             assert_eq!(prepares(&broker), 1, "{state:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn approval_expiry_does_not_replace_an_unresolved_attempt() {
+        let broker = Arc::new(MockBroker {
+            lose_batch_response_once: AtomicBool::new(true),
+            operation_status_unavailable: AtomicBool::new(true),
+            ..MockBroker::default()
+        });
+        let (signer, home, claim, _) = debiting_claim_fixture(&broker, None);
+        approval_of(
+            &reusable_once(&signer, &home, &claim, b"first")
+                .await
+                .unwrap(),
+        );
+        reusable_once(&signer, &home, &claim, b"first")
+            .await
+            .unwrap_err();
+        let mut before = reusable_state(&home);
+        before.expires_at_ms = DecimalU64::new(0);
+        write_state(&home.path().join("petal-reusable.json"), &before).unwrap();
+
+        for bytes in [b"first".as_slice(), b"second".as_slice()] {
+            let error = reusable_once(&signer, &home, &claim, bytes)
+                .await
+                .unwrap_err();
+            assert!(error.contains("has not settled"), "{error}");
+            let after = reusable_state(&home);
+            assert_eq!(after.signing_operation_id, before.signing_operation_id);
+            assert_eq!(after.approval_id, before.approval_id);
+        }
+        assert_eq!(prepares(&broker), 1);
+        assert_eq!(broker.batch_signings.lock().unwrap().len(), 1);
     }
 
     /// A refusal with no lasting effect settles the attempt where it
