@@ -15,20 +15,24 @@ on:
         default: fb31fef6a8ab44d9dc69d4b6a9b456dc0ed5726c
       login_uid_a:
         description: First active GUI login UID
-        required: true
+        required: false
         type: string
+        default: auto
       login_user_a:
         description: First active GUI login name
-        required: true
+        required: false
         type: string
+        default: auto
       login_uid_b:
         description: Second active GUI login UID
-        required: true
+        required: false
         type: string
+        default: auto
       login_user_b:
         description: Second active GUI login name
-        required: true
+        required: false
         type: string
+        default: auto
   workflow_dispatch:
     inputs:
       broker_ref:
@@ -42,15 +46,19 @@ on:
       login_uid_a:
         description: First active GUI login UID
         required: true
+        default: auto
       login_user_a:
         description: First active GUI login name
         required: true
+        default: auto
       login_uid_b:
         description: Second active GUI login UID
         required: true
+        default: auto
       login_user_b:
         description: Second active GUI login name
         required: true
+        default: auto
 
 permissions:
   contents: read
@@ -73,6 +81,29 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           path: bloom
+      - name: Resolve the disposable runner's active GUI identities
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if [[ "$BLOOM_W0_LOGIN_UID_A" != auto || "$BLOOM_W0_LOGIN_USER_A" != auto ||
+                "$BLOOM_W0_LOGIN_UID_B" != auto || "$BLOOM_W0_LOGIN_USER_B" != auto ]]; then
+            [[ "$BLOOM_W0_LOGIN_UID_A" != auto && "$BLOOM_W0_LOGIN_USER_A" != auto &&
+               "$BLOOM_W0_LOGIN_UID_B" != auto && "$BLOOM_W0_LOGIN_USER_B" != auto ]]
+            exit 0
+          fi
+          # Only the explicitly labelled disposable runner reaches this step.
+          # Discover existing sessions; never create accounts or fake a GUI.
+          found=0
+          while read -r login_user login_uid; do
+            [[ "$login_uid" =~ ^[0-9]+$ && "$login_uid" -ge 500 && "$login_uid" != "$(id -u)" ]] || continue
+            sudo launchctl print "gui/$login_uid" >/dev/null 2>&1 || continue
+            if [[ "$found" == 0 ]]; then suffix=A; else suffix=B; fi
+            printf 'BLOOM_W0_LOGIN_UID_%s=%s\nBLOOM_W0_LOGIN_USER_%s=%s\n' \
+              "$suffix" "$login_uid" "$suffix" "$login_user" >> "$GITHUB_ENV"
+            found=$((found + 1))
+            [[ "$found" != 2 ]] || break
+          done < <(dscl . -list /Users UniqueID | sort -nk2)
+          [[ "$found" == 2 ]] || { echo 'Disposable runner requires two existing active GUI sessions besides the runner'; exit 69; }
       - name: Reject mutable sibling refs
         shell: bash
         env:
