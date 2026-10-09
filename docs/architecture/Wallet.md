@@ -159,6 +159,52 @@ application keys. Those Petal-owned keys are not Bloom wallet keys. A
 Bloom-managed wallet or derived `KeyRef` remains Broker/Signer-only and is used
 through the payload-bearing Petal signing protocol.
 
+## Native EVM contract creation
+
+The native outbox accepts an explicit `kind: "deploy"` intent with complete
+initcode (including linked libraries and encoded constructor arguments) and an
+optional native endowment. `StagedTx` records `ContractCreation` with `to: null`.
+Calls retain an address string, including calls to the zero address. Missing
+recipients on old call entries are rejected rather than interpreted as creation.
+
+Gas estimation, pre-sign simulation, and both legacy and EIP-1559 unsigned
+encoding preserve CREATE. Fee replacement retains that kind; cancellation is
+still a separately authorized self-transfer. Sent-entry scanning includes
+creation, and successful mined receipts persist the node's actual
+`contract_address`. The plan shows the initcode hash and the conditional address
+prediction from sender and nonce; constructor effects and ownership are not
+verified from arbitrary bytecode.
+
+Creation rows require this build to read: `to: null` with `ContractCreation`
+does not deserialize in older Machines, so do not downgrade a Machine with
+staged or sent deployments in its outbox — re-upgrade before confirming them.
+
+Creation requires exact payload approval and an explicit canonical policy entry
+`{"chain":"evm-<numeric-chain-id>","destination":"exact"}`. The entry exempts
+contract creation from Machine's recipient allowlist; sends, calls and token
+allowances retain their recipient restrictions. Every transaction still needs
+its own exact owner approval. Broker verifies the
+unsigned transaction preimage against the exact selector, derives the sender
+from Signer's authenticated public key, and commits decoded creation/call
+fields to the owner review. Machine and Broker require protocol 1.6; Signer
+protocol and Petal WIT are unchanged.
+
+`bloom deploy --wallet <wallet> --chain <chain> rpc` exposes a token-authenticated
+loopback endpoint for Foundry unlocked scripts, Hardhat remote accounts, and
+Ignition. It uses the native wallet/outbox rather than a separate WASM wrapper.
+Every submission requires an explicit nonce and gets a durable ID committing
+the normalized request, wallet, and chain. Retries return the existing entry;
+conflicting nonce use fails closed. Plans, approvals, errors, signed bytes, and
+receipts persist in the outbox. Automatic nonce selection includes the node's
+pending transactions.
+
+The HTTP request prepares owner review and waits for a real hash. The agent
+runs `bloom deploy ... resume <id>` after approval; an idle or disconnected
+client does not continue signing in the background. `list` and `status` expose
+recovery, including cached artifacts during outages. See the runnable
+[Foundry/Hardhat/Ignition guide](../../examples/evm-deploy/README.md) and
+[bloom#221](https://github.com/bloom-directory/bloom/issues/221).
+
 ## Policy updates
 
 The mounted policy surface uses Broker's policy custody protocol:
@@ -186,3 +232,9 @@ If Broker is unavailable, Machine may continue cached public reads, unsigned
 staging, and simulation where inputs are available. Signing, approvals, policy
 mutations, and custody fail promptly. Broker failure never causes Machine to
 open legacy authority state or start a ceremony listener.
+
+Numbered `outbox/new.tx` writes may construct unsigned EVM or Solana work from
+the cached authenticated account inventory. The path still fixes the sender;
+Solana artifacts also pin the full account fingerprint. Confirming, replacing, cancelling, restaging,
+session changes and Petal account context still require fresh Broker authority;
+cached membership never authorizes a signature.

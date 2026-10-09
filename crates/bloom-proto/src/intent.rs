@@ -90,6 +90,12 @@ pub enum RawIntentBody {
         value: String,
         data: String,
     },
+    /// Direct contract creation. Data is complete initcode, including constructor arguments.
+    Deploy {
+        data: String,
+        #[serde(default)]
+        value: String,
+    },
     /// ERC-20 approval. `amount` accepts a decimal integer or `"max"`
     /// (shorthand for 2^256 - 1 — the conventional infinite-allowance
     /// value). The tx engine encodes `approve(address,uint256)`; the
@@ -160,6 +166,14 @@ pub struct RawIntent {
     /// transaction is still fully represented by `body`.
     #[serde(default)]
     pub usd_value_hint: Option<String>,
+    /// Ask for a specific owner review of this transaction. Omit it to let
+    /// Broker decide under the wallet's policy. `"opaque_exact"` says the
+    /// caller wants to approve bytes Bloom will not explain, which Broker
+    /// refuses unless policy permits it. There is no value that downgrades a
+    /// readable call quietly: a call that cannot be read under a clear
+    /// request fails preparation instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_mode: Option<String>,
 }
 
 /// A normalised concrete tx-intent (post-resolution): addresses parsed,
@@ -167,7 +181,7 @@ pub struct RawIntent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TxIntent {
     pub from: String,
-    pub to: String,
+    pub to: Option<String>,
     pub value_wei: String,
     pub data_hex: String,
     pub chain_id: u64,

@@ -9,6 +9,10 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Policy {
+    /// Authenticated numeric-chain deployment opt-in. This advisory flag is
+    /// supplied by the Broker projection, never by a local policy document.
+    #[serde(skip)]
+    pub allow_contract_creation: bool,
     #[serde(default)]
     pub caps: PolicyCaps,
     /// Per-section allow/deny compatibility fields.
