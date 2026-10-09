@@ -784,36 +784,84 @@ class AllowOnlyDestinationTests(SolanaEvalTestCase):
     URL = "http://localhost:18734/ceremony/" + "P" * 43
     OPERATION = "ab" * 32
 
-    def projection(self, allowed: list[dict[str, str]]) -> str:
+    def projection(self, allowed, version=1, **overrides) -> str:
         # Broker encodes the canonical policy as URL-safe base64 without
         # padding; a standard decoder rejects it.
         policy = {"wallet_id": WALLET_ID, "allowed_destinations": allowed, "note": "?>"}
-        encoded = base64.urlsafe_b64encode(json.dumps(policy).encode()).decode().rstrip("=")
-        return json.dumps({"policy": {"canonical_policy": encoded}})
+        encoded = (
+            base64.urlsafe_b64encode(json.dumps(policy).encode()).decode().rstrip("=")
+        )
+        snapshot = {
+            "wallet_id": WALLET_ID,
+            "version": str(version),
+            "policy_digest": "cd" * 32,
+            "canonical_policy": encoded,
+        }
+        result = {
+            "wallet": {
+                "wallet_id": WALLET_ID,
+                "policy_version": str(version),
+                "policy_digest": "cd" * 32,
+            },
+            "policy": snapshot,
+            "freshness": "fresh",
+            "verification": "authenticated_broker",
+            "observed_at_ms": int(time.time() * 1000) + 1000,
+        }
+        result.update(overrides)
+        return json.dumps(result)
 
-    def run_allow(self, committed: list[dict[str, str]], staged: str | None = None):
+    def receipt(self, allowed, version=2):
+        return json.dumps(
+            {
+                "operation_id": self.OPERATION,
+                "wallet_id": WALLET_ID,
+                "previous_version": str(version - 1),
+                "committed": json.loads(self.projection(allowed, version))["policy"],
+            }
+        )
+
+    def run_allow(
+        self,
+        committed: list[dict[str, str]],
+        staged: str | None = None,
+        after=None,
+        receipt=None,
+    ):
         definition = self.make()
         definition.destination = DESTINATION
         proposals: list[object] = []
         replies = {
             "projection": [
                 self.projection([{"chain": "solana", "destination": SOURCE}]),
-                self.projection(committed),
+                self.projection([{"chain": "solana", "destination": SOURCE}]),
+                self.projection(committed, 2),
             ],
         }
 
-        def bloom(*args: str) -> str:
+        if after is not None:
+            replies["projection"][2:] = after
+
+        def bloom(*args: str, **kwargs) -> str:
             if args[:2] == ("wallet", "projection"):
-                return replies["projection"].pop(0)
+                if len(replies["projection"]) > 1:
+                    return replies["projection"].pop(0)
+                return replies["projection"][0]
             if args[:2] == ("wallet", "update-policy"):
                 proposals.append(json.loads(Path(args[-1]).read_text()))
-                return staged if staged is not None else (
-                    f"operation_id: {self.OPERATION}\nceremony_kind: PolicyUpdate\n"
-                    f"ceremony_url: {self.URL}\n"
+                return (
+                    staged
+                    if staged is not None
+                    else (
+                        f"operation_id: {self.OPERATION}\nceremony_kind: PolicyUpdate\n"
+                        f"ceremony_url: {self.URL}\n"
+                    )
                 )
             if args[:2] == ("wallet", "commit-policy"):
                 self.assertEqual(args[2], self.OPERATION)
-                return ""
+                return receipt or self.receipt(
+                    [{"chain": "solana", "destination": DESTINATION}]
+                )
             raise AssertionError(args)
 
         ceremonies = SimpleNamespace(complete=mock.Mock())
@@ -836,14 +884,23 @@ class AllowOnlyDestinationTests(SolanaEvalTestCase):
         with self.assertRaisesRegex(EvalError, "did not stage a ceremony"):
             self.run_allow([], staged="operation_id: nope\n")
 
-    def policy_store(self, original: list[dict[str, str]], *, commit_fails: bool = False):
+    def policy_store(
+        self, original: list[dict[str, str]], *, commit_fails: bool = False
+    ):
         """A fake `bloom` whose committed policy follows each proposal."""
-        state = {"allowed": original, "proposed": None, "commits": 0}
+        state = {
+            "allowed": original,
+            "proposed": None,
+            "commits": 0,
+            "version": 1,
+            "receipt": None,
+        }
 
-        def bloom(*args: str) -> str:
+        def bloom(*args: str, **kwargs) -> str:
             if args[:2] == ("wallet", "projection"):
-                return self.projection(state["allowed"])
+                return self.projection(state["allowed"], state["version"])
             if args[:2] == ("wallet", "update-policy"):
+                state["receipt"] = None
                 state["proposed"] = json.loads(Path(args[-1]).read_text())[
                     "allowed_destinations"
                 ]
@@ -853,11 +910,14 @@ class AllowOnlyDestinationTests(SolanaEvalTestCase):
                 )
             if args[:2] == ("wallet", "commit-policy"):
                 state["commits"] += 1
-                if commit_fails and state["commits"] == 1:
-                    state["allowed"] = state["proposed"]
-                    raise EvalError("bloom wallet commit-policy failed")
+                if state["receipt"] is not None:
+                    return state["receipt"]
                 state["allowed"] = state["proposed"]
-                return ""
+                state["version"] += 1
+                state["receipt"] = self.receipt(state["allowed"], state["version"])
+                if commit_fails and state["commits"] == 1:
+                    raise EvalError("bloom wallet commit-policy failed")
+                return state["receipt"]
             raise AssertionError(args)
 
         return state, bloom
@@ -893,6 +953,127 @@ class AllowOnlyDestinationTests(SolanaEvalTestCase):
         definition = self.make()
         with mock.patch.object(definition, "_bloom", side_effect=AssertionError):
             definition._restore_allowed_destinations()
+
+    def test_old_projection_converges_to_exact_receipt(self) -> None:
+        allowed = [{"chain": "solana", "destination": DESTINATION}]
+        with mock.patch("harness.solana_transfer.time.sleep") as sleep:
+            self.run_allow(
+                allowed, after=[self.projection([], 1), self.projection(allowed, 2)]
+            )
+        sleep.assert_called_once()
+
+    def test_old_projection_that_never_converges_is_bounded(self) -> None:
+        with mock.patch(
+            "harness.solana_transfer.POLICY_PROJECTION_TIMEOUT_SECONDS", 0.005
+        ):
+            with self.assertRaisesRegex(EvalError, "projection did not converge"):
+                self.run_allow([], after=[self.projection([], 1)])
+
+    def test_newer_unrelated_policy_is_refused(self) -> None:
+        with self.assertRaisesRegex(EvalError, "changed after this commit"):
+            self.run_allow([], after=[self.projection([], 3)])
+
+    def test_wrong_commit_version_is_refused(self) -> None:
+        allowed = [{"chain": "solana", "destination": DESTINATION}]
+        receipt = json.loads(self.receipt(allowed))
+        receipt["committed"]["version"] = "3"
+        with self.assertRaisesRegex(EvalError, "wrong operation, wallet or version"):
+            self.run_allow(allowed, receipt=json.dumps(receipt))
+
+    def test_wrong_signed_projection_digest_is_refused(self) -> None:
+        allowed = [{"chain": "solana", "destination": DESTINATION}]
+        projected = json.loads(self.projection(allowed, 2))
+        projected["wallet"]["policy_digest"] = "ef" * 32
+        projected["policy"]["policy_digest"] = "ef" * 32
+        with self.assertRaisesRegex(EvalError, "signed projection differs"):
+            self.run_allow(allowed, after=[json.dumps(projected)])
+
+    def test_untrusted_or_wrong_wallet_projection_is_refused(self) -> None:
+        for field, value in [
+            ("freshness", "stale"),
+            ("verification", "unverified"),
+            ("wallet", {"wallet_id": "other"}),
+        ]:
+            with self.subTest(field=field):
+                definition = self.make()
+                with mock.patch.object(
+                    definition,
+                    "_bloom",
+                    return_value=self.projection([], **{field: value}),
+                ):
+                    with self.assertRaisesRegex(EvalError, "not fresh, authenticated"):
+                        definition._allowed_destinations()
+
+    def test_projection_rpc_uses_remaining_deadline(self) -> None:
+        definition = self.make()
+        response = subprocess.CompletedProcess([], 0, self.projection([]), "")
+        with mock.patch(
+            "harness.solana_transfer.subprocess.run", return_value=response
+        ) as run:
+            definition._policy_projection(timeout=0.01)
+        self.assertGreater(run.call_args.kwargs["timeout"], 0)
+        self.assertLessEqual(run.call_args.kwargs["timeout"], 0.01)
+
+    def test_stale_original_body_cannot_skip_cleanup(self) -> None:
+        original = [{"chain": "solana", "destination": SOURCE}]
+        definition = self.make()
+        definition.destination = DESTINATION
+        state, bloom = self.policy_store(original)
+        ceremonies = SimpleNamespace(complete=mock.Mock())
+        with mock.patch.object(definition, "_bloom", side_effect=bloom):
+            definition._allow_only_destination(ceremonies)
+        stale = json.loads(self.projection(original, 1))
+        stale["observed_at_ms"] = 0
+        first = True
+
+        def delayed(*args, **kwargs):
+            nonlocal first
+            if first and args[:2] == ("wallet", "projection"):
+                first = False
+                return json.dumps(stale)
+            return bloom(*args, **kwargs)
+
+        with mock.patch.object(definition, "_bloom", side_effect=delayed), mock.patch(
+            "harness.solana_transfer.time.sleep"
+        ):
+            definition._restore_allowed_destinations()
+        self.assertEqual(state["allowed"], original)
+        self.assertEqual(state["commits"], 2)
+        self.assertFalse(definition._policy_commit_marker.exists())
+
+    def test_unrelated_policy_before_cleanup_is_not_overwritten(self) -> None:
+        original = [{"chain": "solana", "destination": SOURCE}]
+        definition = self.make()
+        definition.destination = DESTINATION
+        state, bloom = self.policy_store(original)
+        with mock.patch.object(definition, "_bloom", side_effect=bloom):
+            definition._allow_only_destination(SimpleNamespace(complete=mock.Mock()))
+            state["version"] += 1
+            state["allowed"] = original
+            with self.assertRaisesRegex(EvalError, "changed before cleanup"):
+                definition._restore_allowed_destinations()
+        self.assertEqual(state["commits"], 1)
+        self.assertTrue(definition._policy_commit_marker.exists())
+
+    def test_ambiguous_commit_recovery_remains_fail_closed(self) -> None:
+        original = [{"chain": "solana", "destination": SOURCE}]
+        definition = self.make()
+        definition.destination = DESTINATION
+        state, bloom = self.policy_store(original, commit_fails=True)
+        with mock.patch.object(definition, "_bloom", side_effect=bloom):
+            with self.assertRaisesRegex(EvalError, "commit-policy failed"):
+                definition._allow_only_destination(
+                    SimpleNamespace(complete=mock.Mock())
+                )
+        with mock.patch.object(
+            definition, "_bloom", side_effect=EvalError("commit response still lost")
+        ):
+            with self.assertRaisesRegex(EvalError, "still lost"):
+                definition._restore_allowed_destinations()
+        self.assertTrue(definition._policy_commit_marker.exists())
+        self.assertIsNotNone(definition._pending_policy_commit)
+        with self.assertRaisesRegex(EvalError, "needs reconciliation"):
+            definition.preflight()
 
 
 class TrialNoteTests(SolanaEvalTestCase):

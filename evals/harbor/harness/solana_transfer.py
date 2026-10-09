@@ -100,6 +100,8 @@ MAX_RESTAGE_HOPS = 10
 LOCAL_HISTORY_MIN_SLOTS = 4500
 
 RPC_TIMEOUT_SECONDS = 30
+POLICY_PROJECTION_TIMEOUT_SECONDS = 10.0
+POLICY_PROJECTION_POLL_SECONDS = 0.25
 # Long enough for a restaged replacement's blockhash to expire and be swept.
 PENDING_DRAIN_ATTEMPTS = 60
 PENDING_DRAIN_DELAY_SECONDS = 3.0
@@ -200,6 +202,9 @@ class SolanaTransferEval(EvalDefinition):
         # through the latter. _ceremonies is None until the trial changes the
         # policy.
         self._original_allowed: Any = None
+        self._policy_observed_after_ms = 0
+        self._pending_policy_commit = None
+        self._committed_policy_snapshot = None
         self._ceremonies: CeremonyDriver | None = None
 
     # ---- paths ---------------------------------------------------------
@@ -380,6 +385,8 @@ class SolanaTransferEval(EvalDefinition):
         self.history_start_slot = slot
 
     def preflight(self) -> None:
+        if self._policy_commit_marker.exists():
+            raise EvalError("an earlier policy commit needs reconciliation before another trial")
         if not self.bloom_mount_value:
             raise EvalError("BLOOM_EVAL_BLOOM_MOUNT is required")
         if WALLET_ID.fullmatch(self.wallet_id) is None:
@@ -766,7 +773,7 @@ class SolanaTransferEval(EvalDefinition):
         leading_zeros = len(raw) - len(raw.lstrip(b"\0"))
         return "1" * leading_zeros + encoded
 
-    def _bloom(self, *args: str) -> str:
+    def _bloom(self, *args: str, timeout: float = 120) -> str:
         try:
             completed = subprocess.run(
                 [self.bloom_bin, "-q", *args],
@@ -774,7 +781,7 @@ class SolanaTransferEval(EvalDefinition):
                 capture_output=True,
                 text=True,
                 check=False,
-                timeout=120,
+                timeout=timeout,
             )
         except (OSError, subprocess.SubprocessError) as error:
             raise EvalError(f"bloom {' '.join(args[:2])} failed: {error}") from error
@@ -785,18 +792,71 @@ class SolanaTransferEval(EvalDefinition):
             )
         return completed.stdout
 
-    def _allowed_destinations(self) -> Any:
-        projection = json.loads(self._bloom("wallet", "projection", self.wallet_id))
-        canonical = projection.get("policy", {}).get("canonical_policy")
-        if not isinstance(canonical, str):
-            raise EvalError("wallet projection has no canonical policy")
-        # Broker's Base64UrlBytes: URL-safe alphabet, no padding.
-        try:
-            return json.loads(
-                base64.urlsafe_b64decode(canonical + "=" * (-len(canonical) % 4))
+    @property
+    def _policy_commit_marker(self) -> Path:
+        return self.jobs_dir / f"solana-policy-commit-{self.wallet_id}.json"
+
+    def _policy_projection(self, timeout: float = POLICY_PROJECTION_TIMEOUT_SECONDS):
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise EvalError("wallet policy projection did not refresh after commit")
+            try:
+                projection = json.loads(self._bloom("wallet", "projection", self.wallet_id, timeout=remaining))
+            except ValueError as error:
+                raise EvalError("wallet policy projection is malformed") from error
+            if not isinstance(projection, dict):
+                raise EvalError("wallet policy projection is malformed")
+            snapshot = projection.get("policy", {})
+            wallet = projection.get("wallet", {})
+            if not isinstance(snapshot, dict) or not isinstance(wallet, dict):
+                raise EvalError("wallet policy projection is malformed")
+            canonical = snapshot.get("canonical_policy")
+            observed = projection.get("observed_at_ms")
+            if (
+                projection.get("freshness") != "fresh"
+                or projection.get("verification") != "authenticated_broker"
+                or wallet.get("wallet_id") != self.wallet_id
+                or snapshot.get("wallet_id") != self.wallet_id
+                or wallet.get("policy_version") != snapshot.get("version")
+                or wallet.get("policy_digest") != snapshot.get("policy_digest")
+                or not isinstance(snapshot.get("version"), str)
+                or re.fullmatch(r"[1-9][0-9]*", snapshot["version"]) is None
+                or not isinstance(snapshot.get("policy_digest"), str)
+                or re.fullmatch(r"[0-9a-f]{64}", snapshot["policy_digest"]) is None
+                or not isinstance(observed, int)
+                or isinstance(observed, bool)
+                or not isinstance(canonical, str)
+            ):
+                raise EvalError(
+                    "wallet policy projection is not fresh, authenticated and consistent"
+                )
+            try:
+                policy = json.loads(
+                    base64.urlsafe_b64decode(canonical + "=" * (-len(canonical) % 4))
+                )
+                version = int(snapshot["version"])
+            except (ValueError, KeyError, TypeError) as error:
+                raise EvalError(
+                    f"wallet projection policy is malformed: {error}"
+                ) from error
+            if (
+                not isinstance(policy, dict)
+                or policy.get("wallet_id") != self.wallet_id
+                or version < 1
+            ):
+                raise EvalError(
+                    "wallet projection policy has the wrong wallet or version"
+                )
+            if observed >= self._policy_observed_after_ms:
+                return snapshot, policy
+            time.sleep(
+                min(POLICY_PROJECTION_POLL_SECONDS, max(0, deadline - time.monotonic()))
             )
-        except (ValueError, json.JSONDecodeError) as error:
-            raise EvalError(f"wallet projection policy is malformed: {error}") from error
+
+    def _allowed_destinations(self) -> Any:
+        return self._policy_projection()[1]
 
     def _allow_only_destination(self, ceremonies: CeremonyDriver) -> None:
         """Allow this trial's destination, and only it, in the wallet policy.
@@ -821,7 +881,16 @@ class SolanaTransferEval(EvalDefinition):
         """Put back the allowed destinations this trial replaced."""
         if self._ceremonies is None:
             return
-        policy = self._allowed_destinations()
+        if self._pending_policy_commit is not None:
+            self._finish_policy_commit(*self._pending_policy_commit)
+        snapshot, policy = self._policy_projection()
+        if (
+            self._committed_policy_snapshot is not None
+            and snapshot != self._committed_policy_snapshot
+        ):
+            raise EvalError(
+                "wallet policy changed before cleanup; refusing to overwrite it"
+            )
         if policy.get("allowed_destinations") != self._original_allowed:
             self._commit_allowed(
                 self._ceremonies,
@@ -830,6 +899,7 @@ class SolanaTransferEval(EvalDefinition):
                 "was not restored to its pre-trial destinations",
             )
         self._ceremonies = None
+        self._policy_commit_marker.unlink(missing_ok=True)
 
     def _commit_allowed(
         self,
@@ -839,6 +909,15 @@ class SolanaTransferEval(EvalDefinition):
         refusal: str,
     ) -> None:
         policy["allowed_destinations"] = allowed
+        baseline, current_policy = self._policy_projection()
+        if self._committed_policy_snapshot is not None and baseline != self._committed_policy_snapshot:
+            raise EvalError("wallet policy changed before staging; refusing to overwrite it")
+        expected = dict(current_policy)
+        expected["allowed_destinations"] = allowed
+        if policy != expected:
+            raise EvalError(
+                "wallet policy changed before staging; refusing to overwrite it"
+            )
         with tempfile.TemporaryDirectory() as scratch:
             proposal = Path(scratch) / "policy.json"
             proposal.write_text(json.dumps(policy))
@@ -850,12 +929,97 @@ class SolanaTransferEval(EvalDefinition):
         )
         url = fields.get("ceremony_url", "").strip()
         operation = fields.get("operation_id", "").strip()
-        if CEREMONY_URL.fullmatch(url) is None or re.fullmatch("[0-9a-f]{64}", operation) is None:
+        if (
+            CEREMONY_URL.fullmatch(url) is None
+            or re.fullmatch("[0-9a-f]{64}", operation) is None
+        ):
             raise EvalError("bloom wallet update-policy did not stage a ceremony")
         ceremonies.complete(url)
-        self._bloom("wallet", "commit-policy", operation)
-        if self._allowed_destinations().get("allowed_destinations") != allowed:
-            raise EvalError(f"the committed wallet policy {refusal}")
+        self._pending_policy_commit = (
+            operation,
+            policy,
+            allowed,
+            refusal,
+            baseline["version"],
+        )
+        self._policy_commit_marker.parent.mkdir(parents=True, exist_ok=True)
+        self._policy_commit_marker.write_text(
+            json.dumps(
+                {
+                    "operation_id": operation,
+                    "wallet_id": self.wallet_id,
+                    "home_root": str(self.home_root),
+                    "proposed_policy": policy,
+                    "original_allowed": self._original_allowed,
+                }
+            )
+        )
+        self._finish_policy_commit(*self._pending_policy_commit)
+
+    def _finish_policy_commit(
+        self, operation, policy, allowed, refusal, baseline_version
+    ):
+        # Replaying this exact completed operation is idempotent. It recovers
+        # the signed receipt if the original commit response was lost.
+        try:
+            receipt = json.loads(
+                self._bloom(
+                    "wallet",
+                    "commit-policy",
+                    operation,
+                    timeout=POLICY_PROJECTION_TIMEOUT_SECONDS,
+                )
+            )
+        except (ValueError, TypeError) as error:
+            raise EvalError("policy commit receipt is malformed") from error
+        finally:
+            # A cached pre-commit view must not make cleanup skip restoration,
+            # including when the commit response failed after its side effect.
+            self._policy_observed_after_ms = int(time.time() * 1000)
+        if not isinstance(receipt, dict):
+            raise EvalError("policy commit receipt is malformed")
+        committed = receipt.get("committed", {})
+        if not isinstance(committed, dict):
+            raise EvalError("policy commit receipt is malformed")
+        if (
+            receipt.get("operation_id") != operation
+            or receipt.get("wallet_id") != self.wallet_id
+            or committed.get("wallet_id") != self.wallet_id
+            or receipt.get("previous_version") != baseline_version
+            or committed.get("version") != str(int(baseline_version) + 1)
+        ):
+            raise EvalError(
+                "policy commit receipt has the wrong operation, wallet or version"
+            )
+        deadline = time.monotonic() + POLICY_PROJECTION_TIMEOUT_SECONDS
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise EvalError(
+                    f"the committed wallet policy {refusal}: projection did not converge"
+                )
+            snapshot, observed_policy = self._policy_projection(remaining)
+            if int(snapshot["version"]) > int(committed["version"]):
+                raise EvalError("wallet policy changed after this commit")
+            if snapshot["version"] == committed["version"]:
+                if not all(
+                    snapshot.get(key) == committed.get(key)
+                    for key in ("policy_digest", "canonical_policy")
+                ):
+                    raise EvalError(
+                        f"the committed wallet policy {refusal}: signed projection differs from receipt"
+                    )
+                if (
+                    observed_policy != policy
+                    or observed_policy.get("allowed_destinations") != allowed
+                ):
+                    raise EvalError(f"the committed wallet policy {refusal}")
+                self._committed_policy_snapshot = snapshot
+                self._pending_policy_commit = None
+                return
+            time.sleep(
+                min(POLICY_PROJECTION_POLL_SECONDS, max(0, deadline - time.monotonic()))
+            )
 
     # ---- provision -----------------------------------------------------
 
