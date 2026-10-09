@@ -637,7 +637,7 @@ class CounterCapacityTests(BuilderFeeFixture, unittest.TestCase):
 class WalletBindingTests(BuilderFeeFixture, unittest.TestCase):
     """The wallet id must be proven to own the address the verifier reads."""
 
-    def wire(self, addresses: object, policy: object | None = None) -> None:
+    def wire(self, addresses: object, policy: object | None = None, projection: dict | None = None) -> None:
         expected = {
             "allowed_destinations": [],
             "allowed_petal_packages": [self.package_hash],
@@ -646,20 +646,29 @@ class WalletBindingTests(BuilderFeeFixture, unittest.TestCase):
             "wallet_id": self.wallet_id,
         }
         body = expected if policy is None else policy
-        if isinstance(addresses, dict) and "policy_digest" not in addresses:
-            canonical = json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
-            addresses["policy_digest"] = hashlib.sha256(canonical).hexdigest()
+        canonical = json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+        digest = hashlib.sha256(canonical).hexdigest()
+        if projection is None:
+            projection = {"freshness":"fresh", "verification":"authenticated_broker",
+                "wallet":{"wallet_id":self.wallet_id,"policy_digest":digest},
+                "policy":{"wallet_id":self.wallet_id,"policy_digest":digest}}
 
         def read(path: Path, timeout: int = 20) -> object:
             del timeout
-            return addresses if path.name == "addresses.json" else body
+            if path == self.definition.wallet_root / "0/account.json":
+                return addresses
+            if path == self.definition.wallet_root / "projection.json":
+                return projection
+            if path == self.definition.wallet_root / "policy.json":
+                return body
+            raise AssertionError(f"unexpected wallet projection path: {path}")
 
         self.definition._read_json = mock.Mock(side_effect=read)
 
     def good_addresses(self) -> dict[str, object]:
         return {
-            "owner": self.wallet,
-            "policy_status": "broker_verified",
+            "schema":"bloom.account.v1", "wallet":self.wallet_id, "number":0,
+            "evm":{"state":"active", "address":self.wallet},
             "freshness": "fresh",
         }
 
@@ -669,16 +678,18 @@ class WalletBindingTests(BuilderFeeFixture, unittest.TestCase):
 
     def test_a_wallet_id_owning_a_different_address_is_refused(self) -> None:
         addresses = self.good_addresses()
-        addresses["owner"] = "0x" + "9" * 40
+        addresses["evm"]["address"] = "0x" + "9" * 40
         self.wire(addresses)
         with self.assertRaisesRegex(EvalError, "does not own"):
             self.definition._require_exact_wallet_policy()
 
     def test_an_unverified_or_stale_projection_is_refused(self) -> None:
         for case, patch, expected in (
-            ("unverified", {"policy_status": "unverified"}, "not Broker-verified"),
             ("stale", {"freshness": "stale"}, "stale"),
-            ("no owner", {"owner": None}, "does not own"),
+            ("no owner", {"evm": {"state":"active", "address":None}}, "does not own"),
+            ("wrong account", {"number": 1}, "wrong wallet or account"),
+            ("boolean account", {"number": False}, "wrong wallet or account"),
+            ("wrong wallet", {"wallet":"another"}, "wrong wallet or account"),
         ):
             addresses = self.good_addresses()
             addresses.update(patch)
@@ -688,10 +699,35 @@ class WalletBindingTests(BuilderFeeFixture, unittest.TestCase):
 
     def test_a_policy_edited_underneath_its_projection_is_refused(self) -> None:
         addresses = self.good_addresses()
-        addresses["policy_digest"] = "0" * 64
-        self.wire(addresses)
+        projection = {"freshness":"fresh", "verification":"authenticated_broker",
+            "wallet":{"wallet_id":self.wallet_id,"policy_digest":"0"*64},
+            "policy":{"wallet_id":self.wallet_id,"policy_digest":"0"*64}}
+        self.wire(addresses, projection=projection)
         with self.assertRaisesRegex(EvalError, "digest does not match"):
             self.definition._require_exact_wallet_policy()
+
+    def test_a_wallet_projection_for_another_wallet_is_refused(self) -> None:
+        self.wire(self.good_addresses(), projection={"freshness":"fresh","verification":"authenticated_broker","wallet":{"wallet_id":"another"},"policy":{}})
+        with self.assertRaisesRegex(EvalError, "not Broker-verified"):
+            self.definition._require_exact_wallet_policy()
+
+    def test_unverified_or_inconsistent_policy_projection_is_refused(self) -> None:
+        for patch in (
+            {"verification":"unverified"},
+            {"policy":{"wallet_id":"another", "policy_digest":"0"*64}},
+            {"policy":{"wallet_id":self.wallet_id, "policy_digest":"1"*64}},
+        ):
+            projection = {"freshness":"fresh", "verification":"authenticated_broker",
+                "wallet":{"wallet_id":self.wallet_id,"policy_digest":"0"*64},
+                "policy":{"wallet_id":self.wallet_id,"policy_digest":"0"*64}}
+            projection.update(patch)
+            self.wire(self.good_addresses(), projection=projection)
+            with self.subTest(patch=patch), self.assertRaisesRegex(EvalError, "not Broker-verified"):
+                self.definition._require_exact_wallet_policy()
+
+    def test_exchange_authority_selects_account_zero(self) -> None:
+        self.assertEqual(self.definition.exchange_root, self.mount / "petals/hyperliquid/testnet/exchange" / self.wallet_id / "0")
+        self.assertEqual(ROUTE_PATTERN, "[network]/exchange/[wallet]/[index]/approve_builder_fee.json")
 
     def test_a_non_object_projection_is_refused(self) -> None:
         self.wire(["not", "an", "object"])

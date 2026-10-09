@@ -12,7 +12,7 @@ seconds; let it finish before the next read starts.
 1. Read `/bloom/petals/hyperliquid/README.md` for the exact request and
    response contract of `approve_builder_fee.json` and `max_builder_fee`.
 2. This task uses the dedicated wallet in `BLOOM_EVAL_WALLET_ID` (a Bloom
-   wallet id, the path segment for the exchange write below) and its on-chain
+   wallet id, with account `0` selected in the exchange write below) and its on-chain
    address in `BLOOM_EVAL_WALLET` (the path segment for the venue read
    below). The two identifiers are not interchangeable; using one where the
    other belongs fails as an unqualified permission error.
@@ -22,7 +22,7 @@ seconds; let it finish before the next read starts.
    submitted: your write is what actually sends it to Hyperliquid, so the
    request body must match byte for byte or it will not be covered by the
    approval. Write exactly this JSON object to
-   `/bloom/petals/hyperliquid/$BLOOM_EVAL_NETWORK/exchange/$BLOOM_EVAL_WALLET_ID/approve_builder_fee.json`:
+   `/bloom/petals/hyperliquid/$BLOOM_EVAL_NETWORK/exchange/$BLOOM_EVAL_WALLET_ID/0/approve_builder_fee.json`:
 
    ```json
    {"builder":"$BLOOM_EVAL_BUILDER","max_fee_tenths_bps":$BLOOM_EVAL_BUILDER_MAX_FEE_TENTHS_BPS,"nonce":$BLOOM_EVAL_APPROVAL_NONCE}
@@ -32,7 +32,7 @@ seconds; let it finish before the next read starts.
    `BLOOM_EVAL_BUILDER_MAX_FEE_TENTHS_BPS`, and `BLOOM_EVAL_APPROVAL_NONCE`
    from your environment — do not compute a new nonce.)
 4. Poll
-   `/bloom/petals/hyperliquid/$BLOOM_EVAL_NETWORK/exchange/$BLOOM_EVAL_WALLET_ID/last_response.json`
+   `/bloom/petals/hyperliquid/$BLOOM_EVAL_NETWORK/exchange/$BLOOM_EVAL_WALLET_ID/0/last_response.json`
    until it exists, then read it. It must be Hyperliquid's own response to
    the `approveBuilderFee` action, not a local Bloom error.
 5. Poll

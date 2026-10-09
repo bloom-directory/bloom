@@ -39,7 +39,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from .core import EvalDefinition, EvalError, EvalRunContext
+from .core import EvalDefinition, EvalError, EvalRunContext, selected_account_owner
 
 CEREMONY_URL = re.compile(r"http://localhost:18734/ceremony/[A-Za-z0-9_-]{43}")
 NETWORKS = ("mainnet", "testnet")
@@ -48,7 +48,7 @@ WALLET_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
 PACKAGE_HASH = re.compile(r"[0-9a-f]{64}")
 LINEAGE_ID = re.compile(r"pln1_[a-z2-7]{52}")
 BASE64URL = re.compile(r"[A-Za-z0-9_-]+")
-ROUTE_PATTERN = "[network]/exchange/[wallet]/approve_builder_fee.json"
+ROUTE_PATTERN = "[network]/exchange/[wallet]/[index]/approve_builder_fee.json"
 OPERATION_CLASS = "hyperliquid.approve_builder_fee"
 # Matches the venue caps enforced in route/src/protocol.rs: 0.1% perps / 1%
 # spot, expressed in tenths of a basis point. This harness only ever grants
@@ -181,7 +181,7 @@ class HyperliquidApproveBuilderFeeEval(EvalDefinition):
 
     @property
     def exchange_root(self) -> Path:
-        return self.network_root / "exchange" / self.wallet_id
+        return self.network_root / "exchange" / self.wallet_id / "0"
 
     @property
     def max_builder_fee_path(self) -> Path:
@@ -510,12 +510,14 @@ class HyperliquidApproveBuilderFeeEval(EvalDefinition):
         self._require_builder_fee_provenance()
 
     def _require_exact_wallet_policy(self) -> None:
-        # The write goes to exchange/<wallet_id>/, while the maxBuilderFee
+        # The write goes to exchange/<wallet_id>/0/, while the maxBuilderFee
         # projection the verifier trusts is keyed by <wallet> -- so bind the
         # two before believing either. Without this the eval can approve a
         # fee on one wallet and read another's projection as proof.
-        addresses = self._read_json(self.wallet_root / "addresses.json")
-        self.require_wallet_binding(addresses, self.wallet)
+        account = self._read_json(self.wallet_root / "0/account.json")
+        projection = self._read_json(self.wallet_root / "projection.json")
+        if selected_account_owner(account, projection, self.wallet_id) != self.wallet:
+            raise EvalError("BLOOM_EVAL_WALLET_ID account 0 does not own BLOOM_EVAL_WALLET")
 
         policy = self._read_json(self.wallet_root / "policy.json")
         if not isinstance(policy, dict):
@@ -531,7 +533,7 @@ class HyperliquidApproveBuilderFeeEval(EvalDefinition):
             raise EvalError(
                 "eval wallet policy does not match the exact bounded policy"
             )
-        self.require_policy_digest(addresses, policy)
+        self.require_policy_digest(projection["policy"], policy)
 
     def preflight(self) -> None:
         if not self.bloom_mount_value:
@@ -868,7 +870,7 @@ class HyperliquidApproveBuilderFeeEval(EvalDefinition):
                 "source": str(self.exchange_root / "approve_builder_fee.json"),
                 "target": (
                     f"/bloom/petals/hyperliquid/{self.network}/exchange/"
-                    f"{self.wallet_id}/approve_builder_fee.json"
+                    f"{self.wallet_id}/0/approve_builder_fee.json"
                 ),
             },
         ]

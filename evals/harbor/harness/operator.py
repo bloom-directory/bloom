@@ -16,7 +16,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from .core import CounterSidecar, EvalError, run_eval
+from .core import CounterSidecar, EvalError, run_eval, selected_account_owner
 from .hyperliquid_order_cancel import (
     MAINNET_ACK,
     PACKAGE_HASH,
@@ -859,17 +859,12 @@ def initialize(args: argparse.Namespace, repo_root: Path) -> None:
     catalog = triad_root / "config/provenance-catalog.json"
     if not os.path.ismount(mount):
         raise EvalError("configured Bloom path is not an active mount")
-    addresses = safe_json(mount / "wallets" / args.wallet_id / "addresses.json")
-    owner = addresses.get("owner") if isinstance(addresses, dict) else None
+    wallet_root = mount / "wallets" / args.wallet_id
+    account = safe_json(wallet_root / "0/account.json")
+    projection = safe_json(wallet_root / "projection.json")
+    owner = selected_account_owner(account, projection, args.wallet_id)
     if not isinstance(owner, str) or WALLET.fullmatch(owner.lower()) is None:
         raise EvalError("wallet owner projection is invalid")
-    if (
-        addresses.get("wallet") != args.wallet_id
-        or addresses.get("policy_status") != "broker_verified"
-    ):
-        raise EvalError(
-            "wallet projection is not Broker-verified for the selected wallet"
-        )
     owner_data = safe_json(owner_record)
     package_hash = owner_data.get("hash") if isinstance(owner_data, dict) else None
     if (

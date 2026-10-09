@@ -21,6 +21,39 @@ class EvalError(RuntimeError):
     """A fail-closed evaluation error suitable for operator display."""
 
 
+def selected_account_owner(account: Any, projection: Any, wallet_id: str) -> str:
+    """Bind these evaluations' explicit account 0 to a fresh Broker projection."""
+    if not isinstance(account, dict) or not isinstance(projection, dict):
+        raise EvalError("eval wallet projection is not a JSON object")
+    if (
+        account.get("schema") != "bloom.account.v1"
+        or account.get("wallet") != wallet_id
+        or type(account.get("number")) is not int
+        or account["number"] != 0
+    ):
+        raise EvalError("eval account projection has the wrong wallet or account")
+    if account.get("freshness") != "fresh" or projection.get("freshness") != "fresh":
+        raise EvalError("eval wallet projection is stale")
+    wallet, policy = projection.get("wallet"), projection.get("policy")
+    if (
+        projection.get("verification") != "authenticated_broker"
+        or not isinstance(wallet, dict)
+        or wallet.get("wallet_id") != wallet_id
+        or not isinstance(policy, dict)
+        or policy.get("wallet_id") != wallet_id
+        or policy.get("policy_digest") != wallet.get("policy_digest")
+    ):
+        raise EvalError("eval wallet projection is not Broker-verified for the selected wallet")
+    evm = account.get("evm")
+    if (
+        not isinstance(evm, dict)
+        or evm.get("state") != "active"
+        or not isinstance(evm.get("address"), str)
+    ):
+        raise EvalError("eval account does not own an active EVM address")
+    return evm["address"].lower()
+
+
 @dataclass(frozen=True)
 class AgentSpec:
     harbor_name: str
