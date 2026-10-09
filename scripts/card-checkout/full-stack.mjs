@@ -32,7 +32,7 @@ const cert=spawnSync('openssl',['req','-x509','-newkey','rsa:2048','-nodes','-ke
 let submits=0;
 const server=https.createServer({key:readFileSync(join(root,'key.pem')),cert:readFileSync(join(root,'cert.pem'))},(request,response)=>{
   response.setHeader('content-type','text/html');
-  if(request.url==='/done'){submits++;response.end('<h1>Order confirmed</h1><p>Order ID: FIXTURE-ONE</p><p>Total USD 3.99</p>');return;}
+  if(new URL(request.url,'https://localhost').pathname==='/done'){submits++;response.end('<h1>Order confirmed</h1><p>Order ID: FIXTURE-ONE</p><p>Total USD 3.99</p>');return;}
   response.end(`<!doctype html><h1>Digital fixture</h1><p data-bloom-total-minor="399" data-bloom-currency="USD">Total USD 3.99</p>
     <form action="/done"><input autocomplete="cc-number"><input autocomplete="cc-exp"><input autocomplete="cc-csc"><button type="submit">Pay</button></form>`);
 });
