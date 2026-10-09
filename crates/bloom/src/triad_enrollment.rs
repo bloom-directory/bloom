@@ -414,10 +414,19 @@ fn enroll_developer_petal_provenance(
         });
     }
     if additions.is_empty() {
-        bail!(
-            "developer Petal {} declares no route provenance operation classes",
-            package.name
-        );
+        // Match release enrollment: packages that only stage through the
+        // native outbox need lineage, without gaining a signing class.
+        additions.push(ProvenanceRecord {
+            subject: ProvenanceSubject::Petal {
+                package_hash: package_hash.clone(),
+                route: "__lineage__".into(),
+            },
+            publisher: publisher.clone(),
+            operation_classes: vec![],
+            petal_lineage: Some(lineage),
+            installer_key_id: installer_key_id.clone(),
+            installer_signature: Base64UrlBytes::from_bytes(&[]),
+        });
     }
 
     catalog.records.retain(|record| {
