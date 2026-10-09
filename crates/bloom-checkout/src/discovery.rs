@@ -838,6 +838,10 @@ mod tests {
             ),
             ("Your card was declined", "declined"),
             (
+                "Thank you, Kyle! Your order is confirmed. Confirmation #FIX01 Total USD 3.99",
+                "paid",
+            ),
+            (
                 "Your payment details couldn’t be verified. Check your card details and try again.",
                 "declined",
             ),
