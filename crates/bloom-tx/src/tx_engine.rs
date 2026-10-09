@@ -6261,22 +6261,18 @@ mod tests {
             assert_eq!(reconciler.tick().await, 1);
         }
 
-        // A reverting constructor must fail simulation before requesting a signature.
+        // A reverting constructor must fail estimation before staging or signing.
         *fixture.completed_result.lock() = None;
         fixture.active.store(false, Ordering::SeqCst);
         let chain = stage_chain(&url);
         let intent =
             crate::intent_parser::parse(r#"{"kind":"deploy","data":"0x60006000fd"}"#).unwrap();
-        let staged = engine
-            .stage(&permit, "alice", from, intent, &chain, &policy, None)
-            .await
-            .unwrap();
         let requests_before = fixture.requests.lock().len();
         let result = engine
-            .confirm(&permit, "alice", "anvil", &staged.id, &chain, &policy, "y")
+            .stage(&permit, "alice", from, intent, &chain, &policy, None)
             .await;
         assert!(
-            matches!(result, Err(TxEngineError::SimulationReverted { .. })),
+            matches!(&result, Err(TxEngineError::Amount(message)) if message.contains("cannot estimate gas")),
             "{result:?}"
         );
         assert!(
