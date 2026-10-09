@@ -186,3 +186,9 @@ If Broker is unavailable, Machine may continue cached public reads, unsigned
 staging, and simulation where inputs are available. Signing, approvals, policy
 mutations, and custody fail promptly. Broker failure never causes Machine to
 open legacy authority state or start a ceremony listener.
+
+Numbered `outbox/new.tx` writes may construct unsigned EVM or Solana work from
+the cached authenticated account inventory. The path still fixes the sender;
+Solana artifacts also pin the full account fingerprint. Confirming, replacing, cancelling, restaging,
+session changes and Petal account context still require fresh Broker authority;
+cached membership never authorizes a signature.
