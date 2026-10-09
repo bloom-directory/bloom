@@ -15,7 +15,7 @@ use std::{
     },
     time::Duration,
 };
-use tokio::sync::{broadcast, oneshot};
+use tokio::sync::oneshot;
 
 type Replies = Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>;
 
@@ -25,16 +25,21 @@ pub(crate) struct Cdp {
     writer: Mutex<File>,
     replies: Replies,
     sequence: AtomicU64,
-    pub events: broadcast::Sender<Value>,
 }
 
 fn pipe() -> Result<(OwnedFd, OwnedFd)> {
     let mut fds = [0; 2];
     // Both descriptors remain private through exec except the deliberate child mapping.
-    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
         return Err(std::io::Error::last_os_error().into());
     }
-    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
+    let pair = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    for fd in [&pair.0, &pair.1] {
+        if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+    Ok(pair)
 }
 
 fn child_fd(fd: &OwnedFd) -> Result<OwnedFd> {
@@ -78,13 +83,11 @@ impl Cdp {
         drop(command_read);
         drop(event_write);
         let replies: Replies = Arc::new(Mutex::new(HashMap::new()));
-        let (events, _) = broadcast::channel(512);
         let browser = Arc::new(Self {
             child: Mutex::new(child),
             writer: Mutex::new(File::from(command_write)),
             replies: replies.clone(),
             sequence: AtomicU64::new(1),
-            events: events.clone(),
         });
         let mut reader = File::from(event_read);
         std::thread::Builder::new()
@@ -103,8 +106,6 @@ impl Cdp {
                                     if let Some(reply) = replies.lock().remove(&id) {
                                         let _ = reply.send(value);
                                     }
-                                } else {
-                                    let _ = events.send(value);
                                 }
                             }
                             frame.clear();

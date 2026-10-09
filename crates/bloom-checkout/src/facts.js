@@ -1,0 +1,39 @@
+(() => {
+  const visible = e => e.getClientRects().length && getComputedStyle(e).visibility === 'visible';
+  const text = document.body.innerText;
+  const controls = [...document.querySelectorAll('button,input[type=submit]')].filter(visible);
+  const pay = controls.filter(e => /^(pay|buy|place order|complete (order|purchase)|subscribe|pagar|comprar)\b/i.test(e.innerText || e.value));
+  if (pay.length !== 1) return null;
+  const explicit = [...document.querySelectorAll('[data-bloom-total-minor][data-bloom-currency]')].filter(visible);
+  let total, currency;
+  if (explicit.length === 1) {
+    total = Number(explicit[0].dataset.bloomTotalMinor); currency = explicit[0].dataset.bloomCurrency;
+  } else {
+    const lines = text.split('\n').map(s => s.trim()).filter(Boolean);
+    const amounts = [];
+    for (let i = 0; i < lines.length; i++) {
+      if (!/^(total|order total|amount due|total due)\b/i.test(lines[i])) continue;
+      const nearby = lines.slice(i, i + 2).join(' ');
+      const match = nearby.match(/\b(USD|CAD|EUR|GBP|BRL|MXN|ARS|CLP|COP|JPY)\s*[$€£R]*\s*([\d,]+(?:\.\d{1,2})?)\b/)
+        || nearby.match(/[$€£R]*\s*([\d,]+(?:\.\d{1,2})?)\s*(USD|CAD|EUR|GBP|BRL|MXN|ARS|CLP|COP|JPY)\b/);
+      if (!match) return null;
+      const code = /^[A-Z]{3}$/.test(match[1]) ? match[1] : match[2];
+      const amount = code === match[1] ? match[2] : match[1];
+      const scale = new Intl.NumberFormat('en', {style:'currency',currency:code}).resolvedOptions().maximumFractionDigits;
+      amounts.push({total:Math.round(Number(amount.replaceAll(',', '')) * 10 ** scale),currency:code});
+    }
+    if (amounts.length !== 1) return null;
+    ({total,currency} = amounts[0]);
+  }
+  const selectors = [...document.querySelectorAll('select')].filter(e => visible(e) && /installment|cuotas|parcelas/i.test([e.name,e.id,e.labels?.[0]?.innerText].join(' ')));
+  let installments = 1;
+  if (selectors.length > 1) return null;
+  if (selectors.length === 1) {
+    const match = selectors[0].selectedOptions[0]?.text.match(/^(\d+)\s*(?:x|installments?|cuotas|parcelas)\b/i);
+    if (!match) return null;
+    installments = Number(match[1]);
+  } else if (/installments?|cuotas|parcelas/i.test(text)) return null;
+  const recurring = /\b(subscription|recurring|auto.?renew|monthly|annually|suscripci[oó]n)\b/i.test(text);
+  globalThis.__bloomPayButton = pay[0];
+  return {origin:location.origin,payment_frame_origins:[],total_minor:total,currency,installments,recurring};
+})()
