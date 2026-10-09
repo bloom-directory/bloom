@@ -154,9 +154,11 @@ pub fn run_once() -> Result<()> {
 }
 
 fn restart_services_for_live_session(login_uid: u32, revoke_gid: u32) -> Result<()> {
-    if !login_sentinel_is_running(login_uid, |target| {
-        command_output("/bin/launchctl", &["print", target])
-    }) {
+    if !prepare_login_sentinel(
+        login_uid,
+        |target| command_output("/bin/launchctl", &["print", target]),
+        |target| command_output("/bin/launchctl", &["kickstart", target]).map(|_| ()),
+    )? {
         return Ok(());
     }
 
@@ -194,15 +196,27 @@ fn restart_services_for_live_session(login_uid: u32, revoke_gid: u32) -> Result<
     Ok(())
 }
 
-fn login_sentinel_is_running(
+fn prepare_login_sentinel(
     login_uid: u32,
     mut inspect: impl FnMut(&str) -> Result<String>,
-) -> bool {
+    mut restart: impl FnMut(&str) -> Result<()>,
+) -> Result<bool> {
     // Keep the GUI-login requirement, but inspect the sentinel where the
     // installer actually loads it. A user-domain job can outlive a GUI login.
-    inspect(&format!("gui/{login_uid}")).is_ok()
-        && inspect(&format!("user/{login_uid}/com.bloom.session"))
-            .is_ok_and(|state| state.lines().any(|line| line.trim() == "state = running"))
+    if inspect(&format!("gui/{login_uid}")).is_err() {
+        return Ok(false);
+    }
+    let target = format!("user/{login_uid}/com.bloom.session");
+    let Ok(state) = inspect(&target) else {
+        return Ok(false);
+    };
+    if state.lines().any(|line| line.trim() == "state = running") {
+        return Ok(true);
+    }
+    restart(&target).context("restart the installed sentinel for a returning GUI login")?;
+    // A successful kickstart is not readiness. Recheck running state and the
+    // socket's full ownership/mode guards on the next monitor tick.
+    Ok(false)
 }
 
 fn macos_managed_time_status() -> (bool, bool) {
@@ -387,32 +401,93 @@ mod tests {
 
     #[test]
     fn live_gui_login_uses_the_installed_user_domain_sentinel() {
-        assert!(login_sentinel_is_running(501, |target| match target {
-            "gui/501" => Ok("GUI domain exists".into()),
-            "user/501/com.bloom.session" => Ok("\tstate = running\n".into()),
-            _ => anyhow::bail!("job does not exist"),
-        }));
+        assert!(
+            prepare_login_sentinel(
+                501,
+                |target| match target {
+                    "gui/501" => Ok("GUI domain exists".into()),
+                    "user/501/com.bloom.session" => Ok("\tstate = running\n".into()),
+                    _ => anyhow::bail!("job does not exist"),
+                },
+                |_| panic!("running sentinel must not be restarted"),
+            )
+            .unwrap()
+        );
     }
 
     #[test]
     fn logged_out_user_job_does_not_authorize_a_service_restart() {
-        assert!(!login_sentinel_is_running(501, |target| match target {
-            "user/501/com.bloom.session" => Ok("state = running".into()),
-            _ => anyhow::bail!("GUI login is absent"),
-        }));
+        assert!(
+            !prepare_login_sentinel(
+                501,
+                |target| match target {
+                    "user/501/com.bloom.session" => Ok("state = running".into()),
+                    _ => anyhow::bail!("GUI login is absent"),
+                },
+                |_| panic!("logged-out job must not be restarted"),
+            )
+            .unwrap()
+        );
     }
 
     #[test]
     fn absent_or_stopped_user_sentinel_cannot_be_replaced_by_a_gui_job() {
         for user_state in [None, Some("state = not running")] {
-            assert!(!login_sentinel_is_running(501, |target| match target {
-                "gui/501" | "gui/501/com.bloom.session" => Ok("state = running".into()),
-                "user/501/com.bloom.session" => user_state
-                    .map(str::to_owned)
-                    .ok_or_else(|| anyhow::anyhow!("sentinel is absent")),
-                _ => anyhow::bail!("unexpected target"),
-            }));
+            assert!(
+                !prepare_login_sentinel(
+                    501,
+                    |target| match target {
+                        "gui/501" | "gui/501/com.bloom.session" => Ok("state = running".into()),
+                        "user/501/com.bloom.session" => user_state
+                            .map(str::to_owned)
+                            .ok_or_else(|| anyhow::anyhow!("sentinel is absent")),
+                        _ => anyhow::bail!("unexpected target"),
+                    },
+                    |target| {
+                        assert!(user_state.is_some(), "missing job must not be restarted");
+                        assert_eq!(target, "user/501/com.bloom.session");
+                        Ok(())
+                    },
+                )
+                .unwrap()
+            );
         }
+    }
+
+    #[test]
+    fn returning_login_waits_for_a_fresh_running_state_after_kickstart() {
+        let running = std::cell::Cell::new(false);
+        let starts = std::cell::Cell::new(0);
+        let mut inspect = |target: &str| match target {
+            "gui/501" => Ok("GUI domain exists".into()),
+            "user/501/com.bloom.session" => Ok(if running.get() {
+                "state = running".into()
+            } else {
+                "state = not running".into()
+            }),
+            _ => anyhow::bail!("unexpected target"),
+        };
+        let mut restart = |target: &str| {
+            assert_eq!(target, "user/501/com.bloom.session");
+            starts.set(starts.get() + 1);
+            running.set(true);
+            Ok(())
+        };
+        assert!(!prepare_login_sentinel(501, &mut inspect, &mut restart).unwrap());
+        assert!(prepare_login_sentinel(501, &mut inspect, &mut restart).unwrap());
+        assert_eq!(starts.get(), 1);
+    }
+
+    #[test]
+    fn failed_sentinel_restart_does_not_authorize_services() {
+        assert!(
+            prepare_login_sentinel(
+                501,
+                |_| Ok("state = not running".into()),
+                |_| anyhow::bail!("kickstart failed"),
+            )
+            .is_err()
+        );
     }
 
     #[test]
