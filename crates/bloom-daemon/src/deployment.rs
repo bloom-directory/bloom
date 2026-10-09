@@ -208,6 +208,7 @@ impl Daemon {
                     {
                         Ok(_) => error = Value::Null,
                         Err(TxEngineError::ApprovalRequired(a)) => {
+                            error = Value::Null;
                             approval = json!({"ceremony_url":a.ceremony_url,"expires_ms":a.expires_ms,"reason":a.reason})
                         }
                         Err(_) => {
