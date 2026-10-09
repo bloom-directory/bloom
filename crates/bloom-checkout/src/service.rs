@@ -566,7 +566,14 @@ impl CheckoutService {
             let Ok(mut status) = self.store.get(&id) else {
                 return;
             };
-            if status.state == "submitted" || status.state == "manual_required" {
+            if matches!(
+                status.state.as_str(),
+                "submitted"
+                    | "manual_required"
+                    | "uncertain"
+                    | "partially_filled"
+                    | "disclosure_unknown"
+            ) {
                 let contexts = checkout
                     .tab
                     .cdp

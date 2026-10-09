@@ -33,6 +33,9 @@ let submits=0;
 const server=https.createServer({key:readFileSync(join(root,'key.pem')),cert:readFileSync(join(root,'cert.pem'))},(request,response)=>{
   response.setHeader('content-type','text/html');
   if(new URL(request.url,'https://localhost').pathname==='/manual'){response.end('<h1>Manual fixture</h1><p>Total is unavailable</p><button>Continue</button>');return;}
+  if(new URL(request.url,'https://localhost').pathname==='/recover'){
+    response.end('<h1>Recoverable fixture</h1><p data-bloom-total-minor="399" data-bloom-currency="USD">Total USD 3.99</p><form action="/done"><input autocomplete="cc-number"><input autocomplete="cc-exp"><input autocomplete="cc-csc"><input aria-label="Billing postal code" required><button type="submit">Pay</button></form>');return;
+  }
   if(new URL(request.url,'https://localhost').pathname==='/done'){submits++;response.end('<h1>Order confirmed</h1><p>Order ID: FIXTURE-ONE</p><p>Total USD 3.99</p>');return;}
   response.end(`<!doctype html><h1>Digital fixture</h1><p data-bloom-total-minor="399" data-bloom-currency="USD">Total USD 3.99</p>
     <form action="/done"><input autocomplete="cc-number"><input autocomplete="cc-exp"><input autocomplete="cc-csc"><button type="submit">Pay</button></form>`);
@@ -80,13 +83,36 @@ try {
   await privatePage.locator('#finish').click();
   assert.equal((await poll(`/checkout/requests/${manual}/status.json`,['uncertain'])).state,'uncertain');
   await returnedToShopping();await privatePage.close();
+  // Missing billing information prevents the one automated submission. A
+  // human can finish in the private view; read-only outcome watching must
+  // then report the merchant's confirmation without an automatic retry.
+  await browse({action:'open',url:merchant+'recover'});await new Promise(r=>setTimeout(r,400));
+  const recover=id();await vfs('write',`/checkout/requests/${recover}/in.json`,{card_id:'stack-card',agent_description:'Fixture missing billing information'});
+  const recoveryPagePromise=context.waitForEvent('page');
+  await approve((await vfs('cat',`/checkout/requests/${recover}/status.json`)).ceremony_url,'checkout');
+  const recoveryPage=await recoveryPagePromise;
+  const uncertain=await poll(`/checkout/requests/${recover}/status.json`,['uncertain']);
+  assert.equal(uncertain.filled_fields.length,3);assert.equal(submits,0);
+  await recoveryPage.locator('#screen').waitFor();
+  async function privateAction(button) {
+    const response=recoveryPage.waitForResponse(r=>new URL(r.url()).pathname==='/action');
+    await button.click();assert.equal((await response).status(),200);
+  }
+  for(let i=0;i<4;i++)await privateAction(recoveryPage.getByRole('button',{name:'Tab',exact:true}));
+  await recoveryPage.locator('#text').fill('12345');
+  await privateAction(recoveryPage.getByRole('button',{name:'Send text',exact:true}));
+  await privateAction(recoveryPage.getByRole('button',{name:'Tab',exact:true}));
+  await privateAction(recoveryPage.getByRole('button',{name:'Enter',exact:true}));
+  const recovered=await poll(`/checkout/requests/${recover}/status.json`,['paid']);
+  assert.equal(recovered.outcome.source,'merchant-reported');assert.equal(submits,1);
+  await returnedToShopping();await recoveryPage.close();
   await browse({action:'open',url:merchant});await new Promise(r=>setTimeout(r,400));await browse({action:'snapshot'});
   const checkout=id();await vfs('write',`/checkout/requests/${checkout}/in.json`,{card_id:'stack-card',agent_description:'One fixture digital item (unverified agent text)'});
   const awaiting=await vfs('cat',`/checkout/requests/${checkout}/status.json`);assert.equal(awaiting.state,'awaiting_approval');
   const blocked=spawnSync(binary,['--quiet','vfs','write',`/checkout/browse/${slot}/in.json`],{input:JSON.stringify({action:'snapshot'}),encoding:'utf8'});assert.notEqual(blocked.status,0);
   await approve(awaiting.ceremony_url,'checkout');
   const paid=await poll(`/checkout/requests/${checkout}/status.json`,['paid','declined','uncertain','manual_required','disclosure_unknown','partially_filled']);
-  assert.equal(paid.state,'paid');assert.equal(paid.outcome.source,'merchant-reported');assert.equal(paid.outcome.merchant_reported_total_minor,399);assert.equal(submits,1);
+  assert.equal(paid.state,'paid');assert.equal(paid.outcome.source,'merchant-reported');assert.equal(paid.outcome.merchant_reported_total_minor,399);assert.equal(submits,2);
   // The durable payment result precedes closing the private tabs. Observation
   // stays revoked during that cleanup; wait only for the fresh browsing tab.
   await returnedToShopping();
@@ -94,6 +120,6 @@ try {
   await approve((await vfs('cat',`/cards/operations/${del}/ceremony.json`)).ceremony_url,'delete');
   await poll(`/cards/operations/${del}/status.json`,['succeeded']);assert.equal((await vfs('cat','/cards/index.json')).length,0);
   const encoded=JSON.stringify(transcript);assert(!encoded.includes('4242424242424242'));assert(!encoded.includes('Bloom Synthetic Cardholder'));assert(!encoded.includes('private?token='));assert(!/"cvc"\s*:\s*"?937/.test(encoded));
-  writeFileSync(output,JSON.stringify({result:'passed',actual_broker_js:true,virtual_authenticator_prf:true,manual_fallback_without_release:true,submission_count:submits,transcript,retained_fixture_directory:root},null,2));
+  writeFileSync(output,JSON.stringify({result:'passed',actual_broker_js:true,virtual_authenticator_prf:true,manual_fallback_without_release:true,user_completed_uncertain_checkout:true,submission_count:submits,transcript,retained_fixture_directory:root},null,2));
   console.log('Full-stack card add, approval, fill, single submission, merchant-reported result, fresh-tab return and delete passed.');
 } finally {await browser.close();server.closeAllConnections();await new Promise(r=>server.close(r));}
