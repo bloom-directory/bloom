@@ -171,9 +171,27 @@ async fn gui_domain_is_present(login_uid: u32) -> bool {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
-    tokio::time::timeout(Duration::from_secs(1), command.status())
-        .await
-        .is_ok_and(|result| result.is_ok_and(|status| status.success()))
+    match tokio::time::timeout(Duration::from_secs(1), command.status()).await {
+        Ok(Ok(status)) if status.success() => true,
+        Ok(Ok(status)) => {
+            crate::native_lifecycle(
+                "session-sentinel",
+                &format!("gui_probe_exit_{:?}", status.code()),
+            );
+            false
+        }
+        Ok(Err(error)) => {
+            crate::native_lifecycle(
+                "session-sentinel",
+                &format!("gui_probe_spawn_errno_{:?}", error.raw_os_error()),
+            );
+            false
+        }
+        Err(_) => {
+            crate::native_lifecycle("session-sentinel", "gui_probe_timeout");
+            false
+        }
+    }
 }
 
 async fn wait_for_gui_logout<F, Fut>(required: bool, poll_interval: Duration, mut is_present: F)
