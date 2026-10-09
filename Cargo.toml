@@ -1,5 +1,6 @@
 [workspace]
 members = [
+  "crates/bloom-checkout",
   "crates/bloom",
   "crates/bloom-machine",
   "crates/bloom-daemon",
