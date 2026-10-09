@@ -7452,6 +7452,7 @@ value = "0""#,
             .with_broker(Some(MachineBrokerClient::new(broker.clone())));
         let request = ApprovalPrepareRequest {
             evm_review_payloads: Vec::new(),
+            safe_review_payloads: Vec::new(),
             operation_id: OperationId::from_bytes([30; 32]),
             terms: approval_terms("alice", None),
             canonical_plan_facts_digest: digest(31),
@@ -7500,6 +7501,7 @@ value = "0""#,
                 .with_broker(Some(MachineBrokerClient::new(broker.clone())));
             let request = ApprovalPrepareRequest {
                 evm_review_payloads: Vec::new(),
+                safe_review_payloads: Vec::new(),
                 operation_id: OperationId::from_bytes([30; 32]),
                 terms: approval_terms("alice", None),
                 canonical_plan_facts_digest: digest(31),
@@ -7533,6 +7535,7 @@ value = "0""#,
             .with_broker(Some(MachineBrokerClient::new(broker.clone())));
         let request = ApprovalPrepareRequest {
             evm_review_payloads: Vec::new(),
+            safe_review_payloads: Vec::new(),
             operation_id: OperationId::from_bytes([30; 32]),
             terms: approval_terms("alice", None),
             canonical_plan_facts_digest: digest(31),
@@ -7565,6 +7568,7 @@ value = "0""#,
             .with_broker(Some(MachineBrokerClient::new(broker)));
         let request = ApprovalPrepareRequest {
             evm_review_payloads: Vec::new(),
+            safe_review_payloads: Vec::new(),
             operation_id: OperationId::from_bytes([30; 32]),
             terms: approval_terms("alice", None),
             canonical_plan_facts_digest: digest(31),
