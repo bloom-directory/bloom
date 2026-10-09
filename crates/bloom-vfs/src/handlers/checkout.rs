@@ -188,13 +188,15 @@ impl Handler for CardsHandler {
 pub struct CheckoutHandler {
     client: CheckoutClient,
     root: PathBuf,
+    profile: PathBuf,
     browse: parking_lot::Mutex<std::collections::BTreeMap<String, (std::time::Instant, Vec<u8>)>>,
 }
 impl CheckoutHandler {
-    pub fn new(client: CheckoutClient, root: PathBuf) -> Self {
+    pub fn new(client: CheckoutClient, root: PathBuf, profile: PathBuf) -> Self {
         Self {
             client,
             root,
+            profile,
             browse: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
         }
     }
@@ -204,6 +206,33 @@ impl CheckoutHandler {
             .await
             .map_err(HandlerError::backend)
     }
+}
+/// Saved contact and billing details the agent types into ordinary checkout
+/// fields. Convenience only: not custody, not behind a passkey.
+#[derive(Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct Profile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    phone: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    billing_address: Option<Address>,
+}
+#[derive(Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct Address {
+    line1: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    line2: Option<String>,
+    city: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    region: Option<String>,
+    postal_code: String,
+    /// ISO 3166-1 alpha-2, for example `US`.
+    country: String,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -225,6 +254,7 @@ impl Handler for CheckoutHandler {
             [] | ["browse"] | ["requests"] => {
                 Ok(Entry::dir(s.last().copied().unwrap_or("checkout")))
             }
+            ["profile.json"] => Ok(Entry::writable_file("profile.json")),
             ["browse" | "requests", id] => {
                 operation(id)?;
                 Ok(Entry::dir(id))
@@ -247,6 +277,10 @@ impl Handler for CheckoutHandler {
             .map(String::as_str)
             .collect::<Vec<_>>();
         match segments.as_slice() {
+            ["profile.json"] => match std::fs::read(&self.profile) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(b"{}\n".to_vec()),
+                result => Ok(result?),
+            },
             ["browse", id, "out.json"] => {
                 operation(id)?;
                 self.browse
@@ -275,6 +309,22 @@ impl Handler for CheckoutHandler {
             .map(String::as_str)
             .collect::<Vec<_>>();
         match segments.as_slice() {
+            ["profile.json"] => {
+                let profile: Profile = serde_json::from_slice(bytes)
+                    .ok()
+                    .filter(|_| bytes.len() <= 4096)
+                    .ok_or_else(|| {
+                        HandlerError::invalid(
+                            "Profile takes email, name, phone and billing_address \
+                             (line1, line2, city, region, postal_code, country); \
+                             never card details",
+                        )
+                    })?;
+                let temp = self.profile.with_extension("json.tmp");
+                std::fs::write(&temp, safe_json(&profile)?)?;
+                std::fs::rename(&temp, &self.profile)?;
+                Ok(())
+            }
             ["browse", id, "in.json"] => {
                 operation(id)?;
                 let request: BrowseRequest = input(bytes)?;
@@ -323,7 +373,11 @@ impl Handler for CheckoutHandler {
             .map(String::as_str)
             .collect::<Vec<_>>();
         match segments.as_slice() {
-            [] => Ok(vec![Entry::dir("browse"), Entry::dir("requests")]),
+            [] => Ok(vec![
+                Entry::writable_file("profile.json"),
+                Entry::dir("browse"),
+                Entry::dir("requests"),
+            ]),
             ["requests"] => Ok(operations(&self.root)),
             ["browse"] => Ok(self.browse.lock().keys().map(|id| Entry::dir(id)).collect()),
             ["browse", id] => {
@@ -343,5 +397,34 @@ impl Handler for CheckoutHandler {
             }
             _ => Err(HandlerError::NotADir(path.to_string_path())),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn profile_round_trips_and_rejects_card_details() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = CheckoutHandler::new(
+            CheckoutClient::new(dir.path().join("unused.sock"), 0),
+            dir.path().join("requests"),
+            dir.path().join("checkout-profile.json"),
+        );
+        let path = VfsPath::parse("/profile.json").unwrap();
+        assert_eq!(handler.read(&path).await.unwrap(), b"{}\n");
+        let profile = br#"{"email":"a@example.com","name":"A B","billing_address":{"line1":"1 Main St","city":"Springfield","region":"IL","postal_code":"62701","country":"US"}}"#;
+        handler.write(&path, profile).await.unwrap();
+        let saved: Value = serde_json::from_slice(&handler.read(&path).await.unwrap()).unwrap();
+        assert_eq!(saved["billing_address"]["postal_code"], "62701");
+        for rejected in [
+            &br#"{"email":"a@example.com","card_number":"4242424242424242"}"#[..],
+            br#"{"billing_address":{"line1":"1 Main St"}}"#,
+        ] {
+            assert!(handler.write(&path, rejected).await.is_err());
+        }
+        let kept: Value = serde_json::from_slice(&handler.read(&path).await.unwrap()).unwrap();
+        assert_eq!(kept["email"], "a@example.com");
     }
 }

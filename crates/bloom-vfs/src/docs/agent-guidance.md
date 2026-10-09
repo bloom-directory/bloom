@@ -34,10 +34,16 @@ tool for this checkout.
   its ceremony URL. The human enters and saves the card privately.
 - To delete, write `cards/delete.json` with `operation_id` and `card_id`, then
   forward the ceremony URL in the same way.
+- Read `checkout/profile.json` for the human's saved email, name, phone and
+  billing address, and type them into ordinary checkout fields. If a value is
+  missing, ask once and save it by writing the whole profile back, for example
+  `{"email":"…","name":"…","billing_address":{"line1":"…","city":"…",
+  "region":"CA","postal_code":"94110","country":"US"}}`.
 - Write a browse request to `checkout/browse/<64-hex-slot>/in.json`; read
   `out.json`. Reuse a slot. Results expire after five minutes. Requests use
-  `action`: `open` plus `url`, `snapshot`, `click` plus `ref`, `type` plus
-  `ref` and `text`, `select` plus `ref` and `value`, or `back`.
+  `action`: `open` plus `url`, `snapshot`, `click` plus `element_ref`, `type`
+  plus `element_ref` and `text`, `select` plus `element_ref` and `value`, or
+  `back`.
 - Use fresh snapshot refs after every action. The browser rejects direct
   card entry and recognizable payment submission through shopping controls.
 - Once checkout is ready, write `checkout/requests/<new-64-hex-id>/in.json`

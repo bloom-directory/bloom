@@ -4666,6 +4666,7 @@ impl Daemon {
                     Arc::new(bloom_vfs::handlers::CheckoutHandler::new(
                         client,
                         home.cache_dir().join("checkout-operations"),
+                        home.root().join("checkout-profile.json"),
                     )) as _,
                 );
         }
