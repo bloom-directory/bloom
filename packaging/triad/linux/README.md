@@ -101,6 +101,11 @@ non-owned directories, sequence rollback, and replacement.
 
 ## Service logs
 
+Installing or upgrading card checkout adds the login to its checkout IPC group.
+An already running desktop and systemd user manager can retain their previous
+supplementary groups. Log out and back in before using checkout if its socket
+is inaccessible after installation; the installer does not restart the desktop.
+
 Machine, Broker, Signer, and the session sentinel emit JSON Lines to journald
 under stable identifiers. For example:
 
