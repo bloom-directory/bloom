@@ -248,6 +248,13 @@ reason to restage. After human approval, retry only its exact `retry_path`;
 `plan_path` and `retry_path` name the outbox the confirm was written through
 (`wallets/<wallet>/<n>/chains/...`, including `n = 0` for account 0).
 
+`bloom wallet confirm` exits 3 when owner approval is pending and 4 when
+confirmation has no recorded result yet. Exit 0 reports a recorded broadcast
+or a completed local discard. Use `--text cancel` to discard an unsigned
+pending entry; an already broadcast transaction needs `bloom wallet cancel`
+and its own approval. Dropping a reservation does not renumber later rows:
+restage with an explicit nonce to fill a gap.
+
 `confirm.override` is not a general escape hatch. Use it only when the
 inspected policy projection explicitly permits that control and the human has
 explicitly accepted the displayed warning.

@@ -11,8 +11,8 @@ current = 1
 downgrade_floor = 1
 
 [state.broker]
-current = 1
-downgrade_floor = 1
+current = 2
+downgrade_floor = 2
 
 [state.signer]
 current = 1

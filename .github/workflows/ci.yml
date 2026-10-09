@@ -261,6 +261,16 @@ jobs:
           --run-ignored all
           --no-tests=fail
           --no-fail-fast
+      - name: Run engine contract-creation integration test
+        run: |
+          anvil --port 18545 > /tmp/bloom-creation-anvil.log 2>&1 &
+          creation_anvil_pid=$!
+          trap 'kill "$creation_anvil_pid"' EXIT
+          for attempt in $(seq 1 50); do
+            if curl -fsS -H 'Content-Type: application/json' --data '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}' http://127.0.0.1:18545 > /dev/null; then break; fi
+            sleep 0.1
+          done
+          BLOOM_TEST_ANVIL_URL=http://127.0.0.1:18545 cargo nextest run --archive-file target/nextest-archive.tar.zst -E 'package(bloom-tx) and test(anvil_creation_approval_broadcast_receipt_and_dependent_call)' --run-ignored ignored-only --no-tests=fail
 
   macos_unix_principal_disposable_w0:
     name: macOS Unix-principal disposable W0
