@@ -18,7 +18,7 @@ card_preserve_path() {
   local path="$1" destination
   [[ -e "$path" || -L "$path" ]] || return 0
   case "$path" in
-    "${RUNNER_TEMP:?}"/*|/private/tmp/bloom-*|/private/var/tmp/bloom-*|/private/etc/.bloom-pf-cleanup.*|/private/var/db/bloom/*|/private/var/run/bloom/*|/var/db/bloom/*|/var/run/bloom/*|/Library/Application\ Support/BloomTriad/*|/usr/local/libexec/bloom)
+    "${RUNNER_TEMP:?}"/*|/private/tmp/bloom-*|/private/var/tmp/bloom-*|/private/etc/.bloom-pf-cleanup.*|/private/var/db/bloom/*|/private/var/run/bloom/*|/private/var/log/bloom/*|/var/db/bloom/*|/var/run/bloom/*|/var/log/bloom/*|/Library/Application\ Support/BloomTriad/*|/usr/local/libexec/bloom)
       ;;
     *) printf 'Refused recursive cleanup outside disposable conformance paths: %q (runner root %q)\n' "$path" "$RUNNER_TEMP" >&2; return 65 ;;
   esac

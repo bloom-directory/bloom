@@ -66,6 +66,7 @@ async function returnedToShopping() {
   throw new Error('Private pages did not close before shopping returned');
 }
 try {
+  const ceremoniesStartedAt=Date.now();
   const add=id();await vfs('write','/cards/add.json',{operation_id:add,card_id:'stack-card',label:'Full-stack fixture'});
   await approve((await vfs('cat',`/cards/operations/${add}/ceremony.json`)).ceremony_url,'add');
   assert.equal((await poll(`/cards/operations/${add}/status.json`,['succeeded'])).state,'succeeded');
@@ -117,6 +118,12 @@ try {
   // The durable payment result precedes closing the private tabs. Observation
   // stays revoked during that cleanup; wait only for the fresh browsing tab.
   await returnedToShopping();
+  // Add, manual handoff and the two checkouts use the Broker's four anonymous
+  // ceremony slots. Keep its production five-minute admission limit intact.
+  writeFileSync(output,JSON.stringify({result:'awaiting_delete_admission',submission_count:submits,transcript},null,2));
+  const admissionDelay=Math.max(0,ceremoniesStartedAt+305000-Date.now());
+  console.log(`Payment paths passed; waiting ${admissionDelay}ms for a new delete ceremony slot.`);
+  await new Promise(r=>setTimeout(r,admissionDelay));
   const del=id();await vfs('write','/cards/delete.json',{operation_id:del,card_id:'stack-card'});
   await approve((await vfs('cat',`/cards/operations/${del}/ceremony.json`)).ceremony_url,'delete');
   await poll(`/cards/operations/${del}/status.json`,['succeeded']);assert.equal((await vfs('cat','/cards/index.json')).length,0);
