@@ -181,6 +181,14 @@ impl Daemon {
                         .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
                         .unwrap_or(Value::Null)
                 };
+                // Older builds persisted provider errors containing private
+                // endpoint URLs. Never return those through the local RPC.
+                if error
+                    .as_str()
+                    .is_some_and(|message| message.contains("://"))
+                {
+                    error = json!("deployment continuation failed; inspect Machine diagnostics");
+                }
                 if inspection
                     && entry.state == OutboxState::Pending
                     && let Ok(bytes) = std::fs::read(entry.dir.join("ceremony.json"))
