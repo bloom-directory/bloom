@@ -2,7 +2,8 @@
   const text = document.body.innerText;
   if (location.origin === 'https://buy.stripe.com' && /We are unable to authenticate your payment method\./.test(text))
     return {state:'declined',source:'merchant-reported',confirmation_reached:false};
-  if (/card (?:was |has been )?declined|payment (?:was )?(?:declined|failed)|insufficient funds/i.test(text))
+  // Shopify: "Your payment details couldn’t be verified."
+  if (/card (?:was |has been )?declined|payment (?:was )?(?:declined|failed)|insufficient funds|payment details couldn.t be verified/i.test(text))
     return {state:'declined',source:'merchant-reported',confirmation_reached:false};
   const hostedSubscription = location.origin === 'https://buy.stripe.com' && /\bThanks for subscribing\b/.test(text);
   if (!hostedSubscription && !/payment (?:successful|succeeded|complete)|order confirmed|thank you for (?:your order|your purchase|shopping)|purchase complete/i.test(text)) return {state:'waiting'};

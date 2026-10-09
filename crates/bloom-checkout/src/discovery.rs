@@ -837,6 +837,10 @@ mod tests {
                 "paid",
             ),
             ("Your card was declined", "declined"),
+            (
+                "Your payment details couldn’t be verified. Check your card details and try again.",
+                "declined",
+            ),
         ] {
             let (url,server)=fixture(merchant(&inputs(),"<label>Installments<select name='installments'><option>6 x installments</option></select></label>",outcome)).await;
             let tab = open(&browser, url).await;
