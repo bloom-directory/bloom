@@ -152,6 +152,34 @@ async fn deployment_tools_and_recovery() -> Result<()> {
     let url = info["rpc_url"].as_str().context("missing RPC URL")?;
     let sender = info["from"].as_str().unwrap();
     ensure!(rpc(url, "eth_accounts", json!([])).await?["result"] == json!([sender]));
+    for invalid in [
+        json!({"from":sender,"nonce":"0x0","data":"0x","gas":"0x186a0"}),
+        json!({"from":sender,"nonce":"0x0","data":"0x6000","chainId":"0x1","gas":"0x186a0"}),
+    ] {
+        let refused = rpc(url, "eth_sendTransaction", json!([invalid])).await?;
+        ensure!(
+            refused["error"]["code"] == -32602,
+            "invalid deployment reached staging: {refused}"
+        );
+    }
+    let mut mismatched = daemon.chains.get("anvil").unwrap().spec().clone();
+    mismatched.name = "mismatch".into();
+    mismatched.chain_id = 1;
+    daemon.chains.add(bloom_evm::ChainClient::new(mismatched)?);
+    let refused = daemon
+        .deployment_rpc("alice", "mismatch", "eth_accounts", json!([]))
+        .await;
+    ensure!(
+        refused["error"]["code"] == -32602,
+        "wrong upstream chain was accepted: {refused}"
+    );
+    ensure!(
+        daemon
+            .deployment_rpc("alice", "anvil", "bloom_deploymentList", json!([]))
+            .await["result"]
+            == json!([]),
+        "invalid requests must reserve no nonce"
+    );
     for method in [
         "eth_sign",
         "eth_signTransaction",

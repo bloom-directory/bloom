@@ -206,6 +206,8 @@ mod tests {
         for (field, value) in [
             ("from", json!("0x1111111111111111111111111111111111111111")),
             ("chainId", json!("0x1")),
+            ("data", json!("0x")),
+            ("reviewMode", json!("unknown")),
             ("nonce", json!("0x00")),
             ("nonce", json!(-1)),
             ("gas", json!("0x0")),
@@ -225,6 +227,11 @@ mod tests {
         let mut no_nonce = base.clone();
         no_nonce.as_object_mut().unwrap().remove("nonce");
         assert!(parse(no_nonce).is_err());
+        let mut clear = base.clone();
+        clear["reviewMode"] = json!("clear");
+        let clear = parse(clear).unwrap();
+        assert_eq!(clear.review_mode.as_deref(), Some("clear"));
+        assert_ne!(tx.id("alice", "anvil"), clear.id("alice", "anvil"));
         let mut call = base;
         call["to"] = json!(Address::ZERO);
         assert!(parse(call).unwrap().to.is_some());
