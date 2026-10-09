@@ -4,7 +4,8 @@ use async_trait::async_trait;
 use bloom_petals::abi::{ChainRequest, ChainResponse};
 use bloom_petals::private_store::account_digest;
 use bloom_petals::{
-    HostError, HostVfsEntry, PetalHost, PetalRouter, PetalRunner, PetalStore, PetalVm,
+    EvmOutboxOutcome, EvmTransactionRequest, HostError, HostVfsEntry, PetalHost, PetalRouter,
+    PetalRunner, PetalStore, PetalVm,
 };
 use bloom_vfs::{Handler, Vfs, path::VfsPath};
 use parking_lot::Mutex;
@@ -14,6 +15,7 @@ use std::sync::Arc;
 #[derive(Default)]
 struct FixtureHost {
     reads: Mutex<Vec<String>>,
+    staged: Mutex<Vec<EvmTransactionRequest>>,
 }
 #[async_trait]
 impl PetalHost for FixtureHost {
@@ -40,8 +42,31 @@ impl PetalHost for FixtureHost {
     }
     async fn chain_read(&self, request: ChainRequest) -> Result<ChainResponse, HostError> {
         assert_eq!(request.method, "eth_call");
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("fixtures/privacy_pools_direct_synthetic.json"))
+                .unwrap();
+        let params: serde_json::Value = serde_json::from_str(&request.params_json).unwrap();
+        let data = params[0]["data"].as_str().unwrap();
+        let value = if data == fixture["selectors"]["scope"].as_str().unwrap() {
+            42
+        } else if data == fixture["selectors"]["asp"].as_str().unwrap() {
+            6
+        } else {
+            0
+        };
         Ok(ChainResponse {
-            result_json: serde_json::to_string(&format!("0x{}", "00".repeat(32))).unwrap(),
+            result_json: serde_json::to_string(&format!("0x{value:064x}")).unwrap(),
+        })
+    }
+    async fn evm_tx_stage(
+        &self,
+        request: EvmTransactionRequest,
+    ) -> Result<EvmOutboxOutcome, HostError> {
+        self.staged.lock().push(request);
+        Ok(EvmOutboxOutcome {
+            outbox_id: "fixture-withdrawal".into(),
+            plan_md: "synthetic, no funds".into(),
+            approval_required: None,
         })
     }
 }
@@ -63,7 +88,7 @@ async fn installed_routes_select_account_and_keep_private_relay_in_account_store
     let package =
         std::env::var("PRIVACY_POOLS_PACKAGE").expect("set PRIVACY_POOLS_PACKAGE to built package");
     let home = tempfile::tempdir().unwrap();
-    let store = PetalStore::open(home.path().join("petals")).unwrap();
+    let store = PetalStore::open(home.path().join("petals/store")).unwrap();
     let (installed, _, _) = store.install_petal_package_dir(package).unwrap();
     let account = home
         .path()
@@ -77,6 +102,14 @@ async fn installed_routes_select_account_and_keep_private_relay_in_account_store
         "precommitment":"0x03", "status":"confirmed", "tx":{"chain":"mainnet", "outbox_id":"private-relay"},
         "value":"100", "label":"0x04", "commitment":"0x05", "spent":false,"backup_verified":true
     })).unwrap()).unwrap();
+    std::fs::copy(&note, note.with_file_name("direct")).unwrap();
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/privacy_pools_direct_synthetic.json")).unwrap();
+    let mut replacement = fixture["replacement"].clone();
+    replacement["parent_id"] = json!("direct");
+    let replacement_path = account.join("secrets/privacy-pools/replacements/fixture/replacement");
+    std::fs::create_dir_all(replacement_path.parent().unwrap()).unwrap();
+    std::fs::write(&replacement_path, serde_json::to_vec(&replacement).unwrap()).unwrap();
     let registry =
         Arc::new(bloom_petals::NameRegistry::open(home.path().join("registry")).unwrap());
     let runner = PetalRunner::new(store, registry, PetalVm::new().unwrap());
@@ -127,4 +160,26 @@ async fn installed_routes_select_account_and_keep_private_relay_in_account_store
     );
     let legacy = VfsPath::parse("/petals/privacy-pools/withdrawals/fixture/note.json").unwrap();
     assert!(vfs.write(&legacy, &private).await.is_err());
+    let direct = VfsPath::parse("/petals/privacy-pools/withdrawals/fixture/1/direct.json").unwrap();
+    let valid = serde_json::to_vec(&fixture["request"]).unwrap();
+    vfs.write(&direct, &valid).await.unwrap();
+    vfs.write(&direct, &valid).await.unwrap();
+    let staged = host.staged.lock();
+    assert_eq!(
+        staged.len(),
+        1,
+        "identical direct retry must not stage twice"
+    );
+    assert_eq!(staged[0].wallet, "fixture");
+    let context = staged[0].context.as_ref().expect("trusted route context");
+    assert!(
+        context
+            .params
+            .contains(&("bloom.account".into(), "1".into()))
+    );
+    assert!(
+        context
+            .params
+            .contains(&("bloom.wallet".into(), "fixture".into()))
+    );
 }
