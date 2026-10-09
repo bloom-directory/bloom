@@ -3292,19 +3292,26 @@ impl WalletsHandler {
         &self,
         wallet: &str,
         selector: Option<&str>,
+        unsigned_stage: bool,
     ) -> Result<SolanaAccount, HandlerError> {
         // Resolve through the cached authenticated inventory like the
         // numbered tree does, so reads and staging carry no live Broker
         // side effect. A stale-marked projection is re-observed live
         // before anything spends from it, because the cache may predate a
         // retirement or a new sibling.
-        let projection = self.wallet_projection(wallet).await?;
+        let projection = if unsigned_stage {
+            self.wallet_projection_navigation(wallet).await?
+        } else {
+            self.wallet_projection(wallet).await?
+        };
         let mut accounts = projection
             .account_inventory()
             .map_err(err_be)?
             .accounts
             .clone();
-        if projection.freshness == bloom_machine_client::ProjectionFreshness::Stale {
+        if !unsigned_stage
+            && projection.freshness == bloom_machine_client::ProjectionFreshness::Stale
+        {
             let broker = self.broker.as_ref().ok_or_else(|| {
                 HandlerError::backend(
                     "the cached Solana account inventory is stale and the Broker edge is \
@@ -3398,7 +3405,7 @@ impl WalletsHandler {
                 intent.account_fingerprint = Some(pinned.fingerprint.to_owned());
                 let destination = intent.destination_bytes().map_err(HandlerError::invalid)?;
                 let child = self
-                    .resolve_solana_child(wallet, intent.account_fingerprint.as_deref())
+                    .resolve_solana_child(wallet, intent.account_fingerprint.as_deref(), true)
                     .await?;
                 let staged = engine
                     .stage(
@@ -3447,7 +3454,11 @@ impl WalletsHandler {
                 // against. Resolving the wallet's children again would let a
                 // second active child sign a message staged for the first.
                 let child = self
-                    .resolve_solana_child(wallet, entry.staged.account_fingerprint.as_deref())
+                    .resolve_solana_child(
+                        wallet,
+                        entry.staged.account_fingerprint.as_deref(),
+                        false,
+                    )
                     .await?;
                 let approval_id = std::fs::read(
                     entry
@@ -3584,7 +3595,11 @@ impl WalletsHandler {
                     .map_err(solana_outbox_err)?;
                 require_pinned(&expired.staged, id)?;
                 let child = self
-                    .resolve_solana_child(wallet, expired.staged.account_fingerprint.as_deref())
+                    .resolve_solana_child(
+                        wallet,
+                        expired.staged.account_fingerprint.as_deref(),
+                        false,
+                    )
                     .await?;
                 let replacement = engine
                     .restage_expired(wallet, id, &child.pubkey, now_ms_u128())
@@ -6393,7 +6408,7 @@ value = "0""#,
     }
 
     #[tokio::test]
-    async fn solana_new_tx_stages_through_the_resolved_child() {
+    async fn solana_new_tx_stages_cached_child_but_confirm_requires_authority() {
         let f = make_handler_with_chain(true);
         let node = spawn_solana_node().await;
         let child_pubkey = [0xccu8; 32];
@@ -6452,9 +6467,14 @@ value = "0""#,
         // through account 0.
         let (projection, _sol0_address, _sol0_fingerprint) =
             bip39_projection_with_solana_account0(f.wallet_addr, &child_pubkey);
+        let mut cached = projection
+            .get_wallet_navigation(&token("alice"))
+            .await
+            .unwrap();
+        cached.freshness = bloom_machine_client::ProjectionFreshness::Stale;
         let handler = f
             .handler
-            .with_projection_reader(projection)
+            .with_projection_reader(Arc::new(NavigationOnlyProjection(cached)))
             .with_broker(Some(bloom_machine_client::MachineBrokerClient::new(broker)))
             .with_solana(std::collections::BTreeMap::from([(
                 "solana-devnet".to_string(),
@@ -6465,6 +6485,17 @@ value = "0""#,
         // the derived Solana child as fee payer and stages the message.
         let destination = bs58::encode([0xbbu8; 32]).into_string();
         let intent = serde_json::json!({ "destination": destination, "lamports": 1_000_000 });
+        let mismatched = serde_json::json!({
+            "destination": destination, "lamports": 1_000_000, "account_fingerprint": "ffff"
+        });
+        let error = handler
+            .write(
+                &VfsPath::parse("/alice/0/chains/solana-devnet/outbox/new.tx").unwrap(),
+                &serde_json::to_vec(&mismatched).unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, HandlerError::Invalid(_)));
         handler
             .write(
                 &VfsPath::parse("/alice/0/chains/solana-devnet/outbox/new.tx").unwrap(),
@@ -6478,6 +6509,21 @@ value = "0""#,
             .await
             .unwrap();
         assert_eq!(listed.len(), 1);
+        let error = handler
+            .write(
+                &VfsPath::parse(&format!(
+                    "/alice/0/chains/solana-devnet/outbox/pending/{}/confirm",
+                    listed[0].name
+                ))
+                .unwrap(),
+                b"y",
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, HandlerError::Backend(message) if message.contains("authority unavailable")),
+            "{error:?}"
+        );
         let intent_bytes = handler
             .read(
                 &VfsPath::parse(&format!(
@@ -8766,6 +8812,212 @@ value = "0""#,
         let parsed: WalletAccountsPublic = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed.wallet_id.as_str(), f.wallet_name);
         assert!(parsed.accounts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unsigned_account_stage_uses_cache_but_authority_paths_stay_live() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let rpc = tokio::spawn(async move {
+            let mut requests = tokio::task::JoinSet::new();
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                requests.spawn(async move {
+                    let request: serde_json::Value = tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        async {
+                            let mut bytes = Vec::new();
+                            let mut chunk = [0; 1024];
+                            loop {
+                                let len = socket.read(&mut chunk).await.unwrap();
+                                assert!(len > 0, "staging RPC ended before its JSON body");
+                                bytes.extend_from_slice(&chunk[..len]);
+                                assert!(bytes.len() <= 8192, "oversized staging RPC");
+                                if let Some((_, body)) = std::str::from_utf8(&bytes).unwrap().split_once("\r\n\r\n")
+                                    && let Ok(request) = serde_json::from_str(body)
+                                {
+                                    break request;
+                                }
+                            }
+                        },
+                    ).await.expect("staging RPC body deadline");
+                    let zero = format!("0x{}", "00".repeat(32));
+                    let result = match request["method"].as_str().unwrap() {
+                        "eth_chainId" => serde_json::json!("0x7a69"),
+                        "eth_getBlockByNumber" => serde_json::json!({
+                            "number":"0x1", "hash":zero, "parentHash":zero,
+                            "sha3Uncles":zero, "logsBloom":format!("0x{}", "00".repeat(256)),
+                            "transactionsRoot":zero,"stateRoot":zero,"receiptsRoot":zero,
+                            "miner":format!("0x{}", "00".repeat(20)),"difficulty":"0x0",
+                            "totalDifficulty":"0x0","extraData":"0x","size":"0x0",
+                            "gasLimit":"0x100000","gasUsed":"0x0","timestamp":"0x1",
+                            "uncles":[],"transactions":[],"mixHash":zero,
+                            "nonce":"0x0000000000000000","baseFeePerGas":"0x1"
+                        }),
+                        "eth_getTransactionCount" => serde_json::json!("0x0"),
+                        "eth_getCode" => serde_json::json!("0x"),
+                        "eth_getBalance" => serde_json::json!("0xde0b6b3a7640000"),
+                        "eth_estimateGas" => serde_json::json!("0x5208"),
+                        "eth_gasPrice" => serde_json::json!("0x1"),
+                        method => panic!("unexpected staging RPC {method}"),
+                    };
+                    let body =
+                        serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":result})
+                            .to_string();
+                    socket.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+                });
+            }
+        });
+        for derived in [false, true] {
+            let mut f = make_handler_with_chain(false);
+            let home = bloom_proto::HomeDir::at(f._tmp.path());
+            f.handler = f
+                .handler
+                .with_home_write_permit(Arc::new(HomeWritePermit::acquire(&home).unwrap()));
+            let spec = bloom_proto::ChainSpec {
+                name: "anvil".into(),
+                chain_id: 31337,
+                rpc_urls: vec![endpoint.clone()],
+                rpc_endpoints: Vec::new(),
+                etherscan_api_url: None,
+                display_name: None,
+                native_symbol: "ETH".into(),
+                native_decimals: 18,
+                legacy_tx: false,
+                op_stack: false,
+            };
+            f.handler
+                .chains
+                .add(bloom_evm::ChainClient::new(spec).unwrap());
+            let mut projection = if derived {
+                bip39_projection_value(
+                    f.wallet_addr,
+                    vec![derived_account(
+                        bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1,
+                        "m/44'/60'/0'/0/1",
+                        72,
+                        &format!("{:#x}", f.wallet_addr),
+                    )],
+                )
+            } else {
+                static_projection_value(f.wallet_addr)
+            };
+            let number = if derived { 1 } else { 0 };
+            let mut policy: CanonicalWalletPolicy =
+                serde_json::from_slice(&projection.policy.canonical_policy.decode()).unwrap();
+            policy
+                .allowed_destinations
+                .push(bloom_broker_api::PolicyDestination {
+                    chain: token("anvil"),
+                    destination: format!("{:#x}", f.wallet_addr),
+                });
+            let canonical = serde_jcs::to_vec(&policy).unwrap();
+            let policy_digest = Digest32::from_bytes(sha2::Sha256::digest(&canonical).into());
+            projection.policy.canonical_policy = Base64UrlBytes::from_bytes(&canonical);
+            projection.policy.policy_digest = policy_digest.clone();
+            projection.wallet.policy_digest = policy_digest;
+            projection.freshness = bloom_machine_client::ProjectionFreshness::Stale;
+            let mut restored = projection.clone();
+            f.handler = f
+                .handler
+                .with_projection_reader(Arc::new(NavigationOnlyProjection(projection)));
+            let root = format!("/alice/{number}");
+            let stage_path = VfsPath::parse(&format!("{root}/chains/anvil/outbox/new.tx")).unwrap();
+            let error = f
+                .handler
+                .write(&stage_path, br#"{"account_fingerprint":"ffff"}"#)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, HandlerError::Invalid(_)));
+            assert!(
+                f.handler
+                    .tx_engine
+                    .outbox
+                    .list("alice", "anvil", OutboxState::Pending)
+                    .unwrap()
+                    .is_empty()
+            );
+            f.handler
+                .write(
+                    &VfsPath::parse(&format!("{root}/chains/anvil/outbox/new.tx")).unwrap(),
+                    format!(
+                        "send 0.000000000000000001 eth to {:#x} on anvil",
+                        f.wallet_addr
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let entries = f
+                .handler
+                .tx_engine
+                .outbox
+                .list("alice", "anvil", OutboxState::Pending)
+                .unwrap();
+            assert_eq!(entries.len(), 1);
+            let staged = f
+                .handler
+                .tx_engine
+                .outbox
+                .read("alice", "anvil", &entries[0])
+                .unwrap();
+            assert_eq!(
+                staged.staged.from,
+                bloom_proto::checksum_address(&f.wallet_addr)
+            );
+            for suffix in [
+                format!("chains/anvil/outbox/pending/{}/confirm", entries[0]),
+                "chains/anvil/outbox/new.tx/extra".into(),
+                "sessions/enso/router/stop".into(),
+            ] {
+                let error = f
+                    .handler
+                    .write(&VfsPath::parse(&format!("{root}/{suffix}")).unwrap(), b"y")
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(&error, HandlerError::Backend(message) if message.contains("authority unavailable")),
+                    "{error:?}"
+                );
+            }
+            let error = f
+                .handler
+                .read(&VfsPath::parse(&format!("{root}/account.json")).unwrap())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&error, HandlerError::Backend(message) if message.contains("authority unavailable")),
+                "{error:?}"
+            );
+            // Restoring authority must not let a cached sender spend as its
+            // replacement.
+            restored.freshness = bloom_machine_client::ProjectionFreshness::Fresh;
+            if derived {
+                restored.accounts.accounts[0].chain_projections[0].address =
+                    format!("{:#x}", Address::repeat_byte(0x22));
+            } else {
+                restored.keys[0].addresses[0] = format!("{:#x}", Address::repeat_byte(0x22));
+            }
+            f.handler = f
+                .handler
+                .with_projection_reader(Arc::new(StaticProjection(restored)));
+            let error = f
+                .handler
+                .write(
+                    &VfsPath::parse(&format!(
+                        "{root}/chains/anvil/outbox/pending/{}/confirm",
+                        entries[0]
+                    ))
+                    .unwrap(),
+                    b"y",
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(error, HandlerError::NotFound(_)), "{error:?}");
+        }
+        rpc.abort();
     }
 
     #[tokio::test]
