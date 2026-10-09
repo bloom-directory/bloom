@@ -141,9 +141,15 @@ impl TriadPolicyUpdateProjection {
         Ok(bytes)
     }
 
+    /// View a pending policy change. `required` and `destinations` are what
+    /// the caller asked to be allowed; a change that does not carry all of
+    /// both is somebody else's, and must never be presented as the caller's
+    /// own. A change with the packages but not their destinations would leave
+    /// those Petals' outbox transactions denied after it commits.
     fn pending_view(
         &self,
-        package_hash: &bloom_broker_api::Digest32,
+        required: &[bloom_broker_api::Digest32],
+        destinations: &[bloom_broker_api::PolicyDestination],
     ) -> Result<bloom_machine_client::PetalEligibility, HandlerError> {
         let proposed: bloom_broker_api::CanonicalWalletPolicy =
             serde_json::from_slice(&self.retained_policy_bytes()?).map_err(err_be)?;
@@ -180,9 +186,12 @@ impl TriadPolicyUpdateProjection {
                     challenge_path: format!(
                         "/wallets/{wallet}/policy-updates/pending/{operation}/{APPROVAL_CHALLENGE_FILE}"
                     ),
-                    includes_requested_package: proposed
-                        .allowed_petal_packages
-                        .contains(package_hash),
+                    includes_requested: required
+                        .iter()
+                        .all(|package| proposed.allowed_petal_packages.contains(package))
+                        && destinations
+                            .iter()
+                            .all(|destination| proposed.allowed_destinations.contains(destination)),
                 },
             ),
         )
@@ -270,6 +279,16 @@ pub trait AccountPetalMount: Send + Sync {
         slot: &str,
     ) -> Result<(), HandlerError>;
 }
+/// What a wallet's first Petal policy proposal also allows: the Petals chosen
+/// during setup and the fixed contracts they transact with. Both are empty for
+/// wallets without a default policy.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DefaultPolicySetup {
+    pub packages: Vec<bloom_broker_api::Digest32>,
+    pub destinations: Vec<bloom_broker_api::PolicyDestination>,
+}
+
+pub type DefaultPolicyPackages = Arc<dyn Fn(&str) -> DefaultPolicySetup + Send + Sync>;
 
 #[derive(Clone)]
 pub struct WalletsHandler {
@@ -301,6 +320,8 @@ pub struct WalletsHandler {
     /// host needs this handler, so there is exactly one of each and the
     /// session seam is attached once both exist.
     account_petals: Arc<parking_lot::RwLock<Option<Arc<dyn AccountPetalMount>>>>,
+    /// Setup choices proposed together with a wallet's first Petal package.
+    default_policy_packages: Option<DefaultPolicyPackages>,
 }
 
 impl WalletsHandler {
@@ -323,7 +344,13 @@ impl WalletsHandler {
             solana: None,
             solana_reads: None,
             account_petals: Arc::new(parking_lot::RwLock::new(None)),
+            default_policy_packages: None,
         }
+    }
+
+    pub fn with_default_policy_packages(mut self, packages: DefaultPolicyPackages) -> Self {
+        self.default_policy_packages = Some(packages);
+        self
     }
 
     /// Attach the session seam that serves `wallets/<w>/<n>/sessions/`.
@@ -1342,7 +1369,63 @@ impl WalletsHandler {
         wallet: &str,
         package_hash: &bloom_broker_api::Digest32,
     ) -> Result<bloom_machine_client::PetalEligibility, HandlerError> {
-        use bloom_machine_client::{PetalEligibility, policy_with_package};
+        // A wallet's first proposal also allows the Petals chosen during setup,
+        // so the owner approves one policy rather than one per Petal. "First"
+        // is the Broker policy version, not the package list: once the owner
+        // has committed any change, later proposals add only the requested
+        // package, so a Petal the owner removed is never proposed again behind
+        // another.
+        let setup = self
+            .default_policy_packages
+            .as_ref()
+            .map(|defaults| defaults(wallet))
+            .unwrap_or_default();
+        self.ensure_policy_allows(
+            wallet,
+            std::slice::from_ref(package_hash),
+            std::slice::from_ref(package_hash),
+            &[],
+            &setup,
+        )
+        .await
+    }
+
+    /// Drive a wallet's default policy: propose every package and destination
+    /// together through the existing policy operation. `Allowed` means the
+    /// policy allows all of them.
+    pub async fn ensure_petal_packages_allowed(
+        &self,
+        wallet: &str,
+        packages: &[bloom_broker_api::Digest32],
+        destinations: &[bloom_broker_api::PolicyDestination],
+    ) -> Result<bloom_machine_client::PetalEligibility, HandlerError> {
+        if packages.is_empty() {
+            return Err(HandlerError::invalid("no Petal packages to allow"));
+        }
+        self.ensure_policy_allows(
+            wallet,
+            packages,
+            packages,
+            destinations,
+            &DefaultPolicySetup::default(),
+        )
+        .await
+    }
+
+    async fn ensure_policy_allows(
+        &self,
+        wallet: &str,
+        required: &[bloom_broker_api::Digest32],
+        additions: &[bloom_broker_api::Digest32],
+        destinations: &[bloom_broker_api::PolicyDestination],
+        // Added only while the policy is still the one wallet creation
+        // installed, so one ceremony makes every chosen Petal usable instead
+        // of gating each one.
+        first_proposal: &DefaultPolicySetup,
+    ) -> Result<bloom_machine_client::PetalEligibility, HandlerError> {
+        use bloom_machine_client::{
+            PetalEligibility, policy_with_destinations, policy_with_packages,
+        };
         use sha2::Digest as _;
 
         self.write_permit()?;
@@ -1356,14 +1439,32 @@ impl WalletsHandler {
                 .join(APPROVAL_CHALLENGE_FILE);
             let projection: TriadPolicyUpdateProjection = read_json(&path)?;
             let proposed_bytes = projection.retained_policy_bytes()?;
-            match self
+            let mut resumed = self
                 .resume_wallet_policy_update(wallet, &operation_id, &proposed_bytes)
-                .await
+                .await;
+            if matches!(resumed, Err(HandlerError::PermissionDenied))
+                && self
+                    .cancel_expired_policy_ceremony(wallet, &operation_id)
+                    .await?
             {
+                resumed = self
+                    .resume_wallet_policy_update(wallet, &operation_id, &proposed_bytes)
+                    .await;
+            }
+            match resumed {
                 Ok(()) => continue,
                 Err(HandlerError::PermissionDenied) => {
                     let projection: TriadPolicyUpdateProjection = read_json(&path)?;
-                    return projection.pending_view(package_hash);
+                    return projection.pending_view(required, destinations);
+                }
+                // A cancelled, expired, or failed ceremony has left `pending`;
+                // propose again from the current policy.
+                Err(_)
+                    if !self
+                        .policy_update_action_dir(wallet, "pending", &operation_id)
+                        .is_dir() =>
+                {
+                    continue;
                 }
                 Err(error) => return Err(error),
             }
@@ -1387,10 +1488,31 @@ impl WalletsHandler {
                 "Broker eligibility policy has invalid wallet, digest, or canonical bytes",
             ));
         }
-        if policy.allowed_petal_packages.contains(package_hash) {
+        if required
+            .iter()
+            .all(|package| policy.allowed_petal_packages.contains(package))
+            && destinations
+                .iter()
+                .all(|destination| policy.allowed_destinations.contains(destination))
+        {
             return Ok(PetalEligibility::Allowed(current));
         }
-        let proposed = policy_with_package(&policy, package_hash);
+        let mut additions = additions.to_vec();
+        // Kept apart from `destinations`, which stays what the caller asked
+        // for so a pending change is judged against the request alone.
+        let mut proposed_destinations = destinations.to_vec();
+        // Wallet creation installs the restrictive policy at version 1 and
+        // every committed change increments it. An empty package list is not
+        // the same fact: the owner may have removed every Petal on purpose.
+        const CREATION_POLICY_VERSION: u64 = 1;
+        if current.version.get() == CREATION_POLICY_VERSION {
+            additions.extend_from_slice(&first_proposal.packages);
+            proposed_destinations.extend_from_slice(&first_proposal.destinations);
+        }
+        let proposed = policy_with_destinations(
+            &policy_with_packages(&policy, &additions),
+            &proposed_destinations,
+        );
         let proposed_bytes = serde_jcs::to_vec(&proposed).map_err(err_be)?;
         match self
             .write_wallet_policy_update_locked(wallet, &proposed_bytes, Some(&current))
@@ -1406,13 +1528,39 @@ impl WalletsHandler {
                     self.policy_update_action_dir(wallet, "pending", &operation_id)
                         .join(APPROVAL_CHALLENGE_FILE),
                 )?;
-                projection.pending_view(package_hash)
+                projection.pending_view(required, destinations)
             }
             Err(error) => Err(error),
             Ok(()) => Err(HandlerError::backend(
                 "fresh policy proposal unexpectedly committed without owner consent",
             )),
         }
+    }
+
+    /// The Broker reports an expired ceremony as awaiting the owner until asked
+    /// to act on it. Cancel a pending policy ceremony past its expiry so the
+    /// next status read is terminal; returns whether the Broker accepted.
+    async fn cancel_expired_policy_ceremony(
+        &self,
+        wallet: &str,
+        operation_id: &str,
+    ) -> Result<bool, HandlerError> {
+        let projection: TriadPolicyUpdateProjection = read_json(
+            self.policy_update_action_dir(wallet, "pending", operation_id)
+                .join(APPROVAL_CHALLENGE_FILE),
+        )?;
+        if !projection
+            .ceremony_expires_at_ms
+            .as_ref()
+            .is_some_and(|expires_at_ms| expires_at_ms.get() <= now_ms_u64())
+        {
+            return Ok(false);
+        }
+        Ok(self
+            .broker()?
+            .cancel_ceremony(projection.operation_id)
+            .await
+            .is_ok())
     }
 
     /// Gate an explicit caller operation without treating policy completion as submission.
@@ -1505,7 +1653,7 @@ impl WalletsHandler {
             .truncate(false)
             .open(directory.join(".coordinator.lock"))?;
         fs2::FileExt::try_lock_exclusive(&file).map_err(|error| {
-            HandlerError::backend(format!("wallet policy coordination busy; retry: {error}"))
+            HandlerError::backend(format!("{POLICY_COORDINATION_BUSY}; retry: {error}"))
         })?;
         Ok(file)
     }
@@ -2138,6 +2286,10 @@ fn validate_policy_action_id(id: &str) -> Result<(), HandlerError> {
     }
     Ok(())
 }
+
+/// Start of the error a policy writer gets while another command holds the
+/// wallet's policy lock. Waiting commands poll again instead of failing.
+pub const POLICY_COORDINATION_BUSY: &str = "wallet policy coordination busy";
 
 fn tx_open_err(e: TxEngineError) -> HandlerError {
     match e {
@@ -3292,19 +3444,26 @@ impl WalletsHandler {
         &self,
         wallet: &str,
         selector: Option<&str>,
+        unsigned_stage: bool,
     ) -> Result<SolanaAccount, HandlerError> {
         // Resolve through the cached authenticated inventory like the
         // numbered tree does, so reads and staging carry no live Broker
         // side effect. A stale-marked projection is re-observed live
         // before anything spends from it, because the cache may predate a
         // retirement or a new sibling.
-        let projection = self.wallet_projection(wallet).await?;
+        let projection = if unsigned_stage {
+            self.wallet_projection_navigation(wallet).await?
+        } else {
+            self.wallet_projection(wallet).await?
+        };
         let mut accounts = projection
             .account_inventory()
             .map_err(err_be)?
             .accounts
             .clone();
-        if projection.freshness == bloom_machine_client::ProjectionFreshness::Stale {
+        if !unsigned_stage
+            && projection.freshness == bloom_machine_client::ProjectionFreshness::Stale
+        {
             let broker = self.broker.as_ref().ok_or_else(|| {
                 HandlerError::backend(
                     "the cached Solana account inventory is stale and the Broker edge is \
@@ -3398,7 +3557,7 @@ impl WalletsHandler {
                 intent.account_fingerprint = Some(pinned.fingerprint.to_owned());
                 let destination = intent.destination_bytes().map_err(HandlerError::invalid)?;
                 let child = self
-                    .resolve_solana_child(wallet, intent.account_fingerprint.as_deref())
+                    .resolve_solana_child(wallet, intent.account_fingerprint.as_deref(), true)
                     .await?;
                 let staged = engine
                     .stage(
@@ -3447,7 +3606,11 @@ impl WalletsHandler {
                 // against. Resolving the wallet's children again would let a
                 // second active child sign a message staged for the first.
                 let child = self
-                    .resolve_solana_child(wallet, entry.staged.account_fingerprint.as_deref())
+                    .resolve_solana_child(
+                        wallet,
+                        entry.staged.account_fingerprint.as_deref(),
+                        false,
+                    )
                     .await?;
                 let approval_id = std::fs::read(
                     entry
@@ -3584,7 +3747,11 @@ impl WalletsHandler {
                     .map_err(solana_outbox_err)?;
                 require_pinned(&expired.staged, id)?;
                 let child = self
-                    .resolve_solana_child(wallet, expired.staged.account_fingerprint.as_deref())
+                    .resolve_solana_child(
+                        wallet,
+                        expired.staged.account_fingerprint.as_deref(),
+                        false,
+                    )
                     .await?;
                 let replacement = engine
                     .restage_expired(wallet, id, &child.pubkey, now_ms_u128())
@@ -6393,7 +6560,7 @@ value = "0""#,
     }
 
     #[tokio::test]
-    async fn solana_new_tx_stages_through_the_resolved_child() {
+    async fn solana_new_tx_stages_cached_child_but_confirm_requires_authority() {
         let f = make_handler_with_chain(true);
         let node = spawn_solana_node().await;
         let child_pubkey = [0xccu8; 32];
@@ -6452,9 +6619,14 @@ value = "0""#,
         // through account 0.
         let (projection, _sol0_address, _sol0_fingerprint) =
             bip39_projection_with_solana_account0(f.wallet_addr, &child_pubkey);
+        let mut cached = projection
+            .get_wallet_navigation(&token("alice"))
+            .await
+            .unwrap();
+        cached.freshness = bloom_machine_client::ProjectionFreshness::Stale;
         let handler = f
             .handler
-            .with_projection_reader(projection)
+            .with_projection_reader(Arc::new(NavigationOnlyProjection(cached)))
             .with_broker(Some(bloom_machine_client::MachineBrokerClient::new(broker)))
             .with_solana(std::collections::BTreeMap::from([(
                 "solana-devnet".to_string(),
@@ -6465,6 +6637,17 @@ value = "0""#,
         // the derived Solana child as fee payer and stages the message.
         let destination = bs58::encode([0xbbu8; 32]).into_string();
         let intent = serde_json::json!({ "destination": destination, "lamports": 1_000_000 });
+        let mismatched = serde_json::json!({
+            "destination": destination, "lamports": 1_000_000, "account_fingerprint": "ffff"
+        });
+        let error = handler
+            .write(
+                &VfsPath::parse("/alice/0/chains/solana-devnet/outbox/new.tx").unwrap(),
+                &serde_json::to_vec(&mismatched).unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, HandlerError::Invalid(_)));
         handler
             .write(
                 &VfsPath::parse("/alice/0/chains/solana-devnet/outbox/new.tx").unwrap(),
@@ -6478,6 +6661,21 @@ value = "0""#,
             .await
             .unwrap();
         assert_eq!(listed.len(), 1);
+        let error = handler
+            .write(
+                &VfsPath::parse(&format!(
+                    "/alice/0/chains/solana-devnet/outbox/pending/{}/confirm",
+                    listed[0].name
+                ))
+                .unwrap(),
+                b"y",
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, HandlerError::Backend(message) if message.contains("authority unavailable")),
+            "{error:?}"
+        );
         let intent_bytes = handler
             .read(
                 &VfsPath::parse(&format!(
@@ -8766,6 +8964,212 @@ value = "0""#,
         let parsed: WalletAccountsPublic = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed.wallet_id.as_str(), f.wallet_name);
         assert!(parsed.accounts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unsigned_account_stage_uses_cache_but_authority_paths_stay_live() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let rpc = tokio::spawn(async move {
+            let mut requests = tokio::task::JoinSet::new();
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                requests.spawn(async move {
+                    let request: serde_json::Value = tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        async {
+                            let mut bytes = Vec::new();
+                            let mut chunk = [0; 1024];
+                            loop {
+                                let len = socket.read(&mut chunk).await.unwrap();
+                                assert!(len > 0, "staging RPC ended before its JSON body");
+                                bytes.extend_from_slice(&chunk[..len]);
+                                assert!(bytes.len() <= 8192, "oversized staging RPC");
+                                if let Some((_, body)) = std::str::from_utf8(&bytes).unwrap().split_once("\r\n\r\n")
+                                    && let Ok(request) = serde_json::from_str(body)
+                                {
+                                    break request;
+                                }
+                            }
+                        },
+                    ).await.expect("staging RPC body deadline");
+                    let zero = format!("0x{}", "00".repeat(32));
+                    let result = match request["method"].as_str().unwrap() {
+                        "eth_chainId" => serde_json::json!("0x7a69"),
+                        "eth_getBlockByNumber" => serde_json::json!({
+                            "number":"0x1", "hash":zero, "parentHash":zero,
+                            "sha3Uncles":zero, "logsBloom":format!("0x{}", "00".repeat(256)),
+                            "transactionsRoot":zero,"stateRoot":zero,"receiptsRoot":zero,
+                            "miner":format!("0x{}", "00".repeat(20)),"difficulty":"0x0",
+                            "totalDifficulty":"0x0","extraData":"0x","size":"0x0",
+                            "gasLimit":"0x100000","gasUsed":"0x0","timestamp":"0x1",
+                            "uncles":[],"transactions":[],"mixHash":zero,
+                            "nonce":"0x0000000000000000","baseFeePerGas":"0x1"
+                        }),
+                        "eth_getTransactionCount" => serde_json::json!("0x0"),
+                        "eth_getCode" => serde_json::json!("0x"),
+                        "eth_getBalance" => serde_json::json!("0xde0b6b3a7640000"),
+                        "eth_estimateGas" => serde_json::json!("0x5208"),
+                        "eth_gasPrice" => serde_json::json!("0x1"),
+                        method => panic!("unexpected staging RPC {method}"),
+                    };
+                    let body =
+                        serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":result})
+                            .to_string();
+                    socket.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+                });
+            }
+        });
+        for derived in [false, true] {
+            let mut f = make_handler_with_chain(false);
+            let home = bloom_proto::HomeDir::at(f._tmp.path());
+            f.handler = f
+                .handler
+                .with_home_write_permit(Arc::new(HomeWritePermit::acquire(&home).unwrap()));
+            let spec = bloom_proto::ChainSpec {
+                name: "anvil".into(),
+                chain_id: 31337,
+                rpc_urls: vec![endpoint.clone()],
+                rpc_endpoints: Vec::new(),
+                etherscan_api_url: None,
+                display_name: None,
+                native_symbol: "ETH".into(),
+                native_decimals: 18,
+                legacy_tx: false,
+                op_stack: false,
+            };
+            f.handler
+                .chains
+                .add(bloom_evm::ChainClient::new(spec).unwrap());
+            let mut projection = if derived {
+                bip39_projection_value(
+                    f.wallet_addr,
+                    vec![derived_account(
+                        bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1,
+                        "m/44'/60'/0'/0/1",
+                        72,
+                        &format!("{:#x}", f.wallet_addr),
+                    )],
+                )
+            } else {
+                static_projection_value(f.wallet_addr)
+            };
+            let number = if derived { 1 } else { 0 };
+            let mut policy: CanonicalWalletPolicy =
+                serde_json::from_slice(&projection.policy.canonical_policy.decode()).unwrap();
+            policy
+                .allowed_destinations
+                .push(bloom_broker_api::PolicyDestination {
+                    chain: token("anvil"),
+                    destination: format!("{:#x}", f.wallet_addr),
+                });
+            let canonical = serde_jcs::to_vec(&policy).unwrap();
+            let policy_digest = Digest32::from_bytes(sha2::Sha256::digest(&canonical).into());
+            projection.policy.canonical_policy = Base64UrlBytes::from_bytes(&canonical);
+            projection.policy.policy_digest = policy_digest.clone();
+            projection.wallet.policy_digest = policy_digest;
+            projection.freshness = bloom_machine_client::ProjectionFreshness::Stale;
+            let mut restored = projection.clone();
+            f.handler = f
+                .handler
+                .with_projection_reader(Arc::new(NavigationOnlyProjection(projection)));
+            let root = format!("/alice/{number}");
+            let stage_path = VfsPath::parse(&format!("{root}/chains/anvil/outbox/new.tx")).unwrap();
+            let error = f
+                .handler
+                .write(&stage_path, br#"{"account_fingerprint":"ffff"}"#)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, HandlerError::Invalid(_)));
+            assert!(
+                f.handler
+                    .tx_engine
+                    .outbox
+                    .list("alice", "anvil", OutboxState::Pending)
+                    .unwrap()
+                    .is_empty()
+            );
+            f.handler
+                .write(
+                    &VfsPath::parse(&format!("{root}/chains/anvil/outbox/new.tx")).unwrap(),
+                    format!(
+                        "send 0.000000000000000001 eth to {:#x} on anvil",
+                        f.wallet_addr
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let entries = f
+                .handler
+                .tx_engine
+                .outbox
+                .list("alice", "anvil", OutboxState::Pending)
+                .unwrap();
+            assert_eq!(entries.len(), 1);
+            let staged = f
+                .handler
+                .tx_engine
+                .outbox
+                .read("alice", "anvil", &entries[0])
+                .unwrap();
+            assert_eq!(
+                staged.staged.from,
+                bloom_proto::checksum_address(&f.wallet_addr)
+            );
+            for suffix in [
+                format!("chains/anvil/outbox/pending/{}/confirm", entries[0]),
+                "chains/anvil/outbox/new.tx/extra".into(),
+                "sessions/enso/router/stop".into(),
+            ] {
+                let error = f
+                    .handler
+                    .write(&VfsPath::parse(&format!("{root}/{suffix}")).unwrap(), b"y")
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(&error, HandlerError::Backend(message) if message.contains("authority unavailable")),
+                    "{error:?}"
+                );
+            }
+            let error = f
+                .handler
+                .read(&VfsPath::parse(&format!("{root}/account.json")).unwrap())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&error, HandlerError::Backend(message) if message.contains("authority unavailable")),
+                "{error:?}"
+            );
+            // Restoring authority must not let a cached sender spend as its
+            // replacement.
+            restored.freshness = bloom_machine_client::ProjectionFreshness::Fresh;
+            if derived {
+                restored.accounts.accounts[0].chain_projections[0].address =
+                    format!("{:#x}", Address::repeat_byte(0x22));
+            } else {
+                restored.keys[0].addresses[0] = format!("{:#x}", Address::repeat_byte(0x22));
+            }
+            f.handler = f
+                .handler
+                .with_projection_reader(Arc::new(StaticProjection(restored)));
+            let error = f
+                .handler
+                .write(
+                    &VfsPath::parse(&format!(
+                        "{root}/chains/anvil/outbox/pending/{}/confirm",
+                        entries[0]
+                    ))
+                    .unwrap(),
+                    b"y",
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(error, HandlerError::NotFound(_)), "{error:?}");
+        }
+        rpc.abort();
     }
 
     #[tokio::test]

@@ -61,6 +61,12 @@ edge_backup=""
 capture_failure_evidence() {
   evidence_dir="${BLOOM_MACOS_W0_EVIDENCE_DIR:-}"
   [[ -n "$evidence_dir" && -d "$evidence_dir" ]] || return 0
+  # Native lifecycle events contain static event names and numeric probe errors,
+  # and survive the installer's rollback of service jobs and runtime files.
+  /usr/bin/log show --last 5m --style json \
+    --predicate 'subsystem == "com.bloom.triad"' \
+    > "$evidence_dir/native-lifecycle.json" 2>&1 || true
+  chmod 0644 "$evidence_dir/native-lifecycle.json" 2>/dev/null || true
   for service in broker signer; do
     source_log="/private/var/log/bloom/$login_uid/$service.jsonl"
     if [[ -f "$source_log" && ! -L "$source_log" ]]; then
@@ -73,6 +79,18 @@ capture_failure_evidence() {
   launchctl print "user/$login_uid/com.bloom.session" \
     > "$evidence_dir/session-launchctl.txt" 2>&1 || true
   chmod 0644 "$evidence_dir/session-launchctl.txt" 2>/dev/null || true
+  if launchctl print "gui/$login_uid" >/dev/null 2>&1; then
+    printf 'GUI domain exists\n' > "$evidence_dir/gui-launchctl.txt"
+  else
+    printf 'GUI domain absent\n' > "$evidence_dir/gui-launchctl.txt"
+  fi
+  launchctl print system/com.bloom.containment \
+    > "$evidence_dir/lifecycle-launchctl.txt" 2>&1 || true
+  chmod 0644 "$evidence_dir/"{gui,lifecycle}-launchctl.txt 2>/dev/null || true
+  status_path="/private/var/run/bloom/$login_uid/containment/status.json"
+  if [[ -f "$status_path" && ! -L "$status_path" ]]; then
+    install -m 0644 "$status_path" "$evidence_dir/lifecycle-status.json" || true
+  fi
   # The Machine launchagent is bootstrapped into the user domain; its launchd
   # state carries the last exit status and run count. Best effort only: the
   # installer's rollback may have booted the job out before this runs.
