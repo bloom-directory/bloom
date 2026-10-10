@@ -76,6 +76,77 @@ pub struct Config {
     /// explicit `[mcp] enabled = true`.
     #[serde(default)]
     pub mcp: McpConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkout: Option<CheckoutConfig>,
+}
+
+/// A separate checkout principal. Its browser and private view never run in Machine.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckoutConfig {
+    pub socket: std::path::PathBuf,
+    pub uid: u32,
+}
+
+impl CheckoutConfig {
+    #[cfg(unix)]
+    pub fn from_installed_root(root: &Path, login_uid: u32) -> Result<Self, ConfigError> {
+        use std::os::unix::fs::MetadataExt;
+        let path = root.join(login_uid.to_string()).join("checkout.json");
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if !metadata.is_file()
+            || metadata.uid() != 0
+            || metadata.nlink() != 1
+            || metadata.mode() & 0o022 != 0
+        {
+            return Err(ConfigError::Invalid("Checkout endpoint must be a root-owned regular file without group or other write access".into()));
+        }
+        let endpoint: Self = serde_json::from_slice(&std::fs::read(path)?)
+            .map_err(|_| ConfigError::Invalid("Invalid installed checkout endpoint".into()))?;
+        if !endpoint.socket.is_absolute() || endpoint.uid == 0 {
+            return Err(ConfigError::Invalid(
+                "Invalid installed checkout principal".into(),
+            ));
+        }
+        Ok(endpoint)
+    }
+
+    /// Root-installed service environment supplies public endpoint coordinates.
+    pub fn from_environment() -> Result<Option<Self>, ConfigError> {
+        Self::from_endpoint_values(
+            std::env::var_os("BLOOM_CHECKOUT_SOCKET"),
+            std::env::var_os("BLOOM_CHECKOUT_UID"),
+        )
+    }
+    fn from_endpoint_values(
+        socket: Option<std::ffi::OsString>,
+        uid: Option<std::ffi::OsString>,
+    ) -> Result<Option<Self>, ConfigError> {
+        match (socket, uid) {
+            (None, None) => Ok(None),
+            (Some(socket), Some(uid)) => {
+                let socket = std::path::PathBuf::from(socket);
+                let uid = uid
+                    .to_str()
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .filter(|v| *v != 0)
+                    .ok_or_else(|| {
+                        ConfigError::Invalid(
+                            "Checkout UID must be a nonzero numeric service UID".into(),
+                        )
+                    })?;
+                if !socket.is_absolute() {
+                    return Err(ConfigError::Invalid(
+                        "Checkout socket must be absolute".into(),
+                    ));
+                }
+                Ok(Some(Self { socket, uid }))
+            }
+            _ => Err(ConfigError::Invalid(
+                "Checkout endpoint and UID must be configured together".into(),
+            )),
+        }
+    }
 }
 
 /// Gate for the `bloom mcp serve` stdio proxy.
@@ -445,6 +516,7 @@ impl Config {
             private_rpc: BTreeMap::new(),
             backends: BackendsConfig::default(),
             mcp: McpConfig::default(),
+            checkout: None,
         }
     }
 
@@ -500,6 +572,15 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if self
+            .checkout
+            .as_ref()
+            .is_some_and(|endpoint| !endpoint.socket.is_absolute() || endpoint.uid == 0)
+        {
+            return Err(ConfigError::Invalid(
+                "Checkout requires an absolute socket and nonzero service UID".into(),
+            ));
+        }
         if self.chains.is_empty() {
             return Err(ConfigError::Invalid(
                 "config.chains must contain at least one entry".into(),
@@ -675,6 +756,37 @@ mod tests {
     use super::*;
     use crate::chain::EndpointSpec;
     use tempfile::tempdir;
+
+    #[test]
+    fn checkout_endpoint_requires_absolute_path_and_service_uid() {
+        let parse = CheckoutConfig::from_endpoint_values;
+        assert!(parse(None, None).unwrap().is_none());
+        assert!(parse(Some("/run/bloom/checkout.sock".into()), None).is_err());
+        assert!(parse(None, Some("31004".into())).is_err());
+        for uid in ["0", "bad", "4294967296"] {
+            assert!(parse(Some("/run/bloom/checkout.sock".into()), Some(uid.into())).is_err());
+        }
+        assert!(parse(Some("relative.sock".into()), Some("31004".into())).is_err());
+        let endpoint = parse(
+            Some("/run/bloom/checkout.sock".into()),
+            Some("31004".into()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(endpoint.uid, 31004);
+        assert_eq!(
+            endpoint.socket,
+            std::path::PathBuf::from("/run/bloom/checkout.sock")
+        );
+        let mut config = Config::local_default();
+        config.checkout = Some(endpoint);
+        assert!(config.validate().is_ok());
+        config.checkout.as_mut().unwrap().uid = 0;
+        assert!(config.validate().is_err());
+        config.checkout.as_mut().unwrap().uid = 31004;
+        config.checkout.as_mut().unwrap().socket = "relative.sock".into();
+        assert!(config.validate().is_err());
+    }
 
     fn http_endpoint() -> EndpointSpec {
         EndpointSpec {

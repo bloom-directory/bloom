@@ -18,6 +18,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
+name = "aead"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1973cfbc1a2daf9cf550e74e1f088c28e7f7d8c1e1418fb6c9dc5184b7e84c99"
+dependencies = [
+ "crypto-common 0.2.2",
+ "inout",
+]
+
+[[package]]
 name = "ahash"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1458,7 +1468,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1469,7 +1479,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1483,6 +1493,15 @@ name = "arbitrary"
 version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
+
+[[package]]
+name = "arc-swap"
+version = "1.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c049c0be4daef0b145cb3555416b3b8ef5b7888a38aea1a3a155801fe7b0810b"
+dependencies = [
+ "rustversion",
+]
 
 [[package]]
 name = "ark-bls12-381"
@@ -1793,6 +1812,45 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
 
 [[package]]
+name = "asn1-rs"
+version = "0.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b7f43a50ac4fdca5df8e885c21b835997f0a1cdee65494a6847694a98652d9d8"
+dependencies = [
+ "asn1-rs-derive",
+ "asn1-rs-impl",
+ "displaydoc",
+ "nom",
+ "num-traits",
+ "rusticata-macros",
+ "thiserror 2.0.18",
+ "time",
+]
+
+[[package]]
+name = "asn1-rs-derive"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3109e49b1e4909e9db6515a30c633684d68cdeaa252f215214cb4fa1a5bfee2c"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+ "synstructure",
+]
+
+[[package]]
+name = "asn1-rs-impl"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b18050c2cd6fe86c3a76584ef5e0baf286d038cda203eb6223df2cc413565f7"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "assert-json-diff"
 version = "2.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1887,13 +1945,13 @@ dependencies = [
 
 [[package]]
 name = "async-trait"
-version = "0.1.89"
+version = "0.1.92"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9035ad2d096bed7955a320ee7e2230574d28fd3c3a0f186cbea1ff3c7eed5dbb"
+checksum = "82f6aeea286b8eb4dd3431a1be1b59d290ace00f5bfd8e2a159bc2a05e2c1667"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.117",
+ "syn 3.0.6",
 ]
 
 [[package]]
@@ -1962,6 +2020,78 @@ dependencies = [
  "dunce",
  "fs_extra",
  "pkg-config",
+]
+
+[[package]]
+name = "axum"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "31b698c5f9a010f6573133b09e0de5408834d0c82f8d7475a89fc1867a71cd90"
+dependencies = [
+ "axum-core",
+ "bytes",
+ "form_urlencoded",
+ "futures-util",
+ "http",
+ "http-body",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "itoa",
+ "matchit",
+ "memchr",
+ "mime",
+ "percent-encoding",
+ "pin-project-lite",
+ "serde_core",
+ "serde_json",
+ "serde_path_to_error",
+ "serde_urlencoded",
+ "sync_wrapper",
+ "tokio",
+ "tower",
+ "tower-layer",
+ "tower-service",
+]
+
+[[package]]
+name = "axum-core"
+version = "0.5.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08c78f31d7b1291f7ee735c1c6780ccde7785daae9a9206026862dab7d8792d1"
+dependencies = [
+ "bytes",
+ "futures-core",
+ "http",
+ "http-body",
+ "http-body-util",
+ "mime",
+ "pin-project-lite",
+ "sync_wrapper",
+ "tower-layer",
+ "tower-service",
+]
+
+[[package]]
+name = "axum-server"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1df331683d982a0b9492b38127151e6453639cd34926eb9c07d4cd8c6d22bfc"
+dependencies = [
+ "arc-swap",
+ "bytes",
+ "either",
+ "fs-err",
+ "http",
+ "http-body",
+ "hyper",
+ "hyper-util",
+ "pin-project-lite",
+ "rustls",
+ "rustls-pki-types",
+ "tokio",
+ "tokio-rustls",
+ "tower-service",
 ]
 
 [[package]]
@@ -2066,6 +2196,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e764a1d40d510daf35e07be9eb06e75770908c27d411ee6c92109c9840eaaf7"
 
 [[package]]
+name = "bit-vec"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b71798fca2c1fe1086445a7258a4bc81e6e49dcd24c8d0dd9a1e57395b603f51"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "bitcoin-io"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2155,7 +2294,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "blake3",
- "bloom-broker-api 0.1.0 (git+https://github.com/bloom-directory/bloom-broker.git?rev=5095af43ad22994cb0a0bdad07a1d7adcf2410eb)",
+ "bloom-broker-api 0.1.0 (git+https://github.com/bloom-directory/bloom-broker.git?rev=e2251a03dc11390f9b8253e369298500e502d1b7)",
  "bloom-daemon",
  "bloom-evm",
  "bloom-machine-client",
@@ -2214,9 +2353,9 @@ dependencies = [
 [[package]]
 name = "bloom-broker-api"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-broker.git?rev=5095af43ad22994cb0a0bdad07a1d7adcf2410eb#5095af43ad22994cb0a0bdad07a1d7adcf2410eb"
+source = "git+https://github.com/bloom-directory/bloom-broker.git?rev=dd2add2b9d41540521d08c77d19fb467a2d8029e#dd2add2b9d41540521d08c77d19fb467a2d8029e"
 dependencies = [
- "bloom-rpc-wire 0.1.3 (git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=ad0072512bb97fb4eb68d249ce785ea3ea4a49ab)",
+ "bloom-rpc-wire 0.1.3 (git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=5db670e1b7507deabfdcf451be8b5d315c1c9d91)",
  "serde",
  "serde_jcs",
  "sha2 0.11.0",
@@ -2225,12 +2364,48 @@ dependencies = [
 [[package]]
 name = "bloom-broker-api"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-broker.git?rev=dd2add2b9d41540521d08c77d19fb467a2d8029e#dd2add2b9d41540521d08c77d19fb467a2d8029e"
+source = "git+https://github.com/bloom-directory/bloom-broker.git?rev=e2251a03dc11390f9b8253e369298500e502d1b7#e2251a03dc11390f9b8253e369298500e502d1b7"
 dependencies = [
- "bloom-rpc-wire 0.1.3 (git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=5db670e1b7507deabfdcf451be8b5d315c1c9d91)",
+ "bloom-rpc-wire 0.1.3 (git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=ad0072512bb97fb4eb68d249ce785ea3ea4a49ab)",
  "serde",
  "serde_jcs",
  "sha2 0.11.0",
+]
+
+[[package]]
+name = "bloom-checkout"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "axum-server",
+ "base64 0.22.1",
+ "bloom-checkout-api",
+ "bloom-service-activation",
+ "bloom-signer-api",
+ "clap",
+ "hpke",
+ "libc",
+ "parking_lot",
+ "rand 0.8.6",
+ "rcgen",
+ "reqwest 0.12.28",
+ "rusqlite",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "url",
+ "zeroize",
+]
+
+[[package]]
+name = "bloom-checkout-api"
+version = "0.4.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -2242,7 +2417,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "blake3",
- "bloom-broker-api 0.1.0 (git+https://github.com/bloom-directory/bloom-broker.git?rev=5095af43ad22994cb0a0bdad07a1d7adcf2410eb)",
+ "bloom-broker-api 0.1.0 (git+https://github.com/bloom-directory/bloom-broker.git?rev=e2251a03dc11390f9b8253e369298500e502d1b7)",
  "bloom-ens",
  "bloom-etherscan",
  "bloom-evm",
@@ -2341,7 +2516,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "base64 0.22.1",
- "bloom-broker-api 0.1.0 (git+https://github.com/bloom-directory/bloom-broker.git?rev=5095af43ad22994cb0a0bdad07a1d7adcf2410eb)",
+ "bloom-broker-api 0.1.0 (git+https://github.com/bloom-directory/bloom-broker.git?rev=e2251a03dc11390f9b8253e369298500e502d1b7)",
  "bloom-daemon",
  "bloom-evm",
  "bloom-machine-client",
@@ -2372,7 +2547,7 @@ name = "bloom-machine"
 version = "0.4.0"
 dependencies = [
  "anyhow",
- "bloom-broker-api 0.1.0 (git+https://github.com/bloom-directory/bloom-broker.git?rev=5095af43ad22994cb0a0bdad07a1d7adcf2410eb)",
+ "bloom-broker-api 0.1.0 (git+https://github.com/bloom-directory/bloom-broker.git?rev=e2251a03dc11390f9b8253e369298500e502d1b7)",
  "bloom-machine-client",
  "clap",
  "hex",
@@ -2390,8 +2565,9 @@ version = "0.4.0"
 dependencies = [
  "async-trait",
  "bloom-audit-checkpoint",
- "bloom-broker-api 0.1.0 (git+https://github.com/bloom-directory/bloom-broker.git?rev=5095af43ad22994cb0a0bdad07a1d7adcf2410eb)",
  "bloom-broker-api 0.1.0 (git+https://github.com/bloom-directory/bloom-broker.git?rev=dd2add2b9d41540521d08c77d19fb467a2d8029e)",
+ "bloom-broker-api 0.1.0 (git+https://github.com/bloom-directory/bloom-broker.git?rev=e2251a03dc11390f9b8253e369298500e502d1b7)",
+ "bloom-checkout-api",
  "bloom-rpc-wire 0.1.3 (git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=ad0072512bb97fb4eb68d249ce785ea3ea4a49ab)",
  "bloom-service-observability",
  "bloom-triad-local-transport",
@@ -2531,7 +2707,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "blake3",
- "bloom-broker-api 0.1.0 (git+https://github.com/bloom-directory/bloom-broker.git?rev=5095af43ad22994cb0a0bdad07a1d7adcf2410eb)",
+ "bloom-broker-api 0.1.0 (git+https://github.com/bloom-directory/bloom-broker.git?rev=e2251a03dc11390f9b8253e369298500e502d1b7)",
  "bloom-petal-contract",
  "bloom-proto",
  "bloom-vfs",
@@ -2696,7 +2872,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer-api"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=bc88ad690757165ebf1978410ea5c7ec652215d3#bc88ad690757165ebf1978410ea5c7ec652215d3"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=97891b1b50a36054ed7ff5328a9710a618e9b9db#97891b1b50a36054ed7ff5328a9710a618e9b9db"
 dependencies = [
  "bloom-rpc-wire 0.1.3 (git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=ad0072512bb97fb4eb68d249ce785ea3ea4a49ab)",
  "ed25519-dalek",
@@ -2706,12 +2882,13 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "thiserror 2.0.18",
+ "url",
 ]
 
 [[package]]
 name = "bloom-signer-derive"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=bc88ad690757165ebf1978410ea5c7ec652215d3#bc88ad690757165ebf1978410ea5c7ec652215d3"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=97891b1b50a36054ed7ff5328a9710a618e9b9db#97891b1b50a36054ed7ff5328a9710a618e9b9db"
 dependencies = [
  "bip39",
  "ed25519-dalek",
@@ -2747,7 +2924,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "blake3",
- "bloom-broker-api 0.1.0 (git+https://github.com/bloom-directory/bloom-broker.git?rev=5095af43ad22994cb0a0bdad07a1d7adcf2410eb)",
+ "bloom-broker-api 0.1.0 (git+https://github.com/bloom-directory/bloom-broker.git?rev=e2251a03dc11390f9b8253e369298500e502d1b7)",
  "bloom-machine-client",
  "bloom-proto",
  "bloom-solana",
@@ -2821,7 +2998,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "blake3",
- "bloom-broker-api 0.1.0 (git+https://github.com/bloom-directory/bloom-broker.git?rev=5095af43ad22994cb0a0bdad07a1d7adcf2410eb)",
+ "bloom-broker-api 0.1.0 (git+https://github.com/bloom-directory/bloom-broker.git?rev=e2251a03dc11390f9b8253e369298500e502d1b7)",
  "bloom-evm",
  "bloom-machine-client",
  "bloom-mempool",
@@ -2866,7 +3043,8 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "blake3",
- "bloom-broker-api 0.1.0 (git+https://github.com/bloom-directory/bloom-broker.git?rev=5095af43ad22994cb0a0bdad07a1d7adcf2410eb)",
+ "bloom-broker-api 0.1.0 (git+https://github.com/bloom-directory/bloom-broker.git?rev=e2251a03dc11390f9b8253e369298500e502d1b7)",
+ "bloom-checkout-api",
  "bloom-ens",
  "bloom-etherscan",
  "bloom-evm",
@@ -3161,8 +3339,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6f8d983286843e49675a4b7a2d174efe136dc93a18d69130dd18198a6c167601"
 dependencies = [
  "cfg-if",
+ "cipher",
  "cpufeatures 0.3.0",
  "rand_core 0.10.1",
+]
+
+[[package]]
+name = "chacha20poly1305"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b89e1c441e926b9c82a8d023f6e1b7ae0adcfaa7d621814e4d60789bac751cb"
+dependencies = [
+ "aead",
+ "chacha20",
+ "cipher",
+ "poly1305",
 ]
 
 [[package]]
@@ -3177,6 +3368,17 @@ dependencies = [
  "serde",
  "wasm-bindgen",
  "windows-link",
+]
+
+[[package]]
+name = "cipher"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e8cf2a2c93cd704877c0858356ed03480ff301ee950b43f1cbe4573b088bfa6c"
+dependencies = [
+ "block-buffer 0.12.0",
+ "crypto-common 0.2.2",
+ "inout",
 ]
 
 [[package]]
@@ -3873,6 +4075,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "der-parser"
+version = "10.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "07da5016415d5a3c4dd39b11ed26f915f52fc4e0dc197d87908bc916e51bc1a6"
+dependencies = [
+ "asn1-rs",
+ "displaydoc",
+ "nom",
+ "num-bigint",
+ "num-traits",
+ "rusticata-macros",
+]
+
+[[package]]
 name = "deranged"
 version = "0.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4392,6 +4608,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2acce4a10f12dc2fb14a218589d4f1f62ef011b2d0cc4b3cb1bba8e94da14649"
 
 [[package]]
+name = "fallible-streaming-iterator"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
+
+[[package]]
 name = "fancy-regex"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4583,6 +4805,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
+]
+
+[[package]]
+name = "fs-err"
+version = "3.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b5c95b673b8f6f7235229ae11c5642d81b04c2e64c1e2fb417bc0cf73ca45f29"
+dependencies = [
+ "autocfg",
+ "tokio",
 ]
 
 [[package]]
@@ -4913,6 +5145,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hashlink"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ba4ff7128dee98c7dc9794b6a411377e1404dba1c97deb8d1a55297bd25d8af"
+dependencies = [
+ "hashbrown 0.14.5",
+]
+
+[[package]]
 name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5102,6 +5343,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hkdf"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4aaa26c720c68b866f2c96ef5c1264b3e6f473fe5d4ce61cd44bbe913e553018"
+dependencies = [
+ "hmac 0.13.0",
+]
+
+[[package]]
 name = "hmac"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5117,6 +5367,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6303bc9732ae41b04cb554b844a762b4115a61bfaa81e3e83050991eeb56863f"
 dependencies = [
  "digest 0.11.3",
+]
+
+[[package]]
+name = "hpke"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5324110b02044183df000f0bd7d2d7e61f1000631508627e77f63983b6fdffb"
+dependencies = [
+ "aead",
+ "chacha20poly1305",
+ "getrandom 0.4.2",
+ "hkdf",
+ "hybrid-array",
+ "rand_core 0.10.1",
+ "sha2 0.11.0",
+ "subtle",
+ "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]
@@ -5473,6 +5741,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "inout"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4250ce6452e92010fdf7268ccc5d14faa80bb12fc741938534c58f16804e03c7"
+dependencies = [
+ "hybrid-array",
+]
+
+[[package]]
 name = "instant"
 version = "0.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5741,6 +6018,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "libsqlite3-sys"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0c10584274047cb335c23d3e61bcef8e323adae7c5c8c760540f73610177fc3f"
+dependencies = [
+ "cc",
+ "pkg-config",
+ "vcpkg",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5825,6 +6113,12 @@ checksum = "d1525a2a28c7f4fa0fc98bb91ae755d1e2d1505079e05539e35bc876b5d65ae9"
 dependencies = [
  "regex-automata",
 ]
+
+[[package]]
+name = "matchit"
+version = "0.8.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "maybe-owned"
@@ -6002,7 +6296,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6158,6 +6452,15 @@ dependencies = [
  "hashbrown 0.15.5",
  "indexmap 2.14.0",
  "memchr",
+]
+
+[[package]]
+name = "oid-registry"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "12f40cff3dde1b6087cc5d5f5d4d65712f34016a03ed60e9c08dcc392736b5b7"
+dependencies = [
+ "asn1-rs",
 ]
 
 [[package]]
@@ -6435,6 +6738,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
 
 [[package]]
+name = "pem"
+version = "4.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d354a98a3d1251555de99e8fdd8afda05573c31b82f59063a7b0a29b5527f120"
+dependencies = [
+ "base64 0.23.1",
+ "serde_core",
+]
+
+[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6570,6 +6883,16 @@ name = "pkg-config"
 version = "0.3.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
+
+[[package]]
+name = "poly1305"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e2d0073b297041425c7c3df6eb4792d598a15323fe63346852b092eca02904c"
+dependencies = [
+ "cpufeatures 0.3.0",
+ "universal-hash",
+]
 
 [[package]]
 name = "portable-atomic"
@@ -7038,6 +7361,20 @@ checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
 dependencies = [
  "crossbeam-deque",
  "crossbeam-utils",
+]
+
+[[package]]
+name = "rcgen"
+version = "0.14.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8774e05a7d0de114588e6a28fe7e71694b82614ed569d86d8b389dfbc98b8ad8"
+dependencies = [
+ "pem",
+ "ring",
+ "rustls-pki-types",
+ "time",
+ "x509-parser",
+ "yasna",
 ]
 
 [[package]]
@@ -7809,6 +8146,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48fd7bd8a6377e15ad9d42a8ec25371b94ddc67abe7c8b9127bec79bebaaae18"
 
 [[package]]
+name = "rusqlite"
+version = "0.31.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b838eba278d213a8beaf485bd313fd580ca4505a00d5871caeb1457c55322cae"
+dependencies = [
+ "bitflags",
+ "fallible-iterator",
+ "fallible-streaming-iterator",
+ "hashlink 0.9.1",
+ "libsqlite3-sys",
+ "smallvec",
+]
+
+[[package]]
 name = "rust_decimal"
 version = "1.42.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7856,6 +8207,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cfcb3a22ef46e85b45de6ee7e79d063319ebb6594faafcf1c225ea92ab6e9b92"
 dependencies = [
  "semver 1.0.28",
+]
+
+[[package]]
+name = "rusticata-macros"
+version = "4.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "faf0c4a6ece9950b9abdb62b1cfcf2a68b3b67a10ba445b3bb85be2a293d0632"
+dependencies = [
+ "nom",
 ]
 
 [[package]]
@@ -8279,6 +8639,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_path_to_error"
+version = "0.1.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10a9ff822e371bb5403e391ecd83e182e0e77ba7f6fe0160b795797109d1b457"
+dependencies = [
+ "itoa",
+ "serde",
+ "serde_core",
+]
+
+[[package]]
 name = "serde_spanned"
 version = "0.6.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8565,7 +8936,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8879,6 +9250,17 @@ name = "syn"
 version = "2.0.117"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e665b8803e7b1d2a727f4023456bbbbe74da67099c585258af0ad9c5013b9b99"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "unicode-ident",
+]
+
+[[package]]
+name = "syn"
+version = "3.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8593e8e72159ed2257d083c7a454a85cbf854f37a0966d8d483aff8c8a3ebcee"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -9660,6 +10042,16 @@ name = "unicode-xid"
 version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
+
+[[package]]
+name = "universal-hash"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f4987bdc12753382e0bec4a65c50738ffaabc998b9cdd1f952fb5f39b0048a96"
+dependencies = [
+ "crypto-common 0.2.2",
+ "ctutils",
+]
 
 [[package]]
 name = "untrusted"
@@ -11035,6 +11427,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "x25519-dalek"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e7e8131a03190127fb2263afc72b322ecadae46b6ff8c6f399ff5d02f5559af6"
+dependencies = [
+ "curve25519-dalek",
+ "rand_core 0.10.1",
+ "zeroize",
+]
+
+[[package]]
 name = "x402-chain-eip155"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11075,6 +11478,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "x509-parser"
+version = "0.18.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d43b0f71ce057da06bc0851b23ee24f3f86190b07203dd8f567d0b706a185202"
+dependencies = [
+ "asn1-rs",
+ "data-encoding",
+ "der-parser",
+ "lazy_static",
+ "nom",
+ "oid-registry",
+ "ring",
+ "rusticata-macros",
+ "thiserror 2.0.18",
+ "time",
+]
+
+[[package]]
 name = "xattr"
 version = "1.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11092,7 +11513,17 @@ checksum = "8902160c4e6f2fb145dbe9d6760a75e3c9522d8bf796ed7047c85919ac7115f8"
 dependencies = [
  "arraydeque",
  "encoding_rs",
- "hashlink",
+ "hashlink 0.8.4",
+]
+
+[[package]]
+name = "yasna"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b5f6765e852b9b4dc8e2a76843e4d64d1cea8e79bcde0b6901aea8e7c7f08282"
+dependencies = [
+ "bit-vec 0.9.1",
+ "time",
 ]
 
 [[package]]

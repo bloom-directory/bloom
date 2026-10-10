@@ -1,0 +1,461 @@
+use anyhow::{Context, Result, bail};
+use parking_lot::Mutex;
+use serde_json::{Value, json};
+use std::{
+    collections::HashMap,
+    fs::File,
+    io::{Read, Write},
+    os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    os::unix::process::CommandExt,
+    path::Path,
+    process::{Child, Command, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
+use tokio::sync::oneshot;
+
+type Replies = Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>;
+
+struct ProcessorResponse {
+    session: String,
+    request: String,
+    frame: String,
+    loader: String,
+    link: String,
+}
+
+pub(crate) struct FrameContext {
+    pub session: String,
+    pub world: i64,
+    pub frame_id: String,
+    pub url: String,
+    pub parent_id: Option<String>,
+}
+
+fn tree_frames(
+    tree: &Value,
+    session: &str,
+    parent: Option<&str>,
+    frames: &mut Vec<(String, String, String, Option<String>)>,
+) {
+    if let (Some(id), Some(url)) = (tree["frame"]["id"].as_str(), tree["frame"]["url"].as_str()) {
+        if let Some(frame) = frames.iter_mut().find(|(known, _, _, _)| known == id) {
+            frame.2 = session.into();
+        } else {
+            frames.push((
+                id.into(),
+                url.into(),
+                session.into(),
+                parent.map(str::to_owned),
+            ));
+        }
+    }
+    if let Some(children) = tree["childFrames"].as_array() {
+        for child in children {
+            tree_frames(child, session, tree["frame"]["id"].as_str(), frames);
+        }
+    }
+}
+
+/// Chrome's debugging channel is inherited pipe descriptors, never a TCP port.
+pub(crate) struct Cdp {
+    processor_responses: Arc<Mutex<Vec<ProcessorResponse>>>,
+    child: Mutex<Child>,
+    writer: Mutex<File>,
+    replies: Replies,
+    iframe_sessions: Mutex<HashMap<String, String>>,
+    sequence: AtomicU64,
+}
+
+fn pipe() -> Result<(OwnedFd, OwnedFd)> {
+    let mut fds = [0; 2];
+    // Both descriptors remain private through exec except the deliberate child mapping.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let pair = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    for fd in [&pair.0, &pair.1] {
+        if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+    Ok(pair)
+}
+
+fn child_fd(fd: &OwnedFd) -> Result<OwnedFd> {
+    // Keep sources above the destination pair so dup2 cannot clobber a source.
+    let copy = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 10) };
+    if copy < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(copy) })
+}
+
+impl Cdp {
+    /// Read the already-received Stripe bootstrap, never initialize a second
+    /// Checkout Session. Bind it to this exact frame and document loader.
+    pub async fn hosted_stripe_facts(
+        &self,
+        session: &str,
+        frame: &str,
+        url: &str,
+    ) -> Result<Value> {
+        let url = url::Url::parse(url)?;
+        if url.origin().ascii_serialization() != "https://buy.stripe.com" {
+            bail!("Not a Stripe Payment Link");
+        }
+        let link = url.path().trim_start_matches('/');
+        let tree = self
+            .call(Some(session), "Page.getFrameTree", json!({}))
+            .await?;
+        let loader = tree["frameTree"]["frame"]["loaderId"]
+            .as_str()
+            .context("Missing checkout document identity")?;
+        let request = self
+            .processor_responses
+            .lock()
+            .iter()
+            .rev()
+            .find(|response| {
+                response.session == session
+                    && response.frame == frame
+                    && response.loader == loader
+                    && response.link == link
+            })
+            .map(|response| response.request.clone())
+            .context("Missing current Stripe bootstrap")?;
+        let response = self
+            .call(
+                Some(session),
+                "Network.getResponseBody",
+                json!({"requestId":request}),
+            )
+            .await?;
+        if response["base64Encoded"] == true {
+            bail!("Unsupported Stripe bootstrap encoding");
+        }
+        let page: Value = serde_json::from_str(
+            response["body"]
+                .as_str()
+                .context("Missing Stripe bootstrap body")?,
+        )?;
+        if !matches!(page["mode"].as_str(), Some("payment" | "subscription"))
+            || !page["session_id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("cs_"))
+        {
+            bail!("Unbound Stripe checkout facts");
+        }
+        Ok(
+            json!({"total_minor":page["total_summary"]["due"],"currency":page["currency"].as_str().map(str::to_uppercase),"recurring":page["mode"]=="subscription","livemode":page["livemode"]}),
+        )
+    }
+    /// Include only frames belonging to this tab, including Chromium's OOPIFs.
+    pub async fn contexts(
+        &self,
+        root_session: &str,
+        world_name: &str,
+    ) -> Result<Vec<FrameContext>> {
+        let tree = self
+            .call(Some(root_session), "Page.getFrameTree", json!({}))
+            .await?;
+        let targets = self.call(None, "Target.getTargets", json!({})).await?;
+        let infos = targets["targetInfos"]
+            .as_array()
+            .context("Missing browser targets")?;
+        self.iframe_sessions
+            .lock()
+            .retain(|id, _| infos.iter().any(|t| t["targetId"] == id.as_str()));
+        let mut frames = Vec::new();
+        tree_frames(&tree["frameTree"], root_session, None, &mut frames);
+        let mut attached = std::collections::HashSet::new();
+        loop {
+            let before = attached.len();
+            for target in infos {
+                let Some(id) = target["targetId"].as_str() else {
+                    continue;
+                };
+                let Some(parent) = target["parentId"].as_str() else {
+                    continue;
+                };
+                if target["type"] != "iframe"
+                    || attached.contains(id)
+                    || !frames.iter().any(|(known, _, _, _)| known == parent)
+                    || infos.iter().any(|t| {
+                        t["type"] == "iframe"
+                            && t["targetId"] == parent
+                            && !attached.contains(parent)
+                    })
+                {
+                    continue;
+                }
+                let cached = self.iframe_sessions.lock().get(id).cloned();
+                let session = if let Some(session) = cached {
+                    session
+                } else {
+                    let attachment = self
+                        .call(
+                            None,
+                            "Target.attachToTarget",
+                            json!({"targetId":id,"flatten":true}),
+                        )
+                        .await?;
+                    let session = attachment["sessionId"]
+                        .as_str()
+                        .context("Missing iframe session")?
+                        .to_owned();
+                    self.iframe_sessions
+                        .lock()
+                        .insert(id.to_owned(), session.clone());
+                    session
+                };
+                if let Some(frame) = frames.iter_mut().find(|(known, _, _, _)| known == id) {
+                    frame.2 = session.clone();
+                }
+                let tree = self
+                    .call(Some(&session), "Page.getFrameTree", json!({}))
+                    .await;
+                let tree = match tree {
+                    Ok(tree) => tree,
+                    Err(error) => {
+                        // A navigation can detach the cached OOPIF session while
+                        // retaining its target. Fail this observation closed and
+                        // attach anew on the caller's next observation.
+                        self.iframe_sessions.lock().remove(id);
+                        let _ = self
+                            .call(
+                                None,
+                                "Target.detachFromTarget",
+                                json!({"sessionId":session}),
+                            )
+                            .await;
+                        return Err(error);
+                    }
+                };
+                tree_frames(&tree["frameTree"], &session, Some(parent), &mut frames);
+                attached.insert(id.to_owned());
+            }
+            if attached.len() == before {
+                break;
+            }
+        }
+        let mut contexts = Vec::new();
+        for (frame_id, url, session, parent_id) in frames {
+            let isolated = self
+                .call(
+                    Some(&session),
+                    "Page.createIsolatedWorld",
+                    json!({
+                        "frameId":frame_id,"worldName":world_name,"grantUniveralAccess":false
+                    }),
+                )
+                .await?;
+            let world = isolated["executionContextId"]
+                .as_i64()
+                .context("Missing frame context")?;
+            // Frame-tree URLs may be empty while an OOPIF is already loaded.
+            // Read identity from this exact isolated document, never guess its URL.
+            let identity = self
+                .call(
+                    Some(&session),
+                    "Runtime.evaluate",
+                    json!({"contextId":world,"expression":"location.href","returnByValue":true}),
+                )
+                .await?;
+            let url = identity["result"]["value"]
+                .as_str()
+                .unwrap_or(&url)
+                .to_owned();
+            contexts.push(FrameContext {
+                session,
+                world,
+                frame_id,
+                url,
+                parent_id,
+            });
+        }
+        Ok(contexts)
+    }
+    pub fn launch(executable: &Path, profile: &Path, test_flags: &[String]) -> Result<Arc<Self>> {
+        let (command_read, command_write) = pipe()?;
+        let (event_read, event_write) = pipe()?;
+        let child_read = child_fd(&command_read)?;
+        let child_write = child_fd(&event_write)?;
+        let mut command = Command::new(executable);
+        command.args(["--headless=new","--remote-debugging-pipe","--no-first-run",
+            "--no-default-browser-check","--disable-sync","--disable-breakpad",
+            "--disable-crash-reporter","--disable-extensions","--disable-component-extensions-with-background-pages",
+            "--force-device-scale-factor=1","--window-size=1280,900",
+            "--disable-features=BackForwardCache,AutofillServerCommunication,AutofillEnableAccountWalletStorage",
+            "--password-store=basic","--disable-save-password-bubble"])
+            .arg(format!("--user-data-dir={}",profile.display()))
+            .env("XDG_CONFIG_HOME",profile.join("config"))
+            .env("XDG_CACHE_HOME",profile.join("cache"))
+            .args(test_flags).arg("about:blank")
+            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        let input = child_read.as_raw_fd();
+        let output = child_write.as_raw_fd();
+        // The child executes only dup2 before exec; no allocation or logging here.
+        unsafe {
+            command.pre_exec(move || {
+                crate::crash_protection::install()?;
+                let limit = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                if libc::setrlimit(libc::RLIMIT_CORE, &limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::dup2(input, 3) < 0 || libc::dup2(output, 4) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = command.spawn().context("Cannot launch checkout browser")?;
+        drop(child_read);
+        drop(child_write);
+        drop(command_read);
+        drop(event_write);
+        let replies: Replies = Arc::new(Mutex::new(HashMap::new()));
+        let processor_responses = Arc::new(Mutex::new(Vec::<ProcessorResponse>::new()));
+        let browser = Arc::new(Self {
+            child: Mutex::new(child),
+            writer: Mutex::new(File::from(command_write)),
+            replies: replies.clone(),
+            processor_responses: processor_responses.clone(),
+            iframe_sessions: Mutex::new(HashMap::new()),
+            sequence: AtomicU64::new(1),
+        });
+        let mut reader = File::from(event_read);
+        std::thread::Builder::new()
+            .name("checkout-cdp".into())
+            .spawn(move || {
+                let mut frame = Vec::new();
+                let mut bytes = [0; 8192];
+                while let Ok(size) = reader.read(&mut bytes) {
+                    if size == 0 {
+                        break;
+                    }
+                    for &byte in &bytes[..size] {
+                        if byte == 0 {
+                            if let Ok(value) = serde_json::from_slice::<Value>(&frame) {
+                                if value["method"] == "Network.responseReceived" {
+                                    let params = &value["params"];
+                                    if params["response"]["status"] == 200
+                                        && let Some(url) = params["response"]["url"]
+                                            .as_str()
+                                            .and_then(|url| url::Url::parse(url).ok())
+                                        && url.origin().ascii_serialization()
+                                            == "https://merchant-ui-api.stripe.com"
+                                        && url.query().is_none()
+                                        && let Some(link) = url
+                                            .path()
+                                            .strip_prefix("/payment-links/")
+                                            .filter(|link| {
+                                                !link.is_empty()
+                                                    && link.bytes().all(|b| {
+                                                        b.is_ascii_alphanumeric() || b == b'_'
+                                                    })
+                                            })
+                                        && let (
+                                            Some(session),
+                                            Some(request),
+                                            Some(frame),
+                                            Some(loader),
+                                        ) = (
+                                            value["sessionId"].as_str(),
+                                            params["requestId"].as_str(),
+                                            params["frameId"].as_str(),
+                                            params["loaderId"].as_str(),
+                                        )
+                                    {
+                                        let mut responses = processor_responses.lock();
+                                        if responses.len() == 16 {
+                                            responses.remove(0);
+                                        }
+                                        responses.push(ProcessorResponse {
+                                            session: session.into(),
+                                            request: request.into(),
+                                            frame: frame.into(),
+                                            loader: loader.into(),
+                                            link: link.into(),
+                                        });
+                                    }
+                                }
+                                if let Some(id) = value["id"].as_u64() {
+                                    if let Some(reply) = replies.lock().remove(&id) {
+                                        let _ = reply.send(value);
+                                    }
+                                }
+                            }
+                            frame.clear();
+                        } else if frame.len() < 8 * 1024 * 1024 {
+                            frame.push(byte);
+                        } else {
+                            return;
+                        }
+                    }
+                }
+                replies.lock().clear();
+            })?;
+        Ok(browser)
+    }
+
+    pub async fn call(&self, session: Option<&str>, method: &str, params: Value) -> Result<Value> {
+        let id = self.sequence.fetch_add(1, Ordering::Relaxed);
+        let (sender, receiver) = oneshot::channel();
+        self.replies.lock().insert(id, sender);
+        let mut message = json!({"id":id,"method":method,"params":params});
+        if let Some(session) = session {
+            message["sessionId"] = json!(session);
+        }
+        let mut bytes = serde_json::to_vec(&message)?;
+        bytes.push(0);
+        if self.writer.lock().write_all(&bytes).is_err() {
+            self.replies.lock().remove(&id);
+            bail!("Checkout browser disconnected");
+        }
+        let response = tokio::time::timeout(Duration::from_secs(30), receiver).await;
+        self.replies.lock().remove(&id);
+        let value = response
+            .with_context(|| format!("Checkout browser timed out during {method}"))?
+            .context("Checkout browser disconnected")?;
+        if value.get("error").is_some() {
+            bail!("Checkout browser command failed during {method}");
+        }
+        Ok(value["result"].clone())
+    }
+
+    #[cfg(test)]
+    pub fn exited(&self) -> bool {
+        self.child.lock().try_wait().unwrap().is_some()
+    }
+
+    #[cfg(test)]
+    pub async fn evaluate(&self, session: &str, expression: String) -> Result<Value> {
+        let result = self
+            .call(
+                Some(session),
+                "Runtime.evaluate",
+                json!({"expression":expression,
+            "returnByValue":true,"awaitPromise":true}),
+            )
+            .await?;
+        if result.get("exceptionDetails").is_some() {
+            bail!("Checkout document changed");
+        }
+        Ok(result["result"]["value"].clone())
+    }
+}
+
+impl Drop for Cdp {
+    fn drop(&mut self) {
+        let child = self.child.get_mut();
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}

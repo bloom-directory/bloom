@@ -21,6 +21,56 @@ use `docs/petals.md` to discover installed packages, then read that package's
 
 ## Authority and safety
 
+### Cards and online checkout
+
+When `cards/` and `checkout/` are present, shop inside Bloom's browser. Never
+ask for card number, expiry, cardholder name, or CVC in chat, shell, or VFS.
+Those go only in the human's Broker ceremony page. Do not use another browser
+tool for this checkout.
+
+- Read `cards/index.json` for card IDs, labels, brands, and last four digits.
+- Write `cards/add.json` with `operation_id` (64 hex characters), `card_id`,
+  and `label`. Read `cards/operations/<operation_id>/ceremony.json` and forward
+  its ceremony URL. The human enters and saves the card privately.
+- To delete, write `cards/delete.json` with `operation_id` and `card_id`, then
+  forward the ceremony URL in the same way.
+- Read `checkout/profile.json` for the human's saved email, name, phone and
+  billing address, and type them into ordinary checkout fields. If a value is
+  missing, ask once and save it by writing the whole profile back, for example
+  `{"email":"…","name":"…","billing_address":{"line1":"…","city":"…",
+  "region":"CA","postal_code":"94110","country":"US"}}`.
+- Write a browse request to `checkout/browse/<64-hex-slot>/in.json`; read
+  `out.json`. Reuse a slot. Results expire after five minutes. Requests use
+  `action`: `open` plus `url`, `snapshot`, `click` plus `element_ref`, `type`
+  plus `element_ref` and `text`, `select` plus `element_ref` and `value`, or
+  `back`.
+- Use fresh snapshot refs after every action. The browser rejects direct
+  card entry and recognizable payment submission through shopping controls.
+- Once checkout is ready, write `checkout/requests/<new-64-hex-id>/in.json`
+  with `card_id` and `agent_description`. That description is shown as agent
+  text, not verified purchase facts. Read `status.json`, forward its ceremony
+  URL, and wait. Shopping access stays paused through private checkout.
+- Cancellation is a write to the request's `cancel` file, only before release.
+
+The human approves website, total, currency, installments, recurring status,
+and card, then enters CVC privately; the approval also shows a screenshot of
+the merchant page so the human can check the order. Bloom fills and submits
+once. Bloom fills a saved card only into fields hosted by a known payment
+provider (Stripe, Shopify, Adyen, Braintree and others). A bank challenge, a
+site that collects the card on its own page, or an unclear total goes to the
+human's private view; its URL and screenshots never appear in VFS. A manual
+fallback releases no saved card.
+
+`filled` means fields were filled, not that payment succeeded. `paid` and
+`declined` describe what the merchant reported; Bloom has not verified the
+bank charge. `partially_filled`, `disclosure_unknown`, and `uncertain` require
+human inspection; never repeat the purchase automatically. Ask the human to
+check the merchant account or confirmation email. After private checkout
+closes, shopping resumes on a fresh tab.
+
+Protection depends on separate service principals. Root and root-equivalent
+access, including membership in the Docker group, is outside that claim.
+
 Machine exposes this VFS; Broker controls approval ceremonies and policy;
 Signer holds Bloom wallet keys and signs. Secret ceremony input belongs only
 in the Broker-hosted browser flow, never a VFS write, shell argument,

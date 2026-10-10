@@ -673,7 +673,7 @@ async fn an_identical_transfer_cannot_be_staged_again_after_dispatch() {
 /// behaves like [`spawn_node`]. Used to exercise the "broadcast RPC call
 /// fails after a successful `sign()`" window (Fix C,
 /// PLAN-SOLANA-PR-FIXES.md).
-async fn spawn_node_with_flaky_broadcast(fail_times: Arc<std::sync::atomic::AtomicU64>) -> String {
+async fn spawn_node_with_flaky_broadcast(fail_times: Arc<std::sync::atomic::AtomicI64>) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -715,12 +715,7 @@ async fn spawn_node_with_flaky_broadcast(fail_times: Arc<std::sync::atomic::Atom
                         r#"{"jsonrpc":"2.0","id":1,"result":{"context":{"slot":1},"value":{"err":null,"logs":[],"unitsConsumed":150}}}"#.to_string()
                     }
                     "sendTransaction" => {
-                        let remaining = fail_times.fetch_update(
-                            std::sync::atomic::Ordering::SeqCst,
-                            std::sync::atomic::Ordering::SeqCst,
-                            |n| n.checked_sub(1),
-                        );
-                        if remaining.is_ok_and(|n| n > 0) {
+                        if fail_times.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) > 0 {
                             r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"simulated broadcast failure"}}"#.to_string()
                         } else {
                             format!(
@@ -872,7 +867,7 @@ async fn stage_and_sign(
 
 #[tokio::test]
 async fn ambiguous_broadcast_failure_is_durable_and_not_retried() {
-    let fail_times = Arc::new(std::sync::atomic::AtomicU64::new(1));
+    let fail_times = Arc::new(std::sync::atomic::AtomicI64::new(1));
     let endpoint = spawn_node_with_flaky_broadcast(fail_times).await;
     let dir = tempfile::tempdir().unwrap();
     let outbox = SolanaOutbox::new(dir.path().join("outbox")).unwrap();
@@ -933,7 +928,7 @@ async fn ambiguous_broadcast_failure_is_durable_and_not_retried() {
 #[tokio::test]
 async fn a_durable_broadcast_attempt_is_not_cancellable() {
     // Never recovers: every `sendTransaction` call fails.
-    let fail_times = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+    let fail_times = Arc::new(std::sync::atomic::AtomicI64::new(i64::MAX));
     let endpoint = spawn_node_with_flaky_broadcast(fail_times).await;
     let dir = tempfile::tempdir().unwrap();
     let outbox = SolanaOutbox::new(dir.path().join("outbox")).unwrap();

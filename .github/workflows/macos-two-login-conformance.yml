@@ -7,56 +7,65 @@ on:
         description: Public bloom-broker ref
         required: false
         type: string
-        default: 5095af43ad22994cb0a0bdad07a1d7adcf2410eb
+        default: e2251a03dc11390f9b8253e369298500e502d1b7
       signer_ref:
         description: Public bloom-signer ref
         required: false
         type: string
-        default: bc88ad690757165ebf1978410ea5c7ec652215d3
+        default: 97891b1b50a36054ed7ff5328a9710a618e9b9db
       login_uid_a:
         description: First active GUI login UID
-        required: true
+        required: false
         type: string
+        default: auto
       login_user_a:
         description: First active GUI login name
-        required: true
+        required: false
         type: string
+        default: auto
       login_uid_b:
         description: Second active GUI login UID
-        required: true
+        required: false
         type: string
+        default: auto
       login_user_b:
         description: Second active GUI login name
-        required: true
+        required: false
         type: string
+        default: auto
   workflow_dispatch:
     inputs:
       broker_ref:
         description: Public bloom-broker ref
         required: true
-        default: 5095af43ad22994cb0a0bdad07a1d7adcf2410eb
+        default: e2251a03dc11390f9b8253e369298500e502d1b7
       signer_ref:
         description: Public bloom-signer ref
         required: true
-        default: bc88ad690757165ebf1978410ea5c7ec652215d3
+        default: 97891b1b50a36054ed7ff5328a9710a618e9b9db
       login_uid_a:
         description: First active GUI login UID
         required: true
+        default: auto
       login_user_a:
         description: First active GUI login name
         required: true
+        default: auto
       login_uid_b:
         description: Second active GUI login UID
         required: true
+        default: auto
       login_user_b:
         description: Second active GUI login name
         required: true
+        default: auto
 
 permissions:
   contents: read
 
 env:
   RUSTUP_TOOLCHAIN: 1.96.0
+  BASH_ENV: ${{ github.workspace }}/bloom/scripts/card-checkout/preserve-ci-scratch.sh
 
 jobs:
   two-login:
@@ -72,11 +81,34 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           path: bloom
+      - name: Resolve the disposable runner's active GUI identities
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if [[ "$BLOOM_W0_LOGIN_UID_A" != auto || "$BLOOM_W0_LOGIN_USER_A" != auto ||
+                "$BLOOM_W0_LOGIN_UID_B" != auto || "$BLOOM_W0_LOGIN_USER_B" != auto ]]; then
+            [[ "$BLOOM_W0_LOGIN_UID_A" != auto && "$BLOOM_W0_LOGIN_USER_A" != auto &&
+               "$BLOOM_W0_LOGIN_UID_B" != auto && "$BLOOM_W0_LOGIN_USER_B" != auto ]]
+            exit 0
+          fi
+          # Only the explicitly labelled disposable runner reaches this step.
+          # Discover existing sessions; never create accounts or fake a GUI.
+          found=0
+          while read -r login_user login_uid; do
+            [[ "$login_uid" =~ ^[0-9]+$ && "$login_uid" -ge 500 && "$login_uid" != "$(id -u)" ]] || continue
+            sudo launchctl print "gui/$login_uid" >/dev/null 2>&1 || continue
+            if [[ "$found" == 0 ]]; then suffix=A; else suffix=B; fi
+            printf 'BLOOM_W0_LOGIN_UID_%s=%s\nBLOOM_W0_LOGIN_USER_%s=%s\n' \
+              "$suffix" "$login_uid" "$suffix" "$login_user" >> "$GITHUB_ENV"
+            found=$((found + 1))
+            [[ "$found" != 2 ]] || break
+          done < <(dscl . -list /Users UniqueID | sort -nk2)
+          [[ "$found" == 2 ]] || { echo 'Disposable runner requires two existing active GUI sessions besides the runner'; exit 69; }
       - name: Reject mutable sibling refs
         shell: bash
         env:
-          BROKER_REF: ${{ inputs.broker_ref || '5095af43ad22994cb0a0bdad07a1d7adcf2410eb' }}
-          SIGNER_REF: ${{ inputs.signer_ref || 'bc88ad690757165ebf1978410ea5c7ec652215d3' }}
+          BROKER_REF: ${{ inputs.broker_ref || 'e2251a03dc11390f9b8253e369298500e502d1b7' }}
+          SIGNER_REF: ${{ inputs.signer_ref || '97891b1b50a36054ed7ff5328a9710a618e9b9db' }}
         run: |
           [[ "$BROKER_REF" =~ ^[0-9a-f]{40}$ ]]
           [[ "$SIGNER_REF" =~ ^[0-9a-f]{40}$ ]]
@@ -84,13 +116,13 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           repository: bloom-directory/bloom-broker
-          ref: ${{ inputs.broker_ref || '5095af43ad22994cb0a0bdad07a1d7adcf2410eb' }}
+          ref: ${{ inputs.broker_ref || 'e2251a03dc11390f9b8253e369298500e502d1b7' }}
           path: bloom-broker
       - name: Check out Signer
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           repository: bloom-directory/bloom-signer
-          ref: ${{ inputs.signer_ref || 'bc88ad690757165ebf1978410ea5c7ec652215d3' }}
+          ref: ${{ inputs.signer_ref || '97891b1b50a36054ed7ff5328a9710a618e9b9db' }}
           path: bloom-signer
       - name: Install Rust toolchain
         run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
@@ -128,6 +160,8 @@ jobs:
           cp "$RUNNER_TEMP/candidate-target/release/bloom-broker" \
             "$RUNNER_TEMP/baseline-staging/bin/bloom-broker"
           for name in baseline failing; do
+            cp "$RUNNER_TEMP/candidate-target/release/bloom-checkout" \
+              "$RUNNER_TEMP/$name-staging/bin/bloom-checkout"
             cp "$RUNNER_TEMP/candidate-target/release/bloom-signer" \
               "$RUNNER_TEMP/$name-staging/bin/bloom-signer"
             cp "$RUNNER_TEMP/candidate-target/release/bloom-signer-migrate" \
@@ -212,6 +246,7 @@ jobs:
         run: |
           set -Eeuo pipefail
           sudo env \
+            BASH_ENV="$BASH_ENV" RUNNER_TEMP="$RUNNER_TEMP" \
             BLOOM_RUN_MACOS_UNIX_W0=true \
             BLOOM_RELEASE_PUBLIC_KEY=/private/var/db/bloom-w0-release-key.pem \
             BLOOM_MACOS_W0_EVIDENCE_DIR="$RUNNER_TEMP/macos-two-login-evidence" \

@@ -215,8 +215,8 @@ jobs:
       github.ref_name == 'triad-architecture'
     uses: ./.github/workflows/macos-unix-conformance.yml
     with:
-      broker_ref: 5095af43ad22994cb0a0bdad07a1d7adcf2410eb
-      signer_ref: bc88ad690757165ebf1978410ea5c7ec652215d3
+      broker_ref: e2251a03dc11390f9b8253e369298500e502d1b7
+      signer_ref: 97891b1b50a36054ed7ff5328a9710a618e9b9db
 
   linux_w0_isolation:
     name: Linux W0 principal and socket isolation
@@ -231,7 +231,7 @@ jobs:
           cp packaging/triad/linux/systemd/*.socket "$unit_dir/"
           for source in packaging/triad/linux/systemd/*.service.in; do
             destination="$unit_dir/$(basename "${source%.in}")"
-            sed 's|@BLOOM_BROKER_BINARY@|/usr/bin/true|; s|@BLOOM_SIGNER_BINARY@|/usr/bin/true|' \
+            sed 's|@BLOOM_[A-Z]*_BINARY@|/usr/bin/true|' \
               "$source" > "$destination"
           done
           cp "$unit_dir/bloom-signer@.service" "$unit_dir/bloom-signer@1000.service"

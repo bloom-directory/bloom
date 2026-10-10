@@ -1,0 +1,11 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<title>Bloom private checkout</title><style>body{font:16px system-ui;margin:24px;max-width:1100px}img{max-width:100%;border:1px solid #aaa}input,button{font:inherit;padding:8px;margin:6px}</style>
+<h1>Private checkout</h1><p id="status">Waiting for checkout…</p>
+<p>Use this view for bank authentication or to finish manually. The agent cannot see this view. Check the merchant and total before paying.</p>
+<img id="screen" alt="Private checkout browser">
+<p><label>Page <select id="pages"></select></label></p>
+<form id="typing"><input id="text" type="password" autocomplete="off" placeholder="Type into the selected field"><button>Send text</button></form>
+<button data-key="Tab">Tab</button><button data-key="Enter">Enter</button><button data-key="Backspace">Backspace</button>
+<button id="finish">Close checkout and return to shopping</button>
+<p>Closing an unresolved checkout records an uncertain outcome. Check your merchant account or email before trying again.</p>
+<script src="/view.js"></script></html>

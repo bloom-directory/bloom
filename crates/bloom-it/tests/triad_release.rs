@@ -18,6 +18,101 @@ fn release_script(name: &str) -> PathBuf {
     workspace().join("packaging/triad/release").join(name)
 }
 
+struct PreservedDirectory(PathBuf);
+impl PreservedDirectory {
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+fn preserved_directory() -> PreservedDirectory {
+    PreservedDirectory(tempfile::tempdir().unwrap().keep())
+}
+
+#[test]
+fn linux_checkout_upgrade_provisions_existing_logins_and_preserves_custody() {
+    let directory = preserved_directory();
+    let root = directory.path().join("root");
+    fs::create_dir(&root).unwrap();
+    let payload = make_installer_payload(directory.path());
+    let installer = release_script("install-linux.sh");
+    let run = |uid: &str, user: &str| {
+        let output = Command::new(&installer)
+            .arg("install")
+            .arg(&root)
+            .args([uid, user])
+            .arg(&payload)
+            .env("BLOOM_ALLOW_TEST_UNCLAIMED", "true")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    run("1000", "alice");
+    run("1001", "bob");
+    for uid in ["1000", "1001"] {
+        // Simulate an enrollment predating checkout. No credential content is read.
+        let config = root.join(format!("etc/bloom/{uid}"));
+        let environment = fs::read_to_string(config.join("machine.env")).unwrap();
+        fs::write(
+            config.join("machine.env"),
+            environment
+                .lines()
+                .filter(|line| !line.starts_with("BLOOM_CHECKOUT_"))
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        fs::remove_file(config.join("checkout.env")).unwrap();
+        fs::write(
+            root.join(format!("usr/lib/sysusers.d/bloom-{uid}.conf")),
+            "# old principals only\n",
+        )
+        .unwrap();
+        fs::create_dir_all(root.join(format!("var/lib/bloom/{uid}/signer"))).unwrap();
+        fs::write(
+            root.join(format!("var/lib/bloom/{uid}/signer/custody-witness")),
+            b"unchanged custody fixture",
+        )
+        .unwrap();
+    }
+    fs::write(payload.join("SHA256SUMS"), b"checkout upgrade payload\n").unwrap();
+    run("1000", "alice");
+    for uid in ["1000", "1001"] {
+        let config = root.join(format!("etc/bloom/{uid}"));
+        let environment = fs::read_to_string(config.join("machine.env")).unwrap();
+        assert_eq!(
+            environment
+                .lines()
+                .filter(|line| line.starts_with("BLOOM_CHECKOUT_SOCKET="))
+                .count(),
+            1
+        );
+        assert!(config.join("checkout.env").is_file());
+        assert!(
+            fs::read_to_string(root.join(format!("usr/lib/sysusers.d/bloom-{uid}.conf")))
+                .unwrap()
+                .contains(&format!("bloom-checkout-{uid}"))
+        );
+        assert_eq!(
+            fs::read(root.join(format!("var/lib/bloom/{uid}/signer/custody-witness"))).unwrap(),
+            b"unchanged custody fixture"
+        );
+    }
+    // Repair stays idempotent rather than appending duplicate endpoints.
+    run("1000", "alice");
+    assert_eq!(
+        fs::read_to_string(root.join("etc/bloom/1001/machine.env"))
+            .unwrap()
+            .matches("BLOOM_CHECKOUT_UID=")
+            .count(),
+        1
+    );
+}
+
 #[test]
 fn machine_production_surfaces_exclude_legacy_wallet_secret_inputs() {
     fn visit_source_files(root: &Path, files: &mut Vec<PathBuf>) {
@@ -374,9 +469,10 @@ fn make_staging(root: &Path) -> PathBuf {
         "bloom-broker",
         "bloom-signer",
         "bloom-signer-migrate",
+        "bloom-checkout",
     ] {
         let path = staging.join("bin").join(binary);
-        let version = if binary == "bloom" {
+        let version = if binary == "bloom" || binary == "bloom-checkout" {
             env!("CARGO_PKG_VERSION")
         } else {
             "0.1.0"
@@ -428,6 +524,7 @@ fn make_installer_payload(root: &Path) -> PathBuf {
         "systemd/bloom-session@.path",
         "systemd/bloom-broker@.service.in",
         "systemd/bloom-signer@.service.in",
+        "systemd/bloom-checkout@.service.in",
         "systemd-user/bloom-session.service",
         "systemd-user/bloom-machine.service",
     ] {
@@ -1073,7 +1170,7 @@ fn triad_developer_launcher_owns_only_its_service_processes() {
     assert!(launcher.contains("trap '' INT TERM HUP"));
     assert!(
         launcher.contains(
-            "for pid in \"$machine_pid\" \"$broker_pid\" \"$signer_pid\" \"$session_pid\""
+            "for pid in \"$checkout_pid\" \"$machine_pid\" \"$broker_pid\" \"$signer_pid\" \"$session_pid\""
         )
     );
     assert!(launcher.contains("rm -f -- \"$ready_file\""));
@@ -1760,7 +1857,7 @@ fn bundle_rejects_a_service_outside_the_current_only_matrix() {
 
 #[test]
 fn linux_installer_upgrade_rotation_and_confirmed_uninstall_are_staged_safely() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = preserved_directory();
     let root = directory.path().join("root");
     fs::create_dir(&root).unwrap();
     let payload = make_installer_payload(directory.path());
@@ -1793,13 +1890,18 @@ fn linux_installer_upgrade_rotation_and_confirmed_uninstall_are_staged_safely() 
         fs::read_to_string(root.join("usr/lib/systemd/user/bloom-machine.service")).unwrap();
     assert!(machine_unit.contains("ExecStart=/usr/bin/bloom serve --mount %h/bloom"));
     let fstab = fs::read_to_string(root.join("etc/fstab")).unwrap();
-    assert!(fstab.contains(
-        "127.0.0.1:/ /home/alice/bloom nfs4 noauto,user,nosuid,nodev,noexec,actimeo=0,vers=4.1,proto=tcp,port=20000,rsize=65536,wsize=65536,timeo=10 0 0 # x-bloom.login-uid=1000"
-    ));
+    let enrollment: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("etc/bloom/enrollments/1000.json")).unwrap())
+            .unwrap();
+    let nfs_port = enrollment["nfs_port"].as_u64().unwrap();
+    assert!((20000..=60999).contains(&nfs_port));
+    assert!(fstab.contains(&format!(
+        "127.0.0.1:/ /home/alice/bloom nfs4 noauto,user,nosuid,nodev,noexec,actimeo=0,vers=4.1,proto=tcp,port={nfs_port},rsize=65536,wsize=65536,timeo=10 0 0 # x-bloom.login-uid=1000"
+    )));
     assert_eq!(
         fs::read_to_string(root.join("etc/bloom/1000/machine.env")).unwrap(),
         format!(
-            "BLOOM_NFS_LISTEN=127.0.0.1:20000\nBLOOM_RELEASE_DIGEST={}\n",
+            "BLOOM_NFS_LISTEN=127.0.0.1:{nfs_port}\nBLOOM_RELEASE_DIGEST={}\nBLOOM_CHECKOUT_SOCKET=/run/bloom/1000/checkout/rpc/checkout.sock\nBLOOM_CHECKOUT_UID=65533\n",
             release_digest
         )
     );
@@ -2270,14 +2372,18 @@ fn linux_installer_allocates_distinct_ports_and_rejects_mixed_release_sets() {
     assert_eq!(
         fs::read_to_string(root.join("etc/bloom/1000/machine.env")).unwrap(),
         format!(
-            "BLOOM_NFS_LISTEN=127.0.0.1:20000\nBLOOM_RELEASE_DIGEST={}\n",
+            "BLOOM_NFS_LISTEN=127.0.0.1:20000\nBLOOM_RELEASE_DIGEST={}\n\
+             BLOOM_CHECKOUT_SOCKET=/run/bloom/1000/checkout/rpc/checkout.sock\n\
+             BLOOM_CHECKOUT_UID=65533\n",
             release_digest
         )
     );
     assert_eq!(
         fs::read_to_string(root.join("etc/bloom/2000/machine.env")).unwrap(),
         format!(
-            "BLOOM_NFS_LISTEN=127.0.0.1:20001\nBLOOM_RELEASE_DIGEST={}\n",
+            "BLOOM_NFS_LISTEN=127.0.0.1:20001\nBLOOM_RELEASE_DIGEST={}\n\
+             BLOOM_CHECKOUT_SOCKET=/run/bloom/2000/checkout/rpc/checkout.sock\n\
+             BLOOM_CHECKOUT_UID=65533\n",
             release_digest
         )
     );
@@ -2565,6 +2671,7 @@ fn linux_installer_materializes_and_checks_service_directories_at_activation() {
             "d /run/bloom/1000/broker/control 0710 bloom-broker-1000 bloom-revoke-1000 -\n",
             "d /run/bloom/1000/signer/rpc 0710 bloom-signer-1000 bloom-broker-signer-1000 -\n",
             "d /run/bloom/1000/session 0710 1000 bloom-session-1000 -\n",
+            "d /run/bloom/1000/checkout/rpc 0710 bloom-checkout-1000 bloom-machine-checkout-1000 -\n",
         ),
     )
     .unwrap();
@@ -2578,6 +2685,8 @@ id() {
     -g:bloom-broker-1000) echo 2101 ;;
     -u:bloom-signer-1000) echo 2002 ;;
     -g:bloom-signer-1000) echo 2102 ;;
+    -u:bloom-checkout-1000) echo 2003 ;;
+    -g:bloom-checkout-1000) echo 2103 ;;
     *) return 1 ;;
   esac
 }
@@ -2587,6 +2696,8 @@ getent() {
     bloom-broker-signer-1000) echo "$2:x:2202:" ;;
     bloom-revoke-1000) echo "$2:x:2203:" ;;
     bloom-session-1000) echo "$2:x:2204:" ;;
+    bloom-machine-checkout-1000) echo "$2:x:2205:" ;;
+    bloom-broker-checkout-1000) echo "$2:x:2206:" ;;
     *) return 1 ;;
   esac
 }
@@ -2610,6 +2721,7 @@ numericize_linux_tmpfiles_ownership "$2" 1000
         "broker/control 0710 2001 2203",
         "signer/rpc 0710 2002 2202",
         "session 0710 1000 2204",
+        "checkout/rpc 0710 2003 2205",
     ] {
         assert!(config.contains(expected), "missing {expected} in {config}");
     }
@@ -4902,6 +5014,10 @@ fn linux_legacy_interrupted_upgrade_recovers_without_operator_intervention() {
     );
     assert_eq!(
         fs::read_to_string(root.join("etc/bloom/1000/machine.env")).unwrap(),
-        format!("BLOOM_NFS_LISTEN=127.0.0.1:20000\nBLOOM_RELEASE_DIGEST={new_digest}\n")
+        format!(
+            "BLOOM_CHECKOUT_SOCKET=/run/bloom/1000/checkout/rpc/checkout.sock\n\
+             BLOOM_CHECKOUT_UID=65533\n\
+             BLOOM_NFS_LISTEN=127.0.0.1:20000\nBLOOM_RELEASE_DIGEST={new_digest}\n"
+        )
     );
 }
