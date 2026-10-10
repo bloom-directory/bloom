@@ -50,12 +50,17 @@ async function approve(url,kind) {
   await page.goto(url);await page.locator('#approve').waitFor();
   if(kind==='add'){
     await page.locator('#card-number').fill('4242424242424242');
-    await page.locator('#card-month').fill('12');await page.locator('#card-year').fill('2034');
+    await page.locator('#card-expiry').fill('12/34');
     await page.locator('#card-name').fill('Bloom Synthetic Cardholder');
   }
-  if(kind==='checkout')await page.locator('#card-cvc').fill('937');
+  if(kind==='checkout'){
+    // The approval shows the merchant page as checkout captured it.
+    await page.waitForFunction(()=>{const image=document.querySelector('.order-preview img');
+      return image&&!image.closest('figure').hidden&&image.complete&&image.naturalWidth>0;},null,{timeout:10000});
+    await page.locator('#card-cvc').fill('937');
+  }
   await page.locator('#approve').click();
-  try {await page.waitForFunction(()=>/Completed\.|Approved\.|Private view authorized/.test(document.getElementById('status').textContent),null,{timeout:20000});}
+  try {await page.waitForFunction(()=>/Completed\.|Approved\.|Card saved\.|Card deleted\.|Private view authorized/.test(document.getElementById('status').textContent),null,{timeout:20000});}
   catch (_) {throw new Error(`Ceremony ${kind}: ${await page.locator('#status').innerText()}`);}
 }
 async function returnedToShopping() {
