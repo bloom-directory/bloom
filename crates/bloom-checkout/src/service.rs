@@ -239,7 +239,8 @@ impl CheckoutService {
                 let request = if let Some(discovery) = &discovery {
                     json!({"method":"prepare","operation_id":operation_id,"card_id":card_id,
                         "facts":discovery.facts,"recipient_key":recipient.as_ref().unwrap().public,
-                        "agent_description":agent_description,"challenge_url":challenge_url})
+                        "agent_description":agent_description,"challenge_url":challenge_url,
+                        "order_preview":crate::discovery::order_preview(&tab).await})
                 } else {
                     json!({"method":"manual","operation_id":operation_id,"card_id":card_id,
                         "agent_description":agent_description,"challenge_url":challenge_url})

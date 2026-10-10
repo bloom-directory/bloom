@@ -34,6 +34,90 @@ pub(crate) struct Discovery {
     pub facts_session: String,
 }
 
+/// Card number, expiry and CVC go only into documents a payment provider
+/// serves, so a look-alike shop never receives them; other pages fall back to
+/// the private view. Origins are taken from each provider's published SDK
+/// (checked 2026-10-10). The cardholder name may stay on the merchant page.
+const PROVIDER_FIELD_ORIGINS: &[&str] = &[
+    "https://js.stripe.com",
+    "https://checkout.pci.shopifyinc.com",
+    "https://assets.braintreegateway.com",
+    "https://checkoutshopper-live.adyen.com",
+    "https://checkoutshopper-live-us.adyen.com",
+    "https://checkoutshopper-live-au.adyen.com",
+    "https://checkoutshopper-live-apse.adyen.com",
+    "https://checkoutshopper-live-in.adyen.com",
+    "https://checkoutshopper-live.cdn.adyen.com",
+    "https://checkoutshopper-live-us.cdn.adyen.com",
+    "https://checkoutshopper-live-au.cdn.adyen.com",
+    "https://checkoutshopper-live-apse.cdn.adyen.com",
+    "https://checkoutshopper-live-in.cdn.adyen.com",
+    "https://js.checkout.com",
+    "https://web.squarecdn.com",
+    "https://api-static.mercadopago.com",
+    "https://js.mollie.com",
+    "https://www.paypal.com",
+    "https://api.recurly.com",
+    "https://api.eu.recurly.com",
+    "https://js.chargebee.com",
+];
+/// Provider-hosted checkout pages whose own document holds the card fields.
+const PROVIDER_PAGE_ORIGINS: &[&str] = &[
+    "https://checkout.stripe.com",
+    "https://buy.stripe.com",
+    "https://www.paypal.com",
+    "https://checkoutshopper-live.adyen.com",
+    "https://checkoutshopper-live-us.adyen.com",
+    "https://www.mercadopago.com.ar",
+    "https://www.mercadopago.com.br",
+    "https://www.mercadopago.com.mx",
+    "https://www.mercadopago.cl",
+    "https://www.mercadopago.com.co",
+    "https://www.mercadopago.com.uy",
+    "https://www.mercadopago.com.pe",
+];
+
+fn provider_hosts_card_fields(frame_origin: &str, top_origin: &str, fixture: bool) -> bool {
+    PROVIDER_FIELD_ORIGINS.contains(&frame_origin)
+        || (frame_origin == top_origin && PROVIDER_PAGE_ORIGINS.contains(&frame_origin))
+        || (fixture
+            && url::Url::parse(frame_origin)
+                .is_ok_and(|u| matches!(u.host_str(), Some("localhost" | "127.0.0.1"))))
+}
+
+/// JPEG of the merchant's checkout page for the approval page, captured before
+/// any card field is filled. None when it cannot fit in 1 MiB.
+pub(crate) async fn order_preview(tab: &PrivateTab) -> Option<String> {
+    use base64::Engine;
+    let metrics = tab
+        .cdp
+        .call(Some(&tab.session), "Page.getLayoutMetrics", json!({}))
+        .await
+        .ok()?;
+    let width = metrics["cssContentSize"]["width"].as_f64()?.min(1280.0);
+    let height = metrics["cssContentSize"]["height"].as_f64()?.min(3000.0);
+    for (quality, scale) in [(70, 1.0), (45, 0.6)] {
+        let shot = tab
+            .cdp
+            .call(
+                Some(&tab.session),
+                "Page.captureScreenshot",
+                json!({
+            "format":"jpeg","quality":quality,"captureBeyondViewport":true,
+            "clip":{"x":0,"y":0,"width":width,"height":height,"scale":scale}}),
+            )
+            .await
+            .ok()?;
+        let jpeg = base64::engine::general_purpose::STANDARD
+            .decode(shot["data"].as_str()?)
+            .ok()?;
+        if jpeg.len() <= 1 << 20 {
+            return Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(jpeg));
+        }
+    }
+    None
+}
+
 async fn evaluate(
     tab: &PrivateTab,
     session: &str,
@@ -151,6 +235,16 @@ impl Discovery {
         }
         let (facts_session, main_world, mut facts) = candidates.remove(0);
         facts.origin = top_origin.context("Missing merchant origin")?;
+        if frames.iter().any(|frame| {
+            frame.fields.iter().any(|field| field.kind != "name")
+                && !provider_hosts_card_fields(
+                    &frame.origin,
+                    &facts.origin,
+                    tab.fixture_payment_hosts,
+                )
+        }) {
+            bail!("Card fields are not hosted by a known payment provider");
+        }
         facts.payment_frame_origins = frames.iter().map(|f| f.origin.clone()).collect();
         facts.payment_frame_origins.sort();
         facts.payment_frame_origins.dedup();
@@ -299,7 +393,8 @@ mod tests {
             .await
             .unwrap();
         tokio::time::sleep(Duration::from_secs(8)).await;
-        let tab = browser.handoff().await.unwrap();
+        let mut tab = browser.handoff().await.unwrap();
+        tab.fixture_payment_hosts = false; // Real provider pages need no fixture trust.
         let discovery = Discovery::read(&tab).await.unwrap();
         assert_eq!(discovery.facts.currency, "USD");
         assert_eq!(discovery.facts.total_minor, 2000);
@@ -334,7 +429,8 @@ mod tests {
                 .await
                 .unwrap();
             tokio::time::sleep(Duration::from_secs(10)).await;
-            let tab = browser.handoff().await.unwrap();
+            let mut tab = browser.handoff().await.unwrap();
+            tab.fixture_payment_hosts = false; // Real provider pages need no fixture trust.
             let tree = tab
                 .cdp
                 .call(Some(&tab.session), "Page.getFrameTree", json!({}))
@@ -484,7 +580,8 @@ mod tests {
             .await
             .unwrap();
         tokio::time::sleep(Duration::from_secs(10)).await;
-        let tab = browser.handoff().await.unwrap();
+        let mut tab = browser.handoff().await.unwrap();
+        tab.fixture_payment_hosts = false; // Real provider pages need no fixture trust.
         let discovery = Discovery::read(&tab).await.unwrap();
         assert_eq!(discovery.facts.currency, "USD");
         assert!((100..=200).contains(&discovery.facts.total_minor));
@@ -551,11 +648,11 @@ mod tests {
             .evaluate(&tab.session, "document.readyState".into())
             .await
             .unwrap()
-            != "complete"
+            == "loading"
         {
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "fixture did not load"
+                "page was not parsed"
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
@@ -755,7 +852,8 @@ mod tests {
             .await
             .unwrap();
         tokio::time::sleep(Duration::from_secs(12)).await;
-        let tab = browser.handoff().await.unwrap();
+        let mut tab = browser.handoff().await.unwrap();
+        tab.fixture_payment_hosts = false; // Real provider pages need no fixture trust.
         let discovery = Discovery::read(&tab).await.unwrap();
         assert_eq!(discovery.facts.currency, "USD");
         assert!(discovery.facts.total_minor > 0);
@@ -828,16 +926,199 @@ mod tests {
         server.abort();
     }
 
+    /// Lines and buttons as captured from live checkouts on 2026-10-10
+    /// (Shopify de-CH, fr-CH, es-ES, pt-BR, en-US), plus formats used in
+    /// Argentina, Chile, Switzerland and the UK, and cases that stay manual.
     #[tokio::test]
-    async fn fixture_ambiguous_decimal_comma_requires_manual_review() {
+    async fn fixture_totals_in_european_and_american_formats() {
         let browser = browser().await;
-        let (url, server) = fixture(format!(
-            "<!doctype html><p>Total BRL 57,00</p>{}<button>Pay</button>",
-            inputs()
-        ))
-        .await;
-        let tab = open(&browser, url).await;
-        assert!(Discovery::read(&tab).await.is_err());
+        let lines = |lang: &str, head: &str, lines: &[&str], button: &str| {
+            let body: String = lines.iter().map(|l| format!("<div>{l}</div>")).collect();
+            format!(
+                "<!doctype html><html lang='{lang}'><head>{head}</head><body>{body}{}<button>{button}</button></body></html>",
+                inputs()
+            )
+        };
+        let cases = [
+            (
+                lines(
+                    "de-CH",
+                    "",
+                    &[
+                        "Zwischensumme",
+                        "CHF\u{a0}39.90",
+                        "Versand",
+                        "Lieferadresse eingeben",
+                        "Gesamt",
+                        "CHF\u{a0}39.90",
+                        "inkl. CHF\u{a0}2.99 MwSt",
+                    ],
+                    "Jetzt kaufen",
+                ),
+                Some((3990, "CHF")),
+            ),
+            (
+                lines(
+                    "fr-CH",
+                    "",
+                    &[
+                        "Sous-total",
+                        "39.90\u{a0}CHF",
+                        "Total",
+                        "39.90 CHF",
+                        "Taxes de 2.99 CHF incluses",
+                    ],
+                    "Payer maintenant",
+                ),
+                Some((3990, "CHF")),
+            ),
+            (
+                lines(
+                    "es-ES",
+                    "",
+                    &[
+                        "Subtotal",
+                        "14,90\u{a0}€",
+                        "Total",
+                        "EUR",
+                        "14,90\u{a0}€",
+                        "Incluye 2,59\u{a0}€ de impuestos",
+                    ],
+                    "Pagar ahora",
+                ),
+                Some((1490, "EUR")),
+            ),
+            (
+                lines(
+                    "pt-BR",
+                    "",
+                    &["Total", "BRL", "R$\u{a0}359,00"],
+                    "Pagar agora",
+                ),
+                Some((35900, "BRL")),
+            ),
+            (
+                lines(
+                    "en-US",
+                    "",
+                    &["Subtotal", "$48.00", "Total", "USD", "$48.00"],
+                    "Pay now",
+                ),
+                Some((4800, "USD")),
+            ),
+            (
+                lines("es-AR", "", &["Total", "$ 12.345,67"], "Pagar"),
+                Some((1234567, "ARS")),
+            ),
+            (
+                lines("es-CL", "", &["Total: $12.990"], "Pagar"),
+                Some((12990, "CLP")),
+            ),
+            (
+                lines(
+                    "de-CH",
+                    "",
+                    &["Total CHF 1'234.50"],
+                    "Zahlungspflichtig bestellen",
+                ),
+                Some((123450, "CHF")),
+            ),
+            (
+                lines("en-GB", "", &["Order total £4.99"], "Place order"),
+                Some((499, "GBP")),
+            ),
+            (
+                lines(
+                    "en",
+                    "<script type='application/ld+json'>{\"offers\":{\"priceCurrency\":\"USD\"}}</script>",
+                    &["Total $10.00"],
+                    "Place order",
+                ),
+                Some((1000, "USD")),
+            ),
+            (
+                lines(
+                    "en",
+                    "",
+                    &["Total savings $5.00", "Total USD $10.00"],
+                    "Pay",
+                ),
+                Some((1000, "USD")),
+            ),
+            // Decimal commas are unambiguous: grouping always has three digits.
+            (
+                lines("pt-BR", "", &["Total BRL 57,00"], "Pay"),
+                Some((5700, "BRL")),
+            ),
+            // A bare dollar with no declared currency or page region is unknown.
+            (lines("en", "", &["Total $10.00"], "Pay"), None),
+            // Three-decimal currencies make "1.234" ambiguous.
+            (lines("ar-KW", "", &["Total KWD 1.234"], "Pay"), None),
+            (lines("en", "", &["Total EUR $5.00"], "Pay"), None),
+            (
+                lines("en", "", &["Total USD 10.00", "Total USD 12.00"], "Pay"),
+                None,
+            ),
+            // An ambiguous continue button is not the final payment button.
+            (
+                lines("it", "", &["Totale", "USD", "90,00\u{a0}$"], "PROCEDI"),
+                None,
+            ),
+        ];
+        for (html, expected) in cases {
+            let (url, server) = fixture(html.clone()).await;
+            let tab = open(&browser, url).await;
+            let found = Discovery::read(&tab)
+                .await
+                .ok()
+                .map(|d| (d.facts.total_minor, d.facts.currency.clone()));
+            assert_eq!(
+                found,
+                expected.map(|(total, currency)| (total, currency.to_owned())),
+                "{html}"
+            );
+            browser.return_control().await.unwrap();
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn fixture_card_fields_outside_payment_providers_require_manual() {
+        assert!(provider_hosts_card_fields(
+            "https://js.stripe.com",
+            "https://shop.example",
+            false
+        ));
+        assert!(provider_hosts_card_fields(
+            "https://checkout.stripe.com",
+            "https://checkout.stripe.com",
+            false
+        ));
+        assert!(!provider_hosts_card_fields(
+            "https://checkout.stripe.com",
+            "https://shop.example",
+            false
+        ));
+        assert!(!provider_hosts_card_fields(
+            "https://shop.example",
+            "https://shop.example",
+            false
+        ));
+        assert!(!provider_hosts_card_fields(
+            "https://js.stripe.com.evil.example",
+            "https://shop.example",
+            false
+        ));
+        let browser = browser().await;
+        let (url, server) = fixture(merchant(&inputs(), "", "Order confirmed")).await;
+        let mut tab = open(&browser, url).await;
+        assert!(Discovery::read(&tab).await.is_ok());
+        tab.fixture_payment_hosts = false;
+        let error = Discovery::read(&tab).await.err().unwrap();
+        assert!(
+            error.to_string().contains("known payment provider"),
+            "{error}"
+        );
         browser.return_control().await.unwrap();
         server.abort();
     }
@@ -900,6 +1181,13 @@ mod tests {
         let discovery = Discovery::read(&tab).await.unwrap();
         assert_eq!(discovery.facts.payment_frame_origins.len(), 1);
         assert!(discovery.facts.payment_frame_origins[0].contains("127.0.0.1"));
+        // The approval screenshot must not disturb the bound payment frames.
+        use base64::Engine;
+        let preview = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(order_preview(&tab).await.unwrap())
+            .unwrap();
+        assert!(preview.starts_with(&[0xff, 0xd8, 0xff]) && preview.len() <= 1 << 20);
+        discovery.recheck(&tab).await.unwrap();
         let mut filled = Vec::new();
         discovery.fill(&tab, &card(), &mut filled).await.unwrap();
         assert_eq!(filled.len(), 3);

@@ -31,6 +31,7 @@ pub struct Browser {
     cdp: Arc<Cdp>,
     tab: Mutex<Tab>,
     revoked: AtomicBool,
+    fixture_payment_hosts: bool,
 }
 
 /// Private checkout access exists only after the public API has drained.
@@ -38,6 +39,8 @@ pub(crate) struct PrivateTab {
     pub cdp: Arc<Cdp>,
     pub session: String,
     pub target: String,
+    /// Local fixture merchants count as payment providers (test TLS mode only).
+    pub fixture_payment_hosts: bool,
 }
 
 impl Browser {
@@ -73,11 +76,17 @@ impl Browser {
         prefs["credentials_enable_service"] = json!(false);
         prefs["profile"]["password_manager_enabled"] = json!(false);
         std::fs::write(path, serde_json::to_vec(&prefs)?)?;
+        // Fixture TLS mode (developer harness and tests only) also accepts card
+        // fields served by local fixture merchants.
+        let fixture_payment_hosts = test_flags
+            .iter()
+            .any(|f| f == "--ignore-certificate-errors");
         let cdp = Cdp::launch(executable, profile, test_flags)?;
         let tab = new_tab(&cdp, 1).await?;
         Ok(Arc::new(Self {
             cdp,
             tab: Mutex::new(tab),
+            fixture_payment_hosts,
             revoked: AtomicBool::new(false),
         }))
     }
@@ -215,7 +224,7 @@ impl Browser {
             if(!e||!e.isConnected||e.disabled||!e.getClientRects().length)throw Error('stale');
             const kind={kind},value={value};
             const label=(e.innerText||e.value||e.getAttribute('aria-label')||'').trim();
-            if(kind==='click' && /^(pay|place order|complete purchase|submit payment|pagar)\b/i.test(label))throw Error('payment requires approval');
+            if(kind==='click' && /^(pay|place( your)? order|complete purchase|submit payment|pagar|finalizar (compra|pedido)|confirmar (compra|pedido)|realizar (el )?pedido|jetzt (kaufen|bezahlen)|(zahlungspflichtig|kostenpflichtig) bestellen|payer|(valider|finaliser|confirmer) (la |ma )?commande|paga ora|conferma (l'ordine|ordine|acquisto)|nu betalen|bestelling plaatsen|zapłać)(?![\p{{L}}\p{{N}}])/iu.test(label))throw Error('payment requires approval');
             if(kind==='click')e.click();else{{
                 if((e.autocomplete||'').split(' ').some(s=>s.startsWith('cc-')))throw Error('private payment input');
                 if(kind==='select'&&e.tagName!=='SELECT')throw Error('wrong field');
@@ -261,6 +270,7 @@ impl Browser {
             cdp: self.cdp.clone(),
             session: tab.session.clone(),
             target: tab.target.clone(),
+            fixture_payment_hosts: self.fixture_payment_hosts,
         })
     }
 

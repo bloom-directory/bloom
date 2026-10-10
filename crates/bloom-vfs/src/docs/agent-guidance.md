@@ -53,9 +53,13 @@ tool for this checkout.
 - Cancellation is a write to the request's `cancel` file, only before release.
 
 The human approves website, total, currency, installments, recurring status,
-and card, then enters CVC privately. Bloom fills and submits once. A bank
-challenge or unsupported checkout goes to the human's private view; its URL
-and screenshots never appear in VFS. A manual fallback releases no saved card.
+and card, then enters CVC privately; the approval also shows a screenshot of
+the merchant page so the human can check the order. Bloom fills and submits
+once. Bloom fills a saved card only into fields hosted by a known payment
+provider (Stripe, Shopify, Adyen, Braintree and others). A bank challenge, a
+site that collects the card on its own page, or an unclear total goes to the
+human's private view; its URL and screenshots never appear in VFS. A manual
+fallback releases no saved card.
 
 `filled` means fields were filled, not that payment succeeded. `paid` and
 `declined` describe what the merchant reported; Bloom has not verified the
