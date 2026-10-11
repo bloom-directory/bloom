@@ -23,7 +23,7 @@ use tokio::{
     sync::Mutex as AsyncMutex,
 };
 
-pub use bloom_checkout_api::{Request, Status};
+pub use bloom_checkout_api::{HistoryEntry, Request, Status};
 
 struct Store(Mutex<Connection>);
 impl Store {
@@ -45,7 +45,7 @@ impl Store {
                 .open(path)?;
         }
         let conn = Connection::open(path)?;
-        conn.execute_batch("PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS operations(id TEXT PRIMARY KEY,state TEXT NOT NULL,status TEXT NOT NULL);")?;
+        conn.execute_batch("PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS operations(id TEXT PRIMARY KEY,state TEXT NOT NULL,status TEXT NOT NULL,created INTEGER NOT NULL,kind TEXT NOT NULL,description TEXT NOT NULL,shop TEXT,total_minor INTEGER,currency TEXT);")?;
         // A lost recipient cannot be reconstructed. Interrupted disclosure is never retried.
         conn.execute("UPDATE operations SET state='disclosure_unknown',status=json_set(status,'$.state','disclosure_unknown','$.ceremony_url',NULL) WHERE state IN ('release_started','filled','submitted','partially_filled')",[])?;
         conn.execute("UPDATE operations SET state='failed_before_release',status=json_set(status,'$.state','failed_before_release','$.ceremony_url',NULL) WHERE state IN ('requested','preparing','awaiting_approval','manual_required','human_control')",[])?;
@@ -61,19 +61,59 @@ impl Store {
             .context("Unknown checkout request")?;
         Ok(serde_json::from_str(&text)?)
     }
-    fn insert(&self, status: &Status) -> Result<()> {
+    fn insert(&self, status: &Status, kind: &str, description: &str) -> Result<()> {
+        let created = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
         self.0
             .lock()
             .execute(
-                "INSERT INTO operations VALUES(?1,?2,?3)",
+                "INSERT INTO operations(id,state,status,created,kind,description) VALUES(?1,?2,?3,?4,?5,?6)",
                 params![
                     status.operation_id,
                     status.state,
-                    serde_json::to_string(status)?
+                    serde_json::to_string(status)?,
+                    created,
+                    kind,
+                    description
                 ],
             )
             .context("Checkout request already exists; use status, never retry automatically")?;
         Ok(())
+    }
+    /// The shop and, when Bloom read one, the total the human approved.
+    fn record_order(&self, id: &str, shop: Option<&str>, total: Option<(u64, &str)>) -> Result<()> {
+        self.0.lock().execute(
+            "UPDATE operations SET shop=?2,total_minor=?3,currency=?4 WHERE id=?1",
+            params![id, shop, total.map(|t| t.0), total.map(|t| t.1)],
+        )?;
+        Ok(())
+    }
+    fn history(&self) -> Result<Vec<HistoryEntry>> {
+        let conn = self.0.lock();
+        let mut query = conn.prepare(
+            "SELECT created,kind,description,shop,total_minor,currency,status FROM operations ORDER BY created DESC,rowid DESC LIMIT 50",
+        )?;
+        let rows = query.query_map([], |r| {
+            Ok((
+                HistoryEntry {
+                    created: r.get(0)?,
+                    kind: r.get(1)?,
+                    description: r.get(2)?,
+                    shop: r.get(3)?,
+                    total_minor: r.get(4)?,
+                    currency: r.get(5)?,
+                    status: None,
+                },
+                r.get::<_, String>(6)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (mut entry, status) = row?;
+            entry.status = Some(serde_json::from_str(&status)?);
+            Ok(entry)
+        })
+        .collect()
     }
     fn update(&self, status: &Status) -> Result<()> {
         self.0.lock().execute(
@@ -211,6 +251,7 @@ impl CheckoutService {
             Request::Status { operation_id } => {
                 Ok(serde_json::to_value(self.store.get(&operation_id)?)?)
             }
+            Request::History => Ok(serde_json::to_value(self.store.history()?)?),
             Request::Checkout {
                 operation_id,
                 card_id,
@@ -242,7 +283,12 @@ impl CheckoutService {
                     filled_fields: Vec::new(),
                     outcome: None,
                 };
-                self.store.insert(&status)?;
+                let kind = match mode {
+                    Mode::Card => "card",
+                    Mode::Site => "site",
+                    Mode::TakeOver => "take_over",
+                };
+                self.store.insert(&status, kind, &agent_description)?;
                 let tab = self.browser.handoff().await?;
                 status.state = "preparing".into();
                 self.store.update(&status)?;
@@ -251,6 +297,20 @@ impl CheckoutService {
                     Mode::Site => Discovery::read_site(&tab).await.ok(),
                     Mode::TakeOver => None,
                 };
+                let shop = match &discovery {
+                    Some(discovery) => Some(discovery.facts.origin.clone()),
+                    None => tab_url(&tab)
+                        .await
+                        .and_then(|url| url::Url::parse(&url).ok())
+                        .map(|url| url.origin().ascii_serialization()),
+                };
+                self.store.record_order(
+                    &operation_id,
+                    shop.as_deref(),
+                    discovery
+                        .as_ref()
+                        .map(|d| (d.facts.total_minor, d.facts.currency.as_str())),
+                )?;
                 let recipient =
                     (mode == Mode::Card && discovery.is_some()).then(Recipient::generate);
                 use rand::RngCore;
@@ -574,17 +634,7 @@ impl CheckoutService {
     }
 
     async fn page_url(checkout: &PrivateCheckout) -> Option<String> {
-        let info = checkout
-            .tab
-            .cdp
-            .call(
-                None,
-                "Target.getTargetInfo",
-                json!({"targetId":checkout.tab.target}),
-            )
-            .await
-            .ok()?;
-        info["targetInfo"]["url"].as_str().map(str::to_owned)
+        tab_url(&checkout.tab).await
     }
 
     async fn select_private_page(checkout: &mut PrivateCheckout, target: String) -> Result<()> {
@@ -860,6 +910,15 @@ impl CheckoutService {
     }
 }
 
+async fn tab_url(tab: &PrivateTab) -> Option<String> {
+    let info = tab
+        .cdp
+        .call(None, "Target.getTargetInfo", json!({"targetId":tab.target}))
+        .await
+        .ok()?;
+    info["targetInfo"]["url"].as_str().map(str::to_owned)
+}
+
 fn hex_token(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -978,7 +1037,7 @@ mod tests {
             filled_fields: Vec::new(),
             outcome: None,
         };
-        service.store.insert(&status).unwrap();
+        service.store.insert(&status, "card", "test").unwrap();
         let token = hex_token(&[42; 32]);
         *service.private.lock().await = Some(PrivateCheckout {
             operation_id: status.operation_id,
@@ -1180,7 +1239,7 @@ mod tests {
             filled_fields: Vec::new(),
             outcome: None,
         };
-        service.store.insert(&status).unwrap();
+        service.store.insert(&status, "card", "test").unwrap();
         let token = hex_token(&[44; 32]);
         *service.private.lock().await = Some(PrivateCheckout {
             operation_id: status.operation_id,
@@ -1227,7 +1286,14 @@ mod tests {
             filled_fields: Vec::new(),
             outcome: None,
         };
-        store.insert(&status).unwrap();
+        store.insert(&status, "card", "Two socks").unwrap();
+        store
+            .record_order(
+                "synthetic-operation",
+                Some("https://shop.example"),
+                Some((1250, "EUR")),
+            )
+            .unwrap();
         let workers = (0..8)
             .map(|_| {
                 let store = store.clone();
@@ -1249,6 +1315,22 @@ mod tests {
             "disclosure_unknown"
         );
         assert!(reopened.consume("synthetic-operation").is_err());
-        assert!(reopened.insert(&status).is_err());
+        assert!(reopened.insert(&status, "card", "again").is_err());
+        let history = reopened.history().unwrap();
+        assert_eq!(history.len(), 1);
+        let entry = &history[0];
+        assert_eq!(
+            (
+                entry.kind.as_str(),
+                entry.description.as_str(),
+                entry.shop.as_deref()
+            ),
+            ("card", "Two socks", Some("https://shop.example"))
+        );
+        assert_eq!(
+            (entry.total_minor, entry.currency.as_deref()),
+            (Some(1250), Some("EUR"))
+        );
+        assert_eq!(entry.status.as_ref().unwrap().state, "disclosure_unknown");
     }
 }

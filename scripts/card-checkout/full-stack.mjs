@@ -159,6 +159,9 @@ try {
   for(let i=0;i<50&&!resumed;i++){try{resumed=await browse({action:'snapshot'});}catch(_){await new Promise(r=>setTimeout(r,100));}}
   assert.equal(resumed.url,merchant+'account');assert.match(resumed.text,/Signed in/);
   await takeOverPage.close();
+  const history=await vfs('cat','/checkout/history.json');
+  assert.deepEqual(history.map(h=>[h.kind,h.status.operation_id]),[['take_over',takeOver],['site',site],['card',checkout],['card',recover],['card',manual]]);
+  assert.equal(history[1].shop,merchant.replace(/\/$/,''));assert(history[1].total_minor>0);
   const del=id();await vfs('write','/cards/delete.json',{operation_id:del,card_id:'stack-card'});
   await approve((await vfs('cat',`/cards/operations/${del}/ceremony.json`)).ceremony_url,'delete');
   await poll(`/cards/operations/${del}/status.json`,['succeeded']);assert.equal((await vfs('cat','/cards/index.json')).length,0);

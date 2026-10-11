@@ -258,6 +258,7 @@ impl Handler for CheckoutHandler {
                 Ok(Entry::dir(s.last().copied().unwrap_or("checkout")))
             }
             ["profile.json"] => Ok(Entry::writable_file("profile.json")),
+            ["history.json"] => Ok(Entry::file("history.json")),
             ["browse" | "requests", id] => {
                 operation(id)?;
                 Ok(Entry::dir(id))
@@ -284,6 +285,7 @@ impl Handler for CheckoutHandler {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(b"{}\n".to_vec()),
                 result => Ok(result?),
             },
+            ["history.json"] => safe_json(self.call(Request::History).await?),
             ["browse", id, "out.json"] => {
                 operation(id)?;
                 self.browse
@@ -379,6 +381,7 @@ impl Handler for CheckoutHandler {
         match segments.as_slice() {
             [] => Ok(vec![
                 Entry::writable_file("profile.json"),
+                Entry::file("history.json"),
                 Entry::dir("browse"),
                 Entry::dir("requests"),
             ]),

@@ -36,6 +36,25 @@ pub enum Request {
     Cancel {
         operation_id: String,
     },
+    /// The 50 most recent checkout requests, newest first.
+    History,
+}
+
+/// One checkout request as the purchase history shows it.
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HistoryEntry {
+    /// Unix seconds when the agent asked.
+    pub created: u64,
+    /// `card`, `site` or `take_over`.
+    pub kind: String,
+    pub description: String,
+    /// The shop's origin, when Bloom could read the page.
+    pub shop: Option<String>,
+    /// The total the human approved, when Bloom read one.
+    pub total_minor: Option<u64>,
+    pub currency: Option<String>,
+    pub status: Option<Status>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]

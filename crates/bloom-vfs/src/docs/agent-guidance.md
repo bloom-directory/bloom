@@ -62,6 +62,9 @@ tool for this checkout.
   Approvals use the passkey set up with the first saved card; if
   `cards/index.json` is empty, ask the human to add a card first.
 - Cancellation is a write to the request's `cancel` file, only before release.
+- Read `checkout/history.json` for the 50 latest requests: time, kind, shop,
+  approved total and final status. Check it before buying again at the same
+  shop so nothing is ordered twice.
 
 The human approves website, total, currency, installments, recurring status,
 and card, then enters CVC privately; the approval also shows a screenshot of
