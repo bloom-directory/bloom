@@ -60,6 +60,8 @@ const PROVIDER_FIELD_ORIGINS: &[&str] = &[
     "https://api.recurly.com",
     "https://api.eu.recurly.com",
     "https://js.chargebee.com",
+    // Booking.com's own payment component (seen on its final page 2026-10-11).
+    "https://paymentcomponent.booking.com",
 ];
 /// Provider-hosted checkout pages whose own document holds the card fields.
 const PROVIDER_PAGE_ORIGINS: &[&str] = &[
@@ -1068,6 +1070,43 @@ mod tests {
                     "Pay now",
                 ),
                 Some((4800, "USD")),
+            ),
+            // Final pages seen on 2026-10-11: Booking.com, Ryanair,
+            // Aerolíneas Argentinas and Zalando.
+            (
+                lines(
+                    "en-GB",
+                    "",
+                    &["Total", "CHF 37.70", "Includes taxes and fees"],
+                    "Complete\u{a0}booking",
+                ),
+                Some((3770, "CHF")),
+            ),
+            (
+                lines("en-GB", "", &["Total to pay", "SFr 24.23"], "Pay now"),
+                Some((2423, "CHF")),
+            ),
+            (
+                lines(
+                    "es-AR",
+                    "",
+                    &["Precio total final", "ARS 55.553,05"],
+                    "Comprar",
+                ),
+                Some((5555305, "ARS")),
+            ),
+            (
+                lines(
+                    "de-CH",
+                    "",
+                    &["Gesamtsummeinkl. MwSt.", "CHF 31.90"],
+                    "Jetzt kaufen",
+                ),
+                Some((3190, "CHF")),
+            ),
+            (
+                lines("en-US", "", &["Total", "USD", "$297.51"], "Confirm and pay"),
+                Some((29751, "USD")),
             ),
             (
                 lines("es-AR", "", &["Total", "$ 12.345,67"], "Pagar"),

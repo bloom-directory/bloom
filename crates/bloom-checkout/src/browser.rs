@@ -223,8 +223,8 @@ impl Browser {
             r#"(()=>{{const e=globalThis.__bloomRefs?.[{index}];
             if(!e||!e.isConnected||e.disabled||!e.getClientRects().length)throw Error('stale');
             const kind={kind},value={value};
-            const label=(e.innerText||e.value||e.getAttribute('aria-label')||'').trim();
-            if(kind==='click' && /^(pay|place( your)? order|complete purchase|submit payment|pagar|finalizar (compra|pedido)|confirmar (compra|pedido)|realizar (el )?pedido|jetzt (kaufen|bezahlen)|(zahlungspflichtig|kostenpflichtig) bestellen|payer|(valider|finaliser|confirmer) (la |ma )?commande|paga ora|conferma (l'ordine|ordine|acquisto)|nu betalen|bestelling plaatsen|zapłać)(?![\p{{L}}\p{{N}}])/iu.test(label))throw Error('payment requires approval');
+            const label=(e.innerText||e.value||e.getAttribute('aria-label')||'').replace(/\s+/g,' ').trim();
+            if(kind==='click' && /^(pay|place( your)? order|complete (purchase|booking)|confirm (and|&) pay|submit payment|buy now|request (uber|ride)|pagar|comprar ahora|finalizar (compra|pedido|reserva)|confirmar (compra|pedido|reserva)|confirmar y pagar|completar reserva|realizar (el )?pedido|jetzt (kaufen|bezahlen)|(zahlungspflichtig|kostenpflichtig) (bestellen|buchen)|buchung abschließen|payer|acheter maintenant|(valider|finaliser|confirmer) (la |ma )?(commande|réservation)|confirmer et payer|paga ora|compra ora|conferma (l'ordine|ordine|acquisto|e paga)|nu betalen|bestelling plaatsen|zapłać)(?![\p{{L}}\p{{N}}])/iu.test(label))throw Error('payment requires approval');
             if(kind==='click')e.click();else{{
                 if((e.autocomplete||'').split(' ').some(s=>s.startsWith('cc-')))throw Error('private payment input');
                 if(kind==='select'&&e.tagName!=='SELECT')throw Error('wrong field');

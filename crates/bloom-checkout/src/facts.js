@@ -4,10 +4,11 @@
   // returns null so the human finishes in the private view.
   const isoCodes = new Set(Intl.supportedValuesOf('currency'));
   const symbols = [['US$','USD'],['U$S','USD'],['USD$','USD'],['R$','BRL'],['CA$','CAD'],['C$','CAD'],['MX$','MXN'],['AR$','ARS'],
-    ['CLP$','CLP'],['COL$','COP'],['$U','UYU'],['S/.','PEN'],['S/','PEN'],['SFr.','CHF'],['Fr.','CHF'],['zł','PLN'],['€','EUR'],['£','GBP'],['$','$']];
+    ['CLP$','CLP'],['COL$','COP'],['$U','UYU'],['S/.','PEN'],['S/','PEN'],['SFr.','CHF'],['SFr','CHF'],['Fr.','CHF'],['zł','PLN'],['€','EUR'],['£','GBP'],['$','$']];
   const dollars = new Set(['USD','CAD','MXN','ARS','CLP','COP','UYU','AUD','NZD','SGD','HKD']);
-  const currencyToken = /US\$|U\$S|USD\$|R\$|CA\$|C\$|MX\$|AR\$|CLP\$|COL\$|\$U|S\/\.?|SFr\.|Fr\.|zł|[€£$]|\b[A-Z]{3}\b/gu;
-  const label = /^(montant à payer|importo totale|total a pagar|total à payer|importe total|montant total|total amount|total to pay|gesamtbetrag|totaalbedrag|grand total|order total|monto total|valor total|gesamtsumme|gesamtpreis|amount due|te betalen|do zapłaty|total due|total ttc|endbetrag|zu zahlen|totale|gesamt|totaal|total|summe|razem|suma)(?![\p{L}\p{N}])/iu;
+  const currencyToken = /US\$|U\$S|USD\$|R\$|CA\$|C\$|MX\$|AR\$|CLP\$|COL\$|\$U|S\/\.?|SFr\.?|Fr\.|zł|[€£$]|\b[A-Z]{3}\b/gu;
+  // Zalando renders "Gesamtsumme" and "inkl. MwSt." with no space between.
+  const label = /^(precio total final|montant à payer|importo totale|precio total|total a pagar|total final|gesamtsumme\s*inkl\.\s*mwst\.|total à payer|importe total|montant total|total amount|total to pay|gesamtbetrag|totaalbedrag|grand total|order total|monto total|valor total|gesamtsumme|gesamtpreis|amount due|te betalen|do zapłaty|total due|total ttc|endbetrag|zu zahlen|totale|gesamt|totaal|total|summe|razem|suma)(?![\p{L}\p{N}])/iu;
   // An amount line holds only currency marks, digits, separators and spacing.
   const amountOnly = line => !/\p{L}/u.test(line.replace(/\([^)]*\)/g, '').replace(currencyToken, ''));
   const declared = () => {
@@ -77,8 +78,9 @@
   const text = document.body.innerText;
   const controls = [...document.querySelectorAll('button,input[type=submit]')].filter(visible);
   // The one final payment button, in the main checkout languages (observed on
-  // Shopify de/fr/es/pt/it/en checkouts and common shop systems).
-  const pay = controls.filter(e => /^(pay|buy|place( your)? order|complete (order|purchase)|subscribe|pagar|comprar|finalizar (compra|pedido)|confirmar (compra|pedido)|realizar (el )?pedido|jetzt (kaufen|bezahlen)|(zahlungspflichtig|kostenpflichtig) bestellen|kaufen|bezahlen|payer|commander|(valider|finaliser|confirmer) (la |ma )?commande|paga|acquista|conferma (l'ordine|ordine|acquisto)|betalen|bestelling plaatsen|zapłać|kupuję)(?![\p{L}\p{N}])/iu.test((e.innerText || e.value).trim()));
+  // Shopify de/fr/es/pt/it/en checkouts, common shop systems, and Booking.com,
+  // Ryanair and Airbnb final pages, 2026-10-11). Labels may use non-breaking spaces.
+  const pay = controls.filter(e => /^(pay|buy|place( your)? order|complete (order|purchase|booking)|confirm (and|&) pay|subscribe|pagar|comprar|finalizar (compra|pedido|reserva)|confirmar (compra|pedido|reserva)|confirmar y pagar|completar reserva|realizar (el )?pedido|jetzt (kaufen|bezahlen)|(zahlungspflichtig|kostenpflichtig) (bestellen|buchen)|buchung abschließen|kaufen|bezahlen|payer|commander|(valider|finaliser|confirmer) (la |ma )?(commande|réservation)|confirmer et payer|paga|acquista|conferma (l'ordine|ordine|acquisto|e paga)|betalen|bestelling plaatsen|zapłać|kupuję)(?![\p{L}\p{N}])/iu.test((e.innerText || e.value).replace(/\s+/g, ' ').trim()));
   if (pay.length !== 1) return null;
   const explicit = [...document.querySelectorAll('[data-bloom-total-minor][data-bloom-currency]')].filter(visible);
   let total, currency;
