@@ -18,10 +18,17 @@ pub enum Request {
     Browse {
         request: BrowseRequest,
     },
+    /// With `card_id`, Bloom fills that saved card. Without one, Bloom clicks
+    /// the merchant's pay button and the merchant charges the payment method
+    /// saved in the buyer's account there. `take_over` instead hands the
+    /// browser to the human (a login, a code) and buys nothing.
     Checkout {
         operation_id: String,
-        card_id: String,
+        #[serde(default)]
+        card_id: Option<String>,
         agent_description: String,
+        #[serde(default)]
+        take_over: bool,
     },
     Status {
         operation_id: String,

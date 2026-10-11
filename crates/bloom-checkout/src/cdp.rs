@@ -284,6 +284,7 @@ impl Cdp {
         let (event_read, event_write) = pipe()?;
         let child_read = child_fd(&command_read)?;
         let child_write = child_fd(&event_write)?;
+        let user_agent = user_agent(executable);
         let mut command = Command::new(executable);
         command.args(["--headless=new","--remote-debugging-pipe","--no-first-run",
             "--no-default-browser-check","--disable-sync","--disable-breakpad",
@@ -292,6 +293,7 @@ impl Cdp {
             "--disable-features=BackForwardCache,AutofillServerCommunication,AutofillEnableAccountWalletStorage",
             "--password-store=basic","--disable-save-password-bubble"])
             .arg(format!("--user-data-dir={}",profile.display()))
+            .args(user_agent.map(|ua| format!("--user-agent={ua}")))
             .env("XDG_CONFIG_HOME",profile.join("config"))
             .env("XDG_CACHE_HOME",profile.join("cache"))
             .args(test_flags).arg("about:blank")
@@ -450,6 +452,43 @@ impl Cdp {
         }
         Ok(result["result"]["value"].clone())
     }
+}
+
+/// Headless Chromium says "HeadlessChrome" in every request, and many shops
+/// block that. Send the desktop Chrome string for the same major version.
+fn user_agent(executable: &Path) -> Option<String> {
+    let output = Command::new(executable)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    chrome_user_agent(&String::from_utf8(output.stdout).ok()?)
+}
+
+fn chrome_user_agent(version: &str) -> Option<String> {
+    let major: u16 = version
+        .split_whitespace()
+        .find(|word| word.contains('.'))?
+        .split('.')
+        .next()?
+        .parse()
+        .ok()?;
+    let platform = if cfg!(target_os = "macos") {
+        "Macintosh; Intel Mac OS X 10_15_7"
+    } else {
+        "X11; Linux x86_64"
+    };
+    Some(format!(
+        "Mozilla/5.0 ({platform}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36"
+    ))
+}
+
+#[test]
+fn user_agent_names_desktop_chrome() {
+    let agent = chrome_user_agent("Chromium 152.0.7977.82 Arch Linux").unwrap();
+    assert!(agent.contains(" Chrome/152.0.0.0 ") && !agent.contains("Headless"));
+    assert!(chrome_user_agent("Chromium").is_none());
 }
 
 impl Drop for Cdp {

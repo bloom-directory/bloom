@@ -48,7 +48,7 @@ impl Store {
         conn.execute_batch("PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS operations(id TEXT PRIMARY KEY,state TEXT NOT NULL,status TEXT NOT NULL);")?;
         // A lost recipient cannot be reconstructed. Interrupted disclosure is never retried.
         conn.execute("UPDATE operations SET state='disclosure_unknown',status=json_set(status,'$.state','disclosure_unknown','$.ceremony_url',NULL) WHERE state IN ('release_started','filled','submitted','partially_filled')",[])?;
-        conn.execute("UPDATE operations SET state='failed_before_release',status=json_set(status,'$.state','failed_before_release','$.ceremony_url',NULL) WHERE state IN ('requested','preparing','awaiting_approval','manual_required')",[])?;
+        conn.execute("UPDATE operations SET state='failed_before_release',status=json_set(status,'$.state','failed_before_release','$.ceremony_url',NULL) WHERE state IN ('requested','preparing','awaiting_approval','manual_required','human_control')",[])?;
         Ok(Self(Mutex::new(conn)))
     }
     fn get(&self, id: &str) -> Result<Status> {
@@ -99,8 +99,19 @@ impl Store {
     }
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    /// Fill a saved Bloom card.
+    Card,
+    /// Click the merchant's pay button; the merchant charges its saved method.
+    Site,
+    /// The human takes over the browser and hands it back; nothing is bought.
+    TakeOver,
+}
+
 struct PrivateCheckout {
     operation_id: String,
+    mode: Mode,
     tab: PrivateTab,
     discovery: Option<Discovery>,
     recipient: Option<Recipient>,
@@ -204,10 +215,19 @@ impl CheckoutService {
                 operation_id,
                 card_id,
                 agent_description,
+                take_over,
             } => {
                 OperationId::new(&operation_id)
                     .map_err(|_| anyhow::anyhow!("Invalid operation ID"))?;
-                Token::new(&card_id).map_err(|_| anyhow::anyhow!("Invalid card ID"))?;
+                if let Some(card_id) = &card_id {
+                    Token::new(card_id).map_err(|_| anyhow::anyhow!("Invalid card ID"))?;
+                }
+                let mode = match (&card_id, take_over) {
+                    (Some(_), true) => bail!("A take-over does not use a card"),
+                    (Some(_), false) => Mode::Card,
+                    (None, false) => Mode::Site,
+                    (None, true) => Mode::TakeOver,
+                };
                 if agent_description.len() > 1024 {
                     bail!("Description exceeds limit");
                 }
@@ -226,8 +246,13 @@ impl CheckoutService {
                 let tab = self.browser.handoff().await?;
                 status.state = "preparing".into();
                 self.store.update(&status)?;
-                let discovery = Discovery::read(&tab).await.ok();
-                let recipient = discovery.as_ref().map(|_| Recipient::generate());
+                let discovery = match mode {
+                    Mode::Card => Discovery::read(&tab).await.ok(),
+                    Mode::Site => Discovery::read_site(&tab).await.ok(),
+                    Mode::TakeOver => None,
+                };
+                let recipient =
+                    (mode == Mode::Card && discovery.is_some()).then(Recipient::generate);
                 use rand::RngCore;
                 let mut token = [0; 32];
                 rand::thread_rng().fill_bytes(&mut token);
@@ -236,14 +261,21 @@ impl CheckoutService {
                     "http://localhost:{}/private?token={}",
                     self.view_port, capability
                 );
-                let request = if let Some(discovery) = &discovery {
-                    json!({"method":"prepare","operation_id":operation_id,"card_id":card_id,
-                        "facts":discovery.facts,"recipient_key":recipient.as_ref().unwrap().public,
+                let request = match (&discovery, &recipient) {
+                    (Some(discovery), Some(recipient)) => {
+                        json!({"method":"prepare","operation_id":operation_id,"card_id":card_id,
+                        "facts":discovery.facts,"recipient_key":recipient.public,
                         "agent_description":agent_description,"challenge_url":challenge_url,
                         "order_preview":crate::discovery::order_preview(&tab).await})
-                } else {
-                    json!({"method":"manual","operation_id":operation_id,"card_id":card_id,
-                        "agent_description":agent_description,"challenge_url":challenge_url})
+                    }
+                    (Some(discovery), None) => {
+                        json!({"method":"site","operation_id":operation_id,
+                        "facts":discovery.facts,"agent_description":agent_description,
+                        "challenge_url":challenge_url,
+                        "order_preview":crate::discovery::order_preview(&tab).await})
+                    }
+                    _ => json!({"method":"manual","operation_id":operation_id,"card_id":card_id,
+                        "agent_description":agent_description,"challenge_url":challenge_url}),
                 };
                 match self.intake(request).await {
                     Ok(IntakeResponse::Prepared { ceremony_url }) => {
@@ -252,6 +284,7 @@ impl CheckoutService {
                         self.store.update(&status)?;
                         *private = Some(PrivateCheckout {
                             operation_id: operation_id.clone(),
+                            mode,
                             view_target: tab.target.clone(),
                             view_session: tab.session.clone(),
                             seen_pages: std::collections::HashSet::from([tab.target.clone()]),
@@ -379,10 +412,26 @@ impl CheckoutService {
         aad: Option<CustodyOutputHpkeAad>,
     ) -> Result<()> {
         let Some(discovery) = &checkout.discovery else {
-            self.set_state(&checkout.operation_id, "manual_required");
+            // Unclear payment facts leave the human to finish in the private view.
+            let state = if checkout.mode == Mode::TakeOver {
+                "human_control"
+            } else {
+                "manual_required"
+            };
+            self.set_state(&checkout.operation_id, state);
             return Ok(());
         };
         let mut status = self.store.consume(&checkout.operation_id)?; // Durable before plaintext.
+        if checkout.mode == Mode::Site {
+            // Record the submission attempt first; a lost response must not cause a second click.
+            status.state = "submitted".into();
+            self.store.update(&status)?;
+            if discovery.submit(&checkout.tab).await.is_err() {
+                status.state = "uncertain".into();
+                self.store.update(&status)?;
+            }
+            return Ok(());
+        }
         discovery.recheck(&checkout.tab).await?;
         let key = checkout
             .recipient
@@ -524,6 +573,20 @@ impl CheckoutService {
         Ok(pages)
     }
 
+    async fn page_url(checkout: &PrivateCheckout) -> Option<String> {
+        let info = checkout
+            .tab
+            .cdp
+            .call(
+                None,
+                "Target.getTargetInfo",
+                json!({"targetId":checkout.tab.target}),
+            )
+            .await
+            .ok()?;
+        info["targetInfo"]["url"].as_str().map(str::to_owned)
+    }
+
     async fn select_private_page(checkout: &mut PrivateCheckout, target: String) -> Result<()> {
         let session = if target == checkout.tab.target {
             checkout.tab.session.clone()
@@ -557,13 +620,16 @@ impl CheckoutService {
     }
 
     async fn watch_outcome(&self, id: String) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+        let started = tokio::time::Instant::now();
         loop {
             tokio::time::sleep(Duration::from_millis(500)).await;
             let mut private = self.private.lock().await;
             let Some(checkout) = private.as_ref().filter(|p| p.operation_id == id) else {
                 return;
             };
+            // A take-over may include a login with an emailed or texted code.
+            let take_over = checkout.mode == Mode::TakeOver;
+            let deadline = started + Duration::from_secs(if take_over { 900 } else { 300 });
             let Ok(mut status) = self.store.get(&id) else {
                 return;
             };
@@ -602,8 +668,13 @@ impl CheckoutService {
                 }
             }
             if tokio::time::Instant::now() >= deadline {
-                self.set_state(&id, "uncertain");
-                if self.browser.return_control().await.is_ok() {
+                self.set_state(&id, if take_over { "returned" } else { "uncertain" });
+                let resume = if take_over {
+                    Self::page_url(checkout).await
+                } else {
+                    None
+                };
+                if self.browser.return_control_at(resume).await.is_ok() {
                     if let Ok(status) = self.store.get(&id) {
                         self.retain_completed(checkout, status);
                     }
@@ -773,8 +844,14 @@ impl CheckoutService {
                 Self::select_private_page(checkout, target).await?;
             }
             ViewAction::Finish => {
-                self.set_state(&checkout.operation_id, "uncertain");
-                self.browser.return_control().await?;
+                if checkout.mode == Mode::TakeOver {
+                    self.set_state(&checkout.operation_id, "returned");
+                    let resume = Self::page_url(checkout).await;
+                    self.browser.return_control_at(resume).await?;
+                } else {
+                    self.set_state(&checkout.operation_id, "uncertain");
+                    self.browser.return_control().await?;
+                }
                 self.retain_completed(checkout, self.store.get(&checkout.operation_id)?);
                 *private = None;
             }
@@ -905,6 +982,7 @@ mod tests {
         let token = hex_token(&[42; 32]);
         *service.private.lock().await = Some(PrivateCheckout {
             operation_id: status.operation_id,
+            mode: Mode::Card,
             view_target: tab.target.clone(),
             view_session: tab.session.clone(),
             seen_pages: std::collections::HashSet::from([tab.target.clone()]),
@@ -1056,6 +1134,87 @@ mod tests {
         viewer.abort();
         fixture_task.abort();
     }
+    #[tokio::test]
+    async fn take_over_returns_shopping_on_the_page_the_human_left() {
+        use axum::{Router, response::Html, routing::get};
+        let fixture = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://127.0.0.1:{}", fixture.local_addr().unwrap().port());
+        let fixture_task = tokio::spawn(async move {
+            axum::serve(
+                fixture,
+                Router::new()
+                    .route("/", get(|| async { Html("<a href='/account'>Log in</a>") }))
+                    .route("/account", get(|| async { Html("<h1>Signed in</h1>") })),
+            )
+            .await
+            .unwrap();
+        });
+        let root = tempfile::tempdir().unwrap().keep();
+        let browser = Browser::launch(
+            &crate::test_chromium(),
+            &root.join("profile"),
+            &["--no-sandbox".into()],
+        )
+        .await
+        .unwrap();
+        browser
+            .browse(crate::browser::BrowseRequest::Open {
+                url: origin.clone(),
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let tab = browser.handoff().await.unwrap();
+        let service = CheckoutService::new(
+            browser.clone(),
+            &root.join("state.db"),
+            root.join("unused.sock"),
+            unsafe { libc::geteuid() },
+            1,
+        )
+        .unwrap();
+        let status = Status {
+            operation_id: "take-over".into(),
+            state: "human_control".into(),
+            ceremony_url: None,
+            filled_fields: Vec::new(),
+            outcome: None,
+        };
+        service.store.insert(&status).unwrap();
+        let token = hex_token(&[44; 32]);
+        *service.private.lock().await = Some(PrivateCheckout {
+            operation_id: status.operation_id,
+            mode: Mode::TakeOver,
+            view_target: tab.target.clone(),
+            view_session: tab.session.clone(),
+            seen_pages: std::collections::HashSet::from([tab.target.clone()]),
+            tab,
+            discovery: None,
+            recipient: None,
+            capability: token.clone(),
+            claimed: true,
+            approved: true,
+        });
+        service
+            .private_action(&token, ViewAction::Click { x: 20., y: 15. })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        service
+            .private_action(&token, ViewAction::Finish)
+            .await
+            .unwrap();
+        assert_eq!(service.store.get("take-over").unwrap().state, "returned");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let snapshot = browser
+            .browse(crate::browser::BrowseRequest::Snapshot)
+            .await
+            .unwrap();
+        assert_eq!(snapshot["url"], format!("{origin}/account"));
+        assert!(snapshot["text"].as_str().unwrap().contains("Signed in"));
+        fixture_task.abort();
+    }
+
     #[test]
     fn durable_consumption_has_one_winner_and_restart_preserves_uncertainty() {
         let root = tempfile::tempdir().unwrap().keep();

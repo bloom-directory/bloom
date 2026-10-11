@@ -152,9 +152,19 @@ async fn check_frame_owners(tab: &PrivateTab, owners: &[(String, String)]) -> Re
 
 impl Discovery {
     pub async fn read(tab: &PrivateTab) -> Result<Self> {
+        Self::read_retrying(tab, false).await
+    }
+
+    /// Facts and the pay button only: the merchant charges the payment method
+    /// saved in the buyer's account, so no card field is read or filled.
+    pub async fn read_site(tab: &PrivateTab) -> Result<Self> {
+        Self::read_retrying(tab, true).await
+    }
+
+    async fn read_retrying(tab: &PrivateTab, site: bool) -> Result<Self> {
         let mut last_error = None;
         for _ in 0..3 {
-            match Self::read_once(tab).await {
+            match Self::read_once(tab, site).await {
                 Ok(discovery) => return Ok(discovery),
                 Err(error) => last_error = Some(error),
             }
@@ -163,7 +173,7 @@ impl Discovery {
         Err(last_error.unwrap())
     }
 
-    async fn read_once(tab: &PrivateTab) -> Result<Self> {
+    async fn read_once(tab: &PrivateTab, site: bool) -> Result<Self> {
         let contexts = tab.cdp.contexts(&tab.session, "bloom-payment").await?;
         let mut frames = Vec::new();
         let mut candidates = Vec::new();
@@ -192,6 +202,9 @@ impl Discovery {
                 if let Ok(facts) = serde_json::from_value::<CheckoutFacts>(candidate) {
                     candidates.push((session.clone(), world, facts));
                 }
+            }
+            if site {
+                continue;
             }
             let fields = evaluate(tab, &session, world, include_str!("fields.js").into()).await?;
             let fields: Vec<Field> =
@@ -258,11 +271,12 @@ impl Discovery {
                 .filter(|f| f.kind == kind)
                 .count()
         };
-        if count("number") != 1
-            || count("cvc") != 1
-            || count("name") > 1
-            || !((count("expiry") == 1 && count("month") == 0 && count("year") == 0)
-                || (count("expiry") == 0 && count("month") == 1 && count("year") == 1))
+        if !site
+            && (count("number") != 1
+                || count("cvc") != 1
+                || count("name") > 1
+                || !((count("expiry") == 1 && count("month") == 0 && count("year") == 0)
+                    || (count("expiry") == 0 && count("month") == 1 && count("year") == 1)))
         {
             bail!("Payment fields require human review");
         }
@@ -922,6 +936,55 @@ mod tests {
         let discovery = Discovery::read(&tab).await.unwrap();
         assert_eq!(discovery.facts.total_minor, 100);
         assert_eq!(discovery.facts.currency, "USD");
+        browser.return_control().await.unwrap();
+        server.abort();
+    }
+
+    /// A logged-in merchant charging its own saved card shows no card fields.
+    #[tokio::test]
+    async fn fixture_site_checkout_reads_facts_without_card_fields_and_submits_once() {
+        let browser = browser().await;
+        let (url, server) = fixture(
+            "<!doctype html><html lang='de-CH'><p id='total'>Gesamtbetrag CHF 49.90</p>\
+             <p>Visa ••4242 (in your account)</p>\
+             <button onclick=\"document.body.innerHTML='Vielen Dank für Ihre Bestellung'\">Jetzt kaufen</button>"
+                .into(),
+        )
+        .await;
+        let tab = open(&browser, url).await;
+        assert!(Discovery::read(&tab).await.is_err());
+        let discovery = Discovery::read_site(&tab).await.unwrap();
+        assert_eq!(
+            (
+                discovery.facts.total_minor,
+                discovery.facts.currency.as_str()
+            ),
+            (4990, "CHF")
+        );
+        assert!(discovery.facts.payment_frame_origins.is_empty());
+        assert!(discovery.frames.is_empty());
+        tab.cdp
+            .evaluate(
+                &tab.session,
+                "document.getElementById('total').textContent='Gesamtbetrag CHF 59.90'".into(),
+            )
+            .await
+            .unwrap();
+        assert!(discovery.submit(&tab).await.is_err());
+        tab.cdp
+            .evaluate(
+                &tab.session,
+                "document.getElementById('total').textContent='Gesamtbetrag CHF 49.90'".into(),
+            )
+            .await
+            .unwrap();
+        discovery.submit(&tab).await.unwrap();
+        let text = tab
+            .cdp
+            .evaluate(&tab.session, "document.body.innerText".into())
+            .await
+            .unwrap();
+        assert_eq!(text, "Vielen Dank für Ihre Bestellung");
         browser.return_control().await.unwrap();
         server.abort();
     }

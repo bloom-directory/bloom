@@ -50,6 +50,17 @@ tool for this checkout.
   with `card_id` and `agent_description`. That description is shown as agent
   text, not verified purchase facts. Read `status.json`, forward its ceremony
   URL, and wait. Shopping access stays paused through private checkout.
+- If the human is logged in to the shop with a saved payment method there,
+  omit `card_id`: after approval Bloom clicks the shop's pay button once and
+  the shop charges its saved method.
+- When a login, verification code, captcha or bot check blocks you, write a
+  request with `"take_over": true` and an `agent_description` saying what the
+  human must do. Forward the ceremony URL. The human approves, works in
+  Bloom's browser, and clicks Done; `status.json` then says `returned` and
+  shopping continues on the page the human left. Logins persist in Bloom's
+  browser, so a take-over is needed once per site, not per purchase.
+  Approvals use the passkey set up with the first saved card; if
+  `cards/index.json` is empty, ask the human to add a card first.
 - Cancellation is a write to the request's `cancel` file, only before release.
 
 The human approves website, total, currency, installments, recurring status,

@@ -310,6 +310,15 @@ impl Browser {
         self.revoked.store(false, Ordering::SeqCst);
         Ok(())
     }
+
+    /// After a take-over, shopping continues on the page the human left.
+    pub(crate) async fn return_control_at(&self, url: Option<String>) -> Result<()> {
+        self.return_control().await?;
+        if let Some(url) = url.filter(|u| u.starts_with("https://") || u.starts_with("http://")) {
+            self.browse(BrowseRequest::Open { url }).await?;
+        }
+        Ok(())
+    }
 }
 
 async fn new_tab(cdp: &Cdp, generation: u64) -> Result<Tab> {
@@ -522,6 +531,14 @@ mod tests {
         let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
         assert!(snapshot["text"].as_str().unwrap().contains("Fixture shop"));
         assert!(!snapshot.to_string().contains("do-not-project-input-value"));
+        let session = browser.tab.lock().await.session.clone();
+        let agent = browser
+            .cdp
+            .evaluate(&session, "navigator.userAgent".into())
+            .await
+            .unwrap();
+        let agent = agent.as_str().unwrap();
+        assert!(agent.contains(" Chrome/") && !agent.contains("Headless"));
         let reference = snapshot["elements"]
             .as_array()
             .unwrap()

@@ -237,8 +237,11 @@ struct Address {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CheckoutInput {
-    card_id: String,
+    #[serde(default)]
+    card_id: Option<String>,
     agent_description: String,
+    #[serde(default)]
+    take_over: bool,
 }
 
 #[async_trait]
@@ -351,6 +354,7 @@ impl Handler for CheckoutHandler {
                         operation_id: (*id).into(),
                         card_id: request.card_id,
                         agent_description: request.agent_description,
+                        take_over: request.take_over,
                     })
                     .await?;
                 record(&self.root, id, &response)
