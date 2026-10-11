@@ -36,6 +36,10 @@ const server=https.createServer({key:readFileSync(join(root,'key.pem')),cert:rea
   if(new URL(request.url,'https://localhost').pathname==='/recover'){
     response.end('<h1>Recoverable fixture</h1><p data-bloom-total-minor="399" data-bloom-currency="USD">Total USD 3.99</p><form action="/done"><input autocomplete="cc-number"><input autocomplete="cc-exp"><input autocomplete="cc-csc"><input aria-label="Billing postal code" required><button type="submit">Pay</button></form>');return;
   }
+  // A logged-in shop paying with its own saved card shows no card fields.
+  if(new URL(request.url,'https://localhost').pathname==='/site'){response.end('<h1>Site fixture</h1><p>Order total USD 3.99</p><p>Visa ending 4242 saved at this shop</p><form action="/done"><button type="submit">Place order</button></form>');return;}
+  if(new URL(request.url,'https://localhost').pathname==='/login'){response.end('<a href="/account" style="display:block;width:100vw;height:100vh">Log in</a>');return;}
+  if(new URL(request.url,'https://localhost').pathname==='/account'){response.end('<h1>Signed in</h1>');return;}
   if(new URL(request.url,'https://localhost').pathname==='/done'){submits++;response.end('<h1>Order confirmed</h1><p>Order ID: FIXTURE-ONE</p><p>Total USD 3.99</p>');return;}
   response.end(`<!doctype html><h1>Digital fixture</h1><p data-bloom-total-minor="399" data-bloom-currency="USD">Total USD 3.99</p>
     <form action="/done"><input autocomplete="cc-number"><input autocomplete="cc-exp"><input autocomplete="cc-csc"><button type="submit">Pay</button></form>`);
@@ -53,14 +57,15 @@ async function approve(url,kind) {
     await page.locator('#card-expiry').fill('12/34');
     await page.locator('#card-name').fill('Bloom Synthetic Cardholder');
   }
-  if(kind==='checkout'){
+  if(kind==='checkout'||kind==='site'){
     // The approval shows the merchant page as checkout captured it.
     await page.waitForFunction(()=>{const image=document.querySelector('.order-preview img');
       return image&&!image.closest('figure').hidden&&image.complete&&image.naturalWidth>0;},null,{timeout:10000});
-    await page.locator('#card-cvc').fill('937');
+    if(kind==='checkout') await page.locator('#card-cvc').fill('937');
+    else assert(await page.locator('#card-cvc-fields').isHidden());
   }
   await page.locator('#approve').click();
-  try {await page.waitForFunction(()=>/Completed\.|Approved\.|Card saved\.|Card deleted\.|Private view authorized/.test(document.getElementById('status').textContent),null,{timeout:20000});}
+  try {await page.waitForFunction(()=>/Completed\.|Approved\.|Card saved\.|Card deleted\.|Private view authorized|browser is yours/.test(document.getElementById('status').textContent),null,{timeout:20000});}
   catch (_) {throw new Error(`Ceremony ${kind}: ${await page.locator('#status').innerText()}`);}
 }
 async function returnedToShopping() {
@@ -127,12 +132,37 @@ try {
   // ceremony slots. Keep its production five-minute admission limit intact.
   writeFileSync(output,JSON.stringify({result:'awaiting_delete_admission',submission_count:submits,transcript},null,2));
   const admissionDelay=Math.max(0,ceremoniesStartedAt+305000-Date.now());
-  console.log(`Payment paths passed; waiting ${admissionDelay}ms for a new delete ceremony slot.`);
+  console.log(`Payment paths passed; waiting ${admissionDelay}ms for new ceremony slots.`);
   await new Promise(r=>setTimeout(r,admissionDelay));
+  // The shop's saved payment method: the approved total, then one click.
+  await browse({action:'open',url:merchant+'site'});await new Promise(r=>setTimeout(r,400));
+  const site=id();await vfs('write',`/checkout/requests/${site}/in.json`,{agent_description:'Fixture order with the shop saved card'});
+  const siteAwaiting=await vfs('cat',`/checkout/requests/${site}/status.json`);assert.equal(siteAwaiting.state,'awaiting_approval');
+  await approve(siteAwaiting.ceremony_url,'site');
+  const sitePaid=await poll(`/checkout/requests/${site}/status.json`,['paid','declined','uncertain','manual_required']);
+  assert.equal(sitePaid.state,'paid');assert.deepEqual(sitePaid.filled_fields,[]);assert.equal(submits,3);
+  await returnedToShopping();
+  // Take-over: the human logs in, clicks Done, and shopping resumes there.
+  await browse({action:'open',url:merchant+'login'});await new Promise(r=>setTimeout(r,400));
+  const takeOver=id();await vfs('write',`/checkout/requests/${takeOver}/in.json`,{agent_description:'Please log in to the fixture shop',take_over:true});
+  const takeOverPagePromise=context.waitForEvent('page');
+  await approve((await vfs('cat',`/checkout/requests/${takeOver}/status.json`)).ceremony_url,'take_over');
+  const takeOverPage=await takeOverPagePromise;
+  await poll(`/checkout/requests/${takeOver}/status.json`,['human_control']);
+  await takeOverPage.locator('#screen').waitFor();
+  await takeOverPage.waitForFunction(()=>document.getElementById('finish').textContent.startsWith('Done'));
+  await takeOverPage.locator('#screen').click({position:{x:40,y:40}});
+  await new Promise(r=>setTimeout(r,500));
+  await takeOverPage.locator('#finish').click();
+  await poll(`/checkout/requests/${takeOver}/status.json`,['returned']);
+  let resumed;
+  for(let i=0;i<50&&!resumed;i++){try{resumed=await browse({action:'snapshot'});}catch(_){await new Promise(r=>setTimeout(r,100));}}
+  assert.equal(resumed.url,merchant+'account');assert.match(resumed.text,/Signed in/);
+  await takeOverPage.close();
   const del=id();await vfs('write','/cards/delete.json',{operation_id:del,card_id:'stack-card'});
   await approve((await vfs('cat',`/cards/operations/${del}/ceremony.json`)).ceremony_url,'delete');
   await poll(`/cards/operations/${del}/status.json`,['succeeded']);assert.equal((await vfs('cat','/cards/index.json')).length,0);
   const encoded=JSON.stringify(transcript);assert(!encoded.includes('4242424242424242'));assert(!encoded.includes('Bloom Synthetic Cardholder'));assert(!encoded.includes('private?token='));assert(!/"cvc"\s*:\s*"?937/.test(encoded));
-  writeFileSync(output,JSON.stringify({result:'passed',actual_broker_js:true,virtual_authenticator_prf:true,manual_fallback_without_release:true,user_completed_uncertain_checkout:true,submission_count:submits,transcript,retained_fixture_directory:root},null,2));
-  console.log('Full-stack card add, approval, fill, single submission, merchant-reported result, fresh-tab return and delete passed.');
+  writeFileSync(output,JSON.stringify({result:'passed',actual_broker_js:true,virtual_authenticator_prf:true,manual_fallback_without_release:true,site_saved_payment:true,take_over_resumed:true,user_completed_uncertain_checkout:true,submission_count:submits,transcript,retained_fixture_directory:root},null,2));
+  console.log('Full-stack card add, approval, fill, single submission, merchant-reported result, fresh-tab return, shop-saved payment, take-over and delete passed.');
 } finally {await browser.close();server.closeAllConnections();await new Promise(r=>server.close(r));}
