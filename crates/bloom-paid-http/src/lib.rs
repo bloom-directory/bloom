@@ -1040,7 +1040,7 @@ mod tests {
         assert_eq!(mixed.amount_usd, Some(0.02));
         assert_eq!(mixed.accepts[0].network.as_deref(), Some("eip155:8453"));
 
-        // v1 merchants can carry the alternatives in the body instead.
+        // Merchants can carry the alternatives in the body instead.
         headers.remove("payment-required");
         assert_eq!(normalize_challenge(&headers, &body, &url).protocol, "x402");
 
