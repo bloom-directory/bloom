@@ -178,7 +178,11 @@ async fn trades_run_only_under_the_wallet_and_account_bloom_selected() {
     }
 
     // The old unscoped paths no longer exist, and touching them runs nothing.
-    assert!(vfs.read(&mounted("trade/alice/preflight.json")).await.is_err());
+    assert!(
+        vfs.read(&mounted("trade/alice/preflight.json"))
+            .await
+            .is_err()
+    );
     assert!(
         vfs.write(&mounted("trade/alice/buy.json"), &buy("op-old"))
             .await
