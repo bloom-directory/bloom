@@ -175,10 +175,6 @@ impl WalletProjection {
     }
 }
 
-#[allow(
-    clippy::double_must_use,
-    reason = "async-trait adds must_use to methods returning boxed futures"
-)]
 #[async_trait]
 pub trait WalletProjectionReader: Send + Sync {
     async fn list_wallets(&self) -> Result<Vec<WalletProjection>, ProtocolError>;
