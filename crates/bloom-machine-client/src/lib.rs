@@ -567,6 +567,35 @@ impl MachineBrokerClient {
         }
     }
 
+    /// A completed signing operation is replay-protected by Broker, so a
+    /// retry may receive `OPERATION_ID_CONFLICT` even when the original result
+    /// was durably committed. Recover that authenticated retained result by
+    /// operation id, but only when its complete operation digest still matches
+    /// this exact request.
+    async fn sign_batch_recovering_result(
+        &self,
+        request: MachineSignRequest,
+    ) -> Result<SigningResult, ProtocolError> {
+        let expected = ExpectedSigningResult::from_request(&request);
+        match self.sign_batch(request).await {
+            Ok(result) => Ok(result),
+            Err(sign_error) => {
+                let Ok(status) = self.operation_status(expected.operation_id.clone()).await else {
+                    return Err(sign_error);
+                };
+                if status.operation_id != expected.operation_id
+                    || status.operation_digest != expected.operation_digest
+                {
+                    return Err(sign_error);
+                }
+                match status.result {
+                    Some(result) => expected.validate(result),
+                    None => Err(status.error.unwrap_or(sign_error)),
+                }
+            }
+        }
+    }
+
     /// Validate and translate a payload-bearing Petal request. Provenance is
     /// supplied independently by the trusted runner, never copied from guest
     /// fields without comparison.
@@ -1217,7 +1246,7 @@ impl MachineBrokerClient {
             }
             .digest()?;
             return self
-                .sign_batch(MachineSignRequest {
+                .sign_batch_recovering_result(MachineSignRequest {
                     operation_id: request.signing_operation_id,
                     operation_digest,
                     approval_id,
