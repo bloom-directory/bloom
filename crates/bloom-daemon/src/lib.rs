@@ -341,6 +341,29 @@ struct PetalTxOutbox {
     write_permit: Option<Arc<HomeWritePermit>>,
 }
 
+/// Review objects fail closed when malformed; older free-text advisories
+/// remain compatible. Broker validates and attributes the same display data.
+fn attributed_advisory(
+    bytes: Option<&[u8]>,
+) -> Result<Option<bloom_broker_api::AttributedAdvisory>, HostError> {
+    let Some(bytes) = bytes else {
+        return Ok(None);
+    };
+    let value = serde_json::from_slice::<serde_json::Value>(bytes).ok();
+    let declares_review = value
+        .as_ref()
+        .and_then(|value| value.get("schema"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|schema| schema.starts_with("bloom.petal.review."));
+    if !declares_review {
+        return Ok(None);
+    }
+    let advisory: bloom_broker_api::AttributedAdvisory = serde_json::from_slice(bytes)
+        .map_err(|_| HostError::Invalid("malformed Petal owner review".into()))?;
+    advisory.validated().map_err(HostError::Invalid)?;
+    Ok(Some(advisory))
+}
+
 impl DaemonPetalHost {
     /// Resolve the path-selected owner against fresh Broker membership before
     /// preparing any approval, custody ceremony, or signature. The path
@@ -964,6 +987,9 @@ impl DaemonPetalHost {
             .map_err(|error| HostError::Invalid(error.to_string()))?;
         let prepared = broker
             .prepare_approval(bloom_broker_api::ApprovalPrepareRequest {
+                attributed_advisory: None,
+                evm_review_payloads: Vec::new(),
+                requested_review_mode: None,
                 operation_id,
                 terms,
                 canonical_plan_facts_digest: plan_digest,
@@ -2068,7 +2094,8 @@ impl PetalHost for DaemonPetalHost {
                 HostError::Backend("installer provenance catalog is not configured".into())
             })?;
             let signer = BrokerExactPayloadSigner::new(broker.clone(), catalog)
-                .with_account_key(account_key.clone());
+                .with_account_key(account_key.clone())
+                .with_attributed_advisory(attributed_advisory(req.advisory.as_deref())?);
             let _guard = self.petal_signing_lock.lock().await;
             let outcome = signer
                 .sign_or_prepare_petal(
@@ -2407,8 +2434,9 @@ impl PetalHost for DaemonPetalHost {
         let catalog = self.provenance_catalog.clone().ok_or_else(|| {
             HostError::Backend("installer provenance catalog is not configured".into())
         })?;
-        let signer =
-            BrokerExactPayloadSigner::new(broker.clone(), catalog).with_account_key(account_key);
+        let signer = BrokerExactPayloadSigner::new(broker.clone(), catalog)
+            .with_account_key(account_key)
+            .with_attributed_advisory(attributed_advisory(req.advisory.as_deref())?);
         let _guard = self.petal_signing_lock.lock().await;
         let outcome = if req.selector == bloom_broker_api::PetalSignSelector::Reusable {
             signer
@@ -5659,6 +5687,36 @@ mod tests {
     use bloom_vfs::handler::Entry;
     use bloom_vfs::handler::Handler;
 
+    #[test]
+    fn owner_review_is_forwarded_and_malformed_review_is_refused() {
+        let review = attributed_advisory(Some(
+            br#"{"schema":"bloom.petal.review.v1","items":["Buy on Pump.fun","Minimum received: 100 tokens"]}"#,
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            review.items,
+            ["Buy on Pump.fun", "Minimum received: 100 tokens"]
+        );
+        for invalid in [
+            &br#"{"schema":"bloom.petal.review.v1","items":[]}"#[..],
+            br#"{"schema":"bloom.petal.review.v1","items":["Buy"],"verified":true}"#,
+            br#"{"schema":"bloom.petal.review.v2","items":["Buy"]}"#,
+            br#"{"schema":"bloom.petal.review.v1","items":["Buy\nSell"]}"#,
+        ] {
+            assert!(matches!(
+                attributed_advisory(Some(invalid)),
+                Err(HostError::Invalid(_))
+            ));
+        }
+        assert!(attributed_advisory(None).unwrap().is_none());
+        assert!(
+            attributed_advisory(Some(b"Legacy withdrawal note"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
     #[cfg(feature = "mount")]
     #[test]
     fn mount_uses_the_configured_nfs_listener() {
@@ -6830,11 +6888,28 @@ mod tests {
             claim_assurance_evidence: None,
             approval_hint: None,
             action: Some(b"two exact orders".to_vec()),
-            advisory: None,
+            advisory: Some(
+                br#"{"schema":"bloom.petal.review.v1","items":["Two app orders"]}"#.to_vec(),
+            ),
             selector: bloom_broker_api::PetalSignSelector::Exact,
             key_ref: None,
             context: Some(context),
         };
+
+        let mut malformed = request.clone();
+        malformed.advisory = Some(br#"{"schema":"bloom.petal.review.v1","items":[]}"#.to_vec());
+        assert!(matches!(
+            host.sign_payload_batch_outcome(malformed).await,
+            Err(HostError::Invalid(_))
+        ));
+        assert!(
+            !broker
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| matches!(request, MachineBrokerRequest::SealedApprovalPrepare(_)))
+        );
 
         let PayloadBatchSignOutcome::ApprovalPending(pending) = host
             .sign_payload_batch_outcome(request.clone())
@@ -6876,6 +6951,17 @@ mod tests {
         };
         assert_eq!(signatures, vec![vec![0x40; 65], vec![0x41; 65]]);
         let requests = broker.requests.lock().unwrap();
+        let prepared = requests
+            .iter()
+            .find_map(|request| match request {
+                MachineBrokerRequest::SealedApprovalPrepare(request) => Some(request),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            prepared.attributed_advisory.as_ref().unwrap().items,
+            ["Two app orders"]
+        );
         let signed = requests.iter().find_map(|request| match request {
             MachineBrokerRequest::SigningSignBatch(request) => Some(request),
             _ => None,
@@ -8239,6 +8325,7 @@ ws_url = "wss://example.invalid"
 
         fn policy(&self) -> bloom_broker_api::SignedPolicySnapshot {
             let canonical = serde_json::to_vec(&bloom_broker_api::CanonicalWalletPolicy {
+                clear_signing: None,
                 wallet_id: bloom_broker_api::Token::new("w").unwrap(),
                 maximum_approval_lifetime_ms: 3_600_000,
                 allowed_petal_packages: Vec::new(),

@@ -74,6 +74,7 @@ pub struct BrokerExactPayloadSigner {
     broker: MachineBrokerClient,
     provenance_catalog: ProvenanceCatalog,
     account_key_ref: Option<bloom_broker_api::KeyRef>,
+    attributed_advisory: Option<bloom_broker_api::AttributedAdvisory>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -256,11 +257,22 @@ impl BrokerExactPayloadSigner {
             broker,
             provenance_catalog,
             account_key_ref: None,
+            attributed_advisory: None,
         }
     }
 
     pub fn with_account_key(mut self, key: Option<bloom_broker_api::KeyRef>) -> Self {
         self.account_key_ref = key;
+        self
+    }
+
+    /// App-attributed presentation for the approval being prepared. This does
+    /// not add payload constraints to a reusable approval.
+    pub fn with_attributed_advisory(
+        mut self,
+        advisory: Option<bloom_broker_api::AttributedAdvisory>,
+    ) -> Self {
+        self.attributed_advisory = advisory;
         self
     }
 
@@ -503,6 +515,7 @@ impl BrokerExactPayloadSigner {
             .transpose()?
             .unwrap_or_default();
         let mut request = ExactPayloadSignRequest {
+            attributed_advisory: self.attributed_advisory.clone(),
             wallet_id,
             preimage: preimage.to_vec(),
             claimed_hash,
@@ -883,6 +896,7 @@ impl BrokerExactPayloadSigner {
             write_state(&attempt_path, attempt)?;
         }
         let request = ExactPayloadBatchSignRequest {
+            attributed_advisory: self.attributed_advisory.clone(),
             wallet_id,
             preimages: preimages.to_vec(),
             claimed_hashes: claimed_hashes.to_vec(),
@@ -1067,6 +1081,7 @@ impl BrokerExactPayloadSigner {
         }
         write_state(state_path, &state)?;
         let mut request = ExactPayloadBatchSignRequest {
+            attributed_advisory: self.attributed_advisory.clone(),
             wallet_id,
             preimages: preimages.to_vec(),
             claimed_hashes: claimed_hashes.to_vec(),
