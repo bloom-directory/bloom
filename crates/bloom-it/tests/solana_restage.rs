@@ -65,6 +65,7 @@ struct SolanaBroker {
 impl SolanaBroker {
     fn policy(&self, wallet_id: Token) -> SignedPolicySnapshot {
         let canonical = serde_json::to_vec(&CanonicalWalletPolicy {
+            clear_signing: None,
             wallet_id: wallet_id.clone(),
             maximum_approval_lifetime_ms: 3_600_000,
             allowed_petal_packages: Vec::new(),

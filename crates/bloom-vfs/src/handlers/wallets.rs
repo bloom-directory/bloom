@@ -4107,6 +4107,7 @@ mod tests {
             derivation: None,
         };
         let canonical = serde_jcs::to_vec(&CanonicalWalletPolicy {
+            clear_signing: None,
             wallet_id: wallet_id.clone(),
             maximum_approval_lifetime_ms: 300_000,
             allowed_petal_packages: Vec::new(),
@@ -4187,6 +4188,7 @@ mod tests {
             }),
         };
         let canonical = serde_jcs::to_vec(&CanonicalWalletPolicy {
+            clear_signing: None,
             wallet_id: wallet_id.clone(),
             maximum_approval_lifetime_ms: 300_000,
             allowed_petal_packages: Vec::new(),
@@ -7396,6 +7398,9 @@ value = "0""#,
             .handler
             .with_broker(Some(MachineBrokerClient::new(broker.clone())));
         let request = ApprovalPrepareRequest {
+            attributed_advisory: None,
+            evm_review_payloads: Vec::new(),
+            requested_review_mode: None,
             operation_id: OperationId::from_bytes([30; 32]),
             terms: approval_terms("alice", None),
             canonical_plan_facts_digest: digest(31),
@@ -7442,6 +7447,9 @@ value = "0""#,
                 .handler
                 .with_broker(Some(MachineBrokerClient::new(broker.clone())));
             let request = ApprovalPrepareRequest {
+                attributed_advisory: None,
+                evm_review_payloads: Vec::new(),
+                requested_review_mode: None,
                 operation_id: OperationId::from_bytes([30; 32]),
                 terms: approval_terms("alice", None),
                 canonical_plan_facts_digest: digest(31),
@@ -7473,6 +7481,9 @@ value = "0""#,
             .handler
             .with_broker(Some(MachineBrokerClient::new(broker.clone())));
         let request = ApprovalPrepareRequest {
+            attributed_advisory: None,
+            evm_review_payloads: Vec::new(),
+            requested_review_mode: None,
             operation_id: OperationId::from_bytes([30; 32]),
             terms: approval_terms("alice", None),
             canonical_plan_facts_digest: digest(31),
@@ -7503,6 +7514,9 @@ value = "0""#,
             .handler
             .with_broker(Some(MachineBrokerClient::new(broker)));
         let request = ApprovalPrepareRequest {
+            attributed_advisory: None,
+            evm_review_payloads: Vec::new(),
+            requested_review_mode: None,
             operation_id: OperationId::from_bytes([30; 32]),
             terms: approval_terms("alice", None),
             canonical_plan_facts_digest: digest(31),

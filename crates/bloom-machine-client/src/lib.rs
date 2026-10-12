@@ -956,6 +956,18 @@ impl MachineBrokerClient {
         };
         terms.validate()?;
         self.prepare_approval(ApprovalPrepareRequest {
+            attributed_advisory: request.attributed_advisory,
+            evm_review_payloads: if matches!(
+                &terms.subject,
+                ApprovalSubject::Cli { command_class, .. }
+                    | ApprovalSubject::System { operation_class: command_class, .. }
+                    if matches!(command_class.as_str(), "transaction.confirm" | "transaction.replace" | "transaction.cancel")
+            ) {
+                vec![Base64UrlBytes::from_bytes(&request.preimage)]
+            } else {
+                Vec::new()
+            },
+            requested_review_mode: None,
             operation_id: request.approval_operation_id,
             terms,
             canonical_plan_facts_digest: request.canonical_plan_facts_digest,
@@ -1127,6 +1139,9 @@ impl MachineBrokerClient {
         };
         terms.validate()?;
         self.prepare_approval(ApprovalPrepareRequest {
+            attributed_advisory: request.attributed_advisory,
+            evm_review_payloads: Vec::new(),
+            requested_review_mode: None,
             operation_id: request.approval_operation_id,
             terms,
             canonical_plan_facts_digest: request.canonical_plan_facts_digest,
@@ -1281,6 +1296,9 @@ impl MachineBrokerClient {
         };
         terms.validate()?;
         self.prepare_approval(ApprovalPrepareRequest {
+            attributed_advisory: request.attributed_advisory,
+            evm_review_payloads: Vec::new(),
+            requested_review_mode: None,
             operation_id: request.approval_operation_id,
             terms,
             canonical_plan_facts_digest: request.canonical_plan_facts_digest,
@@ -1958,6 +1976,7 @@ pub struct TrustedPetalSignRequest {
 
 #[derive(Clone, Debug)]
 pub struct ExactPayloadSignRequest {
+    pub attributed_advisory: Option<bloom_broker_api::AttributedAdvisory>,
     pub wallet_id: Token,
     pub preimage: Vec<u8>,
     pub claimed_hash: Digest32,
@@ -1989,6 +2008,7 @@ pub struct ExactPayloadSignRequest {
 
 #[derive(Clone, Debug)]
 pub struct ExactPayloadBatchSignRequest {
+    pub attributed_advisory: Option<bloom_broker_api::AttributedAdvisory>,
     pub wallet_id: Token,
     pub preimages: Vec<Vec<u8>>,
     pub claimed_hashes: Vec<Digest32>,
@@ -3089,6 +3109,7 @@ mod tests {
     #[test]
     fn claimed_policy_authority_diff_digest_matches_reviewed_v1_vector() {
         let current = bloom_broker_api::CanonicalWalletPolicy {
+            clear_signing: None,
             wallet_id: Token::new("wallet").unwrap(),
             maximum_approval_lifetime_ms: 10,
             allowed_petal_packages: vec![
@@ -3106,6 +3127,7 @@ mod tests {
             }],
         };
         let proposed = bloom_broker_api::CanonicalWalletPolicy {
+            clear_signing: None,
             wallet_id: Token::new("wallet").unwrap(),
             maximum_approval_lifetime_ms: 20,
             allowed_petal_packages: vec![
@@ -3264,6 +3286,8 @@ mod tests {
                         let supported_crypto_suites =
                             if returned_key_ref.locator.contains("unsupported-suite") {
                                 vec![]
+                            } else if returned_key_ref.key_spec == KeySpec::Ed25519 {
+                                vec![CryptoSuite::Ed25519Message]
                             } else {
                                 vec![
                                     CryptoSuite::Secp256k1Keccak256Recoverable,
@@ -3724,6 +3748,7 @@ mod tests {
 
     fn exact_request(payload: Vec<u8>, approval_id: Option<Digest32>) -> ExactPayloadSignRequest {
         ExactPayloadSignRequest {
+            attributed_advisory: None,
             wallet_id: token("wallet"),
             claimed_hash: Digest32::from_bytes(Keccak256::digest(&payload).into()),
             preimage: payload,
@@ -3758,6 +3783,7 @@ mod tests {
             .map(|payload| Digest32::from_bytes(Keccak256::digest(payload).into()))
             .collect();
         ExactPayloadBatchSignRequest {
+            attributed_advisory: None,
             wallet_id: token("wallet"),
             preimages,
             claimed_hashes,
@@ -3850,6 +3876,73 @@ mod tests {
         );
         assert!(request.petal_use_claim.is_none());
         assert!(request.claim_assurance_evidence.is_none());
+    }
+
+    #[tokio::test]
+    async fn reusable_batch_of_one_carries_the_owner_review_into_preparation() {
+        let mut key = key_ref();
+        key.key_spec = KeySpec::Ed25519;
+        let broker = Arc::new(MockBroker {
+            wallet: WalletPublic {
+                wallet_id: token("wallet"),
+                wallet_kind: token("local"),
+                root_key_ref: Some(key.clone()),
+                key_refs: vec![key],
+                policy_version: DecimalU64::new(1),
+                policy_digest: digest(1),
+                wallet_revocation_epoch: DecimalU64::new(0),
+            },
+            accounts: empty_accounts(),
+            requests: Mutex::new(Vec::new()),
+            corrupt_response: false,
+        });
+        let mut request = exact_batch_request(vec![b"unsigned Solana message".to_vec()], None);
+        request.crypto_suite = CryptoSuite::Ed25519Message;
+        request.claimed_hashes = request
+            .preimages
+            .iter()
+            .map(|payload| suite_hash(request.crypto_suite, payload))
+            .collect();
+        request.provenance = ProvenanceSubject::Petal {
+            package_hash: digest(40),
+            route: "r000004".into(),
+        };
+        request.petal_use_claim = Some(PetalUseClaim {
+            package_hash: digest(40),
+            route: "r000004".into(),
+            operation_class: token("pumpfun.buy"),
+            crypto_suite: request.crypto_suite,
+            payload_digest: petal_batch_payload_digest(&request.preimages),
+            ordered_hashes: request.claimed_hashes.clone(),
+            declared_debits: Vec::new(),
+            declared_destinations: Vec::new(),
+            declared_fee: DeclaredFee::None,
+            nonce: RequestNonce::from_bytes([8; 16]),
+            claim_assurance: bloom_broker_api::ClaimAssurance::MachineAsserted,
+        });
+        let advisory = bloom_broker_api::AttributedAdvisory {
+            schema: token(bloom_broker_api::AttributedAdvisory::SCHEMA),
+            items: vec![
+                "Buy on Pump.fun".into(),
+                "Minimum received: 100 tokens".into(),
+            ],
+        };
+        request.attributed_advisory = Some(advisory.clone());
+        MachineBrokerClient::new(broker.clone())
+            .sign_reusable_petal_payload_batch(request)
+            .await
+            .unwrap();
+        let requests = broker.requests.lock().unwrap();
+        let MachineBrokerRequest::SealedApprovalPrepare(prepared) = requests.last().unwrap() else {
+            panic!("expected approval preparation");
+        };
+        assert_eq!(prepared.attributed_advisory, Some(advisory));
+        assert_eq!(prepared.terms.limits.max_operations.get(), 1);
+        assert_eq!(prepared.terms.limits.max_signatures.get(), 1);
+        assert!(matches!(
+            prepared.terms.selector,
+            ApprovalSelector::Petal { .. }
+        ));
     }
 
     #[tokio::test]
@@ -4331,6 +4424,9 @@ mod tests {
         let client = MachineBrokerClient::new(broker);
 
         let approval = ApprovalPrepareRequest {
+            attributed_advisory: None,
+            evm_review_payloads: Vec::new(),
+            requested_review_mode: None,
             operation_id: OperationId::from_bytes([94; 32]),
             terms: approval_terms("wallet", None),
             canonical_plan_facts_digest: digest(95),

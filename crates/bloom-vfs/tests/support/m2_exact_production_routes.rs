@@ -131,6 +131,7 @@ fn projection(address: String) -> (WalletPublic, Arc<dyn WalletProjectionReader>
         derivation: None,
     };
     let policy = CanonicalWalletPolicy {
+        clear_signing: None,
         wallet_id: token("alice"),
         maximum_approval_lifetime_ms: 300_000,
         allowed_petal_packages: Vec::new(),

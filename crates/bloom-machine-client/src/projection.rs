@@ -2015,6 +2015,7 @@ mod tests {
     fn migrated_fixture() -> ProjectionFixture {
         let mut fixture = fixture(1);
         let policy = CanonicalWalletPolicy {
+            clear_signing: None,
             wallet_id: token("alice"),
             maximum_approval_lifetime_ms: 30 * 24 * 60 * 60 * 1_000,
             allowed_petal_packages: Vec::new(),
