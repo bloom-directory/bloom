@@ -5640,6 +5640,20 @@ fn render_petal_discovery_markdown(installed: &[bloom_petals::package::PetalDisc
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn petal_unknown_signing_outcome_never_becomes_a_refusal() {
+        let error = exact_signing_host_error(bloom_vfs::ExactSigningError::OutcomeUnknown(
+            "AMBIGUOUS_PROVIDER_EFFECT: a signature may exist".into(),
+        ));
+        assert!(matches!(error, HostError::Backend(ref message)
+            if message == SIGNING_OUTCOME_UNKNOWN
+                && !message.contains("denied") && !message.contains("invalid")));
+        let refusal = exact_signing_host_error(bloom_vfs::ExactSigningError::Refused(
+            "wallet policy refused the request".into(),
+        ));
+        assert!(matches!(refusal, HostError::Denied(_)));
+    }
     use bloom_broker_api::{MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService};
     use bloom_vfs::VfsPath;
     use bloom_vfs::handler::Entry;

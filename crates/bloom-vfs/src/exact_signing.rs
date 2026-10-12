@@ -2713,6 +2713,10 @@ mod tests {
             let error = reusable_once(&signer, &home, &claim, b"second")
                 .await
                 .unwrap_err();
+            assert!(
+                matches!(error, ExactSigningError::OutcomeUnknown(_)),
+                "{error}"
+            );
             assert!(error.to_string().contains("has not settled"), "{error}");
         }
         let after = reusable_state(&home);
