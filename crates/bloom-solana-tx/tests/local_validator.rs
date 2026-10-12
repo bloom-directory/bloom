@@ -128,9 +128,6 @@ impl MachineBrokerService for BrokerFixture {
                     }))
                 }
                 MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
-                    attributed_advisory: None,
-                    evm_review_payloads: Vec::new(),
-                    requested_review_mode: None,
                     terms,
                     ..
                 }) => Ok(MachineBrokerResponse::SealedApprovalPrepare(
