@@ -2,11 +2,29 @@ const screen = document.getElementById('screen');
 const status = document.getElementById('status');
 const pages = document.getElementById('pages');
 pages.addEventListener('change',()=>act({action:'select_page',target:pages.value}));
-async function act(action) {
-  const response = await fetch('/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(action)});
-  if (!response.ok) status.textContent = 'Action was not confirmed. Inspect the page before trying again.';
+// One action at a time, so keystrokes arrive in order.
+let queue = Promise.resolve();
+function act(action) {
+  queue = queue.then(async () => {
+    const response = await fetch('/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(action)});
+    if (!response.ok) status.textContent = 'Action was not confirmed. Inspect the page before trying again.';
+  }).catch(() => {});
 }
+// Typing straight onto the screen goes to the page's focused field.
+const keys = new Set(['Tab','Enter','Backspace','Escape','ArrowDown','ArrowUp']);
+screen.addEventListener('keydown', event => {
+  if (event.ctrlKey || event.metaKey || event.altKey) return;
+  if (keys.has(event.key)) act({action:'key',key:event.key});
+  else if (event.key.length === 1) act({action:'type',text:event.key});
+  else return;
+  event.preventDefault();
+});
+document.addEventListener('paste', event => {
+  if (document.activeElement !== screen) return;
+  event.preventDefault();const text=event.clipboardData.getData('text');if(text)act({action:'type',text});
+});
 screen.addEventListener('click', event => {
+  screen.focus();
   const rect = screen.getBoundingClientRect();
   act({action:'click',x:(event.clientX-rect.left)*screen.naturalWidth/rect.width,y:(event.clientY-rect.top)*screen.naturalHeight/rect.height});
 });

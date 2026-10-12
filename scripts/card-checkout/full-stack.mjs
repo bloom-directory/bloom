@@ -38,8 +38,8 @@ const server=https.createServer({key:readFileSync(join(root,'key.pem')),cert:rea
   }
   // A logged-in shop paying with its own saved card shows no card fields.
   if(new URL(request.url,'https://localhost').pathname==='/site'){response.end('<h1>Site fixture</h1><p>Order total USD 3.99</p><p>Visa ending 4242 saved at this shop</p><form action="/done"><button type="submit">Place order</button></form>');return;}
-  if(new URL(request.url,'https://localhost').pathname==='/login'){response.end('<a href="/account" style="display:block;width:100vw;height:100vh">Log in</a>');return;}
-  if(new URL(request.url,'https://localhost').pathname==='/account'){response.end('<h1>Signed in</h1>');return;}
+  if(new URL(request.url,'https://localhost').pathname==='/login'){response.end('<form action="/account"><input name="user" aria-label="User" style="width:90vw;height:80vh;font-size:40px"></form>');return;}
+  if(new URL(request.url,'https://localhost').pathname==='/account'){response.end(`<h1>Signed in as ${(new URL(request.url,'https://localhost').searchParams.get('user')||'').replace(/[^a-z]/g,'')}</h1>`);return;}
   if(new URL(request.url,'https://localhost').pathname==='/done'){submits++;response.end('<h1>Order confirmed</h1><p>Order ID: FIXTURE-ONE</p><p>Total USD 3.99</p>');return;}
   response.end(`<!doctype html><h1>Digital fixture</h1><p data-bloom-total-minor="399" data-bloom-currency="USD">Total USD 3.99</p>
     <form action="/done"><input autocomplete="cc-number"><input autocomplete="cc-exp"><input autocomplete="cc-csc"><button type="submit">Pay</button></form>`);
@@ -151,13 +151,15 @@ try {
   await poll(`/checkout/requests/${takeOver}/status.json`,['human_control']);
   await takeOverPage.locator('#screen').waitFor();
   await takeOverPage.waitForFunction(()=>document.getElementById('finish').textContent.startsWith('Done'));
+  // The human clicks the field on the screenshot and types straight onto it.
   await takeOverPage.locator('#screen').click({position:{x:40,y:40}});
-  await new Promise(r=>setTimeout(r,500));
+  await takeOverPage.keyboard.type('ada');await takeOverPage.keyboard.press('Enter');
+  await new Promise(r=>setTimeout(r,800));
   await takeOverPage.locator('#finish').click();
   await poll(`/checkout/requests/${takeOver}/status.json`,['returned']);
   let resumed;
   for(let i=0;i<50&&!resumed;i++){try{resumed=await browse({action:'snapshot'});}catch(_){await new Promise(r=>setTimeout(r,100));}}
-  assert.equal(resumed.url,merchant+'account');assert.match(resumed.text,/Signed in/);
+  assert.equal(resumed.url,merchant+'account');assert.match(resumed.text,/Signed in as ada/);
   await takeOverPage.close();
   const history=await vfs('cat','/checkout/history.json');
   assert.deepEqual(history.map(h=>[h.kind,h.status.operation_id]),[['take_over',takeOver],['site',site],['card',checkout],['card',recover],['card',manual]]);
