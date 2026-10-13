@@ -5387,10 +5387,17 @@ mod tests {
                     }
                     MachineBrokerRequest::OperationStatus(request) => {
                         if let Some(state) = *self.operation_terminal.lock() {
+                            let operation_digest = self
+                                .completed_result
+                                .lock()
+                                .as_ref()
+                                .filter(|result| result.operation_id == request.operation_id)
+                                .map(|result| result.operation_digest.clone())
+                                .unwrap_or_else(|| Digest32::from_bytes([11; 32]));
                             return Ok(MachineBrokerResponse::OperationStatus(
                                 OperationPublicStatus {
                                     operation_id: request.operation_id,
-                                    operation_digest: Digest32::from_bytes([11; 32]),
+                                    operation_digest,
                                     state,
                                     result: None,
                                     error: None,
@@ -8268,7 +8275,7 @@ mod tests {
             gas_limit: staged.gas_limit,
             max_fee_per_gas: 100,
             max_priority_fee_per_gas: 10,
-            to: TxKind::Call(staged.to.parse().unwrap()),
+            to: TxKind::Call(staged.to.as_deref().unwrap().parse().unwrap()),
             value: U256::ZERO,
             access_list: AccessList::default(),
             input: Bytes::new(),
@@ -8490,12 +8497,14 @@ mod tests {
             assert!(dispatched.sign_dispatched);
 
             *fixture.operation_terminal.lock() = Some(terminal);
-            assert!(matches!(
-                engine
-                    .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
-                    .await,
-                Err(TxEngineError::ApprovalDenied(_))
-            ));
+            let outcome = engine
+                .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
+                .await;
+            if marker_should_clear {
+                assert!(matches!(outcome, Err(TxEngineError::ApprovalRequired(_))));
+            } else {
+                assert!(matches!(outcome, Err(TxEngineError::ApprovalDenied(_))));
+            }
 
             let state = read_triad_batch_signing_state(&state_path)
                 .unwrap()
@@ -8505,7 +8514,8 @@ mod tests {
                 "{terminal:?} was handled as though it were the other kind of terminal"
             );
             if marker_should_clear {
-                assert!(state.approval_id.is_none());
+                assert!(state.approval_id.is_some());
+                assert_ne!(state.approval_id, dispatched.approval_id);
                 assert_ne!(
                     state.approval_operation_id,
                     dispatched.approval_operation_id
@@ -8525,10 +8535,9 @@ mod tests {
             } else {
                 assert_eq!(state.approval_id, dispatched.approval_id);
                 assert_eq!(state.signing_operation_id, dispatched.signing_operation_id);
+                assert!(state.ceremony_url.is_none(), "{terminal:?}");
+                assert!(state.ceremony_expires_at_ms.is_none(), "{terminal:?}");
             }
-            // Either way the ceremony URL is dead and must stop being offered.
-            assert!(state.ceremony_url.is_none(), "{terminal:?}");
-            assert!(state.ceremony_expires_at_ms.is_none(), "{terminal:?}");
         }
     }
 
