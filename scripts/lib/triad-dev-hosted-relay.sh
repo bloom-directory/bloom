@@ -58,7 +58,7 @@ wait_for_hosted_relay() {
       local now_ms label metadata
       now_ms=$(( $(date +%s) * 1000 ))
       for label in tunnel dns; do
-        metadata="${config_dir}/relay-${label}.metadata.json"
+        metadata="${developer_root}/config/relay-${label}.metadata.json"
         jq -e --argjson now "$now_ms" \
           '(.expires_at_ms | tonumber) > ($now + 3600000)' "$metadata" >/dev/null 2>&1 ||
           return 1
