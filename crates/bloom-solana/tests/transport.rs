@@ -352,7 +352,7 @@ async fn retries_transient_http_failures() {
                 // Keep the pinned Rust 1.96 API across newer stable CI.
                 #[allow(deprecated)]
                 let remaining =
-                    failures.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
+                    failures.try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
                 let body = if remaining.is_ok() && remaining.unwrap() > 0 {
                     "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_string()
                 } else {
