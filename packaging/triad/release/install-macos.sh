@@ -71,6 +71,13 @@ root_and_uid() {
   fi
 }
 
+require_native_macos_mount() {
+  local version="$1"
+  [[ "$version" =~ ^([1-9][0-9]*)(\.[0-9]+)*$ ]] &&
+    ((${BASH_REMATCH[1]} >= 26)) ||
+    die "Installed Bloom mounting requires macOS 26 or later for NFSv4.1; found '$version'. The unmounted CLI does not require this native mount."
+}
+
 lock_installer() {
   lock=/private/var/run/bloom-triad-installer.lock
   if ! mkdir -m 0700 "$lock" 2>/dev/null; then
@@ -814,6 +821,26 @@ require_triad_health() {
   for ((attempt=0; attempt<240; attempt++)); do launchctl asuser "$uid" /usr/bin/sudo -u "$user" -H "$release_base/current/bloom" --home "$home/.bloom" serve triad-health-check "$digest" >/dev/null 2>&1 && return 0; sleep 0.5; done
   launchctl asuser "$uid" /usr/bin/sudo -u "$user" -H "$release_base/current/bloom" --home "$home/.bloom" serve triad-health-check "$digest"
 }
+capture_activation_failure() {
+  local evidence="${BLOOM_MACOS_W0_EVIDENCE_DIR:-}" service source_log
+  [[ -n "$evidence" && -d "$evidence" && ! -L "$evidence" ]] || return 0
+  # W0-only evidence must survive rollback. Never copy identity/config files.
+  for service in broker signer; do
+    for source_log in "$log_root/$service.jsonl" "$log_root/$service-bootstrap.log"; do
+      [[ -f "$source_log" && ! -L "$source_log" ]] || continue
+      install -m 0644 "$source_log" "$evidence/activation-$(basename "$source_log")" || true
+    done
+    launchctl print "system/com.bloom.$service.$login_uid" \
+      > "$evidence/activation-$service-launchctl.txt" 2>&1 || true
+  done
+  for service in session machine; do
+    launchctl print "user/$login_uid/com.bloom.$service" \
+      > "$evidence/activation-$service-launchctl.txt" 2>&1 || true
+  done
+  launchctl print system/com.bloom.containment \
+    > "$evidence/activation-lifecycle-launchctl.txt" 2>&1 || true
+  chmod 0644 "$evidence/"activation-*-launchctl.txt 2>/dev/null || true
+}
 reload_current_enrollment() {
   plutil -lint "$broker_plist" "$signer_plist" "$containment_plist" "$session_plist" "$machine_plist" >/dev/null
   reload_launchd_job system com.bloom.containment "$containment_plist"
@@ -1031,6 +1058,7 @@ upgrade_release() {
 case "$action" in
   install|restore)
     [[ $# -eq 4 ]] || usage; root_and_uid "$1" "$2"; login_user="$3"; payload="$(cd "$4" && pwd -P)"
+    $live && require_native_macos_mount "$(/usr/bin/sw_vers -productVersion)"
     [[ "$login_user" =~ ^[a-z_][a-z0-9_-]*$ ]] || { echo "unsafe LOGIN_USER" >&2; exit 64; }
     $live && { lock_installer; [[ "$(id -u "$login_user")" == "$login_uid" ]] || die "LOGIN_USER does not match LOGIN_UID"; launchctl print "gui/$login_uid" >/dev/null 2>&1 || die "LOGIN_USER has no active GUI domain"; snapshot_live_payload; }
     requested_uid="$login_uid"; requested_user="$login_user"; load_names; paths; verify_payload; preflight_compatibility; prepare_verified_payload_for_execution
@@ -1084,8 +1112,8 @@ case "$action" in
     fi
     switch_release "$BLOOM_RELEASE_DIGEST"; install_config; disable_legacy_network_guard; write_enrollment activating; install_assets
     if $live; then
-      secure_ownership; reload_current_enrollment || { $fresh && rollback_failed_fresh; die "Bloom failed authenticated activation"; }
-      activate_current_enrollment || { $fresh && rollback_failed_fresh; die "Bloom failed full activation"; }
+      secure_ownership; reload_current_enrollment || { capture_activation_failure; $fresh && rollback_failed_fresh; die "Bloom failed authenticated activation"; }
+      activate_current_enrollment || { capture_activation_failure; $fresh && rollback_failed_fresh; die "Bloom failed full activation"; }
       created_users=""; created_groups=""
     fi
     cleanup_legacy_pf
