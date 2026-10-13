@@ -966,6 +966,8 @@ impl DaemonPetalHost {
             .map_err(|error| HostError::Invalid(error.to_string()))?;
         let prepared = broker
             .prepare_approval(bloom_broker_api::ApprovalPrepareRequest {
+                evm_review_payloads: Vec::new(),
+                requested_review_mode: None,
                 surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
                 operation_id,
                 terms,
@@ -8217,6 +8219,7 @@ ws_url = "wss://example.invalid"
 
         fn policy(&self) -> bloom_broker_api::SignedPolicySnapshot {
             let canonical = serde_json::to_vec(&bloom_broker_api::CanonicalWalletPolicy {
+                clear_signing: None,
                 wallet_id: bloom_broker_api::Token::new("w").unwrap(),
                 maximum_approval_lifetime_ms: 3_600_000,
                 allowed_petal_packages: Vec::new(),

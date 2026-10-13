@@ -181,7 +181,15 @@ cargo test -p bloom-it --test linux_packaging --locked
 `bloom ceremony surfaces` (also `bloom vfs cat /status/ceremonies.json`) reports
 Signer-approved desired exposure and Broker-confirmed effective readiness.
 A pending certificate or route is not working remote access. Treat an
-incomplete provisioning stage as retryable setup work.
+incomplete provisioning stage as retryable setup work. The `credentials_expired` stage
+is different: the computer was off or asleep longer than the relay's renewal
+grace (seven days by default), so remote approvals stay paused until the owner
+re-provisions. `bloom vfs cat /status/ceremonies-repair.json` then gives a
+`repair` summary and `command`
+(`sudo …/bloom-signer admin provision --login-uid "$(id -u)"`), and
+`bloom ceremony surfaces` prints it as a warning; otherwise `repair` is `null`.
+Provisioning re-issues the relay credentials for the same hostname; localhost
+approvals keep working.
 
 Wallet creation and import use Broker's default surface. Use
 `bloom wallet new main --local` or `bloom wallet import main --local` to request

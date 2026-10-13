@@ -4900,6 +4900,7 @@ mod tests {
             derivation: None,
         };
         let canonical = serde_jcs::to_vec(&CanonicalWalletPolicy {
+            clear_signing: None,
             wallet_id: wallet_id.clone(),
             maximum_approval_lifetime_ms: 300_000,
             allowed_petal_packages: Vec::new(),
@@ -4980,6 +4981,7 @@ mod tests {
             }),
         };
         let canonical = serde_jcs::to_vec(&CanonicalWalletPolicy {
+            clear_signing: None,
             wallet_id: wallet_id.clone(),
             maximum_approval_lifetime_ms: 300_000,
             allowed_petal_packages: Vec::new(),
@@ -8661,6 +8663,8 @@ value = "0""#,
             .handler
             .with_broker(Some(MachineBrokerClient::new(broker.clone())));
         let request = ApprovalPrepareRequest {
+            evm_review_payloads: Vec::new(),
+            requested_review_mode: None,
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             operation_id: OperationId::from_bytes([30; 32]),
             terms: approval_terms("alice", None),
@@ -8708,6 +8712,8 @@ value = "0""#,
                 .handler
                 .with_broker(Some(MachineBrokerClient::new(broker.clone())));
             let request = ApprovalPrepareRequest {
+                evm_review_payloads: Vec::new(),
+                requested_review_mode: None,
                 surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
                 operation_id: OperationId::from_bytes([30; 32]),
                 terms: approval_terms("alice", None),
@@ -8740,6 +8746,8 @@ value = "0""#,
             .handler
             .with_broker(Some(MachineBrokerClient::new(broker.clone())));
         let request = ApprovalPrepareRequest {
+            evm_review_payloads: Vec::new(),
+            requested_review_mode: None,
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             operation_id: OperationId::from_bytes([30; 32]),
             terms: approval_terms("alice", None),
@@ -8771,6 +8779,8 @@ value = "0""#,
             .handler
             .with_broker(Some(MachineBrokerClient::new(broker)));
         let request = ApprovalPrepareRequest {
+            evm_review_payloads: Vec::new(),
+            requested_review_mode: None,
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             operation_id: OperationId::from_bytes([30; 32]),
             terms: approval_terms("alice", None),

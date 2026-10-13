@@ -1008,6 +1008,9 @@ impl MachineBrokerClient {
         };
         terms.validate()?;
         self.prepare_approval(ApprovalPrepareRequest {
+            // Native EVM review payloads arrive with bloom#222.
+            requested_review_mode: None,
+            evm_review_payloads: Vec::new(),
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             operation_id: request.approval_operation_id,
             terms,
@@ -1180,6 +1183,9 @@ impl MachineBrokerClient {
         };
         terms.validate()?;
         self.prepare_approval(ApprovalPrepareRequest {
+            // Native EVM review payloads arrive with bloom#222.
+            requested_review_mode: None,
+            evm_review_payloads: Vec::new(),
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             operation_id: request.approval_operation_id,
             terms,
@@ -1335,6 +1341,9 @@ impl MachineBrokerClient {
         };
         terms.validate()?;
         self.prepare_approval(ApprovalPrepareRequest {
+            // Native EVM review payloads arrive with bloom#222.
+            requested_review_mode: None,
+            evm_review_payloads: Vec::new(),
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             operation_id: request.approval_operation_id,
             terms,
@@ -1864,6 +1873,11 @@ impl MachineBrokerClient {
             MachineBrokerResponse::CeremonySurfaceStatus(status) => Ok(status),
             _ => Err(response_mismatch("ceremony.surface_status")),
         }
+    }
+
+    /// The owner action remote ceremonies need, if any; see [`ceremony_repair`].
+    pub async fn ceremony_repair(&self) -> Result<serde_json::Value, ProtocolError> {
+        Ok(ceremony_repair(&self.ceremony_surfaces().await?))
     }
 
     pub async fn credentials(
@@ -2906,9 +2920,74 @@ fn service_unavailable(message: impl Into<String>) -> ProtocolError {
     ProtocolError::new(ProtocolErrorCode::ServiceUnavailable, message.into())
 }
 
+/// `{"repair": null}`, or the owner action remote ceremonies need. Kept beside
+/// Broker's exposure projection rather than inside it, so readers of that
+/// strict type are unaffected. Today only `credentials_expired` needs one: the
+/// relay refuses to renew Broker's expired credentials, and only the Signer
+/// administrator can re-issue them (same hostname, no wallet change).
+pub fn ceremony_repair(status: &bloom_broker_api::CeremonyExposureStatus) -> serde_json::Value {
+    let repair = (status.stage == bloom_broker_api::CeremonyExposureStage::CredentialsExpired)
+        .then(|| {
+            let signer = if cfg!(target_os = "macos") {
+                "/usr/local/libexec/bloom/current/bloom-signer"
+            } else {
+                "/usr/libexec/bloom/current/bloom-signer"
+            };
+            serde_json::json!({
+                "stage": "credentials_expired",
+                "summary": "Remote approvals are paused: the hosted relay refused to renew this computer's expired relay credentials. Localhost approvals still work.",
+                "command": format!("sudo {signer} admin provision --login-uid \"$(id -u)\""),
+            })
+        });
+    serde_json::json!({ "repair": repair })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repair_is_reported_only_when_relay_credentials_expired() {
+        use bloom_broker_api::{
+            CeremonyExposureMode, CeremonyExposureStage, CeremonyExposureStatus, DecimalU64,
+        };
+        let status = |stage| CeremonyExposureStatus {
+            desired_mode: CeremonyExposureMode::RemoteEnabled,
+            desired_revision: DecimalU64::new(1),
+            effective_mode: CeremonyExposureMode::LocalhostOnly,
+            effective_revision: DecimalU64::new(1),
+            local_origin: "http://localhost:18734".into(),
+            remote_origin: Some("https://abcdefghijklmnopqrstuv2345.relay.bloom.directory".into()),
+            remote_tls_ready: true,
+            remote_routing_ready: true,
+            stage,
+        };
+        for stage in [
+            CeremonyExposureStage::Enabled,
+            CeremonyExposureStage::CertificatePending,
+            CeremonyExposureStage::Unprovisioned,
+        ] {
+            assert_eq!(
+                ceremony_repair(&status(stage)),
+                serde_json::json!({"repair": null})
+            );
+        }
+        let expired = ceremony_repair(&status(CeremonyExposureStage::CredentialsExpired));
+        let repair = &expired["repair"];
+        assert_eq!(repair["stage"], "credentials_expired");
+        let command = repair["command"].as_str().unwrap();
+        assert!(command.starts_with("sudo /"), "{command}");
+        assert!(
+            command.ends_with("bloom-signer admin provision --login-uid \"$(id -u)\""),
+            "{command}"
+        );
+        assert!(
+            repair["summary"]
+                .as_str()
+                .unwrap()
+                .contains("Localhost approvals still work")
+        );
+    }
     use std::{
         os::unix::fs::{MetadataExt, PermissionsExt},
         sync::{
@@ -3224,6 +3303,7 @@ mod tests {
     #[test]
     fn claimed_policy_authority_diff_digest_matches_reviewed_v1_vector() {
         let current = bloom_broker_api::CanonicalWalletPolicy {
+            clear_signing: None,
             wallet_id: Token::new("wallet").unwrap(),
             maximum_approval_lifetime_ms: 10,
             allowed_petal_packages: vec![
@@ -3241,6 +3321,7 @@ mod tests {
             }],
         };
         let proposed = bloom_broker_api::CanonicalWalletPolicy {
+            clear_signing: None,
             wallet_id: Token::new("wallet").unwrap(),
             maximum_approval_lifetime_ms: 20,
             allowed_petal_packages: vec![
@@ -4490,6 +4571,8 @@ mod tests {
         let client = MachineBrokerClient::new(broker);
 
         let approval = ApprovalPrepareRequest {
+            evm_review_payloads: Vec::new(),
+            requested_review_mode: None,
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             operation_id: OperationId::from_bytes([94; 32]),
             terms: approval_terms("wallet", None),
