@@ -55,6 +55,13 @@ pub struct PaidHttpSigningFacts {
 /// and approval enforcement out of the protocol crates.
 #[async_trait::async_trait]
 pub trait PaidHttpHostSigner: Send + Sync {
+    async fn sign_paid_http_solana_message(
+        &self,
+        _message: &[u8],
+        _facts: &PaidHttpSigningFacts,
+    ) -> Result<[u8; 64], String> {
+        Err("Solana paid HTTP signing is unavailable".into())
+    }
     /// Sign an exact payload-bearing request. `signing_hash` must equal the
     /// selected suite's hash of `preimage`; the authority service verifies
     /// that binding before approval or signing.
@@ -79,6 +86,9 @@ pub trait PaidHttpHostSigner: Send + Sync {
 }
 
 pub trait PaidHttpChainRpcResolver: Send + Sync {
+    fn solana_spec(&self, _network: &str) -> Option<bloom_proto::SolanaSpec> {
+        None
+    }
     fn http_rpc_urls_for_chain_id(&self, chain_id: u64) -> Vec<String>;
 
     fn http_rpc_url_for_chain_id(&self, chain_id: u64) -> Option<String> {
@@ -252,13 +262,18 @@ impl NormalizedChallenge {
 }
 
 pub fn normalize_challenge(headers: &HeaderMap, body: &[u8], url: &Url) -> NormalizedChallenge {
-    let header_map = headers_to_string_map(headers);
+    let mut header_map = headers_to_string_map(headers);
     let body_json: serde_json::Value = header_map
         .get("payment-required")
         .and_then(|value| B64.decode(value).ok())
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .or_else(|| serde_json::from_slice(body).ok())
         .unwrap_or_else(|| json!({}));
+    // The signing adapter consumes the complete v2 challenge, including its
+    // resource and extensions, even when a merchant supplied it in the body.
+    if !header_map.contains_key("payment-required") && body_json["x402Version"] == 2 {
+        header_map.insert("payment-required".into(), B64.encode(body));
+    }
     // Mixed-protocol merchants offer x402 alongside Tempo. Keep their x402
     // choices available to the wallet's network and asset policy selector.
     let offers_x402 = body_json
@@ -530,6 +545,10 @@ pub fn usd_to_atomic_units(asset: Option<&str>, usd: f64) -> Option<u128> {
 }
 
 fn is_known_six_decimal_usd_asset(asset: &str) -> bool {
+    // Base58 mint identifiers are case-sensitive.
+    if asset == "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" {
+        return true;
+    }
     matches!(
         asset.to_ascii_lowercase().as_str(),
         // USDC on Base.
@@ -542,6 +561,9 @@ fn is_known_six_decimal_usd_asset(asset: &str) -> bool {
 }
 
 pub fn normalize_paid_http_network(network: &str) -> String {
+    if network.trim().starts_with("solana:") {
+        return network.trim().to_owned();
+    }
     let raw = network.trim().to_ascii_lowercase();
     match raw.as_str() {
         "base" | "8453" | "eip155:8453" => "eip155:8453".into(),
@@ -980,6 +1002,24 @@ pub fn headers_to_string_map(headers: &HeaderMap) -> BTreeMap<String, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn solana_usdc_amounts_and_networks_preserve_base58_case() {
+        let mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+        assert_eq!(
+            super::parse_payment_amount_usd(Some(mint), Some("100000")),
+            Some(0.10)
+        );
+        assert_eq!(super::usd_to_atomic_units(Some(mint), 0.10), Some(100000));
+        assert!(!super::is_known_six_decimal_usd_asset(
+            &mint.to_ascii_lowercase()
+        ));
+        let network = "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp";
+        assert_eq!(super::normalize_paid_http_network(network), network);
+        assert!(!super::networks_equivalent(
+            network,
+            &network.to_ascii_lowercase()
+        ));
+    }
     use super::{
         PaymentRequirement, networks_equivalent, selected_requirement_amount_usd,
         usd_to_atomic_units,
