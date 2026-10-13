@@ -770,6 +770,7 @@ impl StatusHandler {
         match path.segments() {
             [] => Ok(Entry::dir("")),
             [s] if s == "ceremonies.json"
+                || s == "ceremonies-repair.json"
                 || s == "daemon.json"
                 || s == "version"
                 || s == "uptime"
@@ -958,6 +959,17 @@ impl StatusHandler {
                     .await
                     .map_err(|error| HandlerError::backend(error.to_string()))?;
                 serde_json::to_vec_pretty(&status)
+                    .map_err(|error| HandlerError::backend(error.to_string()))
+            }
+            [s] if s == "ceremonies-repair.json" => {
+                let broker = self.ceremony_broker.as_ref().ok_or_else(|| {
+                    HandlerError::backend("ceremony status requires the authenticated Broker edge")
+                })?;
+                let repair = broker
+                    .ceremony_repair()
+                    .await
+                    .map_err(|error| HandlerError::backend(error.to_string()))?;
+                serde_json::to_vec_pretty(&repair)
                     .map_err(|error| HandlerError::backend(error.to_string()))
             }
             [s] if s == "version" => Ok(format!("{}\n", self.version).into_bytes()),
@@ -1246,6 +1258,7 @@ impl StatusHandler {
             [] => Ok(vec![
                 Entry::file("daemon.json"),
                 Entry::file("ceremonies.json"),
+                Entry::file("ceremonies-repair.json"),
                 Entry::file("version"),
                 Entry::file("uptime"),
                 Entry::file("started_at"),
@@ -1708,6 +1721,17 @@ mod tests {
         assert_eq!(status["effective_revision"], "2");
         assert_eq!(status["remote_tls_ready"], false);
         assert_eq!(status["remote_routing_ready"], false);
+        assert!(
+            status.get("repair").is_none(),
+            "the projection stays Broker's"
+        );
+        let repair: serde_json::Value = serde_json::from_slice(
+            &h.read(&VfsPath::parse("ceremonies-repair.json").unwrap())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(repair, serde_json::json!({"repair": null}));
     }
 
     #[tokio::test]

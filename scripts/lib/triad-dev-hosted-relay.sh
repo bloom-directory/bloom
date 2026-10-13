@@ -50,8 +50,23 @@ wait_for_hosted_relay() {
     # Signer keeps the admin key and exact allocation/ACME operation IDs in
     # its private state. Once its ACME bind is durable, certificate/routing
     # reconciliation needs only status polling, even after a restart.
+    # Scoped Broker credentials last a day and renew only within the relay's
+    # grace after expiry, so a candidate left off longer comes back with
+    # credentials no renewal can save. Provision re-issues any that are
+    # missing or within an hour of expiry, keeping the same hostname.
+    scoped_credentials_current() {
+      local now_ms label metadata
+      now_ms=$(( $(date +%s) * 1000 ))
+      for label in tunnel dns; do
+        metadata="${developer_root}/config/relay-${label}.metadata.json"
+        jq -e --argjson now "$now_ms" \
+          '(.expires_at_ms | tonumber) > ($now + 3600000)' "$metadata" >/dev/null 2>&1 ||
+          return 1
+      done
+    }
     if [ -n "$(jq -r '.installation_id // empty' "$relay_status_file")" ] &&
-       [ -f "${developer_root}/state/admin/acme-account-bound.json" ]; then
+       [ -f "${developer_root}/state/admin/acme-account-bound.json" ] &&
+       scoped_credentials_current; then
       relay_retry_provision=0
     else
       if ! relay_admin provision; then

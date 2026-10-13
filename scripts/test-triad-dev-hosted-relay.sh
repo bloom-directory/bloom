@@ -66,12 +66,20 @@ effective_revision=1
 if [ "$FAKE_SCENARIO" = localhost ]; then mode=localhost_only; fi
 if [ "$FAKE_SCENARIO" = already_ready ] ||
    [ "$FAKE_SCENARIO" = bound_pending ] ||
+   [ "$FAKE_SCENARIO" = bound_expired ] ||
    [ -e "${FAKE_STATE}/provision.count" ]; then
   installation='"installation-1"'
 fi
 if [ "$FAKE_SCENARIO" = already_ready ] ||
    { [ "$FAKE_SCENARIO" = certificate_pending ] && [ "$command" = status ] && [ "$count" -ge 3 ]; } ||
    { [ "$FAKE_SCENARIO" = uri_pending ] && [ "$command" = status ] && [ "$count" -ge 3 ]; }; then
+  effective=remote_enabled
+  tls=true
+  routing=true
+fi
+# Bound, but its scoped credentials expired: ready only once re-provisioned.
+if [ "$FAKE_SCENARIO" = bound_expired ] && [ "$command" = status ] &&
+   [ -e "${FAKE_STATE}/provision.count" ]; then
   effective=remote_enabled
   tls=true
   routing=true
@@ -96,8 +104,15 @@ chmod +x "${test_root}/fake-signer"
 run_case() {
   local scenario="$1" expected="$2" case_root="${test_root}/${1}"
   mkdir -p "$case_root/logs" "$case_root/state/admin"
-  if [ "$scenario" = bound_pending ]; then
+  if [ "$scenario" = bound_pending ] || [ "$scenario" = bound_expired ]; then
     : > "$case_root/state/admin/acme-account-bound.json"
+    mkdir -p "$case_root/config"
+    local now_ms dns_expiry
+    now_ms=$(( $(date +%s) * 1000 ))
+    dns_expiry=$((now_ms + 86400000))
+    if [ "$scenario" = bound_expired ]; then dns_expiry=$((now_ms - 1000)); fi
+    printf '{"expires_at_ms":%s}\n' "$((now_ms + 86400000))" > "$case_root/config/relay-tunnel.metadata.json"
+    printf '{"expires_at_ms":%s}\n' "$dns_expiry" > "$case_root/config/relay-dns.metadata.json"
   fi
   if FAKE_SCENARIO="$scenario" FAKE_STATE="$case_root" CASE_ROOT="$case_root" \
     FAKE_SIGNER="${test_root}/fake-signer" REPO_ROOT="$repo_root" \
@@ -134,6 +149,8 @@ run_case uri_pending success
 [ "$(cat "${test_root}/uri_pending/provision.count")" -ge 2 ]
 run_case bound_pending success
 [ ! -e "${test_root}/bound_pending/provision.count" ]
+run_case bound_expired success
+[ "$(cat "${test_root}/bound_expired/provision.count")" = 1 ]
 run_case localhost failure
 [ ! -e "${test_root}/localhost/provision.count" ]
 grep -q 'localhost_only' "${test_root}/localhost/out"
