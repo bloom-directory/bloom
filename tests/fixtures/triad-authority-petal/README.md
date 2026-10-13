@@ -11,8 +11,8 @@ install this directory with `bloom petals install`, then use only the mounted
 filesystem:
 
 ```sh
-cp request.json "$BLOOM_MOUNT/petals/triad-authority-fixture/session.json"
-cat "$BLOOM_MOUNT/petals/triad-authority-fixture/session.json"
+cp request.json "$BLOOM_MOUNT/petals/triad-authority-fixture/wallets/<wallet>/<index>/session.json"
+cat "$BLOOM_MOUNT/petals/triad-authority-fixture/wallets/<wallet>/<index>/session.json"
 ```
 
 When the result reports a pending key operation, obtain its owner-only ceremony

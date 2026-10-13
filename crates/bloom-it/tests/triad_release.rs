@@ -159,9 +159,10 @@ fn release_compatibility_declares_each_edge_without_a_global_protocol_range() {
     ] {
         assert!(compatibility.contains(&format!("{revision} = \"")));
     }
-    for component in ["machine", "broker", "signer"] {
-        assert!(compatibility.contains(&format!("[state.{component}]")));
-        assert!(compatibility.contains("downgrade_floor = 1"));
+    for (component, version) in [("machine", 1), ("broker", 2), ("signer", 1)] {
+        assert!(compatibility.contains(&format!(
+            "[state.{component}]\ncurrent = {version}\ndowngrade_floor = {version}"
+        )));
     }
 }
 
@@ -450,7 +451,7 @@ fn build(staging: &Path, output: &Path, key: &Path) -> std::process::Output {
         &compatibility,
         compatibility_source
             .replace(
-                "broker_commit = \"3352190e5909803a49d577f36dadc9b672982bd0\"",
+                "broker_commit = \"df25a54676aa2c52d6b018db486b46ec6a51718a\"",
                 &format!("broker_commit = \"{}\"", "22".repeat(20)),
             )
             .replace(
