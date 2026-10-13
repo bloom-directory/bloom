@@ -68,6 +68,27 @@ was lost. Listing the wallet's outbox states is cheaper than re-issuing the
 write, and re-issuing a broadened version of it is how a correct action becomes
 an incorrect one.
 
+## Reporting Bloom problems
+
+If the Feedback Petal is installed, read `petals/feedback/README.md` for its
+submission format and receipt paths. You may proactively submit one concise,
+sanitized report for a distinct Bloom failure, misleading documentation, or
+missing capability that blocked the task, unless the user has disabled
+reporting. Mention a submitted report briefly when relevant; do not report
+every retry or successful operation.
+
+Write a minimal description and reproduction with placeholders. Never attach
+logs, transcripts, credentials, raw configuration, identifying local paths,
+wallet addresses, balances, transaction details, or other private user content
+automatically. Include contact details only when supplied for feedback. If the
+problem cannot be described without sensitive material, omit that material or
+ask before including it. Installation and discovery do not send feedback.
+
+Submit using `petals/feedback/submit.json`, then inspect
+`petals/feedback/receipts/<submission_id>.json`. A timeout has an unknown
+outcome: retry the same submission ID and payload rather than generating a new
+report. A received receipt confirms storage, not staff review or resolution.
+
 ## Wallet and account identity
 
 Read `wallets/<wallet>/projection.json` and `accounts.json` to select the
@@ -227,6 +248,13 @@ reason to restage. After human approval, retry only its exact `retry_path`;
 `plan_path` and `retry_path` name the outbox the confirm was written through
 (`wallets/<wallet>/<n>/chains/...`, including `n = 0` for account 0).
 
+`bloom wallet confirm` exits 3 when owner approval is pending and 4 when
+confirmation has no recorded result yet. Exit 0 reports a recorded broadcast
+or a completed local discard. Use `--text cancel` to discard an unsigned
+pending entry; an already broadcast transaction needs `bloom wallet cancel`
+and its own approval. Dropping a reservation does not renumber later rows:
+restage with an explicit nonce to fill a gap.
+
 `confirm.override` is not a general escape hatch. Use it only when the
 inspected policy projection explicitly permits that control and the human has
 explicitly accepted the displayed warning.
@@ -267,6 +295,31 @@ Use the challenge's `retry_path` verbatim after the owner completes its
 written through: `wallets/<wallet>/<n>/chains/...`, including `n = 0` for
 account 0.
 
+## Deploying EVM contracts
+
+Build with the project's normal tools. Stage a JSON/TOML intent using
+`kind: "deploy"`, complete hex initcode in `data`, and optional native `value`
+at `wallets/<wallet>/<n>/chains/<chain>/outbox/new.tx`. Append ABI-encoded constructor
+arguments and link libraries before staging; do not supply `to`. Read the
+pending entry's `plan.md` and complete its usual Broker approval flow.
+
+The predicted address depends on sender and nonce. Check the mined
+`sent/<id>/receipt.json` for success and the actual `contract_address`; a
+broadcast hash alone is not a successful deployment. Constructor ownership and
+effects are not verified. Initialization calls are separate transactions with
+their own approvals. The wallet policy must opt into the numeric chain with
+`{"chain":"evm-31337","destination":"exact"}` (replace 31337 as appropriate),
+through the normal policy-update ceremony. This permits contract creation to be
+prepared without a recipient allowlist entry; calls and sends keep their recipient
+restrictions. Every transaction still needs its own exact owner approval.
+
+For Foundry scripts, Hardhat remote accounts, and Ignition, run
+`bloom deploy --wallet <wallet> --chain <chain> rpc`. It prints an ephemeral,
+private submission URL and public sender. After owner review, explicitly run
+`bloom deploy --wallet <wallet> --chain <chain> resume <id>` for the same ID.
+Use `list` and `status <id>` to recover. Do not export signing keys into project
+files or environment variables. See `docs/examples.md` for commands.
+
 ## Updating wallet policy
 
 Replacing `wallets/<wallet>/policy.json` starts a Broker ceremony. Prepare
@@ -279,8 +332,12 @@ walkthrough in `docs/examples.md`.
 
 ## Petals and paid requests
 
-Installed applications live under `petals/<name>/`. Discover the installed
-package and follow its local instructions.
+Installed application documents and public routes live under `petals/<name>/`.
+Account-dependent routes explicitly select a wallet and index, for example
+`petals/enso/intents/<wallet>/<index>/new`. Follow each package's route tree;
+there is no common synthetic wallet root. Account state is isolated; explicitly
+declared service settings are shared across accounts. Keep every follow-up in
+the selected account, including core outbox confirmation paths.
 
 Paid HTTP operations live under `requests/`. They are actions, not ordinary
 reads: inspect the request plan, selected payment protocol, maximum amount,

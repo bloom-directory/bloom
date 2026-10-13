@@ -173,8 +173,24 @@ impl WalletsHandler {
     /// imported single-key wallet is account 0 from its projection; a BIP-39
     /// wallet's accounts come from the authenticated `wallet.accounts`
     /// projection, grouped by the number their paths encode.
-    async fn account_views(&self, wallet: &str) -> Result<Vec<AccountView>, HandlerError> {
-        let projection = self.wallet_projection(wallet).await?;
+    async fn account_views(
+        &self,
+        wallet: &str,
+        navigation: bool,
+    ) -> Result<Vec<AccountView>, HandlerError> {
+        let projection = if navigation {
+            self.wallet_projection_navigation(wallet).await?
+        } else {
+            self.wallet_projection_authority(wallet).await?
+        };
+        // Authority reads bypass the production cache. Also reject stale
+        // results from any other projection-reader implementation before
+        // constructing Petal context or selecting an account for a write.
+        if !navigation && projection.freshness == bloom_machine_client::ProjectionFreshness::Stale {
+            return Err(HandlerError::backend(
+                "SERVICE_UNAVAILABLE: account authority requires a fresh Broker wallet projection",
+            ));
+        }
         if let Some(root) = &projection.wallet.root_key_ref {
             // A root-key wallet is account 0 in the root key's own family:
             // an imported Secp256k1 root renders as EVM, an Ed25519 root as
@@ -249,7 +265,21 @@ impl WalletsHandler {
         wallet: &str,
         number: u32,
     ) -> Result<AccountView, HandlerError> {
-        self.account_views(wallet)
+        self.account_views(wallet, false)
+            .await?
+            .into_iter()
+            .find(|view| view.number == number)
+            .ok_or_else(|| {
+                HandlerError::not_found(format!("wallet '{wallet}' has no account {number}"))
+            })
+    }
+
+    async fn account_view_navigation(
+        &self,
+        wallet: &str,
+        number: u32,
+    ) -> Result<AccountView, HandlerError> {
+        self.account_views(wallet, true)
             .await?
             .into_iter()
             .find(|view| view.number == number)
@@ -264,7 +294,7 @@ impl WalletsHandler {
         wallet: &str,
     ) -> Result<Vec<Entry>, HandlerError> {
         Ok(self
-            .account_views(wallet)
+            .account_views(wallet, true)
             .await?
             .into_iter()
             .map(|view| Entry::dir(&view.number.to_string()))
@@ -435,7 +465,7 @@ impl WalletsHandler {
         number: u32,
         rest: &[String],
     ) -> Result<Entry, HandlerError> {
-        let view = self.account_view(wallet, number).await?;
+        let view = self.account_view_navigation(wallet, number).await?;
         match rest {
             [] => Ok(Entry::dir(&number.to_string())),
             [dir] if dir == "sessions" => Ok(Entry::dir("sessions")),
@@ -468,7 +498,15 @@ impl WalletsHandler {
         number: u32,
         rest: &[String],
     ) -> Result<Vec<u8>, HandlerError> {
-        let view = self.account_view(wallet, number).await?;
+        // The Petal router consumes account.json as an authorization context
+        // even for guest writes and side-effecting reads. Keep that document
+        // on the live authority path; only ordinary navigation uses the
+        // bounded snapshot.
+        let view = if rest == ["account.json"] {
+            self.account_view(wallet, number).await?
+        } else {
+            self.account_view_navigation(wallet, number).await?
+        };
         match rest {
             [leaf] if leaf == "account.json" => self.account_json(wallet, &view),
             [leaf] if ACCOUNT_KEY_FILES.contains(&leaf.as_str()) => {
@@ -503,7 +541,7 @@ impl WalletsHandler {
         number: u32,
         rest: &[String],
     ) -> Result<Vec<Entry>, HandlerError> {
-        let view = self.account_view(wallet, number).await?;
+        let view = self.account_view_navigation(wallet, number).await?;
         match rest {
             [] => Ok(Self::account_dir_entries(&view)),
             [dir] if dir == "sessions" => {
@@ -563,7 +601,15 @@ impl WalletsHandler {
         rest: &[String],
         data: &[u8],
     ) -> Result<(), HandlerError> {
-        let view = self.account_view(wallet, number).await?;
+        // Unsigned construction can use an authenticated cached account while
+        // Broker is unavailable. Every other write still resolves live authority.
+        let unsigned_stage = matches!(rest, [dir, _, sub, leaf]
+            if dir == "chains" && sub == "outbox" && leaf == "new.tx");
+        let view = if unsigned_stage {
+            self.account_view_navigation(wallet, number).await?
+        } else {
+            self.account_view(wallet, number).await?
+        };
         if let [dir, mount, slot, leaf] = rest
             && dir == "sessions"
             && leaf == "stop"
@@ -627,8 +673,27 @@ impl WalletsHandler {
                 family.fingerprint
             )));
         }
-        let projection = self.wallet_projection(wallet).await?;
-        let policy = crate::advisory_evm_policy(&projection, chain).map_err(err_be)?;
+        let projection = if unsigned_stage {
+            self.wallet_projection_navigation(wallet).await?
+        } else {
+            self.wallet_projection(wallet).await?
+        };
+        // The numeric-chain opt-in has to be read here, not only on the
+        // `bloom deploy` RPC path. This is the outbox the docs tell an agent
+        // to stage through, and `advisory_evm_policy` always returns a
+        // non-empty recipient allowlist -- the canonical destinations, or a
+        // fail-closed sentinel when none match the chain name. A contract
+        // creation has no recipient to satisfy one, so every `kind: "deploy"`
+        // staged here carried a hard policy violation and was refused at
+        // confirm, no matter what policy the owner had approved.
+        let chain_id = self
+            .chains
+            .get(chain)
+            .ok_or_else(|| HandlerError::invalid(format!("chain '{chain}' is not configured")))?
+            .spec()
+            .chain_id;
+        let policy =
+            crate::advisory_exact_evm_policy(&projection, chain, chain_id).map_err(err_be)?;
         self.write_outbox_from(wallet, chain, from, &policy, chain_rest, data)
             .await
     }
