@@ -714,7 +714,10 @@ async fn spawn_node_with_flaky_broadcast(fail_times: Arc<std::sync::atomic::Atom
                         r#"{"jsonrpc":"2.0","id":1,"result":{"context":{"slot":1},"value":{"err":null,"logs":[],"unitsConsumed":150}}}"#.to_string()
                     }
                     "sendTransaction" => {
-                        let remaining = fail_times.try_update(
+                        // Keep the pinned Rust 1.96 API; newer stable renames
+                        // this method to try_update.
+                        #[allow(deprecated)]
+                        let remaining = fail_times.fetch_update(
                             std::sync::atomic::Ordering::SeqCst,
                             std::sync::atomic::Ordering::SeqCst,
                             |n| n.checked_sub(1),

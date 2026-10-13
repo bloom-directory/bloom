@@ -5512,6 +5512,7 @@ impl bloom_tx::bump_scanner::BasefeeProvider for ChainBasefeeProvider {
 #[derive(Debug, Clone)]
 struct ConfigPaidHttpRpcResolver {
     by_chain_id: std::collections::BTreeMap<u64, Vec<String>>,
+    solana: Vec<bloom_proto::SolanaSpec>,
 }
 
 impl ConfigPaidHttpRpcResolver {
@@ -5524,11 +5525,24 @@ impl ConfigPaidHttpRpcResolver {
                 (!urls.is_empty()).then_some((spec.chain_id, urls))
             })
             .collect();
-        Self { by_chain_id }
+        Self {
+            by_chain_id,
+            solana: config.solana_chains.values().cloned().collect(),
+        }
     }
 }
 
 impl PaidHttpChainRpcResolver for ConfigPaidHttpRpcResolver {
+    fn solana_spec(&self, network: &str) -> Option<bloom_proto::SolanaSpec> {
+        let reference = network.strip_prefix("solana:")?;
+        let mut matches = self.solana.iter().filter(|spec| {
+            spec.expected_genesis_base58
+                .as_deref()
+                .is_some_and(|genesis| genesis.get(..32) == Some(reference))
+        });
+        let spec = matches.next()?.clone();
+        matches.next().is_none().then_some(spec)
+    }
     fn http_rpc_urls_for_chain_id(&self, chain_id: u64) -> Vec<String> {
         self.by_chain_id.get(&chain_id).cloned().unwrap_or_default()
     }

@@ -14,6 +14,14 @@ async-trait.workspace = true
 x402-chain-eip155 = { version = "2.0.0", features = ["client", "telemetry"] }
 x402-types = "2.0.0"
 tempfile.workspace = true
+serde.workspace = true
+rand.workspace = true
+ed25519-dalek.workspace = true
+bloom-solana.workspace = true
+solana-message = { version = "4.5.0", features = ["wincode"] }
+solana-pubkey = { version = "4.3.0", features = ["curve25519"] }
+solana-instruction = "3.2.0"
+wincode = "0.6"
 
 [dev-dependencies]
 reqwest.workspace = true
