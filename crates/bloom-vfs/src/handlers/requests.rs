@@ -1862,6 +1862,22 @@ fn render_plan(
     dry_run: bool,
 ) -> String {
     if let Some(ch) = challenge {
+        let cost = if ch
+            .network
+            .as_deref()
+            .is_some_and(|network| network.starts_with("solana:"))
+            && ch.asset.as_deref() == Some("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
+        {
+            ch.amount_usd.map(|usd| {
+                format!(
+                    "${} USDC ({} atomic units)",
+                    trim_money(usd),
+                    ch.amount.as_deref().unwrap_or("unknown")
+                )
+            })
+        } else {
+            None
+        };
         format!(
             "# Payment plan\n\nRequest: {} {}\nWallet: {}\nMerchant: {}\nPayment method: paid_http:{}/{}\nNetwork: {}\nAsset: {}\nCost now: {}\nPolicy: {}\n{}\nOn confirm: prepare a redacted {} credential and retry only when a signer/settlement backend is configured. No secret credential material will be written to the VFS.\nDry run: {}\n",
             req.method,
@@ -1872,7 +1888,8 @@ fn render_plan(
             paid_http_intent_label(&ch.intent),
             ch.network.as_deref().unwrap_or("unknown"),
             ch.asset.as_deref().unwrap_or("unknown"),
-            ch.amount.as_deref().unwrap_or("unknown"),
+            cost.as_deref()
+                .unwrap_or_else(|| ch.amount.as_deref().unwrap_or("unknown")),
             if checks.iter().any(|c| c.result == "deny") {
                 "denied"
             } else if checks.iter().any(|c| c.result == "warn") {

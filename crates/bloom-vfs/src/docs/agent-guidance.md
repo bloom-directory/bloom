@@ -313,6 +313,13 @@ wallet, and approval projection before confirming. Keep vendor-specific request
 syntax in the relevant Petal or request documentation rather than assuming a
 provider contract from this root guide.
 
+Solana x402 supports v2 exact USDC payments through the canonical Solana
+account 0. It requires a genesis-pinned configured RPC and a separate
+facilitator fee payer. Broker approves the exact account and message bytes;
+the transfer details are Machine-described, not independently Broker-decoded.
+An expired blockhash stops before payment: cancel the unpaid request and stage
+a fresh one. Never restage a request whose receipt records an unresolved charge.
+
 A paid request's confirm and cancel operations are serialized. Once execution
 has started, cancellation cannot undo the payment. A timeout or interrupted
 confirmation does not prove non-payment: inspect the exact request's receipt
