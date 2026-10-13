@@ -267,6 +267,7 @@ fn policy(maximum_approval_lifetime_ms: u64) -> CanonicalWalletPolicy {
             verifier_id: Token::new("human").unwrap(),
             verifier_digest: Digest32::from_bytes([4; 32]),
         }],
+        clear_signing: None,
     }
 }
 
