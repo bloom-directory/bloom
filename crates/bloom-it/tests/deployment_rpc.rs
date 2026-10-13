@@ -89,68 +89,209 @@ fn clean_tool(name: &str, dir: &Path) -> Command {
     c
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires a built bloom binary, Forge/Anvil, and npm; runs external compatibility projects"]
-async fn deployment_tools_and_recovery() -> Result<()> {
-    let mut anvil = spawn_anvil().await?;
-    let dir = tempfile::tempdir()?;
-    let mut config = Config::local_default();
-    let mut spec = ChainSpec::anvil_default();
-    spec.rpc_urls = vec![anvil.rpc_url()];
-    config.chains.insert("anvil".into(), spec);
-    config.save(&dir.path().join("config.toml"))?;
-    let home = HomeDir::at(dir.path());
-    let permit = Arc::new(HomeWritePermit::acquire(&home)?);
-    let (broker, fixture) = exact_signing_broker(FUNDER_PRIV_KEY)?;
-    fixture.allow_test_deployments();
-    let daemon = Daemon::from_home_with_permit_and_broker(
-        home,
-        permit,
-        broker,
-        exact_signing_catalog(&["transaction.confirm"]),
-    )?;
-    let socket = dir.path().join("run/bloom.sock");
-    let server = IpcServer::new(daemon.vfs.clone(), "deployment-test", vec!["anvil".into()])
-        .with_machine_commands(Arc::new(Commands(daemon.clone())));
-    let stopped = server.clone();
-    let served = socket.clone();
-    let ipc = tokio::spawn(async move { server.serve(&served).await });
-    for _ in 0..100 {
-        if socket.exists() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+struct AbortTask(tokio::task::AbortHandle);
+impl Drop for AbortTask {
+    fn drop(&mut self) {
+        self.0.abort();
     }
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()?;
-    let binary = std::env::var_os("BLOOM_TEST_BINARY")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| root.join("target/debug/bloom"));
-    let mut child = Command::new(&binary)
-        .args([
-            "--connect",
-            &format!("unix:{}", socket.display()),
-            "deploy",
-            "--wallet",
-            "alice",
-            "--chain",
-            "anvil",
-            "rpc",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::from(std::fs::File::create(
-            dir.path().join("bridge.log"),
-        )?))
-        .kill_on_drop(true)
-        .spawn()?;
-    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
-    let line = tokio::time::timeout(Duration::from_secs(30), lines.next_line())
-        .await??
-        .context("bridge exited without URL")?;
-    let info: Value = serde_json::from_str(&line)?;
-    let url = info["rpc_url"].as_str().context("missing RPC URL")?;
-    let sender = info["from"].as_str().unwrap();
+}
+
+struct RunningIpc {
+    server: IpcServer,
+    task: Option<tokio::task::JoinHandle<Result<(), bloom_daemon::ipc::IpcError>>>,
+}
+impl RunningIpc {
+    async fn shutdown(&mut self) -> Result<()> {
+        self.server.trigger_shutdown();
+        if let Some(task) = self.task.take() {
+            task.await??;
+        }
+        Ok(())
+    }
+}
+impl Drop for RunningIpc {
+    fn drop(&mut self) {
+        self.server.trigger_shutdown();
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
+}
+
+struct Harness {
+    ipc: RunningIpc,
+    child: tokio::process::Child,
+    anvil: bloom_it::AnvilGuard,
+    daemon: Daemon,
+    fixture: Arc<bloom_it::ExactSigningBrokerFixture>,
+    dir: tempfile::TempDir,
+    root: std::path::PathBuf,
+    info: Value,
+    url: String,
+    sender: String,
+}
+impl Harness {
+    async fn start() -> Result<Self> {
+        let anvil = spawn_anvil().await?;
+        let dir = tempfile::tempdir()?;
+        let mut config = Config::local_default();
+        let mut spec = ChainSpec::anvil_default();
+        spec.rpc_urls = vec![anvil.rpc_url()];
+        config.chains.insert("anvil".into(), spec);
+        config.save(&dir.path().join("config.toml"))?;
+        let home = HomeDir::at(dir.path());
+        let permit = Arc::new(HomeWritePermit::acquire(&home)?);
+        let (broker, fixture) = exact_signing_broker(FUNDER_PRIV_KEY)?;
+        fixture.allow_test_deployments();
+        let daemon = Daemon::from_home_with_permit_and_broker(
+            home,
+            permit,
+            broker,
+            exact_signing_catalog(&["transaction.confirm"]),
+        )?;
+        let socket = dir.path().join("run/bloom.sock");
+        let server = IpcServer::new(daemon.vfs.clone(), "deployment-test", vec!["anvil".into()])
+            .with_machine_commands(Arc::new(Commands(daemon.clone())));
+        let stopped = server.clone();
+        let served = socket.clone();
+        let ipc = RunningIpc {
+            server: stopped,
+            task: Some(tokio::spawn(async move { server.serve(&served).await })),
+        };
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()?;
+        let binary = std::env::var_os("BLOOM_TEST_BINARY")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| root.join("target/debug/bloom"));
+        let mut child = Command::new(&binary)
+            .args([
+                "--connect",
+                &format!("unix:{}", socket.display()),
+                "deploy",
+                "--wallet",
+                "alice",
+                "--chain",
+                "anvil",
+                "rpc",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::from(std::fs::File::create(
+                dir.path().join("bridge.log"),
+            )?))
+            .kill_on_drop(true)
+            .spawn()?;
+        let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+        let line = tokio::time::timeout(Duration::from_secs(30), lines.next_line())
+            .await??
+            .context("bridge exited without URL")?;
+        let info: Value = serde_json::from_str(&line)?;
+        let url = info["rpc_url"]
+            .as_str()
+            .context("missing RPC URL")?
+            .to_owned();
+        let sender = info["from"].as_str().context("missing sender")?.to_owned();
+
+        Ok(Self {
+            ipc,
+            child,
+            anvil,
+            daemon,
+            fixture,
+            dir,
+            root,
+            info,
+            url,
+            sender,
+        })
+    }
+    async fn shutdown(&mut self) -> Result<()> {
+        self.child.kill().await?;
+        self.ipc.shutdown().await
+    }
+}
+
+fn drive_deployments(daemon: &Daemon) -> AbortTask {
+    let drive = daemon.clone();
+    let driver = tokio::spawn(async move {
+        loop {
+            if let Ok(ids) =
+                drive
+                    .tx_engine
+                    .outbox
+                    .list("alice", "anvil", bloom_tx::OutboxState::Pending)
+            {
+                for id in ids {
+                    if id.starts_with("deploy-") {
+                        let _ = drive
+                            .deployment_rpc(
+                                "alice",
+                                "anvil",
+                                "bloom_deploymentContinue",
+                                json!([id]),
+                            )
+                            .await;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    });
+
+    AbortTask(driver.abort_handle())
+}
+
+async fn hardhat_project(harness: &Harness) -> Result<std::path::PathBuf> {
+    let dir = &harness.dir;
+    let root = &harness.root;
+    let info = &harness.info;
+    let hardhat = dir.path().join("hardhat");
+    std::fs::create_dir_all(&hardhat)?;
+    copy_tree(
+        &root.join("examples/evm-deploy/contracts"),
+        &hardhat.join("contracts"),
+    )?;
+    for file in [
+        "package.json",
+        "package-lock.json",
+        "hardhat.config.ts",
+        "scripts/deploy.ts",
+        "ignition/modules/Deployment.ts",
+    ] {
+        let target = hardhat.join(file);
+        std::fs::create_dir_all(target.parent().unwrap())?;
+        std::fs::copy(root.join("examples/evm-deploy").join(file), target)?;
+    }
+    std::fs::write(hardhat.join("rpc.json"), info.to_string())?;
+    let mut npm = clean_tool("npm", &hardhat);
+    npm.args([
+        "--userconfig",
+        "/dev/null",
+        "ci",
+        "--ignore-scripts",
+        "--no-audit",
+        "--no-fund",
+    ]);
+    run_tool(npm).await?;
+
+    Ok(hardhat)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a built bloom binary and Anvil"]
+async fn deployment_recovery() -> Result<()> {
+    let mut harness = Harness::start().await?;
+    let daemon = &harness.daemon;
+    let fixture = &harness.fixture;
+    let anvil = &mut harness.anvil;
+    let url = harness.url.as_str();
+    let sender = harness.sender.as_str();
     ensure!(rpc(url, "eth_accounts", json!([])).await?["result"] == json!([sender]));
     for invalid in [
         json!({"from":sender,"nonce":"0x0","data":"0x","gas":"0x186a0"}),
@@ -368,9 +509,7 @@ async fn deployment_tools_and_recovery() -> Result<()> {
 
     // One transaction through the sequence production actually has: an HTTP
     // request from a build tool held open while an owner approves out of band,
-    // and `bloom deploy resume` releasing it. Every tool invocation below runs
-    // under the auto-continue driver, which no real deployment has, so without
-    // this the human-in-the-loop path the bridge exists for is never executed.
+    // and `bloom deploy resume` releasing it.
     fixture.deactivate();
     let ids_before: Vec<String> = daemon
         .deployment_rpc("alice", "anvil", "bloom_deploymentList", json!([]))
@@ -511,31 +650,31 @@ async fn deployment_tools_and_recovery() -> Result<()> {
         "the held request must return the transaction hash: {released}"
     );
 
-    let drive = daemon.clone();
-    let driver = tokio::spawn(async move {
-        loop {
-            if let Ok(ids) =
-                drive
-                    .tx_engine
-                    .outbox
-                    .list("alice", "anvil", bloom_tx::OutboxState::Pending)
-            {
-                for id in ids {
-                    if id.starts_with("deploy-") {
-                        let _ = drive
-                            .deployment_rpc(
-                                "alice",
-                                "anvil",
-                                "bloom_deploymentContinue",
-                                json!([id]),
-                            )
-                            .await;
-                    }
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    });
+    if let Some(mut node) = anvil.take_child() {
+        node.kill().await?;
+    }
+    let offline = daemon
+        .deployment_rpc("alice", "anvil", "bloom_deploymentStatus", json!([id]))
+        .await;
+    ensure!(
+        offline["result"]["status"] == "mined",
+        "persisted receipt unavailable offline: {offline}"
+    );
+    ensure!(offline["result"]["receipt"]["contract_address"].is_string());
+
+    harness.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a built bloom binary and Forge/Anvil"]
+async fn foundry_deployment_and_resume() -> Result<()> {
+    let mut harness = Harness::start().await?;
+    harness.fixture.activate();
+    let _driver = drive_deployments(&harness.daemon);
+    let dir = &harness.dir;
+    let root = &harness.root;
+    let url = harness.url.as_str();
+    let sender = harness.sender.as_str();
     let project = dir.path().join("foundry");
     std::fs::create_dir_all(&project)?;
     for folder in ["contracts", "script"] {
@@ -549,11 +688,9 @@ async fn deployment_tools_and_recovery() -> Result<()> {
         project.join("foundry.toml"),
     )?;
     let mut forge = clean_tool("forge", &project);
-    forge.args([
+    forge.env("ETH_RPC_URL", url).args([
         "script",
         "script/Deploy.s.sol:Deploy",
-        "--rpc-url",
-        url,
         "--sender",
         sender,
         "--unlocked",
@@ -563,11 +700,9 @@ async fn deployment_tools_and_recovery() -> Result<()> {
     let output = run_tool(forge).await?;
     eprintln!("Foundry: {output}");
     let mut resume = clean_tool("forge", &project);
-    resume.args([
+    resume.env("ETH_RPC_URL", url).args([
         "script",
         "script/Deploy.s.sol:Deploy",
-        "--rpc-url",
-        url,
         "--sender",
         sender,
         "--unlocked",
@@ -592,11 +727,9 @@ async fn deployment_tools_and_recovery() -> Result<()> {
         for pass in 0..2 {
             let before = rpc(url, "eth_getTransactionCount", json!([sender, "latest"])).await?;
             let mut forge = clean_tool("forge", &copied);
-            forge.args([
+            forge.env("ETH_RPC_URL", url).args([
                 "script",
                 "script/Deploy.s.sol:Deploy",
-                "--rpc-url",
-                url,
                 "--sender",
                 sender,
                 "--unlocked",
@@ -613,34 +746,17 @@ async fn deployment_tools_and_recovery() -> Result<()> {
             }
         }
     }
-    let hardhat = dir.path().join("hardhat");
-    std::fs::create_dir_all(&hardhat)?;
-    copy_tree(
-        &root.join("examples/evm-deploy/contracts"),
-        &hardhat.join("contracts"),
-    )?;
-    for file in [
-        "package.json",
-        "package-lock.json",
-        "hardhat.config.ts",
-        "scripts/deploy.ts",
-        "ignition/modules/Deployment.ts",
-    ] {
-        let target = hardhat.join(file);
-        std::fs::create_dir_all(target.parent().unwrap())?;
-        std::fs::copy(root.join("examples/evm-deploy").join(file), target)?;
-    }
-    std::fs::write(hardhat.join("rpc.json"), info.to_string())?;
-    let mut npm = clean_tool("npm", &hardhat);
-    npm.args([
-        "--userconfig",
-        "/dev/null",
-        "ci",
-        "--ignore-scripts",
-        "--no-audit",
-        "--no-fund",
-    ]);
-    run_tool(npm).await?;
+
+    harness.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a built bloom binary, Anvil and npm"]
+async fn hardhat_deployment() -> Result<()> {
+    let mut harness = Harness::start().await?;
+    harness.fixture.activate();
+    let _driver = drive_deployments(&harness.daemon);
+    let hardhat = hardhat_project(&harness).await?;
     let mut script = clean_tool("node", &hardhat);
     script.args([
         "node_modules/hardhat/dist/src/cli.js",
@@ -650,6 +766,19 @@ async fn deployment_tools_and_recovery() -> Result<()> {
         "bloom",
     ]);
     eprintln!("Hardhat script: {}", run_tool(script).await?);
+
+    harness.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a built bloom binary, Anvil and npm"]
+async fn ignition_deployment_and_reconciliation() -> Result<()> {
+    let mut harness = Harness::start().await?;
+    harness.fixture.activate();
+    let _driver = drive_deployments(&harness.daemon);
+    let hardhat = hardhat_project(&harness).await?;
+    let url = harness.url.as_str();
+    let sender = harness.sender.as_str();
     let mut ignition = clean_tool("node", &hardhat);
     ignition.args([
         "node_modules/hardhat/dist/src/cli.js",
@@ -675,20 +804,6 @@ async fn deployment_tools_and_recovery() -> Result<()> {
         rpc(url, "eth_getTransactionCount", json!([sender, "latest"])).await? == nonce_before,
         "Ignition reconciliation sent a duplicate"
     );
-    driver.abort();
-    if let Some(mut node) = anvil.take_child() {
-        node.kill().await?;
-    }
-    let offline = daemon
-        .deployment_rpc("alice", "anvil", "bloom_deploymentStatus", json!([id]))
-        .await;
-    ensure!(
-        offline["result"]["status"] == "mined",
-        "persisted receipt unavailable offline: {offline}"
-    );
-    ensure!(offline["result"]["receipt"]["contract_address"].is_string());
-    child.kill().await?;
-    stopped.trigger_shutdown();
-    ipc.await??;
-    Ok(())
+
+    harness.shutdown().await
 }

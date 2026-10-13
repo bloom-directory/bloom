@@ -3767,7 +3767,7 @@ impl AccountPetalMount for AccountPetals {
 /// behind Arc/clone-safe inner types).
 #[derive(Clone)]
 pub struct Daemon {
-    deployment_lock: Arc<tokio::sync::Mutex<()>>,
+    deployment_locks: Arc<deployment::DeploymentLocks>,
     pub home: HomeDir,
     pub config: Config,
     pub chains: ChainRegistry,
@@ -4908,7 +4908,7 @@ impl Daemon {
         );
 
         Ok(Self {
-            deployment_lock: Arc::new(tokio::sync::Mutex::new(())),
+            deployment_locks: Arc::new(deployment::DeploymentLocks::default()),
             home,
             config,
             chains,
