@@ -352,8 +352,44 @@ if [[ ! -s "$work/live-projection.log" ]]; then
   cat "$work/live-projection.stderr" >&2
   exit 1
 fi
-wallet_address="$(jq -r '.keys[0].addresses[0] // empty' "$work/live-projection.log")"
-[[ "$wallet_address" =~ ^0x[0-9a-fA-F]{40}$ ]] || exit 1
+# Key inventories can put another curve first. Select the same primary EVM
+# descriptor as WalletProjection, without assuming an inventory order.
+/usr/bin/python3 - "$work/live-projection.log" "$wallet_id" >"$work/primary-key.json" <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+projection = json.loads(pathlib.Path(sys.argv[1]).read_text())
+if (projection["verification"] != "authenticated_broker"
+        or projection["freshness"] != "fresh"
+        or projection["wallet"]["wallet_id"] != sys.argv[2]):
+    raise SystemExit("primary EVM key requires the fresh authenticated fixture wallet")
+root = projection["wallet"].get("root_key_ref")
+keys = []
+for key in projection["keys"]:
+    ref = key["key_ref"]
+    if root is not None:
+        selected = key["role"] == "wallet_root" and ref == root
+    else:
+        derivation = ref.get("derivation") or {}
+        selected = (key["role"] == "derived"
+                    and ref["key_spec"] == "secp256k1"
+                    and derivation.get("scheme") == "bip39-multicurve"
+                    and derivation.get("path") == "m/44'/60'/0'/0/0")
+    if selected:
+        keys.append(key)
+if len(keys) != 1:
+    raise SystemExit(f"expected one primary EVM key; found {len(keys)}")
+key = keys[0]
+address = next(iter(key["addresses"]), "")
+if (key["key_ref"]["key_spec"] != "secp256k1"
+        or not re.fullmatch(r"0x[0-9a-fA-F]{40}", address)
+        or "secp256k1-keccak256-recoverable" not in key["supported_crypto_suites"]):
+    raise SystemExit("primary EVM descriptor lacks a valid address or signing suite")
+print(json.dumps(key))
+PY
+wallet_address="$(jq -r '.addresses[0]' "$work/primary-key.json")"
 
 # Install one explicit destination so the later confirm reaches the Broker
 # signing boundary rather than stopping at Machine's advisory deny-all view.
@@ -370,7 +406,11 @@ sudo -H -u "$login_user" env \
   BLOOM_EDGE_MANIFEST="$edge_manifest" \
   "$machine_binary" --home "$clean_home" --connect "unix:$machine_socket" \
     wallet update-policy "$wallet_id" \
-    --file "$work/live-policy.json" >"$work/policy-prepare-live.log" 2>&1
+    --file "$work/live-policy.json" >"$work/policy-prepare-live.log" 2>&1 || {
+  cat "$work/policy-prepare-live.log" >&2
+  echo "fixture policy prepare was refused" >&2
+  exit 1
+}
 policy_operation_id="$(sed -n 's/^operation_id: //p' "$work/policy-prepare-live.log")"
 policy_ceremony_url="$(sed -n 's/^ceremony_url: //p' "$work/policy-prepare-live.log")"
 [[ "$policy_operation_id" =~ ^[0-9a-f]{64}$ ]]
@@ -466,7 +506,8 @@ sudo -H -u "$login_user" env \
 jq -e \
   --arg address "$wallet_address" \
   --arg wallet "$wallet_id" \
-  '.verification == "authenticated_broker" and .freshness == "fresh" and .wallet.wallet_id == $wallet and .keys[0].addresses[0] == $address' \
+  --slurpfile primary "$work/primary-key.json" \
+  '.verification == "authenticated_broker" and .freshness == "fresh" and .wallet.wallet_id == $wallet and any(.keys[]; .key_ref == $primary[0].key_ref and .addresses[0] == $address)' \
   "$work/live-projection.log" >/dev/null
 /usr/bin/python3 - "$work/live-projection.log" "$wallet_address" <<'PY'
 import base64
@@ -493,13 +534,14 @@ approval_expires_ms="$((approval_issued_ms + 600000))"
 jq -c \
   --arg issued "$approval_issued_ms" \
   --arg expires "$approval_expires_ms" \
+  --slurpfile primary "$work/primary-key.json" \
   '{
     operation_id:"1111111111111111111111111111111111111111111111111111111111111111",
     terms:{
       subject:{kind:"cli",client_id:"bloom-cli",command_class:"ma05.degraded"},
       wallet_id:.wallet.wallet_id,
-      key_ref:.keys[0].key_ref,
-      allowed_crypto_suites:[.keys[0].supported_crypto_suites[0]],
+      key_ref:$primary[0].key_ref,
+      allowed_crypto_suites:["secp256k1-keccak256-recoverable"],
       selector:{kind:"exact",ordered_payload_digests:["2222222222222222222222222222222222222222222222222222222222222222"],ordered_hashes:["3333333333333333333333333333333333333333333333333333333333333333"]},
       limits:{max_operations:"1",max_signatures:"1",operation_rate_limits:[],signature_rate_limits:[],value_limits:[]},
       activation_mode:{kind:"boot_bound"},
@@ -803,7 +845,21 @@ run_login_with_deadline \
   echo "packaged Machine did not preserve cached reads through its kernel mount" >&2
   exit 1
 }
-grep -Fx "$wallet_address" "$work/cached-wallet-address.log" >/dev/null
+# Signer projects lowercase hex; the mounted address uses EIP-55 casing.
+# Validate one complete address and compare its bytes, preserving the real
+# kernel-read check while refusing malformed output or a different wallet.
+/usr/bin/python3 - "$wallet_address" "$work/cached-wallet-address.log" <<'PY'
+import pathlib
+import re
+import sys
+
+expected = sys.argv[1]
+actual = pathlib.Path(sys.argv[2]).read_text().removesuffix("\n")
+if not all(re.fullmatch(r"0x[0-9a-fA-F]{40}", value) for value in (expected, actual)):
+    raise SystemExit("cached wallet read must contain exactly one EVM address")
+if actual.lower() != expected.lower():
+    raise SystemExit(f"cached wallet address differs: expected {expected}, received {actual}")
+PY
 
 degraded_intent="send 0.000000000000000001 eth to $wallet_address on anvil"
 mounted_write_with_deadline \

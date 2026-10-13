@@ -349,7 +349,10 @@ async fn retries_transient_http_failures() {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 let mut buf = vec![0u8; 8192];
                 let _ = socket.read(&mut buf).await.unwrap_or(0);
-                let body = if failures.fetch_sub(1, Ordering::SeqCst) > 0 {
+                #[allow(deprecated)]
+                let remaining =
+                    failures.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
+                let body = if remaining.is_ok() && remaining.unwrap() > 0 {
                     "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_string()
                 } else {
                     let body = r#"{"jsonrpc":"2.0","id":1,"result":777}"#;

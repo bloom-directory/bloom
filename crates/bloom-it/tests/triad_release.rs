@@ -208,14 +208,6 @@ fn release_compatibility_declares_each_edge_without_a_global_protocol_range() {
         );
         assert!(compatibility.contains(&block), "missing {block}");
         assert_eq!(range.minor_min == range.minor_max, exact, "{edge}");
-        if exact {
-            for key in ["minor_min", "minor_max"] {
-                assert!(verifier.contains(&format!(
-                    "require_compat_value protocols.{edge} {key} {}",
-                    range.minor_max
-                )));
-            }
-        }
     }
     // This test runs from a nextest archive with no Cargo git cache. Inspect
     // only lockfile `source =` records; package dependency strings are
@@ -271,8 +263,17 @@ fn release_compatibility_declares_each_edge_without_a_global_protocol_range() {
     assert!(is_legacy_global_protocol_key("  protocol_major = 1"));
     assert!(is_legacy_global_protocol_key("\tprotocol_minor_min = 0"));
 
-    assert!(verifier.contains("for support_edge in signer_control session"));
+    // The verifier holds a bundle to this reviewed record rather than to its
+    // own copies of these values: every line must match except the built
+    // Broker and Signer commits, which must match SOURCE_REVISIONS instead.
+    assert!(verifier.contains("reviewed_compatibility=\"$script_dir/compatibility-v1.toml\""));
+    assert!(verifier.contains("grep -Ev '^(broker|signer)_commit = '"));
+    assert!(
+        verifier.contains("bundle compatibility differs from the reviewed compatibility-v1.toml")
+    );
+    assert!(verifier.contains("bundle compatibility revision does not match SOURCE_REVISIONS"));
     assert!(verifier.contains("must not declare a global protocol range"));
+    assert!(!verifier.contains("require_compat_value"));
 
     for revision in [
         "broker_commit",
@@ -287,7 +288,6 @@ fn release_compatibility_declares_each_edge_without_a_global_protocol_range() {
             "[state.{component}]\ncurrent = 2\ndowngrade_floor = 2\nmigration_floor = 1"
         )));
     }
-    assert!(verifier.contains("require_compat_value \"state.$state_owner\" migration_floor 1"));
 }
 
 #[test]
@@ -571,6 +571,17 @@ fn make_installer_payload(root: &Path) -> PathBuf {
 }
 
 fn build(staging: &Path, output: &Path, key: &Path) -> std::process::Output {
+    build_with_record(staging, output, key, |record| record)
+}
+
+/// Builds a fixture bundle whose compatibility record is the reviewed one with
+/// fixture Broker/Signer commits, then passed through `edit`.
+fn build_with_record(
+    staging: &Path,
+    output: &Path,
+    key: &Path,
+    edit: impl Fn(String) -> String,
+) -> std::process::Output {
     let compatibility = PathBuf::from(format!("{}.compatibility.toml", output.display()));
     let compatibility_source = fs::read_to_string(release_script("compatibility-v1.toml")).unwrap();
     let fixture_compatibility = compatibility_source
@@ -586,7 +597,7 @@ fn build(staging: &Path, output: &Path, key: &Path) -> std::process::Output {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    fs::write(&compatibility, format!("{fixture_compatibility}\n")).unwrap();
+    fs::write(&compatibility, edit(format!("{fixture_compatibility}\n"))).unwrap();
     Command::new(release_script("build-bundle.sh"))
         .args([staging.as_os_str(), output.as_os_str(), key.as_os_str()])
         .arg("1700000000")
@@ -1589,6 +1600,76 @@ fn triad_bundle_is_reproducible_signed_and_self_verifying() {
         "{}",
         String::from_utf8_lossy(&verified.stderr)
     );
+
+    // The verifier shipped inside the bundle checks the record against the
+    // reviewed copy packaged beside it, so offline verification works too.
+    let extracted = directory.path().join("extracted");
+    fs::create_dir_all(&extracted).unwrap();
+    assert!(
+        Command::new("tar")
+            .arg("-xzf")
+            .arg(&first)
+            .arg("-C")
+            .arg(&extracted)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let packaged_verifier = extracted.join("bloom-triad/installer/release/verify-bundle.sh");
+    let verify_with = |verifier: &Path, bundle: &Path| {
+        let checksum = PathBuf::from(format!("{}.sha256", bundle.display()));
+        let signature = PathBuf::from(format!("{}.sig", bundle.display()));
+        let public_key = PathBuf::from(format!("{}.pub", bundle.display()));
+        Command::new(verifier)
+            .args([
+                bundle.as_os_str(),
+                checksum.as_os_str(),
+                signature.as_os_str(),
+                public_key.as_os_str(),
+            ])
+            .env("BLOOM_ALLOW_TEST_UNCLAIMED", "true")
+            .output()
+            .unwrap()
+    };
+    let packaged = verify_with(&packaged_verifier, &first);
+    assert!(
+        packaged.status.success(),
+        "{}",
+        String::from_utf8_lossy(&packaged.stderr)
+    );
+
+    // A correctly signed bundle whose record departs from the reviewed one
+    // (here a lowered Broker downgrade floor) fails both verifiers.
+    let tampered = directory.path().join("tampered.tar.gz");
+    let tampered_build = build_with_record(&staging, &tampered, &key, |record| {
+        record.replacen(
+            "[state.broker]\ncurrent = 2\ndowngrade_floor = 2",
+            "[state.broker]\ncurrent = 2\ndowngrade_floor = 1",
+            1,
+        )
+    });
+    assert!(
+        tampered_build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&tampered_build.stderr)
+    );
+    for verifier in [
+        release_script("verify-bundle.sh"),
+        packaged_verifier.clone(),
+    ] {
+        let refused = verify_with(&verifier, &tampered);
+        assert!(
+            !refused.status.success(),
+            "{} accepted a tampered record",
+            verifier.display()
+        );
+        assert!(
+            String::from_utf8_lossy(&refused.stderr)
+                .contains("bundle compatibility differs from the reviewed compatibility-v1.toml"),
+            "{}",
+            String::from_utf8_lossy(&refused.stderr)
+        );
+    }
 
     let wrong_namespace = Command::new(release_script("ssh-ed25519-verify.sh"))
         .arg(&public_key)

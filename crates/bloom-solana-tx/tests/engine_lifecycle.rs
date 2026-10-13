@@ -715,7 +715,13 @@ async fn spawn_node_with_flaky_broadcast(fail_times: Arc<std::sync::atomic::Atom
                         r#"{"jsonrpc":"2.0","id":1,"result":{"context":{"slot":1},"value":{"err":null,"logs":[],"unitsConsumed":150}}}"#.to_string()
                     }
                     "sendTransaction" => {
-                        if fail_times.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+                        #[allow(deprecated)]
+                        let remaining = fail_times.fetch_update(
+                            std::sync::atomic::Ordering::SeqCst,
+                            std::sync::atomic::Ordering::SeqCst,
+                            |n| n.checked_sub(1),
+                        );
+                        if remaining.is_ok_and(|n| n > 0) {
                             r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"simulated broadcast failure"}}"#.to_string()
                         } else {
                             format!(

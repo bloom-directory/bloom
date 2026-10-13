@@ -84,6 +84,14 @@ signing or GitHub publication. Live candidate installation requires both a
 root-owned, non-writable pin of that artifact's ephemeral public key and the
 explicit `BLOOM_ALLOW_TEST_UNCLAIMED=true` installer opt-in.
 
+**Bloom requires macOS 26 or later.** The installed Machine launch agent always
+mounts `~/bloom` through native NFSv4.1 (`serve --mount-home`), which earlier
+macOS versions do not support, and an installed Bloom has no configuration
+without that mount. Native Unix conformance runs on `macos-26`; live
+installation and restore reject older systems before changing service accounts
+or runtime state. The macOS 15 minimum in the rootless security design concerns
+container protection, not this mount.
+
 `release.sh sign linux|linux-aarch64|macos` is the isolated production signing
 pass. It never executes a candidate-owned binary or script. It verifies the
 expected version, source revisions, and target architecture, replaces the

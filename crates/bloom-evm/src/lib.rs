@@ -358,6 +358,18 @@ impl ChainClient {
         Ok(self.primary.get_transaction_count(addr).pending().await?)
     }
 
+    /// The next nonce counting only mined transactions.
+    ///
+    /// The pending count includes transactions that are merely in a mempool,
+    /// so it answers "what should I stage next?" — not "has this nonce been
+    /// spent?". A caller deciding whether an unmined transaction can still be
+    /// replaced must ask the latter: the transaction it wants to replace is
+    /// itself in that pending count, and reading it there would report the
+    /// nonce as consumed by the very transaction being replaced.
+    pub async fn nonce_latest(&self, addr: Address) -> Result<u64, ChainError> {
+        Ok(self.primary.get_transaction_count(addr).latest().await?)
+    }
+
     pub async fn code(&self, addr: Address) -> Result<Vec<u8>, ChainError> {
         Ok(self.primary.get_code_at(addr).await?.to_vec())
     }
