@@ -119,7 +119,7 @@ jobs:
           cache-targets: false
       - name: Build nextest archive
         run: cargo nextest archive --workspace --all-targets --archive-file target/nextest-archive.tar.zst
-      # deployment_tools_and_recovery drives the real `bloom deploy … rpc`
+      # deployment_rpc tests drive the real `bloom deploy … rpc`
       # bridge as a subprocess, so it needs the CLI itself and not a test
       # binary. A nextest archive carries test binaries only, so the lanes
       # that run it would find nothing at target/debug/bloom. Build it in the
@@ -281,7 +281,7 @@ jobs:
       github.ref_name == 'triad-architecture'
     uses: ./.github/workflows/macos-unix-conformance.yml
     with:
-      broker_ref: f6eeb74410f8774999d8dcd5baf7f8f895a2d4bf
+      broker_ref: 3a8ad42732bcebab2c31d25917190380e8009f33
       signer_ref: 97b9ac7e47ee682e59804d04f6288419f3598a58
 
   linux_w0_isolation:

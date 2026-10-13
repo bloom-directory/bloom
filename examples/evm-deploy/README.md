@@ -49,11 +49,12 @@ requiring clear signing, start it with `bloom deploy --wallet <wallet> --chain <
 In another terminal:
 
 ```sh
-ETH_RPC_URL="$(jq -r .rpc_url rpc.json)" forge script script/Deploy.s.sol:Deploy \
+FOUNDRY_ETH_RPC_URL="$(jq -r .rpc_url rpc.json)" forge script script/Deploy.s.sol:Deploy \
   --sender "$(jq -r .from rpc.json)" \
   --unlocked --broadcast --slow
 ```
-`ETH_RPC_URL` keeps the submission token out of forge's process arguments.
+`FOUNDRY_ETH_RPC_URL` configures Forge without putting the submission token
+in its process arguments. Forge 1.7.1 does not use `ETH_RPC_URL` for this command.
 
 The adapter prints the transaction plan, a durable `deploy-…` ID, and the
 Broker ceremony URL to its terminal. The owner reviews and completes that

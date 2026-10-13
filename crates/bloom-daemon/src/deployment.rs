@@ -5,6 +5,23 @@ use alloy::{primitives::Address, providers::Provider};
 use bloom_tx::{OutboxState, TxEngineError, deployment::DeploymentTransaction};
 use serde_json::{Value, json};
 
+type ScopeLock = std::sync::Arc<tokio::sync::Mutex<()>>;
+
+#[derive(Default)]
+pub(crate) struct DeploymentLocks {
+    scopes: parking_lot::Mutex<std::collections::BTreeMap<(String, String), ScopeLock>>,
+}
+
+impl DeploymentLocks {
+    fn scope(&self, wallet: &str, chain: &str) -> ScopeLock {
+        self.scopes
+            .lock()
+            .entry((wallet.into(), chain.into()))
+            .or_default()
+            .clone()
+    }
+}
+
 impl Daemon {
     pub async fn deployment_rpc(
         &self,
@@ -115,7 +132,8 @@ impl Daemon {
                     .home_write_permit
                     .as_deref()
                     .ok_or_else(|| invalid("Machine has no write permit"))?;
-                let _guard = self.deployment_lock.lock().await;
+                let scope = self.deployment_locks.scope(wallet, chain_name);
+                let _guard = scope.lock().await;
                 let staged = self
                     .tx_engine
                     .stage_deployment(permit, wallet, &tx, &chain, &policy)
@@ -163,7 +181,8 @@ impl Daemon {
                 {
                     return Err(invalid("invalid deployment ID"));
                 }
-                let _guard = self.deployment_lock.lock().await;
+                let scope = self.deployment_locks.scope(wallet, chain_name);
+                let _guard = scope.lock().await;
                 let entry = self
                     .tx_engine
                     .outbox
@@ -387,6 +406,16 @@ fn retain_revert_reason(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn deployment_scopes_do_not_block_unrelated_wallets_or_chains() {
+        let locks = DeploymentLocks::default();
+        let alice = locks.scope("alice", "anvil");
+        let _busy = alice.lock().await;
+        assert!(locks.scope("alice", "anvil").try_lock().is_err());
+        assert!(locks.scope("bob", "anvil").try_lock().is_ok());
+        assert!(locks.scope("alice", "ethereum").try_lock().is_ok());
+    }
 
     fn receipt(reason: Option<&str>) -> bloom_tx::outbox::MinedReceipt {
         bloom_tx::outbox::MinedReceipt {
