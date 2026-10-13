@@ -677,10 +677,13 @@ impl Outbox {
         for state in [OutboxState::Pending, OutboxState::Sent, OutboxState::Failed] {
             let dir = self.state_dir(wallet, chain, state)?.join(id);
             let intent = dir.join("intent.json");
-            if intent.exists() {
-                let staged: StagedTx = serde_json::from_slice(&fs::read(&intent)?)?;
-                return Ok(OutboxEntry { state, staged, dir });
-            }
+            let bytes = match fs::read(&intent) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            let staged: StagedTx = serde_json::from_slice(&bytes)?;
+            return Ok(OutboxEntry { state, staged, dir });
         }
         Err(OutboxError::NotFound(id.into()))
     }
@@ -1806,6 +1809,12 @@ mod tests {
         assert!(matches!(
             outbox.write_pending(&staged, "retry"),
             Err(OutboxError::Json(_))
+        ));
+        fs::remove_file(previous.dir.join("intent.json")).unwrap();
+        fs::create_dir(previous.dir.join("intent.json")).unwrap();
+        assert!(matches!(
+            outbox.write_pending(&staged, "retry"),
+            Err(OutboxError::Io(_))
         ));
         assert_eq!(projection.allocated.lock().unwrap().len(), 1);
         assert!(

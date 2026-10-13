@@ -198,6 +198,12 @@ conflicting nonce use fails closed. Plans, approvals, errors, signed bytes, and
 receipts persist in the outbox. Automatic nonce selection includes the node's
 pending transactions.
 
+Resubmitting a failed deployment keeps its submission ID but allocates a fresh
+central action ID. When that attempt becomes terminal, the previous wallet
+record is retained under `outbox/<wallet>/<chain>/archive/<id>/attempt-*/entry/`.
+If the central transition fails, both wallet records are restored; unreadable
+attempts refuse resubmission rather than being treated as absent.
+
 The HTTP request prepares owner review and waits for a real hash. The agent
 runs `bloom deploy ... resume <id>` after approval; an idle or disconnected
 client does not continue signing in the background. `list` and `status` expose

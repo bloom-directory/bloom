@@ -688,7 +688,7 @@ async fn foundry_deployment_and_resume() -> Result<()> {
         project.join("foundry.toml"),
     )?;
     let mut forge = clean_tool("forge", &project);
-    forge.env("ETH_RPC_URL", url).args([
+    forge.env("FOUNDRY_ETH_RPC_URL", url).args([
         "script",
         "script/Deploy.s.sol:Deploy",
         "--sender",
@@ -700,7 +700,7 @@ async fn foundry_deployment_and_resume() -> Result<()> {
     let output = run_tool(forge).await?;
     eprintln!("Foundry: {output}");
     let mut resume = clean_tool("forge", &project);
-    resume.env("ETH_RPC_URL", url).args([
+    resume.env("FOUNDRY_ETH_RPC_URL", url).args([
         "script",
         "script/Deploy.s.sol:Deploy",
         "--sender",
@@ -727,7 +727,7 @@ async fn foundry_deployment_and_resume() -> Result<()> {
         for pass in 0..2 {
             let before = rpc(url, "eth_getTransactionCount", json!([sender, "latest"])).await?;
             let mut forge = clean_tool("forge", &copied);
-            forge.env("ETH_RPC_URL", url).args([
+            forge.env("FOUNDRY_ETH_RPC_URL", url).args([
                 "script",
                 "script/Deploy.s.sol:Deploy",
                 "--sender",
