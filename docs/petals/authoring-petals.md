@@ -25,7 +25,13 @@ side effects, approval steps, idempotency, and how to recognize completion.
 
 The `name` in `petal.toml` must equal the sole directory under `petal/`. It may
 contain ASCII letters, digits, `-`, and `_`; it may not contain dots or Unicode.
-Bloom mounts `petal/example/` at `/petals/example/`.
+Bloom exposes the package's own route tree at `/petals/example/`. Account-bound
+routes use adjacent `[wallet]/[index]` captures, for example
+`intents/[wallet]/[index]/new`. Public data and documentation stay unscoped.
+The host validates the selected account and supplies trusted `bloom.wallet` and
+`bloom.account` parameters. There is no awareness flag, root prefix rewrite, or
+implicit account-zero selection. Construct links using the explicit captures.
+All accounts, including zero, have separate wallet/index private stores.
 
 ## Manifest
 
@@ -68,6 +74,17 @@ Supported component imports map to manifest capabilities as follows:
 | `bloom:vfs/readwrite@0.1.0` | `bloom:vfs.read` and/or `bloom:vfs.write`, according to used exports |
 | `bloom:env/runtime@0.1.0` | no additional capability |
 
+When releasing an upgrade in an authenticated Petal lineage, expect Bloom to
+copy the previous release's private `bloom:store/kv` bytes into the new
+package's store on first use. A successor must read its predecessor's stored
+format or tolerate and replace it. Test the new release against a fixture
+store written by the previous release, including settings and secrets. Bloom
+does not interpret those bytes or run a migration hook. Every numbered account,
+including 0, has a separate store keyed by package, wallet and account number.
+The first explicit-account release does not import legacy package-level settings
+into account 0; configure credentials again and reconcile funded work with the
+old package before upgrading.
+
 Imports, route metadata, and the top-level manifest must agree. Metadata may
 narrow installed authority at runtime but may not widen it. A package declaring
 `bloom:sign` must list allowed intents, and each signing route's metadata must
@@ -80,15 +97,47 @@ the exact route pattern that imports `bloom:key/derive@0.1.0`:
 
 ```toml
 [[key.derive]]
-route = "[network]/agent_sessions/[wallet]/new.json"
+route = "[network]/agent_sessions/[wallet]/[index]/new.json"
 operation_classes = ["venue.agent_action"]
+allowed_routes = [
+  "[network]/agent_sessions/[wallet]/[index]/cancel.json",
+  "[network]/orders/[wallet]/[index]/new.json",
+]
+allowed_crypto_suites = ["secp256k1-keccak256-recoverable"]
+maximum_lifetime_ms = 86400000
 ```
 
 Every listed class must also appear in `[sign].allowed_intents`. Bloom rejects
 unknown or duplicate routes, empty or duplicate class lists, invalid class
 tokens, and declarations on routes without the key-derivation import. The
-installer records only the route's immediate signing intent and these explicit
-delegated classes; other package-level signing intents are not inherited.
+installer resolves `allowed_routes` from canonical manifest patterns to the
+immutable route IDs in that package and always includes the derivation route
+itself. Each allowed route must have a signing intent included in the declared
+operation classes. At runtime the component may request non-empty subsets of
+the declared operation classes and crypto suites and a shorter lifetime, but it
+cannot widen any bound; Bloom supplies the resolved routes. A manifest scope
+must declare all three bounds: `allowed_routes`, `allowed_crypto_suites`, and
+`maximum_lifetime_ms`.
+
+A crypto suite selects which hash runs over a payload before the child key
+signs it. `allowed_crypto_suites` accepts exactly the values of `CryptoSuite`
+in `bloom-broker-api`, and Bloom rejects anything else at install:
+
+| Value | Wallet | Use for |
+| --- | --- | --- |
+| `secp256k1-keccak256-recoverable` | EVM | keccak256, what Ethereum verifies: transactions, EIP-712, EIP-191 |
+| `secp256k1-sha256-recoverable` | EVM | SHA-256, for off-chain use such as signed venue API requests; no chain accepts these |
+| `ed25519-message` | Solana | the only suite a Solana wallet permits |
+
+The wallet's derivation profile is the ceiling: an EVM wallet permits both
+secp256k1 suites, a Solana wallet permits only `ed25519-message`. Declare the
+narrowest set the Petal actually needs, since a key limited to
+`secp256k1-sha256-recoverable` cannot produce a signature an EVM node accepts.
+
+Omitting all three bounds retains the legacy guest-supplied scope only for
+packages created before this manifest contract. New Petals should always
+declare the complete scope. Other package-level signing intents are not
+inherited.
 
 ## Routes and ABI
 
@@ -103,7 +152,7 @@ The route tree is the public VFS declaration:
 - `status.json.wasm` creates the file `/petals/example/status.json`;
 - `$index.wasm` handles the containing directory;
 - `$lookup.wasm` refines lookup for dynamic entries;
-- `[wallet]/balance.json.wasm` binds a dynamic `wallet` parameter; and
+- `[wallet]/[index]/balance.json.wasm` selects a wallet and numbered account; and
 - static segments take precedence over dynamic segments.
 
 Reserved `$...` names are only valid as recognized special route leaves. A
@@ -132,6 +181,11 @@ to a primary component under `modules/` or `components/` and dependencies under
 [file-driven package design](../superpowers/specs/2026-06-23-petals-v1.md)
 for route precedence, sidecar composition, metadata narrowing, and archive
 normalization rules.
+
+Guest VFS calls cannot invoke another Petal or re-enter the current Petal:
+every `petals/…` path is denied, even under the selected wallet and account.
+Wallet VFS access is restricted to the selected numbered account. Component
+composition described above does not enable nested Petal VFS dispatch.
 
 ## Build and validate
 

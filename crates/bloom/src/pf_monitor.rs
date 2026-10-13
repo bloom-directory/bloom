@@ -1,4 +1,5 @@
-//! One-shot root packet-filter monitor for the macOS Unix-principal profile.
+//! Root session lifecycle monitor. Legacy CLI/job names are retained for upgrades.
+//! macOS PF containment is retired because custom rules disable Private Relay.
 
 use std::{
     fs::{self, OpenOptions},
@@ -16,11 +17,11 @@ use rustix::{
     process::geteuid,
 };
 use serde::Serialize;
-use sha2::{Digest as _, Sha256};
 
 const STATUS_SCHEMA: &str = "bloom.macos-platform-status.3";
 const TRUSTED_TIME_SOURCE: &str = "macos-managed-timed";
 const CEREMONY_OWNER_MARKER: &str = "x-bloom-ceremony-owner: bloom-broker-v1";
+const MONITOR_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Serialize)]
 struct Status {
@@ -28,6 +29,7 @@ struct Status {
     login_uid: u32,
     build_digest: String,
     anchor_sha256: String,
+    network_enforcement: &'static str,
     trusted_time_source: &'static str,
     automatic_time_enabled: bool,
     timed_service_loaded: bool,
@@ -37,17 +39,47 @@ struct Status {
     available: bool,
 }
 
-pub fn run_once() -> Result<()> {
+pub async fn run() -> Result<()> {
     if geteuid() != Uid::ROOT {
-        bail!("the packet-filter monitor must run as root");
+        bail!("the session lifecycle monitor must run as root");
     }
     if std::env::consts::OS != "macos" {
-        bail!("the packet-filter monitor requires macOS");
+        bail!("the session lifecycle monitor requires macOS");
+    }
+    tracing::info!(event = "service.ready", monitor = "session-lifecycle");
+    crate::native_lifecycle("containment-monitor", "ready");
+    let mut interval = tokio::time::interval(MONITOR_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            result = crate::termination_signal() => {
+                result.context("wait for containment shutdown signal")?;
+                tracing::info!(event = "service.shutdown", reason = "signal");
+                crate::native_lifecycle("containment-monitor", "shutdown");
+                return Ok(());
+            }
+            _ = interval.tick() => {
+                if let Err(error) = run_once() {
+                    let _ = error;
+                    tracing::warn!(
+                        event = "containment.refresh_failed",
+                        error_kind = "platform_status"
+                    );
+                }
+            }
+        }
+    }
+}
+
+pub fn run_once() -> Result<()> {
+    if geteuid() != Uid::ROOT {
+        bail!("the session lifecycle monitor must run as root");
+    }
+    if std::env::consts::OS != "macos" {
+        bail!("the session lifecycle monitor requires macOS");
     }
     let enrollment_root = Path::new("/Library/Application Support/BloomTriad/enrollments");
     require_directory(enrollment_root, 0o755)?;
-    let pf_enabled = command_output("/sbin/pfctl", &["-s", "info"])
-        .is_ok_and(|output| output.contains("Status: Enabled"));
     let (automatic_time_enabled, timed_service_loaded) = macos_managed_time_status();
     let trusted_time_available = automatic_time_enabled && timed_service_loaded;
     let ceremony_listener_bloom_shaped = canonical_listener_is_bloom_shaped();
@@ -63,7 +95,6 @@ pub fn run_once() -> Result<()> {
         .collect::<std::io::Result<Vec<_>>>()
         .context("enumerate Bloom enrollments")?;
     enrollments.sort_by_key(|entry| entry.file_name());
-    let mut all_available = true;
     for entry in enrollments {
         let path = entry.path();
         if path.extension().and_then(|value| value.to_str()) != Some("json") {
@@ -85,63 +116,54 @@ pub fn run_once() -> Result<()> {
         if path.file_name().and_then(|value| value.to_str()) != Some(&format!("{login_uid}.json")) {
             bail!("enrollment filename does not match its login UID");
         }
-        let broker_uid = required_u32(&enrollment, "broker_uid")?;
-        let signer_uid = required_u32(&enrollment, "signer_uid")?;
         let revoke_gid = required_u32(&enrollment, "revoke_gid")?;
         let build_digest = required_digest(&enrollment, "release_digest")?;
-        let anchor = PathBuf::from(format!("/etc/pf.anchors/com.bloom.triad.{login_uid}"));
-        require_file_mode(&anchor, 0o600)?;
-        let anchor_bytes =
-            fs::read(&anchor).with_context(|| format!("read {}", anchor.display()))?;
-        let anchor_sha256 = hex::encode(Sha256::digest(&anchor_bytes));
-        let loaded = command_output(
-            "/sbin/pfctl",
-            &["-a", &format!("com.bloom.triad/{login_uid}"), "-sr"],
-        );
-        let available = pf_enabled
-            && loaded.as_ref().is_ok_and(|rules| {
-                rules.contains("block")
-                    && (rules.contains(&broker_uid.to_string())
-                        || rules.contains(&format!("bloom-broker-{login_uid}")))
-                    && (rules.contains(&signer_uid.to_string())
-                        || rules.contains(&format!("bloom-signer-{login_uid}")))
-            });
-        all_available &= available;
+        // /var/run is cleared on boot. Recreate only missing, validated runtime
+        // directories before status publication or the login sentinel can start.
+        crate::macos_runtime::prepare(
+            Path::new("/private/var/run/bloom"),
+            login_uid,
+            required_u32(&enrollment, "broker_uid")?,
+            required_u32(&enrollment, "signer_uid")?,
+            required_u32(&enrollment, "machine_broker_gid")?,
+            required_u32(&enrollment, "broker_signer_gid")?,
+            revoke_gid,
+        )
+        .context("prepare macOS authority runtime")?;
+        stop_sentinel_if_gui_ended(
+            login_uid,
+            |target| command_output("/bin/launchctl", &["print", target]),
+            |target| command_output("/bin/launchctl", &["kill", "SIGTERM", target]).map(|_| ()),
+        )?;
         let status = Status {
             schema: STATUS_SCHEMA,
             login_uid,
             build_digest,
-            anchor_sha256,
+            // Legacy schema stays explicitly unavailable to old PF consumers.
+            anchor_sha256: "0".repeat(64),
+            network_enforcement: "none",
             trusted_time_source: TRUSTED_TIME_SOURCE,
             automatic_time_enabled,
             timed_service_loaded,
             trusted_time_available,
             ceremony_listener_bloom_shaped,
             checked_at_unix_ms,
-            available,
+            available: false,
         };
         write_status(login_uid, &status)?;
         if enrollment_state == "active" {
             restart_services_for_live_session(login_uid, revoke_gid)?;
         }
     }
-    if !all_available {
-        bail!("Bloom packet-filter platform status is unavailable");
-    }
     Ok(())
 }
 
 fn restart_services_for_live_session(login_uid: u32, revoke_gid: u32) -> Result<()> {
-    let session_target = format!("gui/{login_uid}/com.bloom.session");
-    let Ok(session_state) = command_output("/bin/launchctl", &["print", &session_target]) else {
-        // An absent login job means this is a stale socket or a logged-out
-        // session. Either case must not restart the service principals.
-        return Ok(());
-    };
-    if !session_state
-        .lines()
-        .any(|line| line.trim() == "state = running")
-    {
+    if !prepare_login_sentinel(
+        login_uid,
+        |target| command_output("/bin/launchctl", &["print", target]),
+        |target| command_output("/bin/launchctl", &["kickstart", target]).map(|_| ()),
+    )? {
         return Ok(());
     }
 
@@ -177,6 +199,46 @@ fn restart_services_for_live_session(login_uid: u32, revoke_gid: u32) -> Result<
         }
     }
     Ok(())
+}
+
+fn stop_sentinel_if_gui_ended(
+    login_uid: u32,
+    mut inspect: impl FnMut(&str) -> Result<String>,
+    mut terminate: impl FnMut(&str) -> Result<()>,
+) -> Result<()> {
+    if inspect(&format!("gui/{login_uid}")).is_ok() {
+        return Ok(());
+    }
+    let target = format!("user/{login_uid}/com.bloom.session");
+    if inspect(&target)
+        .is_ok_and(|state| state.lines().any(|line| line.trim() == "state = running"))
+    {
+        terminate(&target).context("stop the installed sentinel after GUI logout")?;
+    }
+    Ok(())
+}
+
+fn prepare_login_sentinel(
+    login_uid: u32,
+    mut inspect: impl FnMut(&str) -> Result<String>,
+    mut restart: impl FnMut(&str) -> Result<()>,
+) -> Result<bool> {
+    // Keep the GUI-login requirement, but inspect the sentinel where the
+    // installer actually loads it. A user-domain job can outlive a GUI login.
+    if inspect(&format!("gui/{login_uid}")).is_err() {
+        return Ok(false);
+    }
+    let target = format!("user/{login_uid}/com.bloom.session");
+    let Ok(state) = inspect(&target) else {
+        return Ok(false);
+    };
+    if state.lines().any(|line| line.trim() == "state = running") {
+        return Ok(true);
+    }
+    restart(&target).context("restart the installed sentinel for a returning GUI login")?;
+    // A successful kickstart is not readiness. Recheck running state and the
+    // socket's full ownership/mode guards on the next monitor tick.
+    Ok(false)
 }
 
 fn macos_managed_time_status() -> (bool, bool) {
@@ -313,7 +375,7 @@ fn require_directory(path: &Path, mode: u32) -> Result<()> {
         || metadata.mode() & 0o7777 != mode
     {
         bail!(
-            "unsafe root packet-filter monitor directory {}",
+            "unsafe root session lifecycle monitor directory {}",
             path.display()
         );
     }
@@ -330,13 +392,12 @@ fn require_file(path: &Path, mode: u32) -> Result<()> {
         || metadata.mode() & 0o7777 != mode
         || metadata.nlink() != 1
     {
-        bail!("unsafe root packet-filter monitor file {}", path.display());
+        bail!(
+            "unsafe root session lifecycle monitor file {}",
+            path.display()
+        );
     }
     Ok(())
-}
-
-fn require_file_mode(path: &Path, mode: u32) -> Result<()> {
-    require_file(path, mode)
 }
 
 fn require_service_directory(path: &Path, uid: u32, gid: u32, mode: u32) -> Result<()> {
@@ -349,7 +410,7 @@ fn require_service_directory(path: &Path, uid: u32, gid: u32, mode: u32) -> Resu
         || metadata.mode() & 0o7777 != mode
     {
         bail!(
-            "unsafe root packet-filter monitor service directory {}",
+            "unsafe root session lifecycle monitor service directory {}",
             path.display()
         );
     }
@@ -359,6 +420,148 @@ fn require_service_directory(path: &Path, uid: u32, gid: u32, mode: u32) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gui_logout_terminates_only_the_running_canonical_sentinel() {
+        let terminated = std::cell::Cell::new(false);
+        stop_sentinel_if_gui_ended(
+            501,
+            |target| match target {
+                "gui/501" => anyhow::bail!("GUI domain is absent"),
+                "user/501/com.bloom.session" => Ok("state = running".into()),
+                _ => panic!("unexpected target {target}"),
+            },
+            |target| {
+                assert_eq!(target, "user/501/com.bloom.session");
+                terminated.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(terminated.get());
+    }
+
+    #[test]
+    fn live_gui_login_does_not_terminate_the_sentinel() {
+        stop_sentinel_if_gui_ended(
+            501,
+            |target| {
+                assert_eq!(target, "gui/501");
+                Ok("GUI domain exists".into())
+            },
+            |_| panic!("live session must not be terminated"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn missing_or_stopped_sentinel_needs_no_logout_signal() {
+        for state in [None, Some("state = not running")] {
+            stop_sentinel_if_gui_ended(
+                501,
+                |target| match target {
+                    "gui/501" => anyhow::bail!("GUI domain absent"),
+                    "user/501/com.bloom.session" => state
+                        .map(str::to_owned)
+                        .ok_or_else(|| anyhow::anyhow!("sentinel absent")),
+                    _ => panic!("unexpected target"),
+                },
+                |_| panic!("no running sentinel to terminate"),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn live_gui_login_uses_the_installed_user_domain_sentinel() {
+        assert!(
+            prepare_login_sentinel(
+                501,
+                |target| match target {
+                    "gui/501" => Ok("GUI domain exists".into()),
+                    "user/501/com.bloom.session" => Ok("\tstate = running\n".into()),
+                    _ => anyhow::bail!("job does not exist"),
+                },
+                |_| panic!("running sentinel must not be restarted"),
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn logged_out_user_job_does_not_authorize_a_service_restart() {
+        assert!(
+            !prepare_login_sentinel(
+                501,
+                |target| match target {
+                    "user/501/com.bloom.session" => Ok("state = running".into()),
+                    _ => anyhow::bail!("GUI login is absent"),
+                },
+                |_| panic!("logged-out job must not be restarted"),
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn absent_or_stopped_user_sentinel_cannot_be_replaced_by_a_gui_job() {
+        for user_state in [None, Some("state = not running")] {
+            assert!(
+                !prepare_login_sentinel(
+                    501,
+                    |target| match target {
+                        "gui/501" | "gui/501/com.bloom.session" => Ok("state = running".into()),
+                        "user/501/com.bloom.session" => user_state
+                            .map(str::to_owned)
+                            .ok_or_else(|| anyhow::anyhow!("sentinel is absent")),
+                        _ => anyhow::bail!("unexpected target"),
+                    },
+                    |target| {
+                        assert!(user_state.is_some(), "missing job must not be restarted");
+                        assert_eq!(target, "user/501/com.bloom.session");
+                        Ok(())
+                    },
+                )
+                .unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn returning_login_waits_for_a_fresh_running_state_after_kickstart() {
+        let running = std::cell::Cell::new(false);
+        let starts = std::cell::Cell::new(0);
+        let mut inspect = |target: &str| match target {
+            "gui/501" => Ok("GUI domain exists".into()),
+            "user/501/com.bloom.session" => Ok(if running.get() {
+                "state = running".into()
+            } else {
+                "state = not running".into()
+            }),
+            _ => anyhow::bail!("unexpected target"),
+        };
+        let mut restart = |target: &str| {
+            assert_eq!(target, "user/501/com.bloom.session");
+            starts.set(starts.get() + 1);
+            running.set(true);
+            Ok(())
+        };
+        assert!(!prepare_login_sentinel(501, &mut inspect, &mut restart).unwrap());
+        assert!(prepare_login_sentinel(501, &mut inspect, &mut restart).unwrap());
+        assert_eq!(starts.get(), 1);
+    }
+
+    #[test]
+    fn failed_sentinel_restart_does_not_authorize_services() {
+        assert!(
+            prepare_login_sentinel(
+                501,
+                |_| Ok("state = not running".into()),
+                |_| anyhow::bail!("kickstart failed"),
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn ceremony_owner_marker_is_case_insensitive_but_exact() {

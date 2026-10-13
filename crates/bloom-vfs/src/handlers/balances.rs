@@ -20,6 +20,61 @@ pub(crate) const LIVE_BALANCE_TTL: Duration = Duration::from_secs(5);
 /// repeatedly calling `symbol()` and `decimals()`.
 pub(crate) const TOKEN_METADATA_TTL: Duration = Duration::from_secs(7 * 86_400);
 
+/// The amount facts every native-balance surface shares: the raw base-unit
+/// integer as a *string* (a u64 of lamports or a u256 of wei does not survive
+/// a JSON number for every consumer), plus the trimmed decimal rendering and
+/// its display form. Chain-specific renderers add their own identity fields
+/// on top rather than re-deriving these.
+pub(crate) fn amount_fields(
+    chain: &str,
+    asset: &str,
+    symbol: &str,
+    decimals: u8,
+    raw: U256,
+) -> serde_json::Value {
+    let formatted = format_units(raw, decimals);
+    serde_json::json!({
+        "chain": chain,
+        "asset": asset,
+        "symbol": symbol,
+        "decimals": decimals,
+        "raw": raw.to_string(),
+        "formatted": formatted,
+        "display": format!("{formatted} {symbol}"),
+    })
+}
+
+/// Native SOL decimals, and the symbol Bloom renders lamport amounts with.
+pub(crate) const SOL_DECIMALS: u8 = 9;
+pub(crate) const SOL_SYMBOL: &str = "SOL";
+
+/// `balance.json` for a Solana native balance, bound to the exact derived
+/// child it was observed for. The account identity is what makes the
+/// observation meaningful on a multi-child wallet, so it is carried here
+/// rather than left to be cross-referenced against `accounts.json`.
+pub(crate) fn solana_balance_json(
+    chain: &str,
+    account_address: &str,
+    account_fingerprint: &str,
+    derivation_path: &str,
+    lamports: u64,
+) -> Vec<u8> {
+    let mut obj = amount_fields(
+        chain,
+        "native",
+        SOL_SYMBOL,
+        SOL_DECIMALS,
+        U256::from(lamports),
+    );
+    obj["schema"] = serde_json::Value::String("bloom.solana_native_balance.v1".into());
+    obj["account_address"] = serde_json::Value::String(account_address.to_owned());
+    obj["account_fingerprint"] = serde_json::Value::String(account_fingerprint.to_owned());
+    obj["derivation_path"] = serde_json::Value::String(derivation_path.to_owned());
+    let mut v = serde_json::to_vec_pretty(&obj).expect("balance json serializes");
+    v.push(b'\n');
+    v
+}
+
 /// `"<formatted> <symbol>\n"` for the `balance` leaf.
 pub(crate) fn display_line(raw: U256, decimals: u8, symbol: &str) -> Vec<u8> {
     format!("{} {}\n", format_units(raw, decimals), symbol).into_bytes()
@@ -40,16 +95,7 @@ pub(crate) fn balance_json(
     decimals: u8,
     raw: U256,
 ) -> Vec<u8> {
-    let formatted = format_units(raw, decimals);
-    let mut obj = serde_json::json!({
-        "chain": chain,
-        "asset": asset,
-        "symbol": symbol,
-        "decimals": decimals,
-        "raw": raw.to_string(),
-        "formatted": formatted,
-        "display": format!("{formatted} {symbol}"),
-    });
+    let mut obj = amount_fields(chain, asset, symbol, decimals, raw);
     if let Some(addr) = token_address {
         obj["address"] = serde_json::Value::String(addr.to_string());
     }

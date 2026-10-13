@@ -3,6 +3,9 @@
 This directory implements the root-requiring Unix-principal profile in
 `docs/specs/2026-07-29-macos-unix-principal-isolation.md`. It is source input
 for the signed installer and is never installed directly from a checkout.
+The PF network boundary in that original profile is retired: current macOS
+packages preserve Private Relay and do not enforce service network isolation.
+See [the migration and sandbox plan](../../../docs/operations/macos-private-relay.md).
 
 The rootless code-identity architecture remains documented as a future target
 in `docs/specs/2026-07-30-macos-rootless-code-identity-isolation.md`. Nothing
@@ -27,17 +30,18 @@ connecting peer on macOS, which cannot satisfy the protocol's mutual kernel
 peer-UID check. It does not fall back from failed launchd activation or create
 endpoints outside the signed profile.
 
-Broker owns the canonical ceremony listener by direct exclusive bind to
-`127.0.0.1:18734`. The LaunchDaemon does not declare or pre-bind that TCP
-socket. A conflict is fatal, reported, retried by failure-only `KeepAlive`, and
-never selects a fallback address or port. Before exiting, Broker atomically
-writes a Broker-owned, Machine-readable `broker-startup.json`. Machine accepts
-only its exact owner, group, mode, schema, address, incident, and message, so a
-bind failure is reported promptly as either another Bloom login or a foreign
-or unverifiable listener. The root packet-filter monitor performs the public
-owner-marker probe and publishes its result in the fresh root-owned platform
-status because the confined Broker cannot initiate even a loopback SYN. A
-successful retry removes the stale diagnostic.
+Broker owns the canonical ceremony listeners by direct exclusive bind to
+`127.0.0.1:18734` and `[::1]:18734`. Both families are required because
+Chromium resolves `localhost` to `::1` before `127.0.0.1`. The LaunchDaemon
+does not declare or pre-bind either TCP socket. A conflict is fatal, reported,
+retried by failure-only `KeepAlive`, and never selects a fallback address or
+port. Before exiting, Broker atomically writes a Broker-owned,
+Machine-readable `broker-startup.json`. Machine accepts only its exact owner,
+group, mode, schema, address, incident, and message, so a listener acquisition
+failure is reported promptly. The service log identifies the failing address
+or inherited descriptor and its error. An unavailable IPv6 stack is not
+evidence that another process owns the port. A successful retry removes the
+stale diagnostic.
 
 The global `com.bloom.session` LaunchAgent invokes only Machine's
 `serve session-sentinel` mode. It exits successfully for an unenrolled login,
@@ -50,30 +54,75 @@ service channels. Broker authenticates before binding the canonical ceremony
 listener; Signer authenticates before accepting RPC. Both drain and exit
 successfully on disconnect. The root containment monitor validates a returning
 session socket's enrolled UID, group, mode, and type and kickstarts only that
-enrollment's stopped Signer and Broker jobs. It does nothing while the
-sentinel is absent; the LaunchAgent itself has no system-job control authority.
+enrollment's stopped Signer and Broker jobs. Before publishing status or checking
+the sentinel, it recreates missing directories under `/private/var/run/bloom`
+using the pinned enrollment's principals and the installer's exact modes. This
+restores the volatile runtime after reboot; existing unsafe paths are rejected,
+not repaired. It never starts Signer or Broker while the sentinel is absent;
+the LaunchAgent itself has no system-job control authority.
+
+The global `com.bloom.machine` LaunchAgent runs `bloom serve --mount-home` for
+each enrolled login. Machine resolves the effective login's installed
+enrollment, serves its normal `~/.bloom/run/bloom.sock` endpoint, and mounts the
+VFS at `~/bloom`. The generic template contains no username or home-directory
+literal and exits fail-closed when the effective login is not enrolled.
 
 ## Filesystem and network boundaries
 
 The installer renders the root-owned release, edge manifest, account/group
-record, LaunchDaemon definitions, session LaunchAgent, and packet-filter
-anchor. Broker and Signer state/checkpoint roots remain owned by their
+record, LaunchDaemon definitions, and session LaunchAgent. It installs no PF
+anchor; legacy anchors are removed by post-activation migration. Broker and
+Signer state/checkpoint roots remain owned by their
 respective service UIDs and mode `0700`.
 
 The installer keeps digest-named releases immutable. A same-digest install
 verifies every installed binary and repairs integration files without replacing
 custody. A compatible different digest is staged, all enrolled jobs are stopped,
 the shared `current` symlink and enrollment build digests are switched
-atomically, and each installed triad is checked before the new digest is
-published `active`. A durable transaction makes the next invocation roll an
-interrupted or failed activation back to the prior complete digest. Compatibility
-metadata is mandatory and a state-schema downgrade is rejected before services
-are stopped.
+atomically, and launchd is required to stop and restart the installed jobs. A
+durable intent makes the next invocation finish the transaction after
+interruption; an upgrade that fails authenticated health restores the prior
+release when it can still pass the same check. Compatibility metadata is mandatory and
+a state-schema downgrade is rejected before services are stopped.
+
+Canonical executables live under
+`/usr/local/libexec/bloom/releases/RELEASE_DIGEST`; the root-owned `current`
+selector moves atomically between those immutable directories. The supported
+interactive command is the relative symlink
+`/usr/local/bin/bloom -> ../libexec/bloom/current/bloom`, so it follows every
+repair and upgrade without putting `libexec` itself on `PATH`. Installer
+preflight accepts only that exact managed symlink and refuses to overwrite a
+regular file, directory, or differently targeted link. The command remains
+available while any login has an active enrollment and is removed when the last
+active enrollment is retained or purged; restore recreates it.
+
+Once authenticated activation has committed, the installer migrates the
+enrolled login away from the supported historical standalone location
+`~/.local/bin/bloom`. The home is resolved from Directory Service, and only a
+regular file or final-component symlink at that exact path is unlinked with the
+login user's authority. Parent symlinks and unexpected filesystem objects are
+rejected, and no user-owned binary is executed for identification. Cleanup is
+deliberately post-activation: a failed activation preserves the old command,
+while a cleanup failure reports the installation as incomplete without rolling
+back healthy custody. Other `bloom` commands on `PATH` are not scanned or
+deleted. After migration, a shell that cached the old command may need `hash -r`
+(POSIX shells), `rehash` (zsh/csh), or a new terminal.
+
+Legacy wallet data is not deleted with the standalone command. When
+`~/.bloom/keystore` exists, successful activation prints its resolved absolute
+location and exact staging and ceremony commands for every detected v1 passkey
+wallet. The staging command uses the packaged `bloom-signer-migrate`, the
+installed Signer configuration, and the enrollment's actual login and Signer
+UID/GID. It requires `sudo` to enter Signer's private state and assign isolated
+ownership. The subsequent `/usr/local/bin/bloom wallet migrate-passkey`
+command must run without `sudo` as the enrolled login. Other legacy wallet
+kinds are unsupported by this bounded converter and remain untouched at the
+reported legacy location.
 
 `uninstall --retain-custody / LOGIN_UID` removes launchd, packet-filter, and
 runtime integration while preserving service principals, identities, and
 encrypted state. `restore` accepts only the exact signed retained release and
-publishes Machine access after triad health succeeds. Permanent deletion remains
+reinstalls its integration without rotating custody. Permanent deletion remains
 a separate `delete-bloom-login-LOGIN_UID` confirmation and is described as a
 purge because it destroys custody irrecoverably. Upgrade and restore never run
 enrollment-material generation and never rotate transport or custody identity.
@@ -83,27 +132,46 @@ enrollment-material mode against the signed public templates in `config/`.
 Five application identities and the Broker/Signer signing authorities are
 fresh per login; only their public cross-pins enter the root-owned manifest.
 The temporary root-only generation directory is removed on success or error.
-The root-owned enrollment record is published as `activating`; only the session
-sentinel, PF monitor, and private installer health probe accept that state.
-Ordinary Machine discovery requires `active`, which is atomically published
-only after authenticated Broker and Signer health succeeds. A failed fresh
-install removes Directory Service records created by that invocation. The
-operator must explicitly uninstall any other partial state before retrying.
+The root-owned enrollment record uses `activating` while durable files are being
+converged and is published `active` once the requested digest is selected.
+Authenticated runtime health on the selected digest is an installer commit
+condition. A failed fresh install removes Directory Service records
+created by that invocation. An interrupted upgrade retains its forward intent
+so the next invocation can finish the same convergence safely.
 
-The packet-filter template denies new Broker IP flows and all Signer TCP/UDP
-flows by numeric effective UID. A root/wheel one-shot monitor is launched once
-per second with no socket, RPC, custody, or signing surface. It verifies the
-loaded per-UID anchors and atomically publishes short-lived root-owned status
-records. Broker and Signer require the exact login UID, release digest,
-ownership, mode, availability bit, and freshness before readiness or any
-signing/custody/policy mutation; revocation and public status remain
-available. Production activation is prohibited until the disposable macOS W0
-lane proves IPv4/IPv6, TCP/UDP, loopback, accepted Broker responses, anchor
-drift, Fast User Switching, upgrade/rollback, interrupted recovery,
-retain/restore, same-digest repair, and purge behavior. Local Signer is the only
-initial backend.
+Broker and Signer have `network_containment: null`. No PF rules are installed
+or enabled. Successful install, repair, upgrade and restore remove legacy Bloom
+anchors from disk and flush only their live filter rules. Uninstall scopes that
+cleanup to the removed login. The main system ruleset is never reloaded. Old
+PF enable tokens cannot be safely attributed to Bloom and are left alone.
+
+The root lifecycle monitor retains the `com.bloom.containment` job and
+`triad-pf-monitor` CLI names for upgrade compatibility. It still validates the
+returning session and restarts stopped services, but does not read or write PF.
+Legacy schema-v3 telemetry explicitly reports `available: false` and
+`network_enforcement: "none"`; it cannot satisfy an older PF consumer.
+
+This is an intentional reduction in defense against a compromised Broker or
+Signer making network connections. Unix UID isolation, filesystem and socket
+permissions, authenticated RPC, signing policy, and session revocation remain.
+The disposable macOS W0 lane now checks PF retirement instead of asserting
+network denial and does not emit the original MUI-07 containment evidence.
 
 Static template and staged-root tests are conformance inputs, not proof of an
 operating-system boundary. Tests that create accounts, load LaunchDaemons,
 change `pf`, or exercise multiple GUI users run only on disposable macOS VMs.
 The guarded harness and its current coverage are documented under `w0/`.
+
+## Service logs
+
+Broker and Signer write complete JSON Lines records to
+`/private/var/log/bloom/LOGIN_UID/{broker,signer}.jsonl`. The enrolled user can
+read these files without `sudo` but cannot modify them; service state remains
+private. Rotation is bounded by `/etc/newsyslog.d/bloom-LOGIN_UID.conf` and
+does not require restarting either daemon. Session and containment lifecycle
+messages use launchd's native process logging rather than the per-enrollment
+diagnostic files.
+
+Each daemon also has a small bounded `SERVICE-bootstrap.log` launchd stderr
+fallback. It is only for fixed, sanitized initialization failures that happen
+before the canonical app writer is available; routine events never use it.

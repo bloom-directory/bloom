@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat >&2 <<'EOF'
+usage:
+  sudo bloom-uninstall [--retain-custody] [LOGIN_UID]
+  sudo bloom-uninstall --purge [LOGIN_UID] delete-bloom-login-LOGIN_UID
+
+Without --purge, Bloom is disabled and its runtime integration is removed while
+wallet custody and enrollment identities are retained for a future reinstall.
+With --purge, the login's ~/.bloom Machine state is also permanently deleted.
+EOF
+  exit 64
+}
+
+[[ "$(id -u)" == "0" ]] || {
+  echo "bloom-uninstall must run as root (use sudo)" >&2
+  exit 77
+}
+
+mode="retain"
+case "${1:-}" in
+  --retain-custody)
+    shift
+    ;;
+  --purge)
+    mode="purge"
+    shift
+    ;;
+  --*)
+    usage
+    ;;
+esac
+
+maintenance="/usr/libexec/bloom/bloom-linux-maintenance"
+[[ -x "$maintenance" ]] || {
+  echo "Bloom Linux maintenance helper is missing" >&2
+  exit 66
+}
+
+if [[ "$mode" == "retain" ]]; then
+  [[ $# -le 1 ]] || usage
+  login_uid="${1:-${SUDO_UID:-}}"
+  [[ -n "$login_uid" && "$login_uid" != "0" ]] || usage
+  exec "$maintenance" uninstall --retain-custody / "$login_uid"
+fi
+
+case $# in
+  1)
+    login_uid="${SUDO_UID:-}"
+    confirmation="$1"
+    [[ -n "$login_uid" && "$login_uid" != "0" ]] || usage
+    ;;
+  2)
+    login_uid="$1"
+    confirmation="$2"
+    ;;
+  *)
+    usage
+    ;;
+esac
+exec "$maintenance" uninstall / "$login_uid" "$confirmation"

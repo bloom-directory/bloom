@@ -5,6 +5,7 @@ import copy
 import hashlib
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -78,10 +79,23 @@ class HarnessLifecycleTests(unittest.TestCase):
             definition.events.append(f"harbor:{agent.harbor_name}")
             return self.passing_result()
 
-        run_eval(definition, "codex", harbor_runner=runner)
+        timings: dict[str, float] = {}
+        result = run_eval(
+            definition, "codex", harbor_runner=runner, phase_timings=timings
+        )
         self.assertEqual(
             definition.events,
             ["preflight", "provision:codex", "harbor:codex", "cleanup"],
+        )
+        self.assertEqual(result, self.passing_result())
+        self.assertEqual(
+            set(timings),
+            {
+                "preflight_seconds",
+                "authority_provisioning_seconds",
+                "harbor_seconds",
+                "session_cleanup_seconds",
+            },
         )
 
     def test_cleanup_runs_when_provision_fails_after_starting(self) -> None:
@@ -128,12 +142,12 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         route_dir.mkdir(parents=True)
         self.route_index = route_dir / "route-index.json"
         action_routes = (
-            "[network]/agent_sessions/[wallet]/[session]/cancel.json",
-            "[network]/agent_sessions/[wallet]/[session]/cancel_all",
-            "[network]/agent_sessions/[wallet]/[session]/close_all",
-            "[network]/agent_sessions/[wallet]/[session]/order.json",
-            "[network]/agent_sessions/[wallet]/[session]/schedule_cancel.json",
-            "[network]/agent_sessions/[wallet]/[session]/update_leverage.json",
+            "[network]/agent_sessions/[wallet]/[index]/[session]/cancel.json",
+            "[network]/agent_sessions/[wallet]/[index]/[session]/cancel_all",
+            "[network]/agent_sessions/[wallet]/[index]/[session]/close_all",
+            "[network]/agent_sessions/[wallet]/[index]/[session]/order.json",
+            "[network]/agent_sessions/[wallet]/[index]/[session]/schedule_cancel.json",
+            "[network]/agent_sessions/[wallet]/[index]/[session]/update_leverage.json",
         )
         self.route_index.write_text(
             json.dumps(
@@ -143,7 +157,7 @@ class HyperliquidDefinitionTests(unittest.TestCase):
                     "routes": [
                         {
                             "route_id": "r000021",
-                            "pattern": "[network]/agent_sessions/[wallet]/new.json",
+                            "pattern": "[network]/agent_sessions/[wallet]/[index]/new.json",
                             "install_metadata": {
                                 "required_caps": [
                                     "bloom:http",
@@ -240,12 +254,83 @@ class HyperliquidDefinitionTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
+    def test_read_json_retries_transient_malformed_nfs_snapshot(self) -> None:
+        malformed = subprocess.CompletedProcess(
+            [], 0, b'{"status":"old"}{"status":"new"}', b""
+        )
+        valid = subprocess.CompletedProcess([], 0, b'{"status":"new"}', b"")
+        with (
+            mock.patch.object(
+                hyperliquid_order_cancel.subprocess,
+                "run",
+                side_effect=[malformed, valid],
+            ) as run,
+            mock.patch.object(hyperliquid_order_cancel.time, "sleep") as sleep,
+        ):
+            self.assertEqual(
+                self.definition._read_json(self.mount / "projection.json"),
+                {"status": "new"},
+            )
+        self.assertEqual(run.call_count, 2)
+        sleep.assert_called_once_with(0.2)
+
     def test_missing_seed_variable_fails_closed(self) -> None:
         env = dict(self.env)
         del env["BLOOM_EVAL_AUTHENTICATOR_SEED_FILE"]
         definition = HyperliquidOrderCancelEval(self.repo, env)
         with self.assertRaisesRegex(EvalError, "AUTHENTICATOR_SEED_FILE is required"):
             definition.preflight()
+
+    def test_full_eval_requires_explicit_mount_before_external_work(self) -> None:
+        env = dict(self.env)
+        del env["BLOOM_EVAL_BLOOM_MOUNT"]
+        definition = HyperliquidOrderCancelEval(self.repo, env)
+        with (
+            mock.patch.object(hyperliquid_order_cancel.subprocess, "run") as run,
+            self.assertRaisesRegex(
+                EvalError, "BLOOM_EVAL_BLOOM_MOUNT is required"
+            ),
+        ):
+            definition.preflight()
+        run.assert_not_called()
+
+    def test_full_eval_treats_whitespace_only_mount_as_missing(self) -> None:
+        definition = HyperliquidOrderCancelEval(
+            self.repo, self.env | {"BLOOM_EVAL_BLOOM_MOUNT": " \t "}
+        )
+        with (
+            mock.patch.object(hyperliquid_order_cancel.subprocess, "run") as run,
+            self.assertRaisesRegex(
+                EvalError, "BLOOM_EVAL_BLOOM_MOUNT is required"
+            ),
+        ):
+            definition.preflight()
+        run.assert_not_called()
+
+    def test_full_eval_rejects_invalid_explicit_mount(self) -> None:
+        definition = HyperliquidOrderCancelEval(
+            self.repo, self.env | {"BLOOM_EVAL_BLOOM_MOUNT": "/not-a-mount"}
+        )
+        with (
+            mock.patch.object(
+                hyperliquid_order_cancel.os.path, "ismount", return_value=False
+            ) as ismount,
+            self.assertRaisesRegex(EvalError, "Bloom is not mounted at /not-a-mount"),
+        ):
+            definition._require_bloom_mount()
+        ismount.assert_called_once_with(Path("/not-a-mount"))
+
+    def test_full_eval_accepts_valid_custom_mount_selection(self) -> None:
+        custom = self.root / "custom-mount"
+        definition = HyperliquidOrderCancelEval(
+            self.repo, self.env | {"BLOOM_EVAL_BLOOM_MOUNT": str(custom)}
+        )
+        with mock.patch.object(
+            hyperliquid_order_cancel.os.path, "ismount", return_value=True
+        ) as ismount:
+            definition._require_bloom_mount()
+        self.assertEqual(definition.bloom_mount, custom)
+        ismount.assert_called_once_with(custom)
 
     def test_missing_sign_count_fails_closed(self) -> None:
         env = dict(self.env)
@@ -430,7 +515,9 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         with self.assertRaisesRegex(EvalError, "does not have active Petal lineage"):
             self.definition.preauthorization_preflight()
 
-    def test_preauthorization_does_not_require_or_inspect_temporary_policy(self) -> None:
+    def test_preauthorization_does_not_require_or_inspect_temporary_policy(
+        self,
+    ) -> None:
         self.definition._require_exact_wallet_policy = mock.Mock(
             side_effect=AssertionError("temporary policy must remain unopened")
         )
@@ -478,12 +565,8 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         self.assertEqual(self.definition._pending_petal_key_ceremony(), ceremony)
 
     def test_session_key_slot_is_a_case_sensitive_lowercase_broker_token(self) -> None:
-        upper = session_key_slot(
-            "bloom-eval-codex-20260814T150000Z-0123456789abcdef"
-        )
-        lower = session_key_slot(
-            "bloom-eval-codex-20260814t150000z-0123456789abcdef"
-        )
+        upper = session_key_slot("bloom-eval-codex-20260814T150000Z-0123456789abcdef")
+        lower = session_key_slot("bloom-eval-codex-20260814t150000z-0123456789abcdef")
 
         self.assertEqual(len(upper), 64)
         self.assertRegex(upper, r"^[a-z0-9-]{64}$")
@@ -529,6 +612,8 @@ class HyperliquidDefinitionTests(unittest.TestCase):
             return None
 
         counters: list[str] = []
+        committed: list[int] = []
+        self.definition.counter_committed = committed.append
 
         def fake_run(cmd, **kwargs):
             del kwargs
@@ -557,6 +642,39 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         base = int(self.definition.sign_count_value)
         self.assertEqual(counters, [str(base), str(base + 1), str(base + 2)])
         self.assertEqual(self.definition.next_sign_count, base + 3)
+        self.assertEqual(committed, [base + 1, base + 2, base + 3])
+
+    def test_session_timeout_durably_reserves_next_counter_before_driver(self) -> None:
+        ceremony = "http://localhost:18734/ceremony/" + "A" * 43
+        committed: list[int] = []
+        self.definition.counter_committed = committed.append
+        self.definition._write_route = mock.Mock(
+            return_value=SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+        )
+        self.definition._read_json_if_exists = mock.Mock(return_value=None)
+        self.definition._pending_petal_key_ceremony = mock.Mock(
+            return_value=ceremony
+        )
+        self.definition._pending_agent_approval_ceremony = mock.Mock(
+            return_value=None
+        )
+        base = int(self.definition.sign_count_value)
+
+        with (
+            mock.patch(
+                "harness.hyperliquid_order_cancel.subprocess.run",
+                side_effect=subprocess.TimeoutExpired(["debug-driver"], 45),
+            ) as run,
+            self.assertRaisesRegex(
+                EvalError, f"next unused counter is {base + 1}"
+            ),
+        ):
+            self.definition.provision("codex")
+
+        self.assertEqual(committed, [base + 1])
+        self.assertEqual(self.definition.next_sign_count, base + 1)
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index("--sign-count") + 1], str(base))
 
     def test_session_route_is_addressed_by_wallet_id_not_owner_address(self) -> None:
         written: list[tuple[Path, bytes]] = []
@@ -603,7 +721,9 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         # The container's bind-mount targets must agree with the host paths, and
         # the agent needs both identifiers to address sessions and account reads.
         for mount in context.mounts[1:]:
-            self.assertIn(f"/agent_sessions/{self.definition.wallet_id}/", mount["target"])
+            self.assertIn(
+                f"/mainnet/agent_sessions/{self.definition.wallet_id}/0/", mount["target"]
+            )
         self.assertEqual(
             context.agent_env["BLOOM_EVAL_WALLET_ID"], self.definition.wallet_id
         )
@@ -762,9 +882,11 @@ class HyperliquidDefinitionTests(unittest.TestCase):
             return_value=SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
         )
 
-        with mock.patch.object(hyperliquid_order_cancel.time, "sleep"):
-            with self.assertRaisesRegex(EvalError, "still has open orders"):
-                self.definition.cleanup()
+        with (
+            mock.patch.object(hyperliquid_order_cancel.time, "sleep"),
+            self.assertRaisesRegex(EvalError, "still has open orders"),
+        ):
+            self.definition.cleanup()
 
     def test_cleanup_closes_residual_position_before_stopping(self) -> None:
         self.definition.session_id = "created"
@@ -901,7 +1023,10 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         other_env = dict(self.env)
         other_env["BLOOM_EVAL_WALLET_ID"] = "another-eval-wallet"
         other = HyperliquidOrderCancelEval(self.repo, other_env).agent_name
-        self.assertNotEqual(first, other, "distinct wallets must not share an agent name")
+        self.assertNotEqual(
+            first, other, "distinct wallets must not share an agent name"
+        )
+
     def test_agent_name_override_adopts_an_existing_agent(self) -> None:
         # A wallet carrying an agent from an earlier naming scheme cannot be
         # reconciled by a derived name, and the old agent cannot be safely
@@ -942,6 +1067,33 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         self.definition._read_json = mock.Mock(return_value=own + foreign)
         with self.assertRaisesRegex(EvalError, "this eval did not create"):
             self.definition._require_empty_wallet()
+
+    def test_eval_image_is_pulled_by_immutable_digest(self) -> None:
+        completed = subprocess.CompletedProcess([], 0, stdout="pulled", stderr="")
+        with mock.patch.object(
+            hyperliquid_order_cancel.subprocess, "run", return_value=completed
+        ) as run:
+            self.definition._pull_eval_image()
+
+        self.assertEqual(
+            run.call_args.args[0],
+            ["docker", "pull", hyperliquid_order_cancel.EVAL_IMAGE],
+        )
+        self.assertIn("@sha256:", hyperliquid_order_cancel.EVAL_IMAGE)
+
+    def test_eval_image_pull_fails_closed(self) -> None:
+        completed = subprocess.CompletedProcess(
+            [], 1, stdout="", stderr="manifest unavailable"
+        )
+        with (
+            mock.patch.object(
+                hyperliquid_order_cancel.subprocess, "run", return_value=completed
+            ),
+            self.assertRaisesRegex(
+                EvalError, "pinned Harbor eval image: manifest unavailable"
+            ),
+        ):
+            self.definition._pull_eval_image()
 
 
 if __name__ == "__main__":

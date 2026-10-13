@@ -768,11 +768,13 @@ durations expressed as positive integer milliseconds. Windows include
 reserved, committed, and quarantined entries and exclude only durably released
 known non-effects.
 
-The edge manifest pins the platform time profile. Linux uses monotonic time
-anchored to UTC from its authenticated NTS-backed source. When Linux cannot
-report that source as synchronized, the service starts in a degraded mode
-that serves reads and status but denies new rate-limited signing. Peer-supplied
-time is never authoritative.
+The edge manifest pins the platform time profile. Linux reads the host wall
+clock and persists a nondecreasing floor. During one boot, a suspend-aware
+monotonic anchor detects an unexpected large forward step; across boots Bloom
+accepts nondecreasing elapsed wall time so ordinary powered-off intervals do
+not require repair. Clock rollback or a same-boot discontinuity degrades the
+service and denies new rate-limited signing. Peer-supplied time is never
+authoritative, and no particular host time daemon is required.
 
 The macOS profile uses the host wall clock directly. Changing that clock
 requires administrator authority, and administrator/root compromise is
@@ -2218,6 +2220,14 @@ startup error. Packaging must demonstrate, per platform, that no unprivileged
 process can pre-empt or take over the listener; failure of that negative test
 is an E-05 go/no-go failure for that platform, exactly like the state-isolation
 tests.
+
+Authenticated Unix endpoints are different: on Linux the service principal
+must create its own listener after activation so `SO_PEERCRED` identifies that
+principal in both directions. A root-created systemd Unix listener reports the
+launch manager as the peer to a connecting client and therefore cannot satisfy
+the UID-plus-application-key authentication rule. Packaging may use a separate
+path or demand trigger, but it must not pass a root-created authenticated Unix
+listener to Broker or Signer.
 
 Distinct effective principals or mandatory sandbox identities must prevent a
 compromised Machine from:

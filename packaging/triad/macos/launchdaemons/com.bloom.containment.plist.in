@@ -15,12 +15,10 @@
   <array>
     <string>@BLOOM_MACHINE_BINARY@</string>
     <string>serve</string>
-    <string>triad-pf-monitor-once</string>
+    <string>triad-pf-monitor</string>
   </array>
-  <key>RunAtLoad</key>
+  <key>KeepAlive</key>
   <true/>
-  <key>StartInterval</key>
-  <integer>1</integer>
   <key>ThrottleInterval</key>
   <integer>1</integer>
   <key>ProcessType</key>

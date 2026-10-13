@@ -12,11 +12,7 @@
   "ceremony_key_id": "bloom-signer-ceremony-@LOGIN_UID@",
   "ceremony_signing_seed_hex": "@SIGNER_CEREMONY_SEED_HEX@",
   "build_digest": "@BUILD_DIGEST@",
-  "network_containment": {
-    "status_path": "@BLOOM_CONTAINMENT_STATUS@",
-    "login_uid": @LOGIN_UID@,
-    "maximum_age_ms": 5000
-  },
+  "network_containment": null,
   "maximum_connections": 64,
   "maximum_in_flight_mutations": 16,
   "maximum_requests_per_window": 1200,

@@ -67,6 +67,7 @@ impl HomeDir {
             self.cache_dir(),
             self.blobs_dir(),
             self.outbox_dir(),
+            self.solana_outbox_dir(),
             self.watch_dir(),
             self.logs_dir(),
         ];
@@ -102,6 +103,12 @@ impl HomeDir {
     }
     pub fn outbox_dir(&self) -> PathBuf {
         self.root.join("outbox")
+    }
+    /// Dedicated Solana outbox root. This is deliberately a reserved sibling
+    /// of `outbox/`: putting it below `outbox/solana` would collide with a
+    /// user wallet named `solana` in the legacy `<wallet>/<chain>` layout.
+    pub fn solana_outbox_dir(&self) -> PathBuf {
+        self.root.join(".solana-outbox")
     }
     pub fn watch_dir(&self) -> PathBuf {
         self.root.join("watch")
@@ -203,6 +210,7 @@ mod tests {
         assert_eq!(home.cache_dir(), td.path().join("cache"));
         assert_eq!(home.blobs_dir(), td.path().join("blobs"));
         assert_eq!(home.outbox_dir(), td.path().join("outbox"));
+        assert_eq!(home.solana_outbox_dir(), td.path().join(".solana-outbox"));
         assert_eq!(home.watch_dir(), td.path().join("watch"));
         assert_eq!(home.logs_dir(), td.path().join("logs"));
     }
@@ -219,6 +227,7 @@ mod tests {
             home.cache_dir(),
             home.blobs_dir(),
             home.outbox_dir(),
+            home.solana_outbox_dir(),
             home.watch_dir(),
             home.logs_dir(),
         ] {

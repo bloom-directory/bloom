@@ -37,7 +37,7 @@ An agent using Bloom can:
   challenges staged for review before any x402 or Tempo MPP credential is
   signed;
 - enforce wallet policy: spend caps, allow/deny lists, contract-call gates, private orderflow preferences, and audit logging;
-- use twelve read-ready public EVM networks immediately after `bloom init`: Ethereum, Base, Tempo, Robinhood Chain, Arbitrum, Optimism, Polygon, BNB Smart Chain, Avalanche, Gnosis, Linea, and HyperEVM, plus local Anvil.
+- use thirteen read-ready public EVM networks immediately after `bloom init`: Ethereum, Base, Tempo, Robinhood Chain, Arbitrum, Optimism, Polygon, BNB Smart Chain, Avalanche, Gnosis, Linea, HyperEVM, and Arc, plus local Anvil.
 
 Mainnet and L2 broadcast routing is enabled by default. Live sends still require the applicable signing, policy, confirmation, and Sealed Approval gates.
 
@@ -60,12 +60,12 @@ bloom wallet list
 
 # 4. Stage a devnet transaction when Anvil is running.
 bloom vfs write \
-  /wallets/alice/chains/anvil/outbox/new.tx \
+  /wallets/alice/0/chains/anvil/outbox/new.tx \
   --data 'send 0.01 eth to 0x70997970C51812dc3A010C7d01b50e0d17dc79C8 on anvil'
 
 # 5. Review the generated plan before confirming.
-bloom vfs ls /wallets/alice/chains/anvil/outbox/pending
-bloom vfs cat /wallets/alice/chains/anvil/outbox/pending/<id>/plan.md
+bloom vfs ls /wallets/alice/0/chains/anvil/outbox/pending
+bloom vfs cat /wallets/alice/0/chains/anvil/outbox/pending/<id>/plan.md
 ```
 
 ## Paid HTTP requests

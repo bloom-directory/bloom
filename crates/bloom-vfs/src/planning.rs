@@ -37,6 +37,34 @@ pub fn advisory_evm_policy(projection: &WalletProjection, chain: &str) -> Result
     Ok(policy)
 }
 
+/// Advisory opt-in for native exact transactions, scoped to numeric chain ID.
+/// Broker still checks the policy and decodes the exact payload for owner review.
+/// Reusable Petal planning must continue using `advisory_evm_policy`.
+///
+/// The opt-in permits contract creation, which has no recipient address.
+/// The engine applies that exemption only to creation. All addressed
+/// transactions keep the canonical recipient allowlist.
+pub fn advisory_exact_evm_policy(
+    projection: &WalletProjection,
+    chain: &str,
+    chain_id: u64,
+) -> Result<Policy, String> {
+    let canonical: CanonicalWalletPolicy =
+        serde_json::from_slice(&projection.policy.canonical_policy.decode())
+            .map_err(|error| format!("parse canonical Broker policy projection: {error}"))?;
+    if canonical.wallet_id != projection.wallet.wallet_id {
+        return Err("canonical Broker policy projection names a different wallet".into());
+    }
+    let mut policy = advisory_evm_policy(projection, chain)?;
+    if canonical.allowed_destinations.iter().any(|destination| {
+        destination.chain.as_str() == format!("evm-{chain_id}")
+            && destination.destination == "exact"
+    }) {
+        policy.allow_contract_creation = true;
+    }
+    Ok(policy)
+}
+
 /// Produce a non-authorizing paid-request planning view. Canonical policy has
 /// no legacy HTTP cap fields; Broker evaluates the exact payload and canonical
 /// policy before signing, so Machine must not invent persistent local limits.
@@ -74,13 +102,14 @@ mod tests {
             allowed_petal_packages: Vec::new(),
             allowed_destinations: destinations,
             required_verifiers: Vec::new(),
+            clear_signing: None,
         })
         .unwrap();
         WalletProjection {
             wallet: WalletPublic {
                 wallet_id: wallet_id.clone(),
                 wallet_kind: Token::new("passkey").unwrap(),
-                root_key_ref: root_key_ref.clone(),
+                root_key_ref: Some(root_key_ref.clone()),
                 key_refs: vec![root_key_ref.clone()],
                 policy_version: DecimalU64::new(1),
                 policy_digest: Digest32::from_bytes(sha2::Sha256::digest(&canonical).into()),
@@ -103,12 +132,91 @@ mod tests {
                 policy_verifying_key: Base64UrlBytes::from_bytes(&[1; 32]),
                 signer_signature: Base64UrlBytes::from_bytes(&[2; 64]),
             },
+            accounts: bloom_machine_client::empty_wallet_accounts(
+                bloom_broker_api::Token::new("planning").unwrap(),
+            ),
+            accounts_unavailable: None,
             source_protocol: "bloom.machine-broker.v1".into(),
             response_digest: Digest32::from_bytes([3; 32]),
             observed_at_ms: 1,
             freshness: ProjectionFreshness::Fresh,
             verification: ProjectionVerification::AuthenticatedBroker,
         }
+    }
+
+    #[test]
+    fn exact_opt_in_is_numeric_chain_scoped_and_does_not_broaden_petal_planning() {
+        let projection = projection(vec![PolicyDestination {
+            chain: Token::new("evm-31337").unwrap(),
+            destination: "exact".into(),
+        }]);
+        assert!(
+            advisory_exact_evm_policy(&projection, "anvil", 31337)
+                .unwrap()
+                .allow_contract_creation
+        );
+        assert!(
+            !advisory_exact_evm_policy(&projection, "anvil", 1)
+                .unwrap()
+                .allowlists
+                .recipients
+                .is_empty()
+        );
+        assert!(
+            !advisory_evm_policy(&projection, "anvil")
+                .unwrap()
+                .allowlists
+                .recipients
+                .is_empty()
+        );
+    }
+
+    /// The opt-in lifts the recipient allowlist, which is the one rule a
+    /// contract creation cannot satisfy. It must not discard the rest of the
+    /// advisory policy on the way: a bare `Policy::default()` returned
+    /// whatever `Policy` happens to default to today, so any field the
+    /// canonical projection later contributes would be dropped here without
+    /// anyone deciding to drop it.
+    #[test]
+    fn the_exact_opt_in_lifts_the_recipient_rule_and_nothing_else() {
+        let allowed = "0x0000000000000000000000000000000000000001";
+        let opted_in = projection(vec![
+            PolicyDestination {
+                chain: Token::new("evm-31337").unwrap(),
+                destination: "exact".into(),
+            },
+            PolicyDestination {
+                chain: Token::new("anvil").unwrap(),
+                destination: allowed.into(),
+            },
+        ]);
+
+        let lifted = advisory_exact_evm_policy(&opted_in, "anvil", 31337).unwrap();
+        assert!(lifted.allow_contract_creation);
+        assert!(lifted.allowlists.recipients.contains(allowed));
+
+        // Everything else is whatever `advisory_evm_policy` produced, field
+        // for field, so the two cannot drift apart.
+        let base = advisory_evm_policy(&opted_in, "anvil").unwrap();
+        assert!(base.allowlists.recipients.contains(allowed));
+        assert_eq!(
+            serde_json::to_value(bloom_proto::Policy {
+                allowlists: Default::default(),
+                ..base
+            })
+            .unwrap(),
+            serde_json::to_value(bloom_proto::Policy {
+                allowlists: Default::default(),
+                ..lifted
+            })
+            .unwrap(),
+            "the opt-in must change only the recipient allowlist"
+        );
+
+        // Without the opt-in for this chain, nothing is lifted.
+        let other = advisory_exact_evm_policy(&opted_in, "anvil", 1).unwrap();
+        assert!(!other.allow_contract_creation);
+        assert!(other.allowlists.recipients.contains(allowed));
     }
 
     #[test]
