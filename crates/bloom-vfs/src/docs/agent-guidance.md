@@ -248,6 +248,13 @@ reason to restage. After human approval, retry only its exact `retry_path`;
 `plan_path` and `retry_path` name the outbox the confirm was written through
 (`wallets/<wallet>/<n>/chains/...`, including `n = 0` for account 0).
 
+`bloom wallet confirm` exits 3 when owner approval is pending and 4 when
+confirmation has no recorded result yet. Exit 0 reports a recorded broadcast
+or a completed local discard. Use `--text cancel` to discard an unsigned
+pending entry; an already broadcast transaction needs `bloom wallet cancel`
+and its own approval. Dropping a reservation does not renumber later rows:
+restage with an explicit nonce to fill a gap.
+
 `confirm.override` is not a general escape hatch. Use it only when the
 inspected policy projection explicitly permits that control and the human has
 explicitly accepted the displayed warning.
@@ -287,6 +294,31 @@ Use the challenge's `retry_path` verbatim after the owner completes its
 `expiry_ms` first. `plan_path` and `retry_path` name the outbox the confirm was
 written through: `wallets/<wallet>/<n>/chains/...`, including `n = 0` for
 account 0.
+
+## Deploying EVM contracts
+
+Build with the project's normal tools. Stage a JSON/TOML intent using
+`kind: "deploy"`, complete hex initcode in `data`, and optional native `value`
+at `wallets/<wallet>/<n>/chains/<chain>/outbox/new.tx`. Append ABI-encoded constructor
+arguments and link libraries before staging; do not supply `to`. Read the
+pending entry's `plan.md` and complete its usual Broker approval flow.
+
+The predicted address depends on sender and nonce. Check the mined
+`sent/<id>/receipt.json` for success and the actual `contract_address`; a
+broadcast hash alone is not a successful deployment. Constructor ownership and
+effects are not verified. Initialization calls are separate transactions with
+their own approvals. The wallet policy must opt into the numeric chain with
+`{"chain":"evm-31337","destination":"exact"}` (replace 31337 as appropriate),
+through the normal policy-update ceremony. This permits contract creation to be
+prepared without a recipient allowlist entry; calls and sends keep their recipient
+restrictions. Every transaction still needs its own exact owner approval.
+
+For Foundry scripts, Hardhat remote accounts, and Ignition, run
+`bloom deploy --wallet <wallet> --chain <chain> rpc`. It prints an ephemeral,
+private submission URL and public sender. After owner review, explicitly run
+`bloom deploy --wallet <wallet> --chain <chain> resume <id>` for the same ID.
+Use `list` and `status <id>` to recover. Do not export signing keys into project
+files or environment variables. See `docs/examples.md` for commands.
 
 ## Updating wallet policy
 

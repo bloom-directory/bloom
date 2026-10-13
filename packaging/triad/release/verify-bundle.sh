@@ -114,10 +114,12 @@ signer_revision="$(source_revision BLOOM_SIGNER_SHA)"
 }
 require_compat_value revisions service_runtime_commit '"5db670e1b7507deabfdcf451be8b5d315c1c9d91"'
 require_compat_value revisions petal_contract_commit '"73c5b06a77599368fbc79fb7947a629b5b4c630e"'
-for state_owner in machine broker signer; do
+for state_owner in machine signer; do
   require_compat_value "state.$state_owner" current 1
   require_compat_value "state.$state_owner" downgrade_floor 1
 done
+require_compat_value state.broker current 2
+require_compat_value state.broker downgrade_floor 2
 if grep -Eq '^[[:space:]]*(protocol_major|protocol_minor_min|protocol_minor_max)[[:space:]]*=' "$compatibility"; then
   echo "bundle compatibility must not declare a global protocol range" >&2
   exit 65

@@ -1,0 +1,5 @@
+[profile.default]
+src = "contracts"
+script = "script"
+solc_version = "0.8.28"
+evm_version = "cancun"
