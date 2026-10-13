@@ -183,7 +183,7 @@ Signer-approved desired exposure and Broker-confirmed effective readiness.
 A pending certificate or route is not working remote access. Treat an
 incomplete provisioning stage as retryable setup work. The `credentials_expired` stage
 is different: the computer was off or asleep longer than the relay's renewal
-grace (seven days by default), so remote approvals stay paused until the owner
+grace (30 days by default), so remote approvals stay paused until the owner
 re-provisions. `bloom vfs cat /status/ceremonies-repair.json` then gives a
 `repair` summary and `command`
 (`sudo …/bloom-signer admin provision --login-uid "$(id -u)"`), and
