@@ -2172,10 +2172,11 @@ async fn handle_ceremony(
 ) -> Result<String> {
     let (operation_id, action) = match command {
         CeremonyCmd::Surfaces => {
-            return Ok(format!(
-                "{}\n",
-                serde_json::to_string_pretty(&client.ceremony_surfaces().await?)?
-            ));
+            let status = client.ceremony_surfaces().await?;
+            warn_ceremony_repair(&serde_json::to_vec(
+                &bloom_machine_client::ceremony_repair(&status),
+            )?);
+            return Ok(format!("{}\n", serde_json::to_string_pretty(&status)?));
         }
         CeremonyCmd::Status { operation_id } => (operation_id, "status"),
         CeremonyCmd::Cancel { operation_id } => (operation_id, "cancel"),
@@ -3379,6 +3380,18 @@ async fn ipc_read(endpoint: &ResolvedEndpoint, path: &str) -> Result<Vec<u8>> {
     B64.decode(encoded).context("ipc read: bad base64")
 }
 
+/// Prints a ceremony repair (see `/status/ceremonies-repair.json`) to stderr.
+fn warn_ceremony_repair(bytes: &[u8]) {
+    let Ok(report) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return;
+    };
+    let repair = &report["repair"];
+    if let (Some(summary), Some(command)) = (repair["summary"].as_str(), repair["command"].as_str())
+    {
+        eprintln!("warning: {summary}\nRepair on this computer: {command}");
+    }
+}
+
 async fn ipc_read_to_stdout(endpoint: &ResolvedEndpoint, path: &str, context: &str) -> Result<()> {
     let bytes = ipc_read(endpoint, path)
         .await
@@ -4206,6 +4219,11 @@ async fn run(cli: Cli) -> Result<()> {
                 "ceremony surfaces",
             )
             .await?;
+            // Advisory: stdout stays Broker's projection; an older daemon
+            // without the repair file simply prints nothing extra.
+            if let Ok(bytes) = ipc_read(&client_endpoint, "/status/ceremonies-repair.json").await {
+                warn_ceremony_repair(&bytes);
+            }
             Ok(())
         }
         Cmd::Ceremony(command) => {

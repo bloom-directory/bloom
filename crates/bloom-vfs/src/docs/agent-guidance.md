@@ -291,6 +291,14 @@ example when all of its passkeys are remote and the relay is unavailable.
 Repeating the write does not help. Tell the human, and check `passkeys/` and
 the relay status.
 
+The relay status is `/status/ceremonies.json`. If its `stage` is
+`credentials_expired`, the computer was offline longer than the relay's
+renewal grace and remote approvals stay paused until the owner acts:
+`/status/ceremonies-repair.json` then holds a `repair` with a `summary` and
+the exact `command` to give the human (it needs `sudo` on this computer and
+keeps the same hostname). Localhost approvals still work. Do not retry remote
+ceremonies until the stage changes.
+
 The link is single-use: it disappears once opened, while `status` stays
 readable. Write to `latest/cancel` to abandon an enrollment. Every enrollment
 stays under `enrollments/<operation>/`. Writing `new` again while one to the
