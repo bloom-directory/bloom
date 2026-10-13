@@ -313,6 +313,9 @@ install -m 0755 \
   "$script_dir/ssh-ed25519-verify.sh" \
   "$payload/installer/release/"
 install -m 0755 "$script_dir/verify-bundle.sh" "$payload/installer/release/"
+# The packaged verifier compares the bundle's record with this reviewed copy
+# (not BLOOM_COMPATIBILITY_FILE), exactly as a checkout's verifier does.
+install -m 0644 "$script_dir/compatibility-v1.toml" "$payload/installer/release/"
 
 reject_machine_legacy_authority_files "$payload" "packaged Machine artifact"
 reject_legacy_authority_symbols "$payload/bin/bloom"
