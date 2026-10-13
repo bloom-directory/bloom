@@ -101,6 +101,9 @@ pub struct PetalMeta {
     pub petal: Option<PetalPackageMeta>,
     #[serde(default)]
     pub source: Option<PetalSourceProvenance>,
+    /// Installed owner of this Petal name immediately before this package.
+    #[serde(default)]
+    pub replaced: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -204,6 +207,7 @@ mod tests {
             mode: PetalMode::default(),
             petal: None,
             source: None,
+            replaced: None,
         };
         let s = serde_json::to_string(&m).unwrap();
         let m2: PetalMeta = serde_json::from_str(&s).unwrap();
