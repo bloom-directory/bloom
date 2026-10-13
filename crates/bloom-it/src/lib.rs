@@ -19,9 +19,10 @@ use bloom_broker_api::{
     ApprovalLifecycleState, ApprovalPrepareState, ApprovalPublicStatus, Base64UrlBytes,
     CanonicalWalletPolicy, CredentialPublic, CryptoSuite, DecimalU64, Digest32, KeyPublic, KeyRef,
     KeyRole, KeySpec, MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService,
-    NormalizedSignature, PolicyDestination, ProvenanceCatalog, ProvenanceFeeAsset,
-    ProvenanceOperationClass, ProvenanceRecord, ProvenanceSubject, ServiceFuture,
-    SignedPolicySnapshot, SigningPayloads, SigningResult, Token, WalletPublic, WalletRequest,
+    NormalizedSignature, OperationPublicStatus, OperationState, PolicyDestination,
+    ProvenanceCatalog, ProvenanceFeeAsset, ProvenanceOperationClass, ProvenanceRecord,
+    ProvenanceSubject, ServiceFuture, SignedPolicySnapshot, SigningPayloads, SigningResult, Token,
+    WalletPublic, WalletRequest,
 };
 use bloom_machine_client::MachineBrokerClient;
 use sha2::{Digest as _, Sha256};
@@ -39,9 +40,11 @@ pub const FUNDER_PRIV_KEY: &str =
 pub struct ExactSigningBrokerFixture {
     active: AtomicBool,
     test_deployments: AtomicBool,
+    lose_sign_response_once: AtomicBool,
     signer: alloy_signer_local::PrivateKeySigner,
     key_ref: KeyRef,
     requests: parking_lot::Mutex<Vec<MachineBrokerRequest>>,
+    completed_result: parking_lot::Mutex<Option<SigningResult>>,
 }
 
 impl ExactSigningBrokerFixture {
@@ -125,6 +128,13 @@ impl ExactSigningBrokerFixture {
     /// approval_required again.
     pub fn deactivate(&self) {
         self.active.store(false, Ordering::SeqCst);
+    }
+
+    /// Sign the next payload but lose its response, as a Machine restart or
+    /// socket failure after the Broker commits would. Reconciliation by
+    /// operation ID returns the stored result without signing again.
+    pub fn lose_next_sign_response(&self) {
+        self.lose_sign_response_once.store(true, Ordering::SeqCst);
     }
 
     pub fn requests(&self) -> Vec<MachineBrokerRequest> {
@@ -231,7 +241,7 @@ impl MachineBrokerService for ExactSigningBrokerFixture {
                     use alloy::signers::SignerSync as _;
                     let hash = alloy::primitives::keccak256(payload.decode());
                     let signature = self.signer.sign_hash_sync(&hash).unwrap();
-                    Ok(MachineBrokerResponse::SigningSign(SigningResult {
+                    let result = SigningResult {
                         operation_id: request.operation_id,
                         operation_digest: request.operation_digest,
                         signatures: vec![NormalizedSignature {
@@ -240,7 +250,32 @@ impl MachineBrokerService for ExactSigningBrokerFixture {
                         }],
                         signer_receipt_digest: Digest32::from_bytes([9; 32]),
                         broker_receipt_digest: Digest32::from_bytes([10; 32]),
-                    }))
+                    };
+                    *self.completed_result.lock() = Some(result.clone());
+                    if self.lose_sign_response_once.swap(false, Ordering::SeqCst) {
+                        return Err(bloom_broker_api::ProtocolError::new(
+                            bloom_broker_api::ProtocolErrorCode::ServiceUnavailable,
+                            "simulated local response loss after Broker commit",
+                        ));
+                    }
+                    Ok(MachineBrokerResponse::SigningSign(result))
+                }
+                MachineBrokerRequest::OperationStatus(request) => {
+                    let result = self.completed_result.lock().clone().ok_or_else(|| {
+                        bloom_broker_api::ProtocolError::new(
+                            bloom_broker_api::ProtocolErrorCode::ApprovalNotFound,
+                            "operation not found",
+                        )
+                    })?;
+                    Ok(MachineBrokerResponse::OperationStatus(
+                        OperationPublicStatus {
+                            operation_id: request.operation_id,
+                            operation_digest: result.operation_digest.clone(),
+                            state: OperationState::Succeeded,
+                            result: Some(result),
+                            error: None,
+                        },
+                    ))
                 }
                 other => panic!("unexpected exact signing Broker request: {other:?}"),
             }
@@ -257,6 +292,7 @@ pub fn exact_signing_broker(
     let fixture = Arc::new(ExactSigningBrokerFixture {
         active: AtomicBool::new(false),
         test_deployments: AtomicBool::new(false),
+        lose_sign_response_once: AtomicBool::new(false),
         signer,
         key_ref: KeyRef {
             backend: Token::new("local").unwrap(),
@@ -267,6 +303,7 @@ pub fn exact_signing_broker(
             derivation: None,
         },
         requests: parking_lot::Mutex::new(Vec::new()),
+        completed_result: parking_lot::Mutex::new(None),
     });
     let service: Arc<dyn MachineBrokerService> = fixture.clone();
     Ok((MachineBrokerClient::new(service), fixture))

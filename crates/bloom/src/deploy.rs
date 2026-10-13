@@ -140,6 +140,7 @@ impl Bridge {
         // leave the durable submission discoverable and resumable.
         let mut execution_deadline: Option<tokio::time::Instant> = None;
         let fallback_deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        let mut reported_error: Option<String> = None;
         loop {
             if let Some(hash) = status
                 .pointer("/result/transaction/tx_hash")
@@ -148,23 +149,34 @@ impl Bridge {
                 return json!({"jsonrpc":"2.0","id":id,"result":hash});
             }
             // Only a terminal outbox state ends the caller's transaction, and
-            // only a transport-level `error` ends the poll. A persisted
-            // `/result/error` is the last continuation attempt's message,
-            // which an out-of-band `bloom deploy resume` records on a
-            // transient failure it will retry -- treating that as terminal
-            // aborted the caller's script while the submission was still
-            // alive. It stays visible through `status` and `list`.
+            // only a transport-level `error` ends the poll. `blocked` is a
+            // pending row whose last out-of-band `bloom deploy resume` failed:
+            // a lost Broker signing response leaves the signature recoverable
+            // through the recorded operation, and the next resume reconciles
+            // it. Treating that as terminal aborted the caller's script while
+            // the submission was still alive. The persisted message is for
+            // the operator, so it goes to the terminal once per change and
+            // the request stays open until the execution deadline.
             if status
                 .pointer("/result/status")
                 .and_then(Value::as_str)
-                .is_some_and(|s| matches!(s, "failed" | "blocked" | "reverted"))
+                .is_some_and(|s| matches!(s, "failed" | "reverted"))
                 || status.get("error").is_some()
             {
                 return error(
                     -32000,
-                    "deployment blocked; inspect the durable submission",
+                    "deployment failed; inspect the durable submission",
                     json!({"id":job,"status":status}),
                 );
+            }
+            if let Some(message) = status.pointer("/result/error").and_then(Value::as_str)
+                && reported_error.as_deref() != Some(message)
+            {
+                eprintln!(
+                    "Deployment {job} needs attention: {message}\nContinue: bloom deploy --wallet {} --chain {} resume {job}",
+                    self.wallet, self.chain
+                );
+                reported_error = Some(message.to_owned());
             }
             let phase = status
                 .pointer("/result/status")
@@ -199,7 +211,7 @@ impl Bridge {
                 if tokio::time::Instant::now() >= *deadline {
                     return error(
                         -32001,
-                        "execution pending after signing; continue this ID, then retry the original request",
+                        "submission still pending; continue this ID, then retry the original request",
                         json!({"id":job}),
                     );
                 }

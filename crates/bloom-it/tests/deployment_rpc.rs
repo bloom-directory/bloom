@@ -465,9 +465,32 @@ async fn deployment_tools_and_recovery() -> Result<()> {
         anyhow::bail!("a resume before approval must not abort the caller: {early:?}");
     }
 
-    // The owner approves, then `resume` runs out of band, exactly as the
-    // printed hint tells them to.
+    // The owner approves, but the Broker's signing response is lost on its
+    // way back. The row stays pending with its recorded operation, status
+    // reports `blocked` with the diagnostic, and the caller's request must
+    // survive: the next `resume` reconciles the signature without signing
+    // again.
     fixture.activate();
+    fixture.lose_next_sign_response();
+    let lost = daemon
+        .deployment_rpc(
+            "alice",
+            "anvil",
+            "bloom_deploymentContinue",
+            json!([held_id.clone()]),
+        )
+        .await;
+    ensure!(
+        lost["result"]["status"] == "blocked" && !lost["result"]["error"].is_null(),
+        "{lost}"
+    );
+    tokio::time::sleep(Duration::from_millis(1_000)).await;
+    if held.is_finished() {
+        let early = held.await;
+        anyhow::bail!("a lost signing response must not abort the caller: {early:?}");
+    }
+
+    // `resume` runs out of band, exactly as the printed hint tells them to.
     let resumed = daemon
         .deployment_rpc(
             "alice",
