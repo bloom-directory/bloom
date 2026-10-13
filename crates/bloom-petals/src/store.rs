@@ -15,6 +15,7 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -38,6 +39,7 @@ const ROUTE_INDEX: &str = "route-index.json";
 #[derive(Debug, Clone)]
 pub struct PetalStore {
     base: PathBuf,
+    execution_gate: Arc<tokio::sync::RwLock<()>>,
 }
 
 /// Verified package materialized privately before taking the install mutation lock.
@@ -65,6 +67,18 @@ struct AppOwner {
 }
 
 impl PetalStore {
+    /// Hold from before route selection through guest completion. Ordinary
+    /// invocations share this permit; package activation never waits on a guest.
+    pub(crate) async fn execution_guard(&self) -> tokio::sync::RwLockReadGuard<'_, ()> {
+        self.execution_gate.read().await
+    }
+
+    fn mutation_guard(&self) -> Result<tokio::sync::RwLockWriteGuard<'_, ()>, PetalError> {
+        self.execution_gate.try_write().map_err(|_| {
+            PetalError::vm("Petal execution is in progress; retry the package change when idle")
+        })
+    }
+
     /// Open (or create) a store rooted at `base`. Creates the
     /// `objects/` and `meta/` subdirectories if missing.
     pub fn open(base: impl Into<PathBuf>) -> Result<Self, PetalError> {
@@ -73,7 +87,10 @@ impl PetalStore {
         std::fs::create_dir_all(base.join(META))?;
         std::fs::create_dir_all(base.join(PACKAGES))?;
         std::fs::create_dir_all(base.join(OWNERS))?;
-        let store = Self { base };
+        let store = Self {
+            base,
+            execution_gate: Arc::new(tokio::sync::RwLock::new(())),
+        };
         store.reconcile_petal_owners()?;
         Ok(store)
     }
@@ -90,6 +107,13 @@ impl PetalStore {
             .parent()
             .map(|p| p.join("data"))
             .unwrap_or_else(|| self.base.join("data"))
+    }
+
+    pub fn private_account_data_root(&self) -> PathBuf {
+        self.base
+            .parent()
+            .map(|p| p.join("data-accounts"))
+            .unwrap_or_else(|| self.base.join("data-accounts"))
     }
 
     fn object_path(&self, hash: &str) -> PathBuf {
@@ -160,6 +184,7 @@ impl PetalStore {
                 mode,
                 petal: None,
                 source: None,
+                replaced: None,
             },
             Err(e) => return Err(e),
         };
@@ -262,6 +287,21 @@ impl PetalStore {
     where
         F: Fn() -> Result<(), PetalError>,
     {
+        self.install_staged_petal_package_with_activation(staged, source, commit_guard, |_| Ok(()))
+    }
+
+    pub(crate) fn install_staged_petal_package_with_activation<F, G>(
+        &self,
+        staged: StagedPetalPackage,
+        source: Option<PetalSourceProvenance>,
+        commit_guard: F,
+        prepare_state: G,
+    ) -> Result<(InstallResult, PetalMeta, RouteIndex), PetalError>
+    where
+        F: Fn() -> Result<(), PetalError>,
+        G: Fn(&PetalMeta) -> Result<(), PetalError>,
+    {
+        let _execution = self.mutation_guard()?;
         let StagedPetalPackage { package, directory } = staged;
         let hash = package.hash.clone();
         let package_path = self.package_path_unchecked(&hash);
@@ -302,6 +342,7 @@ impl PetalStore {
                 mode: PetalMode::Local,
                 petal: None,
                 source: None,
+                replaced: None,
             },
         };
         meta.name = Some(package.name.clone());
@@ -314,8 +355,19 @@ impl PetalStore {
             route_index_schema: ROUTE_INDEX_SCHEMA.to_string(),
         });
         meta.source = source;
+        // A reinstall of the same content hash must keep its original
+        // predecessor: replacing it with itself would break first-use copy.
+        let current_owner = self.resolve_petal_owner(&package.name)?;
+        if current_owner.as_deref() != Some(hash.as_str()) {
+            // A failed activation may have left metadata behind. On retry,
+            // record the owner actually being replaced, not that stale value.
+            meta.replaced = current_owner;
+        }
         commit_guard()?;
         self.write_meta(&meta)?;
+        // Prepare compatible state while guest calls are excluded, before
+        // making the successor visible (even if it is never invoked).
+        prepare_state(&meta)?;
 
         // This atomic rename is the installation commit point. Before it,
         // readers continue to resolve the previous package; after it, they
@@ -630,6 +682,7 @@ impl PetalStore {
     /// before the removes, and a non-NotFound IO error between the two
     /// unlinks can leave the store with only one of the two files.
     pub fn uninstall(&self, hash: &str) -> Result<bool, PetalError> {
+        let _execution = self.mutation_guard()?;
         validate_hash_arg(hash)?;
         self.remove_petal_owner_for_hash(hash)?;
         self.remove_package_data(hash)
@@ -1086,6 +1139,53 @@ name = "echo"
     }
 
     #[test]
+    fn retried_activation_records_the_current_predecessor() {
+        let (d, store) = store();
+        let make_package = |name: &str| {
+            let path = d.path().join(name);
+            write_file(
+                &path,
+                "petal.toml",
+                b"schema = \"bloom.petal.package.v1\"\nname = \"echo\"\n",
+            );
+            write_file(&path, "README.md", name.as_bytes());
+            write_file(&path, "AGENTS.md", b"# echo agents");
+            write_file(&path, "petal/echo/one.txt.wasm", route_component_wasm());
+            path
+        };
+        let first = make_package("first");
+        let retry = make_package("retry");
+        let intervening = make_package("intervening");
+        let (first_install, _, _) = store.install_petal_package_dir(&first).unwrap();
+        let calls = std::cell::Cell::new(0);
+        let package = PreparedPetalPackage::from_dir(&retry).unwrap();
+        let retry_hash = package.hash.clone();
+        let result =
+            store.install_prepared_petal_package_with_source_guarded(package, None, || {
+                calls.set(calls.get() + 1);
+                if calls.get() == 3 {
+                    Err(PetalError::vm("cancel before owner commit"))
+                } else {
+                    Ok(())
+                }
+            });
+        assert!(result.is_err());
+        assert_eq!(
+            store.resolve_petal_owner("echo").unwrap(),
+            Some(first_install.hash.clone())
+        );
+        assert_eq!(
+            store.load_meta(&retry_hash).unwrap().replaced,
+            Some(first_install.hash)
+        );
+        let (current, _, _) = store.install_petal_package_dir(&intervening).unwrap();
+        let (_, meta, _) = store.install_petal_package_dir(&retry).unwrap();
+        assert_eq!(meta.replaced, Some(current.hash.clone()));
+        let (_, reinstalled, _) = store.install_petal_package_dir(&retry).unwrap();
+        assert_eq!(reinstalled.replaced, Some(current.hash));
+    }
+
+    #[test]
     fn install_petal_package_uses_packaged_route_artifact_when_present() {
         let (d, store) = store();
         let package = d.path().join("pkg");
@@ -1182,6 +1282,7 @@ name = "echo"
 
         let (replacement, meta, index) = store.install_petal_package_dir(&second).unwrap();
         assert_ne!(replacement.hash, first_hash);
+        assert_eq!(meta.replaced.as_deref(), Some(first_hash.as_str()));
         assert_eq!(meta.petal.as_ref().unwrap().name, "echo");
         assert_eq!(index.routes[0].pattern, "two.txt");
         assert!(store.contains_package(&first_hash));

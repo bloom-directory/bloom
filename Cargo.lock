@@ -1961,13 +1961,13 @@ dependencies = [
 
 [[package]]
 name = "async-trait"
-version = "0.1.89"
+version = "0.1.92"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9035ad2d096bed7955a320ee7e2230574d28fd3c3a0f186cbea1ff3c7eed5dbb"
+checksum = "82f6aeea286b8eb4dd3431a1be1b59d290ace00f5bfd8e2a159bc2a05e2c1667"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.117",
+ "syn 3.0.6",
 ]
 
 [[package]]
@@ -2036,6 +2036,54 @@ dependencies = [
  "dunce",
  "fs_extra",
  "pkg-config",
+]
+
+[[package]]
+name = "axum"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "31b698c5f9a010f6573133b09e0de5408834d0c82f8d7475a89fc1867a71cd90"
+dependencies = [
+ "axum-core",
+ "bytes",
+ "futures-util",
+ "http",
+ "http-body",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "itoa",
+ "matchit",
+ "memchr",
+ "mime",
+ "percent-encoding",
+ "pin-project-lite",
+ "serde_core",
+ "serde_json",
+ "serde_path_to_error",
+ "sync_wrapper",
+ "tokio",
+ "tower",
+ "tower-layer",
+ "tower-service",
+]
+
+[[package]]
+name = "axum-core"
+version = "0.5.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08c78f31d7b1291f7ee735c1c6780ccde7785daae9a9206026862dab7d8792d1"
+dependencies = [
+ "bytes",
+ "futures-core",
+ "http",
+ "http-body",
+ "http-body-util",
+ "mime",
+ "pin-project-lite",
+ "sync_wrapper",
+ "tower-layer",
+ "tower-service",
 ]
 
 [[package]]
@@ -2215,18 +2263,20 @@ dependencies = [
 
 [[package]]
 name = "bloom"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "alloy 2.0.5",
  "anyhow",
  "assert_cmd",
  "async-trait",
+ "axum",
  "base64",
  "blake3",
  "bloom-broker-api",
  "bloom-daemon",
  "bloom-evm",
  "bloom-machine-client",
+ "bloom-mcp",
  "bloom-mount",
  "bloom-petals",
  "bloom-proto",
@@ -2281,7 +2331,7 @@ dependencies = [
 [[package]]
 name = "bloom-broker-api"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-broker.git?rev=dd2add2b9d41540521d08c77d19fb467a2d8029e#dd2add2b9d41540521d08c77d19fb467a2d8029e"
+source = "git+https://github.com/bloom-directory/bloom-broker.git?rev=df25a54676aa2c52d6b018db486b46ec6a51718a#df25a54676aa2c52d6b018db486b46ec6a51718a"
 dependencies = [
  "bloom-rpc-wire",
  "serde",
@@ -2291,7 +2341,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-daemon"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "alloy 2.0.5",
  "anyhow",
@@ -2339,7 +2389,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-ens"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "alloy 2.0.5",
  "bloom-evm",
@@ -2354,7 +2404,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-etherscan"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "alloy 2.0.5",
  "async-trait",
@@ -2372,7 +2422,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-evm"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "alloy 2.0.5",
  "bloom-proto",
@@ -2390,7 +2440,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-it"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "alloy 2.0.5",
  "alloy-signer-local 2.0.5",
@@ -2421,11 +2471,12 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing-subscriber 0.3.23",
+ "url",
 ]
 
 [[package]]
 name = "bloom-machine"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "bloom-broker-api",
@@ -2442,7 +2493,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-machine-client"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "async-trait",
  "bloom-audit-checkpoint",
@@ -2465,8 +2516,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloom-mcp"
+version = "0.3.2"
+dependencies = [
+ "async-trait",
+ "base64",
+ "bloom-daemon",
+ "bloom-proto",
+ "bloom-vfs",
+ "percent-encoding",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "bloom-mempool"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "alloy 2.0.5",
  "alloy-signer-local 2.0.5",
@@ -2488,7 +2557,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-mount"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "async-trait",
  "bloom-vfs",
@@ -2505,7 +2574,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-paid-http"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "async-trait",
  "base64",
@@ -2520,7 +2589,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-paid-mpp"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "alloy 2.0.5",
  "async-trait",
@@ -2537,7 +2606,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-paid-x402"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "alloy 2.0.5",
  "async-trait",
@@ -2563,7 +2632,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-petals"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2598,7 +2667,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-prices"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "parking_lot",
  "reqwest 0.12.28",
@@ -2611,7 +2680,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-proto"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "alloy 2.0.5",
  "blake3",
@@ -2633,7 +2702,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-revert"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "alloy 2.0.5",
  "alloy-dyn-abi",
@@ -2655,7 +2724,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-rpc"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "alloy 2.0.5",
  "bloom-proto",
@@ -2672,7 +2741,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-rpc-common"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "parking_lot",
  "serde",
@@ -2718,7 +2787,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer-api"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=ccc9adb3866b17b87d2774018dcfa015184b1918#ccc9adb3866b17b87d2774018dcfa015184b1918"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=97b9ac7e47ee682e59804d04f6288419f3598a58#97b9ac7e47ee682e59804d04f6288419f3598a58"
 dependencies = [
  "bloom-rpc-wire",
  "ed25519-dalek",
@@ -2733,7 +2802,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer-derive"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=ccc9adb3866b17b87d2774018dcfa015184b1918#ccc9adb3866b17b87d2774018dcfa015184b1918"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=97b9ac7e47ee682e59804d04f6288419f3598a58#97b9ac7e47ee682e59804d04f6288419f3598a58"
 dependencies = [
  "bip39",
  "ed25519-dalek",
@@ -2749,7 +2818,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-solana"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "bloom-proto",
  "bloom-rpc-common",
@@ -2764,7 +2833,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-solana-tx"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "async-trait",
  "base64",
@@ -2793,7 +2862,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-tools"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "alloy 2.0.5",
  "alloy-dyn-abi",
@@ -2835,7 +2904,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-tx"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "alloy 2.0.5",
  "alloy-signer-local 2.0.5",
@@ -2867,7 +2936,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-update"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "parking_lot",
  "reqwest 0.12.28",
@@ -2882,7 +2951,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-vfs"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "alloy 2.0.5",
  "async-trait",
@@ -2931,7 +3000,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-watch"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "alloy 2.0.5",
  "anyhow",
@@ -5849,6 +5918,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "matchit"
+version = "0.8.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
+
+[[package]]
 name = "maybe-owned"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8302,6 +8377,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_path_to_error"
+version = "0.1.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10a9ff822e371bb5403e391ecd83e182e0e77ba7f6fe0160b795797109d1b457"
+dependencies = [
+ "itoa",
+ "serde",
+ "serde_core",
+]
+
+[[package]]
 name = "serde_spanned"
 version = "0.6.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8902,6 +8988,17 @@ name = "syn"
 version = "2.0.117"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e665b8803e7b1d2a727f4023456bbbbe74da67099c585258af0ad9c5013b9b99"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "unicode-ident",
+]
+
+[[package]]
+name = "syn"
+version = "3.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8593e8e72159ed2257d083c7a454a85cbf854f37a0966d8d483aff8c8a3ebcee"
 dependencies = [
  "proc-macro2",
  "quote",

@@ -136,6 +136,7 @@ fn projection(address: String) -> (WalletPublic, Arc<dyn WalletProjectionReader>
         allowed_petal_packages: Vec::new(),
         allowed_destinations: Vec::new(),
         required_verifiers: Vec::new(),
+        clear_signing: None,
     };
     let policy_bytes = serde_jcs::to_vec(&policy).unwrap();
     let policy_digest = Digest32::from_bytes(Sha256::digest(&policy_bytes).into());
