@@ -1210,11 +1210,16 @@ impl WalletsHandler {
             (intent, _) => intent,
         };
         let reused_intent = retained_intent.is_some();
-        let intent = if let Some(intent) = retained_intent {
+        let intent = if let Some(mut intent) = retained_intent {
             if intent.surface_selection != request.surface_selection {
-                return Err(HandlerError::invalid(
-                    "a pending recovery already uses a different surface",
-                ));
+                // No projection exists for this intent, so Broker never
+                // confirmed it. Retrying on the requested surface keeps the
+                // same operation ID: a surface Broker refused outright (for
+                // example remote while the hosted relay is pending) can be
+                // replaced, while an operation Signer did accept on the old
+                // surface rejects the retry instead of gaining a second one.
+                intent.surface_selection = request.surface_selection;
+                write_atomic_json(&intent_path, &intent)?;
             }
             intent
         } else {
@@ -7943,6 +7948,77 @@ value = "0""#,
         fixture.handler.write(&recover, b"lost").await.unwrap();
         let new_projection = fixture.handler.recovery_record("lost").unwrap().1;
         assert_ne!(new_projection.operation_id, old_intent.operation_id);
+    }
+
+    #[tokio::test]
+    async fn refused_recovery_surface_can_be_retried_on_another_with_the_same_operation() {
+        let mut fixture = make_handler();
+        let broker = Arc::new(RegistrationBroker {
+            requests: Mutex::new(Vec::new()),
+            state: Mutex::new(CeremonyState::AwaitingUser),
+            omit_ceremony_url: Mutex::new(false),
+            status_error: Mutex::new(Some(ProtocolErrorCode::ApprovalNotFound)),
+            lose_recovery_prepare_response_once: Mutex::new(true),
+            pause_status_once: Mutex::new(false),
+            status_entered: tokio::sync::Notify::new(),
+            status_release: tokio::sync::Notify::new(),
+        });
+        fixture.handler = fixture
+            .handler
+            .with_broker(Some(MachineBrokerClient::new(broker.clone())));
+        let recover = VfsPath::parse("/recover").unwrap();
+        // Broker refuses the remote surface; the intent stays, because a
+        // failed prepare cannot prove Signer holds no operation.
+        assert!(
+            fixture
+                .handler
+                .write(
+                    &recover,
+                    br#"{"name":"ghost","surface_selection":"remote"}"#
+                )
+                .await
+                .is_err()
+        );
+        let intent: WalletRecoveryIntent =
+            read_json(fixture.handler.recovery_intent_path("ghost")).unwrap();
+        // The advised local retry is accepted and reuses that operation ID.
+        fixture
+            .handler
+            .write(&recover, br#"{"name":"ghost","surface_selection":"local"}"#)
+            .await
+            .unwrap();
+        let projection = fixture.handler.recovery_record("ghost").unwrap().1;
+        assert_eq!(projection.operation_id, intent.operation_id);
+        assert_eq!(
+            projection.surface_selection,
+            bloom_broker_api::CeremonySurfaceSelection::Local
+        );
+        let prepares = broker
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|request| match request {
+                MachineBrokerRequest::RecoveryPrepare(request) => Some((
+                    request.custody_operation_id.clone(),
+                    request.surface_selection,
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            prepares,
+            vec![
+                (
+                    intent.operation_id.clone(),
+                    bloom_broker_api::CeremonySurfaceSelection::Remote
+                ),
+                (
+                    intent.operation_id,
+                    bloom_broker_api::CeremonySurfaceSelection::Local
+                ),
+            ]
+        );
     }
 
     #[tokio::test]
