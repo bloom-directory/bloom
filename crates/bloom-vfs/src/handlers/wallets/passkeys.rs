@@ -312,9 +312,13 @@ impl WalletsHandler {
     }
 
     fn select_enrollment(&self, wallet: &str, operation: &OperationId) -> Result<(), HandlerError> {
+        self.write_latest_pointer(wallet, operation.as_str())
+    }
+
+    fn write_latest_pointer(&self, wallet: &str, operation: &str) -> Result<(), HandlerError> {
         let path = self.latest_pointer(wallet);
         let temporary = path.with_extension("tmp");
-        std::fs::write(&temporary, operation.as_str())?;
+        std::fs::write(&temporary, operation)?;
         std::fs::rename(&temporary, &path)?;
         Ok(())
     }
@@ -444,6 +448,7 @@ impl WalletsHandler {
         // is reused even for another surface: Broker accepted nothing it
         // reported, and if it did accept the old surface it refuses the
         // retry rather than starting a second enrollment.
+        let resumed = pending.is_some();
         let mut record = match pending {
             Some(mut record) => {
                 record.destination = destination;
@@ -466,6 +471,7 @@ impl WalletsHandler {
             }
         };
         let path = path_for(&record.operation_id);
+        let previous = std::fs::read_to_string(self.latest_pointer(wallet)).ok();
         write_atomic_json(&path, &record)?;
         self.select_enrollment(wallet, &record.operation_id)?;
         let prepared = match self
@@ -478,16 +484,33 @@ impl WalletsHandler {
             .await
         {
             Ok(prepared) => prepared,
-            // No active wallet passkey can approve on any usable surface.
-            // Broker answered and refused before creating anything, so the
-            // record goes; repeating the write cannot change the outcome.
-            Err(error) if error.code == bloom_broker_api::ProtocolErrorCode::ApprovalNotFound => {
-                std::fs::remove_file(&path)?;
-                return Err(HandlerError::OperationNotPermitted);
+            Err(error) => {
+                // Broker answered with a refusal that created nothing (for
+                // example a rate limit, or no passkey able to approve). A new
+                // record goes and `latest` returns to what it named; a resumed
+                // one stays pending, since this refusal says nothing about the
+                // attempt whose response was lost.
+                if error.code.contract().durable_effect == bloom_broker_api::DurableEffect::None
+                    && !resumed
+                {
+                    std::fs::remove_file(&path)?;
+                    match previous {
+                        Some(previous) => self.write_latest_pointer(wallet, &previous)?,
+                        None => {
+                            let _ = std::fs::remove_file(self.latest_pointer(wallet));
+                        }
+                    }
+                }
+                // No active wallet passkey can approve on any usable surface;
+                // repeating the write cannot change the outcome.
+                if error.code == bloom_broker_api::ProtocolErrorCode::ApprovalNotFound {
+                    return Err(HandlerError::OperationNotPermitted);
+                }
+                // Anything else either refused cleanly or may have reached
+                // Broker, in which case the pending record lets a retry resume
+                // this operation and a cancel release it.
+                return Err(HandlerError::backend(error.to_string()));
             }
-            // Anything else may have reached Broker: keep the pending record
-            // so a retry resumes this operation and a cancel can release it.
-            Err(error) => return Err(HandlerError::backend(error.to_string())),
         };
         if prepared.operation_id != record.operation_id
             || prepared.state != CeremonyState::AwaitingUser

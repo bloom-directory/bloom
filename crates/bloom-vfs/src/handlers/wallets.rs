@@ -11378,6 +11378,8 @@ value = "0""#,
             /// Fail the next prepare: `true` after accepting it (the response
             /// is lost), `false` before it reaches Broker.
             prepare_fault: Mutex<Option<bool>>,
+            /// Refuse the next prepare with this code before accepting it.
+            prepare_refusal: Mutex<Option<ProtocolErrorCode>>,
         }
 
         impl bloom_broker_api::MachineBrokerService for PasskeyBroker {
@@ -11413,6 +11415,9 @@ value = "0""#,
                             // A real Broker call suspends, letting concurrent
                             // writers interleave as they would in production.
                             tokio::task::yield_now().await;
+                            if let Some(code) = self.prepare_refusal.lock().unwrap().take() {
+                                return Err(ProtocolError::new(code, "Broker refused the prepare"));
+                            }
                             let fault = self.prepare_fault.lock().unwrap().take();
                             if fault == Some(false) {
                                 return Err(ProtocolError::new(
@@ -11499,6 +11504,7 @@ value = "0""#,
                 refuse: Mutex::new(false),
                 accepted: Mutex::new(Default::default()),
                 prepare_fault: Mutex::new(Some(fault)),
+                prepare_refusal: Mutex::new(None),
             })
         }
 
@@ -11593,7 +11599,42 @@ value = "0""#,
                 refuse: Mutex::new(false),
                 accepted: Mutex::new(Default::default()),
                 prepare_fault: Mutex::new(None),
+                prepare_refusal: Mutex::new(None),
             })
+        }
+
+        #[tokio::test]
+        async fn a_refused_enrollment_prepare_leaves_no_record_and_keeps_latest() {
+            let (_tmp, handler) = passkey_handler(vec![credential(1, None, LAPTOP_MS)]);
+            let broker = healthy_passkey_broker();
+            let handler = handler.with_broker(Some(MachineBrokerClient::new(broker.clone())));
+
+            handler
+                .write(&path("/alice/passkeys/new"), b"remote")
+                .await
+                .unwrap();
+            let waiting = latest_operation(&handler).await;
+            // Broker refuses the next one outright, creating nothing: there is
+            // nothing to resume or cancel, so no `preparing` record remains.
+            *broker.prepare_refusal.lock().unwrap() = Some(ProtocolErrorCode::CeremonyRateLimited);
+            assert!(matches!(
+                handler.write(&path("/alice/passkeys/new"), b"local").await,
+                Err(HandlerError::Backend(_))
+            ));
+            let entries = handler
+                .list(&path("/alice/passkeys/enrollments"))
+                .await
+                .unwrap();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].name, waiting);
+            assert_eq!(latest_operation(&handler).await, waiting);
+            // Once Broker allows it, the same write starts the enrollment.
+            handler
+                .write(&path("/alice/passkeys/new"), b"local")
+                .await
+                .unwrap();
+            assert_ne!(latest_operation(&handler).await, waiting);
+            assert_eq!(prepared_operations(&broker).len(), 3);
         }
 
         async fn latest_operation(handler: &WalletsHandler) -> String {
@@ -11707,6 +11748,7 @@ value = "0""#,
                 refuse: Mutex::new(false),
                 accepted: Mutex::new(Default::default()),
                 prepare_fault: Mutex::new(None),
+                prepare_refusal: Mutex::new(None),
             });
             let handler = handler.with_broker(Some(MachineBrokerClient::new(broker.clone())));
 
@@ -11810,6 +11852,7 @@ value = "0""#,
                 refuse: Mutex::new(false),
                 accepted: Mutex::new(Default::default()),
                 prepare_fault: Mutex::new(None),
+                prepare_refusal: Mutex::new(None),
             });
             let handler = handler.with_broker(Some(MachineBrokerClient::new(broker.clone())));
 
