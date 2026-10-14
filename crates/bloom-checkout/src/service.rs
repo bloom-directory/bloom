@@ -1303,6 +1303,81 @@ const BROWSE_ERRORS: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn ready_private_traveler_exposes_only_financial_facts() {
+        let (url, server) = crate::discovery::tests::fixture("<p data-bloom-total-minor='399' data-bloom-currency='USD'>Total USD 3.99</p><input autocomplete='given-name'><input autocomplete='cc-number'><input autocomplete='cc-exp'><input autocomplete='cc-csc'><button>Pay</button>".into()).await;
+        let root = tempfile::tempdir().unwrap().keep();
+        let browser = Browser::launch(
+            &crate::test_chromium(),
+            &root.join("profile"),
+            &["--no-sandbox".into(), "--ignore-certificate-errors".into()],
+        )
+        .await
+        .unwrap();
+        browser
+            .browse(crate::browser::BrowseRequest::Open { url })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let tab = browser.handoff().await.unwrap();
+        let traveler = crate::travelers::TravelerDiscovery::read(
+            &tab,
+            &[bloom_signer_api::TravelerField::GivenName],
+        )
+        .await
+        .unwrap();
+        let service = CheckoutService::new(
+            browser,
+            &root.join("state.db"),
+            root.join("unused.sock"),
+            unsafe { libc::geteuid() },
+            47999,
+        )
+        .unwrap();
+        service
+            .store
+            .insert(
+                &Status {
+                    operation_id: "fixture".into(),
+                    state: "filled".into(),
+                    ceremony_url: None,
+                    filled_fields: vec!["given_name".into()],
+                    outcome: None,
+                },
+                "traveler",
+                "Fixture",
+            )
+            .unwrap();
+        *service.private.lock().await = Some(PrivateCheckout {
+            operation_id: "fixture".into(),
+            mode: Mode::Traveler,
+            view_target: tab.target.clone(),
+            view_session: tab.session.clone(),
+            seen_pages: std::collections::HashSet::from([tab.target.clone()]),
+            tab,
+            discovery: None,
+            recipient: None,
+            traveler: Some(traveler),
+            contains_traveler: true,
+            capability: "fixture".into(),
+            claimed: true,
+            approved: true,
+        });
+        service
+            .private_action("fixture", ViewAction::Finish)
+            .await
+            .unwrap();
+        let facts = service
+            .request(Request::PrivateFacts {
+                operation_id: "fixture".into(),
+            })
+            .await
+            .unwrap();
+        let facts: bloom_checkout_api::PaymentFacts = serde_json::from_value(facts).unwrap();
+        assert_eq!(facts.total_minor, 399);
+        assert_eq!(facts.currency, "USD");
+        server.abort();
+    }
     #[test]
     fn private_origin_guard_survives_restart_and_interrupted_fill_is_not_retried() {
         let root = tempfile::tempdir().unwrap();

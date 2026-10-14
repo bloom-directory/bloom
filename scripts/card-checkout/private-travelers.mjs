@@ -58,7 +58,9 @@ async function approve(url, values = {}) {
 }
 try {
   // Enroll through a traveler without requiring a card, then save a second person.
-  for (const [traveler, given] of [['self', 'SyntheticSelf'], ['wife', 'SyntheticWife']]) {
+  const passengers = process.env.BLOOM_TRAVELER_TEST_ONE_PERSON === '1'
+    ? [['wife', 'SyntheticWife']] : [['self', 'SyntheticSelf'], ['wife', 'SyntheticWife']];
+  for (const [traveler, given] of passengers) {
     const operation = id();
     await vfs('write', '/travelers/save.json', {operation_id: operation, traveler_id: traveler, label: traveler});
     await approve((await vfs('cat', `/travelers/operations/${operation}/ceremony.json`)).ceremony_url, {
@@ -68,13 +70,15 @@ try {
     await poll(`/travelers/operations/${operation}/status.json`, 'succeeded');
   }
   const people = await vfs('cat', '/travelers/index.json');
-  assert.equal(people.length, 2);
+  console.log('Saved private travelers');
+  assert.equal(people.length, passengers.length);
   for (const person of people) assert.deepEqual(Object.keys(person).sort(), ['fields', 'label', 'traveler_id']);
   // Card enrollment uses the same existing passkey.
   const add = id();
   await vfs('write', '/cards/add.json', {operation_id: add, card_id: 'fixture-card', label: 'Synthetic card'});
   await approve((await vfs('cat', `/cards/operations/${add}/ceremony.json`)).ceremony_url, {'card-number': '4242424242424242', 'card-expiry': '12/34', 'card-name': 'Synthetic Cardholder'});
   await poll(`/cards/operations/${add}/status.json`, 'succeeded');
+  console.log('Saved card with existing passkey');
   await browse({action: 'open', url: merchant}); await pause(400);
   const fill = id();
   await vfs('write', `/checkout/requests/${fill}/in.json`, {traveler_id: 'wife', agent_description: 'Synthetic wife passenger'});
@@ -82,15 +86,18 @@ try {
   await approve((await vfs('cat', `/checkout/requests/${fill}/status.json`)).ceremony_url);
   const view = await viewPromise;
   await poll(`/checkout/requests/${fill}/status.json`, 'filled');
+  console.log('Private traveler autofill completed');
   assert.equal(submitted, 0);
   await assert.rejects(browse({action: 'snapshot'}));
   // Only test code observes synthetic private fields, never a real traveler view.
   await view.locator('#finish').click();
   await poll(`/checkout/requests/${fill}/status.json`, 'ready_for_payment');
+  console.log('Ready for payment');
   const facts = await vfs('cat', `/checkout/requests/${fill}/facts.json`);
   assert.equal(facts.total_minor, 399); assert.equal(facts.currency, 'USD');
+  console.log('Financial facts verified');
   const payment = id();
-  const paymentViewPromise = context.waitForEvent('page');
+  const paymentViewPromise = context.waitForEvent('page', {timeout: 30000});
   await vfs('write', `/checkout/requests/${payment}/in.json`, {card_id: 'fixture-card', continue_private: fill, agent_description: 'Synthetic fare USD 3.99'});
   await approve((await vfs('cat', `/checkout/requests/${payment}/status.json`)).ceremony_url, {'card-cvc': '937'});
   const paymentView = await paymentViewPromise;
@@ -99,5 +106,6 @@ try {
   await paymentView.close(); await view.close();
   const publicResults = JSON.stringify(transcript);
   for (const secret of ['SyntheticSelf', 'SyntheticWife', 'FixtureFamily', 'wife@example.com', '1992-02-29', '4242424242424242']) assert(!publicResults.includes(secret));
-  writeFileSync(output, JSON.stringify({result: 'passed', private_save_two_people: true, real_broker_js: true, same_passkey_card: true, autofill_then_separate_payment: true, public_nondisclosure: true, submitted}, null, 2));
-} finally {await browser.close(); await new Promise(resolve => server.close(resolve));}
+  writeFileSync(output, JSON.stringify({result: 'passed', private_passengers_saved: passengers.length, real_broker_js: true, same_passkey_card: true, autofill_then_separate_payment: true, public_nondisclosure: true, submitted}, null, 2));
+} catch (error) {console.error(error); process.exitCode = 1;}
+finally {await browser.close(); server.closeAllConnections(); await new Promise(resolve => server.close(resolve));}
