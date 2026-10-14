@@ -878,6 +878,74 @@ struct WalletRegistrationLaunchProjection {
     signer_contribution_digest: bloom_broker_api::Digest32,
 }
 
+/// Starts a passkey enrollment through `/wallets/<name>/passkeys/new`, the
+/// same path the mount uses, so a CLI-started enrollment is listed under
+/// `enrollments/`, cancellable there, durable before Broker is asked, and
+/// reused by a retry instead of starting another.
+async fn launch_passkey_enrollment_via_vfs(
+    vfs: &bloom_vfs::Vfs,
+    name: &str,
+    local: bool,
+    remote: bool,
+) -> Result<String> {
+    validate_wallet_name(name).context("wallet name must be a safe path segment")?;
+    let surface: &[u8] = if local {
+        b"local"
+    } else if remote {
+        b"remote"
+    } else {
+        b""
+    };
+    let passkeys = format!("/wallets/{name}/passkeys");
+    bloom_vfs::Handler::write(
+        vfs,
+        &bloom_vfs::VfsPath::parse(&format!("{passkeys}/new"))?,
+        surface,
+    )
+    .await?;
+    let latest = bloom_vfs::Handler::lookup(
+        vfs,
+        &bloom_vfs::VfsPath::parse(&format!("{passkeys}/latest"))?,
+    )
+    .await?;
+    let operation = latest
+        .link_target
+        .as_deref()
+        .and_then(|target| target.strip_prefix("enrollments/"))
+        .ok_or_else(|| {
+            machine_error(
+                MachineErrorKind::Internal,
+                "mounted passkey enrollment did not link its latest enrollment",
+            )
+        })?
+        .to_owned();
+    let projection_path = format!("{passkeys}/enrollments/{operation}/status.json");
+    let projection: serde_json::Value = serde_json::from_slice(
+        &bloom_vfs::Handler::read(vfs, &bloom_vfs::VfsPath::parse(&projection_path)?).await?,
+    )
+    .context("decode mounted passkey enrollment projection")?;
+    let field = |key: &str| projection.get(key).and_then(serde_json::Value::as_str);
+    let ceremony_url = field("ceremony_url").ok_or_else(|| {
+        machine_error(
+            MachineErrorKind::Internal,
+            "mounted passkey enrollment has no live link; read its status",
+        )
+    })?;
+    let expires = projection
+        .get("ceremony_expires_at_ms")
+        .and_then(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .or_else(|| value.as_u64().map(|n| n.to_string()))
+        })
+        .unwrap_or_default();
+    emit_remote_preparation("credential_add", Some(&operation));
+    Ok(format!(
+        "operation_id: {operation}\nceremony_url: {ceremony_url}\nceremony_expires_at_ms: {expires}\nprojection: {projection_path}\n",
+    ))
+}
+
 async fn launch_wallet_registration_via_vfs(
     vfs: &bloom_vfs::Vfs,
     requested_name: &str,
@@ -1624,47 +1692,7 @@ async fn execute_machine_command(
             name,
             local,
             remote,
-        } => {
-            use rand::RngCore as _;
-            validate_wallet_name(&name).context("wallet name must be a safe path segment")?;
-            let client = daemon.machine_broker.as_ref().ok_or_else(|| {
-                machine_error(
-                    MachineErrorKind::Unavailable,
-                    "passkey enrollment requires the daemon-owned authenticated Broker edge",
-                )
-            })?;
-            let mut operation = [0_u8; 32];
-            rand::thread_rng().fill_bytes(&mut operation);
-            let response = client
-                .prepare_cross_surface_credential(
-                    bloom_broker_api::CeremonyCrossSurfacePrepareRequest {
-                        operation_id: bloom_broker_api::OperationId::from_bytes(operation),
-                        wallet_id: bloom_broker_api::Token::new(name)?,
-                        destination: if local {
-                            bloom_broker_api::CeremonySurfaceSelection::Local
-                        } else if remote {
-                            bloom_broker_api::CeremonySurfaceSelection::Remote
-                        } else {
-                            bloom_broker_api::CeremonySurfaceSelection::Default
-                        },
-                    },
-                )
-                .await
-                .context("prepare paired passkey enrollment")?;
-            emit_remote_preparation("credential_add", Some(response.operation_id.as_str()));
-            let projection = bloom_machine_client::CeremonyProjection::from_cross_surface_prepare(
-                &response,
-                current_unix_ms(),
-            )?;
-            let path = persist_ceremony_projection(&daemon.home, &projection)?;
-            format!(
-                "operation_id: {}\nceremony_url: {}\nceremony_expires_at_ms: {}\nprojection: {}\n",
-                response.operation_id,
-                response.destination_url,
-                response.expires_at_ms.get(),
-                path.display(),
-            )
-        }
+        } => launch_passkey_enrollment_via_vfs(&daemon.vfs, &name, local, remote).await?,
         MachineCommand::WalletMigrate { receipt } => {
             let receipt: LegacyMigrationReceiptFile =
                 serde_json::from_value(serde_json::to_value(receipt)?)?;
@@ -5063,11 +5091,11 @@ mod tests {
         finish_ceremony_cancel_projection, finish_operation_cancel_local_result,
         finish_policy_commit_local_result, finish_remote_preparation,
         format_petal_consent_net_rule, handle_ceremony, is_completed_policy_update_receipt,
-        launch_wallet_registration_via_vfs, load_ceremony_projection, long_running_role,
-        machine_command_event_fields, machine_error_from_anyhow, machine_wallet_lookup_error,
-        open_machine_audit_with_history, operation_cancel_remote_result,
-        persist_ceremony_projection, policy_commit_remote_result, request_body_with_wallet,
-        wallet_import_kind,
+        launch_passkey_enrollment_via_vfs, launch_wallet_registration_via_vfs,
+        load_ceremony_projection, long_running_role, machine_command_event_fields,
+        machine_error_from_anyhow, machine_wallet_lookup_error, open_machine_audit_with_history,
+        operation_cancel_remote_result, persist_ceremony_projection, policy_commit_remote_result,
+        request_body_with_wallet, wallet_import_kind,
     };
     use bloom_daemon::ipc::{
         MachineCeremonyAction, MachineCommand, MachineCustodyKind, MachineOperationAction,
@@ -5137,6 +5165,89 @@ mod tests {
                 .unwrap()
                 .push((path.to_string_path(), data.to_vec()));
             Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingPasskeyHandler(Mutex<Vec<(String, Vec<u8>)>>);
+
+    #[async_trait]
+    impl bloom_vfs::Handler for RecordingPasskeyHandler {
+        async fn lookup(
+            &self,
+            path: &bloom_vfs::VfsPath,
+        ) -> Result<bloom_vfs::Entry, bloom_vfs::HandlerError> {
+            match path.to_string_path().as_str() {
+                "/main/passkeys/new" => Ok(bloom_vfs::Entry::writable_file("new")),
+                "/main/passkeys/latest" => Ok(bloom_vfs::Entry::symlink(
+                    "latest",
+                    &format!("enrollments/{}", "33".repeat(32)),
+                )),
+                _ => Err(bloom_vfs::HandlerError::NotFound(path.to_string_path())),
+            }
+        }
+
+        async fn read(
+            &self,
+            path: &bloom_vfs::VfsPath,
+        ) -> Result<Vec<u8>, bloom_vfs::HandlerError> {
+            if path.to_string_path()
+                != format!("/main/passkeys/enrollments/{}/status.json", "33".repeat(32))
+            {
+                return Err(bloom_vfs::HandlerError::NotFound(path.to_string_path()));
+            }
+            Ok(serde_json::to_vec(&serde_json::json!({
+                "schema": "bloom.machine-passkey-enrollment.1",
+                "wallet": "main",
+                "destination": "remote",
+                "operation_id": "33".repeat(32),
+                "ceremony_state": "AWAITING_USER",
+                "ceremony_url": "https://relay.test/ceremony/#cap=abc",
+                "ceremony_expires_at_ms": "1800000000000",
+                "created_at_ms": 1,
+            }))
+            .unwrap())
+        }
+
+        async fn write(
+            &self,
+            path: &bloom_vfs::VfsPath,
+            data: &[u8],
+        ) -> Result<(), bloom_vfs::HandlerError> {
+            self.0
+                .lock()
+                .unwrap()
+                .push((path.to_string_path(), data.to_vec()));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn wallet_add_passkey_starts_the_mounted_enrollment() {
+        let handler = std::sync::Arc::new(RecordingPasskeyHandler::default());
+        let vfs = bloom_vfs::Vfs::builder()
+            .mount("wallets", handler.clone())
+            .build();
+        for (local, remote, surface) in [
+            (false, true, b"remote".as_slice()),
+            (true, false, b"local".as_slice()),
+            (false, false, b"".as_slice()),
+        ] {
+            handler.0.lock().unwrap().clear();
+            let output = launch_passkey_enrollment_via_vfs(&vfs, "main", local, remote)
+                .await
+                .unwrap();
+            assert_eq!(
+                *handler.0.lock().unwrap(),
+                vec![("/main/passkeys/new".into(), surface.to_vec())]
+            );
+            assert!(output.contains(&format!("operation_id: {}\n", "33".repeat(32))));
+            assert!(output.contains("ceremony_url: https://relay.test/ceremony/#cap=abc\n"));
+            assert!(output.contains("ceremony_expires_at_ms: 1800000000000\n"));
+            assert!(output.contains(&format!(
+                "projection: /wallets/main/passkeys/enrollments/{}/status.json\n",
+                "33".repeat(32)
+            )));
         }
     }
 
