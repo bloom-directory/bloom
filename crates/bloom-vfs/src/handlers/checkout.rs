@@ -220,6 +220,146 @@ struct Profile {
     phone: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     billing_address: Option<Address>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    travelers: Vec<Traveler>,
+}
+
+/// Ordinary booking data visible to the agent, never card or login credentials.
+#[derive(Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct Traveler {
+    id: String,
+    given_name: String,
+    family_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    born_on: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gender: Option<TravelerGender>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    nationality: Option<String>,
+    /// Save document data only when the owner explicitly requests it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    document: Option<TravelDocument>,
+}
+
+#[derive(Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum TravelerGender {
+    Female,
+    Male,
+    Unspecified,
+}
+
+#[derive(Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct TravelDocument {
+    kind: DocumentKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    number: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    issuing_country: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expires_on: Option<String>,
+}
+
+#[derive(Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DocumentKind {
+    Passport,
+    NationalId,
+}
+
+fn booking_date(value: &str) -> bool {
+    if value.len() != 10 || !value.is_ascii() || &value[4..5] != "-" || &value[7..8] != "-" {
+        return false;
+    }
+    if !value
+        .bytes()
+        .enumerate()
+        .all(|(i, byte)| matches!(i, 4 | 7) || byte.is_ascii_digit())
+    {
+        return false;
+    }
+    let Ok(year) = value[..4].parse::<u32>() else {
+        return false;
+    };
+    let Ok(month) = value[5..7].parse::<usize>() else {
+        return false;
+    };
+    let Ok(day) = value[8..].parse::<u32>() else {
+        return false;
+    };
+    if year == 0 || !(1..=12).contains(&month) {
+        return false;
+    }
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    (1..=days[month - 1]).contains(&day)
+}
+
+impl Profile {
+    fn validate(&self) -> Result<(), HandlerError> {
+        let mut ids = std::collections::BTreeSet::new();
+        if self.travelers.len() > 8 {
+            return Err(HandlerError::invalid(
+                "Profile supports up to eight travelers",
+            ));
+        }
+        let country =
+            |value: &str| value.len() == 2 && value.bytes().all(|c| c.is_ascii_uppercase());
+        for traveler in &self.travelers {
+            if traveler.id.is_empty()
+                || traveler.id.len() > 64
+                || !ids.insert(&traveler.id)
+                || traveler.given_name.trim().is_empty()
+                || traveler.family_name.trim().is_empty()
+                || traveler
+                    .born_on
+                    .as_deref()
+                    .is_some_and(|date| !booking_date(date))
+                || traveler
+                    .nationality
+                    .as_deref()
+                    .is_some_and(|code| !country(code))
+            {
+                return Err(HandlerError::invalid(
+                    "Travelers need unique IDs and given/family names; dates use YYYY-MM-DD and countries use two uppercase letters",
+                ));
+            }
+            if traveler.document.as_ref().is_some_and(|document| {
+                document
+                    .number
+                    .as_deref()
+                    .is_some_and(|number| number.trim().is_empty() || number.len() > 64)
+                    || document
+                        .issuing_country
+                        .as_deref()
+                        .is_some_and(|code| !country(code))
+                    || document
+                        .expires_on
+                        .as_deref()
+                        .is_some_and(|date| !booking_date(date))
+            }) {
+                return Err(HandlerError::invalid(
+                    "Invalid traveler document; dates use YYYY-MM-DD and countries use two uppercase letters",
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 #[derive(Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
@@ -320,13 +460,28 @@ impl Handler for CheckoutHandler {
                     .filter(|_| bytes.len() <= 4096)
                     .ok_or_else(|| {
                         HandlerError::invalid(
-                            "Profile takes email, name, phone and billing_address \
+                            "Profile takes email, name, phone, travelers and billing_address \
                              (line1, line2, city, region, postal_code, country); \
                              never card details",
                         )
                     })?;
+                profile.validate()?;
                 let temp = self.profile.with_extension("json.tmp");
-                std::fs::write(&temp, safe_json(&profile)?)?;
+                use std::io::Write;
+                let mut options = std::fs::OpenOptions::new();
+                options.write(true).create(true).truncate(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.mode(0o600);
+                }
+                let mut file = options.open(&temp)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+                }
+                file.write_all(&safe_json(&profile)?)?;
                 std::fs::rename(&temp, &self.profile)?;
                 Ok(())
             }
@@ -433,5 +588,102 @@ mod tests {
         }
         let kept: Value = serde_json::from_slice(&handler.read(&path).await.unwrap()).unwrap();
         assert_eq!(kept["email"], "a@example.com");
+    }
+
+    #[tokio::test]
+    async fn traveler_profiles_persist_and_invalid_updates_preserve_saved_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("checkout-profile.json");
+        let handler = CheckoutHandler::new(
+            CheckoutClient::new(dir.path().join("unused.sock"), 0),
+            dir.path().join("requests"),
+            file.clone(),
+        );
+        let path = VfsPath::parse("/profile.json").unwrap();
+        let saved = serde_json::json!({"email":"fixture@example.com","travelers":[{
+            "id":"self","given_name":"Ada","family_name":"Fixture","born_on":"1992-02-29",
+            "gender":"female","nationality":"CA","document":{"kind":"passport",
+                "number":"FIXTURE123","issuing_country":"CA","expires_on":"2030-06-30"}
+        }]});
+        handler
+            .write(&path, &serde_json::to_vec(&saved).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&handler.read(&path).await.unwrap()).unwrap(),
+            saved
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        for (field, value) in [
+            ("born_on", "1991-02-29"),
+            ("born_on", "2000-04-31"),
+            ("born_on", "+001-01-01"),
+            ("nationality", "Canada"),
+            ("gender", "guess"),
+            ("card_number", "4242424242424242"),
+            ("password", "fixture-not-a-password"),
+        ] {
+            let mut invalid = saved.clone();
+            invalid["travelers"][0][field] = value.into();
+            assert!(
+                handler
+                    .write(&path, &serde_json::to_vec(&invalid).unwrap())
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                serde_json::from_slice::<Value>(&handler.read(&path).await.unwrap()).unwrap(),
+                saved
+            );
+        }
+        let mut duplicate = saved.clone();
+        duplicate["travelers"]
+            .as_array_mut()
+            .unwrap()
+            .push(saved["travelers"][0].clone());
+        assert!(
+            handler
+                .write(&path, &serde_json::to_vec(&duplicate).unwrap())
+                .await
+                .is_err()
+        );
+        let mut too_many = saved.clone();
+        too_many["travelers"] = (0..9)
+            .map(|i| {
+                let mut traveler = saved["travelers"][0].clone();
+                traveler["id"] = format!("fixture-{i}").into();
+                traveler
+            })
+            .collect::<Vec<_>>()
+            .into();
+        assert!(
+            handler
+                .write(&path, &serde_json::to_vec(&too_many).unwrap())
+                .await
+                .is_err()
+        );
+        let mut no_document = saved.clone();
+        no_document["travelers"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("document");
+        handler
+            .write(&path, &serde_json::to_vec(&no_document).unwrap())
+            .await
+            .unwrap();
+        assert!(
+            !String::from_utf8(handler.read(&path).await.unwrap())
+                .unwrap()
+                .contains("FIXTURE123")
+        );
+        handler.write(&path, br#"{"travelers":[]}"#).await.unwrap();
+        assert_eq!(handler.read(&path).await.unwrap(), b"{}");
     }
 }

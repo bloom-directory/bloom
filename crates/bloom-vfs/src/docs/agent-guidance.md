@@ -39,6 +39,20 @@ tool for this checkout.
   missing, ask once and save it by writing the whole profile back, for example
   `{"email":"…","name":"…","billing_address":{"line1":"…","city":"…",
   "region":"CA","postal_code":"94110","country":"US"}}`.
+- For flights, use `travelers` in that same profile: `id`, `given_name`,
+  `family_name`, optional `born_on` (`YYYY-MM-DD`), `gender` (`female`, `male`,
+  `unspecified`), `nationality` (two uppercase country letters), and optional
+  `document` (`kind`: `passport` or `national_id`, optional `number`,
+  `issuing_country`, `expires_on`). See the saved-traveler example in
+  `docs/examples.md`.
+  Fill ordinary passenger/contact fields from the selected traveler. Ask once
+  for missing details; do not guess legal names, birth dates or gender. Preserve
+  existing contact data and other travelers when saving the whole profile.
+  Save document numbers only if the human explicitly asks to remember them.
+  Saved profile data is readable by the agent, stored locally, and is not the
+  Signer card vault. Never save card details, CVC, login passwords or codes here.
+  Ask the human to take over only for login, verification, a bot check, or a
+  field the shopping controls cannot fill—not for the whole passenger form.
 - Write a browse request to `checkout/browse/<64-hex-slot>/in.json`; read
   `out.json`. Reuse a slot. Results expire after five minutes. Requests use
   `action`: `open` plus `url`, `snapshot`, `click` plus `element_ref`, `type`

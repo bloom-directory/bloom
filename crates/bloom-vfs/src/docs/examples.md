@@ -270,6 +270,53 @@ ls "$BLOOM/wallets/<wallet>/0/chains/<chain>/outbox/"
 Enso, Hyperliquid, Polymarket, and other applications are Petals when installed.
 Use the selected package's own instructions and examples.
 
+## Saved traveler profiles
+
+Flight bookings reuse `checkout/profile.json`; there is no separate flight
+account or passkey ceremony for ordinary passenger details. The agent can read
+the saved profile to fill airline forms. These are local convenience data,
+not encrypted Signer custody. Card details and login credentials never belong
+in this profile.
+
+Read the existing profile first, preserve its contact/billing data and other
+travelers, then write the complete updated JSON. Ask for missing details once
+and save only what the owner wants remembered. For example, after collecting
+the owner's actual details (these values are synthetic):
+
+```json
+{
+  "email": "fixture@example.com",
+  "phone": "+15551234567",
+  "travelers": [{
+    "id": "self",
+    "given_name": "Ada",
+    "family_name": "Fixture",
+    "born_on": "1992-02-29",
+    "gender": "female",
+    "nationality": "CA"
+  }]
+}
+```
+
+Write that JSON to `checkout/profile.json`. Dates use `YYYY-MM-DD`; nationality
+and issuing country use two uppercase country letters. Up to eight travelers
+fit within the profile's existing 4096-byte limit. Select the owner-requested
+traveler by ID; ask which one if unclear. Never infer passport spelling, birth
+date or gender from a label or contact name.
+
+When the owner explicitly asks to save document details, a traveler may also
+have `"document":{"kind":"passport","number":"FIXTURE123",
+"issuing_country":"CA","expires_on":"2030-06-30"}`. Supported kinds are
+`passport` and `national_id`; all fields except kind are optional. Remove the
+document object to forget it, remove a traveler to forget that traveler, or
+write `"travelers":[]` in the otherwise preserved profile to clear them all.
+
+Fill the selected traveler's ordinary passenger fields and the profile's
+contact fields before requesting payment approval. Human takeover is for a
+login, verification, bot check or unsupported field, not a default way of
+filling the whole passenger form. Card release still needs its own owner
+approval for the exact merchant and total.
+
 ## Pure tools
 
 ```sh
