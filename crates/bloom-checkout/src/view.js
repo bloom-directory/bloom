@@ -1,6 +1,12 @@
 const screen = document.getElementById('screen');
 const status = document.getElementById('status');
 const pages = document.getElementById('pages');
+screen.hidden = true;
+screen.addEventListener('load', () => { screen.hidden = false; });
+screen.addEventListener('error', () => {
+  screen.hidden = true;
+  status.textContent = 'Browser image unavailable. Wait for reconnection; do not repeat a payment.';
+});
 pages.addEventListener('change',()=>act({action:'select_page',target:pages.value}));
 // One action at a time, so keystrokes arrive in order.
 let queue = Promise.resolve();
@@ -40,7 +46,7 @@ document.getElementById('finish').addEventListener('click',()=>act({action:'fini
 async function refresh() {
   try {
     const response=await fetch('/state');
-    if (!response.ok) {status.textContent='Private checkout has closed. Return to Bloom for the outcome.';screen.removeAttribute('src');return;}
+    if (!response.ok) {status.textContent='Private checkout has closed. Return to Bloom for the outcome.';screen.hidden=true;screen.removeAttribute('src');return;}
     const state=await response.json();status.textContent=state.state.replaceAll('_',' ');
     if(state.state==='human_control'){
       document.getElementById('heading').textContent="Bloom's browser";
@@ -48,7 +54,7 @@ async function refresh() {
       document.getElementById('finish').textContent='Done, hand back to the agent';
       document.getElementById('note').hidden=true;
     }
-    if(state.closed) {status.textContent += ' (merchant-reported when paid or declined)';screen.removeAttribute('src');return;}
+    if(state.closed) {status.textContent += ' (merchant-reported when paid or declined)';screen.hidden=true;screen.removeAttribute('src');return;}
     pages.replaceChildren(...state.pages.map(page=>{const option=document.createElement('option');option.value=page.target;option.textContent=page.origin;option.selected=page.target===state.selected_page;return option;}));
     screen.src='/frame?refresh='+Date.now();
     setTimeout(refresh,800);

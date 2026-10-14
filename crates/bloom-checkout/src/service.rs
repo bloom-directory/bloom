@@ -658,11 +658,21 @@ impl CheckoutService {
         checkout
             .tab
             .cdp
+            .call(Some(&session), "Page.enable", json!({}))
+            .await?;
+        checkout
+            .tab
+            .cdp
             .call(
                 Some(&session),
                 "Emulation.setDeviceMetricsOverride",
                 json!({"width":1280,"height":900,"deviceScaleFactor":1,"mobile":false}),
             )
+            .await?;
+        checkout
+            .tab
+            .cdp
+            .call(Some(&session), "Page.bringToFront", json!({}))
             .await?;
         checkout.view_target = target;
         checkout.view_session = session;
@@ -785,6 +795,13 @@ impl CheckoutService {
         let private = self.private.lock().await;
         let checkout = private.as_ref().context("No active private checkout")?;
         authorize_view(checkout, token)?;
+        // The initial handoff may not have switched pages. Activate the held
+        // page before capture so a background headless tab paints as well.
+        checkout
+            .tab
+            .cdp
+            .call(Some(&checkout.view_session), "Page.bringToFront", json!({}))
+            .await?;
         let result = checkout
             .tab
             .cdp
@@ -1153,6 +1170,26 @@ mod tests {
         }
         let screenshot = service.private_screenshot(&token).await.unwrap();
         assert_eq!(&screenshot[..8], b"\x89PNG\r\n\x1a\n");
+        // A valid PNG header also passes for a completely black frame.
+        // Prove that this view captures changes in the selected document.
+        {
+            let private = service.private.lock().await;
+            let checkout = private.as_ref().unwrap();
+            checkout
+                .tab
+                .cdp
+                .evaluate(
+                    &checkout.view_session,
+                    "document.body.style.backgroundColor='rgb(255,0,0)'".into(),
+                )
+                .await
+                .unwrap();
+        }
+        let painted = service.private_screenshot(&token).await.unwrap();
+        assert_ne!(
+            screenshot, painted,
+            "Private view must render the selected page"
+        );
         assert!(
             service
                 .private_action(

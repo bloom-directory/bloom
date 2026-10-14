@@ -229,9 +229,21 @@ impl Browser {
                 if((e.autocomplete||'').split(' ').some(s=>s.startsWith('cc-')))throw Error('private payment input');
                 if(kind==='select'&&e.tagName!=='SELECT')throw Error('wrong field');
                 if(kind==='type'&&!['INPUT','TEXTAREA'].includes(e.tagName))throw Error('wrong field');
-                const p=e.tagName==='TEXTAREA'?HTMLTextAreaElement.prototype:e.tagName==='SELECT'?HTMLSelectElement.prototype:HTMLInputElement.prototype;
-                Object.getOwnPropertyDescriptor(p,'value').set.call(e,value);
-                e.dispatchEvent(new Event('input',{{bubbles:true}}));e.dispatchEvent(new Event('change',{{bubbles:true}}));
+                if(kind==='type'){{
+                    // Native editing updates controlled inputs and fires their
+                    // input handlers. Bind focus and insertion in one renderer
+                    // call so navigation cannot redirect a later CDP insertion.
+                    e.focus();
+                    if(!e.isConnected||document.activeElement!==e||(e.autocomplete||'').split(' ').some(s=>s.startsWith('cc-')))throw Error('stale');
+                    e.select();
+                    if(!e.isConnected||document.activeElement!==e||(e.autocomplete||'').split(' ').some(s=>s.startsWith('cc-')))throw Error('stale');
+                    if(!document.execCommand('insertText',false,value))throw Error('input unsupported');
+                    e.dispatchEvent(new KeyboardEvent('keyup',{{key:value.slice(-1),bubbles:true}}));
+                }}else{{
+                    Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value').set.call(e,value);
+                    e.dispatchEvent(new Event('input',{{bubbles:true}}));
+                }}
+                e.dispatchEvent(new Event('change',{{bubbles:true}}));
             }}return {{state:'acted'}};}})()"#,
             kind = serde_json::to_string(kind)?,
             value = serde_json::to_string(value)?
@@ -241,7 +253,7 @@ impl Browser {
             .call(
                 Some(&binding.session),
                 "Runtime.evaluate",
-                json!({"contextId":world,"expression":expression,"returnByValue":true}),
+                json!({"contextId":world,"expression":expression,"returnByValue":true,"userGesture":true}),
             )
             .await?;
         if response.get("exceptionDetails").is_some() {
@@ -249,7 +261,37 @@ impl Browser {
         }
         // Every action invalidates refs, including same-document replacement.
         tab.generation += 1;
+        if kind == "click" {
+            self.follow_popup(tab).await?;
+        }
         Ok(json!({"state":"acted"}))
+    }
+
+    async fn follow_popup(&self, tab: &mut Tab) -> Result<()> {
+        let targets = self.cdp.call(None, "Target.getTargets", json!({})).await?;
+        let pages = targets["targetInfos"]
+            .as_array()
+            .context("Missing browser targets")?;
+        let children = pages
+            .iter()
+            .filter(|page| page["type"] == "page" && page["openerId"] == tab.target)
+            .collect::<Vec<_>>();
+        let child = match children.as_slice() {
+            [] => return Ok(()),
+            [child] => child,
+            _ => bail!("Multiple shopping pages opened; choose the page in private control"),
+        };
+        let url = child["url"].as_str().context("Missing popup URL")?;
+        // Chromium reports an empty URL while a newly opened page initializes.
+        // Snapshot independently checks its eventual document URL.
+        if !matches!(url, "" | "about:blank")
+            && !matches!(url::Url::parse(url)?.scheme(), "http" | "https")
+        {
+            bail!("Only ordinary HTTP(S) shopping popups are supported");
+        }
+        let target = child["targetId"].as_str().context("Missing popup target")?;
+        *tab = attach_tab(&self.cdp, target.to_owned(), tab.generation + 1).await?;
+        Ok(())
     }
 
     fn available(&self) -> Result<()> {
@@ -329,6 +371,10 @@ async fn new_tab(cdp: &Cdp, generation: u64) -> Result<Tab> {
         .as_str()
         .context("Missing tab")?
         .to_owned();
+    attach_tab(cdp, target, generation).await
+}
+
+async fn attach_tab(cdp: &Cdp, target: String, generation: u64) -> Result<Tab> {
     let attached = cdp
         .call(
             None,
@@ -446,6 +492,197 @@ mod tests {
         browser.browse(BrowseRequest::Snapshot).await.unwrap();
     }
     use std::time::Duration;
+
+    #[tokio::test]
+    #[ignore = "public airline airport picker only; no passengers, card or purchase"]
+    async fn aerolineas_public_airport_autocomplete() {
+        let root = tempfile::tempdir().unwrap().keep();
+        let browser = Browser::launch(
+            &crate::test_chromium(),
+            &root.join("profile"),
+            &["--no-sandbox".into()],
+        )
+        .await
+        .unwrap();
+        browser
+            .browse(BrowseRequest::Open {
+                url: "https://www.aerolineas.com.ar/".into(),
+            })
+            .await
+            .unwrap();
+        let mut before = json!({});
+        let mut reference = None;
+        for _ in 0..30 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let Ok(snapshot) = browser.browse(BrowseRequest::Snapshot).await else {
+                continue;
+            };
+            before = snapshot;
+            reference = before["elements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| matches!(e["label"].as_str(), Some("Origen" | "Origin")))
+                .and_then(|e| e["ref"].as_str())
+                .map(str::to_owned);
+            if reference.is_some() {
+                break;
+            }
+        }
+        let reference =
+            reference.unwrap_or_else(|| panic!("Airline origin field absent: {before}"));
+        if let Some(cookie) = before["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["label"] == "Aceptar solo las esenciales")
+        {
+            browser
+                .browse(BrowseRequest::Click {
+                    element_ref: cookie["ref"].as_str().unwrap().into(),
+                })
+                .await
+                .unwrap();
+            let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+            let origin = snapshot["elements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["label"] == "Origen")
+                .unwrap()["ref"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            browser
+                .browse(BrowseRequest::Type {
+                    element_ref: origin,
+                    text: "Cordoba".into(),
+                })
+                .await
+                .unwrap();
+        } else {
+            browser
+                .browse(BrowseRequest::Type {
+                    element_ref: reference,
+                    text: "Cordoba".into(),
+                })
+                .await
+                .unwrap();
+        }
+        let mut after = json!({});
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            if let Ok(snapshot) = browser.browse(BrowseRequest::Snapshot).await {
+                after = snapshot;
+                if after["text"].as_str().unwrap().contains("COR") {
+                    break;
+                }
+            }
+        }
+        let labels = after["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["label"].as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            after["text"].as_str().unwrap().contains("COR"),
+            "Expected Córdoba airport suggestion; got labels {labels:?}, text {}",
+            after["text"]
+        );
+        let airport = after["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| {
+                e["label"]
+                    .as_str()
+                    .is_some_and(|label| label.contains("COR"))
+            })
+            .expect("Clickable Córdoba airport suggestion");
+        browser
+            .browse(BrowseRequest::Click {
+                element_ref: airport["ref"].as_str().unwrap().into(),
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn shopping_type_triggers_autocomplete_and_click_follows_popup() {
+        let root = tempfile::tempdir().unwrap().keep();
+        let browser = Browser::launch(
+            &crate::test_chromium(),
+            &root.join("profile"),
+            &["--no-sandbox".into()],
+        )
+        .await
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let fixture = tokio::spawn(async move {
+            axum::serve(listener, Router::new()
+                .route("/", get(|| async { Html(r#"<!doctype html>
+                  <input aria-label="Origin" onkeyup="document.getElementById('suggestion').hidden=this.value!=='Cordoba'">
+                  <div id="suggestion" role="option" hidden onclick="window.open('/flight')">Córdoba COR</div>
+                  <input aria-label="Private card" autocomplete="cc-number">
+                  <button>Pay</button>"#) }))
+                .route("/flight", get(|| async { Html("<h1>Flight AR1554</h1>") })))
+                .await.unwrap();
+        });
+        browser.browse(BrowseRequest::Open { url }).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let before = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+        let reference = |snapshot: &Value, label: &str| {
+            snapshot["elements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["label"] == label)
+                .unwrap()["ref"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        assert!(!before.to_string().contains("Córdoba COR"));
+        browser
+            .browse(BrowseRequest::Type {
+                element_ref: reference(&before, "Origin"),
+                text: "Cordoba".into(),
+            })
+            .await
+            .unwrap();
+        let after = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+        assert!(after.to_string().contains("Córdoba COR"));
+        assert!(
+            browser
+                .browse(BrowseRequest::Type {
+                    element_ref: reference(&after, "Private card"),
+                    text: "4242424242424242".into(),
+                })
+                .await
+                .is_err()
+        );
+        assert!(
+            browser
+                .browse(BrowseRequest::Click {
+                    element_ref: reference(&after, "Pay"),
+                })
+                .await
+                .is_err()
+        );
+        browser
+            .browse(BrowseRequest::Click {
+                element_ref: reference(&after, "Córdoba COR"),
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let popup = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+        assert!(popup["url"].as_str().unwrap().ends_with("/flight"));
+        assert!(popup["text"].as_str().unwrap().contains("Flight AR1554"));
+        fixture.abort();
+    }
 
     #[tokio::test]
     async fn renderer_and_browser_crashes_leave_no_memory_dumps() {
