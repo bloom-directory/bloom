@@ -764,6 +764,7 @@ impl WalletsHandler {
             .prepare_custody(
                 bloom_machine_client::CustodyPrepareMethod::WalletRegistration,
                 bloom_broker_api::CustodyPrepareRequest {
+                    surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
                     ceremony_kind: bloom_broker_api::CeremonyKind::WalletRegistration,
                     custody_operation_id: operation_id.clone(),
                     wallet_id: Some(wallet_id),
@@ -1554,10 +1555,10 @@ impl WalletsHandler {
             self.policy_update_action_dir(wallet, "pending", operation_id)
                 .join(APPROVAL_CHALLENGE_FILE),
         )?;
-        if !projection
+        if projection
             .ceremony_expires_at_ms
             .as_ref()
-            .is_some_and(|expires_at_ms| expires_at_ms.get() <= now_ms_u64())
+            .is_none_or(|expires_at_ms| expires_at_ms.get() > now_ms_u64())
         {
             return Ok(false);
         }
@@ -4089,6 +4090,8 @@ mod tests {
                     }
                     MachineBrokerRequest::CustodyResult(request) => {
                         Ok(MachineBrokerResponse::CustodyResult(CustodyResult {
+                            surface: None,
+                            credential_authority_generation: None,
                             ceremony_kind: CeremonyKind::WalletRegistration,
                             custody_operation_id: request.operation_id,
                             public_status: *self.state.lock().unwrap(),
@@ -4568,6 +4571,8 @@ mod tests {
                         }
                         Ok(MachineBrokerResponse::CustodyResult(
                             bloom_broker_api::CustodyResult {
+                                surface: None,
+                                credential_authority_generation: None,
                                 ceremony_kind: bloom_broker_api::CeremonyKind::AccountAllocate,
                                 custody_operation_id: bloom_broker_api::OperationId::from_bytes(
                                     [9; 32],
@@ -6100,6 +6105,7 @@ value = "0""#,
                     }
                     MachineBrokerRequest::SealedApprovalLimitState(request) => Ok(
                         MachineBrokerResponse::SealedApprovalLimitState(ApprovalLimitState {
+                            session_budget_state: None,
                             approval_id: request.id,
                             committed_operations: DecimalU64::new(1),
                             reserved_operations: DecimalU64::new(2),
@@ -6170,6 +6176,7 @@ value = "0""#,
 
     fn approval_terms(wallet: &str, renewal_of: Option<Digest32>) -> SealedApprovalTerms {
         SealedApprovalTerms {
+            session_budget: None,
             subject: ApprovalSubject::Cli {
                 client_id: token("bloom-cli"),
                 command_class: token("vfs.test"),
@@ -7603,6 +7610,7 @@ value = "0""#,
             .handler
             .with_broker(Some(MachineBrokerClient::new(broker.clone())));
         let request = ApprovalPrepareRequest {
+            surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             evm_review_payloads: Vec::new(),
             operation_id: OperationId::from_bytes([30; 32]),
             terms: approval_terms("alice", None),
@@ -7651,6 +7659,7 @@ value = "0""#,
                 .handler
                 .with_broker(Some(MachineBrokerClient::new(broker.clone())));
             let request = ApprovalPrepareRequest {
+                surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
                 evm_review_payloads: Vec::new(),
                 operation_id: OperationId::from_bytes([30; 32]),
                 terms: approval_terms("alice", None),
@@ -7684,6 +7693,7 @@ value = "0""#,
             .handler
             .with_broker(Some(MachineBrokerClient::new(broker.clone())));
         let request = ApprovalPrepareRequest {
+            surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             evm_review_payloads: Vec::new(),
             operation_id: OperationId::from_bytes([30; 32]),
             terms: approval_terms("alice", None),
@@ -7716,6 +7726,7 @@ value = "0""#,
             .handler
             .with_broker(Some(MachineBrokerClient::new(broker)));
         let request = ApprovalPrepareRequest {
+            surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             evm_review_payloads: Vec::new(),
             operation_id: OperationId::from_bytes([30; 32]),
             terms: approval_terms("alice", None),

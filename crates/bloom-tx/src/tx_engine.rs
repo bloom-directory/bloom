@@ -3321,6 +3321,18 @@ impl TxEngine {
         };
         write_triad_signing_state(&state_path, &state)?;
 
+        // Session dispatch journals its own approval and digest before sending.
+        // Recover that identity before expiry/rearm logic can rotate this action.
+        if let Some(digest) = service
+            .broker
+            .persona_operation_digest(&state.signing_operation_id)
+            .map_err(protocol_signing_error)?
+        {
+            state.sign_dispatched = true;
+            state.expected_operation_digest = Some(digest);
+            write_triad_signing_state(&state_path, &state)?;
+        }
+
         // A lost prepare response may omit the approval ID. Retry its terms
         // until expiry, then begin a fresh lineage before any dispatch.
         if !state.sign_dispatched
@@ -3529,6 +3541,14 @@ impl TxEngine {
                 )?))
             }
             ExactPayloadSignOutcome::Signed(result) => {
+                if state.expected_operation_digest.is_none() {
+                    state.expected_operation_digest = service
+                        .broker
+                        .persona_operation_digest(&state.signing_operation_id)
+                        .map_err(protocol_signing_error)?;
+                    state.sign_dispatched = state.expected_operation_digest.is_some();
+                    write_triad_signing_state(&state_path, &state)?;
+                }
                 complete_triad_signing_result(&state_path, &mut state, result)
             }
         }
@@ -4603,6 +4623,80 @@ fn requested_review_mode(
     parse_review_mode(staged.review_mode.as_deref())
 }
 
+fn native_evm_session_use(
+    staged: &StagedTx,
+) -> Result<Option<bloom_broker_api::SystemSessionUse>, TxEngineError> {
+    use bloom_broker_api::{
+        AssetId, DecimalU256, SystemSessionAction, SystemSessionChain, SystemSessionUse,
+    };
+    // This projection accounts for gas_limit * maximum_gas_price only. L2
+    // execution can charge additional fees, so those networks retain exact
+    // review until every possible debit can be independently bounded.
+    if !matches!(staged.chain_id, 1 | 137 | 31337) {
+        return Ok(None);
+    }
+    let parse = |value: &str| {
+        DecimalU256::parse(value.to_owned())
+            .map_err(|error| TxEngineError::ApprovalConstruction(error.to_string()))
+    };
+    let (action, token, recipient, amount) = match staged.action_kind {
+        bloom_proto::TxActionKind::NativeTransfer => {
+            let Some(to) = &staged.to else {
+                return Ok(None);
+            };
+            (
+                SystemSessionAction::NativeTransfer,
+                None,
+                to.clone(),
+                parse(&staged.value_wei)?,
+            )
+        }
+        bloom_proto::TxActionKind::Erc20Transfer => {
+            let Some(token) = &staged.token else {
+                return Ok(None);
+            };
+            let Some(amount) = &token.amount_base_units else {
+                return Ok(None);
+            };
+            (
+                SystemSessionAction::Erc20Transfer,
+                Some(AssetId {
+                    chain: Token::new(format!("evm-{}", staged.chain_id))
+                        .map_err(|error| protocol_signing_error(error.into()))?,
+                    asset: token.address.to_ascii_lowercase(),
+                }),
+                token.recipient.clone(),
+                parse(amount)?,
+            )
+        }
+        _ => return Ok(None),
+    };
+    let Some(price) = staged
+        .gas_price
+        .as_ref()
+        .or(staged.max_fee_per_gas.as_ref())
+    else {
+        return Ok(None);
+    };
+    let fee = price
+        .parse::<U256>()
+        .map_err(|error| TxEngineError::ApprovalConstruction(error.to_string()))?
+        .checked_mul(U256::from(staged.gas_limit))
+        .ok_or_else(|| TxEngineError::ApprovalConstruction("session fee exceeds uint256".into()))?;
+    Ok(Some(SystemSessionUse {
+        action,
+        chain: SystemSessionChain::Evm {
+            chain: Token::new(format!("evm-{}", staged.chain_id))
+                .map_err(|error| protocol_signing_error(error.into()))?,
+            chain_id: DecimalU64::new(staged.chain_id),
+        },
+        token,
+        recipient: recipient.to_ascii_lowercase(),
+        amount,
+        maximum_fee: parse(&fee.to_string())?,
+    }))
+}
+
 fn exact_evm_sign_request(
     staged: &StagedTx,
     signing_preimage: &[u8],
@@ -4612,6 +4706,7 @@ fn exact_evm_sign_request(
     account_key_ref: Option<bloom_broker_api::KeyRef>,
 ) -> Result<ExactPayloadSignRequest, TxEngineError> {
     Ok(ExactPayloadSignRequest {
+        session_use: native_evm_session_use(staged)?,
         wallet_id: Token::new(staged.wallet.clone())
             .map_err(|error| TxEngineError::ApprovalConstruction(error.to_string()))?,
         preimage: signing_preimage.to_vec(),
@@ -4647,6 +4742,7 @@ fn expected_evm_sign_operation_digest(
         TxEngineError::ApprovalState("active exact signing is missing its approval ID".into())
     })?;
     SignOperationIdentity {
+        session_accounting_digest: None,
         operation_id: state.signing_operation_id.clone(),
         approval_id,
         key_ref,
@@ -4840,6 +4936,7 @@ fn expected_evm_batch_sign_operation_digest(
         TxEngineError::ApprovalState("active exact batch is missing its approval ID".into())
     })?;
     SignOperationIdentity {
+        session_accounting_digest: None,
         operation_id: state.signing_operation_id.clone(),
         approval_id,
         key_ref,
@@ -5924,6 +6021,58 @@ mod tests {
             action_id: None,
             execution_origin: None,
         }
+    }
+
+    #[test]
+    fn persona_projection_requires_typed_transfer_and_includes_maximum_network_fee() {
+        let mut staged = fake_staged_1559("persona");
+        assert!(
+            native_evm_session_use(&staged).unwrap().is_none(),
+            "historical unknown actions require exact review"
+        );
+        staged.action_kind = TxActionKind::NativeTransfer;
+        staged.value_wei = "12345".into();
+        let action = native_evm_session_use(&staged).unwrap().unwrap();
+        assert_eq!(
+            action.chain.chain().as_str(),
+            format!("evm-{}", staged.chain_id)
+        );
+        assert_eq!(action.amount.as_str(), "12345");
+        assert_eq!(action.maximum_fee.as_str(), "2100000");
+        let supported_chain = staged.chain_id;
+        for chain_id in [8453, 10] {
+            staged.chain_id = chain_id;
+            assert!(
+                native_evm_session_use(&staged).unwrap().is_none(),
+                "OP Stack fees require exact review before a session attempt is journaled"
+            );
+        }
+        staged.chain_id = supported_chain;
+        staged.action_kind = TxActionKind::ContractCall;
+        assert!(
+            native_evm_session_use(&staged).unwrap().is_none(),
+            "arbitrary calldata must not borrow transfer authority"
+        );
+        staged.action_kind = TxActionKind::Erc20Transfer;
+        staged.token = Some(TokenRef {
+            address: "0x0000000000000000000000000000000000000003".into(),
+            recipient: "0x0000000000000000000000000000000000000002".into(),
+            symbol: "USDC".into(),
+            decimals: 6,
+            amount: "1".into(),
+            amount_base_units: None,
+        });
+        assert!(
+            native_evm_session_use(&staged).unwrap().is_none(),
+            "display amounts are not signing authority"
+        );
+        staged.token.as_mut().unwrap().amount_base_units = Some("1000000".into());
+        let action = native_evm_session_use(&staged).unwrap().unwrap();
+        assert_eq!(action.amount.as_str(), "1000000");
+        assert_eq!(
+            action.token.unwrap().asset,
+            "0x0000000000000000000000000000000000000003"
+        );
     }
 
     /// The VFS outbox is the surface the deployment docs point an agent at,

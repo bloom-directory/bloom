@@ -59,6 +59,7 @@ fn open_selected_private_store(
     account: Option<&(String, u32)>,
     policy: Option<&StoreNamespacePolicy>,
     shared_root: Option<&PathBuf>,
+    initialize_only: bool,
 ) -> Result<PrivateStore, crate::host::HostError> {
     let store = match account {
         Some((wallet, number)) => PrivateStore::open_account(root, wallet, *number),
@@ -68,11 +69,13 @@ fn open_selected_private_store(
         Some(root) => store.with_shared_root(root.clone()),
         None => store,
     };
-    Ok(store.with_shared_keys(
-        policy
-            .into_iter()
-            .flat_map(|p| p.shared_keys().iter().cloned()),
-    ))
+    Ok(store
+        .with_initialize_only(initialize_only)
+        .with_shared_keys(
+            policy
+                .into_iter()
+                .flat_map(|p| p.shared_keys().iter().cloned()),
+        ))
 }
 
 const DEFAULT_FUEL: u64 = 100_000_000;
@@ -130,6 +133,8 @@ pub enum ComponentRouteEntryKind {
 
 #[derive(Debug, Clone)]
 pub struct RunOptions {
+    /// Host-only initialization: guest puts cannot overwrite existing values.
+    pub private_store_initialize_only: bool,
     pub fuel: u64,
     pub memory_pages: u32,
     /// Optional runtime network mask. When running through [`PetalRunner`],
@@ -171,6 +176,7 @@ pub struct RunOptions {
 impl Default for RunOptions {
     fn default() -> Self {
         Self {
+            private_store_initialize_only: false,
             fuel: DEFAULT_FUEL,
             memory_pages: DEFAULT_MEMORY_PAGES,
             net_policy: None,
@@ -328,6 +334,7 @@ impl PetalVm {
                             opts.private_store_account.as_ref(),
                             opts.store_namespaces.as_ref(),
                             opts.private_store_shared_root.as_ref(),
+                            opts.private_store_initialize_only,
                         )
                         .map_err(|e| PetalError::vm(format!("private store open: {e}")))?,
                     ),
@@ -412,6 +419,7 @@ impl PetalVm {
                             opts.private_store_account.as_ref(),
                             opts.store_namespaces.as_ref(),
                             opts.private_store_shared_root.as_ref(),
+                            opts.private_store_initialize_only,
                         )
                         .map_err(|e| PetalError::vm(format!("private store open: {e}")))?,
                     ),
@@ -495,6 +503,7 @@ impl PetalVm {
                             opts.private_store_account.as_ref(),
                             opts.store_namespaces.as_ref(),
                             opts.private_store_shared_root.as_ref(),
+                            opts.private_store_initialize_only,
                         )
                         .map_err(|e| PetalError::vm(format!("private store open: {e}")))?,
                     ),
@@ -3975,6 +3984,7 @@ mod tests {
                 account.as_ref(),
                 Some(&policy),
                 Some(&tmp.path().join("data")),
+                false,
             )
             .unwrap();
             let mut store = component_test_store(

@@ -222,6 +222,8 @@ impl MachineBrokerService for BrokerFixture {
                 }
                 MachineBrokerRequest::CustodyResult(request) => {
                     Ok(MachineBrokerResponse::CustodyResult(CustodyResult {
+                        surface: None,
+                        credential_authority_generation: None,
                         ceremony_kind: CeremonyKind::PolicyUpdate,
                         custody_operation_id: request.operation_id,
                         public_status: CeremonyState::Succeeded,

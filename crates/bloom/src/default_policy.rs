@@ -6,12 +6,14 @@
 //! `docs/architecture/Default Wallet Policy.md`.
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read as _, Write};
 
 use anyhow::{Context, Result, bail};
 use bloom_daemon::Daemon;
 use bloom_proto::config::{DEFAULT_POLICY_WALLET, PetalSetupConfig, PetalsConfig};
+use bloom_proto::persona::{PersonaConfig, PersonaPreset};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
 use crate::github_source::{self, PetalSetupTemplate};
 
@@ -25,6 +27,10 @@ pub(crate) const POLICY_LOCK_GRACE_MS: u64 = 30_000;
 /// How long a waiting command keeps polling a ceremony past its expiry while
 /// Machine cancels it and proposes a replacement.
 const EXPIRED_CEREMONY_GRACE_MS: u64 = 30_000;
+
+/// Serialize preference changes with the compilation/preparation they govern.
+/// Otherwise an old broader profile could finish preparing after a narrowing.
+pub(crate) static PERSONA_TRANSITION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Name shown in the setup menu and in messages.
 pub(crate) fn petal_label(name: &str) -> &str {
@@ -61,6 +67,133 @@ pub(crate) fn interactive_setup_available() -> bool {
     std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
 }
 
+/// Save a proposal only. Existing homes keep their choice unless an explicit
+/// selection is supplied, independently of the Petal setup-complete marker.
+pub(crate) fn select_persona(
+    saved: &mut Option<PersonaConfig>,
+    preset: Option<PersonaPreset>,
+    per_action: Option<&str>,
+    daily: Option<&str>,
+    duration: Option<u64>,
+) -> Result<()> {
+    if preset.is_none() && (per_action.is_some() || daily.is_some() || duration.is_some()) {
+        bail!("persona limits require an explicit --persona selection");
+    }
+    let Some(preset) = preset else {
+        return Ok(());
+    };
+    let mut proposal = saved
+        .as_ref()
+        .filter(|saved| saved.preset == preset)
+        .cloned()
+        .unwrap_or_else(|| PersonaConfig::suggested(preset));
+    if let Some(value) = per_action {
+        proposal.per_action_usd_micros = persona_usd_micros(value)?;
+    }
+    if let Some(value) = daily {
+        proposal.daily_usd_micros = persona_usd_micros(value)?;
+    }
+    if let Some(value) = duration {
+        proposal.session_duration_secs = value;
+    }
+    proposal.validate().map_err(anyhow::Error::msg)?;
+    *saved = Some(proposal);
+    Ok(())
+}
+
+pub(crate) fn save_persona_preferences(
+    home: &bloom_proto::HomeDir,
+    preset: PersonaPreset,
+    per_action: Option<&str>,
+    daily: Option<&str>,
+    duration: Option<u64>,
+) -> Result<PersonaConfig> {
+    // IPC config edits run inside the sole daemon/home owner. Serialize them
+    // with each other and atomically replace the latest complete config.
+    static EDIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _edit = EDIT
+        .lock()
+        .map_err(|_| anyhow::anyhow!("persona preference lock poisoned"))?;
+    let path = home.config_path();
+    let mut config = bloom_proto::Config::load(&path)?;
+    select_persona(
+        &mut config.persona,
+        Some(preset),
+        per_action,
+        daily,
+        duration,
+    )?;
+    config.validate()?;
+    let temporary = tempfile::NamedTempFile::new_in(home.root())?;
+    config.save(temporary.path())?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(&path).map_err(|error| error.error)?;
+    std::fs::File::open(home.root())?.sync_all()?;
+    Ok(config
+        .persona
+        .expect("explicit selection records a persona"))
+}
+
+fn persona_usd_micros(value: &str) -> Result<u64> {
+    if !is_setup_amount(value) {
+        bail!("persona USD cap must be a positive decimal with at most six fractional digits");
+    }
+    let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
+    let whole: u64 = whole.parse().context("persona cap is too large")?;
+    let fraction: u64 = format!("{fraction:0<6}").parse()?;
+    whole
+        .checked_mul(1_000_000)
+        .and_then(|whole| whole.checked_add(fraction))
+        .context("persona cap is too large")
+}
+
+pub(crate) fn run_persona_menu(
+    saved: &mut Option<PersonaConfig>,
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+) -> Result<()> {
+    writeln!(
+        output,
+        "Persona for main/account 0: Custodian reviews each transaction; Trader or Degen proposes an owner-approved reusable session."
+    )?;
+    loop {
+        write!(output, "Choose custodian, trader or degen [custodian]: ")?;
+        output.flush()?;
+        let answer = read_answer(input)?.unwrap_or_default();
+        let answer = if answer.is_empty() {
+            "custodian"
+        } else {
+            &answer
+        };
+        match answer.parse::<PersonaPreset>() {
+            Ok(preset) => {
+                select_persona(saved, Some(preset), None, None, None)?;
+                writeln!(output, "{}", persona_message(saved.as_ref()))?;
+                return Ok(());
+            }
+            Err(error) => writeln!(output, "{error}")?,
+        }
+    }
+}
+
+pub(crate) fn persona_message(persona: Option<&PersonaConfig>) -> String {
+    let default = PersonaConfig::default();
+    let persona = persona.unwrap_or(&default);
+    if persona.preset == PersonaPreset::Custodian {
+        "persona: custodian; current transaction approval behavior retained".into()
+    } else {
+        format!(
+            "persona: {}; proposed ${}.{:06}/action, ${}.{:06}/day for covered stablecoin collateral (not total-wallet USD coverage), {} seconds; no session is active until its exact account, packages, classes, assets, destinations and limits are reviewed and approved",
+            persona.preset.as_str(),
+            persona.per_action_usd_micros / 1_000_000,
+            persona.per_action_usd_micros % 1_000_000,
+            persona.daily_usd_micros / 1_000_000,
+            persona.daily_usd_micros % 1_000_000,
+            persona.session_duration_secs
+        )
+    }
+}
+
 /// Ask which Petals to use and the values each chosen Petal's settings need.
 /// An empty answer, or the end of input, accepts the suggestion.
 ///
@@ -73,12 +206,13 @@ pub(crate) fn interactive_setup_available() -> bool {
 /// recorded in `setup`, which the default policy proposes.
 pub(crate) fn run_setup_menu(
     petals: &mut PetalsConfig,
+    persona: Option<&PersonaConfig>,
     input: &mut impl BufRead,
     output: &mut impl Write,
 ) -> Result<()> {
     writeln!(
         output,
-        "Choose the Petals your main wallet's policy allows. Each transaction still needs your approval."
+        "Choose the Petals your main wallet's policy allows. Policy approval is separate from persona session activation."
     )?;
     let earlier = std::mem::take(&mut petals.setup);
     let mut chosen = Vec::new();
@@ -98,12 +232,13 @@ pub(crate) fn run_setup_menu(
         let mut values = BTreeMap::new();
         if let Some(template) = setup_template(name) {
             for value in template.values {
+                let persona_suggestion = suggested_venue_limit(persona, name, value.name);
                 let suggestion = earlier
                     .get(name)
                     .and_then(|setup| setup.values.get(value.name))
                     .map(String::as_str)
                     .filter(|saved| is_setup_amount(saved))
-                    .unwrap_or(value.default);
+                    .unwrap_or(persona_suggestion.as_deref().unwrap_or(value.default));
                 let answer = ask_amount(input, output, value.prompt, suggestion)?;
                 values.insert(value.name.to_owned(), answer);
             }
@@ -118,7 +253,7 @@ pub(crate) fn run_setup_menu(
 /// no earlier choices that records every canonical Petal with the catalog's
 /// values; earlier choices are kept as they are, so a declined Petal stays
 /// declined and a saved value stays saved.
-pub(crate) fn accept_setup_suggestions(petals: &mut PetalsConfig) {
+pub(crate) fn accept_setup_suggestions(petals: &mut PetalsConfig, persona: Option<&PersonaConfig>) {
     if !petals.setup.is_empty() {
         return;
     }
@@ -128,7 +263,13 @@ pub(crate) fn accept_setup_suggestions(petals: &mut PetalsConfig) {
                 template
                     .values
                     .iter()
-                    .map(|value| (value.name.to_owned(), value.default.to_owned()))
+                    .map(|value| {
+                        (
+                            value.name.to_owned(),
+                            suggested_venue_limit(persona, &name, value.name)
+                                .unwrap_or_else(|| value.default.to_owned()),
+                        )
+                    })
                     .collect()
             })
             .unwrap_or_default();
@@ -137,6 +278,28 @@ pub(crate) fn accept_setup_suggestions(petals: &mut PetalsConfig) {
             .entry(name.clone())
             .or_insert(PetalSetupConfig { values });
     }
+}
+
+fn suggested_venue_limit(
+    persona: Option<&PersonaConfig>,
+    petal: &str,
+    value: &str,
+) -> Option<String> {
+    let profile = persona.filter(|profile| profile.preset != PersonaPreset::Custodian)?;
+    if petal != "polymarket" || value != "max_daily_usd" {
+        return None;
+    }
+    let amount = format!(
+        "{}.{:06}",
+        profile.daily_usd_micros / 1_000_000,
+        profile.daily_usd_micros % 1_000_000
+    );
+    Some(
+        amount
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_owned(),
+    )
 }
 
 fn ask_yes_no(
@@ -273,16 +436,25 @@ pub(crate) fn render_petal_settings(
 /// chosen values, or `None` when the Petal has no setup settings.
 pub(crate) async fn write_petal_settings(
     vfs: &bloom_vfs::Vfs,
+    home: &std::path::Path,
     petals: &PetalsConfig,
     name: &str,
 ) -> Result<Option<String>> {
     let Some(settings) = render_petal_settings(petals, name, DEFAULT_POLICY_WALLET)? else {
         return Ok(None);
     };
-    let path = bloom_vfs::VfsPath::parse(&settings.path)?;
-    bloom_vfs::Handler::write(vfs, &path, &settings.body)
+    mark_settings_pending(home, petals, name)?;
+    let obligation = checked_settings_obligation(home, petals, name)?;
+    let path = bloom_vfs::VfsPath::parse(&obligation.path)?;
+    bloom_vfs::Handler::write_if_absent(vfs, &path, &obligation.body, &obligation.package_hash)
         .await
-        .with_context(|| format!("write {} settings to {}", petal_label(name), settings.path))?;
+        .with_context(|| {
+            format!(
+                "write {} frozen settings to {}",
+                petal_label(name),
+                obligation.path
+            )
+        })?;
     Ok(Some(settings.summary))
 }
 
@@ -295,15 +467,124 @@ fn pending_settings_dir(home: &std::path::Path) -> std::path::PathBuf {
     home.join("pending-petal-settings")
 }
 
-fn mark_settings_pending(home: &std::path::Path, name: &str) {
-    if setup_template(name).is_none() {
-        return;
-    }
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PendingSettingsObligation {
+    schema_version: u32,
+    wallet: String,
+    account: u32,
+    package_hash: String,
+    path: String,
+    body: Vec<u8>,
+    settings_digest: String,
+    config_revision: String,
+}
+
+fn settings_obligation(
+    petals: &PetalsConfig,
+    name: &str,
+) -> Result<Option<PendingSettingsObligation>> {
+    let Some(settings) = render_petal_settings(petals, name, DEFAULT_POLICY_WALLET)? else {
+        return Ok(None);
+    };
+    let package_hash = github_source::preinstalled_petal(name)
+        .and_then(|entry| entry.expected_hash)
+        .context("setup obligation needs immutable catalog package hash")?;
+    let config_bytes = serde_json::to_vec(&petals.setup.get(name))?;
+    Ok(Some(PendingSettingsObligation {
+        schema_version: 1,
+        wallet: DEFAULT_POLICY_WALLET.into(),
+        account: 0,
+        package_hash: package_hash.into(),
+        path: settings.path,
+        settings_digest: format!("{:x}", Sha256::digest(&settings.body)),
+        config_revision: format!("{:x}", Sha256::digest(config_bytes)),
+        body: settings.body,
+    }))
+}
+
+fn mark_settings_pending(home: &std::path::Path, petals: &PetalsConfig, name: &str) -> Result<()> {
+    let Some(obligation) = settings_obligation(petals, name)? else {
+        return Ok(());
+    };
     let dir = pending_settings_dir(home);
-    let result = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(dir.join(name), b""));
-    if let Err(error) = result {
-        tracing::warn!(petal = %name, %error, "petal.setup_settings_pending_not_recorded");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(name);
+    let mut file = tempfile::NamedTempFile::new_in(&dir)?;
+    file.write_all(&serde_json::to_vec(&obligation)?)?;
+    file.flush()?;
+    file.as_file().sync_all()?;
+    match file.persist_noclobber(&path) {
+        Ok(_) => {}
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+        Err(error) => return Err(error.error.into()),
     }
+    std::fs::File::open(&dir)?.sync_all()?;
+    Ok(())
+}
+
+fn checked_settings_obligation(
+    home: &std::path::Path,
+    petals: &PetalsConfig,
+    name: &str,
+) -> Result<PendingSettingsObligation> {
+    let path = pending_settings_dir(home).join(name);
+    let mut bytes = Vec::new();
+    std::io::Read::take(std::fs::File::open(&path)?, 65_537).read_to_end(&mut bytes)?;
+    if bytes.is_empty() {
+        bail!(
+            "legacy setup obligation has no frozen package/config revision; review and reconcile {} explicitly",
+            path.display()
+        );
+    }
+    if bytes.len() > 65_536 {
+        bail!("setup obligation exceeds 64 KiB");
+    }
+    let recorded: PendingSettingsObligation = serde_json::from_slice(&bytes)
+        .context("decode frozen setup obligation; reconciliation required")?;
+    let current = settings_obligation(petals, name)?
+        .context("settings template unavailable; reconciliation required")?;
+    if recorded != current {
+        bail!(
+            "setup obligation package, template or config revision changed; review and reconcile {} explicitly (pending work retained)",
+            path.display()
+        );
+    }
+    Ok(recorded)
+}
+
+/// Persist every obligation before acquisition can partially succeed or fail.
+/// Otherwise a retry sees an already-installed package and loses its settings.
+pub(crate) async fn record_setup_settings_obligations(
+    daemon: &Daemon,
+    owners_before: &BTreeMap<String, String>,
+    first_setup: bool,
+) -> Result<()> {
+    let account = default_account_presence(&daemon.vfs).await;
+    for name in daemon.config.petals.setup.keys() {
+        if setup_template(name).is_none() {
+            continue;
+        }
+        if setup_settings_step(
+            first_setup,
+            owners_before.contains_key(name),
+            false,
+            &account,
+        ) == SetupSettingsStep::Write
+        {
+            mark_settings_pending(daemon.home.root(), &daemon.config.petals, name)
+                .context("record frozen setup settings before provisioning")?;
+        }
+    }
+    Ok(())
+}
+
+fn settings_already_exist(error: &anyhow::Error) -> bool {
+    // The initialize-only private store returns this exact refusal through the
+    // guest route. Other backend, routing and policy failures stay retryable.
+    error
+        .chain()
+        .any(|cause| cause.to_string().contains("setup settings already exist"))
 }
 
 fn clear_settings_pending(home: &std::path::Path, name: &str) {
@@ -339,7 +620,14 @@ pub(crate) async fn apply_pending_settings(daemon: &Daemon) -> Vec<String> {
         if !owners.contains_key(&name) {
             continue;
         }
-        match write_petal_settings(&daemon.vfs, &daemon.config.petals, &name).await {
+        match write_petal_settings(
+            &daemon.vfs,
+            daemon.home.root(),
+            &daemon.config.petals,
+            &name,
+        )
+        .await
+        {
             Ok(summary) => {
                 clear_settings_pending(daemon.home.root(), &name);
                 if let Some(summary) = summary {
@@ -347,6 +635,14 @@ pub(crate) async fn apply_pending_settings(daemon: &Daemon) -> Vec<String> {
                 }
             }
             Err(error) => {
+                if settings_already_exist(&error) {
+                    clear_settings_pending(daemon.home.root(), &name);
+                    messages.push(format!(
+                        "petal_settings_preserved: {} already has owner settings",
+                        petal_label(&name)
+                    ));
+                    continue;
+                }
                 tracing::warn!(
                     petal = %name,
                     error = %format!("{error:#}"),
@@ -394,9 +690,15 @@ pub(crate) async fn apply_setup_settings(
         let Some(installed) = owners_after.get(name) else {
             continue;
         };
+        let pending = pending_settings(daemon.home.root(), &daemon.config.petals).contains(name);
         let previous = owners_before.get(name);
         let updated = previous.is_some_and(|previous| previous != installed);
-        let reason = match setup_settings_step(first_setup, previous.is_some(), updated, &account) {
+        let step = if pending {
+            SetupSettingsStep::Write
+        } else {
+            setup_settings_step(first_setup, previous.is_some(), updated, &account)
+        };
+        let reason = match step {
             SetupSettingsStep::Leave => continue,
             SetupSettingsStep::Write => None,
             SetupSettingsStep::KeepOwners => Some(format!(
@@ -427,14 +729,23 @@ pub(crate) async fn apply_setup_settings(
             );
             continue;
         }
-        match write_petal_settings(&daemon.vfs, &daemon.config.petals, name).await {
+        match write_petal_settings(&daemon.vfs, daemon.home.root(), &daemon.config.petals, name)
+            .await
+        {
             Ok(Some(summary)) => {
                 clear_settings_pending(daemon.home.root(), name);
                 messages.push(settings_message(name, &summary, updated));
             }
             Ok(None) => {}
             Err(error) => {
-                mark_settings_pending(daemon.home.root(), name);
+                if settings_already_exist(&error) {
+                    clear_settings_pending(daemon.home.root(), name);
+                    messages.push(format!(
+                        "petal_settings_preserved: {} already has owner settings",
+                        petal_label(name)
+                    ));
+                    continue;
+                }
                 messages.push(format!(
                     "petal_settings_failed: {error:#} (will retry once wallet {DEFAULT_POLICY_WALLET} exists)"
                 ));
@@ -529,7 +840,9 @@ pub(crate) fn apply_provisioned_settings(
             ProvisioningOutcome::Updated => true,
             ProvisioningOutcome::Current | ProvisioningOutcome::Failed(_) => continue,
         };
-        if updated {
+        if updated
+            && !pending_settings(daemon.home.root(), &daemon.config.petals).contains(&result.name)
+        {
             let account = runtime.block_on(default_account_presence(&daemon.vfs));
             if setup_settings_step(false, true, true, &account) != SetupSettingsStep::Write {
                 clear_settings_pending(daemon.home.root(), &result.name);
@@ -542,6 +855,7 @@ pub(crate) fn apply_provisioned_settings(
         }
         match runtime.block_on(write_petal_settings(
             &daemon.vfs,
+            daemon.home.root(),
             &daemon.config.petals,
             &result.name,
         )) {
@@ -556,7 +870,11 @@ pub(crate) fn apply_provisioned_settings(
             }
             Ok(None) => {}
             Err(error) => {
-                mark_settings_pending(daemon.home.root(), &result.name);
+                if settings_already_exist(&error) {
+                    clear_settings_pending(daemon.home.root(), &result.name);
+                    tracing::info!(petal = %result.name, "petal.setup_settings_preserved");
+                    continue;
+                }
                 tracing::warn!(
                     petal = %result.name,
                     error = %format!("{error:#}"),
@@ -564,6 +882,9 @@ pub(crate) fn apply_provisioned_settings(
                 );
             }
         }
+    }
+    for message in runtime.block_on(apply_pending_settings(daemon)) {
+        tracing::info!(message = %message, "petal.setup_settings_recovered");
     }
 }
 
@@ -802,7 +1123,7 @@ impl DefaultPolicyWait {
             DefaultPolicyStatus::Applied { petals } => {
                 writeln!(
                     output,
-                    "default_policy: {wallet} allows {}; each transaction still needs your approval",
+                    "default_policy: {wallet} allows {}; policy approval alone does not activate persona sessions",
                     petal_labels(petals)
                 )?;
                 Ok(WaitStep::Stop)
@@ -905,7 +1226,23 @@ pub(crate) async fn create_wallet_then_default_policy(
     // Without a parseable expiry, wait as long as a wallet ceremony can last.
     let deadline_ms = ceremony_expiry_from_output(&output.stdout)
         .unwrap_or_else(|| crate::current_unix_ms().saturating_add(10 * 60 * 1000));
-    wait_for_default_policy(endpoint, &name, deadline_ms).await
+    if wait_for_default_policy_applied(endpoint, &name, deadline_ms).await? {
+        let session = crate::machine_command(
+            endpoint,
+            bloom_daemon::ipc::MachineCommand::PersonaSessionActivateConfigured {
+                wallet: name,
+                account: 0,
+            },
+        )
+        .await?;
+        if session.stdout.trim_start().starts_with('[') {
+            println!(
+                "persona coverage: basic activation covers Polymarket buys using nominal pUSD collateral on main/account 0; other apps, native transfers and unsupported assets retain exact approval. Approve the returned scope URL, then run `bloom wallet persona activate main --account 0` to reconcile it."
+            );
+        }
+        crate::print_machine_command_output(&session)?;
+    }
+    Ok(())
 }
 
 /// Poll Machine until the wallet's default policy is applied, the announced
@@ -915,6 +1252,16 @@ pub(crate) async fn wait_for_default_policy(
     wallet: &str,
     deadline_ms: u64,
 ) -> Result<()> {
+    wait_for_default_policy_applied(endpoint, wallet, deadline_ms)
+        .await
+        .map(|_| ())
+}
+
+async fn wait_for_default_policy_applied(
+    endpoint: &crate::ResolvedEndpoint,
+    wallet: &str,
+    deadline_ms: u64,
+) -> Result<bool> {
     let mut wait = DefaultPolicyWait::new(wallet, deadline_ms);
     loop {
         let output = crate::machine_command(
@@ -925,19 +1272,21 @@ pub(crate) async fn wait_for_default_policy(
         )
         .await?;
         if output.exit_code != 0 {
-            return crate::print_machine_command_output(&output);
+            crate::print_machine_command_output(&output)?;
+            return Ok(false);
         }
         let status: DefaultPolicyStatus = serde_json::from_str(output.stdout.trim())
             .context("decode default policy status from Machine")?;
         if wait.observe(&status, crate::current_unix_ms(), &mut std::io::stdout())?
             == WaitStep::Stop
         {
-            return Ok(());
+            return Ok(matches!(status, DefaultPolicyStatus::Applied { .. }));
         }
         // Expiry is judged only after a status read, so a ceremony completed in
         // the last poll interval still commits instead of being called expired.
         if wait.ceremony_expired(crate::current_unix_ms()) {
-            return wait.report_expired(&mut std::io::stderr());
+            wait.report_expired(&mut std::io::stderr())?;
+            return Ok(false);
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
@@ -970,16 +1319,69 @@ mod tests {
         let petals = chosen_setup(&["polymarket"]);
         assert!(pending_settings(home.path(), &petals).is_empty());
 
-        mark_settings_pending(home.path(), "polymarket");
+        mark_settings_pending(home.path(), &petals, "polymarket").unwrap();
         assert_eq!(pending_settings(home.path(), &petals), ["polymarket"]);
         // A second failed attempt leaves one marker, not two.
-        mark_settings_pending(home.path(), "polymarket");
+        mark_settings_pending(home.path(), &petals, "polymarket").unwrap();
         assert_eq!(pending_settings(home.path(), &petals), ["polymarket"]);
 
         clear_settings_pending(home.path(), "polymarket");
         assert!(pending_settings(home.path(), &petals).is_empty());
         // Clearing an absent marker is not an error.
         clear_settings_pending(home.path(), "polymarket");
+    }
+
+    #[test]
+    fn deferred_settings_replay_refuses_changed_revision_without_replacing_journal() {
+        let home = tempfile::tempdir().unwrap();
+        let mut petals = chosen_setup(&["polymarket"]);
+        mark_settings_pending(home.path(), &petals, "polymarket").unwrap();
+        let before = std::fs::read(pending_settings_dir(home.path()).join("polymarket")).unwrap();
+        let obligation = checked_settings_obligation(home.path(), &petals, "polymarket").unwrap();
+        assert_eq!(obligation.wallet, "main");
+        assert_eq!(obligation.account, 0);
+        assert_eq!(obligation.package_hash.len(), 64);
+        petals
+            .setup
+            .get_mut("polymarket")
+            .unwrap()
+            .values
+            .insert("max_daily_usd".into(), "42.5".into());
+        mark_settings_pending(home.path(), &petals, "polymarket").unwrap();
+        assert_eq!(
+            std::fs::read(pending_settings_dir(home.path()).join("polymarket")).unwrap(),
+            before
+        );
+        assert!(
+            checked_settings_obligation(home.path(), &petals, "polymarket")
+                .unwrap_err()
+                .to_string()
+                .contains("revision changed")
+        );
+        assert_eq!(pending_settings(home.path(), &petals), ["polymarket"]);
+    }
+
+    #[tokio::test]
+    async fn acquisition_failure_cannot_lose_saved_setup_settings_obligation() {
+        let home = tempfile::tempdir().unwrap();
+        let mut daemon = Daemon::from_home(bloom_proto::HomeDir::at(home.path())).unwrap();
+        daemon.config.petals = chosen_setup(&["polymarket"]);
+        // Choices are durable before package acquisition starts. Even if that
+        // acquisition aborts, recovery must retain the independently recorded work.
+        daemon.config.petals.setup_complete = true;
+        record_setup_settings_obligations(&daemon, &BTreeMap::new(), true)
+            .await
+            .unwrap();
+        assert_eq!(
+            pending_settings(home.path(), &daemon.config.petals),
+            ["polymarket"]
+        );
+        // Restart/retry with setup already complete and no package available.
+        assert!(apply_pending_settings(&daemon).await.is_empty());
+        assert_eq!(
+            pending_settings(home.path(), &daemon.config.petals),
+            ["polymarket"]
+        );
     }
 
     #[test]
@@ -1000,10 +1402,64 @@ mod tests {
             ["polymarket"]
         );
         let fresh = tempfile::tempdir().unwrap();
-        mark_settings_pending(fresh.path(), "not-a-petal");
+        mark_settings_pending(fresh.path(), &PetalsConfig::default(), "not-a-petal").unwrap();
         assert!(!pending_settings_dir(fresh.path()).exists());
     }
     use super::*;
+
+    #[test]
+    fn persona_selection_preserves_legacy_and_custom_limits_without_explicit_change() {
+        let mut legacy = None;
+        select_persona(&mut legacy, None, None, None, None).unwrap();
+        assert_eq!(legacy, None);
+        select_persona(
+            &mut legacy,
+            Some(PersonaPreset::Trader),
+            Some("12.5"),
+            Some("50"),
+            Some(600),
+        )
+        .unwrap();
+        let choice = legacy.clone();
+        select_persona(&mut legacy, None, None, None, None).unwrap();
+        assert_eq!(legacy, choice);
+        assert_eq!(legacy.as_ref().unwrap().per_action_usd_micros, 12_500_000);
+        select_persona(&mut legacy, Some(PersonaPreset::Trader), None, None, None).unwrap();
+        assert_eq!(legacy, choice);
+        assert!(select_persona(&mut legacy, None, Some("10"), None, None).is_err());
+        assert!(
+            select_persona(
+                &mut legacy,
+                Some(PersonaPreset::Trader),
+                Some("51"),
+                None,
+                None
+            )
+            .is_err()
+        );
+        assert_eq!(
+            legacy, choice,
+            "a rejected proposal must not change saved choices"
+        );
+    }
+
+    #[test]
+    fn persona_suggestions_align_fresh_venue_cap_but_preserve_saved_owner_choice() {
+        let trader = PersonaConfig::suggested(PersonaPreset::Trader);
+        let mut fresh = PetalsConfig::default();
+        accept_setup_suggestions(&mut fresh, Some(&trader));
+        assert_eq!(polymarket_limit(&fresh), Some("1000"));
+        fresh
+            .setup
+            .get_mut("polymarket")
+            .unwrap()
+            .values
+            .insert("max_daily_usd".into(), "42.5".into());
+        let mut output = Vec::new();
+        run_setup_menu(&mut fresh, Some(&trader), &mut "".as_bytes(), &mut output).unwrap();
+        assert_eq!(polymarket_limit(&fresh), Some("42.5"));
+        assert!(String::from_utf8(output).unwrap().contains("[42.5]"));
+    }
 
     /// Machine refuses an outbox transaction whose destination the wallet
     /// policy does not list, so a canonical Petal missing from `for_petal`
@@ -1028,7 +1484,7 @@ mod tests {
     fn menu(answers: &str) -> (PetalsConfig, String) {
         let mut petals = PetalsConfig::default();
         let mut output = Vec::new();
-        run_setup_menu(&mut petals, &mut answers.as_bytes(), &mut output).unwrap();
+        run_setup_menu(&mut petals, None, &mut answers.as_bytes(), &mut output).unwrap();
         (petals, String::from_utf8(output).unwrap())
     }
 
@@ -1106,7 +1562,13 @@ mod tests {
             },
         );
         let mut output = Vec::new();
-        run_setup_menu(&mut petals, &mut "\n\n\n\n\n\n".as_bytes(), &mut output).unwrap();
+        run_setup_menu(
+            &mut petals,
+            None,
+            &mut "\n\n\n\n\n\n".as_bytes(),
+            &mut output,
+        )
+        .unwrap();
         let output = String::from_utf8(output).unwrap();
         assert_eq!(chosen(&petals), ["hyperliquid", "polymarket"]);
         assert_eq!(polymarket_limit(&petals), Some("42.5"));
@@ -1119,12 +1581,13 @@ mod tests {
 
         // The same at the end of input, and an explicit answer still wins.
         let mut eof = petals.clone();
-        run_setup_menu(&mut eof, &mut "".as_bytes(), &mut Vec::new()).unwrap();
+        run_setup_menu(&mut eof, None, &mut "".as_bytes(), &mut Vec::new()).unwrap();
         assert_eq!(chosen(&eof), ["hyperliquid", "polymarket"]);
         assert_eq!(polymarket_limit(&eof), Some("42.5"));
         let mut changed = petals.clone();
         run_setup_menu(
             &mut changed,
+            None,
             &mut "\n\ny\n\n\n60\n".as_bytes(),
             &mut Vec::new(),
         )
@@ -1142,7 +1605,7 @@ mod tests {
                 values: BTreeMap::from([("max_daily_usd".into(), "42.5".into())]),
             },
         );
-        accept_setup_suggestions(&mut petals);
+        accept_setup_suggestions(&mut petals, None);
         assert_eq!(chosen(&petals), ["polymarket"]);
         assert_eq!(polymarket_limit(&petals), Some("42.5"));
     }
@@ -1217,7 +1680,7 @@ mod tests {
     #[test]
     fn scripted_setup_chooses_every_canonical_petal_and_keeps_existing_values() {
         let mut petals = PetalsConfig::default();
-        accept_setup_suggestions(&mut petals);
+        accept_setup_suggestions(&mut petals, None);
         assert_eq!(
             chosen(&petals),
             [
@@ -1238,7 +1701,7 @@ mod tests {
                 values: BTreeMap::from([("max_daily_usd".into(), "5".into())]),
             },
         );
-        accept_setup_suggestions(&mut edited);
+        accept_setup_suggestions(&mut edited, None);
         assert_eq!(polymarket_limit(&edited), Some("5"));
         assert_eq!(chosen(&edited), ["polymarket"]);
 
@@ -1249,14 +1712,14 @@ mod tests {
             .or_default()
             .values
             .insert("tolly_writes".into(), "disabled".into());
-        accept_setup_suggestions(&mut disabled);
+        accept_setup_suggestions(&mut disabled, None);
         assert_eq!(tolly_writes(&disabled), Some("disabled"));
     }
 
     #[test]
     fn chosen_petals_round_trip_as_config_tables() {
         let mut config = bloom_proto::Config::local_default();
-        accept_setup_suggestions(&mut config.petals);
+        accept_setup_suggestions(&mut config.petals, None);
         let encoded = toml::to_string(&config).unwrap();
         assert!(encoded.contains("[petals.setup.hyperliquid]"), "{encoded}");
         assert!(

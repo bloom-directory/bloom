@@ -77,6 +77,37 @@ The canonical approval is durable in Broker. Signer stores the enforcement
 projection it independently needs. Machine stores only public status and
 launch projections; deleting or altering them cannot authorize a signature.
 
+## Persona session selectors and shared accounting
+
+Persona metadata never confers authority. The Machine session resolver uses
+activated concrete `SealedApprovalTerms` and fresh wallet/key/policy/provenance
+bindings, preserving exact one-operation helpers. Unsupported actions continue
+through exact review. See [Persona Onboarding](Persona%20Onboarding.md) for the
+initial coverage and rollout gates.
+
+`SystemSession` adds typed native/canonical ERC20 transfer scope. Broker decodes
+the entire canonical preimage and checks the chain, recipient, token, amount and
+maximum encoded fee. Signer independently checks the authenticated projection,
+selector and counters without becoming a transaction parser. Current support
+is Ethereum1, Polygon137 and local31337. Other fee models and Solana require
+exact approval until their full fee/cluster facts can be established.
+
+An optional signed `SessionBudget` descriptor binds wallet, policy, epoch,
+member keys, validity, count/rate limits, raw asset ceilings and reviewed nominal
+collateral scales. Its canonical digest identifies a shared budget across
+member grants. Per-action, rolling and lifetime limits reserve atomically in
+both Broker and Signer. Reserved, committed and ambiguous operations remain
+charged; only authoritatively released reservations stop counting. Nominal
+stablecoin units do not establish fiat value, and unknown assets never count
+as free. Signing replays include the accounting digest in operation identity
+and recover the same result without another reservation.
+
+Normal SQLite reopening retains the shared ledger. Selective Signer archive
+restore disables grouped grants and durably blocks unrecovered budget IDs,
+including identical-descriptor renewal. Fresh owner-reviewed authority needs
+a new descriptor; cached completed results remain recoverable. Public proposal
+journals contain no signing secrets, PRF output or decrypted grants.
+
 ## Petal claims and trust boundary
 
 Each reusable Petal signing operation carries a normalized `PetalUseClaim`
