@@ -216,14 +216,10 @@ mod tests {
         browser.return_control().await.unwrap();
         browser.browse(BrowseRequest::Open { url }).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-        let error = browser
-            .browse(BrowseRequest::Snapshot)
-            .await
-            .err()
-            .unwrap()
-            .to_string();
-        assert!(!error.contains("SyntheticPrivateName"));
-        assert!(error.contains("private traveler"));
+        // The filled session was discarded, so the site is ordinary shopping again.
+        let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+        assert!(!snapshot.to_string().contains("SyntheticPrivateName"));
+        assert!(!snapshot["elements"].as_array().unwrap().is_empty());
         server.abort();
     }
     #[tokio::test]

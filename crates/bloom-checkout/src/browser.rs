@@ -364,7 +364,8 @@ impl Browser {
     }
 
     /// Discards the checkout's browsing context, including cookies and storage
-    /// the merchant kept, so shopping never reopens a private session.
+    /// the merchant kept, so shopping never reopens a private session and may
+    /// return to the booking site.
     pub(crate) async fn return_control(&self) -> Result<()> {
         let mut tab = self.tab.lock().await;
         self.cdp
@@ -405,6 +406,11 @@ impl Browser {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         *tab = new_tab(&self.cdp, None, tab.generation + 1).await?;
+        // The private data lived only in the disposed context.
+        self.private_origins
+            .write()
+            .map_err(|_| anyhow::anyhow!("Private origin guard unavailable"))?
+            .clear();
         self.revoked.store(false, Ordering::SeqCst);
         Ok(())
     }

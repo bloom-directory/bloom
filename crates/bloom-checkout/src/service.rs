@@ -46,9 +46,6 @@ impl Store {
         }
         let conn = Connection::open(path)?;
         conn.execute_batch("PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS operations(id TEXT PRIMARY KEY,state TEXT NOT NULL,status TEXT NOT NULL,created INTEGER NOT NULL,kind TEXT NOT NULL,description TEXT NOT NULL,shop TEXT,total_minor INTEGER,currency TEXT);")?;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS private_origins(origin TEXT PRIMARY KEY NOT NULL);",
-        )?;
         // A lost recipient cannot be reconstructed. Interrupted disclosure is never retried.
         conn.execute("UPDATE operations SET state='disclosure_unknown',status=json_set(status,'$.state','disclosure_unknown','$.ceremony_url',NULL) WHERE state IN ('release_started','filled','submitted','partially_filled','ready_for_payment')",[])?;
         conn.execute("UPDATE operations SET state='failed_before_release',status=json_set(status,'$.state','failed_before_release','$.ceremony_url',NULL) WHERE state IN ('requested','preparing','awaiting_approval','manual_required','human_control')",[])?;
@@ -63,20 +60,6 @@ impl Store {
             })
             .context("Unknown checkout request")?;
         Ok(serde_json::from_str(&text)?)
-    }
-    fn private_origins(&self) -> Result<Vec<String>> {
-        let db = self.0.lock();
-        let mut stmt = db.prepare("SELECT origin FROM private_origins")?;
-        Ok(stmt
-            .query_map([], |r| r.get(0))?
-            .collect::<rusqlite::Result<_>>()?)
-    }
-    fn protect_origin(&self, origin: &str) -> Result<()> {
-        self.0.lock().execute(
-            "INSERT OR IGNORE INTO private_origins VALUES (?1)",
-            [origin],
-        )?;
-        Ok(())
     }
     fn insert(&self, status: &Status, kind: &str, description: &str) -> Result<()> {
         let created = std::time::SystemTime::now()
@@ -325,9 +308,6 @@ impl CheckoutService {
             bail!("Private view port must be explicit");
         }
         let store = Store::open(state)?;
-        for origin in store.private_origins()? {
-            browser.protect_origin(origin)?;
-        }
         Ok(Arc::new(Self {
             browser,
             store,
@@ -659,7 +639,6 @@ impl CheckoutService {
                 .traveler
                 .as_ref()
                 .context("Private traveler binding missing")?;
-            self.store.protect_origin(&traveler.scope.origin)?;
             self.browser.protect_origin(traveler.scope.origin.clone())?;
             let key = checkout
                 .recipient
@@ -1038,7 +1017,6 @@ impl CheckoutService {
                     && let Ok(url) = url::Url::parse(origin)
                     && matches!(url.scheme(), "http" | "https")
                 {
-                    self.store.protect_origin(origin)?;
                     self.browser.protect_origin(origin.to_owned())?;
                 }
             }
@@ -1051,7 +1029,6 @@ impl CheckoutService {
                 if let Ok(url) = url::Url::parse(&context.url) {
                     if matches!(url.scheme(), "http" | "https") {
                         let origin = url.origin().ascii_serialization();
-                        self.store.protect_origin(&origin)?;
                         self.browser.protect_origin(origin)?;
                     }
                 }
@@ -1201,14 +1178,19 @@ impl CheckoutService {
                     }
                     self.set_state(&checkout.operation_id, "ready_for_payment");
                     return Ok(());
-                } else if checkout.mode == Mode::TakeOver {
+                } else if checkout.mode == Mode::TakeOver && !checkout.contains_traveler {
                     let resume = Self::page_url(checkout).await;
                     self.browser
                         .return_control_at(&checkout.view_target, resume)
                         .await?;
                     self.set_state(&checkout.operation_id, "returned");
                 } else {
-                    self.set_state(&checkout.operation_id, "uncertain");
+                    let state = if checkout.mode == Mode::TakeOver {
+                        "returned"
+                    } else {
+                        "uncertain"
+                    };
+                    self.set_state(&checkout.operation_id, state);
                     self.browser.return_control().await?;
                 }
                 self.retain_completed(checkout, self.store.get(&checkout.operation_id)?);
@@ -1381,13 +1363,11 @@ mod tests {
         server.abort();
     }
     #[test]
-    fn private_origin_guard_survives_restart_and_interrupted_fill_is_not_retried() {
+    fn interrupted_fill_is_not_retried_after_restart() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("state.db");
         {
             let store = Store::open(&path).unwrap();
-            store.protect_origin("https://booking.example").unwrap();
-            store.protect_origin("https://booking.example").unwrap();
             let status = Status {
                 operation_id: "fixture".into(),
                 state: "filled".into(),
@@ -1400,10 +1380,6 @@ mod tests {
                 .unwrap();
         }
         let store = Store::open(&path).unwrap();
-        assert_eq!(
-            store.private_origins().unwrap(),
-            ["https://booking.example"]
-        );
         assert_eq!(store.get("fixture").unwrap().state, "disclosure_unknown");
     }
     #[tokio::test]
