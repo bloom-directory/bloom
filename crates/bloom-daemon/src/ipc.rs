@@ -729,6 +729,36 @@ pub enum MachineCommand {
     WalletDefaultPolicy {
         name: String,
     },
+    /// Save browser onboarding choices through the sole Machine home owner.
+    OnboardingSetup {
+        wallet: String,
+        preset: bloom_proto::persona::PersonaPreset,
+        per_action_usd: Option<String>,
+        daily_usd: Option<String>,
+        session_duration_secs: Option<u64>,
+        petals: Vec<String>,
+    },
+    PersonaPreferencesSet {
+        wallet: String,
+        preset: bloom_proto::persona::PersonaPreset,
+        per_action_usd: Option<String>,
+        daily_usd: Option<String>,
+        session_duration_secs: Option<u64>,
+    },
+    PersonaSessionActivateConfigured {
+        wallet: String,
+        account: u32,
+    },
+    PersonaSessionPrepare {
+        proposal: Box<bloom_machine_client::PersonaSessionProposal>,
+    },
+    PersonaSessions {
+        wallet: String,
+    },
+    PersonaSessionsStop {
+        wallet: String,
+        reason: String,
+    },
     WalletOutboxCancel {
         wallet: String,
         chain: String,

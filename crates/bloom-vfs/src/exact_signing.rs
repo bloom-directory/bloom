@@ -359,7 +359,13 @@ impl BrokerExactPayloadSigner {
             return Err("exact signing retry differs from its persisted operation identity".into());
         }
         let now = now_ms()?;
-        if state.expires_at_ms.get() <= now {
+        if state.expires_at_ms.get() <= now
+            && self
+                .broker
+                .persona_operation_digest(&state.signing_operation_id)
+                .map_err(|error| error.to_string())?
+                .is_none()
+        {
             state.approval_operation_id = random_operation_id();
             state.signing_operation_id = random_operation_id();
             state.request_nonce = random_request_nonce();
@@ -373,6 +379,7 @@ impl BrokerExactPayloadSigner {
             .transpose()?
             .unwrap_or_default();
         let mut request = ExactPayloadSignRequest {
+            session_use: None,
             wallet_id,
             preimage: preimage.to_vec(),
             claimed_hash,
@@ -630,7 +637,13 @@ impl BrokerExactPayloadSigner {
             );
         }
         let now = now_ms()?;
-        if state.expires_at_ms.get() <= now {
+        if state.expires_at_ms.get() <= now
+            && self
+                .broker
+                .persona_operation_digest(&state.signing_operation_id)
+                .map_err(|error| error.to_string())?
+                .is_none()
+        {
             state.approval_operation_id = random_operation_id();
             state.signing_operation_id = random_operation_id();
             state.request_nonce = random_request_nonce();
@@ -773,7 +786,13 @@ impl BrokerExactPayloadSigner {
             );
         }
         let now = now_ms()?;
-        if state.expires_at_ms.get() <= now {
+        if state.expires_at_ms.get() <= now
+            && self
+                .broker
+                .persona_operation_digest(&state.signing_operation_id)
+                .map_err(|error| error.to_string())?
+                .is_none()
+        {
             state.approval_operation_id = random_operation_id();
             state.signing_operation_id = random_operation_id();
             state.request_nonce = random_request_nonce();

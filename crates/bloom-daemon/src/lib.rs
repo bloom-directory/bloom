@@ -904,6 +904,7 @@ impl DaemonPetalHost {
         let request_nonce = bloom_broker_api::RequestNonce::new(&request_nonce_hex[..32])
             .map_err(|error| HostError::Invalid(error.to_string()))?;
         let terms = bloom_broker_api::SealedApprovalTerms {
+            session_budget: None,
             subject: bloom_broker_api::ApprovalSubject::Petal {
                 package_hash: scope.package_hash.clone(),
                 route: scope.route.clone(),
@@ -965,6 +966,7 @@ impl DaemonPetalHost {
             .map_err(|error| HostError::Invalid(error.to_string()))?;
         let prepared = broker
             .prepare_approval(bloom_broker_api::ApprovalPrepareRequest {
+                surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
                 evm_review_payloads: Vec::new(),
                 operation_id,
                 terms,
@@ -1690,6 +1692,7 @@ impl PetalHost for DaemonPetalHost {
             .prepare_custody(
                 bloom_machine_client::CustodyPrepareMethod::KeyDerive,
                 bloom_broker_api::CustodyPrepareRequest {
+                    surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
                     ceremony_kind: bloom_broker_api::CeremonyKind::KeyDerive,
                     custody_operation_id: custody_operation_id.clone(),
                     wallet_id: Some(wallet_id),
@@ -3794,6 +3797,7 @@ pub struct Daemon {
     /// Command handlers must reuse this client rather than reopening the
     /// Machine journal and creating a second, stale in-memory head.
     pub machine_broker: Option<MachineBrokerClient>,
+    persona_provenance_catalog: Option<bloom_broker_api::ProvenanceCatalog>,
     pub wallet_projections: Arc<dyn WalletProjectionReader>,
     wallets: Arc<WalletsHandler>,
     pub vfs: Vfs,
@@ -4051,6 +4055,9 @@ impl Daemon {
         provenance_catalog: Option<bloom_broker_api::ProvenanceCatalog>,
     ) -> Result<Self, DaemonError> {
         home.ensure()?;
+        let broker = broker.map(|client| {
+            client.with_persona_session_store(home.cache_dir().join("persona-sessions"))
+        });
 
         // Before anything can serve or scan these projections, retire the
         // ceremonies a previous run left advertised.
@@ -4562,18 +4569,22 @@ impl Daemon {
         // The default-policy wallet's first Petal proposal also allows every
         // installed Petal chosen during setup.
         let default_policy_packages: bloom_vfs::handlers::DefaultPolicyPackages = {
-            // Read once: only `bloom init` writes `[petals.setup]`, and it needs
-            // the home write lock this daemon holds, so the choice cannot change
-            // while this closure is alive. Installed hashes are resolved on each
-            // call, so a Petal update is picked up without a restart.
-            let chosen: Vec<String> = config.petals.setup.keys().cloned().collect();
+            // Browser setup updates choices through this daemon's IPC writer.
+            // Read the current durable selection for every proposal so a running
+            // daemon never reintroduces an integration the owner deselected.
+            let setup_config_path = home.config_path();
             let store = petal_store.clone();
             Arc::new(move |wallet: &str| {
                 if wallet != bloom_proto::config::DEFAULT_POLICY_WALLET {
-                    return bloom_vfs::handlers::DefaultPolicySetup::default();
+                    return Ok(bloom_vfs::handlers::DefaultPolicySetup::default());
                 }
+                let current = Config::load(&setup_config_path).map_err(|error| {
+                    bloom_vfs::HandlerError::Backend(format!(
+                        "cannot read current setup choices before policy proposal: {error}"
+                    ))
+                })?;
                 let mut setup = bloom_vfs::handlers::DefaultPolicySetup::default();
-                for name in &chosen {
+                for name in current.petals.setup.keys() {
                     let installed = match store.resolve_petal_owner(name) {
                         Ok(installed) => installed,
                         Err(error) => {
@@ -4592,7 +4603,7 @@ impl Daemon {
                     setup.packages.push(package);
                     setup.destinations.extend(default_policy_destinations(name));
                 }
-                setup
+                Ok(setup)
             })
         };
         let wallets_handler = Arc::new(
@@ -4969,6 +4980,7 @@ impl Daemon {
             address_book: address_book_arc,
             audit: audit_arc,
             machine_broker: broker,
+            persona_provenance_catalog: provenance_catalog,
             wallet_projections,
             wallets: wallets_handler,
             vfs,
@@ -4991,6 +5003,60 @@ impl Daemon {
     /// callers must not construct a second edge over the same Machine journal.
     pub fn broker_client(&self) -> Option<MachineBrokerClient> {
         self.machine_broker.clone()
+    }
+
+    pub fn persona_provenance_catalog(&self) -> Option<bloom_broker_api::ProvenanceCatalog> {
+        self.persona_provenance_catalog.clone()
+    }
+
+    pub async fn prepare_persona_session(
+        &self,
+        proposal: bloom_machine_client::PersonaSessionProposal,
+    ) -> Result<bloom_machine_client::PersonaSessionStatus, bloom_broker_api::ProtocolError> {
+        self.machine_broker
+            .as_ref()
+            .ok_or_else(|| {
+                bloom_broker_api::ProtocolError::new(
+                    bloom_broker_api::ProtocolErrorCode::ServiceUnavailable,
+                    "Broker is unavailable for persona activation",
+                )
+            })?
+            .prepare_persona_session(proposal)
+            .await
+    }
+
+    pub async fn persona_sessions(
+        &self,
+        wallet: &str,
+    ) -> Result<Vec<bloom_machine_client::PersonaSessionStatus>, bloom_broker_api::ProtocolError>
+    {
+        self.machine_broker
+            .as_ref()
+            .ok_or_else(|| {
+                bloom_broker_api::ProtocolError::new(
+                    bloom_broker_api::ProtocolErrorCode::ServiceUnavailable,
+                    "Broker is unavailable for persona status",
+                )
+            })?
+            .persona_sessions(&bloom_broker_api::Token::new(wallet.to_owned())?)
+            .await
+    }
+
+    pub async fn stop_persona_sessions(
+        &self,
+        wallet: &str,
+        reason: &str,
+    ) -> Result<(), bloom_broker_api::ProtocolError> {
+        self.machine_broker
+            .as_ref()
+            .ok_or_else(|| {
+                bloom_broker_api::ProtocolError::new(
+                    bloom_broker_api::ProtocolErrorCode::ServiceUnavailable,
+                    "Broker is unavailable for persona revocation",
+                )
+            })?
+            .stop_persona_sessions(&bloom_broker_api::Token::new(wallet.to_owned())?, reason)
+            .await
     }
 
     /// Propose every package in `packages` and every destination in
@@ -6145,6 +6211,8 @@ mod tests {
                         }
                         Ok(MachineBrokerResponse::CustodyResult(
                             bloom_broker_api::CustodyResult {
+                                surface: None,
+                                credential_authority_generation: None,
                                 ceremony_kind: bloom_broker_api::CeremonyKind::KeyDerive,
                                 custody_operation_id: request.operation_id,
                                 public_status: bloom_broker_api::CeremonyState::Succeeded,

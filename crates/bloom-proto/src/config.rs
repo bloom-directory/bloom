@@ -52,6 +52,9 @@ pub struct Config {
     /// upper bound.
     #[serde(default)]
     pub petals: PetalsConfig,
+    /// Optional onboarding suggestion. Absent on legacy homes; never grants authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persona: Option<crate::persona::PersonaConfig>,
     #[serde(default)]
     pub mempool: BTreeMap<String, MempoolChainConfig>,
     #[serde(default)]
@@ -449,6 +452,7 @@ impl Config {
             )]),
             etherscan: None,
             petals: PetalsConfig::default(),
+            persona: None,
             mempool: BTreeMap::new(),
             private_rpc: BTreeMap::new(),
             backends: BackendsConfig::default(),
@@ -508,6 +512,9 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if let Some(persona) = &self.persona {
+            persona.validate().map_err(ConfigError::Invalid)?;
+        }
         if self.chains.is_empty() {
             return Err(ConfigError::Invalid(
                 "config.chains must contain at least one entry".into(),
@@ -1142,6 +1149,23 @@ rpc_urls = ["https://ethereum-rpc.publicnode.com"]
         cfg.petals.setup_complete = true;
         let decoded: Config = toml::from_str(&toml::to_string_pretty(&cfg).unwrap()).unwrap();
         assert!(decoded.petals.setup_complete);
+    }
+
+    #[test]
+    fn persona_migration_keeps_legacy_absent_and_independent_of_petal_setup() {
+        let mut cfg = Config::local_default();
+        cfg.petals.setup_complete = true;
+        let legacy = toml::to_string(&cfg).unwrap();
+        assert!(!legacy.contains("[persona]"));
+        let mut decoded: Config = toml::from_str(&legacy).unwrap();
+        assert!(decoded.persona.is_none());
+        decoded.persona = Some(crate::persona::PersonaConfig::suggested(
+            crate::persona::PersonaPreset::Trader,
+        ));
+        let encoded = toml::to_string(&decoded).unwrap();
+        let reloaded: Config = toml::from_str(&encoded).unwrap();
+        assert_eq!(reloaded.persona, decoded.persona);
+        assert!(reloaded.petals.setup_complete);
     }
 
     #[test]

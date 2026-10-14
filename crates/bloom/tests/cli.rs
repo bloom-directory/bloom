@@ -924,6 +924,7 @@ fn init_ignores_legacy_preinstalled_opt_out() {
         .env("NO_PROXY", "")
         .env("no_proxy", "")
         .arg("init")
+        .arg("--no-browser")
         .assert()
         .failure()
         .stdout(predicate::str::contains(
@@ -953,6 +954,7 @@ fn init_runs_setup_once_even_when_the_config_already_exists() {
             .env("NO_PROXY", "")
             .env("no_proxy", "")
             .arg("init")
+            .arg("--no-browser")
             .assert()
             // Setup is saved before Petal provisioning, which is offline here.
             .failure()
@@ -1003,6 +1005,7 @@ fn init_setup_on_an_existing_config_keeps_earlier_choices() {
         .env("NO_PROXY", "")
         .env("no_proxy", "")
         .arg("init")
+        .arg("--no-browser")
         .assert()
         // Setup is saved before Petal provisioning, which is offline here.
         .failure()
@@ -1692,6 +1695,7 @@ fn lifecycle_commands_ignore_invalid_client_endpoint_configuration() {
         .env("NO_PROXY", "")
         .env("no_proxy", "")
         .arg("init")
+        .arg("--no-browser")
         .assert()
         .failure()
         .stderr(predicate::str::contains(
@@ -1826,6 +1830,7 @@ fn init_refuses_when_home_write_lock_is_live() {
 
     bloom_cmd(home.path())
         .arg("init")
+        .arg("--no-browser")
         .assert()
         .failure()
         .stderr(
@@ -2993,6 +2998,7 @@ fn github_source_install_polymarket_dispatches_route_contract() {
 
     bloom_cmd(home.path())
         .arg("init")
+        .arg("--no-browser")
         .assert()
         .success()
         .stdout(predicate::str::contains("preinstalled_petals:"));

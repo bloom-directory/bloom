@@ -6,7 +6,9 @@
 
 #![forbid(unsafe_code)]
 
+mod persona_sessions;
 mod petal_eligibility;
+pub use persona_sessions::{PersonaSessionProposal, PersonaSessionStatus};
 mod projection;
 
 pub use petal_eligibility::{
@@ -84,6 +86,8 @@ pub struct SignOperationIdentity {
     pub claim_assurance_digest: Option<Digest32>,
     pub policy_version: DecimalU64,
     pub policy_digest: Digest32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_accounting_digest: Option<Digest32>,
 }
 
 impl SignOperationIdentity {
@@ -393,6 +397,8 @@ pub struct MachineBrokerClient {
     service: Arc<dyn MachineBrokerService>,
     local_identity: Option<LocalIdentity>,
     unix_service: Option<Arc<UnixMachineBrokerService>>,
+    persona_session_root: Option<Arc<PathBuf>>,
+    persona_session_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl MachineBrokerClient {
@@ -401,6 +407,8 @@ impl MachineBrokerClient {
             service,
             local_identity: None,
             unix_service: None,
+            persona_session_root: None,
+            persona_session_gate: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -418,6 +426,8 @@ impl MachineBrokerClient {
             service: unix_service.clone(),
             local_identity: Some(identity),
             unix_service: Some(unix_service),
+            persona_session_root: None,
+            persona_session_gate: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -678,6 +688,7 @@ impl MachineBrokerClient {
                 ),
             };
         let operation_digest = SignOperationIdentity {
+            session_accounting_digest: None,
             operation_id: operation_id.clone(),
             approval_id: approval_id.clone(),
             key_ref: key_ref.clone(),
@@ -691,6 +702,7 @@ impl MachineBrokerClient {
         }
         .digest()?;
         self.sign(MachineSignRequest {
+            session_use: None,
             operation_id,
             operation_digest,
             approval_id,
@@ -785,7 +797,6 @@ impl MachineBrokerClient {
         request: ExactPayloadSignRequest,
     ) -> Result<ExactPayloadSignOutcome, ProtocolError> {
         request.validate()?;
-        let wallet = self.wallet(request.wallet_id.clone()).await?;
         let payload_digest = Digest32::from_bytes(Sha256::digest(&request.preimage).into());
         let ordered_hash = suite_hash(request.crypto_suite, &request.preimage);
         if request.claimed_hash != ordered_hash {
@@ -878,6 +889,13 @@ impl MachineBrokerClient {
                 }
                 (Some(_), Some(_)) => unreachable!("mutual exclusion checked above"),
             };
+        if request.approval_id.is_none()
+            && let Some(key) = self.persona_recovery_key(&request.signing_operation_id)?
+            && let Some(result) = self.try_persona_sign(&request, &key).await?
+        {
+            return Ok(ExactPayloadSignOutcome::Signed(result));
+        }
+        let wallet = self.wallet(request.wallet_id.clone()).await?;
         let key_ref = self
             .verified_signing_key(
                 &wallet,
@@ -885,6 +903,11 @@ impl MachineBrokerClient {
                 request.account_key_ref.as_ref(),
             )
             .await?;
+        if request.approval_id.is_none()
+            && let Some(result) = self.try_persona_sign(&request, &key_ref).await?
+        {
+            return Ok(ExactPayloadSignOutcome::Signed(result));
+        }
         let activation_mode = request
             .activation_mode
             .clone()
@@ -892,6 +915,7 @@ impl MachineBrokerClient {
 
         if let Some(approval_id) = request.approval_id {
             let operation_digest = SignOperationIdentity {
+                session_accounting_digest: None,
                 operation_id: request.signing_operation_id.clone(),
                 approval_id: approval_id.clone(),
                 key_ref: key_ref.clone(),
@@ -906,6 +930,7 @@ impl MachineBrokerClient {
             .digest()?;
             return self
                 .sign(MachineSignRequest {
+                    session_use: None,
                     operation_id: request.signing_operation_id,
                     operation_digest,
                     approval_id,
@@ -927,6 +952,7 @@ impl MachineBrokerClient {
         }
 
         let terms = SealedApprovalTerms {
+            session_budget: None,
             subject: approval_subject(&request.provenance),
             wallet_id: request.wallet_id,
             key_ref,
@@ -958,6 +984,7 @@ impl MachineBrokerClient {
         };
         terms.validate()?;
         self.prepare_approval(ApprovalPrepareRequest {
+            surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             evm_review_payloads: if native_evm_review(&request.provenance) {
                 vec![Base64UrlBytes::from_bytes(&request.preimage)]
             } else {
@@ -987,7 +1014,6 @@ impl MachineBrokerClient {
         request: ExactPayloadBatchSignRequest,
     ) -> Result<ExactPayloadSignOutcome, ProtocolError> {
         request.validate()?;
-        let wallet = self.wallet(request.wallet_id.clone()).await?;
         let ordered_payload_digests = request
             .preimages
             .iter()
@@ -1048,6 +1074,13 @@ impl MachineBrokerClient {
                 (None, None)
             }
         };
+        if request.approval_id.is_none()
+            && let Some(key) = self.persona_recovery_key(&request.signing_operation_id)?
+            && let Some(result) = self.try_persona_sign_batch(&request, &key).await?
+        {
+            return Ok(ExactPayloadSignOutcome::Signed(result));
+        }
+        let wallet = self.wallet(request.wallet_id.clone()).await?;
         let key_ref = self
             .verified_signing_key(
                 &wallet,
@@ -1055,6 +1088,11 @@ impl MachineBrokerClient {
                 request.account_key_ref.as_ref(),
             )
             .await?;
+        if request.approval_id.is_none()
+            && let Some(result) = self.try_persona_sign_batch(&request, &key_ref).await?
+        {
+            return Ok(ExactPayloadSignOutcome::Signed(result));
+        }
         let activation_mode = request
             .activation_mode
             .clone()
@@ -1062,6 +1100,7 @@ impl MachineBrokerClient {
 
         if let Some(approval_id) = request.approval_id {
             let operation_digest = SignOperationIdentity {
+                session_accounting_digest: None,
                 operation_id: request.signing_operation_id.clone(),
                 approval_id: approval_id.clone(),
                 key_ref: key_ref.clone(),
@@ -1076,6 +1115,7 @@ impl MachineBrokerClient {
             .digest()?;
             return self
                 .sign_batch(MachineSignRequest {
+                    session_use: None,
                     operation_id: request.signing_operation_id,
                     operation_digest,
                     approval_id,
@@ -1107,6 +1147,7 @@ impl MachineBrokerClient {
             )
         })?;
         let terms = SealedApprovalTerms {
+            session_budget: None,
             subject: approval_subject(&request.provenance),
             wallet_id: request.wallet_id,
             key_ref,
@@ -1135,6 +1176,7 @@ impl MachineBrokerClient {
         };
         terms.validate()?;
         self.prepare_approval(ApprovalPrepareRequest {
+            surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             evm_review_payloads: if native_evm_review(&request.provenance) {
                 request
                     .preimages
@@ -1205,6 +1247,12 @@ impl MachineBrokerClient {
                 "reusable Petal batch claim does not match provenance or payloads",
             ));
         }
+        if request.approval_id.is_none()
+            && let Some(key) = self.persona_recovery_key(&request.signing_operation_id)?
+            && let Some(result) = self.try_persona_sign_batch(&request, &key).await?
+        {
+            return Ok(ExactPayloadSignOutcome::Signed(result));
+        }
         let wallet = self.wallet(request.wallet_id.clone()).await?;
         let key_ref = self
             .verified_signing_key(
@@ -1213,6 +1261,11 @@ impl MachineBrokerClient {
                 request.account_key_ref.as_ref(),
             )
             .await?;
+        if request.approval_id.is_none()
+            && let Some(result) = self.try_persona_sign_batch(&request, &key_ref).await?
+        {
+            return Ok(ExactPayloadSignOutcome::Signed(result));
+        }
         let activation_mode = request
             .activation_mode
             .clone()
@@ -1222,6 +1275,7 @@ impl MachineBrokerClient {
 
         if let Some(approval_id) = request.approval_id {
             let operation_digest = SignOperationIdentity {
+                session_accounting_digest: None,
                 operation_id: request.signing_operation_id.clone(),
                 approval_id: approval_id.clone(),
                 key_ref: key_ref.clone(),
@@ -1236,6 +1290,7 @@ impl MachineBrokerClient {
             .digest()?;
             return self
                 .sign_batch(MachineSignRequest {
+                    session_use: None,
                     operation_id: request.signing_operation_id,
                     operation_digest,
                     approval_id,
@@ -1268,6 +1323,7 @@ impl MachineBrokerClient {
         })?;
         let operation_class = claim.operation_class.clone();
         let terms = SealedApprovalTerms {
+            session_budget: None,
             subject: approval_subject(&request.provenance),
             wallet_id: request.wallet_id,
             key_ref,
@@ -1299,6 +1355,7 @@ impl MachineBrokerClient {
         };
         terms.validate()?;
         self.prepare_approval(ApprovalPrepareRequest {
+            surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             evm_review_payloads: Vec::new(),
             operation_id: request.approval_operation_id,
             terms,
@@ -1980,6 +2037,9 @@ pub struct TrustedPetalSignRequest {
 
 #[derive(Clone, Debug)]
 pub struct ExactPayloadSignRequest {
+    /// Semantic projection of a typed native session action. Broker verifies
+    /// it against the complete payload; opaque or unsupported actions omit it.
+    pub session_use: Option<bloom_broker_api::SystemSessionUse>,
     pub wallet_id: Token,
     pub preimage: Vec<u8>,
     pub claimed_hash: Digest32,
@@ -3551,6 +3611,7 @@ mod tests {
                     }
                     MachineBrokerRequest::SealedApprovalLimitState(request) => Ok(
                         MachineBrokerResponse::SealedApprovalLimitState(ApprovalLimitState {
+                            session_budget_state: None,
                             approval_id: request.id,
                             committed_operations: DecimalU64::new(1),
                             reserved_operations: DecimalU64::new(2),
@@ -3860,6 +3921,7 @@ mod tests {
             assert!(exact_sign_request.claim_assurance_evidence.is_none());
             assert_ne!(exact_sign_request.operation_id, reusable_operation_id);
             let expected_exact_digest = SignOperationIdentity {
+                session_accounting_digest: None,
                 operation_id: exact_sign_request.operation_id.clone(),
                 approval_id: digest(50),
                 key_ref: delegated_key_ref.clone(),
@@ -3910,6 +3972,7 @@ mod tests {
 
     fn exact_request(payload: Vec<u8>, approval_id: Option<Digest32>) -> ExactPayloadSignRequest {
         ExactPayloadSignRequest {
+            session_use: None,
             wallet_id: token("wallet"),
             claimed_hash: Digest32::from_bytes(Keccak256::digest(&payload).into()),
             preimage: payload,
@@ -4251,7 +4314,7 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.code, ProtocolErrorCode::SelectorMismatch);
-        assert_eq!(broker.requests.lock().unwrap().len(), 1);
+        assert!(broker.requests.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -4277,7 +4340,7 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.code, ProtocolErrorCode::SelectorMismatch);
-        assert_eq!(broker.requests.lock().unwrap().len(), 1);
+        assert!(broker.requests.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -4579,6 +4642,7 @@ mod tests {
         let client = MachineBrokerClient::new(broker);
 
         let approval = ApprovalPrepareRequest {
+            surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             evm_review_payloads: Vec::new(),
             operation_id: OperationId::from_bytes([94; 32]),
             terms: approval_terms("wallet", None),
@@ -4623,6 +4687,7 @@ mod tests {
         );
 
         let custody = CustodyPrepareRequest {
+            surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             ceremony_kind: CeremonyKind::WalletImport,
             custody_operation_id: OperationId::from_bytes([97; 32]),
             wallet_id: None,
@@ -4652,6 +4717,7 @@ mod tests {
 
     fn approval_terms(wallet: &str, renewal_of: Option<Digest32>) -> SealedApprovalTerms {
         SealedApprovalTerms {
+            session_budget: None,
             subject: ApprovalSubject::Cli {
                 client_id: token("bloom-cli"),
                 command_class: token("test.approval"),
@@ -5396,6 +5462,7 @@ mod tests {
         Arc::get_mut(&mut broker).unwrap().corrupt_response = true;
         let client = MachineBrokerClient::new(broker);
         let request = CustodyPrepareRequest {
+            surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             ceremony_kind: CeremonyKind::AccountAllocate,
             custody_operation_id: OperationId::from_bytes([77; 32]),
             wallet_id: Some(token("wallet")),

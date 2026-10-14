@@ -9,9 +9,9 @@
 #    `bloom wallet default-policy main` reports it applied.
 # 4. Verify the Polymarket settings chosen during setup were applied to main's
 #    account 0 once the wallet existed. The triad starts with the pending
-#    marker `bloom init` leaves when its settings write is refused because the
-#    account does not exist yet (the marker is seeded here rather than produced
-#    by `bloom init`, which cannot run against a live triad). The settings must
+#    frozen settings journal `bloom init` records before provisioning. This
+#    fixture seeds that journal; it does not test a real init crash (init cannot
+#    run against a live triad). The settings must
 #    be absent before the wallet exists, present afterwards with the setup
 #    value rather than the catalog default, and the marker must be cleared.
 #
@@ -59,10 +59,43 @@ new_out="$run_root/wallet-new.out"
 launcher_pid=""
 new_pid=""
 mkdir -p "$machine_home" "$log_dir" "$(dirname "$machine_socket")"
-# What `bloom init` records when the setup settings write is refused because
-# the wallet's account does not exist yet.
+# Seed the exact versioned obligation for the setup config below, using the
+# adopted source catalog pin rather than trusting a local installed package.
 mkdir -p "$machine_home/pending-petal-settings"
-: > "$machine_home/pending-petal-settings/polymarket"
+pm_catalog_hash="$(python3 - "$repo_root/crates/bloom/src/github_source.rs" \
+  "$machine_home/pending-petal-settings/polymarket" <<'PY_SETTINGS_OBLIGATION'
+import hashlib
+import json
+import pathlib
+import re
+import sys
+
+source = pathlib.Path(sys.argv[1]).read_text()
+entry = re.search(r'const PREINSTALLED_POLYMARKET: PreinstalledPetal = PreinstalledPetal \{(.*?)\n\};', source, re.S)
+if entry is None:
+    raise SystemExit("Polymarket source catalog entry missing")
+pin = re.search(r'expected_hash: Some\("([0-9a-f]{64})"\)', entry.group(1))
+if pin is None:
+    raise SystemExit("Polymarket source catalog package hash missing")
+package_hash = pin.group(1)
+body = b'enabled = true\nmax_daily_usd = "73"\n'
+# Matches serde_json::to_vec(&Some(PetalSetupConfig { values: ... })).
+revision = json.dumps({"values": {"max_daily_usd": "73"}}, separators=(",", ":")).encode()
+obligation = {
+    "schema_version": 1,
+    "wallet": "main",
+    "account": 0,
+    "package_hash": package_hash,
+    "path": "/petals/polymarket/settings/main/0/venue.toml",
+    "body": list(body),
+    "settings_digest": hashlib.sha256(body).hexdigest(),
+    "config_revision": hashlib.sha256(revision).hexdigest(),
+}
+with pathlib.Path(sys.argv[2]).open("x") as journal:
+    json.dump(obligation, journal, separators=(",", ":"))
+print(package_hash)
+PY_SETTINGS_OBLIGATION
+)"
 
 cleanup() {
   status=$?
@@ -144,6 +177,8 @@ grep -q '^\[petals.setup.polymarket.values\]' "$machine_home/config.toml" ||
 owner_hash() { jq -er '.hash' "$machine_home/petals/store/owners/$1.json"; }
 hl_hash="$(owner_hash hyperliquid)" || die "hyperliquid is not installed"
 pm_hash="$(owner_hash polymarket)" || die "polymarket is not installed"
+[ "$pm_hash" = "$pm_catalog_hash" ] ||
+  die "local Polymarket package $pm_hash must match the adopted source catalog pin $pm_catalog_hash; rebuild/adopt the release before this check"
 say "installed hyperliquid ${hl_hash:0:12}, polymarket ${pm_hash:0:12}"
 
 settings_path="/petals/polymarket/settings/$WALLET/0/venue.toml"

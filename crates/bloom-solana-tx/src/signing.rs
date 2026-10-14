@@ -194,6 +194,9 @@ impl SolanaTransferSigner {
             },
         };
         let request = ExactPayloadSignRequest {
+            // Solana's live genesis/freshness cannot be established solely
+            // from these bytes; keep this path under exact owner review.
+            session_use: None,
             wallet_id: Token::new(wallet_id).map_err(|e| e.to_string())?,
             preimage,
             claimed_hash,

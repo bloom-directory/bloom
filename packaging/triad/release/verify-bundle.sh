@@ -36,7 +36,9 @@ for required in \
   installer/release/install-linux.sh \
   installer/linux/bin/bloom-uninstall \
   installer/linux/systemd-user/bloom-machine.service \
+  installer/linux/systemd-user/bloom-onboarding.service \
   installer/macos/launchagents/com.bloom.machine.plist.in \
+  installer/macos/launchagents/com.bloom.onboarding.plist.in \
   installer/release/install-macos.sh \
   installer/release/macos-conformance-subject.sh \
   installer/release/sign-macos-conformance-report.sh \
@@ -78,11 +80,11 @@ require_compat_value() {
   }
 }
 require_compat_value protocols.machine_broker major 1
-require_compat_value protocols.machine_broker minor_min 6
-require_compat_value protocols.machine_broker minor_max 6
+require_compat_value protocols.machine_broker minor_min 8
+require_compat_value protocols.machine_broker minor_max 8
 require_compat_value protocols.broker_signer major 1
-require_compat_value protocols.broker_signer minor_min 5
-require_compat_value protocols.broker_signer minor_max 5
+require_compat_value protocols.broker_signer minor_min 7
+require_compat_value protocols.broker_signer minor_max 7
 for support_edge in signer_control session; do
   require_compat_value "protocols.$support_edge" major 1
   require_compat_value "protocols.$support_edge" minor_min 0
@@ -112,7 +114,7 @@ signer_revision="$(source_revision BLOOM_SIGNER_SHA)"
   echo "bundle compatibility revision does not match SOURCE_REVISIONS" >&2
   exit 65
 }
-require_compat_value revisions service_runtime_commit '"5db670e1b7507deabfdcf451be8b5d315c1c9d91"'
+require_compat_value revisions service_runtime_commit '"ad0072512bb97fb4eb68d249ce785ea3ea4a49ab"'
 require_compat_value revisions petal_contract_commit '"73c5b06a77599368fbc79fb7947a629b5b4c630e"'
 for state_owner in machine signer; do
   require_compat_value "state.$state_owner" current 1

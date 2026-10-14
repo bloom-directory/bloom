@@ -13,6 +13,7 @@ pub struct PrivateStore {
     account_digest: Option<String>,
     shared_keys: BTreeSet<String>,
     shared_root: Option<PathBuf>,
+    initialize_only: bool,
 }
 
 impl PrivateStore {
@@ -24,6 +25,7 @@ impl PrivateStore {
             account_digest: None,
             shared_keys: BTreeSet::new(),
             shared_root: None,
+            initialize_only: false,
         })
     }
 
@@ -39,6 +41,11 @@ impl PrivateStore {
 
     pub fn with_shared_keys(mut self, keys: impl IntoIterator<Item = String>) -> Self {
         self.shared_keys = keys.into_iter().collect();
+        self
+    }
+
+    pub fn with_initialize_only(mut self, enabled: bool) -> Self {
+        self.initialize_only = enabled;
         self
     }
 
@@ -70,6 +77,16 @@ impl PrivateStore {
         value: &[u8],
         secret: bool,
     ) -> Result<(), HostError> {
+        if self.initialize_only {
+            return self
+                .put_new(petal_hash, key, value, secret)
+                .map_err(|error| match error {
+                    HostError::Denied(message) if message == "store key already exists" => {
+                        HostError::Invalid("setup settings already exist".into())
+                    }
+                    other => other,
+                });
+        }
         let path = self.key_path(petal_hash, key)?;
         let dir = path
             .parent()
@@ -125,6 +142,11 @@ impl PrivateStore {
     }
 
     pub fn del(&self, petal_hash: &str, key: &str) -> Result<(), HostError> {
+        if self.initialize_only {
+            return Err(HostError::Denied(
+                "setup initialization cannot delete owner settings".into(),
+            ));
+        }
         let path = self.key_path(petal_hash, key)?;
         let _guard = store_op_guard()?;
         match std::fs::remove_file(&path) {
@@ -140,6 +162,11 @@ impl PrivateStore {
         key: &str,
         expected: &[u8],
     ) -> Result<(), HostError> {
+        if self.initialize_only {
+            return Err(HostError::Denied(
+                "setup initialization cannot delete owner settings".into(),
+            ));
+        }
         let path = self.key_path(petal_hash, key)?;
         let _guard = store_op_guard()?;
         let current = match std::fs::read(&path) {
@@ -355,7 +382,34 @@ fn atomic_write(path: &Path, data: &[u8], secret: bool) -> std::io::Result<()> {
 }
 
 fn create_new_file(path: &Path, data: &[u8], secret: bool) -> std::io::Result<()> {
-    write_file_with_mode(path, data, secret, true)
+    use std::io::Write as _;
+    let dir = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("path has no parent"))?;
+    // The final name is published only after all bytes are durable. A hard
+    // link is an atomic no-clobber publication even against another writer.
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".bloom-create-")
+        .tempfile_in(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        temporary
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(if secret {
+                0o600
+            } else {
+                0o644
+            }))?;
+    }
+    #[cfg(not(unix))]
+    let _ = secret;
+    temporary.write_all(data)?;
+    temporary.flush()?;
+    temporary.as_file().sync_all()?;
+    std::fs::hard_link(temporary.path(), path)?;
+    temporary.close()?;
+    std::fs::File::open(dir)?.sync_all()
 }
 
 #[cfg(unix)]
@@ -409,6 +463,50 @@ mod tests {
     use tempfile::TempDir;
 
     const HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn setup_initialization_preserves_owner_edits_and_is_atomic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let owner = PrivateStore::open_account(tmp.path(), "main", 0).unwrap();
+        owner
+            .put(HASH, "state/venue", b"owner limit", false)
+            .unwrap();
+        let setup = owner.clone().with_initialize_only(true);
+        let error = setup
+            .put(HASH, "state/venue", b"setup limit", false)
+            .unwrap_err();
+        assert!(error.to_string().contains("setup settings already exist"));
+        assert_eq!(owner.get(HASH, "state/venue").unwrap(), b"owner limit");
+        assert!(setup.del(HASH, "state/venue").is_err());
+        assert!(
+            setup
+                .del_if_value(HASH, "state/venue", b"owner limit")
+                .is_err()
+        );
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let threads: Vec<_> = [b"first".as_slice(), b"second".as_slice()]
+            .into_iter()
+            .map(|value| {
+                let setup = setup.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    setup.put(HASH, "state/new-venue", value, false).is_ok()
+                })
+            })
+            .collect();
+        let wins = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .filter(|won| *won)
+            .count();
+        assert_eq!(wins, 1);
+        // Ordinary owner writes retain their existing editing behavior.
+        owner
+            .put(HASH, "state/new-venue", b"edited", false)
+            .unwrap();
+        assert_eq!(owner.get(HASH, "state/new-venue").unwrap(), b"edited");
+    }
 
     #[test]
     fn declared_shared_keys_use_global_store_without_account_fallback() {

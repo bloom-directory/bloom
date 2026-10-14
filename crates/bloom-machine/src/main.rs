@@ -772,6 +772,8 @@ mod tests {
 
     fn completed_receipt(operation_id: OperationId) -> CustodyResult {
         CustodyResult {
+            surface: None,
+            credential_authority_generation: None,
             ceremony_kind: CeremonyKind::PolicyUpdate,
             custody_operation_id: operation_id,
             public_status: CeremonyState::Succeeded,
