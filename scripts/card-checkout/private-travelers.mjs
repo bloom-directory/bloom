@@ -97,13 +97,12 @@ try {
   assert.equal(facts.total_minor, 399); assert.equal(facts.currency, 'USD');
   console.log('Financial facts verified');
   const payment = id();
-  const paymentViewPromise = context.waitForEvent('page', {timeout: 30000});
   await vfs('write', `/checkout/requests/${payment}/in.json`, {card_id: 'fixture-card', continue_private: fill, agent_description: 'Synthetic fare USD 3.99'});
   await approve((await vfs('cat', `/checkout/requests/${payment}/status.json`)).ceremony_url, {'card-cvc': '937'});
-  const paymentView = await paymentViewPromise;
   await poll(`/checkout/requests/${payment}/status.json`, 'paid');
   assert.equal(submitted, 1);
-  await paymentView.close(); await view.close();
+  // The ceremony may reuse the named private-view window from traveler fill.
+  for (const privatePage of context.pages().filter(candidate => candidate !== page)) await privatePage.close();
   const publicResults = JSON.stringify(transcript);
   for (const secret of ['SyntheticSelf', 'SyntheticWife', 'FixtureFamily', 'wife@example.com', '1992-02-29', '4242424242424242']) assert(!publicResults.includes(secret));
   writeFileSync(output, JSON.stringify({result: 'passed', private_passengers_saved: passengers.length, real_broker_js: true, same_passkey_card: true, autofill_then_separate_payment: true, public_nondisclosure: true, submitted}, null, 2));
