@@ -227,6 +227,36 @@ mod tests {
         server.abort();
     }
     #[tokio::test]
+    async fn fields_captioned_by_nearby_text_are_found() {
+        // Shaped like JetSMART: captions are plain divs beside unlabeled inputs.
+        let (browser, server, _) = browser_at(
+            "<div class='row'><div><div>Nombres</div><input></div><div><div>Apellidos</div><input></div>
+             <div><div>Número AAdvantage® (Opcional)</div><input></div></div>",
+        )
+        .await;
+        let tab = browser.handoff().await.unwrap();
+        let fields = [TravelerField::GivenName, TravelerField::FamilyName];
+        let discovery = TravelerDiscovery::read(&tab, &fields).await.unwrap();
+        assert_eq!(discovery.scope.fields.len(), 2);
+        let values = [
+            ("given_name".into(), Zeroizing::new("SyntheticName".into())),
+            ("family_name".into(), Zeroizing::new("Fixture".into())),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(discovery.fill(&tab, &values).await.unwrap().len(), 2);
+        let filled = tab
+            .cdp
+            .evaluate(
+                &tab.session,
+                "[...document.querySelectorAll('input')].map(e=>e.value)".into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(filled, json!(["SyntheticName", "Fixture", ""]));
+        server.abort();
+    }
+    #[tokio::test]
     async fn duplicate_people_and_stale_document_bindings_fail_before_reuse() {
         let (browser,server,_)=browser_at("<input autocomplete='given-name'><input autocomplete='family-name'><input autocomplete='given-name'><input autocomplete='family-name'>").await;
         let tab = browser.handoff().await.unwrap();

@@ -6,7 +6,15 @@
     if (!e.getClientRects().length || getComputedStyle(e).visibility !== 'visible' || e.disabled
         || e.readOnly || e.type === 'hidden' || e.type === 'password') continue;
     const ac = (e.autocomplete || '').split(' ').at(-1);
-    const label = normalize([e.getAttribute('aria-label'),e.labels?.[0]?.innerText,e.placeholder,e.name,e.id].filter(Boolean).join(' '));
+    // Some sites caption a field with plain text beside it rather than a
+    // <label>: use the text of the smallest wrapper holding only this field.
+    let caption = '';
+    for (let a = e.parentElement, depth = 0; a && depth < 4; a = a.parentElement, depth++) {
+      if (a.querySelectorAll('input,select,textarea').length > 1) break;
+      const text = (a.innerText || '').trim();
+      if (text) { if (text.length <= 60) caption = text; break; }
+    }
+    const label = normalize([e.getAttribute('aria-label'),e.labels?.[0]?.innerText,e.placeholder,e.name,e.id,caption].filter(Boolean).join(' '));
     if (ac?.startsWith('cc-') || /card|tarjeta|cvc|security code|password|contrasena/.test(label)) continue;
     if (/full.?name|nombre completo|nombre.*apellido/.test(label)) continue;
     let field, part;
