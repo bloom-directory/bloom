@@ -2513,6 +2513,7 @@ if [ "$2" = status ]; then
   printf '{}\n'
   exit 0
 fi
+sleep "$ADMIN_TEST_DELAY_SECONDS"
 exit "$ADMIN_TEST_EXIT"
 "#,
         )
@@ -2550,6 +2551,14 @@ field() {{
                 .arg(directory.path())
                 .env("ADMIN_TEST_LOG", &log)
                 .env("ADMIN_TEST_EXIT", exit_code)
+                .env(
+                    "ADMIN_TEST_DELAY_SECONDS",
+                    if installer == "install-macos.sh" && exit_code != "0" {
+                        "1"
+                    } else {
+                        "0"
+                    },
+                )
                 .env("BLOOM_RELAY_PROVISION_TIMEOUT_SECONDS", "0")
                 .env("BLOOM_RELAY_PROVISION_POLL_SECONDS", "0")
                 .env("ADMIN_DESIRED", "remote_enabled")
