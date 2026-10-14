@@ -32,6 +32,14 @@ const cert=spawnSync('openssl',['req','-x509','-newkey','rsa:2048','-nodes','-ke
 let submits=0;
 const server=https.createServer({key:readFileSync(join(root,'key.pem')),cert:readFileSync(join(root,'cert.pem'))},(request,response)=>{
   response.setHeader('content-type','text/html');
+  if(new URL(request.url,'https://localhost').pathname==='/traveler'){
+    response.end(`<h1 id="ready">Traveler fields incomplete</h1>
+      <input aria-label="Given name" id="given"><input aria-label="Family name" id="family">
+      <input aria-label="Birth date" id="born"><input aria-label="Email" id="email">
+      <script>document.addEventListener('input',()=>{
+        if(given.value==='Ada'&&family.value==='Fixture'&&born.value==='1992-02-29'&&email.value==='fixture@example.com')ready.textContent='Traveler fields ready';
+      });</script>`);return;
+  }
   if(new URL(request.url,'https://localhost').pathname==='/manual'){response.end('<h1>Manual fixture</h1><p>Total is unavailable</p><button>Continue</button>');return;}
   if(new URL(request.url,'https://localhost').pathname==='/recover'){
     response.end('<h1>Recoverable fixture</h1><p data-bloom-total-minor="399" data-bloom-currency="USD">Total USD 3.99</p><form action="/done"><input autocomplete="cc-number"><input autocomplete="cc-exp"><input autocomplete="cc-csc"><input aria-label="Billing postal code" required><button type="submit">Pay</button></form>');return;
@@ -76,6 +84,16 @@ async function returnedToShopping() {
   throw new Error('Private pages did not close before shopping returned');
 }
 try {
+  // Ordinary traveler storage and form filling need no takeover/passkey.
+  const travelerProfile={email:'fixture@example.com',travelers:[{id:'self',given_name:'Ada',family_name:'Fixture',born_on:'1992-02-29',nationality:'CA'}]};
+  await vfs('write','/checkout/profile.json',travelerProfile);
+  const savedProfile=await vfs('cat','/checkout/profile.json');assert.deepEqual(savedProfile,travelerProfile);
+  await browse({action:'open',url:merchant+'traveler'});await new Promise(r=>setTimeout(r,400));
+  for(const [label,text] of [['Given name',savedProfile.travelers[0].given_name],['Family name',savedProfile.travelers[0].family_name],['Birth date',savedProfile.travelers[0].born_on],['Email',savedProfile.email]]){
+    const snapshot=await browse({action:'snapshot'});const field=snapshot.elements.find(e=>e.label===label);assert(field);
+    await browse({action:'type',element_ref:field.ref,text});
+  }
+  assert.match((await browse({action:'snapshot'})).text,/Traveler fields ready/);
   const ceremoniesStartedAt=Date.now();
   const add=id();await vfs('write','/cards/add.json',{operation_id:add,card_id:'stack-card',label:'Full-stack fixture'});
   await approve((await vfs('cat',`/cards/operations/${add}/ceremony.json`)).ceremony_url,'add');
