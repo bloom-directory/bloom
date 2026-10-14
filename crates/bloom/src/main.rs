@@ -2470,6 +2470,16 @@ enum InitInternal {
         release_digest: String,
     },
     #[cfg(feature = "triad-dev-harness")]
+    #[command(name = "triad-install-developer-relay-trust", hide = true)]
+    InstallDeveloperRelayTrust {
+        control_ca: PathBuf,
+        receipt_keys: PathBuf,
+        config_dir: PathBuf,
+        /// Pins earlier signed releases installed; packaged pins only.
+        #[arg(long)]
+        superseded: Option<PathBuf>,
+    },
+    #[cfg(feature = "triad-dev-harness")]
     #[command(name = "triad-refresh-developer-provenance-catalog", hide = true)]
     RefreshDeveloperProvenanceCatalog {
         template: PathBuf,
@@ -3597,6 +3607,19 @@ async fn run(cli: Cli) -> Result<()> {
                         triad_enrollment::run_developer(&template_dir, &output_dir, release_digest)
                             .context("Bloom developer triad enrollment generation failed")
                     }
+                    #[cfg(feature = "triad-dev-harness")]
+                    InitInternal::InstallDeveloperRelayTrust {
+                        control_ca,
+                        receipt_keys,
+                        config_dir,
+                        superseded,
+                    } => triad_relay_setup::run_developer(
+                        &control_ca,
+                        &receipt_keys,
+                        superseded.as_deref(),
+                        &config_dir,
+                    )
+                    .context("Bloom developer relay trust adoption failed"),
                     #[cfg(feature = "triad-dev-harness")]
                     InitInternal::RefreshDeveloperProvenanceCatalog {
                         template,
