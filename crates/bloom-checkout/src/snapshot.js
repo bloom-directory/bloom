@@ -1,7 +1,7 @@
 (() => {
   const visible = e => e.getClientRects().length && getComputedStyle(e).visibility === 'visible';
-  const nodes = [...document.querySelectorAll('a[href],button,input,textarea,select,[role="button"],[role="option"]')]
-    .filter(e => visible(e) && !e.disabled && e.type !== 'hidden').slice(0, 300);
+  const nodes = [...document.querySelectorAll('a[href],button,input,textarea,select,[role="button"],[role="option"],[role="gridcell"]')]
+    .filter(e => visible(e) && !e.disabled && e.getAttribute('aria-disabled') !== 'true' && e.type !== 'hidden').slice(0, 300);
   globalThis.__bloomRefs = nodes;
   const elements = nodes.map(e => ({
     role: e.tagName.toLowerCase(),

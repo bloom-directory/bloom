@@ -221,7 +221,7 @@ impl Browser {
         let world = binding.world;
         let expression = format!(
             r#"(()=>{{const e=globalThis.__bloomRefs?.[{index}];
-            if(!e||!e.isConnected||e.disabled||!e.getClientRects().length)throw Error('stale');
+            if(!e||!e.isConnected||e.disabled||e.getAttribute('aria-disabled')==='true'||!e.getClientRects().length)throw Error('stale');
             const kind={kind},value={value};
             const label=(e.innerText||e.value||e.getAttribute('aria-label')||'').replace(/\s+/g,' ').trim();
             if(kind==='click' && /^(pay|place( your)? order|complete (purchase|booking)|confirm (and|&) pay|submit payment|buy now|request (uber|ride)|pagar|comprar ahora|finalizar (compra|pedido|reserva)|confirmar (compra|pedido|reserva)|confirmar y pagar|completar reserva|realizar (el )?pedido|jetzt (kaufen|bezahlen)|(zahlungspflichtig|kostenpflichtig) (bestellen|buchen)|buchung abschließen|payer|acheter maintenant|(valider|finaliser|confirmer) (la |ma )?(commande|réservation)|confirmer et payer|paga ora|compra ora|conferma (l'ordine|ordine|acquisto|e paga)|nu betalen|bestelling plaatsen|zapłać)(?![\p{{L}}\p{{N}}])/iu.test(label))throw Error('payment requires approval');
@@ -625,6 +625,8 @@ mod tests {
                 .route("/", get(|| async { Html(r#"<!doctype html>
                   <input aria-label="Origin" onkeyup="document.getElementById('suggestion').hidden=this.value!=='Cordoba'">
                   <div id="suggestion" role="option" hidden onclick="window.open('/flight')">Córdoba COR</div>
+                  <div role="gridcell" aria-label="Sun Oct 25 2026" onclick="this.innerText='Date selected'">25</div>
+                  <div role="gridcell" aria-disabled="true">Unavailable date</div>
                   <input aria-label="Private card" autocomplete="cc-number">
                   <button>Pay</button>"#) }))
                 .route("/flight", get(|| async { Html("<h1>Flight AR1554</h1>") })))
@@ -645,6 +647,21 @@ mod tests {
                 .to_owned()
         };
         assert!(!before.to_string().contains("Córdoba COR"));
+        assert!(
+            !before["elements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["label"] == "Unavailable date")
+        );
+        browser
+            .browse(BrowseRequest::Click {
+                element_ref: reference(&before, "Sun Oct 25 2026"),
+            })
+            .await
+            .unwrap();
+        let before = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+        assert!(before["text"].as_str().unwrap().contains("Date selected"));
         browser
             .browse(BrowseRequest::Type {
                 element_ref: reference(&before, "Origin"),
