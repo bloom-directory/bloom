@@ -324,6 +324,9 @@ pub struct WalletsHandler {
     passkey_names_path: Option<std::path::PathBuf>,
     /// Serializes nickname read-modify-write across handler clones.
     passkey_names_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes passkey enrollment prepare and cancel across handler
+    /// clones, so concurrent writes to `passkeys/new` start one enrollment.
+    passkey_enrollment_lock: Arc<tokio::sync::Mutex<()>>,
     /// Solana transfer engines keyed by chain name, dispatching the same
     /// `chains/<chain>/outbox/...` route family as EVM for Solana chains.
     solana: Option<
@@ -360,6 +363,7 @@ impl WalletsHandler {
             recovery_prepare_lock: Arc::new(tokio::sync::Mutex::new(())),
             passkey_names_path: None,
             passkey_names_lock: Arc::new(tokio::sync::Mutex::new(())),
+            passkey_enrollment_lock: Arc::new(tokio::sync::Mutex::new(())),
             solana: None,
             solana_reads: None,
             account_petals: Arc::new(parking_lot::RwLock::new(None)),
@@ -11406,6 +11410,9 @@ value = "0""#,
                             ))
                         }
                         MachineBrokerRequest::CredentialCrossSurfacePrepare(request) => {
+                            // A real Broker call suspends, letting concurrent
+                            // writers interleave as they would in production.
+                            tokio::task::yield_now().await;
                             let fault = self.prepare_fault.lock().unwrap().take();
                             if fault == Some(false) {
                                 return Err(ProtocolError::new(
@@ -11576,6 +11583,72 @@ value = "0""#,
             let operations = prepared_operations(&broker);
             assert_eq!(operations.len(), 2);
             assert_ne!(operations[0], operations[1]);
+        }
+
+        fn healthy_passkey_broker() -> Arc<PasskeyBroker> {
+            Arc::new(PasskeyBroker {
+                requests: Mutex::new(Vec::new()),
+                state: Mutex::new(CeremonyState::AwaitingUser),
+                url_spent: Mutex::new(false),
+                refuse: Mutex::new(false),
+                accepted: Mutex::new(Default::default()),
+                prepare_fault: Mutex::new(None),
+            })
+        }
+
+        async fn latest_operation(handler: &WalletsHandler) -> String {
+            handler
+                .lookup(&path("/alice/passkeys/latest"))
+                .await
+                .unwrap()
+                .link_target
+                .unwrap()
+                .strip_prefix("enrollments/")
+                .unwrap()
+                .to_owned()
+        }
+
+        #[tokio::test]
+        async fn latest_follows_the_enrollment_a_write_reused() {
+            let (_tmp, handler) = passkey_handler(vec![credential(1, None, LAPTOP_MS)]);
+            let broker = healthy_passkey_broker();
+            let handler = handler.with_broker(Some(MachineBrokerClient::new(broker.clone())));
+            handler
+                .write(&path("/alice/passkeys/new"), b"local")
+                .await
+                .unwrap();
+            let local = latest_operation(&handler).await;
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            handler
+                .write(&path("/alice/passkeys/new"), b"remote")
+                .await
+                .unwrap();
+            let remote = latest_operation(&handler).await;
+            assert_ne!(local, remote);
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            // Asking for local again reuses the older local enrollment, and
+            // `latest` now names it rather than the newer remote one.
+            handler
+                .write(&path("/alice/passkeys/new"), b"local")
+                .await
+                .unwrap();
+            assert_eq!(prepared_operations(&broker).len(), 2);
+            assert_eq!(latest_operation(&handler).await, local);
+        }
+
+        #[tokio::test]
+        async fn concurrent_writes_to_new_start_one_enrollment() {
+            let (_tmp, handler) = passkey_handler(vec![credential(1, None, LAPTOP_MS)]);
+            let broker = healthy_passkey_broker();
+            let handler = handler.with_broker(Some(MachineBrokerClient::new(broker.clone())));
+            let new = path("/alice/passkeys/new");
+            let (first, second) = tokio::join!(
+                handler.write(&new, b"remote"),
+                handler.write(&new, b"remote"),
+            );
+            first.unwrap();
+            second.unwrap();
+            assert_eq!(prepared_operations(&broker).len(), 1);
         }
 
         #[tokio::test]

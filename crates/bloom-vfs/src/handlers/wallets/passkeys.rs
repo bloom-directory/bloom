@@ -51,6 +51,10 @@ pub(super) struct PasskeyEnrollmentProjection {
     /// Cleared once Broker reports the operation.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pending_prepare: bool,
+    /// When a write to `new` last created or reused this enrollment; `latest`
+    /// follows it, so a reused older enrollment is the one reported.
+    #[serde(default)]
+    selected_at_ms: u64,
 }
 
 #[derive(Debug, Default, serde::Deserialize, serde::Serialize)]
@@ -305,11 +309,12 @@ impl WalletsHandler {
             .ok_or_else(|| HandlerError::not_found(format!("passkey enrollment {operation}")))
     }
 
+    /// The enrollment the most recent write to `new` created or reused.
     fn latest_enrollment(&self, wallet: &str) -> Result<Option<String>, HandlerError> {
         Ok(self
             .enrollment_records(wallet)?
             .into_iter()
-            .next()
+            .max_by_key(|(_, record)| record.selected_at_ms.max(record.created_at_ms))
             .map(|(_, record)| record.operation_id.as_str().to_owned()))
     }
 
@@ -390,15 +395,16 @@ impl WalletsHandler {
                 ));
             }
         };
+        let _guard = self.passkey_enrollment_lock.lock().await;
         // A shell retry or a replayed NFS write must not start a second
         // enrollment while one to the same surface is still usable, and a
         // pending one (prepare response never seen) is resumed with its ID.
         let mut pending = None;
-        for (_, record) in self.enrollment_records(wallet)? {
+        for (path, record) in self.enrollment_records(wallet)? {
             if terminal(record.ceremony_state) {
                 continue;
             }
-            let refreshed = self
+            let mut refreshed = self
                 .enrollment_projection(wallet, record.operation_id.as_str())
                 .await?;
             if refreshed.pending_prepare {
@@ -407,7 +413,8 @@ impl WalletsHandler {
                 || refreshed.destination == destination)
                 && refreshed.ceremony_state == CeremonyState::AwaitingUser
             {
-                return Ok(());
+                refreshed.selected_at_ms = now_ms_u64();
+                return write_atomic_json(&path, &refreshed);
             }
         }
         let path_for = |operation_id: &OperationId| {
@@ -421,6 +428,7 @@ impl WalletsHandler {
         let mut record = match pending {
             Some(mut record) => {
                 record.destination = destination;
+                record.selected_at_ms = now_ms_u64();
                 record
             }
             None => {
@@ -436,6 +444,7 @@ impl WalletsHandler {
                     ceremony_expires_at_ms: None,
                     created_at_ms: now_ms_u64(),
                     pending_prepare: true,
+                    selected_at_ms: now_ms_u64(),
                 }
             }
         };
@@ -485,6 +494,7 @@ impl WalletsHandler {
         wallet: &str,
         operation: &str,
     ) -> Result<(), HandlerError> {
+        let _guard = self.passkey_enrollment_lock.lock().await;
         let record = self.enrollment_projection(wallet, operation).await?;
         if record.ceremony_state != CeremonyState::AwaitingUser {
             return Err(HandlerError::invalid(
