@@ -1,6 +1,6 @@
 (() => {
   const visible = e => e.getClientRects().length && getComputedStyle(e).visibility === 'visible';
-  const nodes = [...document.querySelectorAll('a[href],button,input,textarea,select,[role="button"],[role="option"],[role="gridcell"]')]
+  const nodes = [...document.querySelectorAll('a[href],button,input,textarea,select,[role="button"],[role="option"],[role="gridcell"],[onclick],[ng-click],[data-ng-click]')]
     .filter(e => visible(e) && !e.disabled && e.getAttribute('aria-disabled') !== 'true' && e.type !== 'hidden').slice(0, 300);
   globalThis.__bloomRefs = nodes;
   const elements = nodes.map(e => ({

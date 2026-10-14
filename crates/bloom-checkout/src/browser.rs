@@ -697,6 +697,10 @@ mod tests {
                   <div id="suggestion" role="option" hidden onclick="setTimeout(()=>window.open('/flight'),100)">Córdoba COR</div>
                   <div role="gridcell" aria-label="Sun Oct 25 2026" onclick="this.innerText='Date selected'">25</div>
                   <div role="gridcell" aria-disabled="true">Unavailable date</div>
+                  <div ng-click="selectFlight()" onclick="this.innerText='Flight selected'">Select itinerary</div>
+                  <div data-ng-click="disabled()" aria-disabled="true">Disabled itinerary</div>
+                  <div ng-click="hidden()" hidden>Hidden itinerary</div>
+                  <div ng-click="pay()" onclick="document.body.innerHTML='Unexpected payment'">Pagar</div>
                   <input aria-label="Private card" autocomplete="cc-number">
                   <button>Pay</button>"#) }))
                 .route("/flight", get(|| async { Html("<h1>Flight AR1554</h1>") })))
@@ -717,6 +721,31 @@ mod tests {
                 .to_owned()
         };
         assert!(!before.to_string().contains("Córdoba COR"));
+        for label in ["Disabled itinerary", "Hidden itinerary"] {
+            assert!(
+                !before["elements"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|e| e["label"] == label)
+            );
+        }
+        assert!(
+            browser
+                .browse(BrowseRequest::Click {
+                    element_ref: reference(&before, "Pagar"),
+                })
+                .await
+                .is_err()
+        );
+        browser
+            .browse(BrowseRequest::Click {
+                element_ref: reference(&before, "Select itinerary"),
+            })
+            .await
+            .unwrap();
+        let before = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+        assert!(before["text"].as_str().unwrap().contains("Flight selected"));
         assert!(
             !before["elements"]
                 .as_array()
