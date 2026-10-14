@@ -57,6 +57,9 @@ tool for this checkout.
   `action`: `open` plus `url`, `snapshot`, `click` plus `element_ref`, `type`
   plus `element_ref` and `text`, `select` plus `element_ref` and `value`, or
   `back`.
+- A snapshot element may carry `context`, the short text around it. Use it
+  to tell repeated controls apart, such as identical fare buttons on
+  different flight cards or the same day number in two calendar months.
 - Use fresh snapshot refs after every action. The browser rejects direct
   card entry and recognizable payment submission through shopping controls.
 - Once checkout is ready, write `checkout/requests/<new-64-hex-id>/in.json`

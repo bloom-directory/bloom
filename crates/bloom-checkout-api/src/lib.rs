@@ -126,6 +126,9 @@ pub struct Element {
     pub frame_origin: Option<String>,
     pub role: String,
     pub label: String,
+    /// Short text around a repeated control, such as its fare card or month.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
     #[serde(rename = "type")]
     pub input_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

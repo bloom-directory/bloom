@@ -837,6 +837,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn script_styled_controls_are_projected_with_their_card() {
+        let root = tempfile::tempdir().unwrap().keep();
+        let browser = Browser::launch(
+            &crate::test_chromium(),
+            &root.join("profile"),
+            &["--no-sandbox".into()],
+        )
+        .await
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        // Shaped like JetSMART: listeners attached by script, a pointer cursor
+        // from the stylesheet, a pointer panel around day cells, identical
+        // fare buttons told apart only by their card, and a restyled radio.
+        let fixture = tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/", get(|| async { Html(r#"<!doctype html>
+              <style>.pick{cursor:pointer}.faded{opacity:0}</style>
+              <ul><li class="pick" id="city">Cordoba COR</li><li class="pick faded">Hidden city</li></ul>
+              <div class="pick"><div>Noviembre 2026</div><div class="pick" id="day">04</div></div>
+              <div class="card">08:06 Cordoba 16:17 Bariloche<div class="pick fare">Tarifa desde $127.664,00</div></div>
+              <div class="card">14:11 Cordoba 21:16 Bariloche<div class="pick fare">Tarifa desde $116.058,00</div></div>
+              <label><input type="radio" name="pass" style="display:none">Llevaré mi tarjeta de embarque<span class="pick">?</span></label>
+              <div class="pick" id="pay">Pagar</div>
+              <script>
+                for (const e of document.querySelectorAll('.pick'))
+                  e.addEventListener('click', () => document.title = 'clicked ' + e.innerText);
+              </script>"#) })))
+                .await.unwrap();
+        });
+        browser.browse(BrowseRequest::Open { url }).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+        let elements = snapshot["elements"].as_array().unwrap();
+        let find = |label: &str| {
+            elements
+                .iter()
+                .filter(|e| e["label"] == label)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(find("Cordoba COR").len(), 1);
+        assert!(find("Hidden city").is_empty());
+        assert_eq!(find("04")[0]["context"], "Noviembre 2026 04");
+        // The panel around the day is layout, not a control.
+        assert!(!elements.iter().any(|e| e["label"] == "Noviembre 2026 04"));
+        let early = elements
+            .iter()
+            .find(|e| {
+                e["context"]
+                    .as_str()
+                    .is_some_and(|c| c.starts_with("08:06"))
+            })
+            .unwrap();
+        assert_eq!(early["label"], "Tarifa desde $127.664,00");
+        assert_eq!(find("Llevaré mi tarjeta de embarque?").len(), 1);
+        browser
+            .browse(BrowseRequest::Click {
+                element_ref: early["ref"].as_str().unwrap().into(),
+            })
+            .await
+            .unwrap();
+        let after = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+        assert!(
+            after["text"]
+                .as_str()
+                .unwrap()
+                .contains("clicked Tarifa desde $127.664,00")
+        );
+        let pay = after["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["label"] == "Pagar")
+            .unwrap()["ref"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(
+            browser
+                .browse(BrowseRequest::Click { element_ref: pay })
+                .await
+                .is_err()
+        );
+        fixture.abort();
+    }
+
+    #[tokio::test]
     async fn renderer_and_browser_crashes_leave_no_memory_dumps() {
         fn assert_no_dump(path: &Path) {
             for entry in std::fs::read_dir(path).unwrap() {
