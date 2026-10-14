@@ -2078,7 +2078,7 @@ impl ExactPayloadBatchSignRequest {
             claim.operation_class.as_str() == bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS
         }) {
             return Err(ProtocolError::new(
-                ProtocolErrorCode::MalformedFrame,
+                ProtocolErrorCode::ClaimInvalid,
                 "Safe confirmations require the single-payload exact path with a Safe review envelope",
             ));
         }
@@ -2107,7 +2107,7 @@ impl ExactPayloadSignRequest {
             .is_some_and(|payload| payload.len() > bloom_broker_api::SINGLE_PAYLOAD_MAX_BYTES)
         {
             return Err(ProtocolError::new(
-                ProtocolErrorCode::MalformedFrame,
+                ProtocolErrorCode::LimitExceededFrame,
                 "Safe review payload is too large",
             ));
         }
@@ -2118,7 +2118,7 @@ impl ExactPayloadSignRequest {
         });
         if safe_operation != self.safe_review_payload.is_some() {
             return Err(ProtocolError::new(
-                ProtocolErrorCode::MalformedFrame,
+                ProtocolErrorCode::ClaimInvalid,
                 "Safe confirmation requires exactly one Safe review payload",
             ));
         }
@@ -2596,7 +2596,7 @@ impl TrustedPetalSignRequest {
             || self.operation_class.as_str() == bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS
         {
             return Err(ProtocolError::new(
-                ProtocolErrorCode::MalformedFrame,
+                ProtocolErrorCode::ClaimInvalid,
                 "Safe confirmations require the single-payload exact path with a Safe review envelope",
             ));
         }
@@ -4005,14 +4005,14 @@ mod tests {
         });
         assert_eq!(
             request.validate().unwrap_err().code,
-            ProtocolErrorCode::MalformedFrame
+            ProtocolErrorCode::ClaimInvalid
         );
         request.safe_review_payload = Some(br#"{"schema":"bloom.safe.review.v1"}"#.to_vec());
         request.validate().unwrap();
         request.safe_review_payload = Some(vec![0; bloom_broker_api::SINGLE_PAYLOAD_MAX_BYTES + 1]);
         assert_eq!(
             request.validate().unwrap_err().code,
-            ProtocolErrorCode::MalformedFrame
+            ProtocolErrorCode::LimitExceededFrame
         );
     }
 
@@ -4038,7 +4038,7 @@ mod tests {
         });
         assert_eq!(
             request.validate().unwrap_err().code,
-            ProtocolErrorCode::MalformedFrame
+            ProtocolErrorCode::ClaimInvalid
         );
     }
 
@@ -4093,13 +4093,13 @@ mod tests {
                 .validate()
                 .unwrap_err()
                 .code,
-            ProtocolErrorCode::MalformedFrame
+            ProtocolErrorCode::ClaimInvalid
         );
         let mut mismatched = build("order.cancel");
         mismatched.operation_class = token("safe.transaction.confirm");
         assert_eq!(
             mismatched.validate().unwrap_err().code,
-            ProtocolErrorCode::MalformedFrame
+            ProtocolErrorCode::ClaimInvalid
         );
     }
 

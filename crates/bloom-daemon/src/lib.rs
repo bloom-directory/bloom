@@ -352,13 +352,13 @@ fn petal_review_payload<'a>(
             "Petal operation class does not match its claim".into(),
         ));
     }
-    Ok(
-        if operation_class == bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS {
-            action
-        } else {
-            None
-        },
-    )
+    if operation_class == bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS {
+        action.map(Some).ok_or_else(|| {
+            HostError::Invalid("Safe confirmation requires a review envelope".into())
+        })
+    } else {
+        Ok(None)
+    }
 }
 
 impl DaemonPetalHost {
@@ -5660,7 +5660,10 @@ mod tests {
             petal_review_payload(safe, safe, Some(envelope)).unwrap(),
             Some(envelope)
         );
-        assert_eq!(petal_review_payload(safe, safe, None).unwrap(), None);
+        assert!(matches!(
+            petal_review_payload(safe, safe, None),
+            Err(HostError::Invalid(message)) if message.contains("requires a review envelope")
+        ));
         assert_eq!(
             petal_review_payload("transaction.confirm", "transaction.confirm", Some(envelope))
                 .unwrap(),
