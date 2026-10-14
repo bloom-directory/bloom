@@ -1207,7 +1207,9 @@ provision_remote_ceremonies() {
   last_report=-1
   status_file="$(mktemp "$runtime/relay-status.XXXXXX")" || die "could not create temporary relay status file"
   chmod 0600 "$status_file"
-  while (( SECONDS <= deadline )); do
+  # A failed provisioning response may already have made the relay ready.
+  # Read status once even when provisioning consumed the polling budget.
+  while :; do
     if ! "$signer" admin status --login-uid "$login_uid" >"$status_file"; then
       echo "Could not read hosted relay status; localhost remains available." >&2
       rm -f "$status_file"
