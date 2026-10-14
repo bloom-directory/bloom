@@ -903,12 +903,22 @@ async fn launch_passkey_enrollment_via_vfs(
         surface,
     )
     .await?;
+    let read_status = |operation: String| {
+        let path = format!("{passkeys}/enrollments/{operation}/status.json");
+        async move {
+            let projection: serde_json::Value = serde_json::from_slice(
+                &bloom_vfs::Handler::read(vfs, &bloom_vfs::VfsPath::parse(&path)?).await?,
+            )
+            .context("decode mounted passkey enrollment projection")?;
+            anyhow::Ok((operation, path, projection))
+        }
+    };
     let latest = bloom_vfs::Handler::lookup(
         vfs,
         &bloom_vfs::VfsPath::parse(&format!("{passkeys}/latest"))?,
     )
     .await?;
-    let operation = latest
+    let latest = latest
         .link_target
         .as_deref()
         .and_then(|target| target.strip_prefix("enrollments/"))
@@ -919,11 +929,49 @@ async fn launch_passkey_enrollment_via_vfs(
             )
         })?
         .to_owned();
-    let projection_path = format!("{passkeys}/enrollments/{operation}/status.json");
-    let projection: serde_json::Value = serde_json::from_slice(
-        &bloom_vfs::Handler::read(vfs, &bloom_vfs::VfsPath::parse(&projection_path)?).await?,
-    )
-    .context("decode mounted passkey enrollment projection")?;
+    let wanted = std::str::from_utf8(surface).unwrap_or_default();
+    let matches = |projection: &serde_json::Value| {
+        wanted.is_empty()
+            || projection
+                .get("destination")
+                .and_then(serde_json::Value::as_str)
+                == Some(wanted)
+    };
+    let mut selected = read_status(latest).await?;
+    // Another writer may have selected a different surface after this write;
+    // report the live enrollment on the surface this command asked for.
+    if !matches(&selected.2) {
+        let entries = bloom_vfs::Handler::list(
+            vfs,
+            &bloom_vfs::VfsPath::parse(&format!("{passkeys}/enrollments"))?,
+        )
+        .await?;
+        let mut found = None;
+        for entry in entries {
+            let candidate = read_status(entry.name).await?;
+            if matches(&candidate.2)
+                && candidate
+                    .2
+                    .get("ceremony_state")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("AWAITING_USER")
+                && candidate
+                    .2
+                    .get("ceremony_url")
+                    .is_some_and(|url| url.is_string())
+            {
+                found = Some(candidate);
+                break;
+            }
+        }
+        selected = found.ok_or_else(|| {
+            machine_error(
+                MachineErrorKind::Internal,
+                "no live passkey enrollment on the requested surface; read passkeys/enrollments",
+            )
+        })?;
+    }
+    let (operation, projection_path, projection) = selected;
     let field = |key: &str| projection.get(key).and_then(serde_json::Value::as_str);
     let ceremony_url = field("ceremony_url").ok_or_else(|| {
         machine_error(
@@ -5210,22 +5258,48 @@ mod tests {
             }
         }
 
+        async fn list(
+            &self,
+            path: &bloom_vfs::VfsPath,
+        ) -> Result<Vec<bloom_vfs::Entry>, bloom_vfs::HandlerError> {
+            if path.to_string_path() != "/main/passkeys/enrollments" {
+                return Err(bloom_vfs::HandlerError::NotFound(path.to_string_path()));
+            }
+            Ok(vec![
+                bloom_vfs::Entry::dir(&"33".repeat(32)),
+                bloom_vfs::Entry::dir(&"44".repeat(32)),
+            ])
+        }
+
         async fn read(
             &self,
             path: &bloom_vfs::VfsPath,
         ) -> Result<Vec<u8>, bloom_vfs::HandlerError> {
-            if path.to_string_path()
-                != format!("/main/passkeys/enrollments/{}/status.json", "33".repeat(32))
-            {
-                return Err(bloom_vfs::HandlerError::NotFound(path.to_string_path()));
-            }
+            // `latest` names the remote enrollment; a live local one exists too.
+            let (operation, destination, url) = match path.to_string_path() {
+                p if p == format!("/main/passkeys/enrollments/{}/status.json", "33".repeat(32)) => {
+                    (
+                        "33".repeat(32),
+                        "remote",
+                        "https://relay.test/ceremony/#cap=abc",
+                    )
+                }
+                p if p == format!("/main/passkeys/enrollments/{}/status.json", "44".repeat(32)) => {
+                    (
+                        "44".repeat(32),
+                        "local",
+                        "http://localhost:18734/ceremony/local",
+                    )
+                }
+                other => return Err(bloom_vfs::HandlerError::NotFound(other)),
+            };
             Ok(serde_json::to_vec(&serde_json::json!({
                 "schema": "bloom.machine-passkey-enrollment.1",
                 "wallet": "main",
-                "destination": "remote",
-                "operation_id": "33".repeat(32),
+                "destination": destination,
+                "operation_id": operation,
                 "ceremony_state": "AWAITING_USER",
-                "ceremony_url": "https://relay.test/ceremony/#cap=abc",
+                "ceremony_url": url,
                 "ceremony_expires_at_ms": "1800000000000",
                 "created_at_ms": 1,
             }))
@@ -5251,10 +5325,30 @@ mod tests {
         let vfs = bloom_vfs::Vfs::builder()
             .mount("wallets", handler.clone())
             .build();
-        for (local, remote, surface) in [
-            (false, true, b"remote".as_slice()),
-            (true, false, b"local".as_slice()),
-            (false, false, b"".as_slice()),
+        for (local, remote, surface, operation, url) in [
+            (
+                false,
+                true,
+                b"remote".as_slice(),
+                "33",
+                "https://relay.test/ceremony/#cap=abc",
+            ),
+            (
+                false,
+                false,
+                b"".as_slice(),
+                "33",
+                "https://relay.test/ceremony/#cap=abc",
+            ),
+            // `latest` names the remote one, but --local reports the live
+            // local enrollment rather than another surface's link.
+            (
+                true,
+                false,
+                b"local".as_slice(),
+                "44",
+                "http://localhost:18734/ceremony/local",
+            ),
         ] {
             handler.0.lock().unwrap().clear();
             let output = launch_passkey_enrollment_via_vfs(&vfs, "main", local, remote)
@@ -5264,12 +5358,18 @@ mod tests {
                 *handler.0.lock().unwrap(),
                 vec![("/main/passkeys/new".into(), surface.to_vec())]
             );
-            assert!(output.contains(&format!("operation_id: {}\n", "33".repeat(32))));
-            assert!(output.contains("ceremony_url: https://relay.test/ceremony/#cap=abc\n"));
+            let operation = operation.repeat(32);
+            assert!(
+                output.contains(&format!("operation_id: {operation}\n")),
+                "{output}"
+            );
+            assert!(
+                output.contains(&format!("ceremony_url: {url}\n")),
+                "{output}"
+            );
             assert!(output.contains("ceremony_expires_at_ms: 1800000000000\n"));
             assert!(output.contains(&format!(
-                "projection: /wallets/main/passkeys/enrollments/{}/status.json\n",
-                "33".repeat(32)
+                "projection: /wallets/main/passkeys/enrollments/{operation}/status.json\n"
             )));
         }
     }

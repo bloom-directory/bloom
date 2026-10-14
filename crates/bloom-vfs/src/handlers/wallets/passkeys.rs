@@ -51,10 +51,6 @@ pub(super) struct PasskeyEnrollmentProjection {
     /// Cleared once Broker reports the operation.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pending_prepare: bool,
-    /// When a write to `new` last created or reused this enrollment; `latest`
-    /// follows it, so a reused older enrollment is the one reported.
-    #[serde(default)]
-    selected_at_ms: u64,
 }
 
 #[derive(Debug, Default, serde::Deserialize, serde::Serialize)]
@@ -309,12 +305,36 @@ impl WalletsHandler {
             .ok_or_else(|| HandlerError::not_found(format!("passkey enrollment {operation}")))
     }
 
-    /// The enrollment the most recent write to `new` created or reused.
+    /// The pointer a write to `new` sets, under the enrollment lock, to the
+    /// enrollment it created or reused. Status reads never touch it.
+    fn latest_pointer(&self, wallet: &str) -> std::path::PathBuf {
+        self.enrollment_root(wallet).join("latest")
+    }
+
+    fn select_enrollment(&self, wallet: &str, operation: &OperationId) -> Result<(), HandlerError> {
+        let path = self.latest_pointer(wallet);
+        let temporary = path.with_extension("tmp");
+        std::fs::write(&temporary, operation.as_str())?;
+        std::fs::rename(&temporary, &path)?;
+        Ok(())
+    }
+
+    /// The enrollment the most recent write to `new` created or reused, or
+    /// (for records from before the pointer existed) the newest one.
     fn latest_enrollment(&self, wallet: &str) -> Result<Option<String>, HandlerError> {
-        Ok(self
-            .enrollment_records(wallet)?
+        let records = self.enrollment_records(wallet)?;
+        if let Ok(selected) = std::fs::read_to_string(self.latest_pointer(wallet)) {
+            let selected = selected.trim();
+            if records
+                .iter()
+                .any(|(_, record)| record.operation_id.as_str() == selected)
+            {
+                return Ok(Some(selected.to_owned()));
+            }
+        }
+        Ok(records
             .into_iter()
-            .max_by_key(|(_, record)| record.selected_at_ms.max(record.created_at_ms))
+            .next()
             .map(|(_, record)| record.operation_id.as_str().to_owned()))
     }
 
@@ -400,11 +420,11 @@ impl WalletsHandler {
         // enrollment while one to the same surface is still usable, and a
         // pending one (prepare response never seen) is resumed with its ID.
         let mut pending = None;
-        for (path, record) in self.enrollment_records(wallet)? {
+        for (_, record) in self.enrollment_records(wallet)? {
             if terminal(record.ceremony_state) {
                 continue;
             }
-            let mut refreshed = self
+            let refreshed = self
                 .enrollment_projection(wallet, record.operation_id.as_str())
                 .await?;
             if refreshed.pending_prepare {
@@ -413,8 +433,7 @@ impl WalletsHandler {
                 || refreshed.destination == destination)
                 && refreshed.ceremony_state == CeremonyState::AwaitingUser
             {
-                refreshed.selected_at_ms = now_ms_u64();
-                return write_atomic_json(&path, &refreshed);
+                return self.select_enrollment(wallet, &refreshed.operation_id);
             }
         }
         let path_for = |operation_id: &OperationId| {
@@ -428,7 +447,6 @@ impl WalletsHandler {
         let mut record = match pending {
             Some(mut record) => {
                 record.destination = destination;
-                record.selected_at_ms = now_ms_u64();
                 record
             }
             None => {
@@ -444,12 +462,12 @@ impl WalletsHandler {
                     ceremony_expires_at_ms: None,
                     created_at_ms: now_ms_u64(),
                     pending_prepare: true,
-                    selected_at_ms: now_ms_u64(),
                 }
             }
         };
         let path = path_for(&record.operation_id);
         write_atomic_json(&path, &record)?;
+        self.select_enrollment(wallet, &record.operation_id)?;
         let prepared = match self
             .custody_broker()?
             .prepare_cross_surface_credential(CeremonyCrossSurfacePrepareRequest {
