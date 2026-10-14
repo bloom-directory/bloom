@@ -4,6 +4,9 @@ BRIJ exposes flight search and booking at `https://travel.brij.fi`, paid in
 Solana-mainnet USDC through x402. Bloom's Solana exact-payment adapter lets an
 agent use it through the existing `/requests` surface. This is an experimental
 integration, not a dedicated flights Petal or a claim that ticketing is verified.
+It requires the Solana x402 adapter introduced in
+[Bloom PR #350](https://github.com/bloom-directory/bloom/pull/350); an older
+EVM-only client cannot make these payments.
 
 ## Verified on October 13, 2026
 
@@ -20,9 +23,9 @@ with owner passkey approval and Solana settlement:
 The search returned Aerolíneas AR1554, Córdoba to Bariloche, October 25, 2026,
 13:20–15:35 local time. The Plus fare was US$166.57 with one carry-on and no
 checked bag. This historical quote is not authority for a future purchase.
-Search settlement `4CGMHye9w6geaB4FQxB3mPLXxSoEHUW4p2nDzoe6Z9qPETR4d4eZXKezPfgUP3vcAshoNLktYYibyYRRdbV9oAr2`
-and intent-fee settlement `52bDUdzp6VGYAFwtqxXim5pBTqJ9U8bCvE4bQu24W9Us7V7PS9DZBsEkqcaDLsNzjUPft69dX4gQxBLdqqUyqU2g`
-were independently confirmed finalized with no error on mainnet.
+Search and intent-fee settlements were independently confirmed finalized with
+no error on mainnet. Test receipts are evidence of API delivery and payment,
+not of an issued airline ticket.
 
 ## Search
 
