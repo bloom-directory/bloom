@@ -3264,16 +3264,18 @@ async fn confirm_projection(
     chain: &str,
     id: &str,
 ) -> Option<ConfirmProjection> {
-    let ceremony_path =
-        format!("/wallets/{wallet}/0/chains/{chain}/outbox/pending/{id}/ceremony.json");
-    if let Ok(bytes) = ipc_read(endpoint, &ceremony_path).await {
+    // The public approval challenge carries the live ceremony link; the
+    // entry's private signing state (`ceremony.json`) is not mounted.
+    let challenge_path =
+        format!("/wallets/{wallet}/0/chains/{chain}/outbox/pending/{id}/approval_challenge.json");
+    if let Ok(bytes) = ipc_read(endpoint, &challenge_path).await {
         let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
         let url = value
             .get("ceremony_url")
             .and_then(serde_json::Value::as_str)
             .map(str::to_string);
         let expires_at_ms = value
-            .get("ceremony_expires_at_ms")
+            .get("expiry_ms")
             .and_then(|field| {
                 field
                     .as_u64()

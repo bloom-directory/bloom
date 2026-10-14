@@ -8556,11 +8556,15 @@ value = "0""#,
         let mut f = make_handler_with_chain(true);
         let w = f.wallet_name.clone();
         let approval = digest(21);
-        let broker = approval_broker(vec![approval_status(
+        // Broker reports the unopened ceremony link while the approval waits.
+        let mut waiting = approval_status(
             approval.clone(),
             &w,
             ApprovalLifecycleState::AwaitingCeremony,
-        )]);
+        );
+        waiting.ceremony_url = Some("https://relay.test/ceremony/#cap=abc".into());
+        waiting.ceremony_expires_at_ms = Some(DecimalU64::new(60_000));
+        let broker = approval_broker(vec![waiting]);
         f.handler = f
             .handler
             .with_broker(Some(MachineBrokerClient::new(broker.clone())));
