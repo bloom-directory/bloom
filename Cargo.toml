@@ -68,7 +68,7 @@ base64 = "0.22"
 bs58 = "0.5"
 argon2 = "0.5"
 chacha20poly1305 = "0.10"
-zeroize = { version = "1", features = ["zeroize_derive"] }
+zeroize = { version = "1", features = ["zeroize_derive", "serde"] }
 rand = "0.8"
 ml-dsa = { version = "0.1.0", features = ["getrandom", "zeroize"] }
 ed25519-dalek = { version = "3", features = ["rand_core"] }
@@ -137,7 +137,7 @@ bloom-petals   = { path = "crates/bloom-petals" }
 bloom-petal-contract = { git = "https://github.com/bloom-directory/petal", rev = "73c5b06a77599368fbc79fb7947a629b5b4c630e" }
 bloom-daemon   = { path = "crates/bloom-daemon" }
 bloom-update   = { path = "crates/bloom-update" }
-bloom-broker-api = { git = "https://github.com/bloom-directory/bloom-broker.git", rev = "26ef038d5ceef5ceabf40d6c309c44ac34bc1924" }
+bloom-broker-api = { git = "https://github.com/bloom-directory/bloom-broker.git", rev = "ccb12d883a980b45a4873fa864e851d26c227d81" }
 bloom-rpc-wire = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "ad0072512bb97fb4eb68d249ce785ea3ea4a49ab" }
 bloom-triad-local-transport = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "ad0072512bb97fb4eb68d249ce785ea3ea4a49ab" }
 bloom-service-activation = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "ad0072512bb97fb4eb68d249ce785ea3ea4a49ab" }

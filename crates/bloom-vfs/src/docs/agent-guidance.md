@@ -34,11 +34,24 @@ tool for this checkout.
   its ceremony URL. The human enters and saves the card privately.
 - To delete, write `cards/delete.json` with `operation_id` and `card_id`, then
   forward the ceremony URL in the same way.
-- Read `checkout/profile.json` for the human's saved email, name, phone and
-  billing address, and type them into ordinary checkout fields. If a value is
-  missing, ask once and save it by writing the whole profile back, for example
-  `{"email":"…","name":"…","billing_address":{"line1":"…","city":"…",
-  "region":"CA","postal_code":"94110","country":"US"}}`.
+- For passenger details, read `travelers/index.json`: IDs, labels and available
+  field categories only. Never ask for or save legal names, birth dates,
+  documents or contact details in chat, shell, or `checkout/profile.json`.
+- Save a person through `travelers/save.json` with `operation_id`, `traveler_id`
+  and a public `label`. Forward the URL in
+  `travelers/operations/<operation_id>/ceremony.json`. The human enters details
+  privately and approves saving them. Reuse an ID to replace that person's
+  record; `travelers/delete.json` accepts `operation_id` and `traveler_id`.
+- At the passenger form, write `checkout/requests/<new-64-hex-id>/in.json`
+  with `traveler_id` and `agent_description`. Forward the status ceremony URL.
+  Approval binds the person, website and fields; it authorizes no payment.
+  Shopping remains private after autofill. The human completes remaining
+  steps and selects Ready for payment. Do not read that page with other tools.
+- Once `status.json` says `ready_for_payment`, read that request's `facts.json`
+  for financial facts only. Start a separate card request with `card_id`,
+  `continue_private` set to the traveler request ID, and `agent_description`.
+  The human approves the final total and CVC separately. Never repeat an
+  uncertain operation automatically or claim unsupported forms can autofill.
 - Write a browse request to `checkout/browse/<64-hex-slot>/in.json`; read
   `out.json`. Reuse a slot. Results expire after five minutes. Requests use
   `action`: `open` plus `url`, `snapshot`, `click` plus `element_ref`, `type`

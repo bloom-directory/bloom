@@ -6,7 +6,8 @@ use crate::{
 use async_trait::async_trait;
 use bloom_broker_api::{
     CardAddRequest, CardDeleteRequest, MachineBrokerRequest as BrokerRequest,
-    MachineBrokerResponse as BrokerResponse, OperationId, OperationRequest,
+    MachineBrokerResponse as BrokerResponse, OperationId, OperationRequest, TravelerDeleteRequest,
+    TravelerSaveRequest,
 };
 use bloom_checkout_api::{BrowseRequest, Request};
 use bloom_machine_client::{MachineBrokerClient, checkout::CheckoutClient};
@@ -17,10 +18,22 @@ use std::path::PathBuf;
 pub struct CardsHandler {
     broker: Option<MachineBrokerClient>,
     root: PathBuf,
+    travelers: bool,
 }
 impl CardsHandler {
     pub fn new(broker: Option<MachineBrokerClient>, root: PathBuf) -> Self {
-        Self { broker, root }
+        Self {
+            broker,
+            root,
+            travelers: false,
+        }
+    }
+    pub fn travelers(broker: Option<MachineBrokerClient>, root: PathBuf) -> Self {
+        Self {
+            broker,
+            root,
+            travelers: true,
+        }
     }
     async fn call(&self, request: BrokerRequest) -> Result<BrokerResponse, HandlerError> {
         self.broker
@@ -90,9 +103,15 @@ impl Handler for CardsHandler {
             .collect::<Vec<_>>();
         let s = segments.as_slice();
         match s {
-            [] | ["operations"] => Ok(Entry::dir(s.last().copied().unwrap_or("cards"))),
+            [] | ["operations"] => Ok(Entry::dir(s.last().copied().unwrap_or(if self.travelers {
+                "travelers"
+            } else {
+                "cards"
+            }))),
             ["index.json"] => Ok(Entry::file("index.json")),
-            ["add.json" | "delete.json"] => Ok(Entry::writable_file(s[0])),
+            ["delete.json"] => Ok(Entry::writable_file(s[0])),
+            ["save.json"] if self.travelers => Ok(Entry::writable_file(s[0])),
+            ["add.json"] if !self.travelers => Ok(Entry::writable_file(s[0])),
             ["operations", id] => {
                 operation(id)?;
                 Ok(Entry::dir(id))
@@ -112,10 +131,15 @@ impl Handler for CardsHandler {
             .collect::<Vec<_>>();
         match segments.as_slice() {
             ["index.json"] => match self
-                .call(BrokerRequest::CardList(bloom_broker_api::Empty {}))
+                .call(if self.travelers {
+                    BrokerRequest::TravelerList(bloom_broker_api::Empty {})
+                } else {
+                    BrokerRequest::CardList(bloom_broker_api::Empty {})
+                })
                 .await?
             {
-                BrokerResponse::CardList(cards) => safe_json(cards),
+                BrokerResponse::CardList(cards) if !self.travelers => safe_json(cards),
+                BrokerResponse::TravelerList(travelers) if self.travelers => safe_json(travelers),
                 _ => Err(HandlerError::backend("Invalid card listing")),
             },
             ["operations", id, "status.json"] => match self
@@ -141,12 +165,26 @@ impl Handler for CardsHandler {
             .map(String::as_str)
             .collect::<Vec<_>>();
         let (id, response) = match segments.as_slice() {
-            ["add.json"] => {
+            ["save.json"] if self.travelers => {
+                let request: TravelerSaveRequest = input(bytes)?;
+                let id = request.operation_id.to_string();
+                (id, self.call(BrokerRequest::TravelerSave(request)).await?)
+            }
+            ["add.json"] if !self.travelers => {
                 let request: CardAddRequest = input(bytes)?;
                 let id = request.operation_id.to_string();
                 (id, self.call(BrokerRequest::CardAdd(request)).await?)
             }
             ["delete.json"] => {
+                if self.travelers {
+                    let request: TravelerDeleteRequest = input(bytes)?;
+                    let id = request.operation_id.to_string();
+                    let response = self.call(BrokerRequest::TravelerDelete(request)).await?;
+                    if let BrokerResponse::TravelerDelete(prepared) = response {
+                        return record(&self.root, &id, &prepared);
+                    }
+                    return Err(HandlerError::backend("Invalid traveler ceremony response"));
+                }
                 let request: CardDeleteRequest = input(bytes)?;
                 let id = request.operation_id.to_string();
                 (id, self.call(BrokerRequest::CardDelete(request)).await?)
@@ -154,7 +192,8 @@ impl Handler for CardsHandler {
             _ => return Err(HandlerError::PermissionDenied),
         };
         let prepared = match response {
-            BrokerResponse::CardAdd(r) | BrokerResponse::CardDelete(r) => r,
+            BrokerResponse::CardAdd(r) | BrokerResponse::CardDelete(r) if !self.travelers => r,
+            BrokerResponse::TravelerSave(r) if self.travelers => r,
             _ => return Err(HandlerError::backend("Invalid card ceremony response")),
         };
         record(&self.root, &id, &prepared)
@@ -168,7 +207,11 @@ impl Handler for CardsHandler {
         match segments.as_slice() {
             [] => Ok(vec![
                 Entry::file("index.json"),
-                Entry::writable_file("add.json"),
+                Entry::writable_file(if self.travelers {
+                    "save.json"
+                } else {
+                    "add.json"
+                }),
                 Entry::writable_file("delete.json"),
                 Entry::dir("operations"),
             ]),
@@ -239,9 +282,14 @@ struct Address {
 struct CheckoutInput {
     #[serde(default)]
     card_id: Option<String>,
+    #[serde(default)]
     agent_description: String,
     #[serde(default)]
     take_over: bool,
+    #[serde(default)]
+    traveler_id: Option<String>,
+    #[serde(default)]
+    continue_private: Option<String>,
 }
 
 #[async_trait]
@@ -271,6 +319,10 @@ impl Handler for CheckoutHandler {
                 operation(id)?;
                 Ok(Entry::file(s[2]))
             }
+            ["requests", id, "facts.json"] => {
+                operation(id)?;
+                Ok(Entry::file("facts.json"))
+            }
             _ => Err(HandlerError::not_found(path.to_string_path())),
         }
     }
@@ -297,12 +349,25 @@ impl Handler for CheckoutHandler {
             }
             ["requests", id, "status.json"] => {
                 operation(id)?;
-                safe_json(
+                let status: bloom_checkout_api::Status = serde_json::from_value(
                     self.call(Request::Status {
                         operation_id: (*id).into(),
                     })
                     .await?,
                 )
+                .map_err(|_| HandlerError::backend("Invalid public checkout status"))?;
+                safe_json(status)
+            }
+            ["requests", id, "facts.json"] => {
+                operation(id)?;
+                let facts: bloom_checkout_api::PaymentFacts = serde_json::from_value(
+                    self.call(Request::PrivateFacts {
+                        operation_id: (*id).into(),
+                    })
+                    .await?,
+                )
+                .map_err(|_| HandlerError::backend("Invalid public payment facts"))?;
+                safe_json(facts)
             }
             _ => Err(HandlerError::not_found(path.to_string_path())),
         }
@@ -351,14 +416,36 @@ impl Handler for CheckoutHandler {
             ["requests", id, "in.json"] => {
                 operation(id)?;
                 let request: CheckoutInput = input(bytes)?;
+                if let Some(traveler_id) = request.traveler_id {
+                    if request.card_id.is_some()
+                        || request.take_over
+                        || request.continue_private.is_some()
+                    {
+                        return Err(HandlerError::invalid(
+                            "Traveler autofill does not accept payment or takeover options",
+                        ));
+                    }
+                    let response = self
+                        .call(Request::Traveler {
+                            operation_id: (*id).into(),
+                            traveler_id,
+                        })
+                        .await?;
+                    let response: bloom_checkout_api::Status = serde_json::from_value(response)
+                        .map_err(|_| HandlerError::backend("Invalid public traveler status"))?;
+                    return record(&self.root, id, &response);
+                }
                 let response = self
                     .call(Request::Checkout {
                         operation_id: (*id).into(),
                         card_id: request.card_id,
                         agent_description: request.agent_description,
                         take_over: request.take_over,
+                        continue_private: request.continue_private,
                     })
                     .await?;
+                let response: bloom_checkout_api::Status = serde_json::from_value(response)
+                    .map_err(|_| HandlerError::backend("Invalid public checkout status"))?;
                 record(&self.root, id, &response)
             }
             ["requests", id, "cancel"] => {
@@ -399,6 +486,7 @@ impl Handler for CheckoutHandler {
                 Ok(vec![
                     Entry::writable_file("in.json"),
                     Entry::file("status.json"),
+                    Entry::file("facts.json"),
                     Entry::writable_file("cancel"),
                 ])
             }

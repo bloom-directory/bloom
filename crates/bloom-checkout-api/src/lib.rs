@@ -29,6 +29,17 @@ pub enum Request {
         agent_description: String,
         #[serde(default)]
         take_over: bool,
+        #[serde(default)]
+        continue_private: Option<String>,
+    },
+    /// Autofill saved fields privately; never purchase or expose their values.
+    Traveler {
+        operation_id: String,
+        traveler_id: String,
+    },
+    /// Financial facts only, while a filled booking remains private.
+    PrivateFacts {
+        operation_id: String,
     },
     Status {
         operation_id: String,
@@ -65,6 +76,18 @@ pub struct Status {
     pub ceremony_url: Option<String>,
     pub filled_fields: Vec<String>,
     pub outcome: Option<Outcome>,
+}
+
+/// The only merchant data exposed after private traveler autofill.
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PaymentFacts {
+    pub origin: String,
+    pub payment_frame_origins: Vec<String>,
+    pub total_minor: u64,
+    pub currency: String,
+    pub installments: u16,
+    pub recurring: bool,
 }
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]

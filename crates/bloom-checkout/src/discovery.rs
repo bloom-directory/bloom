@@ -392,7 +392,7 @@ impl Discovery {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::browser::{BrowseRequest, Browser};
     use axum::{Router, response::Html, routing::get};
@@ -606,7 +606,7 @@ mod tests {
         browser.return_control().await.unwrap();
     }
 
-    async fn fixture(html: String) -> (String, tokio::task::JoinHandle<()>) {
+    pub(crate) async fn fixture(html: String) -> (String, tokio::task::JoinHandle<()>) {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let certificate =
             rcgen::generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()])

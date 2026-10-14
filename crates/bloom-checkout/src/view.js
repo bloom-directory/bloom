@@ -54,7 +54,16 @@ async function refresh() {
       document.getElementById('finish').textContent='Done, hand back to the agent';
       document.getElementById('note').hidden=true;
     }
-    if(state.closed) {status.textContent += ' (merchant-reported when paid or declined)';screen.hidden=true;screen.removeAttribute('src');return;}
+    if(state.traveler) {
+      document.getElementById('heading').textContent='Private traveler autofill';
+      document.getElementById('purpose').textContent='Saved details are filled privately. Complete any unsupported fields, continue to payment, then click Ready. Payment still needs a separate approval.';
+      document.getElementById('finish').textContent='Ready for payment approval';
+      document.getElementById('note').hidden=true;
+    }
+    if(state.closed) {
+      status.textContent=state.state==='ready_for_payment' ? 'Ready for payment approval. Traveler details remain hidden from the agent.' : state.state.replaceAll('_',' ');
+      screen.hidden=true;screen.removeAttribute('src');return;
+    }
     pages.replaceChildren(...state.pages.map(page=>{const option=document.createElement('option');option.value=page.target;option.textContent=page.origin;option.selected=page.target===state.selected_page;return option;}));
     screen.src='/frame?refresh='+Date.now();
     setTimeout(refresh,800);

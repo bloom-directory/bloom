@@ -4664,6 +4664,13 @@ impl Daemon {
             );
             vfs_builder = vfs_builder
                 .mount(
+                    "travelers",
+                    Arc::new(bloom_vfs::handlers::CardsHandler::travelers(
+                        broker.clone(),
+                        home.cache_dir().join("traveler-operations"),
+                    )) as _,
+                )
+                .mount(
                     "cards",
                     Arc::new(bloom_vfs::handlers::CardsHandler::new(
                         broker.clone(),

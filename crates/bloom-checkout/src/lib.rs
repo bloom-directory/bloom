@@ -4,6 +4,7 @@ mod cdp;
 mod discovery;
 mod hpke;
 pub mod service;
+mod travelers;
 pub mod view;
 
 #[cfg(test)]

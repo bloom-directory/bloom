@@ -46,8 +46,11 @@ impl Store {
         }
         let conn = Connection::open(path)?;
         conn.execute_batch("PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS operations(id TEXT PRIMARY KEY,state TEXT NOT NULL,status TEXT NOT NULL,created INTEGER NOT NULL,kind TEXT NOT NULL,description TEXT NOT NULL,shop TEXT,total_minor INTEGER,currency TEXT);")?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS private_origins(origin TEXT PRIMARY KEY NOT NULL);",
+        )?;
         // A lost recipient cannot be reconstructed. Interrupted disclosure is never retried.
-        conn.execute("UPDATE operations SET state='disclosure_unknown',status=json_set(status,'$.state','disclosure_unknown','$.ceremony_url',NULL) WHERE state IN ('release_started','filled','submitted','partially_filled')",[])?;
+        conn.execute("UPDATE operations SET state='disclosure_unknown',status=json_set(status,'$.state','disclosure_unknown','$.ceremony_url',NULL) WHERE state IN ('release_started','filled','submitted','partially_filled','ready_for_payment')",[])?;
         conn.execute("UPDATE operations SET state='failed_before_release',status=json_set(status,'$.state','failed_before_release','$.ceremony_url',NULL) WHERE state IN ('requested','preparing','awaiting_approval','manual_required','human_control')",[])?;
         Ok(Self(Mutex::new(conn)))
     }
@@ -60,6 +63,20 @@ impl Store {
             })
             .context("Unknown checkout request")?;
         Ok(serde_json::from_str(&text)?)
+    }
+    fn private_origins(&self) -> Result<Vec<String>> {
+        let db = self.0.lock();
+        let mut stmt = db.prepare("SELECT origin FROM private_origins")?;
+        Ok(stmt
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+    fn protect_origin(&self, origin: &str) -> Result<()> {
+        self.0.lock().execute(
+            "INSERT OR IGNORE INTO private_origins VALUES (?1)",
+            [origin],
+        )?;
+        Ok(())
     }
     fn insert(&self, status: &Status, kind: &str, description: &str) -> Result<()> {
         let created = std::time::SystemTime::now()
@@ -147,6 +164,7 @@ enum Mode {
     Site,
     /// The human takes over the browser and hands it back; nothing is bought.
     TakeOver,
+    Traveler,
 }
 
 struct PrivateCheckout {
@@ -161,6 +179,8 @@ struct PrivateCheckout {
     view_target: String,
     view_session: String,
     seen_pages: std::collections::HashSet<String>,
+    traveler: Option<crate::travelers::TravelerDiscovery>,
+    contains_traveler: bool,
 }
 
 struct CompletedView {
@@ -182,6 +202,9 @@ pub struct CheckoutService {
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum IntakeResponse {
+    Traveler {
+        traveler: bloom_signer_api::TravelerPublic,
+    },
     Prepared {
         ceremony_url: String,
     },
@@ -197,6 +220,100 @@ enum IntakeResponse {
 }
 
 impl CheckoutService {
+    async fn start_traveler(
+        self: &Arc<Self>,
+        operation_id: String,
+        traveler_id: String,
+    ) -> Result<Value> {
+        OperationId::new(&operation_id).map_err(|_| anyhow::anyhow!("Invalid operation ID"))?;
+        Token::new(&traveler_id).map_err(|_| anyhow::anyhow!("Invalid traveler ID"))?;
+        let mut private = self.private.lock().await;
+        if private.is_some() {
+            bail!("A checkout already has private control");
+        }
+        let metadata = match self
+            .intake(json!({"method":"traveler_info","traveler_id":traveler_id}))
+            .await?
+        {
+            IntakeResponse::Traveler { traveler }
+                if traveler.traveler_id.as_str() == traveler_id =>
+            {
+                traveler
+            }
+            _ => bail!("Traveler metadata unavailable"),
+        };
+        let mut status = Status {
+            operation_id: operation_id.clone(),
+            state: "requested".into(),
+            ceremony_url: None,
+            filled_fields: vec![],
+            outcome: None,
+        };
+        self.store.insert(
+            &status,
+            "traveler",
+            &format!("Autofill {} privately", metadata.label),
+        )?;
+        let tab = self.browser.handoff().await?;
+        let discovery = match crate::travelers::TravelerDiscovery::read(&tab, &metadata.fields)
+            .await
+        {
+            Ok(discovery) => discovery,
+            Err(_) => {
+                self.set_state(&operation_id, "failed_before_release");
+                let resume = tab_url(&tab).await;
+                self.browser.return_control_at(&tab.target, resume).await?;
+                bail!(
+                    "No unambiguous saved traveler fields on this page; continue to passenger entry first"
+                );
+            }
+        };
+        self.store
+            .record_order(&operation_id, Some(&discovery.scope.origin), None)?;
+        let recipient = Recipient::generate();
+        use rand::RngCore;
+        let mut token = [0; 32];
+        rand::thread_rng().fill_bytes(&mut token);
+        let capability = hex_token(&token);
+        let challenge_url = format!(
+            "http://localhost:{}/private?token={}",
+            self.view_port, capability
+        );
+        let response=self.intake(json!({"method":"traveler","operation_id":operation_id,"traveler_id":traveler_id,
+            "scope":discovery.scope,"recipient_key":recipient.public,"challenge_url":challenge_url})).await;
+        let ceremony_url = match response {
+            Ok(IntakeResponse::Prepared { ceremony_url }) => ceremony_url,
+            _ => {
+                self.set_state(&operation_id, "failed_before_release");
+                let resume = tab_url(&tab).await;
+                self.browser.return_control_at(&tab.target, resume).await?;
+                bail!("Private autofill approval unavailable");
+            }
+        };
+        status.state = "awaiting_approval".into();
+        status.ceremony_url = Some(ceremony_url);
+        self.store.update(&status)?;
+        *private = Some(PrivateCheckout {
+            operation_id: operation_id.clone(),
+            mode: Mode::Traveler,
+            view_target: tab.target.clone(),
+            view_session: tab.session.clone(),
+            seen_pages: std::collections::HashSet::from([tab.target.clone()]),
+            tab,
+            discovery: None,
+            traveler: Some(discovery),
+            contains_traveler: true,
+            recipient: Some(recipient),
+            capability,
+            claimed: false,
+            approved: false,
+        });
+        let service = self.clone();
+        tokio::spawn(async move {
+            service.finish_approved(operation_id).await;
+        });
+        Ok(serde_json::to_value(status)?)
+    }
     pub fn new(
         browser: Arc<Browser>,
         state: &Path,
@@ -207,9 +324,13 @@ impl CheckoutService {
         if view_port == 0 {
             bail!("Private view port must be explicit");
         }
+        let store = Store::open(state)?;
+        for origin in store.private_origins()? {
+            browser.protect_origin(origin)?;
+        }
         Ok(Arc::new(Self {
             browser,
-            store: Store::open(state)?,
+            store,
             private: AsyncMutex::new(None),
             completed: Mutex::new(None),
             broker_socket,
@@ -247,6 +368,30 @@ impl CheckoutService {
 
     pub async fn request(self: &Arc<Self>, request: Request) -> Result<Value> {
         match request {
+            Request::Traveler {
+                operation_id,
+                traveler_id,
+            } => self.start_traveler(operation_id, traveler_id).await,
+            Request::PrivateFacts { operation_id } => {
+                let private = self.private.lock().await;
+                let checkout = private
+                    .as_ref()
+                    .filter(|c| {
+                        c.operation_id == operation_id && c.mode == Mode::Traveler && c.approved
+                    })
+                    .context("No approved private traveler booking")?;
+                let discovery = Discovery::read(&checkout.tab)
+                    .await
+                    .context("Supported payment page not ready")?;
+                if checkout
+                    .traveler
+                    .as_ref()
+                    .is_none_or(|t| t.scope.origin != discovery.facts.origin)
+                {
+                    bail!("Booking merchant changed; private review required");
+                }
+                Ok(serde_json::to_value(discovery.facts)?)
+            }
             Request::Browse { request } => self.browser.browse(request).await,
             Request::Status { operation_id } => {
                 Ok(serde_json::to_value(self.store.get(&operation_id)?)?)
@@ -257,6 +402,7 @@ impl CheckoutService {
                 card_id,
                 agent_description,
                 take_over,
+                continue_private,
             } => {
                 OperationId::new(&operation_id)
                     .map_err(|_| anyhow::anyhow!("Invalid operation ID"))?;
@@ -273,8 +419,37 @@ impl CheckoutService {
                     bail!("Description exceeds limit");
                 }
                 let mut private = self.private.lock().await;
-                if private.is_some() {
-                    bail!("A checkout already has private control");
+                let held = if let Some(previous) = private.as_ref() {
+                    if take_over
+                        || previous.mode != Mode::Traveler
+                        || !previous.approved
+                        || continue_private.as_deref() != Some(previous.operation_id.as_str())
+                        || self.store.get(&previous.operation_id)?.state != "ready_for_payment"
+                    {
+                        bail!("A checkout already has private control");
+                    }
+                    if previous.view_target != previous.tab.target {
+                        bail!("Return to the approved booking tab before payment");
+                    }
+                    Some(previous.tab.clone())
+                } else {
+                    if continue_private.is_some() {
+                        bail!("Private booking is no longer active");
+                    }
+                    None
+                };
+                let traveler_origin = private
+                    .as_ref()
+                    .and_then(|p| p.traveler.as_ref())
+                    .map(|t| t.scope.origin.clone());
+                if let Some(origin) = &traveler_origin {
+                    let current = tab_url(held.as_ref().context("Private booking unavailable")?)
+                        .await
+                        .and_then(|u| url::Url::parse(&u).ok())
+                        .map(|u| u.origin().ascii_serialization());
+                    if current.as_ref() != Some(origin) {
+                        bail!("Booking merchant changed; private review required");
+                    }
                 }
                 let mut status = Status {
                     operation_id: operation_id.clone(),
@@ -287,15 +462,20 @@ impl CheckoutService {
                     Mode::Card => "card",
                     Mode::Site => "site",
                     Mode::TakeOver => "take_over",
+                    Mode::Traveler => "traveler",
                 };
                 self.store.insert(&status, kind, &agent_description)?;
-                let tab = self.browser.handoff().await?;
+                let contains_traveler = held.is_some();
+                let tab = match held {
+                    Some(tab) => tab,
+                    None => self.browser.handoff().await?,
+                };
                 status.state = "preparing".into();
                 self.store.update(&status)?;
                 let discovery = match mode {
                     Mode::Card => Discovery::read(&tab).await.ok(),
                     Mode::Site => Discovery::read_site(&tab).await.ok(),
-                    Mode::TakeOver => None,
+                    Mode::TakeOver | Mode::Traveler => None,
                 };
                 let shop = match &discovery {
                     Some(discovery) => Some(discovery.facts.origin.clone()),
@@ -343,6 +523,8 @@ impl CheckoutService {
                         status.ceremony_url = Some(ceremony_url);
                         self.store.update(&status)?;
                         *private = Some(PrivateCheckout {
+                            traveler: None,
+                            contains_traveler,
                             operation_id: operation_id.clone(),
                             mode,
                             view_target: tab.target.clone(),
@@ -471,6 +653,43 @@ impl CheckoutService {
         receipt: Option<Box<CustodyResult>>,
         aad: Option<CustodyOutputHpkeAad>,
     ) -> Result<()> {
+        if checkout.mode == Mode::Traveler {
+            let mut status = self.store.consume(&checkout.operation_id)?;
+            let traveler = checkout
+                .traveler
+                .as_ref()
+                .context("Private traveler binding missing")?;
+            self.store.protect_origin(&traveler.scope.origin)?;
+            self.browser.protect_origin(traveler.scope.origin.clone())?;
+            let key = checkout
+                .recipient
+                .take()
+                .context("Traveler recipient already consumed")?;
+            let receipt = receipt.context("Traveler release unavailable")?;
+            let aad = aad.context("Traveler release binding unavailable")?;
+            if receipt.custody_operation_id.as_str() != checkout.operation_id
+                || aad.custody_operation_id.as_str() != checkout.operation_id
+                || receipt.surface.as_ref() != Some(&aad.surface)
+            {
+                bail!("Traveler release binding mismatch");
+            }
+            let plaintext = key.open(
+                receipt
+                    .encrypted_browser_result
+                    .as_ref()
+                    .context("Traveler release unavailable")?,
+                &aad.canonical_bytes()
+                    .map_err(|_| anyhow::anyhow!("Traveler release binding invalid"))?,
+            )?;
+            let values: std::collections::BTreeMap<String, zeroize::Zeroizing<String>> =
+                serde_json::from_slice(&plaintext)
+                    .map_err(|_| anyhow::anyhow!("Invalid private traveler release"))?;
+            status.filled_fields = traveler.fill(&checkout.tab, &values).await?;
+            status.state = "filled".into();
+            status.ceremony_url = None;
+            self.store.update(&status)?;
+            return Ok(());
+        }
         let Some(discovery) = &checkout.discovery else {
             // Unclear payment facts leave the human to finish in the private view.
             let state = if checkout.mode == Mode::TakeOver {
@@ -698,19 +917,21 @@ impl CheckoutService {
                 return;
             };
             // A take-over may include a login with an emailed or texted code.
-            let take_over = checkout.mode == Mode::TakeOver;
+            let take_over = matches!(checkout.mode, Mode::TakeOver | Mode::Traveler);
             let deadline = started + Duration::from_secs(if take_over { 900 } else { 300 });
             let Ok(mut status) = self.store.get(&id) else {
                 return;
             };
-            if matches!(
-                status.state.as_str(),
-                "submitted"
-                    | "manual_required"
-                    | "uncertain"
-                    | "partially_filled"
-                    | "disclosure_unknown"
-            ) {
+            if checkout.mode != Mode::Traveler
+                && matches!(
+                    status.state.as_str(),
+                    "submitted"
+                        | "manual_required"
+                        | "uncertain"
+                        | "partially_filled"
+                        | "disclosure_unknown"
+                )
+            {
                 let contexts = checkout
                     .tab
                     .cdp
@@ -726,6 +947,12 @@ impl CheckoutService {
                     if matches!(outcome["state"].as_str(), Some("paid" | "declined")) {
                         status.state = outcome["state"].as_str().unwrap().into();
                         status.outcome = serde_json::from_value(outcome).ok();
+                        if checkout.contains_traveler {
+                            if let Some(outcome) = &mut status.outcome {
+                                outcome.order_id = None;
+                                outcome.source = "merchant".into();
+                            }
+                        }
                         status.ceremony_url = None;
                         if self.store.update(&status).is_ok()
                             && self.browser.return_control().await.is_ok()
@@ -801,8 +1028,40 @@ impl CheckoutService {
         authorize_view(checkout, token)?;
         let pages = Self::private_pages(checkout).await?;
         let status = self.store.get(&checkout.operation_id)?;
+        if checkout.contains_traveler {
+            // Popups belong to the same private booking even when they have
+            // not been selected. Never reopen their saved session to shopping.
+            for page in &pages {
+                if let Some(origin) = page["origin"].as_str()
+                    && let Ok(url) = url::Url::parse(origin)
+                    && matches!(url.scheme(), "http" | "https")
+                {
+                    self.store.protect_origin(origin)?;
+                    self.browser.protect_origin(origin.to_owned())?;
+                }
+            }
+            for context in checkout
+                .tab
+                .cdp
+                .contexts(&checkout.view_session, "bloom-private-history")
+                .await?
+            {
+                if let Ok(url) = url::Url::parse(&context.url) {
+                    if matches!(url.scheme(), "http" | "https") {
+                        let origin = url.origin().ascii_serialization();
+                        self.store.protect_origin(&origin)?;
+                        self.browser.protect_origin(origin)?;
+                    }
+                }
+            }
+        }
+        if status.state == "ready_for_payment" {
+            return Ok(
+                json!({"state":"ready_for_payment","outcome":null,"closed":true,"pages":[]}),
+            );
+        }
         Ok(
-            json!({"state":status.state,"outcome":status.outcome,"pages":pages,"selected_page":checkout.view_target,"closed":false}),
+            json!({"state":status.state,"outcome":status.outcome,"pages":pages,"selected_page":checkout.view_target,"closed":false,"traveler":checkout.mode==Mode::Traveler}),
         )
     }
 
@@ -926,7 +1185,21 @@ impl CheckoutService {
                 Self::select_private_page(checkout, target).await?;
             }
             ViewAction::Finish => {
-                if checkout.mode == Mode::TakeOver {
+                if checkout.mode == Mode::Traveler {
+                    let discovery = Discovery::read(&checkout.tab)
+                        .await
+                        .context("Continue to the supported payment page before finishing")?;
+                    if checkout.view_target != checkout.tab.target
+                        || checkout
+                            .traveler
+                            .as_ref()
+                            .is_none_or(|t| t.scope.origin != discovery.facts.origin)
+                    {
+                        bail!("Return to the approved booking tab before payment");
+                    }
+                    self.set_state(&checkout.operation_id, "ready_for_payment");
+                    return Ok(());
+                } else if checkout.mode == Mode::TakeOver {
                     let resume = Self::page_url(checkout).await;
                     self.browser
                         .return_control_at(&checkout.view_target, resume)
@@ -1030,6 +1303,32 @@ const BROWSE_ERRORS: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn private_origin_guard_survives_restart_and_interrupted_fill_is_not_retried() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("state.db");
+        {
+            let store = Store::open(&path).unwrap();
+            store.protect_origin("https://booking.example").unwrap();
+            store.protect_origin("https://booking.example").unwrap();
+            let status = Status {
+                operation_id: "fixture".into(),
+                state: "filled".into(),
+                ceremony_url: None,
+                filled_fields: vec!["given_name".into()],
+                outcome: None,
+            };
+            store
+                .insert(&status, "traveler", "Fixture passenger")
+                .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            store.private_origins().unwrap(),
+            ["https://booking.example"]
+        );
+        assert_eq!(store.get("fixture").unwrap().state, "disclosure_unknown");
+    }
     #[tokio::test]
     async fn private_view_requires_one_shot_claim_and_handles_bank_popup() {
         use axum::{Router, response::Html, routing::get};
@@ -1076,6 +1375,8 @@ mod tests {
         *service.private.lock().await = Some(PrivateCheckout {
             operation_id: status.operation_id,
             mode: Mode::Card,
+            traveler: None,
+            contains_traveler: false,
             view_target: tab.target.clone(),
             view_session: tab.session.clone(),
             seen_pages: std::collections::HashSet::from([tab.target.clone()]),
@@ -1298,6 +1599,8 @@ mod tests {
         *service.private.lock().await = Some(PrivateCheckout {
             operation_id: status.operation_id,
             mode: Mode::TakeOver,
+            traveler: None,
+            contains_traveler: false,
             view_target: tab.target.clone(),
             view_session: tab.session.clone(),
             seen_pages: std::collections::HashSet::from([tab.target.clone()]),

@@ -32,9 +32,11 @@ pub struct Browser {
     tab: Mutex<Tab>,
     revoked: AtomicBool,
     fixture_payment_hosts: bool,
+    private_origins: std::sync::RwLock<std::collections::BTreeSet<String>>,
 }
 
 /// Private checkout access exists only after the public API has drained.
+#[derive(Clone)]
 pub(crate) struct PrivateTab {
     pub cdp: Arc<Cdp>,
     pub session: String,
@@ -88,6 +90,7 @@ impl Browser {
             tab: Mutex::new(tab),
             fixture_payment_hosts,
             revoked: AtomicBool::new(false),
+            private_origins: std::sync::RwLock::new(std::collections::BTreeSet::new()),
         }))
     }
 
@@ -122,6 +125,7 @@ impl Browser {
                 let mut url = String::new();
                 for (position, frame) in contexts.into_iter().enumerate() {
                     let parsed = url::Url::parse(&frame.url)?;
+                    self.guard_origin(&frame.url)?;
                     if !matches!(parsed.scheme(), "http" | "https") && frame.url != "about:blank" {
                         if position == 0 {
                             bail!("Only ordinary shopping documents can be observed");
@@ -135,6 +139,7 @@ impl Browser {
                         bail!("Shopping document changed; request a new snapshot");
                     }
                     let snapshot = &result["result"]["value"];
+                    self.guard_origin(snapshot["url"].as_str().unwrap_or("about:blank"))?;
                     if position == 0 {
                         url = snapshot["url"].as_str().unwrap_or("").into();
                     }
@@ -168,9 +173,10 @@ impl Browser {
                         elements.push(element);
                     }
                 }
-                Ok(
-                    json!({"url":url,"text":text.chars().take(30000).collect::<String>(),"elements":elements}),
-                )
+                Ok({
+                    self.guard_tab(&tab).await?;
+                    json!({"url":url,"text":text.chars().take(30000).collect::<String>(),"elements":elements})
+                })
             }
             BrowseRequest::Back => {
                 let history = self
@@ -204,6 +210,7 @@ impl Browser {
     }
 
     async fn act(&self, tab: &mut Tab, reference: &str, kind: &str, value: &str) -> Result<Value> {
+        self.guard_tab(tab).await?;
         let (generation, index) = reference
             .split_once(':')
             .context("Invalid element reference")?;
@@ -296,6 +303,35 @@ impl Browser {
         Ok(())
     }
 
+    pub(crate) fn protect_origin(&self, origin: String) -> Result<()> {
+        self.private_origins
+            .write()
+            .map_err(|_| anyhow::anyhow!("Private origin guard unavailable"))?
+            .insert(origin);
+        Ok(())
+    }
+    fn guard_origin(&self, url: &str) -> Result<()> {
+        let origin = url::Url::parse(url)?.origin().ascii_serialization();
+        if self
+            .private_origins
+            .read()
+            .map_err(|_| anyhow::anyhow!("Private origin guard unavailable"))?
+            .contains(&origin)
+        {
+            bail!("This booking site contains private traveler data; use approved private control");
+        }
+        Ok(())
+    }
+    async fn guard_tab(&self, tab: &Tab) -> Result<()> {
+        for frame in self
+            .cdp
+            .contexts(&tab.session, "bloom-private-origin-guard")
+            .await?
+        {
+            self.guard_origin(&frame.url)?;
+        }
+        Ok(())
+    }
     fn available(&self) -> Result<()> {
         if self.revoked.load(Ordering::SeqCst) {
             bail!("Checkout has private control; shopping is paused");
