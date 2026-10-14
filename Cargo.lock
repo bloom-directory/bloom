@@ -2263,7 +2263,7 @@ dependencies = [
 [[package]]
 name = "bloom-broker-api"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-broker.git?rev=43425c424bc85b56b7f7efa6516d0978999f3c31#43425c424bc85b56b7f7efa6516d0978999f3c31"
+source = "git+https://github.com/bloom-directory/bloom-broker.git?rev=76064587c0da42974fdc9b70d33b8834400f7c4a#76064587c0da42974fdc9b70d33b8834400f7c4a"
 dependencies = [
  "bloom-rpc-wire",
  "num-bigint",
