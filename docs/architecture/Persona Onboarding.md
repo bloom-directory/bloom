@@ -1,6 +1,29 @@
 # Persona onboarding
 
-`bloom init` offers Custodian, Trader and Degen. Custodian is the default and
+`bloom init` opens the real local browser onboarding flow. `bloom onboard`
+opens or resumes it after install; `bloom onboard --no-open` prints the URL for
+Firefox or another browser. First-install packaging starts it as the enrolled
+login user: macOS after service readiness, Linux at the next graphical login
+once new group membership applies. Repairs and upgrades do not reopen setup.
+`--if-needed` skips the automatic welcome once persona and setup choices are
+saved; it does not imply that wallet policy or session authority is active.
+
+The browser uses Bloom Broker's ceremony design tokens and components. It saves
+persona, limits and Petal choices through the sole Machine daemon's IPC owner,
+provisions the same canonical catalog, then launches actual wallet creation or
+import, policy review and session activation ceremonies. Secret entry remains
+on the Broker origin. Returning from a ceremony explicitly reconciles its
+result; refreshing state never creates authority. Unsupported scopes and the
+Polymarket package rollout gate remain visible.
+
+The HTTP server binds only `127.0.0.1` on an ephemeral port with a random 256-bit
+path capability, exact Host and POST Origin checks, JSON-only bounded mutation
+requests, no CORS, no caching, no referrer and a restrictive CSP. It stops after
+30 minutes or 15 idle minutes. It never stores private key or passkey input.
+`bloom init --no-browser` retains scripted setup; explicit `--persona` flags also
+retain the terminal/script path.
+
+The persona picker offers Custodian, Trader and Degen. Custodian is the default and
 retains the current transaction approval behavior. Config records suggestions,
 not grants: selecting Trader or Degen cannot authorize an action by itself.
 Legacy homes with no persona keep their current choices, venue settings and

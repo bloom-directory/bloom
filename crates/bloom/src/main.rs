@@ -9,6 +9,7 @@
 mod commands {
     pub mod qr;
 }
+mod browser_onboarding;
 mod default_policy;
 mod deploy;
 mod github_source;
@@ -1152,6 +1153,11 @@ fn machine_command_event_fields(
         MachineCommand::WalletDefaultPolicy { .. } => {
             ("default_policy", None, MachineCommandEventClass::Prepared)
         }
+        MachineCommand::OnboardingSetup { .. } => (
+            "onboarding_setup",
+            None,
+            MachineCommandEventClass::DurableMutation,
+        ),
         MachineCommand::PersonaPreferencesSet { .. } => (
             "persona_preferences_set",
             None,
@@ -1658,6 +1664,24 @@ async fn execute_machine_command(
             })?;
             let status = default_policy::advance_default_policy(daemon, &name).await?;
             format!("{}\n", serde_json::to_string(&status)?)
+        }
+        MachineCommand::OnboardingSetup {
+            preset,
+            per_action_usd,
+            daily_usd,
+            session_duration_secs,
+            petals,
+        } => {
+            let result = apply_browser_setup(
+                daemon,
+                preset,
+                per_action_usd.as_deref(),
+                daily_usd.as_deref(),
+                session_duration_secs,
+                &petals,
+            )
+            .await?;
+            format!("{}\n", serde_json::to_string(&result)?)
         }
         MachineCommand::PersonaPreferencesSet {
             wallet,
@@ -2618,8 +2642,20 @@ enum Cmd {
     /// current update-checker state.
     #[command(subcommand)]
     Update(UpdateCmd),
+    /// Open the local browser onboarding flow or resume wallet setup.
+    Onboard {
+        /// Print the local URL without opening the default browser.
+        #[arg(long)]
+        no_open: bool,
+        /// Skip the automatic welcome once persona and setup choices are saved.
+        #[arg(long)]
+        if_needed: bool,
+    },
     /// Initialise ~/.bloom with default config + dirs.
     Init {
+        /// Use terminal/scripted setup instead of browser onboarding.
+        #[arg(long)]
+        no_browser: bool,
         /// Explicit onboarding suggestion; saving it does not activate authority.
         #[arg(long, value_parser = ["custodian", "trader", "degen"])]
         persona: Option<String>,
@@ -3447,6 +3483,123 @@ async fn ipc_read_to_stdout(endpoint: &ResolvedEndpoint, path: &str, context: &s
     Ok(())
 }
 
+fn browser_setup_choices_saved(home: &HomeDir) -> Result<bool> {
+    if !home.config_path().exists() {
+        return Ok(false);
+    }
+    let config = bloom_proto::Config::load(&home.config_path())?;
+    Ok(config.petals.setup_complete && config.persona.is_some())
+}
+
+async fn configure_browser_setup(
+    home: &HomeDir,
+    endpoint: &ResolvedEndpoint,
+    request: browser_onboarding::SetupRequest,
+) -> Result<serde_json::Value> {
+    let command = MachineCommand::OnboardingSetup {
+        preset: request.persona,
+        per_action_usd: request.per_action_usd,
+        daily_usd: request.daily_usd,
+        session_duration_secs: request.session_duration_secs,
+        petals: request.petals,
+    };
+    // A running daemon owns the home, audit and authenticated Broker edge.
+    // Never bypass an incompatible or rejecting service with a local writer.
+    match IpcClient::new(&endpoint.socket)
+        .call_with_protocol("version", serde_json::Value::Null)
+        .await
+    {
+        Ok(_) => {
+            let output = machine_command(endpoint, command).await?;
+            anyhow::ensure!(output.exit_code == 0, "{}", output.stderr);
+            serde_json::from_str(output.stdout.trim()).context("decode onboarding setup result")
+        }
+        Err(IpcClientError::Transport(_)) if !endpoint.socket.exists() => {
+            let (_permit, daemon) = build_write_daemon(home.clone())?;
+            let output = execute_machine_command(home, &daemon, command).await?;
+            serde_json::from_str(output.stdout.trim()).context("decode onboarding setup result")
+        }
+        Err(error) => Err(anyhow::anyhow!(error)).context("connect to the Machine home owner"),
+    }
+}
+
+async fn apply_browser_setup(
+    daemon: &Daemon,
+    preset: bloom_proto::persona::PersonaPreset,
+    per_action: Option<&str>,
+    daily: Option<&str>,
+    duration: Option<u64>,
+    chosen_petals: &[String],
+) -> Result<serde_json::Value> {
+    let _transition = default_policy::PERSONA_TRANSITION.lock().await;
+    let mut config = bloom_proto::Config::load(&daemon.home.config_path())?;
+    let previous = config.clone();
+    let first_setup = !config.petals.setup_complete;
+    default_policy::select_persona(
+        &mut config.persona,
+        Some(preset),
+        per_action,
+        daily,
+        duration,
+    )?;
+    let allowed = default_policy::menu_petals();
+    anyhow::ensure!(
+        chosen_petals.len() <= allowed.len(),
+        "too many selected Petals"
+    );
+    let mut unique = std::collections::BTreeSet::new();
+    for name in chosen_petals {
+        anyhow::ensure!(
+            allowed.contains(name) && unique.insert(name),
+            "unknown or repeated setup Petal"
+        );
+    }
+    // Preserve owner values; fill only new choices using the same catalog defaults
+    // as terminal setup. A persona change never silently widens venue settings.
+    let mut suggestions = bloom_proto::config::PetalsConfig::default();
+    default_policy::accept_setup_suggestions(&mut suggestions, config.persona.as_ref());
+    config
+        .petals
+        .setup
+        .retain(|name, _| chosen_petals.contains(name));
+    for name in chosen_petals {
+        if !config.petals.setup.contains_key(name)
+            && let Some(values) = suggestions.setup.remove(name)
+        {
+            config.petals.setup.insert(name.clone(), values);
+        }
+    }
+    config.petals.setup_complete = true;
+    config.validate()?;
+    if previous.persona != config.persona || previous.petals.setup != config.petals.setup {
+        daemon
+            .stop_persona_sessions("main", "owner changed browser onboarding choices")
+            .await?;
+    }
+    let owners = default_policy::petal_owners(daemon)?;
+    // Freeze setup obligations before the completion marker becomes durable.
+    default_policy::record_setup_settings_obligations_for(
+        daemon,
+        &config.petals,
+        &owners,
+        first_setup,
+    )
+    .await?;
+    let temporary = tempfile::NamedTempFile::new_in(daemon.home.root())?;
+    config.save(temporary.path())?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist(daemon.home.config_path())
+        .map_err(|error| error.error)?;
+    std::fs::File::open(daemon.home.root())?.sync_all()?;
+    // Use the daemon's existing edge, audit writer and VFS throughout setup.
+    let installed = github_source::ensure_preinstalled_petals(&daemon.home, daemon)?;
+    let messages = default_policy::apply_setup_settings(daemon, &owners, first_setup).await?;
+    Ok(
+        serde_json::json!({"setup_complete":true,"persona":config.persona,"petals":config.petals.setup,"installed":installed,"messages":messages}),
+    )
+}
+
 async fn machine_command(
     endpoint: &ResolvedEndpoint,
     command: MachineCommand,
@@ -3598,7 +3751,14 @@ async fn run(cli: Cli) -> Result<()> {
     }
 
     match cli.cmd.context("a command is required")? {
+        Cmd::Onboard { no_open, if_needed } => {
+            if if_needed && browser_setup_choices_saved(&home)? {
+                return Ok(());
+            }
+            browser_onboarding::run(home, client_endpoint, no_open).await
+        }
         Cmd::Init {
+            no_browser,
             internal,
             persona,
             persona_per_action_usd,
@@ -3678,6 +3838,9 @@ async fn run(cli: Cli) -> Result<()> {
                     .context("Bloom macOS identity rotation generation failed"),
                 };
             }
+            if !no_browser && persona.is_none() && !structured_service_output() {
+                return browser_onboarding::run(home, client_endpoint, false).await;
+            }
             if !structured_service_output() {
                 eprintln!("{ALPHA_DISCLOSURE}");
             }
@@ -3699,7 +3862,10 @@ async fn run(cli: Cli) -> Result<()> {
                 persona_session_seconds,
             )?;
             if persona.is_none() && first_setup && d.config.persona.is_none() {
-                if !structured_service_output() && default_policy::interactive_setup_available() {
+                if !no_browser
+                    && !structured_service_output()
+                    && default_policy::interactive_setup_available()
+                {
                     default_policy::run_persona_menu(
                         &mut d.config.persona,
                         &mut std::io::stdin().lock(),
@@ -3720,7 +3886,10 @@ async fn run(cli: Cli) -> Result<()> {
                 .await?;
             }
             if first_setup {
-                if !structured_service_output() && default_policy::interactive_setup_available() {
+                if !no_browser
+                    && !structured_service_output()
+                    && default_policy::interactive_setup_available()
+                {
                     default_policy::run_setup_menu(
                         &mut d.config.petals,
                         d.config.persona.as_ref(),

@@ -175,3 +175,18 @@ diagnostic files.
 Each daemon also has a small bounded `SERVICE-bootstrap.log` launchd stderr
 fallback. It is only for fixed, sanitized initialization failures that happen
 before the canonical app writer is available; routine events never use it.
+
+## First browser setup
+
+After a fresh enrollment passes authenticated runtime health, the installer
+submits a one-shot `bloom onboard --if-needed` LaunchAgent to the enrolled
+login's active GUI domain. launchd runs it as that login, so the browser and
+setup server never run as root. Its plist lives under
+`/Library/Application Support/BloomTriad/onboarding/LOGIN_UID.plist`, outside
+the automatically loaded LaunchAgents directory. It has no keepalive and is
+not submitted during repair, upgrade, or custody restore.
+
+The installer prints `bloom onboard` for opening or resuming the actual setup
+page later. Run it as the enrolled login without `sudo`. Saving persona and
+app choices is separate from completing the wallet, policy, and session owner
+reviews shown on that page. Reopening setup inspects their current status.

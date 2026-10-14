@@ -54,10 +54,12 @@ review. Explicit native transfer sessions currently support Ethereum, Polygon
 and local chain 31337 with reviewed asset and fee unit limits. Other networks
 and Solana retain exact approval. Venue settings may impose tighter limits.
 
+Owner onboarding opens through `bloom init` or `bloom onboard` after install.
+The local browser delegates wallet and permission review to Broker ceremonies.
 If the CLI is available, `bloom wallet persona status main` reports grants,
 expiry and shared usage. Owner-requested changes use `bloom wallet persona set`
 and `activate`; `stop` disables local discovery before remote revocation.
-Never change a profile, stop a grant, reset a budget or rotate an operation ID
+Never change a profile, revoke Broker authority, reset a budget or rotate an operation ID
 merely to work around a denial. A consumed, expired or unavailable grant is not
 authority for a replacement signature. Reconcile the original operation first;
 forward any required fresh ceremony to the owner. Recovering a completed

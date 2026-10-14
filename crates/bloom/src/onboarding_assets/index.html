@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Set up Bloom</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <main class="page">
+    <header><a class="brand" href="./" aria-label="Bloom setup">Bloom</a><span class="local">Private · on this device</span></header>
+    <section class="panel-header intro"><p class="panel-context">Wallet setup</p><h1>Set up Bloom</h1><p>Choose how Bloom helps you, connect your wallet, then review exactly what it can do. Every permission starts with you.</p></section>
+    <div id="notice" class="notice" role="status" aria-live="polite">Connecting to your local Bloom…</div>
+    <section class="panel card" aria-labelledby="preferences-title">
+      <div class="section-heading"><span class="step">1</span><div><h2 id="preferences-title">Find your starting point</h2><p>These are configurable preferences. Saving them does not grant signing permission.</p></div></div>
+      <form id="setup-form">
+        <fieldset class="personas"><legend class="sr-only">Choose a persona</legend>
+          <label class="persona"><input type="radio" name="persona" value="custodian" checked><span><strong>Custodian</strong><small>Review each action</small><span>Stay hands-on. No automatic session permissions.</span></span></label>
+          <label class="persona"><input type="radio" name="persona" value="trader"><span><strong>Trader</strong><small>A little room to move</small><span>Suggested $100 per action, $1,000 per day, for 24 hours.</span></span></label>
+          <label class="persona"><input type="radio" name="persona" value="degen"><span><strong>Degen</strong><small>More room, same control</small><span>Suggested $1,000 per action, $10,000 per day, for 7 days.</span></span></label>
+        </fieldset>
+        <fieldset id="limits" class="limits" hidden><legend>Adjust your suggested limits</legend>
+          <label>Per action · nominal pUSD<input name="per_action_usd" id="per-action" type="text" inputmode="decimal" value="100" pattern="[0-9]+(\.[0-9]{1,6})?" required></label>
+          <label>Per rolling 24 hours · pUSD<input name="daily_usd" id="daily" type="text" inputmode="decimal" value="1000" pattern="[0-9]+(\.[0-9]{1,6})?" required></label>
+          <label>Session duration<select name="session_duration_secs" id="duration"><option value="3600">1 hour</option><option value="86400" selected>24 hours</option><option value="604800">7 days</option><option value="2592000">30 days</option></select></label>
+        </fieldset>
+        <fieldset class="venues"><legend>Choose your Petals</legend><p>Choose the integrations your wallet policy should allow. Existing venue limits are preserved.</p><div id="petal-choices"></div></fieldset>
+        <aside class="coverage"><strong>Know what the limits cover</strong><p>Automatic sessions initially cover eligible Polymarket buys using nominal pUSD collateral. These are not limits on the total USD value of your wallet. Hyperliquid, other apps and uncovered assets require an exact action review. Native assets require explicit unit limits in a separate reviewed proposal.</p><p><strong>Polymarket rollout gate:</strong> automatic BUY coverage needs the updated order-accounting package. The currently released package still requests individual approvals.</p></aside>
+        <div class="form-footer"><button type="submit" id="save-setup">Save preferences &amp; continue</button><span id="setup-status" class="muted"></span></div>
+      </form>
+    </section>
+    <section class="panel card" aria-labelledby="wallet-title"><div class="section-heading"><span class="step">2</span><div><h2 id="wallet-title">Bring your wallet</h2><p>This setup uses wallet <code>main</code>, account <code>0</code>. Your wallet is created or imported through the secure Broker ceremony.</p></div></div><div class="actions"><button data-action="wallet_new">Create a wallet</button><button class="secondary" data-action="wallet_import">Import a wallet</button></div><p id="wallet-summary" class="muted">Wallet status will appear after connecting.</p></section>
+    <section class="panel card" aria-labelledby="policy-title"><div class="section-heading"><span class="step">3</span><div><h2 id="policy-title">Review your wallet policy</h2><p>Review the installed packages and destinations before applying the default policy. Existing settings and unresolved provisioning work may need reconciliation.</p></div></div><button class="secondary" data-action="policy">Review or resume policy</button><p id="policy-summary" class="muted"></p></section>
+    <section class="panel card" aria-labelledby="session-title"><div class="section-heading"><span class="step">4</span><div><h2 id="session-title">Review your session</h2><p id="session-explanation">Custodian keeps each action under your review. Trader and Degen can request a bounded session after the wallet policy is applied.</p></div></div><div class="actions"><button data-action="activate" id="activate" disabled>Review session permissions</button><button class="secondary" data-action="stop">Stop persona sessions</button><button class="text-button" data-action="refresh">Refresh status</button></div><p class="muted">Sessions start only after you approve their exact terms. Some scopes need separate approvals. Stopping sessions revokes persona-managed grants.</p><p id="session-status" class="status-output">No session status yet.</p></section>
+    <section id="review" class="panel card review" hidden aria-labelledby="review-title"><p class="panel-context">YOUR REVIEW IS NEEDED</p><h2 id="review-title">Continue in the secure ceremony</h2><p>Open the review, check the exact wallet and permissions, and approve only if they match your intent. Then return here and continue so Bloom can verify completion.</p><a id="ceremony-link" class="button" target="_blank" rel="noopener noreferrer">Open secure review ↗</a><button id="resume-review" class="text-button" data-action="refresh">I’ve finished — continue</button></section>
+    <details class="panel card details"><summary>Activity &amp; recovery details</summary><p class="muted">If a step fails, keep this page open, resolve the reported issue, then refresh and resume that step. Saved preferences do not mean policy or sessions are approved.</p><pre id="activity" tabindex="0">Waiting for local service.</pre><details><summary>Current service state</summary><pre id="raw-state"></pre></details></details>
+    <footer>Built around your permission. Keep this local setup link private.</footer>
+  </main>
+</body>
+</html>

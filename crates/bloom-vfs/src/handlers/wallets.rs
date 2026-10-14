@@ -288,7 +288,8 @@ pub struct DefaultPolicySetup {
     pub destinations: Vec<bloom_broker_api::PolicyDestination>,
 }
 
-pub type DefaultPolicyPackages = Arc<dyn Fn(&str) -> DefaultPolicySetup + Send + Sync>;
+pub type DefaultPolicyPackages =
+    Arc<dyn Fn(&str) -> Result<DefaultPolicySetup, HandlerError> + Send + Sync>;
 
 #[derive(Clone)]
 pub struct WalletsHandler {
@@ -1385,6 +1386,7 @@ impl WalletsHandler {
             .default_policy_packages
             .as_ref()
             .map(|defaults| defaults(wallet))
+            .transpose()?
             .unwrap_or_default();
         self.ensure_policy_allows(
             wallet,

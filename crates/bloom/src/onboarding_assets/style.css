@@ -1,0 +1,58 @@
+/* Reused Bloom Broker ceremony tokens and page, panel, form and button components.
+ * Source: bloom-broker/src/ceremony_assets/style.css. */
+:root{
+  /* Palette */
+  --ceremony-bg:#f7f6f3;
+  --ceremony-surface:#fffefa;
+  --ceremony-text:#15130f;
+  --ceremony-muted:#706757;
+  --ceremony-border:#e5e0d8;
+  --ceremony-accent:#8a2a3a;
+  --ceremony-accent-deep:#5e1a26;
+  --ceremony-warning:#7a4a10;
+  --ceremony-warning-surface:#fdf3e2;
+  --ceremony-danger:#8a1f2b;
+  --ceremony-danger-surface:#fceced;
+  --ceremony-success:#355f47;
+  /* Type */
+  --ceremony-font:"Avenir Next",Inter,system-ui,-apple-system,"Segoe UI",sans-serif;
+  --ceremony-font-display:var(--ceremony-font);
+  --ceremony-font-mono:"SFMono-Regular",Consolas,"Liberation Mono",monospace;
+  --ceremony-text-size:16px;
+  --ceremony-address-size:13px;
+  --ceremony-heading-size:28px;
+  /* Measure and rhythm: an 8px scale. */
+  --ceremony-width:840px;
+  --ceremony-gutter:24px;
+  --ceremony-padding:32px;
+  --ceremony-label-width:184px;
+  --ceremony-space-1:8px;
+  --ceremony-space-2:16px;
+  --ceremony-space-3:24px;
+  --ceremony-space-4:32px;
+  --ceremony-radius:12px;
+}
+
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+html{background:var(--ceremony-bg);color:var(--ceremony-text);-webkit-text-size-adjust:100%}
+body{margin:0;font:var(--ceremony-text-size)/1.55 var(--ceremony-font);-webkit-font-smoothing:antialiased}
+.page{width:min(var(--ceremony-width),100%);margin:0 auto;padding:calc(var(--ceremony-space-3) + env(safe-area-inset-top,0px)) calc(var(--ceremony-gutter) + env(safe-area-inset-right,0px)) calc(var(--ceremony-space-4) + env(safe-area-inset-bottom,0px)) calc(var(--ceremony-gutter) + env(safe-area-inset-left,0px))}
+.brand{display:flex;align-items:center;gap:var(--ceremony-space-1);margin-bottom:var(--ceremony-space-3);color:var(--ceremony-muted);font-size:14px}
+.brand strong{color:var(--ceremony-accent-deep);font-weight:600}
+.brand-context{margin:0 0 0 auto;text-align:right}
+.panel{border:1px solid var(--ceremony-border);border-radius:var(--ceremony-radius);background:var(--ceremony-surface)}
+.panel-header{padding:var(--ceremony-padding) var(--ceremony-padding) var(--ceremony-space-3)}
+.panel-context{display:flex;align-items:center;gap:8px;margin:0 0 var(--ceremony-space-2);color:var(--ceremony-accent-deep);font-size:14px}
+.panel-title{margin:0;font:600 var(--ceremony-heading-size)/1.25 var(--ceremony-font-display);letter-spacing:-.035em;overflow-wrap:anywhere}
+details pre{max-height:40vh;margin:0;padding:var(--ceremony-space-2);overflow:auto;border:1px solid var(--ceremony-border);border-radius:8px;font:12px/1.55 var(--ceremony-font-mono);white-space:pre-wrap;overflow-wrap:anywhere}
+button{min-height:44px;padding:10px 20px;border:0;border-radius:8px;background:var(--ceremony-accent);color:var(--ceremony-surface);font:600 15px var(--ceremony-font);cursor:pointer}
+button:hover:not(:disabled){background:var(--ceremony-accent-deep)}
+button:disabled{opacity:.5;cursor:default}
+button.secondary{border:1px solid var(--ceremony-border);background:transparent;color:var(--ceremony-text)}
+:focus-visible{outline:3px solid var(--ceremony-accent);outline-offset:2px}
+input,textarea{width:100%;padding:10px 12px;border:1px solid var(--ceremony-border);border-radius:8px;background:var(--ceremony-surface);color:var(--ceremony-text);font:15px/1.5 var(--ceremony-font-mono)}
+.choice{grid-template-columns:auto 1fr;align-items:start}
+.choice input{width:auto}
+
+h1{margin:0 0 12px;font:600 28px/1.25 var(--ceremony-font-display);letter-spacing:-.035em}h2{margin:0 0 8px;font:600 19px/1.4 var(--ceremony-font-display);letter-spacing:-.02em}p{margin:0 0 16px}.brand{justify-content:space-between}.brand a{color:var(--ceremony-accent-deep);text-decoration:none;font-weight:600}.local,.muted{color:var(--ceremony-muted);font-size:14px}.intro{padding-left:0;padding-right:0}.intro>p:last-child{max-width:650px;color:var(--ceremony-muted)}.card{padding:var(--ceremony-padding);margin-bottom:24px}.section-heading{display:flex;align-items:baseline;gap:16px;margin-bottom:24px}.section-heading p{font-size:14px;color:var(--ceremony-muted);margin:0}.step{color:var(--ceremony-muted);font-size:14px;flex-shrink:0}.notice{padding:16px;border:1px solid var(--ceremony-border);border-radius:8px;margin-bottom:24px;font-size:14px;overflow-wrap:anywhere}.notice.error{color:var(--ceremony-danger);background:var(--ceremony-danger-surface)}fieldset{padding:0;border:0;margin:0 0 24px}legend{font-weight:600;font-size:15px;margin-bottom:12px}.personas{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.persona{display:flex;align-items:flex-start;gap:8px;padding:16px;border:1px solid var(--ceremony-border);border-radius:8px;cursor:pointer}.persona:has(input:checked){border-color:var(--ceremony-accent);background:var(--ceremony-bg)}.persona input{width:auto;flex-shrink:0;margin-top:5px;accent-color:var(--ceremony-accent)}.persona strong,.persona small,.persona span>span{display:block}.persona strong{font-size:16px}.persona small{font-size:12px;color:var(--ceremony-muted);margin:4px 0 10px}.persona span>span{font-size:13px;color:var(--ceremony-muted)}.limits{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.limits label{font-size:13px;color:var(--ceremony-muted)}.limits input,.limits select{display:block;margin-top:8px;width:100%;padding:10px 12px;border:1px solid var(--ceremony-border);border-radius:8px;background:var(--ceremony-surface);color:var(--ceremony-text);font:15px/1.5 var(--ceremony-font-mono)}.venues p{font-size:14px;color:var(--ceremony-muted)}#petal-choices{display:grid;grid-template-columns:1fr 1fr;gap:8px 20px}.petal-choice{display:flex;align-items:flex-start;gap:8px;padding:8px 0}.petal-choice input{width:auto;margin-top:5px;accent-color:var(--ceremony-accent)}.petal-choice strong,.petal-choice small{display:block}.petal-choice strong{font-size:14px;font-weight:600}.petal-choice small{font-size:12px;color:var(--ceremony-muted)}.coverage{border-top:1px solid var(--ceremony-border);border-bottom:1px solid var(--ceremony-border);padding:16px 0;margin-bottom:24px;font-size:13px;color:var(--ceremony-muted)}.coverage strong{color:var(--ceremony-text)}.coverage p{margin:8px 0 0}.form-footer,.actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.actions+p{margin-top:16px}.text-button{background:transparent;color:var(--ceremony-accent);border:1px solid var(--ceremony-border)}.button{display:inline-block;min-height:44px;padding:10px 20px;border-radius:8px;background:var(--ceremony-accent);color:var(--ceremony-surface);font-size:15px;font-weight:600;text-decoration:none}.review{border-color:var(--ceremony-accent)}.review p{font-size:14px}.details{font-size:14px}summary{cursor:pointer;color:var(--ceremony-accent)}details>p,details>pre,details>details{margin-top:16px}.status-output{white-space:pre-wrap;overflow-wrap:anywhere;font-size:14px;color:var(--ceremony-muted)}pre{font:12px/1.55 var(--ceremony-font-mono);white-space:pre-wrap;overflow-wrap:anywhere;max-height:40vh;overflow:auto}code{font-family:var(--ceremony-font-mono)}footer{font-size:13px;color:var(--ceremony-muted);text-align:center;margin-top:32px}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}@media(max-width:650px){:root{--ceremony-padding:20px;--ceremony-gutter:16px}.personas,.limits,#petal-choices{grid-template-columns:1fr}.section-heading{gap:12px}.actions button{flex-grow:1}.local{font-size:12px}.form-footer>button{width:100%}}

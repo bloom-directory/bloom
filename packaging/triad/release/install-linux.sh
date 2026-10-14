@@ -1306,6 +1306,7 @@ case "$action" in
       installer/linux/systemd/bloom-signer@.service.in \
       installer/linux/systemd-user/bloom-session.service \
       installer/linux/systemd-user/bloom-machine.service \
+      installer/linux/systemd-user/bloom-onboarding.service \
       installer/release/install-linux.sh
     do
       [[ -f "$payload/$required" && ! -L "$payload/$required" ]] || {
@@ -1476,6 +1477,15 @@ case "$action" in
       "$payload/installer/linux/systemd-user/bloom-machine.service" \
       "$user_unit_root/bloom-machine.service" \
       0644
+    # This stable entrypoint is introduced only for a fresh enrollment and is
+    # not overwritten during upgrades, preserving the existing unit snapshot
+    # contract for interrupted upgrades created by previous installers.
+    if [[ "$fresh_install" == true ]]; then
+      atomic_install \
+        "$payload/installer/linux/systemd-user/bloom-onboarding.service" \
+        "$user_unit_root/bloom-onboarding.service" \
+        0644
+    fi
     sed \
       -e "s|@BLOOM_BROKER_BINARY@|/usr/libexec/bloom/current/bloom-broker|g" \
       "$payload/installer/linux/systemd/bloom-broker@.service.in" \
@@ -1658,6 +1668,14 @@ case "$action" in
         XDG_RUNTIME_DIR="$user_runtime" \
         DBUS_SESSION_BUS_ADDRESS="unix:path=$user_bus" \
         systemctl --user enable bloom-session.service bloom-machine.service
+      # New Unix group membership takes effect at the next login. Enable only
+      # fresh enrollments, without starting a browser from the root installer.
+      if [[ "$fresh_install" == true ]]; then
+        runuser -u "$login_user" -- env \
+          XDG_RUNTIME_DIR="$user_runtime" \
+          DBUS_SESSION_BUS_ADDRESS="unix:path=$user_bus" \
+          systemctl --user enable bloom-onboarding.service
+      fi
       systemctl disable --now \
         "bloom-signer-rpc@$login_uid.socket" \
         "bloom-signer-control@$login_uid.socket" \
@@ -1687,6 +1705,10 @@ case "$action" in
         "BLOOM_RELOGIN_REQUIRED=$([[ "$release_upgrade" == true ]] && printf 0 || printf 1)"
     elif [[ "$release_upgrade" == true ]]; then
       finish_linux_upgrade
+    fi
+    echo "As $login_user, run: bloom onboard (without sudo)."
+    if [[ "$fresh_install" == true ]]; then
+      echo "Log out and back in first. Browser onboarding opens at the next graphical login; headless logins can run bloom onboard manually."
     fi
     ;;
   uninstall)
@@ -1733,9 +1755,9 @@ case "$action" in
           XDG_RUNTIME_DIR="$user_runtime" \
           DBUS_SESSION_BUS_ADDRESS="unix:path=$user_runtime/bus" \
           systemctl --user stop \
-          bloom-machine.service bloom-session.service \
+          bloom-machine.service bloom-session.service bloom-onboarding.service \
           2>/dev/null || true
-        for stopped_user_unit in bloom-machine.service bloom-session.service; do
+        for stopped_user_unit in bloom-machine.service bloom-session.service bloom-onboarding.service; do
           if runuser -u "$login_user" -- env \
             XDG_RUNTIME_DIR="$user_runtime" \
             DBUS_SESSION_BUS_ADDRESS="unix:path=$user_runtime/bus" \
@@ -1748,13 +1770,14 @@ case "$action" in
         runuser -u "$login_user" -- env \
           XDG_RUNTIME_DIR="$user_runtime" \
           DBUS_SESSION_BUS_ADDRESS="unix:path=$user_runtime/bus" \
-          systemctl --user disable bloom-machine.service bloom-session.service \
+          systemctl --user disable bloom-machine.service bloom-session.service bloom-onboarding.service \
           2>/dev/null || true
       fi
       if [[ -n "$login_user" && "$login_home" == /* && "$login_home" != "/" ]]; then
         runuser -u "$login_user" -- rm -f -- \
           "$login_home/.config/systemd/user/default.target.wants/bloom-machine.service" \
-          "$login_home/.config/systemd/user/default.target.wants/bloom-session.service"
+          "$login_home/.config/systemd/user/default.target.wants/bloom-session.service" \
+          "$login_home/.config/systemd/user/graphical-session.target.wants/bloom-onboarding.service"
         if [[ "$retain_custody" == false ]]; then
           runuser -u "$login_user" -- rm -rf -- "$login_home/.bloom"
         fi
@@ -1879,7 +1902,8 @@ case "$action" in
         "$root/usr/lib/systemd/system/bloom-broker-ceremony-ipv6@.socket" \
         "$root/usr/lib/systemd/system/bloom-session@.path" \
         "$root/usr/lib/systemd/user/bloom-machine.service" \
-        "$root/usr/lib/systemd/user/bloom-session.service"
+        "$root/usr/lib/systemd/user/bloom-session.service" \
+        "$root/usr/lib/systemd/user/bloom-onboarding.service"
     fi
 
     retained_custody=false

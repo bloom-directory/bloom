@@ -560,8 +560,20 @@ pub(crate) async fn record_setup_settings_obligations(
     owners_before: &BTreeMap<String, String>,
     first_setup: bool,
 ) -> Result<()> {
+    let petals = bloom_proto::Config::load(&daemon.home.config_path())?.petals;
+    record_setup_settings_obligations_for(daemon, &petals, owners_before, first_setup).await
+}
+
+/// Freeze planned choices before publishing setup_complete. Uses the existing
+/// daemon's authenticated edge and VFS without constructing another home owner.
+pub(crate) async fn record_setup_settings_obligations_for(
+    daemon: &Daemon,
+    petals: &PetalsConfig,
+    owners_before: &BTreeMap<String, String>,
+    first_setup: bool,
+) -> Result<()> {
     let account = default_account_presence(&daemon.vfs).await;
-    for name in daemon.config.petals.setup.keys() {
+    for name in petals.setup.keys() {
         if setup_template(name).is_none() {
             continue;
         }
@@ -572,7 +584,7 @@ pub(crate) async fn record_setup_settings_obligations(
             &account,
         ) == SetupSettingsStep::Write
         {
-            mark_settings_pending(daemon.home.root(), &daemon.config.petals, name)
+            mark_settings_pending(daemon.home.root(), petals, name)
                 .context("record frozen setup settings before provisioning")?;
         }
     }
@@ -614,20 +626,22 @@ fn pending_settings(home: &std::path::Path, petals: &PetalsConfig) -> Vec<String
 /// Write the settings that an earlier attempt could not, now that the default
 /// wallet exists. A failed write keeps its marker for the next attempt.
 pub(crate) async fn apply_pending_settings(daemon: &Daemon) -> Vec<String> {
+    let petals = match bloom_proto::Config::load(&daemon.home.config_path()) {
+        Ok(config) => config.petals,
+        Err(error) => {
+            tracing::warn!(%error, "petal.setup_settings_config_unreadable");
+            return vec![format!(
+                "petal_settings_failed: cannot read current setup choices: {error}"
+            )];
+        }
+    };
     let owners = petal_owners(daemon).unwrap_or_default();
     let mut messages = Vec::new();
-    for name in pending_settings(daemon.home.root(), &daemon.config.petals) {
+    for name in pending_settings(daemon.home.root(), &petals) {
         if !owners.contains_key(&name) {
             continue;
         }
-        match write_petal_settings(
-            &daemon.vfs,
-            daemon.home.root(),
-            &daemon.config.petals,
-            &name,
-        )
-        .await
-        {
+        match write_petal_settings(&daemon.vfs, daemon.home.root(), &petals, &name).await {
             Ok(summary) => {
                 clear_settings_pending(daemon.home.root(), &name);
                 if let Some(summary) = summary {
@@ -683,14 +697,15 @@ pub(crate) async fn apply_setup_settings(
     owners_before: &BTreeMap<String, String>,
     first_setup: bool,
 ) -> Result<Vec<String>> {
+    let petals = bloom_proto::Config::load(&daemon.home.config_path())?.petals;
     let owners_after = petal_owners(daemon)?;
     let account = default_account_presence(&daemon.vfs).await;
     let mut messages = Vec::new();
-    for name in daemon.config.petals.setup.keys() {
+    for name in petals.setup.keys() {
         let Some(installed) = owners_after.get(name) else {
             continue;
         };
-        let pending = pending_settings(daemon.home.root(), &daemon.config.petals).contains(name);
+        let pending = pending_settings(daemon.home.root(), &petals).contains(name);
         let previous = owners_before.get(name);
         let updated = previous.is_some_and(|previous| previous != installed);
         let step = if pending {
@@ -716,7 +731,7 @@ pub(crate) async fn apply_setup_settings(
             // Nothing deferred may later write what setup just declined to.
             clear_settings_pending(daemon.home.root(), name);
             messages.push(
-                match render_petal_settings(&daemon.config.petals, name, DEFAULT_POLICY_WALLET) {
+                match render_petal_settings(&petals, name, DEFAULT_POLICY_WALLET) {
                     Ok(Some(settings)) => format!(
                         "petal_settings_not_written: {} settings were not written: {reason}. To apply setup's choice, run: printf '{}' | bloom vfs write {}",
                         petal_label(name),
@@ -729,9 +744,7 @@ pub(crate) async fn apply_setup_settings(
             );
             continue;
         }
-        match write_petal_settings(&daemon.vfs, daemon.home.root(), &daemon.config.petals, name)
-            .await
-        {
+        match write_petal_settings(&daemon.vfs, daemon.home.root(), &petals, name).await {
             Ok(Some(summary)) => {
                 clear_settings_pending(daemon.home.root(), name);
                 messages.push(settings_message(name, &summary, updated));
@@ -830,9 +843,16 @@ pub(crate) fn apply_provisioned_settings(
 ) {
     use crate::petal_provisioning::ProvisioningOutcome;
 
+    let petals = match bloom_proto::Config::load(&daemon.home.config_path()) {
+        Ok(config) => config.petals,
+        Err(error) => {
+            tracing::warn!(%error, "petal.provisioned_settings_config_unreadable");
+            return;
+        }
+    };
     let runtime = tokio::runtime::Handle::current();
     for result in results {
-        if !daemon.config.petals.setup.contains_key(&result.name) {
+        if !petals.setup.contains_key(&result.name) {
             continue;
         }
         let updated = match result.outcome {
@@ -840,9 +860,7 @@ pub(crate) fn apply_provisioned_settings(
             ProvisioningOutcome::Updated => true,
             ProvisioningOutcome::Current | ProvisioningOutcome::Failed(_) => continue,
         };
-        if updated
-            && !pending_settings(daemon.home.root(), &daemon.config.petals).contains(&result.name)
-        {
+        if updated && !pending_settings(daemon.home.root(), &petals).contains(&result.name) {
             let account = runtime.block_on(default_account_presence(&daemon.vfs));
             if setup_settings_step(false, true, true, &account) != SetupSettingsStep::Write {
                 clear_settings_pending(daemon.home.root(), &result.name);
@@ -856,7 +874,7 @@ pub(crate) fn apply_provisioned_settings(
         match runtime.block_on(write_petal_settings(
             &daemon.vfs,
             daemon.home.root(),
-            &daemon.config.petals,
+            &petals,
             &result.name,
         )) {
             Ok(Some(summary)) => {
@@ -943,7 +961,8 @@ pub(crate) async fn advance_default_policy(
     let mut petals = Vec::new();
     let mut packages = Vec::new();
     let mut destinations = Vec::new();
-    for name in daemon.config.petals.setup.keys() {
+    let config = bloom_proto::Config::load(&daemon.home.config_path())?;
+    for name in config.petals.setup.keys() {
         let Some(hash) = daemon
             .petals
             .store()
@@ -1369,6 +1388,7 @@ mod tests {
         // Choices are durable before package acquisition starts. Even if that
         // acquisition aborts, recovery must retain the independently recorded work.
         daemon.config.petals.setup_complete = true;
+        daemon.config.save(&daemon.home.config_path()).unwrap();
         record_setup_settings_obligations(&daemon, &BTreeMap::new(), true)
             .await
             .unwrap();

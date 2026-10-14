@@ -4569,18 +4569,22 @@ impl Daemon {
         // The default-policy wallet's first Petal proposal also allows every
         // installed Petal chosen during setup.
         let default_policy_packages: bloom_vfs::handlers::DefaultPolicyPackages = {
-            // Read once: only `bloom init` writes `[petals.setup]`, and it needs
-            // the home write lock this daemon holds, so the choice cannot change
-            // while this closure is alive. Installed hashes are resolved on each
-            // call, so a Petal update is picked up without a restart.
-            let chosen: Vec<String> = config.petals.setup.keys().cloned().collect();
+            // Browser setup updates choices through this daemon's IPC writer.
+            // Read the current durable selection for every proposal so a running
+            // daemon never reintroduces an integration the owner deselected.
+            let setup_config_path = home.config_path();
             let store = petal_store.clone();
             Arc::new(move |wallet: &str| {
                 if wallet != bloom_proto::config::DEFAULT_POLICY_WALLET {
-                    return bloom_vfs::handlers::DefaultPolicySetup::default();
+                    return Ok(bloom_vfs::handlers::DefaultPolicySetup::default());
                 }
+                let current = Config::load(&setup_config_path).map_err(|error| {
+                    bloom_vfs::HandlerError::Backend(format!(
+                        "cannot read current setup choices before policy proposal: {error}"
+                    ))
+                })?;
                 let mut setup = bloom_vfs::handlers::DefaultPolicySetup::default();
-                for name in &chosen {
+                for name in current.petals.setup.keys() {
                     let installed = match store.resolve_petal_owner(name) {
                         Ok(installed) => installed,
                         Err(error) => {
@@ -4599,7 +4603,7 @@ impl Daemon {
                     setup.packages.push(package);
                     setup.destinations.extend(default_policy_destinations(name));
                 }
-                setup
+                Ok(setup)
             })
         };
         let wallets_handler = Arc::new(
