@@ -965,7 +965,9 @@ impl CheckoutService {
                 }
             }
             if tokio::time::Instant::now() >= deadline {
-                let resume = if take_over {
+                // Only a plain take-over resumes its page; a session that held
+                // traveler data is discarded with its browsing context.
+                let resume = if checkout.mode == Mode::TakeOver && !checkout.contains_traveler {
                     Self::page_url(checkout).await
                 } else {
                     None

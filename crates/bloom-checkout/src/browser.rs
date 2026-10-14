@@ -21,6 +21,9 @@ struct ElementRef {
 }
 
 struct Tab {
+    /// Shopping runs in a disposable browser context, never the profile's
+    /// default one, so a finished checkout discards its cookies and storage.
+    context: String,
     target: String,
     session: String,
     refs: Vec<ElementRef>,
@@ -84,7 +87,7 @@ impl Browser {
             .iter()
             .any(|f| f == "--ignore-certificate-errors");
         let cdp = Cdp::launch(executable, profile, test_flags)?;
-        let tab = new_tab(&cdp, 1).await?;
+        let tab = new_tab(&cdp, None, 1).await?;
         Ok(Arc::new(Self {
             cdp,
             tab: Mutex::new(tab),
@@ -299,7 +302,13 @@ impl Browser {
             bail!("Only ordinary HTTP(S) shopping popups are supported");
         }
         let target = child["targetId"].as_str().context("Missing popup target")?;
-        *tab = attach_tab(&self.cdp, target.to_owned(), tab.generation + 1).await?;
+        *tab = attach_tab(
+            &self.cdp,
+            tab.context.clone(),
+            target.to_owned(),
+            tab.generation + 1,
+        )
+        .await?;
         Ok(())
     }
 
@@ -354,8 +363,17 @@ impl Browser {
         })
     }
 
+    /// Discards the checkout's browsing context, including cookies and storage
+    /// the merchant kept, so shopping never reopens a private session.
     pub(crate) async fn return_control(&self) -> Result<()> {
         let mut tab = self.tab.lock().await;
+        self.cdp
+            .call(
+                None,
+                "Target.disposeBrowserContext",
+                json!({"browserContextId":tab.context}),
+            )
+            .await?;
         // The entire browser belongs to checkout, including script-opened popups.
         // closeTarget acknowledges a request, not destruction. Keep shopping
         // revoked until every private page has disappeared, including popups
@@ -386,7 +404,7 @@ impl Browser {
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-        *tab = new_tab(&self.cdp, tab.generation + 1).await?;
+        *tab = new_tab(&self.cdp, None, tab.generation + 1).await?;
         self.revoked.store(false, Ordering::SeqCst);
         Ok(())
     }
@@ -398,7 +416,13 @@ impl Browser {
             return self.return_control().await;
         };
         let mut tab = self.tab.lock().await;
-        let mut resumed = attach_tab(&self.cdp, target.to_owned(), tab.generation + 1).await?;
+        let mut resumed = attach_tab(
+            &self.cdp,
+            tab.context.clone(),
+            target.to_owned(),
+            tab.generation + 1,
+        )
+        .await?;
         // Navigate away before returning, so Chrome cannot restore private
         // form values as it might during a reload of the same history entry.
         self.cdp
@@ -469,18 +493,31 @@ impl Browser {
     }
 }
 
-async fn new_tab(cdp: &Cdp, generation: u64) -> Result<Tab> {
+async fn new_tab(cdp: &Cdp, context: Option<String>, generation: u64) -> Result<Tab> {
+    let context = match context {
+        Some(context) => context,
+        None => cdp
+            .call(None, "Target.createBrowserContext", json!({}))
+            .await?["browserContextId"]
+            .as_str()
+            .context("Missing browser context")?
+            .to_owned(),
+    };
     let created = cdp
-        .call(None, "Target.createTarget", json!({"url":"about:blank"}))
+        .call(
+            None,
+            "Target.createTarget",
+            json!({"url":"about:blank","browserContextId":context}),
+        )
         .await?;
     let target = created["targetId"]
         .as_str()
         .context("Missing tab")?
         .to_owned();
-    attach_tab(cdp, target, generation).await
+    attach_tab(cdp, context, target, generation).await
 }
 
-async fn attach_tab(cdp: &Cdp, target: String, generation: u64) -> Result<Tab> {
+async fn attach_tab(cdp: &Cdp, context: String, target: String, generation: u64) -> Result<Tab> {
     let attached = cdp
         .call(
             None,
@@ -504,6 +541,7 @@ async fn attach_tab(cdp: &Cdp, target: String, generation: u64) -> Result<Tab> {
     cdp.call(Some(&session), "Runtime.enable", json!({}))
         .await?;
     Ok(Tab {
+        context,
         target,
         session,
         refs: Vec::new(),
@@ -919,6 +957,51 @@ mod tests {
                 .await
                 .is_err()
         );
+        fixture.abort();
+    }
+
+    #[tokio::test]
+    async fn returning_control_discards_the_merchant_session() {
+        let root = tempfile::tempdir().unwrap().keep();
+        let browser = Browser::launch(
+            &crate::test_chromium(),
+            &root.join("profile"),
+            &["--no-sandbox".into()],
+        )
+        .await
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        // The page shows whatever a previous visit stored, then stores a passenger.
+        let fixture = tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/", get(|| async { Html(r#"<!doctype html>
+              <h1 id="seen"></h1>
+              <script>
+                seen.textContent = 'stored:' + (localStorage.passenger || '') + '|' + document.cookie;
+                localStorage.passenger = 'SyntheticPassenger';
+                document.cookie = 'booking=SyntheticBooking; max-age=3600';
+              </script>"#) })))
+                .await.unwrap();
+        });
+        let visit = || async {
+            browser
+                .browse(BrowseRequest::Open { url: url.clone() })
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            browser.browse(BrowseRequest::Snapshot).await.unwrap()["text"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        visit().await;
+        // Within one shopping session the merchant keeps its state.
+        assert!(visit().await.contains("SyntheticPassenger"));
+        browser.handoff().await.unwrap();
+        browser.return_control().await.unwrap();
+        let after = visit().await;
+        assert!(after.contains("stored:|"), "{after}");
+        assert!(!after.contains("Synthetic"));
         fixture.abort();
     }
 
