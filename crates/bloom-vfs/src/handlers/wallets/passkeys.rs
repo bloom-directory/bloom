@@ -91,8 +91,14 @@ fn civil(ms: u64) -> (i64, u32, u32, u32, u32, u32) {
     crate::handlers::status::unix_to_civil(ms / 1000)
 }
 
-/// `<YYYY-MM-DD>-<surface>-<hex>`, with the digest suffix lengthened only
-/// where two passkeys would otherwise share a name.
+/// Hex digits of the credential digest in a passkey directory name.
+const PASSKEY_SUFFIX_HEX: usize = 12;
+
+/// `<YYYY-MM-DD>-<surface>-<12 hex>`. A name depends only on its own
+/// credential, so adding a passkey never renames an existing one (saved paths
+/// and `by-name/` links stay valid). Should two passkeys of one day and
+/// surface ever share the 48-bit suffix, the later-created one alone takes
+/// the full digest.
 fn passkey_dir_names(credentials: &[CredentialPublic]) -> Vec<(String, &CredentialPublic)> {
     let described: Vec<(String, String, &CredentialPublic)> = credentials
         .iter()
@@ -103,20 +109,22 @@ fn passkey_dir_names(credentials: &[CredentialPublic]) -> Vec<(String, &Credenti
             (prefix, digest, credential)
         })
         .collect();
+    let earlier = |left: &CredentialPublic, right: &CredentialPublic| {
+        (left.created_at_ms.get(), left.credential_id.encoded())
+            < (right.created_at_ms.get(), right.credential_id.encoded())
+    };
     described
         .iter()
         .map(|(prefix, digest, credential)| {
-            let mut length = 4;
-            while length < digest.len()
-                && described.iter().any(|(other_prefix, other_digest, other)| {
-                    !std::ptr::eq(*other, *credential)
-                        && other_prefix == prefix
-                        && other_digest[..length] == digest[..length]
-                })
-            {
-                length += 2;
-            }
-            (format!("{prefix}-{}", &digest[..length]), *credential)
+            let short = &digest[..PASSKEY_SUFFIX_HEX];
+            let displaced = described.iter().any(|(other_prefix, other_digest, other)| {
+                !std::ptr::eq(*other, *credential)
+                    && other_prefix == prefix
+                    && &other_digest[..PASSKEY_SUFFIX_HEX] == short
+                    && earlier(other, credential)
+            });
+            let suffix = if displaced { digest.as_str() } else { short };
+            (format!("{prefix}-{suffix}"), *credential)
         })
         .collect()
 }

@@ -11228,7 +11228,7 @@ value = "0""#,
             assert!(dirs[2].starts_with("2026-09-24-remote-"));
             assert!(
                 dirs.iter()
-                    .all(|dir| dir.rsplit('-').next().unwrap().len() == 4)
+                    .all(|dir| dir.rsplit('-').next().unwrap().len() == 12)
             );
             for fixed in ["by-name", "enrollments", "new"] {
                 assert!(
@@ -11325,13 +11325,16 @@ value = "0""#,
         }
 
         #[test]
-        fn colliding_display_names_lengthen_only_their_suffix() {
+        fn passkey_names_are_fixed_length_and_never_change_when_another_is_added() {
             use sha2::Digest as _;
             let with_id = |bytes: Vec<u8>| CredentialPublic {
                 credential_id: Base64UrlBytes::from_bytes(&bytes),
                 ..credential(0, Some("remote"), PHONE_MS)
             };
-            // Find two credential IDs whose digests share the 4-hex prefix.
+            let dir_names = |credentials: &[CredentialPublic]| {
+                super::super::passkeys::tests_support::dir_names(credentials)
+            };
+            // Two credentials that collided under the old 4-hex suffix.
             let mut seen = std::collections::BTreeMap::new();
             let (first, second) = (0_u16..=u16::MAX)
                 .find_map(|n| {
@@ -11341,21 +11344,23 @@ value = "0""#,
                         .map(|other| (other, bytes))
                 })
                 .expect("a 4-hex prefix collision exists");
-            let unrelated = credential(9, Some("remote"), PHONE_MS);
-            let names = super::super::passkeys::tests_support::dir_names(&[
-                with_id(first),
-                with_id(second),
-                unrelated,
-            ]);
+            let alone = dir_names(&[with_id(first.clone())]);
+            let together = dir_names(&[with_id(first), with_id(second)]);
             let suffix = |name: &String| name.rsplit('-').next().unwrap().len();
+            assert_eq!(
+                alone[0], together[0],
+                "adding a passkey renamed an existing one"
+            );
+            assert_ne!(together[0], together[1]);
             assert!(
-                names
+                together
                     .iter()
                     .all(|name| name.starts_with("2026-09-24-remote-"))
             );
-            assert_ne!(names[0], names[1]);
-            assert!(suffix(&names[0]) > 4 && suffix(&names[1]) > 4, "{names:?}");
-            assert_eq!(suffix(&names[2]), 4, "{names:?}");
+            assert!(
+                together.iter().all(|name| suffix(name) == 12),
+                "{together:?}"
+            );
         }
 
         struct PasskeyBroker {
