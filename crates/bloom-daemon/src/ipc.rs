@@ -731,6 +731,7 @@ pub enum MachineCommand {
     },
     /// Save browser onboarding choices through the sole Machine home owner.
     OnboardingSetup {
+        wallet: String,
         preset: bloom_proto::persona::PersonaPreset,
         per_action_usd: Option<String>,
         daily_usd: Option<String>,

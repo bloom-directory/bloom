@@ -8,13 +8,26 @@ once new group membership applies. Repairs and upgrades do not reopen setup.
 `--if-needed` skips the automatic welcome once persona and setup choices are
 saved; it does not imply that wallet policy or session authority is active.
 
-The browser uses Bloom Broker's ceremony design tokens and components. It saves
-persona, limits and Petal choices through the sole Machine daemon's IPC owner,
-provisions the same canonical catalog, then launches actual wallet creation or
-import, policy review and session activation ceremonies. Secret entry remains
-on the Broker origin. Returning from a ceremony explicitly reconciles its
-result; refreshing state never creates authority. Unsupported scopes and the
-Polymarket package rollout gate remain visible.
+The browser reuses the unchanged Broker ceremony stylesheet, logo and single
+panel layout. It discovers existing wallets from the running Machine/Broker
+projection. One wallet is selected automatically; multiple wallets require an
+explicit choice. No wallet named `main` is assumed. Account 0 is the current
+supported account for automatic sessions.
+
+Persona setup saves preferences for the explicitly selected existing wallet
+and opens only policy/session approval ceremonies. It has no wallet creation,
+seed-import, registration or migration endpoint, never opens a separate home,
+and cannot fall back to a local daemon. No wallet found means this is the wrong
+installation or normal wallet setup has not yet completed; custody setup remains
+separate. Package owners and per-wallet venue settings are not rewritten by
+persona selection. A change to global persona preferences disables managed
+persona sessions before saving; unrelated manual authority is preserved.
+
+Every mutation rechecks live wallet membership. A removed wallet never silently
+switches to another. Unsupported installed services are reported explicitly;
+reading an existing wallet does not prove that persona APIs are available.
+Returning from an approval reconciles its actual result; refreshing creates no
+authority.
 
 The HTTP server binds only `127.0.0.1` on an ephemeral port with a random 256-bit
 path capability, exact Host and POST Origin checks, JSON-only bounded mutation
@@ -50,7 +63,7 @@ any grant becomes active. Distinct package scopes can need separate approval
 ceremonies. A policy-update approval is not a session activation.
 
 The initial automatic compiler covers fee-free Polymarket BUY orders on
-main/account 0, using `polygon:pusd`. It requires the updated Polymarket order
+account 0 of the selected existing wallet, using `polygon:pusd`. It requires the updated Polymarket order
 accounting package to be published and adopted in the installer catalog; the
 currently pinned v0.1.6 package supplies no positive debit claims and therefore
 falls back to exact approval. Publishing that package and updating its immutable

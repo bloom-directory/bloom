@@ -15,10 +15,10 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use bloom_daemon::ipc::{MachineCommand, MachineCommandOutput, MachineCustodyKind};
+use bloom_daemon::ipc::{MachineCommand, MachineCommandOutput};
 use bloom_proto::{HomeDir, persona::PersonaPreset};
 use rand::RngCore as _;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
@@ -46,13 +46,22 @@ pub(super) struct SetupRequest {
 #[serde(deny_unknown_fields)]
 struct ActionRequest {
     action: Action,
+    #[serde(default, deserialize_with = "deserialize_wallet_choice")]
+    wallet: Option<String>,
+}
+
+fn deserialize_wallet_choice<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    // Omission is allowed for ordinary actions; explicit null is not a way
+    // to sneak a wallet field through their closed request contract.
+    String::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Action {
-    WalletNew,
-    WalletImport,
+    SelectWallet,
     Policy,
     Activate,
     Stop,
@@ -65,6 +74,7 @@ struct AppState {
     authority: String,
     origin: String,
     mutations: Mutex<()>,
+    selected_wallet: Mutex<Option<String>>,
     started: Instant,
     last_request_secs: AtomicU64,
 }
@@ -110,6 +120,7 @@ fn app_state(home: HomeDir, endpoint: ResolvedEndpoint, authority: String) -> Ap
         origin: format!("http://{authority}"),
         authority,
         mutations: Mutex::new(()),
+        selected_wallet: Mutex::new(None),
         started: Instant::now(),
         last_request_secs: AtomicU64::new(0),
     })
@@ -120,6 +131,8 @@ fn router(state: App, base: &str) -> Router {
         .route(base, get(index))
         .route(&format!("{base}app.js"), get(script))
         .route(&format!("{base}style.css"), get(styles))
+        .route(&format!("{base}ceremony.css"), get(ceremony_styles))
+        .route(&format!("{base}bloom-primary.svg"), get(brand_mark))
         .route(&format!("{base}api/state"), get(read_state))
         .route(&format!("{base}api/setup"), post(setup))
         .route(&format!("{base}api/action"), post(action))
@@ -202,6 +215,19 @@ async fn styles() -> impl IntoResponse {
     )
 }
 
+async fn ceremony_styles() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        include_str!("onboarding_assets/ceremony.css"),
+    )
+}
+async fn brand_mark() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "image/svg+xml")],
+        include_str!("onboarding_assets/bloom-primary.svg"),
+    )
+}
+
 async fn read_state(State(state): State<App>) -> Response {
     match state_snapshot(&state).await {
         Ok(value) => Json(value).into_response(),
@@ -222,34 +248,62 @@ async fn state_snapshot(state: &AppState) -> Result<Value> {
         json!({"per_action_usd":decimal(p.per_action_usd_micros),"daily_usd":decimal(p.daily_usd_micros),"session_duration_secs":p.session_duration_secs.to_string()})
     });
     let config = json!({"exists":exists, "persona_limits":persona_limits, "setup_complete":config.as_ref().is_some_and(|c| c.petals.setup_complete), "persona":config.as_ref().and_then(|c| c.persona.as_ref()), "petals":config.as_ref().map(|c| c.petals.setup.keys().cloned().collect::<Vec<_>>()).unwrap_or_default()});
-    let wallets = observe(state, MachineCommand::WalletList).await;
-    let available = wallets["available"].as_bool().unwrap_or(false);
-    // Read the public projection including freshness, not the mutation-capable
-    // WalletDefaultPolicy command, which can prepare a new owner ceremony.
-    let mut policy = if available {
+    let mut wallets = observe(state, MachineCommand::WalletList).await;
+    let mut available = wallets["available"].as_bool().unwrap_or(false);
+    let choices = if available {
+        match parse_wallet_choices(wallets["stdout"].as_str().unwrap_or_default()) {
+            Ok(choices) => choices,
+            Err(error) => {
+                wallets = unavailable(&format!("invalid wallet discovery response: {error:#}"));
+                available = false;
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    let selected = choose_wallet(&choices, state.selected_wallet.lock().await.as_deref());
+    // Read the selected public projection, never advance a policy from a GET.
+    let mut policy = if let Some(wallet) = &selected {
         observe(
             state,
             MachineCommand::WalletProjection {
-                name: "main".into(),
+                name: wallet.clone(),
             },
         )
         .await
+    } else if available {
+        wallet_required()
     } else {
         unavailable("Machine is unavailable")
     };
     if let Some(projection) = policy.get_mut("data") {
         *projection = json!({"policy":projection.get("policy"), "freshness":projection.get("freshness"), "observed_at_ms":projection.get("observed_at_ms"), "verification":projection.get("verification")});
     }
-    let sessions = if available {
+    let sessions = if let Some(wallet) = &selected {
         observe(
             state,
             MachineCommand::PersonaSessions {
-                wallet: "main".into(),
+                wallet: wallet.clone(),
             },
         )
         .await
+    } else if available {
+        wallet_required()
     } else {
         unavailable("Machine is unavailable")
+    };
+    let persona_supported = if sessions
+        .get("error")
+        .and_then(Value::as_str)
+        .is_some_and(|error| {
+            error.contains("unknown variant") && error.contains("persona_sessions")
+        }) {
+        Some(false)
+    } else if sessions["available"].as_bool() == Some(true) {
+        Some(true)
+    } else {
+        None
     };
     let ceremony_url = sessions.get("data").and_then(find_ceremony_url);
     let catalog = crate::default_policy::menu_petals()
@@ -257,7 +311,7 @@ async fn state_snapshot(state: &AppState) -> Result<Value> {
         .map(|id| json!({"label":crate::default_policy::petal_label(&id),"id":id}))
         .collect::<Vec<_>>();
     Ok(
-        json!({"config":config, "machine":{"available":available,"error":wallets.get("error")}, "wallets":wallets, "policy":policy, "sessions":sessions, "catalog":catalog, "ceremony_url":ceremony_url}),
+        json!({"config":config, "machine":{"available":available,"persona_supported":persona_supported,"error":wallets.get("error")}, "wallets":wallets, "wallet_choices":choices,"selected_wallet":selected,"wallet_required":available && selected.is_none(), "policy":policy, "sessions":sessions, "catalog":catalog, "ceremony_url":ceremony_url}),
     )
 }
 
@@ -290,40 +344,150 @@ async fn execute(state: &AppState, command: MachineCommand) -> Result<MachineCom
     .context("Machine command timed out; refresh actual state before retrying")?
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct WalletChoice {
+    id: String,
+    address: String,
+    kind: String,
+}
+
+fn parse_wallet_choices(stdout: &str) -> Result<Vec<WalletChoice>> {
+    let mut choices = Vec::<WalletChoice>::new();
+    for row in stdout.lines().filter(|row| !row.trim().is_empty()) {
+        let fields = row.split('\t').collect::<Vec<_>>();
+        anyhow::ensure!(
+            fields.len() == 3,
+            "wallet list must contain exactly id, address and kind"
+        );
+        crate::validate_wallet_name(fields[0])?;
+        bloom_broker_api::Token::new(fields[0])?;
+        anyhow::ensure!(
+            !fields[1].is_empty()
+                && !fields[2].is_empty()
+                && fields[1..]
+                    .iter()
+                    .all(|field| !field.chars().any(char::is_control)),
+            "invalid public wallet fields"
+        );
+        anyhow::ensure!(
+            !choices.iter().any(|choice| choice.id == fields[0]),
+            "duplicate wallet id"
+        );
+        choices.push(WalletChoice {
+            id: fields[0].into(),
+            address: fields[1].into(),
+            kind: fields[2].into(),
+        });
+    }
+    Ok(choices)
+}
+
+fn choose_wallet(choices: &[WalletChoice], explicit: Option<&str>) -> Option<String> {
+    match explicit {
+        Some(id) => choices
+            .iter()
+            .find(|choice| choice.id == id)
+            .map(|choice| choice.id.clone()),
+        None if choices.len() == 1 => Some(choices[0].id.clone()),
+        _ => None,
+    }
+}
+
+fn wallet_required() -> Value {
+    json!({"wallet_required":true,"status":"wallet_required","message":"Select an existing Bloom wallet to continue. No wallet is created by persona setup."})
+}
+
+async fn discover_wallets(state: &AppState) -> Result<Vec<WalletChoice>> {
+    let output = execute(state, MachineCommand::WalletList).await?;
+    anyhow::ensure!(
+        output.exit_code == 0,
+        "wallet discovery failed: {}",
+        output.stderr
+    );
+    parse_wallet_choices(&output.stdout)
+}
+
+async fn require_existing_wallet(state: &AppState) -> Result<String, Response> {
+    let choices = discover_wallets(state).await.map_err(|error| {
+        api_error(
+            StatusCode::BAD_GATEWAY,
+            &format!("Cannot discover existing Bloom wallets: {error:#}"),
+        )
+    })?;
+    if choices.is_empty() {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "No Bloom wallet is available in this installation. Use your existing Bloom installation.",
+        ));
+    }
+    choose_wallet(&choices, state.selected_wallet.lock().await.as_deref()).ok_or_else(|| {
+        api_error(
+            StatusCode::CONFLICT,
+            "Select an existing Bloom wallet before continuing",
+        )
+    })
+}
+
 async fn setup(State(state): State<App>, Json(request): Json<SetupRequest>) -> Response {
     let _guard = state.mutations.lock().await;
-    match crate::configure_browser_setup(&state.home, &state.endpoint, request).await {
+    let wallet = match require_existing_wallet(&state).await {
+        Ok(wallet) => wallet,
+        Err(response) => return response,
+    };
+    match crate::configure_browser_setup(&state.home, &state.endpoint, &wallet, request).await {
         Ok(value) => Json(value).into_response(),
         Err(error) => api_error(StatusCode::BAD_REQUEST, &format!("{error:#}")),
     }
 }
 
 async fn action(State(state): State<App>, Json(request): Json<ActionRequest>) -> Response {
+    if !matches!(request.action, Action::SelectWallet) && request.wallet.is_some() {
+        return api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "wallet is only accepted by select_wallet",
+        );
+    }
     if matches!(request.action, Action::Refresh) {
-        return read_state(State(state)).await;
+        return read_state(State(state.clone())).await;
     }
     let _guard = state.mutations.lock().await;
+    if matches!(request.action, Action::SelectWallet) {
+        let Some(wallet) = request.wallet else {
+            return api_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "select_wallet requires wallet",
+            );
+        };
+        let choices = match discover_wallets(&state).await {
+            Ok(choices) => choices,
+            Err(error) => {
+                return api_error(
+                    StatusCode::BAD_GATEWAY,
+                    &format!("Cannot discover existing Bloom wallets: {error:#}"),
+                );
+            }
+        };
+        if !choices.iter().any(|choice| choice.id == wallet) {
+            return api_error(
+                StatusCode::CONFLICT,
+                "Selected wallet is not present in this Bloom installation",
+            );
+        }
+        *state.selected_wallet.lock().await = Some(wallet);
+        return read_state(State(state.clone())).await;
+    }
+    let wallet = match require_existing_wallet(&state).await {
+        Ok(wallet) => wallet,
+        Err(response) => return response,
+    };
     let command = match request.action {
-        Action::WalletNew => MachineCommand::WalletCustody {
-            name: "main".into(),
-            kind: MachineCustodyKind::New,
-        },
-        Action::WalletImport => MachineCommand::WalletCustody {
-            name: "main".into(),
-            kind: MachineCustodyKind::Import,
-        },
-        Action::Policy => MachineCommand::WalletDefaultPolicy {
-            name: "main".into(),
-        },
-        Action::Activate => MachineCommand::PersonaSessionActivateConfigured {
-            wallet: "main".into(),
-            account: 0,
-        },
+        Action::Policy => MachineCommand::WalletDefaultPolicy { name: wallet },
+        Action::Activate => MachineCommand::PersonaSessionActivateConfigured { wallet, account: 0 },
         Action::Stop => MachineCommand::PersonaSessionsStop {
-            wallet: "main".into(),
+            wallet,
             reason: "owner stopped sessions from onboarding".into(),
         },
-        Action::Refresh => unreachable!("handled read above"),
+        Action::SelectWallet | Action::Refresh => unreachable!("handled above"),
     };
     match execute(&state, command).await {
         Ok(output) => Json(command_result(output)).into_response(),
@@ -334,7 +498,7 @@ async fn action(State(state): State<App>, Json(request): Json<ActionRequest>) ->
 fn command_result(output: MachineCommandOutput) -> Value {
     let data = serde_json::from_str::<Value>(output.stdout.trim()).ok();
     let ceremony_url = data.as_ref().and_then(find_ceremony_url).or_else(|| {
-        // Custody commands use an authenticated, explicitly named output field.
+        // Some authenticated command responses use an explicitly named text field.
         output.stdout.lines().find_map(|line| {
             line.strip_prefix("ceremony_url: ")
                 .and_then(valid_ceremony_url)
@@ -537,6 +701,22 @@ mod tests {
         )
         .await;
         assert!(command.starts_with("HTTP/1.1 422"));
+        for body in [
+            r#"{"action":"wallet_new"}"#,
+            r#"{"action":"wallet_import"}"#,
+            r#"{"action":"refresh","wallet":"other"}"#,
+            r#"{"action":"refresh","wallet":null}"#,
+        ] {
+            let denied = request(
+                &server,
+                "POST",
+                "/onboarding/test-secret/api/action",
+                &headers,
+                body,
+            )
+            .await;
+            assert!(denied.starts_with("HTTP/1.1 422"));
+        }
         assert!(!server.home.path().join("config.toml").exists());
     }
     #[tokio::test]
@@ -571,5 +751,20 @@ mod tests {
             .as_deref(),
             Some("http://127.0.0.1:18734/ceremony/token")
         );
+    }
+    #[test]
+    fn existing_wallet_discovery_requires_fresh_unambiguous_membership() {
+        let none = parse_wallet_choices("").unwrap();
+        assert!(choose_wallet(&none, None).is_none());
+        let one = parse_wallet_choices("primary\t0x111\thd\n").unwrap();
+        assert_eq!(choose_wallet(&one, None).as_deref(), Some("primary"));
+        let two = parse_wallet_choices("primary\t0x111\thd\nvault\t0x222\thd\n").unwrap();
+        assert!(choose_wallet(&two, None).is_none());
+        assert_eq!(choose_wallet(&two, Some("vault")).as_deref(), Some("vault"));
+        // A vanished explicit choice never silently retargets a remaining wallet.
+        assert!(choose_wallet(&one, Some("vault")).is_none());
+        assert!(parse_wallet_choices("../outside\t0x111\thd").is_err());
+        assert!(parse_wallet_choices("primary\t0x111\thd\nprimary\t0x222\thd").is_err());
+        assert!(parse_wallet_choices("primary\t0x111\thd\textra").is_err());
     }
 }

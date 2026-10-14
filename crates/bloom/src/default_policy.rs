@@ -439,12 +439,13 @@ pub(crate) async fn write_petal_settings(
     home: &std::path::Path,
     petals: &PetalsConfig,
     name: &str,
+    expected_existing_hash: Option<&str>,
 ) -> Result<Option<String>> {
     let Some(settings) = render_petal_settings(petals, name, DEFAULT_POLICY_WALLET)? else {
         return Ok(None);
     };
-    mark_settings_pending(home, petals, name)?;
-    let obligation = checked_settings_obligation(home, petals, name)?;
+    mark_settings_pending(home, petals, name, expected_existing_hash)?;
+    let obligation = checked_settings_obligation(home, petals, name, expected_existing_hash)?;
     let path = bloom_vfs::VfsPath::parse(&obligation.path)?;
     bloom_vfs::Handler::write_if_absent(vfs, &path, &obligation.body, &obligation.package_hash)
         .await
@@ -483,13 +484,16 @@ struct PendingSettingsObligation {
 fn settings_obligation(
     petals: &PetalsConfig,
     name: &str,
+    expected_existing_hash: Option<&str>,
 ) -> Result<Option<PendingSettingsObligation>> {
     let Some(settings) = render_petal_settings(petals, name, DEFAULT_POLICY_WALLET)? else {
         return Ok(None);
     };
-    let package_hash = github_source::preinstalled_petal(name)
-        .and_then(|entry| entry.expected_hash)
-        .context("setup obligation needs immutable catalog package hash")?;
+    let package_hash = expected_existing_hash
+        .or_else(|| github_source::preinstalled_petal(name).and_then(|entry| entry.expected_hash))
+        .context("setup obligation needs an observed owner or immutable catalog package hash")?;
+    bloom_broker_api::Digest32::new(package_hash.to_owned())
+        .context("setup obligation package owner hash is invalid")?;
     let config_bytes = serde_json::to_vec(&petals.setup.get(name))?;
     Ok(Some(PendingSettingsObligation {
         schema_version: 1,
@@ -503,8 +507,13 @@ fn settings_obligation(
     }))
 }
 
-fn mark_settings_pending(home: &std::path::Path, petals: &PetalsConfig, name: &str) -> Result<()> {
-    let Some(obligation) = settings_obligation(petals, name)? else {
+fn mark_settings_pending(
+    home: &std::path::Path,
+    petals: &PetalsConfig,
+    name: &str,
+    expected_existing_hash: Option<&str>,
+) -> Result<()> {
+    let Some(obligation) = settings_obligation(petals, name, expected_existing_hash)? else {
         return Ok(());
     };
     let dir = pending_settings_dir(home);
@@ -527,6 +536,7 @@ fn checked_settings_obligation(
     home: &std::path::Path,
     petals: &PetalsConfig,
     name: &str,
+    expected_existing_hash: Option<&str>,
 ) -> Result<PendingSettingsObligation> {
     let path = pending_settings_dir(home).join(name);
     let mut bytes = Vec::new();
@@ -542,7 +552,7 @@ fn checked_settings_obligation(
     }
     let recorded: PendingSettingsObligation = serde_json::from_slice(&bytes)
         .context("decode frozen setup obligation; reconciliation required")?;
-    let current = settings_obligation(petals, name)?
+    let current = settings_obligation(petals, name, expected_existing_hash)?
         .context("settings template unavailable; reconciliation required")?;
     if recorded != current {
         bail!(
@@ -584,8 +594,13 @@ pub(crate) async fn record_setup_settings_obligations_for(
             &account,
         ) == SetupSettingsStep::Write
         {
-            mark_settings_pending(daemon.home.root(), petals, name)
-                .context("record frozen setup settings before provisioning")?;
+            mark_settings_pending(
+                daemon.home.root(),
+                petals,
+                name,
+                owners_before.get(name).map(String::as_str),
+            )
+            .context("record frozen setup settings before provisioning")?;
         }
     }
     Ok(())
@@ -635,13 +650,23 @@ pub(crate) async fn apply_pending_settings(daemon: &Daemon) -> Vec<String> {
             )];
         }
     };
-    let owners = petal_owners(daemon).unwrap_or_default();
+    let owners = match petal_owners(daemon) {
+        Ok(owners) => owners,
+        Err(error) => {
+            tracing::warn!(%error, "petal.setup_settings_owners_unreadable");
+            return vec![format!(
+                "petal_settings_failed: cannot read current package owners: {error:#}"
+            )];
+        }
+    };
     let mut messages = Vec::new();
     for name in pending_settings(daemon.home.root(), &petals) {
-        if !owners.contains_key(&name) {
+        let Some(owner) = owners.get(&name) else {
             continue;
-        }
-        match write_petal_settings(&daemon.vfs, daemon.home.root(), &petals, &name).await {
+        };
+        match write_petal_settings(&daemon.vfs, daemon.home.root(), &petals, &name, Some(owner))
+            .await
+        {
             Ok(summary) => {
                 clear_settings_pending(daemon.home.root(), &name);
                 if let Some(summary) = summary {
@@ -744,7 +769,15 @@ pub(crate) async fn apply_setup_settings(
             );
             continue;
         }
-        match write_petal_settings(&daemon.vfs, daemon.home.root(), &petals, name).await {
+        match write_petal_settings(
+            &daemon.vfs,
+            daemon.home.root(),
+            &petals,
+            name,
+            Some(installed),
+        )
+        .await
+        {
             Ok(Some(summary)) => {
                 clear_settings_pending(daemon.home.root(), name);
                 messages.push(settings_message(name, &summary, updated));
@@ -871,11 +904,23 @@ pub(crate) fn apply_provisioned_settings(
                 continue;
             }
         }
+        let installed = match daemon.petals.store().resolve_petal_owner(&result.name) {
+            Ok(Some(owner)) => owner,
+            Ok(None) => {
+                tracing::warn!(petal = %result.name, "petal.provisioned_settings_owner_missing");
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(petal = %result.name, %error, "petal.provisioned_settings_owner_unreadable");
+                continue;
+            }
+        };
         match runtime.block_on(write_petal_settings(
             &daemon.vfs,
             daemon.home.root(),
             &petals,
             &result.name,
+            Some(&installed),
         )) {
             Ok(Some(summary)) => {
                 clear_settings_pending(daemon.home.root(), &result.name);
@@ -1338,10 +1383,10 @@ mod tests {
         let petals = chosen_setup(&["polymarket"]);
         assert!(pending_settings(home.path(), &petals).is_empty());
 
-        mark_settings_pending(home.path(), &petals, "polymarket").unwrap();
+        mark_settings_pending(home.path(), &petals, "polymarket", None).unwrap();
         assert_eq!(pending_settings(home.path(), &petals), ["polymarket"]);
         // A second failed attempt leaves one marker, not two.
-        mark_settings_pending(home.path(), &petals, "polymarket").unwrap();
+        mark_settings_pending(home.path(), &petals, "polymarket", None).unwrap();
         assert_eq!(pending_settings(home.path(), &petals), ["polymarket"]);
 
         clear_settings_pending(home.path(), "polymarket");
@@ -1354,9 +1399,10 @@ mod tests {
     fn deferred_settings_replay_refuses_changed_revision_without_replacing_journal() {
         let home = tempfile::tempdir().unwrap();
         let mut petals = chosen_setup(&["polymarket"]);
-        mark_settings_pending(home.path(), &petals, "polymarket").unwrap();
+        mark_settings_pending(home.path(), &petals, "polymarket", None).unwrap();
         let before = std::fs::read(pending_settings_dir(home.path()).join("polymarket")).unwrap();
-        let obligation = checked_settings_obligation(home.path(), &petals, "polymarket").unwrap();
+        let obligation =
+            checked_settings_obligation(home.path(), &petals, "polymarket", None).unwrap();
         assert_eq!(obligation.wallet, "main");
         assert_eq!(obligation.account, 0);
         assert_eq!(obligation.package_hash.len(), 64);
@@ -1366,18 +1412,41 @@ mod tests {
             .unwrap()
             .values
             .insert("max_daily_usd".into(), "42.5".into());
-        mark_settings_pending(home.path(), &petals, "polymarket").unwrap();
+        mark_settings_pending(home.path(), &petals, "polymarket", None).unwrap();
         assert_eq!(
             std::fs::read(pending_settings_dir(home.path()).join("polymarket")).unwrap(),
             before
         );
         assert!(
-            checked_settings_obligation(home.path(), &petals, "polymarket")
+            checked_settings_obligation(home.path(), &petals, "polymarket", None)
                 .unwrap_err()
                 .to_string()
                 .contains("revision changed")
         );
         assert_eq!(pending_settings(home.path(), &petals), ["polymarket"]);
+    }
+
+    #[test]
+    fn deferred_settings_freeze_existing_owner_and_refuse_changed_owner() {
+        let home = tempfile::tempdir().unwrap();
+        let petals = chosen_setup(&["polymarket"]);
+        let existing = "ab".repeat(32);
+        let changed = "cd".repeat(32);
+        mark_settings_pending(home.path(), &petals, "polymarket", Some(&existing)).unwrap();
+        let path = pending_settings_dir(home.path()).join("polymarket");
+        let frozen = std::fs::read(&path).unwrap();
+        let obligation =
+            checked_settings_obligation(home.path(), &petals, "polymarket", Some(&existing))
+                .unwrap();
+        assert_eq!(obligation.package_hash, existing);
+        mark_settings_pending(home.path(), &petals, "polymarket", Some(&changed)).unwrap();
+        assert!(
+            checked_settings_obligation(home.path(), &petals, "polymarket", Some(&changed))
+                .unwrap_err()
+                .to_string()
+                .contains("revision changed")
+        );
+        assert_eq!(std::fs::read(path).unwrap(), frozen);
     }
 
     #[tokio::test]
@@ -1422,7 +1491,7 @@ mod tests {
             ["polymarket"]
         );
         let fresh = tempfile::tempdir().unwrap();
-        mark_settings_pending(fresh.path(), &PetalsConfig::default(), "not-a-petal").unwrap();
+        mark_settings_pending(fresh.path(), &PetalsConfig::default(), "not-a-petal", None).unwrap();
         assert!(!pending_settings_dir(fresh.path()).exists());
     }
     use super::*;

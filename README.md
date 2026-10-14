@@ -100,8 +100,8 @@ cargo run -p bloom -- serve --mount "$HOME/bloom"
 
 For an installed triad, `bloom init` opens browser onboarding; `bloom onboard`
 opens it again after installation. Use `bloom onboard --no-open` to print the
-local URL for Firefox. Persona preferences are saved before the separate wallet,
-policy and session approval ceremonies.
+local URL for Firefox. Persona setup uses your existing wallet and requests only policy and session
+approvals; wallet creation and import remain separate.
 
 This is a Machine-only public-read loop. Wallet custody, approval, and signing
 require the separate Broker and Signer processes. Use the triad quickstart for

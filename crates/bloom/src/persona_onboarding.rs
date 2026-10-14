@@ -12,16 +12,17 @@ const ORDER_CLASS: &str = "polymarket.order.poly1271";
 const DAY_MS: u64 = 86_400_000;
 const MAX_SIGNATURES: u64 = 4096;
 
-/// Basic onboarding deliberately covers main/account 0. Broader native scopes
-/// require reviewed explicit asset/fee unit caps; price hints are not authority.
+/// Basic onboarding covers account 0 of the explicitly selected existing wallet.
+/// Other accounts need explicit reviewed proposals. Broader native scopes require
+/// reviewed asset/fee unit caps; price hints are not authority.
 pub(crate) async fn compile_proposals(
     daemon: &Daemon,
     wallet: &str,
     account: u32,
 ) -> Result<Vec<PersonaSessionProposal>> {
-    if wallet != "main" || account != 0 {
+    if account != 0 {
         bail!(
-            "basic persona activation covers main/account 0; other accounts require explicit reviewed proposals"
+            "basic persona activation covers account 0 of the selected wallet; other accounts require explicit reviewed proposals"
         );
     }
     let config = bloom_proto::Config::load(&daemon.home.config_path())?;
@@ -39,6 +40,9 @@ pub(crate) async fn compile_proposals(
     let wallet_id = Token::new(wallet.to_owned())?;
     let descriptor = broker.wallet(wallet_id.clone()).await?;
     let snapshot = broker.policy(wallet_id.clone()).await?;
+    if descriptor.wallet_id != wallet_id || snapshot.wallet_id != wallet_id {
+        bail!("Broker wallet or policy projection differs from the selected wallet");
+    }
     if snapshot.version != descriptor.policy_version
         || snapshot.policy_digest != descriptor.policy_digest
     {
@@ -58,6 +62,9 @@ pub(crate) async fn compile_proposals(
     }
     let suite = CryptoSuite::Secp256k1Keccak256Recoverable;
     let key_ref = if let Some(root) = descriptor.root_key_ref.as_ref() {
+        if !descriptor.key_refs.contains(root) || root.derivation.is_some() {
+            bail!("selected wallet has no unambiguous account 0 owner root");
+        }
         let keys = broker.keys(wallet_id.clone()).await?;
         let key = keys
             .iter()
@@ -70,19 +77,24 @@ pub(crate) async fn compile_proposals(
         key.key_ref.clone()
     } else {
         let accounts = broker.wallet_accounts(wallet_id.clone()).await?;
+        if accounts.wallet_id != wallet_id {
+            bail!("Broker account projection differs from the selected wallet");
+        }
         let candidates = accounts
             .accounts
             .iter()
             .filter(|entry| {
                 entry.lifecycle == AccountLifecycleState::Active
+                    && entry.derivation_profile == DerivationProfile::Bip44EvmSecp256k1V1
                     && entry.path == "m/44'/60'/0'/0/0"
+                    && matches!(&entry.key_ref.derivation, Some(DerivationRef::Bip39Multicurve { profile: DerivationProfile::Bip44EvmSecp256k1V1, path, .. }) if path == &entry.path)
                     && entry.supported_crypto_suites.contains(&suite)
                     && descriptor.key_refs.contains(&entry.key_ref)
             })
             .collect::<Vec<_>>();
         let [entry] = candidates.as_slice() else {
             bail!(
-                "main/account 0 has no unique active EVM owner key; create the account before activating"
+                "selected wallet/account 0 has no unique active EVM owner key; choose an existing EVM account before activating"
             );
         };
         entry.validate()?;
@@ -152,7 +164,7 @@ pub(crate) async fn compile_proposals(
             && status.terms.expires_at_ms.get() > now_ms
     }) {
         bail!(
-            "a persona grant was orphaned after restart; inspect `bloom wallet persona status main`, then explicitly stop it and activate a freshly reviewed session. Retrying activation will not reset its budget"
+            "a persona grant was orphaned after restart; inspect `bloom wallet persona status {wallet}`, then explicitly stop it and activate a freshly reviewed session. Retrying activation will not reset its budget"
         );
     }
     if let Some(status) = existing.iter().find(|status| {
@@ -388,6 +400,31 @@ mod tests {
             amount: DecimalU256::parse("1").unwrap(),
         };
         assert!(compiled.action_nominal_quantity(&[shares]).is_err());
+    }
+
+    #[test]
+    fn compiled_budget_binds_the_selected_existing_wallet_key_and_policy() {
+        let (mut selected, mut key) = wallet();
+        let profile = PersonaConfig::suggested(PersonaPreset::Trader);
+        let main = budget(&selected, &key, &profile, 10_000).unwrap();
+        selected.wallet_id = Token::new("existing-wallet").unwrap();
+        selected.policy_version = DecimalU64::new(7);
+        selected.policy_digest = Digest32::new("44".repeat(32)).unwrap();
+        selected.wallet_revocation_epoch = DecimalU64::new(3);
+        key.locator = "existing-wallet-root".into();
+        key.public_key_fingerprint = Digest32::new("55".repeat(32)).unwrap();
+        selected.root_key_ref = Some(key.clone());
+        selected.key_refs = vec![key.clone()];
+        let compiled = budget(&selected, &key, &profile, 10_000).unwrap();
+        assert_eq!(compiled.wallet_id, selected.wallet_id);
+        assert_eq!(compiled.policy_version, selected.policy_version);
+        assert_eq!(compiled.policy_digest, selected.policy_digest);
+        assert_eq!(
+            compiled.wallet_revocation_epoch,
+            selected.wallet_revocation_epoch
+        );
+        assert_eq!(compiled.member_keys, vec![key]);
+        assert_ne!(compiled.budget_id().unwrap(), main.budget_id().unwrap());
     }
 
     #[test]
