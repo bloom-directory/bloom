@@ -12,7 +12,7 @@ use axum::{
     extract::{DefaultBodyLimit, State},
     http::{Request, StatusCode, header},
     middleware::{self, Next},
-    response::{IntoResponse, Response},
+    response::{IntoResponse, Redirect, Response},
     routing::{get, post},
 };
 use bloom_daemon::ipc::{MachineCommand, MachineCommandOutput};
@@ -73,6 +73,7 @@ struct AppState {
     endpoint: ResolvedEndpoint,
     authority: String,
     origin: String,
+    broker_origin: String,
     mutations: Mutex<()>,
     selected_wallet: Mutex<Option<String>>,
     started: Instant,
@@ -90,7 +91,7 @@ pub(super) async fn run(home: HomeDir, endpoint: ResolvedEndpoint, no_open: bool
     rand::thread_rng().fill_bytes(&mut secret);
     let base = format!("/onboarding/{}/", hex::encode(secret));
     let state = app_state(home, endpoint, authority);
-    let url = format!("{}{}", state.origin, base);
+    let url = onboarding_url(&state, &base);
     println!(
         "Bloom onboarding: {url}\nThis local page closes after 30 minutes. Press Ctrl-C to close it sooner."
     );
@@ -118,6 +119,7 @@ fn app_state(home: HomeDir, endpoint: ResolvedEndpoint, authority: String) -> Ap
         home,
         endpoint,
         origin: format!("http://{authority}"),
+        broker_origin: format!("http://localhost:{}", expected_ceremony_port()),
         authority,
         mutations: Mutex::new(()),
         selected_wallet: Mutex::new(None),
@@ -129,13 +131,15 @@ fn app_state(home: HomeDir, endpoint: ResolvedEndpoint, authority: String) -> Ap
 fn router(state: App, base: &str) -> Router {
     Router::new()
         .route(base, get(index))
-        .route(&format!("{base}app.js"), get(script))
-        .route(&format!("{base}style.css"), get(styles))
-        .route(&format!("{base}ceremony.css"), get(ceremony_styles))
-        .route(&format!("{base}bloom-primary.svg"), get(brand_mark))
         .route(&format!("{base}api/state"), get(read_state))
-        .route(&format!("{base}api/setup"), post(setup))
-        .route(&format!("{base}api/action"), post(action))
+        .route(
+            &format!("{base}api/setup"),
+            post(setup).options(|| async { StatusCode::NO_CONTENT }),
+        )
+        .route(
+            &format!("{base}api/action"),
+            post(action).options(|| async { StatusCode::NO_CONTENT }),
+        )
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .layer(middleware::from_fn_with_state(state.clone(), security))
         .with_state(state)
@@ -152,9 +156,31 @@ async fn security(State(state): State<App>, request: Request<Body>, next: Next) 
         .get(header::ORIGIN)
         .and_then(|v| v.to_str().ok());
     let is_post = request.method() == axum::http::Method::POST;
-    let origin_ok = origin.is_none_or(|v| v == state.origin)
-        && (!is_post || origin == Some(state.origin.as_str()));
-    let mut response = if !host_ok || !origin_ok {
+    let is_preflight = request.method() == axum::http::Method::OPTIONS;
+    let broker_request = origin == Some(state.broker_origin.as_str());
+    let is_api = request.uri().path().contains("/api/");
+    let origin_ok = (!is_api || origin.is_some())
+        && origin.is_none_or(|v| v == state.origin || v == state.broker_origin)
+        && (!(is_post || is_preflight) || origin.is_some());
+    let preflight_ok = !is_preflight
+        || (broker_request
+            && request
+                .headers()
+                .get(header::ACCESS_CONTROL_REQUEST_METHOD)
+                .is_some_and(|v| v == "POST")
+            && request
+                .headers()
+                .get(header::ACCESS_CONTROL_REQUEST_HEADERS)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| {
+                    v.split(',').all(|name| {
+                        matches!(
+                            name.trim().to_ascii_lowercase().as_str(),
+                            "content-type" | "accept"
+                        )
+                    })
+                }));
+    let mut response = if !host_ok || !origin_ok || !preflight_ok {
         api_error(
             StatusCode::FORBIDDEN,
             "This page only accepts requests from its local browser origin",
@@ -180,6 +206,26 @@ async fn security(State(state): State<App>, request: Request<Body>, next: Next) 
             .store(state.started.elapsed().as_secs(), Ordering::Relaxed);
         next.run(request).await
     };
+    // Only the local Broker UI may use this ephemeral capability across
+    // origins. No cookies, wildcard origins, or general command proxy.
+    if host_ok && origin_ok && preflight_ok && broker_request {
+        let headers = response.headers_mut();
+        headers.insert(
+            header::ACCESS_CONTROL_ALLOW_ORIGIN,
+            state.broker_origin.parse().expect("local Broker origin"),
+        );
+        headers.insert(header::VARY, "Origin".parse().unwrap());
+        if is_preflight {
+            headers.insert(
+                header::ACCESS_CONTROL_ALLOW_METHODS,
+                "POST".parse().unwrap(),
+            );
+            headers.insert(
+                header::ACCESS_CONTROL_ALLOW_HEADERS,
+                "content-type, accept".parse().unwrap(),
+            );
+        }
+    }
     for (name, value) in [
         (header::CACHE_CONTROL, "no-store, max-age=0"),
         (header::REFERRER_POLICY, "no-referrer"),
@@ -196,38 +242,15 @@ async fn security(State(state): State<App>, request: Request<Body>, next: Next) 
     response
 }
 
-async fn index() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        include_str!("onboarding_assets/index.html"),
-    )
-}
-async fn script() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-        include_str!("onboarding_assets/app.js"),
-    )
-}
-async fn styles() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
-        include_str!("onboarding_assets/style.css"),
-    )
+fn onboarding_url(state: &AppState, base: &str) -> String {
+    let bridge = format!("{}{base}", state.origin);
+    let bridge: String = url::form_urlencoded::byte_serialize(bridge.as_bytes()).collect();
+    format!("{}/onboarding/#bridge={bridge}", state.broker_origin)
 }
 
-async fn ceremony_styles() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
-        include_str!("onboarding_assets/ceremony.css"),
-    )
+async fn index(State(state): State<App>, uri: axum::http::Uri) -> impl IntoResponse {
+    Redirect::temporary(&onboarding_url(&state, uri.path()))
 }
-async fn brand_mark() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "image/svg+xml")],
-        include_str!("onboarding_assets/bloom-primary.svg"),
-    )
-}
-
 async fn read_state(State(state): State<App>) -> Response {
     match state_snapshot(&state).await {
         Ok(value) => Json(value).into_response(),
@@ -628,6 +651,58 @@ mod tests {
         response
     }
     #[tokio::test]
+    async fn broker_bridge_cors_is_exact_and_bootstrap_keeps_capability_in_fragment() {
+        let server = server().await;
+        let broker = format!("http://localhost:{}", expected_ceremony_port());
+        let path = "/onboarding/test-secret/api/action";
+        let allowed = request(&server, "OPTIONS", path, &format!(
+            "Host: {}\r\nOrigin: {broker}\r\nAccess-Control-Request-Method: POST\r\nAccess-Control-Request-Headers: content-type\r\n", server.address
+        ), "").await;
+        assert!(allowed.starts_with("HTTP/1.1 204"));
+        assert!(allowed.contains(&format!("access-control-allow-origin: {broker}")));
+        assert!(!allowed.contains("access-control-allow-credentials"));
+        for origin in [
+            "http://localhost:1",
+            "http://127.0.0.1:18734",
+            "https://attacker.example",
+            "null",
+        ] {
+            let denied = request(&server, "OPTIONS", path, &format!(
+                "Host: {}\r\nOrigin: {origin}\r\nAccess-Control-Request-Method: POST\r\nAccess-Control-Request-Headers: content-type\r\n", server.address
+            ), "").await;
+            assert!(denied.starts_with("HTTP/1.1 403"), "{origin}: {denied}");
+            assert!(!denied.contains("access-control-allow-origin"));
+        }
+        let denied = request(&server, "OPTIONS", path, &format!(
+            "Host: {}\r\nOrigin: {broker}\r\nAccess-Control-Request-Method: POST\r\nAccess-Control-Request-Headers: authorization\r\n", server.address
+        ), "").await;
+        assert!(denied.starts_with("HTTP/1.1 403"));
+        let state = request(
+            &server,
+            "GET",
+            "/onboarding/test-secret/api/state",
+            &format!("Host: {}\r\nOrigin: {broker}\r\n", server.address),
+            "",
+        )
+        .await;
+        assert!(state.starts_with("HTTP/1.1 200"));
+        assert!(state.contains(&format!("access-control-allow-origin: {broker}")));
+        let redirect = request(
+            &server,
+            "GET",
+            "/onboarding/test-secret/",
+            &format!("Host: {}\r\n", server.address),
+            "",
+        )
+        .await;
+        assert!(redirect.starts_with("HTTP/1.1 307"));
+        assert!(redirect.contains(&format!(
+            "location: {broker}/onboarding/#bridge=http%3A%2F%2F127.0.0.1%3A"
+        )));
+        assert!(!server.home.path().join("config.toml").exists());
+    }
+
+    #[tokio::test]
     async fn host_origin_and_content_type_are_required_before_mutations() {
         let server = server().await;
         let path = "/onboarding/test-secret/api/action";
@@ -726,7 +801,10 @@ mod tests {
             &server,
             "GET",
             "/onboarding/test-secret/api/state",
-            &format!("Host: {}\r\n", server.address),
+            &format!(
+                "Host: {}\r\nOrigin: http://{}\r\n",
+                server.address, server.address
+            ),
             "",
         )
         .await;
