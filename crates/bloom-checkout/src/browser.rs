@@ -112,6 +112,8 @@ impl Browser {
                 Ok(json!({"state":"opened"}))
             }
             BrowseRequest::Snapshot => {
+                // Booking sites may create the tab after the click has returned.
+                self.follow_popup(&mut tab).await?;
                 tab.generation += 1;
                 tab.refs.clear();
                 let contexts = self.cdp.contexts(&tab.session, "bloom-shopping").await?;
@@ -624,7 +626,7 @@ mod tests {
             axum::serve(listener, Router::new()
                 .route("/", get(|| async { Html(r#"<!doctype html>
                   <input aria-label="Origin" onkeyup="document.getElementById('suggestion').hidden=this.value!=='Cordoba'">
-                  <div id="suggestion" role="option" hidden onclick="window.open('/flight')">Córdoba COR</div>
+                  <div id="suggestion" role="option" hidden onclick="setTimeout(()=>window.open('/flight'),100)">Córdoba COR</div>
                   <div role="gridcell" aria-label="Sun Oct 25 2026" onclick="this.innerText='Date selected'">25</div>
                   <div role="gridcell" aria-disabled="true">Unavailable date</div>
                   <input aria-label="Private card" autocomplete="cc-number">
