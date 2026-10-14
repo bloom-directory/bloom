@@ -634,7 +634,17 @@ impl CheckoutService {
     }
 
     async fn page_url(checkout: &PrivateCheckout) -> Option<String> {
-        tab_url(&checkout.tab).await
+        let target = checkout
+            .tab
+            .cdp
+            .call(
+                None,
+                "Target.getTargetInfo",
+                json!({"targetId":checkout.view_target}),
+            )
+            .await
+            .ok()?;
+        target["targetInfo"]["url"].as_str().map(str::to_owned)
     }
 
     async fn select_private_page(checkout: &mut PrivateCheckout, target: String) -> Result<()> {
@@ -728,13 +738,18 @@ impl CheckoutService {
                 }
             }
             if tokio::time::Instant::now() >= deadline {
-                self.set_state(&id, if take_over { "returned" } else { "uncertain" });
                 let resume = if take_over {
                     Self::page_url(checkout).await
                 } else {
                     None
                 };
-                if self.browser.return_control_at(resume).await.is_ok() {
+                if self
+                    .browser
+                    .return_control_at(&checkout.view_target, resume)
+                    .await
+                    .is_ok()
+                {
+                    self.set_state(&id, if take_over { "returned" } else { "uncertain" });
                     if let Ok(status) = self.store.get(&id) {
                         self.retain_completed(checkout, status);
                     }
@@ -912,9 +927,11 @@ impl CheckoutService {
             }
             ViewAction::Finish => {
                 if checkout.mode == Mode::TakeOver {
-                    self.set_state(&checkout.operation_id, "returned");
                     let resume = Self::page_url(checkout).await;
-                    self.browser.return_control_at(resume).await?;
+                    self.browser
+                        .return_control_at(&checkout.view_target, resume)
+                        .await?;
+                    self.set_state(&checkout.operation_id, "returned");
                 } else {
                     self.set_state(&checkout.operation_id, "uncertain");
                     self.browser.return_control().await?;
@@ -1239,8 +1256,8 @@ mod tests {
             axum::serve(
                 fixture,
                 Router::new()
-                    .route("/", get(|| async { Html("<a href='/account'>Log in</a>") }))
-                    .route("/account", get(|| async { Html("<h1>Signed in</h1>") })),
+                    .route("/", get(|| async { Html("<a href='/account' onclick=\"sessionStorage.booking='fixture-active'\">Log in</a>") }))
+                    .route("/account", get(|| async { Html("<h1 id='state'></h1><input id='private-password' type='password' autocomplete='off'><script>document.getElementById('state').textContent=sessionStorage.booking==='fixture-active'?'Signed in; booking kept':'Lost booking';</script>") })),
             )
             .await
             .unwrap();
@@ -1296,6 +1313,21 @@ mod tests {
             .await
             .unwrap();
         tokio::time::sleep(Duration::from_millis(300)).await;
+        {
+            let private = service.private.lock().await;
+            let checkout = private.as_ref().unwrap();
+            checkout.tab.cdp.evaluate(&checkout.view_session,
+                "globalThis.privateFixture='do-not-retain';document.getElementById('private-password').focus()".into()).await.unwrap();
+        }
+        service
+            .private_action(
+                &token,
+                ViewAction::Type {
+                    text: "fixture-private-password".into(),
+                },
+            )
+            .await
+            .unwrap();
         service
             .private_action(&token, ViewAction::Finish)
             .await
@@ -1308,6 +1340,16 @@ mod tests {
             .unwrap();
         assert_eq!(snapshot["url"], format!("{origin}/account"));
         assert!(snapshot["text"].as_str().unwrap().contains("Signed in"));
+        assert!(snapshot["text"].as_str().unwrap().contains("booking kept"));
+        let tab = browser.handoff().await.unwrap();
+        assert_eq!(tab.cdp.evaluate(&tab.session,
+            "globalThis.privateFixture===undefined&&document.getElementById('private-password').value===''".into()).await.unwrap(), json!(true));
+        let history = tab
+            .cdp
+            .call(Some(&tab.session), "Page.getNavigationHistory", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(history["entries"].as_array().unwrap().len(), 1);
         fixture_task.abort();
     }
 

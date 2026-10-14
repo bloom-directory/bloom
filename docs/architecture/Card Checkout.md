@@ -57,6 +57,18 @@ screenshots and forwards clicks and keys to the held tab and its popups (bank
 challenges). While it is open, Machine's browse requests are refused. The URL
 and screenshots never appear in VFS. It is not reachable from another device.
 
+Takeover is for login, verification or an unsupported field, not routine
+passenger entry. On handback, checkout navigates the human-selected tab through
+`about:blank` into a fresh document at the selected URL, closes all other
+pages, and clears navigation history before enabling shopping. This retains
+the site's tab-scoped booking/session storage without handing the private DOM,
+form values or execution contexts to Machine. Storage is not exported through
+the VFS. Failure to replace the document leaves shopping paused.
+
+Card and site-payment completion still close every private page and resume
+shopping in a fresh blank tab. Takeover buys nothing and releases no card;
+saved-card payment needs its separate approval for the exact merchant/total.
+
 ## Durable states and recovery
 
 The operation store is written before every irreversible step:

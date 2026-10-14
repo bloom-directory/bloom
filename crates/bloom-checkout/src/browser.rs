@@ -356,11 +356,79 @@ impl Browser {
     }
 
     /// After a take-over, shopping continues on the page the human left.
-    pub(crate) async fn return_control_at(&self, url: Option<String>) -> Result<()> {
-        self.return_control().await?;
-        if let Some(url) = url.filter(|u| u.starts_with("https://") || u.starts_with("http://")) {
-            self.browse(BrowseRequest::Open { url }).await?;
+    pub(crate) async fn return_control_at(&self, target: &str, url: Option<String>) -> Result<()> {
+        let Some(url) = url.filter(|u| u.starts_with("https://") || u.starts_with("http://"))
+        else {
+            return self.return_control().await;
+        };
+        let mut tab = self.tab.lock().await;
+        let mut resumed = attach_tab(&self.cdp, target.to_owned(), tab.generation + 1).await?;
+        // Navigate away before returning, so Chrome cannot restore private
+        // form values as it might during a reload of the same history entry.
+        self.cdp
+            .call(
+                Some(&resumed.session),
+                "Page.navigate",
+                json!({"url":"about:blank"}),
+            )
+            .await?;
+        let tree = self
+            .cdp
+            .call(Some(&resumed.session), "Page.getFrameTree", json!({}))
+            .await?;
+        let previous = tree["frameTree"]["frame"]["loaderId"]
+            .as_str()
+            .context("Missing private document")?;
+        let navigation = self
+            .cdp
+            .call(Some(&resumed.session), "Page.navigate", json!({"url":url}))
+            .await?;
+        let loader = navigation["loaderId"]
+            .as_str()
+            .filter(|id| *id != previous)
+            .context("Private document was not replaced; shopping remains paused")?;
+        // A new document clears private DOM and execution contexts while the
+        // tab's sessionStorage keeps the airline's booking session alive.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                bail!("Private document replacement timed out; shopping remains paused");
+            }
+            let tree = self
+                .cdp
+                .call(Some(&resumed.session), "Page.getFrameTree", json!({}))
+                .await?;
+            let targets = self.cdp.call(None, "Target.getTargets", json!({})).await?;
+            let other_pages = targets["targetInfos"]
+                .as_array()
+                .context("Missing browser targets")?
+                .iter()
+                .filter(|page| page["type"] == "page" && page["targetId"] != target)
+                .collect::<Vec<_>>();
+            if tree["frameTree"]["frame"]["loaderId"] == loader && other_pages.is_empty() {
+                break;
+            }
+            for page in other_pages {
+                self.cdp
+                    .call(
+                        None,
+                        "Target.closeTarget",
+                        json!({"targetId":page["targetId"]}),
+                    )
+                    .await?;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
+        self.cdp
+            .call(
+                Some(&resumed.session),
+                "Page.resetNavigationHistory",
+                json!({}),
+            )
+            .await?;
+        resumed.refs.clear();
+        *tab = resumed;
+        self.revoked.store(false, Ordering::SeqCst);
         Ok(())
     }
 }
