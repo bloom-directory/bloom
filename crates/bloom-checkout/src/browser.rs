@@ -269,6 +269,59 @@ impl Browser {
         Ok(url.origin().ascii_serialization())
     }
 
+    /// Choose a saved traveler value in a list the agent picked (a select or a
+    /// site-drawn dropdown). The value never comes back; failure says so.
+    pub(crate) async fn choose_traveler(
+        &self,
+        reference: &str,
+        field: &str,
+        value: &str,
+    ) -> Result<()> {
+        self.available()?;
+        let mut tab = self.tab.lock().await;
+        self.guard_tab(&tab).await?;
+        let (generation, index) = reference
+            .split_once(':')
+            .context("Invalid element reference")?;
+        if generation.parse::<u64>()? != tab.generation {
+            bail!("Stale element reference; request a new snapshot");
+        }
+        let binding = tab
+            .refs
+            .get(index.parse::<usize>()?)
+            .context("Stale element reference; request a new snapshot")?
+            .clone();
+        tab.refs.clear();
+        tab.generation += 1;
+        let expression = format!(
+            "(()=>{{const e=globalThis.__bloomRefs?.[{}];if(!e?.isConnected)throw Error('stale');\
+            globalThis.__bloomTravelerRefs={{document,refs:[e],nonce:'choose'}};\
+            const nonce='choose',origin=location.origin,mapped=[{{field:{},choice:e.tagName==='INPUT',index:0}}],values={};\
+            return {};}})()",
+            binding.index,
+            serde_json::to_string(field)?,
+            serde_json::to_string(&json!({ field: value }))?,
+            include_str!("traveler-fill.js")
+        );
+        let result = self
+            .cdp
+            .call(
+                Some(&binding.session),
+                "Runtime.evaluate",
+                json!({"contextId":binding.world,"expression":expression,
+                    "returnByValue":true,"awaitPromise":true,"userGesture":true}),
+            )
+            .await?;
+        if result.get("exceptionDetails").is_some()
+            || !result["result"]["value"]["filled"]
+                .as_array()
+                .is_some_and(|f| f.iter().any(|f| f == field))
+        {
+            bail!("That list did not take the saved value; choose it in the private view");
+        }
+        Ok(())
+    }
+
     /// Fill unlocked traveler values into the shopping page. Only field names
     /// come back; the values are never part of a response.
     pub(crate) async fn fill_traveler(

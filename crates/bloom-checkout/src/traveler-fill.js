@@ -67,7 +67,9 @@
         : value === 'female' ? (spanish ? 'Femenino' : 'Female') : value === 'male' ? (spanish ? 'Masculino' : 'Male') : value;
       const names = o => [o.dataset.testValue, o.dataset.value, o.getAttribute('value'), o.innerText].filter(t => t != null).map(normalize);
       // One-letter codes ("F") also label seat-map columns and the like.
-      const matches = o => names(o).some(t => aliases.some(a => normalize(a).length > 1 && normalize(a) === t)
+      const word = (t, a) => a.length >= 3 && t.length <= 60
+        && new RegExp(`(^|\\W)${a.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(\\W|$)`).test(t);
+      const matches = o => names(o).some(t => aliases.some(a => normalize(a).length > 1 && (normalize(a) === t || word(t, normalize(a))))
         || (!e.readOnly && t.startsWith(normalize(typed)) && /^\W/.test(t.slice(normalize(typed).length))));
       // Real list options, when the site marks them, beat any other matching text.
       const optionLike = o => o.matches('[role=option]') || /option/i.test(`${o.id} ${o.className}`);
@@ -116,7 +118,9 @@
       const taken = normalize(e.value);
       // Typed text alone proves nothing: an editable list must also have closed.
       const closed = !option.isConnected || !option.getClientRects().length;
-      if ((!e.readOnly && !closed) || (!aliases.some(a => normalize(a) === taken) && taken !== chosen && !shownBeside)) throw new Skip('not taken by the field');
+      // A field may show the option's code ("PAS" for "PAS - Pasaporte").
+      const abbreviated = taken.length > 1 && chosen.startsWith(taken) && /^\W/.test(chosen.slice(taken.length));
+      if ((!e.readOnly && !closed) || (!aliases.some(a => normalize(a) === taken) && taken !== chosen && !abbreviated && !shownBeside)) throw new Skip('not taken by the field');
     } else if (e.tagName === 'SELECT') {
       const matches = [...e.options].filter(o=>!o.disabled && aliases.some(a=>normalize(a)===normalize(o.value) || normalize(a)===normalize(o.text)));
       if (matches.length !== 1) throw Error('Traveler choice needs private input');

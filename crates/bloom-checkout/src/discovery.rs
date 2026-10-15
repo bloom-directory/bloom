@@ -153,6 +153,21 @@ pub(crate) async fn order_preview(tab: &PrivateTab) -> Option<String> {
     None
 }
 
+/// Labels and values of every filled field on the merchant page, except
+/// card and password fields, for the human's review page only.
+pub(crate) async fn order_fields(tab: &PrivateTab) -> Value {
+    tab.cdp
+        .call(
+            Some(&tab.session),
+            "Runtime.evaluate",
+            json!({"expression":include_str!("order-fields.js"),"returnByValue":true}),
+        )
+        .await
+        .ok()
+        .and_then(|r| r["result"]["value"].as_array().cloned())
+        .map_or_else(|| json!([]), Value::Array)
+}
+
 async fn evaluate(
     tab: &PrivateTab,
     session: &str,
@@ -1282,6 +1297,14 @@ pub(crate) mod tests {
         assert!((2400.0..2500.0).contains(&top), "{region}");
         assert!(region["height"].as_f64().unwrap() < 200.0, "{region}");
         assert!(order_preview(&tab).await.is_some());
+        // The review lists what was entered, never the card number.
+        assert_eq!(
+            order_fields(&tab).await,
+            json!([
+                {"label":"Nombres *","value":"Synthetic"},
+                {"label":"Correo *","value":"fixture@example.com"}
+            ])
+        );
         browser.return_control().await.unwrap();
         server.abort();
     }

@@ -497,12 +497,22 @@ impl CheckoutService {
         }
         let text = derived_traveler_value(&traveler.values, field)
             .context("That saved traveler field is not available")?;
-        self.browser
-            .browse(BrowseRequest::Type {
-                element_ref,
-                text: text.to_string(),
-            })
-            .await?;
+        if matches!(
+            field,
+            "gender" | "nationality" | "document_kind" | "document_country"
+        ) {
+            // A choice goes into a list: pick the option naming the saved value.
+            self.browser
+                .choose_traveler(&element_ref, field, &text)
+                .await?;
+        } else {
+            self.browser
+                .browse(BrowseRequest::Type {
+                    element_ref,
+                    text: text.to_string(),
+                })
+                .await?;
+        }
         Ok(json!({"state":"typed","filled_fields":[field]}))
     }
 
@@ -733,13 +743,15 @@ impl CheckoutService {
                         json!({"method":"prepare","operation_id":operation_id,"card_id":card_id,
                         "facts":discovery.facts,"recipient_key":recipient.public,
                         "agent_description":agent_description,"challenge_url":challenge_url,
-                        "order_preview":crate::discovery::order_preview(&tab).await})
+                        "order_preview":crate::discovery::order_preview(&tab).await,
+                        "order_fields":crate::discovery::order_fields(&tab).await})
                     }
                     (Some(discovery), None) => {
                         json!({"method":"site","operation_id":operation_id,
                         "facts":discovery.facts,"agent_description":agent_description,
                         "challenge_url":challenge_url,
-                        "order_preview":crate::discovery::order_preview(&tab).await})
+                        "order_preview":crate::discovery::order_preview(&tab).await,
+                        "order_fields":crate::discovery::order_fields(&tab).await})
                     }
                     _ => json!({"method":"manual","operation_id":operation_id,"card_id":card_id,
                         "agent_description":agent_description,"challenge_url":challenge_url}),
@@ -1768,6 +1780,81 @@ mod tests {
         let error = capture.await.unwrap().unwrap_err();
         assert_eq!(error.to_string(), "Private page is still loading");
         assert!(started.elapsed() < Duration::from_secs(10));
+        server.abort();
+    }
+    #[tokio::test]
+    async fn saved_choices_pick_their_option_in_a_chosen_list() {
+        // Shaped like JetSMART's card-holder document type.
+        let (url, server) = crate::discovery::tests::fixture(
+            "<div>Titular <div><div>Documento</div><input id='doc' readonly></div>
+             <div id='list' hidden><div class='opt'>PAS - Pasaporte</div><div class='opt'>DNI - Documento Nacional de Identidad</div></div></div>
+             <script>doc.addEventListener('click',()=>list.hidden=false);
+             for(const o of document.querySelectorAll('.opt'))o.onclick=()=>{doc.value=o.innerText.split(' ')[0];list.hidden=true;};</script>".into(),
+        )
+        .await;
+        let root = tempfile::tempdir().unwrap().keep();
+        let browser = Browser::launch(
+            &crate::test_chromium(),
+            &root.join("profile"),
+            &["--no-sandbox".into(), "--ignore-certificate-errors".into()],
+        )
+        .await
+        .unwrap();
+        browser
+            .browse(BrowseRequest::Open { url: url.clone() })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let service = CheckoutService::new(
+            browser.clone(),
+            &root.join("state.db"),
+            root.join("unused.sock"),
+            unsafe { libc::geteuid() },
+            47999,
+        )
+        .unwrap();
+        *service.traveler.lock().await = Some(UnlockedTraveler {
+            origin: url::Url::parse(&url)
+                .unwrap()
+                .origin()
+                .ascii_serialization(),
+            context: browser.shopping_context().await,
+            fields: vec![],
+            values: [(
+                "document_kind".to_owned(),
+                zeroize::Zeroizing::new("passport".to_owned()),
+            )]
+            .into(),
+            expires: tokio::time::Instant::now() + Duration::from_secs(60),
+        });
+        let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+        let element_ref = snapshot["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["label"] == "Documento")
+            .unwrap()["ref"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        service
+            .request(Request::Browse {
+                request: BrowseRequest::TypeTraveler {
+                    element_ref,
+                    field: "document_kind".into(),
+                },
+            })
+            .await
+            .unwrap();
+        let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+        let documento = snapshot["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["label"] == "Documento")
+            .unwrap()
+            .clone();
+        assert_eq!(documento["value"], "PAS");
         server.abort();
     }
     #[test]
