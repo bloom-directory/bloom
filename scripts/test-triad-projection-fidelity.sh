@@ -359,16 +359,17 @@ if [ -z "${BLOOM_INTEGRATION_DEBUG_DRIVER_BIN:-}" ]; then
 fi
 start_stack
 
-# Machine exposes credential replacement and the explicit legacy-passkey
-# receipt migration workflow. Prove the exact user-visible CLI inventory and
-# that neither operation is exposed as an unaudited mounted mutation surface.
+# Machine exposes paired credential addition, replacement, and explicit legacy
+# receipt migration. Prove the exact CLI inventory and that credential mutation
+# is not exposed as an unaudited mounted control.
 wallet_help="$(cli wallet --help)"
 credential_commands="$(printf '%s\n' "$wallet_help" |
   sed -n 's/^  \([a-z][a-z-]*\)  *.*/\1/p' |
   grep -E '(credential|passkey|authenticator)' || true)"
-[ "$credential_commands" = "migrate-passkey
+[ "$credential_commands" = "add-passkey
+migrate-passkey
 rebind-passkey" ] ||
-  die "credential-change CLI inventory is not exactly migrate-passkey and rebind-passkey: ${credential_commands:-<none>}"
+  die "credential-change CLI inventory differs from add-passkey, migrate-passkey, rebind-passkey: ${credential_commands:-<none>}"
 
 printf 'MA-03: registering wallet through Broker/Signer...\n'
 registration_launch="$(cli wallet new ma03-registration)"
@@ -623,4 +624,4 @@ fi
   die "deleted wallet resurrected in the mounted VFS across restart"
 assert_no_legacy_record "$registered_wallet" "$imported_wallet"
 
-printf 'MA-03 projection fidelity passed: the sole retained credential-change surface (replacement), registration, import, policy update, Petal key derivation, deletion, and restart matched through CLI and mounted VFS; no credential add/remove Machine surface exists.\n'
+printf 'MA-03 projection fidelity passed: registration, import, replacement, policy update, Petal key derivation, deletion, and restart matched through CLI and mounted VFS; paired addition is covered by remote ceremony acceptance.\n'

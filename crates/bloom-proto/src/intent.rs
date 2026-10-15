@@ -137,8 +137,6 @@ pub enum RawIntentBody {
         operator: String,
         approved: bool,
     },
-    /// Enso DeFi intent.
-    Enso { intent: String },
 }
 
 fn default_true() -> bool {
@@ -244,13 +242,6 @@ impl ShellIntent {
             priority,
         })
     }
-}
-
-/// Enso intent body (placeholder; full client lives in the enso petal).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EnsoIntent {
-    pub intent: String,
-    pub chain: Option<String>,
 }
 
 #[cfg(test)]

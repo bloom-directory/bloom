@@ -35,6 +35,12 @@ session socket exists. A canonical-listener conflict therefore fails that family
 (`bloom-broker-ceremony@UID.socket` or `bloom-broker-ceremony-ipv6@UID.socket`)
 and never selects another port.
 
+Broker reaches the hosted relay, Let's Encrypt and DNS over the internet, so
+its unit does not restrict outbound IP traffic (earlier releases allowed only
+loopback). Binding stays restricted: `SocketBindDeny=any` with a single
+`SocketBindAllow=ipv4:tcp:18735` for the loopback hosted-relay upstream, which
+needs systemd 249 or later to be enforced. Signer keeps `PrivateNetwork=yes`.
+
 The user-owned `bloom-machine.service` starts the long-running Machine and
 mounts its VFS at `~/bloom` for the lifetime of the login session. NFS mounts
 normally require privilege, so the installer adds one exact `/etc/fstab`
