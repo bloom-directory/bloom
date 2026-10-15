@@ -5055,12 +5055,13 @@ fn macos_rollback_reloads_every_login_before_reporting_a_timeout() {
     for uid in ["501", "502", "503"] {
         fs::write(enrollments.path().join(format!("{uid}.json")), "{}").unwrap();
     }
-    let run = |reload_all: &str| {
+    let run = |reload_all: &str, fail_signer: &str| {
         let harness = format!(
             r#"set -Eeuo pipefail
 live=true; root_prefix=/unused; release_base=/unused; containment_plist=/unused
 enrollments='{enrollments}'
-reload_launchd_job() {{ :; }}
+# A Signer that fails to load for UID $FAIL_SIGNER is a hard failure.
+reload_launchd_job() {{ [ "$2" != "com.bloom.signer.${{FAIL_SIGNER:-none}}" ]; }}
 reload_launchagent_job() {{ echo "load $1/$2"; }}
 field() {{ echo fixture; }}
 # 501 and 503 have not answered yet; 502 is healthy.
@@ -5074,12 +5075,13 @@ if reload_installed_set; then echo healthy; else echo "timed_out=$health_timed_o
         let output = Command::new("bash")
             .arg("-c")
             .arg(harness)
+            .env("FAIL_SIGNER", fail_signer)
             .output()
             .unwrap();
         assert!(output.status.success(), "{output:?}");
         String::from_utf8(output.stdout).unwrap()
     };
-    let rollback = run("true");
+    let rollback = run("true", "none");
     assert!(
         rollback.contains("load 503/com.bloom.machine"),
         "{rollback}"
@@ -5089,9 +5091,14 @@ if reload_installed_set; then echo healthy; else echo "timed_out=$health_timed_o
         "{rollback}"
     );
     // Outside a rollback the first unanswered login still stops the set.
-    let candidate = run("false");
+    let candidate = run("false", "none");
     assert!(!candidate.contains("load 502/"), "{candidate}");
     assert!(candidate.ends_with("timed_out=true uids=\n"), "{candidate}");
+    // A hard failure after an earlier timeout is reported as a failure, not
+    // as every login loaded.
+    let mixed = run("true", "502");
+    assert!(!mixed.contains("load 503/"), "{mixed}");
+    assert!(mixed.ends_with("timed_out=false uids=501\n"), "{mixed}");
 }
 
 /// Runs one installer's health wait in bash with stubbed system tools; the

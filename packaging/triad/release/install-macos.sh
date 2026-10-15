@@ -948,17 +948,20 @@ rewrite_all_enrollments() {
 # health_timed_out_uids and the set still reports failure.
 reload_installed_set() {
   local record uid; health_timed_out_uids=""; $live || return 0
-  reload_launchd_job system com.bloom.containment "$containment_plist" || return 1
+  # A hard failure is not a timeout, whatever an earlier login reported.
+  reload_failed() { health_timed_out=false; return 1; }
+  reload_launchd_job system com.bloom.containment "$containment_plist" || { reload_failed; return 1; }
   "$release_base/current/bloom" serve triad-pf-monitor-once 2>/dev/null ||
     echo "Bloom installed, but session lifecycle refresh is deferred" >&2
   for record in "$enrollments"/*.json; do
     [[ -f "$record" && ! -L "$record" ]] || continue
     uid="${record##*/}"; uid="${uid%.json}"
-    reload_launchagent_job "$uid" com.bloom.session "$root_prefix/Library/LaunchAgents/com.bloom.session.plist" || return 1
-    reload_launchd_job system "com.bloom.signer.$uid" "$root_prefix/Library/LaunchDaemons/com.bloom.signer.$uid.plist" || return 1
-    reload_launchd_job system "com.bloom.broker.$uid" "$root_prefix/Library/LaunchDaemons/com.bloom.broker.$uid.plist" || return 1
-    reload_launchagent_job "$uid" com.bloom.machine "$root_prefix/Library/LaunchAgents/com.bloom.machine.plist" || return 1
+    reload_launchagent_job "$uid" com.bloom.session "$root_prefix/Library/LaunchAgents/com.bloom.session.plist" || { reload_failed; return 1; }
+    reload_launchd_job system "com.bloom.signer.$uid" "$root_prefix/Library/LaunchDaemons/com.bloom.signer.$uid.plist" || { reload_failed; return 1; }
+    reload_launchd_job system "com.bloom.broker.$uid" "$root_prefix/Library/LaunchDaemons/com.bloom.broker.$uid.plist" || { reload_failed; return 1; }
+    reload_launchagent_job "$uid" com.bloom.machine "$root_prefix/Library/LaunchAgents/com.bloom.machine.plist" || { reload_failed; return 1; }
     if ! require_triad_health "$uid" "$(field "$record" login_user)" "$(field "$record" release_digest)"; then
+      # This login's own check set health_timed_out; keep it as reported.
       [[ "${reload_all_on_timeout:-false}" == true && "${health_timed_out:-false}" == true ]] || return 1
       health_timed_out_uids="${health_timed_out_uids:+$health_timed_out_uids, }$uid"
     fi
