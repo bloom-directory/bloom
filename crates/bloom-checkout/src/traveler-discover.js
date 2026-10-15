@@ -4,7 +4,7 @@
   const mapped = [];
   for (const e of document.querySelectorAll('input,select,textarea')) {
     if (!e.getClientRects().length || getComputedStyle(e).visibility !== 'visible' || e.disabled
-        || e.readOnly || e.type === 'hidden' || e.type === 'password') continue;
+        || e.type === 'hidden' || e.type === 'password') continue;
     const ac = (e.autocomplete || '').split(' ').at(-1);
     // Some sites caption a field with plain text beside it rather than a
     // <label>: use the text of the smallest wrapper holding only this field.
@@ -36,7 +36,10 @@
       field='phone';
     }
     if (!field) continue;
-    mapped.push({field,part,index:refs.length});refs.push(e);
+    // A read-only input is a site-drawn dropdown: fill it only for a fixed set of choices.
+    const choice = e.readOnly && e.tagName === 'INPUT';
+    if (e.readOnly && !(choice && ['gender','nationality','document_kind','document_country'].includes(field))) continue;
+    mapped.push({field,part,choice,index:refs.length});refs.push(e);
   }
   if (mapped.length > 40) throw Error('Ambiguous traveler form');
   for (const field of ['given_name','family_name','gender','nationality','document_kind','document_number','document_country','document_expiry','phone']) {

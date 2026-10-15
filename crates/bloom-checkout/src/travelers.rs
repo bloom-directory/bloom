@@ -25,7 +25,7 @@ async fn evaluate(
             Some(session),
             "Runtime.evaluate",
             json!({"contextId":world,"expression":expression,
-        "returnByValue":true,"userGesture":true}),
+        "returnByValue":true,"awaitPromise":true,"userGesture":true}),
         )
         .await?;
     if response.get("exceptionDetails").is_some() {
@@ -250,6 +250,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(filled, json!(["SyntheticName", "Fixture", ""]));
+        server.abort();
+    }
+    #[tokio::test]
+    async fn site_drawn_dropdowns_are_chosen_by_clicking_their_option() {
+        // Shaped like JetSMART: gender is a read-only input whose options appear on click.
+        let (browser, server, _) = browser_at(
+            "<div><div>Nombres</div><input name='firstName-0'></div>
+             <div><div>Género</div><input name='gender-0' readonly></div>
+             <div><div>Número AAdvantage® (Opcional)</div><input name='ff-0' readonly></div>
+             <div id='list' hidden><div class='opt' data-test-value='Male'>Masculino</div>
+               <div class='opt' data-test-value='Female'>Femenino</div></div>
+             <script>const g=document.querySelector('[name=gender-0]');
+               g.addEventListener('click',()=>setTimeout(()=>list.hidden=false,150));
+               for(const o of document.querySelectorAll('.opt'))o.addEventListener('click',()=>{g.value=o.innerText;list.hidden=true;});</script>",
+        )
+        .await;
+        let tab = browser.handoff().await.unwrap();
+        let fields = [TravelerField::GivenName, TravelerField::Gender];
+        let discovery = TravelerDiscovery::read(&tab, &fields).await.unwrap();
+        assert_eq!(discovery.scope.fields, fields);
+        let values = [
+            ("given_name".into(), Zeroizing::new("SyntheticName".into())),
+            ("gender".into(), Zeroizing::new("female".into())),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(discovery.fill(&tab, &values).await.unwrap().len(), 2);
+        let filled = tab
+            .cdp
+            .evaluate(
+                &tab.session,
+                "[...document.querySelectorAll('input')].map(e=>e.value)".into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(filled, json!(["SyntheticName", "Femenino", ""]));
         server.abort();
     }
     #[tokio::test]
