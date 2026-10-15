@@ -92,9 +92,10 @@ fn latch_degradation(inner: &mut AuditInner, reason: String, cause_code: &'stati
 
 #[cfg(test)]
 thread_local! {
-    /// Runs once between the open-time verification pass and the snapshot
-    /// taken after it, so a test can write to the journal mid-verification.
-    static AFTER_OPEN_INSPECT_FOR_TEST: std::cell::Cell<Option<fn(&Path)>> =
+    /// Runs once after open's last verification read (the rotation-history
+    /// check) and before the snapshot that closes it, so a test can write to
+    /// the journal at the latest point inside the verified window.
+    static AFTER_OPEN_VERIFICATION_FOR_TEST: std::cell::Cell<Option<fn(&Path)>> =
         const { std::cell::Cell::new(None) };
 }
 
@@ -540,16 +541,9 @@ impl AuditLog {
         // every later append trusts.
         let snapshot_before = journal_snapshot(&path)?;
         let inspected = inspect(&path, verifier.as_ref());
-        #[cfg(test)]
-        if let Some(hook) = AFTER_OPEN_INSPECT_FOR_TEST.with(|hook| hook.take()) {
-            hook(&path);
-        }
-        let journal_snapshot = journal_snapshot(&path)?;
-        let changed_during_verification = (journal_snapshot != snapshot_before)
-            .then(|| "journal changed while it was being verified".to_owned());
         // The rotation-history check below re-verifies the current segment
         // only when this full pass succeeded over an unchanged file.
-        let current_verified = inspected.is_ok() && changed_during_verification.is_none();
+        let current_verified = inspected.is_ok() && journal_snapshot(&path)? == snapshot_before;
         let (last_digest, sequence, pending_effects, degraded, inspected_latched) = if path.exists()
         {
             match inspected {
@@ -587,6 +581,16 @@ impl AuditLog {
                 .err()
             })
             .map(|error| error.to_string());
+        #[cfg(test)]
+        if let Some(hook) = AFTER_OPEN_VERIFICATION_FOR_TEST.with(|hook| hook.take()) {
+            hook(&path);
+        }
+        // Every read above, the rotation-history check included, happened
+        // between these two snapshots; a write anywhere in that window means
+        // what was verified is not the file later appends will trust.
+        let journal_snapshot = journal_snapshot(&path)?;
+        let changed_during_verification = (journal_snapshot != snapshot_before)
+            .then(|| "journal changed while it was being verified".to_owned());
         let degradation_latched = inspected_latched
             || changed_during_verification.is_some()
             || legacy_error.is_some()
@@ -2262,7 +2266,7 @@ mod tests {
                 .write_all(b"\n")
                 .unwrap();
         }
-        AFTER_OPEN_INSPECT_FOR_TEST.with(|hook| hook.set(Some(write_during_verification)));
+        AFTER_OPEN_VERIFICATION_FOR_TEST.with(|hook| hook.set(Some(write_during_verification)));
         let reopened = AuditLog::open_signed(&path, id).unwrap();
         let reason = reopened.mutation_degradation().expect("must latch");
         assert!(
