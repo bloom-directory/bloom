@@ -34,8 +34,8 @@ pub(crate) struct Discovery {
     pub facts_session: String,
 }
 
-/// Card number, expiry and CVC go only into documents a payment provider
-/// serves, so a look-alike shop never receives them; other pages fall back to
+/// Card number, expiry and CVC go into documents a payment provider serves,
+/// or into the approved merchant's own HTTPS page; other frames fall back to
 /// the private view. Origins are taken from each provider's published SDK
 /// (checked 2026-10-10). The cardholder name may stay on the merchant page.
 const PROVIDER_FIELD_ORIGINS: &[&str] = &[
@@ -63,25 +63,12 @@ const PROVIDER_FIELD_ORIGINS: &[&str] = &[
     // Booking.com's own payment component (seen on its final page 2026-10-11).
     "https://paymentcomponent.booking.com",
 ];
-/// Provider-hosted checkout pages whose own document holds the card fields.
-const PROVIDER_PAGE_ORIGINS: &[&str] = &[
-    "https://checkout.stripe.com",
-    "https://buy.stripe.com",
-    "https://www.paypal.com",
-    "https://checkoutshopper-live.adyen.com",
-    "https://checkoutshopper-live-us.adyen.com",
-    "https://www.mercadopago.com.ar",
-    "https://www.mercadopago.com.br",
-    "https://www.mercadopago.com.mx",
-    "https://www.mercadopago.cl",
-    "https://www.mercadopago.com.co",
-    "https://www.mercadopago.com.uy",
-    "https://www.mercadopago.com.pe",
-];
 
 fn provider_hosts_card_fields(frame_origin: &str, top_origin: &str, fixture: bool) -> bool {
     PROVIDER_FIELD_ORIGINS.contains(&frame_origin)
-        || (frame_origin == top_origin && PROVIDER_PAGE_ORIGINS.contains(&frame_origin))
+        // Airlines often take the card on their own page. The approval names
+        // that HTTPS origin, which is the one the card is released to.
+        || (frame_origin == top_origin && frame_origin.starts_with("https://"))
         || (fixture
             && url::Url::parse(frame_origin)
                 .is_ok_and(|u| matches!(u.host_str(), Some("localhost" | "127.0.0.1"))))
@@ -1185,42 +1172,63 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn fixture_card_fields_outside_payment_providers_require_manual() {
-        assert!(provider_hosts_card_fields(
-            "https://js.stripe.com",
-            "https://shop.example",
-            false
-        ));
-        assert!(provider_hosts_card_fields(
-            "https://checkout.stripe.com",
-            "https://checkout.stripe.com",
-            false
-        ));
-        assert!(!provider_hosts_card_fields(
-            "https://checkout.stripe.com",
-            "https://shop.example",
-            false
-        ));
-        assert!(!provider_hosts_card_fields(
-            "https://shop.example",
-            "https://shop.example",
-            false
-        ));
-        assert!(!provider_hosts_card_fields(
-            "https://js.stripe.com.evil.example",
-            "https://shop.example",
-            false
-        ));
+    async fn card_fields_go_to_payment_providers_or_the_merchant_page() {
+        for (frame, top, allowed) in [
+            ("https://js.stripe.com", "https://shop.example", true),
+            (
+                "https://checkout.stripe.com",
+                "https://checkout.stripe.com",
+                true,
+            ),
+            // The approved merchant's own page.
+            ("https://shop.example", "https://shop.example", true),
+            ("http://shop.example", "http://shop.example", false),
+            // A frame from anywhere else, including a look-alike provider.
+            ("https://checkout.stripe.com", "https://shop.example", false),
+            ("https://cards.other.example", "https://shop.example", false),
+            (
+                "https://js.stripe.com.evil.example",
+                "https://shop.example",
+                false,
+            ),
+        ] {
+            assert_eq!(
+                provider_hosts_card_fields(frame, top, false),
+                allowed,
+                "{frame} in {top}"
+            );
+        }
         let browser = browser().await;
         let (url, server) = fixture(merchant(&inputs(), "", "Order confirmed")).await;
         let mut tab = open(&browser, url).await;
-        assert!(Discovery::read(&tab).await.is_ok());
         tab.fixture_payment_hosts = false;
-        let error = Discovery::read(&tab).await.err().unwrap();
-        assert!(
-            error.to_string().contains("known payment provider"),
-            "{error}"
-        );
+        assert!(Discovery::read(&tab).await.is_ok());
+        browser.return_control().await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn spanish_card_form_captioned_beside_its_fields_is_supported() {
+        // Shaped like an airline's own payment page: no autocomplete, captions in divs.
+        let html = "<!doctype html><html lang='es-AR'><h1>Pago</h1><p>Total $371.805,17</p>
+            <div><div>Número de tarjeta</div><input name='f1'></div>
+            <div><div>Vencimiento (MM/AA)</div><input name='f2'></div>
+            <div><div>Código de seguridad</div><input name='f3'></div>
+            <div><div>Nombre del titular como figura en la tarjeta</div><input name='f4'></div>
+            <button>Pagar</button></html>";
+        let browser = browser().await;
+        let (url, server) = fixture(html.into()).await;
+        let mut tab = open(&browser, url).await;
+        tab.fixture_payment_hosts = false;
+        let discovery = Discovery::read(&tab).await.unwrap();
+        assert_eq!(discovery.facts.total_minor, 37180517);
+        assert_eq!(discovery.facts.currency, "ARS");
+        let kinds: Vec<_> = discovery.frames[0]
+            .fields
+            .iter()
+            .map(|f| f.kind.as_str())
+            .collect();
+        assert_eq!(kinds, ["number", "expiry", "cvc", "name"]);
         browser.return_control().await.unwrap();
         server.abort();
     }

@@ -15,7 +15,23 @@
   const pointerSelector = valid.join(',');
   const pointer = e => e.style.cursor === 'pointer' || (pointerSelector !== '' && e.matches(pointerSelector));
   const text = e => (e.innerText || '').replace(/\s+/g, ' ').trim();
-  const label = e => (e.getAttribute('aria-label') || e.labels?.[0]?.innerText || e.innerText || e.placeholder || '').replace(/\s+/g, ' ').trim();
+  const field = e => e.matches('input,select,textarea');
+  // Some sites caption a field with text beside it instead of a <label>: use
+  // the text of the smallest wrapper holding only this field.
+  const caption = e => {
+    for (let a = e.parentElement, depth = 0; a && depth < 4; a = a.parentElement, depth++) {
+      if (a.querySelectorAll('input,select,textarea').length > 1) return '';
+      const around = text(a);
+      if (around) return around.length <= 60 ? around : '';
+    }
+    return '';
+  };
+  const label = e => (e.getAttribute('aria-label') || e.labels?.[0]?.innerText || (field(e) ? '' : e.innerText) || e.placeholder
+    || (field(e) ? caption(e) || e.name : '') || '').replace(/\s+/g, ' ').trim();
+  // Card and password values never leave the page; checkout redacts saved
+  // traveler values before the agent reads anything else.
+  const secret = e => e.type === 'password' || /^cc-/.test((e.autocomplete || '').split(' ').at(-1))
+    || /card|tarjeta|cvc|cvv|security|seguridad|password|contrase/i.test(`${e.name} ${e.id} ${label(e)}`);
   // Labels toggle their (often restyled and hidden) radio or checkbox.
   const control = e => e.matches(native) || (e.tagName === 'LABEL' && e.control);
   const candidates = [...document.querySelectorAll('body *')].filter(e =>
@@ -40,8 +56,10 @@
     label: label(e).slice(0, 200),
     context: context(e),
     type: e.type || null,
+    value: field(e) && e.type !== 'checkbox' && e.type !== 'radio' && !secret(e) ? String(e.value).slice(0, 200) : undefined,
+    checked: e.type === 'checkbox' || e.type === 'radio' ? e.checked : undefined,
     options: e.tagName === 'SELECT' ? [...e.options].map(o => ({value: o.value, label: o.text})) : undefined
   }));
-  // Values and child frames are deliberately absent from the shopping projection.
+  // Child frames are observed separately; their contents are never merged here.
   return {url: location.href === 'about:blank' ? 'about:blank' : location.origin + location.pathname, elements};
 })()

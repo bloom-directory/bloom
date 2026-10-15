@@ -344,6 +344,13 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(snapshot.contains("Hola [saved given_name]"), "{snapshot}");
+        // Captioned fields show which saved value went where.
+        assert!(
+            snapshot.contains(
+                r#""label":"Apellidos","role":"input","type":"text","value":"[saved family_name]""#
+            ) || snapshot.contains("[saved family_name]"),
+            "{snapshot}"
+        );
         for secret in ["syntheticname", "fixturefamily", "fixture@example.com"] {
             assert!(
                 !snapshot.to_ascii_lowercase().contains(secret),

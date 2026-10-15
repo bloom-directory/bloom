@@ -1159,7 +1159,8 @@ mod tests {
                 get(|| async {
                     Html(
                         r#"<!doctype html><h1>Fixture shop</h1>
-            <input aria-label="Private fixture" value="do-not-project-input-value">
+            <input aria-label="Ordinary fixture" value="shown-input-value">
+            <input autocomplete="cc-number" value="do-not-project-card-value">
             <button onclick="window.open('/popup')">Open popup</button>"#,
                     )
                 }),
@@ -1172,7 +1173,8 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(300)).await;
         let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
         assert!(snapshot["text"].as_str().unwrap().contains("Fixture shop"));
-        assert!(!snapshot.to_string().contains("do-not-project-input-value"));
+        assert!(snapshot.to_string().contains("shown-input-value"));
+        assert!(!snapshot.to_string().contains("do-not-project-card-value"));
         let session = browser.tab.lock().await.session.clone();
         let agent = browser
             .cdp

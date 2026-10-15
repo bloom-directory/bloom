@@ -85,10 +85,11 @@ tool for this checkout.
 The human approves website, total, currency, installments, recurring status,
 and card, then enters CVC privately; the approval also shows a screenshot of
 the merchant page so the human can check the order. Bloom fills and submits
-once. Bloom fills a saved card only into fields hosted by a known payment
-provider (Stripe, Shopify, Adyen, Braintree and others). A bank challenge, a
-site that collects the card on its own page, or an unclear total goes to the
-human's private view; its URL and screenshots never appear in VFS. A manual
+once. Bloom fills a saved card into fields hosted by a known payment
+provider (Stripe, Shopify, Adyen, Braintree and others) or into the approved
+website's own HTTPS page. A bank challenge, card fields in any other frame, or
+an unclear total goes to the human's private view; its URL and screenshots
+never appear in VFS. A manual
 fallback releases no saved card.
 
 `filled` means fields were filled, not that payment succeeded. `paid` and

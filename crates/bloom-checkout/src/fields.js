@@ -3,13 +3,21 @@
     const autocomplete = e.autocomplete?.toLowerCase().split(' ').pop();
     const direct = {'cc-number':'number','cc-exp':'expiry','cc-exp-month':'month','cc-exp-year':'year','cc-csc':'cvc','cc-name':'name'};
     if (direct[autocomplete]) return direct[autocomplete];
-    const label = [e.name,e.id,e.getAttribute('aria-label'),e.placeholder,e.labels?.[0]?.innerText].filter(Boolean).join(' ').toLowerCase();
-    if (/card.?number|cardnumber/.test(label)) return 'number';
-    if (/cvc|cvv|security.?code/.test(label)) return 'cvc';
-    if (/expir.*month/.test(label)) return 'month';
-    if (/expir.*year/.test(label)) return 'year';
-    if (/expir|mm.?\/.?yy/.test(label)) return 'expiry';
-    if (/cardholder|name.?on.?card/.test(label)) return 'name';
+    // Some sites caption a field with text beside it instead of a <label>.
+    let caption = '';
+    for (let a = e.parentElement, depth = 0; a && depth < 4; a = a.parentElement, depth++) {
+      if (a.querySelectorAll('input,select').length > 1) break;
+      const t = (a.innerText || '').trim();
+      if (t) { if (t.length <= 60) caption = t; break; }
+    }
+    const label = [e.name,e.id,e.getAttribute('aria-label'),e.placeholder,e.labels?.[0]?.innerText,caption].filter(Boolean).join(' ')
+      .normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase();
+    if (/card.?number|cardnumber|numero de (la )?tarjeta|nro\.? de tarjeta/.test(label)) return 'number';
+    if (/cvc|cvv|security.?code|codigo de seguridad/.test(label)) return 'cvc';
+    if (/expir.*month|vencimiento.*mes|^mes$/.test(label)) return 'month';
+    if (/expir.*year|vencimiento.*ano|^ano$/.test(label)) return 'year';
+    if (/expir|mm.?\/.?(yy|aa)|vencimiento|fecha de expiracion/.test(label)) return 'expiry';
+    if (/cardholder|name.?on.?card|titular|nombre (impreso|como figura|en la tarjeta)/.test(label)) return 'name';
     return null;
   };
   const shopify = location.origin === 'https://checkout.pci.shopifyinc.com'
