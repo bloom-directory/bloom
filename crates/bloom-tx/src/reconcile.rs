@@ -45,10 +45,13 @@ struct LookupBackoff {
     first_miss: Instant,
     misses_after_grace: u32,
     next_at: Instant,
-    /// Whether these misses happened after the nonce was seen spent. History
-    /// from before that (no nonce available) must not delay the first lookup
-    /// once the nonce is spent.
-    nonce_spent: bool,
+    /// Whether the nonce has ever been seen spent. Sticky: history from
+    /// before that (no nonce available) must not delay the first lookup once
+    /// it is spent, but switching between spent and unavailable afterwards
+    /// must not restart the backoff either.
+    seen_spent: bool,
+    /// When the nonce was last read while this entry waited out its backoff.
+    nonce_checked_at: Option<Instant>,
 }
 
 /// Polls sent entries and records their mined outcome.
@@ -94,55 +97,61 @@ impl Reconciler {
             .is_some_and(|backoff| now < backoff.next_at)
     }
 
-    /// Whether `key` is waiting out a backoff that began after its nonce was
-    /// spent. Its nonce cannot become unspent, so such a tick skips even the
-    /// nonce read.
-    fn spent_lookup_deferred(&self, key: &str, now: Instant) -> bool {
+    /// Whether `key`, already seen spent, can skip this tick's nonce read: it
+    /// is waiting out a backoff and its nonce was read less than
+    /// [`RECEIPT_LOOKUP_SPACING`] ago. The nonce is still read at that spacing,
+    /// since a reorg can make a spent nonce unspent again.
+    fn spent_nonce_read_deferred(&self, key: &str, now: Instant) -> bool {
         self.backoff
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(key)
-            .is_some_and(|backoff| backoff.nonce_spent && now < backoff.next_at)
+            .is_some_and(|backoff| {
+                backoff.seen_spent
+                    && now < backoff.next_at
+                    && backoff
+                        .nonce_checked_at
+                        .is_some_and(|checked| now < checked + RECEIPT_LOOKUP_SPACING)
+            })
     }
 
-    /// The first tick that sees the nonce spent forgets history from before
-    /// it, so that lookup is never delayed.
-    fn forget_history_before_spent_nonce(&self, key: &str) {
+    /// Called when the nonce is seen spent. The first time, history from
+    /// before it is forgotten so that lookup is never delayed; afterwards the
+    /// backoff keeps going and only the time of this nonce read is noted.
+    fn note_spent_nonce(&self, key: &str, now: Instant) {
         let mut backoffs = self
             .backoff
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if backoffs
-            .get(key)
-            .is_some_and(|backoff| !backoff.nonce_spent)
-        {
-            backoffs.remove(key);
+        match backoffs.get_mut(key) {
+            Some(backoff) if backoff.seen_spent => backoff.nonce_checked_at = Some(now),
+            Some(_) => {
+                backoffs.remove(key);
+            }
+            None => {}
         }
     }
 
-    /// Record a lookup, made after the nonce was spent, that found no receipt
-    /// for this hash. Lookups stay [`RECEIPT_LOOKUP_SPACING`] apart for
-    /// [`RECEIPT_LOOKUP_GRACE`]; after that the wait doubles, up to
-    /// [`RECEIPT_LOOKUP_MAX_DELAY`].
+    /// Record a lookup that found no receipt for this hash, or failed. Once
+    /// the nonce has been seen spent, lookups stay [`RECEIPT_LOOKUP_SPACING`]
+    /// apart for [`RECEIPT_LOOKUP_GRACE`] and then the wait doubles, up to
+    /// [`RECEIPT_LOOKUP_MAX_DELAY`]. `nonce_spent` says whether this lookup
+    /// followed a spent nonce.
     fn record_lookup_miss(&self, key: String, now: Instant, nonce_spent: bool) {
         let mut backoffs = self
             .backoff
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let fresh = LookupBackoff {
+        let backoff = backoffs.entry(key).or_insert(LookupBackoff {
             first_miss: now,
             misses_after_grace: 0,
             next_at: now,
-            nonce_spent,
-        };
-        let backoff = backoffs.entry(key).or_insert(fresh);
-        if backoff.nonce_spent != nonce_spent {
-            *backoff = LookupBackoff {
-                first_miss: now,
-                misses_after_grace: 0,
-                next_at: now,
-                nonce_spent,
-            };
+            seen_spent: nonce_spent,
+            nonce_checked_at: None,
+        });
+        backoff.seen_spent |= nonce_spent;
+        if nonce_spent {
+            backoff.nonce_checked_at = Some(now);
         }
         if now.duration_since(backoff.first_miss) < RECEIPT_LOOKUP_GRACE {
             backoff.next_at = now + RECEIPT_LOOKUP_SPACING;
@@ -155,10 +164,19 @@ impl Reconciler {
         backoff.next_at = now + delay;
     }
 
-    /// Record a lookup, made without a confirmed nonce, that found no receipt:
-    /// the transaction may simply be pending, so keep looking at the normal
-    /// spacing without backing off further.
+    /// Record a lookup, made without a confirmed nonce, that found no receipt.
+    /// A transaction never seen spent may simply be pending, so keep looking
+    /// at the normal spacing; one already seen spent keeps its backoff.
     fn space_next_lookup(&self, key: String, now: Instant) {
+        let seen_spent = self
+            .backoff
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&key)
+            .is_some_and(|backoff| backoff.seen_spent);
+        if seen_spent {
+            return self.record_lookup_miss(key, now, false);
+        }
         self.backoff
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -168,7 +186,8 @@ impl Reconciler {
                     first_miss: now,
                     misses_after_grace: 0,
                     next_at: now + RECEIPT_LOOKUP_SPACING,
-                    nonce_spent: false,
+                    seen_spent: false,
+                    nonce_checked_at: None,
                 },
             );
     }
@@ -203,7 +222,7 @@ impl Reconciler {
             };
             let backoff_key = Self::backoff_key(&se);
             waiting.insert(backoff_key.clone());
-            if self.spent_lookup_deferred(&backoff_key, (self.clock)()) {
+            if self.spent_nonce_read_deferred(&backoff_key, (self.clock)()) {
                 continue;
             }
             let nonce_key = (se.chain.clone(), se.from);
@@ -234,7 +253,7 @@ impl Reconciler {
                     continue;
                 }
                 Some(_) => {
-                    self.forget_history_before_spent_nonce(&backoff_key);
+                    self.note_spent_nonce(&backoff_key, (self.clock)());
                     true
                 }
                 None => false,
@@ -951,6 +970,60 @@ mod tests {
         at(29);
         reconciler.tick().await;
         assert_eq!(rpc.lookups(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_reorg_that_unspends_the_nonce_is_noticed_during_backoff() {
+        let (_directory, outbox) = sent_outbox();
+        let audit_directory = tempfile::tempdir().unwrap();
+        let audit = Arc::new(AuditLog::open(audit_directory.path().join("audit.jsonl")).unwrap());
+        let rpc = MockRpc::new(Some(1), serde_json::Value::Null);
+        let chains = ChainRegistry::default();
+        chains.add(mock_chain(rpc.clone()).await);
+        let (reconciler, at) = clocked(outbox, chains, audit);
+        // Spend the grace window so the backoff is long (next lookup at 331).
+        for secs in [0, 15, 30, 60, 120, 180, 240, 301] {
+            at(secs);
+            reconciler.tick().await;
+        }
+        // A reorg makes the nonce unspent; the next spaced nonce read sees it.
+        *rpc.nonce.lock().unwrap() = Some(0);
+        at(316);
+        reconciler.tick().await;
+        // Our transaction is then mined: recorded on the next tick, not at 331.
+        *rpc.nonce.lock().unwrap() = Some(1);
+        *rpc.receipt.lock().unwrap() = mined_receipt();
+        at(318);
+        assert_eq!(reconciler.tick().await, 1);
+    }
+
+    #[tokio::test]
+    async fn switching_between_spent_and_unavailable_keeps_the_backoff() {
+        let (_directory, outbox) = sent_outbox();
+        let audit_directory = tempfile::tempdir().unwrap();
+        let audit = Arc::new(AuditLog::open(audit_directory.path().join("audit.jsonl")).unwrap());
+        let rpc = MockRpc::new(Some(1), serde_json::Value::Null);
+        let chains = ChainRegistry::default();
+        chains.add(mock_chain(rpc.clone()).await);
+        let (reconciler, at) = clocked(outbox, chains, audit);
+        at(0);
+        reconciler.tick().await;
+        assert_eq!(rpc.lookups(), 1);
+        // The provider fails both calls at 16 s: a miss, still spaced.
+        *rpc.nonce.lock().unwrap() = None;
+        *rpc.receipt_fails.lock().unwrap() = true;
+        at(16);
+        reconciler.tick().await;
+        assert_eq!(rpc.lookups(), 2);
+        // Recovery at 18 s is not a first spent observation again.
+        *rpc.nonce.lock().unwrap() = Some(1);
+        *rpc.receipt_fails.lock().unwrap() = false;
+        at(18);
+        reconciler.tick().await;
+        assert_eq!(rpc.lookups(), 2, "spacing still holds after the switch");
+        at(31);
+        reconciler.tick().await;
+        assert_eq!(rpc.lookups(), 3);
     }
 
     #[tokio::test]
