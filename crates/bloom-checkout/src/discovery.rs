@@ -66,11 +66,33 @@ const PROVIDER_FIELD_ORIGINS: &[&str] = &[
     "https://sdk-web-card.prod.y.uno",
 ];
 
+/// Provider-hosted checkout pages whose own document holds the card fields.
+const PROVIDER_PAGE_ORIGINS: &[&str] = &[
+    "https://checkout.stripe.com",
+    "https://buy.stripe.com",
+    "https://www.paypal.com",
+    "https://checkoutshopper-live.adyen.com",
+    "https://checkoutshopper-live-us.adyen.com",
+    "https://www.mercadopago.com.ar",
+    "https://www.mercadopago.com.br",
+    "https://www.mercadopago.com.mx",
+    "https://www.mercadopago.cl",
+    "https://www.mercadopago.com.co",
+    "https://www.mercadopago.com.uy",
+    "https://www.mercadopago.com.pe",
+];
+/// Merchants that collect the card on their own checkout page, checked by
+/// hand. The approval names the origin the card is entered on.
+const MERCHANT_CARD_ORIGINS: &[&str] = &[
+    // Aerolíneas Argentinas' inline card form (card research 2026-10-13).
+    "https://www.aerolineas.com.ar",
+];
+
 fn provider_hosts_card_fields(frame_origin: &str, top_origin: &str, fixture: bool) -> bool {
     PROVIDER_FIELD_ORIGINS.contains(&frame_origin)
-        // Airlines often take the card on their own page. The approval names
-        // that HTTPS origin, which is the one the card is released to.
-        || (frame_origin == top_origin && frame_origin.starts_with("https://"))
+        || (frame_origin == top_origin
+            && (PROVIDER_PAGE_ORIGINS.contains(&frame_origin)
+                || MERCHANT_CARD_ORIGINS.contains(&frame_origin)))
         || (fixture
             && url::Url::parse(frame_origin)
                 .is_ok_and(|u| matches!(u.host_str(), Some("localhost" | "127.0.0.1"))))
@@ -1182,8 +1204,13 @@ pub(crate) mod tests {
                 "https://checkout.stripe.com",
                 true,
             ),
-            // The approved merchant's own page.
-            ("https://shop.example", "https://shop.example", true),
+            // A listed merchant's own page, but not any HTTPS shop.
+            (
+                "https://www.aerolineas.com.ar",
+                "https://www.aerolineas.com.ar",
+                true,
+            ),
+            ("https://shop.example", "https://shop.example", false),
             ("http://shop.example", "http://shop.example", false),
             // A frame from anywhere else, including a look-alike provider.
             ("https://checkout.stripe.com", "https://shop.example", false),
@@ -1203,8 +1230,13 @@ pub(crate) mod tests {
         let browser = browser().await;
         let (url, server) = fixture(merchant(&inputs(), "", "Order confirmed")).await;
         let mut tab = open(&browser, url).await;
-        tab.fixture_payment_hosts = false;
         assert!(Discovery::read(&tab).await.is_ok());
+        tab.fixture_payment_hosts = false;
+        let error = Discovery::read(&tab).await.err().unwrap();
+        assert!(
+            error.to_string().contains("known payment provider"),
+            "{error}"
+        );
         browser.return_control().await.unwrap();
         server.abort();
     }
@@ -1238,8 +1270,7 @@ pub(crate) mod tests {
             <button>Pagar</button></html>";
         let browser = browser().await;
         let (url, server) = fixture(html.into()).await;
-        let mut tab = open(&browser, url).await;
-        tab.fixture_payment_hosts = false;
+        let tab = open(&browser, url).await;
         let discovery = Discovery::read(&tab).await.unwrap();
         assert_eq!(discovery.facts.total_minor, 37180517);
         assert_eq!(discovery.facts.currency, "ARS");

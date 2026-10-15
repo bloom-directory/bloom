@@ -254,6 +254,11 @@ impl Browser {
         redactions.sort_by_key(|(secret, _)| std::cmp::Reverse(secret.len()));
     }
 
+    /// The disposable browsing context shopping currently runs in.
+    pub(crate) async fn shopping_context(&self) -> String {
+        self.tab.lock().await.context.clone()
+    }
+
     pub(crate) async fn shopping_origin(&self) -> Result<String> {
         let tab = self.tab.lock().await;
         let info = self

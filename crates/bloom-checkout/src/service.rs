@@ -177,6 +177,8 @@ struct PendingUnlock {
 
 struct UnlockedTraveler {
     origin: String,
+    /// The unlock ends with the booking's browsing context.
+    context: String,
     fields: Vec<bloom_signer_api::TravelerField>,
     values: BTreeMap<String, zeroize::Zeroizing<String>>,
     expires: tokio::time::Instant,
@@ -466,6 +468,7 @@ impl CheckoutService {
         status.filled_fields = values.keys().cloned().collect();
         *self.traveler.lock().await = Some(UnlockedTraveler {
             origin: pending.origin,
+            context: self.browser.shopping_context().await,
             fields: pending.fields,
             values,
             expires: tokio::time::Instant::now() + Duration::from_secs(1800),
@@ -479,11 +482,16 @@ impl CheckoutService {
         if self.private.lock().await.is_some() {
             bail!("A checkout already has private control");
         }
-        let traveler = self.traveler.lock().await;
-        let traveler = traveler
+        let mut traveler = self.traveler.lock().await;
+        let context = self.browser.shopping_context().await;
+        // A finished checkout discards the context; the unlock goes with it.
+        if traveler
             .as_ref()
-            .filter(|t| tokio::time::Instant::now() < t.expires)
-            .context("Unlock a saved traveler first")?;
+            .is_some_and(|t| t.context != context || tokio::time::Instant::now() >= t.expires)
+        {
+            *traveler = None;
+        }
+        let traveler = traveler.as_ref().context("Unlock a saved traveler first")?;
         if self.browser.shopping_origin().await? != traveler.origin {
             bail!("Saved traveler details are unlocked for another website");
         }
@@ -502,11 +510,16 @@ impl CheckoutService {
         if self.private.lock().await.is_some() {
             bail!("A checkout already has private control");
         }
-        let traveler = self.traveler.lock().await;
-        let traveler = traveler
+        let mut traveler = self.traveler.lock().await;
+        let context = self.browser.shopping_context().await;
+        // A finished checkout discards the context; the unlock goes with it.
+        if traveler
             .as_ref()
-            .filter(|t| tokio::time::Instant::now() < t.expires)
-            .context("Unlock a saved traveler first")?;
+            .is_some_and(|t| t.context != context || tokio::time::Instant::now() >= t.expires)
+        {
+            *traveler = None;
+        }
+        let traveler = traveler.as_ref().context("Unlock a saved traveler first")?;
         let mut values = traveler.values.clone();
         if let Some(phone) = values.get("phone").and_then(|p| formatted_phone(p)) {
             values.insert("phone".into(), zeroize::Zeroizing::new(phone));
@@ -1279,25 +1292,33 @@ impl CheckoutService {
     }
 
     pub async fn private_screenshot(&self, token: &str) -> Result<Vec<u8>> {
-        let private = self.private.lock().await;
-        let checkout = private.as_ref().context("No active private checkout")?;
-        authorize_view(checkout, token)?;
+        // Copy what the capture needs and release the lock: a page that never
+        // paints must not stall the rest of the private view.
+        let (cdp, session) = {
+            let private = self.private.lock().await;
+            let checkout = private.as_ref().context("No active private checkout")?;
+            authorize_view(checkout, token)?;
+            (checkout.tab.cdp.clone(), checkout.view_session.clone())
+        };
+        let bounded = |method: &'static str, params: Value| {
+            let (cdp, session) = (cdp.clone(), session.clone());
+            async move {
+                tokio::time::timeout(
+                    Duration::from_secs(2),
+                    cdp.call(Some(&session), method, params),
+                )
+                .await
+                .map_err(|_| anyhow::anyhow!("Private page is still loading"))?
+            }
+        };
         // The initial handoff may not have switched pages. Activate the held
         // page before capture so a background headless tab paints as well.
-        checkout
-            .tab
-            .cdp
-            .call(Some(&checkout.view_session), "Page.bringToFront", json!({}))
-            .await?;
-        let result = checkout
-            .tab
-            .cdp
-            .call(
-                Some(&checkout.view_session),
-                "Page.captureScreenshot",
-                json!({"format":"png","captureBeyondViewport":false}),
-            )
-            .await?;
+        bounded("Page.bringToFront", json!({})).await?;
+        let result = bounded(
+            "Page.captureScreenshot",
+            json!({"format":"png","captureBeyondViewport":false}),
+        )
+        .await?;
         use base64::Engine;
         Ok(base64::engine::general_purpose::STANDARD.decode(
             result["data"]
@@ -1645,6 +1666,7 @@ mod tests {
                 .unwrap()
                 .origin()
                 .ascii_serialization(),
+            context: browser.shopping_context().await,
             fields: vec![],
             values,
             expires: tokio::time::Instant::now() + Duration::from_secs(60),
@@ -1674,6 +1696,24 @@ mod tests {
         assert!(snapshot.contains("[saved phone_national]"), "{snapshot}");
         assert!(snapshot.contains("[saved born_on_dmy]"), "{snapshot}");
         assert!(!snapshot.contains("91123456789") && !snapshot.contains("07/05/1990"));
+        // Discarding the booking context (a finished checkout) ends the unlock.
+        browser.handoff().await.unwrap();
+        browser.return_control().await.unwrap();
+        browser.browse(BrowseRequest::Open { url }).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+        let element_ref = snapshot["elements"][0]["ref"].as_str().unwrap().to_owned();
+        let error = service
+            .request(Request::Browse {
+                request: BrowseRequest::TypeTraveler {
+                    element_ref,
+                    field: "phone".into(),
+                },
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "Unlock a saved traveler first");
+        assert!(service.traveler.lock().await.is_none());
         server.abort();
     }
     #[test]

@@ -91,8 +91,9 @@ The human approves website, total, currency, installments, recurring status,
 and card, then enters CVC privately; the approval also shows a screenshot of
 the merchant page so the human can check the order. Bloom fills and submits
 once. Bloom fills a saved card into fields hosted by a known payment
-provider (Stripe, Shopify, Adyen, Braintree and others) or into the approved
-website's own HTTPS page. A bank challenge, card fields in any other frame, or
+provider (Stripe, Shopify, Adyen, Braintree, Yuno and others) or into the own
+checkout page of a listed merchant (Aerolíneas Argentinas). A bank challenge,
+card fields anywhere else, or
 an unclear total goes to the human's private view; its URL and screenshots
 never appear in VFS. A manual
 fallback releases no saved card.
