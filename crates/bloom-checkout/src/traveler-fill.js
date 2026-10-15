@@ -21,12 +21,25 @@
     }
     if (mapping.field === 'gender') aliases.push(...(value === 'female' ? ['F','Femenino','Mujer'] : value === 'male' ? ['M','Masculino','Hombre'] : ['Unspecified','No especificado']));
     if (mapping.field === 'document_kind') aliases.push(...(value === 'passport' ? ['Passport','Pasaporte'] : ['National ID','DNI','Documento nacional']));
+    if (mapping.field === 'phone' && value.startsWith('+')) {
+      // A country prefix shown by a neighbouring field ("Argentina (+54)")
+      // means the number goes in without it.
+      for (let a = e.parentElement, depth = 0; a && depth < 4; a = a.parentElement, depth++) {
+        const shown = [...a.querySelectorAll('input,select')].filter(o => o !== e)
+          .map(o => o.tagName === 'SELECT' ? o.selectedOptions[0]?.text : o.value).join(' ');
+        const code = shown.match(/\(\+(\d{1,3})\)|(?:^|\s)\+(\d{1,3})\b/);
+        if (!code) continue;
+        const digits = code[1] || code[2];
+        if (value.replace(/[^\d+]/g,'').startsWith('+' + digits)) value = value.replace(/[^\d+]/g,'').slice(digits.length + 1);
+        break;
+      }
+    }
     const spanish = /^es/i.test(document.documentElement.lang || navigator.language);
     if (mapping.radio) {
       // `e` is the group: click the one radio naming this value.
       const radios = [...e.querySelectorAll('input[type=radio]')].filter(r => r.getClientRects().length && !r.disabled
         && aliases.some(a => [r.value, r.labels?.[0]?.innerText, r.getAttribute('aria-label')].some(t => t != null && normalize(a) === normalize(t))));
-      if (radios.length !== 1) throw Error('Traveler choice needs private input');
+      if (radios.length !== 1) throw Error(`Traveler radio ambiguous: ${radios.length} options`);
       radios[0].click();
       if (!radios[0].checked) throw Error('Traveler choice needs private input');
       filled.push(mapping.field);
@@ -40,7 +53,8 @@
         : mapping.field === 'document_kind' ? (value === 'passport' ? (spanish ? 'Pasaporte' : 'Passport') : (spanish ? 'DNI' : 'National ID'))
         : value === 'female' ? (spanish ? 'Femenino' : 'Female') : value === 'male' ? (spanish ? 'Masculino' : 'Male') : value;
       const names = o => [o.dataset.testValue, o.dataset.value, o.getAttribute('value'), o.innerText].filter(t => t != null).map(normalize);
-      const matches = o => names(o).some(t => aliases.some(a => normalize(a) === t)
+      // One-letter codes ("F") also label seat-map columns and the like.
+      const matches = o => names(o).some(t => aliases.some(a => normalize(a).length > 1 && normalize(a) === t)
         || (!e.readOnly && t.startsWith(normalize(typed)) && /^\W/.test(t.slice(normalize(typed).length))));
       const candidates = () => [...document.querySelectorAll('[role=option],li,div,span,button')]
         .filter(o => o !== e && !o.contains(e) && o.getClientRects().length && matches(o));
@@ -56,14 +70,14 @@
         await new Promise(r => setTimeout(r, 100));
         const found = candidates().filter(o => !before.has(o));
         const deepest = found.filter(o => !found.some(x => x !== o && o.contains(x)));
-        if (deepest.length > 1) throw Error('Traveler choice needs private input');
+        if (deepest.length > 1) throw Error(`Traveler choice ambiguous: ${deepest.length} options`);
         option = deepest[0];
       }
-      if (!option || !e.isConnected || location.origin !== origin) throw Error('Traveler choice needs private input');
+      if (!option || !e.isConnected || location.origin !== origin) throw Error('Traveler choice option not found');
       option.click();
       await new Promise(r => setTimeout(r, 200));
       const taken = normalize(e.value);
-      if (!aliases.some(a => normalize(a) === taken) && taken !== normalize(option.innerText)) throw Error('Traveler choice needs private input');
+      if (!aliases.some(a => normalize(a) === taken) && taken !== normalize(option.innerText)) throw Error('Traveler choice not taken by the field');
     } else if (e.tagName === 'SELECT') {
       const matches = [...e.options].filter(o=>!o.disabled && aliases.some(a=>normalize(a)===normalize(o.value) || normalize(a)===normalize(o.text)));
       if (matches.length !== 1) throw Error('Traveler choice needs private input');

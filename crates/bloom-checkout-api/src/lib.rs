@@ -22,6 +22,13 @@ pub enum BrowseRequest {
     Back,
     /// Fill the unlocked traveler's fields on this page without returning them.
     FillTraveler,
+    /// Type one unlocked traveler value into an element the agent chose.
+    /// `field` is a saved field, or `phone_national` (no country code),
+    /// `born_on_day`, `born_on_month`, `born_on_year`, `born_on_dmy` (DD/MM/YYYY).
+    TypeTraveler {
+        element_ref: String,
+        field: String,
+    },
 }
 
 #[derive(Deserialize, Serialize)]

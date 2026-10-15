@@ -48,15 +48,18 @@ tool for this checkout.
   that person for this website for 30 minutes; `status.json` then says
   `unlocked`. It authorizes no payment.
 - On each page asking for that person's details, send the browse action
-  `fill_traveler`. It fills the fields it recognizes and returns only their
-  names. Fill anything left, such as a custom dropdown, with ordinary browse
-  actions. Snapshots show unlocked values as `[saved <field>]`; never try to
-  recover them.
+  `fill_traveler`. It fills the empty fields it recognizes and returns only
+  their names; card-holder fields are left for the payer. For a field it
+  missed, send `type_traveler` with `element_ref` and `field`: a saved field,
+  `phone_national` (no country code, when the page shows the prefix
+  separately), `born_on_day`, `born_on_month`, `born_on_year` or `born_on_dmy`.
+  Snapshots show unlocked values as `[saved <field>]`; check each field holds
+  the right placeholder, and never try to recover the values.
 - Write a browse request to `checkout/browse/<64-hex-slot>/in.json`; read
   `out.json`. Reuse a slot. Results expire after five minutes. Requests use
   `action`: `open` plus `url`, `snapshot`, `click` plus `element_ref`, `type`
   plus `element_ref` and `text`, `select` plus `element_ref` and `value`,
-  `back`, or `fill_traveler`.
+  `back`, `fill_traveler`, or `type_traveler` plus `element_ref` and `field`.
 - A snapshot element may carry `context`, the short text around it. Use it
   to tell repeated controls apart, such as identical fare buttons on
   different flight cards or the same day number in two calendar months.

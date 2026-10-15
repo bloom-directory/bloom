@@ -212,7 +212,9 @@ impl Browser {
             BrowseRequest::Select { element_ref, value } => {
                 self.act(&mut tab, &element_ref, "select", &value).await
             }
-            BrowseRequest::FillTraveler => bail!("Unlock a saved traveler first"),
+            BrowseRequest::FillTraveler | BrowseRequest::TypeTraveler { .. } => {
+                bail!("Unlock a saved traveler first")
+            }
         }
     }
 

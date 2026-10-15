@@ -7,6 +7,18 @@
   for (const e of document.querySelectorAll('input,select,textarea')) {
     if (!e.getClientRects().length || getComputedStyle(e).visibility !== 'visible' || e.disabled
         || e.type === 'hidden' || e.type === 'password') continue;
+    // Fill only what is still empty: earlier steps of a one-page booking stay
+    // in the document, and nothing already entered is overwritten.
+    if (e.type !== 'radio' && e.type !== 'checkbox' && e.value) continue;
+    // Card-holder name, document and email belong to the payer, not the traveler.
+    let payer = false;
+    for (let a = e.parentElement, depth = 0; a && depth < 6 && !payer; a = a.parentElement, depth++) {
+      const text = normalize(a.innerText);
+      // Stop at the payment block: a few fields and a short text.
+      if (text.length > 600 || a.querySelectorAll('input,select').length > 5) break;
+      payer = /titular|cardholder|card holder/.test(text);
+    }
+    if (payer) continue;
     const ac = (e.autocomplete || '').split(' ').at(-1);
     // Some sites caption a field with plain text beside it rather than a
     // <label>: use the text of the smallest wrapper holding only this field.
@@ -30,7 +42,8 @@
     let field, part;
     if (e.type === 'radio') {
       // One mapping per radio group; the fill picks the option naming the value.
-      if (!group || !/genero|gender|sexo/.test(groupText) || radioGroups.has(group)) continue;
+      if (!group || !/genero|gender|sexo/.test(groupText) || radioGroups.has(group)
+          || group.querySelector('input[type=radio]:checked')) continue;
       radioGroups.add(group);
       mapped.push({field:'gender',radio:true,index:refs.length});refs.push(group);
       continue;

@@ -182,6 +182,54 @@ struct UnlockedTraveler {
     expires: tokio::time::Instant,
 }
 
+/// Country calling codes, longest first, for numbers sites want without one.
+const CALLING_CODES: &[&str] = &[
+    "598", "595", "593", "591", "506", "507", "502", "503", "504", "505", "351", "353", "54", "55",
+    "56", "57", "58", "51", "52", "53", "34", "44", "49", "33", "39", "41", "31", "32", "61", "64",
+    "81", "82", "86", "91", "1", "7",
+];
+
+/// A saved value, or a form of it that booking forms ask for separately.
+fn derived_traveler_value(
+    values: &BTreeMap<String, zeroize::Zeroizing<String>>,
+    field: &str,
+) -> Option<zeroize::Zeroizing<String>> {
+    let date = |range: std::ops::Range<usize>| {
+        values
+            .get("born_on")
+            .and_then(|v| v.get(range))
+            .map(|s| zeroize::Zeroizing::new(s.to_owned()))
+    };
+    match field {
+        "phone_national" => {
+            let digits: String = values
+                .get("phone")?
+                .chars()
+                .filter(|c| c.is_ascii_digit())
+                .collect();
+            let international = values.get("phone")?.trim_start().starts_with('+');
+            let code = CALLING_CODES
+                .iter()
+                .find(|code| international && digits.starts_with(**code))
+                .map_or(0, |code| code.len());
+            Some(zeroize::Zeroizing::new(digits[code..].to_owned()))
+        }
+        "born_on_year" => date(0..4),
+        "born_on_month" => date(5..7),
+        "born_on_day" => date(8..10),
+        "born_on_dmy" => {
+            let born = values.get("born_on")?;
+            Some(zeroize::Zeroizing::new(format!(
+                "{}/{}/{}",
+                born.get(8..10)?,
+                born.get(5..7)?,
+                born.get(0..4)?
+            )))
+        }
+        _ => values.get(field).cloned(),
+    }
+}
+
 struct CompletedView {
     capability: String,
     claimed: bool,
@@ -374,7 +422,15 @@ impl CheckoutService {
             values
                 .iter()
                 .filter(|(field, _)| !matches!(field.as_str(), "gender" | "document_kind"))
-                .map(|(field, value)| (value.to_string(), format!("[saved {field}]"))),
+                .map(|(field, value)| (value.to_string(), format!("[saved {field}]")))
+                .chain(
+                    ["phone_national", "born_on_dmy"]
+                        .into_iter()
+                        .filter_map(|field| {
+                            derived_traveler_value(&values, field)
+                                .map(|value| (value.to_string(), format!("[saved {field}]")))
+                        }),
+                ),
         );
         status.filled_fields = values.keys().cloned().collect();
         *self.traveler.lock().await = Some(UnlockedTraveler {
@@ -386,6 +442,29 @@ impl CheckoutService {
         status.state = "unlocked".into();
         self.store.update(&status)?;
         Ok(())
+    }
+
+    async fn type_traveler(&self, element_ref: String, field: &str) -> Result<Value> {
+        if self.private.lock().await.is_some() {
+            bail!("A checkout already has private control");
+        }
+        let traveler = self.traveler.lock().await;
+        let traveler = traveler
+            .as_ref()
+            .filter(|t| tokio::time::Instant::now() < t.expires)
+            .context("Unlock a saved traveler first")?;
+        if self.browser.shopping_origin().await? != traveler.origin {
+            bail!("Saved traveler details are unlocked for another website");
+        }
+        let text = derived_traveler_value(&traveler.values, field)
+            .context("That saved traveler field is not available")?;
+        self.browser
+            .browse(BrowseRequest::Type {
+                element_ref,
+                text: text.to_string(),
+            })
+            .await?;
+        Ok(json!({"state":"typed","filled_fields":[field]}))
     }
 
     async fn fill_traveler(&self) -> Result<Value> {
@@ -400,7 +479,8 @@ impl CheckoutService {
         let filled = self
             .browser
             .fill_traveler(&traveler.origin, &traveler.fields, &traveler.values)
-            .await?;
+            .await
+            .inspect_err(|e| eprintln!("traveler fill refused: {e:#}"))?;
         Ok(json!({"state":"filled","filled_fields":filled}))
     }
 
@@ -484,6 +564,9 @@ impl CheckoutService {
             Request::Browse {
                 request: BrowseRequest::FillTraveler,
             } => self.fill_traveler().await,
+            Request::Browse {
+                request: BrowseRequest::TypeTraveler { element_ref, field },
+            } => self.type_traveler(element_ref, &field).await,
             Request::Browse { request } => self.browser.browse(request).await,
             Request::Status { operation_id } => {
                 Ok(serde_json::to_value(self.store.get(&operation_id)?)?)
@@ -1476,6 +1559,86 @@ mod tests {
         let facts: bloom_checkout_api::PaymentFacts = serde_json::from_value(facts).unwrap();
         assert_eq!(facts.total_minor, 399);
         assert_eq!(facts.currency, "USD");
+        server.abort();
+    }
+    #[tokio::test]
+    async fn typed_traveler_values_reach_the_chosen_field_but_not_the_agent() {
+        let (url, server) = crate::discovery::tests::fixture(
+            "<div><div>Teléfono *</div><input name='n1'></div><div><div>Nacimiento</div><input name='n2'></div>".into(),
+        )
+        .await;
+        let root = tempfile::tempdir().unwrap().keep();
+        let browser = Browser::launch(
+            &crate::test_chromium(),
+            &root.join("profile"),
+            &["--no-sandbox".into(), "--ignore-certificate-errors".into()],
+        )
+        .await
+        .unwrap();
+        browser
+            .browse(BrowseRequest::Open { url: url.clone() })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let service = CheckoutService::new(
+            browser.clone(),
+            &root.join("state.db"),
+            root.join("unused.sock"),
+            unsafe { libc::geteuid() },
+            47999,
+        )
+        .unwrap();
+        let values: BTreeMap<String, zeroize::Zeroizing<String>> =
+            [("phone", "+54 9 11 2345-6789"), ("born_on", "1990-05-07")]
+                .into_iter()
+                .map(|(k, v)| (k.into(), zeroize::Zeroizing::new(v.into())))
+                .collect();
+        assert_eq!(
+            derived_traveler_value(&values, "phone_national")
+                .unwrap()
+                .as_str(),
+            "91123456789"
+        );
+        browser.redact(["phone_national", "born_on_dmy"].into_iter().map(|f| {
+            (
+                derived_traveler_value(&values, f).unwrap().to_string(),
+                format!("[saved {f}]"),
+            )
+        }));
+        *service.traveler.lock().await = Some(UnlockedTraveler {
+            origin: url::Url::parse(&url)
+                .unwrap()
+                .origin()
+                .ascii_serialization(),
+            fields: vec![],
+            values,
+            expires: tokio::time::Instant::now() + Duration::from_secs(60),
+        });
+        for (index, field) in [(0, "phone_national"), (1, "born_on_dmy")] {
+            let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+            let element_ref = snapshot["elements"][index]["ref"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let typed = service
+                .request(Request::Browse {
+                    request: BrowseRequest::TypeTraveler {
+                        element_ref,
+                        field: field.into(),
+                    },
+                })
+                .await
+                .unwrap();
+            assert!(!typed.to_string().contains("9112345"));
+        }
+        let snapshot = browser
+            .browse(BrowseRequest::Snapshot)
+            .await
+            .unwrap()
+            .to_string();
+        assert!(snapshot.contains("[saved phone_national]"), "{snapshot}");
+        assert!(snapshot.contains("[saved born_on_dmy]"), "{snapshot}");
+        assert!(!snapshot.contains("91123456789") && !snapshot.contains("07/05/1990"));
         server.abort();
     }
     #[test]

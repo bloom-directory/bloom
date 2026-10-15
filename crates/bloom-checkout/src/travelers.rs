@@ -28,7 +28,19 @@ async fn evaluate(
         "returnByValue":true,"awaitPromise":true,"userGesture":true}),
         )
         .await?;
-    if response.get("exceptionDetails").is_some() {
+    if let Some(details) = response.get("exceptionDetails") {
+        // Only the script's own fixed message: the first line, no page content.
+        let reason = details["exception"]["description"].as_str().unwrap_or("");
+        eprintln!(
+            "traveler form not filled: {}",
+            reason
+                .lines()
+                .next()
+                .unwrap_or("")
+                .chars()
+                .take(120)
+                .collect::<String>()
+        );
         bail!("Traveler form needs private input");
     }
     Ok(response["result"]["value"].clone())
@@ -261,6 +273,7 @@ mod tests {
             "<div><div>Nombres</div><input name='firstName-0'></div>
              <div><div>Género</div><input name='gender-0' readonly></div>
              <div><div>Número AAdvantage® (Opcional)</div><input name='ff-0' readonly></div>
+             <div>Seats <span>A</span><span>F</span><span>M</span></div>
              <div id='list' hidden><div class='opt' data-test-value='Male'>Masculino</div>
                <div class='opt' data-test-value='Female'>Femenino</div></div>
              <script>const g=document.querySelector('[name=gender-0]');
@@ -408,6 +421,77 @@ mod tests {
             filled,
             json!(["7", "5", "1990", "12345678", "Argentina", true])
         );
+        server.abort();
+    }
+    #[tokio::test]
+    async fn earlier_filled_steps_do_not_count_as_a_second_person() {
+        // Shaped like JetSMART's payment page: the filled passenger step stays
+        // in the document above the empty contact form.
+        let (browser, server, _) = browser_at(
+            "<div><div>Nombres</div><input value='Filled'></div><div><div>Apellidos</div><input value='Filled'></div>
+             <div><div>Nombres *</div><input></div><div><div>Apellidos *</div><input></div>
+             <div><div>Correo electrónico *</div><input></div>
+             <div><input value='Argentina (+54)' readonly><div><div>Teléfono *</div><input></div></div>",
+        )
+        .await;
+        let tab = browser.handoff().await.unwrap();
+        let fields = [
+            TravelerField::GivenName,
+            TravelerField::FamilyName,
+            TravelerField::Email,
+            TravelerField::Phone,
+        ];
+        let discovery = TravelerDiscovery::read(&tab, &fields).await.unwrap();
+        assert_eq!(discovery.scope.fields, fields);
+        let values = [
+            ("given_name", "Synthetic"),
+            ("family_name", "Fixture"),
+            ("email", "fixture@example.com"),
+            ("phone", "+54 9 11 0000-0000"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), Zeroizing::new(v.to_owned())))
+        .collect();
+        assert_eq!(discovery.fill(&tab, &values).await.unwrap().len(), 4);
+        let phone = tab
+            .cdp
+            .evaluate(
+                &tab.session,
+                "document.querySelectorAll('input')[6].value".into(),
+            )
+            .await
+            .unwrap();
+        // The prefix field already says +54.
+        assert_eq!(phone, json!("91100000000"));
+        server.abort();
+    }
+    #[tokio::test]
+    async fn card_holder_fields_are_left_for_the_payer() {
+        let (browser, server, _) = browser_at(
+            "<div><div>Nombres *</div><input></div><div><div>Apellidos *</div><input></div>
+             <div><div>Correo *</div><input></div><div><div>Teléfono *</div><input></div>
+             <section><h3>Tarjeta de débito o crédito</h3><div><div>Nombre del titular de la tarjeta</div><input></div>
+               <div><div>nro documento</div><input></div><div><div>Correo electrónico</div><input></div></section>",
+        )
+        .await;
+        let tab = browser.handoff().await.unwrap();
+        let fields = [
+            TravelerField::GivenName,
+            TravelerField::DocumentNumber,
+            TravelerField::Email,
+        ];
+        let discovery = TravelerDiscovery::read(&tab, &fields).await.unwrap();
+        assert_eq!(
+            discovery.mapped.as_array().unwrap().len(),
+            2,
+            "only the contact name and email"
+        );
+        // The contact email is filled; the card holder's is not.
+        assert_eq!(
+            discovery.scope.fields,
+            [TravelerField::GivenName, TravelerField::Email]
+        );
+        assert_eq!(discovery.field_names().len(), 2);
         server.abort();
     }
     #[tokio::test]
