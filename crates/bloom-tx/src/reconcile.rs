@@ -245,11 +245,20 @@ impl Reconciler {
             // that serves receipts but not nonces still reconciles.
             let nonce_spent = match confirmed {
                 Some(confirmed) if confirmed <= se.nonce => {
-                    // Not mined yet: nothing to look up, and no miss history.
-                    self.backoff
+                    // Not mined yet: nothing to look up. A nonce seen spent
+                    // before was undone by a reorg, so its backoff no longer
+                    // applies; spacing from no-nonce lookups is kept, so a
+                    // flapping provider cannot reset it.
+                    let mut backoffs = self
+                        .backoff
                         .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .remove(&backoff_key);
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if backoffs
+                        .get(&backoff_key)
+                        .is_some_and(|backoff| backoff.seen_spent)
+                    {
+                        backoffs.remove(&backoff_key);
+                    }
                     continue;
                 }
                 Some(_) => {
@@ -1024,6 +1033,24 @@ mod tests {
         at(31);
         reconciler.tick().await;
         assert_eq!(rpc.lookups(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_flapping_nonce_read_keeps_no_nonce_lookups_spaced() {
+        let (_directory, outbox) = sent_outbox();
+        let audit_directory = tempfile::tempdir().unwrap();
+        let audit = Arc::new(AuditLog::open(audit_directory.path().join("audit.jsonl")).unwrap());
+        let rpc = MockRpc::new(None, serde_json::Value::Null);
+        let chains = ChainRegistry::default();
+        chains.add(mock_chain(rpc.clone()).await);
+        let (reconciler, at) = clocked(outbox, chains, audit);
+        // Unavailable, then available and unspent, alternately every 2 s.
+        for (index, secs) in (0..30).step_by(2).enumerate() {
+            *rpc.nonce.lock().unwrap() = if index % 2 == 0 { None } else { Some(0) };
+            at(secs);
+            reconciler.tick().await;
+        }
+        assert_eq!(rpc.lookups(), 2, "no-nonce lookups at 0 and 16 s only");
     }
 
     #[tokio::test]
