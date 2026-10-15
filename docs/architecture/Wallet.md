@@ -186,7 +186,7 @@ allowances retain their recipient restrictions. Every transaction still needs
 its own exact owner approval. Broker verifies the
 unsigned transaction preimage against the exact selector, derives the sender
 from Signer's authenticated public key, and commits decoded creation/call
-fields to the owner review. Machine and Broker require protocol 1.6; Signer
+fields to the owner review. Machine and Broker require protocol 1.7; Signer
 protocol and Petal WIT are unchanged.
 
 `bloom deploy --wallet <wallet> --chain <chain> rpc` exposes a token-authenticated
