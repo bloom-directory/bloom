@@ -1971,6 +1971,46 @@ fn evm_approval_challenge(
     })
 }
 
+/// Applies Broker's live approval status to a projected challenge. While the
+/// approval awaits its ceremony, Broker's link and expiry replace the cached
+/// ones: Broker omits the link once the hosted page has exchanged its one-use
+/// capability, so republishing the cached copy would hand out a dead link.
+/// Any other live state withdraws the link. Without a live status the cached
+/// link stays, since nothing shows it was used.
+fn reconcile_approval_challenge(
+    challenge: &mut serde_json::Value,
+    live: Option<&bloom_broker_api::ApprovalPublicStatus>,
+) {
+    let (state, next) = match live {
+        Some(status) => approval_next_step(status.state),
+        None => (
+            "unknown",
+            "Bloom could not read this approval's state. Writing confirm to retry_path is safe and reports it.",
+        ),
+    };
+    let Some(object) = challenge.as_object_mut() else {
+        return;
+    };
+    object.insert("state".into(), state.into());
+    object.insert("next".into(), next.into());
+    let Some(status) = live else {
+        return;
+    };
+    if state == "awaiting_ceremony" {
+        object.insert("ceremony_url".into(), status.ceremony_url.clone().into());
+        object.insert(
+            "expiry_ms".into(),
+            status
+                .ceremony_expires_at_ms
+                .as_ref()
+                .map(|expiry| expiry.get())
+                .into(),
+        );
+    } else {
+        object.insert("ceremony_url".into(), serde_json::Value::Null);
+    }
+}
+
 /// What the approval's live Broker state means for the agent holding the
 /// challenge, as `(state, next)`.
 fn approval_next_step(
@@ -2029,20 +2069,7 @@ impl WalletsHandler {
             Some(id) => self.approval_status_for_wallet(wallet, &id).await.ok(),
             None => None,
         };
-        let (state, next) = match &live {
-            Some(status) => approval_next_step(status.state),
-            None => (
-                "unknown",
-                "Bloom could not read this approval's state. Writing confirm to retry_path is safe and reports it.",
-            ),
-        };
-        if let Some(object) = challenge.as_object_mut() {
-            object.insert("state".into(), state.into());
-            object.insert("next".into(), next.into());
-            if live.is_some() && state != "awaiting_ceremony" {
-                object.insert("ceremony_url".into(), serde_json::Value::Null);
-            }
-        }
+        reconcile_approval_challenge(&mut challenge, live.as_ref());
         let mut out = serde_json::to_vec_pretty(&challenge).map_err(err_be)?;
         out.push(b'\n');
         Ok(out)
@@ -2052,6 +2079,72 @@ impl WalletsHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn challenge_follows_brokers_live_ceremony_link() {
+        use bloom_broker_api::{ApprovalLifecycleState, ApprovalPublicStatus, DecimalU64};
+        let cached = || {
+            serde_json::json!({
+                "ceremony_url": "https://example.relay.bloom.directory/ceremony/#cap=old",
+                "expiry_ms": 1_000,
+            })
+        };
+        let status = |state, url: Option<&str>, expiry: Option<u64>| ApprovalPublicStatus {
+            approval_id: bloom_broker_api::Digest32::from_bytes([7; 32]),
+            wallet_id: bloom_broker_api::Token::new("main").unwrap(),
+            state,
+            effective_claim_assurance: None,
+            ceremony_url: url.map(str::to_owned),
+            ceremony_expires_at_ms: expiry.map(DecimalU64::new),
+        };
+
+        // The hosted page exchanged the capability: Broker omits the link.
+        let mut challenge = cached();
+        reconcile_approval_challenge(
+            &mut challenge,
+            Some(&status(
+                ApprovalLifecycleState::AwaitingCeremony,
+                None,
+                None,
+            )),
+        );
+        assert_eq!(challenge["state"], "awaiting_ceremony");
+        assert!(challenge["ceremony_url"].is_null());
+        assert!(challenge["expiry_ms"].is_null());
+
+        // A live link and expiry come from Broker, not the cache.
+        let mut challenge = cached();
+        reconcile_approval_challenge(
+            &mut challenge,
+            Some(&status(
+                ApprovalLifecycleState::AwaitingCeremony,
+                Some("http://localhost:18734/ceremony/new"),
+                Some(2_000),
+            )),
+        );
+        assert_eq!(
+            challenge["ceremony_url"],
+            "http://localhost:18734/ceremony/new"
+        );
+        assert_eq!(challenge["expiry_ms"], 2_000);
+
+        // Past the ceremony, the link is withdrawn.
+        let mut challenge = cached();
+        reconcile_approval_challenge(
+            &mut challenge,
+            Some(&status(ApprovalLifecycleState::Active, None, None)),
+        );
+        assert!(challenge["ceremony_url"].is_null());
+
+        // Without a live status, the cached link stays.
+        let mut challenge = cached();
+        reconcile_approval_challenge(&mut challenge, None);
+        assert_eq!(challenge["state"], "unknown");
+        assert_eq!(
+            challenge["ceremony_url"],
+            "https://example.relay.bloom.directory/ceremony/#cap=old"
+        );
+    }
 
     #[test]
     fn account_segments_are_canonical_decimal_numbers() {

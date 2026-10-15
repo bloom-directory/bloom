@@ -324,6 +324,9 @@ pub struct WalletsHandler {
     passkey_names_path: Option<std::path::PathBuf>,
     /// Serializes nickname read-modify-write across handler clones.
     passkey_names_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes passkey enrollment prepare and cancel across handler
+    /// clones, so concurrent writes to `passkeys/new` start one enrollment.
+    passkey_enrollment_lock: Arc<tokio::sync::Mutex<()>>,
     /// Solana transfer engines keyed by chain name, dispatching the same
     /// `chains/<chain>/outbox/...` route family as EVM for Solana chains.
     solana: Option<
@@ -360,6 +363,7 @@ impl WalletsHandler {
             recovery_prepare_lock: Arc::new(tokio::sync::Mutex::new(())),
             passkey_names_path: None,
             passkey_names_lock: Arc::new(tokio::sync::Mutex::new(())),
+            passkey_enrollment_lock: Arc::new(tokio::sync::Mutex::new(())),
             solana: None,
             solana_reads: None,
             account_petals: Arc::new(parking_lot::RwLock::new(None)),
@@ -1210,11 +1214,16 @@ impl WalletsHandler {
             (intent, _) => intent,
         };
         let reused_intent = retained_intent.is_some();
-        let intent = if let Some(intent) = retained_intent {
+        let intent = if let Some(mut intent) = retained_intent {
             if intent.surface_selection != request.surface_selection {
-                return Err(HandlerError::invalid(
-                    "a pending recovery already uses a different surface",
-                ));
+                // No projection exists for this intent, so Broker never
+                // confirmed it. Retrying on the requested surface keeps the
+                // same operation ID: a surface Broker refused outright (for
+                // example remote while the hosted relay is pending) can be
+                // replaced, while an operation Signer did accept on the old
+                // surface rejects the retry instead of gaining a second one.
+                intent.surface_selection = request.surface_selection;
+                write_atomic_json(&intent_path, &intent)?;
             }
             intent
         } else {
@@ -7946,6 +7955,77 @@ value = "0""#,
     }
 
     #[tokio::test]
+    async fn refused_recovery_surface_can_be_retried_on_another_with_the_same_operation() {
+        let mut fixture = make_handler();
+        let broker = Arc::new(RegistrationBroker {
+            requests: Mutex::new(Vec::new()),
+            state: Mutex::new(CeremonyState::AwaitingUser),
+            omit_ceremony_url: Mutex::new(false),
+            status_error: Mutex::new(Some(ProtocolErrorCode::ApprovalNotFound)),
+            lose_recovery_prepare_response_once: Mutex::new(true),
+            pause_status_once: Mutex::new(false),
+            status_entered: tokio::sync::Notify::new(),
+            status_release: tokio::sync::Notify::new(),
+        });
+        fixture.handler = fixture
+            .handler
+            .with_broker(Some(MachineBrokerClient::new(broker.clone())));
+        let recover = VfsPath::parse("/recover").unwrap();
+        // Broker refuses the remote surface; the intent stays, because a
+        // failed prepare cannot prove Signer holds no operation.
+        assert!(
+            fixture
+                .handler
+                .write(
+                    &recover,
+                    br#"{"name":"ghost","surface_selection":"remote"}"#
+                )
+                .await
+                .is_err()
+        );
+        let intent: WalletRecoveryIntent =
+            read_json(fixture.handler.recovery_intent_path("ghost")).unwrap();
+        // The advised local retry is accepted and reuses that operation ID.
+        fixture
+            .handler
+            .write(&recover, br#"{"name":"ghost","surface_selection":"local"}"#)
+            .await
+            .unwrap();
+        let projection = fixture.handler.recovery_record("ghost").unwrap().1;
+        assert_eq!(projection.operation_id, intent.operation_id);
+        assert_eq!(
+            projection.surface_selection,
+            bloom_broker_api::CeremonySurfaceSelection::Local
+        );
+        let prepares = broker
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|request| match request {
+                MachineBrokerRequest::RecoveryPrepare(request) => Some((
+                    request.custody_operation_id.clone(),
+                    request.surface_selection,
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            prepares,
+            vec![
+                (
+                    intent.operation_id.clone(),
+                    bloom_broker_api::CeremonySurfaceSelection::Remote
+                ),
+                (
+                    intent.operation_id,
+                    bloom_broker_api::CeremonySurfaceSelection::Local
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn delayed_recovery_status_cannot_overwrite_a_new_operation() {
         let mut fixture = make_handler();
         let broker = Arc::new(RegistrationBroker {
@@ -8480,11 +8560,15 @@ value = "0""#,
         let mut f = make_handler_with_chain(true);
         let w = f.wallet_name.clone();
         let approval = digest(21);
-        let broker = approval_broker(vec![approval_status(
+        // Broker reports the unopened ceremony link while the approval waits.
+        let mut waiting = approval_status(
             approval.clone(),
             &w,
             ApprovalLifecycleState::AwaitingCeremony,
-        )]);
+        );
+        waiting.ceremony_url = Some("https://relay.test/ceremony/#cap=abc".into());
+        waiting.ceremony_expires_at_ms = Some(DecimalU64::new(60_000));
+        let broker = approval_broker(vec![waiting]);
         f.handler = f
             .handler
             .with_broker(Some(MachineBrokerClient::new(broker.clone())));
@@ -11148,7 +11232,7 @@ value = "0""#,
             assert!(dirs[2].starts_with("2026-09-24-remote-"));
             assert!(
                 dirs.iter()
-                    .all(|dir| dir.rsplit('-').next().unwrap().len() == 4)
+                    .all(|dir| dir.rsplit('-').next().unwrap().len() == 12)
             );
             for fixed in ["by-name", "enrollments", "new"] {
                 assert!(
@@ -11245,13 +11329,16 @@ value = "0""#,
         }
 
         #[test]
-        fn colliding_display_names_lengthen_only_their_suffix() {
+        fn passkey_names_are_fixed_length_and_never_change_when_another_is_added() {
             use sha2::Digest as _;
             let with_id = |bytes: Vec<u8>| CredentialPublic {
                 credential_id: Base64UrlBytes::from_bytes(&bytes),
                 ..credential(0, Some("remote"), PHONE_MS)
             };
-            // Find two credential IDs whose digests share the 4-hex prefix.
+            let dir_names = |credentials: &[CredentialPublic]| {
+                super::super::passkeys::tests_support::dir_names(credentials)
+            };
+            // Two credentials that collided under the old 4-hex suffix.
             let mut seen = std::collections::BTreeMap::new();
             let (first, second) = (0_u16..=u16::MAX)
                 .find_map(|n| {
@@ -11261,21 +11348,23 @@ value = "0""#,
                         .map(|other| (other, bytes))
                 })
                 .expect("a 4-hex prefix collision exists");
-            let unrelated = credential(9, Some("remote"), PHONE_MS);
-            let names = super::super::passkeys::tests_support::dir_names(&[
-                with_id(first),
-                with_id(second),
-                unrelated,
-            ]);
+            let alone = dir_names(&[with_id(first.clone())]);
+            let together = dir_names(&[with_id(first), with_id(second)]);
             let suffix = |name: &String| name.rsplit('-').next().unwrap().len();
+            assert_eq!(
+                alone[0], together[0],
+                "adding a passkey renamed an existing one"
+            );
+            assert_ne!(together[0], together[1]);
             assert!(
-                names
+                together
                     .iter()
                     .all(|name| name.starts_with("2026-09-24-remote-"))
             );
-            assert_ne!(names[0], names[1]);
-            assert!(suffix(&names[0]) > 4 && suffix(&names[1]) > 4, "{names:?}");
-            assert_eq!(suffix(&names[2]), 4, "{names:?}");
+            assert!(
+                together.iter().all(|name| suffix(name) == 12),
+                "{together:?}"
+            );
         }
 
         struct PasskeyBroker {
@@ -11284,6 +11373,13 @@ value = "0""#,
             url_spent: Mutex<bool>,
             /// Refuse prepare as Broker does when no passkey could approve.
             refuse: Mutex<bool>,
+            /// Operations Broker accepted; status and cancel know only these.
+            accepted: Mutex<std::collections::HashSet<String>>,
+            /// Fail the next prepare: `true` after accepting it (the response
+            /// is lost), `false` before it reaches Broker.
+            prepare_fault: Mutex<Option<bool>>,
+            /// Refuse the next prepare with this code before accepting it.
+            prepare_refusal: Mutex<Option<ProtocolErrorCode>>,
         }
 
         impl bloom_broker_api::MachineBrokerService for PasskeyBroker {
@@ -11316,6 +11412,31 @@ value = "0""#,
                             ))
                         }
                         MachineBrokerRequest::CredentialCrossSurfacePrepare(request) => {
+                            // A real Broker call suspends, letting concurrent
+                            // writers interleave as they would in production.
+                            tokio::task::yield_now().await;
+                            if let Some(code) = self.prepare_refusal.lock().unwrap().take() {
+                                return Err(ProtocolError::new(code, "Broker refused the prepare"));
+                            }
+                            let fault = self.prepare_fault.lock().unwrap().take();
+                            if fault == Some(false) {
+                                return Err(ProtocolError::new(
+                                    ProtocolErrorCode::ServiceUnavailable,
+                                    "Broker unreachable",
+                                ));
+                            }
+                            self.accepted
+                                .lock()
+                                .unwrap()
+                                .insert(request.operation_id.as_str().to_owned());
+                            if fault == Some(true) {
+                                *self.state.lock().unwrap() = CeremonyState::AwaitingUser;
+                                *self.url_spent.lock().unwrap() = false;
+                                return Err(ProtocolError::new(
+                                    ProtocolErrorCode::ServiceUnavailable,
+                                    "prepare response lost after Broker accepted it",
+                                ));
+                            }
                             *self.state.lock().unwrap() = CeremonyState::AwaitingUser;
                             *self.url_spent.lock().unwrap() = false;
                             Ok(bloom_broker_api::MachineBrokerResponse::CredentialCrossSurfacePrepare(
@@ -11326,6 +11447,15 @@ value = "0""#,
                                     destination_url: "https://relay.test/ceremony/#cap=abc".into(),
                                     expires_at_ms: DecimalU64::new(u64::MAX),
                                 },
+                            ))
+                        }
+                        MachineBrokerRequest::CeremonyStatus(request)
+                        | MachineBrokerRequest::CeremonyCancel(request)
+                            if !self.accepted.lock().unwrap().contains(request.id.as_str()) =>
+                        {
+                            Err(ProtocolError::new(
+                                ProtocolErrorCode::ApprovalNotFound,
+                                "ceremony not found",
                             ))
                         }
                         MachineBrokerRequest::CeremonyStatus(request) => {
@@ -11349,6 +11479,247 @@ value = "0""#,
                     }
                 })
             }
+        }
+
+        fn prepared_operations(broker: &PasskeyBroker) -> Vec<String> {
+            broker
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|request| match request {
+                    MachineBrokerRequest::CredentialCrossSurfacePrepare(request) => {
+                        Some(request.operation_id.as_str().to_owned())
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn faulty_passkey_broker(fault: bool) -> Arc<PasskeyBroker> {
+            Arc::new(PasskeyBroker {
+                requests: Mutex::new(Vec::new()),
+                state: Mutex::new(CeremonyState::AwaitingUser),
+                url_spent: Mutex::new(false),
+                refuse: Mutex::new(false),
+                accepted: Mutex::new(Default::default()),
+                prepare_fault: Mutex::new(Some(fault)),
+                prepare_refusal: Mutex::new(None),
+            })
+        }
+
+        async fn read_text(handler: &WalletsHandler, at: &str) -> String {
+            String::from_utf8(handler.read(&path(at)).await.unwrap()).unwrap()
+        }
+
+        #[tokio::test]
+        async fn a_lost_enrollment_prepare_response_is_resumed_with_the_same_operation() {
+            let (_tmp, handler) = passkey_handler(vec![credential(1, None, LAPTOP_MS)]);
+            let broker = faulty_passkey_broker(true);
+            let handler = handler.with_broker(Some(MachineBrokerClient::new(broker.clone())));
+
+            // Broker accepts, but its response never arrives.
+            assert!(
+                handler
+                    .write(&path("/alice/passkeys/new"), b"remote")
+                    .await
+                    .is_err()
+            );
+            // The enrollment is listed and its status comes from Broker, which
+            // holds it, rather than staying an unknown orphan.
+            let operation = prepared_operations(&broker)[0].clone();
+            let at = |leaf: &str| format!("/alice/passkeys/enrollments/{operation}/{leaf}");
+            assert_eq!(read_text(&handler, &at("status")).await, "awaiting_user\n");
+            // A retry resumes the same operation: Broker sees no second one.
+            handler
+                .write(&path("/alice/passkeys/new"), b"remote")
+                .await
+                .unwrap();
+            let operations = prepared_operations(&broker);
+            assert_eq!(operations.len(), 1, "{operations:?}");
+            let entries = handler
+                .list(&path("/alice/passkeys/enrollments"))
+                .await
+                .unwrap();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].name, operations[0]);
+            assert_eq!(
+                read_text(&handler, &at("url")).await,
+                "https://relay.test/ceremony/#cap=abc\n"
+            );
+        }
+
+        #[tokio::test]
+        async fn an_enrollment_broker_never_saw_is_shown_preparing_and_cancels_locally() {
+            let (_tmp, handler) = passkey_handler(vec![credential(1, None, LAPTOP_MS)]);
+            let broker = faulty_passkey_broker(false);
+            let handler = handler.with_broker(Some(MachineBrokerClient::new(broker.clone())));
+
+            assert!(
+                handler
+                    .write(&path("/alice/passkeys/new"), b"remote")
+                    .await
+                    .is_err()
+            );
+            let operation = handler
+                .list(&path("/alice/passkeys/enrollments"))
+                .await
+                .unwrap()[0]
+                .name
+                .clone();
+            let at = |leaf: &str| format!("/alice/passkeys/enrollments/{operation}/{leaf}");
+            assert_eq!(read_text(&handler, &at("status")).await, "preparing\n");
+            assert!(matches!(
+                handler.read(&path(&at("url"))).await,
+                Err(HandlerError::NotFound(_))
+            ));
+            handler
+                .write(
+                    &path(&format!("/alice/passkeys/enrollments/{operation}/cancel")),
+                    b"cancel",
+                )
+                .await
+                .unwrap();
+            assert_eq!(read_text(&handler, &at("status")).await, "cancelled\n");
+            // A fresh write then starts a new enrollment.
+            handler
+                .write(&path("/alice/passkeys/new"), b"remote")
+                .await
+                .unwrap();
+            let operations = prepared_operations(&broker);
+            assert_eq!(operations.len(), 2);
+            assert_ne!(operations[0], operations[1]);
+        }
+
+        fn healthy_passkey_broker() -> Arc<PasskeyBroker> {
+            Arc::new(PasskeyBroker {
+                requests: Mutex::new(Vec::new()),
+                state: Mutex::new(CeremonyState::AwaitingUser),
+                url_spent: Mutex::new(false),
+                refuse: Mutex::new(false),
+                accepted: Mutex::new(Default::default()),
+                prepare_fault: Mutex::new(None),
+                prepare_refusal: Mutex::new(None),
+            })
+        }
+
+        #[tokio::test]
+        async fn a_refused_enrollment_prepare_leaves_no_record_and_keeps_latest() {
+            let (_tmp, handler) = passkey_handler(vec![credential(1, None, LAPTOP_MS)]);
+            let broker = healthy_passkey_broker();
+            let handler = handler.with_broker(Some(MachineBrokerClient::new(broker.clone())));
+
+            handler
+                .write(&path("/alice/passkeys/new"), b"remote")
+                .await
+                .unwrap();
+            let waiting = latest_operation(&handler).await;
+            // Broker refuses the next one outright, creating nothing: there is
+            // nothing to resume or cancel, so no `preparing` record remains.
+            *broker.prepare_refusal.lock().unwrap() = Some(ProtocolErrorCode::CeremonyRateLimited);
+            assert!(matches!(
+                handler.write(&path("/alice/passkeys/new"), b"local").await,
+                Err(HandlerError::Backend(_))
+            ));
+            let entries = handler
+                .list(&path("/alice/passkeys/enrollments"))
+                .await
+                .unwrap();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].name, waiting);
+            assert_eq!(latest_operation(&handler).await, waiting);
+            // Once Broker allows it, the same write starts the enrollment.
+            handler
+                .write(&path("/alice/passkeys/new"), b"local")
+                .await
+                .unwrap();
+            assert_ne!(latest_operation(&handler).await, waiting);
+            assert_eq!(prepared_operations(&broker).len(), 3);
+        }
+
+        async fn latest_operation(handler: &WalletsHandler) -> String {
+            handler
+                .lookup(&path("/alice/passkeys/latest"))
+                .await
+                .unwrap()
+                .link_target
+                .unwrap()
+                .strip_prefix("enrollments/")
+                .unwrap()
+                .to_owned()
+        }
+
+        #[tokio::test]
+        async fn latest_follows_the_enrollment_a_write_reused() {
+            let (_tmp, handler) = passkey_handler(vec![credential(1, None, LAPTOP_MS)]);
+            let broker = healthy_passkey_broker();
+            let handler = handler.with_broker(Some(MachineBrokerClient::new(broker.clone())));
+            handler
+                .write(&path("/alice/passkeys/new"), b"local")
+                .await
+                .unwrap();
+            let local = latest_operation(&handler).await;
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            handler
+                .write(&path("/alice/passkeys/new"), b"remote")
+                .await
+                .unwrap();
+            let remote = latest_operation(&handler).await;
+            assert_ne!(local, remote);
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            // Asking for local again reuses the older local enrollment, and
+            // `latest` now names it rather than the newer remote one.
+            handler
+                .write(&path("/alice/passkeys/new"), b"local")
+                .await
+                .unwrap();
+            assert_eq!(prepared_operations(&broker).len(), 2);
+            assert_eq!(latest_operation(&handler).await, local);
+        }
+
+        #[tokio::test]
+        async fn concurrent_writes_to_new_start_one_enrollment() {
+            let (_tmp, handler) = passkey_handler(vec![credential(1, None, LAPTOP_MS)]);
+            let broker = healthy_passkey_broker();
+            let handler = handler.with_broker(Some(MachineBrokerClient::new(broker.clone())));
+            let new = path("/alice/passkeys/new");
+            let (first, second) = tokio::join!(
+                handler.write(&new, b"remote"),
+                handler.write(&new, b"remote"),
+            );
+            first.unwrap();
+            second.unwrap();
+            assert_eq!(prepared_operations(&broker).len(), 1);
+        }
+
+        #[tokio::test]
+        async fn a_lost_enrollment_is_cancelled_on_broker() {
+            let (_tmp, handler) = passkey_handler(vec![credential(1, None, LAPTOP_MS)]);
+            let broker = faulty_passkey_broker(true);
+            let handler = handler.with_broker(Some(MachineBrokerClient::new(broker.clone())));
+            assert!(
+                handler
+                    .write(&path("/alice/passkeys/new"), b"remote")
+                    .await
+                    .is_err()
+            );
+            let operation = prepared_operations(&broker)[0].clone();
+            handler
+                .write(
+                    &path(&format!("/alice/passkeys/enrollments/{operation}/cancel")),
+                    b"cancel",
+                )
+                .await
+                .unwrap();
+            assert_eq!(*broker.state.lock().unwrap(), CeremonyState::Cancelled);
+            assert!(
+                broker
+                    .requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|request| matches!(request, MachineBrokerRequest::CeremonyCancel(_)))
+            );
         }
 
         fn prepares(broker: &PasskeyBroker) -> Vec<CeremonySurfaceSelection> {
@@ -11375,6 +11746,9 @@ value = "0""#,
                 state: Mutex::new(CeremonyState::AwaitingUser),
                 url_spent: Mutex::new(false),
                 refuse: Mutex::new(false),
+                accepted: Mutex::new(Default::default()),
+                prepare_fault: Mutex::new(None),
+                prepare_refusal: Mutex::new(None),
             });
             let handler = handler.with_broker(Some(MachineBrokerClient::new(broker.clone())));
 
@@ -11476,6 +11850,9 @@ value = "0""#,
                 state: Mutex::new(CeremonyState::AwaitingUser),
                 url_spent: Mutex::new(false),
                 refuse: Mutex::new(false),
+                accepted: Mutex::new(Default::default()),
+                prepare_fault: Mutex::new(None),
+                prepare_refusal: Mutex::new(None),
             });
             let handler = handler.with_broker(Some(MachineBrokerClient::new(broker.clone())));
 
