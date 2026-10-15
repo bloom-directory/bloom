@@ -234,9 +234,9 @@ the Bloom host; an assigned HTTPS relay ceremony can use another device. Launch
 URLs are owner access capabilities: keep them out of logs and Petal-visible data.
 
 To recover a wallet after losing its passkeys, write only its name to
-`wallets/recover`. This starts an authenticated Broker ceremony without
+`wallets/.control/recover`. This starts an authenticated Broker ceremony without
 needing the wallet in Machine's cached inventory. Read
-`wallets/recoveries/<petname>/status.json`, verify `requested_name`, and
+`wallets/.control/recoveries/<petname>/status.json`, verify `requested_name`, and
 forward the complete `ceremony_url` to the human. The recovery ID and secret,
 and the replacement passkey, belong only in the Broker-hosted Browser page;
 never place them in a VFS write, shell argument, or log. A spent one-use URL
@@ -247,7 +247,8 @@ active passkey, and every other passkey, on any device, is revoked. Tell the
 human that their other devices can no longer approve until they add passkeys
 again (see "Adding a passkey"); `result.json` lists the active credential. A
 cancelled or expired operation can be started again with a fresh write to
-`wallets/recover`.
+`wallets/.control/recover`. The top-level `recover` and `recoveries`
+aliases remain available when no legacy wallet owns those names.
 
 ## Adding a passkey
 

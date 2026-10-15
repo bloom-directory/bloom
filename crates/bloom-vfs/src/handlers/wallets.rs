@@ -11,8 +11,8 @@
 //! - `wallets/registrations/<petname>/status.json`                 — public registration projection
 //! - `wallets/registrations/<petname>/result.json`                 — completed registration result
 //! - `wallets/registrations/<petname>/cancel`                       — write `y`, `yes`, or `cancel` before acceptance
-//! - `wallets/recover`                                              — write a wallet name to prepare browser-only recovery
-//! - `wallets/recoveries/<petname>/{status.json,result.json,cancel}` — recovery lifecycle
+//! - `wallets/.control/recover`                                      — write a wallet name to prepare browser-only recovery
+//! - `wallets/.control/recoveries/<petname>/{status.json,result.json,cancel}` — recovery lifecycle
 //! - `wallets/<wallet>/kind`                                        — wallet kind token
 //! - `wallets/<wallet>/projection.json`                             — authenticated wallet projection
 //! - `wallets/<wallet>/accounts.json`                               — derived accounts, each with its number
@@ -75,12 +75,28 @@ use crate::path::VfsPath;
 
 const APPROVAL_CHALLENGE_FILE: &str = "approval_challenge.json";
 const WALLET_POLICY_SURFACE: &str = "wallet-policy";
+const WALLET_CONTROL_DIR: &str = ".control";
 /// Lifecycle states for a staged wallet-policy update, mirroring the
 /// `/outbox/{pending,sent,failed}` stage/confirm structure. A policy update is
 /// `pending` while it carries an unconsumed challenge, `confirmed` once the
 /// approved policy is installed, or `failed` if the staged baseline changed
 /// before the approved retry landed.
 const POLICY_UPDATE_STATES: &[&str] = &["pending", "confirmed", "failed"];
+
+fn is_recovery_start_path(segs: &[String], legacy_wallet: bool) -> bool {
+    matches!(segs, [name] if name == "recover" && !legacy_wallet)
+        || matches!(segs, [control, name] if control == WALLET_CONTROL_DIR && name == "recover")
+}
+
+fn recovery_control_tail(segs: &[String], legacy_wallet: bool) -> Option<&[String]> {
+    match segs {
+        [root, tail @ ..] if root == "recoveries" && !legacy_wallet => Some(tail),
+        [control, root, tail @ ..] if control == WALLET_CONTROL_DIR && root == "recoveries" => {
+            Some(tail)
+        }
+        _ => None,
+    }
+}
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
@@ -509,6 +525,23 @@ impl WalletsHandler {
         Self::map_wallet_projection(wallet, projections.get_wallet_authority(&wallet_id).await)
     }
 
+    async fn legacy_reserved_wallet(&self, segs: &[String]) -> Result<bool, HandlerError> {
+        let Some(name) = segs
+            .first()
+            .filter(|name| matches!(name.as_str(), "recover" | "recoveries"))
+        else {
+            return Ok(false);
+        };
+        match self.wallet_projection_navigation(name).await {
+            Ok(_) => Ok(true),
+            Err(HandlerError::NotFound(_)) => Ok(false),
+            Err(HandlerError::Backend(message)) if message.contains("SERVICE_UNAVAILABLE") => {
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     fn map_wallet_projection(
         wallet: &str,
         result: Result<WalletProjection, bloom_broker_api::ProtocolError>,
@@ -750,10 +783,7 @@ impl WalletsHandler {
             }
         };
         let requested_name = request.name.as_str();
-        if matches!(
-            requested_name,
-            "new" | "registrations" | "recover" | "recoveries"
-        ) || requested_name.is_empty()
+        if requested_name.is_empty()
             || requested_name.len() > 64
             || !requested_name.chars().all(|character| {
                 character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
@@ -3401,24 +3431,28 @@ impl WalletsHandler {
         if segs.is_empty() {
             return Ok(Entry::dir(""));
         }
+        let legacy_wallet = self.legacy_reserved_wallet(segs).await?;
+        if segs.len() == 1 && segs[0] == WALLET_CONTROL_DIR {
+            return Ok(Entry::dir(WALLET_CONTROL_DIR));
+        }
         if segs.len() == 1 && segs[0] == "new" {
             return Ok(Entry::writable_file("new"));
         }
-        if segs.len() == 1 && segs[0] == "recover" {
+        if is_recovery_start_path(segs, legacy_wallet) {
             return Ok(Entry::writable_file("recover"));
         }
-        if segs[0] == "recoveries" {
-            return match segs {
-                [_] => Ok(Entry::dir("recoveries")),
-                [_, requested_name] => {
+        if let Some(tail) = recovery_control_tail(segs, legacy_wallet) {
+            return match tail {
+                [] => Ok(Entry::dir("recoveries")),
+                [requested_name] => {
                     let _ = self.recovery_record(requested_name)?;
                     Ok(Entry::dir(requested_name))
                 }
-                [_, requested_name, leaf] if leaf == "status.json" => {
+                [requested_name, leaf] if leaf == "status.json" => {
                     let (_, projection) = self.recovery_record(requested_name)?;
                     Self::recovery_status_entry(&projection)
                 }
-                [_, requested_name, leaf] if leaf == "result.json" => {
+                [requested_name, leaf] if leaf == "result.json" => {
                     let projection = self.recovery_projection(requested_name).await?;
                     if Self::recovery_result_ready(&projection) {
                         Ok(Entry::file(leaf))
@@ -3426,7 +3460,7 @@ impl WalletsHandler {
                         Err(HandlerError::not_found(path.to_string_path()))
                     }
                 }
-                [_, requested_name, leaf] if leaf == "cancel" => {
+                [requested_name, leaf] if leaf == "cancel" => {
                     let _ = self.recovery_record(requested_name)?;
                     Ok(Entry::writable_file("cancel"))
                 }
@@ -3580,13 +3614,20 @@ impl WalletsHandler {
         if segs.is_empty() {
             return Err(HandlerError::NotAFile(path.to_string_path()));
         }
+        let legacy_wallet = self.legacy_reserved_wallet(segs).await?;
+        if segs.len() == 1 && segs[0] == WALLET_CONTROL_DIR {
+            return Err(HandlerError::NotAFile(path.to_string_path()));
+        }
         if segs.len() == 1 && segs[0] == "new" {
             return Ok(b"Write a wallet name matching [A-Za-z0-9_-]{1,64}.\n".to_vec());
         }
-        if segs.len() == 1 && segs[0] == "recover" {
+        if is_recovery_start_path(segs, legacy_wallet) {
             return Ok(b"Write the wallet name to start browser-only recovery.\n".to_vec());
         }
-        if segs.len() == 1 && segs[0] != "registrations" && segs[0] != "recoveries" {
+        if segs.len() == 1
+            && segs[0] != "registrations"
+            && (segs[0] != "recoveries" || legacy_wallet)
+        {
             // Reading a wallet directory is EISDIR, but only if the wallet is
             // there. Answering "is a directory" for a name that does not exist
             // tells the caller the opposite of the truth.
@@ -3612,16 +3653,16 @@ impl WalletsHandler {
                 _ => Err(HandlerError::NotAFile(path.to_string_path())),
             };
         }
-        if segs[0] == "recoveries" {
-            return match segs {
-                [_, requested_name, leaf] if leaf == "status.json" => {
+        if let Some(tail) = recovery_control_tail(segs, legacy_wallet) {
+            return match tail {
+                [requested_name, leaf] if leaf == "status.json" => {
                     let projection = self.recovery_projection(requested_name).await?;
                     let mut bytes = serde_json::to_vec_pretty(&projection)
                         .map_err(|error| HandlerError::backend(error.to_string()))?;
                     bytes.push(b'\n');
                     Ok(bytes)
                 }
-                [_, requested_name, leaf] if leaf == "result.json" => {
+                [requested_name, leaf] if leaf == "result.json" => {
                     let projection = self.recovery_projection(requested_name).await?;
                     if !Self::recovery_result_ready(&projection) {
                         return Err(HandlerError::not_found(path.to_string_path()));
@@ -3731,16 +3772,17 @@ impl WalletsHandler {
         if segs.is_empty() {
             return Err(HandlerError::PermissionDenied);
         }
+        let legacy_wallet = self.legacy_reserved_wallet(segs).await?;
         if segs.len() == 1 && segs[0] == "new" {
             self.write_permit()?;
             return self.prepare_wallet_registration(data).await;
         }
-        if segs.len() == 1 && segs[0] == "recover" {
+        if is_recovery_start_path(segs, legacy_wallet) {
             self.write_permit()?;
             return self.prepare_wallet_recovery(data).await;
         }
-        if segs[0] == "recoveries" {
-            if let [_, requested_name, leaf] = segs
+        if let Some(tail) = recovery_control_tail(segs, legacy_wallet) {
+            if let [requested_name, leaf] = tail
                 && leaf == "cancel"
             {
                 self.write_permit()?;
@@ -3851,20 +3893,34 @@ impl WalletsHandler {
                 .into_iter()
                 .map(|projection| Entry::dir(projection.wallet.wallet_id.as_str()))
                 .collect();
+            let has_recover = out.iter().any(|entry| entry.name == "recover");
+            let has_recoveries = out.iter().any(|entry| entry.name == "recoveries");
             out.push(Entry::writable_file("new"));
             out.push(Entry::dir("registrations"));
-            out.push(Entry::writable_file("recover"));
-            out.push(Entry::dir("recoveries"));
+            out.push(Entry::dir(WALLET_CONTROL_DIR));
+            if !has_recover {
+                out.push(Entry::writable_file("recover"));
+            }
+            if !has_recoveries {
+                out.push(Entry::dir("recoveries"));
+            }
             return Ok(out);
         }
-        if segs[0] == "recoveries" {
-            return match segs {
-                [_] => Ok(self
+        let legacy_wallet = self.legacy_reserved_wallet(segs).await?;
+        if segs.len() == 1 && segs[0] == WALLET_CONTROL_DIR {
+            return Ok(vec![
+                Entry::writable_file("recover"),
+                Entry::dir("recoveries"),
+            ]);
+        }
+        if let Some(tail) = recovery_control_tail(segs, legacy_wallet) {
+            return match tail {
+                [] => Ok(self
                     .recovery_names()?
                     .into_iter()
                     .map(|name| Entry::dir(&name))
                     .collect()),
-                [_, requested_name] => {
+                [requested_name] => {
                     let (_, projection) = self.recovery_record(requested_name)?;
                     let mut entries = vec![
                         Self::recovery_status_entry(&projection)?,
@@ -7720,8 +7776,59 @@ value = "0""#,
         assert!(names.contains(&"alice"));
         assert!(names.contains(&"new"));
         assert!(names.contains(&"registrations"));
+        assert!(names.contains(&WALLET_CONTROL_DIR));
         assert!(names.contains(&"recover"));
         assert!(names.contains(&"recoveries"));
+    }
+
+    #[tokio::test]
+    async fn legacy_recovery_control_names_remain_wallets() {
+        for wallet_name in ["recover", "recoveries"] {
+            let mut f = make_handler();
+            let mut projection = static_projection_value(f.wallet_addr);
+            projection.wallet.wallet_id = token(wallet_name);
+            f.handler.wallet_projections = Some(Arc::new(StaticProjection(projection)));
+
+            let root = f.handler.list(&VfsPath::parse("/").unwrap()).await.unwrap();
+            let names: Vec<&str> = root.iter().map(|entry| entry.name.as_str()).collect();
+            assert_eq!(names.iter().filter(|name| **name == wallet_name).count(), 1);
+            assert!(names.contains(&WALLET_CONTROL_DIR));
+
+            assert_eq!(
+                f.handler
+                    .lookup(&VfsPath::parse(&format!("/{wallet_name}")).unwrap())
+                    .await
+                    .unwrap()
+                    .kind,
+                crate::handler::EntryKind::Dir
+            );
+            let wallet_entries = f
+                .handler
+                .list(&VfsPath::parse(&format!("/{wallet_name}")).unwrap())
+                .await
+                .unwrap();
+            assert!(wallet_entries.iter().any(|entry| entry.name == "kind"));
+            assert!(
+                f.handler
+                    .lookup(&VfsPath::parse(&format!("/{wallet_name}/kind")).unwrap())
+                    .await
+                    .is_ok()
+            );
+
+            assert!(
+                f.handler
+                    .lookup(&VfsPath::parse("/.control/recover").unwrap())
+                    .await
+                    .is_ok()
+            );
+            assert!(
+                f.handler
+                    .list(&VfsPath::parse("/.control/recoveries").unwrap())
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
     }
 
     #[tokio::test]
@@ -7730,7 +7837,16 @@ value = "0""#,
         f.handler.wallet_projections = Some(Arc::new(UnavailableProjection));
         let entries = f.handler.list(&VfsPath::parse("/").unwrap()).await.unwrap();
         let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
-        assert_eq!(names, ["new", "registrations", "recover", "recoveries"]);
+        assert_eq!(
+            names,
+            [
+                "new",
+                "registrations",
+                WALLET_CONTROL_DIR,
+                "recover",
+                "recoveries"
+            ]
+        );
     }
 
     #[tokio::test]
@@ -7775,7 +7891,7 @@ value = "0""#,
             .unwrap();
         assert!(root.iter().any(|entry| entry.name == "recover"));
         assert!(root.iter().any(|entry| entry.name == "recoveries"));
-        let recover = VfsPath::parse("/recover").unwrap();
+        let recover = VfsPath::parse("/.control/recover").unwrap();
         for body in [
             br#"{"name":"lost","recovery_secret":"forbidden"}"#.as_slice(),
             b"lost other",
