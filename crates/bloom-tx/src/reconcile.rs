@@ -10,11 +10,12 @@
 //! A receipt can only exist once the sender's confirmed (mined) nonce has
 //! passed the transaction's nonce. Each tick reads that nonce once per sender
 //! and chain and looks a receipt up, journaled before it contacts the
-//! provider, only after the nonce is spent. A pending or dropped transaction,
-//! or a provider that cannot answer, therefore costs no journaled lookup, and
-//! a mined transaction is recorded on the tick after its nonce advances. The
-//! nonce read itself is not journaled: like a balance read, it reveals only
-//! the sender's address, not the transaction.
+//! provider, only after the nonce is spent. A pending or dropped transaction
+//! therefore costs no journaled lookup, and a mined transaction is recorded on
+//! the tick after its nonce advances. The nonce read itself is not journaled:
+//! like a balance read, it reveals only the sender's address, not the
+//! transaction. When no nonce is available the receipt is looked up anyway,
+//! backing off only while the provider fails that lookup too.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -154,19 +155,21 @@ impl Reconciler {
                     confirmed
                 }
             };
-            // A provider that cannot answer gets no journaled lookup; the next
-            // tick asks again.
-            let Some(confirmed) = confirmed else {
-                continue;
+            // Without a confirmed nonce (unsupported, or the provider is
+            // failing) fall back to looking the receipt up, so a provider
+            // that serves receipts but not nonces still reconciles.
+            let nonce_spent = match confirmed {
+                Some(confirmed) if confirmed <= se.nonce => {
+                    // Not mined yet: nothing to look up, and no miss history.
+                    self.backoff
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .remove(&backoff_key);
+                    continue;
+                }
+                Some(_) => true,
+                None => false,
             };
-            if confirmed <= se.nonce {
-                // Not mined yet: nothing to look up, and no miss history.
-                self.backoff
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .remove(&backoff_key);
-                continue;
-            }
             if self.lookup_deferred(&backoff_key, now) {
                 continue;
             }
@@ -203,10 +206,23 @@ impl Reconciler {
                         .remove(&backoff_key);
                     r
                 }
+                // After the nonce was spent, no receipt for this hash means a
+                // replacement was mined or the endpoint lags: back off. With
+                // no nonce to go by, the transaction may simply be pending, so
+                // keep the normal cadence.
                 Ok(None) => {
-                    self.record_lookup_miss(backoff_key, now);
+                    if nonce_spent {
+                        self.record_lookup_miss(backoff_key, now);
+                    } else {
+                        self.backoff
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .remove(&backoff_key);
+                    }
                     continue;
                 }
+                // A provider that answers neither is down: back off, which
+                // bounds the journaled lookups it costs.
                 Err(e) => {
                     tracing::debug!(error = %e, id = %se.id, "reconcile.receipt_failed");
                     self.record_lookup_miss(backoff_key, now);
@@ -425,8 +441,15 @@ mod tests {
     fn sent_outbox() -> (tempfile::TempDir, Outbox) {
         let directory = tempfile::tempdir().unwrap();
         let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        add_sent(&outbox, "tx-1", 0, 7);
+        (directory, outbox)
+    }
+
+    /// A sent transaction from the fixture sender with `nonce` and a hash of
+    /// repeated `hash_byte`.
+    fn add_sent(outbox: &Outbox, id: &str, nonce: u64, hash_byte: u8) {
         let staged = StagedTx {
-            id: "tx-1".into(),
+            id: id.into(),
             wallet: "alice".into(),
             chain: "anvil".into(),
             chain_id: 31337,
@@ -438,14 +461,17 @@ mod tests {
             max_fee_per_gas: Some("100".into()),
             max_priority_fee_per_gas: Some("10".into()),
             gas_price: None,
-            nonce: 0,
+            nonce,
             policy_checks: vec![],
             created_ms: 0,
             expires_ms: 0,
             status: TxStatus::Sent,
             action_kind: TxActionKind::Unknown,
             review_mode: None,
-            tx_hash: Some(format!("{:#x}", alloy::primitives::B256::repeat_byte(7))),
+            tx_hash: Some(format!(
+                "{:#x}",
+                alloy::primitives::B256::repeat_byte(hash_byte)
+            )),
             token: None,
             nft: None,
             usd_value: None,
@@ -455,11 +481,10 @@ mod tests {
             execution_origin: None,
         };
         outbox.write_pending(&staged, "# plan").unwrap();
-        let pending = outbox.read("alice", "anvil", "tx-1").unwrap();
+        let pending = outbox.read("alice", "anvil", id).unwrap();
         outbox
             .transition(&pending, crate::outbox::OutboxState::Sent)
             .unwrap();
-        (directory, outbox)
     }
 
     /// A JSON-RPC endpoint that keeps serving. `eth_getTransactionCount`
@@ -470,7 +495,9 @@ mod tests {
     struct MockRpc {
         nonce: Arc<Mutex<Option<u64>>>,
         receipt: Arc<Mutex<serde_json::Value>>,
+        receipt_fails: Arc<Mutex<bool>>,
         calls: Arc<AtomicUsize>,
+        nonce_calls: Arc<AtomicUsize>,
         fail_result_audit: Option<Arc<AuditLog>>,
     }
 
@@ -479,7 +506,9 @@ mod tests {
             Self {
                 nonce: Arc::new(Mutex::new(nonce)),
                 receipt: Arc::new(Mutex::new(receipt)),
+                receipt_fails: Arc::new(Mutex::new(false)),
                 calls: Arc::new(AtomicUsize::new(0)),
+                nonce_calls: Arc::new(AtomicUsize::new(0)),
                 fail_result_audit: None,
             }
         }
@@ -511,21 +540,31 @@ mod tests {
                         .unwrap_or(serde_json::Value::Null);
                     let reply = |field: &str, value: serde_json::Value| serde_json::json!({"jsonrpc": "2.0", "id": id, field: value});
                     let body = match request_json["method"].as_str() {
-                        Some("eth_getTransactionCount") => match *rpc.nonce.lock().unwrap() {
-                            Some(nonce) => {
-                                reply("result", serde_json::json!(format!("{nonce:#x}")))
+                        Some("eth_getTransactionCount") => {
+                            rpc.nonce_calls.fetch_add(1, Ordering::SeqCst);
+                            match *rpc.nonce.lock().unwrap() {
+                                Some(nonce) => {
+                                    reply("result", serde_json::json!(format!("{nonce:#x}")))
+                                }
+                                None => reply(
+                                    "error",
+                                    serde_json::json!({"code": -32000, "message": "unavailable"}),
+                                ),
                             }
-                            None => reply(
-                                "error",
-                                serde_json::json!({"code": -32000, "message": "unavailable"}),
-                            ),
-                        },
+                        }
                         Some("eth_getTransactionReceipt") => {
                             rpc.calls.fetch_add(1, Ordering::SeqCst);
                             if let Some(audit) = &rpc.fail_result_audit {
                                 audit.fail_next_write_for_test();
                             }
-                            reply("result", rpc.receipt.lock().unwrap().clone())
+                            if *rpc.receipt_fails.lock().unwrap() {
+                                reply(
+                                    "error",
+                                    serde_json::json!({"code": -32000, "message": "unavailable"}),
+                                )
+                            } else {
+                                reply("result", rpc.receipt.lock().unwrap().clone())
+                            }
                         }
                         _ => reply("result", serde_json::Value::Null),
                     }
@@ -679,23 +718,97 @@ mod tests {
         assert!(audit.pending_effect_correlations().unwrap().is_empty());
     }
 
+    /// A reconciler over the fixture outbox whose clock a test sets in
+    /// seconds.
+    fn clocked(
+        outbox: Outbox,
+        chains: ChainRegistry,
+        audit: Arc<AuditLog>,
+    ) -> (Reconciler, impl Fn(u64)) {
+        let start = Instant::now();
+        let elapsed = Arc::new(Mutex::new(Duration::ZERO));
+        let clock_elapsed = elapsed.clone();
+        let reconciler = Reconciler::new(outbox, chains, audit)
+            .with_clock(Arc::new(move || start + *clock_elapsed.lock().unwrap()));
+        (reconciler, move |secs| {
+            *elapsed.lock().unwrap() = Duration::from_secs(secs)
+        })
+    }
+
     #[tokio::test]
-    async fn an_unreachable_provider_costs_no_journaled_lookup() {
+    async fn a_provider_without_nonces_still_reconciles() {
+        let (_directory, outbox) = sent_outbox();
+        let audit_directory = tempfile::tempdir().unwrap();
+        let audit = Arc::new(AuditLog::open(audit_directory.path().join("audit.jsonl")).unwrap());
+        // The nonce method fails but receipts are served.
+        let rpc = MockRpc::new(None, mined_receipt());
+        let chains = ChainRegistry::default();
+        chains.add(mock_chain(rpc.clone()).await);
+        let reconciler = Reconciler::new(outbox.clone(), chains, audit);
+        assert_eq!(reconciler.tick().await, 1);
+        assert!(
+            outbox
+                .read_receipt("alice", "anvil", "tx-1")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn without_nonces_a_pending_transaction_keeps_the_normal_cadence() {
+        let (_directory, outbox) = sent_outbox();
+        let audit_directory = tempfile::tempdir().unwrap();
+        let audit = Arc::new(AuditLog::open(audit_directory.path().join("audit.jsonl")).unwrap());
+        let rpc = MockRpc::new(None, serde_json::Value::Null);
+        let chains = ChainRegistry::default();
+        chains.add(mock_chain(rpc.clone()).await);
+        let (reconciler, at) = clocked(outbox, chains, audit);
+        // Still looked up every tick well past the grace window: with no nonce
+        // to go by, a receipt may appear at any moment.
+        let ticks: Vec<u64> = (0..50).map(|tick| tick * 15).collect();
+        for secs in &ticks {
+            at(*secs);
+            reconciler.tick().await;
+        }
+        assert_eq!(rpc.lookups(), ticks.len());
+    }
+
+    #[tokio::test]
+    async fn a_provider_that_answers_nothing_backs_off() {
         let (_directory, outbox) = sent_outbox();
         let audit_directory = tempfile::tempdir().unwrap();
         let audit = Arc::new(AuditLog::open(audit_directory.path().join("audit.jsonl")).unwrap());
         let rpc = MockRpc::new(None, mined_receipt());
+        *rpc.receipt_fails.lock().unwrap() = true;
         let chains = ChainRegistry::default();
         chains.add(mock_chain(rpc.clone()).await);
-        let reconciler = Reconciler::new(outbox.clone(), chains, audit.clone());
-        for _ in 0..3 {
-            assert_eq!(reconciler.tick().await, 0);
+        let (reconciler, at) = clocked(outbox.clone(), chains, audit.clone());
+        for secs in [0, 15, 60, 240, 301, 320] {
+            at(secs);
+            reconciler.tick().await;
         }
+        assert_eq!(rpc.lookups(), 5, "the grace window, then deferred");
+        assert_eq!(audit.count().unwrap(), 10);
+        // Recovery is picked up at the next scheduled lookup.
+        *rpc.receipt_fails.lock().unwrap() = false;
+        at(332);
+        assert_eq!(reconciler.tick().await, 1);
+    }
+
+    #[tokio::test]
+    async fn transactions_sharing_a_sender_read_its_nonce_once_per_tick() {
+        let (_directory, outbox) = sent_outbox();
+        add_sent(&outbox, "tx-2", 1, 8);
+        let audit_directory = tempfile::tempdir().unwrap();
+        let audit = Arc::new(AuditLog::open(audit_directory.path().join("audit.jsonl")).unwrap());
+        let rpc = MockRpc::new(Some(0), mined_receipt());
+        let chains = ChainRegistry::default();
+        chains.add(mock_chain(rpc.clone()).await);
+        let reconciler = Reconciler::new(outbox, chains, audit.clone());
+        reconciler.tick().await;
+        assert_eq!(rpc.nonce_calls.load(Ordering::SeqCst), 1);
         assert_eq!(rpc.lookups(), 0);
         assert_eq!(audit.count().unwrap(), 0);
-        // Once the provider answers again, the next tick catches up.
-        *rpc.nonce.lock().unwrap() = Some(1);
-        assert_eq!(reconciler.tick().await, 1);
     }
 
     #[tokio::test]
