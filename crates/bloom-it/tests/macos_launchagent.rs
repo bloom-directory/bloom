@@ -602,3 +602,26 @@ fn macos_upgrade_rollback_handles_the_system_etc_symlink() {
         .expect("run macOS rollback archive regression");
     assert!(status.success());
 }
+
+#[test]
+fn interactive_services_are_not_throttled_as_background_jobs() {
+    // Machine, Broker and Signer answer the user's mount, CLI and ceremony
+    // requests. launchd's Background type throttled Machine's startup
+    // journal verification about 60-fold; only the monitors stay Background.
+    for (template, process_type) in [
+        ("launchagents/com.bloom.machine.plist.in", "Standard"),
+        ("launchdaemons/com.bloom.broker.plist.in", "Standard"),
+        ("launchdaemons/com.bloom.signer.plist.in", "Standard"),
+        ("launchagents/com.bloom.session.plist.in", "Background"),
+        ("launchdaemons/com.bloom.containment.plist.in", "Background"),
+    ] {
+        let source =
+            fs::read_to_string(workspace().join("packaging/triad/macos").join(template)).unwrap();
+        assert!(
+            source.contains(&format!(
+                "<key>ProcessType</key>\n  <string>{process_type}</string>"
+            )),
+            "{template} must run as {process_type}"
+        );
+    }
+}
