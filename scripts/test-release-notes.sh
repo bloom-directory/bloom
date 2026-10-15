@@ -47,7 +47,7 @@ changes() {
   shift 3
   printf '%s\n' "$@" >"$work/published"
   "$notes" changes --repo example/bloom --tag "$tag" --sha "$sha" \
-    --published "$work/published" --git-dir "$repo" >"$out"
+    --published "$work/published" -C "$repo" >"$out"
 }
 
 pin a a "Initial import"
@@ -94,6 +94,21 @@ check "a dry run compares with the latest published ancestor" contains "$work/dr
 
 changes "$work/empty" v0.2.1 "$release_sha" v0.2.0
 check "a release on its baseline's commit says nothing changed" contains "$work/empty" "No commits since v0.2.0."
+
+# A git that fails one subcommand, so errors cannot pass for empty history.
+shim="$work/shim"
+mkdir -p "$shim"
+real_git="$(command -v git)"
+fails() {
+  # fails SUBCOMMAND: run `changes` for v0.2.0 with that git subcommand failing
+  printf '#!/bin/sh\n[ "$1" = %s ] && exit 128\nexec %s "$@"\n' "$1" "$real_git" >"$shim/git"
+  chmod +x "$shim/git"
+  printf '%s\n' latest v0.2.0 v0.1.0 >"$work/published"
+  ! PATH="$shim:$PATH" "$notes" changes --repo example/bloom --tag v0.2.0 \
+    --sha "$release_sha" --published "$work/published" -C "$repo" >"$work/failed" 2>&1
+}
+check "a failed commit listing fails instead of reading as no commits" fails log
+check "a failed ancestry check fails instead of reading as a first release" fails merge-base
 
 printf '## Bloom v0.2.0\n\nSignature verification text.\n' >"$work/header"
 "$notes" splice --changes "$work/second" --header "$work/header" >"$work/new-body"

@@ -5,7 +5,7 @@
 # into an existing body.
 #
 #   release-notes.sh changes --repo OWNER/REPO --tag TAG --sha SHA \
-#     --published FILE [--git-dir DIR]
+#     --published FILE [-C DIR]
 #   release-notes.sh splice --changes FILE [--existing FILE] --header FILE
 #
 # `changes` lists every first-parent commit since the baseline: the highest
@@ -72,7 +72,7 @@ changes() {
       --tag) tag="$2"; shift 2 ;;
       --sha) sha="$2"; shift 2 ;;
       --published) published="$2"; shift 2 ;;
-      --git-dir) cd "$2"; shift 2 ;;
+      -C) cd "$2" || die "cannot enter $2"; shift 2 ;;
       *) die "unknown argument: $1" ;;
     esac
   done
@@ -82,7 +82,7 @@ changes() {
   sha="$(git rev-parse --verify -q "$sha^{commit}")" || die "unknown commit: $sha"
 
   # A dry run's tag is not a version, so any published ancestor qualifies.
-  local base="" candidate candidate_sha
+  local base="" candidate candidate_sha ancestry
   while IFS= read -r candidate || [[ -n "$candidate" ]]; do
     is_version_tag "$candidate" || continue
     [[ "$candidate" != "$tag" ]] || continue
@@ -90,27 +90,42 @@ changes() {
       version_lt "$candidate" "$tag" || continue
     fi
     candidate_sha="$(git rev-parse --verify -q "refs/tags/$candidate^{commit}")" || continue
-    git merge-base --is-ancestor "$candidate_sha" "$sha" || continue
+    # 1 means "not an ancestor"; anything else is an error, which must not
+    # read as a missing baseline.
+    ancestry=0
+    git merge-base --is-ancestor "$candidate_sha" "$sha" || ancestry=$?
+    case "$ancestry" in
+      0) ;;
+      1) continue ;;
+      *) die "cannot compare $candidate with $sha" ;;
+    esac
     if [[ -z "$base" ]] || version_lt "$base" "$candidate"; then
       base="$candidate"
     fi
   done <"$published"
 
-  printf '%s\n' "$START_MARKER"
   if [[ -z "$base" ]]; then
+    printf '%s\n' "$START_MARKER"
     printf '### Changes\n\nFirst published release: there is no earlier release to compare against.\n'
     printf '%s\n' "$END_MARKER"
     return
   fi
 
-  local base_sha subject commit count=0
+  local base_sha subject commit log count=0
   base_sha="$(git rev-parse "refs/tags/$base^{commit}")"
+  # Read the log before printing anything, so a failure stops the release
+  # rather than reading as "no commits".
+  log="$(git log --first-parent --format='%H%x09%s' "$base_sha..$sha")" ||
+    die "cannot list commits since $base"
+  printf '%s\n' "$START_MARKER"
   printf '### Changes since %s\n\n' "$base"
-  while IFS=$'\t' read -r commit subject; do
-    count=$((count + 1))
-    printf -- '- %s ([`%s`](https://github.com/%s/commit/%s))\n' \
-      "$subject" "${commit:0:7}" "$repo" "$commit"
-  done < <(git log --first-parent --format='%H%x09%s' "$base_sha..$sha")
+  if [[ -n "$log" ]]; then
+    while IFS=$'\t' read -r commit subject; do
+      count=$((count + 1))
+      printf -- '- %s ([`%s`](https://github.com/%s/commit/%s))\n' \
+        "$subject" "${commit:0:7}" "$repo" "$commit"
+    done <<<"$log"
+  fi
   if ((count == 0)); then
     printf 'No commits since %s.\n' "$base"
   fi
