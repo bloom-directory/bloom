@@ -98,12 +98,18 @@ an unclear total goes to the human's private view; its URL and screenshots
 never appear in VFS. A manual
 fallback releases no saved card.
 
-`filled` means fields were filled, not that payment succeeded. `paid` and
-`declined` describe what the merchant reported; Bloom has not verified the
-bank charge. `partially_filled`, `disclosure_unknown`, and `uncertain` require
-human inspection; never repeat the purchase automatically. Ask the human to
-check the merchant account or confirmation email. After private checkout
-closes, shopping resumes on a fresh tab.
+`filled` means fields were filled, not that payment succeeded. `needs_input`
+means the merchant form stopped before submission; the human corrects it in
+the still-open private view. Before card approval, they return it for a new
+approval; after a known local validation stop, they may click Pay once there.
+`not_submitted` means that view closed without a payment attempt. `booked`,
+`paid`, and `declined` describe what the merchant
+reported; Bloom has not independently verified the bank charge. A reservation
+code remains in the local private view, not the agent-visible status.
+`partially_filled`, `disclosure_unknown`, and `uncertain` require human
+inspection; never repeat the purchase automatically. Ask the human to check
+the merchant account or confirmation email. After private checkout closes,
+shopping resumes on a fresh tab.
 
 Protection depends on separate service principals. Root and root-equivalent
 access, including membership in the Docker group, is outside that claim.

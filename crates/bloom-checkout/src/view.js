@@ -43,11 +43,26 @@ document.getElementById('typing').addEventListener('submit', event => {
 });
 document.querySelectorAll('[data-key]').forEach(button=>button.addEventListener('click',()=>act({action:'key',key:button.dataset.key})));
 document.getElementById('finish').addEventListener('click',()=>act({action:'finish'}));
+function stateText(state) {
+  if (state.state === 'booked') {
+    const code = state.outcome?.order_id;
+    return code ? `Booked — reservation code ${code}` : 'Booked — check your confirmation email for the reservation code.';
+  }
+  if (state.state === 'paid') return 'Payment confirmed by the merchant.';
+  if (state.state === 'declined') return 'Payment declined by the merchant or bank.';
+  if (state.state === 'needs_input') return state.traveler
+    ? 'Payment approval has not started. Complete the highlighted booking fields.'
+    : 'Payment was not submitted. Complete the highlighted fields, then click Pay once.';
+  if (state.state === 'not_submitted') return 'Payment was not submitted.';
+  if (state.state === 'submitted') return 'Payment sent once. Waiting for the merchant confirmation; do not click Pay again.';
+  if (state.state === 'uncertain') return 'Bloom cannot confirm the result. Check the airline email and your bank; do not pay again.';
+  return state.state.replaceAll('_',' ');
+}
 async function refresh() {
   try {
     const response=await fetch('/state');
     if (!response.ok) {status.textContent='Private checkout has closed. Return to Bloom for the outcome.';screen.hidden=true;screen.removeAttribute('src');return;}
-    const state=await response.json();status.textContent=state.state.replaceAll('_',' ');
+    const state=await response.json();status.textContent=stateText(state);
     if(state.state==='human_control'){
       document.getElementById('heading').textContent="Bloom's browser";
       document.getElementById('purpose').textContent='Log in, enter a code or pass a check here. The agent cannot see this view. When you are done, hand the browser back.';
@@ -60,8 +75,24 @@ async function refresh() {
       document.getElementById('finish').textContent='Ready for payment approval';
       document.getElementById('note').hidden=true;
     }
+    if(state.state==='needs_input' && state.traveler) {
+      document.getElementById('heading').textContent='Fix the booking details';
+      document.getElementById('purpose').textContent='Correct the highlighted fields, then click Ready for payment approval. Do not click Pay on the airline page; no card has been approved yet.';
+      document.getElementById('finish').textContent='Ready for payment approval';
+      document.getElementById('note').textContent='Payment still requires a separate approval.';
+      document.getElementById('note').hidden=false;
+    } else if(state.state==='needs_input') {
+      document.getElementById('heading').textContent='Finish the payment form';
+      document.getElementById('purpose').textContent='The page rejected one or more fields before charging. Correct the highlighted fields here, then click Pay once. The agent cannot see this view.';
+      document.getElementById('finish').textContent='Close without paying';
+      document.getElementById('note').textContent='Closing now records that Bloom did not submit payment.';
+      document.getElementById('note').hidden=false;
+    } else if(state.state==='submitted') {
+      document.getElementById('purpose').textContent='Bloom clicked Pay once. Complete any bank or email verification here and wait for the booking result.';
+      document.getElementById('finish').textContent='Close and verify separately';
+    }
     if(state.closed) {
-      status.textContent=state.state==='ready_for_payment' ? 'Ready for payment approval. Traveler details remain hidden from the agent.' : state.state.replaceAll('_',' ');
+      status.textContent=state.state==='ready_for_payment' ? 'Ready for payment approval. Traveler details remain hidden from the agent.' : stateText(state);
       screen.hidden=true;screen.removeAttribute('src');return;
     }
     pages.replaceChildren(...state.pages.map(page=>{const option=document.createElement('option');option.value=page.target;option.textContent=page.origin;option.selected=page.target===state.selected_page;return option;}));

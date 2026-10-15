@@ -20,6 +20,7 @@ pub(crate) struct Field {
     pub kind: String,
     pub index: usize,
 }
+#[derive(Clone)]
 pub(crate) struct Frame {
     pub session: String,
     pub world: i64,
@@ -27,12 +28,22 @@ pub(crate) struct Frame {
     pub fields: Vec<Field>,
     owners: Vec<(String, String)>,
 }
+#[derive(Clone)]
 pub(crate) struct Discovery {
     pub facts: CheckoutFacts,
     pub frames: Vec<Frame>,
     pub main_world: i64,
     pub facts_session: String,
 }
+
+#[derive(Debug)]
+pub(crate) struct BookingFormIncomplete;
+impl std::fmt::Display for BookingFormIncomplete {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Complete the highlighted booking fields before payment approval")
+    }
+}
+impl std::error::Error for BookingFormIncomplete {}
 
 /// Card number, expiry and CVC go into documents a payment provider serves,
 /// or into the approved merchant's own HTTPS page; other frames fall back to
@@ -330,6 +341,16 @@ impl Discovery {
         {
             bail!("Payment fields require human review");
         }
+        let form_ready = evaluate(
+            tab,
+            &facts_session,
+            main_world,
+            include_str!("form-ready.js").into(),
+        )
+        .await?;
+        if form_ready != true {
+            return Err(BookingFormIncomplete.into());
+        }
         Ok(Self {
             facts,
             frames,
@@ -423,7 +444,9 @@ impl Discovery {
         Ok(())
     }
 
-    pub async fn submit(&self, tab: &PrivateTab) -> Result<()> {
+    /// True only when the pay control was clicked. False is a known local
+    /// validation stop, not an ambiguous payment attempt.
+    pub async fn submit(&self, tab: &PrivateTab) -> Result<bool> {
         self.recheck(tab).await?;
         let response = evaluate(
             tab,
@@ -432,10 +455,24 @@ impl Discovery {
             include_str!("submit.js").into(),
         )
         .await?;
-        if response != true {
-            bail!("Payment needs human submission");
-        }
-        Ok(())
+        response
+            .as_bool()
+            .context("Payment submission result unavailable")
+    }
+
+    /// Whether private-view coordinates point at the exact pay control that
+    /// discovery bound. Used to persist a manual retry before dispatching it.
+    pub async fn is_submit_point(&self, tab: &PrivateTab, x: f64, y: f64) -> Result<bool> {
+        let result = evaluate(
+            tab,
+            &self.facts_session,
+            self.main_world,
+            format!(
+                "(()=>{{const n=document.elementFromPoint({x},{y});return !!n&&(n===globalThis.__bloomPayButton||globalThis.__bloomPayButton?.contains(n));}})()"
+            ),
+        )
+        .await?;
+        Ok(result == true)
     }
 }
 
@@ -1369,6 +1406,11 @@ pub(crate) mod tests {
                 "Your payment details couldn’t be verified. Check your card details and try again.",
                 "declined",
             ),
+            (
+                "<input required>Tu compra ha sido confirmada. Código de reserva: AB12CD Total USD 3.99",
+                "booked",
+            ),
+            ("Debes completar todos los campos", "needs_input"),
         ] {
             let (url,server)=fixture(merchant(&inputs(),"<label>Installments<select name='installments'><option>6 x installments</option></select></label>",outcome)).await;
             let tab = open(&browser, url).await;
@@ -1379,20 +1421,59 @@ pub(crate) mod tests {
             let mut filled = Vec::new();
             discovery.fill(&tab, &card(), &mut filled).await.unwrap();
             assert_eq!(filled.len(), 3);
-            discovery.submit(&tab).await.unwrap();
+            assert!(discovery.submit(&tab).await.unwrap());
             let outcome = tab
                 .cdp
                 .evaluate(&tab.session, include_str!("outcome.js").into())
                 .await
                 .unwrap();
             assert_eq!(outcome["state"], expected);
-            if expected == "paid" {
+            if matches!(expected, "paid" | "booked") {
                 assert_eq!(outcome["merchant_reported_total_minor"], 399);
                 assert_eq!(outcome["currency"], "USD");
+            }
+            if expected == "booked" {
+                assert_eq!(outcome["order_id"], "AB12CD");
             }
             browser.return_control().await.unwrap();
             server.abort();
         }
+    }
+
+    #[tokio::test]
+    async fn incomplete_booking_fields_stop_before_approval_or_click() {
+        let browser = browser().await;
+        let html = merchant(
+            &format!(
+                "<label>Email<input id='email' required></label>{}",
+                inputs()
+            ),
+            "",
+            "Order confirmed",
+        );
+        let (url, server) = fixture(html).await;
+        let tab = open(&browser, url).await;
+        let error = Discovery::read(&tab).await.err().unwrap();
+        assert!(error.to_string().contains("highlighted booking fields"));
+        tab.cdp
+            .evaluate(
+                &tab.session,
+                "email.value='fixture@example.com';email.dispatchEvent(new Event('input',{bubbles:true}))"
+                    .into(),
+            )
+            .await
+            .unwrap();
+        let discovery = Discovery::read(&tab).await.unwrap();
+        tab.cdp
+            .evaluate(
+                &tab.session,
+                "email.setAttribute('aria-invalid','true')".into(),
+            )
+            .await
+            .unwrap();
+        assert!(!discovery.submit(&tab).await.unwrap());
+        browser.return_control().await.unwrap();
+        server.abort();
     }
 
     #[tokio::test]

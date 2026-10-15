@@ -133,7 +133,13 @@
       e.focus();e.select();
       if (document.activeElement !== e || !e.isConnected || !document.execCommand('insertText',false,value)) throw Error('Traveler input unsupported');
     }
-    e.dispatchEvent(new Event('change',{bubbles:true}));filled.push(mapping.field);
+    e.dispatchEvent(new Event('change',{bubbles:true}));
+    // Booking sites commonly validate only after a field has been touched and
+    // left. Do that before claiming the saved value was accepted.
+    if (document.activeElement === e) e.blur();
+    await new Promise(r => setTimeout(r, 25));
+    if (!e.checkValidity() || e.getAttribute('aria-invalid') === 'true') throw new Skip('field rejected by page');
+    filled.push(mapping.field);
   } catch (error) {
     if (!(error instanceof Skip)) throw error;
     const e = binding.refs[mapping.index];
