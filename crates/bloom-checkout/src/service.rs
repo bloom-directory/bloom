@@ -1716,6 +1716,60 @@ mod tests {
         assert!(service.traveler.lock().await.is_none());
         server.abort();
     }
+    #[tokio::test]
+    async fn a_page_that_never_paints_does_not_stall_the_private_view() {
+        // A renderer stuck in script cannot answer a screenshot.
+        let (url, server) = crate::discovery::tests::fixture(
+            "<h1>Bank</h1><script>setTimeout(()=>{for(;;){}},300)</script>".into(),
+        )
+        .await;
+        let root = tempfile::tempdir().unwrap().keep();
+        let browser = Browser::launch(
+            &crate::test_chromium(),
+            &root.join("profile"),
+            &["--no-sandbox".into(), "--ignore-certificate-errors".into()],
+        )
+        .await
+        .unwrap();
+        browser.browse(BrowseRequest::Open { url }).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        let tab = browser.handoff().await.unwrap();
+        let service = CheckoutService::new(
+            browser,
+            &root.join("state.db"),
+            root.join("unused.sock"),
+            unsafe { libc::geteuid() },
+            47999,
+        )
+        .unwrap();
+        *service.private.lock().await = Some(PrivateCheckout {
+            operation_id: "fixture".into(),
+            mode: Mode::TakeOver,
+            view_target: tab.target.clone(),
+            view_session: tab.session.clone(),
+            seen_pages: std::collections::HashSet::from([tab.target.clone()]),
+            tab,
+            discovery: None,
+            recipient: None,
+            traveler: None,
+            contains_traveler: false,
+            capability: "fixture".into(),
+            claimed: true,
+            approved: true,
+        });
+        let started = tokio::time::Instant::now();
+        let capture = {
+            let service = service.clone();
+            tokio::spawn(async move { service.private_screenshot("fixture").await })
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // Other private-view requests can take the lock while the capture waits.
+        assert!(service.private.try_lock().is_ok());
+        let error = capture.await.unwrap().unwrap_err();
+        assert_eq!(error.to_string(), "Private page is still loading");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        server.abort();
+    }
     #[test]
     fn saved_phones_split_by_the_numbering_plan() {
         let values = |phone: &str| -> BTreeMap<String, zeroize::Zeroizing<String>> {
