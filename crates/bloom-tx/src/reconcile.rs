@@ -7,8 +7,9 @@
 //! decide whether a dependent same-chain tx may broadcast, and `BumpScanner`
 //! treats a reconciled entry as mined (so it stops fee-bumping it).
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use bloom_evm::ChainRegistry;
 use bloom_proto::{AuditLog, AuditRecord};
@@ -16,12 +17,29 @@ use tokio::sync::oneshot;
 
 use crate::outbox::{MinedReceipt, Outbox, RECEIPT_FILE};
 
+/// How long an unanswered receipt lookup keeps the normal cadence. Every
+/// lookup is journaled before it contacts the provider, so a transaction
+/// that never gets a receipt (a dropped transaction, or a chain whose
+/// endpoint is down) must not be looked up on every tick forever.
+const RECEIPT_LOOKUP_GRACE: Duration = Duration::from_secs(5 * 60);
+/// Longest wait between lookups for such a transaction.
+const RECEIPT_LOOKUP_MAX_DELAY: Duration = Duration::from_secs(30 * 60);
+
+/// Unanswered lookups for one sent entry.
+struct LookupBackoff {
+    first_miss: Instant,
+    misses_after_grace: u32,
+    next_at: Instant,
+}
+
 /// Polls sent entries and records their mined outcome.
 pub struct Reconciler {
     outbox: Outbox,
     chains: ChainRegistry,
     interval: Duration,
     audit: Arc<AuditLog>,
+    backoff: Mutex<HashMap<String, LookupBackoff>>,
+    clock: Arc<dyn Fn() -> Instant + Send + Sync>,
 }
 
 impl Reconciler {
@@ -31,7 +49,53 @@ impl Reconciler {
             chains,
             interval: Duration::from_secs(15),
             audit,
+            backoff: Mutex::new(HashMap::new()),
+            clock: Arc::new(Instant::now),
         }
+    }
+
+    #[cfg(test)]
+    fn with_clock(mut self, clock: Arc<dyn Fn() -> Instant + Send + Sync>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    fn backoff_key(entry: &crate::outbox::SentEntry) -> String {
+        format!("{}/{}/{}", entry.wallet, entry.chain, entry.id)
+    }
+
+    /// Whether `key` is still waiting out its backoff at `now`.
+    fn lookup_deferred(&self, key: &str, now: Instant) -> bool {
+        self.backoff
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(key)
+            .is_some_and(|backoff| now < backoff.next_at)
+    }
+
+    /// Record a lookup that found no receipt. The normal cadence holds for
+    /// [`RECEIPT_LOOKUP_GRACE`]; after that the wait doubles, up to
+    /// [`RECEIPT_LOOKUP_MAX_DELAY`].
+    fn record_lookup_miss(&self, key: String, now: Instant) {
+        let mut backoffs = self
+            .backoff
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let backoff = backoffs.entry(key).or_insert(LookupBackoff {
+            first_miss: now,
+            misses_after_grace: 0,
+            next_at: now,
+        });
+        if now.duration_since(backoff.first_miss) < RECEIPT_LOOKUP_GRACE {
+            backoff.next_at = now;
+            return;
+        }
+        backoff.misses_after_grace = backoff.misses_after_grace.saturating_add(1);
+        let delay = self
+            .interval
+            .saturating_mul(1_u32 << backoff.misses_after_grace.min(16))
+            .min(RECEIPT_LOOKUP_MAX_DELAY);
+        backoff.next_at = now + delay;
     }
 
     pub fn with_interval(mut self, interval: Duration) -> Self {
@@ -50,7 +114,9 @@ impl Reconciler {
                 return 0;
             }
         };
+        let now = (self.clock)();
         let mut updated = 0;
+        let mut waiting = std::collections::HashSet::new();
         for se in entries {
             if se.mined {
                 continue;
@@ -58,6 +124,11 @@ impl Reconciler {
             let Some(chain) = self.chains.get(&se.chain) else {
                 continue;
             };
+            let backoff_key = Self::backoff_key(&se);
+            waiting.insert(backoff_key.clone());
+            if self.lookup_deferred(&backoff_key, now) {
+                continue;
+            }
             let receipt_details = serde_json::json!({
                 "operation": "tx.reconcile.receipt_lookup",
                 "wallet": se.wallet,
@@ -84,10 +155,20 @@ impl Reconciler {
                 break;
             }
             let receipt = match receipt_call {
-                Ok(Some(r)) => r,
-                Ok(None) => continue,
+                Ok(Some(r)) => {
+                    self.backoff
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .remove(&backoff_key);
+                    r
+                }
+                Ok(None) => {
+                    self.record_lookup_miss(backoff_key, now);
+                    continue;
+                }
                 Err(e) => {
                     tracing::debug!(error = %e, id = %se.id, "reconcile.receipt_failed");
+                    self.record_lookup_miss(backoff_key, now);
                     continue;
                 }
             };
@@ -134,6 +215,11 @@ impl Reconciler {
                 Err(e) => tracing::warn!(error = %e, "reconcile.serialize_failed"),
             }
         }
+        // Forget entries that were mined, cancelled or removed.
+        self.backoff
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|key, _| waiting.contains(key));
         updated
     }
 
@@ -440,6 +526,52 @@ mod tests {
         );
         assert_eq!(records[1].kind, "machine.effect.result");
         assert_eq!(records[1].data["result"]["outcome"], "not_found");
+        assert!(audit.pending_effect_correlations().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unanswered_receipt_lookups_back_off_after_the_grace_period() {
+        let (_directory, outbox) = sent_outbox();
+        let audit_directory = tempfile::tempdir().unwrap();
+        let audit = Arc::new(AuditLog::open(audit_directory.path().join("audit.jsonl")).unwrap());
+        let calls = Arc::new(AtomicUsize::new(0));
+        // Answers once with no receipt, then refuses connections: both are
+        // lookups that found nothing.
+        let chain = receipt_chain("null", calls.clone(), None).await;
+        let chains = ChainRegistry::default();
+        chains.add(chain);
+        let start = Instant::now();
+        let elapsed = Arc::new(Mutex::new(Duration::ZERO));
+        let clock_elapsed = elapsed.clone();
+        let reconciler = Reconciler::new(outbox, chains, audit.clone())
+            .with_clock(Arc::new(move || start + *clock_elapsed.lock().unwrap()));
+        let lookups = |audit: &AuditLog| audit.count().unwrap() / 2;
+        let at = |secs: u64| *elapsed.lock().unwrap() = Duration::from_secs(secs);
+
+        // Inside the grace period every tick looks the receipt up.
+        for secs in [0, 15, 60, 240] {
+            at(secs);
+            reconciler.tick().await;
+        }
+        assert_eq!(lookups(&audit), 4);
+        // The first miss after the grace period waits two intervals.
+        at(301);
+        reconciler.tick().await;
+        assert_eq!(lookups(&audit), 5);
+        at(320);
+        reconciler.tick().await;
+        assert_eq!(lookups(&audit), 5, "deferred inside the backoff");
+        at(332);
+        reconciler.tick().await;
+        assert_eq!(lookups(&audit), 6);
+        // The wait keeps doubling but never exceeds the cap.
+        let mut now = 332;
+        for _ in 0..12 {
+            now += RECEIPT_LOOKUP_MAX_DELAY.as_secs();
+            at(now);
+            reconciler.tick().await;
+        }
+        assert_eq!(lookups(&audit), 18, "capped at one lookup per interval");
         assert!(audit.pending_effect_correlations().unwrap().is_empty());
     }
 
