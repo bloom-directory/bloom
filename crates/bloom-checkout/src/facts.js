@@ -65,7 +65,14 @@
       const rest = lines[i].slice(match[0].length).replace(/\([^)]*\)/g, '').replace(/^[\s:]+/, '');
       if (!amountOnly(rest)) continue;
       const segment = [rest];
-      for (let j = i + 1; j < Math.min(lines.length, i + 3) && !/\d/.test(segment.join(' ')) && amountOnly(lines[j]); j++) segment.push(lines[j]);
+      // Take the amount from the next lines, then at most one currency line
+      // after it (JetSMART: "Total", ":", "$371.805,17", "ARS").
+      for (let j = i + 1; j < Math.min(lines.length, i + 4) && amountOnly(lines[j]); j++) {
+        const priced = /\d/.test(segment.join(' '));
+        if (priced && /\d/.test(lines[j])) break;
+        segment.push(lines[j]);
+        if (priced) break;
+      }
       if (/\d/.test(segment.join(' ')) === false) return null;
       const amount = parseAmount(segment.join(' '));
       if (!amount) return null;

@@ -565,7 +565,11 @@ impl CheckoutService {
                 status.state = "preparing".into();
                 self.store.update(&status)?;
                 let discovery = match mode {
-                    Mode::Card => Discovery::read(&tab).await.ok(),
+                    Mode::Card => Discovery::read(&tab)
+                        .await
+                        // The reason is generic text, never page or card content.
+                        .inspect_err(|e| eprintln!("payment page needs the private view: {e:#}"))
+                        .ok(),
                     Mode::Site => Discovery::read_site(&tab).await.ok(),
                     Mode::TakeOver | Mode::Traveler => None,
                 };

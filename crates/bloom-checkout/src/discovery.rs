@@ -1210,6 +1210,24 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn total_split_from_its_currency_code_is_read() {
+        // JetSMART's summary: label, colon, amount and code on separate lines,
+        // on a page whose language names no region.
+        let html = "<!doctype html><html lang='es'><div>Total equipaje</div><div>:</div><div>$0,00</div>
+            <div>Total</div><div>:</div><div>$371.805,17</div><div>ARS</div><div>© 2026 JetSMART</div>
+            <input autocomplete='cc-number'><input autocomplete='cc-exp'><input autocomplete='cc-csc'>
+            <button>Pagar Ahora</button></html>";
+        let browser = browser().await;
+        let (url, server) = fixture(html.into()).await;
+        let tab = open(&browser, url).await;
+        let discovery = Discovery::read(&tab).await.unwrap();
+        assert_eq!(discovery.facts.total_minor, 37180517);
+        assert_eq!(discovery.facts.currency, "ARS");
+        browser.return_control().await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn spanish_card_form_captioned_beside_its_fields_is_supported() {
         // Shaped like an airline's own payment page: no autocomplete, captions in divs.
         let html = "<!doctype html><html lang='es-AR'><h1>Pago</h1><p>Total $371.805,17</p>
