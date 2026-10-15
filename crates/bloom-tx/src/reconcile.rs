@@ -12,7 +12,8 @@
 //! and chain and looks a receipt up, journaled before it contacts the
 //! provider, only after the nonce is spent. A pending or dropped transaction
 //! therefore costs no journaled lookup, and a mined transaction is recorded on
-//! the tick after its nonce advances. The nonce read itself is not journaled:
+//! the tick after its nonce advances; ticks are two seconds apart, while any
+//! further lookups for one transaction are journaled at most every fifteen. The nonce read itself is not journaled:
 //! like a balance read, it reveals only the sender's address, not the
 //! transaction. When no nonce is available the receipt is looked up anyway,
 //! backing off only while the provider fails that lookup too.
@@ -28,10 +29,14 @@ use tokio::sync::oneshot;
 use crate::outbox::{MinedReceipt, Outbox, RECEIPT_FILE};
 
 /// How long a transaction whose nonce is spent but whose receipt is missing
-/// keeps the normal cadence. That covers RPC endpoints that lag one another;
+/// keeps [`RECEIPT_LOOKUP_SPACING`] before backing off further. That covers RPC endpoints that lag one another;
 /// after it, another transaction with the same nonce (a cancel or speed-up)
 /// most likely replaced this one, and its hash will never be mined.
 const RECEIPT_LOOKUP_GRACE: Duration = Duration::from_secs(5 * 60);
+/// Shortest gap between two journaled lookups for one transaction. The tick is
+/// much faster, so a newly spent nonce is noticed within seconds, but every
+/// lookup after the first is journaled at most this often, whatever the tick.
+const RECEIPT_LOOKUP_SPACING: Duration = Duration::from_secs(15);
 /// Longest wait between lookups for such a replaced transaction.
 const RECEIPT_LOOKUP_MAX_DELAY: Duration = Duration::from_secs(30 * 60);
 
@@ -57,7 +62,9 @@ impl Reconciler {
         Self {
             outbox,
             chains,
-            interval: Duration::from_secs(15),
+            // Ticks cost no journal writes unless a nonce was spent, so tick
+            // fast enough for chains with one- or two-second blocks.
+            interval: Duration::from_secs(2),
             audit,
             backoff: Mutex::new(HashMap::new()),
             clock: Arc::new(Instant::now),
@@ -84,7 +91,7 @@ impl Reconciler {
     }
 
     /// Record a lookup, made after the nonce was spent, that found no receipt
-    /// for this hash. The normal cadence holds for
+    /// for this hash. Lookups stay [`RECEIPT_LOOKUP_SPACING`] apart for
     /// [`RECEIPT_LOOKUP_GRACE`]; after that the wait doubles, up to
     /// [`RECEIPT_LOOKUP_MAX_DELAY`].
     fn record_lookup_miss(&self, key: String, now: Instant) {
@@ -98,15 +105,31 @@ impl Reconciler {
             next_at: now,
         });
         if now.duration_since(backoff.first_miss) < RECEIPT_LOOKUP_GRACE {
-            backoff.next_at = now;
+            backoff.next_at = now + RECEIPT_LOOKUP_SPACING;
             return;
         }
         backoff.misses_after_grace = backoff.misses_after_grace.saturating_add(1);
-        let delay = self
-            .interval
+        let delay = RECEIPT_LOOKUP_SPACING
             .saturating_mul(1_u32 << backoff.misses_after_grace.min(16))
             .min(RECEIPT_LOOKUP_MAX_DELAY);
         backoff.next_at = now + delay;
+    }
+
+    /// Record a lookup, made without a confirmed nonce, that found no receipt:
+    /// the transaction may simply be pending, so keep looking at the normal
+    /// spacing without backing off further.
+    fn space_next_lookup(&self, key: String, now: Instant) {
+        self.backoff
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                key,
+                LookupBackoff {
+                    first_miss: now,
+                    misses_after_grace: 0,
+                    next_at: now + RECEIPT_LOOKUP_SPACING,
+                },
+            );
     }
 
     pub fn with_interval(mut self, interval: Duration) -> Self {
@@ -209,15 +232,12 @@ impl Reconciler {
                 // After the nonce was spent, no receipt for this hash means a
                 // replacement was mined or the endpoint lags: back off. With
                 // no nonce to go by, the transaction may simply be pending, so
-                // keep the normal cadence.
+                // keep looking at the normal spacing.
                 Ok(None) => {
                     if nonce_spent {
                         self.record_lookup_miss(backoff_key, now);
                     } else {
-                        self.backoff
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .remove(&backoff_key);
+                        self.space_next_lookup(backoff_key, now);
                     }
                     continue;
                 }
@@ -793,6 +813,32 @@ mod tests {
         *rpc.receipt_fails.lock().unwrap() = false;
         at(332);
         assert_eq!(reconciler.tick().await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_fast_tick_still_journals_lookups_at_most_every_fifteen_seconds() {
+        for (nonce, receipt_fails, label) in [
+            (Some(1), false, "spent nonce, no receipt for this hash"),
+            (None, false, "no nonce, receipt not found"),
+            (None, true, "provider answers nothing"),
+        ] {
+            let (_directory, outbox) = sent_outbox();
+            let audit_directory = tempfile::tempdir().unwrap();
+            let audit =
+                Arc::new(AuditLog::open(audit_directory.path().join("audit.jsonl")).unwrap());
+            let rpc = MockRpc::new(nonce, serde_json::Value::Null);
+            *rpc.receipt_fails.lock().unwrap() = receipt_fails;
+            let chains = ChainRegistry::default();
+            chains.add(mock_chain(rpc.clone()).await);
+            let (reconciler, at) = clocked(outbox, chains, audit.clone());
+            // Two-second ticks for one minute, all inside the grace window.
+            for secs in (0..=60).step_by(2) {
+                at(secs);
+                reconciler.tick().await;
+            }
+            assert_eq!(rpc.lookups(), 4, "{label}: lookups at 0, 16, 32 and 48 s");
+            assert_eq!(audit.count().unwrap(), 8, "{label}");
+        }
     }
 
     #[tokio::test]
