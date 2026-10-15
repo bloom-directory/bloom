@@ -755,9 +755,10 @@ impl SolanaOutbox {
                     }
                     let staged: StagedSolanaTransfer =
                         serde_json::from_slice(&fs::read(&intent_path)?)?;
-                    // A signed pending entry may represent a broadcast whose
-                    // RPC response was lost. Keep it retryable and visible;
-                    // expiry alone must not turn it into a false failure.
+                    // Broadcast moves an entry to `sent` before it submits, so
+                    // a pending entry was never sent, signed or not. The one
+                    // exception is a crash between the broadcast marker and
+                    // that move; like cancel, leave a marked entry alone.
                     let entry = SolanaOutboxEntry {
                         state: SolanaOutboxState::Pending,
                         staged,
@@ -766,14 +767,25 @@ impl SolanaOutbox {
                     let cluster_past_window = live_block_heights
                         .get(&entry.staged.chain)
                         .is_some_and(|height| *height > entry.staged.last_valid_block_height);
-                    if self.recorded_signature(&entry)?.is_none()
+                    if !entry.dir.join(BROADCAST_ATTEMPT_FILE).exists()
                         && entry.staged.expires_ms != 0
                         && now_ms >= entry.staged.expires_ms
                         && cluster_past_window
                     {
                         let mut expired = entry.clone();
                         expired.staged.status = SolanaTxStatus::Expired;
-                        let dir = self.transition(&expired, SolanaOutboxState::Failed)?;
+                        // A concurrent broadcast may have claimed the entry
+                        // for `sent` since it was read. The renames are
+                        // atomic, so exactly one of the two wins.
+                        let dir = match self.transition(&expired, SolanaOutboxState::Failed) {
+                            Ok(dir) => dir,
+                            Err(OutboxError::Io(error))
+                                if error.kind() == std::io::ErrorKind::NotFound =>
+                            {
+                                continue;
+                            }
+                            Err(error) => return Err(error),
+                        };
                         expired.state = SolanaOutboxState::Failed;
                         expired.dir = dir;
                         self.rewrite_intent(&expired)?;
@@ -799,10 +811,11 @@ fn write_private_atomic(path: &Path, body: &[u8]) -> Result<(), OutboxError> {
 }
 
 fn write_atomic_with_mode(path: &Path, body: &[u8], mode: u32) -> Result<(), OutboxError> {
+    // Never create the parent: an entry directory that vanished was moved to
+    // another state, and recreating it would split one transfer in two.
     let parent = path
         .parent()
         .ok_or_else(|| OutboxError::Other("outbox artifact has no parent".into()))?;
-    fs::create_dir_all(parent)?;
     let mut random = [0_u8; 8];
     rand::rngs::OsRng.fill_bytes(&mut random);
     let name = path
