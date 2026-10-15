@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 pub fn router(service: Arc<CheckoutService>) -> Router {
     Router::new().route("/private",get(claim)).route("/view",get(page))
+        .route("/unlocked",get(||async {Html("<!doctype html><meta charset=utf-8><title>Bloom</title><p>Traveler details unlocked for this booking. You can close this page.</p>")}))
         .route("/view.js",get(||async {([(header::CONTENT_TYPE,"application/javascript")],include_str!("view.js"))}))
         .route("/state",get(state)).route("/frame",get(frame)).route("/action",post(action))
         .layer(axum::middleware::from_fn(|request:axum::extract::Request,next:axum::middleware::Next|async move {

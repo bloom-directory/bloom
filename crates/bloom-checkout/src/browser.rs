@@ -36,6 +36,8 @@ pub struct Browser {
     revoked: AtomicBool,
     fixture_payment_hosts: bool,
     private_origins: std::sync::RwLock<std::collections::BTreeSet<String>>,
+    /// Unlocked traveler values and their placeholders, removed from snapshots.
+    redactions: std::sync::RwLock<Vec<(String, String)>>,
 }
 
 /// Private checkout access exists only after the public API has drained.
@@ -94,6 +96,7 @@ impl Browser {
             fixture_payment_hosts,
             revoked: AtomicBool::new(false),
             private_origins: std::sync::RwLock::new(std::collections::BTreeSet::new()),
+            redactions: std::sync::RwLock::new(Vec::new()),
         }))
     }
 
@@ -176,10 +179,8 @@ impl Browser {
                         elements.push(element);
                     }
                 }
-                Ok({
-                    self.guard_tab(&tab).await?;
-                    json!({"url":url,"text":text.chars().take(30000).collect::<String>(),"elements":elements})
-                })
+                self.guard_tab(&tab).await?;
+                self.redacted(json!({"url":url,"text":text.chars().take(30000).collect::<String>(),"elements":elements}))
             }
             BrowseRequest::Back => {
                 let history = self
@@ -209,7 +210,84 @@ impl Browser {
             BrowseRequest::Select { element_ref, value } => {
                 self.act(&mut tab, &element_ref, "select", &value).await
             }
+            BrowseRequest::FillTraveler => bail!("Unlock a saved traveler first"),
         }
+    }
+
+    /// Replace each saved value, in any ASCII letter case, with its placeholder.
+    fn redacted(&self, value: Value) -> Result<Value> {
+        let redactions = self.redactions.read().unwrap();
+        let mut text = serde_json::to_string(&value)?;
+        for (secret, label) in redactions.iter() {
+            let escaped = serde_json::to_string(secret)?;
+            let needle = escaped[1..escaped.len() - 1].to_ascii_lowercase();
+            for variant in [needle.clone(), secret.to_uppercase()] {
+                let mut out = String::with_capacity(text.len());
+                let lower = text.to_ascii_lowercase();
+                let mut last = 0;
+                for (start, _) in lower.match_indices(&variant.to_ascii_lowercase()) {
+                    if start >= last {
+                        out.push_str(&text[last..start]);
+                        out.push_str(label);
+                        last = start + variant.len();
+                    }
+                }
+                out.push_str(&text[last..]);
+                text = out;
+            }
+        }
+        Ok(serde_json::from_str(&text)?)
+    }
+
+    pub(crate) fn redact(&self, values: impl IntoIterator<Item = (String, String)>) {
+        let mut redactions = self.redactions.write().unwrap();
+        redactions.extend(
+            values
+                .into_iter()
+                .filter(|(secret, _)| secret.chars().count() >= 3),
+        );
+        // Longer values first, so a full name is replaced before its parts.
+        redactions.sort_by_key(|(secret, _)| std::cmp::Reverse(secret.len()));
+    }
+
+    pub(crate) async fn shopping_origin(&self) -> Result<String> {
+        let tab = self.tab.lock().await;
+        let info = self
+            .cdp
+            .call(None, "Target.getTargetInfo", json!({"targetId":tab.target}))
+            .await?;
+        let url = url::Url::parse(info["targetInfo"]["url"].as_str().unwrap_or(""))?;
+        Ok(url.origin().ascii_serialization())
+    }
+
+    /// Fill unlocked traveler values into the shopping page. Only field names
+    /// come back; the values are never part of a response.
+    pub(crate) async fn fill_traveler(
+        &self,
+        origin: &str,
+        fields: &[bloom_signer_api::TravelerField],
+        values: &std::collections::BTreeMap<String, zeroize::Zeroizing<String>>,
+    ) -> Result<Vec<String>> {
+        self.available()?;
+        let mut tab = self.tab.lock().await;
+        let view = PrivateTab {
+            cdp: self.cdp.clone(),
+            session: tab.session.clone(),
+            target: tab.target.clone(),
+            fixture_payment_hosts: self.fixture_payment_hosts,
+        };
+        tab.refs.clear();
+        tab.generation += 1;
+        let discovery = crate::travelers::TravelerDiscovery::read(&view, fields).await?;
+        if discovery.scope.origin != origin {
+            bail!("Saved traveler details are unlocked for another website");
+        }
+        let wanted: std::collections::BTreeMap<_, _> = discovery
+            .field_names()
+            .into_iter()
+            .filter_map(|f| values.get(&f).map(|v| (f, v.clone())))
+            .collect();
+        discovery.fill(&view, &wanted).await
     }
 
     async fn act(&self, tab: &mut Tab, reference: &str, kind: &str, value: &str) -> Result<Value> {

@@ -95,13 +95,8 @@ impl TravelerDiscovery {
             mapped: json!(mapped),
         })
     }
-    pub async fn fill(
-        &self,
-        tab: &PrivateTab,
-        values: &BTreeMap<String, Zeroizing<String>>,
-    ) -> Result<Vec<String>> {
-        let expected: Vec<String> = self
-            .scope
+    pub fn field_names(&self) -> Vec<String> {
+        self.scope
             .fields
             .iter()
             .map(|f| {
@@ -111,7 +106,14 @@ impl TravelerDiscovery {
                     .unwrap()
                     .to_owned()
             })
-            .collect();
+            .collect()
+    }
+    pub async fn fill(
+        &self,
+        tab: &PrivateTab,
+        values: &BTreeMap<String, Zeroizing<String>>,
+    ) -> Result<Vec<String>> {
+        let expected = self.field_names();
         if values.len() != expected.len() || expected.iter().any(|f| !values.contains_key(f)) {
             bail!("Traveler release field mismatch");
         }
@@ -286,6 +288,70 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(filled, json!(["SyntheticName", "Femenino", ""]));
+        server.abort();
+    }
+    #[tokio::test]
+    async fn unlocked_traveler_fills_shopping_pages_and_stays_out_of_snapshots() {
+        // The merchant echoes the name into the page, title and URL as typed.
+        let (browser, server, url) = browser_at(
+            "<div><div>Nombres</div><input name='firstName-0'></div>
+             <div><div>Apellidos</div><input name='lastName-0'></div>
+             <input type='email'><h1 id='echo'></h1><button>Continuar</button>
+             <script>document.addEventListener('input',()=>{const n=document.querySelector('[name=firstName-0]').value.toUpperCase();
+               echo.textContent='Hola '+n;document.title=n;history.replaceState({},'','/?n='+n);});</script>",
+        )
+        .await;
+        let origin = url::Url::parse(&url)
+            .unwrap()
+            .origin()
+            .ascii_serialization();
+        assert_eq!(browser.shopping_origin().await.unwrap(), origin);
+        let values: BTreeMap<String, Zeroizing<String>> = [
+            ("given_name", "Syntheticname"),
+            ("family_name", "Fixturefamily"),
+            ("email", "fixture@example.com"),
+            ("phone", "5491100000000"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.into(), Zeroizing::new(v.into())))
+        .collect();
+        browser.redact(
+            values
+                .iter()
+                .map(|(k, v)| (v.to_string(), format!("[saved {k}]"))),
+        );
+        let fields = [
+            TravelerField::GivenName,
+            TravelerField::FamilyName,
+            TravelerField::Email,
+            TravelerField::Phone,
+        ];
+        assert!(
+            browser
+                .fill_traveler("https://elsewhere.example", &fields, &values)
+                .await
+                .is_err()
+        );
+        let filled = browser
+            .fill_traveler(&origin, &fields, &values)
+            .await
+            .unwrap();
+        assert_eq!(filled, ["given_name", "family_name", "email"]);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let snapshot = browser
+            .browse(BrowseRequest::Snapshot)
+            .await
+            .unwrap()
+            .to_string();
+        assert!(snapshot.contains("Hola [saved given_name]"), "{snapshot}");
+        for secret in ["syntheticname", "fixturefamily", "fixture@example.com"] {
+            assert!(
+                !snapshot.to_ascii_lowercase().contains(secret),
+                "{snapshot}"
+            );
+        }
+        // Shopping continues on the same page with fresh refs.
+        assert!(snapshot.contains("Continuar"));
         server.abort();
     }
     #[tokio::test]

@@ -4,15 +4,17 @@ use crate::{
     hpke::Recipient,
 };
 use anyhow::{Context, Result, bail};
+use bloom_checkout_api::BrowseRequest;
 use bloom_signer_api::{
-    CardOperationState, CardOperationStatus, CustodyOutputHpkeAad, CustodyResult, OperationId,
-    Token,
+    CardOperationState, CardOperationStatus, CustodyOutputHpkeAad, CustodyResult, Digest32,
+    OperationId, Token, TravelerFillScope,
 };
 use parking_lot::Mutex;
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
+    collections::BTreeMap,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     sync::Arc,
@@ -166,6 +168,20 @@ struct PrivateCheckout {
     contains_traveler: bool,
 }
 
+struct PendingUnlock {
+    operation_id: String,
+    recipient: Recipient,
+    origin: String,
+    fields: Vec<bloom_signer_api::TravelerField>,
+}
+
+struct UnlockedTraveler {
+    origin: String,
+    fields: Vec<bloom_signer_api::TravelerField>,
+    values: BTreeMap<String, zeroize::Zeroizing<String>>,
+    expires: tokio::time::Instant,
+}
+
 struct CompletedView {
     capability: String,
     claimed: bool,
@@ -176,6 +192,8 @@ pub struct CheckoutService {
     pub browser: Arc<Browser>,
     store: Store,
     private: AsyncMutex<Option<PrivateCheckout>>,
+    unlocking: AsyncMutex<Option<PendingUnlock>>,
+    traveler: AsyncMutex<Option<UnlockedTraveler>>,
     completed: Mutex<Option<CompletedView>>,
     broker_socket: PathBuf,
     broker_uid: u32,
@@ -203,6 +221,9 @@ enum IntakeResponse {
 }
 
 impl CheckoutService {
+    /// One approval unlocks a saved traveler for the shopping website. The
+    /// values stay in this process, are filled on request and are replaced by
+    /// placeholders in everything the agent reads.
     async fn start_traveler(
         self: &Arc<Self>,
         operation_id: String,
@@ -210,8 +231,8 @@ impl CheckoutService {
     ) -> Result<Value> {
         OperationId::new(&operation_id).map_err(|_| anyhow::anyhow!("Invalid operation ID"))?;
         Token::new(&traveler_id).map_err(|_| anyhow::anyhow!("Invalid traveler ID"))?;
-        let mut private = self.private.lock().await;
-        if private.is_some() {
+        let mut unlocking = self.unlocking.lock().await;
+        if self.private.lock().await.is_some() || unlocking.is_some() {
             bail!("A checkout already has private control");
         }
         let metadata = match self
@@ -225,6 +246,19 @@ impl CheckoutService {
             }
             _ => bail!("Traveler metadata unavailable"),
         };
+        let origin = self.browser.shopping_origin().await?;
+        use rand::RngCore;
+        let mut nonce = [0; 32];
+        rand::thread_rng().fill_bytes(&mut nonce);
+        let scope = TravelerFillScope {
+            origin: origin.clone(),
+            frame_origins: vec![origin.clone()],
+            document_binding: Digest32::from_bytes(nonce),
+            fields: metadata.fields.clone(),
+        };
+        scope
+            .validate()
+            .map_err(|_| anyhow::anyhow!("Open the booking website before unlocking a traveler"))?;
         let mut status = Status {
             operation_id: operation_id.clone(),
             state: "requested".into(),
@@ -235,68 +269,141 @@ impl CheckoutService {
         self.store.insert(
             &status,
             "traveler",
-            &format!("Autofill {} privately", metadata.label),
+            &format!("Unlock {} for {}", metadata.label, origin),
         )?;
-        let tab = self.browser.handoff().await?;
-        let discovery = match crate::travelers::TravelerDiscovery::read(&tab, &metadata.fields)
-            .await
-        {
-            Ok(discovery) => discovery,
-            Err(_) => {
-                self.set_state(&operation_id, "failed_before_release");
-                let resume = tab_url(&tab).await;
-                self.browser.return_control_at(&tab.target, resume).await?;
-                bail!(
-                    "No unambiguous saved traveler fields on this page; continue to passenger entry first"
-                );
-            }
-        };
         self.store
-            .record_order(&operation_id, Some(&discovery.scope.origin), None)?;
+            .record_order(&operation_id, Some(&origin), None)?;
         let recipient = Recipient::generate();
-        use rand::RngCore;
-        let mut token = [0; 32];
-        rand::thread_rng().fill_bytes(&mut token);
-        let capability = hex_token(&token);
-        let challenge_url = format!(
-            "http://localhost:{}/private?token={}",
-            self.view_port, capability
-        );
-        let response=self.intake(json!({"method":"traveler","operation_id":operation_id,"traveler_id":traveler_id,
-            "scope":discovery.scope,"recipient_key":recipient.public,"challenge_url":challenge_url})).await;
-        let ceremony_url = match response {
-            Ok(IntakeResponse::Prepared { ceremony_url }) => ceremony_url,
-            _ => {
-                self.set_state(&operation_id, "failed_before_release");
-                let resume = tab_url(&tab).await;
-                self.browser.return_control_at(&tab.target, resume).await?;
-                bail!("Private autofill approval unavailable");
-            }
+        let challenge_url = format!("http://localhost:{}/unlocked", self.view_port);
+        let response = self
+            .intake(
+                json!({"method":"traveler","operation_id":operation_id,"traveler_id":traveler_id,
+            "scope":scope,"recipient_key":recipient.public,"challenge_url":challenge_url}),
+            )
+            .await;
+        let Ok(IntakeResponse::Prepared { ceremony_url }) = response else {
+            self.set_state(&operation_id, "failed_before_release");
+            bail!("Traveler approval unavailable");
         };
         status.state = "awaiting_approval".into();
         status.ceremony_url = Some(ceremony_url);
         self.store.update(&status)?;
-        *private = Some(PrivateCheckout {
+        *unlocking = Some(PendingUnlock {
             operation_id: operation_id.clone(),
-            mode: Mode::Traveler,
-            view_target: tab.target.clone(),
-            view_session: tab.session.clone(),
-            seen_pages: std::collections::HashSet::from([tab.target.clone()]),
-            tab,
-            discovery: None,
-            traveler: Some(discovery),
-            contains_traveler: true,
-            recipient: Some(recipient),
-            capability,
-            claimed: false,
-            approved: false,
+            recipient,
+            origin,
+            fields: metadata.fields,
         });
         let service = self.clone();
-        tokio::spawn(async move {
-            service.finish_approved(operation_id).await;
-        });
+        tokio::spawn(async move { service.finish_unlock(operation_id).await });
         Ok(serde_json::to_value(status)?)
     }
+
+    async fn finish_unlock(self: Arc<Self>, operation_id: String) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(125);
+        loop {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            if tokio::time::Instant::now() >= deadline {
+                self.set_state(&operation_id, "expired");
+                *self.unlocking.lock().await = None;
+                return;
+            }
+            let state = match self
+                .intake(json!({"method":"result","operation_id":operation_id}))
+                .await
+            {
+                Ok(IntakeResponse::Result {
+                    status,
+                    receipt,
+                    output_aad,
+                }) => match status.state {
+                    CardOperationState::Succeeded => {
+                        let pending = self.unlocking.lock().await.take();
+                        match self.open_unlock(pending, receipt, output_aad).await {
+                            Ok(()) => return,
+                            // Released but unusable: nothing reached a page.
+                            Err(_) => "failed",
+                        }
+                    }
+                    CardOperationState::Cancelled
+                    | CardOperationState::Expired
+                    | CardOperationState::Failed
+                    | CardOperationState::Missing => "failed_before_release",
+                    _ => continue,
+                },
+                _ => continue,
+            };
+            self.set_state(&operation_id, state);
+            *self.unlocking.lock().await = None;
+            return;
+        }
+    }
+
+    async fn open_unlock(
+        &self,
+        pending: Option<PendingUnlock>,
+        receipt: Option<Box<CustodyResult>>,
+        aad: Option<CustodyOutputHpkeAad>,
+    ) -> Result<()> {
+        let pending = pending.context("Traveler unlock unavailable")?;
+        let mut status = self.store.consume(&pending.operation_id)?;
+        let receipt = receipt.context("Traveler release unavailable")?;
+        let aad = aad.context("Traveler release binding unavailable")?;
+        if receipt.custody_operation_id.as_str() != pending.operation_id
+            || aad.custody_operation_id.as_str() != pending.operation_id
+            || receipt.surface.as_ref() != Some(&aad.surface)
+        {
+            bail!("Traveler release binding mismatch");
+        }
+        let plaintext = zeroize::Zeroizing::new(
+            pending.recipient.open(
+                receipt
+                    .encrypted_browser_result
+                    .as_ref()
+                    .context("Traveler release unavailable")?,
+                &aad.canonical_bytes()
+                    .map_err(|_| anyhow::anyhow!("Traveler release binding invalid"))?,
+            )?,
+        );
+        let values: BTreeMap<String, zeroize::Zeroizing<String>> =
+            serde_json::from_slice(&plaintext)
+                .map_err(|_| anyhow::anyhow!("Invalid private traveler release"))?;
+        // Choices such as gender are not identifying; names, numbers and
+        // contact details are.
+        self.browser.redact(
+            values
+                .iter()
+                .filter(|(field, _)| !matches!(field.as_str(), "gender" | "document_kind"))
+                .map(|(field, value)| (value.to_string(), format!("[saved {field}]"))),
+        );
+        status.filled_fields = values.keys().cloned().collect();
+        *self.traveler.lock().await = Some(UnlockedTraveler {
+            origin: pending.origin,
+            fields: pending.fields,
+            values,
+            expires: tokio::time::Instant::now() + Duration::from_secs(1800),
+        });
+        status.state = "unlocked".into();
+        self.store.update(&status)?;
+        Ok(())
+    }
+
+    async fn fill_traveler(&self) -> Result<Value> {
+        if self.private.lock().await.is_some() {
+            bail!("A checkout already has private control");
+        }
+        let traveler = self.traveler.lock().await;
+        let traveler = traveler
+            .as_ref()
+            .filter(|t| tokio::time::Instant::now() < t.expires)
+            .context("Unlock a saved traveler first")?;
+        let filled = self
+            .browser
+            .fill_traveler(&traveler.origin, &traveler.fields, &traveler.values)
+            .await?;
+        Ok(json!({"state":"filled","filled_fields":filled}))
+    }
+
     pub fn new(
         browser: Arc<Browser>,
         state: &Path,
@@ -312,6 +419,8 @@ impl CheckoutService {
             browser,
             store,
             private: AsyncMutex::new(None),
+            unlocking: AsyncMutex::new(None),
+            traveler: AsyncMutex::new(None),
             completed: Mutex::new(None),
             broker_socket,
             broker_uid,
@@ -372,6 +481,9 @@ impl CheckoutService {
                 }
                 Ok(serde_json::to_value(discovery.facts)?)
             }
+            Request::Browse {
+                request: BrowseRequest::FillTraveler,
+            } => self.fill_traveler().await,
             Request::Browse { request } => self.browser.browse(request).await,
             Request::Status { operation_id } => {
                 Ok(serde_json::to_value(self.store.get(&operation_id)?)?)

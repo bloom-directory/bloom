@@ -4,12 +4,24 @@ use serde::{Deserialize, Serialize};
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum BrowseRequest {
-    Open { url: String },
+    Open {
+        url: String,
+    },
     Snapshot,
-    Click { element_ref: String },
-    Type { element_ref: String, text: String },
-    Select { element_ref: String, value: String },
+    Click {
+        element_ref: String,
+    },
+    Type {
+        element_ref: String,
+        text: String,
+    },
+    Select {
+        element_ref: String,
+        value: String,
+    },
     Back,
+    /// Fill the unlocked traveler's fields on this page without returning them.
+    FillTraveler,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -32,7 +44,8 @@ pub enum Request {
         #[serde(default)]
         continue_private: Option<String>,
     },
-    /// Autofill saved fields privately; never purchase or expose their values.
+    /// Unlock a saved traveler for the current website with one approval.
+    /// Values stay in checkout; `FillTraveler` puts them on each page.
     Traveler {
         operation_id: String,
         traveler_id: String,

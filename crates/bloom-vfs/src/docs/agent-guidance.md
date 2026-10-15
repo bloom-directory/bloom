@@ -42,21 +42,21 @@ tool for this checkout.
   `travelers/operations/<operation_id>/ceremony.json`. The human enters details
   privately and approves saving them. Reuse an ID to replace that person's
   record; `travelers/delete.json` accepts `operation_id` and `traveler_id`.
-- At the passenger form, write `checkout/requests/<new-64-hex-id>/in.json`
-  with `traveler_id` and `agent_description`. Forward the status ceremony URL.
-  Approval binds the person, website and fields; it authorizes no payment.
-  Shopping remains private after autofill. The human completes remaining
-  steps and selects Ready for payment. Do not read that page with other tools.
-- Once `status.json` says `ready_for_payment`, read that request's `facts.json`
-  for financial facts only. Start a separate card request with `card_id`,
-  `continue_private` set to the traveler request ID, and `agent_description`.
-  The human approves the final total and CVC separately. Never repeat an
-  uncertain operation automatically or claim unsupported forms can autofill.
+- On the booking website, before the passenger form, write
+  `checkout/requests/<new-64-hex-id>/in.json` with `traveler_id` and
+  `agent_description`. Forward the status ceremony URL. One approval unlocks
+  that person for this website for 30 minutes; `status.json` then says
+  `unlocked`. It authorizes no payment.
+- On each page asking for that person's details, send the browse action
+  `fill_traveler`. It fills the fields it recognizes and returns only their
+  names. Fill anything left, such as a custom dropdown, with ordinary browse
+  actions. Snapshots show unlocked values as `[saved <field>]`; never try to
+  recover them.
 - Write a browse request to `checkout/browse/<64-hex-slot>/in.json`; read
   `out.json`. Reuse a slot. Results expire after five minutes. Requests use
   `action`: `open` plus `url`, `snapshot`, `click` plus `element_ref`, `type`
-  plus `element_ref` and `text`, `select` plus `element_ref` and `value`, or
-  `back`.
+  plus `element_ref` and `text`, `select` plus `element_ref` and `value`,
+  `back`, or `fill_traveler`.
 - A snapshot element may carry `context`, the short text around it. Use it
   to tell repeated controls apart, such as identical fare buttons on
   different flight cards or the same day number in two calendar months.
