@@ -272,6 +272,18 @@ fn tag_release_builds_the_locked_triad_and_isolates_production_signing() {
     assert!(workflow.contains("gh release view \"$TAG\" --json assets"));
     assert!(workflow.contains("grep -Fqx -- \"$name\" \"$existing/names\""));
     assert!(workflow.contains("gh release upload \"$TAG\" \"$asset\""));
+    // Release notes are generated once in `prepare` and published by both
+    // the create and retry paths, which keep maintainer-written text.
+    assert!(workflow.contains("packaging/triad/release/release-notes.sh changes"));
+    assert!(workflow.contains("select(.draft | not) | select(.prerelease | not)"));
+    assert!(workflow.contains("name: release-notes"));
+    assert_eq!(
+        workflow
+            .matches("packaging/triad/release/release-notes.sh splice")
+            .count(),
+        2
+    );
+    assert!(workflow.contains("--existing \"$existing_body\""));
     assert_eq!(
         workflow
             .matches("secrets.TRIAD_RELEASE_SIGNING_KEY")
