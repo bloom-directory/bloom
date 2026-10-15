@@ -5135,6 +5135,18 @@ if require_triad_health 502 bob digest; then echo healthy; else echo "timed_out=
 /// Runs one installer's health wait in bash with stubbed system tools; the
 /// health probe succeeds once it has been called `answer_after` times.
 fn run_health_wait(installer: &str, call: &str, answer_after: i64, timeout: &str) -> String {
+    run_health_wait_with_units(installer, call, answer_after, timeout, "1")
+}
+
+/// As [`run_health_wait`], with Linux units active only when `units_active`
+/// is "1".
+fn run_health_wait_with_units(
+    installer: &str,
+    call: &str,
+    answer_after: i64,
+    timeout: &str,
+    units_active: &str,
+) -> String {
     let home = tempfile::tempdir().unwrap();
     let harness = format!(
         r#"set -Eeuo pipefail
@@ -5145,7 +5157,7 @@ probe() {{ probes=$((probes + 1)); [ "$probes" -ge {answer_after} ]; }}
 dscl() {{ echo "NFSHomeDirectory: {home}"; }}
 getent() {{ echo "alice:x:501:501::{home}:/bin/sh"; }}
 launchctl() {{ probe; }}
-linux_release_units_active() {{ return 0; }}
+linux_release_units_active() {{ [ "${{UNITS_ACTIVE:-1}}" = 1 ]; }}
 runuser() {{ probe; }}
 eval "$(sed -n '/^# Machine verifies its whole audit journal/,/^}}$/p' '{installer}')"
 if BLOOM_HEALTH_TIMEOUT_SECONDS={timeout} {call}; then
@@ -5160,6 +5172,7 @@ fi
     let output = Command::new("bash")
         .arg("-c")
         .arg(harness)
+        .env("UNITS_ACTIVE", units_active)
         .output()
         .unwrap();
     assert!(output.status.success(), "{output:?}");
@@ -5185,6 +5198,17 @@ fn installers_wait_for_a_slow_machine_and_report_a_plain_timeout() {
         let never = run_health_wait(installer, call, i64::MAX, "1");
         assert!(never.starts_with("unhealthy"), "{installer}: {never}");
     }
+    // Linux needs its units active as well as a healthy probe. With units
+    // that never start, the final diagnostic probe passing must not turn the
+    // timeout into success.
+    let units_down = run_health_wait_with_units(
+        "install-linux.sh",
+        "require_linux_triad_health / 501 alice digest",
+        1,
+        "1",
+        "0",
+    );
+    assert!(units_down.starts_with("unhealthy"), "{units_down}");
     let macos = run_health_wait(
         "install-macos.sh",
         "require_triad_health 501 alice digest",

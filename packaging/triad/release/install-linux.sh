@@ -902,11 +902,15 @@ require_linux_triad_health() {
     DBUS_SESSION_BUS_ADDRESS="unix:path=$user_runtime/bus" \
     systemctl --user is-active \
       bloom-session.service bloom-machine.service >&2 || true
+  # Diagnostic only: its error says why health failed. A probe that happens
+  # to pass now must not turn a timed-out activation into success, and it
+  # would skip the unit check the loop requires.
   runuser -u "$user" -- env \
     XDG_RUNTIME_DIR="$user_runtime" \
     DBUS_SESSION_BUS_ADDRESS="unix:path=$user_runtime/bus" \
     "$install_root/usr/bin/bloom" --home "$home/.bloom" \
-      serve triad-health-check "$digest"
+      serve triad-health-check "$digest" || true
+  return 1
 }
 
 # Starts every enrolled login and fails if any of them does not pass the
