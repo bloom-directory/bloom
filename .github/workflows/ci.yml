@@ -54,6 +54,8 @@ jobs:
       # (stub launchers; binds no ports and needs no Triad).
       - name: Run concurrency script failure-mode cases
         run: scripts/test-ceremony-port-concurrency-cases.sh
+      - name: Run release-notes generator cases
+        run: scripts/test-release-notes.sh
 
   clippy:
     name: clippy
