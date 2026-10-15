@@ -576,6 +576,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn backoff_is_forgotten_once_the_entry_leaves_the_sent_outbox() {
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        let audit_directory = tempfile::tempdir().unwrap();
+        let audit = Arc::new(AuditLog::open(audit_directory.path().join("audit.jsonl")).unwrap());
+        let reconciler = Reconciler::new(outbox, ChainRegistry::default(), audit);
+        let now = Instant::now();
+        reconciler.record_lookup_miss("alice/anvil/gone".into(), now);
+        assert_eq!(reconciler.backoff.lock().unwrap().len(), 1);
+        reconciler.tick().await;
+        assert!(reconciler.backoff.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn trace_revert_intent_prewrite_failure_prevents_network_call() {
         let (_directory, outbox) = sent_outbox();
         let entry = outbox.walk_all_sent().unwrap().remove(0);
