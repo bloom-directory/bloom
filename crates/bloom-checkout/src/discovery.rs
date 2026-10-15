@@ -62,6 +62,8 @@ const PROVIDER_FIELD_ORIGINS: &[&str] = &[
     "https://js.chargebee.com",
     // Booking.com's own payment component (seen on its final page 2026-10-11).
     "https://paymentcomponent.booking.com",
+    // Yuno secure fields (JetSMART's payment page, SDK checked 2026-10-14).
+    "https://sdk-web-card.prod.y.uno",
 ];
 
 fn provider_hosts_card_fields(frame_origin: &str, top_origin: &str, fixture: bool) -> bool {

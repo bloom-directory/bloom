@@ -365,6 +365,25 @@ mod tests {
         server.abort();
     }
     #[tokio::test]
+    async fn long_pages_leave_room_for_embedded_frames() {
+        // Shaped like JetSMART's payment page: earlier steps stay in the DOM.
+        let (browser, server, _) = browser_at(
+            "<body><script>if (location.search) document.body.innerHTML = \"<input aria-label='Frame field'>\";
+             else { for (let i = 0; i < 350; i++) document.body.insertAdjacentHTML('beforeend', '<button>Step ' + i + '</button>');
+               document.body.insertAdjacentHTML('beforeend', \"<iframe src='/?frame'></iframe>\"); }</script></body>",
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+        let elements = snapshot["elements"].as_array().unwrap();
+        assert!(elements.iter().any(|e| e["label"] == "Frame field"));
+        assert_eq!(
+            elements.iter().filter(|e| e["role"] == "button").count(),
+            300
+        );
+        server.abort();
+    }
+    #[tokio::test]
     async fn duplicate_people_and_stale_document_bindings_fail_before_reuse() {
         let (browser,server,_)=browser_at("<input autocomplete='given-name'><input autocomplete='family-name'><input autocomplete='given-name'><input autocomplete='family-name'>").await;
         let tab = browser.handoff().await.unwrap();

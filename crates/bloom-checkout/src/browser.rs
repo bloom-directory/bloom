@@ -165,7 +165,9 @@ impl Browser {
                         .iter()
                         .enumerate()
                     {
-                        if elements.len() >= 300 {
+                        // A long page must not crowd out its payment and
+                        // other embedded frames, which get their own share.
+                        if index >= if position == 0 { 300 } else { 20 } || elements.len() >= 400 {
                             break;
                         }
                         let mut element = element.clone();
