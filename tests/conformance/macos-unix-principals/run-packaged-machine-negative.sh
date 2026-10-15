@@ -108,6 +108,13 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+# This disposable fixture tests localhost principal isolation. Installation may
+# have provisioned a hosted surface, so select localhost through Signer's
+# privileged interface before creating local test credentials or policies.
+fixture_signer="$(dirname "$machine_binary")/bloom-signer"
+[[ -x "$fixture_signer" && ! -L "$fixture_signer" ]] || exit 65
+"$fixture_signer" admin localhost-only --login-uid "$login_uid"
+
 /usr/bin/xcrun --sdk macosx clang \
   -std=c11 -Wall -Wextra -Werror \
   "$script_dir/hostile-unix-listener.c" \
@@ -309,7 +316,7 @@ if ! sudo -H -u "$login_user" env \
   BLOOM_MACHINE_IDENTITY="$machine_identity" \
   BLOOM_EDGE_MANIFEST="$edge_manifest" \
   "$machine_binary" --home "$clean_home" --connect "unix:$machine_socket" \
-    wallet new ma05-cached \
+    wallet new ma05-cached --local \
   >"$work/registration.log" 2>&1
 then
   cat "$work/registration.log" >&2

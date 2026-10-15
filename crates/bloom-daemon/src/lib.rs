@@ -559,6 +559,8 @@ impl DaemonPetalHost {
             == Some("wallets")
             && ((segments.len() == 2 && segments[1] == "new")
                 || (segments.len() >= 2 && segments[1] == "registrations")
+                || (segments.len() == 2 && segments[1] == "recover")
+                || (segments.len() >= 2 && segments[1] == "recoveries")
                 || (segments.len() == 4
                     && segments[2] == "sealed-approvals"
                     && segments[3] == "new.json")
@@ -984,6 +986,7 @@ impl DaemonPetalHost {
             .map_err(|error| HostError::Invalid(error.to_string()))?;
         let prepared = broker
             .prepare_approval(bloom_broker_api::ApprovalPrepareRequest {
+                surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
                 evm_review_payloads: Vec::new(),
                 safe_review_payloads: Vec::new(),
                 operation_id,
@@ -1710,6 +1713,7 @@ impl PetalHost for DaemonPetalHost {
             .prepare_custody(
                 bloom_machine_client::CustodyPrepareMethod::KeyDerive,
                 bloom_broker_api::CustodyPrepareRequest {
+                    surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
                     ceremony_kind: bloom_broker_api::CeremonyKind::KeyDerive,
                     custody_operation_id: custody_operation_id.clone(),
                     wallet_id: Some(wallet_id),
@@ -4105,7 +4109,8 @@ impl Daemon {
             )
             .map_err(|error| {
                 DaemonError::Audit(format!("Machine wallet projection cache: {error}"))
-            })?,
+            })?
+            .with_max_age(config.wallet_projection_max_age),
         );
         // Build per-chain mempool indexes + handlers from [mempool.<chain>]
         // config. Each entry creates an LRU index, a VFS handler, and
@@ -4524,6 +4529,7 @@ impl Daemon {
                 env!("CARGO_PKG_VERSION"),
                 wallet_projections.clone(),
             )
+            .with_ceremony_broker(broker.clone())
             .with_solana_chains(solana_chain_registry.clone())
             .with_mempool_statuses(initial_mempool_statuses)
             .with_update_snapshot_fn(Arc::new(move || {
@@ -4570,6 +4576,7 @@ impl Daemon {
                 wallet_projections.clone(),
                 home.root().join("machine-policy-projections"),
             )
+            .with_passkey_names_path(home.root().join("passkey-names.json"))
             .with_broker(broker.clone())
             .with_home_write_permit_opt(home_write_permit.clone())
             .with_mempool_indexes(mempool_indexes.clone())
@@ -6130,6 +6137,15 @@ mod tests {
                         }
                         Ok(MachineBrokerResponse::CustodyResult(
                             bloom_broker_api::CustodyResult {
+                                surface: Some(bloom_broker_api::CeremonySurfaceRef {
+                                    surface_id: bloom_broker_api::Token::new("local").unwrap(),
+                                    identity_digest: bloom_broker_api::Digest32::from_bytes(
+                                        [0; 32],
+                                    ),
+                                }),
+                                credential_authority_generation: Some(
+                                    bloom_broker_api::DecimalU64::new(0),
+                                ),
                                 ceremony_kind: bloom_broker_api::CeremonyKind::KeyDerive,
                                 custody_operation_id: request.operation_id,
                                 public_status: bloom_broker_api::CeremonyState::Succeeded,
@@ -6987,6 +7003,11 @@ mod tests {
         let protected = vec![
             "wallets/new".to_string(),
             "wallets/registrations".to_string(),
+            "wallets/recover".to_string(),
+            "wallets/recoveries".to_string(),
+            "wallets/recoveries/alice/status.json".to_string(),
+            "wallets/recoveries/alice/result.json".to_string(),
+            "wallets/recoveries/alice/cancel".to_string(),
             format!("wallets/registrations/{}/status.json", "22".repeat(32)),
             format!("wallets/registrations/{}/result.json", "22".repeat(32)),
             format!("wallets/registrations/{}/cancel", "22".repeat(32)),
@@ -8991,6 +9012,8 @@ allowed = ["bloom:vfs.read"]
 
     #[tokio::test]
     async fn identical_petal_evm_stage_requests_reuse_only_the_selected_account_pending_entry() {
+        // A default chain: a local Anvil node is opt-in. Reusing the staged
+        // entry never reaches the chain's RPC endpoint.
         let (_dir, daemon, broker) = isolation_daemon().await;
         let host =
             test_petal_host(&daemon).with_broker(Some(MachineBrokerClient::new(broker.clone())));
@@ -9000,7 +9023,7 @@ allowed = ["bloom:vfs.read"]
             let context = account_route_context("w", Some(number), None);
             let staged: bloom_proto::StagedTx = serde_json::from_value(serde_json::json!({
                 "id": format!("account-{number}-pending"),
-                "wallet": "w", "chain": "anvil", "chain_id": 31337,
+                "wallet": "w", "chain": "ethereum", "chain_id": 1,
                 "from": broker.child(true, number).address, "to": to,
                 "value_wei": "0", "data_hex": "0x", "gas_limit": 21000,
                 "nonce": 0, "policy_checks": [], "created_ms": 1,
@@ -9019,7 +9042,7 @@ allowed = ["bloom:vfs.read"]
             let outcome = host
                 .evm_tx_stage(EvmTransactionRequest {
                     wallet: "w".into(),
-                    chain: "anvil".into(),
+                    chain: "ethereum".into(),
                     to: to.clone(),
                     value_wei: "0".into(),
                     data_hex: "0x".into(),
@@ -9036,7 +9059,7 @@ allowed = ["bloom:vfs.read"]
             daemon
                 .tx_engine
                 .outbox
-                .list("w", "anvil", OutboxState::Pending)
+                .list("w", "ethereum", OutboxState::Pending)
                 .unwrap()
                 .len(),
             2
