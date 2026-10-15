@@ -140,7 +140,15 @@ impl TravelerDiscovery {
         let result = evaluate(tab, &self.session, self.world, expression).await?;
         let filled: Vec<String> =
             serde_json::from_value(result["filled"].clone()).context("Traveler fill incomplete")?;
-        if filled.len() != expected.len() || filled.iter().any(|f| !expected.contains(f)) {
+        // Field names and fixed reasons only, for diagnosing site lists.
+        for skipped in result["skipped"].as_array().into_iter().flatten() {
+            eprintln!(
+                "traveler field left for the agent: {}",
+                skipped.as_str().unwrap_or("")
+            );
+        }
+        // A skipped site list is reported by omission; nothing else may appear.
+        if filled.iter().any(|f| !expected.contains(f)) {
             bail!("Traveler fill incomplete");
         }
         Ok(filled)

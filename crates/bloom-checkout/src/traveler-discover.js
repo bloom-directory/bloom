@@ -32,11 +32,12 @@
     // A short caption shared by several fields: "Fecha de Nacimiento Día Mes Año"
     // or "Género Femenino Masculino".
     let group, groupText = '';
-    for (let a = e.parentElement, depth = 0; a && depth < 4; a = a.parentElement, depth++) {
+    for (let a = e.parentElement, depth = 0; a && depth < 8; a = a.parentElement, depth++) {
       const text = normalize(a.innerText);
       if (text.length > 80) break;
       if (/nacimiento|birth|genero|gender|sexo/.test(text)) { group = a; groupText = text; break; }
     }
+    const combobox = e.getAttribute('role') === 'combobox' || e.hasAttribute('aria-autocomplete') || /^react-select-/.test(e.id);
     const label = normalize([e.getAttribute('aria-label'),e.labels?.[0]?.innerText,e.placeholder,e.name,e.id,caption].filter(Boolean).join(' '));
     if (ac?.startsWith('cc-') || /card|tarjeta|cvc|security code|password|contrasena/.test(label)) continue;
     if (/full.?name|nombre completo|nombre.*apellido/.test(label)) continue;
@@ -63,21 +64,24 @@
     else if (/document.*expiry|passport.*expiry|vencimiento/.test(label) && e.type === 'date') field='document_expiry';
     else if (ac === 'sex' || /gender|genero|sexo/.test(label)) field='gender';
     else if (ac === 'email' || e.type === 'email' || /email|e-mail|correo/.test(label)) field='email';
+    else if (/area.?code|cod\.? ?area|areacode/.test(label)) { field='phone'; part='area'; }
     else if (ac === 'tel' || e.type === 'tel' || /phone|telefono/.test(label)) {
-      if (/country|area|prefijo|codigo|extension/.test(label) || e.tagName === 'SELECT') continue;
+      if (/country|prefijo|codigo|extension/.test(label) || e.tagName === 'SELECT') continue;
       field='phone';
     }
     if (!field) continue;
     // Sites draw these lists themselves: a read-only input opens on click, an
     // editable one filters as the name is typed. Either way an option is clicked.
-    const choice = e.tagName === 'INPUT' && choices.includes(field);
+    const choice = e.tagName === 'INPUT' && (choices.includes(field) || combobox);
     if (e.readOnly && !choice) continue;
     mapped.push({field,part,choice,index:refs.length});refs.push(e);
   }
   if (mapped.length > 40) throw Error('Ambiguous traveler form');
   for (const field of ['given_name','family_name','gender','nationality','document_kind','document_number','document_country','document_expiry','phone']) {
-    if (mapped.filter(m=>m.field===field).length > 1) throw Error('Multiple traveler forms require private selection');
+    if (new Set(mapped.filter(m=>m.field===field).map(m=>m.part)).size !== mapped.filter(m=>m.field===field).length) throw Error('Multiple traveler forms require private selection');
   }
+  // A separate area-code field means the phone field takes the local number.
+  if (mapped.some(m=>m.field==='phone' && m.part==='area')) for (const m of mapped) if (m.field==='phone' && !m.part) m.part='local';
   const birth = mapped.filter(m=>m.field==='born_on');
   if (new Set(birth.map(m=>m.part || 'date')).size !== birth.length) throw Error('Ambiguous birth fields');
   globalThis.__bloomTravelerRefs = {document,refs,nonce:globalThis.__bloomTravelerNonce};
