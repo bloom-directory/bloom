@@ -3492,7 +3492,7 @@ reload_installed_set() {{
     partial) return 0;;
     # The candidate times out; then the restore's own reload either times
     # out, succeeds, or fails without a timeout.
-    restore_timeout) health_timed_out=true; return 1;;
+    restore_timeout) health_timed_out=true; health_timed_out_uids="501, 502"; return 1;;
     activation_timeout) [[ "$count" -gt 1 ]] || {{ health_timed_out=true; return 1; }};;
     restore_failed) [[ "$count" -gt 1 ]] && return 1; health_timed_out=true; return 1;;
   esac
@@ -3572,7 +3572,9 @@ find "$ROOT" -name '*.new.*' -print > "$ROOT/stray"
                     "an unconfirmed restore keeps the journal"
                 );
                 let expected = match scenario {
-                    "restore_timeout" => "reinstated and its services are running",
+                    "restore_timeout" => {
+                        "services are loaded for every login, but UID 501, 502 did not report healthy"
+                    }
                     "activation_timeout" => "did not report healthy within 600s and was stopped",
                     _ => "automatic restoration of the previous Bloom release failed",
                 };
@@ -5041,6 +5043,57 @@ fn linux_legacy_interrupted_upgrade_recovers_without_operator_intervention() {
     );
 }
 
+#[test]
+fn macos_rollback_reloads_every_login_before_reporting_a_timeout() {
+    let source = fs::read_to_string(release_script("install-macos.sh")).unwrap();
+    let start = source
+        .find("# During a rollback (reload_all_on_timeout=true)")
+        .unwrap();
+    let end = start + source[start..].find("\n}\n").unwrap() + 3;
+    let function = &source[start..end];
+    let enrollments = tempfile::tempdir().unwrap();
+    for uid in ["501", "502", "503"] {
+        fs::write(enrollments.path().join(format!("{uid}.json")), "{}").unwrap();
+    }
+    let run = |reload_all: &str| {
+        let harness = format!(
+            r#"set -Eeuo pipefail
+live=true; root_prefix=/unused; release_base=/unused; containment_plist=/unused
+enrollments='{enrollments}'
+reload_launchd_job() {{ :; }}
+reload_launchagent_job() {{ echo "load $1/$2"; }}
+field() {{ echo fixture; }}
+# 501 and 503 have not answered yet; 502 is healthy.
+require_triad_health() {{ [ "$1" = 502 ] && return 0; health_timed_out=true; return 1; }}
+{function}
+reload_all_on_timeout={reload_all}
+if reload_installed_set; then echo healthy; else echo "timed_out=$health_timed_out uids=$health_timed_out_uids"; fi
+"#,
+            enrollments = enrollments.path().display(),
+        );
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg(harness)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let rollback = run("true");
+    assert!(
+        rollback.contains("load 503/com.bloom.machine"),
+        "{rollback}"
+    );
+    assert!(
+        rollback.ends_with("timed_out=true uids=501, 503\n"),
+        "{rollback}"
+    );
+    // Outside a rollback the first unanswered login still stops the set.
+    let candidate = run("false");
+    assert!(!candidate.contains("load 502/"), "{candidate}");
+    assert!(candidate.ends_with("timed_out=true uids=\n"), "{candidate}");
+}
+
 /// Runs one installer's health wait in bash with stubbed system tools; the
 /// health probe succeeds once it has been called `answer_after` times.
 fn run_health_wait(installer: &str, call: &str, answer_after: i64, timeout: &str) -> String {
@@ -5105,7 +5158,5 @@ fn installers_wait_for_a_slow_machine_and_report_a_plain_timeout() {
     // A timed-out rollback says the old release is reinstated, not that
     // restoring it failed.
     let installer = fs::read_to_string(release_script("install-macos.sh")).unwrap();
-    assert!(
-        installer.contains("previous Bloom release is reinstated and its services are running")
-    );
+    assert!(installer.contains("previous Bloom release is reinstated and its services are loaded"));
 }

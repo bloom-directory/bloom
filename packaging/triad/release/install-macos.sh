@@ -943,8 +943,11 @@ rewrite_all_enrollments() {
   fi
 }
 
+# During a rollback (reload_all_on_timeout=true) a login that has not answered
+# yet does not stop the others from being reloaded; its UID is recorded in
+# health_timed_out_uids and the set still reports failure.
 reload_installed_set() {
-  local record uid; $live || return 0
+  local record uid; health_timed_out_uids=""; $live || return 0
   reload_launchd_job system com.bloom.containment "$containment_plist" || return 1
   "$release_base/current/bloom" serve triad-pf-monitor-once 2>/dev/null ||
     echo "Bloom installed, but session lifecycle refresh is deferred" >&2
@@ -955,8 +958,12 @@ reload_installed_set() {
     reload_launchd_job system "com.bloom.signer.$uid" "$root_prefix/Library/LaunchDaemons/com.bloom.signer.$uid.plist" || return 1
     reload_launchd_job system "com.bloom.broker.$uid" "$root_prefix/Library/LaunchDaemons/com.bloom.broker.$uid.plist" || return 1
     reload_launchagent_job "$uid" com.bloom.machine "$root_prefix/Library/LaunchAgents/com.bloom.machine.plist" || return 1
-    require_triad_health "$uid" "$(field "$record" login_user)" "$(field "$record" release_digest)" || return 1
+    if ! require_triad_health "$uid" "$(field "$record" login_user)" "$(field "$record" release_digest)"; then
+      [[ "${reload_all_on_timeout:-false}" == true && "${health_timed_out:-false}" == true ]] || return 1
+      health_timed_out_uids="${health_timed_out_uids:+$health_timed_out_uids, }$uid"
+    fi
   done
+  if [[ -n "$health_timed_out_uids" ]]; then health_timed_out=true; return 1; fi
 }
 
 activate_installed_set() {
@@ -1273,8 +1280,9 @@ upgrade_release() {
     stop_all_enrollments || true
     if [[ "$upgrade_phase" == rollback_allowed ]]; then
       restore_macos_upgrade_state; switch_release "$old"
-      # Judge the restore by its own health checks, not the candidate's.
-      health_timed_out=false
+      # Judge the restore by its own health checks, not the candidate's, and
+      # reload every login even if one has not answered yet.
+      health_timed_out=false; reload_all_on_timeout=true
       if reload_installed_set; then
         if activate_installed_set; then install_cli_link; rm -rf -- "$upgrade_transaction"; upgrade_transaction=""; upgrade_phase=""
           echo "previous Bloom release restored after rollback-safe failure" >&2
@@ -1284,8 +1292,9 @@ upgrade_release() {
       elif [[ "${health_timed_out:-false}" == true ]]; then
         # The old release is selected and its services are loaded; it only
         # has not answered yet. Say so rather than reporting a failed restore.
-        echo "previous Bloom release is reinstated and its services are running, but it did not report healthy within ${BLOOM_HEALTH_TIMEOUT_SECONDS:-600}s; it may still be starting. Rerunning this installer resumes the recorded upgrade." >&2
+        echo "previous Bloom release is reinstated and its services are loaded for every login, but UID ${health_timed_out_uids:-?} did not report healthy within ${BLOOM_HEALTH_TIMEOUT_SECONDS:-600}s; it may still be starting. Rerunning this installer resumes the recorded upgrade." >&2
       else echo "automatic restoration of the previous Bloom release failed" >&2; fi
+      reload_all_on_timeout=false
     else
       rewrite_all_enrollments "$new" activating
       echo "state migration is forward-only; retry this candidate release" >&2
