@@ -108,7 +108,29 @@ pub(crate) async fn order_preview(tab: &PrivateTab) -> Option<String> {
         .await
         .ok()?;
     let width = metrics["cssContentSize"]["width"].as_f64()?.min(1280.0);
-    let height = metrics["cssContentSize"]["height"].as_f64()?.min(3000.0);
+    let height = metrics["cssContentSize"]["height"].as_f64()?;
+    // Show the human what was entered: the part of the page holding the
+    // filled fields (names, contact, card holder), not the page top.
+    let filled = tab
+        .cdp
+        .call(
+            Some(&tab.session),
+            "Runtime.evaluate",
+            json!({"expression":include_str!("filled-region.js"),"returnByValue":true}),
+        )
+        .await
+        .ok()
+        .map(|r| r["result"]["value"].clone())
+        .filter(|r| r["height"].as_f64().is_some_and(|h| h > 0.0));
+    let (y, height) = match &filled {
+        Some(region) => {
+            let top = (region["top"].as_f64()? - 80.0).max(0.0);
+            let bottom = (region["top"].as_f64()? + region["height"].as_f64()? + 80.0).min(height);
+            // Keep the end nearest the payment form when the region is tall.
+            ((bottom - 3000.0).max(top), (bottom - top).min(3000.0))
+        }
+        None => (0.0, height.min(3000.0)),
+    };
     for (quality, scale) in [(70, 1.0), (45, 0.6)] {
         let shot = tab
             .cdp
@@ -117,7 +139,7 @@ pub(crate) async fn order_preview(tab: &PrivateTab) -> Option<String> {
                 "Page.captureScreenshot",
                 json!({
             "format":"jpeg","quality":quality,"captureBeyondViewport":true,
-            "clip":{"x":0,"y":0,"width":width,"height":height,"scale":scale}}),
+            "clip":{"x":0,"y":y,"width":width,"height":height,"scale":scale}}),
             )
             .await
             .ok()?;
@@ -1237,6 +1259,29 @@ pub(crate) mod tests {
             error.to_string().contains("known payment provider"),
             "{error}"
         );
+        browser.return_control().await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn approval_preview_shows_the_filled_fields() {
+        // An airline page: earlier steps above, filled contact fields far down.
+        let html = "<!doctype html><div style='height:2400px'>Seat map</div>
+            <div><div>Nombres *</div><input value='Synthetic'></div>
+            <div><div>Correo *</div><input value='fixture@example.com'></div><input>
+            <input autocomplete='cc-number' value='4242'><p>Total USD 3.99</p><button>Pay</button>";
+        let browser = browser().await;
+        let (url, server) = fixture(html.into()).await;
+        let tab = open(&browser, url).await;
+        let region = tab
+            .cdp
+            .evaluate(&tab.session, include_str!("filled-region.js").into())
+            .await
+            .unwrap();
+        let top = region["top"].as_f64().unwrap();
+        assert!((2400.0..2500.0).contains(&top), "{region}");
+        assert!(region["height"].as_f64().unwrap() < 200.0, "{region}");
+        assert!(order_preview(&tab).await.is_some());
         browser.return_control().await.unwrap();
         server.abort();
     }
