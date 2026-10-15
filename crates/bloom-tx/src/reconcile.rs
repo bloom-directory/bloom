@@ -45,6 +45,10 @@ struct LookupBackoff {
     first_miss: Instant,
     misses_after_grace: u32,
     next_at: Instant,
+    /// Whether these misses happened after the nonce was seen spent. History
+    /// from before that (no nonce available) must not delay the first lookup
+    /// once the nonce is spent.
+    nonce_spent: bool,
 }
 
 /// Polls sent entries and records their mined outcome.
@@ -90,20 +94,56 @@ impl Reconciler {
             .is_some_and(|backoff| now < backoff.next_at)
     }
 
-    /// Record a lookup, made after the nonce was spent, that found no receipt
-    /// for this hash. Lookups stay [`RECEIPT_LOOKUP_SPACING`] apart for
-    /// [`RECEIPT_LOOKUP_GRACE`]; after that the wait doubles, up to
-    /// [`RECEIPT_LOOKUP_MAX_DELAY`].
-    fn record_lookup_miss(&self, key: String, now: Instant) {
+    /// Whether `key` is waiting out a backoff that began after its nonce was
+    /// spent. Its nonce cannot become unspent, so such a tick skips even the
+    /// nonce read.
+    fn spent_lookup_deferred(&self, key: &str, now: Instant) -> bool {
+        self.backoff
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(key)
+            .is_some_and(|backoff| backoff.nonce_spent && now < backoff.next_at)
+    }
+
+    /// The first tick that sees the nonce spent forgets history from before
+    /// it, so that lookup is never delayed.
+    fn forget_history_before_spent_nonce(&self, key: &str) {
         let mut backoffs = self
             .backoff
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let backoff = backoffs.entry(key).or_insert(LookupBackoff {
+        if backoffs
+            .get(key)
+            .is_some_and(|backoff| !backoff.nonce_spent)
+        {
+            backoffs.remove(key);
+        }
+    }
+
+    /// Record a lookup, made after the nonce was spent, that found no receipt
+    /// for this hash. Lookups stay [`RECEIPT_LOOKUP_SPACING`] apart for
+    /// [`RECEIPT_LOOKUP_GRACE`]; after that the wait doubles, up to
+    /// [`RECEIPT_LOOKUP_MAX_DELAY`].
+    fn record_lookup_miss(&self, key: String, now: Instant, nonce_spent: bool) {
+        let mut backoffs = self
+            .backoff
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let fresh = LookupBackoff {
             first_miss: now,
             misses_after_grace: 0,
             next_at: now,
-        });
+            nonce_spent,
+        };
+        let backoff = backoffs.entry(key).or_insert(fresh);
+        if backoff.nonce_spent != nonce_spent {
+            *backoff = LookupBackoff {
+                first_miss: now,
+                misses_after_grace: 0,
+                next_at: now,
+                nonce_spent,
+            };
+        }
         if now.duration_since(backoff.first_miss) < RECEIPT_LOOKUP_GRACE {
             backoff.next_at = now + RECEIPT_LOOKUP_SPACING;
             return;
@@ -128,6 +168,7 @@ impl Reconciler {
                     first_miss: now,
                     misses_after_grace: 0,
                     next_at: now + RECEIPT_LOOKUP_SPACING,
+                    nonce_spent: false,
                 },
             );
     }
@@ -148,7 +189,6 @@ impl Reconciler {
                 return 0;
             }
         };
-        let now = (self.clock)();
         let mut updated = 0;
         let mut waiting = std::collections::HashSet::new();
         // Confirmed nonce per (chain, sender) for this tick; None when the
@@ -163,6 +203,9 @@ impl Reconciler {
             };
             let backoff_key = Self::backoff_key(&se);
             waiting.insert(backoff_key.clone());
+            if self.spent_lookup_deferred(&backoff_key, (self.clock)()) {
+                continue;
+            }
             let nonce_key = (se.chain.clone(), se.from);
             let confirmed = match confirmed_nonces.get(&nonce_key) {
                 Some(confirmed) => *confirmed,
@@ -190,9 +233,15 @@ impl Reconciler {
                         .remove(&backoff_key);
                     continue;
                 }
-                Some(_) => true,
+                Some(_) => {
+                    self.forget_history_before_spent_nonce(&backoff_key);
+                    true
+                }
                 None => false,
             };
+            // Spacing is measured from when each lookup actually happens, not
+            // from the start of a tick that may have waited on nonce reads.
+            let now = (self.clock)();
             if self.lookup_deferred(&backoff_key, now) {
                 continue;
             }
@@ -235,7 +284,7 @@ impl Reconciler {
                 // keep looking at the normal spacing.
                 Ok(None) => {
                     if nonce_spent {
-                        self.record_lookup_miss(backoff_key, now);
+                        self.record_lookup_miss(backoff_key, now, true);
                     } else {
                         self.space_next_lookup(backoff_key, now);
                     }
@@ -245,7 +294,7 @@ impl Reconciler {
                 // bounds the journaled lookups it costs.
                 Err(e) => {
                     tracing::debug!(error = %e, id = %se.id, "reconcile.receipt_failed");
-                    self.record_lookup_miss(backoff_key, now);
+                    self.record_lookup_miss(backoff_key, now, nonce_spent);
                     continue;
                 }
             };
@@ -507,6 +556,9 @@ mod tests {
             .unwrap();
     }
 
+    /// A test clock's elapsed time, and the seconds to set it to.
+    type ClockOnNonce = Arc<Mutex<Option<(Arc<Mutex<Duration>>, u64)>>>;
+
     /// A JSON-RPC endpoint that keeps serving. `eth_getTransactionCount`
     /// answers with the confirmed `nonce`, or an error while it is `None`;
     /// `eth_getTransactionReceipt` answers with `receipt` and is counted in
@@ -518,6 +570,9 @@ mod tests {
         receipt_fails: Arc<Mutex<bool>>,
         calls: Arc<AtomicUsize>,
         nonce_calls: Arc<AtomicUsize>,
+        /// Set the test clock to this many seconds when the next nonce read
+        /// is answered, simulating a slow read inside one tick.
+        clock_on_nonce: ClockOnNonce,
         fail_result_audit: Option<Arc<AuditLog>>,
     }
 
@@ -529,6 +584,7 @@ mod tests {
                 receipt_fails: Arc::new(Mutex::new(false)),
                 calls: Arc::new(AtomicUsize::new(0)),
                 nonce_calls: Arc::new(AtomicUsize::new(0)),
+                clock_on_nonce: Arc::new(Mutex::new(None)),
                 fail_result_audit: None,
             }
         }
@@ -562,6 +618,10 @@ mod tests {
                     let body = match request_json["method"].as_str() {
                         Some("eth_getTransactionCount") => {
                             rpc.nonce_calls.fetch_add(1, Ordering::SeqCst);
+                            if let Some((elapsed, secs)) = rpc.clock_on_nonce.lock().unwrap().take()
+                            {
+                                *elapsed.lock().unwrap() = Duration::from_secs(secs);
+                            }
                             match *rpc.nonce.lock().unwrap() {
                                 Some(nonce) => {
                                     reply("result", serde_json::json!(format!("{nonce:#x}")))
@@ -745,14 +805,23 @@ mod tests {
         chains: ChainRegistry,
         audit: Arc<AuditLog>,
     ) -> (Reconciler, impl Fn(u64)) {
+        let (reconciler, elapsed) = clocked_with_elapsed(outbox, chains, audit);
+        (reconciler, move |secs| {
+            *elapsed.lock().unwrap() = Duration::from_secs(secs)
+        })
+    }
+
+    fn clocked_with_elapsed(
+        outbox: Outbox,
+        chains: ChainRegistry,
+        audit: Arc<AuditLog>,
+    ) -> (Reconciler, Arc<Mutex<Duration>>) {
         let start = Instant::now();
         let elapsed = Arc::new(Mutex::new(Duration::ZERO));
         let clock_elapsed = elapsed.clone();
         let reconciler = Reconciler::new(outbox, chains, audit)
             .with_clock(Arc::new(move || start + *clock_elapsed.lock().unwrap()));
-        (reconciler, move |secs| {
-            *elapsed.lock().unwrap() = Duration::from_secs(secs)
-        })
+        (reconciler, elapsed)
     }
 
     #[tokio::test]
@@ -842,6 +911,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_nonce_seen_spent_after_being_unavailable_is_looked_up_at_once() {
+        let (_directory, outbox) = sent_outbox();
+        let audit_directory = tempfile::tempdir().unwrap();
+        let audit = Arc::new(AuditLog::open(audit_directory.path().join("audit.jsonl")).unwrap());
+        let rpc = MockRpc::new(None, serde_json::Value::Null);
+        let chains = ChainRegistry::default();
+        chains.add(mock_chain(rpc.clone()).await);
+        let (reconciler, at) = clocked(outbox, chains, audit);
+        at(0);
+        assert_eq!(reconciler.tick().await, 0);
+        assert_eq!(rpc.lookups(), 1);
+        // Two seconds later the nonce is available, spent, and the receipt
+        // exists: the no-nonce spacing must not hold the lookup back.
+        *rpc.nonce.lock().unwrap() = Some(1);
+        *rpc.receipt.lock().unwrap() = mined_receipt();
+        at(2);
+        assert_eq!(reconciler.tick().await, 1);
+    }
+
+    #[tokio::test]
+    async fn spacing_is_measured_from_the_lookup_not_the_start_of_the_tick() {
+        let (_directory, outbox) = sent_outbox();
+        let audit_directory = tempfile::tempdir().unwrap();
+        let audit = Arc::new(AuditLog::open(audit_directory.path().join("audit.jsonl")).unwrap());
+        let rpc = MockRpc::new(Some(1), serde_json::Value::Null);
+        let chains = ChainRegistry::default();
+        chains.add(mock_chain(rpc.clone()).await);
+        let (reconciler, elapsed) = clocked_with_elapsed(outbox, chains, audit);
+        // The tick starts at 0, but its nonce read takes until 14 s, so the
+        // journaled lookup happens at 14 s.
+        *rpc.clock_on_nonce.lock().unwrap() = Some((elapsed.clone(), 14));
+        reconciler.tick().await;
+        assert_eq!(rpc.lookups(), 1);
+        let at = |secs: u64| *elapsed.lock().unwrap() = Duration::from_secs(secs);
+        at(16);
+        reconciler.tick().await;
+        assert_eq!(rpc.lookups(), 1, "only 2 s after the previous lookup");
+        at(29);
+        reconciler.tick().await;
+        assert_eq!(rpc.lookups(), 2);
+    }
+
+    #[tokio::test]
     async fn transactions_sharing_a_sender_read_its_nonce_once_per_tick() {
         let (_directory, outbox) = sent_outbox();
         add_sent(&outbox, "tx-2", 1, 8);
@@ -909,7 +1021,7 @@ mod tests {
         let audit = Arc::new(AuditLog::open(audit_directory.path().join("audit.jsonl")).unwrap());
         let reconciler = Reconciler::new(outbox, ChainRegistry::default(), audit);
         let now = Instant::now();
-        reconciler.record_lookup_miss("alice/anvil/gone".into(), now);
+        reconciler.record_lookup_miss("alice/anvil/gone".into(), now, true);
         assert_eq!(reconciler.backoff.lock().unwrap().len(), 1);
         reconciler.tick().await;
         assert!(reconciler.backoff.lock().unwrap().is_empty());
