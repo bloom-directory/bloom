@@ -528,6 +528,9 @@ impl AuditLog {
         };
         let verifier = identity.as_ref().map(AuditIdentity::verifier);
         let inspected = inspect(&path, verifier.as_ref());
+        // The rotation-history check below re-verifies the current segment
+        // only when this full pass did not already succeed with its key.
+        let current_verified = inspected.is_ok();
         let (last_digest, sequence, pending_effects, degraded, inspected_latched) = if path.exists()
         {
             match inspected {
@@ -557,7 +560,13 @@ impl AuditLog {
         let history_error = identity
             .as_ref()
             .and_then(|current| {
-                verify_rotation_history(&path, &current.verifier(), trusted_history).err()
+                verify_rotation_history(
+                    &path,
+                    &current.verifier(),
+                    trusted_history,
+                    current_verified,
+                )
+                .err()
             })
             .map(|error| error.to_string());
         let degradation_latched = inspected_latched
@@ -776,6 +785,13 @@ impl AuditLog {
 
     pub fn pending_effect_correlations(&self) -> Result<Vec<String>, AuditError> {
         let g = self.inner.lock();
+        // The journal was verified in full at open and every append since
+        // kept this set exact. While the file is still the one this process
+        // last verified or wrote, the set needs no rescan; any outside change,
+        // or a latched failure to report, takes the full pass below.
+        if !g.degradation_latched && journal_snapshot(&g.path)? == g.journal_snapshot {
+            return Ok(g.pending_effects.iter().cloned().collect());
+        }
         let verifier = g.identity.as_ref().map(AuditIdentity::verifier);
         let (_, tail) = inspect(&g.path, verifier.as_ref())?;
         Ok(tail.pending_effects.into_iter().collect())
@@ -1236,7 +1252,7 @@ fn finish_rotation_from_marker(
     sync_parent(path)?;
     std::fs::rename(&next, path)?;
     sync_parent(path)?;
-    verify_rotation_history(path, &new_identity.verifier(), &complete_history)?;
+    verify_rotation_history(path, &new_identity.verifier(), &complete_history, false)?;
     std::fs::remove_file(path.with_extension("rotation.json"))?;
     sync_parent(path)?;
     Ok(archive)
@@ -1319,18 +1335,27 @@ fn recover_rotation(
             )));
         }
     }
-    verify_rotation_history(path, current, trusted_history)?;
+    verify_rotation_history(path, current, trusted_history, false)?;
     std::fs::remove_file(&marker_path)?;
     sync_parent(path)
 }
 
+/// `current_verified` says the caller has just verified the whole current
+/// segment with `current`, so that pass is not repeated.
 fn verify_rotation_history(
     path: &Path,
     current: &AuditVerifierIdentity,
     trusted_history: &[AuditTrustedPredecessor],
+    current_verified: bool,
 ) -> Result<(), AuditError> {
     let mut consumed = std::collections::BTreeSet::new();
-    verify_rotation_segment(path, current, trusted_history, &mut consumed)?;
+    verify_rotation_segment(
+        path,
+        current,
+        trusted_history,
+        &mut consumed,
+        current_verified,
+    )?;
     if consumed.len() != trusted_history.len() {
         return Err(AuditError::Degraded(
             "packaging supplied extra or conflicting audit predecessor history".to_owned(),
@@ -1344,10 +1369,14 @@ fn verify_rotation_segment(
     current: &AuditVerifierIdentity,
     trusted_history: &[AuditTrustedPredecessor],
     consumed: &mut std::collections::BTreeSet<usize>,
+    verified: bool,
 ) -> Result<(), AuditError> {
-    inspect(path, Some(current))?;
-    let lines = read_signed_lines(path)?;
-    let Some(first) = lines.first() else {
+    if !verified {
+        inspect(path, Some(current))?;
+    }
+    // Only a segment that begins with a rotation genesis has predecessors;
+    // read the rest of it only then.
+    let Some(first) = first_signed_line(path)? else {
         if trusted_history.is_empty() {
             return Ok(());
         }
@@ -1358,6 +1387,7 @@ fn verify_rotation_segment(
     if first.record.kind != "machine.audit.key_rotation.genesis" {
         return Ok(());
     }
+    let lines = read_signed_lines(path)?;
     let authorization = &first.record.data["authorization"];
     let old_key_id = authorization["old_key_id"]
         .as_str()
@@ -1456,6 +1486,7 @@ fn verify_rotation_segment(
         &old_verifier,
         trusted_history,
         consumed,
+        false,
     )
 }
 
@@ -1516,6 +1547,21 @@ fn verify_detached_signature(
         .map_err(|_| AuditError::Signature { line: 0 })?
         .verify(message, &Signature::from_bytes(&signature))
         .map_err(|_| AuditError::Signature { line: 0 })
+}
+
+/// The first non-empty line of a signed journal, without reading the rest.
+fn first_signed_line(path: &Path) -> Result<Option<SignedAuditLine>, AuditError> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let file = std::fs::File::open(path)?;
+    for line in BufReader::new(file).lines() {
+        let line = line?;
+        if !line.is_empty() {
+            return Ok(Some(serde_json::from_str(&line)?));
+        }
+    }
+    Ok(None)
 }
 
 fn read_signed_lines(path: &Path) -> Result<Vec<SignedAuditLine>, AuditError> {
@@ -1629,6 +1675,8 @@ fn inspect(
     let mut sequence = 0_u64;
     let mut pending_effects = std::collections::BTreeSet::new();
     let mut inferred_identity: Option<(String, String, [u8; 32])> = None;
+    // Every line of a segment carries the same key; decode it once.
+    let mut decoded_key: Option<([u8; 32], VerifyingKey)> = None;
     for (i, raw) in BufReader::new(f).lines().enumerate() {
         let raw = raw?;
         if raw.is_empty() {
@@ -1684,8 +1732,15 @@ fn inspect(
                 .ok()
                 .and_then(|bytes| bytes.try_into().ok())
                 .ok_or(AuditError::Signature { line: i + 1 })?;
-            let public = VerifyingKey::from_bytes(&key_bytes)
-                .map_err(|_| AuditError::Signature { line: i + 1 })?;
+            let public = match &decoded_key {
+                Some((bytes, key)) if *bytes == key_bytes => *key,
+                _ => {
+                    let key = VerifyingKey::from_bytes(&key_bytes)
+                        .map_err(|_| AuditError::Signature { line: i + 1 })?;
+                    decoded_key = Some((key_bytes, key));
+                    key
+                }
+            };
             public
                 .verify(
                     &audit_signature_bytes(
@@ -2168,6 +2223,40 @@ mod tests {
                 .contains("without its application identity")
         );
         assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn pending_effects_come_from_memory_until_the_journal_changes_outside_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let log = AuditLog::open_signed(&path, identity(11, "machine-audit-status")).unwrap();
+        let effect = |kind: &str| AuditRecord {
+            ts_ms: 0,
+            kind: kind.into(),
+            wallet: None,
+            chain: None,
+            data: serde_json::json!({"correlation_id": "op:1"}),
+            prev: String::new(),
+            digest: String::new(),
+        };
+        log.append(effect("machine.effect.intent")).unwrap();
+        assert_eq!(
+            log.pending_effect_correlations().unwrap(),
+            vec!["op:1".to_owned()]
+        );
+        log.append(effect("machine.effect.result")).unwrap();
+        assert!(log.pending_effect_correlations().unwrap().is_empty());
+
+        // An outside write changes the file this process verified, so the
+        // status read verifies the whole journal again and reports the damage.
+        use std::io::Write as _;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"ts_ms\":0}\n")
+            .unwrap();
+        assert!(log.pending_effect_correlations().is_err());
     }
 
     #[test]
