@@ -109,8 +109,9 @@ fields to zero and decodes the supported call before constructing approval
 text. A delegatecall is constrained to an official Safe library address, and
 Safe creation to an official singleton and fallback handler, on a chain whose
 deployments of those addresses were read and matched against their recorded
-runtime code hashes; an unrecognised address falls back to the reading that
-says Bloom cannot describe the call. Of the Safe's calls to itself it accepts a
+runtime code hashes. Broker refuses a delegatecall to any other address. A
+Safe creation with an unrecognised singleton or handler, or with setup code,
+falls back to the reading that says Bloom cannot describe the call. Of the Safe's calls to itself it accepts a
 rejection and the four owner and threshold changes, which it shows decoded
 against the reported current threshold; every other one, such as enabling a
 module or setting a guard, is rejected, as is any self-call inside a call-only
@@ -141,7 +142,7 @@ so the selector binds it. The exact selector remains the signing authority.
 Both sides require the envelope. Machine refuses the class without one; Broker
 reads the package's installer-signed provenance record, and a package declaring
 the class gets no exact approval without an envelope and no reusable approval
-at all. A claim sent beside an envelope may not declare amounts, destinations
+that names the Safe class. A claim sent beside an envelope may not declare amounts, destinations
 or fees: the rebuilt transaction is the review.
 
 Petals always submit complete payload bytes through a payload-bearing host
