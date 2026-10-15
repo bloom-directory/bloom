@@ -79,9 +79,10 @@
         return found.some(optionLike) ? found.filter(optionLike) : found;
       };
       // A read-only list may already sit in the page, hidden or clipped.
-      const before = new Set(e.readOnly ? [] : candidates());
+      const before = new Set(e.readOnly || mapping.listOpen ? [] : candidates());
       // A month list may use numbers or names: try the number, then the name.
-      const attempts = e.readOnly ? [typed] : mapping.part === 'month' ? [typed, aliases.at(-1)]
+      // listOpen: checkout already opened the list with a real click.
+      const attempts = mapping.listOpen ? [null] : e.readOnly ? [typed] : mapping.part === 'month' ? [typed, aliases.at(-1)]
         : mapping.part === 'day' ? [typed, typed.padStart(2,'0')] : [typed];
       // A list that searches from the start of each option ("PAS - Pasaporte")
       // finds nothing for the name: last, clear the box and open the whole list.
@@ -89,11 +90,23 @@
       let option;
       for (const attempt of attempts) {
         typed = attempt ?? '';
-        if (e.readOnly) e.click();
+        if (e.readOnly && !mapping.listOpen) e.click();
         else if (attempt === null) {
-          e.focus(); e.select(); document.execCommand('delete');
-          e.click();
-          [...(e.parentElement?.parentElement?.querySelectorAll('button') || [])].find(b => !b.contains(e))?.click();
+          if (!mapping.listOpen) { e.focus(); e.select(); document.execCommand('delete'); }
+          // Open the list one way at a time: some toggle on each event, so
+          // stop as soon as options show.
+          let toggle;
+          for (let a = e.parentElement, depth = 0; a && depth < 4 && !toggle; a = a.parentElement, depth++)
+            toggle = [...a.querySelectorAll('button,[role=button]')].find(b => !b.contains(e) && b.getClientRects().length);
+          // Clearing a search box may already list every option.
+          for (const open of [() => {}, () => e.click(),
+                              () => e.dispatchEvent(new KeyboardEvent('keydown', {key: 'ArrowDown', code: 'ArrowDown', keyCode: 40, bubbles: true})),
+                              () => toggle?.click(),
+                              () => toggle?.dispatchEvent(new MouseEvent('mousedown', {bubbles: true}))]) {
+            open();
+            await new Promise(r => setTimeout(r, 300));
+            if (candidates().some(o => !before.has(o))) break;
+          }
         } else {
           e.focus();e.select();
           if (document.activeElement !== e || !document.execCommand('insertText',false,typed)) throw Error('Traveler input unsupported');

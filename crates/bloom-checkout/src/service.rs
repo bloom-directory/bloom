@@ -1679,13 +1679,14 @@ mod tests {
         // JetSMART's card-holder document type: an editable box that only
         // matches the start of "PAS - Pasaporte", and a button opening the list.
         let (url, server) = crate::discovery::tests::fixture(
-            "<div><div>Documento</div><div><input id='doc'><button id='toggle'></button></div>
+            "<div><div><div>Documento</div><div><div><input id='doc'></div></div></div><button id='toggle'></button>
              <div id='list'></div></div>
              <script>const all=['PAS - Pasaporte','DNI - Documento Nacional de Identidad'];
              const show=f=>{list.innerHTML='';for(const o of all.filter(f)){const d=document.createElement('div');d.className='option';d.textContent=o;
                d.onclick=()=>{doc.value=o.split(' ')[0];list.innerHTML='';};list.append(d);}};
-             doc.addEventListener('input',()=>show(o=>doc.value&&o.toLowerCase().startsWith(doc.value.toLowerCase())));
-             toggle.onclick=()=>show(()=>true);</script>".into(),
+             doc.addEventListener('input',()=>show(o=>!doc.value||o.toLowerCase().startsWith(doc.value.toLowerCase())));
+             toggle.onclick=()=>list.children.length?list.innerHTML='':show(()=>true);
+             doc.addEventListener('click',()=>list.children.length?list.innerHTML='':show(()=>true));</script>".into(),
         )
         .await;
         let root = tempfile::tempdir().unwrap().keep();

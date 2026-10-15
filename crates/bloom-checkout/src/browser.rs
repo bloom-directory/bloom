@@ -302,10 +302,24 @@ impl Browser {
             .clone();
         tab.refs.clear();
         tab.generation += 1;
+        // Open the list the way a shopping click does: synchronously, with a
+        // user gesture. Some lists ignore clicks from later script turns.
+        let open = format!(
+            "(()=>{{const e=globalThis.__bloomRefs?.[{}];if(!e?.isConnected)throw Error('stale');e.focus();e.click();return true;}})()",
+            binding.index
+        );
+        self.cdp
+            .call(
+                Some(&binding.session),
+                "Runtime.evaluate",
+                json!({"contextId":binding.world,"expression":open,"returnByValue":true,"userGesture":true}),
+            )
+            .await?;
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
         let expression = format!(
             "(()=>{{const e=globalThis.__bloomRefs?.[{}];if(!e?.isConnected)throw Error('stale');\
             globalThis.__bloomTravelerRefs={{document,refs:[e],nonce:'choose'}};\
-            const nonce='choose',origin=location.origin,mapped=[{{field:{},choice:e.tagName==='INPUT',index:0}}],values={};\
+            const nonce='choose',origin=location.origin,mapped=[{{field:{},choice:e.tagName==='INPUT',listOpen:e.tagName==='INPUT',index:0}}],values={};\
             return {};}})()",
             binding.index,
             serde_json::to_string(field)?,
@@ -321,6 +335,28 @@ impl Browser {
                     "returnByValue":true,"awaitPromise":true,"userGesture":true}),
             )
             .await?;
+        // Field name and fixed reason only, for diagnosing site lists.
+        for skipped in result["result"]["value"]["skipped"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            eprintln!(
+                "traveler choice not taken: {}",
+                skipped.as_str().unwrap_or("")
+            );
+        }
+        if let Some(details) = result.get("exceptionDetails") {
+            eprintln!(
+                "traveler choice failed: {}",
+                details["exception"]["description"]
+                    .as_str()
+                    .unwrap_or("")
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+            );
+        }
         if result.get("exceptionDetails").is_some()
             || !result["result"]["value"]["filled"]
                 .as_array()
