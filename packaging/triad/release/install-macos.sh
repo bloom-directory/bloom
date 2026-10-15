@@ -411,8 +411,22 @@ remove_legacy_cli() {
   return 1
 }
 
+# A legacy wallet has finished migrating when its staging receipt names the
+# address the running Machine now reports for that wallet. Anything that cannot
+# be confirmed (no receipt, an unreadable one, a Machine that does not answer)
+# counts as not migrated, so its instructions are still shown.
+legacy_wallet_migrated() {
+  local wallet_name="$1" receipt="$2" staged current
+  $live || return 1
+  [[ -f "$receipt" && ! -L "$receipt" ]] || return 1
+  staged="$(/usr/bin/sudo -u "$login_user" -- /usr/bin/plutil -extract address raw -o - "$receipt" 2>/dev/null)" || return 1
+  [[ "$staged" =~ ^0x[0-9a-fA-F]{40}$ ]] || return 1
+  current="$(launchctl asuser "$login_uid" /usr/bin/sudo -u "$login_user" -H "$release_base/current/bloom" --home "$login_home/.bloom" -q wallet address "$wallet_name" 2>/dev/null)" || return 1
+  [[ "$(printf '%s' "$current" | tr 'A-F' 'a-f')" == "$(printf '%s' "$staged" | tr 'A-F' 'a-f')" ]]
+}
+
 report_legacy_wallet_migrations() {
-  local wallet_root wallet_dir kind_file kind wallet_name receipt
+  local wallet_root wallet_dir kind_file kind wallet_name receipt migrated=""
   local found_wallet=false found_supported=false
   resolve_login_home
   wallet_root="$login_home/.bloom/keystore"
@@ -452,6 +466,10 @@ report_legacy_wallet_migrations() {
 
     found_supported=true
     receipt="$login_home/.bloom/$wallet_name.triad-migration-receipt.json"
+    if legacy_wallet_migrated "$wallet_name" "$receipt"; then
+      migrated="${migrated:+$migrated, }$wallet_name"
+      continue
+    fi
     echo "Migrate legacy passkey wallet $wallet_name with these two commands. Only the staging command requires sudo:"
     printf '  sudo %q stage --source %q --config %q --source-uid %q --signer-uid %q --signer-gid %q --receipt %q\n' \
       "$release_base/current/bloom-signer-migrate" "$wallet_dir" \
@@ -459,6 +477,9 @@ report_legacy_wallet_migrations() {
       "$BLOOM_MACOS_SIGNER_GID" "$receipt"
     printf '  %q wallet migrate-passkey %q\n' "$cli_link" "$receipt"
   done
+  if [[ -n "$migrated" ]]; then
+    echo "Already migrated, no action needed: $migrated"
+  fi
   if ! $found_wallet; then
     echo "No legacy wallets were found in $wallet_root"
   elif ! $found_supported; then

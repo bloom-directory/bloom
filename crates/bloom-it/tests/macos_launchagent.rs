@@ -625,3 +625,82 @@ fn interactive_services_are_not_throttled_as_background_jobs() {
         );
     }
 }
+
+#[test]
+fn macos_installer_hides_legacy_wallets_whose_migration_completed() {
+    let source =
+        fs::read_to_string(workspace().join("packaging/triad/release/install-macos.sh")).unwrap();
+    let start = source
+        .find("# A legacy wallet has finished migrating")
+        .unwrap();
+    let report = source[start..]
+        .find("report_legacy_wallet_migrations() {")
+        .unwrap()
+        + start;
+    let end = report + source[report..].find("\n}\n").unwrap() + 3;
+    let functions = &source[start..end];
+
+    let home = tempfile::tempdir().unwrap();
+    let keystore = home.path().join(".bloom/keystore");
+    for name in ["done", "differs", "pending"] {
+        fs::create_dir_all(keystore.join(name)).unwrap();
+        fs::write(keystore.join(name).join("kind"), "passkey").unwrap();
+    }
+    let receipt = |name: &str, address: &str| {
+        fs::write(
+            home.path()
+                .join(format!(".bloom/{name}.triad-migration-receipt.json")),
+            format!(r#"{{"address":"{address}"}}"#),
+        )
+        .unwrap();
+    };
+    receipt("done", "0x62D236408548f0F4694Acc9CcD2B1CB6a9551154");
+    receipt("differs", "0x10ad25D496aFeD7e172bF7b79F1CD786CFE30722");
+
+    let harness = format!(
+        r#"set -Eeuo pipefail
+live=true; legacy_cli_removed=false; login_uid=501; login_user=alice
+release_base=/unused; signer_config=/unused; cli_link=/usr/local/bin/bloom
+BLOOM_MACOS_SIGNER_UID=503; BLOOM_MACOS_SIGNER_GID=703
+resolve_login_home() {{ login_home='{home}'; }}
+# The receipt is read as the login user; the Machine reports live addresses.
+/usr/bin/sudo() {{ shift 3; "$@"; }}
+/usr/bin/plutil() {{ sed -n 's/.*"address":"\([^"]*\)".*/\1/p' "${{@: -1}}"; }}
+launchctl() {{
+  case "${{@: -1}}" in
+    done) echo 0x62d236408548f0f4694acc9ccd2b1cb6a9551154 ;;
+    differs) echo 0x943431A21c2DFF4aB97e9AB41E5dfF9E306c4bD5 ;;
+    *) return 1 ;;
+  esac
+}}
+{functions}
+report_legacy_wallet_migrations
+"#,
+        home = home.path().display(),
+    );
+    let output = Command::new("bash")
+        .arg("-c")
+        .arg(harness)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("Already migrated, no action needed: done\n"),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("Migrate legacy passkey wallet done"),
+        "{stdout}"
+    );
+    // A receipt whose address the Machine does not report, or no receipt at
+    // all, still gets its instructions.
+    assert!(
+        stdout.contains("Migrate legacy passkey wallet differs"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("Migrate legacy passkey wallet pending"),
+        "{stdout}"
+    );
+}
