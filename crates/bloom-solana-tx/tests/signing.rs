@@ -180,6 +180,7 @@ impl MachineBrokerService for SolanaBrokerFixture {
                     }))
                 }
                 MachineBrokerRequest::SealedApprovalPrepare(ApprovalPrepareRequest {
+                    surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
                     terms,
                     system_use_claim,
                     ..
