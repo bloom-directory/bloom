@@ -196,6 +196,6 @@ it must reconcile to a receipt.
 
 A staged transfer's blockhash lives about a minute. An agent must inspect,
 confirm, wait for approval, and retry inside it. The mounted walkthrough shows
-how: confirm and keep retrying in one command. Agents that retry a turn later
-often miss the window and restage repeatedly until the ceremony cap. Removing that race is a Machine and Broker design change, tracked in
+how: confirm, poll the challenge, and confirm again in one command. Agents
+that confirm a turn later often miss the window and restage repeatedly until the ceremony cap. Removing that race is a Machine and Broker design change, tracked in
 [pm#58](https://github.com/bloom-directory/pm/issues/58).
