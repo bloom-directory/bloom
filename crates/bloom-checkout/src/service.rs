@@ -189,6 +189,19 @@ const CALLING_CODES: &[&str] = &[
     "81", "82", "86", "91", "1", "7",
 ];
 
+/// The saved phone in international format, grouped by the country's
+/// numbering plan ("+54 9 294 412-3456"), so a form's area-code and number
+/// fields can each take their part. None when the number does not parse.
+fn formatted_phone(raw: &str) -> Option<String> {
+    let number = phonenumber::parse(None, raw).ok()?;
+    phonenumber::is_valid(&number).then(|| {
+        number
+            .format()
+            .mode(phonenumber::Mode::International)
+            .to_string()
+    })
+}
+
 /// A saved value, or a form of it that booking forms ask for separately.
 fn derived_traveler_value(
     values: &BTreeMap<String, zeroize::Zeroizing<String>>,
@@ -213,6 +226,24 @@ fn derived_traveler_value(
                 .find(|code| international && digits.starts_with(**code))
                 .map_or(0, |code| code.len());
             Some(zeroize::Zeroizing::new(digits[code..].to_owned()))
+        }
+        "phone_area" | "phone_local" => {
+            let formatted = formatted_phone(values.get("phone")?)?;
+            let mut groups: Vec<&str> = formatted.split(' ').skip(1).collect();
+            if groups.first() == Some(&"9") && groups.len() > 2 {
+                groups.remove(0);
+            }
+            let area = groups.first()?.to_string();
+            let local: String = groups[1..]
+                .concat()
+                .chars()
+                .filter(|c| c.is_ascii_digit())
+                .collect();
+            Some(zeroize::Zeroizing::new(if field == "phone_area" {
+                area
+            } else {
+                local
+            }))
         }
         "born_on_year" => date(0..4),
         "born_on_month" => date(5..7),
@@ -424,7 +455,7 @@ impl CheckoutService {
                 .filter(|(field, _)| !matches!(field.as_str(), "gender" | "document_kind"))
                 .map(|(field, value)| (value.to_string(), format!("[saved {field}]")))
                 .chain(
-                    ["phone_national", "born_on_dmy"]
+                    ["phone_national", "phone_local", "born_on_dmy"]
                         .into_iter()
                         .filter_map(|field| {
                             derived_traveler_value(&values, field)
@@ -476,9 +507,13 @@ impl CheckoutService {
             .as_ref()
             .filter(|t| tokio::time::Instant::now() < t.expires)
             .context("Unlock a saved traveler first")?;
+        let mut values = traveler.values.clone();
+        if let Some(phone) = values.get("phone").and_then(|p| formatted_phone(p)) {
+            values.insert("phone".into(), zeroize::Zeroizing::new(phone));
+        }
         let filled = self
             .browser
-            .fill_traveler(&traveler.origin, &traveler.fields, &traveler.values)
+            .fill_traveler(&traveler.origin, &traveler.fields, &values)
             .await
             .inspect_err(|e| eprintln!("traveler fill refused: {e:#}"))?;
         Ok(json!({"state":"filled","filled_fields":filled}))
@@ -1640,6 +1675,39 @@ mod tests {
         assert!(snapshot.contains("[saved born_on_dmy]"), "{snapshot}");
         assert!(!snapshot.contains("91123456789") && !snapshot.contains("07/05/1990"));
         server.abort();
+    }
+    #[test]
+    fn saved_phones_split_by_the_numbering_plan() {
+        let values = |phone: &str| -> BTreeMap<String, zeroize::Zeroizing<String>> {
+            [(
+                "phone".to_owned(),
+                zeroize::Zeroizing::new(phone.to_owned()),
+            )]
+            .into()
+        };
+        // Argentine mobiles: 11 for Buenos Aires, three and four digit areas elsewhere.
+        for (phone, area, local) in [
+            ("+5492944123456", "294", "4123456"),
+            ("+5491123456789", "11", "23456789"),
+            ("+5493514123456", "351", "4123456"),
+        ] {
+            let values = values(phone);
+            assert_eq!(
+                derived_traveler_value(&values, "phone_area")
+                    .unwrap()
+                    .as_str(),
+                area,
+                "{phone}"
+            );
+            assert_eq!(
+                derived_traveler_value(&values, "phone_local")
+                    .unwrap()
+                    .as_str(),
+                local,
+                "{phone}"
+            );
+        }
+        assert!(derived_traveler_value(&values("12345"), "phone_area").is_none());
     }
     #[test]
     fn interrupted_fill_is_not_retried_after_restart() {

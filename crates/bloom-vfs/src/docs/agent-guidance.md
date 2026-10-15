@@ -52,7 +52,9 @@ tool for this checkout.
   their names; card-holder fields are left for the payer. For a field it
   missed, send `type_traveler` with `element_ref` and `field`: a saved field,
   `phone_national` (no country code, when the page shows the prefix
-  separately), `born_on_day`, `born_on_month`, `born_on_year` or `born_on_dmy`.
+  separately), `phone_area` and `phone_local` (area code and number, split by
+  the country's numbering plan), `born_on_day`, `born_on_month`,
+  `born_on_year` or `born_on_dmy`.
   Snapshots show unlocked values as `[saved <field>]`; check each field holds
   the right placeholder, and never try to recover the values.
 - Write a browse request to `checkout/browse/<64-hex-slot>/in.json`; read

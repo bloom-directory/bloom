@@ -26,6 +26,7 @@ zeroize.workspace = true
 bloom-signer-api = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "84f51a675c7016bdc9c9e712f3da8c681f1881c6" }
 hpke = { version = "0.14", default-features = false, features = ["alloc", "getrandom", "x25519", "chacha"] }
 rusqlite.workspace = true
+phonenumber = "0.3"
 
 [dev-dependencies]
 reqwest.workspace = true
