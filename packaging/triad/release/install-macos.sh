@@ -838,11 +838,12 @@ reload_launchagent_job() {
 health_timed_out=false
 require_triad_health() {
   local uid="$1" user="$2" digest="$3" home timeout started last_report waited
+  health_timed_out=false
   home="$(dscl . -read "/Users/$user" NFSHomeDirectory | awk 'NR==1{sub(/^NFSHomeDirectory:[[:space:]]*/,"");print}')"
   [[ "$home" == /* && -d "$home" ]] || { echo "cannot resolve home for $user" >&2; return 1; }
   timeout="${BLOOM_HEALTH_TIMEOUT_SECONDS:-600}"
   [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || die "invalid Bloom health wait"
-  health_timed_out=false; started=$SECONDS; last_report=$SECONDS
+  started=$SECONDS; last_report=$SECONDS
   until launchctl asuser "$uid" /usr/bin/sudo -u "$user" -H "$release_base/current/bloom" --home "$home/.bloom" serve triad-health-check "$digest" >/dev/null 2>&1; do
     waited=$((SECONDS - started))
     if ((waited >= timeout)); then

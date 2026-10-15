@@ -5101,6 +5101,37 @@ if reload_installed_set; then echo healthy; else echo "timed_out=$health_timed_o
     assert!(mixed.ends_with("timed_out=false uids=501\n"), "{mixed}");
 }
 
+#[test]
+fn macos_health_check_never_inherits_an_earlier_timeout() {
+    let source = fs::read_to_string(release_script("install-macos.sh")).unwrap();
+    let start = source
+        .find("# Machine verifies its whole audit journal")
+        .unwrap();
+    let end = start + source[start..].find("\n}\n").unwrap() + 3;
+    let harness = format!(
+        r#"set -Eeuo pipefail
+die() {{ echo "$*" >&2; exit 65; }}
+release_base=/nonexistent
+dscl() {{ echo "NFSHomeDirectory: /nonexistent-home"; }}
+{function}
+health_timed_out=true
+if require_triad_health 502 bob digest; then echo healthy; else echo "timed_out=$health_timed_out"; fi
+"#,
+        function = &source[start..end],
+    );
+    let output = Command::new("bash")
+        .arg("-c")
+        .arg(harness)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    // An unresolvable home is a failure of its own, not an earlier timeout.
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "timed_out=false\n"
+    );
+}
+
 /// Runs one installer's health wait in bash with stubbed system tools; the
 /// health probe succeeds once it has been called `answer_after` times.
 fn run_health_wait(installer: &str, call: &str, answer_after: i64, timeout: &str) -> String {
