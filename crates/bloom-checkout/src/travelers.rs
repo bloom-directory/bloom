@@ -365,6 +365,52 @@ mod tests {
         server.abort();
     }
     #[tokio::test]
+    async fn split_dates_radios_and_typeahead_lists_are_filled() {
+        // Shaped like Aerolíneas Argentinas' passenger form.
+        let (browser, server, _) = browser_at(
+            "<a href='#'>Argentina</a>
+             <div><div>Fecha de Nacimiento</div><div><input aria-label='Día'><input aria-label='Mes'><input aria-label='Año'></div></div>
+             <div><div>Género</div><label><input type='radio' name='g' value='F'>Femenino</label><label><input type='radio' name='g' value='M'>Masculino</label></div>
+             <div><div>nro documento</div><input name='doc'></div>
+             <div><div>Nacionalidad</div><input id='nat'><ul id='list'></ul></div>
+             <script>nat.addEventListener('input',()=>{list.innerHTML='';for(const c of ['Argentina','Armenia'])
+               if(c.toLowerCase().startsWith(nat.value.toLowerCase())){const li=document.createElement('li');li.textContent=c;
+               li.onclick=()=>{nat.value=c;list.innerHTML='';};list.append(li);}});</script>",
+        )
+        .await;
+        let tab = browser.handoff().await.unwrap();
+        let fields = [
+            TravelerField::BornOn,
+            TravelerField::Gender,
+            TravelerField::DocumentNumber,
+            TravelerField::Nationality,
+        ];
+        let discovery = TravelerDiscovery::read(&tab, &fields).await.unwrap();
+        let values = [
+            ("born_on", "1990-05-07"),
+            ("gender", "female"),
+            ("document_number", "12345678"),
+            ("nationality", "AR"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), Zeroizing::new(v.to_owned())))
+        .collect();
+        assert_eq!(discovery.fill(&tab, &values).await.unwrap().len(), 4);
+        let filled = tab
+            .cdp
+            .evaluate(
+                &tab.session,
+                "[...document.querySelectorAll('input:not([type=radio])')].map(e=>e.value).concat(document.querySelector('[value=F]').checked)".into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            filled,
+            json!(["7", "5", "1990", "12345678", "Argentina", true])
+        );
+        server.abort();
+    }
+    #[tokio::test]
     async fn long_pages_leave_room_for_embedded_frames() {
         // Shaped like JetSMART's payment page: earlier steps stay in the DOM.
         let (browser, server, _) = browser_at(

@@ -1,7 +1,9 @@
 (() => {
-  const normalize = s => (s || '').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase();
+  const normalize = s => (s || '').normalize('NFD').replace(/[̀-ͯ]/g,'').toLowerCase();
   const refs = [];
   const mapped = [];
+  const radioGroups = new Set();
+  const choices = ['gender','nationality','document_kind','document_country'];
   for (const e of document.querySelectorAll('input,select,textarea')) {
     if (!e.getClientRects().length || getComputedStyle(e).visibility !== 'visible' || e.disabled
         || e.type === 'hidden' || e.type === 'password') continue;
@@ -14,20 +16,36 @@
       const text = (a.innerText || '').trim();
       if (text) { if (text.length <= 60) caption = text; break; }
     }
+    // A short caption shared by several fields: "Fecha de Nacimiento Día Mes Año"
+    // or "Género Femenino Masculino".
+    let group, groupText = '';
+    for (let a = e.parentElement, depth = 0; a && depth < 4; a = a.parentElement, depth++) {
+      const text = normalize(a.innerText);
+      if (text.length > 80) break;
+      if (/nacimiento|birth|genero|gender|sexo/.test(text)) { group = a; groupText = text; break; }
+    }
     const label = normalize([e.getAttribute('aria-label'),e.labels?.[0]?.innerText,e.placeholder,e.name,e.id,caption].filter(Boolean).join(' '));
     if (ac?.startsWith('cc-') || /card|tarjeta|cvc|security code|password|contrasena/.test(label)) continue;
     if (/full.?name|nombre completo|nombre.*apellido/.test(label)) continue;
     let field, part;
+    if (e.type === 'radio') {
+      // One mapping per radio group; the fill picks the option naming the value.
+      if (!group || !/genero|gender|sexo/.test(groupText) || radioGroups.has(group)) continue;
+      radioGroups.add(group);
+      mapped.push({field:'gender',radio:true,index:refs.length});refs.push(group);
+      continue;
+    }
+    const datePart = /^(day|dia)\b/.test(label) ? 'day' : /^(month|mes)\b/.test(label) ? 'month' : /^(year|ano)\b/.test(label) ? 'year' : undefined;
     if (ac === 'given-name' || /first.?name|given.?name|primer nombre|(?:^|\W)nombre(?:s|\(s\))?(?:\W|$)/.test(label)) field = 'given_name';
     else if (ac === 'family-name' || /last.?name|family.?name|surname|apellido/.test(label)) field = 'family_name';
-    else if (ac?.startsWith('bday') || /birth|nacimiento/.test(label)) {
-      field='born_on';part=ac?.split('-')[1];
+    else if (ac?.startsWith('bday') || /birth|nacimiento/.test(label) || (datePart && /nacimiento|birth/.test(groupText))) {
+      field='born_on';part=ac?.split('-')[1] || datePart;
       if (!part) part = /year|ano/.test(label) ? 'year' : /month|mes/.test(label) ? 'month' : /day|dia/.test(label) ? 'day' : undefined;
       if (!part && e.type !== 'date') continue;
     } else if (/nationality|nacionalidad/.test(label)) field='nationality';
-    else if (/issuing.?country|pais emisor|document.?country/.test(label)) field='document_country';
+    else if (/issuing.?country|pais emisor|pais de emision|document.?country/.test(label)) field='document_country';
     else if (/document.?type|tipo de documento|document.?kind/.test(label)) field='document_kind';
-    else if (/passport.?number|document.?number|numero.*documento|numero.*pasaporte/.test(label)) field='document_number';
+    else if (/passport.?number|document.?number|(numero|nro)\.?.*documento|(numero|nro)\.?.*pasaporte/.test(label)) field='document_number';
     else if (/document.*expiry|passport.*expiry|vencimiento/.test(label) && e.type === 'date') field='document_expiry';
     else if (ac === 'sex' || /gender|genero|sexo/.test(label)) field='gender';
     else if (ac === 'email' || e.type === 'email' || /email|e-mail|correo/.test(label)) field='email';
@@ -36,9 +54,10 @@
       field='phone';
     }
     if (!field) continue;
-    // A read-only input is a site-drawn dropdown: fill it only for a fixed set of choices.
-    const choice = e.readOnly && e.tagName === 'INPUT';
-    if (e.readOnly && !(choice && ['gender','nationality','document_kind','document_country'].includes(field))) continue;
+    // Sites draw these lists themselves: a read-only input opens on click, an
+    // editable one filters as the name is typed. Either way an option is clicked.
+    const choice = e.tagName === 'INPUT' && choices.includes(field);
+    if (e.readOnly && !choice) continue;
     mapped.push({field,part,choice,index:refs.length});refs.push(e);
   }
   if (mapped.length > 40) throw Error('Ambiguous traveler form');
