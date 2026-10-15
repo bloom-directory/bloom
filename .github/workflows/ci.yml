@@ -50,6 +50,10 @@ jobs:
         run: scripts/test-harbor-evals.sh
       - name: Validate hosted relay launcher readiness
         run: scripts/test-triad-dev-hosted-relay.sh
+      # Failure-mode cases for the ceremony-port A/B concurrency script
+      # (stub launchers; binds no ports and needs no Triad).
+      - name: Run concurrency script failure-mode cases
+        run: scripts/test-ceremony-port-concurrency-cases.sh
 
   clippy:
     name: clippy
@@ -280,7 +284,7 @@ jobs:
     uses: ./.github/workflows/macos-unix-conformance.yml
     with:
       broker_ref: cb43ce76071fa632ab2ca1d7d3e961bfca1556f7
-      signer_ref: 84f51a675c7016bdc9c9e712f3da8c681f1881c6
+      signer_ref: 968838a2b4cd27cb931b9c16cfff54148e362499
 
   linux_w0_isolation:
     name: Linux W0 principal and socket isolation

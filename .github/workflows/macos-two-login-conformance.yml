@@ -12,7 +12,7 @@ on:
         description: Public bloom-signer ref
         required: false
         type: string
-        default: 84f51a675c7016bdc9c9e712f3da8c681f1881c6
+        default: 968838a2b4cd27cb931b9c16cfff54148e362499
       login_uid_a:
         description: First active GUI login UID
         required: false
@@ -42,7 +42,7 @@ on:
       signer_ref:
         description: Public bloom-signer ref
         required: true
-        default: 84f51a675c7016bdc9c9e712f3da8c681f1881c6
+        default: 968838a2b4cd27cb931b9c16cfff54148e362499
       login_uid_a:
         description: First active GUI login UID
         required: true
@@ -108,7 +108,7 @@ jobs:
         shell: bash
         env:
           BROKER_REF: ${{ inputs.broker_ref || 'cb43ce76071fa632ab2ca1d7d3e961bfca1556f7' }}
-          SIGNER_REF: ${{ inputs.signer_ref || '84f51a675c7016bdc9c9e712f3da8c681f1881c6' }}
+          SIGNER_REF: ${{ inputs.signer_ref || '968838a2b4cd27cb931b9c16cfff54148e362499' }}
         run: |
           [[ "$BROKER_REF" =~ ^[0-9a-f]{40}$ ]]
           [[ "$SIGNER_REF" =~ ^[0-9a-f]{40}$ ]]
@@ -122,7 +122,7 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           repository: bloom-directory/bloom-signer
-          ref: ${{ inputs.signer_ref || '84f51a675c7016bdc9c9e712f3da8c681f1881c6' }}
+          ref: ${{ inputs.signer_ref || '968838a2b4cd27cb931b9c16cfff54148e362499' }}
           path: bloom-signer
       - name: Install Rust toolchain
         run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
