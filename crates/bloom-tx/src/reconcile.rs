@@ -6,6 +6,15 @@
 //! reason). The dependency gate in [`crate::tx_engine`] reads that record to
 //! decide whether a dependent same-chain tx may broadcast, and `BumpScanner`
 //! treats a reconciled entry as mined (so it stops fee-bumping it).
+//!
+//! A receipt can only exist once the sender's confirmed (mined) nonce has
+//! passed the transaction's nonce. Each tick reads that nonce once per sender
+//! and chain and looks a receipt up, journaled before it contacts the
+//! provider, only after the nonce is spent. A pending or dropped transaction,
+//! or a provider that cannot answer, therefore costs no journaled lookup, and
+//! a mined transaction is recorded on the tick after its nonce advances. The
+//! nonce read itself is not journaled: like a balance read, it reveals only
+//! the sender's address, not the transaction.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -17,15 +26,15 @@ use tokio::sync::oneshot;
 
 use crate::outbox::{MinedReceipt, Outbox, RECEIPT_FILE};
 
-/// How long an unanswered receipt lookup keeps the normal cadence. Every
-/// lookup is journaled before it contacts the provider, so a transaction
-/// that never gets a receipt (a dropped transaction, or a chain whose
-/// endpoint is down) must not be looked up on every tick forever.
+/// How long a transaction whose nonce is spent but whose receipt is missing
+/// keeps the normal cadence. That covers RPC endpoints that lag one another;
+/// after it, another transaction with the same nonce (a cancel or speed-up)
+/// most likely replaced this one, and its hash will never be mined.
 const RECEIPT_LOOKUP_GRACE: Duration = Duration::from_secs(5 * 60);
-/// Longest wait between lookups for such a transaction.
+/// Longest wait between lookups for such a replaced transaction.
 const RECEIPT_LOOKUP_MAX_DELAY: Duration = Duration::from_secs(30 * 60);
 
-/// Unanswered lookups for one sent entry.
+/// Missed lookups for one sent entry whose nonce is spent.
 struct LookupBackoff {
     first_miss: Instant,
     misses_after_grace: u32,
@@ -73,7 +82,8 @@ impl Reconciler {
             .is_some_and(|backoff| now < backoff.next_at)
     }
 
-    /// Record a lookup that found no receipt. The normal cadence holds for
+    /// Record a lookup, made after the nonce was spent, that found no receipt
+    /// for this hash. The normal cadence holds for
     /// [`RECEIPT_LOOKUP_GRACE`]; after that the wait doubles, up to
     /// [`RECEIPT_LOOKUP_MAX_DELAY`].
     fn record_lookup_miss(&self, key: String, now: Instant) {
@@ -117,6 +127,9 @@ impl Reconciler {
         let now = (self.clock)();
         let mut updated = 0;
         let mut waiting = std::collections::HashSet::new();
+        // Confirmed nonce per (chain, sender) for this tick; None when the
+        // provider could not answer.
+        let mut confirmed_nonces = HashMap::new();
         for se in entries {
             if se.mined {
                 continue;
@@ -126,6 +139,34 @@ impl Reconciler {
             };
             let backoff_key = Self::backoff_key(&se);
             waiting.insert(backoff_key.clone());
+            let nonce_key = (se.chain.clone(), se.from);
+            let confirmed = match confirmed_nonces.get(&nonce_key) {
+                Some(confirmed) => *confirmed,
+                None => {
+                    let confirmed = chain
+                        .nonce_latest(se.from)
+                        .await
+                        .map_err(|error| {
+                            tracing::debug!(%error, chain = %se.chain, "reconcile.nonce_unavailable")
+                        })
+                        .ok();
+                    confirmed_nonces.insert(nonce_key, confirmed);
+                    confirmed
+                }
+            };
+            // A provider that cannot answer gets no journaled lookup; the next
+            // tick asks again.
+            let Some(confirmed) = confirmed else {
+                continue;
+            };
+            if confirmed <= se.nonce {
+                // Not mined yet: nothing to look up, and no miss history.
+                self.backoff
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(&backoff_key);
+                continue;
+            }
             if self.lookup_deferred(&backoff_key, now) {
                 continue;
             }
@@ -421,46 +462,119 @@ mod tests {
         (directory, outbox)
     }
 
+    /// A JSON-RPC endpoint that keeps serving. `eth_getTransactionCount`
+    /// answers with the confirmed `nonce`, or an error while it is `None`;
+    /// `eth_getTransactionReceipt` answers with `receipt` and is counted in
+    /// `calls`.
+    #[derive(Clone)]
+    struct MockRpc {
+        nonce: Arc<Mutex<Option<u64>>>,
+        receipt: Arc<Mutex<serde_json::Value>>,
+        calls: Arc<AtomicUsize>,
+        fail_result_audit: Option<Arc<AuditLog>>,
+    }
+
+    impl MockRpc {
+        fn new(nonce: Option<u64>, receipt: serde_json::Value) -> Self {
+            Self {
+                nonce: Arc::new(Mutex::new(nonce)),
+                receipt: Arc::new(Mutex::new(receipt)),
+                calls: Arc::new(AtomicUsize::new(0)),
+                fail_result_audit: None,
+            }
+        }
+
+        fn lookups(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    async fn mock_chain(rpc: MockRpc) -> ChainClient {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let rpc = rpc.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+                    let mut request = vec![0_u8; 8192];
+                    let Ok(read) = stream.read(&mut request).await else {
+                        return;
+                    };
+                    let request_text = String::from_utf8_lossy(&request[..read]);
+                    let request_body = request_text.split("\r\n\r\n").nth(1).unwrap_or("{}");
+                    let request_json: serde_json::Value = serde_json::from_str(request_body)
+                        .unwrap_or_else(|_| serde_json::json!({}));
+                    let id = request_json
+                        .get("id")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                    let reply = |field: &str, value: serde_json::Value| serde_json::json!({"jsonrpc": "2.0", "id": id, field: value});
+                    let body = match request_json["method"].as_str() {
+                        Some("eth_getTransactionCount") => match *rpc.nonce.lock().unwrap() {
+                            Some(nonce) => {
+                                reply("result", serde_json::json!(format!("{nonce:#x}")))
+                            }
+                            None => reply(
+                                "error",
+                                serde_json::json!({"code": -32000, "message": "unavailable"}),
+                            ),
+                        },
+                        Some("eth_getTransactionReceipt") => {
+                            rpc.calls.fetch_add(1, Ordering::SeqCst);
+                            if let Some(audit) = &rpc.fail_result_audit {
+                                audit.fail_next_write_for_test();
+                            }
+                            reply("result", rpc.receipt.lock().unwrap().clone())
+                        }
+                        _ => reply("result", serde_json::Value::Null),
+                    }
+                    .to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        let mut spec = ChainSpec::anvil_default();
+        spec.rpc_urls = vec![format!("http://{address}")];
+        ChainClient::new(spec).unwrap()
+    }
+
+    /// A chain where the sent fixture's nonce (0) is already spent, answering
+    /// receipt lookups with `result_json`.
     async fn receipt_chain(
         result_json: &'static str,
         calls: Arc<AtomicUsize>,
         fail_result_audit: Option<Arc<AuditLog>>,
     ) -> ChainClient {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-            let mut request = vec![0_u8; 8192];
-            let read = stream.read(&mut request).await.unwrap();
-            calls.fetch_add(1, Ordering::SeqCst);
-            if let Some(audit) = fail_result_audit {
-                audit.fail_next_write_for_test();
-            }
-            let request_text = String::from_utf8_lossy(&request[..read]);
-            let request_body = request_text.split("\r\n\r\n").nth(1).unwrap_or("{}");
-            let request_json: serde_json::Value =
-                serde_json::from_str(request_body).unwrap_or_else(|_| serde_json::json!({}));
-            let id = request_json
-                .get("id")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null);
-            let body = serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": serde_json::from_str::<serde_json::Value>(result_json).unwrap(),
-            })
-            .to_string();
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            stream.write_all(response.as_bytes()).await.unwrap();
-        });
-        let mut spec = ChainSpec::anvil_default();
-        spec.rpc_urls = vec![format!("http://{address}")];
-        ChainClient::new(spec).unwrap()
+        let mut rpc = MockRpc::new(Some(1), serde_json::from_str(result_json).unwrap());
+        rpc.calls = calls;
+        rpc.fail_result_audit = fail_result_audit;
+        mock_chain(rpc).await
+    }
+
+    /// A successful receipt for the sent fixture's transaction.
+    fn mined_receipt() -> serde_json::Value {
+        serde_json::json!({
+            "transactionHash": format!("{:#x}", alloy::primitives::B256::repeat_byte(7)),
+            "transactionIndex": "0x0",
+            "blockHash": format!("{:#x}", alloy::primitives::B256::repeat_byte(9)),
+            "blockNumber": "0x5",
+            "from": "0x0000000000000000000000000000000000000001",
+            "to": "0x0000000000000000000000000000000000000002",
+            "cumulativeGasUsed": "0x5208",
+            "gasUsed": "0x5208",
+            "contractAddress": null,
+            "logs": [],
+            "logsBloom": format!("0x{}", "00".repeat(256)),
+            "status": "0x1",
+            "effectiveGasPrice": "0x1",
+            "type": "0x2"
+        })
     }
 
     #[tokio::test]
@@ -530,40 +644,93 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unanswered_receipt_lookups_back_off_after_the_grace_period() {
+    async fn a_pending_transaction_is_looked_up_only_once_its_nonce_is_spent() {
         let (_directory, outbox) = sent_outbox();
         let audit_directory = tempfile::tempdir().unwrap();
         let audit = Arc::new(AuditLog::open(audit_directory.path().join("audit.jsonl")).unwrap());
-        let calls = Arc::new(AtomicUsize::new(0));
-        // Answers once with no receipt, then refuses connections: both are
-        // lookups that found nothing.
-        let chain = receipt_chain("null", calls.clone(), None).await;
+        // The receipt is already available, but the sender's confirmed nonce
+        // has not passed the transaction's (0): nothing can be mined yet.
+        let rpc = MockRpc::new(Some(0), mined_receipt());
         let chains = ChainRegistry::default();
-        chains.add(chain);
+        chains.add(mock_chain(rpc.clone()).await);
+        let reconciler = Reconciler::new(outbox.clone(), chains, audit.clone());
+        for _ in 0..3 {
+            assert_eq!(reconciler.tick().await, 0);
+        }
+        assert_eq!(rpc.lookups(), 0);
+        assert_eq!(
+            audit.count().unwrap(),
+            0,
+            "a pending transaction journals nothing"
+        );
+
+        // The tick after the nonce advances records the receipt.
+        *rpc.nonce.lock().unwrap() = Some(1);
+        assert_eq!(reconciler.tick().await, 1);
+        assert_eq!(rpc.lookups(), 1);
+        assert_eq!(
+            outbox
+                .read_receipt("alice", "anvil", "tx-1")
+                .unwrap()
+                .unwrap()
+                .outcome,
+            "success"
+        );
+        assert!(audit.pending_effect_correlations().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_provider_costs_no_journaled_lookup() {
+        let (_directory, outbox) = sent_outbox();
+        let audit_directory = tempfile::tempdir().unwrap();
+        let audit = Arc::new(AuditLog::open(audit_directory.path().join("audit.jsonl")).unwrap());
+        let rpc = MockRpc::new(None, mined_receipt());
+        let chains = ChainRegistry::default();
+        chains.add(mock_chain(rpc.clone()).await);
+        let reconciler = Reconciler::new(outbox.clone(), chains, audit.clone());
+        for _ in 0..3 {
+            assert_eq!(reconciler.tick().await, 0);
+        }
+        assert_eq!(rpc.lookups(), 0);
+        assert_eq!(audit.count().unwrap(), 0);
+        // Once the provider answers again, the next tick catches up.
+        *rpc.nonce.lock().unwrap() = Some(1);
+        assert_eq!(reconciler.tick().await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_spent_nonce_without_our_receipt_backs_off_after_the_grace_window() {
+        let (_directory, outbox) = sent_outbox();
+        let audit_directory = tempfile::tempdir().unwrap();
+        let audit = Arc::new(AuditLog::open(audit_directory.path().join("audit.jsonl")).unwrap());
+        // The nonce is spent but this hash has no receipt: a replacement was
+        // mined, or the receipt endpoint lags the nonce endpoint.
+        let rpc = MockRpc::new(Some(1), serde_json::Value::Null);
+        let chains = ChainRegistry::default();
+        chains.add(mock_chain(rpc.clone()).await);
         let start = Instant::now();
         let elapsed = Arc::new(Mutex::new(Duration::ZERO));
         let clock_elapsed = elapsed.clone();
         let reconciler = Reconciler::new(outbox, chains, audit.clone())
             .with_clock(Arc::new(move || start + *clock_elapsed.lock().unwrap()));
-        let lookups = |audit: &AuditLog| audit.count().unwrap() / 2;
         let at = |secs: u64| *elapsed.lock().unwrap() = Duration::from_secs(secs);
 
-        // Inside the grace period every tick looks the receipt up.
+        // Inside the grace window every tick looks the receipt up.
         for secs in [0, 15, 60, 240] {
             at(secs);
             reconciler.tick().await;
         }
-        assert_eq!(lookups(&audit), 4);
-        // The first miss after the grace period waits two intervals.
+        assert_eq!(rpc.lookups(), 4);
+        // The first miss after the window waits two intervals.
         at(301);
         reconciler.tick().await;
-        assert_eq!(lookups(&audit), 5);
+        assert_eq!(rpc.lookups(), 5);
         at(320);
         reconciler.tick().await;
-        assert_eq!(lookups(&audit), 5, "deferred inside the backoff");
+        assert_eq!(rpc.lookups(), 5, "deferred inside the backoff");
         at(332);
         reconciler.tick().await;
-        assert_eq!(lookups(&audit), 6);
+        assert_eq!(rpc.lookups(), 6);
         // The wait keeps doubling but never exceeds the cap.
         let mut now = 332;
         for _ in 0..12 {
@@ -571,7 +738,7 @@ mod tests {
             at(now);
             reconciler.tick().await;
         }
-        assert_eq!(lookups(&audit), 18, "capped at one lookup per interval");
+        assert_eq!(rpc.lookups(), 18, "capped at one lookup per interval");
         assert!(audit.pending_effect_correlations().unwrap().is_empty());
     }
 
