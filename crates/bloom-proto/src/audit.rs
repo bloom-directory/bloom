@@ -90,6 +90,14 @@ fn latch_degradation(inner: &mut AuditInner, reason: String, cause_code: &'stati
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Runs once between the open-time verification pass and the snapshot
+    /// taken after it, so a test can write to the journal mid-verification.
+    static AFTER_OPEN_INSPECT_FOR_TEST: std::cell::Cell<Option<fn(&Path)>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// Cheap identity and mutation evidence for the journal verified at startup.
 /// This detects replacement, truncation, growth, and ordinary in-place edits
 /// without re-authenticating every historical signature before each append.
@@ -527,10 +535,21 @@ impl AuditLog {
             (None, None)
         };
         let verifier = identity.as_ref().map(AuditIdentity::verifier);
+        // Bind the verification pass to the file it read: a write during the
+        // pass would otherwise leave unverified bytes behind a snapshot that
+        // every later append trusts.
+        let snapshot_before = journal_snapshot(&path)?;
         let inspected = inspect(&path, verifier.as_ref());
+        #[cfg(test)]
+        if let Some(hook) = AFTER_OPEN_INSPECT_FOR_TEST.with(|hook| hook.take()) {
+            hook(&path);
+        }
+        let journal_snapshot = journal_snapshot(&path)?;
+        let changed_during_verification = (journal_snapshot != snapshot_before)
+            .then(|| "journal changed while it was being verified".to_owned());
         // The rotation-history check below re-verifies the current segment
-        // only when this full pass did not already succeed with its key.
-        let current_verified = inspected.is_ok();
+        // only when this full pass succeeded over an unchanged file.
+        let current_verified = inspected.is_ok() && changed_during_verification.is_none();
         let (last_digest, sequence, pending_effects, degraded, inspected_latched) = if path.exists()
         {
             match inspected {
@@ -556,7 +575,6 @@ impl AuditLog {
                 false,
             )
         };
-        let journal_snapshot = journal_snapshot(&path)?;
         let history_error = identity
             .as_ref()
             .and_then(|current| {
@@ -570,6 +588,7 @@ impl AuditLog {
             })
             .map(|error| error.to_string());
         let degradation_latched = inspected_latched
+            || changed_during_verification.is_some()
             || legacy_error.is_some()
             || rotation_recovery_error.is_some()
             || history_error.is_some();
@@ -581,7 +600,8 @@ impl AuditLog {
                 pending_effects,
                 journal_snapshot,
                 identity,
-                degraded: legacy_error
+                degraded: changed_during_verification
+                    .or(legacy_error)
                     .or(degraded)
                     .or(rotation_recovery_error)
                     .or(history_error),
@@ -2226,6 +2246,33 @@ mod tests {
     }
 
     #[test]
+    fn a_journal_written_during_open_verification_latches_degradation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let id = identity(12, "machine-audit-open-race");
+        let log = AuditLog::open_signed(&path, id.clone()).unwrap();
+        log.append(record("first", 1)).unwrap();
+        drop(log);
+        fn write_during_verification(path: &Path) {
+            use std::io::Write as _;
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(path)
+                .unwrap()
+                .write_all(b"\n")
+                .unwrap();
+        }
+        AFTER_OPEN_INSPECT_FOR_TEST.with(|hook| hook.set(Some(write_during_verification)));
+        let reopened = AuditLog::open_signed(&path, id).unwrap();
+        let reason = reopened.mutation_degradation().expect("must latch");
+        assert!(
+            reason.contains("changed while it was being verified"),
+            "{reason}"
+        );
+        assert!(reopened.append(record("after", 2)).is_err());
+    }
+
+    #[test]
     fn pending_effects_come_from_memory_until_the_journal_changes_outside_the_log() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit.jsonl");
@@ -2245,6 +2292,23 @@ mod tests {
             vec!["op:1".to_owned()]
         );
         log.append(effect("machine.effect.result")).unwrap();
+        assert!(log.pending_effect_correlations().unwrap().is_empty());
+
+        // An in-place edit that keeps the length still changes the file's
+        // change time, so the status read verifies the journal again.
+        {
+            use std::io::{Seek as _, Write as _};
+            let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            file.seek(std::io::SeekFrom::Start(2)).unwrap();
+            file.write_all(b"X").unwrap();
+        }
+        assert!(log.pending_effect_correlations().is_err());
+        let log = {
+            drop(log);
+            std::fs::remove_file(&path).unwrap();
+            AuditLog::open_signed(&path, identity(11, "machine-audit-status")).unwrap()
+        };
+        log.append(record("fresh", 1)).unwrap();
         assert!(log.pending_effect_correlations().unwrap().is_empty());
 
         // An outside write changes the file this process verified, so the
