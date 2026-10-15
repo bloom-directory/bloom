@@ -864,7 +864,9 @@ require_linux_triad_health() {
     echo "cannot resolve home for $user" >&2
     return 1
   }
-  for ((attempt = 0; attempt < 20; attempt++)); do
+  # Match macOS's startup allowance; RPC and wallet initialization can outlast
+  # the former ten-second window even when every service is healthy.
+  for ((attempt = 0; attempt < 240; attempt++)); do
     if linux_release_units_active "$uid" "$user" "$user_runtime" &&
       runuser -u "$user" -- env \
         XDG_RUNTIME_DIR="$user_runtime" \
