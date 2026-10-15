@@ -61,6 +61,13 @@ atomic_install() {
   mv -f "$temporary" "$destination"
 }
 
+provision_linux_remote_ceremonies() {
+  local login_uid="$1"
+  if ! /usr/libexec/bloom/current/bloom-signer admin provision --login-uid "$login_uid"; then
+    echo "Remote ceremony provisioning is incomplete; localhost remains available. Retry: sudo /usr/libexec/bloom/current/bloom-signer admin provision --login-uid $login_uid" >&2
+  fi
+}
+
 materialize_linux_layout() {
   layout_config="$1"
   layout_uid="$2"
@@ -73,8 +80,11 @@ materialize_linux_layout() {
     "/run/bloom/$layout_uid/signer" \
     "/run/bloom/$layout_uid/signer/rpc" \
     "/run/bloom/$layout_uid/signer/control" \
+    "/run/bloom/$layout_uid/signer/admin" \
     "/run/bloom/$layout_uid/session" \
     "/var/lib/bloom/$layout_uid/broker" \
+    "/var/lib/bloom/$layout_uid/broker/relay" \
+    "/var/lib/bloom/$layout_uid/installer/admin" \
     "/var/lib/bloom/$layout_uid/signer" \
     "/var/lib/bloom/$layout_uid/machine"
   do
@@ -1627,6 +1637,8 @@ case "$action" in
     fi
     rm -f -- "$authority_edge_history_source"
     if [[ "$root" == "/" ]]; then
+      "$binary_root/bloom" init triad-install-relay-trust \
+        "$payload/installer/relay" "$config_root" "$(id -u "bloom-signer-$login_uid")"
       chown "bloom-broker-$login_uid:bloom-broker-$login_uid" \
         "$config_root/broker/config.json" \
         "$config_root/broker/identity.json"
@@ -1681,6 +1693,7 @@ case "$action" in
       else
         systemctl enable --now "bloom-session@$login_uid.path"
       fi
+      provision_linux_remote_ceremonies "$login_uid"
       printf '%s\n' \
         "BLOOM_BIN=/usr/bin/bloom" \
         "BLOOM_INSTALL_MODE=triad-linux-systemd" \

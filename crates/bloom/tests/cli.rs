@@ -1671,6 +1671,24 @@ fn lifecycle_commands_ignore_invalid_client_endpoint_configuration() {
 }
 
 #[test]
+fn triad_health_check_uses_the_configured_client_endpoint() {
+    let home = fresh_home();
+    let configured_socket = home.path().join("run").join("custom-machine.sock");
+    let default_socket = bloom_daemon::ipc::default_socket_path(home.path());
+    let endpoint = format!("unix:{}", configured_socket.display());
+
+    bloom_cmd(home.path())
+        .env("BLOOM_RPC_ENDPOINT", endpoint)
+        .args(["serve", "triad-health-check", &"11".repeat(32)])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains(configured_socket.display().to_string())
+                .and(predicate::str::contains(default_socket.display().to_string()).not()),
+        );
+}
+
+#[test]
 fn ipc_socket_flag_beats_rpc_endpoint_env() {
     let home = fresh_home();
     let flag_socket = home.path().join("run").join("ipc-flag-missing.sock");
@@ -2500,9 +2518,9 @@ fn wallet_confirm_reports_the_pending_ceremony_url() {
         Vec::new(),
     );
     files.insert(
-        "/alice/0/chains/base/outbox/pending/0001-cafe/ceremony.json".to_string(),
+        "/alice/0/chains/base/outbox/pending/0001-cafe/approval_challenge.json".to_string(),
         format!(
-            "{{\"ceremony_url\":\"http://localhost:18734/c/secret\",\"ceremony_expires_at_ms\":\"{expires}\"}}"
+            "{{\"schema\":\"bloom.evm-approval-challenge/1\",\"state\":\"awaiting_ceremony\",\"ceremony_url\":\"http://localhost:18734/c/secret\",\"expiry_ms\":{expires}}}"
         )
         .into_bytes(),
     );
@@ -2582,9 +2600,9 @@ fn wallet_confirm_surfaces_unrelated_failures_despite_an_existing_ceremony() {
         + 180_000) as u64;
     let mut files = std::collections::HashMap::new();
     files.insert(
-        "/alice/0/chains/base/outbox/pending/0001-feed/ceremony.json".to_string(),
+        "/alice/0/chains/base/outbox/pending/0001-feed/approval_challenge.json".to_string(),
         format!(
-            "{{\"ceremony_url\":\"http://localhost:18734/c/old\",\"ceremony_expires_at_ms\":\"{expires}\"}}"
+            "{{\"schema\":\"bloom.evm-approval-challenge/1\",\"state\":\"awaiting_ceremony\",\"ceremony_url\":\"http://localhost:18734/c/old\",\"expiry_ms\":{expires}}}"
         )
         .into_bytes(),
     );

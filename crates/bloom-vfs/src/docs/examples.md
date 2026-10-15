@@ -46,8 +46,10 @@ ls "$BLOOM/wallets/alice/0/chains/anvil/outbox/failed/"
 
 If confirmation requires fresh approval, read this exact pending action's
 `approval_challenge.json`. Check its wallet, action, intent, and expiry before
-forwarding the ceremony URL to the human. After approval, retry only the
-challenge's `retry_path`. Do not restage while approval is pending.
+forwarding the ceremony URL to the human. Re-read it while they approve: its
+`state` turns from `awaiting_ceremony` to `active` as soon as they finish. Then
+write `confirm` to the challenge's `retry_path`. Do not restage while approval
+is pending.
 
 
 Follow `$ID` into its resulting state and read its intent and receipt before
@@ -84,7 +86,7 @@ Creation remains subject to exact Broker approval; recipient allowlists do
 not grant deployment permission. Follow-up initialization calls are separate
 transactions and approvals. First add the numeric-chain policy opt-in through
 its normal ceremony: `{"chain":"evm-31337","destination":"exact"}` for Anvil.
-Machine and Broker must both support protocol 1.6.
+Machine and Broker must both support protocol 1.7.
 
 For an existing Foundry project, start the adapter in a separate terminal:
 
@@ -137,6 +139,22 @@ printf 'cancel\n' > "$BLOOM/wallets/registrations/main/cancel"
 Do not put a mnemonic, private key, passkey response, or PRF output in the
 mount. Those inputs stay inside the Broker-hosted browser ceremony.
 
+## Recovering a wallet
+
+```sh
+printf 'main\n' > "$BLOOM/wallets/recover"
+cat "$BLOOM/wallets/recoveries/main/status.json"
+# Open the complete ceremony_url in a browser and enter recovery material there.
+# Poll until ceremony_state is SUCCEEDED, then inspect:
+cat "$BLOOM/wallets/recoveries/main/result.json"
+```
+
+The write needs only the wallet name, even when Machine has no cached wallet
+inventory. A consumed one-use URL is removed from status. To cancel a pending
+ceremony, write `cancel` to `wallets/recoveries/main/cancel`; after cancellation
+or expiry, write the name to `wallets/recover` again for a new operation.
+Never write the recovery ID or secret into the mount or pass them as arguments.
+
 ## Solana account-aware reads and transfer
 
 ```sh
@@ -169,18 +187,16 @@ ID="<exact-id>"
 cat "$BLOOM/wallets/alice/$N/chains/$CHAIN/outbox/pending/$ID/intent.json"
 cat "$BLOOM/wallets/alice/$N/chains/$CHAIN/outbox/pending/$ID/plan.md"
 
-# 4. Confirm, and once the owner has approved, retry in the same command.
-#    The staged blockhash lives about a minute, so a turn spent between
-#    approval and retry can let it expire. A repeated confirm reuses the
-#    pending approval. A redirect's exit status does not show a refusal, so
-#    judge by where the action is, not by the write.
+# 4. Confirm, and once the owner has approved, confirm again in the same
+#    command. The staged blockhash lives about a minute, so a turn spent
+#    between approval and confirm can let it expire.
 E="$BLOOM/wallets/alice/$N/chains/$CHAIN/outbox"
 printf 'confirm\n' > "$E/pending/$ID/confirm"
 cat "$E/pending/$ID/approval_challenge.json"  # verify, then give the owner its URL
-until [ -e "$E/sent/$ID" ] || [ -e "$E/failed/$ID" ]; do
-  printf 'confirm\n' > "$E/pending/$ID/confirm" 2>/dev/null
+while [ "$(jq -r .state "$E/pending/$ID/approval_challenge.json")" = awaiting_ceremony ]; do
   sleep 2
 done
+printf 'confirm\n' > "$E/pending/$ID/confirm"
 ```
 
 Verify that the staged intent names the chosen fingerprint, derivation path,
