@@ -43,25 +43,28 @@ document.getElementById('typing').addEventListener('submit', event => {
 });
 document.querySelectorAll('[data-key]').forEach(button=>button.addEventListener('click',()=>act({action:'key',key:button.dataset.key})));
 document.getElementById('finish').addEventListener('click',()=>act({action:'finish'}));
+// What each state means for the person watching, in plain words.
+const describe = state => ({
+  submitted: 'Payment sent. Waiting for the site to confirm it. Keep this window open.',
+  needs_attention: 'The site needs something from you before the payment completes. Check what the page highlights or asks to confirm, then press its button.',
+  paid: 'Done: the site confirmed the purchase.' + (state.outcome?.order_id ? ` Booking or order code: ${state.outcome.order_id}.` : ''),
+  declined: 'The payment was declined. Bloom will not try again.',
+  uncertain: 'Bloom could not confirm the result. Do not pay again yet: check your email and bank or card app first.',
+  manual_required: 'Finish the payment yourself in this window.',
+}[state.state] || state.state.replaceAll('_', ' '));
 async function refresh() {
   try {
     const response=await fetch('/state');
     if (!response.ok) {status.textContent='Private checkout has closed. Return to Bloom for the outcome.';screen.hidden=true;screen.removeAttribute('src');return;}
-    const state=await response.json();status.textContent=state.state.replaceAll('_',' ');
+    const state=await response.json();status.textContent=describe(state);
     if(state.state==='human_control'){
       document.getElementById('heading').textContent="Bloom's browser";
       document.getElementById('purpose').textContent='Log in, enter a code or pass a check here. The agent cannot see this view. When you are done, hand the browser back.';
       document.getElementById('finish').textContent='Done, hand back to the agent';
       document.getElementById('note').hidden=true;
     }
-    if(state.traveler) {
-      document.getElementById('heading').textContent='Private traveler autofill';
-      document.getElementById('purpose').textContent='Saved details are filled privately. Complete any unsupported fields, continue to payment, then click Ready. Payment still needs a separate approval.';
-      document.getElementById('finish').textContent='Ready for payment approval';
-      document.getElementById('note').hidden=true;
-    }
     if(state.closed) {
-      status.textContent=state.state==='ready_for_payment' ? 'Ready for payment approval. Traveler details remain hidden from the agent.' : state.state.replaceAll('_',' ');
+      status.textContent=describe(state);
       screen.hidden=true;screen.removeAttribute('src');return;
     }
     pages.replaceChildren(...state.pages.map(page=>{const option=document.createElement('option');option.value=page.target;option.textContent=page.origin;option.selected=page.target===state.selected_page;return option;}));

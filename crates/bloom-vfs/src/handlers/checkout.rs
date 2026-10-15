@@ -288,8 +288,6 @@ struct CheckoutInput {
     take_over: bool,
     #[serde(default)]
     traveler_id: Option<String>,
-    #[serde(default)]
-    continue_private: Option<String>,
 }
 
 #[async_trait]
@@ -318,10 +316,6 @@ impl Handler for CheckoutHandler {
             ["browse" | "requests", id, "out.json" | "status.json"] => {
                 operation(id)?;
                 Ok(Entry::file(s[2]))
-            }
-            ["requests", id, "facts.json"] => {
-                operation(id)?;
-                Ok(Entry::file("facts.json"))
             }
             _ => Err(HandlerError::not_found(path.to_string_path())),
         }
@@ -357,17 +351,6 @@ impl Handler for CheckoutHandler {
                 )
                 .map_err(|_| HandlerError::backend("Invalid public checkout status"))?;
                 safe_json(status)
-            }
-            ["requests", id, "facts.json"] => {
-                operation(id)?;
-                let facts: bloom_checkout_api::PaymentFacts = serde_json::from_value(
-                    self.call(Request::PrivateFacts {
-                        operation_id: (*id).into(),
-                    })
-                    .await?,
-                )
-                .map_err(|_| HandlerError::backend("Invalid public payment facts"))?;
-                safe_json(facts)
             }
             _ => Err(HandlerError::not_found(path.to_string_path())),
         }
@@ -417,10 +400,7 @@ impl Handler for CheckoutHandler {
                 operation(id)?;
                 let request: CheckoutInput = input(bytes)?;
                 if let Some(traveler_id) = request.traveler_id {
-                    if request.card_id.is_some()
-                        || request.take_over
-                        || request.continue_private.is_some()
-                    {
+                    if request.card_id.is_some() || request.take_over {
                         return Err(HandlerError::invalid(
                             "Traveler autofill does not accept payment or takeover options",
                         ));
@@ -441,7 +421,6 @@ impl Handler for CheckoutHandler {
                         card_id: request.card_id,
                         agent_description: request.agent_description,
                         take_over: request.take_over,
-                        continue_private: request.continue_private,
                     })
                     .await?;
                 let response: bloom_checkout_api::Status = serde_json::from_value(response)
@@ -486,7 +465,6 @@ impl Handler for CheckoutHandler {
                 Ok(vec![
                     Entry::writable_file("in.json"),
                     Entry::file("status.json"),
-                    Entry::file("facts.json"),
                     Entry::writable_file("cancel"),
                 ])
             }

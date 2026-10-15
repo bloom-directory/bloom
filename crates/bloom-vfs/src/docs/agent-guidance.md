@@ -67,6 +67,8 @@ tool for this checkout.
   different flight cards or the same day number in two calendar months.
 - Use fresh snapshot refs after every action. The browser rejects direct
   card entry and recognizable payment submission through shopping controls.
+- A payment request is refused while the page shows form errors; take a
+  snapshot, fix what it marks, and request again.
 - Once checkout is ready, write `checkout/requests/<new-64-hex-id>/in.json`
   with `card_id` and `agent_description`. That description is shown as agent
   text, not verified purchase facts. Read `status.json`, forward its ceremony
@@ -100,7 +102,10 @@ fallback releases no saved card.
 
 `filled` means fields were filled, not that payment succeeded. `paid` and
 `declined` describe what the merchant reported; Bloom has not verified the
-bank charge. `partially_filled`, `disclosure_unknown`, and `uncertain` require
+bank charge. For a booking, `outcome.order_id` holds the booking code the
+site showed. `needs_attention` means the site refused the submission or asked
+the human to re-enter details: the payment has not gone through and the human
+finishes it in the private view. `partially_filled`, `disclosure_unknown`, and `uncertain` require
 human inspection; never repeat the purchase automatically. Ask the human to
 check the merchant account or confirmation email. After private checkout
 closes, shopping resumes on a fresh tab.

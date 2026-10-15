@@ -149,7 +149,6 @@ enum Mode {
     Site,
     /// The human takes over the browser and hands it back; nothing is bought.
     TakeOver,
-    Traveler,
 }
 
 struct PrivateCheckout {
@@ -164,8 +163,6 @@ struct PrivateCheckout {
     view_target: String,
     view_session: String,
     seen_pages: std::collections::HashSet<String>,
-    traveler: Option<crate::travelers::TravelerDiscovery>,
-    contains_traveler: bool,
 }
 
 struct PendingUnlock {
@@ -599,26 +596,6 @@ impl CheckoutService {
                 operation_id,
                 traveler_id,
             } => self.start_traveler(operation_id, traveler_id).await,
-            Request::PrivateFacts { operation_id } => {
-                let private = self.private.lock().await;
-                let checkout = private
-                    .as_ref()
-                    .filter(|c| {
-                        c.operation_id == operation_id && c.mode == Mode::Traveler && c.approved
-                    })
-                    .context("No approved private traveler booking")?;
-                let discovery = Discovery::read(&checkout.tab)
-                    .await
-                    .context("Supported payment page not ready")?;
-                if checkout
-                    .traveler
-                    .as_ref()
-                    .is_none_or(|t| t.scope.origin != discovery.facts.origin)
-                {
-                    bail!("Booking merchant changed; private review required");
-                }
-                Ok(serde_json::to_value(discovery.facts)?)
-            }
             Request::Browse {
                 request: BrowseRequest::FillTraveler,
             } => self.fill_traveler().await,
@@ -635,7 +612,6 @@ impl CheckoutService {
                 card_id,
                 agent_description,
                 take_over,
-                continue_private,
             } => {
                 OperationId::new(&operation_id)
                     .map_err(|_| anyhow::anyhow!("Invalid operation ID"))?;
@@ -652,37 +628,8 @@ impl CheckoutService {
                     bail!("Description exceeds limit");
                 }
                 let mut private = self.private.lock().await;
-                let held = if let Some(previous) = private.as_ref() {
-                    if take_over
-                        || previous.mode != Mode::Traveler
-                        || !previous.approved
-                        || continue_private.as_deref() != Some(previous.operation_id.as_str())
-                        || self.store.get(&previous.operation_id)?.state != "ready_for_payment"
-                    {
-                        bail!("A checkout already has private control");
-                    }
-                    if previous.view_target != previous.tab.target {
-                        bail!("Return to the approved booking tab before payment");
-                    }
-                    Some(previous.tab.clone())
-                } else {
-                    if continue_private.is_some() {
-                        bail!("Private booking is no longer active");
-                    }
-                    None
-                };
-                let traveler_origin = private
-                    .as_ref()
-                    .and_then(|p| p.traveler.as_ref())
-                    .map(|t| t.scope.origin.clone());
-                if let Some(origin) = &traveler_origin {
-                    let current = tab_url(held.as_ref().context("Private booking unavailable")?)
-                        .await
-                        .and_then(|u| url::Url::parse(&u).ok())
-                        .map(|u| u.origin().ascii_serialization());
-                    if current.as_ref() != Some(origin) {
-                        bail!("Booking merchant changed; private review required");
-                    }
+                if private.is_some() {
+                    bail!("A checkout already has private control");
                 }
                 let mut status = Status {
                     operation_id: operation_id.clone(),
@@ -691,18 +638,33 @@ impl CheckoutService {
                     filled_fields: Vec::new(),
                     outcome: None,
                 };
+                if matches!(mode, Mode::Card | Mode::Site) {
+                    // Ask for payment only once the page accepts what was entered.
+                    let attention = self.browser.page_attention().await.unwrap_or_default();
+                    let errors: Vec<&str> = attention["errors"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .collect();
+                    if !errors.is_empty() || attention["invalid"].as_u64().unwrap_or(0) > 0 {
+                        bail!(
+                            "The page shows form errors; fix them before payment: {}",
+                            if errors.is_empty() {
+                                "a field is marked invalid".into()
+                            } else {
+                                errors.join(" / ")
+                            }
+                        );
+                    }
+                }
                 let kind = match mode {
                     Mode::Card => "card",
                     Mode::Site => "site",
                     Mode::TakeOver => "take_over",
-                    Mode::Traveler => "traveler",
                 };
                 self.store.insert(&status, kind, &agent_description)?;
-                let contains_traveler = held.is_some();
-                let tab = match held {
-                    Some(tab) => tab,
-                    None => self.browser.handoff().await?,
-                };
+                let tab = self.browser.handoff().await?;
                 status.state = "preparing".into();
                 self.store.update(&status)?;
                 let discovery = match mode {
@@ -712,7 +674,7 @@ impl CheckoutService {
                         .inspect_err(|e| eprintln!("payment page needs the private view: {e:#}"))
                         .ok(),
                     Mode::Site => Discovery::read_site(&tab).await.ok(),
-                    Mode::TakeOver | Mode::Traveler => None,
+                    Mode::TakeOver => None,
                 };
                 let shop = match &discovery {
                     Some(discovery) => Some(discovery.facts.origin.clone()),
@@ -762,8 +724,6 @@ impl CheckoutService {
                         status.ceremony_url = Some(ceremony_url);
                         self.store.update(&status)?;
                         *private = Some(PrivateCheckout {
-                            traveler: None,
-                            contains_traveler,
                             operation_id: operation_id.clone(),
                             mode,
                             view_target: tab.target.clone(),
@@ -892,42 +852,6 @@ impl CheckoutService {
         receipt: Option<Box<CustodyResult>>,
         aad: Option<CustodyOutputHpkeAad>,
     ) -> Result<()> {
-        if checkout.mode == Mode::Traveler {
-            let mut status = self.store.consume(&checkout.operation_id)?;
-            let traveler = checkout
-                .traveler
-                .as_ref()
-                .context("Private traveler binding missing")?;
-            self.browser.protect_origin(traveler.scope.origin.clone())?;
-            let key = checkout
-                .recipient
-                .take()
-                .context("Traveler recipient already consumed")?;
-            let receipt = receipt.context("Traveler release unavailable")?;
-            let aad = aad.context("Traveler release binding unavailable")?;
-            if receipt.custody_operation_id.as_str() != checkout.operation_id
-                || aad.custody_operation_id.as_str() != checkout.operation_id
-                || receipt.surface.as_ref() != Some(&aad.surface)
-            {
-                bail!("Traveler release binding mismatch");
-            }
-            let plaintext = key.open(
-                receipt
-                    .encrypted_browser_result
-                    .as_ref()
-                    .context("Traveler release unavailable")?,
-                &aad.canonical_bytes()
-                    .map_err(|_| anyhow::anyhow!("Traveler release binding invalid"))?,
-            )?;
-            let values: std::collections::BTreeMap<String, zeroize::Zeroizing<String>> =
-                serde_json::from_slice(&plaintext)
-                    .map_err(|_| anyhow::anyhow!("Invalid private traveler release"))?;
-            status.filled_fields = traveler.fill(&checkout.tab, &values).await?;
-            status.state = "filled".into();
-            status.ceremony_url = None;
-            self.store.update(&status)?;
-            return Ok(());
-        }
         let Some(discovery) = &checkout.discovery else {
             // Unclear payment facts leave the human to finish in the private view.
             let state = if checkout.mode == Mode::TakeOver {
@@ -1148,28 +1072,29 @@ impl CheckoutService {
 
     async fn watch_outcome(&self, id: String) {
         let started = tokio::time::Instant::now();
+        let mut copied_contact = false;
         loop {
             tokio::time::sleep(Duration::from_millis(500)).await;
             let mut private = self.private.lock().await;
             let Some(checkout) = private.as_ref().filter(|p| p.operation_id == id) else {
                 return;
             };
-            // A take-over may include a login with an emailed or texted code.
-            let take_over = matches!(checkout.mode, Mode::TakeOver | Mode::Traveler);
-            let deadline = started + Duration::from_secs(if take_over { 900 } else { 300 });
+            // A take-over may include a login with an emailed or texted code;
+            // a payment may need a bank check or a correction from the human.
+            let take_over = checkout.mode == Mode::TakeOver;
+            let deadline = started + Duration::from_secs(900);
             let Ok(mut status) = self.store.get(&id) else {
                 return;
             };
-            if checkout.mode != Mode::Traveler
-                && matches!(
-                    status.state.as_str(),
-                    "submitted"
-                        | "manual_required"
-                        | "uncertain"
-                        | "partially_filled"
-                        | "disclosure_unknown"
-                )
-            {
+            if matches!(
+                status.state.as_str(),
+                "submitted"
+                    | "needs_attention"
+                    | "manual_required"
+                    | "uncertain"
+                    | "partially_filled"
+                    | "disclosure_unknown"
+            ) {
                 let contexts = checkout
                     .tab
                     .cdp
@@ -1177,20 +1102,33 @@ impl CheckoutService {
                     .await
                     .unwrap_or_default();
                 for context in contexts {
-                    let result=checkout.tab.cdp.call(Some(&context.session),"Runtime.evaluate",json!({"contextId":context.world,"expression":include_str!("outcome.js"),"returnByValue":true})).await;
+                    let expression = concat!(
+                        include_str!("form-attention.js"),
+                        ";",
+                        include_str!("outcome.js")
+                    );
+                    let result=checkout.tab.cdp.call(Some(&context.session),"Runtime.evaluate",json!({"contextId":context.world,"expression":expression,"returnByValue":true})).await;
                     let Ok(result) = result else {
                         continue;
                     };
                     let outcome = result["result"]["value"].clone();
+                    if outcome["state"] == "needs_attention" {
+                        // Not paid yet: the human corrects the page in the private view.
+                        if status.state == "submitted" {
+                            self.set_state(&id, "needs_attention");
+                        }
+                        if outcome["reason"] == "confirm_contact" && !copied_contact {
+                            // Copy the contact email and phone already on the page into
+                            // the re-entry fields; the human checks them and confirms.
+                            copied_contact = true;
+                            let _ = checkout.tab.cdp.call(Some(&context.session),"Runtime.evaluate",
+                                json!({"contextId":context.world,"expression":include_str!("confirm-contact.js"),"returnByValue":true})).await;
+                        }
+                        continue;
+                    }
                     if matches!(outcome["state"].as_str(), Some("paid" | "declined")) {
                         status.state = outcome["state"].as_str().unwrap().into();
                         status.outcome = serde_json::from_value(outcome).ok();
-                        if checkout.contains_traveler {
-                            if let Some(outcome) = &mut status.outcome {
-                                outcome.order_id = None;
-                                outcome.source = "merchant".into();
-                            }
-                        }
                         status.ceremony_url = None;
                         if self.store.update(&status).is_ok()
                             && self.browser.return_control().await.is_ok()
@@ -1205,7 +1143,7 @@ impl CheckoutService {
             if tokio::time::Instant::now() >= deadline {
                 // Only a plain take-over resumes its page; a session that held
                 // traveler data is discarded with its browsing context.
-                let resume = if checkout.mode == Mode::TakeOver && !checkout.contains_traveler {
+                let resume = if checkout.mode == Mode::TakeOver {
                     Self::page_url(checkout).await
                 } else {
                     None
@@ -1268,38 +1206,8 @@ impl CheckoutService {
         authorize_view(checkout, token)?;
         let pages = Self::private_pages(checkout).await?;
         let status = self.store.get(&checkout.operation_id)?;
-        if checkout.contains_traveler {
-            // Popups belong to the same private booking even when they have
-            // not been selected. Never reopen their saved session to shopping.
-            for page in &pages {
-                if let Some(origin) = page["origin"].as_str()
-                    && let Ok(url) = url::Url::parse(origin)
-                    && matches!(url.scheme(), "http" | "https")
-                {
-                    self.browser.protect_origin(origin.to_owned())?;
-                }
-            }
-            for context in checkout
-                .tab
-                .cdp
-                .contexts(&checkout.view_session, "bloom-private-history")
-                .await?
-            {
-                if let Ok(url) = url::Url::parse(&context.url) {
-                    if matches!(url.scheme(), "http" | "https") {
-                        let origin = url.origin().ascii_serialization();
-                        self.browser.protect_origin(origin)?;
-                    }
-                }
-            }
-        }
-        if status.state == "ready_for_payment" {
-            return Ok(
-                json!({"state":"ready_for_payment","outcome":null,"closed":true,"pages":[]}),
-            );
-        }
         Ok(
-            json!({"state":status.state,"outcome":status.outcome,"pages":pages,"selected_page":checkout.view_target,"closed":false,"traveler":checkout.mode==Mode::Traveler}),
+            json!({"state":status.state,"outcome":status.outcome,"pages":pages,"selected_page":checkout.view_target,"closed":false}),
         )
     }
 
@@ -1316,7 +1224,7 @@ impl CheckoutService {
             let (cdp, session) = (cdp.clone(), session.clone());
             async move {
                 tokio::time::timeout(
-                    Duration::from_secs(2),
+                    Duration::from_secs(5),
                     cdp.call(Some(&session), method, params),
                 )
                 .await
@@ -1431,21 +1339,7 @@ impl CheckoutService {
                 Self::select_private_page(checkout, target).await?;
             }
             ViewAction::Finish => {
-                if checkout.mode == Mode::Traveler {
-                    let discovery = Discovery::read(&checkout.tab)
-                        .await
-                        .context("Continue to the supported payment page before finishing")?;
-                    if checkout.view_target != checkout.tab.target
-                        || checkout
-                            .traveler
-                            .as_ref()
-                            .is_none_or(|t| t.scope.origin != discovery.facts.origin)
-                    {
-                        bail!("Return to the approved booking tab before payment");
-                    }
-                    self.set_state(&checkout.operation_id, "ready_for_payment");
-                    return Ok(());
-                } else if checkout.mode == Mode::TakeOver && !checkout.contains_traveler {
+                if checkout.mode == Mode::TakeOver {
                     let resume = Self::page_url(checkout).await;
                     self.browser
                         .return_control_at(&checkout.view_target, resume)
@@ -1555,8 +1449,12 @@ const BROWSE_ERRORS: &[&str] = &[
 mod tests {
     use super::*;
     #[tokio::test]
-    async fn ready_private_traveler_exposes_only_financial_facts() {
-        let (url, server) = crate::discovery::tests::fixture("<p data-bloom-total-minor='399' data-bloom-currency='USD'>Total USD 3.99</p><input autocomplete='given-name'><input autocomplete='cc-number'><input autocomplete='cc-exp'><input autocomplete='cc-csc'><button>Pay</button>".into()).await;
+    async fn a_page_that_never_paints_does_not_stall_the_private_view() {
+        // A renderer stuck in script cannot answer a screenshot.
+        let (url, server) = crate::discovery::tests::fixture(
+            "<h1>Bank</h1><script>setTimeout(()=>{for(;;){}},300)</script>".into(),
+        )
+        .await;
         let root = tempfile::tempdir().unwrap().keep();
         let browser = Browser::launch(
             &crate::test_chromium(),
@@ -1565,18 +1463,9 @@ mod tests {
         )
         .await
         .unwrap();
-        browser
-            .browse(crate::browser::BrowseRequest::Open { url })
-            .await
-            .unwrap();
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        browser.browse(BrowseRequest::Open { url }).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(800)).await;
         let tab = browser.handoff().await.unwrap();
-        let traveler = crate::travelers::TravelerDiscovery::read(
-            &tab,
-            &[bloom_signer_api::TravelerField::GivenName],
-        )
-        .await
-        .unwrap();
         let service = CheckoutService::new(
             browser,
             &root.join("state.db"),
@@ -1585,48 +1474,30 @@ mod tests {
             47999,
         )
         .unwrap();
-        service
-            .store
-            .insert(
-                &Status {
-                    operation_id: "fixture".into(),
-                    state: "filled".into(),
-                    ceremony_url: None,
-                    filled_fields: vec!["given_name".into()],
-                    outcome: None,
-                },
-                "traveler",
-                "Fixture",
-            )
-            .unwrap();
         *service.private.lock().await = Some(PrivateCheckout {
             operation_id: "fixture".into(),
-            mode: Mode::Traveler,
+            mode: Mode::TakeOver,
             view_target: tab.target.clone(),
             view_session: tab.session.clone(),
             seen_pages: std::collections::HashSet::from([tab.target.clone()]),
             tab,
             discovery: None,
             recipient: None,
-            traveler: Some(traveler),
-            contains_traveler: true,
             capability: "fixture".into(),
             claimed: true,
             approved: true,
         });
-        service
-            .private_action("fixture", ViewAction::Finish)
-            .await
-            .unwrap();
-        let facts = service
-            .request(Request::PrivateFacts {
-                operation_id: "fixture".into(),
-            })
-            .await
-            .unwrap();
-        let facts: bloom_checkout_api::PaymentFacts = serde_json::from_value(facts).unwrap();
-        assert_eq!(facts.total_minor, 399);
-        assert_eq!(facts.currency, "USD");
+        let started = tokio::time::Instant::now();
+        let capture = {
+            let service = service.clone();
+            tokio::spawn(async move { service.private_screenshot("fixture").await })
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // Other private-view requests can take the lock while the capture waits.
+        assert!(service.private.try_lock().is_ok());
+        let error = capture.await.unwrap().unwrap_err();
+        assert_eq!(error.to_string(), "Private page is still loading");
+        assert!(started.elapsed() < Duration::from_secs(15));
         server.abort();
     }
     #[tokio::test]
@@ -1726,60 +1597,6 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.to_string(), "Unlock a saved traveler first");
         assert!(service.traveler.lock().await.is_none());
-        server.abort();
-    }
-    #[tokio::test]
-    async fn a_page_that_never_paints_does_not_stall_the_private_view() {
-        // A renderer stuck in script cannot answer a screenshot.
-        let (url, server) = crate::discovery::tests::fixture(
-            "<h1>Bank</h1><script>setTimeout(()=>{for(;;){}},300)</script>".into(),
-        )
-        .await;
-        let root = tempfile::tempdir().unwrap().keep();
-        let browser = Browser::launch(
-            &crate::test_chromium(),
-            &root.join("profile"),
-            &["--no-sandbox".into(), "--ignore-certificate-errors".into()],
-        )
-        .await
-        .unwrap();
-        browser.browse(BrowseRequest::Open { url }).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(800)).await;
-        let tab = browser.handoff().await.unwrap();
-        let service = CheckoutService::new(
-            browser,
-            &root.join("state.db"),
-            root.join("unused.sock"),
-            unsafe { libc::geteuid() },
-            47999,
-        )
-        .unwrap();
-        *service.private.lock().await = Some(PrivateCheckout {
-            operation_id: "fixture".into(),
-            mode: Mode::TakeOver,
-            view_target: tab.target.clone(),
-            view_session: tab.session.clone(),
-            seen_pages: std::collections::HashSet::from([tab.target.clone()]),
-            tab,
-            discovery: None,
-            recipient: None,
-            traveler: None,
-            contains_traveler: false,
-            capability: "fixture".into(),
-            claimed: true,
-            approved: true,
-        });
-        let started = tokio::time::Instant::now();
-        let capture = {
-            let service = service.clone();
-            tokio::spawn(async move { service.private_screenshot("fixture").await })
-        };
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        // Other private-view requests can take the lock while the capture waits.
-        assert!(service.private.try_lock().is_ok());
-        let error = capture.await.unwrap().unwrap_err();
-        assert_eq!(error.to_string(), "Private page is still loading");
-        assert!(started.elapsed() < Duration::from_secs(10));
         server.abort();
     }
     #[tokio::test]
@@ -1890,6 +1707,50 @@ mod tests {
         }
         assert!(derived_traveler_value(&values("12345"), "phone_area").is_none());
     }
+    #[tokio::test]
+    async fn payment_is_not_requested_while_the_page_shows_form_errors() {
+        let (url, server) = crate::discovery::tests::fixture(
+            "<input aria-label='Nombres *' aria-invalid='true'><div class='field-error'>Este campo es obligatorio</div>
+             <p data-bloom-total-minor='399' data-bloom-currency='USD'>Total USD 3.99</p>
+             <input autocomplete='cc-number'><input autocomplete='cc-exp'><input autocomplete='cc-csc'><button>Pay</button>".into(),
+        )
+        .await;
+        let root = tempfile::tempdir().unwrap().keep();
+        let browser = Browser::launch(
+            &crate::test_chromium(),
+            &root.join("profile"),
+            &["--no-sandbox".into(), "--ignore-certificate-errors".into()],
+        )
+        .await
+        .unwrap();
+        browser.browse(BrowseRequest::Open { url }).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let service = CheckoutService::new(
+            browser.clone(),
+            &root.join("state.db"),
+            root.join("unused.sock"),
+            unsafe { libc::geteuid() },
+            47999,
+        )
+        .unwrap();
+        let error = service
+            .request(Request::Checkout {
+                operation_id: "c".repeat(64),
+                card_id: Some("fixture-card".into()),
+                agent_description: "Fixture".into(),
+                take_over: false,
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("Este campo es obligatorio"),
+            "{error}"
+        );
+        // Nothing was recorded or handed off: shopping goes on on the same page.
+        assert!(service.store.get(&"c".repeat(64)).is_err());
+        assert!(browser.browse(BrowseRequest::Snapshot).await.is_ok());
+        server.abort();
+    }
     #[test]
     fn interrupted_fill_is_not_retried_after_restart() {
         let root = tempfile::tempdir().unwrap();
@@ -1956,8 +1817,6 @@ mod tests {
         *service.private.lock().await = Some(PrivateCheckout {
             operation_id: status.operation_id,
             mode: Mode::Card,
-            traveler: None,
-            contains_traveler: false,
             view_target: tab.target.clone(),
             view_session: tab.session.clone(),
             seen_pages: std::collections::HashSet::from([tab.target.clone()]),
@@ -2180,8 +2039,6 @@ mod tests {
         *service.private.lock().await = Some(PrivateCheckout {
             operation_id: status.operation_id,
             mode: Mode::TakeOver,
-            traveler: None,
-            contains_traveler: false,
             view_target: tab.target.clone(),
             view_session: tab.session.clone(),
             seen_pages: std::collections::HashSet::from([tab.target.clone()]),

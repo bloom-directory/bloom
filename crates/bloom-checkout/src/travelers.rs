@@ -216,9 +216,6 @@ mod tests {
         .into_iter()
         .map(|(k, v)| (k.into(), Zeroizing::new(v.into())))
         .collect();
-        browser
-            .protect_origin(discovery.scope.origin.clone())
-            .unwrap();
         assert_eq!(discovery.fill(&tab, &values).await.unwrap().len(), 6);
         let checked=tab.cdp.evaluate(&tab.session,"({born:document.querySelector('[autocomplete=bday]').value,nation:document.querySelector('select').value,card:document.querySelector('[autocomplete=cc-number]').value,password:document.querySelector('[type=password]').value})".into()).await.unwrap();
         assert_eq!(
@@ -318,6 +315,7 @@ mod tests {
             "<div><div>Nombres</div><input name='firstName-0'></div>
              <div><div>Apellidos</div><input name='lastName-0'></div>
              <input type='email'><h1 id='echo'></h1><button>Continuar</button>
+             <p id='keys'></p><script>let keys=0;document.addEventListener('keyup',()=>{keys++;document.getElementById('keys').textContent='key releases '+keys;});</script>
              <script>document.addEventListener('input',()=>{const n=document.querySelector('[name=firstName-0]').value.toUpperCase();
                echo.textContent='Hola '+n;document.title=n;history.replaceState({},'','/?n='+n);});</script>",
         )
@@ -358,6 +356,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(filled, ["given_name", "family_name", "email"]);
+        // Forms that accept a value only on a key release see one per field.
+        let keys = browser.browse(BrowseRequest::Snapshot).await.unwrap()["text"].to_string();
+        assert!(keys.contains("key releases 3"), "{keys}");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
         // Machine accepts only the closed public response shapes.

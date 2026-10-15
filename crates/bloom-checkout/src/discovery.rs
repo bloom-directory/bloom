@@ -1278,6 +1278,93 @@ pub(crate) mod tests {
         server.abort();
     }
 
+    async fn outcome_of(browser: &Browser, html: &str) -> Value {
+        let (url, server) = fixture(html.into()).await;
+        let tab = open(browser, url).await;
+        let outcome = tab
+            .cdp
+            .evaluate(
+                &tab.session,
+                concat!(
+                    include_str!("form-attention.js"),
+                    ";",
+                    include_str!("outcome.js")
+                )
+                .into(),
+            )
+            .await
+            .unwrap();
+        browser.return_control().await.unwrap();
+        server.abort();
+        outcome
+    }
+
+    #[tokio::test]
+    async fn airline_outcomes_read_booking_codes_and_requests_for_attention() {
+        let browser = browser().await;
+        // JetSMART's itinerary page after payment.
+        let booked = outcome_of(
+            &browser,
+            "<h1>Itinerario de vuelo</h1><p>Código de reserva</p><p>QX7T2M</p>",
+        )
+        .await;
+        assert_eq!(booked["state"], "paid");
+        assert_eq!(booked["order_id"], "QX7T2M");
+        // The form refused the submission: not paid, the human corrects it.
+        let refused = outcome_of(&browser, "<input aria-label='Nombres *' value='Karen'><div class='error'>Debes completar todos los campos.</div>").await;
+        assert_eq!(refused["state"], "needs_attention");
+        assert_eq!(refused["reason"], "form_errors");
+        // A label that names a booking code field is not a confirmation.
+        let form = outcome_of(
+            &browser,
+            "<label>Código de reserva <input></label><p>Apellido</p>",
+        )
+        .await;
+        assert_eq!(form["state"], "waiting");
+        browser.return_control().await.ok();
+    }
+
+    #[tokio::test]
+    async fn contact_reentry_is_copied_from_the_page_for_the_human_to_confirm() {
+        let browser = browser().await;
+        let (url, server) = fixture("<div><div>Correo electrónico *</div><input name='email' value='fixture@example.com'></div>
+            <input name='prefix' value='Argentina (+54)'><div><div>Teléfono *</div><input name='phone' value='2944808829'></div>
+            <div role='dialog'><p>Por favor reingresa tu correo y teléfono para confirmarlos.</p>
+              <input name='confirmEmail' placeholder='Correo'><input name='confirmPhone' placeholder='Teléfono'><button>Confirmar</button></div>".into()).await;
+        let tab = open(&browser, url).await;
+        let outcome = tab
+            .cdp
+            .evaluate(
+                &tab.session,
+                concat!(
+                    include_str!("form-attention.js"),
+                    ";",
+                    include_str!("outcome.js")
+                )
+                .into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome["reason"], "confirm_contact");
+        let copied = tab
+            .cdp
+            .evaluate(&tab.session, include_str!("confirm-contact.js").into())
+            .await
+            .unwrap();
+        assert_eq!(copied["copied"], 2);
+        let values = tab
+            .cdp
+            .evaluate(
+                &tab.session,
+                "[...document.querySelectorAll('[role=dialog] input')].map(e=>e.value)".into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(values, json!(["fixture@example.com", "2944808829"]));
+        browser.return_control().await.unwrap();
+        server.abort();
+    }
+
     #[tokio::test]
     async fn approval_preview_shows_the_filled_fields() {
         // An airline page: earlier steps above, filled contact fields far down.

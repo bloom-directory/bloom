@@ -132,6 +132,12 @@
     } else {
       e.focus();e.select();
       if (document.activeElement !== e || !e.isConnected || !document.execCommand('insertText',false,value)) throw Error('Traveler input unsupported');
+      // Some forms only accept a value after a key release and leaving the field.
+      e.dispatchEvent(new KeyboardEvent('keyup',{key:value.slice(-1),bubbles:true}));
+      e.dispatchEvent(new Event('change',{bubbles:true}));
+      e.blur();
+      filled.push(mapping.field);
+      continue;
     }
     e.dispatchEvent(new Event('change',{bubbles:true}));filled.push(mapping.field);
   } catch (error) {
