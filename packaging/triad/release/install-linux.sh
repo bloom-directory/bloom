@@ -856,15 +856,25 @@ linux_release_units_active() {
   done
 }
 
+# Machine verifies its whole audit journal before it listens, so a long-lived
+# install can take minutes to answer. Wait up to BLOOM_HEALTH_TIMEOUT_SECONDS
+# (default 600) and report progress.
 require_linux_triad_health() {
   local install_root="$1" uid="$2" user="$3" digest="$4"
-  local user_runtime="/run/user/$uid" home attempt
+  local user_runtime="/run/user/$uid" home timeout started last_report waited
   home="$(getent passwd "$uid" | cut -d: -f6)"
   [[ "$home" == /* && "$home" != "/" ]] || {
     echo "cannot resolve home for $user" >&2
     return 1
   }
-  for ((attempt = 0; attempt < 20; attempt++)); do
+  timeout="${BLOOM_HEALTH_TIMEOUT_SECONDS:-600}"
+  [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || {
+    echo "invalid Bloom health wait: $timeout" >&2
+    return 1
+  }
+  started=$SECONDS
+  last_report=$SECONDS
+  while :; do
     if linux_release_units_active "$uid" "$user" "$user_runtime" &&
       runuser -u "$user" -- env \
         XDG_RUNTIME_DIR="$user_runtime" \
@@ -874,9 +884,15 @@ require_linux_triad_health() {
     then
       return 0
     fi
+    waited=$((SECONDS - started))
+    ((waited < timeout)) || break
+    if ((SECONDS - last_report >= 30)); then
+      echo "Waiting for Bloom to start for UID $uid (${waited}s of up to ${timeout}s; Machine verifies its audit journal first)..." >&2
+      last_report=$SECONDS
+    fi
     sleep 0.5
   done
-  echo "Bloom Linux release failed authenticated activation for UID $uid" >&2
+  echo "Bloom Linux release did not pass authenticated activation for UID $uid within ${timeout}s" >&2
   systemctl is-active \
     "bloom-session@$uid.path" \
     "bloom-broker@$uid.service" \

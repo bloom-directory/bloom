@@ -832,14 +832,29 @@ reload_launchagent_job() {
   stop_launchd_job "gui/$uid/$label"; stop_launchd_job "user/$uid/$label"
   reload_launchd_job "user/$uid" "$label" "$plist"
 }
+# Machine verifies its whole audit journal before it listens, so a long-lived
+# install can take minutes to answer. Wait up to BLOOM_HEALTH_TIMEOUT_SECONDS
+# (default 600) and report progress; health_timed_out records a plain timeout.
+health_timed_out=false
 require_triad_health() {
-  local uid="$1" user="$2" digest="$3" home attempt
+  local uid="$1" user="$2" digest="$3" home timeout started last_report waited
   home="$(dscl . -read "/Users/$user" NFSHomeDirectory | awk 'NR==1{sub(/^NFSHomeDirectory:[[:space:]]*/,"");print}')"
   [[ "$home" == /* && -d "$home" ]] || { echo "cannot resolve home for $user" >&2; return 1; }
-  # Full Machine startup can warm RPC/cache state well beyond ten seconds.
-  # Keep activation bounded while allowing a cold installed home to become ready.
-  for ((attempt=0; attempt<240; attempt++)); do launchctl asuser "$uid" /usr/bin/sudo -u "$user" -H "$release_base/current/bloom" --home "$home/.bloom" serve triad-health-check "$digest" >/dev/null 2>&1 && return 0; sleep 0.5; done
-  launchctl asuser "$uid" /usr/bin/sudo -u "$user" -H "$release_base/current/bloom" --home "$home/.bloom" serve triad-health-check "$digest"
+  timeout="${BLOOM_HEALTH_TIMEOUT_SECONDS:-600}"
+  [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || die "invalid Bloom health wait"
+  health_timed_out=false; started=$SECONDS; last_report=$SECONDS
+  until launchctl asuser "$uid" /usr/bin/sudo -u "$user" -H "$release_base/current/bloom" --home "$home/.bloom" serve triad-health-check "$digest" >/dev/null 2>&1; do
+    waited=$((SECONDS - started))
+    if ((waited >= timeout)); then
+      launchctl asuser "$uid" /usr/bin/sudo -u "$user" -H "$release_base/current/bloom" --home "$home/.bloom" serve triad-health-check "$digest" && return 0
+      health_timed_out=true; return 1
+    fi
+    if ((SECONDS - last_report >= 30)); then
+      echo "Waiting for Bloom to start (${waited}s of up to ${timeout}s; Machine verifies its audit journal first)..." >&2
+      last_report=$SECONDS
+    fi
+    sleep 0.5
+  done
 }
 capture_activation_failure() {
   local evidence="${BLOOM_MACOS_W0_EVIDENCE_DIR:-}" service source_log
@@ -1250,11 +1265,20 @@ upgrade_release() {
   rewrite_all_enrollments "$new" activating
   switch_release "$new"
   if ! reload_installed_set; then
-    echo "new Bloom release failed authenticated pre-activation health" >&2; stop_all_enrollments || true
+    if [[ "${health_timed_out:-false}" == true ]]; then
+      echo "new Bloom release did not report healthy within ${BLOOM_HEALTH_TIMEOUT_SECONDS:-600}s" >&2
+    else
+      echo "new Bloom release failed authenticated pre-activation health" >&2
+    fi
+    stop_all_enrollments || true
     if [[ "$upgrade_phase" == rollback_allowed ]]; then
       restore_macos_upgrade_state; switch_release "$old"
       if reload_installed_set && activate_installed_set; then install_cli_link; rm -rf -- "$upgrade_transaction"; upgrade_transaction=""; upgrade_phase=""
         echo "previous Bloom release restored after rollback-safe failure" >&2
+      elif [[ "${health_timed_out:-false}" == true ]]; then
+        # The old release is selected and its services are loaded; it only
+        # has not answered yet. Say so rather than reporting a failed restore.
+        echo "previous Bloom release is reinstated and its services are running, but it did not report healthy within ${BLOOM_HEALTH_TIMEOUT_SECONDS:-600}s; it may still be starting. Rerunning this installer resumes the recorded upgrade." >&2
       else echo "automatic restoration of the previous Bloom release failed" >&2; fi
     else
       rewrite_all_enrollments "$new" activating
