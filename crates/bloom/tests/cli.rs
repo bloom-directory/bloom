@@ -787,7 +787,7 @@ fn spawn_bloom_serve(home: &Path) -> SpawnedServe {
         .expect("locate bloom binary")
         .get_program()
         .to_owned();
-    let mut child = std::process::Command::new(binary)
+    let child = std::process::Command::new(binary)
         .env("BLOOM_HOME", home)
         .env(
             "BLOOM_ENROLLMENT_ROOT",
@@ -818,6 +818,9 @@ fn spawn_bloom_serve(home: &Path) -> SpawnedServe {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn bloom serve");
+    // Guard it before waiting, so a daemon that never binds is still killed.
+    let mut serve = SpawnedServe(Some(child));
+    let child = serve.0.as_mut().expect("just spawned");
     let socket = bloom_daemon::ipc::default_socket_path(home);
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while !ipc_endpoint_accepting(&socket) {
@@ -841,7 +844,7 @@ fn spawn_bloom_serve(home: &Path) -> SpawnedServe {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
-    SpawnedServe(Some(child))
+    serve
 }
 
 /// Stops a daemon through its shutdown RPC. Until it has exited, the guard
