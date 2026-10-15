@@ -3486,10 +3486,20 @@ write_state_schema() {{ printf 'machine=2\nbroker=2\nsigner=2\n' > "$product/sta
 reload_installed_set() {{
   count=$(cat "$ROOT/reload-count" 2>/dev/null || echo 0); count=$((count + 1)); echo "$count" > "$ROOT/reload-count"
   echo "reload $count" >> "$ROOT/log"
-  case "$SCENARIO" in rollback) [[ "$count" -gt 1 ]];; migration|resume_floor) return 1;; partial) return 0;; esac
+  case "$SCENARIO" in
+    rollback) [[ "$count" -gt 1 ]];;
+    migration|resume_floor) return 1;;
+    partial) return 0;;
+    # The candidate times out; then the restore's own reload either times
+    # out, succeeds, or fails without a timeout.
+    restore_timeout) health_timed_out=true; return 1;;
+    activation_timeout) [[ "$count" -gt 1 ]] || {{ health_timed_out=true; return 1; }};;
+    restore_failed) [[ "$count" -gt 1 ]] && return 1; health_timed_out=true; return 1;;
+  esac
 }}
 activate_installed_set() {{
   echo 'activate first-full-machine then second-fails' >> "$ROOT/log"
+  [[ "$SCENARIO" != activation_timeout ]] || {{ health_timed_out=true; return 1; }}
   [[ "$SCENARIO" != partial ]]
 }}
 if [[ "$SCENARIO" == resume_floor ]]; then
@@ -3512,6 +3522,9 @@ find "$ROOT" -name '*.new.*' -print > "$ROOT/stray"
         ("migration", "1", "2"),
         ("resume_floor", "1", "2"),
         ("partial", "2", "2"),
+        ("restore_timeout", "2", "2"),
+        ("activation_timeout", "2", "2"),
+        ("restore_failed", "2", "2"),
     ] {
         let directory = tempfile::tempdir().unwrap();
         let output = Command::new("bash")
@@ -3550,6 +3563,24 @@ find "$ROOT" -name '*.new.*' -print > "$ROOT/stray"
                 );
                 assert!(log.contains("state\nactivate first-full-machine then second-fails"));
                 assert!(log.ends_with("rewrite new activating\n"));
+            }
+            "restore_timeout" | "activation_timeout" | "restore_failed" => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(log.contains("restore\nswitch old"), "{log}");
+                assert!(
+                    transaction.exists(),
+                    "an unconfirmed restore keeps the journal"
+                );
+                let expected = match scenario {
+                    "restore_timeout" => "reinstated and its services are running",
+                    "activation_timeout" => "did not report healthy within 600s and was stopped",
+                    _ => "automatic restoration of the previous Bloom release failed",
+                };
+                assert!(stderr.contains(expected), "{scenario}: {stderr}");
+                assert!(
+                    stderr.contains("did not report healthy within 600s\n"),
+                    "{scenario}: the candidate timed out: {stderr}"
+                );
             }
             _ => unreachable!(),
         }

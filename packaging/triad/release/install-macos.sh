@@ -1273,8 +1273,14 @@ upgrade_release() {
     stop_all_enrollments || true
     if [[ "$upgrade_phase" == rollback_allowed ]]; then
       restore_macos_upgrade_state; switch_release "$old"
-      if reload_installed_set && activate_installed_set; then install_cli_link; rm -rf -- "$upgrade_transaction"; upgrade_transaction=""; upgrade_phase=""
-        echo "previous Bloom release restored after rollback-safe failure" >&2
+      # Judge the restore by its own health checks, not the candidate's.
+      health_timed_out=false
+      if reload_installed_set; then
+        if activate_installed_set; then install_cli_link; rm -rf -- "$upgrade_transaction"; upgrade_transaction=""; upgrade_phase=""
+          echo "previous Bloom release restored after rollback-safe failure" >&2
+        elif [[ "${health_timed_out:-false}" == true ]]; then
+          echo "previous Bloom release is reinstated, but its Machine did not report healthy within ${BLOOM_HEALTH_TIMEOUT_SECONDS:-600}s and was stopped. Rerunning this installer resumes the recorded upgrade." >&2
+        else echo "automatic restoration of the previous Bloom release failed" >&2; fi
       elif [[ "${health_timed_out:-false}" == true ]]; then
         # The old release is selected and its services are loaded; it only
         # has not answered yet. Say so rather than reporting a failed restore.
