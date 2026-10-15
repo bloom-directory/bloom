@@ -11,17 +11,26 @@ def run(client, entry, clock, before_write):
     challenge = client.read(entry + '/approval_challenge.json', 3)
     expected = dict(schema='bloom.solana-approval-challenge/1', wallet=wallet, chain=chain,
                     tx_id=tx_id, action_id=tx_id, retry_path=entry + '/confirm')
+    expiry = challenge.get('expiry_ms') if isinstance(challenge, dict) else None
+    consumed_link = (isinstance(challenge, dict)
+                     and 'expiry_ms' in challenge and expiry is None
+                     and challenge.get('state') == 'awaiting_ceremony'
+                     and 'ceremony_url' in challenge and challenge['ceremony_url'] is None)
     if (not isinstance(challenge, dict)
             or any(challenge.get(key) != value for key, value in expected.items())
             or not isinstance(challenge.get('approval_id'), str)
             or not re.fullmatch('[0-9a-f]{64}', challenge['approval_id'])
-            or type(challenge.get('expiry_ms')) is not int or challenge['expiry_ms'] <= 0):
+            or not ((type(expiry) is int and expiry > 0) or consumed_link)):
         raise RuntimeError('challenge schema or identity mismatch')
     status_path = f"wallets/{wallet}/sealed-approvals/{challenge['approval_id']}/status.json"
-    expiry = challenge['expiry_ms']
-    deadline = clock.monotonic() + min(60, max(0, (expiry - clock.wall_ms()) / 1000))
+    started = clock.monotonic()
+    deadline = started + 60
+    if expiry is not None:
+        deadline = started + min(60, max(0, (expiry - clock.wall_ms()) / 1000))
     def remaining():
-        seconds = min(deadline - clock.monotonic(), (expiry - clock.wall_ms()) / 1000)
+        seconds = deadline - clock.monotonic()
+        if expiry is not None:
+            seconds = min(seconds, (expiry - clock.wall_ms()) / 1000)
         if seconds <= 0:
             raise RuntimeError('approval expired or bounded wait elapsed')
         return seconds

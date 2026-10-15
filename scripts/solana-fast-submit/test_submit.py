@@ -79,6 +79,53 @@ class Tests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, 'challenge'): m.run(c, ENTRY, Clock(), lambda: None)
                 self.assertEqual(c.writes, [])
 
+    def test_consumed_hosted_link_waits_on_live_status_and_confirms(self):
+        m = self.module(); c = Client(); original = c.read
+        def read(path, timeout):
+            value = original(path, timeout)
+            if path.endswith('approval_challenge.json'):
+                value.update(state='awaiting_ceremony', ceremony_url=None, expiry_ms=None)
+            return value
+        c.read = read
+        self.assertEqual(m.run(c, ENTRY, Clock(), lambda: None),
+                         'sent (not proof of confirmation)')
+        self.assertEqual(c.writes, [ENTRY + '/confirm'])
+
+    def test_null_expiry_requires_exact_consumed_link_shape(self):
+        m = self.module()
+        for changed in [dict(), dict(state='unknown', ceremony_url=None),
+                        dict(state='awaiting_ceremony'),
+                        dict(state='awaiting_ceremony', ceremony_url='https://used.example')]:
+            with self.subTest(changed=changed):
+                c = Client(); original = c.read
+                def read(path, timeout):
+                    value = original(path, timeout)
+                    if path.endswith('approval_challenge.json'):
+                        value['expiry_ms'] = None
+                        value.update(changed)
+                    return value
+                c.read = read
+                with self.assertRaisesRegex(RuntimeError, 'challenge'):
+                    m.run(c, ENTRY, Clock(), lambda: None)
+                self.assertEqual(c.writes, [])
+
+    def test_consumed_link_wait_remains_monotonic_bounded(self):
+        m = self.module(); c = Client(); original = c.read
+        def read(path, timeout):
+            if path.endswith('approval_challenge.json'):
+                value = original(path, timeout)
+                value.update(state='awaiting_ceremony', ceremony_url=None, expiry_ms=None)
+                return value
+            if '/sealed-approvals/' in path:
+                return dict(wallet_id='main', approval_id=APPROVAL,
+                            state='AWAITING_CEREMONY')
+            return original(path, timeout)
+        c.read = read; clock = Clock()
+        with self.assertRaisesRegex(RuntimeError, 'bounded wait'):
+            m.run(c, ENTRY, clock, lambda: None)
+        self.assertEqual(c.writes, [])
+        self.assertEqual(clock.t, 61000)
+
     def test_cli_executes_once_and_refuses_restart(self):
         import json, os, subprocess, sys, tempfile, time
         with tempfile.TemporaryDirectory() as temp:

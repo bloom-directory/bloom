@@ -17,9 +17,9 @@ python3 scripts/solana-fast-submit/submit.py \
 
 Paths and EXACT_ID are intentionally non-runnable placeholders. Start the listener before delivering the existing ceremony URL. Do not run another confirmer concurrently. Without explicit `--execute`, it refuses to run.
 
-1. Read the exact existing `bloom.solana-approval-challenge/1` via Machine IPC; validate wallet, chain, entry, action, approval ID, expiry and retry path.
+1. Read the exact existing `bloom.solana-approval-challenge/1` via Machine IPC; validate wallet, chain, entry, action, approval ID, retry path, and either its expiry or Broker's exact consumed-link projection (`awaiting_ceremony` with null URL and expiry).
 2. Poll the sealed approval's live Broker-backed `status.json` via IPC, not a mount or cached challenge. Wait only for `PREPARED`/`AWAITING_CEREMONY`; proceed only on matching `ACTIVE`.
-3. Fail closed on malformed/unknown states, identity mismatch, read failure, or deadline. Recheck wall expiry after status and before dispatch; cap waiting at 60 seconds with a monotonic clock. Poll gap is 250 ms plus read duration, not a guaranteed detection bound.
+3. Fail closed on malformed/unknown states, identity mismatch, read failure, or deadline. Recheck a published wall expiry after status and before dispatch; always cap waiting at 60 seconds with a monotonic clock, including when Broker has withdrawn a consumed link and its ceremony expiry. Poll gap is 250 ms plus read duration, not a guaranteed detection bound.
 4. Persist/fsync the guard, then issue at most one `vfs write <exact-entry>/confirm` with `y\n`. Never retry after timeout or ambiguous response. Killing the CLI does not cancel daemon work already accepted.
 5. Read the exact sent intent and validate identity/status. A `sent` result is **not finality**; verify the chain receipt separately.
 
@@ -31,9 +31,9 @@ The O_EXCL guard covers invocations using the same exact endpoint/entry strings 
 python3 -W error -m unittest discover -s scripts/solana-fast-submit -p test_submit.py -v
 ```
 
-28 unit/subprocess tests cover exact identity/path binding, a wallet named `pending`, deadline boundaries, slow/failing/malformed transport, pre/post-dispatch fsync failures, concurrent O_EXCL ownership and restart refusal. The core script is byte-for-byte the real-service-tested helper (SHA-256 `c26278884dcad35b47961732eb0165d341e31a1840acdbcc4492aac6d3de8a57`).
+31 unit/subprocess tests cover exact identity/path binding, the consumed-link startup race, a wallet named `pending`, deadline boundaries, slow/failing/malformed transport, pre/post-dispatch fsync failures, concurrent O_EXCL ownership and restart refusal. The committed live-service trials predate the consumed-link fix; the earlier tested helper had SHA-256 `c26278884dcad35b47961732eb0165d341e31a1840acdbcc4492aac6d3de8a57`.
 
-[Public acceptance evidence](evidence/results.json) records three real isolated triad/local-validator trials using generated disposable identities and the supported software WebAuthn driver. Each observed live ACTIVE, issued one helper confirm, signed, submitted and returned a finalized transaction with `meta.err == null`. Same-entry restart exited 2 without another confirm. Per-trial finalized transactions and monotonic events are alongside the results. No real funds, imported user keys or production services were used.
+[Public acceptance evidence](evidence/results.json) records three real isolated triad/local-validator trials using generated disposable identities and the supported software WebAuthn driver. Each observed live ACTIVE, issued one helper confirm, signed, submitted and returned a finalized transaction with `meta.err == null`. Same-entry restart exited 2 without another confirm. Per-trial finalized transactions and monotonic events are alongside the results. No real funds, imported user keys or production services were used. These trials are historical evidence for the pre-fix helper, not fresh acceptance of the consumed-link path.
 
 Tested services: Machine `059f900b0f147c6b1ab5c924b71835129bfc2761`; Broker `23b7b687f62c7d78e2f80a6f3434dd2e28a16d66` (built before the evidence commit, identical executable source); Signer `bc88ad690757165ebf1978410ea5c7ec652215d3`. Optimized builds used `--locked` and the same-UID developer harness, not production principal isolation. Earlier exact-pin and phone trials used the prior helper and are not fresh phone acceptance of this revision.
 
