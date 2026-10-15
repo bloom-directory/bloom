@@ -768,7 +768,20 @@ fn stop_ipc_server(
     server_thread.join().expect("ipc server thread panicked");
 }
 
-fn spawn_bloom_serve(home: &Path) -> std::process::Child {
+/// A `bloom serve` started by a test. Dropping it kills the daemon, so a test
+/// that panics before [`stop_bloom_serve`] does not leave it running.
+struct SpawnedServe(Option<std::process::Child>);
+
+impl Drop for SpawnedServe {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn spawn_bloom_serve(home: &Path) -> SpawnedServe {
     prepare_hermetic_machine_state(home);
     let binary = Command::cargo_bin("bloom")
         .expect("locate bloom binary")
@@ -828,23 +841,27 @@ fn spawn_bloom_serve(home: &Path) -> std::process::Child {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
-    child
+    SpawnedServe(Some(child))
 }
 
-fn stop_bloom_serve(home: &Path, mut child: std::process::Child) {
+/// Stops a daemon through its shutdown RPC. Until it has exited, the guard
+/// still owns it, so any panic here kills it on drop.
+fn stop_bloom_serve(home: &Path, mut serve: SpawnedServe) {
     bloom_cmd(home)
         .args(["ipc", "call", "shutdown"])
         .assert()
         .success();
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
+        let child = serve.0.as_mut().expect("bloom serve already stopped");
         if child.try_wait().unwrap().is_some() {
+            serve.0 = None;
             return;
         }
-        if std::time::Instant::now() >= deadline {
-            child.kill().expect("kill stuck bloom serve");
-            panic!("bloom serve did not stop after shutdown RPC");
-        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "bloom serve did not stop after shutdown RPC"
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
 }
