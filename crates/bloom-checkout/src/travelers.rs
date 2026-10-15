@@ -471,7 +471,9 @@ mod tests {
             "<div><div>Nombres *</div><input></div><div><div>Apellidos *</div><input></div>
              <div><div>Correo *</div><input></div><div><div>Teléfono *</div><input></div>
              <section><h3>Tarjeta de débito o crédito</h3><div><div>Nombre del titular de la tarjeta</div><input></div>
-               <div><div>nro documento</div><input></div><div><div>Correo electrónico</div><input></div></section>",
+               <div><div>Documento</div><input type='hidden'><input type='hidden'><input type='hidden'>
+                 <div><div>Número</div><input name='documentNumber'></div></div>
+               <div><div>Correo electrónico</div><input></div></section>",
         )
         .await;
         let tab = browser.handoff().await.unwrap();
