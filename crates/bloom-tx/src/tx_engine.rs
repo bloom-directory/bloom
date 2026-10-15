@@ -7952,6 +7952,9 @@ mod tests {
             );
             assert_eq!(held.request_nonce, first.request_nonce, "{code:?}");
         }
+        // The simulated QUOTA_EXCEEDED above makes the Machine client refuse
+        // requests locally for its initial 250 ms backoff.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         *fixture.deny_sign.lock() = Some(ProtocolErrorCode::ClaimInvalid);
         assert!(matches!(
             engine
@@ -8343,6 +8346,9 @@ mod tests {
             );
             assert_eq!(held.request_nonce, first.request_nonce, "{code:?}");
         }
+        // The simulated QUOTA_EXCEEDED above makes the Machine client refuse
+        // requests locally for its initial 250 ms backoff.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         *fixture.deny_sign.lock() = Some(ProtocolErrorCode::ClaimInvalid);
         assert!(matches!(
             engine
