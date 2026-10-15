@@ -12,7 +12,7 @@
     if (e.type !== 'radio' && e.type !== 'checkbox' && e.value) continue;
     // Card-holder name, document and email belong to the payer, not the traveler.
     let payer = false;
-    for (let a = e.parentElement, depth = 0; a && depth < 6 && !payer; a = a.parentElement, depth++) {
+    for (let a = e.parentElement; a && !payer; a = a.parentElement) {
       const text = normalize(a.innerText);
       // Stop at the payment block: a few fields and a short text.
       const fields = [...a.querySelectorAll('input,select')].filter(f => f.type !== 'hidden' && f.getClientRects().length);

@@ -472,7 +472,7 @@ mod tests {
              <div><div>Correo *</div><input></div><div><div>Teléfono *</div><input></div>
              <section><h3>Tarjeta de débito o crédito</h3><div><div>Nombre del titular de la tarjeta</div><input></div>
                <div><div>Documento</div><input type='hidden'><input type='hidden'><input type='hidden'>
-                 <div><div>Número</div><input name='documentNumber'></div></div>
+                 <div><div><div><div><div><div><div>Número</div><input name='documentNumber'></div></div></div></div></div></div></div>
                <div><div>Correo electrónico</div><input></div></section>",
         )
         .await;
