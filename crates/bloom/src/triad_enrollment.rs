@@ -1272,12 +1272,28 @@ mod tests {
     use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
     use std::os::unix::fs::PermissionsExt as _;
 
+    /// The shipped templates, copied once at mode 0644. The enrollment refuses
+    /// group- or world-writable templates, so reading the checkout directly
+    /// would make these tests depend on the umask it was cloned with.
     fn template_dir() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(Path::parent)
-            .unwrap()
-            .join("packaging/triad/macos/config")
+        static COPY: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        COPY.get_or_init(|| {
+            let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .and_then(Path::parent)
+                .unwrap()
+                .join("packaging/triad/macos/config");
+            let copy = tempfile::tempdir().unwrap();
+            for entry in fs::read_dir(source).unwrap() {
+                let entry = entry.unwrap();
+                let target = copy.path().join(entry.file_name());
+                fs::copy(entry.path(), &target).unwrap();
+                fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+            }
+            copy
+        })
+        .path()
+        .to_owned()
     }
 
     #[test]
