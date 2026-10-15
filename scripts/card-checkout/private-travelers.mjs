@@ -37,10 +37,13 @@ let submitted = 0;
 const server = https.createServer({key: readFileSync(join(root, 'key.pem')), cert: readFileSync(join(root, 'cert.pem'))}, (request, response) => {
   response.setHeader('content-type', 'text/html');
   if (request.url.startsWith('/done')) {submitted++; response.end('<h1>Order confirmed</h1><p>Order ID: SYNTHETIC</p><p>Total USD 3.99</p>'); return;}
-  response.end(`<h1>Private passenger fixture</h1><p data-bloom-total-minor="399" data-bloom-currency="USD">Total USD 3.99</p>
-    <form action="/done"><input autocomplete="given-name"><input autocomplete="family-name"><input autocomplete="bday" type="date">
-    <input type="email"><input autocomplete="cc-number"><input autocomplete="cc-exp"><input autocomplete="cc-csc"><button type="submit">Pay</button></form>
-    <script>document.addEventListener('input',()=>{document.title=document.querySelector('[autocomplete=given-name]').value;});</script>`);
+  // Like an airline: the passenger page echoes the name, contact details follow on the payment page.
+  if (request.url.startsWith('/payment')) {response.end(`<html lang="es"><h1>Pago</h1><div>Total</div><div>:</div><div>$3,99</div><div>USD</div>
+    <form action="/done"><div><div>Correo electrónico</div><input name="email"></div>
+    <input autocomplete="cc-number"><input autocomplete="cc-exp"><input autocomplete="cc-csc"><button type="submit">Pagar Ahora</button></form></html>`); return;}
+  response.end(`<h1>Passenger fixture</h1><div><div>Nombres</div><input name="firstName-0"></div><div><div>Apellidos</div><input name="lastName-0"></div>
+    <input autocomplete="bday" type="date"><h2 id="echo"></h2><a href="/payment">Continuar</a>
+    <script>document.addEventListener('input',()=>{const n=document.querySelector('[name=firstName-0]').value;echo.textContent='Hola '+n;document.title=n;});</script>`);
 });
 await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
 const merchant = `https://localhost:${server.address().port}/`;
@@ -80,31 +83,33 @@ try {
   await poll(`/cards/operations/${add}/status.json`, 'succeeded');
   console.log('Saved card with existing passkey');
   await browse({action: 'open', url: merchant}); await pause(400);
-  const fill = id();
-  await vfs('write', `/checkout/requests/${fill}/in.json`, {traveler_id: 'wife', agent_description: 'Synthetic wife passenger'});
-  const viewPromise = context.waitForEvent('page');
-  await approve((await vfs('cat', `/checkout/requests/${fill}/status.json`)).ceremony_url);
-  const view = await viewPromise;
-  await poll(`/checkout/requests/${fill}/status.json`, 'filled');
-  console.log('Private traveler autofill completed');
+  // One approval unlocks the person for this website; the agent keeps shopping.
+  const unlock = id();
+  await vfs('write', `/checkout/requests/${unlock}/in.json`, {traveler_id: 'wife', agent_description: 'Synthetic wife passenger'});
+  await approve((await vfs('cat', `/checkout/requests/${unlock}/status.json`)).ceremony_url);
+  await poll(`/checkout/requests/${unlock}/status.json`, 'unlocked');
+  console.log('Traveler unlocked with one approval');
+  const first = await browse({action: 'fill_traveler'});
+  assert.deepEqual(first.filled_fields, ['given_name', 'family_name', 'born_on']);
+  let snapshot = await browse({action: 'snapshot'});
+  assert(JSON.stringify(snapshot).includes('Hola [saved given_name]'));
+  assert(snapshot.elements.some(e => e.label === 'Apellidos' && e.value === '[saved family_name]'));
+  const next = snapshot.elements.find(e => e.label === 'Continuar');
+  await browse({action: 'click', element_ref: next.ref}); await pause(600);
+  const second = await browse({action: 'fill_traveler'});
+  assert.deepEqual(second.filled_fields, ['email']);
+  snapshot = await browse({action: 'snapshot'});
+  assert(snapshot.elements.some(e => e.value === '[saved email]'));
+  console.log('Filled passenger and payment pages without exposing values');
   assert.equal(submitted, 0);
-  await assert.rejects(browse({action: 'snapshot'}));
-  // Only test code observes synthetic private fields, never a real traveler view.
-  await view.locator('#finish').click();
-  await poll(`/checkout/requests/${fill}/status.json`, 'ready_for_payment');
-  console.log('Ready for payment');
-  const facts = await vfs('cat', `/checkout/requests/${fill}/facts.json`);
-  assert.equal(facts.total_minor, 399); assert.equal(facts.currency, 'USD');
-  console.log('Financial facts verified');
   const payment = id();
-  await vfs('write', `/checkout/requests/${payment}/in.json`, {card_id: 'fixture-card', continue_private: fill, agent_description: 'Synthetic fare USD 3.99'});
+  await vfs('write', `/checkout/requests/${payment}/in.json`, {card_id: 'fixture-card', agent_description: 'Synthetic fare USD 3.99'});
   await approve((await vfs('cat', `/checkout/requests/${payment}/status.json`)).ceremony_url, {'card-cvc': '937'});
   await poll(`/checkout/requests/${payment}/status.json`, 'paid');
   assert.equal(submitted, 1);
-  // The ceremony may reuse the named private-view window from traveler fill.
   for (const privatePage of context.pages().filter(candidate => candidate !== page)) await privatePage.close();
   const publicResults = JSON.stringify(transcript);
   for (const secret of ['SyntheticSelf', 'SyntheticWife', 'FixtureFamily', 'wife@example.com', '1992-02-29', '4242424242424242']) assert(!publicResults.includes(secret));
-  writeFileSync(output, JSON.stringify({result: 'passed', private_passengers_saved: passengers.length, real_broker_js: true, same_passkey_card: true, autofill_then_separate_payment: true, public_nondisclosure: true, submitted}, null, 2));
+  writeFileSync(output, JSON.stringify({result: 'passed', private_passengers_saved: passengers.length, real_broker_js: true, same_passkey_card: true, unlock_once_fill_two_pages_then_pay: true, public_nondisclosure: true, submitted}, null, 2));
 } catch (error) {console.error(error); process.exitCode = 1;}
 finally {await browser.close(); server.closeAllConnections(); await new Promise(resolve => server.close(resolve));}
