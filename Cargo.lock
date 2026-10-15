@@ -2275,6 +2275,7 @@ dependencies = [
  "base64",
  "blake3",
  "bloom-broker-api",
+ "bloom-daemon",
  "bloom-ens",
  "bloom-etherscan",
  "bloom-evm",
