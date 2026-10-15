@@ -123,6 +123,9 @@ pub enum BrowseResponse {
 #[serde(deny_unknown_fields)]
 pub struct Action {
     pub state: String,
+    /// Field names `FillTraveler` filled; never their values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filled_fields: Option<Vec<String>>,
 }
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -146,6 +149,12 @@ pub struct Element {
     pub input_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub options: Option<Vec<SelectOption>>,
+    /// Field contents, except card and password fields. Unlocked traveler
+    /// values appear as `[saved <field>]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked: Option<bool>,
 }
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]

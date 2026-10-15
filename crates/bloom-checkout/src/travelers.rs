@@ -338,11 +338,14 @@ mod tests {
             .unwrap();
         assert_eq!(filled, ["given_name", "family_name", "email"]);
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        let snapshot = browser
-            .browse(BrowseRequest::Snapshot)
-            .await
-            .unwrap()
-            .to_string();
+        let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+        // Machine accepts only the closed public response shapes.
+        serde_json::from_value::<bloom_checkout_api::BrowseResponse>(snapshot.clone()).unwrap();
+        serde_json::from_value::<bloom_checkout_api::BrowseResponse>(
+            json!({"state":"filled","filled_fields":filled}),
+        )
+        .unwrap();
+        let snapshot = snapshot.to_string();
         assert!(snapshot.contains("Hola [saved given_name]"), "{snapshot}");
         // Captioned fields show which saved value went where.
         assert!(
