@@ -252,7 +252,8 @@ cancelled or expired operation can be started again with a fresh write to
 ## Adding a passkey
 
 `wallets/<wallet>/passkeys/` lists the wallet's passkeys, one directory each,
-named `<created date>-<surface>-<digest>`. Each holds `surface` (`local` for
+named `<created date>-<surface>-<digest>` (a 12-hex digest; a name never
+changes once listed). Each holds `surface` (`local` for
 this host's browser, `remote` for the relay), `created`, `state`,
 `credential_id`, and `name`.
 

@@ -283,6 +283,14 @@ fn service_sandboxes_preserve_signer_isolation_and_broker_relay_egress() {
     assert!(broker.contains("RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6"));
     // Broker owns outbound relay, ACME and DNS traffic. Signer remains isolated.
     assert!(!broker.contains("IPAddressDeny=any"));
+    // Broker may bind only its loopback hosted-relay upstream; the ceremony
+    // listeners are socket-activated.
+    assert!(broker.contains("SocketBindDeny=any"));
+    let allowed: Vec<&str> = broker
+        .lines()
+        .filter_map(|line| line.strip_prefix("SocketBindAllow="))
+        .collect();
+    assert_eq!(allowed, ["ipv4:tcp:18735"]);
     assert!(!broker.contains("PrivateNetwork=yes"));
     assert!(signer.contains("User=bloom-signer-%i"));
     assert!(signer.contains("PrivateNetwork=yes"));

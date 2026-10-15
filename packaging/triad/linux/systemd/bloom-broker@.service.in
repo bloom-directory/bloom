@@ -49,9 +49,13 @@ RemoveIPC=yes
 CapabilityBoundingSet=
 AmbientCapabilities=
 LimitCORE=0
-# Broker owns outbound authenticated relay HTTPS, ACME and DNS resolution.
-# Ceremony TLS still binds only the fixed loopback listener; authority RPC is Unix-only.
+# Broker owns outbound authenticated relay HTTPS, ACME and DNS resolution, so
+# egress is not IP-restricted. Binding is: the ceremony listeners arrive from
+# the bloom-broker-ceremony sockets and authority RPC is Unix-only, so Broker
+# itself may bind only its loopback hosted-relay upstream (default port 18735).
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SocketBindDeny=any
+SocketBindAllow=ipv4:tcp:18735
 ReadWritePaths=/var/lib/bloom/%i/broker /run/bloom/%i/broker
 
 [Install]
