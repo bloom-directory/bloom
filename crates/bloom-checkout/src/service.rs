@@ -1674,6 +1674,85 @@ mod tests {
         assert_eq!(documento["value"], "PAS");
         server.abort();
     }
+    #[tokio::test]
+    async fn a_list_searching_option_starts_is_opened_whole() {
+        // JetSMART's card-holder document type: an editable box that only
+        // matches the start of "PAS - Pasaporte", and a button opening the list.
+        let (url, server) = crate::discovery::tests::fixture(
+            "<div><div>Documento</div><div><input id='doc'><button id='toggle'></button></div>
+             <div id='list'></div></div>
+             <script>const all=['PAS - Pasaporte','DNI - Documento Nacional de Identidad'];
+             const show=f=>{list.innerHTML='';for(const o of all.filter(f)){const d=document.createElement('div');d.className='option';d.textContent=o;
+               d.onclick=()=>{doc.value=o.split(' ')[0];list.innerHTML='';};list.append(d);}};
+             doc.addEventListener('input',()=>show(o=>doc.value&&o.toLowerCase().startsWith(doc.value.toLowerCase())));
+             toggle.onclick=()=>show(()=>true);</script>".into(),
+        )
+        .await;
+        let root = tempfile::tempdir().unwrap().keep();
+        let browser = Browser::launch(
+            &crate::test_chromium(),
+            &root.join("profile"),
+            &["--no-sandbox".into(), "--ignore-certificate-errors".into()],
+        )
+        .await
+        .unwrap();
+        browser
+            .browse(BrowseRequest::Open { url: url.clone() })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let service = CheckoutService::new(
+            browser.clone(),
+            &root.join("state.db"),
+            root.join("unused.sock"),
+            unsafe { libc::geteuid() },
+            47999,
+        )
+        .unwrap();
+        *service.traveler.lock().await = Some(UnlockedTraveler {
+            origin: url::Url::parse(&url)
+                .unwrap()
+                .origin()
+                .ascii_serialization(),
+            context: browser.shopping_context().await,
+            fields: vec![],
+            values: [(
+                "document_kind".to_owned(),
+                zeroize::Zeroizing::new("passport".to_owned()),
+            )]
+            .into(),
+            expires: tokio::time::Instant::now() + Duration::from_secs(60),
+        });
+        let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+        let element_ref = snapshot["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["label"] == "Documento")
+            .unwrap()["ref"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        service
+            .request(Request::Browse {
+                request: BrowseRequest::TypeTraveler {
+                    element_ref,
+                    field: "document_kind".into(),
+                },
+            })
+            .await
+            .unwrap();
+        let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+        let documento = snapshot["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["label"] == "Documento")
+            .unwrap()
+            .clone();
+        assert_eq!(documento["value"], "PAS");
+        server.abort();
+    }
     #[test]
     fn saved_phones_split_by_the_numbering_plan() {
         let values = |phone: &str| -> BTreeMap<String, zeroize::Zeroizing<String>> {

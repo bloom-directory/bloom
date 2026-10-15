@@ -70,7 +70,7 @@
       const word = (t, a) => a.length >= 3 && t.length <= 60
         && new RegExp(`(^|\\W)${a.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(\\W|$)`).test(t);
       const matches = o => names(o).some(t => aliases.some(a => normalize(a).length > 1 && (normalize(a) === t || word(t, normalize(a))))
-        || (!e.readOnly && t.startsWith(normalize(typed)) && /^\W/.test(t.slice(normalize(typed).length))));
+        || (!e.readOnly && typed && t.startsWith(normalize(typed)) && /^\W/.test(t.slice(normalize(typed).length))));
       // Real list options, when the site marks them, beat any other matching text.
       const optionLike = o => o.matches('[role=option]') || /option/i.test(`${o.id} ${o.className}`);
       const candidates = () => {
@@ -83,11 +83,18 @@
       // A month list may use numbers or names: try the number, then the name.
       const attempts = e.readOnly ? [typed] : mapping.part === 'month' ? [typed, aliases.at(-1)]
         : mapping.part === 'day' ? [typed, typed.padStart(2,'0')] : [typed];
+      // A list that searches from the start of each option ("PAS - Pasaporte")
+      // finds nothing for the name: last, clear the box and open the whole list.
+      if (!e.readOnly) attempts.push(null);
       let option;
       for (const attempt of attempts) {
-        typed = attempt;
+        typed = attempt ?? '';
         if (e.readOnly) e.click();
-        else {
+        else if (attempt === null) {
+          e.focus(); e.select(); document.execCommand('delete');
+          e.click();
+          [...(e.parentElement?.parentElement?.querySelectorAll('button') || [])].find(b => !b.contains(e))?.click();
+        } else {
           e.focus();e.select();
           if (document.activeElement !== e || !document.execCommand('insertText',false,typed)) throw Error('Traveler input unsupported');
         }
