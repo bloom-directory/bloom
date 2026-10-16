@@ -250,17 +250,23 @@ impl Browser {
     }
 
     /// Form errors the shopping page shows, read before payment is requested.
+    /// Copies the page's contact email and phone into its re-entry fields,
+    /// then reports what the page still asks of the human.
     pub(crate) async fn page_attention(&self) -> Result<Value> {
         let tab = self.tab.lock().await;
-        let result = self
-            .cdp
-            .call(
+        let evaluate = |expression: &str| {
+            self.cdp.call(
                 Some(&tab.session),
                 "Runtime.evaluate",
-                json!({"expression":concat!(include_str!("form-attention.js"), ";globalThis.__bloomAttention()"),
-                    "returnByValue":true}),
+                json!({"expression":expression,"returnByValue":true}),
             )
-            .await?;
+        };
+        evaluate(include_str!("confirm-contact.js")).await?;
+        let result = evaluate(concat!(
+            include_str!("form-attention.js"),
+            ";globalThis.__bloomAttention()"
+        ))
+        .await?;
         Ok(result["result"]["value"].clone())
     }
 

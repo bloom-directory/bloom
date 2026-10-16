@@ -259,8 +259,8 @@ impl Discovery {
                 continue;
             }
             let fields = evaluate(tab, &session, world, include_str!("fields.js").into()).await?;
-            let fields: Vec<Field> =
-                serde_json::from_value(fields).context("Ambiguous payment fields")?;
+            let fields: Vec<Field> = serde_json::from_value(fields)
+                .with_context(|| format!("Ambiguous payment fields in {origin}"))?;
             if !fields.is_empty() {
                 let mut owners = Vec::new();
                 let mut child = context;
@@ -308,6 +308,14 @@ impl Discovery {
                     tab.fixture_payment_hosts,
                 )
         }) {
+            let found: Vec<String> = frames
+                .iter()
+                .map(|f| {
+                    let kinds: Vec<&str> = f.fields.iter().map(|x| x.kind.as_str()).collect();
+                    format!("{} {}", f.origin, kinds.join(","))
+                })
+                .collect();
+            eprintln!("card fields found: {}", found.join("; "));
             bail!("Card fields are not hosted by a known payment provider");
         }
         facts.payment_frame_origins = frames.iter().map(|f| f.origin.clone()).collect();
@@ -1384,11 +1392,67 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn read_only_and_contact_boxes_are_not_card_fields() {
+        let browser = browser().await;
+        let html = merchant(
+            &format!(
+                "<div><div>Código de seguridad</div><input readonly></div>
+                 <div><div>Confirma correo electrónico</div><input autocomplete='cc-csc'></div>{}",
+                inputs()
+            ),
+            "",
+            "Order confirmed",
+        );
+        let (url, server) = fixture(html).await;
+        let tab = open(&browser, url).await;
+        let discovery = Discovery::read(&tab).await.unwrap();
+        assert_eq!(discovery.facts.total_minor, 399);
+        browser.return_control().await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn inline_contact_confirmation_is_copied_and_is_not_a_form_error() {
+        // JetSMART's payment page asks for the re-entry before Pay, inline.
+        let browser = browser().await;
+        let (url, server) = fixture("<div><div>Correo electrónico *</div><input name='e1' value='fixture@example.com'></div>
+            <div><div>Teléfono *</div><input name='contact.emailaddress' value='2944808829'></div>
+            <p class='error'>Por favor reingresa tu correo y teléfono para confirmarlos. Deben coincidir con los anteriores.</p>
+            <div><div>Confirma correo electrónico</div><input name='e2'></div>
+            <div><div>Confirma teléfono</div><input name='p2'></div>".into()).await;
+        let tab = open(&browser, url).await;
+        let copied = tab
+            .cdp
+            .evaluate(&tab.session, include_str!("confirm-contact.js").into())
+            .await
+            .unwrap();
+        assert_eq!(copied["copied"], 2);
+        let attention = tab
+            .cdp
+            .evaluate(
+                &tab.session,
+                concat!(
+                    include_str!("form-attention.js"),
+                    ";[globalThis.__bloomAttention(),...['e2','p2'].map(n=>document.querySelector(`[name=${n}]`).value)]"
+                )
+                .into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(attention[0]["errors"], json!([]));
+        assert_eq!(attention[1], "fixture@example.com");
+        assert_eq!(attention[2], "2944808829");
+        browser.return_control().await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn approval_preview_shows_the_filled_fields() {
         // An airline page: earlier steps above, filled contact fields far down.
         let html = "<!doctype html><div style='height:2400px'>Seat map</div>
             <div><div>Nombres *</div><input value='Synthetic'></div>
             <div><div>Correo *</div><input value='fixture@example.com'></div><input>
+            <div><div>Confirma correo</div><input autocomplete='cc-csc' value='fixture@example.com'></div>
             <input autocomplete='cc-number' value='4242'><p>Total USD 3.99</p><button>Pay</button>";
         let browser = browser().await;
         let (url, server) = fixture(html.into()).await;
@@ -1407,7 +1471,8 @@ pub(crate) mod tests {
             order_fields(&tab).await,
             json!([
                 {"label":"Nombres *","value":"Synthetic"},
-                {"label":"Correo *","value":"fixture@example.com"}
+                {"label":"Correo *","value":"fixture@example.com"},
+                {"label":"Confirma correo","value":"fixture@example.com"}
             ])
         );
         browser.return_control().await.unwrap();

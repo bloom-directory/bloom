@@ -10,11 +10,15 @@
     }
     return '';
   };
-  const secret = e => e.type === 'password' || /^cc-/.test((e.autocomplete || '').split(' ').at(-1));
+  // Card markup on a box captioned email or phone is a site's autofill guard
+  // (JetSMART's confirm boxes), not a card field.
+  const secret = (e, label) => e.type === 'password'
+    || (/^cc-/.test((e.autocomplete || '').split(' ').at(-1)) && !/e-?mail|correo|tel[eé]fono|phone/i.test(label));
   const fields = [];
   for (const e of document.querySelectorAll('input,select,textarea')) {
-    if (!e.getClientRects().length || e.type === 'hidden' || secret(e) || e.disabled) continue;
+    if (!e.getClientRects().length || e.type === 'hidden' || e.disabled) continue;
     let label = e.getAttribute('aria-label') || text(e.labels?.[0]) || e.placeholder || caption(e) || e.name || '';
+    if (secret(e, label)) continue;
     let value;
     if (e.type === 'checkbox') { if (!e.checked) continue; value = 'Yes'; }
     else if (e.type === 'radio') { if (!e.checked) continue; value = text(e.labels?.[0]) || e.value;

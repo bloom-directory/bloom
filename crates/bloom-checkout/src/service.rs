@@ -653,6 +653,7 @@ impl CheckoutService {
                         .filter_map(Value::as_str)
                         .collect();
                     if !errors.is_empty() || attention["invalid"].as_u64().unwrap_or(0) > 0 {
+                        eprintln!("payment refused over form errors: {attention}");
                         bail!(
                             "The page shows form errors; fix them before payment: {}",
                             if errors.is_empty() {

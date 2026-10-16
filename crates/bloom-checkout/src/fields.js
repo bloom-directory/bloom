@@ -1,8 +1,5 @@
 (() => {
   const kind = e => {
-    const autocomplete = e.autocomplete?.toLowerCase().split(' ').pop();
-    const direct = {'cc-number':'number','cc-exp':'expiry','cc-exp-month':'month','cc-exp-year':'year','cc-csc':'cvc','cc-name':'name'};
-    if (direct[autocomplete]) return direct[autocomplete];
     // Some sites caption a field with text beside it instead of a <label>.
     let caption = '';
     for (let a = e.parentElement, depth = 0; a && depth < 4; a = a.parentElement, depth++) {
@@ -12,6 +9,12 @@
     }
     const label = [e.name,e.id,e.getAttribute('aria-label'),e.placeholder,e.labels?.[0]?.innerText,caption].filter(Boolean).join(' ')
       .normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase();
+    // Contact fields are never card fields, whatever their markup says
+    // (JetSMART marks its confirm-email box autocomplete=cc-csc).
+    if (/e-?mail|correo|telefono|phone/.test(label)) return null;
+    const autocomplete = e.autocomplete?.toLowerCase().split(' ').pop();
+    const direct = {'cc-number':'number','cc-exp':'expiry','cc-exp-month':'month','cc-exp-year':'year','cc-csc':'cvc','cc-name':'name'};
+    if (direct[autocomplete]) return direct[autocomplete];
     if (/card.?number|cardnumber|numero de (la )?tarjeta|nro\.? de tarjeta/.test(label)) return 'number';
     if (/cvc|cvv|security.?code|codigo de seguridad/.test(label)) return 'cvc';
     if (/expir.*month|vencimiento.*mes|^mes$/.test(label)) return 'month';
@@ -24,7 +27,9 @@
     && /^\/build\/[a-f0-9]{7,40}\/(number|name|expiry|verification_value|issue_date|issue_number)-ltr\.html$/.test(location.pathname);
   const shopifyId = shopify ? location.pathname.split('/').pop().replace('-ltr.html','') : null;
   const candidates = () => {
-    const all = [...document.querySelectorAll('input')].filter(e => kind(e));
+    // A read-only or disabled box takes no typing, so it is never a card field
+    // (JetSMART shows one captioned like a security code beside its frames).
+    const all = [...document.querySelectorAll('input')].filter(e => !e.readOnly && !e.disabled && kind(e));
     if (!shopify) return all;
     // Shopify's named PCI frames include off-screen proxy inputs for the
     // other fields. Accept only the real field named by this frame's URL.
