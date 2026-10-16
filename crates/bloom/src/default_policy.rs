@@ -330,14 +330,81 @@ fn pending_settings(home: &std::path::Path, petals: &PetalsConfig) -> Vec<String
     names
 }
 
+/// What a deferred setup write does, judged from a read of the Petal's
+/// settings route.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PendingSettingsStep {
+    /// The route still reads as unset: write setup's choice.
+    Write,
+    /// Settings were written there since the marker was left; keep them.
+    Keep,
+    /// The route could not be read, as before the account exists; try later.
+    Retry,
+}
+
+/// `current` is what the route read, or `None` when it could not be read.
+pub(crate) fn pending_settings_step(
+    current: Option<&[u8]>,
+    unset_body: &str,
+) -> PendingSettingsStep {
+    match current {
+        Some(body) if body == unset_body.as_bytes() => PendingSettingsStep::Write,
+        Some(_) => PendingSettingsStep::Keep,
+        None => PendingSettingsStep::Retry,
+    }
+}
+
 /// Write the settings that an earlier attempt could not, now that the default
-/// wallet exists. A failed write keeps its marker for the next attempt.
+/// wallet exists. A failed write keeps its marker for the next attempt. Once
+/// the route reads anything but its unset contents, those settings stay and
+/// the marker is cleared: the owner may have written them in the meantime.
 pub(crate) async fn apply_pending_settings(daemon: &Daemon) -> Vec<String> {
     let owners = petal_owners(daemon).unwrap_or_default();
     let mut messages = Vec::new();
     for name in pending_settings(daemon.home.root(), &daemon.config.petals) {
         if !owners.contains_key(&name) {
             continue;
+        }
+        let Some(template) = setup_template(&name) else {
+            continue;
+        };
+        let read = async {
+            let settings =
+                render_petal_settings(&daemon.config.petals, &name, DEFAULT_POLICY_WALLET)?
+                    .context("Petal has no setup settings")?;
+            let path = bloom_vfs::VfsPath::parse(&settings.path)?;
+            let current = bloom_vfs::Handler::read(&daemon.vfs, &path).await?;
+            anyhow::Ok((settings, current))
+        }
+        .await;
+        let current = read.as_ref().ok().map(|(_, current)| current.as_slice());
+        match pending_settings_step(current, template.unset_body) {
+            PendingSettingsStep::Write => {}
+            PendingSettingsStep::Keep => {
+                clear_settings_pending(daemon.home.root(), &name);
+                if let Ok((settings, _)) = &read {
+                    tracing::info!(
+                        petal = %name,
+                        message = %settings_not_written(
+                            &name,
+                            settings,
+                            "settings were written there after setup, so they stay as they are"
+                        ),
+                        "petal.setup_settings_preserved"
+                    );
+                }
+                continue;
+            }
+            PendingSettingsStep::Retry => {
+                if let Err(error) = &read {
+                    tracing::warn!(
+                        petal = %name,
+                        error = %format!("{error:#}"),
+                        "petal.setup_settings_retry_failed"
+                    );
+                }
+                continue;
+            }
         }
         match write_petal_settings(&daemon.vfs, &daemon.config.petals, &name).await {
             Ok(summary) => {
@@ -415,12 +482,7 @@ pub(crate) async fn apply_setup_settings(
             clear_settings_pending(daemon.home.root(), name);
             messages.push(
                 match render_petal_settings(&daemon.config.petals, name, DEFAULT_POLICY_WALLET) {
-                    Ok(Some(settings)) => format!(
-                        "petal_settings_not_written: {} settings were not written: {reason}. To apply setup's choice, run: printf '{}' | bloom vfs write {}",
-                        petal_label(name),
-                        String::from_utf8_lossy(&settings.body).replace('\n', "\\n"),
-                        settings.path
-                    ),
+                    Ok(Some(settings)) => settings_not_written(name, &settings, &reason),
                     Ok(None) => continue,
                     Err(error) => format!("petal_settings_failed: {error:#}"),
                 },
@@ -567,6 +629,16 @@ pub(crate) fn apply_provisioned_settings(
     }
 }
 
+/// A setup choice Bloom did not write, with the command that applies it.
+fn settings_not_written(name: &str, settings: &PetalSettingsWrite, reason: &str) -> String {
+    format!(
+        "petal_settings_not_written: {} settings were not written: {reason}. To apply setup's choice, run: printf '{}' | bloom vfs write {}",
+        petal_label(name),
+        String::from_utf8_lossy(&settings.body).replace('\n', "\\n"),
+        settings.path
+    )
+}
+
 pub(crate) fn settings_message(name: &str, summary: &str, updated: bool) -> String {
     if updated {
         format!(
@@ -609,6 +681,9 @@ pub(crate) enum DefaultPolicyStatus {
     },
     /// The wallet policy allows every chosen, installed Petal.
     Applied { petals: Vec<String> },
+    /// The policy has changed since the wallet was created and does not allow
+    /// `missing`. Only a new wallet's policy is proposed, so nothing is.
+    ChangedSinceCreation { missing: Vec<String> },
     /// Another command holds the wallet's policy lock; ask again shortly.
     Busy,
 }
@@ -676,6 +751,11 @@ pub(crate) async fn advance_default_policy(
         bloom_machine_client::PetalEligibility::Allowed(_) => {
             DefaultPolicyStatus::Applied { petals }
         }
+        bloom_machine_client::PetalEligibility::ChangedSinceCreation(current) => {
+            DefaultPolicyStatus::ChangedSinceCreation {
+                missing: petals_not_allowed(&current, &petals, &packages)?,
+            }
+        }
         bloom_machine_client::PetalEligibility::AwaitingPolicyApproval(pending) => {
             DefaultPolicyStatus::AwaitingOwner {
                 operation_id: pending.operation_id.as_str().to_owned(),
@@ -692,6 +772,30 @@ pub(crate) async fn advance_default_policy(
             }
         }
     })
+}
+
+/// The chosen Petals `current` does not allow: its package, or any of the
+/// destinations its transactions need, is missing. `packages` pairs with
+/// `petals` by position.
+fn petals_not_allowed(
+    current: &bloom_broker_api::SignedPolicySnapshot,
+    petals: &[String],
+    packages: &[bloom_broker_api::Digest32],
+) -> Result<Vec<String>> {
+    let policy: bloom_broker_api::CanonicalWalletPolicy =
+        serde_json::from_slice(&current.canonical_policy.decode())
+            .context("decode the wallet's current policy")?;
+    let mut missing = Vec::new();
+    for (name, package) in petals.iter().zip(packages) {
+        if !policy.allowed_petal_packages.contains(package)
+            || policy_destinations(name)?
+                .iter()
+                .any(|destination| !policy.allowed_destinations.contains(destination))
+        {
+            missing.push(name.clone());
+        }
+    }
+    Ok(missing)
 }
 
 /// The destinations a chosen Petal's transactions need, from Bloom's catalog.
@@ -766,11 +870,11 @@ impl DefaultPolicyWait {
             match ceremony_url {
                 Some(url) => writeln!(
                     output,
-                    "default_policy: another policy change for {wallet} is waiting for you at {url}; the default policy follows once it finishes"
+                    "default_policy: another policy change for {wallet} is waiting for you at {url}; the default policy is checked again once it finishes"
                 )?,
                 None => writeln!(
                     output,
-                    "default_policy: another policy change for {wallet} is in progress; the default policy follows once it finishes"
+                    "default_policy: another policy change for {wallet} is in progress; the default policy is checked again once it finishes"
                 )?,
             }
         }
@@ -804,6 +908,14 @@ impl DefaultPolicyWait {
                     output,
                     "default_policy: {wallet} allows {}; each transaction still needs your approval",
                     petal_labels(petals)
+                )?;
+                Ok(WaitStep::Stop)
+            }
+            DefaultPolicyStatus::ChangedSinceCreation { missing } => {
+                writeln!(
+                    output,
+                    "default_policy: {wallet}'s policy has changed since the wallet was created and does not allow {}; Bloom proposes the default policy only for a new wallet, so nothing was proposed. To allow one again, propose it with `bloom wallet update-policy {wallet} --file <policy.json>`",
+                    petal_labels(missing)
                 )?;
                 Ok(WaitStep::Stop)
             }
@@ -982,6 +1094,33 @@ mod tests {
         assert!(pending_settings(home.path(), &petals).is_empty());
         // Clearing an absent marker is not an error.
         clear_settings_pending(home.path(), "polymarket");
+    }
+
+    #[test]
+    fn a_deferred_setup_write_never_replaces_settings_written_since() {
+        let unset = setup_template("polymarket").unwrap().unset_body;
+        assert_eq!(
+            pending_settings_step(Some(unset.as_bytes()), unset),
+            PendingSettingsStep::Write
+        );
+        // The owner turned Polymarket off or chose another limit; anything but
+        // the route's exact unset contents stays.
+        for written in [
+            "enabled = false\n",
+            "enabled = true\nmax_daily_usd = \"500\"\n",
+            "enabled = false\nallow_neg_risk = true",
+        ] {
+            assert_eq!(
+                pending_settings_step(Some(written.as_bytes()), unset),
+                PendingSettingsStep::Keep,
+                "{written:?}"
+            );
+        }
+        // Before the account exists the route cannot be read.
+        assert_eq!(
+            pending_settings_step(None, unset),
+            PendingSettingsStep::Retry
+        );
     }
 
     #[test]
@@ -1481,6 +1620,52 @@ mod tests {
             serde_json::to_value(DefaultPolicyStatus::WaitingForWallet { reason: None }).unwrap(),
             serde_json::json!({"state": "waiting_for_wallet"})
         );
+        assert_eq!(
+            serde_json::to_value(DefaultPolicyStatus::ChangedSinceCreation {
+                missing: vec!["hyperliquid".into()]
+            })
+            .unwrap(),
+            serde_json::json!({"state": "changed_since_creation", "missing": ["hyperliquid"]})
+        );
+    }
+
+    #[test]
+    fn a_changed_policy_reports_each_chosen_petal_it_does_not_fully_allow() {
+        let package = |byte| bloom_broker_api::Digest32::from_bytes([byte; 32]);
+        let petals = ["hyperliquid".to_owned(), "polymarket".to_owned()];
+        let packages = [package(1), package(2)];
+        let snapshot = |policy: &bloom_broker_api::CanonicalWalletPolicy| {
+            let bytes = serde_jcs::to_vec(policy).unwrap();
+            bloom_broker_api::SignedPolicySnapshot {
+                wallet_id: bloom_broker_api::Token::new("main").unwrap(),
+                version: bloom_broker_api::DecimalU64::new(3),
+                canonical_policy: bloom_broker_api::Base64UrlBytes::from_bytes(&bytes),
+                policy_digest: package(9),
+                policy_signing_key_id: bloom_broker_api::Token::new("policy-key").unwrap(),
+                policy_verifying_key: bloom_broker_api::Base64UrlBytes::from_bytes(&[2; 32]),
+                signer_signature: bloom_broker_api::Base64UrlBytes::from_bytes(&[3; 64]),
+            }
+        };
+        let mut policy = bloom_broker_api::CanonicalWalletPolicy {
+            wallet_id: bloom_broker_api::Token::new("main").unwrap(),
+            allowed_petal_packages: packages.to_vec(),
+            allowed_destinations: policy_destinations("polymarket").unwrap(),
+            maximum_approval_lifetime_ms: 60_000,
+            required_verifiers: Vec::new(),
+            clear_signing: None,
+        };
+        assert!(
+            petals_not_allowed(&snapshot(&policy), &petals, &packages)
+                .unwrap()
+                .is_empty()
+        );
+        // The owner removed Hyperliquid, and one of Polymarket's destinations.
+        policy.allowed_petal_packages.remove(0);
+        policy.allowed_destinations.pop();
+        assert_eq!(
+            petals_not_allowed(&snapshot(&policy), &petals, &packages).unwrap(),
+            petals
+        );
     }
 
     fn awaiting(operation: &str, expires_at_ms: u64) -> DefaultPolicyStatus {
@@ -1555,6 +1740,26 @@ mod tests {
         assert_eq!(output.matches("another policy change for main").count(), 1);
         assert!(output.contains("http://localhost:18734/ceremony/other"));
         assert!(!output.contains("approve the policy for main to allow"));
+        assert!(!output.contains("default_policy_url: "));
+    }
+
+    #[test]
+    fn wait_reports_a_policy_changed_since_creation_and_proposes_nothing() {
+        let mut wait = DefaultPolicyWait::new("main", 1_000);
+        let mut output = Vec::new();
+        let changed = DefaultPolicyStatus::ChangedSinceCreation {
+            missing: vec!["near-intents".into()],
+        };
+        assert_eq!(
+            wait.observe(&changed, 10, &mut output).unwrap(),
+            WaitStep::Stop
+        );
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains(
+            "main's policy has changed since the wallet was created and does not allow NEAR Intents"
+        ));
+        assert!(output.contains("nothing was proposed"));
+        assert!(output.contains("bloom wallet update-policy main --file"));
         assert!(!output.contains("default_policy_url: "));
     }
 

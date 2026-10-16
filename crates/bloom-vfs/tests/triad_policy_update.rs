@@ -1127,6 +1127,31 @@ async fn revoking_every_petal_does_not_bring_the_setup_proposal_back() {
 }
 
 #[tokio::test]
+async fn the_default_policy_is_not_proposed_once_the_owner_has_changed_the_policy() {
+    let temp = tempfile::tempdir().unwrap();
+    // The owner has committed changes since creation, removing every Petal.
+    let fixture = broker_fixture_with_policy(false, policy(60_000), 3);
+    let packages = [Digest32::from_bytes([7; 32])];
+    let handler = eligibility_handler(temp.path(), fixture.clone());
+
+    let PetalEligibility::ChangedSinceCreation(current) = handler
+        .ensure_petal_packages_allowed("alice", &packages, &[setup_destination()])
+        .await
+        .unwrap()
+    else {
+        panic!("what the owner removed must not be proposed again");
+    };
+    assert_eq!(current.version.get(), 3);
+    assert!(
+        !fixture
+            .requests
+            .lock()
+            .iter()
+            .any(|request| matches!(request, MachineBrokerRequest::PolicyValidateUpdate(_)))
+    );
+}
+
+#[tokio::test]
 async fn a_pending_change_without_every_required_package_is_reported_as_unrelated() {
     let temp = tempfile::tempdir().unwrap();
     let fixture = broker_fixture(false);

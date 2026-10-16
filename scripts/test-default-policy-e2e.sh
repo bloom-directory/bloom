@@ -15,6 +15,11 @@
 #    by `bloom init`, which cannot run against a live triad). The settings must
 #    be absent before the wallet exists, present afterwards with the setup
 #    value rather than the catalog default, and the marker must be cleared.
+# 5. Leave the marker again, as a stopped `wallet new` would, after the owner
+#    has written their own Polymarket settings. Resuming keeps the owner's
+#    settings and clears the marker.
+# 6. Remove Hyperliquid through an ordinary policy ceremony. Resuming then
+#    reports that the policy changed and proposes nothing.
 #
 # Binaries: BLOOM_INTEGRATION_BROKER_BIN, BLOOM_INTEGRATION_SIGNER_BIN and
 # BLOOM_INTEGRATION_DEBUG_DRIVER_BIN must point at builds of the Broker and
@@ -181,20 +186,28 @@ wait_for_line() {
   die "timed out waiting for ${prefix}"
 }
 
+# Each completion needs a higher signature counter than the last. A higher
+# counter is always safe after a refused attempt; reuse never is.
+sign_count=0
+complete_ceremony() {
+  local url="$1" label="$2"
+  sign_count=$((sign_count + 1))
+  if ! "$driver_bin" complete "$url" "$AUTH_SEED" --sign-count "$sign_count" >>"$run_root/driver.out" 2>&1; then
+    sign_count=$((sign_count + 1))
+    "$driver_bin" complete "$url" "$AUTH_SEED" --sign-count "$sign_count" >>"$run_root/driver.out" 2>&1 ||
+      { cat "$run_root/driver.out" >&2; die "$label ceremony failed"; }
+  fi
+}
+
 wallet_url="$(wait_for_line 'ceremony_url: ')"
 say "completing the wallet registration ceremony"
-"$driver_bin" complete "$wallet_url" "$AUTH_SEED" --sign-count 1 >/dev/null ||
-  die "wallet registration ceremony failed"
+complete_ceremony "$wallet_url" "wallet registration"
 
 policy_url="$(wait_for_line 'default_policy_url: ')"
 grep -q '^default_policy: approve the policy for main to allow ' "$new_out" ||
   die "default policy announcement missing: $(cat "$new_out")"
 say "completing the default-policy ceremony"
-if ! "$driver_bin" complete "$policy_url" "$AUTH_SEED" --sign-count 2 >"$run_root/policy-driver.out" 2>&1; then
-  # A higher counter is always safe after a refused attempt; reuse never is.
-  "$driver_bin" complete "$policy_url" "$AUTH_SEED" --sign-count 3 >>"$run_root/policy-driver.out" 2>&1 ||
-    { cat "$run_root/policy-driver.out" >&2; die "default-policy ceremony failed"; }
-fi
+complete_ceremony "$policy_url" "default-policy"
 
 deadline=$(( $(date +%s) + 120 ))
 while kill -0 "$new_pid" 2>/dev/null; do
@@ -240,5 +253,43 @@ printf '%s\n' "$settings" | grep -q '^max_daily_usd = "73"$' || die "settings li
 [ ! -e "$machine_home/pending-petal-settings/polymarket" ] ||
   die "the pending settings marker was not cleared after the write succeeded"
 say "Polymarket settings for $WALLET/0 applied from setup: enabled = true, max_daily_usd = \"73\""
+
+# 5. A deferred setup write never replaces settings written since.
+owner_settings="$(printf 'enabled = false\nmax_daily_usd = "5"\n')"
+printf '%s\n' "$owner_settings" | cli vfs write "$settings_path" >/dev/null ||
+  die "could not write the owner's Polymarket settings"
+: > "$machine_home/pending-petal-settings/polymarket"
+resume="$(cli wallet default-policy "$WALLET" 2>&1)" || die "default-policy resume failed: $resume"
+printf '%s\n' "$resume" | grep -q '^default_policy: main allows ' ||
+  die "default-policy resume did not report applied: $resume"
+settings="$(cli vfs cat "$settings_path")"
+[ "$settings" = "$owner_settings" ] ||
+  die "resuming replaced the owner's Polymarket settings: $settings"
+[ ! -e "$machine_home/pending-petal-settings/polymarket" ] ||
+  die "the pending settings marker survived settings the owner wrote"
+say "resuming kept the owner's Polymarket settings (enabled = false) and cleared the stale marker"
+
+# 6. Once the owner changes the policy, resuming proposes nothing.
+policy_path="/wallets/$WALLET/policy.json"
+reduced="$run_root/policy-without-hyperliquid.json"
+cli vfs cat "$policy_path" | jq --arg hl "$hl_hash" '.allowed_petal_packages -= [$hl]' >"$reduced"
+if cli vfs write "$policy_path" <"$reduced" >"$run_root/reduce.out" 2>&1; then
+  die "removing a Petal from the policy did not ask for the owner's approval"
+fi
+reduce_url="$(cli vfs cat "/wallets/$WALLET/policy-updates/latest/status.json" | jq -r '.ceremony_url // empty')"
+[ -n "$reduce_url" ] || die "no ceremony for the policy change: $(cat "$run_root/reduce.out")"
+say "completing the owner's ceremony that removes Hyperliquid"
+complete_ceremony "$reduce_url" "policy change"
+cli vfs write "$policy_path" <"$reduced" >/dev/null || die "the approved policy change did not commit"
+cli vfs cat "$policy_path" | jq -e --arg hl "$hl_hash" '.allowed_petal_packages | index($hl) == null' >/dev/null ||
+  die "Hyperliquid is still allowed after the owner removed it"
+resume="$(cli wallet default-policy "$WALLET" 2>&1)" || die "default-policy resume failed: $resume"
+printf '%s\n' "$resume" | grep -q "^default_policy: main's policy has changed since the wallet was created and does not allow Hyperliquid" ||
+  die "default-policy resume did not report the changed policy: $resume"
+printf '%s\n' "$resume" | grep -q 'default_policy_url' &&
+  die "default-policy resume proposed the removed Petal again: $resume"
+cli vfs cat "$policy_path" | jq -e --arg hl "$hl_hash" '.allowed_petal_packages | index($hl) == null' >/dev/null ||
+  die "Hyperliquid came back after resuming"
+say "after the owner removed Hyperliquid, bloom wallet default-policy main proposes nothing"
 
 say "passed"

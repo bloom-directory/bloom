@@ -626,6 +626,10 @@ impl DaemonPetalHost {
             bloom_machine_client::PetalEligibility::AwaitingPolicyApproval(pending) => {
                 Ok(Some(pending))
             }
+            // Not produced here: this request is proposed at any version.
+            bloom_machine_client::PetalEligibility::ChangedSinceCreation(_) => Err(
+                HostError::Denied("wallet policy does not allow this Petal package".into()),
+            ),
         }
     }
 

@@ -1949,13 +1949,16 @@ impl WalletsHandler {
             std::slice::from_ref(package_hash),
             &[],
             &setup,
+            true,
         )
         .await
     }
 
     /// Drive a wallet's default policy: propose every package and destination
     /// together through the existing policy operation. `Allowed` means the
-    /// policy allows all of them.
+    /// policy allows all of them. Nothing is proposed once the owner has
+    /// committed any change, so a Petal or destination the owner removed is
+    /// reported as `ChangedSinceCreation` instead of being proposed again.
     pub async fn ensure_petal_packages_allowed(
         &self,
         wallet: &str,
@@ -1971,6 +1974,7 @@ impl WalletsHandler {
             packages,
             destinations,
             &DefaultPolicySetup::default(),
+            false,
         )
         .await
     }
@@ -1985,6 +1989,9 @@ impl WalletsHandler {
         // installed, so one ceremony makes every chosen Petal usable instead
         // of gating each one.
         first_proposal: &DefaultPolicySetup,
+        // Whether to propose the request once the policy is no longer the one
+        // wallet creation installed.
+        propose_after_creation: bool,
     ) -> Result<bloom_machine_client::PetalEligibility, HandlerError> {
         use bloom_machine_client::{
             PetalEligibility, policy_with_destinations, policy_with_packages,
@@ -2060,15 +2067,19 @@ impl WalletsHandler {
         {
             return Ok(PetalEligibility::Allowed(current));
         }
-        let mut additions = additions.to_vec();
-        // Kept apart from `destinations`, which stays what the caller asked
-        // for so a pending change is judged against the request alone.
-        let mut proposed_destinations = destinations.to_vec();
         // Wallet creation installs the restrictive policy at version 1 and
         // every committed change increments it. An empty package list is not
         // the same fact: the owner may have removed every Petal on purpose.
         const CREATION_POLICY_VERSION: u64 = 1;
-        if current.version.get() == CREATION_POLICY_VERSION {
+        let creation_policy = current.version.get() == CREATION_POLICY_VERSION;
+        if !creation_policy && !propose_after_creation {
+            return Ok(PetalEligibility::ChangedSinceCreation(current));
+        }
+        let mut additions = additions.to_vec();
+        // Kept apart from `destinations`, which stays what the caller asked
+        // for so a pending change is judged against the request alone.
+        let mut proposed_destinations = destinations.to_vec();
+        if creation_policy {
             additions.extend_from_slice(&first_proposal.packages);
             proposed_destinations.extend_from_slice(&first_proposal.destinations);
         }
@@ -2134,6 +2145,10 @@ impl WalletsHandler {
     ) -> Result<(), HandlerError> {
         match self.ensure_petal_eligibility(wallet, package_hash).await? {
             bloom_machine_client::PetalEligibility::Allowed(_) => Ok(()),
+            // Not produced here: this request is proposed at any version.
+            bloom_machine_client::PetalEligibility::ChangedSinceCreation(_) => Err(
+                HandlerError::backend("wallet policy does not allow this Petal package"),
+            ),
             bloom_machine_client::PetalEligibility::AwaitingPolicyApproval(pending) => {
                 Err(HandlerError::backend(format!(
                     "POLICY_APPROVAL_REQUIRED: complete the owner ceremony at {} then retry this operation; status: {}",

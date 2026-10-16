@@ -278,7 +278,13 @@ chosen Petals:
 4. Once the owner completes the ceremony, the next check commits the policy,
    and the command reports that `main` now allows the chosen Petals.
 
-Petal settings are not written here: `bloom init` already wrote them.
+On a new home `main` does not exist when `bloom init` runs, so its settings
+write is refused and leaves a retry marker. The first check after `main`
+appears writes the settings, but only while the Petal's settings route still
+reads exactly as it does before anything is written there (for Polymarket,
+its built-in `enabled = false` default). Anything else may be the owner's, so
+it stays: Machine clears the marker and logs the command that would apply
+setup's choice.
 
 If the owner stops the command, or the policy ceremony expires, the wallet
 still exists:
@@ -288,6 +294,10 @@ still exists:
   The Broker reports an expired ceremony as awaiting the owner until asked to
   act on it, so Machine cancels a proposal past its expiry and proposes again.
   A waiting command never announces a ceremony that has already expired.
+  It proposes only while `main`'s policy is still the one wallet creation
+  installed. Once any change has been committed, it reports which chosen
+  Petals the policy does not allow and proposes nothing, so a Petal or
+  destination the owner removed is never proposed again.
 - **Several commands can wait on the same wallet.** Only one updates its
   policy at a time; a command that finds the wallet's policy lock held checks
   again on its next poll instead of failing.

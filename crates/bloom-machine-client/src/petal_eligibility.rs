@@ -41,6 +41,10 @@ pub fn policy_with_destinations(
 pub enum PetalEligibility {
     Allowed(SignedPolicySnapshot),
     AwaitingPolicyApproval(PendingPolicyUpdate),
+    /// The policy does not allow the request and is no longer the one wallet
+    /// creation installed. Returned only to a caller that proposes nothing
+    /// after creation, so a request never restores what the owner removed.
+    ChangedSinceCreation(SignedPolicySnapshot),
 }
 
 /// A view of the existing wallet-scoped policy operation, including unrelated consent.
