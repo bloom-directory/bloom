@@ -334,13 +334,19 @@ forward the complete `ceremony_url` to the human. The recovery ID and secret,
 and the replacement passkey, belong only in the Broker-hosted Browser page;
 never place them in a VFS write, shell argument, or log. A spent one-use URL
 disappears from status while the operation remains readable and cancellable.
-After `SUCCEEDED`, read `result.json`. A cancelled or expired operation can
-be started again with a fresh write to `wallets/recover`.
+After `SUCCEEDED`, read `result.json`. Recovery replaces the wallet's
+passkeys rather than adding one: the replacement becomes the wallet's only
+active passkey, and every other passkey, on any device, is revoked. Tell the
+human that their other devices can no longer approve until they add passkeys
+again (see "Adding a passkey"); `result.json` lists the active credential. A
+cancelled or expired operation can be started again with a fresh write to
+`wallets/recover`.
 
 ## Adding a passkey
 
 `wallets/<wallet>/passkeys/` lists the wallet's passkeys, one directory each,
-named `<created date>-<surface>-<digest>`. Each holds `surface` (`local` for
+named `<created date>-<surface>-<digest>` (a 12-hex digest; a name never
+changes once listed). Each holds `surface` (`local` for
 this host's browser, `remote` for the relay), `created`, `state`,
 `credential_id`, and `name`.
 

@@ -110,6 +110,19 @@ uploads the `test-unclaimed` candidate for inspection, and skips both the
 protected production-signing job and the publish job. Normal tag pushes and
 tag retries cannot select dry-run mode.
 
+Release notes list every Bloom commit since the previous release, with links
+to the Broker and Signer changes between the two releases' compatibility
+records. `release-notes.sh changes` picks that baseline: the highest published,
+non-draft, non-prerelease `vX.Y.Z` release that is an ancestor of the release
+commit and older than its tag. A retry therefore reproduces the same list. The
+`prepare` job generates this section once, shows it in the job summary (so a dry
+run previews it), and the publish job uses it to create or retry the release.
+The section sits between `<!-- bloom-release-changes:start -->` and `end`
+markers. On a retry, `release-notes.sh splice` replaces only that section and
+keeps anything a maintainer wrote around it, such as upgrade notes or known
+issues. A body from before the markers keeps its text and gains the section at
+the end. `scripts/test-release-notes.sh` covers these cases.
+
 Before compiling, `release.sh` rejects the remaining forbidden production
 Machine features from the resolved normal/build Cargo graph. Bundle assembly
 independently rejects forbidden paths, printable markers, and retained Machine

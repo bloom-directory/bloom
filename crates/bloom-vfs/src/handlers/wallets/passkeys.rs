@@ -46,6 +46,11 @@ pub(super) struct PasskeyEnrollmentProjection {
     ceremony_url: Option<String>,
     ceremony_expires_at_ms: Option<DecimalU64>,
     created_at_ms: u64,
+    /// Written before Broker is asked, so a lost prepare response leaves a
+    /// record whose operation ID a retry reuses and a cancel can release.
+    /// Cleared once Broker reports the operation.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pending_prepare: bool,
 }
 
 #[derive(Debug, Default, serde::Deserialize, serde::Serialize)]
@@ -54,6 +59,26 @@ struct PasskeyNames {
     schema: String,
     /// Full base64url credential ID to nickname.
     names: std::collections::BTreeMap<String, String>,
+}
+
+/// A pending enrollment Broker still does not know is abandoned only after
+/// Broker's own cross-surface deadline (10 minutes) has certainly passed: a
+/// "not found" before then cannot prove Broker never accepted it.
+const PENDING_PREPARE_ABANDON_MS: u64 = 15 * 60 * 1_000;
+
+/// The surface a prepared enrollment uses: Broker resolves the default to the
+/// hosted relay (an HTTPS link) or this host's browser.
+fn resolved_destination(
+    requested: CeremonySurfaceSelection,
+    url: Option<&str>,
+) -> CeremonySurfaceSelection {
+    match (requested, url) {
+        (CeremonySurfaceSelection::Default, Some(url)) if url.starts_with("https://") => {
+            CeremonySurfaceSelection::Remote
+        }
+        (CeremonySurfaceSelection::Default, Some(_)) => CeremonySurfaceSelection::Local,
+        (requested, _) => requested,
+    }
 }
 
 fn terminal(state: CeremonyState) -> bool {
@@ -91,8 +116,14 @@ fn civil(ms: u64) -> (i64, u32, u32, u32, u32, u32) {
     crate::handlers::status::unix_to_civil(ms / 1000)
 }
 
-/// `<YYYY-MM-DD>-<surface>-<hex>`, with the digest suffix lengthened only
-/// where two passkeys would otherwise share a name.
+/// Hex digits of the credential digest in a passkey directory name.
+const PASSKEY_SUFFIX_HEX: usize = 12;
+
+/// `<YYYY-MM-DD>-<surface>-<12 hex>`. A name depends only on its own
+/// credential, so adding a passkey never renames an existing one (saved paths
+/// and `by-name/` links stay valid). Should two passkeys of one day and
+/// surface ever share the 48-bit suffix, the later-created one alone takes
+/// the full digest.
 fn passkey_dir_names(credentials: &[CredentialPublic]) -> Vec<(String, &CredentialPublic)> {
     let described: Vec<(String, String, &CredentialPublic)> = credentials
         .iter()
@@ -103,20 +134,22 @@ fn passkey_dir_names(credentials: &[CredentialPublic]) -> Vec<(String, &Credenti
             (prefix, digest, credential)
         })
         .collect();
+    let earlier = |left: &CredentialPublic, right: &CredentialPublic| {
+        (left.created_at_ms.get(), left.credential_id.encoded())
+            < (right.created_at_ms.get(), right.credential_id.encoded())
+    };
     described
         .iter()
         .map(|(prefix, digest, credential)| {
-            let mut length = 4;
-            while length < digest.len()
-                && described.iter().any(|(other_prefix, other_digest, other)| {
-                    !std::ptr::eq(*other, *credential)
-                        && other_prefix == prefix
-                        && other_digest[..length] == digest[..length]
-                })
-            {
-                length += 2;
-            }
-            (format!("{prefix}-{}", &digest[..length]), *credential)
+            let short = &digest[..PASSKEY_SUFFIX_HEX];
+            let displaced = described.iter().any(|(other_prefix, other_digest, other)| {
+                !std::ptr::eq(*other, *credential)
+                    && other_prefix == prefix
+                    && &other_digest[..PASSKEY_SUFFIX_HEX] == short
+                    && earlier(other, credential)
+            });
+            let suffix = if displaced { digest.as_str() } else { short };
+            (format!("{prefix}-{suffix}"), *credential)
         })
         .collect()
 }
@@ -272,9 +305,38 @@ impl WalletsHandler {
             .ok_or_else(|| HandlerError::not_found(format!("passkey enrollment {operation}")))
     }
 
+    /// The pointer a write to `new` sets, under the enrollment lock, to the
+    /// enrollment it created or reused. Status reads never touch it.
+    fn latest_pointer(&self, wallet: &str) -> std::path::PathBuf {
+        self.enrollment_root(wallet).join("latest")
+    }
+
+    fn select_enrollment(&self, wallet: &str, operation: &OperationId) -> Result<(), HandlerError> {
+        self.write_latest_pointer(wallet, operation.as_str())
+    }
+
+    fn write_latest_pointer(&self, wallet: &str, operation: &str) -> Result<(), HandlerError> {
+        let path = self.latest_pointer(wallet);
+        let temporary = path.with_extension("tmp");
+        std::fs::write(&temporary, operation)?;
+        std::fs::rename(&temporary, &path)?;
+        Ok(())
+    }
+
+    /// The enrollment the most recent write to `new` created or reused, or
+    /// (for records from before the pointer existed) the newest one.
     fn latest_enrollment(&self, wallet: &str) -> Result<Option<String>, HandlerError> {
-        Ok(self
-            .enrollment_records(wallet)?
+        let records = self.enrollment_records(wallet)?;
+        if let Ok(selected) = std::fs::read_to_string(self.latest_pointer(wallet)) {
+            let selected = selected.trim();
+            if records
+                .iter()
+                .any(|(_, record)| record.operation_id.as_str() == selected)
+            {
+                return Ok(Some(selected.to_owned()));
+            }
+        }
+        Ok(records
             .into_iter()
             .next()
             .map(|(_, record)| record.operation_id.as_str().to_owned()))
@@ -290,11 +352,32 @@ impl WalletsHandler {
         if terminal(record.ceremony_state) {
             return Ok(record);
         }
-        let status = self
+        let status = match self
             .custody_broker()?
             .ceremony_status(record.operation_id.clone())
             .await
-            .map_err(|error| HandlerError::backend(error.to_string()))?;
+        {
+            Ok(status) => status,
+            // Broker holds no such operation yet: the prepare never reached it
+            // or its acceptance is still unknown, so the record stays pending
+            // until Broker's own deadline has certainly passed.
+            Err(error)
+                if record.pending_prepare
+                    && error.code == bloom_broker_api::ProtocolErrorCode::ApprovalNotFound =>
+            {
+                if now_ms_u64()
+                    > record
+                        .created_at_ms
+                        .saturating_add(PENDING_PREPARE_ABANDON_MS)
+                {
+                    record.pending_prepare = false;
+                    record.ceremony_state = CeremonyState::Expired;
+                    write_atomic_json(&path, &record)?;
+                }
+                return Ok(record);
+            }
+            Err(error) => return Err(HandlerError::backend(error.to_string())),
+        };
         if status.operation_id != record.operation_id
             || status.ceremony_kind != CeremonyKind::CredentialAdd
         {
@@ -302,7 +385,10 @@ impl WalletsHandler {
                 "Broker returned a mismatched passkey enrollment status",
             ));
         }
+        record.pending_prepare = false;
         record.ceremony_state = status.state;
+        record.destination =
+            resolved_destination(record.destination, status.ceremony_url.as_deref());
         if status.state == CeremonyState::AwaitingUser && status.expires_at_ms.get() > now_ms_u64()
         {
             // Broker omits a remote link once its one-time capability is used.
@@ -333,43 +419,100 @@ impl WalletsHandler {
                 ));
             }
         };
+        let _guard = self.passkey_enrollment_lock.lock().await;
         // A shell retry or a replayed NFS write must not start a second
-        // enrollment while one to the same surface is still usable.
+        // enrollment while one to the same surface is still usable, and a
+        // pending one (prepare response never seen) is resumed with its ID.
+        let mut pending = None;
         for (_, record) in self.enrollment_records(wallet)? {
-            if (destination == CeremonySurfaceSelection::Default
-                || record.destination == destination)
-                && !terminal(record.ceremony_state)
+            if terminal(record.ceremony_state) {
+                continue;
+            }
+            let refreshed = self
+                .enrollment_projection(wallet, record.operation_id.as_str())
+                .await?;
+            if refreshed.pending_prepare {
+                pending.get_or_insert(refreshed);
+            } else if (destination == CeremonySurfaceSelection::Default
+                || refreshed.destination == destination)
+                && refreshed.ceremony_state == CeremonyState::AwaitingUser
             {
-                let refreshed = self
-                    .enrollment_projection(wallet, record.operation_id.as_str())
-                    .await?;
-                if refreshed.ceremony_state == CeremonyState::AwaitingUser {
-                    return Ok(());
-                }
+                return self.select_enrollment(wallet, &refreshed.operation_id);
             }
         }
-        let mut operation_bytes = [0_u8; 32];
-        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut operation_bytes);
-        let operation_id = OperationId::from_bytes(operation_bytes);
-        let prepared = self
+        let path_for = |operation_id: &OperationId| {
+            self.enrollment_root(wallet)
+                .join(format!("{}.json", operation_id.as_str()))
+        };
+        // Persist the operation before Broker sees it. A pending record's ID
+        // is reused even for another surface: Broker accepted nothing it
+        // reported, and if it did accept the old surface it refuses the
+        // retry rather than starting a second enrollment.
+        let resumed = pending.is_some();
+        let mut record = match pending {
+            Some(mut record) => {
+                record.destination = destination;
+                record
+            }
+            None => {
+                let mut operation_bytes = [0_u8; 32];
+                rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut operation_bytes);
+                PasskeyEnrollmentProjection {
+                    schema: ENROLLMENT_SCHEMA.into(),
+                    wallet: wallet.to_owned(),
+                    destination,
+                    operation_id: OperationId::from_bytes(operation_bytes),
+                    ceremony_state: CeremonyState::AwaitingUser,
+                    ceremony_url: None,
+                    ceremony_expires_at_ms: None,
+                    created_at_ms: now_ms_u64(),
+                    pending_prepare: true,
+                }
+            }
+        };
+        let path = path_for(&record.operation_id);
+        let previous = std::fs::read_to_string(self.latest_pointer(wallet)).ok();
+        write_atomic_json(&path, &record)?;
+        self.select_enrollment(wallet, &record.operation_id)?;
+        let prepared = match self
             .custody_broker()?
             .prepare_cross_surface_credential(CeremonyCrossSurfacePrepareRequest {
-                operation_id: operation_id.clone(),
+                operation_id: record.operation_id.clone(),
                 wallet_id: Self::wallet_id(wallet)?,
                 destination,
             })
             .await
-            .map_err(|error| {
-                // No active wallet passkey can approve on any usable surface.
-                // Broker refuses before a link exists, and repeating the
-                // write cannot change that.
-                if error.code == bloom_broker_api::ProtocolErrorCode::ApprovalNotFound {
-                    HandlerError::OperationNotPermitted
-                } else {
-                    HandlerError::backend(error.to_string())
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                // Broker answered with a refusal that created nothing (for
+                // example a rate limit, or no passkey able to approve). A new
+                // record goes and `latest` returns to what it named; a resumed
+                // one stays pending, since this refusal says nothing about the
+                // attempt whose response was lost.
+                if error.code.contract().durable_effect == bloom_broker_api::DurableEffect::None
+                    && !resumed
+                {
+                    std::fs::remove_file(&path)?;
+                    match previous {
+                        Some(previous) => self.write_latest_pointer(wallet, &previous)?,
+                        None => {
+                            let _ = std::fs::remove_file(self.latest_pointer(wallet));
+                        }
+                    }
                 }
-            })?;
-        if prepared.operation_id != operation_id
+                // No active wallet passkey can approve on any usable surface;
+                // repeating the write cannot change the outcome.
+                if error.code == bloom_broker_api::ProtocolErrorCode::ApprovalNotFound {
+                    return Err(HandlerError::OperationNotPermitted);
+                }
+                // Anything else either refused cleanly or may have reached
+                // Broker, in which case the pending record lets a retry resume
+                // this operation and a cancel release it.
+                return Err(HandlerError::backend(error.to_string()));
+            }
+        };
+        if prepared.operation_id != record.operation_id
             || prepared.state != CeremonyState::AwaitingUser
             || prepared.destination_url.trim().is_empty()
             || prepared.expires_at_ms.get() <= now_ms_u64()
@@ -379,31 +522,12 @@ impl WalletsHandler {
             ));
         }
         // Record the surface Broker chose, so `status.json` names it.
-        let destination = match destination {
-            CeremonySurfaceSelection::Default
-                if prepared.destination_url.starts_with("https://") =>
-            {
-                CeremonySurfaceSelection::Remote
-            }
-            CeremonySurfaceSelection::Default => CeremonySurfaceSelection::Local,
-            chosen => chosen,
-        };
-        let record = PasskeyEnrollmentProjection {
-            schema: ENROLLMENT_SCHEMA.into(),
-            wallet: wallet.to_owned(),
-            destination,
-            operation_id: operation_id.clone(),
-            ceremony_state: CeremonyState::AwaitingUser,
-            ceremony_url: Some(prepared.destination_url),
-            ceremony_expires_at_ms: Some(prepared.expires_at_ms),
-            created_at_ms: now_ms_u64(),
-        };
-        write_atomic_json(
-            &self
-                .enrollment_root(wallet)
-                .join(format!("{}.json", operation_id.as_str())),
-            &record,
-        )
+        record.destination = resolved_destination(destination, Some(&prepared.destination_url));
+        record.pending_prepare = false;
+        record.ceremony_state = CeremonyState::AwaitingUser;
+        record.ceremony_url = Some(prepared.destination_url);
+        record.ceremony_expires_at_ms = Some(prepared.expires_at_ms);
+        write_atomic_json(&path, &record)
     }
 
     async fn cancel_passkey_enrollment(
@@ -411,17 +535,32 @@ impl WalletsHandler {
         wallet: &str,
         operation: &str,
     ) -> Result<(), HandlerError> {
+        let _guard = self.passkey_enrollment_lock.lock().await;
         let record = self.enrollment_projection(wallet, operation).await?;
         if record.ceremony_state != CeremonyState::AwaitingUser {
             return Err(HandlerError::invalid(
                 "passkey enrollment is no longer cancellable",
             ));
         }
-        let status = self
+        let status = match self
             .custody_broker()?
             .cancel_ceremony(record.operation_id.clone())
             .await
-            .map_err(|error| HandlerError::backend(error.to_string()))?;
+        {
+            Ok(status) => status,
+            // A pending enrollment Broker never accepted has nothing to
+            // release there; the cancellation is then purely local.
+            Err(error)
+                if record.pending_prepare
+                    && error.code == bloom_broker_api::ProtocolErrorCode::ApprovalNotFound =>
+            {
+                let (path, mut record) = self.enrollment_record(wallet, operation)?;
+                record.pending_prepare = false;
+                record.ceremony_state = CeremonyState::Cancelled;
+                return write_atomic_json(&path, &record);
+            }
+            Err(error) => return Err(HandlerError::backend(error.to_string())),
+        };
         if status.operation_id != record.operation_id
             || status.ceremony_kind != CeremonyKind::CredentialAdd
             || status.state != CeremonyState::Cancelled
@@ -552,7 +691,11 @@ impl WalletsHandler {
             [enrollments, operation, leaf] if enrollments == "enrollments" => {
                 let record = self.enrollment_projection(wallet, operation).await?;
                 match leaf.as_str() {
+                    "status" if record.pending_prepare => Ok(line("preparing")),
                     "status" => Ok(line(&state_word(record.ceremony_state)?)),
+                    "url" if record.pending_prepare => Err(HandlerError::not_found(
+                        "no enrollment link yet: Broker has not confirmed this enrollment; write the same surface to `new` again to resume it",
+                    )),
                     "url" => record.ceremony_url.as_deref().map(line).ok_or_else(|| {
                         HandlerError::not_found(
                             "no live enrollment link: it was already opened, finished, cancelled or expired",

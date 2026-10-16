@@ -114,11 +114,23 @@ fn parse_keys<'a>(words: impl Iterator<Item = &'a str>) -> Result<Vec<String>> {
     Ok(keys)
 }
 
-fn read_release(templates: &Path, owner: u32) -> Result<ReleasePins> {
-    let (ca, _) = read_checked(&templates.join("control-ca.pem"), &[owner], false)?;
-    let (keys, _) = read_checked(&templates.join("receipt-public-keys.hex"), &[owner], false)?;
+/// The release's trust inputs: its CA, its receipt key set, and the pins
+/// earlier releases installed (none for custom developer pins, which
+/// therefore never replace anything).
+struct ReleaseSources<'a> {
+    ca: &'a Path,
+    keys: &'a Path,
+    superseded: Option<&'a Path>,
+}
+
+fn read_release(sources: &ReleaseSources<'_>, owner: u32) -> Result<ReleasePins> {
+    let (ca, _) = read_checked(sources.ca, &[owner], false)?;
+    let (keys, _) = read_checked(sources.keys, &[owner], false)?;
     let keys = parse_keys(std::str::from_utf8(&keys)?.split_whitespace())?;
-    let (history, _) = read_checked(&templates.join("superseded-pins"), &[owner], false)?;
+    let history = match sources.superseded {
+        Some(path) => read_checked(path, &[owner], false)?.0,
+        None => Vec::new(),
+    };
     let mut pins = ReleasePins {
         ca,
         keys,
@@ -180,7 +192,56 @@ fn install(templates: &Path, config: &Path, signer_uid: u32, owner: u32) -> Resu
     directory(templates, &[owner], false)?;
     directory(config, &[owner], false)?;
     directory(&config.join("signer"), &[owner, signer_uid], true)?;
-    let release = read_release(templates, owner)?;
+    install_paths(
+        &ReleaseSources {
+            ca: &templates.join("control-ca.pem"),
+            keys: &templates.join("receipt-public-keys.hex"),
+            superseded: Some(&templates.join("superseded-pins")),
+        },
+        config,
+        &config.join("signer/config.json"),
+        &[owner, signer_uid],
+        owner,
+    )
+}
+
+/// Developer-harness trust adoption: the same policy as the installer, run
+/// as the developer over a developer root (`relay-control-ca.pem`,
+/// `relay.json` and `signer.json` in one owner-only config directory). The
+/// launcher keeps no copy of this policy.
+#[cfg(feature = "triad-dev-harness")]
+pub fn run_developer(
+    ca: &Path,
+    keys: &Path,
+    superseded: Option<&Path>,
+    config: &Path,
+) -> Result<()> {
+    let owner = rustix::process::geteuid().as_raw();
+    if owner == 0 {
+        bail!("developer relay trust adoption runs as the developer, never root");
+    }
+    directory(config, &[owner], true)?;
+    install_paths(
+        &ReleaseSources {
+            ca,
+            keys,
+            superseded,
+        },
+        config,
+        &config.join("signer.json"),
+        &[owner],
+        owner,
+    )
+}
+
+fn install_paths(
+    sources: &ReleaseSources<'_>,
+    config: &Path,
+    signer_path: &Path,
+    signer_owners: &[u32],
+    owner: u32,
+) -> Result<()> {
+    let release = read_release(sources, owner)?;
     let ca_path = config.join("relay-control-ca.pem");
     let relay_path = config.join("relay.json");
     let expected = json!({"control_ca_pem_path": ca_path, "receipt_public_key_hex": release.keys});
@@ -223,8 +284,7 @@ fn install(templates: &Path, config: &Path, signer_uid: u32, owner: u32) -> Resu
         bail!("relay configuration exists without its CA; refusing to rotate trust");
     }
 
-    let signer_path = config.join("signer/config.json");
-    let (mut bytes, metadata) = read_checked(&signer_path, &[owner, signer_uid], true)?;
+    let (mut bytes, metadata) = read_checked(signer_path, signer_owners, true)?;
     let parsed = serde_json::from_slice::<Value>(&bytes);
     use zeroize::Zeroize;
     bytes.zeroize();
@@ -264,13 +324,7 @@ fn install(templates: &Path, config: &Path, signer_uid: u32, owner: u32) -> Resu
     if signer_pin != Pin::Current {
         object.insert("relay_receipt_public_key_hex".into(), json!(release.keys));
         let mut output = serde_json::to_vec_pretty(&signer)?;
-        let result = atomic_write(
-            config,
-            &signer_path,
-            &output,
-            metadata.uid(),
-            metadata.gid(),
-        );
+        let result = atomic_write(config, signer_path, &output, metadata.uid(), metadata.gid());
         output.zeroize();
         result?;
     }
@@ -490,5 +544,66 @@ mod tests {
         symlink(&sentinel, config.join("relay.json")).unwrap();
         assert!(install(&templates, &config, uid, uid).is_err());
         assert_eq!(fs::read_to_string(sentinel).unwrap(), "untouched");
+    }
+
+    #[cfg(feature = "triad-dev-harness")]
+    #[test]
+    fn developer_roots_adopt_trust_with_the_installer_policy() {
+        let root = tempfile::tempdir().unwrap();
+        let pins = root.path().join("pins");
+        let config = root.path().join("config");
+        fs::create_dir(&pins).unwrap();
+        fs::create_dir(&config).unwrap();
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o700)).unwrap();
+        let ca = pins.join("control-ca.pem");
+        let keys = pins.join("receipt-public-keys.hex");
+        fs::write(
+            &ca,
+            include_bytes!("../../../packaging/triad/relay/control-ca.pem"),
+        )
+        .unwrap();
+        fs::write(&keys, format!("{}\n{}\n", key('a'), key('b'))).unwrap();
+        let signer = config.join("signer.json");
+        fs::write(
+            &signer,
+            br#"{"relay_receipt_public_key_hex":null,"keep":1}"#,
+        )
+        .unwrap();
+        fs::set_permissions(&signer, fs::Permissions::from_mode(0o600)).unwrap();
+
+        run_developer(&ca, &keys, None, &config).unwrap();
+        let relay: Value =
+            serde_json::from_slice(&fs::read(config.join("relay.json")).unwrap()).unwrap();
+        assert_eq!(
+            relay,
+            json!({
+                "control_ca_pem_path": config.join("relay-control-ca.pem"),
+                "receipt_public_key_hex": [key('a'), key('b')],
+            })
+        );
+        assert_eq!(
+            fs::read(config.join("relay-control-ca.pem")).unwrap(),
+            fs::read(&ca).unwrap()
+        );
+        let signer_config: Value = serde_json::from_slice(&fs::read(&signer).unwrap()).unwrap();
+        assert_eq!(
+            signer_config["relay_receipt_public_key_hex"],
+            json!([key('a'), key('b')])
+        );
+        assert_eq!(signer_config["keep"], 1);
+
+        // A rerun with the same pins changes nothing.
+        let before = fs::read(config.join("relay.json")).unwrap();
+        run_developer(&ca, &keys, None, &config).unwrap();
+        assert_eq!(fs::read(config.join("relay.json")).unwrap(), before);
+
+        // Custom pins supersede nothing: a different CA is refused.
+        fs::write(&ca, OLD_CA).unwrap();
+        let refused = run_developer(&ca, &keys, None, &config).unwrap_err();
+        assert!(
+            refused.to_string().contains("refusing to rotate trust"),
+            "{refused:#}"
+        );
+        assert_eq!(fs::read(config.join("relay.json")).unwrap(), before);
     }
 }
