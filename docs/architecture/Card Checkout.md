@@ -13,9 +13,10 @@ the approval page, or the human's private view of the browser.
   requests to Broker (cards) and to `bloom-checkout` (shopping), and re-parses
   every response into a closed public type before it reaches VFS.
 - **`bloom-checkout`** is its own principal. It owns a headless Chromium over a
-  CDP pipe, with a persistent profile, and accepts Machine requests only from
-  the Machine UID. It reads checkout facts from the page, fills a released card
-  and clicks the pay button. Its operation store is a private SQLite file.
+  CDP pipe or, when configured, one allowlisted tab in the person's browser.
+  It accepts Machine requests only from the Machine UID, reads checkout facts,
+  fills a released card and clicks the pay button. Its operation store is a
+  private SQLite file.
 - **Broker** turns a checkout intake into a card ceremony, shows the approval
   page and relays ciphertext. It never holds card plaintext.
 - **Signer** stores cards encrypted, binds each approval to its facts, and
@@ -46,8 +47,23 @@ ceremony that releases no card, and the human finishes in the private view.
 A card is filled only into fields hosted by a known payment provider
 (`PROVIDER_FIELD_ORIGINS`); other pages go to the private view.
 
-The approval page also shows a screenshot of the order. It is a human aid and
-is not bound to the approval.
+The approval page also shows the entered fields and, when checkout owns the
+browser, a screenshot of the order. These are human aids and are not bound to
+the approval.
+
+## User browser extension
+
+Sites that reject a fresh automated browser can run in one tab of the person's
+existing Chromium profile. A Manifest V3 content-script extension connects to
+checkout through Chrome native messaging; it uses neither the debugger API nor
+a localhost web port. The extension creates and controls one tab, accepts only
+the Aerolíneas, JetSMART and Flybondi origins, and never reads other tabs.
+
+Machine keeps the same browse and checkout API. Named, bundled page functions
+replace arbitrary script evaluation. Traveler and card values still cross the
+Broker and Signer ceremonies, are released for the approved origin, and are
+redacted from snapshots. The extension does not weaken payment discovery,
+fact rechecks, the single-submit rule or restart recovery.
 
 ## Private view
 
@@ -68,6 +84,10 @@ the VFS. Failure to replace the document leaves shopping paused.
 Card and site-payment completion still close every private page and resume
 shopping in a fresh blank tab. Takeover buys nothing and releases no card;
 saved-card payment needs its separate approval for the exact merchant/total.
+
+The extension tab is already visible in the person's browser, so it is not
+mirrored into the private view. Approval follow-up instead tells the person to
+return to the Bloom tab for a bank check or correction.
 
 ## Durable states and recovery
 
@@ -97,4 +117,5 @@ after one use. Nothing persists a PRF output, CVC, or reusable grant.
 - Card ceremonies share Broker's anonymous quota of four per five minutes.
 - Take-over and site payment need the card passkey, so one card must be saved.
 - The private view is local; phone take-over needs a remote surface.
-- Sites that block headless browsers (Akamai and similar) cannot be used.
+- Sites that block the headless browser require an allowlisted extension origin
+  and the person's existing browser profile.

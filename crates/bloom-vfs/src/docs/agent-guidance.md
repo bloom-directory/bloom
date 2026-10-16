@@ -90,8 +90,8 @@ tool for this checkout.
   shop so nothing is ordered twice.
 
 The human approves website, total, currency, installments, recurring status,
-and card, then enters CVC privately; the approval also shows a screenshot of
-the merchant page so the human can check the order. Bloom fills and submits
+and card, then enters CVC privately; the approval also lists entered fields
+and shows a screenshot when checkout owns the browser. Bloom fills and submits
 once. Bloom fills a saved card into fields hosted by a known payment
 provider (Stripe, Shopify, Adyen, Braintree, Yuno and others) or into the own
 checkout page of a listed merchant (Aerolíneas Argentinas). A bank challenge,
@@ -99,6 +99,11 @@ card fields anywhere else, or
 an unclear total goes to the human's private view; its URL and screenshots
 never appear in VFS. A manual
 fallback releases no saved card.
+
+When the Bloom browser extension is connected, the same browse and checkout
+actions use one allowlisted Bloom tab in the person's browser. After approval,
+the person completes any bank check or correction in that tab; the follow-up
+page points them there instead of showing a duplicate private browser.
 
 `filled` means fields were filled, not that payment succeeded. `booked`,
 `paid` and `declined` describe what the merchant reported; Bloom has not
