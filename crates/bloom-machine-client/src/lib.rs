@@ -1018,6 +1018,7 @@ impl MachineBrokerClient {
                 .safe_review_payload
                 .map(|payload| vec![Base64UrlBytes::from_bytes(&payload)])
                 .unwrap_or_default(),
+            evm_reported_token: request.evm_reported_token,
             operation_id: request.approval_operation_id,
             terms,
             canonical_plan_facts_digest: request.canonical_plan_facts_digest,
@@ -1189,6 +1190,7 @@ impl MachineBrokerClient {
         };
         terms.validate()?;
         self.prepare_approval(ApprovalPrepareRequest {
+            evm_reported_token: None,
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             evm_review_payloads: if native_evm_review(&request.provenance) {
                 request
@@ -1354,6 +1356,7 @@ impl MachineBrokerClient {
         };
         terms.validate()?;
         self.prepare_approval(ApprovalPrepareRequest {
+            evm_reported_token: None,
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             evm_review_payloads: Vec::new(),
             safe_review_payloads: Vec::new(),
@@ -2095,6 +2098,8 @@ pub struct ExactPayloadSignRequest {
     pub system_use_claim: Option<SystemUseClaim>,
     pub claim_assurance_evidence: Option<Vec<u8>>,
     pub safe_review_payload: Option<Vec<u8>>,
+    /// What an unlisted token reports about itself, for Broker's display.
+    pub evm_reported_token: Option<bloom_broker_api::EvmReportedToken>,
     /// Value movement authorized by the reviewed exact claim. System callers
     /// must supply an exact per-asset ceiling; non-value signing leaves this
     /// empty.
@@ -4012,6 +4017,7 @@ mod tests {
 
     fn exact_request(payload: Vec<u8>, approval_id: Option<Digest32>) -> ExactPayloadSignRequest {
         ExactPayloadSignRequest {
+            evm_reported_token: None,
             wallet_id: token("wallet"),
             claimed_hash: Digest32::from_bytes(Keccak256::digest(&payload).into()),
             preimage: payload,
@@ -4816,6 +4822,7 @@ mod tests {
         let client = MachineBrokerClient::new(broker);
 
         let approval = ApprovalPrepareRequest {
+            evm_reported_token: None,
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             evm_review_payloads: Vec::new(),
             safe_review_payloads: Vec::new(),

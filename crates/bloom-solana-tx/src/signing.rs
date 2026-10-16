@@ -194,6 +194,7 @@ impl SolanaTransferSigner {
             },
         };
         let request = ExactPayloadSignRequest {
+            evm_reported_token: None,
             wallet_id: Token::new(wallet_id).map_err(|e| e.to_string())?,
             preimage,
             claimed_hash,

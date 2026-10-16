@@ -377,6 +377,7 @@ impl BrokerExactPayloadSigner {
             .transpose()?
             .unwrap_or_default();
         let mut request = ExactPayloadSignRequest {
+            evm_reported_token: None,
             wallet_id,
             preimage: preimage.to_vec(),
             claimed_hash,

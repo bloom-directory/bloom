@@ -3106,6 +3106,7 @@ impl TxEngine {
             .host_sign_evm_hash(
                 entry,
                 staged,
+                chain,
                 action_kind,
                 &signing_preimage,
                 prepared.signing_hash,
@@ -3153,6 +3154,7 @@ impl TxEngine {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     async fn triad_sign_evm_payload(
         &self,
         entry: &crate::outbox::OutboxEntry,
@@ -3160,6 +3162,26 @@ impl TxEngine {
         action_kind: EvmOutboxActionKind,
         signing_preimage: &[u8],
         signing_hash: B256,
+    ) -> Result<Signature, TxEngineError> {
+        self.triad_sign_evm_payload_with(
+            entry,
+            staged,
+            action_kind,
+            signing_preimage,
+            signing_hash,
+            None,
+        )
+        .await
+    }
+
+    async fn triad_sign_evm_payload_with(
+        &self,
+        entry: &crate::outbox::OutboxEntry,
+        staged: &StagedTx,
+        action_kind: EvmOutboxActionKind,
+        signing_preimage: &[u8],
+        signing_hash: B256,
+        reported_token: Option<bloom_broker_api::EvmReportedToken>,
     ) -> Result<Signature, TxEngineError> {
         let service = self.triad_signing.as_ref().ok_or_else(|| {
             TxEngineError::ApprovalServiceUnavailable(
@@ -3427,6 +3449,7 @@ impl TxEngine {
             provenance,
             &state,
             key.selector.clone(),
+            reported_token,
         )?;
         if state.approval_id.is_some() {
             let expected_operation_digest = expected_evm_sign_operation_digest(
@@ -3821,12 +3844,21 @@ impl TxEngine {
         &self,
         entry: &crate::outbox::OutboxEntry,
         staged: &StagedTx,
+        chain: &ChainClient,
         action_kind: EvmOutboxActionKind,
         signing_preimage: &[u8],
         signing_hash: B256,
     ) -> Result<Signature, TxEngineError> {
-        self.triad_sign_evm_payload(entry, staged, action_kind, signing_preimage, signing_hash)
-            .await
+        let reported_token = reported_token(chain, staged).await;
+        self.triad_sign_evm_payload_with(
+            entry,
+            staged,
+            action_kind,
+            signing_preimage,
+            signing_hash,
+            reported_token,
+        )
+        .await
     }
 
     /// Refuse to broadcast when a same-chain dependency has not mined
@@ -4506,6 +4538,31 @@ async fn evm_signing_key(
     }
 }
 
+/// What the called contract reports about itself when the call has the exact
+/// ERC-20 `transfer` or `approve` shape, so Broker can show a readable amount
+/// for a token it does not list. Broker labels it unverified; a contract that
+/// does not answer gets no report and the amount stays in raw units.
+async fn reported_token(
+    chain: &ChainClient,
+    staged: &StagedTx,
+) -> Option<bloom_broker_api::EvmReportedToken> {
+    let data = staged.data_hex.trim_start_matches("0x");
+    let erc20_shape =
+        data.len() == 136 && (data.starts_with("a9059cbb") || data.starts_with("095ea7b3"));
+    let to: Address = staged.to.as_deref()?.parse().ok()?;
+    if !erc20_shape
+        || bloom_broker_api::tokens_on(staged.chain_id)
+            .any(|token| token.address == format!("{to:#x}"))
+    {
+        return None;
+    }
+    Some(bloom_broker_api::EvmReportedToken {
+        address: format!("{to:#x}"),
+        decimals: chain.erc20_decimals(to).await.ok()??,
+        symbol: chain.erc20_symbol(to).await.ok()??,
+    })
+}
+
 fn exact_evm_sign_request(
     staged: &StagedTx,
     signing_preimage: &[u8],
@@ -4513,6 +4570,7 @@ fn exact_evm_sign_request(
     provenance: &ProvenanceRecord,
     state: &TriadEvmSigningState,
     account_key_ref: Option<bloom_broker_api::KeyRef>,
+    evm_reported_token: Option<bloom_broker_api::EvmReportedToken>,
 ) -> Result<ExactPayloadSignRequest, TxEngineError> {
     Ok(ExactPayloadSignRequest {
         wallet_id: Token::new(staged.wallet.clone())
@@ -4535,6 +4593,7 @@ fn exact_evm_sign_request(
         system_use_claim: None,
         claim_assurance_evidence: None,
         safe_review_payload: None,
+        evm_reported_token,
         approval_value_limits: Vec::new(),
     })
 }
