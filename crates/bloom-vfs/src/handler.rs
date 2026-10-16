@@ -185,6 +185,19 @@ pub enum HandlerError {
     NotAFile(String),
     #[error("permission denied")]
     PermissionDenied,
+    /// The operation is authorized in principle but needs an owner ceremony
+    /// first. This is a step in the flow, not a refusal, and the caller cannot
+    /// take that step without the ceremony URL — so it carries one.
+    #[error(
+        "approval required: {reason}; complete the owner ceremony at {ceremony_url} \
+         (action {action_id}), then retry this exact request"
+    )]
+    ApprovalRequired {
+        action_id: String,
+        ceremony_url: String,
+        expires_ms: u64,
+        reason: String,
+    },
     #[error("operation not permitted")]
     OperationNotPermitted,
     #[error("invalid input: {0}")]
