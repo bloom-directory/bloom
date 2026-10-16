@@ -243,7 +243,11 @@ snapshot and authenticates and installs exclusively from that snapshot. It then
 journals the old and new digests plus source and target schema watermarks, stops every enrollment before
 the shared atomic `current` switch, updates build-digest state, and validates
 each installed triad in health-only mode before publishing any enrollment
-active. Same-schema failures before publication may restore the old release.
+active. Machine verifies its whole audit journal before it listens, so both
+installers wait up to `BLOOM_HEALTH_TIMEOUT_SECONDS` (default 600) for that
+health, printing progress every 30 seconds. If a rollback's restored release
+has not answered by then, the macOS installer says it is reinstated and may
+still be starting, rather than reporting a failed restore. Same-schema failures before publication may restore the old release.
 Schema migrations become forward-only before candidate authority services
 start; every upgrade commits forward before a full Machine can write its cache
 or accept user work. Interrupted upgrades resume the recorded target or a

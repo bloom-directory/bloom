@@ -5247,6 +5247,15 @@ fn run_expiry_sweep_once(
     audit: &AuditLog,
     now_ms: u128,
 ) -> Result<usize, String> {
+    // A sweep with nothing to expire changes nothing, so an idle tick is not
+    // journaled; otherwise every tick would grow the audit journal forever.
+    if outbox
+        .expired_pending(now_ms)
+        .map_err(|error| error.to_string())?
+        .is_empty()
+    {
+        return Ok(0);
+    }
     let intent = serde_json::json!({
         "operation": "tx.outbox.sweep_expired",
         "cutoff_ms": now_ms.to_string(),
@@ -5302,6 +5311,14 @@ fn run_solana_expiry_sweep_once(
     now_ms: u128,
     live_block_heights: &std::collections::HashMap<String, u64>,
 ) -> Result<usize, String> {
+    // As for EVM: an idle tick changes nothing and is not journaled.
+    if outbox
+        .expired_pending(now_ms, live_block_heights)
+        .map_err(|error| error.to_string())?
+        .is_empty()
+    {
+        return Ok(0);
+    }
     let intent = serde_json::json!({
         "operation": "solana_tx.outbox.sweep_expired",
         "cutoff_ms": now_ms.to_string(),
@@ -8125,6 +8142,38 @@ ws_url = "wss://example.invalid"
         tokio::time::timeout(std::time::Duration::from_secs(2), tasks.shutdown())
             .await
             .expect("background task did not honour shutdown signal");
+    }
+
+    #[tokio::test]
+    async fn idle_expiry_sweeps_leave_the_audit_journal_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = HomeDir::at(dir.path());
+        let d = Daemon::from_home(home.clone()).unwrap();
+        let solana_outbox =
+            bloom_solana_tx::outbox::SolanaOutbox::new(home.solana_outbox_dir()).unwrap();
+        let before = d.audit.count().unwrap();
+        for now_ms in [1_u128, 2, 3] {
+            assert_eq!(
+                run_expiry_sweep_once(&d.tx_engine.outbox, &d.audit, now_ms).unwrap(),
+                0
+            );
+            assert_eq!(
+                run_solana_expiry_sweep_once(
+                    &solana_outbox,
+                    &d.audit,
+                    now_ms,
+                    &std::collections::HashMap::new(),
+                )
+                .unwrap(),
+                0
+            );
+        }
+        assert_eq!(
+            d.audit.count().unwrap(),
+            before,
+            "idle sweeps must not append records"
+        );
+        assert!(d.audit.pending_effect_correlations().unwrap().is_empty());
     }
 
     // Fix D (PLAN-SOLANA-PR-FIXES.md): the periodic sweep task only ever
