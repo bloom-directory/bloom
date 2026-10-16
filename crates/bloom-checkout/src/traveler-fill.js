@@ -66,10 +66,11 @@
         : mapping.field === 'document_kind' ? (value === 'passport' ? (spanish ? 'Pasaporte' : 'Passport') : (spanish ? 'DNI' : 'National ID'))
         : value === 'female' ? (spanish ? 'Femenino' : 'Female') : value === 'male' ? (spanish ? 'Masculino' : 'Male') : value;
       const names = o => [o.dataset.testValue, o.dataset.value, o.getAttribute('value'), o.innerText].filter(t => t != null).map(normalize);
-      // One-letter codes ("F") also label seat-map columns and the like.
+      // One-letter codes ("F") also label seat-map columns and the like; a
+      // date list's "7" is the day.
       const word = (t, a) => a.length >= 3 && t.length <= 60
         && new RegExp(`(^|\\W)${a.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(\\W|$)`).test(t);
-      const matches = o => names(o).some(t => aliases.some(a => normalize(a).length > 1 && (normalize(a) === t || word(t, normalize(a))))
+      const matches = o => names(o).some(t => aliases.some(a => (normalize(a).length > 1 || mapping.part) && (normalize(a) === t || word(t, normalize(a))))
         || (!e.readOnly && typed && t.startsWith(normalize(typed)) && /^\W/.test(t.slice(normalize(typed).length))));
       // Real list options, when the site marks them, beat any other matching text.
       const optionLike = o => o.matches('[role=option]') || /option/i.test(`${o.id} ${o.className}`);

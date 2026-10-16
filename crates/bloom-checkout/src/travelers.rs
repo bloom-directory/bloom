@@ -472,6 +472,35 @@ mod tests {
         server.abort();
     }
     #[tokio::test]
+    async fn a_single_digit_day_is_picked_from_a_site_list() {
+        // Shaped like Aerolíneas Argentinas' birth day: a search box whose
+        // options are 1..31, and the choice shown beside an emptied box.
+        let (browser, server, _) = browser_at(
+            "<div><div>Fecha de Nacimiento</div><div>
+               <div><div id='shown'></div><input aria-label='Día' id='day' role='combobox'><div id='list'></div></div>
+               <input aria-label='Mes'><input aria-label='Año'></div></div>
+             <script>day.addEventListener('input',()=>{list.innerHTML='';for(let d=1;d<=31;d++)
+               if(day.value&&String(d).startsWith(day.value)){const o=document.createElement('div');o.className='option';o.textContent=d;
+               o.onclick=()=>{shown.textContent=d;day.value='';list.innerHTML='';};list.append(o);}});</script>",
+        )
+        .await;
+        let tab = browser.handoff().await.unwrap();
+        let discovery = TravelerDiscovery::read(&tab, &[TravelerField::BornOn])
+            .await
+            .unwrap();
+        let values = [("born_on".to_owned(), Zeroizing::new("1990-05-07".to_owned()))]
+            .into_iter()
+            .collect();
+        assert_eq!(discovery.fill(&tab, &values).await.unwrap().len(), 1);
+        let shown = tab
+            .cdp
+            .evaluate(&tab.session, "shown.textContent".into())
+            .await
+            .unwrap();
+        assert_eq!(shown, json!("7"));
+        server.abort();
+    }
+    #[tokio::test]
     async fn earlier_filled_steps_do_not_count_as_a_second_person() {
         // Shaped like JetSMART's payment page: the filled passenger step stays
         // in the document above the empty contact form.
