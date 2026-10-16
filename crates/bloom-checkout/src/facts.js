@@ -123,6 +123,9 @@
     ({total,currency} = found);
   }
   const selectors = [...document.querySelectorAll('select')].filter(e => visible(e) && /installment|cuotas|parcelas/i.test([e.name,e.id,e.labels?.[0]?.innerText].join(' ')));
+  const selectedInstallments = [...text.matchAll(/\b(?:you selected|selected|seleccionaste|seleccionado|seleccionada|escolheu)\s+(\d+)\s*(?:x|installments?|cuotas?|parcelas?)\b/giu)]
+    .map(match => Number(match[1]));
+  const selectedCounts = new Set(selectedInstallments);
   const shopifyCard = /^\/checkouts\/cn\/[A-Za-z0-9]+\//.test(location.pathname)
     && [...document.querySelectorAll('iframe')].some(e => {
       try {return new URL(e.src).origin === 'https://checkout.pci.shopifyinc.com';} catch {return false;}
@@ -130,11 +133,13 @@
     && document.querySelector('input#basic-creditCards[name=basic]')?.checked === true
     && [...document.querySelectorAll('input[name=basic]:checked')].length === 1;
   let installments = 1;
-  if (selectors.length > 1) return null;
+  if (selectors.length > 1 || selectedCounts.size > 1) return null;
   if (selectors.length === 1) {
     const match = selectors[0].selectedOptions[0]?.text.match(/^(\d+)\s*(?:x|installments?|cuotas|parcelas)\b/i);
     if (!match) return null;
     installments = Number(match[1]);
+  } else if (selectedCounts.size === 1) {
+    installments = [...selectedCounts][0];
   } else if (/installments?|cuotas|parcelas/i.test(text) && !shopifyCard) return null;
   const recurring = processorRecurring ?? /\b(subscription|recurring|auto.?renew|monthly|annually|suscripci[oó]n)\b/i.test(text);
   globalThis.__bloomPayButton = pay[0];

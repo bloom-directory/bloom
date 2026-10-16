@@ -1642,6 +1642,25 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn selected_installments_are_distinguished_from_other_offers() {
+        // Aerolíneas keeps every installment offer in the page after one is chosen.
+        let html = "<!doctype html><html lang='es-AR'><p>Precio total final ARS 57.823,35</p>
+            <p>Seleccionaste 1 cuota sin interés con Visa</p><p>3 Cuotas sin interés</p>
+            <p>6 Cuotas sin interés</p><input autocomplete='cc-number'>
+            <input autocomplete='cc-exp'><input autocomplete='cc-csc'>
+            <button>Finalizar Compra</button></html>";
+        let browser = browser().await;
+        let (url, server) = fixture(html.into()).await;
+        let tab = open(&browser, url).await;
+        let discovery = Discovery::read(&tab).await.unwrap();
+        assert_eq!(discovery.facts.total_minor, 5_782_335);
+        assert_eq!(discovery.facts.currency, "ARS");
+        assert_eq!(discovery.facts.installments, 1);
+        browser.return_control().await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn fixture_plain_installments_confirmation_and_decline() {
         let browser = browser().await;
         for (outcome, expected) in [

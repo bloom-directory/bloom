@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 pub fn router(service: Arc<CheckoutService>) -> Router {
     Router::new().route("/private",get(claim)).route("/view",get(page))
+        .route("/extension",get(||async {Html("<!doctype html><meta charset=utf-8><title>Bloom</title><p>Bloom is finishing in your browser's Bloom tab. Return to that tab for any bank check or correction. Do not click Pay again unless Bloom says the payment was not submitted.</p>")}))
         .route("/unlocked",get(||async {Html("<!doctype html><meta charset=utf-8><title>Bloom</title><p>Traveler details unlocked for this booking. You can close this page.</p>")}))
         .route("/view.js",get(||async {([(header::CONTENT_TYPE,"application/javascript")],include_str!("view.js"))}))
         .route("/state",get(state)).route("/frame",get(frame)).route("/action",post(action))

@@ -706,10 +706,8 @@ impl CheckoutService {
                 let mut token = [0; 32];
                 rand::thread_rng().fill_bytes(&mut token);
                 let capability = hex_token(&token);
-                let challenge_url = format!(
-                    "http://localhost:{}/private?token={}",
-                    self.view_port, capability
-                );
+                let challenge_url =
+                    challenge_url(self.view_port, &capability, tab.extension.is_some());
                 let request = match (&discovery, &recipient) {
                     (Some(discovery), Some(recipient)) => {
                         json!({"method":"prepare","operation_id":operation_id,"card_id":card_id,
@@ -982,6 +980,14 @@ fn same_token(expected: &str, received: &str) -> bool {
         .zip(received.bytes())
         .fold(0, |difference, (a, b)| difference | (a ^ b))
         == 0
+}
+
+fn challenge_url(view_port: u16, capability: &str, extension: bool) -> String {
+    if extension {
+        format!("http://localhost:{view_port}/extension")
+    } else {
+        format!("http://localhost:{view_port}/private?token={capability}")
+    }
 }
 
 impl CheckoutService {
@@ -1740,6 +1746,18 @@ const BROWSE_ERRORS: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extension_checkout_keeps_the_person_in_the_bloom_tab() {
+        assert_eq!(
+            challenge_url(8123, "secret", true),
+            "http://localhost:8123/extension"
+        );
+        assert_eq!(
+            challenge_url(8123, "secret", false),
+            "http://localhost:8123/private?token=secret"
+        );
+    }
     #[tokio::test]
     async fn airline_confirmation_becomes_booked_with_its_code() {
         let (url, server) = crate::discovery::tests::fixture(

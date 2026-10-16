@@ -407,6 +407,49 @@ mod tests {
         assert_eq!(filled, json!(["SyntheticName", "Femenino", ""]));
         server.abort();
     }
+
+    #[tokio::test]
+    async fn document_expiry_parts_are_chosen_from_site_drawn_lists() {
+        let (browser, server, _) = browser_at(
+            r#"<html lang='es'><div id='expiry'>Fecha de Caducidad
+              <label>Día<input id='day' aria-label='Día de vencimiento' aria-autocomplete='list' readonly></label>
+              <label>Mes<input id='month' aria-label='Mes de vencimiento' aria-autocomplete='list' readonly></label>
+              <label>Año<input id='year' aria-label='Año de vencimiento' aria-autocomplete='list' readonly></label>
+            </div><div id='options' hidden></div><p id='accepted'></p>
+            <script>
+              const values={day:['31','31'],month:['12','Diciembre'],year:['2035','2035']};
+              for(const input of expiry.querySelectorAll('input')) input.addEventListener('click',()=>{
+                const [value,label]=values[input.id];options.innerHTML='<div role="option">'+label+'</div>';
+                options.hidden=false;options.firstChild.addEventListener('click',()=>{
+                  input.value=value;input.dataset.accepted='yes';options.hidden=true;
+                  accepted.textContent=[...expiry.querySelectorAll('input')].every(e=>e.dataset.accepted==='yes')?'accepted':'';
+                });
+              });
+            </script></html>"#,
+        )
+        .await;
+        let tab = browser.handoff().await.unwrap();
+        let discovery = TravelerDiscovery::read(&tab, &[TravelerField::DocumentExpiry])
+            .await
+            .unwrap();
+        let values = [(
+            "document_expiry".into(),
+            Zeroizing::new("2035-12-31".into()),
+        )]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            discovery.fill(&tab, &values).await.unwrap(),
+            ["document_expiry"]
+        );
+        let accepted = tab
+            .cdp
+            .evaluate(&tab.session, "accepted.textContent".into())
+            .await
+            .unwrap();
+        assert_eq!(accepted, json!("accepted"));
+        server.abort();
+    }
     #[tokio::test]
     async fn unlocked_traveler_fills_shopping_pages_and_stays_out_of_snapshots() {
         // The merchant echoes the name into the page, title and URL as typed.

@@ -6,7 +6,8 @@
   // A site list that does not take the value is left for the agent's type_traveler.
   class Skip extends Error {}
   // Date widgets may clear the day when the month or year changes: day last.
-  const order = [...mapped.filter(m => !(m.field === 'born_on' && m.part === 'day')), ...mapped.filter(m => m.field === 'born_on' && m.part === 'day')];
+  const dateDay = m => ['born_on','document_expiry'].includes(m.field) && m.part === 'day';
+  const order = [...mapped.filter(m => !dateDay(m)), ...mapped.filter(dateDay)];
   for (const mapping of order) {
   try {
     const e=binding.refs[mapping.index];
@@ -15,7 +16,7 @@
     let value=values[mapping.field];
     if (typeof value !== 'string') throw Error('Traveler field unavailable');
     let aliases = [value];
-    if (mapping.field === 'born_on' && mapping.part) {
+    if (['born_on','document_expiry'].includes(mapping.field) && mapping.part) {
       value = String(Number(value.slice(mapping.part === 'year' ? 0 : mapping.part === 'month' ? 5 : 8,
         mapping.part === 'year' ? 4 : mapping.part === 'month' ? 7 : 10)));
       aliases=[value,value.padStart(2,'0')];
@@ -62,7 +63,7 @@
       // The site draws its own list. Open it (read-only input) or filter it by
       // typing the name (editable input), then click the one new option naming
       // this value; options already on the page, like a country menu, never count.
-      let typed = mapping.field === 'born_on' ? value : ['nationality','document_country'].includes(mapping.field) ? aliases.at(-1)
+      let typed = ['born_on','document_expiry'].includes(mapping.field) ? value : ['nationality','document_country'].includes(mapping.field) ? aliases.at(-1)
         : mapping.field === 'document_kind' ? (value === 'passport' ? (spanish ? 'Pasaporte' : 'Passport') : (spanish ? 'DNI' : 'National ID'))
         : value === 'female' ? (spanish ? 'Femenino' : 'Female') : value === 'male' ? (spanish ? 'Masculino' : 'Male') : value;
       const names = o => [o.dataset.testValue, o.dataset.value, o.getAttribute('value'), o.innerText].filter(t => t != null).map(normalize);

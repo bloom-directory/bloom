@@ -35,7 +35,7 @@
     for (let a = e.parentElement, depth = 0; a && depth < 8; a = a.parentElement, depth++) {
       const text = normalize(a.innerText);
       if (text.length > 80) break;
-      if (/nacimiento|birth|genero|gender|sexo/.test(text)) { group = a; groupText = text; break; }
+      if (/nacimiento|birth|genero|gender|sexo|caducidad|vencimiento|expir(?:y|ation)/.test(text)) { group = a; groupText = text; break; }
     }
     const combobox = e.getAttribute('role') === 'combobox' || e.hasAttribute('aria-autocomplete') || /^react-select-/.test(e.id);
     const label = normalize([e.getAttribute('aria-label'),e.labels?.[0]?.innerText,e.placeholder,e.name,e.id,caption].filter(Boolean).join(' '));
@@ -57,11 +57,14 @@
       field='born_on';part=ac?.split('-')[1] || datePart;
       if (!part) part = /year|ano/.test(label) ? 'year' : /month|mes/.test(label) ? 'month' : /day|dia/.test(label) ? 'day' : undefined;
       if (!part && e.type !== 'date') continue;
+    } else if (/document.*expiry|passport.*expiry|caducidad|vencimiento|expir(?:y|ation)/.test(label)
+        || (datePart && /caducidad|vencimiento|expir(?:y|ation)/.test(groupText))) {
+      field='document_expiry';part=datePart;
+      if (!part && e.type !== 'date') continue;
     } else if (/nationality|nacionalidad/.test(label)) field='nationality';
     else if (/issuing.?country|pais emisor|pais de emision|document.?country/.test(label)) field='document_country';
     else if (/document.?type|tipo de documento|document.?kind/.test(label)) field='document_kind';
     else if (/passport.?number|document.?number|(numero|nro)\.?.*documento|(numero|nro)\.?.*pasaporte/.test(label)) field='document_number';
-    else if (/document.*expiry|passport.*expiry|vencimiento/.test(label) && e.type === 'date') field='document_expiry';
     else if (ac === 'sex' || /gender|genero|sexo/.test(label)) field='gender';
     else if (ac === 'email' || e.type === 'email' || /email|e-mail|correo/.test(label)) field='email';
     else if (/area.?code|cod\.? ?area|areacode/.test(label)) { field='phone'; part='area'; }
