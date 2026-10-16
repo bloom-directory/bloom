@@ -177,6 +177,8 @@ if command -v expect >/dev/null 2>&1; then
       send "\r"
       expect "Complete the passkey ceremony in the browser, then press Return"
       send "\r"
+      expect "Complete the passkey ceremony in the browser, then press Return"
+      send "\r"
       expect eof
       set result [wait]
       exit [lindex $result 3]
@@ -212,6 +214,8 @@ if command -v expect >/dev/null 2>&1; then
       send "\r"
       expect "Complete the passkey ceremony in the browser, then press Return"
       send "\r"
+      expect "Complete the passkey ceremony in the browser, then press Return"
+      send "\r"
       expect "to authorize the selected submission(s):"
       send "EXECUTE POLYMARKET MAINNET ORDER\r"
       expect "to request its passkey approval:"
@@ -236,6 +240,8 @@ if command -v expect >/dev/null 2>&1; then
       spawn $env(RUNNER) --wallet test-passkey --execute-polymarket \
         --pm-slug fixture --pm-outcome Yes --pm-side buy \
         --pm-amount 1 --pm-price-bound 0.5 --pm-order-type FAK
+      expect "Complete the passkey ceremony in the browser, then press Return"
+      send "\r"
       expect "Complete the passkey ceremony in the browser, then press Return"
       send "\r"
       expect "Complete the passkey ceremony in the browser, then press Return"
