@@ -113,9 +113,9 @@ These pages are deliberately narrow about what they claim:
 - **Holds nothing** means the network answered and reported an empty balance.
   It is listed rather than dropped, so that holding nothing stays
   distinguishable from a network that was never read.
-- A balance on a chain with no market for its native unit (a faucet or
-  development chain) is shown in its own table and never priced. Its quantity
-  is real; it is not money.
+- A native balance without a configured market price is shown in its own
+  table and excluded from dollar totals. This is a valuation limitation, not
+  a claim that the network is a testnet or that its native asset has no value.
 - **App coverage incomplete** means a read failed, returned invalid data,
   exceeded a discovery limit, or supplied no sufficiently recent timestamp.
   The same warning appears in the briefing. Missing rows are not zero balances.

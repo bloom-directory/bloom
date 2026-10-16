@@ -1527,8 +1527,7 @@ impl ViewsHandler {
                 ))
             ));
         }
-        // The disclaimer belongs to the group, not to every line: one note
-        // quarantines all of them.
+        // The disclaimer belongs to the group, not to every line.
         let off_market = portfolio.off_market();
         for holding in &off_market {
             out.push_str(&format!(
@@ -1539,7 +1538,9 @@ impl ViewsHandler {
             ));
         }
         if !off_market.is_empty() {
-            out.push_str("Faucet and development quantities are real, but are not money.\n");
+            out.push_str(
+                "These native balances have no configured market price and are excluded from dollar totals.\n",
+            );
         }
         out.push('\n');
 
@@ -1902,18 +1903,18 @@ impl ViewsHandler {
                 ));
             }
 
-            // Faucet and development balances get their own table, under a
-            // disclosure. Sharing one with real funds is how an enormous test
-            // quantity ends up reading as a portfolio.
+            // Balances without a configured native-asset market get their own
+            // table. This includes unpriced mainnets as well as development
+            // chains, so the label must not guess which environment they use.
             if !wallet_off_market.is_empty() {
                 body.push_str(&format!(
-                    "<details><summary>Test and development balances · {count}</summary>\
+                    "<details><summary>Unpriced balances · {count}</summary>\
                      {table}</details>",
                     count = wallet_off_market.len(),
                     table = holdings_table(
                         &wallet_off_market,
-                        "Balances on chains with no market for their native unit. \
-                         Quantities here are not money.",
+                        "No market price is configured for these native assets. \
+                         They are excluded from dollar totals.",
                     ),
                 ));
             }
@@ -3214,8 +3215,8 @@ impl Portfolio {
             .collect()
     }
 
-    /// Rows holding a quantity on a chain with no market for its native unit:
-    /// faucet and development balances, kept well away from money.
+    /// Rows holding a quantity with no configured market for the native unit.
+    /// This says nothing about whether the chain is mainnet or development.
     fn off_market(&self) -> Vec<&Holding> {
         self.holdings
             .iter()
@@ -3557,10 +3558,8 @@ impl Holding {
         self.amount > 0.0
     }
 
-    /// Whether the native unit here is an asset with a market. A development
-    /// or app chain may name its unit "ETH" and hand out an enormous faucet
-    /// balance; that quantity is real but it is not money, and it must never
-    /// share a table with funds that are.
+    /// Whether Bloom has a market mapping for the native unit. This is a
+    /// valuation property, not a mainnet/testnet classification.
     fn is_off_market(&self) -> bool {
         self.price_key.is_none()
     }
@@ -6554,9 +6553,9 @@ mod tests {
         for chain_id in [1u64, 10, 8453, 42161, 59144] {
             assert!(native_asset_has_market(chain_id), "{chain_id}");
         }
-        // A development or app chain may call its native unit "ETH" and hand
-        // out an enormous faucet balance. Valuing that at ether's price
-        // produced a nonsense headline total; it must stay unpriced.
+        // A chain may call its native unit "ETH" without that unit being the
+        // market asset priced as ether. It must stay unpriced until Bloom has
+        // an explicit market mapping.
         for chain_id in [4217u64, 31337, 4663] {
             assert!(
                 !native_asset_has_market(chain_id),
@@ -6584,7 +6583,7 @@ mod tests {
         assert_eq!(native_asset_market(43114), Some("coingecko:avalanche-2"));
         assert_eq!(native_asset_market(5042), Some("coingecko:usd-coin"));
         assert_eq!(native_asset_market(5042002), None);
-        // A faucet chain naming its unit "ETH" is still not ether.
+        // A native unit named "ETH" is not enough to identify the asset.
         assert_eq!(native_asset_market(4217), None);
     }
 
@@ -6809,15 +6808,15 @@ mod tests {
 
     #[test]
     fn an_off_market_unit_keeps_initials_even_when_the_spelling_is_familiar() {
-        let mut faucet = holding_fixture("tempo", 4217, "ETH", 4.2e57, None);
+        let mut unpriced = holding_fixture("tempo", 4217, "ETH", 4.2e57, None);
         assert!(
-            asset_mark(&faucet.symbol, !faucet.is_off_market()).contains(">ET<"),
-            "a development chain's ETH must not wear ether's logo"
+            asset_mark(&unpriced.symbol, !unpriced.is_off_market()).contains(">ET<"),
+            "an unverified native unit must not wear ether's logo"
         );
-        faucet.chain_id = 1;
-        faucet.price_key = native_asset_market(1);
+        unpriced.chain_id = 1;
+        unpriced.price_key = native_asset_market(1);
         assert!(
-            asset_mark(&faucet.symbol, !faucet.is_off_market())
+            asset_mark(&unpriced.symbol, !unpriced.is_off_market())
                 .contains("src=\"icons/token-ethereum.png\""),
             "real ether is the branded asset"
         );
@@ -6897,6 +6896,34 @@ mod tests {
             MarketData::with_base_url("http://127.0.0.1:1"),
         );
         base
+    }
+
+    #[tokio::test]
+    async fn an_unpriced_mainnet_is_not_presented_as_a_development_network() {
+        let fixture = fixture_with_unreachable_chains();
+        let address = ADDRESS.parse::<alloy::primitives::Address>().unwrap();
+        fixture.handler.remember_balance(
+            "alice",
+            "tempo",
+            &format!("{address:#x}"),
+            &Holding {
+                wallet: "alice".into(),
+                chain: "tempo".into(),
+                chain_id: 4217,
+                account: String::new(),
+                price_key: None,
+                label: "Tempo Mainnet".into(),
+                symbol: "ETH".into(),
+                quantity: "1.25".into(),
+                amount: 1.25,
+                value: None,
+            },
+        );
+
+        let html = render(&fixture.handler, WALLETS_HTML).await;
+        assert!(html.contains("Unpriced balances · 1"), "{html}");
+        assert!(html.contains("excluded from dollar totals"), "{html}");
+        assert!(!html.contains("Test and development"), "{html}");
     }
 
     #[tokio::test]
