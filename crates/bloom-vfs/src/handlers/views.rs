@@ -35,7 +35,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use bloom_evm::ChainRegistry;
@@ -107,6 +107,10 @@ const BALANCE_TIMEOUT: Duration = Duration::from_secs(8);
 /// An account still unread when it expires is reported, never shown as empty.
 const PORTFOLIO_BUDGET: Duration = Duration::from_secs(10);
 const PORTFOLIO_CONCURRENCY: usize = 8;
+/// Keep the last successful native-balance observation briefly. A transient
+/// RPC failure must not make a wallet appear to lose funds between reloads;
+/// older observations expire rather than becoming an indefinite estimate.
+const BALANCE_CACHE_MAX_AGE: Duration = Duration::from_secs(5 * 60);
 
 /// Valuation is optional; the page is still useful unpriced.
 const PRICE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -146,6 +150,10 @@ pub struct ViewsHandler {
     solana: Option<bloom_solana::SolanaChainRegistry>,
     /// Where the person's `skin.css` lives, when the daemon has a home.
     skin: Option<std::path::PathBuf>,
+    /// Recent successful native-balance reads, shared by cloned handlers.
+    /// Values are re-priced on each render; only the observed quantity is
+    /// retained, and every fallback is disclosed in the page's coverage data.
+    balance_cache: Arc<parking_lot::RwLock<BTreeMap<BalanceCacheKey, CachedHolding>>>,
 }
 
 impl ViewsHandler {
@@ -166,6 +174,7 @@ impl ViewsHandler {
             petals: None,
             solana: None,
             skin: None,
+            balance_cache: Arc::new(parking_lot::RwLock::new(BTreeMap::new())),
         }
     }
 
@@ -454,18 +463,17 @@ impl ViewsHandler {
                 (this.clone(), slots.clone(), evm.clone(), solana.clone());
             reads.spawn(async move {
                 let _slot = slots.acquire_owned().await.ok()?;
-                let read = match job {
+                let mut read = match job {
                     BalanceJob::Evm {
                         wallet,
                         account,
                         address,
                     } => {
-                        let (mut holdings, unavailable) =
-                            this.read_balances(&wallet, address, &evm).await;
-                        for holding in &mut holdings {
+                        let mut read = this.read_balances(&wallet, address, &evm).await;
+                        for holding in &mut read.holdings {
                             holding.account = account.clone();
                         }
-                        (holdings, unavailable)
+                        read
                     }
                     BalanceJob::Solana {
                         wallet,
@@ -476,6 +484,8 @@ impl ViewsHandler {
                             .await
                     }
                 };
+                read.cached.sort();
+                read.cached.dedup();
                 Some((index, read))
             });
         }
@@ -483,10 +493,11 @@ impl ViewsHandler {
         let mut answered = vec![false; jobs.len()];
         loop {
             match tokio::time::timeout_at(deadline, reads.join_next()).await {
-                Ok(Some(Ok(Some((index, (holdings, unavailable)))))) => {
+                Ok(Some(Ok(Some((index, read))))) => {
                     answered[index] = true;
-                    portfolio.holdings.extend(holdings);
-                    portfolio.unavailable.extend(unavailable);
+                    portfolio.holdings.extend(read.holdings);
+                    portfolio.unavailable.extend(read.unavailable);
+                    portfolio.cached_balances.extend(read.cached);
                 }
                 // A failed read stays unanswered and is reported below.
                 Ok(Some(_)) => {}
@@ -502,14 +513,32 @@ impl ViewsHandler {
             if answered {
                 continue;
             }
-            portfolio.accounts_unread += 1;
-            let (wallet, chains) = match job {
-                BalanceJob::Evm { wallet, .. } => (wallet, evm_chains),
-                BalanceJob::Solana { wallet, .. } => (wallet, solana_chains),
+            let (wallet, account, address, chains) = match job {
+                BalanceJob::Evm {
+                    wallet,
+                    account,
+                    address,
+                } => (wallet, account, format!("{address:#x}"), evm_chains),
+                BalanceJob::Solana {
+                    wallet,
+                    account,
+                    address,
+                } => (wallet, account, address.clone(), solana_chains),
             };
-            portfolio
-                .unavailable
-                .extend(chains.iter().map(|chain| (wallet.clone(), chain.clone())));
+            let mut has_unavailable = false;
+            for chain in chains {
+                if let Some(mut holding) = self.cached_balance(wallet, chain, &address) {
+                    holding.account = account.clone();
+                    portfolio.holdings.push(holding);
+                    portfolio
+                        .cached_balances
+                        .push((wallet.clone(), chain.clone()));
+                } else {
+                    has_unavailable = true;
+                    portfolio.unavailable.push((wallet.clone(), chain.clone()));
+                }
+            }
+            portfolio.accounts_unread += usize::from(has_unavailable);
         }
     }
 
@@ -528,6 +557,28 @@ impl ViewsHandler {
             .collect()
     }
 
+    fn remember_balance(&self, wallet: &str, chain: &str, address: &str, holding: &Holding) {
+        let key = BalanceCacheKey::new(wallet, chain, address);
+        self.balance_cache.write().insert(
+            key,
+            CachedHolding {
+                observed_at: Instant::now(),
+                holding: holding.clone(),
+            },
+        );
+    }
+
+    fn cached_balance(&self, wallet: &str, chain: &str, address: &str) -> Option<Holding> {
+        let key = BalanceCacheKey::new(wallet, chain, address);
+        let mut cache = self.balance_cache.write();
+        let cached = cache.get(&key)?;
+        if cached.observed_at.elapsed() <= BALANCE_CACHE_MAX_AGE {
+            return Some(cached.holding.clone());
+        }
+        cache.remove(&key);
+        None
+    }
+
     /// Native balance on every configured chain for one address. The reads
     /// run concurrently, so one slow endpoint costs a single budget rather
     /// than the sum of them.
@@ -536,7 +587,7 @@ impl ViewsHandler {
         owner: &str,
         address: alloy::primitives::Address,
         chains: &[String],
-    ) -> (Vec<Holding>, Vec<(String, String)>) {
+    ) -> BalanceRead {
         let mut reads = tokio::task::JoinSet::new();
         let mut seen_chains = BTreeSet::new();
         for chain in chains {
@@ -566,7 +617,8 @@ impl ViewsHandler {
                 (name, raw, symbol, decimals, chain_id)
             });
         }
-        let (mut holdings, mut unavailable) = (Vec::new(), Vec::new());
+        let mut read = BalanceRead::default();
+        let address_text = format!("{address:#x}");
         while let Some(joined) = reads.join_next().await {
             let Ok((chain, raw, symbol, decimals, chain_id)) = joined else {
                 continue;
@@ -578,7 +630,7 @@ impl ViewsHandler {
                 Some(raw) => {
                     let quantity = bloom_proto::format_units(raw, decimals);
                     let amount = quantity.parse::<f64>().unwrap_or(0.0);
-                    holdings.push(Holding {
+                    let holding = Holding {
                         label: self.network_label(&chain),
                         wallet: owner.to_owned(),
                         chain,
@@ -589,12 +641,21 @@ impl ViewsHandler {
                         quantity,
                         amount,
                         value: None,
-                    });
+                    };
+                    self.remember_balance(owner, &holding.chain, &address_text, &holding);
+                    read.holdings.push(holding);
                 }
-                None => unavailable.push((owner.to_owned(), chain)),
+                None => {
+                    if let Some(holding) = self.cached_balance(owner, &chain, &address_text) {
+                        read.holdings.push(holding);
+                        read.cached.push((owner.to_owned(), chain));
+                    } else {
+                        read.unavailable.push((owner.to_owned(), chain));
+                    }
+                }
             }
         }
-        (holdings, unavailable)
+        read
     }
 
     /// Configured Solana chain names, sorted. Empty when no Solana registry
@@ -620,9 +681,9 @@ impl ViewsHandler {
         account: &str,
         address: &str,
         chains: &[String],
-    ) -> (Vec<Holding>, Vec<(String, String)>) {
+    ) -> BalanceRead {
         let Some(registry) = self.solana.clone() else {
-            return (Vec::new(), Vec::new());
+            return BalanceRead::default();
         };
         let mut reads = tokio::task::JoinSet::new();
         for chain in chains {
@@ -648,7 +709,7 @@ impl ViewsHandler {
                 (name, lamports)
             });
         }
-        let (mut holdings, mut unavailable) = (Vec::new(), Vec::new());
+        let mut read = BalanceRead::default();
         while let Some(joined) = reads.join_next().await {
             let Ok((chain, lamports)) = joined else {
                 continue;
@@ -663,7 +724,7 @@ impl ViewsHandler {
                     } else {
                         Some("coingecko:solana")
                     };
-                    holdings.push(Holding {
+                    let holding = Holding {
                         label: solana_network_label(&chain),
                         wallet: owner.to_owned(),
                         chain,
@@ -674,12 +735,21 @@ impl ViewsHandler {
                         quantity,
                         amount,
                         value: None,
-                    });
+                    };
+                    self.remember_balance(owner, &holding.chain, address, &holding);
+                    read.holdings.push(holding);
                 }
-                None => unavailable.push((owner.to_owned(), chain)),
+                None => {
+                    if let Some(holding) = self.cached_balance(owner, &chain, address) {
+                        read.holdings.push(holding);
+                        read.cached.push((owner.to_owned(), chain));
+                    } else {
+                        read.unavailable.push((owner.to_owned(), chain));
+                    }
+                }
             }
         }
-        (holdings, unavailable)
+        read
     }
 
     /// Balances for the addresses that sent your own recorded operations,
@@ -721,8 +791,10 @@ impl ViewsHandler {
                 addresses: vec![from.clone()],
                 kind: "observed address".to_owned(),
             });
-            let (holdings, _) = self.read_balances(&label, address, &chains).await;
-            portfolio.holdings.extend(holdings);
+            let read = self.read_balances(&label, address, &chains).await;
+            portfolio.holdings.extend(read.holdings);
+            portfolio.unavailable.extend(read.unavailable);
+            portfolio.cached_balances.extend(read.cached);
         }
         self.price(&mut portfolio).await;
         portfolio
@@ -3039,8 +3111,41 @@ struct Portfolio {
     /// Accounts whose balance reads had not finished when the page's
     /// `PORTFOLIO_BUDGET` expired.
     accounts_unread: usize,
+    /// `(wallet, chain)` pairs using a recent successful observation because
+    /// the current RPC read failed or exceeded the page budget.
+    cached_balances: Vec<(String, String)>,
     price_coverage_gap: bool,
     stale: bool,
+}
+
+#[derive(Default)]
+struct BalanceRead {
+    holdings: Vec<Holding>,
+    unavailable: Vec<(String, String)>,
+    cached: Vec<(String, String)>,
+}
+
+#[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
+struct BalanceCacheKey {
+    wallet: String,
+    chain: String,
+    address: String,
+}
+
+impl BalanceCacheKey {
+    fn new(wallet: &str, chain: &str, address: &str) -> Self {
+        Self {
+            wallet: wallet.to_owned(),
+            chain: chain.to_owned(),
+            address: address.to_owned(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct CachedHolding {
+    observed_at: Instant,
+    holding: Holding,
 }
 
 /// One account address whose native balances a page reads.
@@ -3158,6 +3263,21 @@ impl Portfolio {
                 html_escape(&count_noun(self.accounts_unread, "account", "accounts")),
             ));
         }
+        if !self.cached_balances.is_empty() {
+            let mut names: Vec<&str> = self
+                .cached_balances
+                .iter()
+                .map(|(_, chain)| chain.as_str())
+                .collect();
+            names.sort();
+            names.dedup();
+            out.push_str(&format!(
+                "<section class=\"callout warn\"><strong>Using recent balances</strong>\
+                 <p>{names} could not be read live. Their last successful observations, \
+                 no more than five minutes old, remain in the total.</p></section>",
+                names = html_escape(&names.join(", ")),
+            ));
+        }
         if self.price_coverage_gap {
             out.push_str(
                 "<section class=\"callout\"><strong>Some prices are missing</strong>\
@@ -3199,6 +3319,20 @@ impl Portfolio {
                 "Balance reads ran out of time: {} not read and excluded from totals. \
                  Reload to try again.",
                 count_noun(self.accounts_unread, "account", "accounts")
+            ));
+        }
+        if !self.cached_balances.is_empty() {
+            let mut names: Vec<&str> = self
+                .cached_balances
+                .iter()
+                .map(|(_, chain)| chain.as_str())
+                .collect();
+            names.sort();
+            names.dedup();
+            out.push(format!(
+                "Using recent balances: {} could not be read live, so observations no more \
+                 than five minutes old remain in the total.",
+                names.join(", ")
             ));
         }
         if self.price_coverage_gap {
@@ -3395,6 +3529,7 @@ fn is_solana_address(address: &str) -> bool {
             .is_ok_and(|bytes| bytes.len() == 32)
 }
 
+#[derive(Clone)]
 struct Holding {
     wallet: String,
     chain: String,
@@ -5568,6 +5703,61 @@ mod tests {
             }
         });
         url
+    }
+
+    #[tokio::test]
+    async fn recent_balance_survives_a_transient_rpc_failure() {
+        let fixture = fixture_with_unreachable_chains();
+        let address = ADDRESS.parse::<alloy::primitives::Address>().unwrap();
+        let address_text = format!("{address:#x}");
+        fixture.handler.remember_balance(
+            "alice",
+            "ethereum",
+            &address_text,
+            &Holding {
+                wallet: "alice".into(),
+                chain: "ethereum".into(),
+                chain_id: 1,
+                account: String::new(),
+                price_key: Some("coingecko:ethereum"),
+                label: "Ethereum".into(),
+                symbol: "ETH".into(),
+                quantity: "1.25".into(),
+                amount: 1.25,
+                value: None,
+            },
+        );
+
+        let read = fixture
+            .handler
+            .read_balances("alice", address, &["ethereum".into()])
+            .await;
+
+        assert!(read.unavailable.is_empty(), "recent observation is usable");
+        assert_eq!(read.cached, vec![("alice".into(), "ethereum".into())]);
+        assert_eq!(read.holdings.len(), 1);
+        assert_eq!(read.holdings[0].quantity, "1.25");
+        let portfolio = Portfolio {
+            cached_balances: read.cached,
+            ..Portfolio::default()
+        };
+        assert!(portfolio.notices().contains("Using recent balances"));
+
+        let key = BalanceCacheKey::new("alice", "ethereum", &address_text);
+        fixture
+            .handler
+            .balance_cache
+            .write()
+            .get_mut(&key)
+            .unwrap()
+            .observed_at = Instant::now() - BALANCE_CACHE_MAX_AGE - Duration::from_secs(1);
+        assert!(
+            fixture
+                .handler
+                .cached_balance("alice", "ethereum", &address_text)
+                .is_none(),
+            "expired observations must not become indefinite estimates"
+        );
     }
 
     #[tokio::test]
