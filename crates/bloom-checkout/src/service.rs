@@ -383,7 +383,8 @@ impl CheckoutService {
     }
 
     async fn finish_unlock(self: Arc<Self>, operation_id: String) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(125);
+        // Approval links last fifteen minutes; wait a little past that.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(930);
         loop {
             tokio::time::sleep(Duration::from_millis(300)).await;
             if tokio::time::Instant::now() >= deadline {
@@ -799,7 +800,8 @@ impl CheckoutService {
     }
 
     async fn finish_approved(self: Arc<Self>, operation_id: String) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(125);
+        // Approval links last fifteen minutes; wait a little past that.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(930);
         loop {
             tokio::time::sleep(Duration::from_millis(300)).await;
             let mut private = self.private.lock().await;
