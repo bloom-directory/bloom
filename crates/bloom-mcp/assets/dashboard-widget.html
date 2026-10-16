@@ -78,6 +78,9 @@
       letter-spacing: 0;
     }
     .bloom-widget .widget-action {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
       margin-left: auto;
       padding: 6px 10px;
       border: 1px solid var(--rule-2);
@@ -86,6 +89,10 @@
       background: transparent;
       font: 600 10px/1 var(--sans);
       cursor: pointer;
+    }
+    .bloom-widget .widget-action-icon {
+      font-size: 13px;
+      line-height: .8;
     }
     .bloom-widget .widget-action:hover,
     .bloom-widget .widget-action:focus-visible {
@@ -425,6 +432,7 @@
     .bloom-widget .receive-address-line {
       display: grid;
       grid-template-columns: minmax(0, 1fr) auto;
+      align-items: center;
       gap: 6px;
       width: min(250px, 100%);
       margin-top: 9px;
@@ -439,13 +447,14 @@
       overflow-wrap: anywhere;
     }
     .bloom-widget .copy-address {
-      align-self: stretch;
-      padding: 0 9px;
+      width: 34px;
+      height: 34px;
+      padding: 0;
       border: 1px solid var(--rule-2);
       border-radius: 7px;
       color: var(--ink);
       background: transparent;
-      font: 600 9px/1 var(--sans);
+      font: 600 8px/1 var(--sans);
       cursor: pointer;
     }
     .bloom-widget .receiving-network,
@@ -466,6 +475,7 @@
   const pending = new Map();
   const appliedHostVariables = new Set();
   const callableViewTools = new Set(["show_bloom_wallets", "show_bloom_receive"]);
+  const viewResultCache = new Map();
   let nextId = 0;
   let hostContext = {};
 
@@ -728,8 +738,8 @@
 
   const addViewAction = (page, header, title) => {
     const destinations = {
-      Wallets: ["show_bloom_receive", "Receive"],
-      Receive: ["show_bloom_wallets", "Wallets"],
+      Wallets: ["show_bloom_receive", "Receive", "↓"],
+      Receive: ["show_bloom_wallets", "Wallets", "←"],
     };
     const destination = destinations[title];
     if (!destination) return;
@@ -737,13 +747,19 @@
     button.type = "button";
     button.className = "widget-action";
     button.dataset.viewTool = destination[0];
-    button.textContent = destination[1];
+    const icon = page.createElement("span");
+    icon.className = "widget-action-icon";
+    icon.setAttribute("aria-hidden", "true");
+    icon.textContent = destination[2];
+    button.append(icon, destination[1]);
     header.append(button);
   };
 
   const render = (result, requestedHash = "") => {
     const payload = result?._meta?.["bloom/view"];
     if (!payload?.html) return;
+    const viewKey = result?.structuredContent?.view;
+    if (viewKey) viewResultCache.set(viewKey, result);
     const page = new DOMParser().parseFromString(payload.html, "text/html");
     document.title = page.title || "Bloom dashboard";
     document.getElementById("bloom-styles").textContent = payload.css || "";
@@ -826,6 +842,12 @@
     const viewButton = event.target.closest("button[data-view-tool]");
     if (viewButton) {
       if (!callableViewTools.has(viewButton.dataset.viewTool)) return;
+      const viewKey = viewButton.dataset.viewTool.replace(/^show_bloom_/, "");
+      const cached = viewResultCache.get(viewKey);
+      if (cached) {
+        render(cached);
+        return;
+      }
       viewButton.setAttribute("aria-busy", "true");
       try {
         const result = await send("tools/call", { name: viewButton.dataset.viewTool, arguments: {} });
