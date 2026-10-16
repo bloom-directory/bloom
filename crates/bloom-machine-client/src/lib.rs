@@ -1713,6 +1713,19 @@ impl MachineBrokerClient {
         }
     }
 
+    /// Every enrolled key derived from `parent`, described in one request.
+    pub async fn derived_keys(&self, parent: KeyRef) -> Result<Vec<KeyPublic>, ProtocolError> {
+        match self
+            .request(MachineBrokerRequest::KeyListDerived(KeyRequest {
+                key_ref: parent,
+            }))
+            .await?
+        {
+            MachineBrokerResponse::KeyListDerived(keys) => Ok(keys),
+            _ => Err(response_mismatch("key.list_derived")),
+        }
+    }
+
     /// The wallet's signable key for `suite`: the root for legacy/imported-scalar
     /// wallets, or a derived child for BIP-39 wallets (whose root is a
     /// non-signable seed).
