@@ -27,6 +27,9 @@ use tokio::{
 
 pub use bloom_checkout_api::{HistoryEntry, Request, Status};
 
+/// Approval links last fifteen minutes; allow a short result-delivery grace.
+const APPROVAL_RESULT_WAIT: Duration = Duration::from_secs(15 * 60 + 30);
+
 struct Store(Mutex<Connection>);
 impl Store {
     fn open(path: &Path) -> Result<Self> {
@@ -383,8 +386,7 @@ impl CheckoutService {
     }
 
     async fn finish_unlock(self: Arc<Self>, operation_id: String) {
-        // Approval links last fifteen minutes; wait a little past that.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(930);
+        let deadline = tokio::time::Instant::now() + APPROVAL_RESULT_WAIT;
         loop {
             tokio::time::sleep(Duration::from_millis(300)).await;
             if tokio::time::Instant::now() >= deadline {
@@ -800,8 +802,7 @@ impl CheckoutService {
     }
 
     async fn finish_approved(self: Arc<Self>, operation_id: String) {
-        // Approval links last fifteen minutes; wait a little past that.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(930);
+        let deadline = tokio::time::Instant::now() + APPROVAL_RESULT_WAIT;
         loop {
             tokio::time::sleep(Duration::from_millis(300)).await;
             let mut private = self.private.lock().await;
@@ -2631,6 +2632,11 @@ mod tests {
             .unwrap();
         assert_eq!(history["entries"].as_array().unwrap().len(), 1);
         fixture_task.abort();
+    }
+
+    #[test]
+    fn result_wait_outlives_the_approval_link() {
+        assert!(APPROVAL_RESULT_WAIT > Duration::from_secs(15 * 60));
     }
 
     #[test]
