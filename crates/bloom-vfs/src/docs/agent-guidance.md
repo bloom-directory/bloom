@@ -257,15 +257,11 @@ and the wallet's `passkeys/` entries (`surface` and `state`). Relay readiness do
 not mean the wallet has an active remote passkey.
 
 If the wallet has only local passkeys, explain that hosted approvals require a
-remote passkey. With the human's agreement, use the "Adding a passkey" flow below
-or `bloom wallet add-passkey <wallet> --to remote`. The existing local passkey
-approves the addition; the wallet, addresses, and local passkey stay intact. The
-new passkey can be created on the same computer or another device.
+remote passkey. With the human's agreement, refer to the "Adding a passkey"
+flow below to add a remote passkey to their existing wallet.
 
 Wait for enrollment `SUCCEEDED`, verify the remote passkey is active, then resume
-the original operation with its unchanged proposal or intent. If Chrome reports
-PRF `evalByCredential` with an empty allow list, check for this surface mismatch
-instead of repeatedly generating links or switching browsers.
+the original operation with its unchanged proposal or intent.
 
 ## Adding a passkey
 
