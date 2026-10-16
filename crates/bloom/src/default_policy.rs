@@ -690,9 +690,12 @@ pub(crate) enum DefaultPolicyStatus {
 
 /// Propose the Petals chosen during setup for `wallet` through its existing
 /// policy operation, committing a completed ceremony, and report the result.
+/// After the policy has changed since creation they are proposed only when
+/// `owner_just_chose` says the owner has just recorded this choice.
 pub(crate) async fn advance_default_policy(
     daemon: &Daemon,
     wallet: &str,
+    owner_just_chose: bool,
 ) -> Result<DefaultPolicyStatus> {
     let mut petals = Vec::new();
     let mut packages = Vec::new();
@@ -736,7 +739,7 @@ pub(crate) async fn advance_default_policy(
         }
     }
     let eligibility = match daemon
-        .ensure_default_policy(wallet, &packages, &destinations)
+        .ensure_default_policy(wallet, &packages, &destinations, owner_just_chose)
         .await
     {
         Ok(eligibility) => eligibility,
@@ -1033,8 +1036,10 @@ pub(crate) async fn wait_for_default_policy(
     loop {
         let output = crate::machine_command(
             endpoint,
+            // A waiting command resumes a setup choice; it never re-chooses.
             bloom_daemon::ipc::MachineCommand::WalletDefaultPolicy {
                 name: wallet.to_owned(),
+                owner_just_chose: false,
             },
         )
         .await?;
@@ -1626,6 +1631,40 @@ mod tests {
             })
             .unwrap(),
             serde_json::json!({"state": "changed_since_creation", "missing": ["hyperliquid"]})
+        );
+    }
+
+    #[test]
+    fn the_owner_choice_flag_is_sent_only_when_set() {
+        use bloom_daemon::ipc::MachineCommand;
+        // Omitted when false, so a waiting command's request is unchanged and
+        // an older Machine, which rejects unknown fields, still accepts it.
+        let resume = MachineCommand::WalletDefaultPolicy {
+            name: "main".into(),
+            owner_just_chose: false,
+        };
+        assert_eq!(
+            serde_json::to_value(&resume).unwrap(),
+            serde_json::json!({"command": "wallet_default_policy", "name": "main"})
+        );
+        assert_eq!(
+            serde_json::from_value::<MachineCommand>(
+                serde_json::json!({"command": "wallet_default_policy", "name": "main"})
+            )
+            .unwrap(),
+            resume
+        );
+        assert_eq!(
+            serde_json::to_value(MachineCommand::WalletDefaultPolicy {
+                name: "main".into(),
+                owner_just_chose: true,
+            })
+            .unwrap(),
+            serde_json::json!({
+                "command": "wallet_default_policy",
+                "name": "main",
+                "owner_just_chose": true
+            })
         );
     }
 

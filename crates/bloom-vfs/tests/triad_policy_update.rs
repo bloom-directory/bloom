@@ -966,7 +966,7 @@ async fn default_wallet_first_proposal_allows_setup_packages_together() {
     let restarted =
         eligibility_handler(temp.path(), fixture.clone()).with_default_policy_packages(defaults);
     let PetalEligibility::Allowed(snapshot) = restarted
-        .ensure_petal_packages_allowed("alice", &[requested.clone(), chosen.clone()], &[])
+        .ensure_petal_packages_allowed("alice", &[requested.clone(), chosen.clone()], &[], false)
         .await
         .unwrap()
     else {
@@ -1012,7 +1012,7 @@ async fn default_policy_proposes_packages_and_destinations_in_one_ceremony() {
     }];
     let handler = eligibility_handler(temp.path(), fixture.clone());
     let PetalEligibility::AwaitingPolicyApproval(pending) = handler
-        .ensure_petal_packages_allowed("alice", &packages, &destinations)
+        .ensure_petal_packages_allowed("alice", &packages, &destinations, false)
         .await
         .unwrap()
     else {
@@ -1022,7 +1022,7 @@ async fn default_policy_proposes_packages_and_destinations_in_one_ceremony() {
 
     fixture.complete.store(true, Ordering::SeqCst);
     let PetalEligibility::Allowed(snapshot) = handler
-        .ensure_petal_packages_allowed("alice", &packages, &destinations)
+        .ensure_petal_packages_allowed("alice", &packages, &destinations, false)
         .await
         .unwrap()
     else {
@@ -1135,7 +1135,7 @@ async fn the_default_policy_is_not_proposed_once_the_owner_has_changed_the_polic
     let handler = eligibility_handler(temp.path(), fixture.clone());
 
     let PetalEligibility::ChangedSinceCreation(current) = handler
-        .ensure_petal_packages_allowed("alice", &packages, &[setup_destination()])
+        .ensure_petal_packages_allowed("alice", &packages, &[setup_destination()], false)
         .await
         .unwrap()
     else {
@@ -1149,6 +1149,34 @@ async fn the_default_policy_is_not_proposed_once_the_owner_has_changed_the_polic
             .iter()
             .any(|request| matches!(request, MachineBrokerRequest::PolicyValidateUpdate(_)))
     );
+}
+
+#[tokio::test]
+async fn a_choice_the_owner_has_just_made_is_proposed_on_a_changed_policy() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = broker_fixture_with_policy(false, policy(60_000), 3);
+    let packages = [Digest32::from_bytes([7; 32])];
+    let handler = eligibility_handler(temp.path(), fixture.clone());
+
+    let PetalEligibility::AwaitingPolicyApproval(pending) = handler
+        .ensure_petal_packages_allowed("alice", &packages, &[setup_destination()], true)
+        .await
+        .unwrap()
+    else {
+        panic!("a choice the owner has just made must be proposed");
+    };
+    assert!(pending.includes_requested);
+    let proposed: CanonicalWalletPolicy = serde_json::from_slice(
+        fixture
+            .state
+            .lock()
+            .proposed_policy
+            .as_ref()
+            .expect("a policy was proposed"),
+    )
+    .unwrap();
+    assert_eq!(proposed.allowed_petal_packages, packages);
+    assert!(proposed.allowed_destinations.contains(&setup_destination()));
 }
 
 #[tokio::test]
@@ -1171,7 +1199,7 @@ async fn a_pending_change_without_every_required_package_is_reported_as_unrelate
     // The pending change allows `first` only. A caller asking for both must be
     // told this change is not theirs, so nothing announces it as such.
     let PetalEligibility::AwaitingPolicyApproval(pending) = handler
-        .ensure_petal_packages_allowed("alice", &[first, second], &[])
+        .ensure_petal_packages_allowed("alice", &[first, second], &[], false)
         .await
         .unwrap()
     else {
@@ -1192,7 +1220,7 @@ async fn a_pending_change_without_every_required_destination_is_reported_as_unre
     let handler = eligibility_handler(temp.path(), fixture.clone());
 
     let PetalEligibility::AwaitingPolicyApproval(pending) = handler
-        .ensure_petal_packages_allowed("alice", &packages, &[])
+        .ensure_petal_packages_allowed("alice", &packages, &[], false)
         .await
         .unwrap()
     else {
@@ -1204,7 +1232,7 @@ async fn a_pending_change_without_every_required_destination_is_reported_as_unre
     // it would leave the Petal's outbox transactions denied and need a second
     // ceremony, so it must not be announced as the caller's default policy.
     let PetalEligibility::AwaitingPolicyApproval(pending) = handler
-        .ensure_petal_packages_allowed("alice", &packages, &[router])
+        .ensure_petal_packages_allowed("alice", &packages, &[router], false)
         .await
         .unwrap()
     else {
@@ -1220,7 +1248,7 @@ async fn expired_default_policy_proposal_is_replaced_by_a_new_ceremony() {
     let packages = [Digest32::from_bytes([7; 32]), Digest32::from_bytes([8; 32])];
     let handler = eligibility_handler(temp.path(), fixture.clone());
     let PetalEligibility::AwaitingPolicyApproval(first) = handler
-        .ensure_petal_packages_allowed("alice", &packages, &[])
+        .ensure_petal_packages_allowed("alice", &packages, &[], false)
         .await
         .unwrap()
     else {
@@ -1229,7 +1257,7 @@ async fn expired_default_policy_proposal_is_replaced_by_a_new_ceremony() {
 
     *fixture.ceremony_state_override.lock() = Some(CeremonyState::Expired);
     let PetalEligibility::AwaitingPolicyApproval(replacement) = handler
-        .ensure_petal_packages_allowed("alice", &packages, &[])
+        .ensure_petal_packages_allowed("alice", &packages, &[], false)
         .await
         .unwrap()
     else {
@@ -1261,7 +1289,7 @@ async fn policy_ceremony_past_expiry_is_cancelled_and_replaced() {
     let packages = [Digest32::from_bytes([7; 32]), Digest32::from_bytes([8; 32])];
     let handler = eligibility_handler(temp.path(), fixture.clone());
     let PetalEligibility::AwaitingPolicyApproval(first) = handler
-        .ensure_petal_packages_allowed("alice", &packages, &[])
+        .ensure_petal_packages_allowed("alice", &packages, &[], false)
         .await
         .unwrap()
     else {
@@ -1271,7 +1299,7 @@ async fn policy_ceremony_past_expiry_is_cancelled_and_replaced() {
     // The Broker still reports the ceremony as awaiting the owner after expiry.
     fixture.ceremony_expires_at_ms.store(1, Ordering::SeqCst);
     let PetalEligibility::AwaitingPolicyApproval(replacement) = handler
-        .ensure_petal_packages_allowed("alice", &packages, &[])
+        .ensure_petal_packages_allowed("alice", &packages, &[], false)
         .await
         .unwrap()
     else {

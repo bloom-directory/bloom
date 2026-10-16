@@ -41,10 +41,10 @@ pub fn for_petal(name: &str) -> &'static [PetalPolicyDestination] {
 /// a chain means checking its router the same way.
 ///
 /// Enso's approvals go to the input token, which varies per route, so a swap
-/// from an ERC-20 still needs that token allowed separately. Enso v0.1.5 also
-/// names BNB Chain `bnb` while Bloom names it `bsc`, so its own rules refuse
-/// `bsc` routes until Enso accepts Bloom's name; the destination is listed
-/// here so the policy is ready when it does.
+/// from an ERC-20 still needs that token allowed separately. Enso v0.1.6's
+/// shipped rules also name BNB Chain `bnb` while Bloom names it `bsc`, so they
+/// refuse `bsc` routes until they use Bloom's name; the destination is listed
+/// here so the policy is ready when they do.
 pub const ENSO_POLICY_DESTINATIONS: &[PetalPolicyDestination] = &[
     PetalPolicyDestination {
         chain: "arbitrum",
@@ -111,8 +111,9 @@ const ENSO_ROUTER_V2_ARC_FAMILY: &str = "0xcfbaa9cfce952ca4f4069874ff1df8c05e37a
 /// 1Click API, so no fixed address can be listed. `petal:near-intents` instead
 /// says the wallet trusts this Petal to choose the destination on these chains:
 /// Machine accepts the address it staged, and nothing else on the wallet is
-/// loosened. The Petal's own venue policy caps the input, pins the payout to
-/// the wallet's address unless the owner says otherwise, and every deposit is
+/// loosened. The pinned release verifies the quote's signature, sends refunds
+/// to the wallet and caps slippage, but does not cap the input or pin the
+/// payout to the wallet (bloom-petal-near#11 adds both). Every deposit is
 /// still an approval the owner signs. Removing this entry gates NEAR again.
 ///
 /// The chains are the ones the pinned release maps (`route/src/assets.rs`).

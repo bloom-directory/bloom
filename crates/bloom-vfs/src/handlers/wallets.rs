@@ -1956,14 +1956,16 @@ impl WalletsHandler {
 
     /// Drive a wallet's default policy: propose every package and destination
     /// together through the existing policy operation. `Allowed` means the
-    /// policy allows all of them. Nothing is proposed once the owner has
-    /// committed any change, so a Petal or destination the owner removed is
+    /// policy allows all of them. Once any change has been committed, nothing
+    /// is proposed unless `propose_after_creation` says the owner has just
+    /// chosen these again, so a Petal or destination the owner removed is
     /// reported as `ChangedSinceCreation` instead of being proposed again.
     pub async fn ensure_petal_packages_allowed(
         &self,
         wallet: &str,
         packages: &[bloom_broker_api::Digest32],
         destinations: &[bloom_broker_api::PolicyDestination],
+        propose_after_creation: bool,
     ) -> Result<bloom_machine_client::PetalEligibility, HandlerError> {
         if packages.is_empty() {
             return Err(HandlerError::invalid("no Petal packages to allow"));
@@ -1974,7 +1976,7 @@ impl WalletsHandler {
             packages,
             destinations,
             &DefaultPolicySetup::default(),
-            false,
+            propose_after_creation,
         )
         .await
     }

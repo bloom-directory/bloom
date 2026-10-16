@@ -367,6 +367,8 @@ enum ListMode {
 }
 
 /// The `petal:<name>` allow-list entry covering this transaction, if any.
+/// Petal names are case-sensitive (`Near-Intents` and `near-intents` are two
+/// Petals), so the entry must name exactly the Petal that staged it.
 fn petal_destination_entry(policy: &Policy, ctx: &AddressContext) -> Option<String> {
     let staged_by = ctx.staged_by_petal.as_deref()?.trim();
     if staged_by.is_empty() || !staged_by.starts_with("petal:") {
@@ -376,7 +378,7 @@ fn petal_destination_entry(policy: &Policy, ctx: &AddressContext) -> Option<Stri
         .allowlists
         .recipients
         .iter()
-        .find(|entry| entry.trim().eq_ignore_ascii_case(staged_by))
+        .find(|entry| entry.trim() == staged_by)
         .cloned()
 }
 
@@ -546,6 +548,26 @@ mod tests {
                 18,
                 staged_by(Some(origin), DEPOSIT),
             )));
+        }
+    }
+
+    #[test]
+    fn a_petal_entry_covers_only_the_petal_it_names_exactly() {
+        // Another Petal whose name differs only in case is a different Petal.
+        for (entry, origin) in [
+            ("petal:near-intents", "petal:Near-Intents"),
+            ("petal:NEAR-INTENTS", "petal:near-intents"),
+        ] {
+            assert!(
+                has_hard_violation(&evaluate(
+                    &policy_allowing(&[entry]),
+                    "arbitrum",
+                    U256::ZERO,
+                    18,
+                    staged_by(Some(origin), DEPOSIT),
+                )),
+                "{entry} must not cover {origin}"
+            );
         }
     }
 

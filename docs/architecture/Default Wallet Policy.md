@@ -71,8 +71,8 @@ Agreed on 2026-09-14:
     interrupted, or a config `bloom serve` created first, still gets setup
     on the next `bloom init`.
 11. **Enso owns its own route rules.** Bloom writes no Enso settings. The
-    pinned Enso v0.1.5 keeps per-wallet rules at
-    `settings/wallets/<wallet>/venue.toml` and ships defaults covering the 13
+    pinned Enso v0.1.6 keeps per-account rules at
+    `settings/<wallet>/<index>/venue.toml` and ships defaults covering the 13
     chains it supports, so a fresh wallet can swap without a setup write. The
     owner can replace those rules through Enso's own route. Bloom's part is
     decision 13: allowing Enso's router as a destination on each of those
@@ -80,11 +80,11 @@ Agreed on 2026-09-14:
 
     Enso's shipped rules allow at most 100 bps of slippage and do not require
     calldata verification, because Enso cannot yet prove a route's receiver or
-    minimum output; each plan still reports both as warnings. Enso v0.1.5 names
-    BNB Chain `bnb` while Bloom names it `bsc`, so its own rules refuse `bsc`
-    routes until Enso accepts Bloom's name, and its token-symbol table covers
-    only Ethereum, Polygon, Base, Optimism, Arbitrum, BNB Chain, and
-    Avalanche; on the other chains an intent needs `0x` token addresses.
+    minimum output; each plan still reports both as warnings. Enso v0.1.6's
+    shipped rules name BNB Chain `bnb` while Bloom names it `bsc`, so they
+    refuse `bsc` routes until they use Bloom's name. Its token-symbol table
+    covers every chain it supports except Arc, where an intent needs `0x`
+    token addresses.
 12. **Feedback needs no setup settings or destination allowance.** It is the
     fifth canonical Petal, replacing retired Tolly. Setup does not enable any
     Petal's runtime writes.
@@ -144,12 +144,16 @@ Agreed on 2026-09-14:
     and nothing is signed or broadcast. This decision neither adds that check
     nor relaxes it.
 
-    What the shipped Petal enforces: its own venue policy, at
-    `settings/wallets/<wallet>/venue.toml`, caps the input, caps slippage, and
-    pays out only to the wallet's own address unless the owner lists other
-    recipients; and the deposit address comes from a quote whose signature the
-    Petal verifies. Machine does not independently enforce those quote or
-    deposit constraints. The owner is trusting that Petal's logic for every
+    What the pinned release (v0.1.4) enforces: the deposit address comes from
+    a quote whose signature the Petal verifies, the quote must echo the
+    request's amount, assets, slippage and recipient, refunds go to the
+    wallet, and slippage is at most 1000 bps. It has no input cap, and the
+    payout recipient is whatever the request names, which need not be the
+    wallet. A per-wallet venue policy that caps the input and pins the payout
+    to the wallet is in
+    [bloom-petal-near#11](https://github.com/bloom-directory/bloom-petal-near/pull/11),
+    not yet released. Machine does not independently enforce any of these
+    quote or deposit constraints. The owner is trusting that Petal's logic for every
     destination it calls on those chains; all other applicable policy checks
     and each transaction's owner approval remain required.
 
@@ -242,11 +246,12 @@ chosen Petals:
   "wallet_id": "main",
   "maximum_approval_lifetime_ms": 2592000000,
   "allowed_petal_packages": [
-    "a564d9559a70520995e550df685f74d3ee26af6fbb16facc08de2745bf5ec693",
-    "aa1c50d3443f4c1a710d0ce93a70a65d196fd5842d241e0f78260c8a019d811c"
+    "07fdcc9841c88de8fe1d0b4526bc01deac004c1c7dec202e2c8d7443300f22af",
+    "0f365cd7f613129f73ce66fb07256c8a42c4e70abbb77721804dbd6df85b96b5"
   ],
   "allowed_destinations": [
     { "chain": "polygon", "destination": "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb" },
+    { "chain": "polygon", "destination": "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359" },
     { "chain": "polygon", "destination": "0x2791bca1f2de4661ed88a30c99a7a9449aa84174" },
     { "chain": "polygon", "destination": "0xf75584ef6673ad213a685a1b58cc0330b8ea22cf" }
   ],
@@ -255,7 +260,7 @@ chosen Petals:
 ```
 
 - **`allowed_petal_packages`** lists each chosen Petal by the exact hash
-  Bloom's catalog pins: Polymarket v0.1.4 and Hyperliquid v0.1.5.
+  Bloom's catalog pins: Hyperliquid v0.1.7 and Polymarket v0.1.6.
 - **`allowed_destinations`** lists the fixed contracts each chosen Petal
   transacts with (decision 13), from Bloom's catalog only; an edited config
   cannot add any. Existing destinations are kept, and a wallet whose policy
@@ -297,7 +302,10 @@ still exists:
   It proposes only while `main`'s policy is still the one wallet creation
   installed. Once any change has been committed, it reports which chosen
   Petals the policy does not allow and proposes nothing, so a Petal or
-  destination the owner removed is never proposed again.
+  destination the owner removed is never proposed again. A flow that has just
+  recorded the owner's choice, such as browser onboarding, sets
+  `owner_just_chose` on the `wallet_default_policy` command to propose that
+  choice anyway; the CLI never sets it.
 - **Several commands can wait on the same wallet.** Only one updates its
   policy at a time; a command that finds the wallet's policy lock held checks
   again on its next poll instead of failing.
@@ -372,6 +380,12 @@ contract between the two:
   The owner then re-activates. Re-activation is a new reviewed approval with a
   fresh budget, so a daily limit restarts after each policy change and
   re-review.
+- **A fresh choice is proposed explicitly.** Browser onboarding saves the
+  owner's Petal selection and then applies it through `wallet_default_policy`.
+  Once the wallet's policy has changed since creation, that command proposes
+  only with `owner_just_chose` set, which bloom#352 must send when it has just
+  saved the selection. Without it the owner sees which Petals are not allowed,
+  and nothing is proposed.
 - **Two daily limits; the lower applies.** Polymarket's `max_daily_usd`,
   written by setup, is enforced by the Petal before it asks for a signature. A
   persona's daily budget is enforced by Broker and Signer. They are independent,

@@ -1771,14 +1771,18 @@ async fn execute_machine_command(
         MachineCommand::WalletPolicyCommit { operation_id } => {
             commit_policy_update(home, machine_broker()?, operation_id).await?
         }
-        MachineCommand::WalletDefaultPolicy { name } => {
+        MachineCommand::WalletDefaultPolicy {
+            name,
+            owner_just_chose,
+        } => {
             validate_wallet_name(&name).map_err(|error| {
                 machine_error(
                     MachineErrorKind::InvalidParams,
                     format!("wallet name must be a safe single path segment: {error:#}"),
                 )
             })?;
-            let status = default_policy::advance_default_policy(daemon, &name).await?;
+            let status =
+                default_policy::advance_default_policy(daemon, &name, owner_just_chose).await?;
             format!("{}\n", serde_json::to_string(&status)?)
         }
         MachineCommand::WalletOutboxCancel {

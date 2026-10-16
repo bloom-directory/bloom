@@ -5006,15 +5006,18 @@ impl Daemon {
 
     /// Propose every package in `packages` and every destination in
     /// `destinations` together through the wallet's existing policy operation.
-    /// `Allowed` means the policy allows all of them.
+    /// `Allowed` means the policy allows all of them. Once the policy has
+    /// changed since creation, they are proposed only when
+    /// `propose_after_creation` is set.
     pub async fn ensure_default_policy(
         &self,
         wallet: &str,
         packages: &[bloom_broker_api::Digest32],
         destinations: &[bloom_broker_api::PolicyDestination],
+        propose_after_creation: bool,
     ) -> Result<bloom_machine_client::PetalEligibility, bloom_vfs::HandlerError> {
         self.wallets
-            .ensure_petal_packages_allowed(wallet, packages, destinations)
+            .ensure_petal_packages_allowed(wallet, packages, destinations, propose_after_creation)
             .await
     }
 
