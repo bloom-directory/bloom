@@ -1,0 +1,28 @@
+{
+  "clock": "time.monotonic_ns",
+  "trials": [
+    {
+      "trial": 1,
+      "active_to_confirm_ms": 12.255525,
+      "confirm_call_ms": 159.129139,
+      "active_to_sent_readback_ms": 195.628511
+    },
+    {
+      "trial": 2,
+      "active_to_confirm_ms": 7.811659,
+      "confirm_call_ms": 109.075327,
+      "active_to_sent_readback_ms": 120.794322
+    },
+    {
+      "trial": 3,
+      "active_to_confirm_ms": 8.89461,
+      "confirm_call_ms": 106.478905,
+      "active_to_sent_readback_ms": 119.438649
+    }
+  ],
+  "median_ms": {
+    "active_to_confirm_ms": 8.89461,
+    "confirm_call_ms": 109.075327,
+    "active_to_sent_readback_ms": 120.794322
+  }
+}
