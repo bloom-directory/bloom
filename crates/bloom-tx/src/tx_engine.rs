@@ -3771,6 +3771,7 @@ impl TxEngine {
             }
         }
         let request = ExactPayloadBatchSignRequest {
+            attributed_advisory: None,
             wallet_id: Token::new(wallet.to_string())
                 .map_err(|error| TxEngineError::ApprovalConstruction(error.to_string()))?,
             preimages: preimages.to_vec(),
@@ -4565,6 +4566,7 @@ fn exact_evm_sign_request(
     account_key_ref: Option<bloom_broker_api::KeyRef>,
 ) -> Result<ExactPayloadSignRequest, TxEngineError> {
     Ok(ExactPayloadSignRequest {
+        attributed_advisory: None,
         wallet_id: Token::new(staged.wallet.clone())
             .map_err(|error| TxEngineError::ApprovalConstruction(error.to_string()))?,
         preimage: signing_preimage.to_vec(),
