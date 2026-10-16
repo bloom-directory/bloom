@@ -1,6 +1,6 @@
 # Default Wallet Policy
 
-**Status:** design proposal, updated for the implementation on 2026-10-09
+**Status:** design proposal, updated for the implementation on 2026-10-16
 **Audience:** Bloom engineers, Petal authors, and implementation agents
 
 A new Bloom user should go from installing Bloom to using their Petals by
@@ -336,11 +336,58 @@ An update receives them only when the default wallet is known not to exist.
 Each change is one policy update ceremony. Changes waiting at the same time
 merge into one proposal, as Machine already reconciles pending proposals.
 
+### 6. Persona sessions
+
+[bloom#352](https://github.com/bloom-directory/bloom/pull/352) adds Custodian,
+Trader and Degen onboarding with reusable session approvals, together with
+[bloom-broker#100](https://github.com/bloom-directory/bloom-broker/pull/100),
+[bloom-signer#68](https://github.com/bloom-directory/bloom-signer/pull/68) and
+[bloom-petal-polymarket#19](https://github.com/bloom-directory/bloom-petal-polymarket/pull/19).
+This design does not depend on them, and section 4 holds until they land. The
+contract between the two:
+
+- **The policy stays the boundary.** A persona session is a reusable Sealed
+  Approval with a shared budget, not a policy change. It adds no package or
+  destination and is usable only within what this policy already allows.
+  Activation for Polymarket is refused until Polymarket is in the signed
+  policy, so the default policy is applied first. Choosing a persona grants
+  nothing on its own.
+- **A policy change ends persona sessions.** A session and its budget are
+  bound to the policy version and digest they were approved under. Any later
+  policy commit stops them signing:
+  - a per-Petal proposal from section 5;
+  - a Petal update's new package hash;
+  - an owner's `bloom wallet update-policy`.
+
+  The owner then re-activates. Re-activation is a new reviewed approval with a
+  fresh budget, so a daily limit restarts after each policy change and
+  re-review.
+- **Two daily limits; the lower applies.** Polymarket's `max_daily_usd`,
+  written by setup, is enforced by the Petal before it asks for a signature. A
+  persona's daily budget is enforced by Broker and Signer. They are independent,
+  and a buy must pass both. Setup's suggested 100 is therefore the effective
+  Polymarket limit under a Trader or Degen persona until the owner raises it.
+- **Destination chain names differ.** This policy names destinations by Bloom
+  chain name, such as `polygon`. Typed persona sessions for native and ERC-20
+  transfers match destinations named `evm-<chain id>`, such as `evm-137`. The
+  catalog destinations proposed here authorize Petal transactions, not typed
+  session transfers, which need destinations of their own. One naming is to be
+  agreed with bloom-broker#100.
+- **Pending settings.** This design records a pending setup setting as an empty
+  marker file. bloom#352 replaces it with a versioned journal that binds the
+  package hash, the settings and the config revision. It must migrate or
+  reconcile markers written by this design.
+- **Versions.** bloom-broker#100 accepts only Machine↔Broker protocol 1.8 and
+  requires bloom-signer#68. This design keeps the current Broker and Signer pins
+  until those merge, in this order: bloom-signer#68, then bloom-broker#100, then
+  the Machine changes.
+
 ## What still asks the owner
 
 - **Setup:** the creation ceremony and the default policy ceremony.
 - **Every transaction:** each swap, trade, token approval, Polymarket
-  onboarding step, and Hyperliquid owner action.
+  onboarding step, and Hyperliquid owner action, unless a persona session
+  (section 6) covers it.
 - **Hyperliquid sessions:** a key-derivation ceremony and an approval
   ([bloom#171](https://github.com/bloom-directory/bloom/issues/171)).
 - **Petal changes:** one policy update ceremony each.
@@ -390,6 +437,8 @@ These need other repositories and are out of scope:
 | Keep Petal settings across updates | The stable installation slot in [Petal derived keys and package succession](./Petal%20derived%20key%20succession.md) |
 | Accept Bloom's `bsc` chain name so BNB Chain routes work | bloom-petal-enso |
 | Create Hyperliquid sessions with fewer ceremonies | [bloom#171](https://github.com/bloom-directory/bloom/issues/171) |
+| Agree one chain naming for policy destinations and typed persona sessions | bloom, bloom-broker ([bloom-broker#100](https://github.com/bloom-directory/bloom-broker/pull/100)) |
+| Migrate pending setup-settings markers to versioned journals | bloom ([bloom#352](https://github.com/bloom-directory/bloom/pull/352)) |
 
 ## Implementation plan
 
@@ -460,3 +509,4 @@ Next part:
 - [Wallet Architecture](./Wallet.md)
 - [Sealed Approvals](./Sealed%20Approvals.md)
 - [Petal derived keys and package succession](./Petal%20derived%20key%20succession.md)
+- Persona onboarding and reusable sessions: [bloom#352](https://github.com/bloom-directory/bloom/pull/352)
