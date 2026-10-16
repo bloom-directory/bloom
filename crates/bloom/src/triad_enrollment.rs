@@ -10,12 +10,14 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, bail};
+#[cfg(any(test, feature = "triad-dev-harness"))]
+use bloom_broker_api::ProvenanceFeeAsset;
 use bloom_broker_api::{
     Base64UrlBytes, DecimalU64, Digest32, PROVENANCE_RECORD_SIGNATURE_DOMAIN,
     PetalLineageMembership, ProvenanceCatalog, ProvenanceOperationClass, ProvenanceRecord,
     ProvenanceSubject, Token,
 };
-#[cfg(feature = "triad-dev-harness")]
+#[cfg(any(test, feature = "triad-dev-harness"))]
 use bloom_petals::package::build_petal_package_dir;
 use ed25519_dalek::{Signer as _, SigningKey};
 use rand::{RngCore as _, rngs::OsRng};
@@ -170,10 +172,10 @@ fn validate_developer_caller(uid: u32, os: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "triad-dev-harness")]
+#[cfg(any(test, feature = "triad-dev-harness"))]
 const DEVELOPER_PETAL_LINEAGE_DOMAIN: &[u8] = b"bloom-developer-petal-lineage/v1";
 
-#[cfg(feature = "triad-dev-harness")]
+#[cfg(any(test, feature = "triad-dev-harness"))]
 #[derive(Serialize)]
 struct DeveloperPetalLineageStatement<'a> {
     schema: &'static str,
@@ -186,7 +188,7 @@ struct DeveloperPetalLineageStatement<'a> {
     active: bool,
 }
 
-#[cfg(feature = "triad-dev-harness")]
+#[cfg(any(test, feature = "triad-dev-harness"))]
 struct DeveloperPetalLineageInput<'a> {
     lineage_id: &'a str,
     package_hash: &'a Digest32,
@@ -216,7 +218,7 @@ fn base32_lower_no_pad(bytes: &[u8]) -> String {
     output
 }
 
-#[cfg(feature = "triad-dev-harness")]
+#[cfg(any(test, feature = "triad-dev-harness"))]
 fn developer_petal_lineage_id(publisher: &Token, package_name: &str) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(DEVELOPER_PETAL_LINEAGE_DOMAIN);
@@ -227,7 +229,7 @@ fn developer_petal_lineage_id(publisher: &Token, package_name: &str) -> String {
     format!("pln1_{}", base32_lower_no_pad(hasher.finalize().as_bytes()))
 }
 
-#[cfg(feature = "triad-dev-harness")]
+#[cfg(any(test, feature = "triad-dev-harness"))]
 fn sign_developer_petal_lineage(
     signing_key: &SigningKey,
     input: DeveloperPetalLineageInput<'_>,
@@ -255,7 +257,7 @@ fn sign_developer_petal_lineage(
     })
 }
 
-#[cfg(feature = "triad-dev-harness")]
+#[cfg(any(test, feature = "triad-dev-harness"))]
 fn load_developer_installer(config_dir: &Path) -> Result<(SigningKey, Token)> {
     let mut identity_bytes = fs::read(config_dir.join("installer-identity.json"))?;
     let mut identity: OwnedInstallerIdentity =
@@ -353,7 +355,7 @@ fn refresh_developer_provenance_catalog(
     rewrite_private_json(&catalog_path, &serde_json::to_value(catalog)?)
 }
 
-#[cfg(feature = "triad-dev-harness")]
+#[cfg(any(test, feature = "triad-dev-harness"))]
 fn enroll_developer_petal_provenance(
     config_dir: &Path,
     petal_dir: &Path,
@@ -475,7 +477,8 @@ fn enroll_developer_petal_provenance(
 
     let mut additions = Vec::new();
     for route in &package.route_index.routes {
-        let operation_classes = developer_route_operation_classes(route)?;
+        let operation_classes =
+            developer_route_operation_classes(route, package.route_index.sign_fee_asset.as_ref())?;
         if operation_classes.is_empty() {
             continue;
         }
@@ -520,9 +523,10 @@ fn enroll_developer_petal_provenance(
     Ok(())
 }
 
-#[cfg(feature = "triad-dev-harness")]
+#[cfg(any(test, feature = "triad-dev-harness"))]
 fn developer_route_operation_classes(
     route: &bloom_petals::package::RouteIndexRecord,
+    fee_asset: Option<&ProvenanceFeeAsset>,
 ) -> Result<Vec<ProvenanceOperationClass>> {
     let mut classes = route
         .key_derive_operation_classes
@@ -537,13 +541,13 @@ fn developer_route_operation_classes(
         .map(|operation_class| {
             Ok(ProvenanceOperationClass {
                 operation_class: Token::new(operation_class)?,
-                fee_asset: None,
+                fee_asset: fee_asset.cloned(),
             })
         })
         .collect()
 }
 
-#[cfg(feature = "triad-dev-harness")]
+#[cfg(any(test, feature = "triad-dev-harness"))]
 fn require_private_developer_file(path: &Path, expected_owner: u32, label: &str) -> Result<()> {
     let metadata = fs::symlink_metadata(path).with_context(|| format!("inspect {label}"))?;
     if !metadata.file_type().is_file()
@@ -1345,14 +1349,12 @@ struct OwnedInstallerIdentity {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "triad-dev-harness")]
     use bloom_petals::package::PreparedPetalPackage;
     use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
     use std::os::unix::fs::PermissionsExt as _;
 
     /// Building the fixture Petal rewrites its package artifacts in place, so
     /// tests that build it must not run concurrently.
-    #[cfg(feature = "triad-dev-harness")]
     static FIXTURE_PETAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn template_dir() -> PathBuf {
@@ -1361,6 +1363,19 @@ mod tests {
             .and_then(Path::parent)
             .unwrap()
             .join("packaging/triad/macos/config")
+    }
+
+    fn copy_dir(source: &Path, target: &Path) {
+        fs::create_dir_all(target).unwrap();
+        for entry in fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let destination = target.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_dir(&entry.path(), &destination);
+            } else {
+                fs::copy(entry.path(), destination).unwrap();
+            }
+        }
     }
 
     #[test]
@@ -1382,7 +1397,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "triad-dev-harness")]
     #[test]
     fn developer_route_provenance_unions_only_immediate_and_explicit_classes() {
         let route = bloom_petals::package::RouteIndexRecord {
@@ -1415,13 +1429,26 @@ mod tests {
             key_derive_maximum_lifetime_ms: Some(60_000),
         };
 
-        let classes = developer_route_operation_classes(&route)
-            .unwrap()
-            .into_iter()
-            .map(|class| class.operation_class.to_string())
-            .collect::<Vec<_>>();
-        assert_eq!(classes, ["fixture.delegated", "fixture.immediate"]);
-        assert!(!classes.contains(&"fixture.package_wide".to_string()));
+        let classes = developer_route_operation_classes(&route, None).unwrap();
+        assert_eq!(
+            classes
+                .iter()
+                .map(|class| class.operation_class.as_str())
+                .collect::<Vec<_>>(),
+            ["fixture.delegated", "fixture.immediate"]
+        );
+        assert!(classes.iter().all(|class| class.fee_asset.is_none()));
+
+        let fee = ProvenanceFeeAsset {
+            chain: Token::new("solana").unwrap(),
+            asset: "native".into(),
+        };
+        let classes = developer_route_operation_classes(&route, Some(&fee)).unwrap();
+        assert!(
+            classes
+                .iter()
+                .all(|class| class.fee_asset.as_ref() == Some(&fee))
+        );
     }
 
     #[cfg(feature = "triad-dev-harness")]
@@ -1532,7 +1559,6 @@ mod tests {
         assert_eq!(fs::metadata(&catalog_path).unwrap().ino(), inode);
     }
 
-    #[cfg(feature = "triad-dev-harness")]
     #[test]
     fn enrolled_linux_petal_satisfies_the_machine_active_lineage_gate() {
         let _fixture = FIXTURE_PETAL
@@ -1554,14 +1580,16 @@ mod tests {
             release_digest: "44".repeat(32),
         };
         generate_for_owner(&plan, owner).unwrap();
-        let petal_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(Path::parent)
-            .unwrap()
-            .join("tests/fixtures/triad-authority-petal");
-        let package = PreparedPetalPackage::from_dir(&petal_dir).unwrap();
-
+        // Enrollment rebuilds the package artifacts in place, so enroll a copy
+        // rather than rewriting the shared fixture under other tests.
+        let petal_dir = directory.path().join("petal");
+        copy_dir(
+            &Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/triad-authority-petal"),
+            &petal_dir,
+        );
         enroll_developer_petal_provenance(&output, &petal_dir, owner).unwrap();
+        let package = PreparedPetalPackage::from_dir(&petal_dir).unwrap();
         let first: ProvenanceCatalog =
             serde_json::from_slice(&fs::read(output.join("provenance-catalog.json")).unwrap())
                 .unwrap();
