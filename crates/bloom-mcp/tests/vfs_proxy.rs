@@ -770,15 +770,15 @@ async fn every_advertised_argument_reaches_the_daemon() {
 #[tokio::test]
 async fn dashboard_tool_returns_widget_data_and_a_text_fallback() {
     let harness = Harness::start().await;
-    let result = harness.ok_tool("show_bloom_today", json!({})).await;
+    let result = harness.ok_tool("show_bloom_wallets", json!({})).await;
 
     assert!(
         result["content"][0]["text"]
             .as_str()
             .unwrap()
-            .contains("views/index.html")
+            .contains("views/wallets.html")
     );
-    assert_eq!(result["structuredContent"]["view"], "index");
+    assert_eq!(result["structuredContent"]["view"], "wallets");
     assert_eq!(
         result["_meta"]["bloom/view"]["html"],
         std::str::from_utf8(DASHBOARD_HTML).unwrap()
@@ -819,7 +819,6 @@ async fn the_proxy_cannot_reach_non_vfs_daemon_methods() {
             "vfs_stat",
             "vfs_write",
             "vfs_write_then_stat",
-            "show_bloom_today",
             "show_bloom_wallets",
             "show_bloom_receive",
             "show_bloom_activity",

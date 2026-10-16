@@ -30,7 +30,7 @@ bloom mcp status
 # transport: stdio
 # endpoint: unix:/home/you/.bloom/private-run/bloom.sock
 # protocol: 2025-06-18
-# tools: vfs_list, vfs_read, vfs_stat, vfs_write, vfs_write_then_stat, show_bloom_today, show_bloom_wallets, show_bloom_receive, show_bloom_activity, show_bloom_next_moves, show_bloom_contacts, show_bloom_policy, show_bloom_networks, show_bloom_markets
+# tools: vfs_list, vfs_read, vfs_stat, vfs_write, vfs_write_then_stat, show_bloom_wallets, show_bloom_receive, show_bloom_activity, show_bloom_next_moves, show_bloom_contacts, show_bloom_policy, show_bloom_networks, show_bloom_markets
 ```
 
 `bloom mcp serve` checks the flag before it reads a byte of stdin or touches
@@ -71,8 +71,8 @@ is implemented, so the claim holds for every revision listed.
 | `vfs_write`           | `write`             | `bloom vfs write` | false          |
 | `vfs_write_then_stat` | `write_with_lookup` | (staging flows)   | false          |
 
-The read-only dashboard tools are `show_bloom_today`, `show_bloom_wallets`,
-`show_bloom_receive`, `show_bloom_activity`, `show_bloom_next_moves`,
+The read-only dashboard tools are `show_bloom_wallets`, `show_bloom_receive`,
+`show_bloom_activity`, `show_bloom_next_moves`,
 `show_bloom_contacts`, `show_bloom_policy`, `show_bloom_networks`, and
 `show_bloom_markets`. They accept no arguments and render the corresponding
 canonical `/views/*.html` page. `show_bloom_networks` also covers the legacy
@@ -102,14 +102,14 @@ reachable from MCP until it is added to that allowlist too.
 
 ## Dashboard widgets
 
-Bloom links each `show_bloom_*` tool to one sandboxed
-`ui://bloom/dashboard-v2.html` resource with the standard
+Bloom links each `show_bloom_*` tool to its own sandboxed `ui://bloom/*.html`
+resource with the standard
 `_meta.ui.resourceUri` field and ChatGPT's `openai/outputTemplate`
 compatibility alias. The resource uses the `text/html;profile=mcp-app` MIME
 type.
-The host renders a fresh widget for the selected tool; navigation inside the
-widget calls the other dashboard tools. Networks sorting and Receive wallet
-links work there as they do in the browser.
+The host renders only the selected view. Browser mastheads, cross-view
+navigation, and the browser-only Today/index page are not exposed as widgets.
+Networks sorting still works inside its own widget.
 
 The daemon remains the renderer. The MCP adapter reads the finished page,
 `bloom.css`, `skin.css`, and referenced local artwork through `read_inert` and

@@ -56,8 +56,9 @@ Discover paths with `vfs_list` starting at `/`, read files with `vfs_read`, insp
 `vfs_stat`, and stage actions by writing intents with `vfs_write`. Value-moving actions are staged \
 and must be confirmed by a second write after reviewing the generated plan. This server is a proxy \
 for the same VFS commands as `bloom vfs …`; it holds no keys and adds no permissions of its own. \
-When a person asks to see wallet information, prefer the matching `show_bloom_*` tool. A capable \
-desktop host renders its read-only MCP App inline; other hosts receive the browser path fallback.";
+When a person asks to see a supported Bloom view, always call the matching `show_bloom_*` tool \
+instead of reconstructing it with VFS reads. A capable desktop host opens that single read-only \
+MCP App view directly; other hosts receive the browser path fallback.";
 
 /// An MCP server bound to one canonical VFS command transport.
 pub struct McpServer {
@@ -364,7 +365,7 @@ impl McpServer {
                 }))
             })
             .collect();
-        resources.push(views::app_resource_descriptor());
+        resources.extend(views::VIEW_TOOLS.iter().map(views::app_resource_descriptor));
         ok_response(id, json!({ "resources": resources }))
     }
 
@@ -383,8 +384,8 @@ impl McpServer {
         let Some(uri) = params.get("uri").and_then(Value::as_str) else {
             return error_response(id, -32602, "resources/read requires a `uri`");
         };
-        if uri == views::APP_RESOURCE_URI {
-            return ok_response(id, json!({ "contents": [views::app_resource()] }));
+        if let Some(tool) = views::find_by_resource_uri(uri) {
+            return ok_response(id, json!({ "contents": [views::app_resource(tool)] }));
         }
         let path = match tools::path_from_uri(uri) {
             Ok(path) => path,
@@ -459,9 +460,9 @@ fn needs_backend(request: &Value) -> bool {
             .is_some_and(|version| version == "2.0")
         && match request.get("method").and_then(Value::as_str) {
             Some("tools/call" | "resources/list") => true,
-            Some("resources/read") => {
-                request["params"]["uri"].as_str() != Some(views::APP_RESOURCE_URI)
-            }
+            Some("resources/read") => request["params"]["uri"]
+                .as_str()
+                .is_none_or(|uri| views::find_by_resource_uri(uri).is_none()),
             _ => false,
         }
 }
@@ -1036,7 +1037,6 @@ mod tests {
                 "vfs_stat",
                 "vfs_write",
                 "vfs_write_then_stat",
-                "show_bloom_today",
                 "show_bloom_wallets",
                 "show_bloom_receive",
                 "show_bloom_activity",
@@ -1049,10 +1049,10 @@ mod tests {
         );
         let tools = response["result"]["tools"].as_array().unwrap();
         assert!(tools[..5].iter().all(|tool| tool.get("_meta").is_none()));
-        assert!(tools[5..].iter().all(|tool| {
-            tool["_meta"]["ui"]["resourceUri"] == views::APP_RESOURCE_URI
-                && tool["_meta"]["openai/outputTemplate"] == views::APP_RESOURCE_URI
-        }));
+        for (tool, view) in tools[5..].iter().zip(views::VIEW_TOOLS) {
+            assert_eq!(tool["_meta"]["ui"]["resourceUri"], view.resource_uri());
+            assert_eq!(tool["_meta"]["openai/outputTemplate"], view.resource_uri());
+        }
     }
 
     #[tokio::test]
@@ -1072,16 +1072,19 @@ mod tests {
             .handle(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}))
             .await
             .unwrap();
-        let today = response["result"]["tools"]
+        let wallets = response["result"]["tools"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|tool| tool["name"] == "show_bloom_today")
+            .find(|tool| tool["name"] == "show_bloom_wallets")
             .unwrap();
-        assert_eq!(today["_meta"]["ui"]["resourceUri"], views::APP_RESOURCE_URI);
         assert_eq!(
-            today["_meta"]["openai/outputTemplate"],
-            views::APP_RESOURCE_URI
+            wallets["_meta"]["ui"]["resourceUri"],
+            views::VIEW_TOOLS[0].resource_uri()
+        );
+        assert_eq!(
+            wallets["_meta"]["openai/outputTemplate"],
+            views::VIEW_TOOLS[0].resource_uri()
         );
     }
 
@@ -1091,7 +1094,7 @@ mod tests {
         let response = server
             .handle(json!({
                 "jsonrpc": "2.0", "id": 1, "method": "resources/read",
-                "params": { "uri": views::APP_RESOURCE_URI },
+                "params": { "uri": views::VIEW_TOOLS[0].resource_uri() },
             }))
             .await
             .unwrap();
@@ -1101,6 +1104,9 @@ mod tests {
         assert!(html.contains("ui/initialize"));
         assert!(html.contains("hostContext.styles?.variables"));
         assert!(html.contains("--ink: var(--color-text-primary"));
+        assert!(html.contains("page.querySelector(\"main\")"));
+        assert!(html.contains("document.body.replaceChildren(document.importNode(main, true))"));
+        assert!(!html.contains("tools/call"));
         assert!(commands.calls.lock().unwrap().is_empty());
     }
 

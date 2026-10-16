@@ -16,7 +16,6 @@ use crate::backend::{VfsCommandError, VfsCommands, VfsMethod};
 use crate::tools::{ToolError, error_result, read_bytes};
 
 pub const APP_MIME_TYPE: &str = "text/html;profile=mcp-app";
-pub const APP_RESOURCE_URI: &str = "ui://bloom/dashboard-v2.html";
 const APP_HTML: &str = include_str!("../assets/dashboard-widget.html");
 const BASE_CSS_PATH: &str = "/views/bloom.css";
 const SKIN_CSS_PATH: &str = "/views/skin.css";
@@ -29,59 +28,53 @@ pub struct ViewToolSpec {
     pub page: &'static str,
 }
 
-pub const VIEW_TOOLS: [ViewToolSpec; 9] = [
-    ViewToolSpec {
-        name: "show_bloom_today",
-        title: "Show Bloom Today",
-        description: "Show the person's Bloom Today dashboard: holdings, items needing attention, app positions, and recent activity. Prefer this tool when the person asks to see their Bloom overview; MCP Apps hosts render it inline and other hosts receive a browser fallback.",
-        page: "index.html",
-    },
+pub const VIEW_TOOLS: [ViewToolSpec; 8] = [
     ViewToolSpec {
         name: "show_bloom_wallets",
         title: "Show Bloom wallets",
-        description: "Show the person's read-only Bloom wallet dashboard. Prefer this tool when the person asks to see wallets or balances; MCP Apps hosts render it inline and other hosts receive a browser fallback.",
+        description: "Use this tool whenever the person asks to see Bloom wallets or balances. It opens the read-only Wallets widget directly in MCP Apps hosts; do not reconstruct the view with VFS reads. Other hosts receive a browser fallback.",
         page: "wallets.html",
     },
     ViewToolSpec {
         name: "show_bloom_receive",
         title: "Show Bloom receive addresses",
-        description: "Show the person's receiving addresses and QR codes grouped by wallet. Prefer this tool when the person asks where to receive funds; MCP Apps hosts render it inline and other hosts receive a browser fallback.",
+        description: "Use this tool whenever the person asks for Bloom receiving addresses or QR codes. It opens the read-only Receive widget directly in MCP Apps hosts; do not reconstruct the view with VFS reads. Other hosts receive a browser fallback.",
         page: "receive.html",
     },
     ViewToolSpec {
         name: "show_bloom_activity",
         title: "Show Bloom activity",
-        description: "Show the person's recorded Bloom activity and transaction links. Prefer this tool when the person asks to see wallet history; MCP Apps hosts render it inline and other hosts receive a browser fallback.",
+        description: "Use this tool whenever the person asks for Bloom activity or wallet history. It opens the read-only Activity widget directly in MCP Apps hosts; do not reconstruct the view with VFS reads. Other hosts receive a browser fallback.",
         page: "activity.html",
     },
     ViewToolSpec {
         name: "show_bloom_next_moves",
         title: "Show Bloom next moves",
-        description: "Show staged Bloom operations awaiting review and their policy status. Prefer this tool when the person asks what needs attention; MCP Apps hosts render it inline and other hosts receive a browser fallback.",
+        description: "Use this tool whenever the person asks what Bloom operations need attention. It opens the read-only Next moves widget directly in MCP Apps hosts; do not reconstruct the view with VFS reads. Other hosts receive a browser fallback.",
         page: "next-moves.html",
     },
     ViewToolSpec {
         name: "show_bloom_contacts",
         title: "Show Bloom contacts",
-        description: "Show the person's saved Bloom contacts and recipient suggestions. Prefer this tool when the person asks to see contacts; MCP Apps hosts render it inline and other hosts receive a browser fallback.",
+        description: "Use this tool whenever the person asks for Bloom contacts or recipient suggestions. It opens the read-only Contacts widget directly in MCP Apps hosts; do not reconstruct the view with VFS reads. Other hosts receive a browser fallback.",
         page: "contacts.html",
     },
     ViewToolSpec {
         name: "show_bloom_policy",
         title: "Show Bloom policy",
-        description: "Show the person's read-only Bloom wallet policy summary. Prefer this tool when the person asks to inspect policy or approval scope; MCP Apps hosts render it inline and other hosts receive a browser fallback.",
+        description: "Use this tool whenever the person asks about Bloom wallet policy or approval scope. It opens the read-only Policy widget directly in MCP Apps hosts; do not reconstruct the view with VFS reads. Other hosts receive a browser fallback.",
         page: "policy.html",
     },
     ViewToolSpec {
         name: "show_bloom_networks",
         title: "Show Bloom networks",
-        description: "Show Bloom's sortable Networks dashboard with public market activity, fees, and the person's holdings by network. Prefer this tool for network or fee views; MCP Apps hosts render it inline and other hosts receive a browser fallback.",
+        description: "Use this tool whenever the person asks for Bloom networks or fees. It opens the read-only Networks widget directly in MCP Apps hosts; do not reconstruct the view with VFS reads. Other hosts receive a browser fallback.",
         page: "chains.html",
     },
     ViewToolSpec {
         name: "show_bloom_markets",
         title: "Show Bloom markets",
-        description: "Show Bloom's public market-movers dashboard and its sample coverage. Prefer this tool when the person asks to see markets; MCP Apps hosts render it inline and other hosts receive a browser fallback.",
+        description: "Use this tool whenever the person asks for Bloom markets or market movers. It opens the read-only Markets widget directly in MCP Apps hosts; do not reconstruct the view with VFS reads. Other hosts receive a browser fallback.",
         page: "markets.html",
     },
 ];
@@ -91,7 +84,12 @@ pub fn find(name: &str) -> Option<&'static ViewToolSpec> {
 }
 
 impl ViewToolSpec {
+    pub fn resource_uri(&self) -> String {
+        format!("ui://bloom/{}-v1.html", self.page.trim_end_matches(".html"))
+    }
+
     pub fn descriptor(&self) -> Value {
+        let resource_uri = self.resource_uri();
         json!({
             "name": self.name,
             "title": self.title,
@@ -120,13 +118,17 @@ impl ViewToolSpec {
             },
             "_meta": {
                 "ui": {
-                    "resourceUri": APP_RESOURCE_URI,
+                    "resourceUri": resource_uri,
                     "visibility": ["model", "app"],
                 },
-                "openai/outputTemplate": APP_RESOURCE_URI,
+                "openai/outputTemplate": resource_uri,
             },
         })
     }
+}
+
+pub fn find_by_resource_uri(uri: &str) -> Option<&'static ViewToolSpec> {
+    VIEW_TOOLS.iter().find(|tool| tool.resource_uri() == uri)
 }
 
 pub async fn call(
@@ -256,9 +258,10 @@ fn asset_mime_type(path: &str) -> &'static str {
     }
 }
 
-pub fn app_resource() -> Value {
+pub fn app_resource(tool: &ViewToolSpec) -> Value {
+    let resource_uri = tool.resource_uri();
     json!({
-        "uri": APP_RESOURCE_URI,
+        "uri": resource_uri,
         "mimeType": APP_MIME_TYPE,
         "text": APP_HTML,
         "_meta": {
@@ -273,18 +276,18 @@ pub fn app_resource() -> Value {
             "openai/ui": {
                 "availableDisplayModes": ["inline", "fullscreen"],
             },
-            "openai/widgetDescription": "Bloom's read-only wallet dashboard.",
+            "openai/widgetDescription": format!("Bloom's read-only {} view.", tool.title),
             "openai/widgetPrefersBorder": true,
         },
     })
 }
 
-pub fn app_resource_descriptor() -> Value {
+pub fn app_resource_descriptor(tool: &ViewToolSpec) -> Value {
     json!({
-        "uri": APP_RESOURCE_URI,
-        "name": "bloom-dashboard-app",
-        "title": "Bloom dashboard",
-        "description": "Sandboxed renderer for Bloom's read-only dashboard views.",
+        "uri": tool.resource_uri(),
+        "name": format!("bloom-{}-app", tool.page.trim_end_matches(".html")),
+        "title": tool.title,
+        "description": format!("Sandboxed renderer for Bloom's read-only {} view.", tool.title),
         "mimeType": APP_MIME_TYPE,
     })
 }
@@ -306,8 +309,24 @@ mod tests {
     #[test]
     fn widget_tools_advertise_standard_and_chatgpt_ui_metadata() {
         let app = VIEW_TOOLS[0].descriptor();
-        assert_eq!(app["_meta"]["ui"]["resourceUri"], APP_RESOURCE_URI);
-        assert_eq!(app["_meta"]["openai/outputTemplate"], APP_RESOURCE_URI);
+        assert_eq!(
+            app["_meta"]["ui"]["resourceUri"],
+            VIEW_TOOLS[0].resource_uri()
+        );
+        assert_eq!(
+            app["_meta"]["openai/outputTemplate"],
+            VIEW_TOOLS[0].resource_uri()
+        );
         assert_eq!(app["annotations"]["readOnlyHint"], true);
+    }
+
+    #[test]
+    fn every_view_has_its_own_resource() {
+        let uris = VIEW_TOOLS
+            .iter()
+            .map(ViewToolSpec::resource_uri)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(uris.len(), VIEW_TOOLS.len());
+        assert!(!uris.iter().any(|uri| uri.contains("index")));
     }
 }

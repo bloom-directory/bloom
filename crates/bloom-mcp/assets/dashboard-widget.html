@@ -37,6 +37,11 @@
       --sans: var(--font-sans, system-ui, sans-serif);
       --mono: var(--font-mono, ui-monospace, monospace);
     }
+    body > main {
+      width: min(1160px, 100%);
+      margin: auto;
+      padding: 24px;
+    }
   </style>
   <style id="bloom-skin-styles"></style>
 </head>
@@ -45,18 +50,6 @@
 (() => {
   "use strict";
 
-  const viewTools = {
-    "index.html": "show_bloom_today",
-    "wallets.html": "show_bloom_wallets",
-    "receive.html": "show_bloom_receive",
-    "activity.html": "show_bloom_activity",
-    "next-moves.html": "show_bloom_next_moves",
-    "contacts.html": "show_bloom_contacts",
-    "policy.html": "show_bloom_policy",
-    "chains.html": "show_bloom_networks",
-    "fees.html": "show_bloom_networks",
-    "markets.html": "show_bloom_markets",
-  };
   const pending = new Map();
   const appliedHostVariables = new Set();
   let nextId = 0;
@@ -162,7 +155,17 @@
       const replacement = payload.assets?.[image.getAttribute("src")];
       if (replacement) image.setAttribute("src", replacement);
     }
-    document.body.replaceChildren(...[...page.body.childNodes].map((node) => document.importNode(node, true)));
+    const main = page.querySelector("main");
+    if (!main) return;
+    for (const anchor of main.querySelectorAll("a[href]")) {
+      const raw = anchor.getAttribute("href");
+      if (!raw || raw.startsWith("#")) continue;
+      let url;
+      try { url = new URL(raw, "https://bloom.invalid/views/"); } catch { continue; }
+      if (url.origin === "https://bloom.invalid") anchor.remove();
+    }
+    for (const emptyNav of main.querySelectorAll("nav:not(:has(a))")) emptyNav.remove();
+    document.body.replaceChildren(document.importNode(main, true));
     enableNetworksSorting();
     selectReceiveWallet(requestedHash);
     reportSize();
@@ -175,22 +178,7 @@
     if (!raw || raw.startsWith("#")) return;
     let url;
     try { url = new URL(raw, "https://bloom.invalid/views/"); } catch { return; }
-    if (url.origin === "https://bloom.invalid") {
-      const page = url.pathname.split("/").pop();
-      const tool = viewTools[page];
-      if (!tool) {
-        event.preventDefault();
-        return;
-      }
-      event.preventDefault();
-      try {
-        const response = await send("tools/call", { name: tool, arguments: {} });
-        render(response, url.hash);
-      } catch (error) {
-        console.error("Bloom view navigation failed", error);
-      }
-      return;
-    }
+    if (url.origin === "https://bloom.invalid") return;
     if (url.protocol === "https:" || url.protocol === "http:") {
       event.preventDefault();
       try { await send("ui/open-link", { url: url.href }); } catch (error) { console.error("Opening link failed", error); }
@@ -221,7 +209,7 @@
   (async () => {
     try {
       const initialized = await send("ui/initialize", {
-        appInfo: { name: "Bloom dashboard", version: "1" },
+        appInfo: { name: "Bloom view", version: "1" },
         appCapabilities: { availableDisplayModes: ["inline", "fullscreen"] },
         protocolVersion: "2026-01-26",
       });

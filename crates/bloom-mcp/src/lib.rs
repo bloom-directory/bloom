@@ -57,7 +57,7 @@ pub use server::{
     SUPPORTED_PROTOCOL_VERSIONS,
 };
 pub use tools::{RESOURCE_SCHEME, TOOLS, ToolSpec};
-pub use views::{APP_MIME_TYPE, APP_RESOURCE_URI, VIEW_TOOLS, ViewToolSpec};
+pub use views::{APP_MIME_TYPE, VIEW_TOOLS, ViewToolSpec};
 
 /// Returned when the MCP server is asked to start without an explicit opt-in.
 #[derive(Debug, Error)]

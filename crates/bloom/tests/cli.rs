@@ -2422,7 +2422,6 @@ async fn mcp_serve_proxies_vfs_commands_over_stdio_when_enabled() {
             "vfs_stat",
             "vfs_write",
             "vfs_write_then_stat",
-            "show_bloom_today",
             "show_bloom_wallets",
             "show_bloom_receive",
             "show_bloom_activity",
