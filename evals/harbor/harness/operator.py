@@ -330,7 +330,9 @@ def redact(error: BaseException, state: dict[str, Any] | None) -> str:
         (v for v in sensitive if isinstance(v, str)), key=len, reverse=True
     ):
         text = text.replace(value, "[REDACTED]")
-    text = re.sub(r"http://localhost:18734/ceremony/[A-Za-z0-9_-]+", "[REDACTED]", text)
+    text = re.sub(
+        r"http://localhost:[0-9]+/ceremony/[A-Za-z0-9_-]+", "[REDACTED]", text
+    )
     return text
 
 

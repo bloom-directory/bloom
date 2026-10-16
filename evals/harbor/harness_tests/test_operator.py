@@ -189,6 +189,12 @@ class OperatorStateTests(unittest.TestCase):
         self.assertNotIn(str(self.root), message)
         self.assertNotIn(ceremony, message)
 
+    def test_redaction_removes_ceremony_urls_on_configured_port(self) -> None:
+        ceremony = "http://localhost:28735/ceremony/" + "A" * 43
+        message = redact(EvalError(f"ceremony at {ceremony}"), self.state)
+        self.assertNotIn(ceremony, message)
+        self.assertNotIn("A" * 43, message)
+
     def test_init_cannot_replace_state_while_policy_recovery_is_pending(self) -> None:
         atomic_write(self.store.backup_path, b"{}\n")
         with self.assertRaisesRegex(EvalError, "recovery is pending"):

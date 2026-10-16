@@ -22,7 +22,11 @@ from typing import Any
 from .core import EvalDefinition, EvalError, EvalRunContext
 
 MAINNET_ACK = "PLACE_AND_CANCEL_BTC_MAINNET_UP_TO_11_USD"
-CEREMONY_URL = re.compile(r"http://localhost:18734/ceremony/[A-Za-z0-9_-]{43}")
+# The ceremony port is configurable per Triad (`--ceremony-port`), so accept
+# any loopback port; the path and token shape stay exact.
+CEREMONY_URL = re.compile(
+    r"http://localhost:[1-9][0-9]{0,4}/ceremony/[A-Za-z0-9_-]{43}"
+)
 WALLET = re.compile(r"0x[0-9a-f]{40}")
 WALLET_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
 PACKAGE_HASH = re.compile(r"[0-9a-f]{64}")

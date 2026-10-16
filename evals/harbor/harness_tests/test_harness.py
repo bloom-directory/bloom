@@ -581,6 +581,44 @@ class HyperliquidDefinitionTests(unittest.TestCase):
 
         self.assertEqual(self.definition._pending_petal_key_ceremony(), ceremony)
 
+    def test_pending_key_ceremony_accepts_configured_loopback_port(self) -> None:
+        # Triads launched with `--ceremony-port` publish that port; the
+        # default-port Triad may already hold 18734 on the same host.
+        self.definition.session_id = "exact-session"
+        root = self.mount / "petal-key-requests"
+        root.mkdir(parents=True)
+        path = root / ("d" * 64 + ".json")
+
+        def write(ceremony: str) -> None:
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema": "bloom.machine.petal-key-request.v3",
+                        "key_slot": session_key_slot("exact-session"),
+                        "scope": {
+                            "wallet_id": self.wallet_id,
+                            "package_hash": self.package_hash,
+                        },
+                        "status": "awaiting_user",
+                        "ceremony_url": ceremony,
+                    }
+                )
+            )
+
+        ceremony = "http://localhost:28735/ceremony/" + "A" * 43
+        write(ceremony)
+        self.assertEqual(self.definition._pending_petal_key_ceremony(), ceremony)
+        for invalid in (
+            "http://example.com:28735/ceremony/" + "A" * 43,
+            "http://localhost:0/ceremony/" + "A" * 43,
+            "http://localhost/ceremony/" + "A" * 43,
+            "http://localhost:28735/ceremony/" + "A" * 42,
+        ):
+            with self.subTest(ceremony=invalid):
+                write(invalid)
+                with self.assertRaisesRegex(EvalError, "invalid ceremony URL"):
+                    self.definition._pending_petal_key_ceremony()
+
     def test_pending_key_schema_fails_only_for_exact_binding(self) -> None:
         self.definition.session_id = "exact-session"
         root = self.mount / "petal-key-requests"
