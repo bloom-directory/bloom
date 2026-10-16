@@ -85,7 +85,7 @@ pub fn find(name: &str) -> Option<&'static ViewToolSpec> {
 
 impl ViewToolSpec {
     pub fn resource_uri(&self) -> String {
-        format!("ui://bloom/{}-v9.html", self.page.trim_end_matches(".html"))
+        format!("ui://bloom/{}-v10.html", self.page.trim_end_matches(".html"))
     }
 
     pub fn descriptor(&self) -> Value {
@@ -271,7 +271,7 @@ pub fn app_resource(tool: &ViewToolSpec) -> Value {
                 "csp": {
                     "connectDomains": [],
                     "resourceDomains": [],
-                    "frameDomains": [],
+                    "frameDomains": ["http://127.0.0.1:48763"],
                 },
             },
             "openai/ui": {

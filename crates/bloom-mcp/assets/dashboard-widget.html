@@ -776,6 +776,7 @@
   const pending = new Map();
   const appliedHostVariables = new Set();
   const callableViewTools = new Set(["show_bloom_wallets", "show_bloom_receive"]);
+  const checkoutProbeOrigin = "http://127.0.0.1:48763";
   const viewResultCache = new Map();
   let nextId = 0;
   let hostContext = {};
@@ -1216,28 +1217,32 @@
       const finish = (message) => {
         if (finished) return;
         finished = true;
+        removeEventListener("message", receiveProbeResult);
         frame.remove();
         status.textContent = message;
         reportSize();
       };
+      const receiveProbeResult = (event) => {
+        if (event.source !== frame.contentWindow || event.origin !== checkoutProbeOrigin) return;
+        if (event.data?.type !== "bloom-webauthn-probe") return;
+        const { available, allowed, secureContext } = event.data;
+        if (!secureContext) finish("Blocked: the localhost checkout is not a secure context.");
+        else if (!available) finish("Unavailable: the localhost frame has no WebAuthn API.");
+        else if (outer === false) finish("Blocked: the host does not delegate WebAuthn to Bloom.");
+        else if (allowed === false) finish("Blocked: WebAuthn does not reach the localhost checkout frame.");
+        else if (outer === true && allowed === true) finish("Passed: WebAuthn reaches a cross-origin localhost checkout.");
+        else finish("Inconclusive: this host does not expose Permissions Policy inspection.");
+      };
       frame.hidden = true;
       frame.title = "WebAuthn permission probe";
-      frame.sandbox = "allow-same-origin";
+      frame.sandbox = "allow-scripts allow-same-origin";
       frame.allow = "publickey-credentials-get *";
-      frame.srcdoc = "<!doctype html><title>WebAuthn permission probe</title>";
-      frame.addEventListener("load", () => {
-        const nested = frame.contentDocument ? webAuthnAllowed(frame.contentDocument) : null;
-        const available = Boolean(frame.contentWindow?.PublicKeyCredential && frame.contentWindow?.navigator?.credentials);
-        if (!available) finish("Unavailable: this host runtime has no WebAuthn API.");
-        else if (outer === false) finish("Blocked: the host does not delegate WebAuthn to Bloom.");
-        else if (nested === false) finish("Blocked: WebAuthn does not reach a nested checkout frame.");
-        else if (outer === true && nested === true) finish("Passed: the host permits nested WebAuthn. Next: test the localhost ceremony.");
-        else finish("Inconclusive: this host does not expose Permissions Policy inspection.");
-      }, { once: true });
+      frame.src = `${checkoutProbeOrigin}/probe`;
+      addEventListener("message", receiveProbeResult);
       document.body.append(frame);
       setTimeout(() => finish(outer === false
         ? "Blocked: the host does not delegate WebAuthn to Bloom."
-        : "Blocked: the host's widget CSP did not permit the nested test frame."), 1200);
+        : "Blocked: the host did not load the localhost checkout frame."), 2000);
     };
     button.addEventListener("click", run);
     run();
