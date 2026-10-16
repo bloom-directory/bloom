@@ -5,9 +5,9 @@
 //! Petal route artifact.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bloom_proto::config::PetalRuntimeConfig;
@@ -22,6 +22,14 @@ use crate::host::PetalHost;
 use crate::runner::{PETAL_DOCUMENT_NAMES, PetalRunner};
 use crate::vm::{COMPONENT_NOT_A_DIR_CODE, COMPONENT_UNSUPPORTED_CODE, RunOptions};
 
+/// How long lookups, listings and plain reads may reuse a live account
+/// observation, matching the Machine's default wallet-projection reuse window.
+/// One mounted path traversal issues several lookups before its read; each
+/// live observation costs a full Broker wallet refresh.
+const ACCOUNT_CONTEXT_REUSE: Duration = Duration::from_secs(1);
+
+type AccountContextCache = BTreeMap<(String, u32), (Instant, AccountPetalContext)>;
+
 #[derive(Clone)]
 pub struct PetalRouter {
     runner: PetalRunner,
@@ -29,6 +37,8 @@ pub struct PetalRouter {
     runtime_petals: BTreeMap<String, PetalRuntimeConfig>,
     audit: Option<Arc<AuditLog>>,
     audit_effect_lock: Arc<tokio::sync::Mutex<()>>,
+    account_contexts: Arc<Mutex<AccountContextCache>>,
+    account_context_reuse: Duration,
 }
 
 impl PetalRouter {
@@ -39,6 +49,8 @@ impl PetalRouter {
             runtime_petals: BTreeMap::new(),
             audit: None,
             audit_effect_lock: Arc::new(tokio::sync::Mutex::new(())),
+            account_contexts: Arc::new(Mutex::new(BTreeMap::new())),
+            account_context_reuse: ACCOUNT_CONTEXT_REUSE,
         }
     }
 
@@ -112,13 +124,53 @@ impl PetalRouter {
         entries
     }
 
+    /// Resolve the account a wallet-scoped route runs as. `account.json` is
+    /// served on the live authority path, so every read is a Broker wallet
+    /// refresh. Writes and side-effecting reads (`live`) always observe it
+    /// afresh; lookups, listings and plain reads reuse an observation made in
+    /// the last `account_context_reuse`.
     async fn account_context(
         &self,
         wallet: &str,
         number: &str,
+        live: bool,
     ) -> Result<AccountPetalContext, HandlerError> {
         let number = canonical_account(number)
             .ok_or_else(|| HandlerError::not_found("invalid account number"))?;
+        let key = (wallet.to_owned(), number);
+        if !live
+            && let Some((observed, context)) = self
+                .account_contexts
+                .lock()
+                .map_err(|_| HandlerError::backend("account context cache poisoned"))?
+                .get(&key)
+            && observed.elapsed() <= self.account_context_reuse
+        {
+            return Ok(context.clone());
+        }
+        let observed = Instant::now();
+        let result = self.observe_account_context(wallet, number).await;
+        let mut cache = self
+            .account_contexts
+            .lock()
+            .map_err(|_| HandlerError::backend("account context cache poisoned"))?;
+        match &result {
+            Ok(context) => {
+                cache.insert(key, (observed, context.clone()));
+            }
+            // Never serve an account the latest observation refused.
+            Err(_) => {
+                cache.remove(&key);
+            }
+        }
+        result
+    }
+
+    async fn observe_account_context(
+        &self,
+        wallet: &str,
+        number: u32,
+    ) -> Result<AccountPetalContext, HandlerError> {
         let bytes = self
             .host
             .vfs_read(&format!("wallets/{wallet}/{number}/account.json"))
@@ -192,7 +244,7 @@ impl PetalRouter {
                 .map(|(_, value)| **value);
             if let (Some(wallet), Some(number)) = (wallet, number) {
                 if checked_accounts.insert((wallet, number)) {
-                    self.account_context(wallet, number).await?;
+                    self.account_context(wallet, number, false).await?;
                 }
             } else if let Some(wallet) = wallet
                 && checked_wallets.insert(wallet)
@@ -286,7 +338,8 @@ impl PetalRouter {
                 {
                     return Err(HandlerError::PermissionDenied);
                 }
-                let account = self.account_context(wallet, index).await?;
+                let live = self.is_effect(mount, op, &path);
+                let account = self.account_context(wallet, index, live).await?;
                 self.dispatch_for_account(mount, op, path, body, &account, &execution)
                     .await
             }
@@ -337,6 +390,20 @@ fn map_host_err(error: crate::host::HostError) -> HandlerError {
 }
 
 impl PetalRouter {
+    /// Whether this operation is a security effect: a write, or a read whose
+    /// route declares it side-effecting. Unknown read metadata counts as one.
+    fn is_effect(&self, mount: &str, op: DispatchOp, path: &str) -> bool {
+        match op {
+            DispatchOp::Write => true,
+            DispatchOp::Read => self
+                .runner
+                .petal_route_effective_metadata(mount, op, path)
+                .map(|(_, metadata)| metadata.side_effecting_read)
+                .unwrap_or(true),
+            DispatchOp::Lookup | DispatchOp::List => false,
+        }
+    }
+
     /// Dispatch using the account identity resolved by the host from live core state.
     #[allow(clippy::too_many_arguments)]
     async fn dispatch_for_account(
@@ -382,15 +449,7 @@ impl PetalRouter {
         // makes a single mounted path traversal append (and authenticate) many
         // journal records before NFS reaches the command WRITE. A read is an
         // effect only when its route explicitly declares that property.
-        let audit_effect = match op {
-            DispatchOp::Write => true,
-            DispatchOp::Read => self
-                .runner
-                .petal_route_effective_metadata(mount, op, &path)
-                .map(|(_, metadata)| metadata.side_effecting_read)
-                .unwrap_or(true),
-            DispatchOp::Lookup | DispatchOp::List => false,
-        };
+        let audit_effect = self.is_effect(mount, op, &path);
         let _audit_guard = if audit_effect {
             Some(self.audit_effect_lock.lock().await)
         } else {
@@ -872,7 +931,7 @@ mod tests {
         ] {
             let (_dir, runner) = runner();
             let router = PetalRouter::new(runner, Arc::new(LifecycleHost { evm, solana }));
-            let result = router.account_context("alice", "0").await;
+            let result = router.account_context("alice", "0", true).await;
             if evm != "active" && solana != "active" {
                 assert!(matches!(result, Err(HandlerError::NotFound(_))));
             } else {
@@ -881,6 +940,67 @@ mod tests {
                 assert_eq!(context.solana_fingerprint.is_some(), solana == "active");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn account_context_reuses_recent_observations_only_for_non_effects() {
+        struct CountingHost {
+            reads: std::sync::atomic::AtomicUsize,
+            refuse: AtomicBool,
+        }
+        #[async_trait]
+        impl PetalHost for CountingHost {
+            async fn vfs_lookup(&self, path: &str) -> Result<HostVfsEntry, HostError> {
+                AccountHost.vfs_lookup(path).await
+            }
+            async fn vfs_list(&self, path: &str) -> Result<Vec<HostVfsEntry>, HostError> {
+                AccountHost.vfs_list(path).await
+            }
+            async fn vfs_write(&self, path: &str, bytes: &[u8]) -> Result<(), HostError> {
+                AccountHost.vfs_write(path, bytes).await
+            }
+            async fn vfs_read(&self, path: &str) -> Result<Vec<u8>, HostError> {
+                self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if self.refuse.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(HostError::Denied(path.into()));
+                }
+                AccountHost.vfs_read(path).await
+            }
+        }
+        let host = Arc::new(CountingHost {
+            reads: Default::default(),
+            refuse: AtomicBool::new(false),
+        });
+        let reads = || host.reads.load(std::sync::atomic::Ordering::SeqCst);
+        let (_dir, runner) = runner();
+        let mut router = PetalRouter::new(runner, host.clone());
+
+        // A traversal's lookups and its read share one live observation.
+        for _ in 0..3 {
+            router.account_context("alice", "0", false).await.unwrap();
+        }
+        assert_eq!(reads(), 1);
+        // Accounts are cached independently.
+        router.account_context("alice", "1", false).await.unwrap();
+        assert_eq!(reads(), 2);
+        // Effects never reuse a cached observation.
+        router.account_context("alice", "0", true).await.unwrap();
+        router.account_context("alice", "0", true).await.unwrap();
+        assert_eq!(reads(), 4);
+
+        // A refused live observation evicts the cached account.
+        host.refuse.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(router.account_context("alice", "0", true).await.is_err());
+        assert!(router.account_context("alice", "0", false).await.is_err());
+        assert_eq!(reads(), 6);
+
+        // An expired observation is refreshed.
+        host.refuse
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        router.account_context_reuse = Duration::ZERO;
+        router.account_context("alice", "1", false).await.unwrap();
+        router.account_context("alice", "1", false).await.unwrap();
+        assert_eq!(reads(), 8);
     }
 
     fn runner() -> (TempDir, PetalRunner) {
@@ -1463,7 +1583,10 @@ name = "example"
         }
         runner.store().install_petal_package_dir(&package).unwrap();
         let host = Arc::new(CountingAccountHost::default());
-        let router = PetalRouter::new(runner, host.clone());
+        let mut router = PetalRouter::new(runner, host.clone());
+        // Without reuse, each invocation observes live account state once
+        // however many ancestor routes share the account.
+        router.account_context_reuse = Duration::ZERO;
         router
             .list(&VfsPath::parse("demo/intents").unwrap())
             .await
@@ -1485,6 +1608,17 @@ name = "example"
             2,
             "each invocation rechecks live account state exactly once"
         );
+        // Within the reuse window, a traversal's repeated lookups share one
+        // live observation.
+        router.account_context_reuse = ACCOUNT_CONTEXT_REUSE;
+        router.account_contexts.lock().unwrap().clear();
+        for _ in 0..3 {
+            router
+                .lookup(&VfsPath::parse("demo/intents/alice/0").unwrap())
+                .await
+                .unwrap();
+        }
+        assert_eq!(host.reads.load(Ordering::Relaxed), 3);
     }
 
     #[test]
