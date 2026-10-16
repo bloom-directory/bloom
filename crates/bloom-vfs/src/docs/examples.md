@@ -186,6 +186,17 @@ ls "$BLOOM/wallets/alice/$N/chains/$CHAIN/outbox/pending/"
 ID="<exact-id>"
 cat "$BLOOM/wallets/alice/$N/chains/$CHAIN/outbox/pending/$ID/intent.json"
 cat "$BLOOM/wallets/alice/$N/chains/$CHAIN/outbox/pending/$ID/plan.md"
+
+# 4. Confirm, and once the owner has approved, confirm again in the same
+#    command. The staged blockhash lives about a minute, so a turn spent
+#    between approval and confirm can let it expire.
+E="$BLOOM/wallets/alice/$N/chains/$CHAIN/outbox"
+printf 'confirm\n' > "$E/pending/$ID/confirm"
+cat "$E/pending/$ID/approval_challenge.json"  # verify, then give the owner its URL
+while [ "$(jq -r .state "$E/pending/$ID/approval_challenge.json")" = awaiting_ceremony ]; do
+  sleep 2
+done
+printf 'confirm\n' > "$E/pending/$ID/confirm"
 ```
 
 Verify that the staged intent names the chosen fingerprint, derivation path,
@@ -194,6 +205,16 @@ and fee payer. After submission, read the same action under `sent/`: its
 `broadcast_attempted.json` to `receipt.json` and check the receipt's outcome
 and confirmation status. The receipt contains no account fingerprint. Do not
 blindly retry an ambiguous broadcast.
+
+A staged Solana transfer is valid only until its blockhash expires, about a
+minute (`last_valid_block_height` in `intent.json`). If it expires before it
+is sent, its `intent.json` status becomes `expired`. Do not stage the transfer
+again through `new.tx`. Write to that action's own `restage` file instead
+(`pending/$ID/restage`, or `failed/$ID/restage` once it has moved): Bloom
+stages exactly one replacement with a fresh blockhash, even if the write is
+repeated, and names it in the expired action's `restage_advice.json`. Inspect
+and confirm that replacement; it needs its own approval. An action under
+`sent/` is never restaged; reconcile it by signature.
 
 ## ERC-20 discovery
 

@@ -19,10 +19,9 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
-from .core import EvalDefinition, EvalError, EvalRunContext
+from .core import CEREMONY_URL, EvalDefinition, EvalError, EvalRunContext
 
 MAINNET_ACK = "PLACE_AND_CANCEL_BTC_MAINNET_UP_TO_11_USD"
-CEREMONY_URL = re.compile(r"http://localhost:18734/ceremony/[A-Za-z0-9_-]{43}")
 WALLET = re.compile(r"0x[0-9a-f]{40}")
 WALLET_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
 PACKAGE_HASH = re.compile(r"[0-9a-f]{64}")
@@ -66,7 +65,7 @@ STATUS_SETTLE_ATTEMPTS = 50
 STATUS_SETTLE_DELAY_SECONDS = 0.2
 EVAL_IMAGE = (
     "ghcr.io/bloom-directory/bloom-eval-agent-base@"
-    "sha256:20988c7f8a6751c25e0115c2136710a885bef69d245e077d2ae3b2cc2c0837fd"
+    "sha256:c1fa42378d25f356d791bc32b20e6e3898f1942368a765830d5419e446b81a7e"
 )
 EVAL_IMAGE_PULL_TIMEOUT_SECONDS = 600
 

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import copy
 import hashlib
+import io
 import json
 import os
 import subprocess
@@ -13,7 +15,18 @@ from types import SimpleNamespace
 from unittest import mock
 
 from harness import hyperliquid_order_cancel
-from harness.core import AgentSpec, EvalDefinition, EvalError, EvalRunContext, run_eval
+from harness.core import (
+    AGENTS,
+    AgentFailure,
+    AgentSpec,
+    TokenUsage,
+    EvalDefinition,
+    EvalError,
+    EvalRunContext,
+    _agent_spec,
+    run_eval,
+)
+from harness.__main__ import parser, run_trials
 from harness.hyperliquid_order_cancel import (
     ACTION_FILES,
     MAINNET_ACK,
@@ -62,6 +75,124 @@ class HarnessLifecycleTests(unittest.TestCase):
         self.auth.stop()
         self.temp.cleanup()
 
+    def test_glm_uses_zai_coding_plan_through_claude_code(self) -> None:
+        with mock.patch.dict(os.environ, {"GLM_API_KEY": "test-glm-key"}, clear=True):
+            spec = _agent_spec("glm")
+
+        self.assertEqual(spec.harbor_name, "claude-code")
+        self.assertEqual(spec.model, "glm-5.2")
+        self.assertEqual(spec.env["ANTHROPIC_AUTH_TOKEN"], "test-glm-key")
+        self.assertEqual(
+            spec.env["ANTHROPIC_BASE_URL"], "https://api.z.ai/api/anthropic"
+        )
+
+    def test_cli_agent_choices_come_from_the_agent_registry(self) -> None:
+        action = next(
+            action for action in parser()._actions if action.dest == "agent"
+        )
+        self.assertEqual(tuple(action.choices), tuple(AGENTS))
+
+    def test_smoke_cli_needs_no_agent(self) -> None:
+        args = parser().parse_args(["solana-transfer", "--smoke-only"])
+        self.assertTrue(args.smoke_only)
+        self.assertIsNone(args.agent)
+
+    def test_agent_model_can_be_selected_without_a_code_change(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"ZAI_API_KEY": "test-zai-key", "BLOOM_EVAL_MODEL": "glm-5.3"},
+            clear=True,
+        ):
+            spec = _agent_spec("glm")
+
+        self.assertEqual(spec.model, "glm-5.3")
+
+    def test_an_empty_agent_model_override_is_rejected(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"ZAI_API_KEY": "test-zai-key", "BLOOM_EVAL_MODEL": "  "},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(EvalError, "BLOOM_EVAL_MODEL"):
+                _agent_spec("glm")
+
+    def test_glm_requires_a_zai_coding_plan_key(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(EvalError, "GLM Coding Plan auth is missing"):
+                _agent_spec("glm")
+
+    def test_deepseek_uses_anthropic_compatibility_with_a_turn_limit(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"DEEPSEEK_API_KEY": "test-deepseek-key", "BLOOM_EVAL_MAX_TURNS": "15"},
+            clear=True,
+        ):
+            spec = _agent_spec("deepseek")
+
+        self.assertEqual(spec.harbor_name, "claude-code")
+        self.assertEqual(spec.model, "deepseek-v4-flash")
+        self.assertEqual(spec.env["ANTHROPIC_API_KEY"], "test-deepseek-key")
+        self.assertEqual(
+            spec.env["ANTHROPIC_BASE_URL"],
+            "https://api.deepseek.com/anthropic",
+        )
+        self.assertEqual(spec.kwargs["max_turns"], 15)
+
+    def test_minimax_uses_its_anthropic_compatible_endpoint(self) -> None:
+        with mock.patch.dict(os.environ, {"MINIMAX_API_KEY": "test-minimax-key"}, clear=True):
+            spec = _agent_spec("minimax")
+        self.assertEqual(spec.harbor_name, "claude-code")
+        self.assertEqual(spec.model, "MiniMax-M3")
+        self.assertEqual(spec.env["ANTHROPIC_AUTH_TOKEN"], "test-minimax-key")
+        self.assertEqual(spec.env["ANTHROPIC_BASE_URL"], "https://api.minimax.io/anthropic")
+
+    def test_minimax_requires_its_api_key(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(EvalError, "MINIMAX_API_KEY"):
+                _agent_spec("minimax")
+
+    def test_deepseek_requires_its_api_key(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(EvalError, "DeepSeek auth is missing"):
+                _agent_spec("deepseek")
+
+    def test_opencode_uses_deepseek_native_provider(self) -> None:
+        with mock.patch.dict(
+            os.environ, {"DEEPSEEK_API_KEY": "test-deepseek-key"}, clear=True
+        ):
+            spec = _agent_spec("opencode")
+
+        self.assertEqual(spec.harbor_name, "opencode")
+        self.assertEqual(spec.model, "deepseek/deepseek-v4-flash")
+        self.assertEqual(spec.env["DEEPSEEK_API_KEY"], "test-deepseek-key")
+        self.assertNotIn("ANTHROPIC_BASE_URL", spec.env)
+
+    def test_opencode_requires_its_api_key(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(EvalError, "OpenCode DeepSeek auth is missing"):
+                _agent_spec("opencode")
+
+    def test_opencode_model_override_requires_provider_prefix(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "DEEPSEEK_API_KEY": "test-deepseek-key",
+                "BLOOM_EVAL_MODEL": "deepseek-v4-flash",
+            },
+            clear=True,
+        ):
+            with self.assertRaisesRegex(EvalError, "provider/model"):
+                _agent_spec("opencode")
+
+    def test_claude_adapter_turn_limit_is_bounded(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"DEEPSEEK_API_KEY": "test", "BLOOM_EVAL_MAX_TURNS": "101"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(EvalError, "must be from 1 to 100"):
+                _agent_spec("deepseek")
+
     def passing_result(self) -> SimpleNamespace:
         trial = SimpleNamespace(
             exception_info=None,
@@ -98,6 +229,25 @@ class HarnessLifecycleTests(unittest.TestCase):
             },
         )
 
+    def test_run_eval_can_use_a_credential_free_runner_spec(self) -> None:
+        definition = FakeDefinition(self.root)
+
+        async def runner(_context: EvalRunContext, agent: AgentSpec) -> object:
+            definition.events.append(f"runner:{agent.model}")
+            return self.passing_result()
+
+        with mock.patch.dict(os.environ, {}, clear=True):
+            run_eval(
+                definition,
+                "smoke",
+                harbor_runner=runner,
+                agent_spec=AgentSpec("smoke", "deterministic"),
+            )
+        self.assertEqual(
+            definition.events,
+            ["preflight", "provision:smoke", "runner:deterministic", "cleanup"],
+        )
+
     def test_cleanup_runs_when_provision_fails_after_starting(self) -> None:
         definition = FakeDefinition(
             self.root, provision_error=EvalError("provision failed")
@@ -119,6 +269,160 @@ class HarnessLifecycleTests(unittest.TestCase):
 
         with self.assertRaisesRegex(EvalError, "run failed.*cleanup also failed"):
             run_eval(definition, "codex", harbor_runner=runner)
+
+    def test_provider_error_is_reported_instead_of_aggregate_trial_count(self) -> None:
+        definition = FakeDefinition(self.root)
+        trial = SimpleNamespace(
+            exception_info=SimpleNamespace(
+                exception_type="UnknownApiError",
+                exception_message=(
+                    "command failed with a long transcript\n"
+                    'result={"result":"API Error: Request rejected (429) · '
+                    '[1310][Weekly/Monthly Limit Exhausted.]","type":"result"}'
+                ),
+            ),
+            verifier_result=None,
+        )
+        result = SimpleNamespace(
+            stats=SimpleNamespace(n_errored_trials=1, n_cancelled_trials=0),
+            trial_results=[trial],
+        )
+
+        with self.assertRaisesRegex(
+            EvalError,
+            r"UnknownApiError: API Error: Request rejected \(429\).*Limit Exhausted",
+        ):
+            definition.validate_result(result)
+
+
+class VerdictTests(unittest.TestCase):
+    """FAIL is the agent's outcome; INVALID says nothing about the agent."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+
+    def result(self, *, reward: float = 1, exception_type: str | None = None) -> SimpleNamespace:
+        info = (
+            None
+            if exception_type is None
+            else SimpleNamespace(exception_type=exception_type, exception_message="x")
+        )
+        trial = SimpleNamespace(
+            exception_info=info,
+            verifier_result=SimpleNamespace(rewards={"reward": reward}),
+        )
+        return SimpleNamespace(
+            stats=SimpleNamespace(n_errored_trials=0, n_cancelled_trials=0),
+            trial_results=[trial],
+        )
+
+    def test_a_zero_reward_is_an_agent_failure(self) -> None:
+        with self.assertRaises(AgentFailure):
+            FakeDefinition(self.root).validate_result(self.result(reward=0))
+
+    def test_running_out_of_time_is_an_agent_failure(self) -> None:
+        with self.assertRaises(AgentFailure):
+            FakeDefinition(self.root).validate_result(
+                self.result(exception_type="AgentTimeoutError")
+            )
+
+    def test_running_out_of_turns_is_an_agent_failure(self) -> None:
+        agent = self.root / "trial" / "agent"
+        agent.mkdir(parents=True)
+        (agent / "claude-code.txt").write_text('{"type":"result","subtype":"error_max_turns"}\n')
+        result = self.result(exception_type="NonZeroAgentExitCodeError")
+        result.trial_results[0].trial_uri = (self.root / "trial").as_uri()
+        with self.assertRaises(AgentFailure):
+            FakeDefinition(self.root).validate_result(result)
+
+    def test_a_crashed_agent_is_not_an_agent_failure(self) -> None:
+        (self.root / "trial" / "agent").mkdir(parents=True)
+        result = self.result(exception_type="NonZeroAgentExitCodeError")
+        result.trial_results[0].trial_uri = (self.root / "trial").as_uri()
+        with self.assertRaises(EvalError) as raised:
+            FakeDefinition(self.root).validate_result(result)
+        self.assertNotIsInstance(raised.exception, AgentFailure)
+
+    def test_a_provider_error_is_not_an_agent_failure(self) -> None:
+        with self.assertRaises(EvalError) as raised:
+            FakeDefinition(self.root).validate_result(
+                self.result(exception_type="UnknownApiError")
+            )
+        self.assertNotIsInstance(raised.exception, AgentFailure)
+
+    def test_trials_are_independent_and_counted_by_verdict(self) -> None:
+        outcomes = [None, AgentFailure("reward 0"), EvalError("validator down"), None]
+        made: list[FakeDefinition] = []
+
+        def make() -> FakeDefinition:
+            made.append(FakeDefinition(self.root))
+            return made[-1]
+
+        def run(definition: EvalDefinition) -> None:
+            outcome = outcomes[len(made) - 1]
+            if outcome is not None:
+                raise outcome
+
+        with mock.patch("sys.stdout"), mock.patch("sys.stderr"):
+            code = run_trials(make, 4, run)
+        self.assertEqual(len({id(d) for d in made}), 4)
+        # An invalid trial means the run cannot be trusted as a whole.
+        self.assertEqual(code, 2)
+
+    def usage_result(self, tokens_in: int, cached: int, tokens_out: int) -> SimpleNamespace:
+        agent = SimpleNamespace(
+            n_input_tokens=tokens_in, n_cache_tokens=cached, n_output_tokens=tokens_out
+        )
+        return SimpleNamespace(trial_results=[SimpleNamespace(agent_result=agent)])
+
+    def test_usage_is_read_from_the_harbor_trial(self) -> None:
+        usage = TokenUsage.from_result(self.usage_result(600_000, 550_000, 4_500))
+        self.assertEqual(usage, TokenUsage(600_000, 550_000, 4_500))
+        self.assertEqual(str(usage), "600k in (550k cached), 4.5k out")
+        # A smoke or crashed run carries no agent usage.
+        self.assertIsNone(TokenUsage.from_result(None))
+        self.assertIsNone(
+            TokenUsage.from_result(SimpleNamespace(trial_results=[SimpleNamespace()]))
+        )
+
+    def test_usage_is_reported_per_trial_and_averaged_over_judged_trials(self) -> None:
+        plan = [
+            (None, (400_000, 300_000, 4_000)),
+            (AgentFailure("reward 0"), (800_000, 700_000, 8_000)),
+            (EvalError("provider 403"), (5_000, 0, 100)),
+        ]
+        made: list[FakeDefinition] = []
+
+        def make() -> FakeDefinition:
+            made.append(FakeDefinition(self.root))
+            return made[-1]
+
+        def run(definition: EvalDefinition) -> None:
+            outcome, usage = plan[len(made) - 1]
+            definition.last_harbor_result = self.usage_result(*usage)
+            if outcome is not None:
+                raise outcome
+
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            run_trials(make, 3, run)
+        self.assertIn("[tokens: 400k in (300k cached), 4.0k out]", out.getvalue())
+        self.assertIn("[tokens: 800k in (700k cached), 8.0k out]", err.getvalue())
+        # The invalid trial is left out of the mean.
+        self.assertIn("tokens per judged trial: 600k in (500k cached), 6.0k out", out.getvalue())
+
+    def test_all_passing_trials_exit_zero_and_a_failure_exits_one(self) -> None:
+        with mock.patch("sys.stdout"), mock.patch("sys.stderr"):
+            self.assertEqual(
+                run_trials(lambda: FakeDefinition(self.root), 3, lambda _d: None), 0
+            )
+
+            def fail(_definition: EvalDefinition) -> None:
+                raise AgentFailure("reward 0")
+
+            self.assertEqual(run_trials(lambda: FakeDefinition(self.root), 2, fail), 1)
 
 
 class HyperliquidDefinitionTests(unittest.TestCase):
