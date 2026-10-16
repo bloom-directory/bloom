@@ -735,6 +735,32 @@
     .bloom-widget .receiving-network,
     .bloom-widget .receiving-network-list,
     .bloom-widget .receiving-card > .external-link { display: none; }
+    .bloom-widget .checkout-probe {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 5px 10px;
+      align-items: center;
+      margin-top: 14px;
+      padding-top: 12px;
+      border-top: 1px solid var(--rule-2);
+      font-size: 10px;
+    }
+    .bloom-widget .checkout-probe strong { font-size: 11px; }
+    .bloom-widget .checkout-probe-status {
+      grid-column: 1 / -1;
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.4;
+    }
+    .bloom-widget .checkout-probe button {
+      padding: 5px 8px;
+      border: 1px solid var(--rule-2);
+      border-radius: 7px;
+      color: var(--ink);
+      background: transparent;
+      font: 600 9px/1 var(--sans);
+      cursor: pointer;
+    }
     @media (max-width: 420px) {
       body.bloom-widget > main { padding: 15px 13px; }
       .bloom-widget .directory-row .wallet-worth > span { display: none; }
@@ -1155,6 +1181,68 @@
     for (const heading of main.querySelectorAll(":scope > .section-head")) heading.classList.add("markets-heading");
   };
 
+  const addCheckoutProbe = (page, main) => {
+    const probe = page.createElement("section");
+    probe.className = "checkout-probe";
+    const title = page.createElement("strong");
+    title.textContent = "Embedded checkout test";
+    const button = page.createElement("button");
+    button.type = "button";
+    button.dataset.checkoutProbe = "";
+    button.textContent = "Retry";
+    const status = page.createElement("p");
+    status.className = "checkout-probe-status";
+    status.textContent = "Checking WebAuthn iframe delegation…";
+    probe.append(title, button, status);
+    main.append(probe);
+  };
+
+  const webAuthnAllowed = (targetDocument) => {
+    const policy = targetDocument.permissionsPolicy || targetDocument.featurePolicy;
+    if (!policy?.allowsFeature) return null;
+    try { return policy.allowsFeature("publickey-credentials-get"); }
+    catch { return null; }
+  };
+
+  const enableCheckoutProbe = () => {
+    const button = document.querySelector("button[data-checkout-probe]");
+    const status = document.querySelector(".checkout-probe-status");
+    if (!button || !status) return;
+    const run = () => {
+      status.textContent = "Checking WebAuthn iframe delegation…";
+      const outer = webAuthnAllowed(document);
+      const frame = document.createElement("iframe");
+      let finished = false;
+      const finish = (message) => {
+        if (finished) return;
+        finished = true;
+        frame.remove();
+        status.textContent = message;
+        reportSize();
+      };
+      frame.hidden = true;
+      frame.title = "WebAuthn permission probe";
+      frame.sandbox = "allow-same-origin";
+      frame.allow = "publickey-credentials-get *";
+      frame.srcdoc = "<!doctype html><title>WebAuthn permission probe</title>";
+      frame.addEventListener("load", () => {
+        const nested = frame.contentDocument ? webAuthnAllowed(frame.contentDocument) : null;
+        const available = Boolean(frame.contentWindow?.PublicKeyCredential && frame.contentWindow?.navigator?.credentials);
+        if (!available) finish("Unavailable: this host runtime has no WebAuthn API.");
+        else if (outer === false) finish("Blocked: the host does not delegate WebAuthn to Bloom.");
+        else if (nested === false) finish("Blocked: WebAuthn does not reach a nested checkout frame.");
+        else if (outer === true && nested === true) finish("Passed: the host permits nested WebAuthn. Next: test the localhost ceremony.");
+        else finish("Inconclusive: this host does not expose Permissions Policy inspection.");
+      }, { once: true });
+      document.body.append(frame);
+      setTimeout(() => finish(outer === false
+        ? "Blocked: the host does not delegate WebAuthn to Bloom."
+        : "Blocked: the host's widget CSP did not permit the nested test frame."), 1200);
+    };
+    button.addEventListener("click", run);
+    run();
+  };
+
   const addViewAction = (page, header, title) => {
     const destinations = {
       Wallets: ["show_bloom_receive", "Receive", "↓"],
@@ -1213,6 +1301,7 @@
     if (title === "Policy") preparePolicy(page, main);
     if (title === "Networks") prepareNetworks(page, main);
     if (title === "Markets") prepareMarkets(main);
+    if (title === "Wallets") addCheckoutProbe(page, main);
     addViewAction(page, header, title);
 
     const walletDirectory = main.querySelector(".wallet-directory");
@@ -1266,6 +1355,7 @@
     for (const emptyNav of main.querySelectorAll("nav:not(:has(a))")) emptyNav.remove();
     document.body.replaceChildren(document.importNode(main, true));
     enableNetworksSorting();
+    enableCheckoutProbe();
     selectReceiveWallet(requestedHash);
     reportSize();
   };
