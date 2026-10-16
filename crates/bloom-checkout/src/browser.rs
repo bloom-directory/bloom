@@ -1,4 +1,5 @@
 use crate::cdp::Cdp;
+use crate::extension::ExtensionLink;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use std::{
@@ -37,6 +38,9 @@ pub struct Browser {
     fixture_payment_hosts: bool,
     /// Unlocked traveler values and their placeholders, removed from snapshots.
     redactions: std::sync::RwLock<Vec<(String, String)>>,
+    /// While the Bloom extension is connected, browsing happens in one tab of
+    /// the person's own browser instead of checkout's Chromium.
+    extension: std::sync::RwLock<Option<Arc<ExtensionLink>>>,
 }
 
 /// Private checkout access exists only after the public API has drained.
@@ -95,13 +99,29 @@ impl Browser {
             fixture_payment_hosts,
             revoked: AtomicBool::new(false),
             redactions: std::sync::RwLock::new(Vec::new()),
+            extension: std::sync::RwLock::new(None),
         }))
+    }
+
+    pub(crate) fn attach_extension(&self, link: Arc<ExtensionLink>) {
+        *self.extension.write().unwrap() = Some(link);
+    }
+
+    pub(crate) fn detach_extension(&self, link: &Arc<ExtensionLink>) {
+        let mut current = self.extension.write().unwrap();
+        if current.as_ref().is_some_and(|c| Arc::ptr_eq(c, link)) {
+            *current = None;
+        }
     }
 
     pub async fn browse(&self, request: BrowseRequest) -> Result<Value> {
         self.available()?;
         let mut tab = self.tab.lock().await;
         self.available()?;
+        let extension = self.extension.read().unwrap().clone();
+        if let Some(link) = extension {
+            return self.browse_extension(&link, &mut tab, request).await;
+        }
         match request {
             BrowseRequest::Open { url } => {
                 let parsed = url::Url::parse(&url).context("Invalid browsing URL")?;
@@ -211,6 +231,116 @@ impl Browser {
                 bail!("Unlock a saved traveler first")
             }
         }
+    }
+
+    /// The same actions, in the person's browser. Refs carry the extension
+    /// snapshot's element index; the extension restricts sites itself too.
+    async fn browse_extension(
+        &self,
+        link: &ExtensionLink,
+        tab: &mut Tab,
+        request: BrowseRequest,
+    ) -> Result<Value> {
+        let invalidate = |tab: &mut Tab| {
+            tab.refs.clear();
+            tab.generation += 1;
+        };
+        match request {
+            BrowseRequest::Open { url } => {
+                let parsed = url::Url::parse(&url).context("Invalid browsing URL")?;
+                if parsed.scheme() != "https"
+                    || !parsed.username().is_empty()
+                    || parsed.password().is_some()
+                {
+                    bail!("Only ordinary HTTPS booking URLs are supported in your browser");
+                }
+                link.call(json!({"action":"open","url":url})).await?;
+                invalidate(tab);
+                Ok(json!({"state":"opened"}))
+            }
+            BrowseRequest::Snapshot => {
+                let snapshot = link.call(json!({"action":"snapshot"})).await?;
+                invalidate(tab);
+                let origin = url::Url::parse(snapshot["url"].as_str().unwrap_or(""))
+                    .map(|u| u.origin().ascii_serialization())
+                    .unwrap_or_default();
+                let mut elements = Vec::new();
+                for (index, element) in snapshot["elements"]
+                    .as_array()
+                    .context("Missing shopping elements")?
+                    .iter()
+                    .take(300)
+                    .enumerate()
+                {
+                    let mut element = element.clone();
+                    element["ref"] = json!(format!("{}:{}", tab.generation, tab.refs.len()));
+                    element["frame_origin"] = json!(origin);
+                    tab.refs.push(ElementRef {
+                        session: String::new(),
+                        world: 0,
+                        index,
+                    });
+                    elements.push(element);
+                }
+                let text: String = snapshot["text"]
+                    .as_str()
+                    .unwrap_or("")
+                    .chars()
+                    .take(30000)
+                    .collect();
+                self.redacted(json!({"url":snapshot["url"],"text":text,"elements":elements}))
+            }
+            BrowseRequest::Back => {
+                link.call(json!({"action":"back"})).await?;
+                invalidate(tab);
+                Ok(json!({"state":"navigated"}))
+            }
+            BrowseRequest::Click { element_ref } => {
+                self.act_extension(link, tab, &element_ref, "click", "")
+                    .await
+            }
+            BrowseRequest::Type { element_ref, text } => {
+                self.act_extension(link, tab, &element_ref, "type", &text)
+                    .await
+            }
+            BrowseRequest::Select { element_ref, value } => {
+                self.act_extension(link, tab, &element_ref, "select", &value)
+                    .await
+            }
+            BrowseRequest::FillTraveler | BrowseRequest::TypeTraveler { .. } => {
+                bail!("Saved travelers are not yet available in your browser")
+            }
+        }
+    }
+
+    async fn act_extension(
+        &self,
+        link: &ExtensionLink,
+        tab: &mut Tab,
+        reference: &str,
+        kind: &str,
+        value: &str,
+    ) -> Result<Value> {
+        let (generation, index) = reference
+            .split_once(':')
+            .context("Invalid element reference")?;
+        if generation.parse::<u64>()? != tab.generation {
+            bail!("Stale element reference; request a new snapshot");
+        }
+        if value.len() > 8192 {
+            bail!("Input exceeds limit");
+        }
+        let index = tab
+            .refs
+            .get(index.parse::<usize>()?)
+            .context("Stale element reference; request a new snapshot")?
+            .index;
+        // Every action invalidates refs, as in checkout's own browser.
+        tab.generation += 1;
+        link.call(json!({"action":kind,"index":index,"value":value}))
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}; request a new snapshot"))?;
+        Ok(json!({"state":"acted"}))
     }
 
     /// Replace each saved value, in any ASCII letter case, with its placeholder.
@@ -422,33 +552,10 @@ impl Browser {
         let index = binding.index;
         let world = binding.world;
         let expression = format!(
-            r#"(()=>{{const e=globalThis.__bloomRefs?.[{index}];
-            if(!e||!e.isConnected||e.disabled||e.getAttribute('aria-disabled')==='true'||!e.getClientRects().length)throw Error('stale');
-            const kind={kind},value={value};
-            const label=(e.innerText||e.value||e.getAttribute('aria-label')||'').replace(/\s+/g,' ').trim();
-            if(kind==='click' && /^(pay|place( your)? order|complete (purchase|booking)|confirm (and|&) pay|submit payment|buy now|request (uber|ride)|pagar|comprar ahora|finalizar (compra|pedido|reserva)|confirmar (compra|pedido|reserva)|confirmar y pagar|completar reserva|realizar (el )?pedido|jetzt (kaufen|bezahlen)|(zahlungspflichtig|kostenpflichtig) (bestellen|buchen)|buchung abschließen|payer|acheter maintenant|(valider|finaliser|confirmer) (la |ma )?(commande|réservation)|confirmer et payer|paga ora|compra ora|conferma (l'ordine|ordine|acquisto|e paga)|nu betalen|bestelling plaatsen|zapłać)(?![\p{{L}}\p{{N}}])/iu.test(label))throw Error('payment requires approval');
-            if(kind==='click')e.click();else{{
-                if((e.autocomplete||'').split(' ').some(s=>s.startsWith('cc-')))throw Error('private payment input');
-                if(kind==='select'&&e.tagName!=='SELECT')throw Error('wrong field');
-                if(kind==='type'&&!['INPUT','TEXTAREA'].includes(e.tagName))throw Error('wrong field');
-                if(kind==='type'){{
-                    // Native editing updates controlled inputs and fires their
-                    // input handlers. Bind focus and insertion in one renderer
-                    // call so navigation cannot redirect a later CDP insertion.
-                    e.focus();
-                    if(!e.isConnected||document.activeElement!==e||(e.autocomplete||'').split(' ').some(s=>s.startsWith('cc-')))throw Error('stale');
-                    e.select();
-                    if(!e.isConnected||document.activeElement!==e||(e.autocomplete||'').split(' ').some(s=>s.startsWith('cc-')))throw Error('stale');
-                    if(!document.execCommand('insertText',false,value))throw Error('input unsupported');
-                    e.dispatchEvent(new KeyboardEvent('keyup',{{key:value.slice(-1),bubbles:true}}));
-                }}else{{
-                    Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value').set.call(e,value);
-                    e.dispatchEvent(new Event('input',{{bubbles:true}}));
-                }}
-                e.dispatchEvent(new Event('change',{{bubbles:true}}));
-            }}return {{state:'acted'}};}})()"#,
-            kind = serde_json::to_string(kind)?,
-            value = serde_json::to_string(value)?
+            "({})({index},{},{})",
+            include_str!("act.js"),
+            serde_json::to_string(kind)?,
+            serde_json::to_string(value)?
         );
         let response = self
             .cdp

@@ -29,6 +29,7 @@ rusqlite.workspace = true
 phonenumber = "0.3"
 
 [dev-dependencies]
+sha2.workspace = true
 reqwest.workspace = true
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 tempfile.workspace = true

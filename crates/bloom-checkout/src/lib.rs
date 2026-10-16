@@ -2,6 +2,7 @@
 pub mod browser;
 mod cdp;
 mod discovery;
+pub mod extension;
 mod hpke;
 pub mod service;
 mod travelers;

@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "Bloom",
+  "version": "0.1.0",
+  "description": "Lets your Bloom agent book on approved airline sites in one tab of this browser. It never reads your other tabs.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAo5vtPmlBX8KbldiFG60upFHmpd6OwWgLLYXEZCkJ4ArpFqD/Kf8OTWcoUtOxJDGNcMlrAsI86cMQkeBBcxijgqD8/QJKTY/XAWPuvDWyFyynBmHA+7cnhCwAIB6dFl8JHbS7WRRR2hQXNRt2/hPk3+Gb3Ok9LYsq3ekV9evlgHXF5o8YGQm4h56uedxuOc5bMfsPWSteGOcUxDblJoTPIsGOwp9z4IJQGvZ4cuHlHGS+j2CDrC2BRqTRRKWN09YavyekVBBRykqJf2ycuzUPugg7dByGoftrTfJ6nLnNooOwN69rQOQasAlzRr2H1/UTiFO4TdrD2gekrskEDpmCqwIDAQAB",
+  "permissions": ["nativeMessaging", "alarms", "storage"],
+  "host_permissions": [
+    "https://*.aerolineas.com.ar/*",
+    "https://*.jetsmart.com/*",
+    "https://*.flybondi.com/*"
+  ],
+  "background": {"service_worker": "background.js"},
+  "content_scripts": [
+    {
+      "matches": [
+        "https://*.aerolineas.com.ar/*",
+        "https://*.jetsmart.com/*",
+        "https://*.flybondi.com/*"
+      ],
+      "js": ["page.js"]
+    }
+  ]
+}
