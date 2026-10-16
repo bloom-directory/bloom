@@ -266,6 +266,151 @@
     .bloom-widget .app-identity small { margin-top: 1px; font-size: 10px; }
     .bloom-widget .app-value { font-size: 15px; }
     .bloom-widget .position-list .app-position .position-evidence { margin-left: 37px; font-size: 10px; }
+    .bloom-widget .historical-disclosure {
+      margin-top: 22px;
+      border-top: 1px solid var(--rule);
+    }
+    .bloom-widget .historical-disclosure > summary {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 2px 10px;
+      min-height: 0;
+      padding: 12px 0;
+      list-style: none;
+      cursor: pointer;
+    }
+    .bloom-widget .historical-disclosure > summary::-webkit-details-marker { display: none; }
+    .bloom-widget .historical-disclosure > summary::after {
+      content: "+";
+      grid-column: 2;
+      grid-row: 1 / span 2;
+      align-self: center;
+      color: var(--accent);
+      font-size: 17px;
+    }
+    .bloom-widget .historical-disclosure[open] > summary::after { content: "−"; }
+    .bloom-widget .historical-disclosure-title { font-size: 13px; font-weight: 600; }
+    .bloom-widget .historical-disclosure-note { color: var(--muted); font-size: 9px; }
+    .bloom-widget .historical-disclosure-content { padding-bottom: 8px; }
+
+    /* Policy reads as rules first; evidence is available on demand. */
+    .bloom-widget .policy-wallet {
+      margin: 8px 0;
+      border: 1px solid var(--rule);
+      border-radius: 10px;
+      background: var(--surface);
+      overflow: hidden;
+    }
+    .bloom-widget .policy-wallet > summary {
+      display: grid;
+      grid-template-columns: 25px minmax(0, 1fr) auto 10px;
+      align-items: center;
+      gap: 2px 8px;
+      min-height: 0;
+      padding: 12px;
+      list-style: none;
+      cursor: pointer;
+    }
+    .bloom-widget .policy-wallet > summary::-webkit-details-marker { display: none; }
+    .bloom-widget .policy-wallet > summary::after {
+      content: "+";
+      color: var(--accent);
+      font-size: 16px;
+    }
+    .bloom-widget .policy-wallet[open] > summary::after { content: "−"; }
+    .bloom-widget .policy-wallet-icon {
+      grid-row: 1 / span 2;
+      display: grid;
+      place-items: center;
+      width: 24px;
+      height: 24px;
+      border-radius: 50%;
+      background: var(--accent-tint);
+      font-size: 13px;
+    }
+    .bloom-widget .policy-wallet-name { font-size: 14px; font-weight: 650; }
+    .bloom-widget .policy-wallet-version { grid-column: 2; color: var(--muted); font-size: 9px; }
+    .bloom-widget .policy-wallet-count {
+      grid-column: 3;
+      grid-row: 1 / span 2;
+      color: var(--muted);
+      font-size: 9px;
+      text-align: right;
+    }
+    .bloom-widget .policy-wallet-body {
+      padding: 0 12px 12px;
+      border-top: 1px solid var(--rule);
+    }
+    .bloom-widget .policy-verdict {
+      display: flex;
+      gap: 7px;
+      margin: 0;
+      padding: 10px 0;
+      color: var(--ink-2);
+      font-size: 10px;
+      line-height: 1.4;
+    }
+    .bloom-widget .policy-verdict-icon { flex: 0 0 auto; font-size: 13px; }
+    .bloom-widget .policy-rules {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      border-block: 1px solid var(--rule);
+    }
+    .bloom-widget .policy-rule {
+      min-width: 0;
+      padding: 9px 7px;
+      border-right: 1px solid var(--rule);
+      border-bottom: 1px solid var(--rule);
+    }
+    .bloom-widget .policy-rule:nth-child(2n) { border-right: 0; }
+    .bloom-widget .policy-rule:nth-last-child(-n + 2) { border-bottom: 0; }
+    .bloom-widget .policy-rule-label {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      color: var(--muted);
+      font-size: 8px;
+    }
+    .bloom-widget .policy-rule-value {
+      display: block;
+      margin-top: 3px;
+      color: var(--ink);
+      font-size: 11px;
+      line-height: 1.25;
+    }
+    .bloom-widget .policy-destinations,
+    .bloom-widget .policy-safeguards { margin-top: 9px; }
+    .bloom-widget .policy-destinations > summary,
+    .bloom-widget .policy-safeguards > summary {
+      min-height: 0;
+      padding: 5px 0;
+      color: var(--ink-2);
+      font-size: 10px;
+      font-weight: 600;
+    }
+    .bloom-widget .policy-exceptions { gap: 5px; margin-top: 5px; }
+    .bloom-widget .policy-exception {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 2px 8px;
+      padding: 8px 9px;
+      border-radius: 7px;
+      background: var(--paper);
+    }
+    .bloom-widget .policy-exception > div { display: block; }
+    .bloom-widget .policy-exception .badge { display: none; }
+    .bloom-widget .policy-exception .asset-label { gap: 5px; font-size: 9px; }
+    .bloom-widget .policy-exception .asset-mark { width: 15px; height: 15px; flex-basis: 15px; }
+    .bloom-widget .policy-exception h3 { grid-column: 2; grid-row: 1; margin: 0; font-size: 9px; font-weight: 600; }
+    .bloom-widget .policy-exception code {
+      grid-column: 1 / -1;
+      overflow: hidden;
+      color: var(--muted);
+      font-size: 8px;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .bloom-widget .policy-safeguards p { margin: 3px 0 0; color: var(--muted); font-size: 9px; }
 
     /* Activity is a ledger, not a stack of dashboard cards. */
     .bloom-widget .outcome-overview {
@@ -736,6 +881,128 @@
     }
   };
 
+  const prepareHistoricalAccounts = (page, main) => {
+    const section = main.querySelector(":scope > .historical-accounts");
+    if (!section) return;
+    const heading = section.querySelector(":scope > .section-head");
+    const entries = [...section.querySelectorAll(":scope > .historical-account")];
+    const disclosure = page.createElement("details");
+    disclosure.className = "historical-disclosure";
+    const summary = page.createElement("summary");
+    const title = page.createElement("span");
+    title.className = "historical-disclosure-title";
+    title.textContent = `Historical accounts · ${entries.length}`;
+    const note = page.createElement("span");
+    note.className = "historical-disclosure-note";
+    note.textContent = heading?.querySelector("p")?.textContent?.trim() || "Not connected to a current wallet";
+    summary.append(title, note);
+    const content = page.createElement("div");
+    content.className = "historical-disclosure-content";
+    for (const child of [...section.children]) {
+      if (child !== heading) content.append(child);
+    }
+    disclosure.append(summary, content);
+    section.replaceWith(disclosure);
+  };
+
+  const preparePolicy = (page, main) => {
+    const icons = {
+      "Where it may send": "📍",
+      "Allowed app": "🧩",
+      "Amount cap": "💰",
+      "Approval window": "⏱",
+    };
+    const sections = [...main.querySelectorAll(":scope > section[id^='wallet-']")];
+    for (const section of sections) {
+      const head = section.querySelector(":scope > .section-head");
+      const name = head?.querySelector("h2")?.textContent?.trim() || "Wallet";
+      const version = head?.querySelector("p")?.textContent?.trim() || "Policy";
+      const exceptions = section.querySelector(":scope > .policy-exceptions");
+      const destinationCount = exceptions?.querySelectorAll(".policy-exception").length || 0;
+      const sourceSummary = section.querySelector(":scope > .policy-summary");
+      const sourceLimits = section.querySelector(":scope > .policy-limits");
+      const sourcePlain = section.querySelector(":scope > .policy-plain");
+
+      const wallet = page.createElement("details");
+      wallet.className = "policy-wallet";
+      wallet.setAttribute("name", "policy-wallet");
+      wallet.open = name === "main" || (sections.length === 1);
+      const summary = page.createElement("summary");
+      const shield = page.createElement("span");
+      shield.className = "policy-wallet-icon";
+      shield.setAttribute("aria-hidden", "true");
+      shield.textContent = "🛡️";
+      const walletName = page.createElement("span");
+      walletName.className = "policy-wallet-name";
+      walletName.textContent = name;
+      const walletVersion = page.createElement("span");
+      walletVersion.className = "policy-wallet-version";
+      walletVersion.textContent = version;
+      const count = page.createElement("span");
+      count.className = "policy-wallet-count";
+      count.textContent = destinationCount === 1 ? "1 destination" : `${destinationCount} destinations`;
+      summary.append(shield, walletName, walletVersion, count);
+
+      const body = page.createElement("div");
+      body.className = "policy-wallet-body";
+      const verdict = page.createElement("p");
+      verdict.className = "policy-verdict";
+      const verdictIcon = page.createElement("span");
+      verdictIcon.className = "policy-verdict-icon";
+      verdictIcon.setAttribute("aria-hidden", "true");
+      verdictIcon.textContent = destinationCount ? "✅" : "⛔";
+      const verdictText = page.createElement("span");
+      verdictText.textContent = destinationCount
+        ? "A transfer can proceed only when every rule below matches; approval is still required."
+        : "Sending is blocked because this policy lists no destination."
+      verdict.append(verdictIcon, verdictText);
+      body.append(verdict);
+
+      if (sourceLimits) {
+        const rules = page.createElement("div");
+        rules.className = "policy-rules";
+        for (const item of sourceLimits.querySelectorAll(":scope > div")) {
+          const labelText = item.querySelector("dt")?.textContent?.trim() || "Rule";
+          let valueText = item.querySelector("dd")?.textContent?.trim() || "Not specified";
+          if (labelText === "Amount cap" && valueText === "None expressed here") valueText = "Not specified";
+          const rule = page.createElement("div");
+          rule.className = "policy-rule";
+          const label = page.createElement("span");
+          label.className = "policy-rule-label";
+          label.textContent = `${icons[labelText] || "•"} ${labelText}`;
+          const value = page.createElement("strong");
+          value.className = "policy-rule-value";
+          value.textContent = valueText;
+          rule.append(label, value);
+          rules.append(rule);
+        }
+        body.append(rules);
+      }
+
+      if (exceptions) {
+        const destinations = page.createElement("details");
+        destinations.className = "policy-destinations";
+        const destinationSummary = page.createElement("summary");
+        destinationSummary.textContent = `📍 ${destinationCount} allowed ${destinationCount === 1 ? "destination" : "destinations"}`;
+        destinations.append(destinationSummary, exceptions);
+        body.append(destinations);
+      }
+      if (sourcePlain) {
+        const safeguards = page.createElement("details");
+        safeguards.className = "policy-safeguards";
+        const safeguardSummary = page.createElement("summary");
+        safeguardSummary.textContent = "🔒 Other safeguards";
+        safeguards.append(safeguardSummary, sourcePlain);
+        body.append(safeguards);
+      }
+      sourceSummary?.remove();
+      head?.remove();
+      sourceLimits?.remove();
+      wallet.append(summary, body);
+      section.replaceWith(wallet);
+    }
+  };
+
   const addViewAction = (page, header, title) => {
     const destinations = {
       Wallets: ["show_bloom_receive", "Receive", "↓"],
@@ -790,6 +1057,8 @@
     if (title === "Contacts") prepareContacts(main);
     if (title === "Receive") prepareReceive(page, main);
     prepareHoldingAccounts(page, main);
+    prepareHistoricalAccounts(page, main);
+    if (title === "Policy") preparePolicy(page, main);
     addViewAction(page, header, title);
 
     const walletDirectory = main.querySelector(".wallet-directory");
@@ -811,6 +1080,8 @@
       addDataStatus(page, header, [...main.querySelectorAll(":scope > .coverage-notice, :scope > details:not(.contacts-secondary), :scope > details.contacts-secondary:last-child")].filter((item) => item.textContent.includes("Excluded targets") || item.classList.contains("coverage-notice")));
     } else if (title === "Receive") {
       addDataStatus(page, header, [...main.querySelectorAll(":scope > .coverage-notice, :scope > .callout.warn")]);
+    } else if (title === "Policy") {
+      addDataStatus(page, header, [...main.querySelectorAll(":scope > .directory-note, :scope > .callout.warn")]);
     }
     main.prepend(header);
     for (const callout of main.querySelectorAll(".callout.warn")) {
