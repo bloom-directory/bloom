@@ -85,7 +85,7 @@ pub fn find(name: &str) -> Option<&'static ViewToolSpec> {
 
 impl ViewToolSpec {
     pub fn resource_uri(&self) -> String {
-        format!("ui://bloom/{}-v3.html", self.page.trim_end_matches(".html"))
+        format!("ui://bloom/{}-v4.html", self.page.trim_end_matches(".html"))
     }
 
     pub fn descriptor(&self) -> Value {
@@ -122,6 +122,7 @@ impl ViewToolSpec {
                     "visibility": ["model", "app"],
                 },
                 "openai/outputTemplate": resource_uri,
+                "openai/widgetAccessible": true,
             },
         })
     }
@@ -317,6 +318,7 @@ mod tests {
             app["_meta"]["openai/outputTemplate"],
             VIEW_TOOLS[0].resource_uri()
         );
+        assert_eq!(app["_meta"]["openai/widgetAccessible"], true);
         assert_eq!(app["annotations"]["readOnlyHint"], true);
     }
 

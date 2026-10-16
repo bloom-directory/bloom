@@ -1106,7 +1106,9 @@ mod tests {
         assert!(html.contains("--ink: var(--color-text-primary"));
         assert!(html.contains("page.querySelector(\"main\")"));
         assert!(html.contains("document.body.replaceChildren(document.importNode(main, true))"));
-        assert!(!html.contains("tools/call"));
+        assert!(html.contains("tools/call"));
+        assert!(html.contains("callableViewTools"));
+        assert!(!html.contains("vfs_write"));
         assert!(commands.calls.lock().unwrap().is_empty());
     }
 

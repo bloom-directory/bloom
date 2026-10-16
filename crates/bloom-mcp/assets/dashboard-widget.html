@@ -77,6 +77,24 @@
       font: 500 11px/1 var(--sans);
       letter-spacing: 0;
     }
+    .bloom-widget .widget-action {
+      margin-left: auto;
+      padding: 6px 10px;
+      border: 1px solid var(--rule-2);
+      border-radius: 999px;
+      color: var(--ink);
+      background: transparent;
+      font: 600 10px/1 var(--sans);
+      cursor: pointer;
+    }
+    .bloom-widget .widget-action:hover,
+    .bloom-widget .widget-action:focus-visible {
+      border-color: var(--accent);
+      color: var(--accent-deep);
+      outline: none;
+    }
+    .bloom-widget .widget-action[aria-busy="true"] { opacity: .55; cursor: progress; }
+    .bloom-widget .widget-action + .widget-data-status { margin-left: 0; }
     .bloom-widget .widget-data-status { position: relative; margin: 0 0 0 auto; padding: 0; border: 0; }
     .bloom-widget .widget-data-status > summary {
       display: grid;
@@ -233,6 +251,199 @@
     .bloom-widget .app-identity small { margin-top: 1px; font-size: 10px; }
     .bloom-widget .app-value { font-size: 15px; }
     .bloom-widget .position-list .app-position .position-evidence { margin-left: 37px; font-size: 10px; }
+
+    /* Activity is a ledger, not a stack of dashboard cards. */
+    .bloom-widget .outcome-overview {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 0;
+      margin: 0 0 12px;
+      border-block: 1px solid var(--rule);
+    }
+    .bloom-widget .outcome-overview > a {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 1px 6px;
+      align-items: baseline;
+      padding: 9px 8px;
+      border: 0;
+      border-right: 1px solid var(--rule);
+      border-radius: 0;
+      background: transparent;
+    }
+    .bloom-widget .outcome-overview > a:last-child { border-right: 0; }
+    .bloom-widget .outcome-overview .mini-outcome { display: none; }
+    .bloom-widget .outcome-overview strong { font-size: 18px; font-weight: 600; }
+    .bloom-widget .outcome-overview a > span:last-child {
+      grid-column: 1 / -1;
+      color: var(--muted);
+      font-size: 9px;
+      white-space: nowrap;
+    }
+    .bloom-widget .activity-index {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      margin: 0 0 5px;
+    }
+    .bloom-widget .activity-index h2 { margin: 0; font-size: 12px; }
+    .bloom-widget .activity-index p { margin: 0; color: var(--muted); font-size: 9px; }
+    .bloom-widget .activity-day {
+      margin: 11px 0 2px;
+      padding: 0 0 4px;
+      border-bottom: 1px solid var(--rule);
+    }
+    .bloom-widget .activity-day h3 { margin: 0; color: var(--muted); font-size: 10px; font-weight: 600; }
+    .bloom-widget .activity-ledger { border: 0; border-radius: 0; background: transparent; }
+    .bloom-widget .activity-row {
+      display: grid;
+      grid-template-columns: 18px minmax(0, 1fr);
+      gap: 7px;
+      padding: 9px 2px;
+      border: 0;
+      border-bottom: 1px solid var(--rule);
+      background: transparent !important;
+    }
+    .bloom-widget .activity-row.status-failed,
+    .bloom-widget .activity-row.status-pending { border-left: 0; }
+    .bloom-widget .outcome-symbol {
+      width: 17px;
+      height: 17px;
+      border-width: 1px;
+      font-size: 10px;
+    }
+    .bloom-widget .activity-description h3 {
+      margin: 0;
+      font-size: 12px;
+      line-height: 1.35;
+    }
+    .bloom-widget .activity-meta { gap: 3px 8px; margin-top: 3px; }
+    .bloom-widget .activity-meta > span { font-size: 9px; }
+    .bloom-widget .activity-meta .asset-mark { width: 13px; height: 13px; flex-basis: 13px; }
+    .bloom-widget .activity-description > details { display: inline-block; margin: 3px 10px 0 0; }
+    .bloom-widget .activity-description > details > summary {
+      min-height: 0;
+      padding: 2px 0;
+      color: var(--muted);
+      font-size: 9px;
+    }
+    .bloom-widget .activity-description > details > dl { margin-top: 6px; }
+    .bloom-widget .activity-outcome { display: none; }
+
+    /* Contacts prioritize people and frequency; raw evidence stays disclosed. */
+    .bloom-widget .contacts-section { margin-top: 0; }
+    .bloom-widget .contacts-section + .contacts-section { margin-top: 14px; }
+    .bloom-widget .contacts-section > .section-head { margin-bottom: 3px; }
+    .bloom-widget .contacts-section > .section-head h2 { margin: 0; font-size: 13px; }
+    .bloom-widget .contacts-section > .section-head p { margin: 0; font-size: 9px; }
+    .bloom-widget .contact-list { border-block: 1px solid var(--rule); }
+    .bloom-widget .contact-row {
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 2px 10px;
+      padding: 10px 0;
+    }
+    .bloom-widget .contact-row .badge { display: none; }
+    .bloom-widget .contact-row h3 { margin: 0; font: 600 12px/1.3 var(--mono); }
+    .bloom-widget .contact-row p { margin: 1px 0 0; font-size: 9px; }
+    .bloom-widget .contact-stats {
+      display: flex;
+      align-items: baseline;
+      gap: 3px;
+      text-align: right;
+      white-space: nowrap;
+    }
+    .bloom-widget .contact-stats span { font-size: 9px; }
+    .bloom-widget .contact-stats span:first-child { color: var(--ink); font-size: 10px; font-weight: 600; }
+    .bloom-widget .contact-row details { margin-top: 2px; }
+    .bloom-widget .contact-row details > summary { min-height: 0; padding: 2px 0; font-size: 9px; }
+    .bloom-widget .contact-row code { font-size: 9px; }
+    .bloom-widget .contacts-secondary { margin-top: 10px; }
+    .bloom-widget .contacts-secondary > summary { min-height: 30px; padding: 5px 0; font-size: 10px; }
+
+    /* Receive presents one scannable address at a time. */
+    .bloom-widget .receiving-wallet {
+      margin: 7px 0;
+      border-radius: 10px;
+    }
+    .bloom-widget .receiving-wallet > summary { gap: 8px; min-height: 0; padding: 11px 12px; }
+    .bloom-widget .receiving-wallet > summary::after { font-size: 17px; }
+    .bloom-widget .wallet-identity strong { font-size: 13px; }
+    .bloom-widget .wallet-identity small { margin-top: 0; font-size: 9px; }
+    .bloom-widget .wallet-count { margin-left: auto; font-size: 9px; }
+    .bloom-widget .receiving-wallet .grid {
+      display: block;
+      margin: 0;
+      padding: 10px 12px 13px;
+      background: transparent;
+    }
+    .bloom-widget .receive-address-tabs {
+      display: flex;
+      gap: 5px;
+      margin-bottom: 10px;
+      overflow-x: auto;
+      scrollbar-width: none;
+    }
+    .bloom-widget .receive-address-tabs::-webkit-scrollbar { display: none; }
+    .bloom-widget .receive-address-tab {
+      flex: 0 0 auto;
+      padding: 5px 8px;
+      border: 1px solid var(--rule);
+      border-radius: 999px;
+      color: var(--muted);
+      background: transparent;
+      font: 500 9px/1 var(--sans);
+      cursor: pointer;
+    }
+    .bloom-widget .receive-address-tab[aria-selected="true"] {
+      border-color: var(--accent);
+      color: var(--accent-deep);
+      background: var(--accent-tint);
+    }
+    .bloom-widget .receiving-card {
+      display: flex;
+      align-items: center;
+      padding: 0;
+      border: 0;
+      background: transparent;
+      box-shadow: none;
+      text-align: center;
+    }
+    .bloom-widget .receiving-card[hidden] { display: none; }
+    .bloom-widget .receiving-card > h3 { margin: 0 0 8px; font-size: 12px; }
+    .bloom-widget .receiving-card .asset-mark { width: 18px; height: 18px; flex-basis: 18px; }
+    .bloom-widget .receiving-qr { margin: 0; }
+    .bloom-widget .receiving-qr > div { padding: 9px; border: 0; border-radius: 10px; }
+    .bloom-widget .receiving-qr svg,
+    .bloom-widget .receiving-qr img { width: min(158px, 62vw); }
+    .bloom-widget .receive-address-line {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 6px;
+      width: min(250px, 100%);
+      margin-top: 9px;
+    }
+    .bloom-widget .receive-address-line .address {
+      min-width: 0;
+      padding: 7px 8px;
+      border-radius: 7px;
+      background: var(--paper);
+      font-size: 9px;
+      line-height: 1.35;
+      overflow-wrap: anywhere;
+    }
+    .bloom-widget .copy-address {
+      align-self: stretch;
+      padding: 0 9px;
+      border: 1px solid var(--rule-2);
+      border-radius: 7px;
+      color: var(--ink);
+      background: transparent;
+      font: 600 9px/1 var(--sans);
+      cursor: pointer;
+    }
+    .bloom-widget .receiving-network,
+    .bloom-widget .receiving-network-list,
+    .bloom-widget .receiving-card > .external-link { display: none; }
     @media (max-width: 420px) {
       body.bloom-widget > main { padding: 15px 13px; }
       .bloom-widget .directory-row .wallet-worth > span { display: none; }
@@ -247,6 +458,7 @@
 
   const pending = new Map();
   const appliedHostVariables = new Set();
+  const callableViewTools = new Set(["show_bloom_wallets", "show_bloom_receive"]);
   let nextId = 0;
   let hostContext = {};
 
@@ -339,6 +551,137 @@
     if (wallet?.matches("details.receiving-wallet")) wallet.open = true;
   };
 
+  const noticeText = (notice) => {
+    const headingNode = notice.querySelector("summary, strong");
+    const heading = headingNode?.textContent?.trim() || "About this data";
+    const items = [...notice.querySelectorAll(":scope > p, :scope > ul > li")]
+      .map((item) => item.textContent.trim())
+      .filter(Boolean);
+    let detail = items.join(" ");
+    if (!detail) {
+      detail = notice.textContent.trim();
+      if (detail.startsWith(heading)) detail = detail.slice(heading.length).trim();
+    }
+    return detail ? `${heading} — ${detail}` : heading;
+  };
+
+  const addDataStatus = (page, header, notices) => {
+    const details = notices.map(noticeText).filter(Boolean);
+    notices.forEach((notice) => notice.remove());
+    if (!details.length) return;
+    const status = page.createElement("details");
+    status.className = "widget-data-status";
+    const summary = page.createElement("summary");
+    summary.textContent = "i";
+    summary.title = "Data details";
+    summary.setAttribute("aria-label", "Data details");
+    const panel = page.createElement("div");
+    panel.className = "widget-data-panel";
+    const panelTitle = page.createElement("strong");
+    panelTitle.textContent = "About this data";
+    panel.append(panelTitle);
+    for (const detail of details) {
+      const paragraph = page.createElement("p");
+      paragraph.textContent = detail;
+      panel.append(paragraph);
+    }
+    status.append(summary, panel);
+    header.append(status);
+  };
+
+  const prepareActivity = (main) => {
+    const overviewLabels = ["Sent", "Review", "Stopped"];
+    [...main.querySelectorAll(".outcome-overview > a > span:last-child")]
+      .forEach((label, index) => { if (overviewLabels[index]) label.textContent = overviewLabels[index]; });
+    const index = main.querySelector(".section-head#ledger");
+    if (index) index.classList.add("activity-index");
+    for (const day of main.querySelectorAll(".activity-ledger > .section-head")) day.classList.add("activity-day");
+    for (const meta of main.querySelectorAll(".activity-meta")) {
+      for (const item of [...meta.children]) {
+        const text = item.textContent.trim();
+        if (/^(evm|solana)-wallet$/i.test(text) || /^petal[:-]/i.test(text)) item.remove();
+        else if (/^\d{1,2} \w{3} \d{4} · /.test(text)) item.textContent = text.replace(/^\d{1,2} \w{3} \d{4} · /, "");
+      }
+    }
+  };
+
+  const prepareContacts = (main) => {
+    for (const section of main.querySelectorAll(":scope > section")) {
+      const heading = section.querySelector(":scope > .section-head h2")?.textContent?.trim();
+      if (!heading) continue;
+      if (heading === "Saved contacts" && section.querySelector(".empty-state")) {
+        section.remove();
+        continue;
+      }
+      section.classList.add("contacts-section");
+    }
+    for (const stats of main.querySelectorAll(".contact-stats")) {
+      const values = [...stats.querySelectorAll("span")];
+      if (values[0]) values[0].textContent = `${values[0].textContent.trim()} ·`;
+      if (values[1]) values[1].textContent = values[1].textContent.trim().replace(/^(\d{1,2} \w{3}).*$/, "$1");
+    }
+    for (const details of main.querySelectorAll(":scope > details")) details.classList.add("contacts-secondary");
+  };
+
+  const prepareReceive = (page, main) => {
+    const wallets = [...main.querySelectorAll(".receiving-wallet")];
+    const preferredWallet = wallets.find((wallet) => wallet.id === "wallet-main") || wallets[0];
+    if (preferredWallet) preferredWallet.open = true;
+    for (const wallet of wallets) {
+      const grid = wallet.querySelector(":scope > .grid");
+      if (!grid) continue;
+      grid.querySelectorAll(".receiving-unavailable").forEach((card) => card.remove());
+      const cards = [...grid.querySelectorAll(":scope > .receiving-card")].filter((card) => card.querySelector(".address"));
+      if (!cards.length) continue;
+      const tabs = page.createElement("div");
+      tabs.className = "receive-address-tabs";
+      tabs.setAttribute("role", "tablist");
+      cards.forEach((card, index) => {
+        const address = card.querySelector(".address");
+        const family = card.querySelector("h3")?.textContent?.trim() || `Address ${index + 1}`;
+        const suffix = address.textContent.trim().slice(-4);
+        const id = `${wallet.id}-address-${index}`;
+        card.id = id;
+        card.hidden = index !== 0;
+        const button = page.createElement("button");
+        button.type = "button";
+        button.className = "receive-address-tab";
+        button.dataset.receiveTarget = id;
+        button.setAttribute("role", "tab");
+        button.setAttribute("aria-controls", id);
+        button.setAttribute("aria-selected", String(index === 0));
+        button.textContent = `${family.replace("Ethereum & EVM", "EVM")} · ${suffix}`;
+        tabs.append(button);
+
+        const line = page.createElement("div");
+        line.className = "receive-address-line";
+        const copy = page.createElement("button");
+        copy.type = "button";
+        copy.className = "copy-address";
+        copy.dataset.copyAddress = address.textContent.trim();
+        copy.textContent = "Copy";
+        address.replaceWith(line);
+        line.append(address, copy);
+      });
+      grid.prepend(tabs);
+    }
+  };
+
+  const addViewAction = (page, header, title) => {
+    const destinations = {
+      Wallets: ["show_bloom_receive", "Receive"],
+      Receive: ["show_bloom_wallets", "Wallets"],
+    };
+    const destination = destinations[title];
+    if (!destination) return;
+    const button = page.createElement("button");
+    button.type = "button";
+    button.className = "widget-action";
+    button.dataset.viewTool = destination[0];
+    button.textContent = destination[1];
+    header.append(button);
+  };
+
   const render = (result, requestedHash = "") => {
     const payload = result?._meta?.["bloom/view"];
     if (!payload?.html) return;
@@ -368,52 +711,30 @@
     viewTitle.textContent = title;
     header.append(brand, viewTitle);
 
+    if (title === "Activity") prepareActivity(main);
+    if (title === "Contacts") prepareContacts(main);
+    if (title === "Receive") prepareReceive(page, main);
+    addViewAction(page, header, title);
+
     const walletDirectory = main.querySelector(".wallet-directory");
     if (walletDirectory?.querySelector(".directory-entry")) {
-      const noticeText = (notice) => {
-        const headingNode = notice.querySelector("summary, strong");
-        const heading = headingNode?.textContent?.trim() || "About these balances";
-        const items = [...notice.querySelectorAll(":scope > p, :scope > ul > li")]
-          .map((item) => item.textContent.trim())
-          .filter(Boolean);
-        let detail = items.join(" ");
-        if (!detail) {
-          detail = notice.textContent.trim();
-          if (detail.startsWith(heading)) detail = detail.slice(heading.length).trim();
-        }
-        return detail ? `${heading} — ${detail}` : heading;
-      };
       const notices = [...main.querySelectorAll(
         ":scope > .coverage-notice, :scope > .callout, :scope > .directory-note"
       )];
-      const details = notices.map(noticeText);
-      notices.forEach((notice) => notice.remove());
 
       const count = main.querySelector(".inventory-summary > div:first-child strong");
       if (count) count.textContent = count.textContent.replace(/ loaded$/, "");
       const balanceLabel = main.querySelector(".inventory-value span");
       if (balanceLabel) balanceLabel.textContent = balanceLabel.textContent.replace(/\s*·\s*partial$/, "");
 
-      if (details.length) {
-        const status = page.createElement("details");
-        status.className = "widget-data-status";
-        const summary = page.createElement("summary");
-        summary.textContent = "i";
-        summary.title = "Data coverage details";
-        summary.setAttribute("aria-label", "Data coverage details");
-        const panel = page.createElement("div");
-        panel.className = "widget-data-panel";
-        const panelTitle = page.createElement("strong");
-        panelTitle.textContent = "Data coverage";
-        panel.append(panelTitle);
-        for (const detail of details) {
-          const paragraph = page.createElement("p");
-          paragraph.textContent = detail;
-          panel.append(paragraph);
-        }
-        status.append(summary, panel);
-        header.append(status);
-      }
+      addDataStatus(page, header, notices);
+    }
+    if (title === "Activity") {
+      addDataStatus(page, header, [...main.querySelectorAll(":scope > .coverage-notice, :scope > p.coverage")]);
+    } else if (title === "Contacts") {
+      addDataStatus(page, header, [...main.querySelectorAll(":scope > .coverage-notice, :scope > details:not(.contacts-secondary), :scope > details.contacts-secondary:last-child")].filter((item) => item.textContent.includes("Excluded targets") || item.classList.contains("coverage-notice")));
+    } else if (title === "Receive") {
+      addDataStatus(page, header, [...main.querySelectorAll(":scope > .coverage-notice, :scope > .callout.warn")]);
     }
     main.prepend(header);
     for (const callout of main.querySelectorAll(".callout.warn")) {
@@ -449,6 +770,49 @@
   };
 
   document.addEventListener("click", async (event) => {
+    const viewButton = event.target.closest("button[data-view-tool]");
+    if (viewButton) {
+      if (!callableViewTools.has(viewButton.dataset.viewTool)) return;
+      viewButton.setAttribute("aria-busy", "true");
+      try {
+        const result = await send("tools/call", { name: viewButton.dataset.viewTool, arguments: {} });
+        render(result);
+      } catch (error) {
+        viewButton.removeAttribute("aria-busy");
+        console.error("Opening Bloom view failed", error);
+      }
+      return;
+    }
+    const receiveTab = event.target.closest("button[data-receive-target]");
+    if (receiveTab) {
+      const wallet = receiveTab.closest(".receiving-wallet");
+      wallet.querySelectorAll(".receive-address-tab").forEach((button) => button.setAttribute("aria-selected", String(button === receiveTab)));
+      wallet.querySelectorAll(".receiving-card").forEach((card) => { card.hidden = card.id !== receiveTab.dataset.receiveTarget; });
+      reportSize();
+      return;
+    }
+    const copyButton = event.target.closest("button[data-copy-address]");
+    if (copyButton) {
+      try {
+        if (navigator.clipboard?.writeText) {
+          await navigator.clipboard.writeText(copyButton.dataset.copyAddress);
+        } else {
+          const input = document.createElement("textarea");
+          input.value = copyButton.dataset.copyAddress;
+          input.style.position = "fixed";
+          input.style.opacity = "0";
+          document.body.append(input);
+          input.select();
+          document.execCommand("copy");
+          input.remove();
+        }
+        copyButton.textContent = "Copied";
+        setTimeout(() => { copyButton.textContent = "Copy"; }, 1400);
+      } catch (error) {
+        console.error("Copying address failed", error);
+      }
+      return;
+    }
     const anchor = event.target.closest("a[href]");
     if (!anchor) return;
     const raw = anchor.getAttribute("href");
