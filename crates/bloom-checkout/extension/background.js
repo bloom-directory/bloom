@@ -13,7 +13,8 @@ function connect() {
       .then(value => ({ok: true, value}), error => ({ok: false, error: String(error.message || error)}))
       .then(result => port?.postMessage({id: command.id, ...result}));
   });
-  port.onDisconnect.addListener(() => { port = null; });
+  // Checkout restarted or stopped; the alarm reconnects. Reading lastError marks it handled.
+  port.onDisconnect.addListener(() => { void chrome.runtime.lastError; port = null; });
 }
 
 async function bloomTab() {
@@ -23,6 +24,9 @@ async function bloomTab() {
 }
 
 async function run(command) {
+  // Checkout updated the extension's files: load them (unpacked installs).
+  if (command.action === 'version') return BLOOM_VERSION;
+  if (command.action === 'reload') { setTimeout(() => chrome.runtime.reload(), 100); return {state: 'reloading'}; }
   if (command.action === 'open') {
     if (!SITES.test(command.url)) throw Error('Bloom only opens approved booking sites in this browser');
     let tab = await bloomTab();
@@ -35,9 +39,12 @@ async function run(command) {
   // The person may have navigated this tab elsewhere; never act there.
   if (!SITES.test(tab.url || '')) throw Error('The Bloom tab is not on an approved booking site');
   if (command.action === 'back') { await chrome.tabs.goBack(tab.id); return {state: 'navigated'}; }
+  if (command.action === 'location') return {url: tab.url};
+  // Filling waits inside the page, and Chrome slows timers in background tabs.
+  const limit = command.action.startsWith('traveler_') || command.action === 'type_traveler' ? 300000 : 60000;
   const reply = await Promise.race([
     chrome.tabs.sendMessage(tab.id, command, {frameId: 0}),
-    new Promise((_, fail) => setTimeout(() => fail(Error('The page did not answer')), 60000)),
+    new Promise((_, fail) => setTimeout(() => fail(Error('The page did not answer')), limit)),
   ]);
   if (!reply || reply.error) throw Error(reply?.error || 'The page did not answer');
   return reply.value;

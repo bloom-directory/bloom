@@ -46,6 +46,99 @@ async fn evaluate(
     Ok(response["result"]["value"].clone())
 }
 
+/// The fields the page asks for that the saved traveler has, bound to the
+/// document the discovery script marked with `binding`.
+fn scope_of(
+    result: &Value,
+    available: &[TravelerField],
+    binding: Digest32,
+) -> Result<(TravelerFillScope, Value)> {
+    let origin = result["origin"]
+        .as_str()
+        .context("Traveler origin unavailable")?
+        .to_owned();
+    #[derive(Deserialize)]
+    struct Mapping {
+        field: TravelerField,
+    }
+    let mapped: Vec<Value> = result["mapped"]
+        .as_array()
+        .context("Traveler fields unavailable")?
+        .iter()
+        .filter(|m| {
+            serde_json::from_value::<Mapping>((*m).clone())
+                .is_ok_and(|m| available.contains(&m.field))
+        })
+        .cloned()
+        .collect();
+    let mut fields = Vec::new();
+    for m in &mapped {
+        let m: Mapping = serde_json::from_value(m.clone())?;
+        if !fields.contains(&m.field) {
+            fields.push(m.field);
+        }
+    }
+    let scope = TravelerFillScope {
+        origin: origin.clone(),
+        frame_origins: vec![origin],
+        document_binding: binding,
+        fields,
+    };
+    scope
+        .validate()
+        .map_err(|_| anyhow::anyhow!("No supported traveler fields on a secure booking page"))?;
+    Ok((scope, json!(mapped)))
+}
+
+/// The same discovery and fill, in the person's browser through the Bloom
+/// extension. Values go to the page for the unlocked origin only.
+pub(crate) async fn fill_in_extension(
+    link: &crate::extension::ExtensionLink,
+    origin: &str,
+    available: &[TravelerField],
+    values: &BTreeMap<String, Zeroizing<String>>,
+) -> Result<Vec<String>> {
+    use rand::RngCore;
+    let mut nonce = [0; 32];
+    rand::thread_rng().fill_bytes(&mut nonce);
+    let binding = Digest32::from_bytes(nonce);
+    let result = link
+        .call(json!({"action":"traveler_discover","nonce":binding.as_str()}))
+        .await?;
+    let (scope, mapped) = scope_of(&result, available, binding.clone())?;
+    if scope.origin != origin {
+        bail!("Saved traveler details are unlocked for another website");
+    }
+    let names: Vec<String> = scope
+        .fields
+        .iter()
+        .filter_map(|f| serde_json::to_value(f).ok()?.as_str().map(str::to_owned))
+        .collect();
+    let wanted: BTreeMap<_, _> = names
+        .iter()
+        .filter_map(|f| values.get(f).map(|v| (f.clone(), v.clone())))
+        .collect();
+    let result = link
+        .call_within(
+            json!({"action":"traveler_fill","nonce":binding.as_str(),"origin":origin,
+                "mapped":mapped,"values":wanted}),
+            std::time::Duration::from_secs(300),
+        )
+        .await?;
+    for skipped in result["skipped"].as_array().into_iter().flatten() {
+        eprintln!(
+            "traveler field left for the agent: {}",
+            skipped.as_str().unwrap_or("")
+        );
+    }
+    let filled: Vec<String> =
+        serde_json::from_value(result["filled"].clone()).context("Traveler fill incomplete")?;
+    if filled.iter().any(|f| !names.contains(f)) {
+        bail!("Traveler fill incomplete");
+    }
+    Ok(filled)
+}
+
 impl TravelerDiscovery {
     pub async fn read(tab: &PrivateTab, available: &[TravelerField]) -> Result<Self> {
         use rand::RngCore;
@@ -66,45 +159,12 @@ impl TravelerDiscovery {
             include_str!("traveler-discover.js")
         );
         let result = evaluate(tab, &root.session, root.world, expression).await?;
-        let origin = result["origin"]
-            .as_str()
-            .context("Traveler origin unavailable")?
-            .to_owned();
-        #[derive(Deserialize)]
-        struct Mapping {
-            field: TravelerField,
-        }
-        let mapped: Vec<Value> = result["mapped"]
-            .as_array()
-            .context("Traveler fields unavailable")?
-            .iter()
-            .filter(|m| {
-                serde_json::from_value::<Mapping>((*m).clone())
-                    .is_ok_and(|m| available.contains(&m.field))
-            })
-            .cloned()
-            .collect();
-        let mut fields = Vec::new();
-        for m in &mapped {
-            let m: Mapping = serde_json::from_value(m.clone())?;
-            if !fields.contains(&m.field) {
-                fields.push(m.field);
-            }
-        }
-        let scope = TravelerFillScope {
-            origin: origin.clone(),
-            frame_origins: vec![origin],
-            document_binding: binding,
-            fields,
-        };
-        scope.validate().map_err(|_| {
-            anyhow::anyhow!("No supported traveler fields on a secure booking page")
-        })?;
+        let (scope, mapped) = scope_of(&result, available, binding)?;
         Ok(Self {
             scope,
             session: root.session.clone(),
             world: root.world,
-            mapped: json!(mapped),
+            mapped,
         })
     }
     pub fn field_names(&self) -> Vec<String> {

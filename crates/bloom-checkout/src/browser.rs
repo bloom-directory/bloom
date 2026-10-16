@@ -406,6 +406,10 @@ impl Browser {
     }
 
     pub(crate) async fn shopping_origin(&self) -> Result<String> {
+        let extension = self.extension.read().unwrap().clone();
+        if let Some(link) = extension {
+            return self.shopping_origin_of(&link).await;
+        }
         let tab = self.tab.lock().await;
         let info = self
             .cdp
@@ -413,6 +417,13 @@ impl Browser {
             .await?;
         let url = url::Url::parse(info["targetInfo"]["url"].as_str().unwrap_or(""))?;
         Ok(url.origin().ascii_serialization())
+    }
+
+    async fn shopping_origin_of(&self, link: &ExtensionLink) -> Result<String> {
+        let location = link.call(json!({"action":"location"})).await?;
+        Ok(url::Url::parse(location["url"].as_str().unwrap_or(""))?
+            .origin()
+            .ascii_serialization())
     }
 
     /// Choose a saved traveler value in a list the agent picked (a select or a
@@ -438,6 +449,28 @@ impl Browser {
             .clone();
         tab.refs.clear();
         tab.generation += 1;
+        let extension = self.extension.read().unwrap().clone();
+        if let Some(link) = extension {
+            let origin = self.shopping_origin_of(&link).await?;
+            link.call(json!({"action":"open_list","index":binding.index}))
+                .await?;
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            let result = link
+                .call_within(
+                    json!({"action":"type_traveler","index":binding.index,"field":field,"value":value,"origin":origin}),
+                    std::time::Duration::from_secs(300),
+                )
+                .await?;
+            if !result["filled"]
+                .as_array()
+                .is_some_and(|f| f.iter().any(|f| f == field))
+            {
+                bail!(
+                    "That list did not take the saved value; choose it yourself in the Bloom tab"
+                );
+            }
+            return Ok(());
+        }
         // Open the list the way a shopping click does: synchronously, with a
         // user gesture. Some lists ignore clicks from later script turns.
         let open = format!(
@@ -513,6 +546,12 @@ impl Browser {
     ) -> Result<Vec<String>> {
         self.available()?;
         let mut tab = self.tab.lock().await;
+        let extension = self.extension.read().unwrap().clone();
+        if let Some(link) = extension {
+            tab.refs.clear();
+            tab.generation += 1;
+            return crate::travelers::fill_in_extension(&link, origin, fields, values).await;
+        }
         let view = PrivateTab {
             cdp: self.cdp.clone(),
             session: tab.session.clone(),

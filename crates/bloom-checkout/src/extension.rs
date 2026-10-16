@@ -30,7 +30,12 @@ pub struct ExtensionLink {
 }
 
 impl ExtensionLink {
-    pub async fn call(&self, mut command: Value) -> Result<Value> {
+    pub async fn call(&self, command: Value) -> Result<Value> {
+        self.call_within(command, Duration::from_secs(90)).await
+    }
+
+    pub async fn call_within(&self, mut command: Value, limit: Duration) -> Result<Value> {
+        let command_name = command["action"].as_str().unwrap_or("?").to_owned();
         let id = self.next.fetch_add(1, Ordering::SeqCst);
         command["id"] = json!(id);
         let (reply, answer) = oneshot::channel();
@@ -38,18 +43,22 @@ impl ExtensionLink {
         self.commands
             .send(serde_json::to_string(&command)?)
             .map_err(|_| anyhow::anyhow!("The Bloom extension disconnected"))?;
-        let result = tokio::time::timeout(Duration::from_secs(90), answer).await;
+        let result = tokio::time::timeout(limit, answer).await;
         self.pending.lock().await.remove(&id);
         let result = result
             .context("The Bloom extension did not answer")?
             .context("The Bloom extension disconnected")?;
         if result["ok"] != true {
-            bail!(
-                "{}",
-                result["error"]
-                    .as_str()
-                    .unwrap_or("The Bloom extension refused")
+            let error = result["error"]
+                .as_str()
+                .unwrap_or("The Bloom extension refused");
+            // The extension's own fixed messages, for diagnosing the link.
+            eprintln!(
+                "extension {}: {}",
+                command_name,
+                error.chars().take(160).collect::<String>()
             );
+            bail!("{error}");
         }
         Ok(result["value"].clone())
     }
@@ -74,6 +83,13 @@ pub async fn serve_extension(path: &Path, browser: Arc<Browser>) -> Result<()> {
             next: AtomicU64::new(1),
         });
         browser.attach_extension(link.clone());
+        // An extension older than the installed files reloads them.
+        let checked = link.clone();
+        tokio::spawn(async move {
+            if checked.call(json!({"action":"version"})).await.ok() != Some(json!(version())) {
+                let _ = checked.call(json!({"action":"reload"})).await;
+            }
+        });
         tokio::spawn(async move {
             while let Some(line) = outgoing.recv().await {
                 if writer
@@ -147,11 +163,14 @@ pub fn relay(socket: &Path) -> Result<()> {
 /// both browsers run the same code.
 pub fn bundle() -> Vec<(&'static str, String)> {
     let page = format!(
-        "const BLOOM_SCRIPTS = {{\n  snapshot: () => {},\n  act: {},\n}};\n{}",
+        "const BLOOM_SCRIPTS = (() => {{\n  // Chrome slows timers in background tabs to a second or more; page\n  // scripts wait in short steps, so they use message-loop timers instead.\n  const setTimeout = (done, ms = 0) => {{ const end = performance.now() + ms; const channel = new MessageChannel(); channel.port1.onmessage = () => performance.now() >= end ? done() : channel.port2.postMessage(0); channel.port2.postMessage(0); }};\n  return {{\n  snapshot: () => {},\n  act: {},\n  travelerDiscover: nonce => {{ globalThis.__bloomTravelerNonce = nonce; return {}; }},\n  travelerFill: (nonce, origin, mapped, values) => {},\n}};\n}})();\n{}",
         include_str!("snapshot.js").trim(),
         include_str!("act.js").trim(),
+        include_str!("traveler-discover.js").trim(),
+        include_str!("traveler-fill.js").trim(),
         include_str!("../extension/page.js")
     );
+    let background = include_str!("../extension/background.js");
     vec![
         (
             "manifest.json",
@@ -159,10 +178,29 @@ pub fn bundle() -> Vec<(&'static str, String)> {
         ),
         (
             "background.js",
-            include_str!("../extension/background.js").into(),
+            format!("const BLOOM_VERSION = '{}';\n{background}", version()),
         ),
         ("page.js", page),
     ]
+}
+
+/// Changes whenever the extension's files change, so checkout can tell the
+/// installed extension to reload itself after an update.
+pub fn version() -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::hash::DefaultHasher::new();
+    for part in [
+        include_str!("../extension/manifest.json"),
+        include_str!("../extension/background.js"),
+        include_str!("../extension/page.js"),
+        include_str!("snapshot.js"),
+        include_str!("act.js"),
+        include_str!("traveler-discover.js"),
+        include_str!("traveler-fill.js"),
+    ] {
+        part.hash(&mut hasher);
+    }
+    format!("{:016x}", hasher.finish())
 }
 
 /// Native messaging manifest naming `host` (an executable) for the extension.
