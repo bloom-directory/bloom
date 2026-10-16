@@ -98,43 +98,62 @@ pub(crate) async fn fill_in_extension(
     available: &[TravelerField],
     values: &BTreeMap<String, Zeroizing<String>>,
 ) -> Result<Vec<String>> {
-    use rand::RngCore;
-    let mut nonce = [0; 32];
-    rand::thread_rng().fill_bytes(&mut nonce);
-    let binding = Digest32::from_bytes(nonce);
-    let result = link
-        .call(json!({"action":"traveler_discover","nonce":binding.as_str()}))
-        .await?;
-    let (scope, mapped) = scope_of(&result, available, binding.clone())?;
-    if scope.origin != origin {
-        bail!("Saved traveler details are unlocked for another website");
-    }
-    let names: Vec<String> = scope
-        .fields
-        .iter()
-        .filter_map(|f| serde_json::to_value(f).ok()?.as_str().map(str::to_owned))
-        .collect();
-    let wanted: BTreeMap<_, _> = names
-        .iter()
-        .filter_map(|f| values.get(f).map(|v| (f.clone(), v.clone())))
-        .collect();
-    let result = link
-        .call_within(
-            json!({"action":"traveler_fill","nonce":binding.as_str(),"origin":origin,
-                "mapped":mapped,"values":wanted}),
-            std::time::Duration::from_secs(300),
-        )
-        .await?;
-    for skipped in result["skipped"].as_array().into_iter().flatten() {
-        eprintln!(
-            "traveler field left for the agent: {}",
-            skipped.as_str().unwrap_or("")
-        );
-    }
-    let filled: Vec<String> =
-        serde_json::from_value(result["filled"].clone()).context("Traveler fill incomplete")?;
-    if filled.iter().any(|f| !names.contains(f)) {
-        bail!("Traveler fill incomplete");
+    let mut filled = Vec::new();
+    // A choice can reveal dependent fields, such as document expiry after the
+    // document kind. One bounded rediscovery fills those without an agent retry.
+    for pass in 0..2 {
+        use rand::RngCore;
+        let mut nonce = [0; 32];
+        rand::thread_rng().fill_bytes(&mut nonce);
+        let binding = Digest32::from_bytes(nonce);
+        let result = match link
+            .call(json!({"action":"traveler_discover","nonce":binding.as_str()}))
+            .await
+        {
+            Ok(result) => result,
+            Err(_) if pass > 0 => break,
+            Err(error) => return Err(error),
+        };
+        let (scope, mapped) = match scope_of(&result, available, binding.clone()) {
+            Ok(discovery) => discovery,
+            Err(_) if pass > 0 => break,
+            Err(error) => return Err(error),
+        };
+        if scope.origin != origin {
+            bail!("Saved traveler details are unlocked for another website");
+        }
+        let names: Vec<String> = scope
+            .fields
+            .iter()
+            .filter_map(|f| serde_json::to_value(f).ok()?.as_str().map(str::to_owned))
+            .collect();
+        let wanted: BTreeMap<_, _> = names
+            .iter()
+            .filter_map(|f| values.get(f).map(|v| (f.clone(), v.clone())))
+            .collect();
+        let result = link
+            .call_within(
+                json!({"action":"traveler_fill","nonce":binding.as_str(),"origin":origin,
+                    "mapped":mapped,"values":wanted}),
+                std::time::Duration::from_secs(300),
+            )
+            .await?;
+        for skipped in result["skipped"].as_array().into_iter().flatten() {
+            eprintln!(
+                "traveler field left for the agent: {}",
+                skipped.as_str().unwrap_or("")
+            );
+        }
+        let pass_filled: Vec<String> =
+            serde_json::from_value(result["filled"].clone()).context("Traveler fill incomplete")?;
+        if pass_filled.iter().any(|f| !names.contains(f)) {
+            bail!("Traveler fill incomplete");
+        }
+        for field in pass_filled {
+            if !filled.contains(&field) {
+                filled.push(field);
+            }
+        }
     }
     Ok(filled)
 }
@@ -448,6 +467,56 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(accepted, json!("accepted"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_choice_revealing_dependent_fields_is_filled_in_one_request() {
+        let (browser, server, url) = browser_at(
+            r#"<html lang='es'><label>Tipo de Documento<select id='kind'>
+              <option value=''>Seleccionar</option><option value='national_id'>DNI</option>
+            </select></label><div id='expiry' hidden>Fecha de Caducidad
+              <label>Día<input id='day' aria-label='Día de vencimiento' aria-autocomplete='list' readonly></label>
+              <label>Mes<input id='month' aria-label='Mes de vencimiento' aria-autocomplete='list' readonly></label>
+              <label>Año<input id='year' aria-label='Año de vencimiento' aria-autocomplete='list' readonly></label>
+            </div><div id='options' hidden></div><p id='accepted'></p>
+            <script>
+              kind.addEventListener('input',()=>expiry.hidden=false);
+              const values={day:['31','31'],month:['12','Diciembre'],year:['2035','2035']};
+              for(const input of expiry.querySelectorAll('input')) input.addEventListener('click',()=>{
+                const [value,label]=values[input.id];options.innerHTML='<div role="option">'+label+'</div>';
+                options.hidden=false;options.firstChild.addEventListener('click',()=>{
+                  input.value=value;input.dataset.accepted='yes';options.hidden=true;
+                  accepted.textContent=[...expiry.querySelectorAll('input')].every(e=>e.dataset.accepted==='yes')?'accepted':'';
+                });
+              });
+            </script></html>"#,
+        )
+        .await;
+        let origin = url::Url::parse(&url)
+            .unwrap()
+            .origin()
+            .ascii_serialization();
+        let values = [
+            ("document_kind".into(), Zeroizing::new("national_id".into())),
+            (
+                "document_expiry".into(),
+                Zeroizing::new("2035-12-31".into()),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let filled = browser
+            .fill_traveler(
+                &origin,
+                &[TravelerField::DocumentKind, TravelerField::DocumentExpiry],
+                &values,
+            )
+            .await
+            .unwrap();
+        assert_eq!(filled, ["document_kind", "document_expiry"]);
+        let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+        assert!(snapshot["text"].as_str().unwrap().contains("accepted"));
         server.abort();
     }
     #[tokio::test]

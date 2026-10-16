@@ -575,16 +575,28 @@ impl Browser {
         };
         tab.refs.clear();
         tab.generation += 1;
-        let discovery = crate::travelers::TravelerDiscovery::read(&view, fields).await?;
-        if discovery.scope.origin != origin {
-            bail!("Saved traveler details are unlocked for another website");
+        let mut filled = Vec::new();
+        for pass in 0..2 {
+            let discovery = match crate::travelers::TravelerDiscovery::read(&view, fields).await {
+                Ok(discovery) => discovery,
+                Err(_) if pass > 0 => break,
+                Err(error) => return Err(error),
+            };
+            if discovery.scope.origin != origin {
+                bail!("Saved traveler details are unlocked for another website");
+            }
+            let wanted: std::collections::BTreeMap<_, _> = discovery
+                .field_names()
+                .into_iter()
+                .filter_map(|f| values.get(&f).map(|v| (f, v.clone())))
+                .collect();
+            for field in discovery.fill(&view, &wanted).await? {
+                if !filled.contains(&field) {
+                    filled.push(field);
+                }
+            }
         }
-        let wanted: std::collections::BTreeMap<_, _> = discovery
-            .field_names()
-            .into_iter()
-            .filter_map(|f| values.get(&f).map(|v| (f, v.clone())))
-            .collect();
-        discovery.fill(&view, &wanted).await
+        Ok(filled)
     }
 
     async fn act(&self, tab: &mut Tab, reference: &str, kind: &str, value: &str) -> Result<Value> {
