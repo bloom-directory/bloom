@@ -12,6 +12,13 @@ async function handle(command) {
       return BLOOM_SCRIPTS.act(command.index, command.action, command.value ?? '');
     // Saved traveler values arrive only after the person's approval, for
     // this site; they go into the page and never back out.
+    // Payment scripts: facts, card fields, the card fill after approval, and
+    // the single Pay click; their names match checkout's script files.
+    case 'script': {
+      const script = BLOOM_SCRIPTS[command.name];
+      if (!['facts', 'fields', 'submit', 'orderFields', 'confirmContact', 'attention', 'attentionOutcome', 'valid', 'fill'].includes(command.name) || !script) throw Error('Unknown page script');
+      return await script(...command.args);
+    }
     case 'traveler_discover':
       return BLOOM_SCRIPTS.travelerDiscover(command.nonce);
     case 'traveler_fill':

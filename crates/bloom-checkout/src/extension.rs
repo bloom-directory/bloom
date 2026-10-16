@@ -162,14 +162,77 @@ pub fn relay(socket: &Path) -> Result<()> {
 /// The extension's files. `page.js` carries checkout's own page scripts, so
 /// both browsers run the same code.
 pub fn bundle() -> Vec<(&'static str, String)> {
-    let page = format!(
-        "const BLOOM_SCRIPTS = (() => {{\n  // Chrome slows timers in background tabs to a second or more; page\n  // scripts wait in short steps, so they use message-loop timers instead.\n  const setTimeout = (done, ms = 0) => {{ const end = performance.now() + ms; const channel = new MessageChannel(); channel.port1.onmessage = () => performance.now() >= end ? done() : channel.port2.postMessage(0); channel.port2.postMessage(0); }};\n  return {{\n  snapshot: () => {},\n  act: {},\n  travelerDiscover: nonce => {{ globalThis.__bloomTravelerNonce = nonce; return {}; }},\n  travelerFill: (nonce, origin, mapped, values) => {},\n}};\n}})();\n{}",
-        include_str!("snapshot.js").trim(),
-        include_str!("act.js").trim(),
-        include_str!("traveler-discover.js").trim(),
-        include_str!("traveler-fill.js").trim(),
-        include_str!("../extension/page.js")
+    // Each entry runs one of checkout's page scripts, unchanged.
+    let scripts = [
+        (
+            "snapshot",
+            format!("() => {}", include_str!("snapshot.js").trim()),
+        ),
+        ("act", include_str!("act.js").trim().into()),
+        (
+            "travelerDiscover",
+            format!(
+                "nonce => {{ globalThis.__bloomTravelerNonce = nonce; return {}; }}",
+                include_str!("traveler-discover.js").trim()
+            ),
+        ),
+        (
+            "travelerFill",
+            format!(
+                "(nonce, origin, mapped, values) => {}",
+                include_str!("traveler-fill.js").trim()
+            ),
+        ),
+        (
+            "facts",
+            format!("() => {}", include_str!("facts.js").trim()),
+        ),
+        (
+            "fields",
+            format!("() => {}", include_str!("fields.js").trim()),
+        ),
+        (
+            "submit",
+            format!("() => {}", include_str!("submit.js").trim()),
+        ),
+        (
+            "orderFields",
+            format!("() => {}", include_str!("order-fields.js").trim()),
+        ),
+        (
+            "confirmContact",
+            format!("() => {}", include_str!("confirm-contact.js").trim()),
+        ),
+        (
+            "attention",
+            format!(
+                "() => {{ {}; return globalThis.__bloomAttention(); }}",
+                include_str!("form-attention.js").trim()
+            ),
+        ),
+        (
+            "attentionOutcome",
+            format!(
+                "() => {{ {}; return {}; }}",
+                include_str!("form-attention.js").trim(),
+                include_str!("outcome.js").trim()
+            ),
+        ),
+        ("valid", include_str!("payment-valid.js").trim().into()),
+        ("fill", include_str!("payment-fill.js").trim().into()),
+    ];
+    let mut page = String::from(
+        "const BLOOM_SCRIPTS = (() => {\n\
+         // Chrome slows timers in background tabs to a second or more; page\n\
+         // scripts wait in short steps, so they use message-loop timers instead.\n\
+         const setTimeout = (done, ms = 0) => { const end = performance.now() + ms; const channel = new MessageChannel(); channel.port1.onmessage = () => performance.now() >= end ? done() : channel.port2.postMessage(0); channel.port2.postMessage(0); };\n\
+         return {\n",
     );
+    for (name, script) in scripts {
+        page.push_str(&format!("{name}: {script},\n"));
+    }
+    page.push_str("};\n})();\n");
+    page.push_str(include_str!("../extension/page.js"));
     let background = include_str!("../extension/background.js");
     vec![
         (
@@ -197,6 +260,15 @@ pub fn version() -> String {
         include_str!("act.js"),
         include_str!("traveler-discover.js"),
         include_str!("traveler-fill.js"),
+        include_str!("facts.js"),
+        include_str!("fields.js"),
+        include_str!("submit.js"),
+        include_str!("order-fields.js"),
+        include_str!("confirm-contact.js"),
+        include_str!("form-attention.js"),
+        include_str!("outcome.js"),
+        include_str!("payment-valid.js"),
+        include_str!("payment-fill.js"),
     ] {
         part.hash(&mut hasher);
     }

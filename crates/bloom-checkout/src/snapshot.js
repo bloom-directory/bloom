@@ -26,8 +26,10 @@
     }
     return '';
   };
+  // Logo buttons (card brands, banks) name themselves only in image text.
+  const pictured = e => [...e.querySelectorAll('img[alt],[title]')].map(i => i.alt || i.title).filter(Boolean).join(' ');
   const label = e => (e.getAttribute('aria-label') || e.labels?.[0]?.innerText || (field(e) ? '' : e.innerText) || e.placeholder
-    || (field(e) ? caption(e) || e.name : '') || '').replace(/\s+/g, ' ').trim();
+    || (field(e) ? caption(e) || e.name : pictured(e)) || '').replace(/\s+/g, ' ').trim();
   // Card and password values never leave the page; checkout redacts saved
   // traveler values before the agent reads anything else.
   const secret = e => e.type === 'password' || /^cc-/.test((e.autocomplete || '').split(' ').at(-1))

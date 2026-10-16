@@ -51,6 +51,8 @@ pub(crate) struct PrivateTab {
     pub target: String,
     /// Local fixture merchants count as payment providers (test TLS mode only).
     pub fixture_payment_hosts: bool,
+    /// Set when the page is in the person's own browser (Bloom extension).
+    pub extension: Option<Arc<ExtensionLink>>,
 }
 
 impl Browser {
@@ -383,6 +385,18 @@ impl Browser {
     /// Copies the page's contact email and phone into its re-entry fields,
     /// then reports what the page still asks of the human.
     pub(crate) async fn page_attention(&self) -> Result<Value> {
+        let extension = self.extension.read().unwrap().clone();
+        if let Some(link) = extension {
+            let view = PrivateTab {
+                cdp: self.cdp.clone(),
+                session: String::new(),
+                target: String::new(),
+                fixture_payment_hosts: self.fixture_payment_hosts,
+                extension: Some(link),
+            };
+            crate::discovery::run(&view, "", 0, crate::discovery::Script::ConfirmContact).await?;
+            return crate::discovery::run(&view, "", 0, crate::discovery::Script::Attention).await;
+        }
         let tab = self.tab.lock().await;
         let evaluate = |expression: &str| {
             self.cdp.call(
@@ -557,6 +571,7 @@ impl Browser {
             session: tab.session.clone(),
             target: tab.target.clone(),
             fixture_payment_hosts: self.fixture_payment_hosts,
+            extension: None,
         };
         tab.refs.clear();
         tab.generation += 1;
@@ -667,6 +682,7 @@ impl Browser {
             session: tab.session.clone(),
             target: tab.target.clone(),
             fixture_payment_hosts: self.fixture_payment_hosts,
+            extension: self.extension.read().unwrap().clone(),
         })
     }
 

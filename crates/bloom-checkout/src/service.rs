@@ -383,7 +383,8 @@ impl CheckoutService {
     }
 
     async fn finish_unlock(self: Arc<Self>, operation_id: String) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(125);
+        // Approval links last fifteen minutes; wait a little past that.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(930);
         loop {
             tokio::time::sleep(Duration::from_millis(300)).await;
             if tokio::time::Instant::now() >= deadline {
@@ -799,7 +800,8 @@ impl CheckoutService {
     }
 
     async fn finish_approved(self: Arc<Self>, operation_id: String) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(125);
+        // Approval links last fifteen minutes; wait a little past that.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(930);
         loop {
             tokio::time::sleep(Duration::from_millis(300)).await;
             let mut private = self.private.lock().await;
@@ -930,6 +932,11 @@ impl CheckoutService {
         drop(plaintext);
         status.state = "filled".into();
         self.store.update(&status)?;
+        // Rehearsals with made-up cards on live sites stop before paying.
+        #[cfg(feature = "triad-dev-harness")]
+        if std::env::var_os("BLOOM_CHECKOUT_REHEARSAL_NO_SUBMIT").is_some() {
+            return Ok(());
+        }
         // Record the submission attempt first; a lost response must not cause a second click.
         status.state = "submitted".into();
         self.store.update(&status)?;
@@ -1089,15 +1096,40 @@ impl CheckoutService {
                     | "partially_filled"
                     | "disclosure_unknown"
             ) {
-                let contexts = tokio::time::timeout(
-                    Duration::from_secs(2),
-                    tab.cdp.contexts(&tab.session, "bloom-outcome"),
-                )
-                .await
-                .ok()
-                .and_then(Result::ok)
-                .unwrap_or_default();
                 let mut observed = Vec::new();
+                if tab.extension.is_some() {
+                    use crate::discovery::{Script, run};
+                    let outcome = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        run(&tab, "", 0, Script::AttentionOutcome),
+                    )
+                    .await
+                    .ok()
+                    .and_then(Result::ok);
+                    if let Some(outcome) = outcome {
+                        if outcome["reason"] == "confirm_contact" && !copied_contact {
+                            copied_contact = true;
+                            let _ = tokio::time::timeout(
+                                Duration::from_secs(5),
+                                run(&tab, "", 0, Script::ConfirmContact),
+                            )
+                            .await;
+                        }
+                        observed.push(outcome);
+                    }
+                }
+                let contexts = if tab.extension.is_some() {
+                    Vec::new()
+                } else {
+                    tokio::time::timeout(
+                        Duration::from_secs(2),
+                        tab.cdp.contexts(&tab.session, "bloom-outcome"),
+                    )
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .unwrap_or_default()
+                };
                 for context in contexts {
                     let expression = concat!(
                         include_str!("form-attention.js"),
@@ -1620,6 +1652,9 @@ impl CheckoutService {
 }
 
 async fn tab_url(tab: &PrivateTab) -> Option<String> {
+    if tab.extension.is_some() {
+        return crate::discovery::extension_url(tab).await.ok();
+    }
     let info = tab
         .cdp
         .call(None, "Target.getTargetInfo", json!({"targetId":tab.target}))
