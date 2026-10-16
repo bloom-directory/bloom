@@ -240,6 +240,14 @@
     .bloom-widget .holdings-table .asset-mark { width: 22px; height: 22px; flex-basis: 22px; }
     .bloom-widget .holdings-table .asset-label strong { font-size: 12px; line-height: 1.25; }
     .bloom-widget .holdings-table .asset-label small { margin: 1px 0 0; font-size: 9px; }
+    .bloom-widget .holding-network { display: block; }
+    .bloom-widget .holding-account {
+      display: block;
+      margin-top: 1px;
+      color: var(--accent-deep);
+      font: 500 8px/1.25 var(--sans);
+      white-space: nowrap;
+    }
     .bloom-widget details > summary { min-height: 34px; padding: 7px 0; }
     .bloom-widget .wallet-subsection { margin-top: 12px; }
     .bloom-widget .wallet-subsection .section-head { margin-bottom: 6px; }
@@ -377,15 +385,13 @@
       background: transparent;
     }
     .bloom-widget .receive-address-tabs {
-      display: flex;
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
       gap: 5px;
       margin-bottom: 10px;
-      overflow-x: auto;
-      scrollbar-width: none;
     }
-    .bloom-widget .receive-address-tabs::-webkit-scrollbar { display: none; }
     .bloom-widget .receive-address-tab {
-      flex: 0 0 auto;
+      min-width: 0;
       padding: 5px 8px;
       border: 1px solid var(--rule);
       border-radius: 999px;
@@ -393,6 +399,7 @@
       background: transparent;
       font: 500 9px/1 var(--sans);
       cursor: pointer;
+      white-space: nowrap;
     }
     .bloom-widget .receive-address-tab[aria-selected="true"] {
       border-color: var(--accent);
@@ -623,6 +630,14 @@
     for (const details of main.querySelectorAll(":scope > details")) details.classList.add("contacts-secondary");
   };
 
+  const accountNumberFromPath = (path) => {
+    const evm = path.match(/^m\/44'\/60'\/\d+'\/\d+\/(\d+)$/);
+    if (evm) return Number(evm[1]) + 1;
+    const solana = path.match(/^m\/44'\/501'\/(\d+)'/);
+    if (solana) return Number(solana[1]) + 1;
+    return 1;
+  };
+
   const prepareReceive = (page, main) => {
     const wallets = [...main.querySelectorAll(".receiving-wallet")];
     const preferredWallet = wallets.find((wallet) => wallet.id === "wallet-main") || wallets[0];
@@ -633,12 +648,24 @@
       grid.querySelectorAll(".receiving-unavailable").forEach((card) => card.remove());
       const cards = [...grid.querySelectorAll(":scope > .receiving-card")].filter((card) => card.querySelector(".address"));
       if (!cards.length) continue;
+      cards.sort((left, right) => {
+        const leftFamily = left.querySelector("h3")?.textContent?.includes("Solana") ? 1 : 0;
+        const rightFamily = right.querySelector("h3")?.textContent?.includes("Solana") ? 1 : 0;
+        if (leftFamily !== rightFamily) return leftFamily - rightFamily;
+        const leftPath = left.querySelector(".receiving-network code")?.textContent?.trim() || "";
+        const rightPath = right.querySelector(".receiving-network code")?.textContent?.trim() || "";
+        return accountNumberFromPath(leftPath) - accountNumberFromPath(rightPath);
+      });
+      cards.forEach((card) => grid.append(card));
       const tabs = page.createElement("div");
       tabs.className = "receive-address-tabs";
       tabs.setAttribute("role", "tablist");
       cards.forEach((card, index) => {
         const address = card.querySelector(".address");
         const family = card.querySelector("h3")?.textContent?.trim() || `Address ${index + 1}`;
+        const path = card.querySelector(".receiving-network code")?.textContent?.trim() || "";
+        const accountNumber = accountNumberFromPath(path);
+        const accountLabel = accountNumber === 1 ? "Primary" : `Account ${accountNumber}`;
         const suffix = address.textContent.trim().slice(-4);
         const id = `${wallet.id}-address-${index}`;
         card.id = id;
@@ -650,7 +677,8 @@
         button.setAttribute("role", "tab");
         button.setAttribute("aria-controls", id);
         button.setAttribute("aria-selected", String(index === 0));
-        button.textContent = `${family.replace("Ethereum & EVM", "EVM")} · ${suffix}`;
+        button.textContent = `${family.replace("Ethereum & EVM", "EVM").replace("Solana", "SOL")} · ${accountLabel}`;
+        button.title = `${family}, ${accountLabel}, address ending ${suffix}${path ? ` · ${path}` : ""}`;
         tabs.append(button);
 
         const line = page.createElement("div");
@@ -664,6 +692,37 @@
         line.append(address, copy);
       });
       grid.prepend(tabs);
+    }
+  };
+
+  const prepareHoldingAccounts = (page, main) => {
+    for (const table of main.querySelectorAll(".holdings-table")) {
+      const rows = [...table.querySelectorAll("tbody tr")].map((row) => {
+        const label = row.querySelector("td:nth-child(2) .asset-label > span");
+        if (!label) return null;
+        const full = label.textContent.trim();
+        const separator = full.indexOf(" · ");
+        return {
+          label,
+          network: separator < 0 ? full : full.slice(0, separator),
+          path: separator < 0 ? "" : full.slice(separator + 3),
+        };
+      }).filter(Boolean);
+      const counts = new Map();
+      for (const row of rows) counts.set(row.network, (counts.get(row.network) || 0) + 1);
+      for (const row of rows) {
+        row.label.title = row.path ? `${row.network} · ${row.path}` : row.network;
+        const network = page.createElement("span");
+        network.className = "holding-network";
+        network.textContent = row.network;
+        row.label.replaceChildren(network);
+        if ((counts.get(row.network) || 0) < 2) continue;
+        const accountNumber = accountNumberFromPath(row.path);
+        const account = page.createElement("small");
+        account.className = "holding-account";
+        account.textContent = accountNumber === 1 ? "Primary account" : `Account ${accountNumber}`;
+        row.label.append(account);
+      }
     }
   };
 
@@ -714,6 +773,7 @@
     if (title === "Activity") prepareActivity(main);
     if (title === "Contacts") prepareContacts(main);
     if (title === "Receive") prepareReceive(page, main);
+    prepareHoldingAccounts(page, main);
     addViewAction(page, header, title);
 
     const walletDirectory = main.querySelector(".wallet-directory");
@@ -747,13 +807,6 @@
         if (!child.matches("strong")) details.append(child);
       }
       callout.replaceWith(details);
-    }
-    for (const label of main.querySelectorAll(".holdings-table td:nth-child(2) .asset-label > span")) {
-      const full = label.textContent;
-      const separator = full.indexOf(" · ");
-      if (separator < 0) continue;
-      label.title = full;
-      label.textContent = full.slice(0, separator);
     }
     for (const anchor of main.querySelectorAll("a[href]")) {
       const raw = anchor.getAttribute("href");

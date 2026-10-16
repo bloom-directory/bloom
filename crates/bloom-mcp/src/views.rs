@@ -85,7 +85,7 @@ pub fn find(name: &str) -> Option<&'static ViewToolSpec> {
 
 impl ViewToolSpec {
     pub fn resource_uri(&self) -> String {
-        format!("ui://bloom/{}-v4.html", self.page.trim_end_matches(".html"))
+        format!("ui://bloom/{}-v5.html", self.page.trim_end_matches(".html"))
     }
 
     pub fn descriptor(&self) -> Value {
