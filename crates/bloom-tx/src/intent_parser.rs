@@ -67,8 +67,6 @@ struct LooseIntent {
     approved: Option<bool>,
     #[serde(default)]
     usd_value_hint: Option<String>,
-    #[serde(default)]
-    review_mode: Option<String>,
 }
 
 impl LooseIntent {
@@ -223,7 +221,6 @@ impl LooseIntent {
             nonce: self.nonce,
             gas_limit_hint: None,
             usd_value_hint: self.usd_value_hint,
-            review_mode: self.review_mode,
         })
     }
 }
@@ -287,7 +284,6 @@ pub fn parse(input: &str) -> Result<RawIntent, ParseError> {
             nonce: None,
             gas_limit_hint: None,
             usd_value_hint: None,
-            review_mode: None,
         });
     }
     if s.starts_with("nft ") {
@@ -410,7 +406,6 @@ fn parse_nft_shell(line: &str) -> Result<RawIntent, ParseError> {
         nonce: None,
         gas_limit_hint: None,
         usd_value_hint: None,
-        review_mode: None,
     })
 }
 

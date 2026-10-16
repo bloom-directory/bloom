@@ -1237,10 +1237,6 @@ impl TxEngine {
                 nonce: request.nonce,
                 gas_limit_hint: request.gas,
                 usd_value_hint: None,
-                // Contract creation carries initcode, not a call to an
-                // existing described contract, so it keeps the exact
-                // envelope review either way.
-                review_mode: request.review_mode.clone(),
             },
             &selected_chain,
             policy,
@@ -1365,10 +1361,6 @@ impl TxEngine {
                 .validate()
                 .map_err(TxEngineError::ApprovalConstruction)?;
         }
-        // Reject an unknown review mode before reserving a nonce or writing
-        // a pending entry; signing-time validation would otherwise fail the
-        // row only after staging side effects.
-        parse_review_mode(intent.review_mode.as_deref())?;
         // Only creation lacks a recipient. A deployment grant must leave
         // sends, calls, spenders and operators under the ordinary allowlist.
         let mut creation_policy;
@@ -1916,10 +1908,6 @@ impl TxEngine {
             },
             status: TxStatus::Pending,
             action_kind,
-            // The owner's choice is recorded with the immutable row, so the
-            // mode at signing is the one staging was reviewed under and not
-            // whatever a later caller asks for.
-            review_mode: intent.review_mode.clone(),
             tx_hash: None,
             token: token_for_plan,
             nft: nft_for_plan,
@@ -3757,19 +3745,6 @@ impl TxEngine {
             .await
             .map_err(protocol_signing_error)?;
         let key = evm_signing_key(&service.broker, &wallet_public, sender).await?;
-        // Broker reviews a batch under one mode. Members that were staged
-        // asking for different reviews are refused here rather than sent for
-        // Broker to reject, because the disagreement is in this outbox.
-        let batch_review_mode = requested_review_mode(&staged_plans[0])?;
-        for staged in &staged_plans[1..] {
-            if requested_review_mode(staged)? != batch_review_mode {
-                return Err(TxEngineError::ApprovalDenied(
-                    "a transaction batch must be reviewed one way; its members ask for different \
-                     reviews. Confirm them separately."
-                        .into(),
-                ));
-            }
-        }
         let request = ExactPayloadBatchSignRequest {
             wallet_id: Token::new(wallet.to_string())
                 .map_err(|error| TxEngineError::ApprovalConstruction(error.to_string()))?,
@@ -3785,7 +3760,6 @@ impl TxEngine {
             issued_at_ms: state.issued_at_ms.clone(),
             expires_at_ms: state.expires_at_ms.clone(),
             canonical_plan_facts_digest: state.canonical_plan_facts_digest.clone(),
-            requested_review_mode: batch_review_mode,
             approval_id: state.approval_id.clone(),
             account_key_ref: key.selector.clone(),
             petal_use_claim: None,
@@ -4531,31 +4505,6 @@ async fn evm_signing_key(
     }
 }
 
-/// Parse a review mode named by an intent or a staged row.
-///
-/// An unrecognised value is an error rather than a default: a row asking for
-/// a mode this build does not know must not be prepared under some other
-/// one, because the difference is exactly what the owner will be shown.
-fn parse_review_mode(
-    mode: Option<&str>,
-) -> Result<Option<bloom_broker_api::ReviewMode>, TxEngineError> {
-    match mode {
-        None => Ok(None),
-        Some("clear") => Ok(Some(bloom_broker_api::ReviewMode::Clear)),
-        Some("opaque_exact") => Ok(Some(bloom_broker_api::ReviewMode::OpaqueExact)),
-        Some(other) => Err(TxEngineError::ApprovalConstruction(format!(
-            "unknown review mode `{other}`; use `clear`, `opaque_exact`, or omit it"
-        ))),
-    }
-}
-
-/// The review the staged row asked for.
-fn requested_review_mode(
-    staged: &StagedTx,
-) -> Result<Option<bloom_broker_api::ReviewMode>, TxEngineError> {
-    parse_review_mode(staged.review_mode.as_deref())
-}
-
 fn exact_evm_sign_request(
     staged: &StagedTx,
     signing_preimage: &[u8],
@@ -4579,7 +4528,6 @@ fn exact_evm_sign_request(
         issued_at_ms: state.issued_at_ms.clone(),
         expires_at_ms: state.expires_at_ms.clone(),
         canonical_plan_facts_digest: state.canonical_plan_facts_digest.clone(),
-        requested_review_mode: requested_review_mode(staged)?,
         approval_id: state.approval_id.clone(),
         account_key_ref,
         petal_use_claim: None,
@@ -5794,7 +5742,6 @@ mod tests {
             nonce: None,
             gas_limit_hint: None,
             usd_value_hint: usd_hint.map(str::to_string),
-            review_mode: None,
         }
     }
 
@@ -5837,7 +5784,6 @@ mod tests {
             expires_ms: 0,
             status: TxStatus::Pending,
             action_kind: TxActionKind::Unknown,
-            review_mode: None,
             tx_hash: None,
             token: None,
             nft: None,
@@ -6364,7 +6310,6 @@ mod tests {
             nonce: None,
             gas_limit_hint: None,
             usd_value_hint: None,
-            review_mode: None,
         };
         let staged = engine
             .stage(
@@ -6490,62 +6435,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stage_rejects_unknown_review_mode_before_any_write() {
-        let url = spawn_stage_rpc(true).await;
-        let oracle = RecordingOracle {
-            calls: Arc::new(parking_lot::Mutex::new(Vec::new())),
-            usd_micro: 42_000_000,
-            age_ms: 0,
-            max_age_ms: 60_000,
-        };
-        let (engine, _dir, permit, chain) = stage_fixture(&url, oracle);
-        let from: Address = TEST_SIGNER_ADDRESS.parse().unwrap();
-        let body = r#"{"kind":"deploy","data":"0x60006000f3","value":"123 wei"}"#;
-        let mut intent = crate::intent_parser::parse(body).unwrap();
-        intent.review_mode = Some("Clear".into());
-        let error = engine
-            .stage(
-                &permit,
-                "alice",
-                from,
-                intent,
-                &chain,
-                &Policy::default(),
-                None,
-            )
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(&error, TxEngineError::ApprovalConstruction(reason) if reason.contains("unknown review mode")),
-            "{error:?}"
-        );
-        // The rejection happens before any nonce reservation or outbox write.
-        assert!(
-            engine
-                .outbox
-                .list("alice", "anvil", OutboxState::Pending)
-                .unwrap()
-                .is_empty()
-        );
-        // A known mode still stages.
-        let mut intent = crate::intent_parser::parse(body).unwrap();
-        intent.review_mode = Some("opaque_exact".into());
-        let staged = engine
-            .stage(
-                &permit,
-                "alice",
-                from,
-                intent,
-                &chain,
-                &Policy::default(),
-                None,
-            )
-            .await
-            .unwrap();
-        assert_eq!(staged.review_mode.as_deref(), Some("opaque_exact"));
-    }
-
-    #[tokio::test]
     async fn stage_deployment_restages_a_failed_row_instead_of_replaying_it() {
         // Two stagings against one server: repeat every queued response.
         let mut responses = stage_rpc_responses(true);
@@ -6563,7 +6452,6 @@ mod tests {
         let (engine, _dir, permit, chain) = stage_fixture(&url, oracle);
         let from: Address = TEST_SIGNER_ADDRESS.parse().unwrap();
         let request = crate::deployment::DeploymentTransaction {
-            review_mode: None,
             chain_id: 31337,
             from,
             to: None,
@@ -6648,7 +6536,6 @@ mod tests {
         std::fs::create_dir_all(&orphan).unwrap();
 
         let request = crate::deployment::DeploymentTransaction {
-            review_mode: None,
             chain_id: 31337,
             from,
             to: None,
@@ -6735,7 +6622,6 @@ mod tests {
             nonce: None,
             gas_limit_hint: None,
             usd_value_hint: Some("999999".into()),
-            review_mode: None,
         };
         let staged = engine
             .stage(
@@ -6780,7 +6666,6 @@ mod tests {
             nonce: None,
             gas_limit_hint: None,
             usd_value_hint: Some("999999".into()),
-            review_mode: None,
         };
         let staged = engine
             .stage_with_oracle_valuation_target(

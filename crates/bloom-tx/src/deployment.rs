@@ -6,8 +6,6 @@ use serde_json::Value;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeploymentTransaction {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub review_mode: Option<String>,
     pub chain_id: u64,
     pub from: Address,
     pub to: Option<Address>,
@@ -55,7 +53,6 @@ impl DeploymentTransaction {
                 "chainId",
                 "type",
                 "accessList",
-                "reviewMode",
             ]
             .contains(&key.as_str())
             {
@@ -155,13 +152,6 @@ impl DeploymentTransaction {
             return Err("gas must be positive".into());
         }
         Ok(Self {
-            review_mode: match o.get("reviewMode") {
-                None => None,
-                Some(Value::String(mode)) if mode == "clear" || mode == "opaque_exact" => {
-                    Some(mode.clone())
-                }
-                _ => return Err("reviewMode must be clear or opaque_exact".into()),
-            },
             chain_id,
             from,
             to,
@@ -207,7 +197,6 @@ mod tests {
             ("from", json!("0x1111111111111111111111111111111111111111")),
             ("chainId", json!("0x1")),
             ("data", json!("0x")),
-            ("reviewMode", json!("unknown")),
             ("nonce", json!("0x00")),
             ("nonce", json!(-1)),
             ("gas", json!("0x0")),
@@ -227,11 +216,6 @@ mod tests {
         let mut no_nonce = base.clone();
         no_nonce.as_object_mut().unwrap().remove("nonce");
         assert!(parse(no_nonce).is_err());
-        let mut clear = base.clone();
-        clear["reviewMode"] = json!("clear");
-        let clear = parse(clear).unwrap();
-        assert_eq!(clear.review_mode.as_deref(), Some("clear"));
-        assert_ne!(tx.id("alice", "anvil"), clear.id("alice", "anvil"));
         let mut call = base;
         call["to"] = json!(Address::ZERO);
         assert!(parse(call).unwrap().to.is_some());

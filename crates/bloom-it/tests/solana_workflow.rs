@@ -61,7 +61,6 @@ impl SolanaBroker {
             allowed_petal_packages: Vec::new(),
             allowed_destinations: Vec::new(),
             required_verifiers: Vec::new(),
-            clear_signing: None,
         })
         .unwrap();
         SignedPolicySnapshot {
