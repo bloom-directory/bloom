@@ -5084,14 +5084,15 @@ fn short_addr_label(a: &Address) -> String {
     }
 }
 
-/// Resolve a common ERC-20 symbol to its address via the shared
-/// `bloom_proto::tokens` table (the single source of truth across the send
-/// path, route path, and VFS token surface). Anvil mainnet forks share chain
+/// Resolve an ERC-20 symbol to its address via the token list Broker also
+/// compiles in, so a symbol resolves to the token Broker names on the
+/// approval page. An ambiguous symbol resolves to nothing. Anvil mainnet forks share chain
 /// id 31337 with vanilla Anvil, so they reuse the Ethereum (id 1) majors; a
 /// caller can always pass a 0x address explicitly.
 fn lookup_known_token(chain_id: u64, symbol_upper: &str) -> Option<&'static str> {
     let lookup_chain = if chain_id == 31337 { 1 } else { chain_id };
-    let hit = bloom_proto::tokens::resolve_symbol(lookup_chain, symbol_upper).map(|t| t.address);
+    let hit = bloom_broker_api::token_by_symbol(lookup_chain, symbol_upper)
+        .map(|token| token.address.as_str());
     if hit.is_none() {
         debug!(chain_id, symbol = symbol_upper, "tx.known_token_miss");
     }
