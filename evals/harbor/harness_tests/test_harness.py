@@ -367,10 +367,16 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         self.definition._read_json = mock.Mock(
             side_effect=[
                 {
-                    "owner": self.wallet,
-                    "policy_status": "broker_verified",
+                    "wallet": self.wallet_id,
+                    "number": 0,
+                    "evm": {"state": "active", "address": self.wallet},
                     "freshness": "fresh",
-                    "policy_digest": digest,
+                },
+                {
+                    "wallet": {"wallet_id": self.wallet_id},
+                    "verification": "authenticated_broker",
+                    "freshness": "fresh",
+                    "policy": {"policy_digest": digest},
                 },
                 policy,
             ]
@@ -389,10 +395,16 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         self.definition._read_json = mock.Mock(
             side_effect=[
                 {
-                    "owner": self.wallet,
-                    "policy_status": "broker_verified",
+                    "wallet": self.wallet_id,
+                    "number": 0,
+                    "evm": {"state": "active", "address": self.wallet},
                     "freshness": "fresh",
-                    "policy_digest": "d" * 64,
+                },
+                {
+                    "wallet": {"wallet_id": self.wallet_id},
+                    "verification": "authenticated_broker",
+                    "freshness": "fresh",
+                    "policy": {"policy_digest": "d" * 64},
                 },
                 policy,
             ]
@@ -417,10 +429,16 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         self.definition._read_json = mock.Mock(
             side_effect=[
                 {
-                    "owner": self.wallet,
-                    "policy_status": "broker_verified",
+                    "wallet": self.wallet_id,
+                    "number": 0,
+                    "evm": {"state": "active", "address": self.wallet},
                     "freshness": "fresh",
-                    "policy_digest": digest,
+                },
+                {
+                    "wallet": {"wallet_id": self.wallet_id},
+                    "verification": "authenticated_broker",
+                    "freshness": "fresh",
+                    "policy": {"policy_digest": digest},
                 },
                 policy,
             ]
@@ -1094,6 +1112,73 @@ class HyperliquidDefinitionTests(unittest.TestCase):
             ),
         ):
             self.definition._pull_eval_image()
+
+
+class WalletAccountOwnerTests(unittest.TestCase):
+    """The eval reads its wallet owner from the per-account layout (#282)."""
+
+    WALLET_ID = "bloom-eval-hyperliquid"
+    OWNER = "0x2425C1bDf231F37EBDEEEa462A3F00970F52f06a"
+
+    def wallet_root(self, *, account=None, projection=None) -> Path:
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(root, ignore_errors=True))
+        (root / "0").mkdir()
+        account_json = {
+            "schema": "bloom.account.v1",
+            "wallet": self.WALLET_ID,
+            "number": 0,
+            "evm": {"state": "active", "address": self.OWNER.lower()},
+            "freshness": "fresh",
+        }
+        account_json.update(account or {})
+        projection_json = {
+            "wallet": {"wallet_id": self.WALLET_ID},
+            "verification": "authenticated_broker",
+            "freshness": "fresh",
+            "policy": {"policy_digest": "a" * 64},
+        }
+        projection_json.update(projection or {})
+        (root / "0" / "account.json").write_text(json.dumps(account_json))
+        (root / "projection.json").write_text(json.dumps(projection_json))
+        return root
+
+    def owner(self, root: Path) -> str:
+        owner, digest = hyperliquid_order_cancel.wallet_account_projection(
+            lambda path: json.loads(path.read_text()), root, self.WALLET_ID
+        )
+        self.assertEqual(digest, "a" * 64)
+        return owner
+
+    def test_account_zero_owner_is_returned_lowercase(self) -> None:
+        self.assertEqual(self.owner(self.wallet_root()), self.OWNER.lower())
+
+    def test_refuses_an_account_that_is_not_this_wallets_active_account_zero(self) -> None:
+        for account in (
+            {"wallet": "another-wallet"},
+            {"number": 1},
+            {"evm": {"state": "retired", "address": self.OWNER.lower()}},
+            {"evm": {"state": "active", "address": "not-an-address"}},
+        ):
+            with self.subTest(account=account), self.assertRaises(EvalError):
+                self.owner(self.wallet_root(account=account))
+
+    def test_refuses_a_projection_not_authenticated_by_broker_for_this_wallet(self) -> None:
+        for projection in (
+            {"verification": "cached"},
+            {"wallet": {"wallet_id": "another-wallet"}},
+            {"policy": {}},
+        ):
+            with self.subTest(projection=projection), self.assertRaises(EvalError):
+                self.owner(self.wallet_root(projection=projection))
+
+    def test_refuses_stale_projections(self) -> None:
+        for root in (
+            self.wallet_root(account={"freshness": "stale"}),
+            self.wallet_root(projection={"freshness": "stale"}),
+        ):
+            with self.subTest(root=root), self.assertRaises(EvalError):
+                self.owner(root)
 
 
 if __name__ == "__main__":

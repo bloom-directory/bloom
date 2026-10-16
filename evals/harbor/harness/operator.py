@@ -20,9 +20,9 @@ from .core import EvalError, run_eval
 from .hyperliquid_order_cancel import (
     MAINNET_ACK,
     PACKAGE_HASH,
-    WALLET,
     WALLET_ID,
     HyperliquidOrderCancelEval,
+    wallet_account_projection,
 )
 
 STATE_SCHEMA = "bloom.eval.operator-state.v1"
@@ -827,17 +827,9 @@ def initialize(args: argparse.Namespace, repo_root: Path) -> None:
     catalog = triad_root / "config/provenance-catalog.json"
     if not os.path.ismount(mount):
         raise EvalError("configured Bloom path is not an active mount")
-    addresses = safe_json(mount / "wallets" / args.wallet_id / "addresses.json")
-    owner = addresses.get("owner") if isinstance(addresses, dict) else None
-    if not isinstance(owner, str) or WALLET.fullmatch(owner.lower()) is None:
-        raise EvalError("wallet owner projection is invalid")
-    if (
-        addresses.get("wallet") != args.wallet_id
-        or addresses.get("policy_status") != "broker_verified"
-    ):
-        raise EvalError(
-            "wallet projection is not Broker-verified for the selected wallet"
-        )
+    owner, _ = wallet_account_projection(
+        safe_json, mount / "wallets" / args.wallet_id, args.wallet_id
+    )
     owner_data = safe_json(owner_record)
     package_hash = owner_data.get("hash") if isinstance(owner_data, dict) else None
     if (

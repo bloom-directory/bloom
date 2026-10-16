@@ -78,6 +78,51 @@ def session_key_slot(session_id: str) -> str:
     return f"hyperliquid-{digest[:52]}"
 
 
+def wallet_account_projection(
+    read_json: Callable[[Path], Any], wallet_root: Path, wallet_id: str
+) -> tuple[str, str]:
+    """The lowercase EVM owner of a wallet's account 0, and its policy digest.
+
+    Read from the per-account layout (`<wallet>/0/account.json`) and the
+    wallet's Broker-authenticated `projection.json`, which replaced the
+    wallet-level `addresses.json` in #282. Fails unless account 0 belongs to
+    `wallet_id` and is active, the projection is authenticated by Broker for the
+    same wallet, and both are fresh. The digest is the projection's
+    `policy.policy_digest`, the SHA-256 of the canonical `policy.json`.
+    """
+    account = read_json(wallet_root / "0" / "account.json")
+    evm = account.get("evm") if isinstance(account, dict) else None
+    if (
+        not isinstance(evm, dict)
+        or account.get("wallet") != wallet_id
+        or account.get("number") != 0
+        or evm.get("state") != "active"
+    ):
+        raise EvalError("wallet account 0 projection is invalid for the selected wallet")
+    owner = evm.get("address")
+    if not isinstance(owner, str) or WALLET.fullmatch(owner.lower()) is None:
+        raise EvalError("wallet owner projection is invalid")
+    projection = read_json(wallet_root / "projection.json")
+    projected_wallet = (
+        projection.get("wallet") if isinstance(projection, dict) else None
+    )
+    if (
+        not isinstance(projected_wallet, dict)
+        or projected_wallet.get("wallet_id") != wallet_id
+        or projection.get("verification") != "authenticated_broker"
+    ):
+        raise EvalError(
+            "wallet projection is not Broker-verified for the selected wallet"
+        )
+    if account.get("freshness") != "fresh" or projection.get("freshness") != "fresh":
+        raise EvalError("eval wallet projection is stale")
+    policy = projection.get("policy")
+    digest = policy.get("policy_digest") if isinstance(policy, dict) else None
+    if not isinstance(digest, str) or PACKAGE_HASH.fullmatch(digest) is None:
+        raise EvalError("wallet projection has no valid policy digest")
+    return owner.lower(), digest
+
+
 class HyperliquidOrderCancelEval(EvalDefinition):
     name = "hyperliquid-order-cancel"
 
@@ -624,14 +669,11 @@ class HyperliquidOrderCancelEval(EvalDefinition):
                 "BLOOM_EVAL_HYPERLIQUID_PACKAGE_HASH must be a lowercase BLAKE3"
             )
 
-        addresses = self._read_json(self.wallet_root / "addresses.json")
-        owner = addresses.get("owner") if isinstance(addresses, dict) else None
-        if not isinstance(owner, str) or owner.lower() != self.wallet:
+        owner, policy_digest = wallet_account_projection(
+            self._read_json, self.wallet_root, self.wallet_id
+        )
+        if owner != self.wallet:
             raise EvalError("BLOOM_EVAL_WALLET_ID does not own BLOOM_EVAL_WALLET")
-        if addresses.get("policy_status") != "broker_verified":
-            raise EvalError("eval wallet policy is not Broker-verified")
-        if addresses.get("freshness") != "fresh":
-            raise EvalError("eval wallet policy projection is stale")
 
         policy = self._read_json(self.wallet_root / "policy.json")
         if not isinstance(policy, dict):
@@ -649,7 +691,7 @@ class HyperliquidOrderCancelEval(EvalDefinition):
             )
         canonical = json.dumps(policy, sort_keys=True, separators=(",", ":")).encode()
         digest = hashlib.sha256(canonical).hexdigest()
-        if addresses.get("policy_digest") != digest:
+        if policy_digest != digest:
             raise EvalError(
                 "eval wallet policy digest does not match its public projection"
             )
