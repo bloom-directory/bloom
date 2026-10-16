@@ -37,15 +37,124 @@
       --sans: var(--font-sans, system-ui, sans-serif);
       --mono: var(--font-mono, ui-monospace, monospace);
     }
-    body > main {
+    body.bloom-widget {
+      font-size: 13px;
+      line-height: 1.45;
+    }
+    body.bloom-widget > main {
       width: min(1160px, 100%);
       margin: auto;
-      padding: 24px;
+      padding: 18px;
+    }
+    .bloom-widget h1 { font-size: 28px; letter-spacing: -.03em; }
+    .bloom-widget h2 { font-size: 17px; }
+    .bloom-widget h3 { font-size: 14px; }
+    .bloom-widget .intro { display: block; margin-bottom: 14px; }
+    .bloom-widget section + section { margin-top: 20px; }
+    .bloom-widget .coverage-notice {
+      margin: 0 0 10px;
+      padding-left: 11px;
+      font-size: 10px;
+      line-height: 1.4;
+    }
+    .bloom-widget .coverage-notice::before { top: .5em; width: 5px; height: 5px; }
+    .bloom-widget .callout { margin-bottom: 12px; padding: 11px 13px; font-size: 12px; }
+    .bloom-widget .callout p { margin-top: 3px; }
+    .bloom-widget .widget-callout {
+      margin: 0 0 12px;
+      padding: 2px 12px;
+      border: 0;
+      border-left: 3px solid var(--accent);
+      background: var(--accent-tint);
+    }
+    .bloom-widget .widget-callout summary { font-size: 11px; font-weight: 600; }
+    .bloom-widget .widget-callout p { margin: 0 0 9px; font-size: 10px; color: var(--muted); }
+    .bloom-widget .inventory-summary {
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: end;
+      gap: 12px;
+      padding-bottom: 12px;
+    }
+    .bloom-widget .inventory-summary strong { font-size: 18px; }
+    .bloom-widget .inventory-value { text-align: right; }
+    .bloom-widget .directory-note { margin: 10px 0 14px; font-size: 10px; line-height: 1.45; }
+    .bloom-widget .wallet-directory { border-radius: 10px; }
+    .bloom-widget .directory-entry > summary.directory-row {
+      grid-template-columns: minmax(0, 1fr) auto 12px;
+      gap: 10px;
+      padding: 13px 14px;
+    }
+    .bloom-widget .directory-icon { display: none; }
+    .bloom-widget .directory-identity { gap: 1px; }
+    .bloom-widget .directory-identity > strong { font-size: 15px; }
+    .bloom-widget .directory-identity > span { display: none; }
+    .bloom-widget .directory-identity .wallet-address { font-size: 10px; }
+    .bloom-widget .directory-row .wallet-worth {
+      grid-column: 2;
+      grid-row: 1;
+      align-self: center;
+      text-align: right;
+    }
+    .bloom-widget .directory-row .wallet-worth strong { font-size: 16px; }
+    .bloom-widget .directory-row .wallet-worth > span { margin: 0; font-size: 9px; }
+    .bloom-widget .directory-row::after { grid-column: 3; grid-row: 1; font-size: 17px; }
+    .bloom-widget .directory-content {
+      margin: 0 14px 14px;
+      padding-top: 10px;
+    }
+    .bloom-widget .directory-content > .wallet-address,
+    .bloom-widget .directory-content > .crumbs { display: none; }
+    .bloom-widget .directory-content > p { margin-top: 0; font-size: 10px; }
+    .bloom-widget .table-wrap { border-bottom: 0; }
+    .bloom-widget .holdings-table,
+    .bloom-widget .holdings-table tbody { display: block; }
+    .bloom-widget .holdings-table caption,
+    .bloom-widget .holdings-table thead { display: none; }
+    .bloom-widget .holdings-table tr {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1.15fr) auto;
+      align-items: center;
+      gap: 8px;
+      padding: 9px 0;
+      border-top: 1px solid var(--rule);
+    }
+    .bloom-widget .holdings-table td,
+    .bloom-widget .holdings-table td:first-child,
+    .bloom-widget .holdings-table td:last-child {
+      display: block;
+      width: auto;
+      min-width: 0;
+      padding: 0;
+      border: 0;
+      text-align: left;
+      font-size: 12px;
+    }
+    .bloom-widget .holdings-table td::before { display: none; }
+    .bloom-widget .holdings-table td:last-child { text-align: right; white-space: nowrap; }
+    .bloom-widget .holdings-table .asset-label { gap: 7px; }
+    .bloom-widget .holdings-table .asset-mark { width: 22px; height: 22px; flex-basis: 22px; }
+    .bloom-widget .holdings-table .asset-label strong { font-size: 12px; line-height: 1.25; }
+    .bloom-widget .holdings-table .asset-label small { margin: 1px 0 0; font-size: 9px; }
+    .bloom-widget details > summary { min-height: 34px; padding: 7px 0; }
+    .bloom-widget .wallet-subsection { margin-top: 12px; }
+    .bloom-widget .wallet-subsection .section-head { margin-bottom: 6px; }
+    .bloom-widget .position-list .app-position { gap: 8px 12px; padding: 12px 0; }
+    .bloom-widget .app-identity { gap: 9px; }
+    .bloom-widget .app-identity > .asset-mark,
+    .bloom-widget .app-identity > .monogram { width: 28px; height: 28px; }
+    .bloom-widget .app-name { font-size: 14px; }
+    .bloom-widget .app-identity small { margin-top: 1px; font-size: 10px; }
+    .bloom-widget .app-value { font-size: 15px; }
+    .bloom-widget .position-list .app-position .position-evidence { margin-left: 37px; font-size: 10px; }
+    @media (max-width: 420px) {
+      body.bloom-widget > main { padding: 15px 13px; }
+      .bloom-widget h1 { font-size: 25px; }
+      .bloom-widget .directory-row .wallet-worth > span { display: none; }
     }
   </style>
   <style id="bloom-skin-styles"></style>
 </head>
-<body><p class="widget-status">Loading Bloom…</p>
+<body class="bloom-widget"><p class="widget-status">Loading Bloom…</p>
 <script>
 (() => {
   "use strict";
@@ -157,6 +266,24 @@
     }
     const main = page.querySelector("main");
     if (!main) return;
+    for (const callout of main.querySelectorAll(".callout.warn")) {
+      const details = page.createElement("details");
+      details.className = "widget-callout";
+      const summary = page.createElement("summary");
+      summary.textContent = callout.querySelector("strong")?.textContent || "Important notice";
+      details.append(summary);
+      for (const child of [...callout.children]) {
+        if (!child.matches("strong")) details.append(child);
+      }
+      callout.replaceWith(details);
+    }
+    for (const label of main.querySelectorAll(".holdings-table td:nth-child(2) .asset-label > span")) {
+      const full = label.textContent;
+      const separator = full.indexOf(" · ");
+      if (separator < 0) continue;
+      label.title = full;
+      label.textContent = full.slice(0, separator);
+    }
     for (const anchor of main.querySelectorAll("a[href]")) {
       const raw = anchor.getAttribute("href");
       if (!raw || raw.startsWith("#")) continue;
