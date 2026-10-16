@@ -1,7 +1,9 @@
 //! Category: integration
 //! Exercise the real stdio scheduler with a deliberately blocked backend.
 use async_trait::async_trait;
-use bloom_mcp::{McpServer, VfsCommandError, VfsCommands, VfsMethod};
+use bloom_mcp::{
+    APP_MIME_TYPE, APP_RESOURCE_URI, McpServer, VfsCommandError, VfsCommands, VfsMethod,
+};
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, ReadHalf, WriteHalf};
@@ -110,7 +112,16 @@ async fn ping_and_cancellation_bypass_slow_work_without_reordering_writes() {
         .await;
     assert_eq!(
         s.recv().await["result"]["tools"].as_array().unwrap().len(),
-        5
+        14
+    );
+    s.send(json!({
+        "jsonrpc":"2.0", "id":6, "method":"resources/read",
+        "params":{"uri":APP_RESOURCE_URI}
+    }))
+    .await;
+    assert_eq!(
+        s.recv().await["result"]["contents"][0]["mimeType"],
+        APP_MIME_TYPE
     );
     s.ping().await;
     assert_eq!(*s.backend.calls.lock().unwrap(), ["/slow"]);

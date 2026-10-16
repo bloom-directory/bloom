@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Bloom dashboard</title>
+  <style id="bloom-styles">
+    :root { color-scheme: light dark; }
+    body { margin: 0; }
+    .widget-status { box-sizing: border-box; padding: 1rem; font: 14px/1.5 system-ui, sans-serif; }
+  </style>
+</head>
+<body><p class="widget-status">Loading Bloom…</p>
+<script>
+(() => {
+  "use strict";
+
+  const viewTools = {
+    "index.html": "show_bloom_today",
+    "wallets.html": "show_bloom_wallets",
+    "receive.html": "show_bloom_receive",
+    "activity.html": "show_bloom_activity",
+    "next-moves.html": "show_bloom_next_moves",
+    "contacts.html": "show_bloom_contacts",
+    "policy.html": "show_bloom_policy",
+    "chains.html": "show_bloom_networks",
+    "fees.html": "show_bloom_networks",
+    "markets.html": "show_bloom_markets",
+  };
+  const pending = new Map();
+  let nextId = 0;
+  let hostContext = {};
+
+  const send = (method, params) => {
+    const id = nextId++;
+    parent.postMessage({ jsonrpc: "2.0", id, method, params }, "*");
+    return new Promise((resolve, reject) => pending.set(id, { resolve, reject }));
+  };
+  const notify = (method, params) => {
+    const message = { jsonrpc: "2.0", method };
+    if (params !== undefined) message.params = params;
+    parent.postMessage(message, "*");
+  };
+  const answer = (id, result) => parent.postMessage({ jsonrpc: "2.0", id, result }, "*");
+
+  const setTheme = (context) => {
+    hostContext = { ...hostContext, ...(context || {}) };
+    document.documentElement.dataset.theme = hostContext.theme || "light";
+    document.documentElement.style.colorScheme = hostContext.theme || "light";
+  };
+
+  const reportSize = () => notify("ui/notifications/size-changed", {
+    width: Math.ceil(document.documentElement.scrollWidth),
+    height: Math.ceil(document.documentElement.scrollHeight),
+  });
+
+  const enableNetworksSorting = () => {
+    const list = document.querySelector("[data-network-list]");
+    if (!list) return;
+    const rows = list.querySelector("[data-network-rows]");
+    const buttons = [...list.querySelectorAll("button[data-sort]")];
+    const status = list.querySelector(".sort-status");
+    const labels = { name: "Network", "fees-all": "Fees · all time", "fees-day": "Fees · 24h", "dex-day": "DEX volume · 24h" };
+    buttons.forEach((button) => button.addEventListener("click", () => {
+      const key = button.dataset.sort;
+      const direction = button.getAttribute("aria-pressed") === "true" && button.dataset.direction === "desc" ? "asc" : "desc";
+      const dataKey = key.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase());
+      const items = [...rows.querySelectorAll(".network-row")];
+      items.sort((leftRow, rightRow) => {
+        let comparison;
+        if (key === "name") comparison = leftRow.dataset.name.localeCompare(rightRow.dataset.name);
+        else {
+          const left = leftRow.dataset[dataKey];
+          const right = rightRow.dataset[dataKey];
+          if (left === "" && right !== "") return 1;
+          if (right === "" && left !== "") return -1;
+          comparison = left === "" ? 0 : Number(left) - Number(right);
+        }
+        if (comparison === 0) comparison = leftRow.dataset.name.localeCompare(rightRow.dataset.name);
+        return direction === "asc" ? comparison : -comparison;
+      });
+      items.forEach((item) => rows.append(item));
+      buttons.forEach((candidate) => {
+        const active = candidate.dataset.sort === key;
+        candidate.setAttribute("aria-pressed", String(active));
+        candidate.dataset.direction = active ? direction : "";
+        candidate.querySelector("span").textContent = active ? (direction === "asc" ? "↑" : "↓") : "↕";
+      });
+      if (status) status.textContent = `Sorted by ${labels[key]}, ${direction === "asc" ? "ascending" : "descending"}.`;
+      reportSize();
+    }));
+  };
+
+  const selectReceiveWallet = (hash) => {
+    const match = hash.match(/^#wallet-(.+)$/);
+    if (!match) return;
+    const wallet = document.getElementById(`wallet-${match[1]}`);
+    if (wallet?.matches("details.receiving-wallet")) wallet.open = true;
+  };
+
+  const render = (result, requestedHash = "") => {
+    const payload = result?._meta?.["bloom/view"];
+    if (!payload?.html) return;
+    const page = new DOMParser().parseFromString(payload.html, "text/html");
+    document.title = page.title || "Bloom dashboard";
+    document.getElementById("bloom-styles").textContent = `${payload.css || ""}\n${payload.skinCss || ""}`;
+    for (const image of page.querySelectorAll("img[src]")) {
+      const replacement = payload.assets?.[image.getAttribute("src")];
+      if (replacement) image.setAttribute("src", replacement);
+    }
+    document.body.replaceChildren(...[...page.body.childNodes].map((node) => document.importNode(node, true)));
+    enableNetworksSorting();
+    selectReceiveWallet(requestedHash);
+    reportSize();
+  };
+
+  document.addEventListener("click", async (event) => {
+    const anchor = event.target.closest("a[href]");
+    if (!anchor) return;
+    const raw = anchor.getAttribute("href");
+    if (!raw || raw.startsWith("#")) return;
+    let url;
+    try { url = new URL(raw, "https://bloom.invalid/views/"); } catch { return; }
+    if (url.origin === "https://bloom.invalid") {
+      const page = url.pathname.split("/").pop();
+      const tool = viewTools[page];
+      if (!tool) {
+        event.preventDefault();
+        return;
+      }
+      event.preventDefault();
+      try {
+        const response = await send("tools/call", { name: tool, arguments: {} });
+        render(response, url.hash);
+      } catch (error) {
+        console.error("Bloom view navigation failed", error);
+      }
+      return;
+    }
+    if (url.protocol === "https:" || url.protocol === "http:") {
+      event.preventDefault();
+      try { await send("ui/open-link", { url: url.href }); } catch (error) { console.error("Opening link failed", error); }
+    }
+  });
+
+  addEventListener("message", (event) => {
+    if (event.source !== parent) return;
+    const message = event.data;
+    if (!message || message.jsonrpc !== "2.0") return;
+    if (Object.prototype.hasOwnProperty.call(message, "id") && !message.method) {
+      const waiter = pending.get(message.id);
+      if (!waiter) return;
+      pending.delete(message.id);
+      if (message.error) waiter.reject(new Error(message.error.message));
+      else waiter.resolve(message.result);
+      return;
+    }
+    if (message.method === "ui/notifications/tool-result") render(message.params);
+    else if (message.method === "ui/notifications/host-context-changed") setTheme(message.params);
+    else if (message.method === "ping" && Object.prototype.hasOwnProperty.call(message, "id")) {
+      answer(message.id, {});
+    } else if (message.method === "ui/resource-teardown" && Object.prototype.hasOwnProperty.call(message, "id")) {
+      answer(message.id, {});
+    }
+  });
+
+  (async () => {
+    try {
+      const initialized = await send("ui/initialize", {
+        appInfo: { name: "Bloom dashboard", version: "1" },
+        appCapabilities: { availableDisplayModes: ["inline", "fullscreen"] },
+        protocolVersion: "2026-01-26",
+      });
+      setTheme(initialized.hostContext);
+      notify("ui/notifications/initialized");
+      new ResizeObserver(reportSize).observe(document.documentElement);
+    } catch (error) {
+      document.body.innerHTML = `<p class="widget-status">Bloom widget could not connect to this host.</p>`;
+      console.error(error);
+    }
+  })();
+})();
+</script>
+</body>
+</html>

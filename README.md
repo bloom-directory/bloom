@@ -155,8 +155,10 @@ cargo run -p bloom -- mcp serve    # stdio; an MCP client spawns this
 `mcp serve` adds no permissions of its own: it forwards `list`, `read`,
 `lookup`, `write`, and `write_with_lookup` to the daemon a mount would have
 used, so policy, confirmation, and audit gates apply unchanged. There is no
-network listener. See [`docs/guides/mcp.md`](./docs/guides/mcp.md) for the tool
-catalog, resource URI rules, and error codes.
+network listener. MCP Apps-capable hosts also render Bloom's read-only wallet
+views inline; other clients receive browser-path fallbacks. See
+[`docs/guides/mcp.md`](./docs/guides/mcp.md) for the tool catalog, resource URI
+rules, widgets, and error codes.
 
 ## Development commands
 

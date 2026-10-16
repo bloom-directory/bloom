@@ -3307,6 +3307,7 @@ async fn run_mcp(home: &HomeDir, endpoint: &ResolvedEndpoint, command: McpCmd) -
     let tools = bloom_mcp::TOOLS
         .iter()
         .map(|tool| tool.name)
+        .chain(bloom_mcp::VIEW_TOOLS.iter().map(|tool| tool.name))
         .collect::<Vec<_>>()
         .join(", ");
     match command {

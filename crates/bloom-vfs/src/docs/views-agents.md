@@ -5,6 +5,10 @@ browser, plus one Markdown briefing for chat. They render the same facts the
 surrounding VFS exposes as JSON and Markdown; they never introduce a new
 authority surface.
 
+In an MCP client, prefer the matching `show_bloom_*` tool. A host that
+advertises MCP Apps support renders the page inline; other hosts return the
+browser path below as a fallback.
+
 Open one from the mount, for example:
 
 ```sh
@@ -84,11 +88,13 @@ host; the mount itself is read-only.
 
 ## What to tell a person
 
-Point them at the file path and let the browser render it. For anything that
-must be said inside the chat itself, quote `briefing.md` rather than
-summarizing from memory. Do not paste the HTML into a chat transcript, and do
-not re-render these pages yourself: the canonical values live in the sibling
-JSON leaves
+Prefer the matching `show_bloom_*` MCP tool so a capable desktop host can
+render the view inline. If that tool is unavailable or the host cannot render
+MCP Apps, point the person at the file path and let the browser render it. For
+anything that must be said inside chat itself, quote `briefing.md` rather than
+summarizing from memory. Do not paste the HTML into a transcript, and do not
+re-render these pages yourself: the canonical values live in the sibling JSON
+leaves
 (`wallets/<wallet>/addresses.json`, `wallets/<wallet>/chains/<chain>/balance.json`,
 `outbox/<state>/<action>/intent.json` and `result.json`).
 

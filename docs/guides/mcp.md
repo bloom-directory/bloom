@@ -2,10 +2,11 @@
 
 `bloom mcp serve` exposes Bloom's virtual filesystem to Model Context Protocol
 clients over stdio. It is a proxy, not a second API: every tool and resource
-uses the daemon VFS surface on its Unix socket. The five tools use the same
-commands as `bloom vfs ls|cat|stat|write`; resource reads use `read_inert`. Path parsing,
-authorization, policy gates, confirmation, audit journalling, and error codes
-all stay in `bloom-vfs`.
+uses the daemon VFS surface on its Unix socket. The five general VFS tools use
+the same commands as `bloom vfs ls|cat|stat|write`; the nine dashboard tools
+and resource reads use `read_inert`. Path parsing, authorization, policy
+gates, confirmation, audit journalling, and error codes all stay in
+`bloom-vfs`.
 
 Use it when your agent client speaks MCP and you would rather not mount the
 filesystem. If you can mount, mounting is still the richer surface: see
@@ -29,7 +30,7 @@ bloom mcp status
 # transport: stdio
 # endpoint: unix:/home/you/.bloom/private-run/bloom.sock
 # protocol: 2025-06-18
-# tools: vfs_list, vfs_read, vfs_stat, vfs_write, vfs_write_then_stat
+# tools: vfs_list, vfs_read, vfs_stat, vfs_write, vfs_write_then_stat, show_bloom_today, show_bloom_wallets, show_bloom_receive, show_bloom_activity, show_bloom_next_moves, show_bloom_contacts, show_bloom_policy, show_bloom_networks, show_bloom_markets
 ```
 
 `bloom mcp serve` checks the flag before it reads a byte of stdin or touches
@@ -70,6 +71,13 @@ is implemented, so the claim holds for every revision listed.
 | `vfs_write`           | `write`             | `bloom vfs write` | false          |
 | `vfs_write_then_stat` | `write_with_lookup` | (staging flows)   | false          |
 
+The read-only dashboard tools are `show_bloom_today`, `show_bloom_wallets`,
+`show_bloom_receive`, `show_bloom_activity`, `show_bloom_next_moves`,
+`show_bloom_contacts`, `show_bloom_policy`, `show_bloom_networks`, and
+`show_bloom_markets`. They accept no arguments and render the corresponding
+canonical `/views/*.html` page. `show_bloom_networks` also covers the legacy
+`fees.html` alias, which is byte-for-byte the Networks page.
+
 `vfs_read` advertises `readOnlyHint=false` and `destructiveHint=true` on purpose. Most of the VFS is inert data,
 but a handler may declare a path's read side-effecting (a Petal route can).
 `vfs_stat` reports this per path as `read_side_effecting`, and is itself always
@@ -91,6 +99,27 @@ Each tool forwards a fixed set of arguments (`path`, plus `text`/`bytes_b64`
 and `projection_path` where they apply) and rejects anything else before the
 daemon is called. A parameter added to a daemon VFS method is therefore *not*
 reachable from MCP until it is added to that allowlist too.
+
+## Dashboard widgets
+
+During `initialize`, a host advertises MCP Apps support through the
+`io.modelcontextprotocol/ui` extension and the
+`text/html;profile=mcp-app` MIME type. Bloom then links each
+`show_bloom_*` tool to one sandboxed `ui://bloom/dashboard-v1.html` resource.
+The host renders a fresh widget for the selected tool; navigation inside the
+widget calls the other dashboard tools. Networks sorting and Receive wallet
+links work there as they do in the browser.
+
+The daemon remains the renderer. The MCP adapter reads the finished page,
+`bloom.css`, `skin.css`, and referenced local artwork through `read_inert` and
+delivers them in tool-result metadata, which stays out of model context. The
+widget makes no network requests and cannot approve, stage, sign, or execute
+an operation. External explorer links are opened through the host.
+
+If the client does not advertise MCP Apps, Bloom registers the same tools
+without UI metadata. Their ordinary text result points to the matching path
+under `views/`, so a person can open it in a browser. This is also the fallback
+for terminal clients that support MCP tools but cannot display an iframe.
 
 ## Resources
 
@@ -145,8 +174,9 @@ it. The daemon's code is always preserved in `error.data.daemonCode`.
 The daemon also exposes `machine.execute`, `petals.*`, `confirm_batch`, and
 `shutdown` on the same socket. None of them are tools here and there is no
 generic pass-through, so an MCP client cannot name them — the proxy models the
-five tool methods plus guarded resource reads as a closed enum rather than
-forwarding an arbitrary method string.
+five general VFS methods, nine fixed read-only view methods, and guarded
+resource reads as a closed enum rather than forwarding an arbitrary method
+string.
 
 ### Scheduling and cancellation
 

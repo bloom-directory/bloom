@@ -10,7 +10,10 @@ use std::{
     collections::{HashMap, VecDeque},
     future::Future,
     pin::Pin,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use serde_json::{Value, json};
@@ -21,6 +24,7 @@ use crate::backend::{
     DAEMON_NOT_FOUND_CODE, DAEMON_UNREACHABLE_CODE, VfsCommandError, VfsCommands, VfsMethod,
 };
 use crate::tools::{self, ToolError};
+use crate::views;
 
 /// Server name reported in `initialize`.
 pub const SERVER_NAME: &str = "bloom-vfs";
@@ -50,17 +54,31 @@ pub const RESOURCE_IS_AN_ACTION_CODE: i32 = -32010;
 /// misbehaving client from growing the read buffer without bound.
 const MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 
-const INSTRUCTIONS: &str = "Bloom exposes an agentic Ethereum wallet as a virtual filesystem. \
+const INSTRUCTIONS: &str = "Bloom exposes an agentic wallet as a virtual filesystem. \
 Discover paths with `vfs_list` starting at `/`, read files with `vfs_read`, inspect metadata with \
 `vfs_stat`, and stage actions by writing intents with `vfs_write`. Value-moving actions are staged \
 and must be confirmed by a second write after reviewing the generated plan. This server is a proxy \
-for the same VFS commands as `bloom vfs …`; it holds no keys and adds no permissions of its own.";
+for the same VFS commands as `bloom vfs …`; it holds no keys and adds no permissions of its own. \
+When a person asks to see wallet information, prefer the matching `show_bloom_*` tool. A capable \
+desktop host renders its read-only MCP App inline; other hosts receive the browser path fallback.";
 
 /// An MCP server bound to one canonical VFS command transport.
-#[derive(Clone)]
 pub struct McpServer {
     commands: Arc<dyn VfsCommands>,
     version: String,
+    app_enabled: AtomicBool,
+}
+
+impl Clone for McpServer {
+    fn clone(&self) -> Self {
+        Self {
+            commands: self.commands.clone(),
+            version: self.version.clone(),
+            // Capability negotiation belongs to one client session; a copied
+            // server starts unnegotiated until its own client initializes.
+            app_enabled: AtomicBool::new(false),
+        }
+    }
 }
 
 impl McpServer {
@@ -68,6 +86,7 @@ impl McpServer {
         Self {
             commands,
             version: version.into(),
+            app_enabled: AtomicBool::new(false),
         }
     }
 
@@ -276,7 +295,10 @@ impl McpServer {
         Some(match method {
             "initialize" => ok_response(id, self.initialize(&params)),
             "ping" => ok_response(id, json!({})),
-            "tools/list" => ok_response(id, json!({ "tools": tool_descriptors() })),
+            "tools/list" => ok_response(
+                id,
+                json!({ "tools": tool_descriptors(self.app_enabled.load(Ordering::Relaxed)) }),
+            ),
             "tools/call" => self.tools_call(id, &params).await,
             "resources/list" => self.resources_list(id).await,
             "resources/templates/list" => ok_response(id, resource_templates()),
@@ -286,6 +308,8 @@ impl McpServer {
     }
 
     fn initialize(&self, params: &Value) -> Value {
+        self.app_enabled
+            .store(views::client_supports_app(params), Ordering::Relaxed);
         let requested = params.get("protocolVersion").and_then(Value::as_str);
         let negotiated = requested
             .filter(|version| SUPPORTED_PROTOCOL_VERSIONS.contains(version))
@@ -310,6 +334,12 @@ impl McpServer {
             return error_response(id, -32602, "tools/call requires a tool `name`");
         };
         let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
+        if let Some(tool) = views::find(name) {
+            return match views::call(self.commands.as_ref(), tool, &arguments).await {
+                Ok(result) => ok_response(id, result),
+                Err(error) => error_response(id, -32602, error.message()),
+            };
+        }
         match tools::call(self.commands.as_ref(), name, &arguments).await {
             Ok(result) => ok_response(id, result),
             Err(error @ (ToolError::UnknownTool(_) | ToolError::InvalidArguments(_))) => {
@@ -332,7 +362,7 @@ impl McpServer {
             Ok(_) => return error_response(id, -32603, "daemon list reply is not an array"),
             Err(error) => return vfs_error_response(id, &error),
         };
-        let resources: Vec<Value> = entries
+        let mut resources: Vec<Value> = entries
             .iter()
             .filter(|entry| entry.get("kind").and_then(Value::as_str) == Some("file"))
             .filter_map(|entry| {
@@ -347,6 +377,9 @@ impl McpServer {
                 }))
             })
             .collect();
+        if self.app_enabled.load(Ordering::Relaxed) {
+            resources.push(views::app_resource_descriptor());
+        }
         ok_response(id, json!({ "resources": resources }))
     }
 
@@ -365,6 +398,9 @@ impl McpServer {
         let Some(uri) = params.get("uri").and_then(Value::as_str) else {
             return error_response(id, -32602, "resources/read requires a `uri`");
         };
+        if uri == views::APP_RESOURCE_URI {
+            return ok_response(id, json!({ "contents": [views::app_resource()] }));
+        }
         let path = match tools::path_from_uri(uri) {
             Ok(path) => path,
             Err(message) => return error_response(id, -32602, message),
@@ -436,10 +472,13 @@ fn needs_backend(request: &Value) -> bool {
         && request
             .get("jsonrpc")
             .is_some_and(|version| version == "2.0")
-        && matches!(
-            request.get("method").and_then(Value::as_str),
-            Some("tools/call" | "resources/list" | "resources/read")
-        )
+        && match request.get("method").and_then(Value::as_str) {
+            Some("tools/call" | "resources/list") => true,
+            Some("resources/read") => {
+                request["params"]["uri"].as_str() != Some(views::APP_RESOURCE_URI)
+            }
+            _ => false,
+        }
 }
 
 async fn send_reply<W: AsyncWrite + Unpin>(
@@ -467,8 +506,16 @@ async fn send_reply<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-fn tool_descriptors() -> Vec<Value> {
-    tools::TOOLS.iter().map(|tool| tool.descriptor()).collect()
+fn tool_descriptors(app_enabled: bool) -> Vec<Value> {
+    tools::TOOLS
+        .iter()
+        .map(|tool| tool.descriptor())
+        .chain(
+            views::VIEW_TOOLS
+                .iter()
+                .map(|tool| tool.descriptor(app_enabled)),
+        )
+        .collect()
 }
 
 fn resource_templates() -> Value {
@@ -988,7 +1035,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tools_list_advertises_every_vfs_capability() {
+    async fn tools_list_advertises_vfs_and_dashboard_capabilities() {
         let (server, _) = server(Ok(Value::Null));
         let response = server
             .handle(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}))
@@ -1007,9 +1054,70 @@ mod tests {
                 "vfs_read",
                 "vfs_stat",
                 "vfs_write",
-                "vfs_write_then_stat"
+                "vfs_write_then_stat",
+                "show_bloom_today",
+                "show_bloom_wallets",
+                "show_bloom_receive",
+                "show_bloom_activity",
+                "show_bloom_next_moves",
+                "show_bloom_contacts",
+                "show_bloom_policy",
+                "show_bloom_networks",
+                "show_bloom_markets",
             ]
         );
+        assert!(
+            response["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|tool| tool.get("_meta").is_none()),
+            "a client that did not advertise MCP Apps gets text-only tools"
+        );
+    }
+
+    #[tokio::test]
+    async fn initialize_enables_app_metadata_only_for_capable_clients() {
+        let (server, _) = server(Ok(Value::Null));
+        server
+            .handle(json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {
+                    "protocolVersion": PROTOCOL_VERSION,
+                    "capabilities": { "extensions": {
+                        (views::APP_EXTENSION_ID): { "mimeTypes": [views::APP_MIME_TYPE] }
+                    }}
+                },
+            }))
+            .await
+            .unwrap();
+        let response = server
+            .handle(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}))
+            .await
+            .unwrap();
+        let today = response["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "show_bloom_today")
+            .unwrap();
+        assert_eq!(today["_meta"]["ui"]["resourceUri"], views::APP_RESOURCE_URI);
+    }
+
+    #[tokio::test]
+    async fn app_resource_is_static_and_does_not_touch_the_daemon() {
+        let (server, commands) = server(Err(VfsCommandError::unreachable("offline")));
+        let response = server
+            .handle(json!({
+                "jsonrpc": "2.0", "id": 1, "method": "resources/read",
+                "params": { "uri": views::APP_RESOURCE_URI },
+            }))
+            .await
+            .unwrap();
+        let resource = &response["result"]["contents"][0];
+        assert_eq!(resource["mimeType"], views::APP_MIME_TYPE);
+        assert!(resource["text"].as_str().unwrap().contains("ui/initialize"));
+        assert!(commands.calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
