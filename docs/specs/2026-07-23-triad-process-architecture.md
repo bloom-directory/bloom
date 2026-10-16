@@ -1562,7 +1562,8 @@ derived addresses.
 
 An owner starts recovery through the authenticated Machine-to-Broker
 `recovery.prepare` request using only the wallet name. Machine exposes the
-returned one-use ceremony URL under `wallets/recoveries/<name>/status.json`;
+returned one-use ceremony URL under
+`wallets/.control/recoveries/<name>/status.json`;
 the recovery ID and secret are entered only in the Broker-hosted Browser
 ceremony. Broker does not expose a public recovery bootstrap endpoint or a
 wallet-name probe. The bare root always redirects to `https://bloom.directory`
