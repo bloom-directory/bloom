@@ -5,6 +5,7 @@ import json
 import stat
 import subprocess
 import tempfile
+import time
 import unittest
 from argparse import Namespace
 from pathlib import Path
@@ -81,6 +82,50 @@ class OperatorStateTests(unittest.TestCase):
         with self.assertRaisesRegex(EvalError, "non-advancing"):
             self.store.update_counter(8)
 
+    def test_failed_trial_summary_retains_reward_and_observed_cleanup(self) -> None:
+        state = self.store.read()
+        state["lineage"] = {}
+        self.store.write(state)
+        for cleanup_fails in (False, True):
+            with self.subTest(cleanup_fails=cleanup_fails):
+                definition = SimpleNamespace(
+                    phase_timings={},
+                    cleanup_observations={
+                        "open_orders": 1 if cleanup_fails else 0,
+                        "positions": None if cleanup_fails else 0,
+                        "session_stopped": False if cleanup_fails else True,
+                    },
+                )
+                def run(_definition, _model, *, evidence, **_kwargs):
+                    evidence.result = SimpleNamespace(
+                        stats=SimpleNamespace(n_errored_trials=0, n_cancelled_trials=0),
+                        trial_results=[SimpleNamespace(
+                            verifier_result=SimpleNamespace(rewards={"reward": 0})
+                        )],
+                    )
+                    evidence.cleanup_succeeded = not cleanup_fails
+                    evidence.cleanup_error = "residual order" if cleanup_fails else None
+                    raise EvalError("Harbor verifier did not award a passing reward")
+
+                with (
+                    mock.patch("harness.operator.validate_lineage"),
+                    mock.patch("harness.operator.HyperliquidOrderCancelEval", return_value=definition),
+                    mock.patch("harness.operator.PolicyLifecycle"),
+                    mock.patch("harness.operator.run_eval", side_effect=run),
+                    self.assertRaisesRegex(EvalError, "passing reward"),
+                ):
+                    run_or_recover(
+                        Namespace(state=self.store.path, ack=MAINNET_ACK),
+                        self.root, recover_only=False,
+                    )
+                summary = json.loads(next(self.store.summary_dir.glob("*.json")).read_text())
+                self.assertEqual(summary["outcome"], "failed")
+                self.assertEqual(summary["result"]["rewards"], {"reward": 0})
+                self.assertEqual(summary["cleanup"]["succeeded"], not cleanup_fails)
+                self.assertEqual(summary["cleanup"]["error"], "residual order" if cleanup_fails else None)
+                for key, value in definition.cleanup_observations.items():
+                    self.assertEqual(summary["final_state"][key], value)
+
     def test_default_handoff_is_repository_local_and_self_describing(self) -> None:
         args = parser(self.root).parse_args(["status"])
         self.assertEqual(args.state, self.root / DEFAULT_STATE_RELATIVE)
@@ -145,6 +190,12 @@ class OperatorStateTests(unittest.TestCase):
         self.assertNotIn(str(self.root), message)
         self.assertNotIn(ceremony, message)
 
+    def test_redaction_removes_ceremony_urls_on_configured_port(self) -> None:
+        ceremony = "http://localhost:28735/ceremony/" + "A" * 43
+        message = redact(EvalError(f"ceremony at {ceremony}"), self.state)
+        self.assertNotIn(ceremony, message)
+        self.assertNotIn("A" * 43, message)
+
     def test_init_cannot_replace_state_while_policy_recovery_is_pending(self) -> None:
         atomic_write(self.store.backup_path, b"{}\n")
         with self.assertRaisesRegex(EvalError, "recovery is pending"):
@@ -184,7 +235,7 @@ class OperatorStateTests(unittest.TestCase):
             self.store.write(current)
             self.store.backup_path.unlink()
 
-        definition = SimpleNamespace(phase_timings={})
+        definition = SimpleNamespace(phase_timings={}, cleanup_observations={})
         policy = SimpleNamespace(restore=restore)
         with (
             mock.patch(
@@ -234,7 +285,7 @@ class OperatorStateTests(unittest.TestCase):
             self.store.write(current)
             self.store.backup_path.unlink()
 
-        definition = SimpleNamespace(phase_timings={})
+        definition = SimpleNamespace(phase_timings={}, cleanup_observations={})
         policy = SimpleNamespace(activate=activate, restore=restore)
         with (
             mock.patch("harness.operator.validate_lineage"),
@@ -785,6 +836,38 @@ class PolicyRecoveryTests(unittest.TestCase):
                 "eval-wallet",
                 "b" * 64,
             )
+
+    def test_init_ignores_expired_key_request_but_not_live_or_unknown(self) -> None:
+        request_root = self.root / "mount/petal-key-requests"
+        request_root.mkdir(parents=True)
+        path = request_root / ("a" * 64 + ".json")
+        now_ms = int(time.time() * 1000)
+
+        def write(expires_at_ms: object) -> None:
+            record = {
+                "schema": "bloom.machine.petal-key-request.v3",
+                "status": "awaiting_user",
+                "scope": {"wallet_id": "eval-wallet", "package_hash": "b" * 64},
+            }
+            if expires_at_ms is not None:
+                record["ceremony_expires_at_ms"] = expires_at_ms
+            path.write_text(json.dumps(record))
+
+        write(str(now_ms - 1))
+        require_no_pending_owner_requests(
+            self.definition,  # type: ignore[arg-type]
+            "eval-wallet",
+            "b" * 64,
+        )
+        for expires_at_ms in (str(now_ms + 60_000), None, "soon", now_ms - 1):
+            with self.subTest(expires_at_ms=expires_at_ms):
+                write(expires_at_ms)
+                with self.assertRaisesRegex(EvalError, "owner ceremony is pending"):
+                    require_no_pending_owner_requests(
+                        self.definition,  # type: ignore[arg-type]
+                        "eval-wallet",
+                        "b" * 64,
+                    )
 
 
 if __name__ == "__main__":

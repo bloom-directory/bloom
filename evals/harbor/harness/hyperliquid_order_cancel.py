@@ -22,7 +22,11 @@ from typing import Any
 from .core import EvalDefinition, EvalError, EvalRunContext
 
 MAINNET_ACK = "PLACE_AND_CANCEL_BTC_MAINNET_UP_TO_11_USD"
-CEREMONY_URL = re.compile(r"http://localhost:18734/ceremony/[A-Za-z0-9_-]{43}")
+# The ceremony port is configurable per Triad (`--ceremony-port`), so accept
+# any loopback port; the path and token shape stay exact.
+CEREMONY_URL = re.compile(
+    r"http://localhost:[1-9][0-9]{0,4}/ceremony/[A-Za-z0-9_-]{43}"
+)
 WALLET = re.compile(r"0x[0-9a-f]{40}")
 WALLET_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
 PACKAGE_HASH = re.compile(r"[0-9a-f]{64}")
@@ -76,6 +80,51 @@ def session_key_slot(session_id: str) -> str:
         b"bloom-hyperliquid-session-key/v1\0" + session_id.encode()
     ).hexdigest()
     return f"hyperliquid-{digest[:52]}"
+
+
+def wallet_account_projection(
+    read_json: Callable[[Path], Any], wallet_root: Path, wallet_id: str
+) -> tuple[str, str]:
+    """The lowercase EVM owner of a wallet's account 0, and its policy digest.
+
+    Read from the per-account layout (`<wallet>/0/account.json`) and the
+    wallet's Broker-authenticated `projection.json`, which replaced the
+    wallet-level `addresses.json` in #282. Fails unless account 0 belongs to
+    `wallet_id` and is active, the projection is authenticated by Broker for the
+    same wallet, and both are fresh. The digest is the projection's
+    `policy.policy_digest`, the SHA-256 of the canonical `policy.json`.
+    """
+    account = read_json(wallet_root / "0" / "account.json")
+    evm = account.get("evm") if isinstance(account, dict) else None
+    if (
+        not isinstance(evm, dict)
+        or account.get("wallet") != wallet_id
+        or account.get("number") != 0
+        or evm.get("state") != "active"
+    ):
+        raise EvalError("wallet account 0 projection is invalid for the selected wallet")
+    owner = evm.get("address")
+    if not isinstance(owner, str) or WALLET.fullmatch(owner.lower()) is None:
+        raise EvalError("wallet owner projection is invalid")
+    projection = read_json(wallet_root / "projection.json")
+    projected_wallet = (
+        projection.get("wallet") if isinstance(projection, dict) else None
+    )
+    if (
+        not isinstance(projected_wallet, dict)
+        or projected_wallet.get("wallet_id") != wallet_id
+        or projection.get("verification") != "authenticated_broker"
+    ):
+        raise EvalError(
+            "wallet projection is not Broker-verified for the selected wallet"
+        )
+    if account.get("freshness") != "fresh" or projection.get("freshness") != "fresh":
+        raise EvalError("eval wallet projection is stale")
+    policy = projection.get("policy")
+    digest = policy.get("policy_digest") if isinstance(policy, dict) else None
+    if not isinstance(digest, str) or PACKAGE_HASH.fullmatch(digest) is None:
+        raise EvalError("wallet projection has no valid policy digest")
+    return owner.lower(), digest
 
 
 class HyperliquidOrderCancelEval(EvalDefinition):
@@ -133,6 +182,7 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         self.session_created = False
         self.counter_committed = counter_committed
         self.phase_timings: dict[str, float] = {}
+        self.cleanup_observations: dict[str, Any] = {}
 
     @property
     def lock_path(self) -> Path:
@@ -279,12 +329,17 @@ class HyperliquidOrderCancelEval(EvalDefinition):
             if not isinstance(scope, dict):
                 continue
             if (
-                record.get("schema") != "bloom.machine.petal-key-request.v2"
-                or record.get("key_slot") != session_key_slot(self.session_id)
+                record.get("key_slot") != session_key_slot(self.session_id)
                 or scope.get("wallet_id") != self.wallet_id
                 or scope.get("package_hash") != self.package_hash
             ):
                 continue
+            if record.get("schema") != "bloom.machine.petal-key-request.v3":
+                raise EvalError(
+                    "matching owner Petal key request has an unsupported schema; "
+                    "expected bloom.machine.petal-key-request.v3; "
+                    "check Machine and Harbor harness compatibility"
+                )
             ceremony_url = record.get("ceremony_url")
             if record.get("status") == "awaiting_user" and isinstance(
                 ceremony_url, str
@@ -624,14 +679,11 @@ class HyperliquidOrderCancelEval(EvalDefinition):
                 "BLOOM_EVAL_HYPERLIQUID_PACKAGE_HASH must be a lowercase BLAKE3"
             )
 
-        addresses = self._read_json(self.wallet_root / "addresses.json")
-        owner = addresses.get("owner") if isinstance(addresses, dict) else None
-        if not isinstance(owner, str) or owner.lower() != self.wallet:
+        owner, policy_digest = wallet_account_projection(
+            self._read_json, self.wallet_root, self.wallet_id
+        )
+        if owner != self.wallet:
             raise EvalError("BLOOM_EVAL_WALLET_ID does not own BLOOM_EVAL_WALLET")
-        if addresses.get("policy_status") != "broker_verified":
-            raise EvalError("eval wallet policy is not Broker-verified")
-        if addresses.get("freshness") != "fresh":
-            raise EvalError("eval wallet policy projection is stale")
 
         policy = self._read_json(self.wallet_root / "policy.json")
         if not isinstance(policy, dict):
@@ -649,7 +701,7 @@ class HyperliquidOrderCancelEval(EvalDefinition):
             )
         canonical = json.dumps(policy, sort_keys=True, separators=(",", ":")).encode()
         digest = hashlib.sha256(canonical).hexdigest()
-        if addresses.get("policy_digest") != digest:
+        if policy_digest != digest:
             raise EvalError(
                 "eval wallet policy digest does not match its public projection"
             )
@@ -680,16 +732,24 @@ class HyperliquidOrderCancelEval(EvalDefinition):
                 nonzero_positions.append(item)
         return nonzero_positions
 
-    def _require_no_orders_or_positions(self) -> None:
+    def _require_no_orders_or_positions(self, *, record_cleanup: bool = False) -> None:
+        if record_cleanup:
+            self.cleanup_observations["open_orders"] = None
+            self.cleanup_observations["positions"] = None
         orders = self._read_json(self.user_root / "open_orders.json")
         if not isinstance(orders, list):
             raise EvalError("open-orders projection is not a JSON array")
+        if record_cleanup:
+            self.cleanup_observations["open_orders"] = len(orders)
         if orders:
             raise EvalError(
                 "dedicated wallet already has an open order; use an empty eval wallet"
             )
 
-        if self._nonzero_positions():
+        positions = self._nonzero_positions()
+        if record_cleanup:
+            self.cleanup_observations["positions"] = len(positions)
+        if positions:
             raise EvalError(
                 "dedicated wallet has an open position; use an empty eval wallet"
             )
@@ -1035,6 +1095,7 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         )
 
     def cleanup(self) -> None:
+        self.cleanup_observations.clear()
         if self.session_base is None or self.session_id is None:
             return
         failures: list[str] = []
@@ -1082,6 +1143,9 @@ class HyperliquidOrderCancelEval(EvalDefinition):
 
             def no_open_orders() -> bool:
                 orders = self._read_json(self.user_root / "open_orders.json")
+                self.cleanup_observations["open_orders"] = (
+                    len(orders) if isinstance(orders, list) else None
+                )
                 return isinstance(orders, list) and not orders
 
             if not self._poll_until(
@@ -1093,6 +1157,13 @@ class HyperliquidOrderCancelEval(EvalDefinition):
 
         try:
             positions = self._nonzero_positions()
+            self.cleanup_observations["positions"] = len(positions)
+
+            def no_positions() -> bool:
+                remaining = self._nonzero_positions()
+                self.cleanup_observations["positions"] = len(remaining)
+                return not remaining
+
             if positions and not stopped:
                 closed = self._write_route(
                     self.session_base / "close_all", b"host-cleanup", 45
@@ -1100,7 +1171,7 @@ class HyperliquidOrderCancelEval(EvalDefinition):
                 if closed.returncode != 0:
                     failures.append("session close_all failed")
                 elif not self._poll_until(
-                    lambda: not self._nonzero_positions(),
+                    no_positions,
                     VENUE_SETTLE_ATTEMPTS,
                     VENUE_SETTLE_DELAY_SECONDS,
                 ):
@@ -1120,7 +1191,14 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         try:
 
             def session_stopped() -> bool:
+                self.cleanup_observations["session_stopped"] = None
                 final_status = self._read_json(self.session_base / "status.json")
+                self.cleanup_observations["session_stopped"] = (
+                    final_status.get("stopped")
+                    if isinstance(final_status, dict)
+                    and isinstance(final_status.get("stopped"), bool)
+                    else None
+                )
                 return (
                     isinstance(final_status, dict)
                     and final_status.get("stopped") is True
@@ -1134,7 +1212,7 @@ class HyperliquidOrderCancelEval(EvalDefinition):
             failures.append(str(error))
 
         try:
-            self._require_no_orders_or_positions()
+            self._require_no_orders_or_positions(record_cleanup=True)
         except EvalError as error:
             failures.append(str(error))
 

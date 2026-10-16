@@ -16,13 +16,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from .core import EvalError, run_eval
+from .core import EvalError, EvalEvidence, reasoning_effort, run_eval
 from .hyperliquid_order_cancel import (
     MAINNET_ACK,
     PACKAGE_HASH,
-    WALLET,
     WALLET_ID,
     HyperliquidOrderCancelEval,
+    wallet_account_projection,
 )
 
 STATE_SCHEMA = "bloom.eval.operator-state.v1"
@@ -261,6 +261,7 @@ def require_deny_policy(definition: HyperliquidOrderCancelEval, wallet_id: str) 
 def require_no_pending_owner_requests(
     definition: HyperliquidOrderCancelEval, wallet_id: str, package_hash: str
 ) -> None:
+    now_ms = int(time.time() * 1000)
     for root_name, statuses in (
         ("petal-key-requests", {"awaiting_user"}),
         ("petal-signing-requests", {"awaiting_owner_approval"}),
@@ -280,6 +281,16 @@ def require_no_pending_owner_requests(
             except EvalError:
                 continue
             if not isinstance(record, dict) or record.get("status") not in statuses:
+                continue
+            # Machine keeps an abandoned key request at `awaiting_user` after
+            # its ceremony expires; an expired ceremony can never complete.
+            # Anything without a parseable expiry still counts as pending.
+            expires_at_ms = record.get("ceremony_expires_at_ms")
+            if (
+                isinstance(expires_at_ms, str)
+                and expires_at_ms.isdigit()
+                and int(expires_at_ms) <= now_ms
+            ):
                 continue
             scope = record.get("scope")
             scoped_wallet = scope.get("wallet_id") if isinstance(scope, dict) else None
@@ -330,7 +341,9 @@ def redact(error: BaseException, state: dict[str, Any] | None) -> str:
         (v for v in sensitive if isinstance(v, str)), key=len, reverse=True
     ):
         text = text.replace(value, "[REDACTED]")
-    text = re.sub(r"http://localhost:18734/ceremony/[A-Za-z0-9_-]+", "[REDACTED]", text)
+    text = re.sub(
+        r"http://localhost:[0-9]+/ceremony/[A-Za-z0-9_-]+", "[REDACTED]", text
+    )
     return text
 
 
@@ -827,17 +840,9 @@ def initialize(args: argparse.Namespace, repo_root: Path) -> None:
     catalog = triad_root / "config/provenance-catalog.json"
     if not os.path.ismount(mount):
         raise EvalError("configured Bloom path is not an active mount")
-    addresses = safe_json(mount / "wallets" / args.wallet_id / "addresses.json")
-    owner = addresses.get("owner") if isinstance(addresses, dict) else None
-    if not isinstance(owner, str) or WALLET.fullmatch(owner.lower()) is None:
-        raise EvalError("wallet owner projection is invalid")
-    if (
-        addresses.get("wallet") != args.wallet_id
-        or addresses.get("policy_status") != "broker_verified"
-    ):
-        raise EvalError(
-            "wallet projection is not Broker-verified for the selected wallet"
-        )
+    owner, _ = wallet_account_projection(
+        safe_json, mount / "wallets" / args.wallet_id, args.wallet_id
+    )
     owner_data = safe_json(owner_record)
     package_hash = owner_data.get("hash") if isinstance(owner_data, dict) else None
     if (
@@ -1005,12 +1010,14 @@ def run_or_recover(
     state = store.read()
     if args.ack != MAINNET_ACK:
         raise EvalError(f"explicit acknowledgement must equal {MAINNET_ACK}")
+    # Validate before any policy change so a bad value costs nothing.
+    effort = reasoning_effort(state["model"])
     lock_path = Path(state["paths"]["lock_file"])
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     started_total = time.monotonic()
     timings: dict[str, float] = {}
     outcome = "failed"
-    result: Any | None = None
+    evidence = EvalEvidence()
     error_text: str | None = None
     definition = HyperliquidOrderCancelEval(
         repo_root,
@@ -1052,11 +1059,12 @@ def run_or_recover(
                         )
                     refreshed = store.read()
                     definition.sign_count_value = str(refreshed["next_sign_count"])
-                    result = run_eval(
+                    run_eval(
                         definition,
                         state["model"],
                         acquire_lock=False,
                         phase_timings=timings,
+                        evidence=evidence,
                     )
                 finally:
                     if store.backup_path.exists():
@@ -1080,16 +1088,23 @@ def run_or_recover(
                 "finished_at": datetime.now(UTC).isoformat(),
                 "outcome": outcome,
                 "model": state["model"],
+                "reasoning_effort": effort or "harbor-default",
                 "harbor_version": os.environ.get("HARBOR_VERSION", "0.21.0"),
                 "package_hash": state["package_hash"],
                 "lineage": state["lineage"],
                 "timings": {key: round(value, 6) for key, value in timings.items()},
-                "result": result_summary(result) if result is not None else None,
+                "result": result_summary(evidence.result)
+                if evidence.result is not None else None,
                 "error": error_text,
+                "cleanup": {
+                    "succeeded": evidence.cleanup_succeeded,
+                    "error": redact(evidence.cleanup_error, state)
+                    if evidence.cleanup_error is not None else None,
+                },
                 "final_state": {
-                    "open_orders": 0 if outcome == "passed" else None,
-                    "positions": 0 if outcome == "passed" else None,
-                    "session_stopped": True if outcome == "passed" else None,
+                    "open_orders": definition.cleanup_observations.get("open_orders"),
+                    "positions": definition.cleanup_observations.get("positions"),
+                    "session_stopped": definition.cleanup_observations.get("session_stopped"),
                     "policy_restored": not store.backup_path.exists(),
                     "counter_reconciled": store.read().get("pending_policy_recovery")
                     is None,
