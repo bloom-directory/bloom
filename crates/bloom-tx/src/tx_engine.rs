@@ -781,7 +781,8 @@ impl TxEngine {
             return Ok((addr, upper));
         }
         Err(TxEngineError::Token(format!(
-            "unknown token '{token}' on chain id {chain_id}"
+            "unknown token '{token}' on chain id {chain_id}: pass its 0x address \
+             (tokens/known.json lists the tokens Bloom knows by symbol)"
         )))
     }
 
