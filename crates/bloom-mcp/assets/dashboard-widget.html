@@ -412,6 +412,136 @@
     }
     .bloom-widget .policy-safeguards p { margin: 3px 0 0; color: var(--muted); font-size: 9px; }
 
+    /* Network comparison keeps one primary and two secondary metrics per row. */
+    .bloom-widget .network-list { margin-top: 0; }
+    .bloom-widget .network-columns {
+      display: flex;
+      gap: 4px;
+      margin-bottom: 5px;
+      padding: 0;
+      overflow-x: auto;
+      scrollbar-width: none;
+    }
+    .bloom-widget .network-columns::-webkit-scrollbar { display: none; }
+    .bloom-widget .network-columns button,
+    .bloom-widget .network-columns button:not(:first-child) {
+      flex: 0 0 auto;
+      padding: 5px 8px;
+      border: 1px solid var(--rule);
+      border-radius: 999px;
+      text-align: left;
+      font-size: 8px;
+      line-height: 1;
+    }
+    .bloom-widget .network-columns button[aria-pressed="true"] {
+      border-color: var(--accent);
+      background: var(--accent-tint);
+    }
+    .bloom-widget .sort-status { display: none; }
+    .bloom-widget .network-row { border-bottom: 1px solid var(--rule); }
+    .bloom-widget .network-row[open] { border-radius: 0; background: transparent; }
+    .bloom-widget .network-row > summary {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 3px 10px;
+      min-height: 0;
+      padding: 10px 2px;
+      border-radius: 0;
+    }
+    .bloom-widget .network-name { grid-column: 1; grid-row: 1; }
+    .bloom-widget .network-name .asset-label { gap: 7px; font-size: 11px; }
+    .bloom-widget .network-name .asset-mark { width: 22px; height: 22px; flex-basis: 22px; }
+    .bloom-widget .network-name::before { font-size: 12px; }
+    .bloom-widget .network-number {
+      min-width: 0;
+      padding: 0;
+      text-align: right;
+      font-size: 9px;
+      white-space: nowrap;
+    }
+    .bloom-widget .network-number > small { display: inline; margin-right: 3px; font-size: 7px; }
+    .bloom-widget .network-number:nth-of-type(2) { grid-column: 2; grid-row: 1; }
+    .bloom-widget .network-number:nth-of-type(3) { grid-column: 1; grid-row: 2; text-align: left; }
+    .bloom-widget .network-number:nth-of-type(4) { grid-column: 2; grid-row: 2; }
+    .bloom-widget .network-number strong { font-size: 11px; }
+    .bloom-widget .network-context { margin: 0; padding: 8px 2px; font-size: 8px; }
+    .bloom-widget .network-detail { padding: 9px 2px 12px; }
+
+    /* Markets read as dense quotes, not full dashboard tiles. */
+    .bloom-widget .markets-heading { margin: 0 0 5px; }
+    .bloom-widget .markets-heading h2 { font-size: 13px; }
+    .bloom-widget .markets-heading p { font-size: 8px; }
+    .bloom-widget .mover-grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 0;
+      margin: 0 0 14px;
+      border-block: 1px solid var(--rule);
+    }
+    .bloom-widget .mover-tile {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 1px 8px;
+      padding: 8px 2px;
+      border: 0;
+      border-bottom: 1px solid var(--rule);
+      border-radius: 0;
+      background: transparent;
+    }
+    .bloom-widget .mover-tile:last-child { border-bottom: 0; }
+    .bloom-widget .mover-tile h3 { margin: 0; font-size: 11px; }
+    .bloom-widget .mover-tile .asset-label { gap: 7px; }
+    .bloom-widget .mover-tile .asset-mark { width: 22px; height: 22px; flex-basis: 22px; }
+    .bloom-widget .mover-tile > strong {
+      grid-column: 2;
+      grid-row: 1 / span 2;
+      margin: 0;
+      font-size: 17px;
+    }
+    .bloom-widget .mover-tile small { grid-column: 1; margin-left: 29px; font-size: 8px; }
+    .bloom-widget .market-table,
+    .bloom-widget .market-table tbody { display: block; }
+    .bloom-widget .market-table thead { display: none; }
+    .bloom-widget .market-table tr {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto auto;
+      align-items: center;
+      gap: 2px 9px;
+      padding: 9px 2px;
+      border-top: 1px solid var(--rule);
+    }
+    .bloom-widget .market-table td,
+    .bloom-widget .market-table td:first-child,
+    .bloom-widget .market-table td:last-child {
+      display: block;
+      width: auto !important;
+      min-width: 0;
+      padding: 0;
+      border: 0;
+      text-align: right;
+      font-size: 10px;
+    }
+    .bloom-widget .market-table td::before { display: none; }
+    .bloom-widget .market-table td:first-child {
+      grid-column: 1;
+      grid-row: 1 / span 2;
+      text-align: left;
+    }
+    .bloom-widget .market-table td:nth-child(2) { grid-column: 2; grid-row: 1; }
+    .bloom-widget .market-table td:nth-child(3) { grid-column: 3; grid-row: 1; }
+    .bloom-widget .market-table td:nth-child(4) {
+      grid-column: 2 / span 2;
+      grid-row: 2;
+      color: var(--muted);
+      font-size: 8px;
+    }
+    .bloom-widget .market-table td:nth-child(4)::before { display: inline; content: "Vol "; }
+    .bloom-widget .market-table .asset-label { gap: 7px; }
+    .bloom-widget .market-table .asset-mark { width: 23px; height: 23px; flex-basis: 23px; }
+    .bloom-widget .market-table .asset-label strong { font-size: 10px; }
+    .bloom-widget .market-table .asset-label small { margin-top: 0; font-size: 8px; }
+
     /* Activity is a ledger, not a stack of dashboard cards. */
     .bloom-widget .outcome-overview {
       display: grid;
@@ -1003,6 +1133,28 @@
     }
   };
 
+  const prepareNetworks = (page, main) => {
+    const labels = ["Name", "All-time", "24h fees", "DEX 24h"];
+    [...main.querySelectorAll(".network-columns button")].forEach((button, index) => {
+      const arrow = button.querySelector("span")?.textContent || "";
+      button.replaceChildren(`${labels[index] || button.textContent.trim()} `);
+      const indicator = page.createElement("span");
+      indicator.setAttribute("aria-hidden", "true");
+      indicator.textContent = arrow;
+      button.append(indicator);
+    });
+    for (const number of main.querySelectorAll(".network-number small")) {
+      number.textContent = number.textContent
+        .replace("All-time fees", "All")
+        .replace("24h fees", "24h")
+        .replace("24h DEX volume", "DEX");
+    }
+  };
+
+  const prepareMarkets = (main) => {
+    for (const heading of main.querySelectorAll(":scope > .section-head")) heading.classList.add("markets-heading");
+  };
+
   const addViewAction = (page, header, title) => {
     const destinations = {
       Wallets: ["show_bloom_receive", "Receive", "↓"],
@@ -1059,6 +1211,8 @@
     prepareHoldingAccounts(page, main);
     prepareHistoricalAccounts(page, main);
     if (title === "Policy") preparePolicy(page, main);
+    if (title === "Networks") prepareNetworks(page, main);
+    if (title === "Markets") prepareMarkets(main);
     addViewAction(page, header, title);
 
     const walletDirectory = main.querySelector(".wallet-directory");
@@ -1082,6 +1236,13 @@
       addDataStatus(page, header, [...main.querySelectorAll(":scope > .coverage-notice, :scope > .callout.warn")]);
     } else if (title === "Policy") {
       addDataStatus(page, header, [...main.querySelectorAll(":scope > .directory-note, :scope > .callout.warn")]);
+    } else if (title === "Networks") {
+      const notices = [...main.querySelectorAll(":scope > .coverage-notice, :scope > .callout, :scope > p.coverage")];
+      const context = notices.find((item) => item.textContent.includes("Network-wide totals"));
+      context?.remove();
+      addDataStatus(page, header, notices.filter((item) => item !== context));
+    } else if (title === "Markets") {
+      addDataStatus(page, header, [...main.querySelectorAll(":scope > .chart-note")]);
     }
     main.prepend(header);
     for (const callout of main.querySelectorAll(".callout.warn")) {
