@@ -1097,7 +1097,10 @@ mod tests {
             .unwrap();
         let resource = &response["result"]["contents"][0];
         assert_eq!(resource["mimeType"], views::APP_MIME_TYPE);
-        assert!(resource["text"].as_str().unwrap().contains("ui/initialize"));
+        let html = resource["text"].as_str().unwrap();
+        assert!(html.contains("ui/initialize"));
+        assert!(html.contains("hostContext.styles?.variables"));
+        assert!(html.contains("--ink: var(--color-text-primary"));
         assert!(commands.calls.lock().unwrap().is_empty());
     }
 

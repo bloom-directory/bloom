@@ -9,6 +9,36 @@
     body { margin: 0; }
     .widget-status { box-sizing: border-box; padding: 1rem; font: 14px/1.5 system-ui, sans-serif; }
   </style>
+  <style id="bloom-host-styles">
+    :root {
+      --paper: var(--color-background-primary, light-dark(#f4efe6, #181818));
+      --surface: var(--color-background-secondary, light-dark(#faf7f1, #242424));
+      --tint: var(--color-background-tertiary, light-dark(#eee7dc, #303030));
+      --ink: var(--color-text-primary, light-dark(#15130f, #fff));
+      --ink-2: var(--color-text-secondary, light-dark(#342d24, #e8e8e8));
+      --muted: var(--color-text-secondary, light-dark(#706757, #b8b8b8));
+      --rule: var(--color-border-secondary, light-dark(#e2d9cb, #3d3d3d));
+      --rule-2: var(--color-border-primary, light-dark(#d5c9b6, #565656));
+      --accent: var(--color-text-info, light-dark(#8a2a3a, #83c3ff));
+      --accent-deep: var(--color-text-info, light-dark(#5e1a26, #a9d5ff));
+      --accent-tint: var(--color-background-info, light-dark(#f1e1e1, #0d273f));
+      --accent-rule: var(--color-border-info, light-dark(#c6a5a8, #31577a));
+      --success: var(--color-text-success, light-dark(#2e6b34, #6ed49a));
+      --success-tint: var(--color-background-success, light-dark(#eeebf1, #173826));
+      --success-rule: var(--color-border-success, light-dark(#d4ccdc, #315d43));
+      --up: var(--color-text-success, light-dark(#2e6b34, #6ed49a));
+      --down: var(--color-text-danger, light-dark(#8a2a3a, #ff8885));
+      --pending: var(--color-text-warning, light-dark(#765425, #ffab70));
+      --pending-tint: var(--color-background-warning, light-dark(#f6efdf, #422b19));
+      --pending-rule: var(--color-border-warning, light-dark(#c9b08a, #765030));
+      --radius: var(--border-radius-lg, 14px);
+      --radius-sm: var(--border-radius-sm, 8px);
+      --serif: var(--font-sans, system-ui, sans-serif);
+      --sans: var(--font-sans, system-ui, sans-serif);
+      --mono: var(--font-mono, ui-monospace, monospace);
+    }
+  </style>
+  <style id="bloom-skin-styles"></style>
 </head>
 <body><p class="widget-status">Loading Bloom…</p>
 <script>
@@ -28,6 +58,7 @@
     "markets.html": "show_bloom_markets",
   };
   const pending = new Map();
+  const appliedHostVariables = new Set();
   let nextId = 0;
   let hostContext = {};
 
@@ -44,7 +75,29 @@
   const answer = (id, result) => parent.postMessage({ jsonrpc: "2.0", id, result }, "*");
 
   const setTheme = (context) => {
-    hostContext = { ...hostContext, ...(context || {}) };
+    const update = context || {};
+    hostContext = {
+      ...hostContext,
+      ...update,
+      styles: {
+        ...(hostContext.styles || {}),
+        ...(update.styles || {}),
+        variables: {
+          ...(hostContext.styles?.variables || {}),
+          ...(update.styles?.variables || {}),
+        },
+      },
+    };
+    const variables = hostContext.styles.variables;
+    for (const name of appliedHostVariables) {
+      if (!(name in variables)) document.documentElement.style.removeProperty(name);
+    }
+    appliedHostVariables.clear();
+    for (const [name, value] of Object.entries(variables)) {
+      if (!name.startsWith("--") || typeof value !== "string") continue;
+      document.documentElement.style.setProperty(name, value);
+      appliedHostVariables.add(name);
+    }
     document.documentElement.dataset.theme = hostContext.theme || "light";
     document.documentElement.style.colorScheme = hostContext.theme || "light";
   };
@@ -103,7 +156,8 @@
     if (!payload?.html) return;
     const page = new DOMParser().parseFromString(payload.html, "text/html");
     document.title = page.title || "Bloom dashboard";
-    document.getElementById("bloom-styles").textContent = `${payload.css || ""}\n${payload.skinCss || ""}`;
+    document.getElementById("bloom-styles").textContent = payload.css || "";
+    document.getElementById("bloom-skin-styles").textContent = payload.skinCss || "";
     for (const image of page.querySelectorAll("img[src]")) {
       const replacement = payload.assets?.[image.getAttribute("src")];
       if (replacement) image.setAttribute("src", replacement);

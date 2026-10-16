@@ -16,7 +16,7 @@ use crate::backend::{VfsCommandError, VfsCommands, VfsMethod};
 use crate::tools::{ToolError, error_result, read_bytes};
 
 pub const APP_MIME_TYPE: &str = "text/html;profile=mcp-app";
-pub const APP_RESOURCE_URI: &str = "ui://bloom/dashboard-v1.html";
+pub const APP_RESOURCE_URI: &str = "ui://bloom/dashboard-v2.html";
 const APP_HTML: &str = include_str!("../assets/dashboard-widget.html");
 const BASE_CSS_PATH: &str = "/views/bloom.css";
 const SKIN_CSS_PATH: &str = "/views/skin.css";

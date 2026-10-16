@@ -103,7 +103,7 @@ reachable from MCP until it is added to that allowlist too.
 ## Dashboard widgets
 
 Bloom links each `show_bloom_*` tool to one sandboxed
-`ui://bloom/dashboard-v1.html` resource with the standard
+`ui://bloom/dashboard-v2.html` resource with the standard
 `_meta.ui.resourceUri` field and ChatGPT's `openai/outputTemplate`
 compatibility alias. The resource uses the `text/html;profile=mcp-app` MIME
 type.
