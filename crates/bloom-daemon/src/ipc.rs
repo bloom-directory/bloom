@@ -734,6 +734,18 @@ pub enum MachineCommand {
     WalletPolicyCommit {
         operation_id: String,
     },
+    /// Propose the Petals chosen during setup for a wallet through its policy
+    /// operation, and report where that default policy stands.
+    WalletDefaultPolicy {
+        name: String,
+        /// Set only by a flow that has just recorded the owner's Petal choice,
+        /// such as browser onboarding. It proposes that choice even after the
+        /// wallet's policy has changed since creation; without it nothing is
+        /// proposed then, so a stale setup choice never restores what the
+        /// owner removed.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        owner_just_chose: bool,
+    },
     WalletOutboxCancel {
         wallet: String,
         chain: String,
