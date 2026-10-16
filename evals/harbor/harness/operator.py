@@ -261,6 +261,7 @@ def require_deny_policy(definition: HyperliquidOrderCancelEval, wallet_id: str) 
 def require_no_pending_owner_requests(
     definition: HyperliquidOrderCancelEval, wallet_id: str, package_hash: str
 ) -> None:
+    now_ms = int(time.time() * 1000)
     for root_name, statuses in (
         ("petal-key-requests", {"awaiting_user"}),
         ("petal-signing-requests", {"awaiting_owner_approval"}),
@@ -280,6 +281,16 @@ def require_no_pending_owner_requests(
             except EvalError:
                 continue
             if not isinstance(record, dict) or record.get("status") not in statuses:
+                continue
+            # Machine keeps an abandoned key request at `awaiting_user` after
+            # its ceremony expires; an expired ceremony can never complete.
+            # Anything without a parseable expiry still counts as pending.
+            expires_at_ms = record.get("ceremony_expires_at_ms")
+            if (
+                isinstance(expires_at_ms, str)
+                and expires_at_ms.isdigit()
+                and int(expires_at_ms) <= now_ms
+            ):
                 continue
             scope = record.get("scope")
             scoped_wallet = scope.get("wallet_id") if isinstance(scope, dict) else None

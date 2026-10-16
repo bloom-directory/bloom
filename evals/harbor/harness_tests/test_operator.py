@@ -5,6 +5,7 @@ import json
 import stat
 import subprocess
 import tempfile
+import time
 import unittest
 from argparse import Namespace
 from pathlib import Path
@@ -835,6 +836,38 @@ class PolicyRecoveryTests(unittest.TestCase):
                 "eval-wallet",
                 "b" * 64,
             )
+
+    def test_init_ignores_expired_key_request_but_not_live_or_unknown(self) -> None:
+        request_root = self.root / "mount/petal-key-requests"
+        request_root.mkdir(parents=True)
+        path = request_root / ("a" * 64 + ".json")
+        now_ms = int(time.time() * 1000)
+
+        def write(expires_at_ms: object) -> None:
+            record = {
+                "schema": "bloom.machine.petal-key-request.v3",
+                "status": "awaiting_user",
+                "scope": {"wallet_id": "eval-wallet", "package_hash": "b" * 64},
+            }
+            if expires_at_ms is not None:
+                record["ceremony_expires_at_ms"] = expires_at_ms
+            path.write_text(json.dumps(record))
+
+        write(str(now_ms - 1))
+        require_no_pending_owner_requests(
+            self.definition,  # type: ignore[arg-type]
+            "eval-wallet",
+            "b" * 64,
+        )
+        for expires_at_ms in (str(now_ms + 60_000), None, "soon", now_ms - 1):
+            with self.subTest(expires_at_ms=expires_at_ms):
+                write(expires_at_ms)
+                with self.assertRaisesRegex(EvalError, "owner ceremony is pending"):
+                    require_no_pending_owner_requests(
+                        self.definition,  # type: ignore[arg-type]
+                        "eval-wallet",
+                        "b" * 64,
+                    )
 
 
 if __name__ == "__main__":
