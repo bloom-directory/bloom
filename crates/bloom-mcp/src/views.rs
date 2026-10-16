@@ -17,8 +17,6 @@ use crate::tools::{ToolError, error_result, read_bytes};
 
 pub const APP_MIME_TYPE: &str = "text/html;profile=mcp-app";
 pub const APP_RESOURCE_URI: &str = "ui://bloom/dashboard-v1.html";
-pub const APP_EXTENSION_ID: &str = "io.modelcontextprotocol/ui";
-
 const APP_HTML: &str = include_str!("../assets/dashboard-widget.html");
 const BASE_CSS_PATH: &str = "/views/bloom.css";
 const SKIN_CSS_PATH: &str = "/views/skin.css";
@@ -92,15 +90,9 @@ pub fn find(name: &str) -> Option<&'static ViewToolSpec> {
     VIEW_TOOLS.iter().find(|tool| tool.name == name)
 }
 
-pub fn client_supports_app(params: &Value) -> bool {
-    params["capabilities"]["extensions"][APP_EXTENSION_ID]["mimeTypes"]
-        .as_array()
-        .is_some_and(|types| types.iter().any(|kind| kind == APP_MIME_TYPE))
-}
-
 impl ViewToolSpec {
-    pub fn descriptor(&self, app_enabled: bool) -> Value {
-        let mut descriptor = json!({
+    pub fn descriptor(&self) -> Value {
+        json!({
             "name": self.name,
             "title": self.title,
             "description": self.description,
@@ -126,16 +118,14 @@ impl ViewToolSpec {
                 "idempotentHint": true,
                 "openWorldHint": true,
             },
-        });
-        if app_enabled {
-            descriptor["_meta"] = json!({
+            "_meta": {
                 "ui": {
                     "resourceUri": APP_RESOURCE_URI,
                     "visibility": ["model", "app"],
                 },
-            });
-        }
-        descriptor
+                "openai/outputTemplate": APP_RESOURCE_URI,
+            },
+        })
     }
 }
 
@@ -280,6 +270,11 @@ pub fn app_resource() -> Value {
                     "frameDomains": [],
                 },
             },
+            "openai/ui": {
+                "availableDisplayModes": ["inline", "fullscreen"],
+            },
+            "openai/widgetDescription": "Bloom's read-only wallet dashboard.",
+            "openai/widgetPrefersBorder": true,
         },
     })
 }
@@ -299,21 +294,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn app_support_requires_the_registered_mime_type() {
-        assert!(client_supports_app(&json!({
-            "capabilities": { "extensions": {
-                (APP_EXTENSION_ID): { "mimeTypes": [APP_MIME_TYPE] }
-            }}
-        })));
-        assert!(!client_supports_app(&json!({
-            "capabilities": { "extensions": {
-                (APP_EXTENSION_ID): { "mimeTypes": ["text/html"] }
-            }}
-        })));
-        assert!(!client_supports_app(&json!({ "capabilities": {} })));
-    }
-
-    #[test]
     fn only_safe_local_sources_are_collected() {
         let sources = local_sources(concat!(
             "<img src=\"icons/a.png\"><script src=\"bloom.js\"></script>",
@@ -324,11 +304,10 @@ mod tests {
     }
 
     #[test]
-    fn widget_tools_only_gain_ui_metadata_for_capable_hosts() {
-        let plain = VIEW_TOOLS[0].descriptor(false);
-        let app = VIEW_TOOLS[0].descriptor(true);
-        assert!(plain.get("_meta").is_none());
+    fn widget_tools_advertise_standard_and_chatgpt_ui_metadata() {
+        let app = VIEW_TOOLS[0].descriptor();
         assert_eq!(app["_meta"]["ui"]["resourceUri"], APP_RESOURCE_URI);
+        assert_eq!(app["_meta"]["openai/outputTemplate"], APP_RESOURCE_URI);
         assert_eq!(app["annotations"]["readOnlyHint"], true);
     }
 }

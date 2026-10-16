@@ -10,10 +10,7 @@ use std::{
     collections::{HashMap, VecDeque},
     future::Future,
     pin::Pin,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::Arc,
 };
 
 use serde_json::{Value, json};
@@ -66,7 +63,6 @@ desktop host renders its read-only MCP App inline; other hosts receive the brows
 pub struct McpServer {
     commands: Arc<dyn VfsCommands>,
     version: String,
-    app_enabled: AtomicBool,
 }
 
 impl Clone for McpServer {
@@ -74,9 +70,6 @@ impl Clone for McpServer {
         Self {
             commands: self.commands.clone(),
             version: self.version.clone(),
-            // Capability negotiation belongs to one client session; a copied
-            // server starts unnegotiated until its own client initializes.
-            app_enabled: AtomicBool::new(false),
         }
     }
 }
@@ -86,7 +79,6 @@ impl McpServer {
         Self {
             commands,
             version: version.into(),
-            app_enabled: AtomicBool::new(false),
         }
     }
 
@@ -295,10 +287,7 @@ impl McpServer {
         Some(match method {
             "initialize" => ok_response(id, self.initialize(&params)),
             "ping" => ok_response(id, json!({})),
-            "tools/list" => ok_response(
-                id,
-                json!({ "tools": tool_descriptors(self.app_enabled.load(Ordering::Relaxed)) }),
-            ),
+            "tools/list" => ok_response(id, json!({ "tools": tool_descriptors() })),
             "tools/call" => self.tools_call(id, &params).await,
             "resources/list" => self.resources_list(id).await,
             "resources/templates/list" => ok_response(id, resource_templates()),
@@ -308,8 +297,6 @@ impl McpServer {
     }
 
     fn initialize(&self, params: &Value) -> Value {
-        self.app_enabled
-            .store(views::client_supports_app(params), Ordering::Relaxed);
         let requested = params.get("protocolVersion").and_then(Value::as_str);
         let negotiated = requested
             .filter(|version| SUPPORTED_PROTOCOL_VERSIONS.contains(version))
@@ -377,9 +364,7 @@ impl McpServer {
                 }))
             })
             .collect();
-        if self.app_enabled.load(Ordering::Relaxed) {
-            resources.push(views::app_resource_descriptor());
-        }
+        resources.push(views::app_resource_descriptor());
         ok_response(id, json!({ "resources": resources }))
     }
 
@@ -506,15 +491,11 @@ async fn send_reply<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-fn tool_descriptors(app_enabled: bool) -> Vec<Value> {
+fn tool_descriptors() -> Vec<Value> {
     tools::TOOLS
         .iter()
         .map(|tool| tool.descriptor())
-        .chain(
-            views::VIEW_TOOLS
-                .iter()
-                .map(|tool| tool.descriptor(app_enabled)),
-        )
+        .chain(views::VIEW_TOOLS.iter().map(|tool| tool.descriptor()))
         .collect()
 }
 
@@ -1066,27 +1047,23 @@ mod tests {
                 "show_bloom_markets",
             ]
         );
-        assert!(
-            response["result"]["tools"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|tool| tool.get("_meta").is_none()),
-            "a client that did not advertise MCP Apps gets text-only tools"
-        );
+        let tools = response["result"]["tools"].as_array().unwrap();
+        assert!(tools[..5].iter().all(|tool| tool.get("_meta").is_none()));
+        assert!(tools[5..].iter().all(|tool| {
+            tool["_meta"]["ui"]["resourceUri"] == views::APP_RESOURCE_URI
+                && tool["_meta"]["openai/outputTemplate"] == views::APP_RESOURCE_URI
+        }));
     }
 
     #[tokio::test]
-    async fn initialize_enables_app_metadata_only_for_capable_clients() {
+    async fn app_metadata_does_not_depend_on_nonstandard_client_capability_shape() {
         let (server, _) = server(Ok(Value::Null));
         server
             .handle(json!({
                 "jsonrpc": "2.0", "id": 1, "method": "initialize",
                 "params": {
                     "protocolVersion": PROTOCOL_VERSION,
-                    "capabilities": { "extensions": {
-                        (views::APP_EXTENSION_ID): { "mimeTypes": [views::APP_MIME_TYPE] }
-                    }}
+                    "capabilities": {}
                 },
             }))
             .await
@@ -1102,6 +1079,10 @@ mod tests {
             .find(|tool| tool["name"] == "show_bloom_today")
             .unwrap();
         assert_eq!(today["_meta"]["ui"]["resourceUri"], views::APP_RESOURCE_URI);
+        assert_eq!(
+            today["_meta"]["openai/outputTemplate"],
+            views::APP_RESOURCE_URI
+        );
     }
 
     #[tokio::test]

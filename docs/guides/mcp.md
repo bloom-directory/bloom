@@ -102,10 +102,11 @@ reachable from MCP until it is added to that allowlist too.
 
 ## Dashboard widgets
 
-During `initialize`, a host advertises MCP Apps support through the
-`io.modelcontextprotocol/ui` extension and the
-`text/html;profile=mcp-app` MIME type. Bloom then links each
-`show_bloom_*` tool to one sandboxed `ui://bloom/dashboard-v1.html` resource.
+Bloom links each `show_bloom_*` tool to one sandboxed
+`ui://bloom/dashboard-v1.html` resource with the standard
+`_meta.ui.resourceUri` field and ChatGPT's `openai/outputTemplate`
+compatibility alias. The resource uses the `text/html;profile=mcp-app` MIME
+type.
 The host renders a fresh widget for the selected tool; navigation inside the
 widget calls the other dashboard tools. Networks sorting and Receive wallet
 links work there as they do in the browser.
@@ -116,10 +117,10 @@ delivers them in tool-result metadata, which stays out of model context. The
 widget makes no network requests and cannot approve, stage, sign, or execute
 an operation. External explorer links are opened through the host.
 
-If the client does not advertise MCP Apps, Bloom registers the same tools
-without UI metadata. Their ordinary text result points to the matching path
-under `views/`, so a person can open it in a browser. This is also the fallback
-for terminal clients that support MCP tools but cannot display an iframe.
+Clients that do not render MCP Apps ignore the UI metadata. The tools' ordinary
+text result still points to the matching path under `views/`, so a person can
+open it in a browser. This is also the fallback for terminal clients that
+support MCP tools but cannot display an iframe.
 
 ## Resources
 
