@@ -42,6 +42,23 @@ AGENTS: dict[str, AgentSpec] = {
     "codex": AgentSpec("codex", "gpt-5.6-terra"),
 }
 
+REASONING_EFFORT_ENV = "BLOOM_EVAL_REASONING_EFFORT"
+REASONING_EFFORTS = ("low", "medium", "high", "xhigh")
+
+
+def reasoning_effort(agent_name: str) -> str | None:
+    """The opt-in Codex reasoning effort; None keeps Harbor's default (high)."""
+    value = os.environ.get(REASONING_EFFORT_ENV)
+    if not value:
+        return None
+    if agent_name != "codex":
+        raise EvalError(f"{REASONING_EFFORT_ENV} applies only to the codex agent")
+    if value not in REASONING_EFFORTS:
+        raise EvalError(
+            f"{REASONING_EFFORT_ENV} must be one of: {', '.join(REASONING_EFFORTS)}"
+        )
+    return value
+
 
 @dataclass(frozen=True)
 class EvalRunContext:
@@ -122,6 +139,8 @@ async def run_harbor_job(context: EvalRunContext, agent: AgentSpec) -> Any:
 
     shared_env = dict(context.agent_env)
     shared_env.update(agent.env)
+    effort = reasoning_effort(agent.harbor_name)
+    agent_kwargs = {"reasoning_effort": effort} if effort is not None else {}
     config = JobConfig(
         job_name=context.job_name,
         jobs_dir=context.jobs_dir,
@@ -134,6 +153,7 @@ async def run_harbor_job(context: EvalRunContext, agent: AgentSpec) -> Any:
                 model_name=agent.model,
                 n_concurrent=1,
                 env=shared_env,
+                kwargs=agent_kwargs,
             )
         ],
         environment=EnvironmentConfig(

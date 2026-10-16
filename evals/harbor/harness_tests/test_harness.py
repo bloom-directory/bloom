@@ -13,7 +13,16 @@ from types import SimpleNamespace
 from unittest import mock
 
 from harness import hyperliquid_order_cancel
-from harness.core import AgentSpec, EvalDefinition, EvalError, EvalEvidence, EvalRunContext, run_eval
+from harness.core import (
+    REASONING_EFFORT_ENV,
+    AgentSpec,
+    EvalDefinition,
+    EvalError,
+    EvalEvidence,
+    EvalRunContext,
+    reasoning_effort,
+    run_eval,
+)
 from harness.hyperliquid_order_cancel import (
     ACTION_FILES,
     MAINNET_ACK,
@@ -1273,6 +1282,31 @@ class WalletAccountOwnerTests(unittest.TestCase):
         ):
             with self.subTest(root=root), self.assertRaises(EvalError):
                 self.owner(root)
+
+
+class ReasoningEffortTests(unittest.TestCase):
+    def test_unset_keeps_harbor_default(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(REASONING_EFFORT_ENV, None)
+            self.assertIsNone(reasoning_effort("codex"))
+            self.assertIsNone(reasoning_effort("claude"))
+
+    def test_codex_accepts_known_efforts(self) -> None:
+        for effort in ("low", "medium", "high", "xhigh"):
+            with mock.patch.dict(os.environ, {REASONING_EFFORT_ENV: effort}):
+                self.assertEqual(reasoning_effort("codex"), effort)
+
+    def test_unknown_effort_and_other_agents_are_refused(self) -> None:
+        with (
+            mock.patch.dict(os.environ, {REASONING_EFFORT_ENV: "max"}),
+            self.assertRaisesRegex(EvalError, "must be one of"),
+        ):
+            reasoning_effort("codex")
+        with (
+            mock.patch.dict(os.environ, {REASONING_EFFORT_ENV: "medium"}),
+            self.assertRaisesRegex(EvalError, "only to the codex agent"),
+        ):
+            reasoning_effort("claude")
 
 
 if __name__ == "__main__":

@@ -16,7 +16,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from .core import EvalError, EvalEvidence, run_eval
+from .core import EvalError, EvalEvidence, reasoning_effort, run_eval
 from .hyperliquid_order_cancel import (
     MAINNET_ACK,
     PACKAGE_HASH,
@@ -1010,6 +1010,8 @@ def run_or_recover(
     state = store.read()
     if args.ack != MAINNET_ACK:
         raise EvalError(f"explicit acknowledgement must equal {MAINNET_ACK}")
+    # Validate before any policy change so a bad value costs nothing.
+    effort = reasoning_effort(state["model"])
     lock_path = Path(state["paths"]["lock_file"])
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     started_total = time.monotonic()
@@ -1086,6 +1088,7 @@ def run_or_recover(
                 "finished_at": datetime.now(UTC).isoformat(),
                 "outcome": outcome,
                 "model": state["model"],
+                "reasoning_effort": effort or "harbor-default",
                 "harbor_version": os.environ.get("HARBOR_VERSION", "0.21.0"),
                 "package_hash": state["package_hash"],
                 "lineage": state["lineage"],
