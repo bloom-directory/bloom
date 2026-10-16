@@ -488,9 +488,12 @@ mod tests {
         let discovery = TravelerDiscovery::read(&tab, &[TravelerField::BornOn])
             .await
             .unwrap();
-        let values = [("born_on".to_owned(), Zeroizing::new("1990-05-07".to_owned()))]
-            .into_iter()
-            .collect();
+        let values = [(
+            "born_on".to_owned(),
+            Zeroizing::new("1990-05-07".to_owned()),
+        )]
+        .into_iter()
+        .collect();
         assert_eq!(discovery.fill(&tab, &values).await.unwrap().len(), 1);
         let shown = tab
             .cdp
