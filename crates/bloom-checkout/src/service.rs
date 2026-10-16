@@ -49,7 +49,9 @@ impl Store {
         let conn = Connection::open(path)?;
         conn.execute_batch("PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS operations(id TEXT PRIMARY KEY,state TEXT NOT NULL,status TEXT NOT NULL,created INTEGER NOT NULL,kind TEXT NOT NULL,description TEXT NOT NULL,shop TEXT,total_minor INTEGER,currency TEXT);")?;
         // A lost recipient cannot be reconstructed. Interrupted disclosure is never retried.
-        conn.execute("UPDATE operations SET state='disclosure_unknown',status=json_set(status,'$.state','disclosure_unknown','$.ceremony_url',NULL) WHERE state IN ('release_started','filled','submitted','partially_filled','ready_for_payment')",[])?;
+        conn.execute("UPDATE operations SET state='uncertain',status=json_set(status,'$.state','uncertain','$.ceremony_url',NULL) WHERE state='submitted'",[])?;
+        conn.execute("UPDATE operations SET state='not_submitted',status=json_set(status,'$.state','not_submitted','$.ceremony_url',NULL) WHERE state='needs_input'",[])?;
+        conn.execute("UPDATE operations SET state='disclosure_unknown',status=json_set(status,'$.state','disclosure_unknown','$.ceremony_url',NULL) WHERE state IN ('release_started','filled','partially_filled')",[])?;
         conn.execute("UPDATE operations SET state='failed_before_release',status=json_set(status,'$.state','failed_before_release','$.ceremony_url',NULL) WHERE state IN ('requested','preparing','awaiting_approval','manual_required','human_control')",[])?;
         Ok(Self(Mutex::new(conn)))
     }
@@ -163,6 +165,9 @@ struct PrivateCheckout {
     view_target: String,
     view_session: String,
     seen_pages: std::collections::HashSet<String>,
+    /// A human retry is an attempted payment even if the old validation text
+    /// remains visible while the merchant processes it.
+    manual_submission: bool,
 }
 
 struct PendingUnlock {
@@ -668,11 +673,14 @@ impl CheckoutService {
                 status.state = "preparing".into();
                 self.store.update(&status)?;
                 let discovery = match mode {
-                    Mode::Card => Discovery::read(&tab)
-                        .await
+                    Mode::Card => match Discovery::read(&tab).await {
+                        Ok(discovery) => Some(discovery),
                         // The reason is generic text, never page or card content.
-                        .inspect_err(|e| eprintln!("payment page needs the private view: {e:#}"))
-                        .ok(),
+                        Err(error) => {
+                            eprintln!("payment page needs the private view: {error:#}");
+                            None
+                        }
+                    },
                     Mode::Site => Discovery::read_site(&tab).await.ok(),
                     Mode::TakeOver => None,
                 };
@@ -735,6 +743,7 @@ impl CheckoutService {
                             capability,
                             claimed: false,
                             approved: false,
+                            manual_submission: false,
                         });
                         let service = self.clone();
                         tokio::spawn(async move {
@@ -867,9 +876,16 @@ impl CheckoutService {
             // Record the submission attempt first; a lost response must not cause a second click.
             status.state = "submitted".into();
             self.store.update(&status)?;
-            if discovery.submit(&checkout.tab).await.is_err() {
-                status.state = "uncertain".into();
-                self.store.update(&status)?;
+            match discovery.submit(&checkout.tab).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    status.state = "needs_input".into();
+                    self.store.update(&status)?;
+                }
+                Err(_) => {
+                    status.state = "uncertain".into();
+                    self.store.update(&status)?;
+                }
             }
             return Ok(());
         }
@@ -916,10 +932,16 @@ impl CheckoutService {
         // Record the submission attempt first; a lost response must not cause a second click.
         status.state = "submitted".into();
         self.store.update(&status)?;
-        if discovery.submit(&checkout.tab).await.is_err() {
-            status.state = "uncertain".into();
-            self.store.update(&status)?;
-            return Ok(());
+        match discovery.submit(&checkout.tab).await {
+            Ok(true) => {}
+            Ok(false) => {
+                status.state = "needs_input".into();
+                self.store.update(&status)?;
+            }
+            Err(_) => {
+                status.state = "uncertain".into();
+                self.store.update(&status)?;
+            }
         }
         // Outcome watching and private user interaction are handled by the view worker.
         Ok(())
@@ -965,16 +987,12 @@ impl CheckoutService {
 
     // Only pages descended from the held checkout belong to the private view.
     // A bank may open a popup; never switch to unrelated browser targets.
-    async fn private_pages(checkout: &mut PrivateCheckout) -> Result<Vec<Value>> {
-        let targets = checkout
-            .tab
-            .cdp
-            .call(None, "Target.getTargets", json!({}))
-            .await?;
+    async fn list_private_pages(tab: &PrivateTab) -> Result<Vec<Value>> {
+        let targets = tab.cdp.call(None, "Target.getTargets", json!({})).await?;
         let infos = targets["targetInfos"]
             .as_array()
             .context("Missing private pages")?;
-        let mut owned = std::collections::HashSet::from([checkout.tab.target.clone()]);
+        let mut owned = std::collections::HashSet::from([tab.target.clone()]);
         loop {
             let count = owned.len();
             for info in infos {
@@ -991,7 +1009,6 @@ impl CheckoutService {
             }
         }
         let mut pages = Vec::new();
-        let mut selected = None;
         for info in infos {
             let Some(id) = info["targetId"].as_str().filter(|id| owned.contains(*id)) else {
                 continue;
@@ -1001,39 +1018,15 @@ impl CheckoutService {
                 .map(|u| u.origin().ascii_serialization())
                 .unwrap_or_else(|| "Loading".into());
             pages.push(json!({"target":id,"origin":origin}));
-            if checkout.seen_pages.insert(id.to_owned()) {
-                selected = Some(id.to_owned());
-            }
-        }
-        if !pages.iter().any(|p| p["target"] == checkout.view_target) {
-            selected = Some(checkout.tab.target.clone());
-        }
-        if let Some(target) = selected {
-            Self::select_private_page(checkout, target).await?;
         }
         Ok(pages)
     }
 
-    async fn page_url(checkout: &PrivateCheckout) -> Option<String> {
-        let target = checkout
-            .tab
-            .cdp
-            .call(
-                None,
-                "Target.getTargetInfo",
-                json!({"targetId":checkout.view_target}),
-            )
-            .await
-            .ok()?;
-        target["targetInfo"]["url"].as_str().map(str::to_owned)
-    }
-
-    async fn select_private_page(checkout: &mut PrivateCheckout, target: String) -> Result<()> {
-        let session = if target == checkout.tab.target {
-            checkout.tab.session.clone()
+    async fn prepare_private_page(tab: &PrivateTab, target: &str) -> Result<String> {
+        let session = if target == tab.target {
+            tab.session.clone()
         } else {
-            let attachment = checkout
-                .tab
+            let attachment = tab
                 .cdp
                 .call(
                     None,
@@ -1046,28 +1039,20 @@ impl CheckoutService {
                 .context("Private page closed")?
                 .to_owned()
         };
-        checkout
-            .tab
-            .cdp
+        tab.cdp
             .call(Some(&session), "Page.enable", json!({}))
             .await?;
-        checkout
-            .tab
-            .cdp
+        tab.cdp
             .call(
                 Some(&session),
                 "Emulation.setDeviceMetricsOverride",
                 json!({"width":1280,"height":900,"deviceScaleFactor":1,"mobile":false}),
             )
             .await?;
-        checkout
-            .tab
-            .cdp
+        tab.cdp
             .call(Some(&session), "Page.bringToFront", json!({}))
             .await?;
-        checkout.view_target = target;
-        checkout.view_session = session;
-        Ok(())
+        Ok(session)
     }
 
     async fn watch_outcome(&self, id: String) {
@@ -1075,66 +1060,112 @@ impl CheckoutService {
         let mut copied_contact = false;
         loop {
             tokio::time::sleep(Duration::from_millis(500)).await;
-            let mut private = self.private.lock().await;
-            let Some(checkout) = private.as_ref().filter(|p| p.operation_id == id) else {
+            // Outcome polling must not own the private-view lock while Chromium
+            // is slow. Copy the stable browser handles, then do bounded calls.
+            let (mode, tab, view_target) = {
+                let private = self.private.lock().await;
+                let Some(checkout) = private.as_ref().filter(|p| p.operation_id == id) else {
+                    return;
+                };
+                (
+                    checkout.mode,
+                    checkout.tab.clone(),
+                    checkout.view_target.clone(),
+                )
+            };
+            let Ok(mut status) = self.store.get(&id) else {
                 return;
             };
             // A take-over may include a login with an emailed or texted code;
             // a payment may need a bank check or a correction from the human.
-            let take_over = checkout.mode == Mode::TakeOver;
             let deadline = started + Duration::from_secs(900);
-            let Ok(mut status) = self.store.get(&id) else {
-                return;
-            };
             if matches!(
                 status.state.as_str(),
                 "submitted"
-                    | "needs_attention"
+                    | "needs_input"
                     | "manual_required"
                     | "uncertain"
                     | "partially_filled"
                     | "disclosure_unknown"
             ) {
-                let contexts = checkout
-                    .tab
-                    .cdp
-                    .contexts(&checkout.tab.session, "bloom-outcome")
-                    .await
-                    .unwrap_or_default();
+                let contexts = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    tab.cdp.contexts(&tab.session, "bloom-outcome"),
+                )
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or_default();
+                let mut observed = Vec::new();
                 for context in contexts {
                     let expression = concat!(
                         include_str!("form-attention.js"),
                         ";",
                         include_str!("outcome.js")
                     );
-                    let result=checkout.tab.cdp.call(Some(&context.session),"Runtime.evaluate",json!({"contextId":context.world,"expression":expression,"returnByValue":true})).await;
-                    let Ok(result) = result else {
+                    let result = tokio::time::timeout(
+                        Duration::from_secs(2),
+                        tab.cdp.call(Some(&context.session),"Runtime.evaluate",json!({"contextId":context.world,"expression":expression,"returnByValue":true})),
+                    ).await.ok().and_then(Result::ok);
+                    let Some(result) = result else {
                         continue;
                     };
                     let outcome = result["result"]["value"].clone();
-                    if outcome["state"] == "needs_attention" {
-                        // Not paid yet: the human corrects the page in the private view.
-                        if status.state == "submitted" {
-                            self.set_state(&id, "needs_attention");
-                        }
-                        if outcome["reason"] == "confirm_contact" && !copied_contact {
-                            // Copy the contact email and phone already on the page into
-                            // the re-entry fields; the human checks them and confirms.
-                            copied_contact = true;
-                            let _ = checkout.tab.cdp.call(Some(&context.session),"Runtime.evaluate",
-                                json!({"contextId":context.world,"expression":include_str!("confirm-contact.js"),"returnByValue":true})).await;
-                        }
-                        continue;
+                    if outcome["reason"] == "confirm_contact" && !copied_contact {
+                        // Copy the contact email and phone already on the page into
+                        // the re-entry fields; the human checks them and confirms.
+                        copied_contact = true;
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(2),
+                            tab.cdp.call(Some(&context.session),"Runtime.evaluate",
+                                json!({"contextId":context.world,"expression":include_str!("confirm-contact.js"),"returnByValue":true})),
+                        ).await;
                     }
-                    if matches!(outcome["state"].as_str(), Some("paid" | "declined")) {
-                        status.state = outcome["state"].as_str().unwrap().into();
-                        status.outcome = serde_json::from_value(outcome).ok();
+                    observed.push(outcome);
+                }
+                let outcome = observed
+                    .iter()
+                    .find(|outcome| {
+                        matches!(
+                            outcome["state"].as_str(),
+                            Some("booked" | "paid" | "declined")
+                        )
+                    })
+                    .or_else(|| {
+                        observed
+                            .iter()
+                            .find(|outcome| outcome["state"] == "needs_input")
+                    });
+                if let Some(outcome) = outcome {
+                    let state = outcome["state"].as_str().unwrap();
+                    if state == "needs_input" {
+                        // Not paid: the human corrects the page in the private view.
+                        // Serialize with the manual retry marker: whichever
+                        // happens last leaves the durable state conservative.
+                        let private = self.private.lock().await;
+                        let manually_retried = private
+                            .as_ref()
+                            .filter(|checkout| checkout.operation_id == id)
+                            .is_some_and(|checkout| checkout.manual_submission);
+                        if !manually_retried && status.state != state {
+                            status.state = state.into();
+                            status.ceremony_url = None;
+                            let _ = self.store.update(&status);
+                        }
+                    } else {
+                        status.state = state.into();
+                        status.outcome = serde_json::from_value(outcome.clone()).ok();
                         status.ceremony_url = None;
                         if self.store.update(&status).is_ok()
                             && self.browser.return_control().await.is_ok()
                         {
-                            self.retain_completed(checkout, status);
-                            *private = None;
+                            let mut private = self.private.lock().await;
+                            if let Some(checkout) =
+                                private.as_ref().filter(|p| p.operation_id == id)
+                            {
+                                self.retain_completed(checkout, status);
+                                *private = None;
+                            }
                         }
                         return;
                     }
@@ -1143,22 +1174,43 @@ impl CheckoutService {
             if tokio::time::Instant::now() >= deadline {
                 // Only a plain take-over resumes its page; a session that held
                 // traveler data is discarded with its browsing context.
-                let resume = if checkout.mode == Mode::TakeOver {
-                    Self::page_url(checkout).await
+                let resume = if mode == Mode::TakeOver {
+                    tokio::time::timeout(
+                        Duration::from_secs(2),
+                        tab.cdp.call(
+                            None,
+                            "Target.getTargetInfo",
+                            json!({"targetId":view_target}),
+                        ),
+                    )
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .and_then(|target| target["targetInfo"]["url"].as_str().map(str::to_owned))
                 } else {
                     None
                 };
                 if self
                     .browser
-                    .return_control_at(&checkout.view_target, resume)
+                    .return_control_at(&view_target, resume)
                     .await
                     .is_ok()
                 {
-                    self.set_state(&id, if take_over { "returned" } else { "uncertain" });
+                    let final_state = if status.state == "needs_input" {
+                        "not_submitted"
+                    } else if mode == Mode::TakeOver {
+                        "returned"
+                    } else {
+                        "uncertain"
+                    };
+                    self.set_state(&id, final_state);
                     if let Ok(status) = self.store.get(&id) {
-                        self.retain_completed(checkout, status);
+                        let mut private = self.private.lock().await;
+                        if let Some(checkout) = private.as_ref().filter(|p| p.operation_id == id) {
+                            self.retain_completed(checkout, status);
+                            *private = None;
+                        }
                     }
-                    *private = None;
                 }
                 return;
             }
@@ -1191,23 +1243,83 @@ impl CheckoutService {
         bail!("Private checkout approval not complete")
     }
 
-    pub async fn private_state(&self, token: &str) -> Result<Value> {
-        let mut private = self.private.lock().await;
-        let Some(checkout) = private.as_mut() else {
-            let completed = self.completed.lock();
-            let completed = completed
-                .as_ref()
-                .filter(|c| c.claimed && same_token(&c.capability, token))
-                .context("Private view rejected")?;
-            return Ok(
-                json!({"state":completed.status.state,"outcome":completed.status.outcome,"closed":true,"pages":[]}),
-            );
-        };
-        authorize_view(checkout, token)?;
-        let pages = Self::private_pages(checkout).await?;
-        let status = self.store.get(&checkout.operation_id)?;
+    fn completed_private_state(&self, token: &str) -> Result<Value> {
+        let completed = self.completed.lock();
+        let completed = completed
+            .as_ref()
+            .filter(|c| c.claimed && same_token(&c.capability, token))
+            .context("Private view rejected")?;
         Ok(
-            json!({"state":status.state,"outcome":status.outcome,"pages":pages,"selected_page":checkout.view_target,"closed":false}),
+            json!({"state":completed.status.state,"outcome":completed.status.outcome,"closed":true,"pages":[]}),
+        )
+    }
+
+    pub async fn private_state(&self, token: &str) -> Result<Value> {
+        let (operation_id, tab, original_target, original_session, seen_pages) = {
+            let private = self.private.lock().await;
+            let Some(checkout) = private.as_ref() else {
+                return self.completed_private_state(token);
+            };
+            authorize_view(checkout, token)?;
+            (
+                checkout.operation_id.clone(),
+                checkout.tab.clone(),
+                checkout.view_target.clone(),
+                checkout.view_session.clone(),
+                checkout.seen_pages.clone(),
+            )
+        };
+        let pages = tokio::time::timeout(Duration::from_secs(2), Self::list_private_pages(&tab))
+            .await
+            .map_err(|_| anyhow::anyhow!("Private page is still loading"))??;
+        let mut selected = pages
+            .iter()
+            .filter(|page| page["origin"] != "Loading")
+            .filter_map(|page| page["target"].as_str())
+            .rfind(|target| !seen_pages.contains(*target))
+            .map(str::to_owned);
+        if !pages.iter().any(|page| page["target"] == original_target) {
+            selected = Some(tab.target.clone());
+        }
+        let prepared = if let Some(target) = selected {
+            let session = tokio::time::timeout(
+                Duration::from_secs(2),
+                Self::prepare_private_page(&tab, &target),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("Private page is still loading"))??;
+            Some((target, session))
+        } else {
+            None
+        };
+        let selected_page = {
+            let mut private = self.private.lock().await;
+            let Some(checkout) = private
+                .as_mut()
+                .filter(|checkout| checkout.operation_id == operation_id)
+            else {
+                return self.completed_private_state(token);
+            };
+            authorize_view(checkout, token)?;
+            for page in &pages {
+                if page["origin"] != "Loading"
+                    && let Some(target) = page["target"].as_str()
+                {
+                    checkout.seen_pages.insert(target.to_owned());
+                }
+            }
+            if checkout.view_target == original_target
+                && checkout.view_session == original_session
+                && let Some((target, session)) = prepared
+            {
+                checkout.view_target = target;
+                checkout.view_session = session;
+            }
+            checkout.view_target.clone()
+        };
+        let status = self.store.get(&operation_id)?;
+        Ok(
+            json!({"state":status.state,"outcome":status.outcome,"pages":pages,"selected_page":selected_page,"closed":false}),
         )
     }
 
@@ -1248,9 +1360,6 @@ impl CheckoutService {
     }
 
     pub async fn private_action(&self, token: &str, action: ViewAction) -> Result<()> {
-        let mut private = self.private.lock().await;
-        let checkout = private.as_mut().context("No active private checkout")?;
-        authorize_view(checkout, token)?;
         match action {
             ViewAction::Click { x, y } => {
                 if !x.is_finite()
@@ -1260,32 +1369,81 @@ impl CheckoutService {
                 {
                     bail!("Invalid private pointer");
                 }
+                let (tab, session, operation_id, discovery) = {
+                    let private = self.private.lock().await;
+                    let checkout = private.as_ref().context("No active private checkout")?;
+                    authorize_view(checkout, token)?;
+                    (
+                        checkout.tab.clone(),
+                        checkout.view_session.clone(),
+                        checkout.operation_id.clone(),
+                        checkout.discovery.clone(),
+                    )
+                };
+                if let Some(discovery) = discovery.filter(|d| d.facts_session == session) {
+                    let payment = tokio::time::timeout(
+                        Duration::from_secs(2),
+                        discovery.is_submit_point(&tab, x, y),
+                    )
+                    .await
+                    .map_err(|_| anyhow::anyhow!("Private page is still loading"))??;
+                    if payment {
+                        let mut status = self.store.get(&operation_id)?;
+                        if status.state != "needs_input" {
+                            bail!("Payment was already attempted; do not click it again");
+                        }
+                        tokio::time::timeout(Duration::from_secs(2), discovery.recheck(&tab))
+                            .await
+                            .map_err(|_| anyhow::anyhow!("Private page is still loading"))??;
+                        {
+                            let mut private = self.private.lock().await;
+                            let checkout = private
+                                .as_mut()
+                                .filter(|checkout| checkout.operation_id == operation_id)
+                                .context("Private checkout changed")?;
+                            authorize_view(checkout, token)?;
+                            checkout.manual_submission = true;
+                        }
+                        // The next browser input may submit. Persist that fact first.
+                        status.state = "submitted".into();
+                        status.outcome = None;
+                        self.store.update(&status)?;
+                    }
+                }
                 for kind in ["mousePressed", "mouseReleased"] {
-                    checkout
-                        .tab
-                        .cdp
-                        .call(
-                            Some(&checkout.view_session),
+                    tokio::time::timeout(
+                        Duration::from_secs(2),
+                        tab.cdp.call(
+                            Some(&session),
                             "Input.dispatchMouseEvent",
                             json!({"type":kind,"x":x,"y":y,"button":"left","clickCount":1}),
-                        )
-                        .await?;
+                        ),
+                    )
+                    .await
+                    .map_err(|_| anyhow::anyhow!("Private page is still loading"))??;
                 }
             }
             ViewAction::Type { text } => {
                 if text.len() > 4096 {
                     bail!("Private input exceeds limit");
                 }
+                let (cdp, session) = {
+                    let private = self.private.lock().await;
+                    let checkout = private.as_ref().context("No active private checkout")?;
+                    authorize_view(checkout, token)?;
+                    (checkout.tab.cdp.clone(), checkout.view_session.clone())
+                };
                 let text = zeroize::Zeroizing::new(text);
-                checkout
-                    .tab
-                    .cdp
-                    .call(
-                        Some(&checkout.view_session),
+                tokio::time::timeout(
+                    Duration::from_secs(2),
+                    cdp.call(
+                        Some(&session),
                         "Input.insertText",
                         json!({"text":text.as_str()}),
-                    )
-                    .await?;
+                    ),
+                )
+                .await
+                .map_err(|_| anyhow::anyhow!("Private page is still loading"))??;
             }
             ViewAction::Key { key } => {
                 let key_code = match key.as_str() {
@@ -1297,18 +1455,58 @@ impl CheckoutService {
                     "ArrowUp" => 38,
                     _ => bail!("Unsupported private key"),
                 };
+                let (tab, session, operation_id, discovery) = {
+                    let private = self.private.lock().await;
+                    let checkout = private.as_ref().context("No active private checkout")?;
+                    authorize_view(checkout, token)?;
+                    (
+                        checkout.tab.clone(),
+                        checkout.view_session.clone(),
+                        checkout.operation_id.clone(),
+                        checkout.discovery.clone(),
+                    )
+                };
+                if key == "Enter"
+                    && discovery
+                        .as_ref()
+                        .is_some_and(|d| d.facts_session == session)
+                {
+                    let mut status = self.store.get(&operation_id)?;
+                    if status.state != "needs_input" {
+                        bail!("Payment was already attempted; do not submit it again");
+                    }
+                    tokio::time::timeout(
+                        Duration::from_secs(2),
+                        discovery.as_ref().unwrap().recheck(&tab),
+                    )
+                    .await
+                    .map_err(|_| anyhow::anyhow!("Private page is still loading"))??;
+                    {
+                        let mut private = self.private.lock().await;
+                        let checkout = private
+                            .as_mut()
+                            .filter(|checkout| checkout.operation_id == operation_id)
+                            .context("Private checkout changed")?;
+                        authorize_view(checkout, token)?;
+                        checkout.manual_submission = true;
+                    }
+                    status.state = "submitted".into();
+                    status.outcome = None;
+                    self.store.update(&status)?;
+                }
                 for kind in ["keyDown", "keyUp"] {
-                    checkout
-                        .tab
-                        .cdp
-                        .call(
-                            Some(&checkout.view_session),
+                    tokio::time::timeout(
+                        Duration::from_secs(2),
+                        tab.cdp.call(
+                            Some(&session),
                             "Input.dispatchKeyEvent",
                             json!({"type":kind,"key":key,"code":key,
                                 "windowsVirtualKeyCode":key_code,
                                 "text":if key == "Enter" && kind == "keyDown" {"\r"} else {""}}),
-                        )
-                        .await?;
+                        ),
+                    )
+                    .await
+                    .map_err(|_| anyhow::anyhow!("Private page is still loading"))??;
                 }
             }
             ViewAction::Scroll { x, y, delta_y } => {
@@ -1321,41 +1519,99 @@ impl CheckoutService {
                 {
                     bail!("Invalid private scroll");
                 }
-                checkout
-                    .tab
-                    .cdp
-                    .call(
-                        Some(&checkout.view_session),
+                let (cdp, session) = {
+                    let private = self.private.lock().await;
+                    let checkout = private.as_ref().context("No active private checkout")?;
+                    authorize_view(checkout, token)?;
+                    (checkout.tab.cdp.clone(), checkout.view_session.clone())
+                };
+                tokio::time::timeout(
+                    Duration::from_secs(2),
+                    cdp.call(
+                        Some(&session),
                         "Input.dispatchMouseEvent",
                         json!({"type":"mouseWheel","x":x,"y":y,"deltaX":0,"deltaY":delta_y}),
-                    )
-                    .await?;
+                    ),
+                )
+                .await
+                .map_err(|_| anyhow::anyhow!("Private page is still loading"))??;
             }
             ViewAction::SelectPage { target } => {
-                let pages = Self::private_pages(checkout).await?;
+                let (operation_id, tab) = {
+                    let private = self.private.lock().await;
+                    let checkout = private.as_ref().context("No active private checkout")?;
+                    authorize_view(checkout, token)?;
+                    (checkout.operation_id.clone(), checkout.tab.clone())
+                };
+                let pages =
+                    tokio::time::timeout(Duration::from_secs(2), Self::list_private_pages(&tab))
+                        .await
+                        .map_err(|_| anyhow::anyhow!("Private page is still loading"))??;
                 if !pages.iter().any(|p| p["target"] == target) {
                     bail!("Unknown private page");
                 }
-                Self::select_private_page(checkout, target).await?;
+                let session = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    Self::prepare_private_page(&tab, &target),
+                )
+                .await
+                .map_err(|_| anyhow::anyhow!("Private page is still loading"))??;
+                let mut private = self.private.lock().await;
+                let checkout = private
+                    .as_mut()
+                    .filter(|checkout| checkout.operation_id == operation_id)
+                    .context("Private checkout changed")?;
+                authorize_view(checkout, token)?;
+                checkout.seen_pages.insert(target.clone());
+                checkout.view_target = target;
+                checkout.view_session = session;
             }
             ViewAction::Finish => {
-                if checkout.mode == Mode::TakeOver {
-                    let resume = Self::page_url(checkout).await;
-                    self.browser
-                        .return_control_at(&checkout.view_target, resume)
-                        .await?;
-                    self.set_state(&checkout.operation_id, "returned");
+                let (operation_id, mode, tab, view_target) = {
+                    let private = self.private.lock().await;
+                    let checkout = private.as_ref().context("No active private checkout")?;
+                    authorize_view(checkout, token)?;
+                    (
+                        checkout.operation_id.clone(),
+                        checkout.mode,
+                        checkout.tab.clone(),
+                        checkout.view_target.clone(),
+                    )
+                };
+                if mode == Mode::TakeOver {
+                    let resume = tokio::time::timeout(
+                        Duration::from_secs(2),
+                        tab.cdp.call(
+                            None,
+                            "Target.getTargetInfo",
+                            json!({"targetId":view_target}),
+                        ),
+                    )
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .and_then(|target| target["targetInfo"]["url"].as_str().map(str::to_owned));
+                    self.browser.return_control_at(&view_target, resume).await?;
+                    self.set_state(&operation_id, "returned");
                 } else {
-                    let state = if checkout.mode == Mode::TakeOver {
+                    let state = if mode == Mode::TakeOver {
                         "returned"
+                    } else if self.store.get(&operation_id)?.state == "needs_input" {
+                        "not_submitted"
                     } else {
                         "uncertain"
                     };
-                    self.set_state(&checkout.operation_id, state);
+                    self.set_state(&operation_id, state);
                     self.browser.return_control().await?;
                 }
-                self.retain_completed(checkout, self.store.get(&checkout.operation_id)?);
-                *private = None;
+                let mut private = self.private.lock().await;
+                if let Some(checkout) = private
+                    .as_ref()
+                    .filter(|checkout| checkout.operation_id == operation_id)
+                {
+                    self.retain_completed(checkout, self.store.get(&operation_id)?);
+                    *private = None;
+                }
             }
         }
         Ok(())
@@ -1449,6 +1705,194 @@ const BROWSE_ERRORS: &[&str] = &[
 mod tests {
     use super::*;
     #[tokio::test]
+    async fn airline_confirmation_becomes_booked_with_its_code() {
+        let (url, server) = crate::discovery::tests::fixture(
+            "<p data-bloom-total-minor='21730759' data-bloom-currency='ARS'>Total ARS 217307.59</p>
+             <input autocomplete='cc-number'><input autocomplete='cc-exp'><input autocomplete='cc-csc'>
+             <button>Pagar</button><h1>Tu compra ha sido confirmada</h1><p>Código de reserva: AB12CD</p>".into(),
+        )
+        .await;
+        let root = tempfile::tempdir().unwrap().keep();
+        let browser = Browser::launch(
+            &crate::test_chromium(),
+            &root.join("profile"),
+            &["--no-sandbox".into(), "--ignore-certificate-errors".into()],
+        )
+        .await
+        .unwrap();
+        browser
+            .browse(crate::browser::BrowseRequest::Open { url })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let tab = browser.handoff().await.unwrap();
+        let discovery = Discovery::read(&tab).await.unwrap();
+        let service = Arc::new(
+            CheckoutService::new(
+                browser,
+                &root.join("state.db"),
+                root.join("unused.sock"),
+                unsafe { libc::geteuid() },
+                47999,
+            )
+            .unwrap(),
+        );
+        let status = Status {
+            operation_id: "fixture-booking".into(),
+            state: "submitted".into(),
+            ceremony_url: None,
+            filled_fields: vec!["number".into(), "expiry".into(), "cvc".into()],
+            outcome: None,
+        };
+        service
+            .store
+            .insert(&status, "card", "Fixture flight")
+            .unwrap();
+        let token = hex_token(&[23; 32]);
+        *service.private.lock().await = Some(PrivateCheckout {
+            operation_id: status.operation_id.clone(),
+            mode: Mode::Card,
+            view_target: tab.target.clone(),
+            view_session: tab.session.clone(),
+            seen_pages: std::collections::HashSet::from([tab.target.clone()]),
+            tab,
+            discovery: Some(discovery),
+            recipient: None,
+            capability: token.clone(),
+            claimed: true,
+            approved: true,
+            manual_submission: false,
+        });
+        tokio::time::timeout(
+            Duration::from_secs(4),
+            service.watch_outcome(status.operation_id.clone()),
+        )
+        .await
+        .unwrap();
+        let public = service.store.get(&status.operation_id).unwrap();
+        assert_eq!(public.state, "booked");
+        assert_eq!(public.outcome.unwrap().order_id.as_deref(), Some("AB12CD"));
+        let private = service.private_state(&token).await.unwrap();
+        assert_eq!(private["state"], "booked");
+        assert_eq!(private["outcome"]["order_id"], "AB12CD");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn form_error_stays_private_and_manual_pay_is_recorded_before_click() {
+        let (url, server) = crate::discovery::tests::fixture(
+            "<p data-bloom-total-minor='399' data-bloom-currency='USD'>Total USD 3.99</p>
+             <input autocomplete='cc-number'><input autocomplete='cc-exp'><input autocomplete='cc-csc'>
+             <p>Debes completar todos los campos</p>
+             <button id='pay' onclick=\"setTimeout(()=>document.body.innerHTML='<h1>Tu compra ha sido confirmada</h1><p>Código de reserva: ZX98YU</p>',1200)\">Pagar</button>".into(),
+        )
+        .await;
+        let root = tempfile::tempdir().unwrap().keep();
+        let browser = Browser::launch(
+            &crate::test_chromium(),
+            &root.join("profile"),
+            &["--no-sandbox".into(), "--ignore-certificate-errors".into()],
+        )
+        .await
+        .unwrap();
+        browser
+            .browse(crate::browser::BrowseRequest::Open { url })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let tab = browser.handoff().await.unwrap();
+        let observer = tab.clone();
+        let discovery = Discovery::read(&tab).await.unwrap();
+        let service = Arc::new(
+            CheckoutService::new(
+                browser,
+                &root.join("state.db"),
+                root.join("unused.sock"),
+                unsafe { libc::geteuid() },
+                47999,
+            )
+            .unwrap(),
+        );
+        let status = Status {
+            operation_id: "fixture-correction".into(),
+            state: "submitted".into(),
+            ceremony_url: None,
+            filled_fields: vec!["number".into(), "expiry".into(), "cvc".into()],
+            outcome: None,
+        };
+        service
+            .store
+            .insert(&status, "card", "Fixture correction")
+            .unwrap();
+        let token = hex_token(&[29; 32]);
+        *service.private.lock().await = Some(PrivateCheckout {
+            operation_id: status.operation_id.clone(),
+            mode: Mode::Card,
+            view_target: tab.target.clone(),
+            view_session: tab.session.clone(),
+            seen_pages: std::collections::HashSet::from([tab.target.clone()]),
+            tab,
+            discovery: Some(discovery),
+            recipient: None,
+            capability: token.clone(),
+            claimed: true,
+            approved: true,
+            manual_submission: false,
+        });
+        let watcher = tokio::spawn({
+            let service = service.clone();
+            let operation_id = status.operation_id.clone();
+            async move { service.watch_outcome(operation_id).await }
+        });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while service.store.get(&status.operation_id).unwrap().state != "needs_input" {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(service.private.lock().await.is_some());
+        let point = observer
+            .cdp
+            .evaluate(
+                &observer.session,
+                "(()=>{const r=document.getElementById('pay').getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2};})()".into(),
+            )
+            .await
+            .unwrap();
+        service
+            .private_action(
+                &token,
+                ViewAction::Click {
+                    x: point["x"].as_f64().unwrap(),
+                    y: point["y"].as_f64().unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            service.store.get(&status.operation_id).unwrap().state,
+            "submitted"
+        );
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert_eq!(
+            service.store.get(&status.operation_id).unwrap().state,
+            "submitted",
+            "stale validation text must not authorize a second payment click"
+        );
+        assert!(service.private.lock().await.is_some());
+        tokio::time::timeout(Duration::from_secs(4), watcher)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            service.store.get(&status.operation_id).unwrap().state,
+            "booked"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn a_page_that_never_paints_does_not_stall_the_private_view() {
         // A renderer stuck in script cannot answer a screenshot.
         let (url, server) = crate::discovery::tests::fixture(
@@ -1486,6 +1930,7 @@ mod tests {
             capability: "fixture".into(),
             claimed: true,
             approved: true,
+            manual_submission: false,
         });
         let started = tokio::time::Instant::now();
         let capture = {
@@ -1906,6 +2351,7 @@ mod tests {
             capability: token.clone(),
             claimed: false,
             approved: false,
+            manual_submission: false,
         });
         let router = crate::view::router(service.clone());
         let viewer = tokio::spawn(async move {
@@ -1964,9 +2410,6 @@ mod tests {
             .private_action(&token, ViewAction::Click { x: 28., y: 20. })
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let state = service.private_state(&token).await.unwrap();
-        assert_eq!(state["pages"].as_array().unwrap().len(), 2);
         let root_target = service
             .private
             .lock()
@@ -1976,6 +2419,18 @@ mod tests {
             .tab
             .target
             .clone();
+        let state = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let state = service.private_state(&token).await.unwrap();
+                if state["selected_page"] != root_target {
+                    break state;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(state["pages"].as_array().unwrap().len(), 2);
         assert_ne!(state["selected_page"], root_target);
         service
             .private_action(&token, ViewAction::Key { key: "Tab".into() })
@@ -2128,6 +2583,7 @@ mod tests {
             capability: token.clone(),
             claimed: true,
             approved: true,
+            manual_submission: false,
         });
         service
             .private_action(&token, ViewAction::Click { x: 20., y: 15. })
@@ -2232,5 +2688,29 @@ mod tests {
             (Some(1250), Some("EUR"))
         );
         assert_eq!(entry.status.as_ref().unwrap().state, "disclosure_unknown");
+        let submitted = Status {
+            operation_id: "submitted-operation".into(),
+            state: "submitted".into(),
+            ceremony_url: None,
+            filled_fields: vec!["number".into(), "expiry".into(), "cvc".into()],
+            outcome: None,
+        };
+        reopened.insert(&submitted, "card", "Flight").unwrap();
+        let mut needs_input = submitted.clone();
+        needs_input.operation_id = "needs-input-operation".into();
+        needs_input.state = "needs_input".into();
+        reopened
+            .insert(&needs_input, "card", "Flight form")
+            .unwrap();
+        drop(reopened);
+        let reopened = Store::open(&path).unwrap();
+        assert_eq!(
+            reopened.get("submitted-operation").unwrap().state,
+            "uncertain"
+        );
+        assert_eq!(
+            reopened.get("needs-input-operation").unwrap().state,
+            "not_submitted"
+        );
     }
 }

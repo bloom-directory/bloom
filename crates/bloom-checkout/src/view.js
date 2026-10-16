@@ -45,9 +45,11 @@ document.querySelectorAll('[data-key]').forEach(button=>button.addEventListener(
 document.getElementById('finish').addEventListener('click',()=>act({action:'finish'}));
 // What each state means for the person watching, in plain words.
 const describe = state => ({
-  submitted: 'Payment sent. Waiting for the site to confirm it. Keep this window open.',
-  needs_attention: 'The site needs something from you before the payment completes. Check what the page highlights or asks to confirm, then press its button.',
-  paid: 'Done: the site confirmed the purchase.' + (state.outcome?.order_id ? ` Booking or order code: ${state.outcome.order_id}.` : ''),
+  submitted: 'Payment sent once. Waiting for the site to confirm it; do not click Pay again. Finish any bank or email check here.',
+  needs_input: 'The site refused the payment form; nothing was charged. Correct what the page highlights, then click Pay once.',
+  not_submitted: 'Payment was not submitted. Nothing was charged.',
+  booked: 'Booked.' + (state.outcome?.order_id ? ` Booking code: ${state.outcome.order_id}.` : ' The booking code is in the confirmation email.'),
+  paid: 'Done: the site confirmed the purchase.' + (state.outcome?.order_id ? ` Order code: ${state.outcome.order_id}.` : ''),
   declined: 'The payment was declined. Bloom will not try again.',
   uncertain: 'Bloom could not confirm the result. Do not pay again yet: check your email and bank or card app first.',
   manual_required: 'Finish the payment yourself in this window.',
@@ -62,6 +64,11 @@ async function refresh() {
       document.getElementById('purpose').textContent='Log in, enter a code or pass a check here. The agent cannot see this view. When you are done, hand the browser back.';
       document.getElementById('finish').textContent='Done, hand back to the agent';
       document.getElementById('note').hidden=true;
+    }
+    if(state.state==='needs_input') {
+      document.getElementById('finish').textContent='Close without paying';
+      document.getElementById('note').textContent='Closing now records that the payment was not submitted.';
+      document.getElementById('note').hidden=false;
     }
     if(state.closed) {
       status.textContent=describe(state);

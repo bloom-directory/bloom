@@ -100,12 +100,13 @@ an unclear total goes to the human's private view; its URL and screenshots
 never appear in VFS. A manual
 fallback releases no saved card.
 
-`filled` means fields were filled, not that payment succeeded. `paid` and
-`declined` describe what the merchant reported; Bloom has not verified the
-bank charge. For a booking, `outcome.order_id` holds the booking code the
-site showed. `needs_attention` means the site refused the submission or asked
-the human to re-enter details: the payment has not gone through and the human
-finishes it in the private view. `partially_filled`, `disclosure_unknown`, and `uncertain` require
+`filled` means fields were filled, not that payment succeeded. `booked`,
+`paid` and `declined` describe what the merchant reported; Bloom has not
+verified the bank charge. For `booked`, `outcome.order_id` holds the booking
+code the site showed. `needs_input` means the site refused the payment form:
+nothing was submitted, and the human corrects it and clicks Pay once in the
+private view. `not_submitted` means that view closed without a payment
+attempt. `partially_filled`, `disclosure_unknown`, and `uncertain` require
 human inspection; never repeat the purchase automatically. Ask the human to
 check the merchant account or confirmation email. After private checkout
 closes, shopping resumes on a fresh tab.

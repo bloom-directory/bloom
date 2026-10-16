@@ -272,6 +272,45 @@ mod tests {
         server.abort();
     }
     #[tokio::test]
+    async fn text_fields_are_touched_and_confirmation_email_is_repeated() {
+        let (browser, server, _) = browser_at(
+            "<div><div>Nombres</div><input id='name' required></div>
+             <label>Correo electrónico<input id='email' type='email' required></label>
+             <label>Confirmar correo electrónico<input id='confirm' type='email' required></label>
+             <button id='next' disabled>Continuar</button>
+             <script>const nameField=document.getElementById('name'),emailField=document.getElementById('email'),confirmField=document.getElementById('confirm'),nextButton=document.getElementById('next');
+               const fields=[nameField,emailField,confirmField];
+               const update=()=>nextButton.disabled=!(fields.every(e=>e.dataset.touched==='yes')&&nameField.value&&emailField.value===confirmField.value);
+               for(const e of fields){e.addEventListener('input',update);e.addEventListener('focusout',()=>{e.dataset.touched='yes';update();});}</script>",
+        )
+        .await;
+        let tab = browser.handoff().await.unwrap();
+        let discovery =
+            TravelerDiscovery::read(&tab, &[TravelerField::GivenName, TravelerField::Email])
+                .await
+                .unwrap();
+        let values = [
+            ("given_name".into(), Zeroizing::new("Synthetic".into())),
+            ("email".into(), Zeroizing::new("fixture@example.com".into())),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            discovery.fill(&tab, &values).await.unwrap(),
+            ["given_name", "email"]
+        );
+        let state = tab
+            .cdp
+            .evaluate(
+                &tab.session,
+                "(()=>{const fields=['name','email','confirm'].map(id=>document.getElementById(id));return {same:fields[1].value===fields[2].value,touched:fields.every(e=>e.dataset.touched==='yes'),ready:!document.getElementById('next').disabled};})()".into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(state, json!({"same":true,"touched":true,"ready":true}));
+        server.abort();
+    }
+    #[tokio::test]
     async fn site_drawn_dropdowns_are_chosen_by_clicking_their_option() {
         // Shaped like JetSMART: gender is a read-only input whose options appear on click.
         let (browser, server, _) = browser_at(
