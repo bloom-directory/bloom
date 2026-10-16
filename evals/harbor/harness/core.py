@@ -18,6 +18,15 @@ class EvalError(RuntimeError):
     """A fail-closed evaluation error suitable for operator display."""
 
 
+@dataclass
+class EvalEvidence:
+    """Observed lifecycle evidence, retained even when the run raises."""
+
+    result: Any | None = None
+    cleanup_succeeded: bool | None = None
+    cleanup_error: str | None = None
+
+
 @dataclass(frozen=True)
 class AgentSpec:
     harbor_name: str
@@ -172,11 +181,13 @@ def run_eval(
     harbor_runner: HarborRunner = run_harbor_job,
     acquire_lock: bool = True,
     phase_timings: dict[str, float] | None = None,
+    evidence: EvalEvidence | None = None,
 ) -> Any:
     """Execute one provisioned eval and guarantee outer cleanup."""
     agent = _agent_spec(agent_name)
     definition.lock_path.parent.mkdir(parents=True, exist_ok=True)
     timings = phase_timings if phase_timings is not None else {}
+    evidence = evidence if evidence is not None else EvalEvidence()
 
     def execute() -> Any:
         started = time.monotonic()
@@ -198,6 +209,7 @@ def run_eval(
             timings["authority_provisioning_seconds"] = time.monotonic() - started
             started = time.monotonic()
             result = asyncio.run(harbor_runner(context, agent))
+            evidence.result = result
             timings["harbor_seconds"] = time.monotonic() - started
             definition.validate_result(result)
         except BaseException as error:  # noqa: BLE001 -- cleanup must cover interrupts
@@ -208,8 +220,11 @@ def run_eval(
                 started = time.monotonic()
                 try:
                     definition.cleanup()
+                    evidence.cleanup_succeeded = True
                     timings["session_cleanup_seconds"] = time.monotonic() - started
                 except BaseException as cleanup_error:
+                    evidence.cleanup_succeeded = False
+                    evidence.cleanup_error = str(cleanup_error)
                     timings["session_cleanup_seconds"] = time.monotonic() - started
                     if run_error is not None:
                         raise EvalError(
