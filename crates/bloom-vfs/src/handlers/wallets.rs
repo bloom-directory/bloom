@@ -2336,6 +2336,18 @@ impl WalletsHandler {
                     "pending",
                     "confirmed",
                 )?;
+                // Reads reuse a projection observed within the cache's max
+                // age, which may predate this commit. Observe the wallet again
+                // so its projection shows the committed policy at once. The
+                // commit has succeeded either way.
+                if let Err(error) = self.wallet_projection_authority(wallet).await {
+                    tracing::warn!(
+                        wallet = wallet,
+                        action_id = projection.operation_id.as_str(),
+                        error = %error,
+                        "policy_update.projection_refresh_failed"
+                    );
+                }
                 Ok(())
             }
             bloom_broker_api::CeremonyState::Cancelled

@@ -2,7 +2,8 @@
 # End-to-end check of the default wallet policy on a throwaway developer triad.
 #
 # 1. Launch a triad whose Machine config chooses Hyperliquid and Polymarket in
-#    [petals.setup], with both Petals installed from local builds.
+#    [petals.setup], and wait for Machine to install both from the release
+#    catalog, as it does on a release install.
 # 2. `bloom wallet new main`: the debug driver completes the wallet
 #    registration ceremony, then the default-policy ceremony the command opens.
 # 3. Verify main's policy allows exactly both installed package hashes, that
@@ -18,17 +19,21 @@
 # Binaries: BLOOM_INTEGRATION_BROKER_BIN, BLOOM_INTEGRATION_SIGNER_BIN and
 # BLOOM_INTEGRATION_DEBUG_DRIVER_BIN must point at builds of the Broker and
 # Signer revisions pinned in packaging/triad/release/compatibility-v1.toml.
-# Petal checkouts default to siblings of this repository (BLOOM_PETALS_ROOT).
+#
+# The Petals are the catalog releases, not local builds. Machine installs the
+# catalog releases as soon as it starts, and a local build cannot replace one
+# afterwards because the catalog has no successor record for it. Installing
+# the releases downloads their pinned archives, so this needs network access.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
-petals_root="$(cd "${BLOOM_PETALS_ROOT:-$repo_root/..}" && pwd -P)"
 launcher="$repo_root/scripts/triad-dev-launch.sh"
 bloom_bin="${BLOOM_INTEGRATION_MACHINE_BIN:-$repo_root/target/debug/bloom}"
 driver_bin="${BLOOM_INTEGRATION_DEBUG_DRIVER_BIN:?set to the pinned bloom-broker-debug-driver}"
 : "${BLOOM_INTEGRATION_BROKER_BIN:?set to the pinned bloom-broker}"
 : "${BLOOM_INTEGRATION_SIGNER_BIN:?set to the pinned bloom-signer}"
 startup_timeout_secs="${BLOOM_INTEGRATION_STARTUP_TIMEOUT_SECS:-600}"
+provisioning_timeout_secs="${BLOOM_INTEGRATION_PROVISIONING_TIMEOUT_SECS:-300}"
 AUTH_SEED="default-policy-e2e-auth"
 WALLET="main"
 
@@ -39,8 +44,6 @@ command -v jq >/dev/null 2>&1 || die "jq is required"
 command -v python3 >/dev/null 2>&1 || die "python3 is required"
 [ -x "$launcher" ] || die "launcher is not executable: $launcher"
 [ -x "$driver_bin" ] || die "debug driver is not executable: $driver_bin"
-[ -d "$petals_root/bloom-petal-hyperliquid/petal/hyperliquid" ] || die "build bloom-petal-hyperliquid first"
-[ -d "$petals_root/bloom-petal-polymarket/petal/polymarket" ] || die "build bloom-petal-polymarket first"
 
 free_port() {
   python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()'
@@ -85,7 +88,7 @@ trap cleanup EXIT INT TERM
 cli() { "$bloom_bin" --home "$machine_home" "$@"; }
 
 # 1. Machine config: a placeholder chain (nothing here reads chain state) and
-#    the setup choices. The launcher forces preinstalled = [] but keeps these.
+#    the setup choices. The launcher copies it unchanged.
 nfs_port="$(free_port)"
 ceremony_port="$(free_port)"
 cat > "$machine_config" <<EOF
@@ -105,7 +108,6 @@ legacy_tx = false
 op_stack = false
 
 [petals]
-preinstalled = []
 setup_complete = true
 
 [petals.setup.hyperliquid]
@@ -117,9 +119,6 @@ chmod 0600 "$machine_config"
 
 say "launching the developer triad (logs: $launcher_log)"
 BLOOM_TRIAD_DEV_MACHINE_CONFIG="$machine_config" \
-BLOOM_TRIAD_DEV_BUILD_PETALS=0 \
-BLOOM_TRIAD_DEV_HYPERLIQUID_PACKAGE="$petals_root/bloom-petal-hyperliquid" \
-BLOOM_TRIAD_DEV_POLYMARKET_PACKAGE="$petals_root/bloom-petal-polymarket" \
   "$launcher" \
     --ceremony-port "$ceremony_port" \
     --developer-root "$developer_root" \
@@ -141,7 +140,19 @@ say "triad ready"
 grep -q '^\[petals.setup.polymarket.values\]' "$machine_home/config.toml" ||
   die "launcher dropped the [petals.setup] tables"
 
-owner_hash() { jq -er '.hash' "$machine_home/petals/store/owners/$1.json"; }
+# Machine installs the catalog Petals in the background once it is ready.
+owners_dir="$machine_home/petals/store/owners"
+deadline=$(( $(date +%s) + provisioning_timeout_secs ))
+until [ -f "$owners_dir/hyperliquid.json" ] && [ -f "$owners_dir/polymarket.json" ]; do
+  kill -0 "$launcher_pid" 2>/dev/null || { tail -40 "$launcher_log" >&2; die "triad exited while installing the catalog Petals"; }
+  [ "$(date +%s)" -lt "$deadline" ] || {
+    grep 'petal.provisioning_finished' "$log_dir/machine.log" >&2 || true
+    die "Machine did not install hyperliquid and polymarket from the catalog"
+  }
+  sleep 1
+done
+
+owner_hash() { jq -er '.hash' "$owners_dir/$1.json"; }
 hl_hash="$(owner_hash hyperliquid)" || die "hyperliquid is not installed"
 pm_hash="$(owner_hash polymarket)" || die "polymarket is not installed"
 say "installed hyperliquid ${hl_hash:0:12}, polymarket ${pm_hash:0:12}"
