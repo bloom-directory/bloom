@@ -47,6 +47,11 @@ tool for this checkout.
   `agent_description`. Forward the status ceremony URL. One approval unlocks
   that person for this website for 30 minutes; `status.json` then says
   `unlocked`. It authorizes no payment.
+- Unlock each passenger, payer or contact separately once. Approved records
+  remain available across this journey's pages; do not repeat the ceremony on
+  every page. With multiple people unlocked, `fill_traveler` and
+  `type_traveler` require the exact `traveler_id`. Omitting it is allowed only
+  when one record is unlocked. An unapproved ID is refused.
 - On each page asking for that person's details, send the browse action
   `fill_traveler`. It fills the empty fields it recognizes and returns only
   their names; card-holder fields are left for the payer. For a field it
@@ -57,6 +62,15 @@ tool for this checkout.
   `born_on_year` or `born_on_dmy`.
   Snapshots show unlocked values as `[saved <field>]`; check each field holds
   the right placeholder, and never try to recover the values.
+  When a page contains multiple passenger blocks, use `type_traveler` with the
+  person's ID and fresh references to that person's specific fields. Automatic
+  filling of duplicate/ambiguous fields stays blocked. Use the payer/contact's
+  own approved ID for those fields; never substitute a passenger by position.
+  A new explicit open, private completion/handback or expiry ends the unlock.
+  To cancel an outstanding unlock or revoke future fills from an unlocked
+  record, write to its original `checkout/requests/<operation_id>/cancel`.
+  The file ignores the body. Values already sent to the site
+  cannot be retracted; cancellation prevents future private fills.
 - Write a browse request to `checkout/browse/<64-hex-slot>/in.json`; read
   `out.json`. Reuse a slot. Results expire after five minutes. Requests use
   `action`: `open` plus `url`, `snapshot`, `click` plus `element_ref`, `type`
@@ -126,8 +140,9 @@ closes, shopping resumes on a fresh tab.
 
 Protection depends on separate service principals. Root and root-equivalent
 access, including membership in the Docker group, is outside that claim.
-Installed private filling through the normal-profile extension is not yet
-accepted across the service-user boundary. Its development same-UID bridge
+Private filling and checkout handoff through the normal-profile extension are
+disabled in release builds until that boundary is protected. A development
+rehearsal requires an explicit non-release opt-in. Its same-UID bridge
 does not establish isolation from other programs running as the login user.
 
 Machine exposes this VFS; Broker controls approval ceremonies and policy;

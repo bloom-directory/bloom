@@ -51,6 +51,28 @@ The approval page also shows the entered fields and, when checkout owns the
 browser, a screenshot of the order. These are human aids and are not bound to
 the approval.
 
+## Saved booking party
+
+Checkout retains up to twelve independently approved traveler records within
+one origin/journey (nine passengers and separate payer/billing/contact roles).
+Private values remain in checkout. `fill_traveler` and `type_traveler` accept
+`traveler_id`; it is mandatory when multiple records are unlocked and must
+name an already approved record. Existing single-person JSON remains valid.
+
+Duplicate passenger forms are not filled by guessing DOM order. The agent uses
+public field references and the exact approved person's ID for each passenger
+or payer/contact field. No raw saved values are accepted from or returned to
+Machine. A new explicit open and private completion/handback clear the cache;
+expired records are refused synchronously and erased by a one-second sweep.
+Cancellation discards an outstanding recipient key or removes the unlocked
+record, durably marks the operation cancelled and cannot be reversed by a late
+release/poll result. Broker cancellation is best effort after local revocation;
+an unavailable Broker cannot preserve local fill access. Already disclosed
+page values cannot be recalled.
+Snapshot-redaction patterns use zeroizing storage and remain until the browser
+context is safely discarded, so expiry cannot expose values already in a DOM.
+Final itinerary/party review and binding remain a separate acceptance gate.
+
 ## User browser extension
 
 The extension's manifest, background worker, content-script dispatcher and
@@ -132,6 +154,10 @@ malformed/truncated/oversized input and lost connections fail closed. Platform
 registration follows [Chrome native messaging](https://developer.chrome.com/docs/extensions/develop/concepts/native-messaging).
 
 This is still a development connection, not installed extension acceptance.
+Release builds reject private extension handoff, traveler unlock and private
+fill regardless of connection state. Only a `triad-dev-harness` build exposes
+`--development-extension-private` for explicit synthetic rehearsal; that flag
+requires `--extension-socket`. It is not a production trust decision.
 Checkout currently accepts only its own UID on the extension socket; the
 installed browser uses the login UID, not the isolated checkout UID. Do not
 remove this check or open the socket to the login UID as a packaging shortcut.

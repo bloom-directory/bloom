@@ -12,12 +12,13 @@
     if (e.type !== 'radio' && e.type !== 'checkbox' && e.value) continue;
     // Card-holder name, document and email belong to the payer, not the traveler.
     let payer = false;
-    for (let a = e.parentElement; a && !payer; a = a.parentElement) {
+    for (let a = e.parentElement; a && a !== document.body && !payer; a = a.parentElement) {
       const text = normalize(a.innerText);
       // Stop at the payment block: a few fields and a short text.
       const fields = [...a.querySelectorAll('input,select')].filter(f => f.type !== 'hidden' && f.getClientRects().length);
       if (text.length > 600 || fields.length > 5) break;
       payer = /titular|cardholder|card holder/.test(text);
+      if (a.matches('fieldset,[role=group]')) break;
     }
     if (payer) continue;
     const ac = (e.autocomplete || '').split(' ').at(-1);

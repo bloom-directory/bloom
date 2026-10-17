@@ -257,7 +257,29 @@ mod tests {
             .browse(BrowseRequest::Open { url: url.clone() })
             .await
             .unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let expected_origin = url::Url::parse(&url)
+            .unwrap()
+            .origin()
+            .ascii_serialization();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let snapshot = browser.browse(BrowseRequest::Snapshot).await;
+                if snapshot.is_ok_and(|snapshot| {
+                    snapshot["elements"]
+                        .as_array()
+                        .is_some_and(|elements| !elements.is_empty())
+                }) && browser
+                    .shopping_origin()
+                    .await
+                    .is_ok_and(|origin| origin == expected_origin)
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("traveler fixture never became ready");
         (browser, server, url)
     }
     #[tokio::test]

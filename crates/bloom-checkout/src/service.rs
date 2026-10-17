@@ -69,6 +69,18 @@ impl Store {
             .context("Unknown checkout request")?;
         Ok(serde_json::from_str(&text)?)
     }
+    fn kind(&self, id: &str) -> Result<String> {
+        self.0
+            .lock()
+            .query_row("SELECT kind FROM operations WHERE id=?1", [id], |row| {
+                row.get(0)
+            })
+            .context("Unknown checkout request")
+    }
+    fn finish_traveler(&self, id: &str, state: &str) -> Result<()> {
+        self.0.lock().execute("UPDATE operations SET state=?2,status=json_set(status,'$.state',?2,'$.ceremony_url',NULL) WHERE id=?1 AND kind='traveler' AND state!='cancelled'",params![id,state])?;
+        Ok(())
+    }
     fn insert(&self, status: &Status, kind: &str, description: &str) -> Result<()> {
         let created = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
@@ -176,6 +188,7 @@ struct PrivateCheckout {
 
 struct PendingUnlock {
     operation_id: String,
+    traveler_id: String,
     recipient: Recipient,
     origin: String,
     context: String,
@@ -183,12 +196,48 @@ struct PendingUnlock {
 }
 
 struct UnlockedTraveler {
+    operation_id: String,
     origin: String,
     /// The unlock ends with the booking's browsing context.
     context: String,
     fields: Vec<bloom_signer_api::TravelerField>,
     values: BTreeMap<String, zeroize::Zeroizing<String>>,
     expires: tokio::time::Instant,
+}
+
+// Nine passengers plus distinct payer, billing and booking contacts.
+const MAX_UNLOCKED_TRAVELERS: usize = 12;
+
+fn prune_travelers(
+    travelers: &mut BTreeMap<String, UnlockedTraveler>,
+    context: &str,
+    origin: &str,
+) {
+    let now = tokio::time::Instant::now();
+    travelers.retain(|_, traveler| {
+        traveler.context == context && traveler.origin == origin && now < traveler.expires
+    });
+}
+
+fn selected_traveler<'a>(
+    travelers: &'a mut BTreeMap<String, UnlockedTraveler>,
+    context: &str,
+    origin: &str,
+    id: Option<&str>,
+) -> Result<&'a UnlockedTraveler> {
+    prune_travelers(travelers, context, origin);
+    if let Some(id) = id {
+        return travelers
+            .get(id)
+            .context("Unlock that saved traveler for this booking first");
+    }
+    if travelers.len() > 1 {
+        bail!("Choose traveler_id explicitly when multiple people are unlocked");
+    }
+    travelers
+        .values()
+        .next()
+        .context("Unlock a saved traveler first")
 }
 
 /// Country calling codes, longest first, for numbers sites want without one.
@@ -281,7 +330,7 @@ pub struct CheckoutService {
     store: Store,
     private: AsyncMutex<Option<PrivateCheckout>>,
     unlocking: AsyncMutex<Option<PendingUnlock>>,
-    traveler: AsyncMutex<Option<UnlockedTraveler>>,
+    travelers: AsyncMutex<BTreeMap<String, UnlockedTraveler>>,
     completed: Mutex<Option<CompletedView>>,
     broker_socket: PathBuf,
     broker_uid: u32,
@@ -334,7 +383,17 @@ impl CheckoutService {
             }
             _ => bail!("Traveler metadata unavailable"),
         };
-        let (context, origin) = self.browser.shopping_scope().await?;
+        let (context, origin) = self.browser.private_shopping_scope().await?;
+        {
+            let mut travelers = self.travelers.lock().await;
+            prune_travelers(&mut travelers, &context, &origin);
+            if travelers.contains_key(&traveler_id) {
+                bail!("That traveler is already unlocked; select their traveler_id when filling");
+            }
+            if travelers.len() >= MAX_UNLOCKED_TRAVELERS {
+                bail!("This booking already has the maximum number of unlocked travelers");
+            }
+        }
         use rand::RngCore;
         let mut nonce = [0; 32];
         rand::thread_rng().fill_bytes(&mut nonce);
@@ -378,6 +437,7 @@ impl CheckoutService {
         self.store.update(&status)?;
         *unlocking = Some(PendingUnlock {
             operation_id: operation_id.clone(),
+            traveler_id,
             recipient,
             origin,
             context,
@@ -392,8 +452,15 @@ impl CheckoutService {
         let deadline = tokio::time::Instant::now() + APPROVAL_RESULT_WAIT;
         loop {
             tokio::time::sleep(Duration::from_millis(300)).await;
+            if self
+                .store
+                .get(&operation_id)
+                .is_ok_and(|status| status.state == "cancelled")
+            {
+                return;
+            }
             if tokio::time::Instant::now() >= deadline {
-                self.set_state(&operation_id, "expired");
+                let _ = self.store.finish_traveler(&operation_id, "expired");
                 *self.unlocking.lock().await = None;
                 return;
             }
@@ -410,6 +477,14 @@ impl CheckoutService {
                         let pending = self.unlocking.lock().await.take();
                         match self.open_unlock(pending, receipt, output_aad).await {
                             Ok(()) => return,
+                            Err(_)
+                                if self
+                                    .store
+                                    .get(&operation_id)
+                                    .is_ok_and(|status| status.state == "cancelled") =>
+                            {
+                                return;
+                            }
                             // Released but unusable: nothing reached a page.
                             Err(_) => "failed",
                         }
@@ -422,7 +497,7 @@ impl CheckoutService {
                 },
                 _ => continue,
             };
-            self.set_state(&operation_id, state);
+            let _ = self.store.finish_traveler(&operation_id, state);
             *self.unlocking.lock().await = None;
             return;
         }
@@ -435,6 +510,9 @@ impl CheckoutService {
         aad: Option<CustodyOutputHpkeAad>,
     ) -> Result<()> {
         let pending = pending.context("Traveler unlock unavailable")?;
+        // Serialize record installation with cancellation, so a late release
+        // cannot resurrect permission after cancel has returned.
+        let mut travelers = self.travelers.lock().await;
         let mut status = self.store.consume(&pending.operation_id)?;
         let (context, origin) = self.browser.shopping_scope().await?;
         if context != pending.context || origin != pending.origin {
@@ -478,35 +556,67 @@ impl CheckoutService {
                 ),
         );
         status.filled_fields = values.keys().cloned().collect();
-        *self.traveler.lock().await = Some(UnlockedTraveler {
-            origin: pending.origin,
-            context: pending.context,
-            fields: pending.fields,
-            values,
-            expires: tokio::time::Instant::now() + Duration::from_secs(1800),
-        });
+        prune_travelers(&mut travelers, &pending.context, &pending.origin);
+        travelers.insert(
+            pending.traveler_id,
+            UnlockedTraveler {
+                operation_id: pending.operation_id,
+                origin: pending.origin,
+                context: pending.context,
+                fields: pending.fields,
+                values,
+                expires: tokio::time::Instant::now() + Duration::from_secs(1800),
+            },
+        );
         status.state = "unlocked".into();
         self.store.update(&status)?;
         Ok(())
     }
 
-    async fn type_traveler(&self, element_ref: String, field: &str) -> Result<Value> {
+    async fn cancel_traveler(&self, operation_id: &str) -> Result<Value> {
+        let mut unlocking = self.unlocking.lock().await;
+        let mut travelers = self.travelers.lock().await;
+        let mut status = self.store.get(operation_id)?;
+        if !matches!(
+            status.state.as_str(),
+            "requested" | "awaiting_approval" | "release_started" | "unlocked"
+        ) {
+            return Ok(serde_json::to_value(status)?);
+        }
+        let pending = unlocking
+            .as_ref()
+            .is_some_and(|record| record.operation_id == operation_id);
+        if pending {
+            unlocking.take();
+        } // Drops the only recipient private key.
+        travelers.retain(|_, traveler| traveler.operation_id != operation_id);
+        status.state = "cancelled".into();
+        status.ceremony_url = None;
+        self.store.update(&status)?;
+        drop(travelers);
+        drop(unlocking);
+        if pending {
+            // Local revocation is already durable. If Broker is unavailable,
+            // its old ciphertext is unusable and the ceremony expires normally.
+            let _ = self
+                .intake(json!({"method":"cancel","operation_id":operation_id}))
+                .await;
+        }
+        Ok(serde_json::to_value(status)?)
+    }
+
+    async fn type_traveler(
+        &self,
+        element_ref: String,
+        field: &str,
+        traveler_id: Option<&str>,
+    ) -> Result<Value> {
         if self.private.lock().await.is_some() {
             bail!("A checkout already has private control");
         }
-        let mut traveler = self.traveler.lock().await;
-        let context = self.browser.shopping_context().await;
-        // A finished checkout discards the context; the unlock goes with it.
-        if traveler
-            .as_ref()
-            .is_some_and(|t| t.context != context || tokio::time::Instant::now() >= t.expires)
-        {
-            *traveler = None;
-        }
-        let traveler = traveler.as_ref().context("Unlock a saved traveler first")?;
-        if self.browser.shopping_origin().await? != traveler.origin {
-            bail!("Saved traveler details are unlocked for another website");
-        }
+        let (context, origin) = self.browser.shopping_scope().await?;
+        let mut travelers = self.travelers.lock().await;
+        let traveler = selected_traveler(&mut travelers, &context, &origin, traveler_id)?;
         let text = derived_traveler_value(&traveler.values, field)
             .context("That saved traveler field is not available")?;
         if matches!(
@@ -531,20 +641,13 @@ impl CheckoutService {
         Ok(json!({"state":"typed","filled_fields":[field]}))
     }
 
-    async fn fill_traveler(&self) -> Result<Value> {
+    async fn fill_traveler(&self, traveler_id: Option<&str>) -> Result<Value> {
         if self.private.lock().await.is_some() {
             bail!("A checkout already has private control");
         }
-        let mut traveler = self.traveler.lock().await;
-        let context = self.browser.shopping_context().await;
-        // A finished checkout discards the context; the unlock goes with it.
-        if traveler
-            .as_ref()
-            .is_some_and(|t| t.context != context || tokio::time::Instant::now() >= t.expires)
-        {
-            *traveler = None;
-        }
-        let traveler = traveler.as_ref().context("Unlock a saved traveler first")?;
+        let (context, origin) = self.browser.shopping_scope().await?;
+        let mut travelers = self.travelers.lock().await;
+        let traveler = selected_traveler(&mut travelers, &context, &origin, traveler_id)?;
         let mut values = traveler.values.clone();
         if let Some(phone) = values.get("phone").and_then(|p| formatted_phone(p)) {
             values.insert("phone".into(), zeroize::Zeroizing::new(phone));
@@ -562,6 +665,16 @@ impl CheckoutService {
         Ok(json!({"state":"filled","filled_fields":filled}))
     }
 
+    async fn return_control(&self) -> Result<()> {
+        self.travelers.lock().await.clear();
+        self.browser.return_control().await
+    }
+
+    async fn return_control_at(&self, target: &str, url: Option<String>) -> Result<()> {
+        self.travelers.lock().await.clear();
+        self.browser.return_control_at(target, url).await
+    }
+
     pub fn new(
         browser: Arc<Browser>,
         state: &Path,
@@ -572,18 +685,36 @@ impl CheckoutService {
         if view_port == 0 {
             bail!("Private view port must be explicit");
         }
+        let runtime =
+            tokio::runtime::Handle::try_current().context("Checkout needs an async runtime")?;
         let store = Store::open(state)?;
-        Ok(Arc::new(Self {
+        let service = Arc::new(Self {
             browser,
             store,
             private: AsyncMutex::new(None),
             unlocking: AsyncMutex::new(None),
-            traveler: AsyncMutex::new(None),
+            travelers: AsyncMutex::new(BTreeMap::new()),
             completed: Mutex::new(None),
             broker_socket,
             broker_uid,
             view_port,
-        }))
+        });
+        let weak = Arc::downgrade(&service);
+        runtime.spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let Some(service) = weak.upgrade() else {
+                    break;
+                };
+                let now = tokio::time::Instant::now();
+                service
+                    .travelers
+                    .lock()
+                    .await
+                    .retain(|_, record| now < record.expires);
+            }
+        });
+        Ok(service)
     }
 
     async fn intake(&self, request: Value) -> Result<IntakeResponse> {
@@ -620,12 +751,25 @@ impl CheckoutService {
                 traveler_id,
             } => self.start_traveler(operation_id, traveler_id).await,
             Request::Browse {
-                request: BrowseRequest::FillTraveler,
-            } => self.fill_traveler().await,
+                request: BrowseRequest::FillTraveler { traveler_id },
+            } => self.fill_traveler(traveler_id.as_deref()).await,
             Request::Browse {
-                request: BrowseRequest::TypeTraveler { element_ref, field },
-            } => self.type_traveler(element_ref, &field).await,
-            Request::Browse { request } => self.browser.browse(request).await,
+                request:
+                    BrowseRequest::TypeTraveler {
+                        element_ref,
+                        field,
+                        traveler_id,
+                    },
+            } => {
+                self.type_traveler(element_ref, &field, traveler_id.as_deref())
+                    .await
+            }
+            Request::Browse { request } => {
+                if matches!(request, BrowseRequest::Open { .. }) {
+                    self.travelers.lock().await.clear();
+                }
+                self.browser.browse(request).await
+            }
             Request::Status { operation_id } => {
                 Ok(serde_json::to_value(self.store.get(&operation_id)?)?)
             }
@@ -771,12 +915,15 @@ impl CheckoutService {
                     _ => {
                         status.state = "failed_before_release".into();
                         self.store.update(&status)?;
-                        self.browser.return_control().await?;
+                        self.return_control().await?;
                         Ok(serde_json::to_value(status)?)
                     }
                 }
             }
             Request::Cancel { operation_id } => {
+                if self.store.kind(&operation_id)? == "traveler" {
+                    return self.cancel_traveler(&operation_id).await;
+                }
                 let mut private = self.private.lock().await;
                 if private
                     .as_ref()
@@ -807,7 +954,7 @@ impl CheckoutService {
                 status.state = "cancelled".into();
                 status.ceremony_url = None;
                 self.store.update(&status)?;
-                self.browser.return_control().await?;
+                self.return_control().await?;
                 *private = None;
                 Ok(serde_json::to_value(status)?)
             }
@@ -846,7 +993,7 @@ impl CheckoutService {
                     | CardOperationState::Failed
                     | CardOperationState::Missing => {
                         self.set_state(&operation_id, "failed_before_release");
-                        if self.browser.return_control().await.is_ok() {
+                        if self.return_control().await.is_ok() {
                             *private = None;
                         }
                         return;
@@ -856,7 +1003,7 @@ impl CheckoutService {
             }
             if tokio::time::Instant::now() >= deadline {
                 self.set_state(&operation_id, "expired");
-                if self.browser.return_control().await.is_ok() {
+                if self.return_control().await.is_ok() {
                     *private = None;
                 }
                 return;
@@ -1212,8 +1359,7 @@ impl CheckoutService {
                         status.state = state.into();
                         status.outcome = serde_json::from_value(outcome.clone()).ok();
                         status.ceremony_url = None;
-                        if self.store.update(&status).is_ok()
-                            && self.browser.return_control().await.is_ok()
+                        if self.store.update(&status).is_ok() && self.return_control().await.is_ok()
                         {
                             let mut private = self.private.lock().await;
                             if let Some(checkout) =
@@ -1246,12 +1392,7 @@ impl CheckoutService {
                 } else {
                     None
                 };
-                if self
-                    .browser
-                    .return_control_at(&view_target, resume)
-                    .await
-                    .is_ok()
-                {
+                if self.return_control_at(&view_target, resume).await.is_ok() {
                     let final_state = if mode == Mode::TakeOver {
                         "returned"
                     } else {
@@ -1645,11 +1786,11 @@ impl CheckoutService {
                     .ok()
                     .and_then(Result::ok)
                     .and_then(|target| target["targetInfo"]["url"].as_str().map(str::to_owned));
-                    self.browser.return_control_at(&view_target, resume).await?;
+                    self.return_control_at(&view_target, resume).await?;
                     self.set_state(&operation_id, "returned");
                 } else {
                     self.set_state(&operation_id, "uncertain");
-                    self.browser.return_control().await?;
+                    self.return_control().await?;
                 }
                 let mut private = self.private.lock().await;
                 if let Some(checkout) = private
@@ -1754,11 +1895,297 @@ const BROWSE_ERRORS: &[&str] = &[
     "The Bloom extension did not answer",
     "The Bloom extension has too many pending requests",
     "Saved traveler details are unlocked for another booking or website",
+    "Choose traveler_id explicitly when multiple people are unlocked",
+    "Unlock that saved traveler for this booking first",
+    "Private filling in the normal-profile extension is disabled; use the isolated checkout browser",
 ];
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn multiple_travelers_and_a_different_payer_require_explicit_records_and_targets() {
+        let (url, server) = crate::discovery::tests::fixture(
+            "<fieldset><legend>Passenger one</legend><input aria-label='Passenger one given name' autocomplete='given-name'></fieldset>
+             <fieldset><legend>Passenger two</legend><input aria-label='Passenger two given name' autocomplete='given-name'></fieldset>
+             <fieldset><legend>Cardholder</legend><input aria-label='Payer given name' autocomplete='given-name'></fieldset>
+             <input type='email' aria-label='Contact email'>".into(),
+        ).await;
+        let root = tempfile::tempdir().unwrap();
+        let browser = Browser::launch(
+            &crate::test_chromium(),
+            &root.path().join("profile"),
+            &["--no-sandbox".into(), "--ignore-certificate-errors".into()],
+        )
+        .await
+        .unwrap();
+        browser
+            .browse(BrowseRequest::Open { url: url.clone() })
+            .await
+            .unwrap();
+        let mut ready = false;
+        for _ in 0..100 {
+            if browser
+                .browse(BrowseRequest::Snapshot)
+                .await
+                .is_ok_and(|s| s["elements"].as_array().is_some_and(|e| e.len() == 4))
+            {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(ready, "fixture did not load");
+        let service = CheckoutService::new(
+            browser.clone(),
+            &root.path().join("state.db"),
+            root.path().join("unused.sock"),
+            unsafe { libc::geteuid() },
+            47999,
+        )
+        .unwrap();
+        let (context, origin) = browser.shopping_scope().await.unwrap();
+        // Cancellation remains effective even if Broker is unavailable and a
+        // delayed poll/expiry tries to publish an older lifecycle result.
+        service
+            .store
+            .insert(
+                &Status {
+                    operation_id: "pending-unlock".into(),
+                    state: "awaiting_approval".into(),
+                    ceremony_url: None,
+                    filled_fields: vec![],
+                    outcome: None,
+                },
+                "traveler",
+                "Synthetic pending unlock",
+            )
+            .unwrap();
+        *service.unlocking.lock().await = Some(PendingUnlock {
+            operation_id: "pending-unlock".into(),
+            traveler_id: "cancelled-record".into(),
+            recipient: Recipient::generate(),
+            context: context.clone(),
+            origin: origin.clone(),
+            fields: vec![],
+        });
+        assert_eq!(
+            service.cancel_traveler("pending-unlock").await.unwrap()["state"],
+            "cancelled"
+        );
+        assert!(service.unlocking.lock().await.is_none());
+        service
+            .store
+            .finish_traveler("pending-unlock", "expired")
+            .unwrap();
+        assert_eq!(
+            service.store.get("pending-unlock").unwrap().state,
+            "cancelled"
+        );
+        assert!(service.store.consume("pending-unlock").is_err());
+        // These records stand in for three independently approved releases.
+        // There is no Broker fixture here and no claim of ceremony acceptance.
+        for (id, name, email) in [
+            ("person-one", "FixtureAlice", "alice@example.test"),
+            ("person-two", "FixtureBob", "bob@example.test"),
+            ("payer", "FixtureCasey", "payer@example.test"),
+        ] {
+            browser.redact([
+                (name.into(), "[saved given_name]".into()),
+                (email.into(), "[saved email]".into()),
+            ]);
+            service.travelers.lock().await.insert(
+                id.into(),
+                UnlockedTraveler {
+                    operation_id: format!("{id}-unlock"),
+                    origin: origin.clone(),
+                    context: context.clone(),
+                    fields: vec![
+                        bloom_signer_api::TravelerField::GivenName,
+                        bloom_signer_api::TravelerField::Email,
+                    ],
+                    values: [
+                        ("given_name".into(), zeroize::Zeroizing::new(name.into())),
+                        ("email".into(), zeroize::Zeroizing::new(email.into())),
+                    ]
+                    .into(),
+                    expires: tokio::time::Instant::now() + Duration::from_secs(60),
+                },
+            );
+        }
+        let error = service
+            .request(Request::Browse {
+                request: BrowseRequest::FillTraveler { traveler_id: None },
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("Choose traveler_id"));
+        // Even an explicit person must not auto-fill two passenger blocks.
+        assert!(
+            service
+                .request(Request::Browse {
+                    request: BrowseRequest::FillTraveler {
+                        traveler_id: Some("person-one".into())
+                    }
+                })
+                .await
+                .is_err()
+        );
+        assert!(
+            service
+                .request(Request::Browse {
+                    request: BrowseRequest::FillTraveler {
+                        traveler_id: Some("not-approved".into())
+                    }
+                })
+                .await
+                .is_err()
+        );
+        for (id, label, field) in [
+            ("person-one", "Passenger one given name", "given_name"),
+            ("person-two", "Passenger two given name", "given_name"),
+            ("payer", "Payer given name", "given_name"),
+            ("payer", "Contact email", "email"),
+        ] {
+            let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+            let element_ref = snapshot["elements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["label"] == label)
+                .unwrap()["ref"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let response = service
+                .request(Request::Browse {
+                    request: BrowseRequest::TypeTraveler {
+                        element_ref,
+                        field: field.into(),
+                        traveler_id: Some(id.into()),
+                    },
+                })
+                .await
+                .unwrap();
+            assert_eq!(response, json!({"state":"typed","filled_fields":[field]}));
+        }
+        let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+        for element in snapshot["elements"].as_array().unwrap() {
+            assert!(element["value"].as_str().unwrap().starts_with("[saved "));
+        }
+        let tab = browser.handoff().await.unwrap();
+        let actual = tab
+            .cdp
+            .evaluate(
+                &tab.session,
+                "Array.from(document.querySelectorAll('input'), e => e.value)".into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            actual,
+            json!([
+                "FixtureAlice",
+                "FixtureBob",
+                "FixtureCasey",
+                "payer@example.test"
+            ])
+        );
+        service
+            .store
+            .insert(
+                &Status {
+                    operation_id: "person-two-unlock".into(),
+                    state: "unlocked".into(),
+                    ceremony_url: None,
+                    filled_fields: vec![],
+                    outcome: None,
+                },
+                "traveler",
+                "Synthetic approved person",
+            )
+            .unwrap();
+        let cancelled = service
+            .request(Request::Cancel {
+                operation_id: "person-two-unlock".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(cancelled["state"], "cancelled");
+        assert!(!service.travelers.lock().await.contains_key("person-two"));
+        service
+            .travelers
+            .lock()
+            .await
+            .get_mut("person-one")
+            .unwrap()
+            .expires = tokio::time::Instant::now();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while service.travelers.lock().await.contains_key("person-one") {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("expired record was not erased without another fill request");
+        assert_eq!(service.travelers.lock().await.len(), 1);
+        service.return_control().await.unwrap();
+        assert!(service.travelers.lock().await.is_empty());
+        service
+            .request(Request::Browse {
+                request: BrowseRequest::Open { url },
+            })
+            .await
+            .unwrap();
+        assert!(service.fill_traveler(Some("person-one")).await.is_err());
+        assert!(service.travelers.lock().await.is_empty());
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn traveler_cache_drops_expired_records_and_rejects_unapproved_ids() {
+        let mut records = BTreeMap::new();
+        for (id, expired) in [("active", false), ("expired", true)] {
+            records.insert(
+                id.into(),
+                UnlockedTraveler {
+                    operation_id: format!("{id}-unlock"),
+                    origin: "https://shop.example".into(),
+                    context: "booking".into(),
+                    fields: vec![],
+                    values: BTreeMap::new(),
+                    expires: tokio::time::Instant::now()
+                        + if expired {
+                            Duration::ZERO
+                        } else {
+                            Duration::from_secs(60)
+                        },
+                },
+            );
+        }
+        assert!(
+            selected_traveler(
+                &mut records,
+                "booking",
+                "https://shop.example",
+                Some("expired")
+            )
+            .is_err()
+        );
+        assert_eq!(records.len(), 1);
+        assert!(selected_traveler(&mut records, "booking", "https://shop.example", None).is_ok());
+        assert!(
+            selected_traveler(
+                &mut records,
+                "booking",
+                "https://other.example",
+                Some("active")
+            )
+            .is_err()
+        );
+        assert!(records.is_empty());
+    }
 
     #[test]
     fn extension_checkout_keeps_the_person_in_the_bloom_tab() {
@@ -2056,16 +2483,20 @@ mod tests {
                 format!("[saved {f}]"),
             )
         }));
-        *service.traveler.lock().await = Some(UnlockedTraveler {
-            origin: url::Url::parse(&url)
-                .unwrap()
-                .origin()
-                .ascii_serialization(),
-            context: browser.shopping_context().await,
-            fields: vec![],
-            values,
-            expires: tokio::time::Instant::now() + Duration::from_secs(60),
-        });
+        service.travelers.lock().await.insert(
+            "fixture".into(),
+            UnlockedTraveler {
+                operation_id: "fixture-unlock".into(),
+                origin: url::Url::parse(&url)
+                    .unwrap()
+                    .origin()
+                    .ascii_serialization(),
+                context: browser.shopping_context().await,
+                fields: vec![],
+                values,
+                expires: tokio::time::Instant::now() + Duration::from_secs(60),
+            },
+        );
         for (index, field) in [(0, "phone_national"), (1, "born_on_dmy")] {
             let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
             let element_ref = snapshot["elements"][index]["ref"]
@@ -2077,6 +2508,7 @@ mod tests {
                     request: BrowseRequest::TypeTraveler {
                         element_ref,
                         field: field.into(),
+                        traveler_id: None,
                     },
                 })
                 .await
@@ -2103,12 +2535,13 @@ mod tests {
                 request: BrowseRequest::TypeTraveler {
                     element_ref,
                     field: "phone".into(),
+                    traveler_id: None,
                 },
             })
             .await
             .unwrap_err();
         assert_eq!(error.to_string(), "Unlock a saved traveler first");
-        assert!(service.traveler.lock().await.is_none());
+        assert!(service.travelers.lock().await.is_empty());
         server.abort();
     }
     #[tokio::test]
@@ -2142,20 +2575,24 @@ mod tests {
             47999,
         )
         .unwrap();
-        *service.traveler.lock().await = Some(UnlockedTraveler {
-            origin: url::Url::parse(&url)
-                .unwrap()
-                .origin()
-                .ascii_serialization(),
-            context: browser.shopping_context().await,
-            fields: vec![],
-            values: [(
-                "document_kind".to_owned(),
-                zeroize::Zeroizing::new("passport".to_owned()),
-            )]
-            .into(),
-            expires: tokio::time::Instant::now() + Duration::from_secs(60),
-        });
+        service.travelers.lock().await.insert(
+            "fixture".into(),
+            UnlockedTraveler {
+                operation_id: "fixture-unlock".into(),
+                origin: url::Url::parse(&url)
+                    .unwrap()
+                    .origin()
+                    .ascii_serialization(),
+                context: browser.shopping_context().await,
+                fields: vec![],
+                values: [(
+                    "document_kind".to_owned(),
+                    zeroize::Zeroizing::new("passport".to_owned()),
+                )]
+                .into(),
+                expires: tokio::time::Instant::now() + Duration::from_secs(60),
+            },
+        );
         let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
         let element_ref = snapshot["elements"]
             .as_array()
@@ -2171,6 +2608,7 @@ mod tests {
                 request: BrowseRequest::TypeTraveler {
                     element_ref,
                     field: "document_kind".into(),
+                    traveler_id: None,
                 },
             })
             .await
@@ -2222,20 +2660,24 @@ mod tests {
             47999,
         )
         .unwrap();
-        *service.traveler.lock().await = Some(UnlockedTraveler {
-            origin: url::Url::parse(&url)
-                .unwrap()
-                .origin()
-                .ascii_serialization(),
-            context: browser.shopping_context().await,
-            fields: vec![],
-            values: [(
-                "document_kind".to_owned(),
-                zeroize::Zeroizing::new("passport".to_owned()),
-            )]
-            .into(),
-            expires: tokio::time::Instant::now() + Duration::from_secs(60),
-        });
+        service.travelers.lock().await.insert(
+            "fixture".into(),
+            UnlockedTraveler {
+                operation_id: "fixture-unlock".into(),
+                origin: url::Url::parse(&url)
+                    .unwrap()
+                    .origin()
+                    .ascii_serialization(),
+                context: browser.shopping_context().await,
+                fields: vec![],
+                values: [(
+                    "document_kind".to_owned(),
+                    zeroize::Zeroizing::new("passport".to_owned()),
+                )]
+                .into(),
+                expires: tokio::time::Instant::now() + Duration::from_secs(60),
+            },
+        );
         let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
         let element_ref = snapshot["elements"]
             .as_array()
@@ -2251,6 +2693,7 @@ mod tests {
                 request: BrowseRequest::TypeTraveler {
                     element_ref,
                     field: "document_kind".into(),
+                    traveler_id: None,
                 },
             })
             .await

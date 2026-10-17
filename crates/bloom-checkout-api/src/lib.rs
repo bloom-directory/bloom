@@ -21,7 +21,11 @@ pub enum BrowseRequest {
     },
     Back,
     /// Fill the unlocked traveler's fields on this page without returning them.
-    FillTraveler,
+    FillTraveler {
+        /// Required when more than one saved person is unlocked for this journey.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        traveler_id: Option<String>,
+    },
     /// Type one unlocked traveler value into an element the agent chose.
     /// `field` is a saved field, or `phone_national` (no country code),
     /// `phone_area`, `phone_local`,
@@ -29,6 +33,8 @@ pub enum BrowseRequest {
     TypeTraveler {
         element_ref: String,
         field: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        traveler_id: Option<String>,
     },
 }
 
@@ -152,4 +158,25 @@ pub struct Element {
 pub struct SelectOption {
     pub value: String,
     pub label: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn traveler_selection_keeps_single_person_json_compatible() {
+        for value in [
+            json!({"action":"fill_traveler"}),
+            json!({"action":"type_traveler","element_ref":"1:0","field":"given_name"}),
+        ] {
+            let request: BrowseRequest = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(request).unwrap(), value);
+        }
+        let value = json!({"action":"type_traveler","element_ref":"1:0","field":"given_name","traveler_id":"saved-person-one"});
+        let request: BrowseRequest = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(request).unwrap(), value);
+        assert!(serde_json::from_value::<BrowseRequest>(json!({"action":"fill_traveler","traveler_id":"one","values":{"given_name":"not allowed"}})).is_err());
+    }
 }

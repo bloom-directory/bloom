@@ -41,9 +41,11 @@ pub struct Browser {
     revoked: AtomicBool,
     fixture_payment_hosts: bool,
     /// Unlocked traveler values and their placeholders, removed from snapshots.
-    redactions: std::sync::RwLock<Vec<(String, String)>>,
+    redactions: std::sync::RwLock<Vec<(zeroize::Zeroizing<String>, String)>>,
     /// Available connection for a new supported journey, never a global override.
     extension: std::sync::RwLock<Option<Arc<ExtensionLink>>>,
+    /// A normal-profile relay is not an isolated private-data principal.
+    extension_private_allowed: AtomicBool,
 }
 
 /// Private checkout access exists only after the public API has drained.
@@ -105,11 +107,26 @@ impl Browser {
             revoked: AtomicBool::new(false),
             redactions: std::sync::RwLock::new(Vec::new()),
             extension: std::sync::RwLock::new(None),
+            extension_private_allowed: AtomicBool::new(false),
         }))
     }
 
     pub(crate) fn attach_extension(&self, link: Arc<ExtensionLink>) {
         *self.extension.write().unwrap() = Some(link);
+    }
+
+    #[cfg(any(test, feature = "triad-dev-harness"))]
+    pub fn allow_development_extension_private(&self) {
+        self.extension_private_allowed.store(true, Ordering::SeqCst);
+    }
+
+    fn ensure_private_transport(&self, tab: &Tab) -> Result<()> {
+        if tab.extension.is_some() && !self.extension_private_allowed.load(Ordering::SeqCst) {
+            bail!(
+                "Private filling in the normal-profile extension is disabled; use the isolated checkout browser"
+            );
+        }
+        Ok(())
     }
 
     pub(crate) fn detach_extension(&self, link: &Arc<ExtensionLink>) {
@@ -238,7 +255,7 @@ impl Browser {
             BrowseRequest::Select { element_ref, value } => {
                 self.act(&mut tab, &element_ref, "select", &value).await
             }
-            BrowseRequest::FillTraveler | BrowseRequest::TypeTraveler { .. } => {
+            BrowseRequest::FillTraveler { .. } | BrowseRequest::TypeTraveler { .. } => {
                 bail!("Unlock a saved traveler first")
             }
         }
@@ -318,7 +335,7 @@ impl Browser {
                 self.act_extension(link, tab, &element_ref, "select", &value)
                     .await
             }
-            BrowseRequest::FillTraveler | BrowseRequest::TypeTraveler { .. } => {
+            BrowseRequest::FillTraveler { .. } | BrowseRequest::TypeTraveler { .. } => {
                 bail!("Saved travelers are not yet available in your browser")
             }
         }
@@ -359,7 +376,7 @@ impl Browser {
         let redactions = self.redactions.read().unwrap();
         let mut text = serde_json::to_string(&value)?;
         for (secret, label) in redactions.iter() {
-            let escaped = serde_json::to_string(secret)?;
+            let escaped = serde_json::to_string(secret.as_str())?;
             let needle = escaped[1..escaped.len() - 1].to_ascii_lowercase();
             for variant in [needle.clone(), secret.to_uppercase()] {
                 let mut out = String::with_capacity(text.len());
@@ -384,7 +401,8 @@ impl Browser {
         redactions.extend(
             values
                 .into_iter()
-                .filter(|(secret, _)| secret.chars().count() >= 3),
+                .filter(|(secret, _)| secret.chars().count() >= 3)
+                .map(|(secret, label)| (zeroize::Zeroizing::new(secret), label)),
         );
         // Longer values first, so a full name is replaced before its parts.
         redactions.sort_by_key(|(secret, _)| std::cmp::Reverse(secret.len()));
@@ -423,11 +441,13 @@ impl Browser {
     }
 
     /// Distinguishes explicit journeys, including two opens on the same origin.
+    #[cfg(test)]
     pub(crate) async fn shopping_context(&self) -> String {
         let tab = self.tab.lock().await;
         journey_context(&tab)
     }
 
+    #[cfg(test)]
     pub(crate) async fn shopping_origin(&self) -> Result<String> {
         let tab = self.tab.lock().await;
         self.origin(&tab).await
@@ -435,6 +455,13 @@ impl Browser {
 
     pub(crate) async fn shopping_scope(&self) -> Result<(String, String)> {
         let tab = self.tab.lock().await;
+        Ok((journey_context(&tab), self.origin(&tab).await?))
+    }
+
+    pub(crate) async fn private_shopping_scope(&self) -> Result<(String, String)> {
+        let tab = self.tab.lock().await;
+        self.available()?;
+        self.ensure_private_transport(&tab)?;
         Ok((journey_context(&tab), self.origin(&tab).await?))
     }
 
@@ -458,6 +485,7 @@ impl Browser {
     }
 
     async fn check_traveler_scope(&self, tab: &Tab, context: &str, origin: &str) -> Result<()> {
+        self.ensure_private_transport(tab)?;
         if journey_context(tab) != context || self.origin(tab).await? != origin {
             bail!("Saved traveler details are unlocked for another booking or website");
         }
@@ -738,6 +766,10 @@ impl Browser {
             bail!("Checkout is already private");
         }
         let mut tab = self.tab.lock().await; // Drain the one in-flight command.
+        if let Err(error) = self.ensure_private_transport(&tab) {
+            self.revoked.store(false, Ordering::SeqCst);
+            return Err(error);
+        }
         tab.refs.clear();
         tab.generation += 1;
         Ok(PrivateTab {
@@ -797,6 +829,9 @@ impl Browser {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         *tab = new_tab(&self.cdp, None, tab.generation + 1).await?;
+        // Old private pages are gone. Until then these patterns must remain so
+        // an expired traveler still present in the DOM cannot enter a snapshot.
+        self.redactions.write().unwrap().clear();
         self.revoked.store(false, Ordering::SeqCst);
         Ok(())
     }
@@ -1142,6 +1177,34 @@ mod tests {
             })
             .await
             .unwrap();
+        assert!(
+            browser
+                .handoff()
+                .await
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("is disabled")
+        );
+        // The synthetic relay can exercise private routing only after explicit
+        // development opt-in; that switch does not exist in release builds.
+        assert!(
+            browser
+                .type_traveler("0:0", "PRIVATE-FIXTURE", "unused", "https://jetsmart.com")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("is disabled")
+        );
+        assert!(
+            browser
+                .fill_traveler("https://jetsmart.com", "unused", &[], &Default::default())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("is disabled")
+        );
+        browser.allow_development_extension_private();
         assert_eq!(observed.recv().await.unwrap(), "open");
         assert_ne!(browser.shopping_context().await, initial);
         browser.detach_extension(&first);
@@ -1451,8 +1514,24 @@ mod tests {
             })
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let popup = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+        let popup = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(snapshot) = browser.browse(BrowseRequest::Snapshot).await {
+                    if snapshot["url"]
+                        .as_str()
+                        .is_some_and(|url| url.ends_with("/flight"))
+                        && snapshot["text"]
+                            .as_str()
+                            .is_some_and(|text| text.contains("Flight AR1554"))
+                    {
+                        break snapshot;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("shopping popup never became ready");
         assert!(popup["url"].as_str().unwrap().ends_with("/flight"));
         assert!(popup["text"].as_str().unwrap().contains("Flight AR1554"));
         fixture.abort();

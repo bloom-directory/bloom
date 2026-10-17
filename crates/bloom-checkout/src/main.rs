@@ -35,6 +35,10 @@ struct Args {
     #[cfg(feature = "triad-dev-harness")]
     #[arg(long)]
     fixture_allow_insecure_tls: bool,
+    /// Synthetic development rehearsal only; not available in release builds.
+    #[cfg(feature = "triad-dev-harness")]
+    #[arg(long, requires = "extension_socket")]
+    development_extension_private: bool,
 }
 
 #[tokio::main]
@@ -60,6 +64,10 @@ async fn main() -> Result<()> {
     #[cfg(not(feature = "triad-dev-harness"))]
     let flags = Vec::new();
     let browser = Browser::launch(&args.chromium, &args.profile, &flags).await?;
+    #[cfg(feature = "triad-dev-harness")]
+    if args.development_extension_private {
+        browser.allow_development_extension_private();
+    }
     if let Some(path) = args.extension_socket.clone() {
         let browser = browser.clone();
         tokio::spawn(async move {
@@ -98,4 +106,19 @@ async fn main() -> Result<()> {
     };
     tokio::select! {result=api=>result?,result=viewer=>result?,_=tokio::signal::ctrl_c()=>{},_=lifecycle=>{}}
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn private_extension_opt_in_exists_only_in_development_builds() {
+        let command = Args::command();
+        let present = command
+            .get_arguments()
+            .any(|arg| arg.get_id() == "development_extension_private");
+        assert_eq!(present, cfg!(feature = "triad-dev-harness"));
+    }
 }
