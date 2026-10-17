@@ -1989,8 +1989,14 @@ impl TxEngine {
         let hard = policy_engine::has_hard_violation(&staged.policy_checks);
         if hard {
             staged.status = TxStatus::Failed;
-            self.outbox
+            let failed_dir = self
+                .outbox
                 .transition(&entry, crate::outbox::OutboxState::Failed)?;
+            self.outbox.write_artefact(
+                &failed_dir,
+                "intent.json",
+                &serde_json::to_vec_pretty(&staged).map_err(OutboxError::from)?,
+            )?;
             debug!(
                 id = %staged.id,
                 wallet,
@@ -2388,8 +2394,14 @@ impl TxEngine {
         let hard = policy_engine::has_hard_violation(&staged.policy_checks);
         if hard {
             staged.status = TxStatus::Failed;
-            self.outbox
+            let failed_dir = self
+                .outbox
                 .transition(&entry, crate::outbox::OutboxState::Failed)?;
+            self.outbox.write_artefact(
+                &failed_dir,
+                "intent.json",
+                &serde_json::to_vec_pretty(&staged).map_err(OutboxError::from)?,
+            )?;
             debug!(
                 id = %staged.id,
                 wallet,
@@ -9234,6 +9246,21 @@ mod tests {
             crate::outbox::OutboxState::Failed,
             "tx must be Failed after hard deny"
         );
+        assert_eq!(entry.staged.status, TxStatus::Failed);
+
+        // The mounted confirm path prepares before it submits. It must expose
+        // the same terminal outcome to a Petal reconciling its execution.
+        staged.id = "0002-prepare".into();
+        engine.outbox.write_pending(&staged, "p").unwrap();
+        let result = engine
+            .prepare_confirm_write_open(
+                &permit, "alice", "anvil", &staged.id, &chain, &policy, false,
+            )
+            .await;
+        assert!(matches!(result, Err(TxEngineError::PolicyDenied)));
+        let entry = engine.outbox.read("alice", "anvil", &staged.id).unwrap();
+        assert_eq!(entry.state, OutboxState::Failed);
+        assert_eq!(entry.staged.status, TxStatus::Failed);
     }
 
     /// A soft-Warn check must block confirm() when no override sentinel is
