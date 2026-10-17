@@ -53,11 +53,16 @@ the approval.
 
 ## User browser extension
 
-Sites that reject a fresh automated browser can run in one tab of the person's
-existing Chromium profile. A Manifest V3 content-script extension connects to
-checkout through Chrome native messaging; it uses neither the debugger API nor
-a localhost web port. The extension creates and controls one tab, accepts only
-the Aerolíneas, JetSMART and Flybondi origins, and never reads other tabs.
+A fresh Chromium profile fails Aerolíneas' passenger check even when it is
+headed and not marked as automated. The person's long-lived profile passes.
+Chrome refuses remote debugging of that default profile, so checkout reaches
+it only through this extension. Desktop clicks are not a checkout path.
+
+A Manifest V3 content-script extension connects to checkout through Chrome
+native messaging; it uses neither the debugger API nor a localhost web port.
+The extension creates and controls one tab, accepts only the Aerolíneas and
+JetSMART origins, and never reads other tabs. Flybondi is omitted: its origin
+no longer resolves to a server that can take a booking.
 
 Machine keeps the same browse and checkout API. Named, bundled page functions
 replace arbitrary script evaluation. Traveler and card values still cross the
@@ -117,5 +122,7 @@ after one use. Nothing persists a PRF output, CVC, or reusable grant.
 - Card ceremonies share Broker's anonymous quota of four per five minutes.
 - Take-over and site payment need the card passkey, so one card must be saved.
 - The private view is local; phone take-over needs a remote surface.
-- Sites that block the headless browser require an allowlisted extension origin
-  and the person's existing browser profile.
+- Sites that block a fresh browser need an allowlisted origin in the person's
+  existing profile. The extension does not make a refused connection or a dead
+  airline bookable. New origins stay off until a rehearsal in that profile
+  reaches payment and stops before Pay. The caller supplies the booking link.

@@ -7,16 +7,14 @@
   "permissions": ["nativeMessaging", "alarms", "storage"],
   "host_permissions": [
     "https://*.aerolineas.com.ar/*",
-    "https://*.jetsmart.com/*",
-    "https://*.flybondi.com/*"
+    "https://*.jetsmart.com/*"
   ],
   "background": {"service_worker": "background.js"},
   "content_scripts": [
     {
       "matches": [
         "https://*.aerolineas.com.ar/*",
-        "https://*.jetsmart.com/*",
-        "https://*.flybondi.com/*"
+        "https://*.jetsmart.com/*"
       ],
       "js": ["page.js"]
     }

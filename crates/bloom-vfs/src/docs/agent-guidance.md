@@ -101,9 +101,14 @@ never appear in VFS. A manual
 fallback releases no saved card.
 
 When the Bloom browser extension is connected, the same browse and checkout
-actions use one allowlisted Bloom tab in the person's browser. After approval,
-the person completes any bank check or correction in that tab; the follow-up
-page points them there instead of showing a duplicate private browser.
+actions use one allowlisted Bloom tab in the person's browser. That tab is the
+only way to drive the person's browser. Do not click or type through the
+desktop, and do not collect airline pages. Open the booking link you were
+given. A fresh profile fails checks the person's long-lived profile passes,
+and the extension does not bypass a site that refuses the connection. After
+approval, the person completes any bank check or correction in that tab; the
+follow-up page points them there instead of showing a duplicate private
+browser.
 
 `filled` means fields were filled, not that payment succeeded. `booked`,
 `paid` and `declined` describe what the merchant reported; Bloom has not

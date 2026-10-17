@@ -2,7 +2,7 @@
 // approved booking sites only. Commands arrive from checkout over native
 // messaging; the page work happens in page.js.
 const HOST = 'directory.bloom.checkout';
-const SITES = /^https:\/\/([a-z0-9-]+\.)*(aerolineas\.com\.ar|jetsmart\.com|flybondi\.com)(\/|$)/;
+const SITES = /^https:\/\/([a-z0-9-]+\.)*(aerolineas\.com\.ar|jetsmart\.com)(\/|$)/;
 let port = null;
 
 function connect() {
