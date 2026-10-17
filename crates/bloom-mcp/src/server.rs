@@ -10,7 +10,10 @@ use std::{
     collections::{HashMap, VecDeque},
     future::Future,
     pin::Pin,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use serde_json::{Value, json};
@@ -58,12 +61,17 @@ and must be confirmed by a second write after reviewing the generated plan. This
 for the same VFS commands as `bloom vfs …`; it holds no keys and adds no permissions of its own. \
 When a person asks to see a supported Bloom view, always call the matching `show_bloom_*` tool \
 instead of reconstructing it with VFS reads. A capable desktop host opens that single read-only \
-MCP App view directly; other hosts receive the browser path fallback.";
+MCP App view directly; other hosts are pointed to the text briefing.";
+
+/// The MCP Apps extension a widget-capable client announces at initialize.
+const APPS_EXTENSION: &str = "io.modelcontextprotocol/ui";
 
 /// An MCP server bound to one canonical VFS command transport.
 pub struct McpServer {
     commands: Arc<dyn VfsCommands>,
     version: String,
+    /// Whether the client announced the MCP Apps extension at initialize.
+    apps_declared: Arc<AtomicBool>,
 }
 
 impl Clone for McpServer {
@@ -71,6 +79,7 @@ impl Clone for McpServer {
         Self {
             commands: self.commands.clone(),
             version: self.version.clone(),
+            apps_declared: self.apps_declared.clone(),
         }
     }
 }
@@ -80,6 +89,7 @@ impl McpServer {
         Self {
             commands,
             version: version.into(),
+            apps_declared: Arc::default(),
         }
     }
 
@@ -298,6 +308,11 @@ impl McpServer {
     }
 
     fn initialize(&self, params: &Value) -> Value {
+        let capabilities = &params["capabilities"];
+        let apps_declared = [&capabilities["extensions"], &capabilities["experimental"]]
+            .iter()
+            .any(|group| group.get(APPS_EXTENSION).is_some());
+        self.apps_declared.store(apps_declared, Ordering::Relaxed);
         let requested = params.get("protocolVersion").and_then(Value::as_str);
         let negotiated = requested
             .filter(|version| SUPPORTED_PROTOCOL_VERSIONS.contains(version))
@@ -323,7 +338,14 @@ impl McpServer {
         };
         let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
         if let Some(tool) = views::find(name) {
-            return match views::call(self.commands.as_ref(), tool, &arguments).await {
+            return match views::call(
+                self.commands.as_ref(),
+                tool,
+                &arguments,
+                self.apps_declared.load(Ordering::Relaxed),
+            )
+            .await
+            {
                 Ok(result) => ok_response(id, result),
                 Err(error) => error_response(id, -32602, error.message()),
             };
@@ -1086,6 +1108,44 @@ mod tests {
             wallets["_meta"]["openai/outputTemplate"],
             views::VIEW_TOOLS[0].resource_uri()
         );
+    }
+
+    #[tokio::test]
+    async fn view_results_route_clients_without_apps_to_the_text_briefing() {
+        async fn note(capabilities: Value) -> String {
+            let (server, _) = server(Ok(json!({ "bytes_b64": "aGk=" })));
+            server
+                .handle(json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                    "params": { "protocolVersion": PROTOCOL_VERSION, "capabilities": capabilities },
+                }))
+                .await
+                .unwrap();
+            let response = server
+                .handle(json!({
+                    "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                    "params": { "name": "show_bloom_wallets", "arguments": {} },
+                }))
+                .await
+                .unwrap();
+            let result = &response["result"];
+            assert_eq!(
+                result["content"][0]["text"],
+                result["structuredContent"]["note"]
+            );
+            result["structuredContent"]["note"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        }
+
+        // Claude Code's initialize: no MCP Apps extension.
+        let text_only = note(json!({ "roots": { "listChanged": true }, "elicitation": {} })).await;
+        assert!(text_only.contains("/views/briefing.md"));
+        assert!(text_only.contains("views/wallets.html"));
+
+        let apps = note(json!({ "extensions": { APPS_EXTENSION: {} } })).await;
+        assert!(!apps.contains("briefing"));
     }
 
     #[tokio::test]

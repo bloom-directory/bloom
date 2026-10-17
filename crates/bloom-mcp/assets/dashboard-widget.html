@@ -40,6 +40,10 @@
     }
     /* Hosts draw the conversation behind the frame; never paint over it. */
     html, body { margin: 0; background: transparent; }
+    .widget-skeleton { display: grid; gap: 10px; padding: 18px; }
+    .widget-skeleton span { height: 14px; border-radius: var(--radius-sm); background: var(--tint); }
+    .widget-skeleton span:first-child { width: 40%; height: 28px; }
+    .widget-skeleton span:nth-child(n + 3) { height: 52px; }
     .widget-status { box-sizing: border-box; padding: 1rem; font: 14px/1.5 var(--sans); color: var(--muted); }
     body.bloom-widget {
       font-size: var(--font-text-sm-size, 14px);
@@ -771,7 +775,7 @@
   </style>
   <style id="bloom-skin-styles"></style>
 </head>
-<body class="bloom-widget"><p class="widget-status">Loading Bloom…</p>
+<body class="bloom-widget"><main class="widget-skeleton" role="status" aria-label="Loading Bloom"><span></span><span></span><span></span><span></span></main>
 <script>
 (() => {
   "use strict";
@@ -820,6 +824,11 @@
     };
     const fonts = document.getElementById("bloom-host-fonts");
     if (update.styles?.css?.fonts && !fonts.textContent) fonts.textContent = update.styles.css.fonts;
+    const insets = hostContext.safeAreaInsets;
+    if (insets) {
+      document.body.style.padding = ["top", "right", "bottom", "left"]
+        .map((side) => `${Number(insets[side]) || 0}px`).join(" ");
+    }
     const variables = hostContext.styles.variables;
     for (const name of appliedHostVariables) {
       if (!(name in variables)) document.documentElement.style.removeProperty(name);

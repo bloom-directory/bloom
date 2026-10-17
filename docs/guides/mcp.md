@@ -120,10 +120,13 @@ background is transparent and it adopts the host's theme variables and font. The
 widget makes no network requests and cannot approve, stage, sign, or execute
 an operation. External explorer links are opened through the host.
 
-Clients that do not render MCP Apps ignore the UI metadata. The tools' ordinary
-text result still points to the matching path under `views/`, so a person can
-open it in a browser. This is also the fallback for terminal clients that
-support MCP tools but cannot display an iframe.
+Clients that do not render MCP Apps ignore the UI metadata. When a client did
+not declare the `io.modelcontextprotocol/ui` extension at `initialize`, the
+result's text and `structuredContent.note` point the model to
+`/views/briefing.md` for a text summary and to the matching path under
+`views/` for a browser. Claude Code is such a client: it calls the tools but
+does not display widgets. ChatGPT renders widgets without declaring the
+extension, so the note only applies when the person cannot see the widget.
 
 ## Resources
 
