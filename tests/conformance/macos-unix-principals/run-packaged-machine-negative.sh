@@ -196,8 +196,11 @@ chown "$login_uid" "$clean_home/cache"
 chmod 0700 "$clean_home/cache"
 # Keep the test home intentionally small but valid. Degraded authority does not
 # bypass normal Machine configuration validation.
+# This fixture must observe its just-committed policy before poisoning the
+# offline cache. Disable display coalescing rather than racing its one-second TTL.
 printf '%s\n' \
   'default_chain = "anvil"' \
+  'wallet_projection_max_age = "0s"' \
   '' \
   '[petals]' \
   'preinstalled = []' \
@@ -528,7 +531,10 @@ encoded += "=" * (-len(encoded) % 4)
 policy = json.loads(base64.urlsafe_b64decode(encoded))
 expected = {"chain": "anvil", "destination": sys.argv[2]}
 if expected not in policy["allowed_destinations"]:
-    raise SystemExit("authenticated policy projection omitted the MA-05 destination")
+    raise SystemExit(
+        "authenticated policy projection omitted the MA-05 destination; "
+        f"expected={expected!r}, observed={policy['allowed_destinations']!r}"
+    )
 PY
 [[ -s "$clean_home/cache/wallet-projections.json" ]]
 kill "$machine_service_pid"
