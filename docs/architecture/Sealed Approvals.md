@@ -92,6 +92,50 @@ therefore consume the remaining approved capacity by lying within that trust
 model. Exact selectors prevent payload substitution; reusable selectors rely
 on the documented claim assurance.
 
+The `safe.transaction.confirm` operation has an additional review contract. The
+trusted signing registration must declare that class to trigger Safe review.
+An arbitrary EIP-712 preimage under another signing class receives that class's
+ordinary exact review; Machine cannot identify a Safe transaction from its
+hash alone. Correctly registering the Safe Petal is part of this boundary.
+The Petal supplies one canonical Safe review envelope alongside the exact EIP-712
+preimage. Machine accepts and forwards that envelope only for this operation
+class, requires it for that class on the single-payload exact path, and refuses
+the class on every other path — the batch request and the reusable
+single-payload request both carry no envelope field, so each refuses it in its
+own validation rather than relying on the other. Broker independently rebuilds
+the Safe transaction hash from the envelope and rejects a malformed envelope or
+one whose reconstruction does not equal the exact selector. It then reads the
+transaction as the `execTransaction` call the Safe will run, with the same
+built-in catalog it uses for every EVM call: inner calls, owner and threshold
+changes, batches through Safe's MultiSendCallOnly and deployments through its
+CreateCall. A delegatecall is read only when it enters one of those Safe
+libraries, and a gas refund is not read at all. Anything Broker cannot read is
+shown as exact bytes with the reason, and the owner decides.
+
+A Safe-declaring route is limited to that one operation class for now. Machine
+keys the envelope requirement on the claim's class and Broker keys it on the
+classes the route's installer provenance declares, so a route that declared the
+Safe class alongside a second exact-signing class could not sign the second
+one.
+
+Only the EIP-712 members are bound that way, and Broker checks nothing else.
+The envelope's account of the Safe's own configuration — owner set, threshold,
+guard, enabled modules, fallback handler, singleton, singleton code hash and
+version — is not part of the preimage, and Broker holds no chain client, so none
+of it can be corroborated. It is therefore not matched against pinned tables
+either: both operands of such a check would come from the same Petal message, so
+it could only refuse an honest Petal reporting a Safe the table has not heard of.
+Approval text does not show it. The one fact Broker establishes about the
+signer is that the envelope's owner equals the key this approval will sign
+with; `safe_tx.to` is an EIP-712 member, so the selector binds the call that is
+read. The exact selector remains the signing authority.
+
+Both sides require the envelope. Machine refuses the class without one; Broker
+reads the package's installer-signed provenance record, and a package declaring
+the class gets no exact approval without an envelope and no reusable approval
+that names the Safe class. A claim sent beside an envelope may not declare amounts, destinations
+or fees: the rebuilt transaction is the review.
+
 Petals always submit complete payload bytes through a payload-bearing host
 call. Hash-only guest signing is unsupported. Machine may validate guest
 capabilities and provenance, but only Broker can authorize and only Signer can

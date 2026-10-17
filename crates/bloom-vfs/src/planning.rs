@@ -102,7 +102,6 @@ mod tests {
             allowed_petal_packages: Vec::new(),
             allowed_destinations: destinations,
             required_verifiers: Vec::new(),
-            clear_signing: None,
         })
         .unwrap();
         WalletProjection {

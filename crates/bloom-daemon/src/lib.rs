@@ -342,6 +342,25 @@ struct PetalTxOutbox {
     write_permit: Option<Arc<HomeWritePermit>>,
 }
 
+fn petal_review_payload<'a>(
+    operation_class: &str,
+    claimed_class: &str,
+    action: Option<&'a [u8]>,
+) -> Result<Option<&'a [u8]>, HostError> {
+    if operation_class != claimed_class {
+        return Err(HostError::Invalid(
+            "Petal operation class does not match its claim".into(),
+        ));
+    }
+    if operation_class == bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS {
+        action.map(Some).ok_or_else(|| {
+            HostError::Invalid("Safe confirmation requires a review envelope".into())
+        })
+    } else {
+        Ok(None)
+    }
+}
+
 impl DaemonPetalHost {
     /// Resolve the path-selected owner against fresh Broker membership before
     /// preparing any approval, custody ceremony, or signature. The path
@@ -967,8 +986,10 @@ impl DaemonPetalHost {
             .map_err(|error| HostError::Invalid(error.to_string()))?;
         let prepared = broker
             .prepare_approval(bloom_broker_api::ApprovalPrepareRequest {
+                evm_reported_token: None,
                 surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
                 evm_review_payloads: Vec::new(),
+                safe_review_payloads: Vec::new(),
                 operation_id,
                 terms,
                 canonical_plan_facts_digest: plan_digest,
@@ -977,7 +998,6 @@ impl DaemonPetalHost {
                 // belongs to the native Solana transfer path.
                 petal_use_claim: None,
                 system_use_claim: None,
-                requested_review_mode: None,
             })
             .await
             .map_err(|error| {
@@ -1988,6 +2008,11 @@ impl PetalHost for DaemonPetalHost {
                 "PetalUseClaim must use exact RFC 8785 canonical JSON".into(),
             ));
         }
+        let review_payload = petal_review_payload(
+            &req.operation_class,
+            claim.operation_class.as_str(),
+            req.action.as_deref(),
+        )?;
         let trusted_package_hash = bloom_broker_api::Digest32::new(context.package_hash.clone())
             .map_err(|error| HostError::Invalid(error.to_string()))?;
         if let Some(pending) = self
@@ -2087,6 +2112,7 @@ impl PetalHost for DaemonPetalHost {
                     &trusted_subject,
                     &claim,
                     req.claim_assurance_evidence.as_deref(),
+                    review_payload,
                 )
                 .await
                 .map_err(|reason| {
@@ -2646,7 +2672,6 @@ impl PetalHost for DaemonPetalHost {
                     nonce: req.nonce,
                     gas_limit_hint: None,
                     usd_value_hint: None,
-                    review_mode: None,
                 },
                 &chain,
                 &wallet_policy,
@@ -2806,6 +2831,30 @@ impl PetalHost for DaemonPetalHost {
             .as_ref()
             .map(|receipt| receipt.outcome.clone())
             .unwrap_or_else(|| entry.staged.status.to_string());
+        // Older hard-policy refusals moved the entry but did not persist its
+        // failed status. Report that terminal outcome so a Petal can retry.
+        // A signed or broadcast attempt must keep its reconciliation path.
+        let state = if entry.state == bloom_tx::outbox::OutboxState::Failed
+            && state == "pending"
+            && entry.staged.tx_hash.is_none()
+            && entry
+                .staged
+                .policy_checks
+                .iter()
+                .any(|check| check.is_hard_violation())
+            && service
+                .tx_engine
+                .outbox
+                .read_broadcast_attempt(&entry, bloom_tx::outbox::BroadcastAttemptKind::Confirm)
+                .map_err(|error| {
+                    HostError::Backend(format!("read EVM broadcast attempt: {error}"))
+                })?
+                .is_none()
+        {
+            "failed".to_owned()
+        } else {
+            state
+        };
         let receipt_json = receipt
             .map(|receipt| serde_json::to_string(&receipt))
             .transpose()
@@ -5650,6 +5699,31 @@ mod tests {
     use bloom_vfs::handler::Entry;
     use bloom_vfs::handler::Handler;
 
+    #[test]
+    fn safe_petal_review_mapping_rejects_class_substitution() {
+        let safe = bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS;
+        let envelope = b"safe review".as_slice();
+        assert_eq!(
+            petal_review_payload(safe, safe, Some(envelope)).unwrap(),
+            Some(envelope)
+        );
+        assert!(matches!(
+            petal_review_payload(safe, safe, None),
+            Err(HostError::Invalid(message)) if message.contains("requires a review envelope")
+        ));
+        assert_eq!(
+            petal_review_payload("transaction.confirm", "transaction.confirm", Some(envelope))
+                .unwrap(),
+            None
+        );
+        for (operation, claim) in [(safe, "transaction.confirm"), ("transaction.confirm", safe)] {
+            assert!(matches!(
+                petal_review_payload(operation, claim, Some(envelope)),
+                Err(HostError::Invalid(message)) if message.contains("does not match")
+            ));
+        }
+    }
+
     #[cfg(feature = "mount")]
     #[test]
     fn mount_uses_the_configured_nfs_listener() {
@@ -7175,7 +7249,6 @@ mod tests {
             expires_ms: u128::MAX,
             status: bloom_proto::TxStatus::Pending,
             action_kind: bloom_proto::TxActionKind::Unknown,
-            review_mode: None,
             tx_hash: Some(tx_hash.clone()),
             token: None,
             nft: None,
@@ -7305,6 +7378,73 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(denied, HostError::Denied(_)));
+
+        // Legacy failed entries can still persist status=pending. Only an
+        // unbroadcast hard-policy refusal is safe to expose as retryable.
+        for (id, known_hash, broadcast, expected) in [
+            ("legacy-refusal", None, false, "failed"),
+            ("legacy-hashed", Some(tx_hash.clone()), false, "pending"),
+            ("legacy-broadcast", None, true, "pending"),
+        ] {
+            let mut legacy = staged.clone();
+            legacy.id = id.into();
+            legacy.tx_hash = known_hash;
+            legacy.policy_checks = vec![bloom_proto::policy::PolicyCheck::hard(
+                "recipient",
+                bloom_proto::policy::PolicyOutcome::Deny,
+                "Safe is not an allowed destination",
+            )];
+            daemon
+                .tx_engine
+                .outbox
+                .write_pending(&legacy, "plan")
+                .unwrap();
+            let entry = daemon.tx_engine.outbox.read("w", "anvil", id).unwrap();
+            if broadcast {
+                daemon
+                    .tx_engine
+                    .outbox
+                    .write_broadcast_attempt(
+                        &entry,
+                        bloom_tx::outbox::BroadcastAttemptKind::Confirm,
+                        &bloom_tx::outbox::BroadcastAttempt {
+                            schema: "bloom.evm.broadcast-attempt.v1".into(),
+                            tx_hash: tx_hash.clone(),
+                            raw_tx_blake3: "ab".repeat(32),
+                            raw_tx_path: "raw_tx".into(),
+                            from: legacy.from.clone(),
+                            to: legacy.to.clone(),
+                            nonce: legacy.nonce,
+                            chain_id: legacy.chain_id,
+                            created_ms: 1,
+                            transport: bloom_tx::outbox::BroadcastTransport::PublicRpc,
+                            private_provider: None,
+                        },
+                    )
+                    .unwrap();
+            }
+            daemon
+                .tx_engine
+                .outbox
+                .transition(&entry, bloom_tx::outbox::OutboxState::Failed)
+                .unwrap();
+            let inspection = host
+                .evm_tx_inspect("w".into(), "anvil".into(), id.into(), Some(context.clone()))
+                .await
+                .unwrap();
+            assert_eq!(inspection.state, expected, "{id}");
+            assert_eq!(
+                daemon
+                    .tx_engine
+                    .outbox
+                    .read("w", "anvil", id)
+                    .unwrap()
+                    .staged
+                    .status,
+                bloom_proto::TxStatus::Pending,
+                "inspection must be read-only"
+            );
+        }
 
         let mut other_context = context;
         other_context.package_hash = "c".repeat(64);
@@ -7768,7 +7908,6 @@ ws_url = "wss://example.invalid"
             expires_ms: 0,
             status: bloom_proto::TxStatus::Pending,
             action_kind: bloom_proto::TxActionKind::ContractCreation,
-            review_mode: None,
             tx_hash: None,
             token: None,
             nft: None,
@@ -7820,7 +7959,6 @@ ws_url = "wss://example.invalid"
             expires_ms: 0,
             status: bloom_proto::TxStatus::Pending,
             action_kind: bloom_proto::TxActionKind::ContractCreation,
-            review_mode: None,
             tx_hash: None,
             token: None,
             nft: None,
@@ -8071,7 +8209,6 @@ ws_url = "wss://example.invalid"
             expires_ms: 1,
             status: bloom_proto::TxStatus::Pending,
             action_kind: bloom_proto::TxActionKind::Unknown,
-            review_mode: None,
             tx_hash: None,
             token: None,
             nft: None,
@@ -8218,7 +8355,6 @@ ws_url = "wss://example.invalid"
             expires_ms: 1,
             status: bloom_proto::TxStatus::Pending,
             action_kind: bloom_proto::TxActionKind::Unknown,
-            review_mode: None,
             tx_hash: None,
             token: None,
             nft: None,
@@ -8517,7 +8653,6 @@ ws_url = "wss://example.invalid"
                 allowed_petal_packages: Vec::new(),
                 allowed_destinations: Vec::new(),
                 required_verifiers: Vec::new(),
-                clear_signing: None,
             })
             .unwrap();
             bloom_broker_api::SignedPolicySnapshot {
