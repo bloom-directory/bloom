@@ -100,8 +100,10 @@ an unclear total goes to the human's private view; its URL and screenshots
 never appear in VFS. A manual
 fallback releases no saved card.
 
-When the Bloom browser extension is connected, the same browse and checkout
-actions use one allowlisted Bloom tab in the person's browser. That tab is the
+Opening a supported airline journey while the Bloom extension is connected
+selects one allowlisted Bloom tab in the person's browser. Other sites use
+Bloom's browser. Connecting, replacing or disconnecting the extension must not
+move an active journey to another browser. That tab is the
 only way to drive the person's browser. Do not click or type through the
 desktop, and do not collect airline pages. Open the booking link you were
 given. A fresh profile fails checks the person's long-lived profile passes,
@@ -113,16 +115,20 @@ browser.
 `filled` means fields were filled, not that payment succeeded. `booked`,
 `paid` and `declined` describe what the merchant reported; Bloom has not
 verified the bank charge. For `booked`, `outcome.order_id` holds the booking
-code the site showed. `needs_input` means the site refused the payment form:
-nothing was submitted, and the human corrects it and clicks Pay once in the
-private view. `not_submitted` means that view closed without a payment
-attempt. `partially_filled`, `disclosure_unknown`, and `uncertain` require
+code the site showed; a reference alone does not prove payment or ticket issue.
+`needs_input` means the page needs attention, not that no payment was submitted.
+Do not infer a charge outcome from a form error, timeout or closing the view.
+Older `not_submitted` records are also ambiguous and become `uncertain` on
+restart. `partially_filled`, `disclosure_unknown`, and `uncertain` require
 human inspection; never repeat the purchase automatically. Ask the human to
 check the merchant account or confirmation email. After private checkout
 closes, shopping resumes on a fresh tab.
 
 Protection depends on separate service principals. Root and root-equivalent
 access, including membership in the Docker group, is outside that claim.
+Installed private filling through the normal-profile extension is not yet
+accepted across the service-user boundary. Its development same-UID bridge
+does not establish isolation from other programs running as the login user.
 
 Machine exposes this VFS; Broker controls approval ceremonies and policy;
 Signer holds Bloom wallet keys and signs. Secret ceremony input belongs only
