@@ -5,9 +5,11 @@
   // Declines, in the main checkout languages. Shopify: "Your payment details couldn’t be verified."
   if (/card (?:was |has been )?declined|payment (?:was )?(?:declined|failed)|insufficient funds|payment details couldn.t be verified|(?:zahlung|karte) (?:wurde )?abgelehnt|zahlung fehlgeschlagen|paiement (?:a été )?refusé|carte (?:a été )?refusée|paiement échoué|(?:pago|tarjeta) (?:fue )?(?:rechazad[oa]|denegad[oa])|pagamento (?:foi )?recusado|cartão (?:foi )?recusado|pagamento (?:è stato )?rifiutato|carta rifiutata|betaling (?:is )?mislukt|betaling geweigerd/i.test(text))
     return {state:'declined',source:'merchant-reported',confirmation_reached:false};
-  // Airlines confirm with a booking code ("Código de reserva AB12CD").
+  // A reservation reference can exist before payment. Require the merchant to
+  // report a purchase/payment confirmation or an issued ticket as well.
   const booking = text.match(/(?:[Cc][oó]digo (?:de |da )?reserva|[Bb]ooking (?:reference|code|number)|[Rr]eservation code|[Ll]ocalizador|\bPNR)\s*[:#]?\s*([A-Z0-9]{5,8})\b/);
-  if (booking) return {state:'booked',source:'merchant-reported',confirmation_reached:true,order_id:booking[1],
+  const purchaseConfirmed = /(?:payment|purchase) (?:was |has been )?(?:confirmed|successful|received|approved|completed)|(?:compra|pago) (?:ha sido |fue |está )?(?:confirmad[oa]|aprobad[oa]|exitos[oa]|acreditad[oa])|pagamento (?:aprovado|confirmado)|zahlung erfolgreich|paiement (?:confirmé|accepté)|(?:e-?ticket|ticket number|n[uú]mero (?:de )?(?:billete|boleto))\s*[:#]?\s*\d{3}[- ]?\d{10}\b/i.test(text);
+  if (booking && purchaseConfirmed) return {state:'booked',source:'merchant-reported',confirmation_reached:true,order_id:booking[1],
     merchant_reported_total_minor:null,currency:null};
   // A request to re-enter contact details: the payment may be in progress, so
   // the state stays as it is; checkout copies the details for the human.
@@ -15,6 +17,7 @@
   if (attention?.confirm_contact) return {state:'waiting',reason:'confirm_contact'};
   // A form error after the click: the merchant kept the human on the form.
   if (attention && (attention.errors.length || attention.invalid)) return {state:'needs_input',reason:'form_errors'};
+  if (booking) return {state:'waiting',reason:'reservation_reference_only',order_id:booking[1]};
   const hostedSubscription = location.origin === 'https://buy.stripe.com' && /\bThanks for subscribing\b/.test(text);
   // Shopify's thank-you page is reached only after the order is created.
   const shopifyThankYou = /^(?:\/\d+)?\/checkouts\/(?:[a-z]+\/)?[A-Za-z0-9]+(?:\/[a-z]{2}(?:-[a-z]{2})?)?\/thank[-_]you(?:\/|$)/i.test(location.pathname);

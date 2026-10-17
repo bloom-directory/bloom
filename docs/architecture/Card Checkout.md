@@ -149,11 +149,19 @@ The operation store is written before every irreversible step:
 - `release_started` is committed before card plaintext exists; `submitted`
   before the site-mode click. A lost response never causes a second fill or
   click.
-- On restart, operations that may have disclosed or submitted become
-  `disclosure_unknown`; operations still waiting become
-  `failed_before_release`. Neither is retried automatically.
-- Outcomes (`paid`, `declined`, `uncertain`) are what the merchant page showed,
-  not a bank confirmation.
+- On restart, interrupted disclosure becomes `disclosure_unknown`; submission
+  and form-error states become `uncertain`. Earlier `not_submitted` records
+  also become `uncertain`, since older code inferred them from form errors.
+  Operations still awaiting release become `failed_before_release`. None is
+  retried automatically.
+- Form errors, timeout and closing the private view do not establish that no
+  charge occurred. The UI asks the person to check the merchant and bank before
+  another attempt; it never promises that nothing was charged.
+- A reservation reference alone is not a successful purchase. `booked` needs
+  the reference plus a merchant-reported purchase/payment confirmation or
+  issued-ticket evidence. This remains page-derived evidence, not independent
+  bank settlement. Durable per-booking reconciliation and protection against
+  retrying an unresolved purchase under a new operation ID remain unfinished.
 
 `checkout/history.json` lists the 50 latest requests with mode, shop origin,
 the approved total and the current status, so an agent can avoid buying twice.

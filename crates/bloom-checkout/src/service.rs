@@ -52,8 +52,9 @@ impl Store {
         let conn = Connection::open(path)?;
         conn.execute_batch("PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS operations(id TEXT PRIMARY KEY,state TEXT NOT NULL,status TEXT NOT NULL,created INTEGER NOT NULL,kind TEXT NOT NULL,description TEXT NOT NULL,shop TEXT,total_minor INTEGER,currency TEXT);")?;
         // A lost recipient cannot be reconstructed. Interrupted disclosure is never retried.
-        conn.execute("UPDATE operations SET state='uncertain',status=json_set(status,'$.state','uncertain','$.ceremony_url',NULL) WHERE state='submitted'",[])?;
-        conn.execute("UPDATE operations SET state='not_submitted',status=json_set(status,'$.state','not_submitted','$.ceremony_url',NULL) WHERE state='needs_input'",[])?;
+        // Form errors can arrive after a pay click. Older versions incorrectly
+        // converted them to not_submitted; neither state proves no charge.
+        conn.execute("UPDATE operations SET state='uncertain',status=json_set(status,'$.state','uncertain','$.ceremony_url',NULL) WHERE state IN ('submitted','needs_input','not_submitted')",[])?;
         conn.execute("UPDATE operations SET state='disclosure_unknown',status=json_set(status,'$.state','disclosure_unknown','$.ceremony_url',NULL) WHERE state IN ('release_started','filled','partially_filled')",[])?;
         conn.execute("UPDATE operations SET state='failed_before_release',status=json_set(status,'$.state','failed_before_release','$.ceremony_url',NULL) WHERE state IN ('requested','preparing','awaiting_approval','manual_required','human_control')",[])?;
         Ok(Self(Mutex::new(conn)))
@@ -1193,7 +1194,8 @@ impl CheckoutService {
                 if let Some(outcome) = outcome {
                     let state = outcome["state"].as_str().unwrap();
                     if state == "needs_input" {
-                        // Not paid: the human corrects the page in the private view.
+                        // The page needs attention, but may already have sent
+                        // payment. Do not infer a bank outcome from form text.
                         // Serialize with the manual retry marker: whichever
                         // happens last leaves the durable state conservative.
                         let private = self.private.lock().await;
@@ -1250,9 +1252,7 @@ impl CheckoutService {
                     .await
                     .is_ok()
                 {
-                    let final_state = if status.state == "needs_input" {
-                        "not_submitted"
-                    } else if mode == Mode::TakeOver {
+                    let final_state = if mode == Mode::TakeOver {
                         "returned"
                     } else {
                         "uncertain"
@@ -1648,14 +1648,7 @@ impl CheckoutService {
                     self.browser.return_control_at(&view_target, resume).await?;
                     self.set_state(&operation_id, "returned");
                 } else {
-                    let state = if mode == Mode::TakeOver {
-                        "returned"
-                    } else if self.store.get(&operation_id)?.state == "needs_input" {
-                        "not_submitted"
-                    } else {
-                        "uncertain"
-                    };
-                    self.set_state(&operation_id, state);
+                    self.set_state(&operation_id, "uncertain");
                     self.browser.return_control().await?;
                 }
                 let mut private = self.private.lock().await;
@@ -2781,6 +2774,12 @@ mod tests {
         reopened
             .insert(&needs_input, "card", "Flight form")
             .unwrap();
+        let mut legacy = needs_input.clone();
+        legacy.operation_id = "legacy-not-submitted-operation".into();
+        legacy.state = "not_submitted".into();
+        reopened
+            .insert(&legacy, "card", "Legacy ambiguous result")
+            .unwrap();
         drop(reopened);
         let reopened = Store::open(&path).unwrap();
         assert_eq!(
@@ -2789,7 +2788,15 @@ mod tests {
         );
         assert_eq!(
             reopened.get("needs-input-operation").unwrap().state,
-            "not_submitted"
+            "uncertain"
         );
+        assert_eq!(
+            reopened
+                .get("legacy-not-submitted-operation")
+                .unwrap()
+                .state,
+            "uncertain"
+        );
+        assert!(reopened.consume("legacy-not-submitted-operation").is_err());
     }
 }

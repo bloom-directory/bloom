@@ -1447,15 +1447,20 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn airline_outcomes_read_booking_codes_and_requests_for_attention() {
         let browser = browser().await;
-        // JetSMART's itinerary page after payment.
+        // A synthetic merchant confirmation, not live JetSMART acceptance.
         let booked = outcome_of(
             &browser,
-            "<h1>Itinerario de vuelo</h1><p>Código de reserva</p><p>QX7T2M</p>",
+            "<h1>Pago aprobado</h1><p>Código de reserva</p><p>QX7T2M</p>",
         )
         .await;
         assert_eq!(booked["state"], "booked");
         assert_eq!(booked["order_id"], "QX7T2M");
-        // The form refused the submission: not paid, the human corrects it.
+        let unpaid = outcome_of(&browser,
+            "<h1>Itinerario de vuelo</h1><p>Código de reserva QX7T2M</p><p>Reserva confirmada</p><button>Pagar</button>",
+        ).await;
+        assert_eq!(unpaid["state"], "waiting");
+        assert_eq!(unpaid["reason"], "reservation_reference_only");
+        // Form text requests attention; it does not establish a bank outcome.
         let refused = outcome_of(&browser, "<input aria-label='Nombres *' value='Karen'><div class='error'>Debes completar todos los campos.</div>").await;
         assert_eq!(refused["state"], "needs_input");
         assert_eq!(refused["reason"], "form_errors");
