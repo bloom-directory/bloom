@@ -196,11 +196,8 @@ chown "$login_uid" "$clean_home/cache"
 chmod 0700 "$clean_home/cache"
 # Keep the test home intentionally small but valid. Degraded authority does not
 # bypass normal Machine configuration validation.
-# This fixture must observe its just-committed policy before poisoning the
-# offline cache. Disable display coalescing rather than racing its one-second TTL.
 printf '%s\n' \
   'default_chain = "anvil"' \
-  'wallet_projection_max_age = "0s"' \
   '' \
   '[petals]' \
   'preinstalled = []' \
@@ -506,20 +503,26 @@ for service_log in "$broker_log" "$signer_log"; do
   sudo -u "$login_user" test -r "$service_log"
   if sudo -u "$login_user" test -w "$service_log"; then exit 1; fi
 done
-sudo -H -u "$login_user" env \
-  BLOOM_HOME="$clean_home" \
-  BLOOM_MACHINE_IDENTITY="$machine_identity" \
-  BLOOM_EDGE_MANIFEST="$edge_manifest" \
-  "$machine_binary" --home "$clean_home" --connect "unix:$machine_socket" \
-    wallet projection "$wallet_id" \
-  >"$work/live-projection.log" 2>"$work/live-projection.stderr"
-jq -e \
-  --arg address "$wallet_address" \
-  --arg wallet "$wallet_id" \
-  --slurpfile primary "$work/primary-key.json" \
-  '.verification == "authenticated_broker" and .freshness == "fresh" and .wallet.wallet_id == $wallet and any(.keys[]; .key_ref == $primary[0].key_ref and .addresses[0] == $address)' \
-  "$work/live-projection.log" >/dev/null
-/usr/bin/python3 - "$work/live-projection.log" "$wallet_address" <<'PY'
+# Observe the committed policy before copying the authenticated offline cache.
+# Keep normal display coalescing for the later degraded-read checks; only this
+# live read needs to wait for the pre-commit snapshot to expire.
+projection_deadline=$((SECONDS + 10))
+while true; do
+  sudo -H -u "$login_user" env \
+    BLOOM_HOME="$clean_home" \
+    BLOOM_MACHINE_IDENTITY="$machine_identity" \
+    BLOOM_EDGE_MANIFEST="$edge_manifest" \
+    "$machine_binary" --home "$clean_home" --connect "unix:$machine_socket" \
+      wallet projection "$wallet_id" \
+    >"$work/live-projection.log" 2>"$work/live-projection.stderr"
+  jq -e \
+    --arg address "$wallet_address" \
+    --arg wallet "$wallet_id" \
+    --slurpfile primary "$work/primary-key.json" \
+    '.verification == "authenticated_broker" and .freshness == "fresh" and .wallet.wallet_id == $wallet and any(.keys[]; .key_ref == $primary[0].key_ref and .addresses[0] == $address)' \
+    "$work/live-projection.log" >/dev/null
+  if /usr/bin/python3 - "$work/live-projection.log" "$wallet_address" \
+    2>"$work/live-policy-check.stderr" <<'PY'
 import base64
 import json
 import pathlib
@@ -536,6 +539,15 @@ if expected not in policy["allowed_destinations"]:
         f"expected={expected!r}, observed={policy['allowed_destinations']!r}"
     )
 PY
+  then
+    break
+  fi
+  if [[ $SECONDS -ge $projection_deadline ]]; then
+    cat "$work/live-policy-check.stderr" >&2
+    exit 1
+  fi
+  sleep 0.2
+done
 [[ -s "$clean_home/cache/wallet-projections.json" ]]
 kill "$machine_service_pid"
 wait "$machine_service_pid" 2>/dev/null || true
@@ -1037,7 +1049,11 @@ assert_mounted_effect_denied \
   "$approval_audit_start"
 run_login_with_deadline \
   "$work/approval-after.log" \
-  /bin/cat "$mount_dir/wallets/$wallet_id/sealed-approvals/new.json"
+  /bin/cat "$mount_dir/wallets/$wallet_id/sealed-approvals/new.json" || {
+  cat "$work/approval-after.log" >&2
+  echo "packaged Machine could not read the approval request template with Broker stopped" >&2
+  exit 1
+}
 /usr/bin/python3 - "$work/approval-after.log" <<'PY'
 import json
 import pathlib
