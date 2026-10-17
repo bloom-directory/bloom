@@ -18,10 +18,7 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::browser::Browser;
 
-/// Native messaging host name; Chrome lets only the extension id below use it.
-pub const HOST_NAME: &str = "directory.bloom.checkout";
-/// Fixed by the public key in `extension/manifest.json`.
-pub const EXTENSION_ID: &str = "ngpolgaijmajlonmjmcndcjajgnfcpom";
+pub use bloom_browser_extension::{EXTENSION_ID, HOST_NAME};
 
 pub struct ExtensionLink {
     commands: mpsc::UnboundedSender<String>,
@@ -161,9 +158,8 @@ pub fn relay(socket: &Path) -> Result<()> {
 
 /// The extension's files. `page.js` carries checkout's own page scripts, so
 /// both browsers run the same code.
-pub fn bundle() -> Vec<(&'static str, String)> {
-    // Each entry runs one of checkout's page scripts, unchanged.
-    let scripts = [
+fn scripts() -> Vec<(&'static str, String)> {
+    vec![
         (
             "snapshot",
             format!("() => {}", include_str!("snapshot.js").trim()),
@@ -220,59 +216,16 @@ pub fn bundle() -> Vec<(&'static str, String)> {
         ),
         ("valid", include_str!("payment-valid.js").trim().into()),
         ("fill", include_str!("payment-fill.js").trim().into()),
-    ];
-    let mut page = String::from(
-        "const BLOOM_SCRIPTS = (() => {\n\
-         // Chrome slows timers in background tabs to a second or more; page\n\
-         // scripts wait in short steps, so they use message-loop timers instead.\n\
-         const setTimeout = (done, ms = 0) => { const end = performance.now() + ms; const channel = new MessageChannel(); channel.port1.onmessage = () => performance.now() >= end ? done() : channel.port2.postMessage(0); channel.port2.postMessage(0); };\n\
-         return {\n",
-    );
-    for (name, script) in scripts {
-        page.push_str(&format!("{name}: {script},\n"));
-    }
-    page.push_str("};\n})();\n");
-    page.push_str(include_str!("../extension/page.js"));
-    let background = include_str!("../extension/background.js");
-    vec![
-        (
-            "manifest.json",
-            include_str!("../extension/manifest.json").into(),
-        ),
-        (
-            "background.js",
-            format!("const BLOOM_VERSION = '{}';\n{background}", version()),
-        ),
-        ("page.js", page),
     ]
 }
 
-/// Changes whenever the extension's files change, so checkout can tell the
-/// installed extension to reload itself after an update.
+pub fn bundle() -> Vec<(&'static str, String)> {
+    bloom_browser_extension::bundle(&scripts())
+}
+
+/// Includes both the external transport assets and checkout's DOM scripts.
 pub fn version() -> String {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::hash::DefaultHasher::new();
-    for part in [
-        include_str!("../extension/manifest.json"),
-        include_str!("../extension/background.js"),
-        include_str!("../extension/page.js"),
-        include_str!("snapshot.js"),
-        include_str!("act.js"),
-        include_str!("traveler-discover.js"),
-        include_str!("traveler-fill.js"),
-        include_str!("facts.js"),
-        include_str!("fields.js"),
-        include_str!("submit.js"),
-        include_str!("order-fields.js"),
-        include_str!("confirm-contact.js"),
-        include_str!("form-attention.js"),
-        include_str!("outcome.js"),
-        include_str!("payment-valid.js"),
-        include_str!("payment-fill.js"),
-    ] {
-        part.hash(&mut hasher);
-    }
-    format!("{:016x}", hasher.finish())
+    bloom_browser_extension::version(&scripts())
 }
 
 /// Native messaging manifest naming `host` (an executable) for the extension.
@@ -293,8 +246,7 @@ mod tests {
     #[test]
     fn extension_id_matches_the_manifest_key() {
         use base64::Engine;
-        let manifest: Value =
-            serde_json::from_str(include_str!("../extension/manifest.json")).unwrap();
+        let manifest: Value = serde_json::from_str(bloom_browser_extension::MANIFEST).unwrap();
         let key = base64::engine::general_purpose::STANDARD
             .decode(manifest["key"].as_str().unwrap())
             .unwrap();

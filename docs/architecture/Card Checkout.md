@@ -53,6 +53,24 @@ the approval.
 
 ## User browser extension
 
+The extension's manifest, background worker, content-script dispatcher and
+bundle assembly live in `bloom-directory/bloom-browser-extension`. Checkout
+pins that crate at an exact Git revision and supplies its generic DOM scripts
+to the bundler. The native messaging host and socket adapter remain here.
+There is no runtime source download or sibling-checkout dependency. The
+installed version hashes both extension assets and supplied DOM scripts.
+
+Flight search, itinerary selection, airline navigation instructions and the
+seller handoff live in `bloom-directory/bloom-petal-flights`. Its booking route
+uses the existing checkout VFS with declared read/write capabilities. Petals
+can orchestrate that public surface; they do not receive saved card/traveler
+plaintext or authorize disclosure. Merchant/provider origin allowlists stay
+with the components enforcing disclosure and extension permissions.
+
+The extension payment path currently inspects only the top document. Its
+JetSMART browsing permission does not prove Yuno iframe card support; the
+verified JetSMART purchase used checkout's own browser.
+
 A fresh Chromium profile fails Aerolíneas' passenger check even when it is
 headed and not marked as automated. The person's long-lived profile passes.
 Chrome refuses remote debugging of that default profile, so checkout reaches

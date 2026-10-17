@@ -9,6 +9,7 @@ license.workspace = true
 triad-dev-harness = []
 
 [dependencies]
+bloom-browser-extension = { git = "https://github.com/bloom-directory/bloom-browser-extension.git", rev = "c168057a03ba9863faa0749f77520aa45e357491" }
 bloom-checkout-api.workspace = true
 bloom-service-activation.workspace = true
 anyhow.workspace = true
@@ -23,7 +24,7 @@ serde_json.workspace = true
 tokio.workspace = true
 url.workspace = true
 zeroize.workspace = true
-bloom-signer-api = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "968838a2b4cd27cb931b9c16cfff54148e362499" }
+bloom-signer-api = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "47bd08b4d5c612335f7ae146917ed2004135fa10" }
 hpke = { version = "0.14", default-features = false, features = ["alloc", "getrandom", "x25519", "chacha"] }
 rusqlite.workspace = true
 phonenumber = "0.3"
