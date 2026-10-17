@@ -1,0 +1,39 @@
+[Unit]
+Description=Bloom checkout browser for login UID %i
+Requires=bloom-broker@%i.service
+After=bloom-broker@%i.service
+PartOf=bloom-broker@%i.service
+
+[Service]
+Type=simple
+User=bloom-checkout-%i
+Group=bloom-checkout-%i
+UMask=0077
+EnvironmentFile=/etc/bloom/%i/checkout.env
+ExecStart=@BLOOM_CHECKOUT_BINARY@ --chromium ${BLOOM_CHECKOUT_CHROMIUM} --profile /var/lib/bloom/%i/checkout/profile --state /var/lib/bloom/%i/checkout/operations.sqlite3 --socket /run/bloom/%i/checkout/rpc/checkout.sock --broker-socket /run/bloom/%i/broker/checkout/intake.sock --broker-uid ${BLOOM_CHECKOUT_BROKER_UID} --machine-uid %i --view-port 18736
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=bloom-checkout-%i
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+RestrictRealtime=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+LimitCORE=0
+ReadWritePaths=/var/lib/bloom/%i/checkout /run/bloom/%i/checkout
+# Chromium needs network, executable memory, namespaces, and its /proc view.
+# Its launch-time filter separately blocks Crashpad memory inspection.
+
+[Install]
+WantedBy=multi-user.target

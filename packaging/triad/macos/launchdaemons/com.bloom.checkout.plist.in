@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.bloom.checkout.@LOGIN_UID@</string>
+  <key>UserName</key><string>@BLOOM_CHECKOUT_USER@</string>
+  <key>GroupName</key><string>@BLOOM_CHECKOUT_GROUP@</string>
+  <key>InitGroups</key><true/>
+  <key>Umask</key><integer>63</integer>
+  <key>ProgramArguments</key><array>
+    <string>@BLOOM_CHECKOUT_BINARY@</string>
+    <string>--chromium</string><string>/Applications/Google Chrome.app/Contents/MacOS/Google Chrome</string>
+    <string>--profile</string><string>@BLOOM_CHECKOUT_STATE@/profile</string>
+    <string>--state</string><string>@BLOOM_CHECKOUT_STATE@/operations.sqlite3</string>
+    <string>--socket</string><string>@BLOOM_CHECKOUT_SOCKET@</string>
+    <string>--broker-socket</string><string>@BLOOM_CHECKOUT_INTAKE@</string>
+    <string>--broker-uid</string><string>@BLOOM_BROKER_UID@</string>
+    <string>--machine-uid</string><string>@LOGIN_UID@</string>
+    <string>--view-port</string><string>18736</string>
+    <string>--follow-broker-lifecycle</string>
+  </array>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+  <key>ThrottleInterval</key><integer>5</integer>
+  <key>ProcessType</key><string>Background</string>
+  <key>WorkingDirectory</key><string>@BLOOM_CHECKOUT_STATE@</string>
+  <key>SoftResourceLimits</key><dict><key>Core</key><integer>0</integer><key>NumberOfFiles</key><integer>4096</integer></dict>
+  <key>HardResourceLimits</key><dict><key>Core</key><integer>0</integer></dict>
+  <key>StandardOutPath</key><string>/dev/null</string>
+  <key>StandardErrorPath</key><string>/dev/null</string>
+</dict></plist>

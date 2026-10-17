@@ -1,5 +1,6 @@
 [Unit]
 Description=Bloom Broker for login UID %i
+Wants=bloom-checkout@%i.service
 Requires=bloom-broker-ceremony@%i.socket bloom-broker-ceremony-ipv6@%i.socket bloom-signer@%i.service
 After=bloom-broker-ceremony@%i.socket bloom-broker-ceremony-ipv6@%i.socket bloom-signer@%i.service
 
@@ -8,6 +9,7 @@ Type=simple
 User=bloom-broker-%i
 Group=bloom-broker-%i
 UMask=0077
+EnvironmentFile=/etc/bloom/%i/checkout.env
 ExecStart=@BLOOM_BROKER_BINARY@
 StandardOutput=journal
 StandardError=journal

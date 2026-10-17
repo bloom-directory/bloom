@@ -198,7 +198,7 @@ fn legacy_monitor_preserves_session_lifecycle_without_claiming_network_containme
     assert!(monitor.contains("session.sock"));
     assert!(monitor.contains("metadata.file_type().is_socket()"));
     assert!(monitor.contains("system/com.bloom.{service}.{login_uid}"));
-    assert!(monitor.contains("[\"signer\", \"broker\"]"));
+    assert!(monitor.contains("[\"signer\", \"broker\", \"checkout\"]"));
     assert!(monitor.contains("\"kickstart\""));
     assert!(!monitor.contains("signing_seed"));
     assert_ordered(
@@ -207,7 +207,7 @@ fn legacy_monitor_preserves_session_lifecycle_without_claiming_network_containme
             "gui/{login_uid}/com.bloom.session",
             "state = running",
             "session.sock",
-            "[\"signer\", \"broker\"]",
+            "[\"signer\", \"broker\", \"checkout\"]",
         ],
     );
 
