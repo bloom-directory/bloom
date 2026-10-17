@@ -594,7 +594,7 @@ impl ViewsHandler {
             let Some(client) = self.chains.get(chain) else {
                 continue;
             };
-            if !seen_chains.insert(client.spec().chain_id) {
+            if !client.spec().has_native_token() || !seen_chains.insert(client.spec().chain_id) {
                 continue;
             }
             let name = chain.clone();
@@ -6882,6 +6882,7 @@ mod tests {
             ("ethereum", 1u64, "Ethereum"),
             ("base", 8453, "Base"),
             ("tempo", 4217, "Tempo"),
+            ("robinhood", 4663, "Robinhood Chain"),
         ] {
             chains.add(
                 bloom_evm::ChainClient::new(bloom_proto::ChainSpec {
@@ -6917,15 +6918,15 @@ mod tests {
         let address = ADDRESS.parse::<alloy::primitives::Address>().unwrap();
         fixture.handler.remember_balance(
             "alice",
-            "tempo",
+            "robinhood",
             &format!("{address:#x}"),
             &Holding {
                 wallet: "alice".into(),
-                chain: "tempo".into(),
-                chain_id: 4217,
+                chain: "robinhood".into(),
+                chain_id: 4663,
                 account: String::new(),
                 price_key: None,
-                label: "Tempo Mainnet".into(),
+                label: "Robinhood Chain".into(),
                 symbol: "ETH".into(),
                 quantity: "1.25".into(),
                 amount: 1.25,
@@ -6937,6 +6938,34 @@ mod tests {
         assert!(html.contains("Unpriced balances · 1"), "{html}");
         assert!(html.contains("excluded from dollar totals"), "{html}");
         assert!(!html.contains("Test and development"), "{html}");
+    }
+
+    #[tokio::test]
+    async fn a_chain_without_a_native_token_shows_no_native_balance() {
+        let fixture = fixture_with_unreachable_chains();
+        let address = ADDRESS.parse::<alloy::primitives::Address>().unwrap();
+        // Even a remembered placeholder from an older build stays hidden.
+        fixture.handler.remember_balance(
+            "alice",
+            "tempo",
+            &format!("{address:#x}"),
+            &Holding {
+                wallet: "alice".into(),
+                chain: "tempo".into(),
+                chain_id: 4217,
+                account: String::new(),
+                price_key: None,
+                label: "Tempo".into(),
+                symbol: "ETH".into(),
+                quantity: "4242424242424242424242424242424242424242424242424242424242".into(),
+                amount: 4.24e57,
+                value: None,
+            },
+        );
+
+        let html = render(&fixture.handler, WALLETS_HTML).await;
+        assert!(!html.contains("4242424242"), "{html}");
+        assert!(!html.contains("Tempo"), "{html}");
     }
 
     #[tokio::test]
