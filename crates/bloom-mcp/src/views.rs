@@ -6,7 +6,7 @@
 //! without MCP Apps support get the same tools without UI metadata and a
 //! useful browser-path fallback in ordinary tool content.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::sync::LazyLock;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
@@ -15,9 +15,10 @@ use serde_json::{Value, json};
 use crate::backend::{VfsCommandError, VfsCommands, VfsMethod};
 use crate::tools::{ToolError, error_result, read_bytes};
 
+/// Claude serves its host font from here; nothing else may load.
+const CLAUDE_FONT_ORIGIN: &str = "https://assets.claude.ai";
 pub const APP_MIME_TYPE: &str = "text/html;profile=mcp-app";
-const APP_HTML: &str = include_str!("../assets/dashboard-widget.html");
-const BASE_CSS_PATH: &str = "/views/bloom.css";
+const APP_TEMPLATE: &str = include_str!("../assets/dashboard-widget.html");
 const SKIN_CSS_PATH: &str = "/views/skin.css";
 
 #[derive(Clone, Copy, Debug)]
@@ -85,7 +86,7 @@ pub fn find(name: &str) -> Option<&'static ViewToolSpec> {
 
 impl ViewToolSpec {
     pub fn resource_uri(&self) -> String {
-        format!("ui://bloom/{}-v8.html", self.page.trim_end_matches(".html"))
+        format!("ui://bloom/{}-v9.html", self.page.trim_end_matches(".html"))
     }
 
     pub fn descriptor(&self) -> Value {
@@ -143,15 +144,10 @@ pub async fn call(
         Ok(html) => html,
         Err(error) => return Ok(error_result(&error)),
     };
-    let css = match read_utf8(commands, BASE_CSS_PATH).await {
-        Ok(css) => css,
-        Err(error) => return Ok(error_result(&error)),
-    };
     let skin_css = match read_utf8(commands, SKIN_CSS_PATH).await {
         Ok(css) => css,
         Err(error) => return Ok(error_result(&error)),
     };
-    let assets = collect_assets(commands, &html).await;
     let browser_path = format!("views/{}", tool.page);
 
     Ok(json!({
@@ -171,9 +167,7 @@ pub async fn call(
         "_meta": {
             "bloom/view": {
                 "html": html,
-                "css": css,
                 "skinCss": skin_css,
-                "assets": assets,
             },
         },
     }))
@@ -206,55 +200,45 @@ async fn read_utf8(commands: &dyn VfsCommands, path: &str) -> Result<String, Vfs
     })
 }
 
-async fn collect_assets(commands: &dyn VfsCommands, html: &str) -> Value {
-    let mut assets = BTreeMap::new();
-    for source in local_sources(html) {
-        let path = format!("/views/{source}");
-        let Ok(reply) = commands
-            .call(VfsMethod::ReadInert, json!({ "path": path }))
-            .await
-        else {
-            continue;
-        };
-        let Ok(bytes) = read_bytes(&reply) else {
-            continue;
-        };
-        assets.insert(
-            source.clone(),
-            format!(
+/// The App document with the stylesheet and icons every view shares built
+/// in, so each tool result carries only its page. Hosts fetch the resource
+/// once; Claude stops delivering results inline beyond about 150k characters.
+static APP_HTML: LazyLock<String> = LazyLock::new(|| {
+    let icons = bloom_vfs::handlers::views::bundled_icons()
+        .map(|(path, bytes)| {
+            let uri = format!(
                 "data:{};base64,{}",
-                asset_mime_type(&source),
+                asset_mime_type(bytes),
                 B64.encode(bytes)
-            ),
-        );
-    }
-    json!(assets)
-}
+            );
+            (path, Value::String(uri))
+        })
+        .collect::<serde_json::Map<_, _>>();
+    APP_TEMPLATE
+        .replace("/*BLOOM_CSS*/", bloom_vfs::handlers::views::bundled_css())
+        .replace("/*BLOOM_ICONS*/", &Value::Object(icons).to_string())
+});
 
-fn local_sources(html: &str) -> BTreeSet<String> {
-    let mut sources = BTreeSet::new();
-    for part in html.split("src=\"").skip(1) {
-        let Some(source) = part.split('"').next() else {
-            continue;
-        };
-        if !source.is_empty()
-            && !source.starts_with(['/', '#'])
-            && !source.contains(':')
-            && source != "bloom.js"
-            && !source.split('/').any(|segment| segment == "..")
-        {
-            sources.insert(source.to_owned());
-        }
-    }
-    sources
-}
-
-fn asset_mime_type(path: &str) -> &'static str {
-    match path.rsplit('.').next() {
-        Some("svg") => "image/svg+xml",
-        Some("png") => "image/png",
-        Some("jpg" | "jpeg") => "image/jpeg",
-        Some("webp") => "image/webp",
+/// Several bundled icons carry another format's extension, so trust the bytes.
+fn asset_mime_type(bytes: &[u8]) -> &'static str {
+    match bytes {
+        [0x89, b'P', b'N', b'G', ..] => "image/png",
+        [0xff, 0xd8, ..] => "image/jpeg",
+        [
+            b'R',
+            b'I',
+            b'F',
+            b'F',
+            _,
+            _,
+            _,
+            _,
+            b'W',
+            b'E',
+            b'B',
+            b'P',
+            ..,
+        ] => "image/webp",
         _ => "application/octet-stream",
     }
 }
@@ -264,13 +248,13 @@ pub fn app_resource(tool: &ViewToolSpec) -> Value {
     json!({
         "uri": resource_uri,
         "mimeType": APP_MIME_TYPE,
-        "text": APP_HTML,
+        "text": APP_HTML.as_str(),
         "_meta": {
             "ui": {
-                "prefersBorder": true,
+                "prefersBorder": false,
                 "csp": {
                     "connectDomains": [],
-                    "resourceDomains": [],
+                    "resourceDomains": [CLAUDE_FONT_ORIGIN],
                     "frameDomains": [],
                 },
             },
@@ -296,15 +280,27 @@ pub fn app_resource_descriptor(tool: &ViewToolSpec) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     #[test]
-    fn only_safe_local_sources_are_collected() {
-        let sources = local_sources(concat!(
-            "<img src=\"icons/a.png\"><script src=\"bloom.js\"></script>",
-            "<img src=\"https://example/a.png\"><img src=\"../secret\">",
-            "<img src=\"data:image/png;base64,x\"><img src=\"/absolute\">",
-        ));
-        assert_eq!(sources, BTreeSet::from(["icons/a.png".to_owned()]));
+    fn app_document_embeds_shared_assets() {
+        assert!(!APP_HTML.contains("/*BLOOM_CSS*/"));
+        assert!(APP_HTML.contains(bloom_vfs::handlers::views::bundled_css()));
+        let icons = APP_HTML
+            .split("<script type=\"application/json\" id=\"bloom-icons\">")
+            .nth(1)
+            .and_then(|rest| rest.split("</script>").next())
+            .unwrap();
+        let icons: serde_json::Map<String, Value> = serde_json::from_str(icons).unwrap();
+        assert_eq!(
+            icons.len(),
+            bloom_vfs::handlers::views::bundled_icons().count()
+        );
+        assert!(
+            icons
+                .values()
+                .all(|uri| uri.as_str().unwrap().starts_with("data:image/"))
+        );
     }
 
     #[test]

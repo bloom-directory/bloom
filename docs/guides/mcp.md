@@ -111,9 +111,12 @@ The host renders only the selected view. Browser mastheads, cross-view
 navigation, and the browser-only Today/index page are not exposed as widgets.
 Networks sorting still works inside its own widget.
 
-The daemon remains the renderer. The MCP adapter reads the finished page,
-`bloom.css`, `skin.css`, and referenced local artwork through `read_inert` and
-delivers them in tool-result metadata, which stays out of model context. The
+The daemon remains the renderer. The MCP adapter reads the finished page and
+`skin.css` through `read_inert` and delivers them in tool-result metadata,
+which stays out of model context. The shared `bloom.css` and bundled artwork
+ship once inside the App resource, which keeps every result well under
+Claude's roughly 150,000-character limit for inline tool results. The App's
+background is transparent and it adopts the host's theme variables and font. The
 widget makes no network requests and cannot approve, stage, sign, or execute
 an operation. External explorer links are opened through the host.
 

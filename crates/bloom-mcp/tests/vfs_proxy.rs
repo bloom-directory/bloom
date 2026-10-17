@@ -783,16 +783,9 @@ async fn dashboard_tool_returns_widget_data_and_a_text_fallback() {
         result["_meta"]["bloom/view"]["html"],
         std::str::from_utf8(DASHBOARD_HTML).unwrap()
     );
-    assert_eq!(
-        result["_meta"]["bloom/view"]["css"],
-        "body { color: black; }"
-    );
-    assert!(
-        result["_meta"]["bloom/view"]["assets"]["icons/test.png"]
-            .as_str()
-            .unwrap()
-            .starts_with("data:image/png;base64,")
-    );
+    // Shared CSS and artwork ship once in the App resource, not per result.
+    assert!(result["_meta"]["bloom/view"].get("css").is_none());
+    assert!(result["_meta"]["bloom/view"].get("assets").is_none());
 
     harness.stop().await;
 }

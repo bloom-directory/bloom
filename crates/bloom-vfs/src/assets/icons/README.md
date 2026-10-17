@@ -8,7 +8,11 @@ into the HTML. See `handlers/views.rs` (`token_icon`, `chain_icon`,
 
 ## Provenance
 
-- `chain-arc.png`: unmodified 256px Arc mark from Arc's official website,
+Every mark is downscaled to at most 72px, twice its largest 36px display
+size, and re-encoded in its original format; the artwork is otherwise
+unchanged. Small files keep MCP App resources light.
+
+- `chain-arc.png`: 256px Arc mark from Arc's official website,
   downloaded 2026-09-22. Source:
   https://cdn.prod.website-files.com/685311a976e7c248b5dfde95/68926aad995d4eae931403a4_arc-favicon-256x256.png
   Used solely to identify the supported network, not as Bloom branding or an

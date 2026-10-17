@@ -4687,6 +4687,19 @@ const ICON_FILES: &[&IconFile] = &[
     &ZCASH,
 ];
 
+/// The stylesheet every page links, for renderers that cannot fetch it.
+pub fn bundled_css() -> &'static str {
+    BLOOM_CSS
+}
+
+/// Every bundled icon as `(path below views/, bytes)`, for renderers that
+/// cannot fetch `icons/` themselves.
+pub fn bundled_icons() -> impl Iterator<Item = (String, &'static [u8])> {
+    ICON_FILES
+        .iter()
+        .map(|icon| (format!("icons/{}", icon.name), icon.bytes))
+}
+
 /// The only names a request may serve. Anything else under `icons/` is
 /// refused, so a path can never escape into the filesystem.
 fn icon_by_name(name: &str) -> Option<&'static IconFile> {
