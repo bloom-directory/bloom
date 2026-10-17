@@ -177,6 +177,7 @@ struct PendingUnlock {
     operation_id: String,
     recipient: Recipient,
     origin: String,
+    context: String,
     fields: Vec<bloom_signer_api::TravelerField>,
 }
 
@@ -332,7 +333,7 @@ impl CheckoutService {
             }
             _ => bail!("Traveler metadata unavailable"),
         };
-        let origin = self.browser.shopping_origin().await?;
+        let (context, origin) = self.browser.shopping_scope().await?;
         use rand::RngCore;
         let mut nonce = [0; 32];
         rand::thread_rng().fill_bytes(&mut nonce);
@@ -378,6 +379,7 @@ impl CheckoutService {
             operation_id: operation_id.clone(),
             recipient,
             origin,
+            context,
             fields: metadata.fields,
         });
         let service = self.clone();
@@ -433,6 +435,10 @@ impl CheckoutService {
     ) -> Result<()> {
         let pending = pending.context("Traveler unlock unavailable")?;
         let mut status = self.store.consume(&pending.operation_id)?;
+        let (context, origin) = self.browser.shopping_scope().await?;
+        if context != pending.context || origin != pending.origin {
+            bail!("Booking changed during traveler approval; unlock again for this booking");
+        }
         let receipt = receipt.context("Traveler release unavailable")?;
         let aad = aad.context("Traveler release binding unavailable")?;
         if receipt.custody_operation_id.as_str() != pending.operation_id
@@ -473,7 +479,7 @@ impl CheckoutService {
         status.filled_fields = values.keys().cloned().collect();
         *self.traveler.lock().await = Some(UnlockedTraveler {
             origin: pending.origin,
-            context: self.browser.shopping_context().await,
+            context: pending.context,
             fields: pending.fields,
             values,
             expires: tokio::time::Instant::now() + Duration::from_secs(1800),
@@ -508,14 +514,17 @@ impl CheckoutService {
         ) {
             // A choice goes into a list: pick the option naming the saved value.
             self.browser
-                .choose_traveler(&element_ref, field, &text)
+                .choose_traveler(
+                    &element_ref,
+                    field,
+                    &text,
+                    &traveler.context,
+                    &traveler.origin,
+                )
                 .await?;
         } else {
             self.browser
-                .browse(BrowseRequest::Type {
-                    element_ref,
-                    text: text.to_string(),
-                })
+                .type_traveler(&element_ref, &text, &traveler.context, &traveler.origin)
                 .await?;
         }
         Ok(json!({"state":"typed","filled_fields":[field]}))
@@ -541,7 +550,12 @@ impl CheckoutService {
         }
         let filled = self
             .browser
-            .fill_traveler(&traveler.origin, &traveler.fields, &values)
+            .fill_traveler(
+                &traveler.origin,
+                &traveler.context,
+                &traveler.fields,
+                &values,
+            )
             .await
             .inspect_err(|e| eprintln!("traveler fill refused: {e:#}"))?;
         Ok(json!({"state":"filled","filled_fields":filled}))
@@ -1742,6 +1756,11 @@ const BROWSE_ERRORS: &[&str] = &[
     "Stale element reference; request a new snapshot",
     "Input exceeds limit",
     "Checkout has private control; shopping is paused",
+    "The Bloom extension is unavailable or busy",
+    "The Bloom extension disconnected",
+    "The Bloom extension did not answer",
+    "The Bloom extension has too many pending requests",
+    "Saved traveler details are unlocked for another booking or website",
 ];
 
 #[cfg(test)]

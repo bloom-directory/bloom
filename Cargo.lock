@@ -2385,7 +2385,7 @@ dependencies = [
 [[package]]
 name = "bloom-browser-extension"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-browser-extension.git?rev=4f19dcffa672105d6fe8db46c9565be7536f633a#4f19dcffa672105d6fe8db46c9565be7536f633a"
+source = "git+https://github.com/bloom-directory/bloom-browser-extension.git?rev=a854bd3beb1ff4fcfb9b2c93d3fd789d80f2792c#a854bd3beb1ff4fcfb9b2c93d3fd789d80f2792c"
 dependencies = [
  "sha2 0.10.9",
 ]

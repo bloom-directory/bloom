@@ -29,6 +29,10 @@ struct Tab {
     session: String,
     refs: Vec<ElementRef>,
     generation: u64,
+    /// The connection selected when this journey opened. Keep it even after a
+    /// disconnect: resuming on another transport could repeat a private action.
+    extension: Option<Arc<ExtensionLink>>,
+    journey: u64,
 }
 
 pub struct Browser {
@@ -38,8 +42,7 @@ pub struct Browser {
     fixture_payment_hosts: bool,
     /// Unlocked traveler values and their placeholders, removed from snapshots.
     redactions: std::sync::RwLock<Vec<(String, String)>>,
-    /// While the Bloom extension is connected, browsing happens in one tab of
-    /// the person's own browser instead of checkout's Chromium.
+    /// Available connection for a new supported journey, never a global override.
     extension: std::sync::RwLock<Option<Arc<ExtensionLink>>>,
 }
 
@@ -116,23 +119,29 @@ impl Browser {
         }
     }
 
-    pub async fn browse(&self, request: BrowseRequest) -> Result<Value> {
+    pub async fn browse(&self, mut request: BrowseRequest) -> Result<Value> {
         self.available()?;
         let mut tab = self.tab.lock().await;
         self.available()?;
-        let extension = self.extension.read().unwrap().clone();
-        if let Some(link) = extension {
+        if let BrowseRequest::Open { url } = &mut request {
+            let parsed = shopping_url(url)?;
+            *url = parsed.to_string();
+            // An explicit open starts a new public journey. Connecting or
+            // disconnecting an extension must never change an existing one.
+            tab.extension = if crate::extension::supports_url(&parsed) {
+                self.extension.read().unwrap().clone()
+            } else {
+                None
+            };
+            tab.journey += 1;
+            tab.refs.clear();
+            tab.generation += 1;
+        }
+        if let Some(link) = tab.extension.clone() {
             return self.browse_extension(&link, &mut tab, request).await;
         }
         match request {
             BrowseRequest::Open { url } => {
-                let parsed = url::Url::parse(&url).context("Invalid browsing URL")?;
-                if !matches!(parsed.scheme(), "http" | "https")
-                    || !parsed.username().is_empty()
-                    || parsed.password().is_some()
-                {
-                    bail!("Only ordinary HTTP(S) shopping URLs are supported");
-                }
                 self.cdp
                     .call(Some(&tab.session), "Page.navigate", json!({"url":url}))
                     .await?;
@@ -385,8 +394,8 @@ impl Browser {
     /// Copies the page's contact email and phone into its re-entry fields,
     /// then reports what the page still asks of the human.
     pub(crate) async fn page_attention(&self) -> Result<Value> {
-        let extension = self.extension.read().unwrap().clone();
-        if let Some(link) = extension {
+        let tab = self.tab.lock().await;
+        if let Some(link) = tab.extension.clone() {
             let view = PrivateTab {
                 cdp: self.cdp.clone(),
                 session: String::new(),
@@ -397,7 +406,6 @@ impl Browser {
             crate::discovery::run(&view, "", 0, crate::discovery::Script::ConfirmContact).await?;
             return crate::discovery::run(&view, "", 0, crate::discovery::Script::Attention).await;
         }
-        let tab = self.tab.lock().await;
         let evaluate = |expression: &str| {
             self.cdp.call(
                 Some(&tab.session),
@@ -414,17 +422,26 @@ impl Browser {
         Ok(result["result"]["value"].clone())
     }
 
-    /// The disposable browsing context shopping currently runs in.
+    /// Distinguishes explicit journeys, including two opens on the same origin.
     pub(crate) async fn shopping_context(&self) -> String {
-        self.tab.lock().await.context.clone()
+        let tab = self.tab.lock().await;
+        journey_context(&tab)
     }
 
     pub(crate) async fn shopping_origin(&self) -> Result<String> {
-        let extension = self.extension.read().unwrap().clone();
-        if let Some(link) = extension {
+        let tab = self.tab.lock().await;
+        self.origin(&tab).await
+    }
+
+    pub(crate) async fn shopping_scope(&self) -> Result<(String, String)> {
+        let tab = self.tab.lock().await;
+        Ok((journey_context(&tab), self.origin(&tab).await?))
+    }
+
+    async fn origin(&self, tab: &Tab) -> Result<String> {
+        if let Some(link) = tab.extension.clone() {
             return self.shopping_origin_of(&link).await;
         }
-        let tab = self.tab.lock().await;
         let info = self
             .cdp
             .call(None, "Target.getTargetInfo", json!({"targetId":tab.target}))
@@ -440,6 +457,33 @@ impl Browser {
             .ascii_serialization())
     }
 
+    async fn check_traveler_scope(&self, tab: &Tab, context: &str, origin: &str) -> Result<()> {
+        if journey_context(tab) != context || self.origin(tab).await? != origin {
+            bail!("Saved traveler details are unlocked for another booking or website");
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn type_traveler(
+        &self,
+        reference: &str,
+        value: &str,
+        context: &str,
+        origin: &str,
+    ) -> Result<()> {
+        self.available()?;
+        let mut tab = self.tab.lock().await;
+        self.available()?;
+        self.check_traveler_scope(&tab, context, origin).await?;
+        if let Some(link) = tab.extension.clone() {
+            self.act_extension(&link, &mut tab, reference, "type", value)
+                .await?;
+        } else {
+            self.act(&mut tab, reference, "type", value).await?;
+        }
+        Ok(())
+    }
+
     /// Choose a saved traveler value in a list the agent picked (a select or a
     /// site-drawn dropdown). The value never comes back; failure says so.
     pub(crate) async fn choose_traveler(
@@ -447,9 +491,13 @@ impl Browser {
         reference: &str,
         field: &str,
         value: &str,
+        context: &str,
+        origin: &str,
     ) -> Result<()> {
         self.available()?;
         let mut tab = self.tab.lock().await;
+        self.available()?;
+        self.check_traveler_scope(&tab, context, origin).await?;
         let (generation, index) = reference
             .split_once(':')
             .context("Invalid element reference")?;
@@ -463,8 +511,7 @@ impl Browser {
             .clone();
         tab.refs.clear();
         tab.generation += 1;
-        let extension = self.extension.read().unwrap().clone();
-        if let Some(link) = extension {
+        if let Some(link) = tab.extension.clone() {
             let origin = self.shopping_origin_of(&link).await?;
             link.call(json!({"action":"open_list","index":binding.index}))
                 .await?;
@@ -555,13 +602,15 @@ impl Browser {
     pub(crate) async fn fill_traveler(
         &self,
         origin: &str,
+        context: &str,
         fields: &[bloom_signer_api::TravelerField],
         values: &std::collections::BTreeMap<String, zeroize::Zeroizing<String>>,
     ) -> Result<Vec<String>> {
         self.available()?;
         let mut tab = self.tab.lock().await;
-        let extension = self.extension.read().unwrap().clone();
-        if let Some(link) = extension {
+        self.available()?;
+        self.check_traveler_scope(&tab, context, origin).await?;
+        if let Some(link) = tab.extension.clone() {
             tab.refs.clear();
             tab.generation += 1;
             return crate::travelers::fill_in_extension(&link, origin, fields, values).await;
@@ -665,6 +714,7 @@ impl Browser {
             bail!("Only ordinary HTTP(S) shopping popups are supported");
         }
         let target = child["targetId"].as_str().context("Missing popup target")?;
+        let journey = tab.journey;
         *tab = attach_tab(
             &self.cdp,
             tab.context.clone(),
@@ -672,6 +722,7 @@ impl Browser {
             tab.generation + 1,
         )
         .await?;
+        tab.journey = journey;
         Ok(())
     }
 
@@ -694,7 +745,7 @@ impl Browser {
             session: tab.session.clone(),
             target: tab.target.clone(),
             fixture_payment_hosts: self.fixture_payment_hosts,
-            extension: self.extension.read().unwrap().clone(),
+            extension: tab.extension.clone(),
         })
     }
 
@@ -703,6 +754,11 @@ impl Browser {
     /// return to the booking site.
     pub(crate) async fn return_control(&self) -> Result<()> {
         let mut tab = self.tab.lock().await;
+        if let Some(link) = &tab.extension {
+            // Do not clear private control until the original connection has
+            // closed its private page. Never clean up through a replacement.
+            link.call(json!({"action":"close"})).await?;
+        }
         self.cdp
             .call(
                 None,
@@ -752,6 +808,9 @@ impl Browser {
             return self.return_control().await;
         };
         let mut tab = self.tab.lock().await;
+        if tab.extension.is_some() {
+            bail!("Existing-browser takeover cannot resume public browsing safely yet");
+        }
         let mut resumed = attach_tab(
             &self.cdp,
             tab.context.clone(),
@@ -759,6 +818,7 @@ impl Browser {
             tab.generation + 1,
         )
         .await?;
+        resumed.journey = tab.journey;
         // Navigate away before returning, so Chrome cannot restore private
         // form values as it might during a reload of the same history entry.
         self.cdp
@@ -882,7 +942,24 @@ async fn attach_tab(cdp: &Cdp, context: String, target: String, generation: u64)
         session,
         refs: Vec::new(),
         generation,
+        extension: None,
+        journey: 0,
     })
+}
+
+fn shopping_url(url: &str) -> Result<url::Url> {
+    let parsed = url::Url::parse(url).context("Invalid browsing URL")?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        bail!("Only ordinary HTTP(S) shopping URLs are supported");
+    }
+    Ok(parsed)
+}
+
+fn journey_context(tab: &Tab) -> String {
+    format!("{}:{}", tab.context, tab.journey)
 }
 
 fn accessibility_text(tree: &Value) -> Result<String> {
@@ -936,6 +1013,177 @@ fn accessibility_text(tree: &Value) -> Result<String> {
 mod tests {
     use super::*;
     use axum::{Router, response::Html, routing::get};
+
+    #[tokio::test]
+    async fn opening_another_booking_on_the_same_origin_invalidates_traveler_scope() {
+        let root = tempfile::tempdir().unwrap();
+        let browser = Browser::launch(
+            &crate::test_chromium(),
+            &root.path().join("profile"),
+            &["--no-sandbox".into()],
+        )
+        .await
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let origin = url.trim_end_matches('/');
+        let site = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/",
+                    get(|| async { Html("<label>Given name<input name='first_name'></label>") }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        browser
+            .browse(BrowseRequest::Open { url: url.clone() })
+            .await
+            .unwrap();
+        let old_context = browser.shopping_context().await;
+        browser
+            .browse(BrowseRequest::Open { url: url.clone() })
+            .await
+            .unwrap();
+        let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+        let reference = snapshot["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["kind"] == "textbox" || e["tag"] == "input")
+            .or_else(|| snapshot["elements"].as_array().unwrap().first())
+            .unwrap()["ref"]
+            .as_str()
+            .unwrap();
+        let error = browser
+            .type_traveler(reference, "PRIVATE-FIXTURE", &old_context, origin)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("another booking"));
+        assert!(
+            browser
+                .fill_traveler(origin, &old_context, &[], &Default::default())
+                .await
+                .is_err()
+        );
+        let value = browser
+            .cdp
+            .call(
+                Some(&browser.tab.lock().await.session),
+                "Runtime.evaluate",
+                json!({"expression":"document.querySelector('input').value","returnByValue":true}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(value["result"]["value"], "");
+        site.abort();
+        let _ = site.await;
+    }
+
+    #[tokio::test]
+    async fn connected_extension_does_not_override_or_migrate_a_journey() {
+        let root = tempfile::tempdir().unwrap();
+        let browser = Browser::launch(
+            &crate::test_chromium(),
+            &root.path().join("profile"),
+            &["--no-sandbox".into()],
+        )
+        .await
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let site = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/", get(|| async { Html("<h1>Ordinary shop</h1>") })),
+            )
+            .await
+            .unwrap();
+        });
+        let (first, mut commands) = ExtensionLink::fixture();
+        let (events, mut observed) = tokio::sync::mpsc::unbounded_channel();
+        let connection = first.clone();
+        let relay = tokio::spawn(async move {
+            while let Some(command) = commands.recv().await {
+                let command: Value = serde_json::from_str(&command).unwrap();
+                let action = command["action"].as_str().unwrap();
+                events.send(action.to_owned()).unwrap();
+                let value = match action {
+                    "snapshot" => {
+                        json!({"url":"https://jetsmart.com/","text":"Airline","elements":[]})
+                    }
+                    "location" => json!({"url":"https://jetsmart.com/"}),
+                    _ => json!({"state":"done"}),
+                };
+                connection
+                    .answer_fixture(command["id"].as_u64().unwrap(), value)
+                    .await;
+            }
+        });
+        browser
+            .browse(BrowseRequest::Open { url: url.clone() })
+            .await
+            .unwrap();
+        let initial = browser.shopping_context().await;
+        browser.attach_extension(first.clone());
+        // Attaching during shopping must not replace the selected CDP page.
+        let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+        assert_eq!(snapshot["url"], url);
+        assert!(observed.try_recv().is_err());
+        let held = browser.handoff().await.unwrap();
+        assert!(held.extension.is_none());
+        browser.return_control().await.unwrap();
+
+        browser
+            .browse(BrowseRequest::Open {
+                url: "https://jetsmart.com/".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(observed.recv().await.unwrap(), "open");
+        assert_ne!(browser.shopping_context().await, initial);
+        browser.detach_extension(&first);
+        let (replacement, mut unused) = ExtensionLink::fixture();
+        browser.attach_extension(replacement);
+        assert_eq!(
+            browser.browse(BrowseRequest::Snapshot).await.unwrap()["text"],
+            "Airline"
+        );
+        assert_eq!(observed.recv().await.unwrap(), "snapshot");
+        let held = browser.handoff().await.unwrap();
+        assert!(Arc::ptr_eq(held.extension.as_ref().unwrap(), &first));
+        browser.return_control().await.unwrap();
+        assert_eq!(observed.recv().await.unwrap(), "close");
+        assert!(unused.try_recv().is_err());
+
+        // Unsupported extension origins still use CDP on a new journey.
+        browser
+            .browse(BrowseRequest::Open { url: url.clone() })
+            .await
+            .unwrap();
+        assert_eq!(
+            browser.browse(BrowseRequest::Snapshot).await.unwrap()["url"],
+            url
+        );
+        assert!(unused.try_recv().is_err());
+
+        browser.attach_extension(first.clone());
+        browser
+            .browse(BrowseRequest::Open {
+                url: "https://jetsmart.com/".into(),
+            })
+            .await
+            .unwrap();
+        relay.abort();
+        let _ = relay.await;
+        browser.detach_extension(&first);
+        assert!(browser.browse(BrowseRequest::Snapshot).await.is_err());
+        // It must fail, not silently show the old CDP shop after disconnect.
+        site.abort();
+        let _ = site.await;
+    }
 
     #[tokio::test]
     #[ignore = "real public Shopify cart, no card or purchase; requires network"]

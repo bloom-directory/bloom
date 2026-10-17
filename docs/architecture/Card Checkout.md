@@ -112,6 +112,36 @@ The extension tab is already visible in the person's browser, so it is not
 mirrored into the private view. Approval follow-up instead tells the person to
 return to the Bloom tab for a bank check or correction.
 
+### Journey selection and installed-extension limit
+
+An explicit shopping `open` selects the extension only for origins in its
+pinned permissions, otherwise checkout's browser. Connecting an extension does
+not take over an existing journey. That journey retains its original connection
+through private execution; a disconnect or replacement fails rather than
+switching browsers or replaying payment. Completion closes only the extension's
+recorded tab before returning public control. Unsupported extension takeover
+resumption remains paused instead of exposing the private document.
+
+Every explicit open starts a new traveler-unlock context, even on the same
+origin. An approval returned for an earlier context is discarded. Private
+traveler actions recheck context and origin while holding the browsing lock.
+
+The native host registers in Linux Chrome/Chromium config directories or macOS
+Application Support directories. Its relay uses bounded JSON frames and queues;
+malformed/truncated/oversized input and lost connections fail closed. Platform
+registration follows [Chrome native messaging](https://developer.chrome.com/docs/extensions/develop/concepts/native-messaging).
+
+This is still a development connection, not installed extension acceptance.
+Checkout currently accepts only its own UID on the extension socket; the
+installed browser uses the login UID, not the isolated checkout UID. Do not
+remove this check or open the socket to the login UID as a packaging shortcut.
+A login-UID check alone cannot distinguish Chrome's native host from Machine
+or another process running under that same login. A normal-profile browser is
+therefore a different trust boundary from checkout's isolated browser. Private
+installed-extension support needs a protected bridge or an explicit product
+decision accepting the trusted-login-browser limitation, with accurate claims
+and acceptance tests. Neither this change nor green fixture tests grants it.
+
 ## Durable states and recovery
 
 The operation store is written before every irreversible step:

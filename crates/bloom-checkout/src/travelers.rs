@@ -509,6 +509,7 @@ mod tests {
         let filled = browser
             .fill_traveler(
                 &origin,
+                &browser.shopping_context().await,
                 &[TravelerField::DocumentKind, TravelerField::DocumentExpiry],
                 &values,
             )
@@ -558,12 +559,17 @@ mod tests {
         ];
         assert!(
             browser
-                .fill_traveler("https://elsewhere.example", &fields, &values)
+                .fill_traveler(
+                    "https://elsewhere.example",
+                    &browser.shopping_context().await,
+                    &fields,
+                    &values
+                )
                 .await
                 .is_err()
         );
         let filled = browser
-            .fill_traveler(&origin, &fields, &values)
+            .fill_traveler(&origin, &browser.shopping_context().await, &fields, &values)
             .await
             .unwrap();
         assert_eq!(filled, ["given_name", "family_name", "email"]);
