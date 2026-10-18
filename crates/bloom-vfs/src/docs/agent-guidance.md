@@ -447,6 +447,20 @@ walkthrough in `docs/examples.md`.
 
 ## Petals and paid requests
 
+Known Gasless/Venice payment and login actions and owner-signed Hyperliquid
+actions require complete message-review envelopes from their installed Petal
+package. If an older package cannot prepare a readable approval, update it
+with the matching service release; never strip the review, substitute a hash,
+change accounts or switch to a reusable/batch path to avoid the refusal. Retry
+the exact same request after its own owner approval. Venice uses a fresh login
+proof for each later HTTP request. A login approval grants no payment authority.
+
+Readings have explicit limits: Enso input amounts do not prove its quoted
+output or shortcut effects; Privacy Pools proof words are not proof verification;
+exchange acceptance is not settlement. Unknown assets retain their exact
+identity/raw units. Delegated sessions use their existing bounded authority
+and do not imply independent owner review of every future trade.
+
 Installed application documents and public routes live under `petals/<name>/`.
 Account-dependent routes explicitly select a wallet and index, for example
 `petals/enso/intents/<wallet>/<index>/new`. Follow each package's route tree;

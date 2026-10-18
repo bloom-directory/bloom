@@ -136,6 +136,37 @@ the class gets no exact approval without an envelope and no reusable approval
 that names the Safe class. A claim sent beside an envelope may not declare amounts, destinations
 or fees: the rebuilt transaction is the review.
 
+### Payment, authentication and exchange message reviews
+
+Exact Petal signing can carry a bounded `bloom.message.review.v1` envelope in
+the existing `PayloadSignRequest.action` field. Machine binds it into the
+persisted exact-operation identity and forwards it to Broker through
+`message_review_payloads`; it does not interpret the Petal's prose as facts.
+Broker reconstructs EIP-712 or EIP-191 preimages, or supported Hyperliquid
+ordered MessagePack actions and their Agent domain, and checks the approved
+SHA-256 preimage commitment and Keccak signing hash. Every typed leaf is read
+from the signed value. Known ERC-3009 and HyperCore payment claims must match
+the signed debit, recipient and value limit. Quoted outputs, available balances,
+fees not in the signature, proof validity and settlement remain unverified.
+
+The known exact-message classes in Broker API's
+`MESSAGE_REVIEW_OPERATION_CLASSES` require full envelopes and refuse opaque,
+batch or reusable downgrades. This does not turn an existing delegated agent
+grant into a fresh owner ceremony for each future action. Full per-call
+interpretation and reusable scope enforcement are separate properties.
+
+Broker's compiled catalog binds token units/artwork to exact chain/address
+identities. Mainnet HyperCore USDC uses an explicit venue/asset identity;
+test collateral and unknown assets do not borrow its mark. Protocol readers
+remain bounded: Enso source inputs do not establish shortcut effects, and a
+Privacy Pools direct withdrawal does not establish ZK-proof validity or relay
+recipient semantics. Unknown content retains an explicit missing-coverage reason.
+
+Publish matching Gasless, Venice and Hyperliquid packages with the new services.
+Old hash-only caller packages cannot satisfy the required exact-message review.
+This is a coordinated package compatibility change, not a new SDK signing ABI
+or a new wallet clear-signing mode.
+
 Petals always submit complete payload bytes through a payload-bearing host
 call. Hash-only guest signing is unsupported. Machine may validate guest
 capabilities and provenance, but only Broker can authorize and only Signer can
@@ -214,9 +245,11 @@ rejects widening and supplies the resolved route IDs itself. Packages predating
 that complete manifest scope retain their legacy request semantics only as a
 compatibility path.
 
-Venue-specific custody and signing protocols do not belong in Machine, Broker,
-or Signer. An installed Hyperliquid Petal, for example, uses this generic scope
-instead of a native Machine agent-session key.
+Petals construct venue actions through the generic custody/signing interfaces;
+Machine and Signer do not implement a native venue account or submission flow.
+Broker independently reads supported signing formats before owner approval.
+An installed Hyperliquid Petal uses the generic derived-key scope instead of a
+native Machine agent-session key.
 
 ## By-key revocation and Exact survival
 
