@@ -1018,6 +1018,10 @@ impl MachineBrokerClient {
                 .safe_review_payload
                 .map(|payload| vec![Base64UrlBytes::from_bytes(&payload)])
                 .unwrap_or_default(),
+            message_review_payloads: request
+                .message_review_payload
+                .map(|payload| vec![Base64UrlBytes::from_bytes(&payload)])
+                .unwrap_or_default(),
             evm_reported_token: request.evm_reported_token,
             operation_id: request.approval_operation_id,
             terms,
@@ -1202,6 +1206,7 @@ impl MachineBrokerClient {
                 Vec::new()
             },
             safe_review_payloads: Vec::new(),
+            message_review_payloads: Vec::new(),
             operation_id: request.approval_operation_id,
             terms,
             canonical_plan_facts_digest: request.canonical_plan_facts_digest,
@@ -1360,6 +1365,7 @@ impl MachineBrokerClient {
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             evm_review_payloads: Vec::new(),
             safe_review_payloads: Vec::new(),
+            message_review_payloads: Vec::new(),
             operation_id: request.approval_operation_id,
             terms,
             canonical_plan_facts_digest: request.canonical_plan_facts_digest,
@@ -2098,6 +2104,7 @@ pub struct ExactPayloadSignRequest {
     pub system_use_claim: Option<SystemUseClaim>,
     pub claim_assurance_evidence: Option<Vec<u8>>,
     pub safe_review_payload: Option<Vec<u8>>,
+    pub message_review_payload: Option<Vec<u8>>,
     /// What an unlisted token reports about itself, for Broker's display.
     pub evm_reported_token: Option<bloom_broker_api::EvmReportedToken>,
     /// Value movement authorized by the reviewed exact claim. System callers
@@ -2154,10 +2161,12 @@ impl ExactPayloadBatchSignRequest {
         // signed unreviewed. Broker also refuses it; this keeps the error local.
         if self.petal_use_claim.as_ref().is_some_and(|claim| {
             claim.operation_class.as_str() == bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS
+                || bloom_broker_api::MESSAGE_REVIEW_OPERATION_CLASSES
+                    .contains(&claim.operation_class.as_str())
         }) {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::ClaimInvalid,
-                "Safe confirmations require the single-payload exact path with a Safe review envelope",
+                "Reviewed Petal signatures require the single-payload exact path with a review envelope",
             ));
         }
         SigningPayloads::Batch {
@@ -2198,6 +2207,36 @@ impl ExactPayloadSignRequest {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::ClaimInvalid,
                 "Safe confirmation requires exactly one Safe review payload",
+            ));
+        }
+        if self
+            .message_review_payload
+            .as_ref()
+            .is_some_and(|payload| payload.len() > bloom_broker_api::SINGLE_PAYLOAD_MAX_BYTES)
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::LimitExceededFrame,
+                "Message review payload is too large",
+            ));
+        }
+        let message_required = self.petal_use_claim.as_ref().is_some_and(|claim| {
+            bloom_broker_api::MESSAGE_REVIEW_OPERATION_CLASSES
+                .contains(&claim.operation_class.as_str())
+        });
+        if message_required && self.message_review_payload.is_none() {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::ClaimInvalid,
+                "This message operation requires a review envelope",
+            ));
+        }
+        if self.message_review_payload.is_some()
+            && (safe_operation
+                || self.petal_use_claim.is_none()
+                || self.crypto_suite != CryptoSuite::Secp256k1Keccak256Recoverable)
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::ClaimInvalid,
+                "Message review requires an independent recoverable secp256k1 Petal signature",
             ));
         }
         SigningPayloads::Single {
@@ -2698,10 +2737,14 @@ impl TrustedPetalSignRequest {
         // envelope, rather than of one of the two.
         if self.claim.operation_class.as_str() == bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS
             || self.operation_class.as_str() == bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS
+            || bloom_broker_api::MESSAGE_REVIEW_OPERATION_CLASSES
+                .contains(&self.claim.operation_class.as_str())
+            || bloom_broker_api::MESSAGE_REVIEW_OPERATION_CLASSES
+                .contains(&self.operation_class.as_str())
         {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::ClaimInvalid,
-                "Safe confirmations require the single-payload exact path with a Safe review envelope",
+                "Reviewed Petal signatures require the single-payload exact path with a review envelope",
             ));
         }
         SigningPayloads::Single {
@@ -4039,6 +4082,7 @@ mod tests {
             system_use_claim: None,
             claim_assurance_evidence: None,
             safe_review_payload: None,
+            message_review_payload: None,
             approval_value_limits: Vec::new(),
             account_key_ref: None,
         }
@@ -4071,6 +4115,24 @@ mod tests {
             request.validate().unwrap_err().code,
             ProtocolErrorCode::LimitExceededFrame
         );
+        request.safe_review_payload = None;
+        for class in bloom_broker_api::MESSAGE_REVIEW_OPERATION_CLASSES {
+            request.petal_use_claim.as_mut().unwrap().operation_class = token(class);
+            request.message_review_payload = None;
+            assert_eq!(
+                request.validate().unwrap_err().code,
+                ProtocolErrorCode::ClaimInvalid
+            );
+            request.message_review_payload =
+                Some(br#"{"schema":"bloom.message.review.v1"}"#.to_vec());
+            request.validate().unwrap();
+            request.message_review_payload =
+                Some(vec![0; bloom_broker_api::SINGLE_PAYLOAD_MAX_BYTES + 1]);
+            assert_eq!(
+                request.validate().unwrap_err().code,
+                ProtocolErrorCode::LimitExceededFrame
+            );
+        }
     }
 
     #[test]
@@ -4826,6 +4888,7 @@ mod tests {
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             evm_review_payloads: Vec::new(),
             safe_review_payloads: Vec::new(),
+            message_review_payloads: Vec::new(),
             operation_id: OperationId::from_bytes([94; 32]),
             terms: approval_terms("wallet", None),
             canonical_plan_facts_digest: digest(95),

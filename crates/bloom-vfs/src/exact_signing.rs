@@ -242,7 +242,7 @@ impl BrokerExactPayloadSigner {
         trusted_subject: &ProvenanceSubject,
         claim: &PetalUseClaim,
         claim_assurance_evidence: Option<&[u8]>,
-        safe_review_payload: Option<&[u8]>,
+        petal_review_payload: Option<&[u8]>,
     ) -> Result<ExactPayloadOutcome, String> {
         let parent = state_path
             .parent()
@@ -276,7 +276,7 @@ impl BrokerExactPayloadSigner {
                 canonical_plan_facts,
                 Some(trusted_subject),
                 Some((claim, claim_assurance_evidence)),
-                safe_review_payload,
+                petal_review_payload,
             )
             .await;
         let _ = lock.unlock();
@@ -296,7 +296,7 @@ impl BrokerExactPayloadSigner {
         canonical_plan_facts: &serde_json::Value,
         trusted_subject: Option<&ProvenanceSubject>,
         petal_claim: Option<(&PetalUseClaim, Option<&[u8]>)>,
-        safe_review_payload: Option<&[u8]>,
+        petal_review_payload: Option<&[u8]>,
     ) -> Result<ExactPayloadOutcome, String> {
         let operation_class_token = Token::new(operation_class.to_owned())
             .map_err(|error| format!("operation class: {error}"))?;
@@ -397,7 +397,12 @@ impl BrokerExactPayloadSigner {
             system_use_claim: None,
             claim_assurance_evidence: petal_claim
                 .and_then(|(_, evidence)| evidence.map(<[u8]>::to_vec)),
-            safe_review_payload: safe_review_payload.map(<[u8]>::to_vec),
+            safe_review_payload: petal_review_payload
+                .filter(|_| operation_class == bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS)
+                .map(<[u8]>::to_vec),
+            message_review_payload: petal_review_payload
+                .filter(|_| operation_class != bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS)
+                .map(<[u8]>::to_vec),
             approval_value_limits,
         };
         let mut response = self.broker.sign_exact_payload(request.clone()).await;
@@ -1452,6 +1457,21 @@ mod tests {
 
     #[tokio::test]
     async fn safe_confirmation_forwards_its_review_envelope_to_approval_preparation() {
+        review_envelope_forwarding(
+            bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS,
+            "bloom.safe.review.v1",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn message_signatures_forward_their_review_envelopes_and_refuse_omission() {
+        for class in bloom_broker_api::MESSAGE_REVIEW_OPERATION_CLASSES {
+            review_envelope_forwarding(class, "bloom.message.review.v1").await;
+        }
+    }
+
+    async fn review_envelope_forwarding(class: &str, schema: &str) {
         let broker = Arc::new(MockBroker::default());
         let package_hash = digest(30);
         let subject = ProvenanceSubject::Petal {
@@ -1467,7 +1487,7 @@ mod tests {
                     publisher: token("bloom-installer"),
                     petal_lineage: None,
                     operation_classes: vec![ProvenanceOperationClass {
-                        operation_class: token(bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS),
+                        operation_class: token(class),
                         fee_asset: None,
                     }],
                     installer_key_id: token("test-key"),
@@ -1481,7 +1501,7 @@ mod tests {
         let claim = PetalUseClaim {
             package_hash,
             route: "transactions/confirm".into(),
-            operation_class: token(bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS),
+            operation_class: token(class),
             crypto_suite: CryptoSuite::Secp256k1Keccak256Recoverable,
             payload_digest: {
                 let mut digest = Sha256::new();
@@ -1498,7 +1518,7 @@ mod tests {
             nonce: RequestNonce::from_bytes([31; 16]),
             claim_assurance: bloom_broker_api::ClaimAssurance::MachineAsserted,
         };
-        let envelope = br#"{"schema":"bloom.safe.review.v1"}"#;
+        let envelope = serde_json::to_vec(&serde_json::json!({"schema":schema})).unwrap();
         let prepared_envelopes = || {
             broker
                 .requests
@@ -1507,7 +1527,13 @@ mod tests {
                 .iter()
                 .filter_map(|request| match request {
                     MachineBrokerRequest::SealedApprovalPrepare(prepared) => {
-                        Some(prepared.safe_review_payloads.clone())
+                        Some(if class == bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS {
+                            assert!(prepared.message_review_payloads.is_empty());
+                            prepared.safe_review_payloads.clone()
+                        } else {
+                            assert!(prepared.safe_review_payloads.is_empty());
+                            prepared.message_review_payloads.clone()
+                        })
                     }
                     _ => None,
                 })
@@ -1520,7 +1546,7 @@ mod tests {
                 &temporary.path().join("missing.json"),
                 "confirm",
                 "wallet",
-                bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS,
+                class,
                 payload,
                 ordered_hash.clone(),
                 CryptoSuite::Secp256k1Keccak256Recoverable,
@@ -1532,7 +1558,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(error.contains("Safe review payload"), "{error}");
+        assert!(error.to_lowercase().contains("review"), "{error}");
         assert!(prepared_envelopes().is_empty());
 
         let outcome = signer
@@ -1540,7 +1566,7 @@ mod tests {
                 &temporary.path().join("confirm.json"),
                 "confirm",
                 "wallet",
-                bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS,
+                class,
                 payload,
                 ordered_hash,
                 CryptoSuite::Secp256k1Keccak256Recoverable,
@@ -1548,7 +1574,7 @@ mod tests {
                 &subject,
                 &claim,
                 None,
-                Some(envelope),
+                Some(&envelope),
             )
             .await
             .unwrap();
@@ -1558,7 +1584,7 @@ mod tests {
         ));
         assert_eq!(
             prepared_envelopes(),
-            vec![vec![Base64UrlBytes::from_bytes(envelope)]]
+            vec![vec![Base64UrlBytes::from_bytes(&envelope)]]
         );
     }
 

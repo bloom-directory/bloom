@@ -4605,6 +4605,7 @@ fn exact_evm_sign_request(
         system_use_claim: None,
         claim_assurance_evidence: None,
         safe_review_payload: None,
+        message_review_payload: None,
         evm_reported_token,
         approval_value_limits: Vec::new(),
     })

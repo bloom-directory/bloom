@@ -357,7 +357,19 @@ fn petal_review_payload<'a>(
             HostError::Invalid("Safe confirmation requires a review envelope".into())
         })
     } else {
-        Ok(None)
+        let message = action.filter(|bytes| {
+            serde_json::from_slice::<serde_json::Value>(bytes)
+                .ok()
+                .is_some_and(|value| value["schema"] == "bloom.message.review.v1")
+        });
+        if bloom_broker_api::MESSAGE_REVIEW_OPERATION_CLASSES.contains(&operation_class)
+            && message.is_none()
+        {
+            return Err(HostError::Invalid(
+                "This signing operation requires a message review envelope".into(),
+            ));
+        }
+        Ok(message)
     }
 }
 
@@ -990,6 +1002,7 @@ impl DaemonPetalHost {
                 surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
                 evm_review_payloads: Vec::new(),
                 safe_review_payloads: Vec::new(),
+                message_review_payloads: Vec::new(),
                 operation_id,
                 terms,
                 canonical_plan_facts_digest: plan_digest,
@@ -5722,6 +5735,31 @@ mod tests {
                 Err(HostError::Invalid(message)) if message.contains("does not match")
             ));
         }
+    }
+
+    #[test]
+    fn message_review_mapping_keeps_full_envelopes_and_refuses_downgrades() {
+        let envelope =
+            br#"{"schema":"bloom.message.review.v1","kind":"personal","message":"exact text"}"#
+                .as_slice();
+        for class in bloom_broker_api::MESSAGE_REVIEW_OPERATION_CLASSES {
+            assert_eq!(
+                petal_review_payload(class, class, Some(envelope)).unwrap(),
+                Some(envelope)
+            );
+            assert!(petal_review_payload(class, class, None).is_err());
+            assert!(petal_review_payload(class, class, Some(b"raw action")).is_err());
+            assert!(petal_review_payload(class, "another.class", Some(envelope)).is_err());
+        }
+        assert_eq!(
+            petal_review_payload("custom.message", "custom.message", Some(envelope)).unwrap(),
+            Some(envelope)
+        );
+        assert_eq!(
+            petal_review_payload("custom.message", "custom.message", Some(b"legacy action"))
+                .unwrap(),
+            None
+        );
     }
 
     #[cfg(feature = "mount")]

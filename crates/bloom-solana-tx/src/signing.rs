@@ -219,6 +219,7 @@ impl SolanaTransferSigner {
             system_use_claim: Some(system_use_claim),
             claim_assurance_evidence: Some(message_bytes.to_vec()),
             safe_review_payload: None,
+            message_review_payload: None,
             account_key_ref,
             // Solana, not EVM: there is no contract call for the EVM review
             // to read, in either mode.
