@@ -455,6 +455,12 @@ change accounts or switch to a reusable/batch path to avoid the refusal. Retry
 the exact same request after its own owner approval. Venice uses a fresh login
 proof for each later HTTP request. A login approval grants no payment authority.
 
+Polymarket orders and wallet calls have exact reviews. Its CLOB login instead
+asks for one `polymarket.clob_auth.v1` authentication permission, whose actual
+message Broker verifies after the server timestamp refreshes. That permission
+can create API credentials with account API access; it cannot sign a payment,
+order or wallet batch. Old pending onboarding login grants need replacement.
+
 Readings have explicit limits: Enso input amounts do not prove its quoted
 output or shortcut effects; Privacy Pools proof words are not proof verification;
 exchange acceptance is not settlement. Unknown assets retain their exact

@@ -460,6 +460,7 @@ impl BrokerExactPayloadSigner {
         trusted_subject: &ProvenanceSubject,
         claim: &PetalUseClaim,
         claim_assurance_evidence: Option<&[u8]>,
+        message_review_payload: Option<&[u8]>,
     ) -> Result<ExactPayloadBatchOutcome, String> {
         let parent = state_path
             .parent()
@@ -494,6 +495,7 @@ impl BrokerExactPayloadSigner {
                 trusted_subject,
                 claim,
                 claim_assurance_evidence,
+                message_review_payload,
             )
             .await;
         let _ = lock.unlock();
@@ -647,6 +649,7 @@ impl BrokerExactPayloadSigner {
         }
         write_state(state_path, &state)?;
         let request = ExactPayloadBatchSignRequest {
+            message_review_payload: None,
             wallet_id,
             preimages: preimages.to_vec(),
             claimed_hashes: claimed_hashes.to_vec(),
@@ -707,6 +710,7 @@ impl BrokerExactPayloadSigner {
         trusted_subject: &ProvenanceSubject,
         claim: &PetalUseClaim,
         claim_assurance_evidence: Option<&[u8]>,
+        message_review_payload: Option<&[u8]>,
     ) -> Result<ExactPayloadBatchOutcome, String> {
         let operation_class_token = Token::new(operation_class.to_owned())
             .map_err(|error| format!("operation class: {error}"))?;
@@ -786,6 +790,7 @@ impl BrokerExactPayloadSigner {
         }
         write_state(state_path, &state)?;
         let mut request = ExactPayloadBatchSignRequest {
+            message_review_payload: message_review_payload.map(<[u8]>::to_vec),
             wallet_id,
             preimages: preimages.to_vec(),
             claimed_hashes: claimed_hashes.to_vec(),
@@ -1417,6 +1422,7 @@ mod tests {
                             &subject,
                             &claim,
                             Some(b"assurance"),
+                            None,
                         )
                         .await
                 };
@@ -1460,6 +1466,7 @@ mod tests {
         review_envelope_forwarding(
             bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS,
             "bloom.safe.review.v1",
+            false,
         )
         .await;
     }
@@ -1467,11 +1474,14 @@ mod tests {
     #[tokio::test]
     async fn message_signatures_forward_their_review_envelopes_and_refuse_omission() {
         for class in bloom_broker_api::MESSAGE_REVIEW_OPERATION_CLASSES {
-            review_envelope_forwarding(class, "bloom.message.review.v1").await;
+            review_envelope_forwarding(class, "bloom.message.review.v1", false).await;
+        }
+        for class in bloom_broker_api::POLYMARKET_REVIEW_OPERATION_CLASSES {
+            review_envelope_forwarding(class, "prepared", true).await;
         }
     }
 
-    async fn review_envelope_forwarding(class: &str, schema: &str) {
+    async fn review_envelope_forwarding(class: &str, schema: &str, batch: bool) {
         let broker = Arc::new(MockBroker::default());
         let package_hash = digest(30);
         let subject = ProvenanceSubject::Petal {
@@ -1541,47 +1551,87 @@ mod tests {
         };
 
         // Without the envelope the class must not reach approval preparation.
-        let error = signer
-            .sign_or_prepare_petal(
-                &temporary.path().join("missing.json"),
-                "confirm",
-                "wallet",
-                class,
-                payload,
-                ordered_hash.clone(),
-                CryptoSuite::Secp256k1Keccak256Recoverable,
-                &serde_json::json!({}),
-                &subject,
-                &claim,
-                None,
-                None,
-            )
-            .await
-            .unwrap_err();
+        let missing = if batch {
+            signer
+                .sign_or_prepare_petal_batch(
+                    &temporary.path().join("missing.json"),
+                    "confirm",
+                    "wallet",
+                    class,
+                    &[payload.to_vec()],
+                    std::slice::from_ref(&ordered_hash),
+                    CryptoSuite::Secp256k1Keccak256Recoverable,
+                    &serde_json::json!({}),
+                    &subject,
+                    &claim,
+                    None,
+                    None,
+                )
+                .await
+                .map(|_| ())
+        } else {
+            signer
+                .sign_or_prepare_petal(
+                    &temporary.path().join("missing.json"),
+                    "confirm",
+                    "wallet",
+                    class,
+                    payload,
+                    ordered_hash.clone(),
+                    CryptoSuite::Secp256k1Keccak256Recoverable,
+                    &serde_json::json!({}),
+                    &subject,
+                    &claim,
+                    None,
+                    None,
+                )
+                .await
+                .map(|_| ())
+        };
+        let error = missing.unwrap_err();
         assert!(error.to_lowercase().contains("review"), "{error}");
         assert!(prepared_envelopes().is_empty());
 
-        let outcome = signer
-            .sign_or_prepare_petal(
-                &temporary.path().join("confirm.json"),
-                "confirm",
-                "wallet",
-                class,
-                payload,
-                ordered_hash,
-                CryptoSuite::Secp256k1Keccak256Recoverable,
-                &serde_json::json!({}),
-                &subject,
-                &claim,
-                None,
-                Some(&envelope),
-            )
-            .await
-            .unwrap();
-        assert!(matches!(
-            outcome,
-            ExactPayloadOutcome::ApprovalRequired { .. }
-        ));
+        let prepared = if batch {
+            let outcome = signer
+                .sign_or_prepare_petal_batch(
+                    &temporary.path().join("confirm.json"),
+                    "confirm",
+                    "wallet",
+                    class,
+                    &[payload.to_vec()],
+                    std::slice::from_ref(&ordered_hash),
+                    CryptoSuite::Secp256k1Keccak256Recoverable,
+                    &serde_json::json!({}),
+                    &subject,
+                    &claim,
+                    None,
+                    Some(&envelope),
+                )
+                .await
+                .unwrap();
+            matches!(outcome, ExactPayloadBatchOutcome::ApprovalRequired { .. })
+        } else {
+            let outcome = signer
+                .sign_or_prepare_petal(
+                    &temporary.path().join("confirm.json"),
+                    "confirm",
+                    "wallet",
+                    class,
+                    payload,
+                    ordered_hash,
+                    CryptoSuite::Secp256k1Keccak256Recoverable,
+                    &serde_json::json!({}),
+                    &subject,
+                    &claim,
+                    None,
+                    Some(&envelope),
+                )
+                .await
+                .unwrap();
+            matches!(outcome, ExactPayloadOutcome::ApprovalRequired { .. })
+        };
+        assert!(prepared);
         assert_eq!(
             prepared_envelopes(),
             vec![vec![Base64UrlBytes::from_bytes(&envelope)]]

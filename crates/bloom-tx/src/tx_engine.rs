@@ -3782,6 +3782,7 @@ impl TxEngine {
             .map_err(protocol_signing_error)?;
         let key = evm_signing_key(&service.broker, &wallet_public, sender).await?;
         let request = ExactPayloadBatchSignRequest {
+            message_review_payload: None,
             wallet_id: Token::new(wallet.to_string())
                 .map_err(|error| TxEngineError::ApprovalConstruction(error.to_string()))?,
             preimages: preimages.to_vec(),

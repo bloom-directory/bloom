@@ -2268,6 +2268,28 @@ impl PetalHost for DaemonPetalHost {
                 "Petal payload batches require Machine-owned approval and root selection".into(),
             ));
         }
+        let review_payload = if req.selector == bloom_broker_api::PetalSignSelector::Exact
+            && bloom_broker_api::POLYMARKET_REVIEW_OPERATION_CLASSES
+                .contains(&req.operation_class.as_str())
+        {
+            let bytes = req.action.as_deref().ok_or_else(|| {
+                HostError::Invalid(
+                    "Polymarket exact signing requires its complete prepared record".into(),
+                )
+            })?;
+            if bytes.len() > bloom_broker_api::SINGLE_PAYLOAD_MAX_BYTES
+                || req.payloads.len() != 1
+                || req.signature_algorithm != "secp256k1-keccak256-recoverable"
+                || !serde_json::from_slice::<serde_json::Value>(bytes)
+                    .ok()
+                    .is_some_and(|value| value.as_array().is_some_and(|items| items.len() == 1))
+            {
+                return Err(HostError::Invalid("Polymarket exact signing requires one bounded prepared record and one recoverable Keccak payload".into()));
+            }
+            Some(bytes)
+        } else {
+            None
+        };
         let broker = self.broker.as_ref().ok_or_else(|| {
             HostError::Backend("SERVICE_UNAVAILABLE: Broker client is not configured".into())
         })?;
@@ -2473,6 +2495,7 @@ impl PetalHost for DaemonPetalHost {
                     &trusted_subject,
                     &claim,
                     req.claim_assurance_evidence.as_deref(),
+                    review_payload,
                 )
                 .await
         }

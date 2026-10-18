@@ -155,6 +155,24 @@ batch or reusable downgrades. This does not turn an existing delegated agent
 grant into a fresh owner ceremony for each future action. Full per-call
 interpretation and reusable scope enforcement are separate properties.
 
+Polymarket's current caller uses the batch host API with one prepared record.
+Machine forwards that complete record for exact orders, wallet permissions and
+relayer batches; Broker reconstructs the ERC-7739 order or DepositWallet Batch.
+The outer exact preimage/hash, selected owner and every call remain bound.
+Unrecognized call contents remain explicit, and auxiliary draft labels never
+become signed facts. pUSD is a separate Polygon token, not Circle USDC.
+
+CLOB authentication uses the distinct immutable `polymarket.clob_auth.v1`
+permission: one operation/signature, Polygon ClobAuthDomain version 1, selected
+owner, nonce zero, fixed wallet attestation and a timestamp within 300 seconds
+of Broker's guarded clock at use. The review describes this future profile,
+not an invented exact hash. Broker reconstructs the actual 66-byte preimage
+before reserving budgets or requesting a signature. Any wider profile needs a
+new class; old `polymarket.onboard` reusable grants are refused at preparation
+and use. The caller can refresh Polymarket server time after owner approval.
+This signature can create or derive API credentials; those credentials confer
+account API access and must not be described as harmless read-only login.
+
 Broker's compiled catalog binds token units/artwork to exact chain/address
 identities. Mainnet HyperCore USDC uses an explicit venue/asset identity;
 test collateral and unknown assets do not borrow its mark. Protocol readers
@@ -162,7 +180,7 @@ remain bounded: Enso source inputs do not establish shortcut effects, and a
 Privacy Pools direct withdrawal does not establish ZK-proof validity or relay
 recipient semantics. Unknown content retains an explicit missing-coverage reason.
 
-Publish matching Gasless, Venice and Hyperliquid packages with the new services.
+Publish matching Gasless, Venice, Hyperliquid and Polymarket packages with the new services.
 Old hash-only caller packages cannot satisfy the required exact-message review.
 This is a coordinated package compatibility change, not a new SDK signing ABI
 or a new wallet clear-signing mode.
