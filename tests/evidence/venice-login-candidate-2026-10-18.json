@@ -1,0 +1,56 @@
+{
+  "runnerSha256": "ef2133571a87b5ad5b1f01027df50458680e9208629b8d6f99fb14babb1b1aa1",
+  "machine": "aa4b828cc987a154cd36e12d7653fe8563602d6b",
+  "machineApiBroker": "60510f0fd26fcba7c1e2c28f75b2c867dda502f7",
+  "broker": "78ca7902f74d6b0186b93ba3a3a23368e07ad335",
+  "signer": "bc88ad690757165ebf1978410ea5c7ec652215d3",
+  "petal": "642855a11c5bfa51c4d1771b1c0112f353747cde",
+  "packageHash": "4b3aef5730793551aabbdd87c73dd9809cf3b17f4865f0c1273596da81fd9450",
+  "observations": [
+    {
+      "uri": "https://api.venice.ai/api/v1/x402/balance/0xd52dfd2cc88ea51a621652978b874217578fbdac",
+      "requestId": "7ae227645543ee3f020ce87981bd1b4a147b08cecffa9bd204646018355592f5",
+      "kind": "siwe",
+      "status": "signed",
+      "approvedRetryExit": 0,
+      "backendHttpStatus": 200,
+      "noAdditionalApprovalDuringApprovedRetry": true
+    },
+    {
+      "uri": "https://api.venice.ai/api/v1/x402/balance/0xd52dfd2cc88ea51a621652978b874217578fbdac",
+      "requestId": "c88ed5a3db47d5792be84c67b7b6a20f8a4a050875e058e19f3a175cded0c651",
+      "kind": "siwe",
+      "status": "signed",
+      "approvedRetryExit": 0,
+      "backendHttpStatus": 200,
+      "noAdditionalApprovalDuringApprovedRetry": true
+    },
+    {
+      "uri": "https://api.venice.ai/api/v1/chat/completions",
+      "requestId": "ebc9bfafa30dda714e58fc8b61af77f3cadd0025719a78412f773c51caaa6051",
+      "kind": "siwe",
+      "status": "signed",
+      "approvedRetryExit": 1,
+      "backendHttpStatus": 402,
+      "noAdditionalApprovalDuringApprovedRetry": true
+    },
+    {
+      "uri": "https://api.venice.ai/api/v1/chat/completions",
+      "requestId": "4fa8ef64e93ad286e26a568a5a5884d24cca0a0d4f679051734d8f0aedd57880",
+      "kind": "siwe",
+      "status": "signed",
+      "approvedRetryExit": 1,
+      "backendHttpStatus": 402,
+      "noAdditionalApprovalDuringApprovedRetry": true
+    }
+  ],
+  "noncanonicalAccountRefused": true,
+  "bodyAccountSubstitutionRefused": true,
+  "fundsMoved": false,
+  "paidInference": false,
+  "limits": "Software test approvals, a fresh disposable wallet, and local Anvil. Two real Venice balance responses report zero credit; two deliberately unfunded chat requests return HTTP 402. No funds moved and no paid inference ran. This does not prove a funded top-up, paid inference, physical passkey acceptance, or final release conformance.",
+  "initial_petal_git_head_before_source_commit": "e02899872cedbd1a3dc975950306e36fe0515f34",
+  "source_match": "The tested working tree was committed as the Petal revision above. A post-commit Bloom build reproduced the identical package hash.",
+  "successful_signing_rpc_calls": 4,
+  "schema": "bloom.clear-signing.message-candidate.v1"
+}

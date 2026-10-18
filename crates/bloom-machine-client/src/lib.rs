@@ -3151,7 +3151,7 @@ mod tests {
         let claim: PetalUseClaim = serde_json::from_value(serde_json::json!({
             "package_hash": "0000000000000000000000000000000000000000000000000000000000000000",
             "route": "r000045",
-            "operation_class": "hyperliquid.withdraw",
+            "operation_class": "fixture.withdraw",
             "crypto_suite": "secp256k1-keccak256-recoverable",
             "payload_digest": "0100000000000000000000000000000000000000000000000000000000000000",
             "ordered_hashes": ["0200000000000000000000000000000000000000000000000000000000000000"],
@@ -3199,10 +3199,12 @@ mod tests {
     }
 
     fn value_limit_claim(debit_amount: &str, fee: serde_json::Value) -> PetalUseClaim {
+        // Generic accounting fixture; protocol-specific payment shapes are
+        // independently checked by Broker's message reader.
         serde_json::from_value(serde_json::json!({
             "package_hash": "0000000000000000000000000000000000000000000000000000000000000000",
             "route": "r000045",
-            "operation_class": "hyperliquid.withdraw",
+            "operation_class": "fixture.withdraw",
             "crypto_suite": "secp256k1-keccak256-recoverable",
             "payload_digest": "0100000000000000000000000000000000000000000000000000000000000000",
             "ordered_hashes": ["0200000000000000000000000000000000000000000000000000000000000000"],
@@ -4358,7 +4360,7 @@ mod tests {
         request.petal_use_claim = Some(PetalUseClaim {
             package_hash,
             route,
-            operation_class: token("hyperliquid.approve_agent"),
+            operation_class: token("fixture.approve_agent"),
             crypto_suite: request.crypto_suite,
             payload_digest: petal_batch_payload_digest(std::slice::from_ref(&payload)),
             ordered_hashes: vec![request.claimed_hash.clone()],

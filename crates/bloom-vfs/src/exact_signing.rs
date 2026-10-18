@@ -1590,6 +1590,8 @@ mod tests {
 
     /// Builds the shared fixture: a petal exact signer whose provenance
     /// catalog marks one class with the scenario's fee asset.
+    /// Its arbitrary SHA-256 payload and multiple assets exercise generic
+    /// accounting, not Hyperliquid's single-message protocol contract.
     fn debiting_claim_fixture(
         broker: &Arc<MockBroker>,
         class_fee_asset: Option<bloom_broker_api::ProvenanceFeeAsset>,
@@ -1613,7 +1615,7 @@ mod tests {
                     publisher: token("bloom-installer"),
                     petal_lineage: None,
                     operation_classes: vec![ProvenanceOperationClass {
-                        operation_class: token("hyperliquid.withdraw"),
+                        operation_class: token("fixture.withdraw"),
                         fee_asset: class_fee_asset,
                     }],
                     installer_key_id: token("test-key"),
@@ -1627,7 +1629,7 @@ mod tests {
         let claim = PetalUseClaim {
             package_hash,
             route: "withdraw/request".into(),
-            operation_class: token("hyperliquid.withdraw"),
+            operation_class: token("fixture.withdraw"),
             crypto_suite: CryptoSuite::Secp256k1Sha256Recoverable,
             payload_digest: {
                 let mut digest = Sha256::new();
@@ -1674,7 +1676,7 @@ mod tests {
                 &home.path().join("petal-exact.json"),
                 "withdraw-action",
                 "wallet",
-                "hyperliquid.withdraw",
+                "fixture.withdraw",
                 b"exact withdraw payload",
                 hash.clone(),
                 CryptoSuite::Secp256k1Sha256Recoverable,
