@@ -1026,7 +1026,8 @@ def result_summary(result: Any) -> dict[str, Any]:
     stats = result.stats
     rewards: dict[str, Any] = {}
     if result.trial_results and result.trial_results[0].verifier_result is not None:
-        rewards = dict(result.trial_results[0].verifier_result.rewards)
+        # Harbor leaves rewards null when verification never produced any.
+        rewards = dict(result.trial_results[0].verifier_result.rewards or {})
     return {
         "rewards": rewards,
         "errored_trials": stats.n_errored_trials,

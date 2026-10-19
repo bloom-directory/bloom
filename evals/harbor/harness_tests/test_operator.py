@@ -28,6 +28,7 @@ from harness.operator import (
     parser,
     redact,
     require_no_pending_owner_requests,
+    result_summary,
     run_or_recover,
     validate_ceremony_origin,
     validate_lineage,
@@ -311,6 +312,15 @@ class OperatorStateTests(unittest.TestCase):
         self.assertFalse(self.store.backup_path.exists())
         self.assertIsNone(self.store.read()["pending_policy_recovery"])
 
+
+    def test_summary_tolerates_verifier_without_rewards(self) -> None:
+        result = SimpleNamespace(
+            stats=SimpleNamespace(n_errored_trials=1, n_cancelled_trials=0),
+            trial_results=[
+                SimpleNamespace(verifier_result=SimpleNamespace(rewards=None))
+            ],
+        )
+        self.assertEqual(result_summary(result)["rewards"], {})
 
     def test_ceremony_origin_must_match_the_machine_projection(self) -> None:
         status = self.root / "mount/status"
