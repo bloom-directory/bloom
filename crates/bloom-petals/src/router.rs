@@ -28,7 +28,20 @@ use crate::vm::{COMPONENT_NOT_A_DIR_CODE, COMPONENT_UNSUPPORTED_CODE, RunOptions
 /// live observation costs a full Broker wallet refresh.
 const ACCOUNT_CONTEXT_REUSE: Duration = Duration::from_secs(1);
 
-type AccountContextCache = BTreeMap<(String, u32), (Instant, AccountPetalContext)>;
+/// Recent account observations, ordered by when each began. A refusal is
+/// kept (as `None`) rather than removed, so an older observation that
+/// finishes later cannot reinstate the account it refused.
+#[derive(Default)]
+struct AccountContextCache {
+    next_generation: u64,
+    entries: BTreeMap<(String, u32), CachedAccountContext>,
+}
+
+struct CachedAccountContext {
+    generation: u64,
+    observed: Instant,
+    context: Option<AccountPetalContext>,
+}
 
 #[derive(Clone)]
 pub struct PetalRouter {
@@ -49,7 +62,7 @@ impl PetalRouter {
             runtime_petals: BTreeMap::new(),
             audit: None,
             audit_effect_lock: Arc::new(tokio::sync::Mutex::new(())),
-            account_contexts: Arc::new(Mutex::new(BTreeMap::new())),
+            account_contexts: Arc::new(Mutex::new(AccountContextCache::default())),
             account_context_reuse: ACCOUNT_CONTEXT_REUSE,
         }
     }
@@ -138,32 +151,52 @@ impl PetalRouter {
         let number = canonical_account(number)
             .ok_or_else(|| HandlerError::not_found("invalid account number"))?;
         let key = (wallet.to_owned(), number);
-        if !live
-            && let Some((observed, context)) = self
-                .account_contexts
-                .lock()
-                .map_err(|_| HandlerError::backend("account context cache poisoned"))?
-                .get(&key)
-            && observed.elapsed() <= self.account_context_reuse
-        {
-            return Ok(context.clone());
-        }
-        let observed = Instant::now();
+        let (generation, observed) = {
+            let mut cache = self.account_context_cache()?;
+            if !live
+                && let Some(CachedAccountContext {
+                    observed,
+                    context: Some(context),
+                    ..
+                }) = cache.entries.get(&key)
+                && observed.elapsed() <= self.account_context_reuse
+            {
+                return Ok(context.clone());
+            }
+            let generation = cache.next_generation;
+            cache.next_generation += 1;
+            (generation, Instant::now())
+        };
         let result = self.observe_account_context(wallet, number).await;
-        let mut cache = self
-            .account_contexts
-            .lock()
-            .map_err(|_| HandlerError::backend("account context cache poisoned"))?;
-        match &result {
-            Ok(context) => {
-                cache.insert(key, (observed, context.clone()));
-            }
-            // Never serve an account the latest observation refused.
-            Err(_) => {
-                cache.remove(&key);
-            }
+        let mut cache = self.account_context_cache()?;
+        let reuse = self.account_context_reuse;
+        // Only the newest observation of an account is kept, so a slow
+        // success never overwrites a later refusal. One already older than the
+        // reuse window could not be reused, and neither could any entry it
+        // would replace.
+        let superseded = cache
+            .entries
+            .get(&key)
+            .is_some_and(|entry| entry.generation > generation);
+        if !superseded && observed.elapsed() <= reuse {
+            cache.entries.insert(
+                key,
+                CachedAccountContext {
+                    generation,
+                    observed,
+                    context: result.as_ref().ok().cloned(),
+                },
+            );
         }
         result
+    }
+
+    fn account_context_cache(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, AccountContextCache>, HandlerError> {
+        self.account_contexts
+            .lock()
+            .map_err(|_| HandlerError::backend("account context cache poisoned"))
     }
 
     async fn observe_account_context(
@@ -1003,6 +1036,56 @@ mod tests {
         assert_eq!(reads(), 8);
     }
 
+    #[tokio::test]
+    async fn a_slow_success_never_overwrites_a_later_refusal() {
+        struct GatedHost {
+            reads: std::sync::atomic::AtomicUsize,
+            refuse: AtomicBool,
+            gate: tokio::sync::Notify,
+        }
+        #[async_trait]
+        impl PetalHost for GatedHost {
+            async fn vfs_lookup(&self, path: &str) -> Result<HostVfsEntry, HostError> {
+                AccountHost.vfs_lookup(path).await
+            }
+            async fn vfs_list(&self, path: &str) -> Result<Vec<HostVfsEntry>, HostError> {
+                AccountHost.vfs_list(path).await
+            }
+            async fn vfs_write(&self, path: &str, bytes: &[u8]) -> Result<(), HostError> {
+                AccountHost.vfs_write(path, bytes).await
+            }
+            async fn vfs_read(&self, path: &str) -> Result<Vec<u8>, HostError> {
+                self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if self.refuse.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(HostError::Denied(path.into()));
+                }
+                // Observed before the refusal, but finishes after it.
+                self.gate.notified().await;
+                AccountHost.vfs_read(path).await
+            }
+        }
+        let host = Arc::new(GatedHost {
+            reads: Default::default(),
+            refuse: AtomicBool::new(false),
+            gate: tokio::sync::Notify::new(),
+        });
+        let (_dir, runner) = runner();
+        let router = PetalRouter::new(runner, host.clone());
+
+        let (slow, refused) = tokio::join!(router.account_context("alice", "0", true), async {
+            host.refuse.store(true, std::sync::atomic::Ordering::SeqCst);
+            let refused = router.account_context("alice", "0", true).await;
+            host.gate.notify_one();
+            refused
+        });
+        assert!(slow.is_ok());
+        assert!(refused.is_err());
+        // The cached refusal is newer than the slow success, so a non-effect
+        // observes again rather than reusing the account.
+        assert!(router.account_context("alice", "0", false).await.is_err());
+        assert_eq!(host.reads.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
     fn runner() -> (TempDir, PetalRunner) {
         let dir = TempDir::new().unwrap();
         let store = PetalStore::open(dir.path().join("store")).unwrap();
@@ -1611,7 +1694,7 @@ name = "example"
         // Within the reuse window, a traversal's repeated lookups share one
         // live observation.
         router.account_context_reuse = ACCOUNT_CONTEXT_REUSE;
-        router.account_contexts.lock().unwrap().clear();
+        router.account_contexts.lock().unwrap().entries.clear();
         for _ in 0..3 {
             router
                 .lookup(&VfsPath::parse("demo/intents/alice/0").unwrap())
