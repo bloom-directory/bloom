@@ -1,7 +1,7 @@
 {
   "schema": "bloom.clear-signing.route-inventory.v1",
   "date": "2026-10-19",
-  "broker_revision": "b10cc950405261ba43e7e953e292507db97a47f7",
+  "broker_revision": "51cb3b614e0317567b68f316e5ba9f494fa2701a",
   "acceptance_scope_note": "User narrowed completion to the five default-enabled Petals: Enso, Hyperliquid, Polymarket, NEAR Intents and Feedback. Pump.fun is excluded from the remaining acceptance scope. The wider source inventory below preserves historical work and is not an enabled-package list.",
   "scope": "All route source leaves at pinned default/candidate revisions, grouped by actual authority surface. A route file may be read-only, administrative, or share a handler. Lists do not prove every route executes a decoded transaction; coverage_status applies only to reading_scope, never to effects, identity, settlement or release acceptance. Unknown future targets/assets/layouts remain explicitly unknown.",
   "coverage_status_definitions": {
@@ -13,12 +13,12 @@
   "petals": [
     {
       "petal": "enso",
-      "revision": "7dea0c0528083cdd36ee0654ef13de2df50af18d",
+      "revision": "53b0b7328df9f060c3e65f0283954edd9709fb83",
       "source_kind": "pinned_candidate_pr_16",
-      "source_url": "https://github.com/bloom-directory/bloom-petal-enso/tree/7dea0c0528083cdd36ee0654ef13de2df50af18d",
+      "source_url": "https://github.com/bloom-directory/bloom-petal-enso/tree/53b0b7328df9f060c3e65f0283954edd9709fb83",
       "coverage_status": "partial",
-      "reading_scope": "Native/ERC-20 inputs, safe-route receiver and requested output balance-increase checks on all twelve accepted networks. Petal locally prepares same-chain safeRouteSingle/Multi preserving inner bytes; refresh preserves the reviewed calldata floor; settlement uses its actual minimum.",
-      "limits": "Nested shortcut code/effects, runtime code, fees and cross-chain settlement. The same-chain output check constrains successful execution, not proof of received funds. Unknown token identities stay raw. 140 Petal tests and six private-EVM pinned-contract cases passed; no funded venue or physical owner acceptance.",
+      "reading_scope": "Native/ERC-20 Router V2 inputs and same-chain output constraints on twelve accepted networks; bounded Weiroll command/state decoding and catalog readings for constant nested calls. Return-dependent values remain symbolic. Five-provider bridge/intent tracking distinguishes delivery, execution, manual recovery and refunds; matched destination receipts use net token transfers or direct native transfers to an undelegated EOA.",
+      "limits": "Runtime code/effects and fees are not verified. Unknown contracts/assets remain explicit. Bridge linkage is provider asserted, with contiguous delivered hops required for multi-bridge completion. Internal native output without trace evidence remains unverified. 146 Petal tests; six Solidity encoder differential cases and six Router execution cases. No funded venue, release publication or physical-owner acceptance.",
       "route_source_files": [
         "route/files/$index.rs",
         "route/files/README.md.rs",

@@ -1,0 +1,50 @@
+{
+  "schema": "bloom.enso.shortcut-boundary-evidence.v1",
+  "date": "2026-10-19",
+  "broker_revision": "51cb3b614e0317567b68f316e5ba9f494fa2701a",
+  "petal_revision": "53b0b7328df9f060c3e65f0283954edd9709fb83",
+  "broker_branch": "enso-shortcut-command-reader",
+  "machine_branch": "enso-destination-receipt-reads",
+  "integration_state": "Prepared additions; Broker #103 and Machine #224 now have another active writer. These branches are not their PR heads. Do not overwrite those heads.",
+  "contract_sources": {
+    "router": "EnsoBuild/enso-router-contracts@483408a3219451858abcd92c2f7b19a9783c14cc",
+    "weiroll": "EnsoBuild/enso-weiroll@900250114203727ff236d3f6313673c17c2d90dd",
+    "openzeppelin": "v5.2.0"
+  },
+  "api_schema": "https://api.enso.build/api-json",
+  "checks": {
+    "petal_tests": 146,
+    "solidity_encoder_differentials": 6,
+    "router_execution_cases": 6,
+    "unsigned_native_erc20_presentations": 16,
+    "nested_shortcut_presentations": 2,
+    "rpc_boundary": "Machine typed receipt JSON, missing transaction null, canonical block-hash code reads; method and input validation",
+    "bridge_cases": [
+      "delivery is not intent execution",
+      "cache expires at ten seconds",
+      "wrong receipt hash",
+      "wrong network",
+      "wrong token",
+      "reverted destination",
+      "refund",
+      "manual recovery",
+      "rate-limit response",
+      "native output without evidence",
+      "mined direct native transfer",
+      "incomplete multi-hop linkage",
+      "changed cross-chain shortcut requires review",
+      "net ERC20 inflows subtract outgoing transfers"
+    ]
+  },
+  "fixture_limits": [
+    "No live API route discovery or funded venue execution",
+    "Provider linkage is not cryptographic proof",
+    "Native internal transfers without trace evidence remain unverified",
+    "Receipt observation does not establish finality",
+    "No production publication or owner ceremony"
+  ],
+  "encoder_differential_fixture": {
+    "sha256": "48035fc81131c4f6ad658d0866177f98153f66ca55f6d0fcf38cb2ed1ef8dfb8",
+    "results": "[PASS] testCase0() (gas: 3216)\n[PASS] testCase1() (gas: 3064)\n[PASS] testCase2() (gas: 3695)\n[PASS] testCase3() (gas: 4258)\n[PASS] testCase4() (gas: 5024)\n[PASS] testCase5() (gas: 7158)\nSuite result: ok. 6 passed; 0 failed; 0 skipped; finished in 2.10ms (517.31\u00b5s CPU time)"
+  }
+}

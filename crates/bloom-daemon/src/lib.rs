@@ -18,7 +18,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy::network::TransactionBuilder;
-use alloy::primitives::{Address, Bytes, U256};
+use alloy::primitives::{Address, B256, Bytes, U256};
+use alloy::providers::Provider;
 use alloy::rpc::types::eth::TransactionRequest;
 use bloom_evm::{ChainClient, ChainRegistry};
 
@@ -2985,13 +2986,26 @@ async fn daemon_petal_chain_read(
             format!("{balance:#x}")
         }
         "eth_getCode" if matches!(params.len(), 1 | 2) => {
-            require_latest_block_param(&params, 1)?;
             let address = parse_petal_address(&params[0], "eth_getCode address")?;
+            let block = parse_petal_code_block(params.get(1))?;
             let code = chain
-                .code(address)
+                .provider()
+                .get_code_at(address)
+                .block_id(block)
                 .await
                 .map_err(|e| HostError::Backend(format!("contract code: {e}")))?;
             format!("0x{}", hex::encode(code))
+        }
+        "eth_getTransactionReceipt" | "eth_getTransactionByHash" if params.len() == 1 => {
+            let hash = parse_petal_transaction_hash(&params[0])?;
+            let value = if method == "eth_getTransactionReceipt" {
+                chain.receipt_json(hash).await
+            } else {
+                chain.tx_json(hash).await
+            }
+            .map_err(|e| HostError::Backend(format!("{method}: {e}")))?;
+            return serde_json::to_string(&value)
+                .map_err(|e| HostError::Backend(format!("encode chain response: {e}")));
         }
         "eth_call" if matches!(params.len(), 1 | 2) => {
             require_latest_block_param(&params, 1)?;
@@ -3024,7 +3038,12 @@ async fn daemon_petal_chain_read(
                 .map_err(|e| HostError::Backend(format!("eth_call: {e}")))?;
             format!("0x{}", hex::encode(bytes))
         }
-        "eth_chainId" | "eth_getBalance" | "eth_getCode" | "eth_call" => {
+        "eth_chainId"
+        | "eth_getBalance"
+        | "eth_getCode"
+        | "eth_call"
+        | "eth_getTransactionReceipt"
+        | "eth_getTransactionByHash" => {
             return Err(HostError::Invalid(format!(
                 "invalid {method} parameters; only latest-block reads are allowed"
             )));
@@ -3037,6 +3056,42 @@ async fn daemon_petal_chain_read(
     };
     serde_json::to_string(&result)
         .map_err(|e| HostError::Backend(format!("encode chain response: {e}")))
+}
+
+fn parse_petal_transaction_hash(value: &serde_json::Value) -> Result<B256, HostError> {
+    let hash = value
+        .as_str()
+        .filter(|s| s.len() == 66 && s.starts_with("0x"))
+        .ok_or_else(|| HostError::Invalid("transaction hash must be 0x and 32 bytes".into()))?;
+    hash.parse()
+        .map_err(|_| HostError::Invalid("invalid transaction hash".into()))
+}
+
+fn parse_petal_code_block(
+    value: Option<&serde_json::Value>,
+) -> Result<alloy::eips::BlockId, HostError> {
+    if value.is_none_or(|value| value.as_str() == Some("latest")) {
+        return Ok(alloy::eips::BlockNumberOrTag::Latest.into());
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "camelCase")]
+    struct PinnedBlock {
+        block_hash: String,
+        require_canonical: bool,
+    }
+    let block: PinnedBlock = serde_json::from_value(value.unwrap().clone()).map_err(|_| {
+        HostError::Invalid("code block must be latest or a canonical block hash".into())
+    })?;
+    if !block.require_canonical {
+        return Err(HostError::Invalid(
+            "code block hash requires requireCanonical=true".into(),
+        ));
+    }
+    let hash = parse_petal_transaction_hash(&serde_json::Value::String(block.block_hash))?;
+    Ok(alloy::eips::BlockId::Hash(alloy::eips::RpcBlockHash {
+        block_hash: hash,
+        require_canonical: Some(true),
+    }))
 }
 
 fn require_latest_block_param(params: &[serde_json::Value], index: usize) -> Result<(), HostError> {
@@ -7232,6 +7287,119 @@ mod tests {
                 write_permit: daemon.home_write_permit.clone(),
             },
         )
+    }
+
+    #[tokio::test]
+    async fn daemon_petal_receipt_reads_cross_the_rpc_boundary_without_string_wrapping() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/", listener.local_addr().unwrap());
+        let hash = format!("0x{}", "11".repeat(32));
+        let block = format!("0x{}", "22".repeat(32));
+        let expected_hash = hash.clone();
+        let expected_block = block.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let request = loop {
+                    let mut chunk = [0u8; 4096];
+                    let count = socket.read(&mut chunk).await.unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&chunk[..count]);
+                    if let Some(start) = bytes.windows(4).position(|v| v == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&bytes[..start]);
+                        let length: usize = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse().unwrap())
+                            })
+                            .unwrap();
+                        if bytes.len() >= start + 4 + length {
+                            break serde_json::from_slice::<serde_json::Value>(
+                                &bytes[start + 4..start + 4 + length],
+                            )
+                            .unwrap();
+                        }
+                    }
+                };
+                let result = match request["method"].as_str().unwrap() {
+                    "eth_getTransactionReceipt" => {
+                        assert_eq!(request["params"], serde_json::json!([expected_hash]));
+                        serde_json::json!({"transactionHash":expected_hash,"transactionIndex":"0x0","blockHash":expected_block,"blockNumber":"0x1","from":"0x0000000000000000000000000000000000000001","to":"0x0000000000000000000000000000000000000002","cumulativeGasUsed":"0x5208","gasUsed":"0x5208","effectiveGasPrice":"0x1","contractAddress":null,"logs":[],"logsBloom":format!("0x{}","00".repeat(256)),"status":"0x1","type":"0x0"})
+                    }
+                    "eth_getTransactionByHash" => {
+                        assert_eq!(request["params"], serde_json::json!([expected_hash]));
+                        serde_json::Value::Null
+                    }
+                    "eth_getCode" => {
+                        assert_eq!(
+                            request["params"][1],
+                            serde_json::json!({"blockHash":expected_block,"requireCanonical":true})
+                        );
+                        serde_json::json!("0x")
+                    }
+                    method => panic!("unexpected RPC {method}"),
+                };
+                let body = serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":result})
+                    .to_string();
+                socket.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",body.len(),body).as_bytes()).await.unwrap();
+            }
+        });
+        let chain = ChainClient::new(ChainSpec {
+            name: "test".into(),
+            chain_id: 1,
+            rpc_urls: vec![endpoint],
+            rpc_endpoints: vec![],
+            etherscan_api_url: None,
+            display_name: None,
+            native_symbol: "ETH".into(),
+            native_decimals: 18,
+            legacy_tx: false,
+            op_stack: false,
+        })
+        .unwrap();
+        let receipt = daemon_petal_chain_read(
+            &chain,
+            "eth_getTransactionReceipt",
+            &serde_json::json!([hash]).to_string(),
+        )
+        .await
+        .unwrap();
+        let receipt: serde_json::Value = serde_json::from_str(&receipt).unwrap();
+        assert_eq!(receipt["transactionHash"], hash);
+        assert_eq!(receipt["status"], "0x1");
+        assert_eq!(
+            daemon_petal_chain_read(
+                &chain,
+                "eth_getTransactionByHash",
+                &serde_json::json!([hash]).to_string()
+            )
+            .await
+            .unwrap(),
+            "null"
+        );
+        assert_eq!(daemon_petal_chain_read(&chain,"eth_getCode",&serde_json::json!(["0x0000000000000000000000000000000000000002",{"blockHash":block,"requireCanonical":true}]).to_string()).await.unwrap(),"\"0x\"");
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+        for invalid in [
+            serde_json::json!("0x1"),
+            serde_json::json!(format!("0x{}", "zz".repeat(32))),
+            serde_json::json!({"hash":hash}),
+        ] {
+            assert!(parse_petal_transaction_hash(&invalid).is_err());
+        }
+        for invalid in [
+            serde_json::json!("pending"),
+            serde_json::json!({"blockHash":block,"requireCanonical":false}),
+            serde_json::json!({"blockHash":block,"requireCanonical":true,"stateOverride":{}}),
+        ] {
+            assert!(parse_petal_code_block(Some(&invalid)).is_err());
+        }
     }
 
     #[tokio::test]
