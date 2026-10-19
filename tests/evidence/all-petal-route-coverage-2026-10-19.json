@@ -1,7 +1,8 @@
 {
   "schema": "bloom.clear-signing.route-inventory.v1",
   "date": "2026-10-19",
-  "broker_revision": "3fbc12579ca8cb21f5c967d6a0130a285407a96f",
+  "broker_revision": "f0c933f35b08f731f0546f8ed37dd62e46e54b69",
+  "acceptance_scope_note": "User narrowed completion to Petals already enabled in Bloom; Pump.fun is excluded from the remaining acceptance scope. The wider source inventory below preserves historical work and is not an enabled-package list.",
   "scope": "All route source leaves at pinned default/candidate revisions, grouped by actual authority surface. A route file may be read-only, administrative, or share a handler. Lists do not prove every route executes a decoded transaction; coverage_status applies only to reading_scope, never to effects, identity, settlement or release acceptance. Unknown future targets/assets/layouts remain explicitly unknown.",
   "coverage_status_definitions": {
     "independently_read": "Broker reconstructs supported actual signing bytes. Does not establish code, state, market/asset identities or effects beyond the stated scope.",
@@ -12,12 +13,12 @@
   "petals": [
     {
       "petal": "enso",
-      "revision": "7bbe03770721c7cfdbe6c7c34a9b1665ae2eec9f",
-      "source_kind": "pinned_default_branch",
-      "source_url": "https://github.com/bloom-directory/bloom-petal-enso/tree/7bbe03770721c7cfdbe6c7c34a9b1665ae2eec9f",
+      "revision": "d38f0d7605fa358838953b2d74f8accafb5fa75e",
+      "source_kind": "pinned_candidate_pr_16",
+      "source_url": "https://github.com/bloom-directory/bloom-petal-enso/tree/d38f0d7605fa358838953b2d74f8accafb5fa75e",
       "coverage_status": "partial",
-      "reading_scope": "Native/ERC-20 inputs on eight compiled Router V2 deployments; safeRouteSingle/Multi actual receiver and requested native/ERC-20 output balance-increase minimums.",
-      "limits": "Shortcut code/effects, fees and settlement. Ordinary routeSingle/Multi do not encode output checks or receivers; safe-route minimums are requested checks, not proof of received funds. Unknown token identities stay raw.",
+      "reading_scope": "Native/ERC-20 inputs, safe-route receiver and requested output balance-increase checks on all twelve accepted networks. Petal locally prepares same-chain safeRouteSingle/Multi preserving inner bytes; refresh preserves the reviewed calldata floor; settlement uses its actual minimum.",
+      "limits": "Nested shortcut code/effects, runtime code, fees and cross-chain settlement. The same-chain output check constrains successful execution, not proof of received funds. Unknown token identities stay raw. 140 Petal tests and six private-EVM pinned-contract cases passed; no funded venue or physical owner acceptance.",
       "route_source_files": [
         "route/files/$index.rs",
         "route/files/README.md.rs",
@@ -722,6 +723,22 @@
             {
               "chainId": 43114,
               "address": "0xf75584ef6673ad213a685a1b58cc0330b8ea22cf"
+            },
+            {
+              "chainId": 999,
+              "address": "0xf75584ef6673ad213a685a1b58cc0330b8ea22cf"
+            },
+            {
+              "chainId": 59144,
+              "address": "0xa146d46823f3f594b785200102be5385cafce9b5"
+            },
+            {
+              "chainId": 4217,
+              "address": "0xcfbaa9cfce952ca4f4069874ff1df8c05e37a3c7"
+            },
+            {
+              "chainId": 4663,
+              "address": "0xcfbaa9cfce952ca4f4069874ff1df8c05e37a3c7"
             }
           ]
         }
@@ -732,7 +749,7 @@
         "safeRouteSingle((uint8 tokenType,bytes data) tokenIn,(uint8 tokenType,bytes data) tokenOut,address receiver,bytes data)",
         "safeRouteMulti((uint8 tokenType,bytes data)[] tokensIn,(uint8 tokenType,bytes data)[] tokensOut,address receiver,bytes data)"
       ],
-      "source_and_limits": "Enso Router V2 input envelopes and safe-route output balance-increase checks; Bloom ensoToken/ensoTokenOutput extensions. Source: EnsoBuild/shortcuts-client-contracts 483408a3219451858abcd92c2f7b19a9783c14cc src/interfaces/IEnsoRouter.sol, src/router/EnsoRouter.sol and broadcast/EnsoRouterDeployer.s.sol/<chain>/run-latest.json. No runtime code or shortcut program attestation."
+      "source_and_limits": "Enso Router V2 input envelopes and safe-route output balance-increase checks; Bloom ensoToken/ensoTokenOutput extensions. Source: EnsoBuild/shortcuts-client-contracts 483408a3219451858abcd92c2f7b19a9783c14cc src/interfaces/IEnsoRouter.sol, src/router/EnsoRouter.sol and broadcast/EnsoRouterDeployer.s.sol/<chain>/run-latest.json; Tempo 4217 and Robinhood 4663 deployments: https://docs.enso.build/pages/build/reference/deployments.md retrieved 2026-10-19. Covers all 12 networks accepted by the Enso Petal's chain parser. No runtime code or shortcut program attestation."
     },
     {
       "source_path": "crates/bloom-evm-clear-signing/catalogs/morpho/bundler3.json",
