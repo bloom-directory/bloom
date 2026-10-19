@@ -12,7 +12,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from harness.core import EvalError
+from harness.core import REASONING_EFFORT_ENV, EvalError
 from harness.operator import (
     DEFAULT_STATE_RELATIVE,
     MAINNET_ACK,
@@ -321,6 +321,68 @@ class OperatorStateTests(unittest.TestCase):
             ],
         )
         self.assertEqual(result_summary(result)["rewards"], {})
+
+    def test_recovery_ignores_invalid_reasoning_effort(self) -> None:
+        state = self.store.read()
+        state["lineage"] = {}
+        self.store.write(state)
+        atomic_write(self.store.backup_path, b"protected backup\n")
+
+        def restore() -> None:
+            current = self.store.read()
+            current["pending_policy_recovery"] = None
+            self.store.write(current)
+            self.store.backup_path.unlink()
+
+        definition = SimpleNamespace(phase_timings={}, cleanup_observations={})
+        policy = SimpleNamespace(restore=restore)
+        with (
+            mock.patch.dict("os.environ", {REASONING_EFFORT_ENV: "maximum"}),
+            mock.patch(
+                "harness.operator.HyperliquidOrderCancelEval",
+                return_value=definition,
+            ),
+            mock.patch("harness.operator.PolicyLifecycle", return_value=policy),
+            mock.patch("builtins.print"),
+        ):
+            run_or_recover(
+                Namespace(state=self.store.path, ack=MAINNET_ACK),
+                self.root,
+                recover_only=True,
+            )
+
+        self.assertFalse(self.store.backup_path.exists())
+        summary = json.loads(next(self.store.summary_dir.glob("*.json")).read_text())
+        self.assertEqual(summary["outcome"], "recovered")
+        self.assertEqual(summary["reasoning_effort"], "n/a")
+
+    def test_run_rejects_invalid_reasoning_effort_before_activation(self) -> None:
+        state = self.store.read()
+        state["lineage"] = {}
+        self.store.write(state)
+        definition = SimpleNamespace(phase_timings={}, cleanup_observations={})
+        policy = SimpleNamespace(
+            activate=mock.Mock(side_effect=AssertionError("activated")),
+            restore=mock.Mock(),
+        )
+        with (
+            mock.patch.dict("os.environ", {REASONING_EFFORT_ENV: "maximum"}),
+            mock.patch("harness.operator.validate_lineage"),
+            mock.patch("harness.operator.validate_ceremony_origin"),
+            mock.patch(
+                "harness.operator.HyperliquidOrderCancelEval",
+                return_value=definition,
+            ),
+            mock.patch("harness.operator.PolicyLifecycle", return_value=policy),
+            mock.patch("builtins.print"),
+            self.assertRaisesRegex(EvalError, REASONING_EFFORT_ENV),
+        ):
+            run_or_recover(
+                Namespace(state=self.store.path, ack=MAINNET_ACK),
+                self.root,
+                recover_only=False,
+            )
+        policy.activate.assert_not_called()
 
     def test_ceremony_origin_must_match_the_machine_projection(self) -> None:
         status = self.root / "mount/status"

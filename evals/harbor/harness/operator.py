@@ -1043,8 +1043,9 @@ def run_or_recover(
     state = store.read()
     if args.ack != MAINNET_ACK:
         raise EvalError(f"explicit acknowledgement must equal {MAINNET_ACK}")
-    # Validate before any policy change so a bad value costs nothing.
-    effort = reasoning_effort(state["model"])
+    # Only a new run uses the reasoning effort; recovery must never depend on
+    # it, so a stale or invalid value cannot leave an allow policy in place.
+    effort: str | None = None
     lock_path = Path(state["paths"]["lock_file"])
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     started_total = time.monotonic()
@@ -1083,6 +1084,8 @@ def run_or_recover(
                 # backup after a branch switch or rebuild.
                 validate_lineage(state, repo_root)
                 validate_ceremony_origin(state)
+                # Validate before any policy change so a bad value costs nothing.
+                effort = reasoning_effort(state["model"])
                 try:
                     phase = time.monotonic()
                     try:
@@ -1122,7 +1125,9 @@ def run_or_recover(
                 "finished_at": datetime.now(UTC).isoformat(),
                 "outcome": outcome,
                 "model": state["model"],
-                "reasoning_effort": effort or "harbor-default",
+                "reasoning_effort": "n/a"
+                if recover_only
+                else effort or "harbor-default",
                 "harbor_version": os.environ.get("HARBOR_VERSION", "0.21.0"),
                 "package_hash": state["package_hash"],
                 "lineage": state["lineage"],
