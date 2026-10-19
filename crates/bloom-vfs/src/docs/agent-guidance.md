@@ -58,9 +58,13 @@ whether an earlier operation completed or whether retrying a write is safe.
   operation. Inspect `policy_check.json` where exposed and the chain's status.
   Repeating the write does not remove the gate.
 - **Input/output error** — a backend or I/O operation failed. Inspect action
-  state and diagnostics before considering a retry. For a possibly submitted
-  transaction, reconcile by its recorded hash or signature; never blindly
-  restage or rebroadcast.
+  state and diagnostics before considering a retry. On an EVM outbox confirm,
+  read `last_error.json` beside the pending entry: it gives the refusal and the
+  next step. `kind: policy_approval_required` means the wallet policy must
+  first allow the Petal that staged the transaction; give the owner the
+  ceremony link in `error`, then confirm again once they approve. For a
+  possibly submitted transaction, reconcile by its recorded hash or signature;
+  never blindly restage or rebroadcast.
 
 If you write to a control file and then cannot find what you wrote, check
 whether the transfer moved to `sent/` or `failed/` before assuming the write
@@ -224,6 +228,108 @@ registration's `cancel` control before acceptance. Do not start a second
 registration merely because the first is waiting. Commands are in the
 wallet-creation walkthrough in `docs/examples.md`.
 
+Pass the complete Broker URL to the human, including any `#` fragment. Do not
+rewrite its hostname, scheme, or port. A localhost ceremony needs a browser on
+the Bloom host; an assigned HTTPS relay ceremony can use another device. Launch
+URLs are owner access capabilities: keep them out of logs and Petal-visible data.
+
+To recover a wallet after losing its passkeys, write only its name to
+`wallets/recover`. This starts an authenticated Broker ceremony without
+needing the wallet in Machine's cached inventory. Read
+`wallets/recoveries/<petname>/status.json`, verify `requested_name`, and
+forward the complete `ceremony_url` to the human. The recovery ID and secret,
+and the replacement passkey, belong only in the Broker-hosted Browser page;
+never place them in a VFS write, shell argument, or log. A spent one-use URL
+disappears from status while the operation remains readable and cancellable.
+After `SUCCEEDED`, read `result.json`. Recovery replaces the wallet's
+passkeys rather than adding one: the replacement becomes the wallet's only
+active passkey, and every other passkey, on any device, is revoked. Tell the
+human that their other devices can no longer approve until they add passkeys
+again (see "Adding a passkey"); `result.json` lists the active credential. A
+cancelled or expired operation can be started again with a fresh write to
+`wallets/recover`.
+
+## Check passkeys before hosted approvals
+
+A localhost passkey cannot approve on the hosted relay domain, even in the same
+browser. Before a hosted signing or policy ceremony, check `status/ceremonies.json`
+and the wallet's `passkeys/` entries (`surface` and `state`). Relay readiness does
+not mean the wallet has an active remote passkey.
+
+If the wallet has only local passkeys, explain that hosted approvals require a
+remote passkey. With the human's agreement, refer to the "Adding a passkey"
+flow below to add a remote passkey to their existing wallet.
+
+Wait for enrollment `SUCCEEDED`, verify the remote passkey is active, then resume
+the original operation with its unchanged proposal or intent.
+
+## Adding a passkey
+
+`wallets/<wallet>/passkeys/` lists the wallet's passkeys, one directory each,
+named `<created date>-<surface>-<digest>` (a 12-hex digest; a name never
+changes once listed). Each holds `surface` (`local` for
+this host's browser, `remote` for the relay), `created`, `state`,
+`credential_id`, and `name`.
+
+To add a passkey on another device, such as a phone, write the new passkey's
+surface to `new` and follow `latest`. Use `remote` unless the human asks for
+this host's browser: a remote passkey works from any device through the relay,
+while `local` only works in a browser on this host. An empty write picks
+`remote` when the relay is available and `local` otherwise.
+
+```sh
+echo remote > wallets/<wallet>/passkeys/new
+cat wallets/<wallet>/passkeys/latest/url      # forward the complete link to the human
+cat wallets/<wallet>/passkeys/latest/status   # awaiting_user, then a final state
+```
+
+Tell the human to open the link on the new device. That page gives them an
+approval link and a six-digit code: they open the approval link on a device
+that already has a passkey for the wallet (the page can share or copy it),
+check that both pages show the same code, and approve there. Bloom chooses
+which existing passkey approves: one on the new passkey's own surface when the
+wallet has it, otherwise one on the other surface. You do not choose it.
+
+When `status` stops being `awaiting_user`, tell the human what happened:
+
+- `succeeded` — the new passkey is enrolled. Name it as described below.
+- `already_registered` — nothing was added, and nothing is wrong. The new
+  device's passkey provider already holds one of this wallet's passkeys,
+  usually because passkeys sync between the human's devices (for example
+  iCloud Keychain, Google Password Manager or 1Password) or because that
+  device was registered earlier. Tell the human that device can already
+  approve for the wallet and nothing else is needed. Do not retry: another
+  attempt from that device ends the same way.
+- `cancelled` or `expired` — nothing changed. Start again with a fresh write
+  to `new` only if the human still wants the passkey.
+- `failed` — nothing changed. Offer to start again with a fresh write to
+  `new`.
+
+If the write to `new` fails with *Operation not permitted*, the wallet has no
+active passkey that could approve an addition on any usable surface, for
+example when all of its passkeys are remote and the relay is unavailable.
+Repeating the write does not help. Tell the human, and check `passkeys/` and
+the relay status.
+
+The relay status is `/status/ceremonies.json`. If its `stage` is
+`credentials_expired`, the computer was offline longer than the relay's
+renewal grace and remote approvals stay paused until the owner acts:
+`/status/ceremonies-repair.json` then holds a `repair` with a `summary` and
+the exact `command` to give the human (it needs `sudo` on this computer and
+keeps the same hostname). Localhost approvals still work. Do not retry remote
+ceremonies until the stage changes.
+
+The link is single-use: it disappears once opened, while `status` stays
+readable. Write to `latest/cancel` to abandon an enrollment. Every enrollment
+stays under `enrollments/<operation>/`. Writing `new` again while one to the
+same surface is still waiting reuses it.
+
+After enrollment succeeds, ask the human what to call the new passkey and
+write it to that passkey's `name`; `by-name/<name>` then links to it. Names
+are Machine-only labels for telling passkeys apart. They are never shown on
+ceremony pages and carry no authority, so do not use a name to decide which
+passkey approves anything.
+
 ## The transaction loop
 
 Use this loop for native Machine transaction surfaces and for Petal actions that
@@ -242,11 +348,27 @@ project into the central outbox:
 8. Read the sent, failed, or receipt projection before reporting success.
 
 A confirm write may return permission denied while projecting
-`approval_challenge.json`. Verify the challenge's wallet, action, intent, and
-expiry before presenting its ceremony URL. This is a waiting state, not a
-reason to restage. After human approval, retry only its exact `retry_path`;
+`approval_challenge.json` beside the pending entry, on EVM and Solana chains
+alike. Verify the challenge's wallet, action, intent, and expiry before
+presenting its ceremony URL. This is a waiting state, not a reason to restage.
 `plan_path` and `retry_path` name the outbox the confirm was written through
 (`wallets/<wallet>/<n>/chains/...`, including `n = 0` for account 0).
+
+Reading the challenge asks Bloom for the approval's current state, so poll it
+while the human approves. `state` is `awaiting_ceremony` until they finish,
+then `active`, and `next` says what to do. As soon as `state` is `active`,
+write `confirm` to `retry_path`; the approval does not broadcast on its own.
+Retrying `retry_path` before then is also safe: it starts no new ceremony and
+returns permission denied again. Once the ceremony can no longer be used,
+`ceremony_url` is withdrawn. For `expired`, `cancelled` or `refused`, tell the
+human rather than retrying on your own.
+
+`bloom wallet confirm` exits 3 when owner approval is pending and 4 when
+confirmation has no recorded result yet. Exit 0 reports a recorded broadcast
+or a completed local discard. Use `--text cancel` to discard an unsigned
+pending entry; an already broadcast transaction needs `bloom wallet cancel`
+and its own approval. Dropping a reservation does not renumber later rows:
+restage with an explicit nonce to fill a gap.
 
 `confirm.override` is not a general escape hatch. Use it only when the
 inspected policy projection explicitly permits that control and the human has
@@ -287,6 +409,31 @@ Use the challenge's `retry_path` verbatim after the owner completes its
 `expiry_ms` first. `plan_path` and `retry_path` name the outbox the confirm was
 written through: `wallets/<wallet>/<n>/chains/...`, including `n = 0` for
 account 0.
+
+## Deploying EVM contracts
+
+Build with the project's normal tools. Stage a JSON/TOML intent using
+`kind: "deploy"`, complete hex initcode in `data`, and optional native `value`
+at `wallets/<wallet>/<n>/chains/<chain>/outbox/new.tx`. Append ABI-encoded constructor
+arguments and link libraries before staging; do not supply `to`. Read the
+pending entry's `plan.md` and complete its usual Broker approval flow.
+
+The predicted address depends on sender and nonce. Check the mined
+`sent/<id>/receipt.json` for success and the actual `contract_address`; a
+broadcast hash alone is not a successful deployment. Constructor ownership and
+effects are not verified. Initialization calls are separate transactions with
+their own approvals. The wallet policy must opt into the numeric chain with
+`{"chain":"evm-31337","destination":"exact"}` (replace 31337 as appropriate),
+through the normal policy-update ceremony. This permits contract creation to be
+prepared without a recipient allowlist entry; calls and sends keep their recipient
+restrictions. Every transaction still needs its own exact owner approval.
+
+For Foundry scripts, Hardhat remote accounts, and Ignition, run
+`bloom deploy --wallet <wallet> --chain <chain> rpc`. It prints an ephemeral,
+private submission URL and public sender. After owner review, explicitly run
+`bloom deploy --wallet <wallet> --chain <chain> resume <id>` for the same ID.
+Use `list` and `status <id>` to recover. Do not export signing keys into project
+files or environment variables. See `docs/examples.md` for commands.
 
 ## Updating wallet policy
 
@@ -347,17 +494,38 @@ challenge either way.
 Because Bloom rebuilds that one shape, it must encode exactly. Calldata that
 is already ERC-20 transfer shaped — the `transfer` selector, exactly 68 bytes,
 no native value — has to decode and then re-encode back to the bytes you
-supplied. In practice what fails this is noncanonical padding: the address
-argument occupies a 32-byte word whose twelve high-order bytes must be zero.
-Such a write is refused at staging, and the error begins `ERC-20 transfer
-calldata` — `… : type check failed for "(address,uint256)"` when the word is
-dirty, and `… is not canonical` when the bytes decode but do not round-trip.
-Nothing is staged and no nonce is reserved: the check runs before Bloom takes
-the staging lock. Left-pad the address with zeros and stage again; retrying
-the same bytes fails the same way.
+supplied. What fails this is noncanonical padding: the address argument
+occupies a 32-byte word whose twelve high-order bytes must be zero. Such a
+write is refused at staging with an error that begins `ERC-20 transfer
+calldata: type check failed for "(address,uint256)"`. Nothing is staged and
+no nonce is reserved: the check runs before Bloom takes the staging lock.
+Left-pad the address with zeros and stage again; retrying the same bytes fails
+the same way.
 
 This is not a general rule about padding. A call Bloom leaves generic keeps
 the bytes you gave it and stages normally, even with that padding — including
 a call carrying nonzero native value, one of any other calldata length, one
 bearing another selector, and one addressed to a contract the registry does
 not list. Bloom only rejects what it would otherwise rewrite.
+
+## Local development chains
+
+A local Anvil node is not configured by default. Bloom reads a chain's files
+from its RPC endpoint, so a configured chain whose endpoint is unreachable
+makes every read under that chain's paths wait for the endpoint to fail.
+
+To work against a local Anvil node, ask the operator to add it to the Machine
+configuration (`~/.bloom/config.toml`) and restart Bloom:
+
+```toml
+[chains.anvil]
+name = "anvil"
+chain_id = 31337
+rpc_urls = ["http://127.0.0.1:8545"]
+display_name = "Anvil (local)"
+native_symbol = "ETH"
+native_decimals = 18
+```
+
+Then confirm it with `ls chains/`. Remove the entry when the node is no longer
+running.

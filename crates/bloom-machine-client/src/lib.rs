@@ -20,12 +20,58 @@ use std::{
     collections::BTreeSet,
     future::Future,
     path::{Path, PathBuf},
-    sync::{Arc, RwLock},
-    time::Duration,
+    sync::{Arc, Mutex, RwLock},
+    time::{Duration, Instant},
 };
 
 const AUTHORITY_HEAD_EXCHANGE_CADENCE: Duration = Duration::from_secs(45);
 const AUTHORITY_HEAD_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
+const QUOTA_BACKOFF_INITIAL: Duration = Duration::from_millis(250);
+const QUOTA_BACKOFF_MAXIMUM: Duration = Duration::from_secs(30);
+
+/// Exponential backoff after Broker reports its request quota exhausted.
+/// Broker admits requests over a sliding window, so callers that retry on
+/// rejection (such as VFS readers after a restart) keep that window saturated.
+/// While backing off, requests are refused locally without reaching Broker.
+#[derive(Default)]
+struct QuotaBackoff {
+    state: Mutex<Option<(Duration, Instant)>>,
+}
+
+impl QuotaBackoff {
+    fn admit(&self, now: Instant) -> Result<(), ProtocolError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| service_unavailable("Broker quota backoff lock poisoned"))?;
+        match *state {
+            Some((_, until)) if now < until => Err(ProtocolError::new(
+                ProtocolErrorCode::QuotaExceeded,
+                format!(
+                    "Broker request quota exhausted; retry in {} ms",
+                    (until - now).as_millis().max(1)
+                ),
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    fn record<T>(&self, result: &Result<T, ProtocolError>, now: Instant) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        match result {
+            Ok(_) => *state = None,
+            Err(error) if error.code == ProtocolErrorCode::QuotaExceeded => {
+                let delay = state.map_or(QUOTA_BACKOFF_INITIAL, |(delay, _)| {
+                    (delay * 2).min(QUOTA_BACKOFF_MAXIMUM)
+                });
+                *state = Some((delay, now + delay));
+            }
+            Err(_) => {}
+        }
+    }
+}
 
 async fn run_periodic_authority_head_exchange<F, Fut, T>(mut exchange: F)
 where
@@ -55,7 +101,7 @@ use bloom_broker_api::{
     MachineSignRequest, OperationId, OperationPublicStatus, OperationRequest, PetalUseClaim,
     PolicyCommitReceipt, PolicyCommitUpdateRequest, PolicyUpdatePrepareResponse,
     PolicyUpdateRequest, ProtocolError, ProtocolErrorCode, ProvenanceCatalog, ProvenanceSubject,
-    RequestNonce, RevocationState, RevokeForKeyRequest, RevokeRequest,
+    RequestNonce, ReviewMode, RevocationState, RevokeForKeyRequest, RevokeRequest,
     SealedApprovalPrepareResponse, SealedApprovalTerms, SignedPolicySnapshot, SigningPayloads,
     SigningResult, SystemUseClaim, Token, TypedRequestMethod, ValueLimit, WalletAccountsPublic,
     WalletOperationRequest, WalletPublic, WalletRequest, is_read_only_method,
@@ -391,6 +437,7 @@ pub struct MachineBrokerClient {
     service: Arc<dyn MachineBrokerService>,
     local_identity: Option<LocalIdentity>,
     unix_service: Option<Arc<UnixMachineBrokerService>>,
+    quota_backoff: Arc<QuotaBackoff>,
 }
 
 impl MachineBrokerClient {
@@ -399,6 +446,7 @@ impl MachineBrokerClient {
             service,
             local_identity: None,
             unix_service: None,
+            quota_backoff: Arc::default(),
         }
     }
 
@@ -416,6 +464,7 @@ impl MachineBrokerClient {
             service: unix_service.clone(),
             local_identity: Some(identity),
             unix_service: Some(unix_service),
+            quota_backoff: Arc::default(),
         }
     }
 
@@ -539,7 +588,10 @@ impl MachineBrokerClient {
         &self,
         request: MachineBrokerRequest,
     ) -> Result<MachineBrokerResponse, ProtocolError> {
-        self.service.dispatch(request).await
+        self.quota_backoff.admit(Instant::now())?;
+        let result = self.service.dispatch(request).await;
+        self.quota_backoff.record(&result, Instant::now());
+        result
     }
 
     pub async fn sign(&self, request: MachineSignRequest) -> Result<SigningResult, ProtocolError> {
@@ -956,11 +1008,18 @@ impl MachineBrokerClient {
         };
         terms.validate()?;
         self.prepare_approval(ApprovalPrepareRequest {
+            surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
+            evm_review_payloads: if native_evm_review(&request.provenance) {
+                vec![Base64UrlBytes::from_bytes(&request.preimage)]
+            } else {
+                Vec::new()
+            },
             operation_id: request.approval_operation_id,
             terms,
             canonical_plan_facts_digest: request.canonical_plan_facts_digest,
             petal_use_claim: request.petal_use_claim,
             system_use_claim: request.system_use_claim,
+            requested_review_mode: request.requested_review_mode,
         })
         .await
         .map(ExactPayloadSignOutcome::ApprovalRequired)
@@ -1127,11 +1186,22 @@ impl MachineBrokerClient {
         };
         terms.validate()?;
         self.prepare_approval(ApprovalPrepareRequest {
+            surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
+            evm_review_payloads: if native_evm_review(&request.provenance) {
+                request
+                    .preimages
+                    .iter()
+                    .map(|p| Base64UrlBytes::from_bytes(p))
+                    .collect()
+            } else {
+                Vec::new()
+            },
             operation_id: request.approval_operation_id,
             terms,
             canonical_plan_facts_digest: request.canonical_plan_facts_digest,
             petal_use_claim: request.petal_use_claim,
             system_use_claim: None,
+            requested_review_mode: request.requested_review_mode,
         })
         .await
         .map(ExactPayloadSignOutcome::ApprovalRequired)
@@ -1281,11 +1351,16 @@ impl MachineBrokerClient {
         };
         terms.validate()?;
         self.prepare_approval(ApprovalPrepareRequest {
+            surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
+            evm_review_payloads: Vec::new(),
             operation_id: request.approval_operation_id,
             terms,
             canonical_plan_facts_digest: request.canonical_plan_facts_digest,
             petal_use_claim: Some(claim.clone()),
             system_use_claim: None,
+            // A reusable Petal batch carries no EVM review payloads, so
+            // there is no contract call to read either way.
+            requested_review_mode: None,
         })
         .await
         .map(ExactPayloadSignOutcome::ApprovalRequired)
@@ -1777,6 +1852,45 @@ impl MachineBrokerClient {
         Ok(key_ref)
     }
 
+    /// Start paired enrollment through Broker. Browser private keys stay in the browser.
+    pub async fn prepare_cross_surface_credential(
+        &self,
+        request: bloom_broker_api::CeremonyCrossSurfacePrepareRequest,
+    ) -> Result<bloom_broker_api::CeremonyCrossSurfacePrepareResponse, ProtocolError> {
+        let operation_id = request.operation_id.clone();
+        match self
+            .request(MachineBrokerRequest::CredentialCrossSurfacePrepare(request))
+            .await?
+        {
+            MachineBrokerResponse::CredentialCrossSurfacePrepare(response)
+                if response.operation_id == operation_id =>
+            {
+                Ok(response)
+            }
+            _ => Err(response_mismatch("credential.cross_surface_prepare")),
+        }
+    }
+
+    /// Read Signer-approved exposure through Broker; Machine cannot mutate it.
+    pub async fn ceremony_surfaces(
+        &self,
+    ) -> Result<bloom_broker_api::CeremonyExposureStatus, ProtocolError> {
+        match self
+            .request(MachineBrokerRequest::CeremonySurfaceStatus(
+                bloom_broker_api::Empty {},
+            ))
+            .await?
+        {
+            MachineBrokerResponse::CeremonySurfaceStatus(status) => Ok(status),
+            _ => Err(response_mismatch("ceremony.surface_status")),
+        }
+    }
+
+    /// The owner action remote ceremonies need, if any; see [`ceremony_repair`].
+    pub async fn ceremony_repair(&self) -> Result<serde_json::Value, ProtocolError> {
+        Ok(ceremony_repair(&self.ceremony_surfaces().await?))
+    }
+
     pub async fn credentials(
         &self,
         wallet_id: Token,
@@ -1985,6 +2099,15 @@ pub struct ExactPayloadSignRequest {
     /// BIP-39 and holds more than one child for `crypto_suite`; `None` keeps
     /// the single-account and legacy-root behaviour.
     pub account_key_ref: Option<KeyRef>,
+    /// Which review the owner should be shown for a native EVM contract
+    /// call. `None` lets Broker choose under the wallet's policy: clear when
+    /// the wallet enables it and a signed description covers the call,
+    /// otherwise the existing envelope review. `OpaqueExact` is the caller
+    /// deliberately asking to approve bytes Bloom will not explain, and
+    /// Broker refuses it unless policy allows it. Nothing here can downgrade
+    /// a clear review silently: an unreadable call under a clear request
+    /// fails the preparation.
+    pub requested_review_mode: Option<ReviewMode>,
 }
 
 #[derive(Clone, Debug)]
@@ -2011,6 +2134,15 @@ pub struct ExactPayloadBatchSignRequest {
     /// BIP-39 and holds more than one child for `crypto_suite`; `None` keeps
     /// the single-account and legacy-root behaviour.
     pub account_key_ref: Option<KeyRef>,
+    /// Which review the owner should be shown for a native EVM contract
+    /// call. `None` lets Broker choose under the wallet's policy: clear when
+    /// the wallet enables it and a signed description covers the call,
+    /// otherwise the existing envelope review. `OpaqueExact` is the caller
+    /// deliberately asking to approve bytes Bloom will not explain, and
+    /// Broker refuses it unless policy allows it. Nothing here can downgrade
+    /// a clear review silently: an unreadable call under a clear request
+    /// fails the preparation.
+    pub requested_review_mode: Option<ReviewMode>,
 }
 
 impl ExactPayloadBatchSignRequest {
@@ -2134,6 +2266,28 @@ impl CeremonyProjection {
         )
     }
 
+    pub fn from_cross_surface_prepare(
+        response: &bloom_broker_api::CeremonyCrossSurfacePrepareResponse,
+        now_ms: u64,
+    ) -> Result<Self, ProtocolError> {
+        if response.state != CeremonyState::AwaitingUser {
+            return Err(projection_mismatch(
+                "paired enrollment is not awaiting user",
+            ));
+        }
+        Self::awaiting(
+            CeremonyProjectionIdentity::Custody {
+                operation_id: response.operation_id.clone(),
+                ceremony_kind: bloom_broker_api::CeremonyKind::CredentialAdd,
+            },
+            CeremonyProjectionState::Custody(CeremonyState::AwaitingUser),
+            response.destination_url.clone(),
+            response.expires_at_ms.clone(),
+            None,
+            now_ms,
+        )
+    }
+
     pub fn from_policy_prepare(
         response: &PolicyUpdatePrepareResponse,
         now_ms: u64,
@@ -2160,34 +2314,38 @@ impl CeremonyProjection {
         status: &CeremonyPublicStatus,
         now_ms: u64,
     ) -> Result<Self, ProtocolError> {
-        if status.state != CeremonyState::AwaitingUser {
-            return Ok(Self {
-                identity: Some(CeremonyProjectionIdentity::Custody {
+        if status.state == CeremonyState::AwaitingUser
+            && let Some(url) = status.ceremony_url.clone()
+            && status.expires_at_ms.get() > now_ms
+        {
+            return Self::awaiting(
+                CeremonyProjectionIdentity::Custody {
                     operation_id: status.operation_id.clone(),
                     ceremony_kind: status.ceremony_kind,
-                }),
-                ceremony_state: Some(CeremonyProjectionState::Custody(status.state)),
-                ceremony_url: None,
-                ceremony_expires_at_ms: None,
-                review_manifest_digest: None,
-                receipt_digest: status.receipt_digest.clone(),
-                last_error: None,
-            });
+                },
+                CeremonyProjectionState::Custody(status.state),
+                url,
+                status.expires_at_ms.clone(),
+                None,
+                now_ms,
+            );
         }
-        let url = status.ceremony_url.clone().ok_or_else(|| {
-            projection_mismatch("awaiting custody status is missing ceremony URL")
-        })?;
-        Self::awaiting(
-            CeremonyProjectionIdentity::Custody {
+        // Broker withholds the URL once a remote browser has exchanged its
+        // one-time capability, and a status can race the expiry sweep. Both
+        // leave the ceremony awaiting without a usable launch URL, which is the
+        // projection `reconcile_custody` reaches for an existing record.
+        Ok(Self {
+            identity: Some(CeremonyProjectionIdentity::Custody {
                 operation_id: status.operation_id.clone(),
                 ceremony_kind: status.ceremony_kind,
-            },
-            CeremonyProjectionState::Custody(status.state),
-            url,
-            status.expires_at_ms.clone(),
-            None,
-            now_ms,
-        )
+            }),
+            ceremony_state: Some(CeremonyProjectionState::Custody(status.state)),
+            ceremony_url: None,
+            ceremony_expires_at_ms: None,
+            review_manifest_digest: None,
+            receipt_digest: status.receipt_digest.clone(),
+            last_error: None,
+        })
     }
 
     pub fn from_custody_result(result: &CustodyResult) -> Self {
@@ -2614,6 +2772,19 @@ struct ClaimedPolicyAuthorityDiff {
     removed_destinations: Vec<ClaimedPolicyAuthorityDestination>,
     added_required_verifiers: Vec<ClaimedPolicyAuthorityVerifier>,
     removed_required_verifiers: Vec<ClaimedPolicyAuthorityVerifier>,
+    /// Present only when clear signing actually changed, so every policy
+    /// update that predates it keeps its exact claimed-diff bytes. Broker
+    /// recomputes the same shape; a mismatch is refused there.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    clear_signing: Option<ClaimedPolicyAuthorityClearSigning>,
+}
+
+#[derive(Clone, Eq, PartialEq, Serialize)]
+struct ClaimedPolicyAuthorityClearSigning {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    before: Option<bloom_broker_api::ClearSigningPolicy>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    after: Option<bloom_broker_api::ClearSigningPolicy>,
 }
 
 #[derive(Clone, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -2692,6 +2863,12 @@ pub fn claimed_policy_authority_diff_digest(
         removed_destinations,
         added_required_verifiers,
         removed_required_verifiers,
+        clear_signing: (current.clear_signing != proposed.clear_signing).then(|| {
+            ClaimedPolicyAuthorityClearSigning {
+                before: current.clear_signing.clone(),
+                after: proposed.clear_signing.clone(),
+            }
+        }),
     };
     let mut hasher = Sha256::new();
     hasher.update(CLAIMED_POLICY_AUTHORITY_DIFF_DOMAIN);
@@ -2791,9 +2968,88 @@ fn service_unavailable(message: impl Into<String>) -> ProtocolError {
     ProtocolError::new(ProtocolErrorCode::ServiceUnavailable, message.into())
 }
 
+fn native_evm_review(provenance: &ProvenanceSubject) -> bool {
+    let class = match provenance {
+        ProvenanceSubject::Cli { command_class, .. } => command_class.as_str(),
+        ProvenanceSubject::System {
+            operation_class, ..
+        } => operation_class.as_str(),
+        ProvenanceSubject::Petal { .. } => return false,
+    };
+    matches!(
+        class,
+        "transaction.confirm" | "transaction.replace" | "transaction.cancel"
+    )
+}
+
+/// `{"repair": null}`, or the owner action remote ceremonies need. Kept beside
+/// Broker's exposure projection rather than inside it, so readers of that
+/// strict type are unaffected. Today only `credentials_expired` needs one: the
+/// relay refuses to renew Broker's expired credentials, and only the Signer
+/// administrator can re-issue them (same hostname, no wallet change).
+pub fn ceremony_repair(status: &bloom_broker_api::CeremonyExposureStatus) -> serde_json::Value {
+    let repair = (status.stage == bloom_broker_api::CeremonyExposureStage::CredentialsExpired)
+        .then(|| {
+            let signer = if cfg!(target_os = "macos") {
+                "/usr/local/libexec/bloom/current/bloom-signer"
+            } else {
+                "/usr/libexec/bloom/current/bloom-signer"
+            };
+            serde_json::json!({
+                "stage": "credentials_expired",
+                "summary": "Remote approvals are paused: the hosted relay refused to renew this computer's expired relay credentials. Localhost approvals still work.",
+                "command": format!("sudo {signer} admin provision --login-uid \"$(id -u)\""),
+            })
+        });
+    serde_json::json!({ "repair": repair })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repair_is_reported_only_when_relay_credentials_expired() {
+        use bloom_broker_api::{
+            CeremonyExposureMode, CeremonyExposureStage, CeremonyExposureStatus, DecimalU64,
+        };
+        let status = |stage| CeremonyExposureStatus {
+            desired_mode: CeremonyExposureMode::RemoteEnabled,
+            desired_revision: DecimalU64::new(1),
+            effective_mode: CeremonyExposureMode::LocalhostOnly,
+            effective_revision: DecimalU64::new(1),
+            local_origin: "http://localhost:18734".into(),
+            remote_origin: Some("https://abcdefghijklmnopqrstuv2345.relay.bloom.directory".into()),
+            remote_tls_ready: true,
+            remote_routing_ready: true,
+            stage,
+        };
+        for stage in [
+            CeremonyExposureStage::Enabled,
+            CeremonyExposureStage::CertificatePending,
+            CeremonyExposureStage::Unprovisioned,
+        ] {
+            assert_eq!(
+                ceremony_repair(&status(stage)),
+                serde_json::json!({"repair": null})
+            );
+        }
+        let expired = ceremony_repair(&status(CeremonyExposureStage::CredentialsExpired));
+        let repair = &expired["repair"];
+        assert_eq!(repair["stage"], "credentials_expired");
+        let command = repair["command"].as_str().unwrap();
+        assert!(command.starts_with("sudo /"), "{command}");
+        assert!(
+            command.ends_with("bloom-signer admin provision --login-uid \"$(id -u)\""),
+            "{command}"
+        );
+        assert!(
+            repair["summary"]
+                .as_str()
+                .unwrap()
+                .contains("Localhost approvals still work")
+        );
+    }
     use std::{
         os::unix::fs::{MetadataExt, PermissionsExt},
         sync::{
@@ -2809,6 +3065,26 @@ mod tests {
     };
     use ed25519_dalek::SigningKey;
     use tracing_subscriber::prelude::*;
+
+    #[test]
+    fn paired_enrollment_projection_preserves_opaque_destination_and_rejects_expiry() {
+        let response = bloom_broker_api::CeremonyCrossSurfacePrepareResponse {
+            operation_id: OperationId::from_bytes([71; 32]),
+            ceremony_id: Digest32::from_bytes([72; 32]),
+            state: CeremonyState::AwaitingUser,
+            destination_url:
+                "https://abcdefghijklmnopqrstuvwxyz.relay.bloom.directory/ceremony#cap=opaque"
+                    .into(),
+            expires_at_ms: DecimalU64::new(2_000),
+        };
+        let projection = CeremonyProjection::from_cross_surface_prepare(&response, 1_000).unwrap();
+        assert_eq!(projection.operation_id(), Some(&response.operation_id));
+        assert_eq!(
+            projection.ceremony_url(),
+            Some(response.destination_url.as_str())
+        );
+        assert!(CeremonyProjection::from_cross_surface_prepare(&response, 2_000).is_err());
+    }
 
     #[test]
     fn petal_claim_value_limits_sum_debits_and_fee_per_asset() {
@@ -3086,6 +3362,117 @@ mod tests {
         );
     }
 
+    /// The exact canonical bytes Broker computes for the same change.
+    /// `bloom-broker`'s `w9_clear_signing` suite asserts this same literal:
+    /// if the two shapes drift, every clear-signing policy ceremony fails
+    /// preflight with a diff mismatch, and this catches it here instead.
+    const UNLIMITED_ALLOWANCE_DIFF_JCS: &str = concat!(
+        r#"{"added_destinations":[],"added_petal_packages":[],"added_required_verifiers":[],"#,
+        r#""clear_signing":{"after":{"catalog_id":"bloom-tokens","maximum_observation_age_ms":86400000,"#,
+        r#""opaque_exact_allowed":false,"signature_threshold":1,"#,
+        r#""trusted_keys":[{"key_id":"publisher-1","verifying_key":"bnoc3Smwt4_ROvTFWY_v9O8qlxZuPKby5Pv8zYBQW_E"}],"#,
+        r#""unlimited_allowance_allowed":true,"#,
+        r#""verifier":{"verifier_digest":"VERIFIER","verifier_id":"evm-clear-signing-v1"}},"#,
+        r#""before":{"catalog_id":"bloom-tokens","maximum_observation_age_ms":86400000,"#,
+        r#""opaque_exact_allowed":false,"signature_threshold":1,"#,
+        r#""trusted_keys":[{"key_id":"publisher-1","verifying_key":"bnoc3Smwt4_ROvTFWY_v9O8qlxZuPKby5Pv8zYBQW_E"}],"#,
+        r#""unlimited_allowance_allowed":false,"#,
+        r#""verifier":{"verifier_digest":"VERIFIER","verifier_id":"evm-clear-signing-v1"}}},"#,
+        r#""maximum_approval_lifetime_ms_after":"100000","maximum_approval_lifetime_ms_before":"100000","#,
+        r#""removed_destinations":[],"removed_petal_packages":[],"removed_required_verifiers":[]}"#,
+    );
+
+    fn clear_signing_wallet_policy(
+        unlimited_allowance_allowed: bool,
+    ) -> bloom_broker_api::CanonicalWalletPolicy {
+        bloom_broker_api::CanonicalWalletPolicy {
+            wallet_id: Token::new("wallet-1").unwrap(),
+            maximum_approval_lifetime_ms: 100_000,
+            allowed_petal_packages: Vec::new(),
+            allowed_destinations: Vec::new(),
+            required_verifiers: Vec::new(),
+            clear_signing: Some(bloom_broker_api::ClearSigningPolicy {
+                catalog_id: Token::new("bloom-tokens").unwrap(),
+                trusted_keys: vec![bloom_broker_api::CatalogTrustedKey {
+                    key_id: Token::new("publisher-1").unwrap(),
+                    verifying_key: bloom_broker_api::Base64UrlBytes::from_bytes(
+                        &ed25519_dalek::SigningKey::from_bytes(&[5; 32])
+                            .verifying_key()
+                            .to_bytes(),
+                    ),
+                }],
+                signature_threshold: 1,
+                maximum_observation_age_ms: 86_400_000,
+                opaque_exact_allowed: false,
+                unlimited_allowance_allowed,
+                verifier: bloom_broker_api::RequiredVerifier {
+                    verifier_id: Token::new(bloom_broker_api::EVM_CLEAR_SIGNING_VERIFIER_ID)
+                        .unwrap(),
+                    verifier_digest: Digest32::from_bytes(
+                        bloom_broker_api::EVM_CLEAR_SIGNING_VERIFIER_DIGEST_BYTES,
+                    ),
+                },
+            }),
+        }
+    }
+
+    #[test]
+    fn enabling_unlimited_allowances_reaches_the_owner_as_an_authority_change() {
+        let before = clear_signing_wallet_policy(false);
+        let after = clear_signing_wallet_policy(true);
+
+        // An unchanged policy claims no clear-signing change, so a policy
+        // update that never touches it keeps the exact bytes it had before
+        // this field existed.
+        let unchanged = claimed_diff(&before, &before);
+        assert!(!unchanged.contains("clear_signing"), "{unchanged}");
+
+        assert_eq!(
+            claimed_diff(&before, &after),
+            UNLIMITED_ALLOWANCE_DIFF_JCS.replace(
+                "VERIFIER",
+                Digest32::from_bytes(bloom_broker_api::EVM_CLEAR_SIGNING_VERIFIER_DIGEST_BYTES)
+                    .as_str()
+            ),
+            "Broker asserts these same bytes; a change here must be made on both sides"
+        );
+
+        // And the digest actually differs, so the ceremony cannot present the
+        // enabling update as the no-op it would otherwise look like.
+        assert_ne!(
+            claimed_policy_authority_diff_digest(&before, &after).unwrap(),
+            claimed_policy_authority_diff_digest(&before, &before).unwrap()
+        );
+    }
+
+    fn claimed_diff(
+        current: &bloom_broker_api::CanonicalWalletPolicy,
+        proposed: &bloom_broker_api::CanonicalWalletPolicy,
+    ) -> String {
+        let (added_petal_packages, removed_petal_packages) = (Vec::new(), Vec::new());
+        serde_jcs::to_string(&ClaimedPolicyAuthorityDiff {
+            maximum_approval_lifetime_ms_before: DecimalU64::new(
+                current.maximum_approval_lifetime_ms,
+            ),
+            maximum_approval_lifetime_ms_after: DecimalU64::new(
+                proposed.maximum_approval_lifetime_ms,
+            ),
+            added_petal_packages,
+            removed_petal_packages,
+            added_destinations: Vec::new(),
+            removed_destinations: Vec::new(),
+            added_required_verifiers: Vec::new(),
+            removed_required_verifiers: Vec::new(),
+            clear_signing: (current.clear_signing != proposed.clear_signing).then(|| {
+                ClaimedPolicyAuthorityClearSigning {
+                    before: current.clear_signing.clone(),
+                    after: proposed.clear_signing.clone(),
+                }
+            }),
+        })
+        .unwrap()
+    }
+
     #[test]
     fn claimed_policy_authority_diff_digest_matches_reviewed_v1_vector() {
         let current = bloom_broker_api::CanonicalWalletPolicy {
@@ -3104,6 +3491,7 @@ mod tests {
                 verifier_id: Token::new("human").unwrap(),
                 verifier_digest: Digest32::from_bytes([3; 32]),
             }],
+            clear_signing: None,
         };
         let proposed = bloom_broker_api::CanonicalWalletPolicy {
             wallet_id: Token::new("wallet").unwrap(),
@@ -3118,6 +3506,7 @@ mod tests {
                 destination: "new".into(),
             }],
             required_verifiers: Vec::new(),
+            clear_signing: None,
         };
         assert_eq!(
             claimed_policy_authority_diff_digest(&current, &proposed)
@@ -3746,6 +4135,7 @@ mod tests {
             claim_assurance_evidence: None,
             approval_value_limits: Vec::new(),
             account_key_ref: None,
+            requested_review_mode: None,
         }
     }
 
@@ -3764,7 +4154,7 @@ mod tests {
             crypto_suite: CryptoSuite::Secp256k1Keccak256Recoverable,
             provenance: ProvenanceSubject::Cli {
                 client_id: token("bloom-cli"),
-                command_class: token("transaction.confirm_batch"),
+                command_class: token("transaction.confirm"),
             },
             provenance_digest: digest(60),
             activation_mode: Some(ActivationMode::BootBound),
@@ -3778,6 +4168,7 @@ mod tests {
             petal_use_claim: None,
             claim_assurance_evidence: None,
             account_key_ref: None,
+            requested_review_mode: None,
         }
     }
 
@@ -3825,6 +4216,10 @@ mod tests {
                 }
             );
             assert_eq!(request.terms.provenance_digest, digest(60));
+            assert_eq!(
+                request.evm_review_payloads,
+                vec![Base64UrlBytes::from_bytes(&payload)]
+            );
             assert_eq!(request.terms.key_ref, root_key_ref);
             assert_eq!(request.terms.limits.max_operations.get(), 1);
             assert_eq!(request.terms.limits.max_signatures.get(), 1);
@@ -3899,6 +4294,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_confirm_replace_cancel_forward_payload_and_review_mode() {
+        let broker = Arc::new(MockBroker {
+            wallet: WalletPublic {
+                wallet_id: token("wallet"),
+                wallet_kind: token("local"),
+                root_key_ref: Some(key_ref()),
+                key_refs: vec![key_ref()],
+                policy_version: DecimalU64::new(7),
+                policy_digest: digest(7),
+                wallet_revocation_epoch: DecimalU64::new(2),
+            },
+            accounts: empty_accounts(),
+            requests: Mutex::new(Vec::new()),
+            corrupt_response: false,
+        });
+        let client = MachineBrokerClient::new(broker.clone());
+        for class in [
+            "transaction.confirm",
+            "transaction.replace",
+            "transaction.cancel",
+        ] {
+            for mode in [ReviewMode::Clear, ReviewMode::OpaqueExact] {
+                broker.requests.lock().unwrap().clear();
+                let payload = format!("unsigned {class}").into_bytes();
+                let mut request = exact_request(payload.clone(), None);
+                request.provenance = ProvenanceSubject::Cli {
+                    client_id: token("bloom-cli"),
+                    command_class: token(class),
+                };
+                request.requested_review_mode = Some(mode);
+                client.sign_exact_payload(request).await.unwrap();
+                let requests = broker.requests.lock().unwrap();
+                let prepare = requests
+                    .iter()
+                    .find_map(|request| match request {
+                        MachineBrokerRequest::SealedApprovalPrepare(prepare) => Some(prepare),
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(
+                    prepare.evm_review_payloads,
+                    vec![Base64UrlBytes::from_bytes(&payload)]
+                );
+                assert_eq!(prepare.requested_review_mode, Some(mode));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn exact_payload_batch_prepares_then_uses_sign_batch_with_receipts() {
         let broker = Arc::new(MockBroker {
             wallet: WalletPublic {
@@ -3919,10 +4363,9 @@ mod tests {
             b"unsigned EVM child 1".to_vec(),
             b"unsigned EVM child 2".to_vec(),
         ];
-        let prepared = client
-            .sign_exact_payload_batch(exact_batch_request(payloads.clone(), None))
-            .await
-            .unwrap();
+        let mut native_batch = exact_batch_request(payloads.clone(), None);
+        native_batch.requested_review_mode = Some(ReviewMode::OpaqueExact);
+        let prepared = client.sign_exact_payload_batch(native_batch).await.unwrap();
         let ExactPayloadSignOutcome::ApprovalRequired(prepared) = prepared else {
             panic!("first call must prepare one exact batch approval");
         };
@@ -3934,6 +4377,14 @@ mod tests {
             };
             assert_eq!(request.terms.limits.max_operations.get(), 1);
             assert_eq!(request.terms.limits.max_signatures.get(), 2);
+            assert_eq!(request.requested_review_mode, Some(ReviewMode::OpaqueExact));
+            assert_eq!(
+                request.evm_review_payloads,
+                payloads
+                    .iter()
+                    .map(|payload| Base64UrlBytes::from_bytes(payload))
+                    .collect::<Vec<_>>()
+            );
             assert_eq!(
                 request.terms.selector,
                 ApprovalSelector::Exact {
@@ -4099,14 +4550,15 @@ mod tests {
             ceremony_kind: CeremonyKind::WalletImport,
             custody_operation_id: OperationId::from_bytes([4; 32]),
             state: CustodyPrepareState::AwaitingUser,
-            ceremony_url: "http://127.0.0.1:18734/c/opaque".into(),
+            ceremony_url:
+                "https://abcdefghijklmnopqrstuvwxyz.relay.bloom.directory/ceremony#opaque".into(),
             ceremony_expires_at_ms: DecimalU64::new(2_000),
             signer_contribution_digest: digest(6),
         };
         let mut projection = CeremonyProjection::from_custody_prepare(&prepare, 1_000).unwrap();
         assert_eq!(
             projection.ceremony_url(),
-            Some("http://127.0.0.1:18734/c/opaque")
+            Some("https://abcdefghijklmnopqrstuvwxyz.relay.bloom.directory/ceremony#opaque")
         );
         projection
             .reconcile_custody(
@@ -4116,7 +4568,10 @@ mod tests {
                     operation_id: OperationId::from_bytes([4; 32]),
                     state: CeremonyState::AwaitingUser,
                     expires_at_ms: DecimalU64::new(2_000),
-                    ceremony_url: Some("http://127.0.0.1:18734/c/opaque".into()),
+                    ceremony_url: Some(
+                        "https://abcdefghijklmnopqrstuvwxyz.relay.bloom.directory/ceremony#opaque"
+                            .into(),
+                    ),
                     receipt_digest: None,
                 },
                 1_999,
@@ -4156,7 +4611,8 @@ mod tests {
         let approval = SealedApprovalPrepareResponse {
             approval_id: digest(10),
             state: ApprovalPrepareState::AwaitingCeremony,
-            ceremony_url: "http://127.0.0.1:18734/c/approval".into(),
+            ceremony_url:
+                "https://abcdefghijklmnopqrstuvwxyz.relay.bloom.directory/ceremony#approval".into(),
             ceremony_expires_at_ms: DecimalU64::new(3_000),
             review_manifest_digest: digest(11),
         };
@@ -4207,6 +4663,25 @@ mod tests {
         assert!(status.ceremony_url.is_some());
         let rebuilt = CeremonyProjection::from_custody_status(&status, 8_000).unwrap();
         assert_eq!(rebuilt.ceremony_url(), status.ceremony_url.as_deref());
+
+        // A remote browser consumed the capability, or the status raced the
+        // expiry sweep: the ceremony stays awaiting with no launch URL.
+        let expiry = status.expires_at_ms.get();
+        let opened = CeremonyPublicStatus {
+            ceremony_url: None,
+            ..status.clone()
+        };
+        for (candidate, now_ms) in [(&opened, 8_000), (&status, expiry)] {
+            let rebuilt = CeremonyProjection::from_custody_status(candidate, now_ms).unwrap();
+            assert_eq!(
+                rebuilt.state(),
+                Some(CeremonyProjectionState::Custody(
+                    CeremonyState::AwaitingUser
+                ))
+            );
+            assert_eq!(rebuilt.ceremony_url(), None);
+            assert_eq!(rebuilt.expires_at_ms(), None);
+        }
 
         let cancelled = client.cancel_ceremony(operation_id.clone()).await.unwrap();
         assert_eq!(cancelled.operation_id, operation_id);
@@ -4331,11 +4806,14 @@ mod tests {
         let client = MachineBrokerClient::new(broker);
 
         let approval = ApprovalPrepareRequest {
+            surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
+            evm_review_payloads: Vec::new(),
             operation_id: OperationId::from_bytes([94; 32]),
             terms: approval_terms("wallet", None),
             canonical_plan_facts_digest: digest(95),
             petal_use_claim: None,
             system_use_claim: None,
+            requested_review_mode: None,
         };
         assert_eq!(
             client.prepare_approval(approval).await.unwrap_err().code,
@@ -4373,6 +4851,7 @@ mod tests {
         );
 
         let custody = CustodyPrepareRequest {
+            surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             ceremony_kind: CeremonyKind::WalletImport,
             custody_operation_id: OperationId::from_bytes([97; 32]),
             wallet_id: None,
@@ -4521,6 +5000,73 @@ mod tests {
             requests[4],
             MachineBrokerRequest::SealedApprovalRevokeAll(revoke_all)
         );
+    }
+
+    struct QuotaBroker {
+        calls: std::sync::atomic::AtomicUsize,
+        exhausted: std::sync::atomic::AtomicBool,
+    }
+
+    impl MachineBrokerService for QuotaBroker {
+        fn dispatch<'a>(
+            &'a self,
+            _request: MachineBrokerRequest,
+        ) -> ServiceFuture<'a, MachineBrokerResponse> {
+            use std::sync::atomic::Ordering;
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let exhausted = self.exhausted.load(Ordering::SeqCst);
+            Box::pin(async move {
+                if exhausted {
+                    Err(ProtocolError::new(
+                        ProtocolErrorCode::QuotaExceeded,
+                        "request rate quota exhausted",
+                    ))
+                } else {
+                    Ok(MachineBrokerResponse::WalletListPublic(vec![]))
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn quota_rejections_back_off_locally_and_reset_on_success() {
+        use std::sync::atomic::Ordering;
+        let broker = Arc::new(QuotaBroker {
+            calls: 0.into(),
+            exhausted: true.into(),
+        });
+        let client = MachineBrokerClient::new(broker.clone());
+        let expire_backoff = |client: &MachineBrokerClient| {
+            let mut state = client.quota_backoff.state.lock().unwrap();
+            let (delay, _) = state.unwrap();
+            *state = Some((delay, Instant::now()));
+            delay
+        };
+
+        // A burst of readers after one rejection never reaches Broker.
+        for _ in 0..10 {
+            let error = client.wallets().await.unwrap_err();
+            assert_eq!(error.code, ProtocolErrorCode::QuotaExceeded);
+        }
+        assert_eq!(broker.calls.load(Ordering::SeqCst), 1);
+
+        // Each rejected probe doubles the backoff up to its ceiling.
+        let mut delays = vec![expire_backoff(&client)];
+        for _ in 0..10 {
+            client.wallets().await.unwrap_err();
+            delays.push(expire_backoff(&client));
+        }
+        assert_eq!(delays[0], QUOTA_BACKOFF_INITIAL);
+        assert_eq!(delays[1], QUOTA_BACKOFF_INITIAL * 2);
+        assert_eq!(delays.last(), Some(&QUOTA_BACKOFF_MAXIMUM));
+        assert_eq!(broker.calls.load(Ordering::SeqCst), 11);
+
+        // Clones share the backoff, and one success clears it.
+        broker.exhausted.store(false, Ordering::SeqCst);
+        client.clone().wallets().await.unwrap();
+        assert!(client.quota_backoff.state.lock().unwrap().is_none());
+        client.wallets().await.unwrap();
+        assert_eq!(broker.calls.load(Ordering::SeqCst), 13);
     }
 
     struct MismatchedApprovalBroker;
@@ -5146,6 +5692,7 @@ mod tests {
         Arc::get_mut(&mut broker).unwrap().corrupt_response = true;
         let client = MachineBrokerClient::new(broker);
         let request = CustodyPrepareRequest {
+            surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             ceremony_kind: CeremonyKind::AccountAllocate,
             custody_operation_id: OperationId::from_bytes([77; 32]),
             wallet_id: Some(token("wallet")),

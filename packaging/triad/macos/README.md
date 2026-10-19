@@ -21,6 +21,12 @@ LaunchDaemons:
 - `com.bloom.broker.LOGIN_UID`, running as `bloom-broker-LOGIN_UID`;
 - `com.bloom.signer.LOGIN_UID`, running as `bloom-signer-LOGIN_UID`.
 
+Broker, Signer and the Machine LaunchAgent run with launchd's `Standard`
+process type because they answer the user's mount, CLI and ceremony requests.
+`Background` throttles CPU and disk I/O heavily enough that Machine's startup
+verification of its audit journal ran about 60 times slower. The session and
+containment monitors remain `Background`.
+
 Each daemon explicitly binds its Unix sockets inside endpoint directories
 owned by that service UID. The directories use distinct edge groups and mode
 `0710`; a service validates this metadata before publishing a `0660` socket.
@@ -54,8 +60,12 @@ service channels. Broker authenticates before binding the canonical ceremony
 listener; Signer authenticates before accepting RPC. Both drain and exit
 successfully on disconnect. The root containment monitor validates a returning
 session socket's enrolled UID, group, mode, and type and kickstarts only that
-enrollment's stopped Signer and Broker jobs. It does nothing while the
-sentinel is absent; the LaunchAgent itself has no system-job control authority.
+enrollment's stopped Signer and Broker jobs. Before publishing status or checking
+the sentinel, it recreates missing directories under `/private/var/run/bloom`
+using the pinned enrollment's principals and the installer's exact modes. This
+restores the volatile runtime after reboot; existing unsafe paths are rejected,
+not repaired. It never starts Signer or Broker while the sentinel is absent;
+the LaunchAgent itself has no system-job control authority.
 
 The global `com.bloom.machine` LaunchAgent runs `bloom serve --mount-home` for
 each enrolled login. Machine resolves the effective login's installed
