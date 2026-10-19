@@ -1,8 +1,8 @@
 {
   "schema": "bloom.clear-signing.route-inventory.v1",
   "date": "2026-10-19",
-  "broker_revision": "f0c933f35b08f731f0546f8ed37dd62e46e54b69",
-  "acceptance_scope_note": "User narrowed completion to Petals already enabled in Bloom; Pump.fun is excluded from the remaining acceptance scope. The wider source inventory below preserves historical work and is not an enabled-package list.",
+  "broker_revision": "b10cc950405261ba43e7e953e292507db97a47f7",
+  "acceptance_scope_note": "User narrowed completion to the five default-enabled Petals: Enso, Hyperliquid, Polymarket, NEAR Intents and Feedback. Pump.fun is excluded from the remaining acceptance scope. The wider source inventory below preserves historical work and is not an enabled-package list.",
   "scope": "All route source leaves at pinned default/candidate revisions, grouped by actual authority surface. A route file may be read-only, administrative, or share a handler. Lists do not prove every route executes a decoded transaction; coverage_status applies only to reading_scope, never to effects, identity, settlement or release acceptance. Unknown future targets/assets/layouts remain explicitly unknown.",
   "coverage_status_definitions": {
     "independently_read": "Broker reconstructs supported actual signing bytes. Does not establish code, state, market/asset identities or effects beyond the stated scope.",
@@ -13,9 +13,9 @@
   "petals": [
     {
       "petal": "enso",
-      "revision": "d38f0d7605fa358838953b2d74f8accafb5fa75e",
+      "revision": "7dea0c0528083cdd36ee0654ef13de2df50af18d",
       "source_kind": "pinned_candidate_pr_16",
-      "source_url": "https://github.com/bloom-directory/bloom-petal-enso/tree/d38f0d7605fa358838953b2d74f8accafb5fa75e",
+      "source_url": "https://github.com/bloom-directory/bloom-petal-enso/tree/7dea0c0528083cdd36ee0654ef13de2df50af18d",
       "coverage_status": "partial",
       "reading_scope": "Native/ERC-20 inputs, safe-route receiver and requested output balance-increase checks on all twelve accepted networks. Petal locally prepares same-chain safeRouteSingle/Multi preserving inner bytes; refresh preserves the reviewed calldata floor; settlement uses its actual minimum.",
       "limits": "Nested shortcut code/effects, runtime code, fees and cross-chain settlement. The same-chain output check constrains successful execution, not proof of received funds. Unknown token identities stay raw. 140 Petal tests and six private-EVM pinned-contract cases passed; no funded venue or physical owner acceptance.",
