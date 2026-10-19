@@ -1,0 +1,1346 @@
+{
+  "schema": "bloom.clear-signing.route-inventory.v1",
+  "date": "2026-10-19",
+  "broker_revision": "55c4b156d8608acd6666b3ea2f5caae3d9baa0e9",
+  "scope": "All route source leaves at pinned default/candidate revisions, grouped by actual authority surface. A route file may be read-only, administrative, or share a handler. Lists do not prove every route executes a decoded transaction; coverage_status applies only to reading_scope, never to effects, identity, settlement or release acceptance. Unknown future targets/assets/layouts remain explicitly unknown.",
+  "coverage_status_definitions": {
+    "independently_read": "Broker reconstructs supported actual signing bytes. Does not establish code, state, market/asset identities or effects beyond the stated scope.",
+    "partial": "Shared structural readers cover the stated fields; additional semantics/identities remain unresolved.",
+    "api_consent": "Consent uses API credentials, not wallet signing.",
+    "not_applicable": "No wallet signing/outbox capability at the pinned manifest."
+  },
+  "petals": [
+    {
+      "petal": "enso",
+      "revision": "7bbe03770721c7cfdbe6c7c34a9b1665ae2eec9f",
+      "source_kind": "pinned_default_branch",
+      "source_url": "https://github.com/bloom-directory/bloom-petal-enso/tree/7bbe03770721c7cfdbe6c7c34a9b1665ae2eec9f",
+      "coverage_status": "partial",
+      "reading_scope": "Native/ERC-20 source envelopes and shared approvals on eight compiled Router V2 deployments.",
+      "limits": "Shortcut bytecode effects, output, recipient, fees and settlement.",
+      "route_source_files": [
+        "route/files/$index.rs",
+        "route/files/README.md.rs",
+        "route/files/intents/$index.rs",
+        "route/files/intents/[wallet]/$index.rs",
+        "route/files/intents/[wallet]/[index]/$index.rs",
+        "route/files/intents/[wallet]/[index]/[id]/$index.rs",
+        "route/files/intents/[wallet]/[index]/[id]/abandon.rs",
+        "route/files/intents/[wallet]/[index]/[id]/confirm.rs",
+        "route/files/intents/[wallet]/[index]/[id]/destination_chain.txt.rs",
+        "route/files/intents/[wallet]/[index]/[id]/intent.txt.rs",
+        "route/files/intents/[wallet]/[index]/[id]/outbox.json.rs",
+        "route/files/intents/[wallet]/[index]/[id]/plan.md.rs",
+        "route/files/intents/[wallet]/[index]/[id]/policy_check.json.rs",
+        "route/files/intents/[wallet]/[index]/[id]/receipt.json.rs",
+        "route/files/intents/[wallet]/[index]/[id]/review_intent.json.rs",
+        "route/files/intents/[wallet]/[index]/[id]/route.json.rs",
+        "route/files/intents/[wallet]/[index]/[id]/settlement.json.rs",
+        "route/files/intents/[wallet]/[index]/[id]/simulation.json.rs",
+        "route/files/intents/[wallet]/[index]/[id]/status.json.rs",
+        "route/files/intents/[wallet]/[index]/[id]/tx.json.rs",
+        "route/files/intents/[wallet]/[index]/[id]/wait_settlement.json.rs",
+        "route/files/intents/[wallet]/[index]/latest.rs",
+        "route/files/intents/[wallet]/[index]/new.rs",
+        "route/files/meta/$index.rs",
+        "route/files/meta/route-contract.json.rs",
+        "route/files/settings/$index.rs",
+        "route/files/settings/[wallet]/$index.rs",
+        "route/files/settings/[wallet]/[index]/$index.rs",
+        "route/files/settings/[wallet]/[index]/venue.toml.rs",
+        "route/files/settings/api-key.rs",
+        "route/files/settings/status.json.rs"
+      ],
+      "capabilities": [
+        "bloom:http",
+        "bloom:store",
+        "bloom:tx.outbox",
+        "bloom:chain",
+        "bloom:vfs.read"
+      ],
+      "declared_signing_intents": []
+    },
+    {
+      "petal": "flights",
+      "revision": "414e451d36a0445b015936cf839cec7c45fc60ba",
+      "source_kind": "pinned_default_branch",
+      "source_url": "https://github.com/bloom-directory/bloom-petal-flights/tree/414e451d36a0445b015936cf839cec7c45fc60ba",
+      "coverage_status": "not_applicable",
+      "reading_scope": "HTTP/store routes; no wallet signing or outbox authority.",
+      "limits": "Airline checkout consent is outside wallet clear signing.",
+      "route_source_files": [
+        "route/files/$index.rs",
+        "route/files/options.json.rs",
+        "route/files/search.json.rs",
+        "route/files/token.rs"
+      ],
+      "capabilities": [
+        "bloom:http",
+        "bloom:store"
+      ],
+      "declared_signing_intents": []
+    },
+    {
+      "petal": "gasless",
+      "revision": "36c6f5ce7b46e05aafdfeba8fd95e006c0c87f79",
+      "source_kind": "published_candidate",
+      "source_url": "https://github.com/bloom-directory/bloom-petal-gasless/tree/36c6f5ce7b46e05aafdfeba8fd95e006c0c87f79",
+      "coverage_status": "independently_read",
+      "reading_scope": "ERC-3009 signed owner, token/debit, payee, validity and nonce.",
+      "limits": "Funded relay, destination/output and settlement acceptance.",
+      "route_source_files": [
+        "route/files/$index.rs",
+        "route/files/status.json.rs",
+        "route/files/transactions/$index.rs",
+        "route/files/transactions/[wallet]/$index.rs",
+        "route/files/transactions/[wallet]/[index]/$index.rs",
+        "route/files/transactions/[wallet]/[index]/[id].json.rs"
+      ],
+      "capabilities": [
+        "bloom:http",
+        "bloom:store",
+        "bloom:sign",
+        "bloom:vfs.read"
+      ],
+      "declared_signing_intents": [
+        "gasless.relay"
+      ]
+    },
+    {
+      "petal": "hyperliquid",
+      "revision": "2390d3ad3d63f980260e63188db97932f7090306",
+      "source_kind": "published_candidate",
+      "source_url": "https://github.com/bloom-directory/bloom-petal-hyperliquid/tree/2390d3ad3d63f980260e63188db97932f7090306",
+      "coverage_status": "independently_read",
+      "reading_scope": "Full supported owner typed messages and delegated ordered action/preimage reconstruction.",
+      "limits": "Market identity, venue effects/fills and session-local caps; delegated real-service acceptance.",
+      "route_source_files": [
+        "route/files/$index.rs",
+        "route/files/[network]/$index.rs",
+        "route/files/[network]/agent_sessions/$index.rs",
+        "route/files/[network]/agent_sessions/[wallet]/$index.rs",
+        "route/files/[network]/agent_sessions/[wallet]/[index]/$index.rs",
+        "route/files/[network]/agent_sessions/[wallet]/[index]/[session]/$index.rs",
+        "route/files/[network]/agent_sessions/[wallet]/[index]/[session]/audit.jsonl.rs",
+        "route/files/[network]/agent_sessions/[wallet]/[index]/[session]/cancel.json.rs",
+        "route/files/[network]/agent_sessions/[wallet]/[index]/[session]/cancel_all.rs",
+        "route/files/[network]/agent_sessions/[wallet]/[index]/[session]/close_all.rs",
+        "route/files/[network]/agent_sessions/[wallet]/[index]/[session]/last_error.json.rs",
+        "route/files/[network]/agent_sessions/[wallet]/[index]/[session]/last_response.json.rs",
+        "route/files/[network]/agent_sessions/[wallet]/[index]/[session]/order.json.rs",
+        "route/files/[network]/agent_sessions/[wallet]/[index]/[session]/plan.md.rs",
+        "route/files/[network]/agent_sessions/[wallet]/[index]/[session]/receipts/$index.rs",
+        "route/files/[network]/agent_sessions/[wallet]/[index]/[session]/receipts/[cloid]/$index.rs",
+        "route/files/[network]/agent_sessions/[wallet]/[index]/[session]/receipts/[cloid]/cancel.json.rs",
+        "route/files/[network]/agent_sessions/[wallet]/[index]/[session]/receipts/[cloid]/order.json.rs",
+        "route/files/[network]/agent_sessions/[wallet]/[index]/[session]/schedule_cancel.json.rs",
+        "route/files/[network]/agent_sessions/[wallet]/[index]/[session]/session.json.rs",
+        "route/files/[network]/agent_sessions/[wallet]/[index]/[session]/status.json.rs",
+        "route/files/[network]/agent_sessions/[wallet]/[index]/[session]/stop.rs",
+        "route/files/[network]/agent_sessions/[wallet]/[index]/[session]/update_leverage.json.rs",
+        "route/files/[network]/agent_sessions/[wallet]/[index]/last_error.json.rs",
+        "route/files/[network]/agent_sessions/[wallet]/[index]/new.json.rs",
+        "route/files/[network]/asset_contexts/$index.rs",
+        "route/files/[network]/asset_contexts/[coin].json.rs",
+        "route/files/[network]/books/$index.rs",
+        "route/files/[network]/books/[coin].json.rs",
+        "route/files/[network]/candles/$index.rs",
+        "route/files/[network]/candles/[coin]/$index.rs",
+        "route/files/[network]/candles/[coin]/[interval].json.rs",
+        "route/files/[network]/exchange/$index.rs",
+        "route/files/[network]/exchange/[wallet]/$index.rs",
+        "route/files/[network]/exchange/[wallet]/[index]/$index.rs",
+        "route/files/[network]/exchange/[wallet]/[index]/cancel.json.rs",
+        "route/files/[network]/exchange/[wallet]/[index]/cancel_by_cloid.json.rs",
+        "route/files/[network]/exchange/[wallet]/[index]/last_response.json.rs",
+        "route/files/[network]/exchange/[wallet]/[index]/order.json.rs",
+        "route/files/[network]/exchange/[wallet]/[index]/raw_signed.json.rs",
+        "route/files/[network]/exchange/[wallet]/[index]/schedule_cancel.json.rs",
+        "route/files/[network]/exchange/[wallet]/[index]/send_asset.json.rs",
+        "route/files/[network]/exchange/[wallet]/[index]/update_leverage.json.rs",
+        "route/files/[network]/exchange/[wallet]/[index]/usd_class_transfer.json.rs",
+        "route/files/[network]/exchange/[wallet]/[index]/usd_send.json.rs",
+        "route/files/[network]/exchange/[wallet]/[index]/withdraw.json.rs",
+        "route/files/[network]/exchange/[wallet]/[index]/withdrawals/$index.rs",
+        "route/files/[network]/exchange/[wallet]/[index]/withdrawals/[nonce].json.rs",
+        "route/files/[network]/funding_history/$index.rs",
+        "route/files/[network]/funding_history/[coin].json.rs",
+        "route/files/[network]/mids.json.rs",
+        "route/files/[network]/perp_contexts.json.rs",
+        "route/files/[network]/perp_meta.json.rs",
+        "route/files/[network]/predicted_fundings.json.rs",
+        "route/files/[network]/recent_trades/$index.rs",
+        "route/files/[network]/recent_trades/[coin].json.rs",
+        "route/files/[network]/spot_contexts.json.rs",
+        "route/files/[network]/spot_meta.json.rs",
+        "route/files/[network]/status.json.rs",
+        "route/files/[network]/users/$index.rs",
+        "route/files/[network]/users/[account]/$index.rs",
+        "route/files/[network]/users/[account]/active_asset_data/$index.rs",
+        "route/files/[network]/users/[account]/active_asset_data/[coin].json.rs",
+        "route/files/[network]/users/[account]/clearinghouse.json.rs",
+        "route/files/[network]/users/[account]/extra_agents.json.rs",
+        "route/files/[network]/users/[account]/fills.json.rs",
+        "route/files/[network]/users/[account]/frontend_open_orders.json.rs",
+        "route/files/[network]/users/[account]/funding/$index.rs",
+        "route/files/[network]/users/[account]/funding/[coin].json.rs",
+        "route/files/[network]/users/[account]/open_orders.json.rs",
+        "route/files/[network]/users/[account]/portfolio.json.rs",
+        "route/files/[network]/users/[account]/rate_limit.json.rs",
+        "route/files/[network]/users/[account]/spot_state.json.rs",
+        "route/files/asset_ids.md.rs"
+      ],
+      "capabilities": [
+        "bloom:http",
+        "bloom:store",
+        "bloom:sign",
+        "bloom:key.derive"
+      ],
+      "declared_signing_intents": [
+        "hyperliquid.approve_agent",
+        "hyperliquid.agent_action",
+        "hyperliquid.usd_send",
+        "hyperliquid.usd_class_transfer",
+        "hyperliquid.withdraw",
+        "hyperliquid.order",
+        "hyperliquid.cancel",
+        "hyperliquid.cancel_by_cloid",
+        "hyperliquid.schedule_cancel",
+        "hyperliquid.update_leverage"
+      ]
+    },
+    {
+      "petal": "morpho",
+      "revision": "d504bf08140b9d6e0270e010defc0cff74bf03d0",
+      "source_kind": "pinned_default_branch",
+      "source_url": "https://github.com/bloom-directory/bloom-petal-morpho/tree/d504bf08140b9d6e0270e010defc0cff74bf03d0",
+      "coverage_status": "partial",
+      "reading_scope": "ERC-4626/Bundler calls; exact reviewed Base vault-underlying binding.",
+      "limits": "Other vault/share identities, route effect and final-set acceptance.",
+      "route_source_files": [
+        "route/files/$index.rs",
+        "route/files/README.md.rs",
+        "route/files/[chain]/$index.rs",
+        "route/files/[chain]/actions/$index.rs",
+        "route/files/[chain]/actions/[wallet]/$index.rs",
+        "route/files/[chain]/actions/[wallet]/[id]/$index.rs",
+        "route/files/[chain]/actions/[wallet]/[id]/confirm.rs",
+        "route/files/[chain]/actions/[wallet]/[id]/draft.json.rs",
+        "route/files/[chain]/actions/[wallet]/[id]/plan.md.rs",
+        "route/files/[chain]/actions/[wallet]/[id]/status.json.rs",
+        "route/files/[chain]/markets/$index.rs",
+        "route/files/[chain]/markets/[market].json.rs",
+        "route/files/[chain]/positions/$index.rs",
+        "route/files/[chain]/positions/[wallet].json.rs",
+        "route/files/[chain]/vaults/$index.rs",
+        "route/files/[chain]/vaults/[vault].json.rs",
+        "route/files/status.json.rs"
+      ],
+      "capabilities": [
+        "bloom:http",
+        "bloom:store",
+        "bloom:chain",
+        "bloom:tx.outbox",
+        "bloom:vfs.read"
+      ],
+      "declared_signing_intents": []
+    },
+    {
+      "petal": "polymarket",
+      "revision": "cca3d5b11e1a0c2c270cfb309eba3481e08d32d5",
+      "source_kind": "published_candidate",
+      "source_url": "https://github.com/bloom-directory/bloom-petal-polymarket/tree/cca3d5b11e1a0c2c270cfb309eba3481e08d32d5",
+      "coverage_status": "partial",
+      "reading_scope": "ERC-7739 orders, DepositWallet batches, known nested calls and versioned CLOB authentication.",
+      "limits": "Market/outcome identity and units, wallet implementation/ownership, unknown calls and funded venue effects.",
+      "route_source_files": [
+        "route/files/$index.rs",
+        "route/files/account/$index.rs",
+        "route/files/account/[wallet]/$index.rs",
+        "route/files/account/[wallet]/[index]/$index.rs",
+        "route/files/account/[wallet]/[index]/buying_power.json.rs",
+        "route/files/account/[wallet]/[index]/funding_options.json.rs",
+        "route/files/account/[wallet]/[index]/orders.json.rs",
+        "route/files/account/[wallet]/[index]/portfolio.json.rs",
+        "route/files/account/[wallet]/[index]/status.json.rs",
+        "route/files/builder-keys/$index.rs",
+        "route/files/builder-keys/[wallet]/$index.rs",
+        "route/files/builder-keys/[wallet]/[index]/$index.rs",
+        "route/files/builder-keys/[wallet]/[index]/keys.json.rs",
+        "route/files/builder-keys/[wallet]/[index]/revoke.rs",
+        "route/files/fund/$index.rs",
+        "route/files/fund/[wallet]/$index.rs",
+        "route/files/fund/[wallet]/[index]/$index.rs",
+        "route/files/fund/[wallet]/[index]/[id]/$index.rs",
+        "route/files/fund/[wallet]/[index]/[id]/approval.json.rs",
+        "route/files/fund/[wallet]/[index]/[id]/confirm.rs",
+        "route/files/fund/[wallet]/[index]/[id]/plan.md.rs",
+        "route/files/fund/[wallet]/[index]/[id]/request.json.rs",
+        "route/files/fund/[wallet]/[index]/[id]/review_intent.json.rs",
+        "route/files/fund/[wallet]/[index]/[id]/status.json.rs",
+        "route/files/fund/[wallet]/[index]/new.rs",
+        "route/files/markets/$index.rs",
+        "route/files/markets/[slug]/$index.rs",
+        "route/files/markets/[slug]/book.json.rs",
+        "route/files/markets/[slug]/market.json.rs",
+        "route/files/markets/[slug]/prices.json.rs",
+        "route/files/meta/$index.rs",
+        "route/files/meta/route-contract.json.rs",
+        "route/files/obligations/$index.rs",
+        "route/files/obligations/[wallet]/$index.rs",
+        "route/files/obligations/[wallet]/[index]/$index.rs",
+        "route/files/obligations/[wallet]/[index]/status.json.rs",
+        "route/files/onboard/$index.rs",
+        "route/files/onboard/[wallet]/$index.rs",
+        "route/files/onboard/[wallet]/[index]/$index.rs",
+        "route/files/onboard/[wallet]/[index]/approval.json.rs",
+        "route/files/onboard/[wallet]/[index]/approvals.json.rs",
+        "route/files/onboard/[wallet]/[index]/begin.rs",
+        "route/files/onboard/[wallet]/[index]/plan.md.rs",
+        "route/files/onboard/[wallet]/[index]/review_intent.json.rs",
+        "route/files/onboard/[wallet]/[index]/review_relayer_intent.json.rs",
+        "route/files/onboard/[wallet]/[index]/status.json.rs",
+        "route/files/positions/$index.rs",
+        "route/files/positions/[wallet]/$index.rs",
+        "route/files/positions/[wallet]/[index]/$index.rs",
+        "route/files/positions/[wallet]/[index]/activity.json.rs",
+        "route/files/positions/[wallet]/[index]/positions.json.rs",
+        "route/files/positions/[wallet]/[index]/trades.json.rs",
+        "route/files/redeem/$index.rs",
+        "route/files/redeem/[wallet]/$index.rs",
+        "route/files/redeem/[wallet]/[index]/$index.rs",
+        "route/files/redeem/[wallet]/[index]/[slug]/$index.rs",
+        "route/files/redeem/[wallet]/[index]/[slug]/approval.json.rs",
+        "route/files/redeem/[wallet]/[index]/[slug]/confirm.rs",
+        "route/files/redeem/[wallet]/[index]/[slug]/plan.md.rs",
+        "route/files/redeem/[wallet]/[index]/[slug]/receipt.json.rs",
+        "route/files/redeem/[wallet]/[index]/[slug]/review_intent.json.rs",
+        "route/files/revoke-approvals/$index.rs",
+        "route/files/revoke-approvals/[wallet]/$index.rs",
+        "route/files/revoke-approvals/[wallet]/[index]/$index.rs",
+        "route/files/revoke-approvals/[wallet]/[index]/request/$index.rs",
+        "route/files/revoke-approvals/[wallet]/[index]/request/approval.json.rs",
+        "route/files/revoke-approvals/[wallet]/[index]/request/confirm.rs",
+        "route/files/revoke-approvals/[wallet]/[index]/request/plan.md.rs",
+        "route/files/revoke-approvals/[wallet]/[index]/request/receipt.json.rs",
+        "route/files/revoke-approvals/[wallet]/[index]/request/review_intent.json.rs",
+        "route/files/search/$index.rs",
+        "route/files/search/[query].rs",
+        "route/files/settings/$index.rs",
+        "route/files/settings/[wallet]/$index.rs",
+        "route/files/settings/[wallet]/[index]/$index.rs",
+        "route/files/settings/[wallet]/[index]/relayer.json.rs",
+        "route/files/settings/[wallet]/[index]/venue.toml.rs",
+        "route/files/settings/enso-api-key.rs",
+        "route/files/trade/$index.rs",
+        "route/files/trade/[wallet]/$index.rs",
+        "route/files/trade/[wallet]/[index]/$index.rs",
+        "route/files/trade/[wallet]/[index]/drafts/$index.rs",
+        "route/files/trade/[wallet]/[index]/drafts/[id]/$index.rs",
+        "route/files/trade/[wallet]/[index]/drafts/[id]/approval.json.rs",
+        "route/files/trade/[wallet]/[index]/drafts/[id]/order.json.rs",
+        "route/files/trade/[wallet]/[index]/drafts/[id]/plan.md.rs",
+        "route/files/trade/[wallet]/[index]/drafts/[id]/policy_check.json.rs",
+        "route/files/trade/[wallet]/[index]/drafts/[id]/post.rs",
+        "route/files/trade/[wallet]/[index]/drafts/[id]/post_attempt.json.rs",
+        "route/files/trade/[wallet]/[index]/drafts/[id]/quote.json.rs",
+        "route/files/trade/[wallet]/[index]/drafts/[id]/revalidate.rs",
+        "route/files/trade/[wallet]/[index]/drafts/[id]/review_intent.json.rs",
+        "route/files/trade/[wallet]/[index]/new.rs",
+        "route/files/trade/[wallet]/[index]/orders/$index.rs",
+        "route/files/trade/[wallet]/[index]/orders/[clob-order-id]/$index.rs",
+        "route/files/trade/[wallet]/[index]/orders/[clob-order-id]/cancel.rs",
+        "route/files/trade/[wallet]/[index]/receipts/$index.rs",
+        "route/files/trade/[wallet]/[index]/receipts/[id]/$index.rs",
+        "route/files/trade/[wallet]/[index]/receipts/[id]/cancel.rs",
+        "route/files/trade/[wallet]/[index]/receipts/[id]/receipt.json.rs",
+        "route/files/withdraw/$index.rs",
+        "route/files/withdraw/[wallet]/$index.rs",
+        "route/files/withdraw/[wallet]/[index]/$index.rs",
+        "route/files/withdraw/[wallet]/[index]/pusd/$index.rs",
+        "route/files/withdraw/[wallet]/[index]/pusd/approval.json.rs",
+        "route/files/withdraw/[wallet]/[index]/pusd/confirm.rs",
+        "route/files/withdraw/[wallet]/[index]/pusd/plan.md.rs",
+        "route/files/withdraw/[wallet]/[index]/pusd/receipt.json.rs",
+        "route/files/withdraw/[wallet]/[index]/pusd/review_intent.json.rs"
+      ],
+      "capabilities": [
+        "bloom:http",
+        "bloom:store",
+        "bloom:sign",
+        "bloom:tx.outbox",
+        "bloom:chain",
+        "bloom:vfs.read",
+        "bloom:vfs.write"
+      ],
+      "declared_signing_intents": [
+        "polymarket.clob_auth.v1",
+        "polymarket.onboard",
+        "polymarket.order.poly1271",
+        "polymarket.relayer_batch"
+      ]
+    },
+    {
+      "petal": "privacy-pools",
+      "revision": "c2ef8b3e6e03735999308c63ed132ad741e6dbe4",
+      "source_kind": "pinned_default_branch",
+      "source_url": "https://github.com/bloom-directory/bloom-petal-privacy-pools/tree/c2ef8b3e6e03735999308c63ed132ad741e6dbe4",
+      "coverage_status": "partial",
+      "reading_scope": "Mainnet native deposits/direct withdrawals with proof words, required caller and recipient.",
+      "limits": "Proof validity, relay companion semantics, fees and settlement; keep private notes out of agent logs.",
+      "route_source_files": [
+        "route/files/$index.rs",
+        "route/files/deposits/$index.rs",
+        "route/files/deposits/[wallet]/$index.rs",
+        "route/files/deposits/[wallet]/[id].json.rs",
+        "route/files/notes/$index.rs",
+        "route/files/notes/[wallet]/$index.rs",
+        "route/files/notes/[wallet]/[id].json.rs",
+        "route/files/pool/$index.rs",
+        "route/files/pool/config.json.rs",
+        "route/files/pool/state.json.rs",
+        "route/files/protocol.json.rs",
+        "route/files/status.json.rs",
+        "route/files/withdrawals/$index.rs",
+        "route/files/withdrawals/[wallet]/$index.rs",
+        "route/files/withdrawals/[wallet]/[id].json.rs"
+      ],
+      "capabilities": [
+        "bloom:store",
+        "bloom:tx.outbox",
+        "bloom:chain",
+        "bloom:vfs.read",
+        "bloom:private-input"
+      ],
+      "declared_signing_intents": []
+    },
+    {
+      "petal": "pumpfun",
+      "revision": "9f0dd3fb68bef2173e9f9f2e1c49dccaf440ea00",
+      "source_kind": "pinned_default_branch",
+      "source_url": "https://github.com/bloom-directory/bloom-petal-pumpfun/tree/9f0dd3fb68bef2173e9f9f2e1c49dccaf440ea00",
+      "coverage_status": "independently_read",
+      "reading_scope": "Legacy/v0 actual message; 16 Pump/PumpSwap layouts plus System/Compute Budget/ATA/SPL. One-operation review binds all bytes except recent blockhash.",
+      "limits": "Lookup table contents, cluster/freshness, mint metadata/decimals, program code/CPI and live trade effects. Unknown instruction layouts retain raw bytes.",
+      "route_source_files": [
+        "route/files/$index.rs",
+        "route/files/README.md.rs",
+        "route/files/coins/$index.rs",
+        "route/files/coins/[mint].html.rs",
+        "route/files/coins/[mint].json.rs",
+        "route/files/coins/[mint].md.rs",
+        "route/files/coins/latest.html.rs",
+        "route/files/coins/latest.json.rs",
+        "route/files/coins/latest.md.rs",
+        "route/files/coins/live.html.rs",
+        "route/files/coins/live.json.rs",
+        "route/files/coins/live.md.rs",
+        "route/files/index.html.rs",
+        "route/files/market/$index.rs",
+        "route/files/market/[mint]/$index.rs",
+        "route/files/market/[mint]/candles.json.rs",
+        "route/files/market/[mint]/trades.json.rs",
+        "route/files/status.json.rs",
+        "route/files/trade/$index.rs",
+        "route/files/trade/[wallet]/$index.rs",
+        "route/files/trade/[wallet]/[index]/$index.rs",
+        "route/files/trade/[wallet]/[index]/buy.json.rs",
+        "route/files/trade/[wallet]/[index]/close_token_account.json.rs",
+        "route/files/trade/[wallet]/[index]/holdings.html.rs",
+        "route/files/trade/[wallet]/[index]/holdings.json.rs",
+        "route/files/trade/[wallet]/[index]/holdings.md.rs",
+        "route/files/trade/[wallet]/[index]/launch.json.rs",
+        "route/files/trade/[wallet]/[index]/operations/$index.rs",
+        "route/files/trade/[wallet]/[index]/operations/[operation].json.rs",
+        "route/files/trade/[wallet]/[index]/preflight.json.rs",
+        "route/files/trade/[wallet]/[index]/sell.json.rs"
+      ],
+      "capabilities": [
+        "bloom:http",
+        "bloom:store",
+        "bloom:sign",
+        "bloom:vfs.read"
+      ],
+      "declared_signing_intents": [
+        "pumpfun.buy",
+        "pumpfun.sell",
+        "pumpfun.close_token_account",
+        "pumpfun.launch"
+      ]
+    },
+    {
+      "petal": "robinhood",
+      "revision": "8cab93a32ea8d34189d91ea965bf684546ce1e3b",
+      "source_kind": "pinned_default_branch",
+      "source_url": "https://github.com/bloom-directory/bloom-petal-robinhood/tree/8cab93a32ea8d34189d91ea965bf684546ce1e3b",
+      "coverage_status": "partial",
+      "reading_scope": "Shared exact ERC-20 transfer fields and compiled exact Stock Token metadata.",
+      "limits": "Issuer/recipient route acceptance and live effects.",
+      "route_source_files": [
+        "route/files/$index.rs",
+        "route/files/README.md.rs",
+        "route/files/activity.json.rs",
+        "route/files/assets/$index.rs",
+        "route/files/assets/[symbol].json.rs",
+        "route/files/corporate_actions.json.rs",
+        "route/files/portfolio/$index.rs",
+        "route/files/portfolio/[wallet].json.rs",
+        "route/files/prices/$index.rs",
+        "route/files/prices/[symbol].json.rs",
+        "route/files/prices/all.json.rs",
+        "route/files/status.json.rs",
+        "route/files/transfers/$index.rs",
+        "route/files/transfers/[wallet]/$index.rs",
+        "route/files/transfers/[wallet]/[id]/$index.rs",
+        "route/files/transfers/[wallet]/[id]/confirm.rs",
+        "route/files/transfers/[wallet]/[id]/draft.json.rs",
+        "route/files/transfers/[wallet]/[id]/plan.md.rs",
+        "route/files/transfers/[wallet]/[id]/status.json.rs"
+      ],
+      "capabilities": [
+        "bloom:http",
+        "bloom:store",
+        "bloom:chain",
+        "bloom:tx.outbox",
+        "bloom:vfs.read"
+      ],
+      "declared_signing_intents": []
+    },
+    {
+      "petal": "safe",
+      "revision": "5e7d29f560810eb149d8520c21ccedf1ee0f1c69",
+      "source_kind": "published_candidate",
+      "source_url": "https://github.com/bloom-directory/bloom-petal-safe/tree/5e7d29f560810eb149d8520c21ccedf1ee0f1c69",
+      "coverage_status": "partial",
+      "reading_scope": "Supported Safe setup, signatures, execution, call-only batches/deployments and owner/threshold changes; bounded fork evidence.",
+      "limits": "Final physical-passkey/hosted-service acceptance; unsupported delegatecall/module/guard/fallback/refund features remain refused.",
+      "route_source_files": [
+        "route/files/$index.rs",
+        "route/files/README.md.rs",
+        "route/files/deployments/$index.rs",
+        "route/files/deployments/[wallet]/$index.rs",
+        "route/files/deployments/[wallet]/[index]/$index.rs",
+        "route/files/deployments/[wallet]/[index]/[safe_id].json.rs",
+        "route/files/safes/$index.rs",
+        "route/files/safes/[wallet]/$index.rs",
+        "route/files/safes/[wallet]/[index]/$index.rs",
+        "route/files/safes/[wallet]/[index]/[safe_id].json.rs",
+        "route/files/service-keys/$index.rs",
+        "route/files/service-keys/[wallet]/$index.rs",
+        "route/files/service-keys/[wallet]/[index]/$index.rs",
+        "route/files/service-keys/[wallet]/[index]/[safe_id].rs",
+        "route/files/status.json.rs",
+        "route/files/transactions/$index.rs",
+        "route/files/transactions/[wallet]/$index.rs",
+        "route/files/transactions/[wallet]/[index]/$index.rs",
+        "route/files/transactions/[wallet]/[index]/[id]/$index.rs",
+        "route/files/transactions/[wallet]/[index]/[id]/confirm.json.rs",
+        "route/files/transactions/[wallet]/[index]/[id]/discard.json.rs",
+        "route/files/transactions/[wallet]/[index]/[id]/draft.json.rs",
+        "route/files/transactions/[wallet]/[index]/[id]/execute.json.rs",
+        "route/files/transactions/[wallet]/[index]/[id]/plan.md.rs",
+        "route/files/transactions/[wallet]/[index]/[id]/status.json.rs"
+      ],
+      "capabilities": [
+        "bloom:http",
+        "bloom:store",
+        "bloom:sign",
+        "bloom:chain",
+        "bloom:tx.outbox",
+        "bloom:vfs.read"
+      ],
+      "declared_signing_intents": [
+        "safe.transaction.confirm"
+      ]
+    },
+    {
+      "petal": "venice-x402",
+      "revision": "e835527048883f803ce2f86d3c0d97adb0fdad03",
+      "source_kind": "published_candidate",
+      "source_url": "https://github.com/bloom-directory/bloom-petal-venice-x402/tree/e835527048883f803ce2f86d3c0d97adb0fdad03",
+      "coverage_status": "independently_read",
+      "reading_scope": "SIWE and ERC-3009 exact signatures, account binding and conservative uncertain-payment recovery.",
+      "limits": "Funded payment/inference and provider reconciliation acceptance.",
+      "route_source_files": [
+        "route/files/$index.rs",
+        "route/files/accounts/$index.rs",
+        "route/files/accounts/[wallet]/$index.rs",
+        "route/files/accounts/[wallet]/[index]/$index.rs",
+        "route/files/accounts/[wallet]/[index]/balance.json.rs",
+        "route/files/accounts/[wallet]/[index]/chat/[id].json.rs",
+        "route/files/accounts/[wallet]/[index]/topup.json.rs",
+        "route/files/models.json.rs",
+        "route/files/status.json.rs"
+      ],
+      "capabilities": [
+        "bloom:http",
+        "bloom:store",
+        "bloom:sign",
+        "bloom:vfs.read"
+      ],
+      "declared_signing_intents": [
+        "venice-x402.balance",
+        "venice-x402.topup",
+        "venice-x402.chat"
+      ]
+    },
+    {
+      "petal": "safetrade",
+      "revision": "f7d7d2f389614473b542ae7da4f5a17087be271b",
+      "source_kind": "published_candidate",
+      "source_url": "https://github.com/bloom-directory/bloom-petal-safetrade/tree/f7d7d2f389614473b542ae7da4f5a17087be271b",
+      "coverage_status": "api_consent",
+      "reading_scope": "API spot-order confirmation, exact confirmation body and durable at-most-once submission. No wallet signing.",
+      "limits": "Market identity/price/quantity/fees, live effects and ambiguous-outcome reconciliation. Market orders have no price ceiling.",
+      "route_source_files": [
+        "route/files/$index.rs",
+        "route/files/README.md.rs",
+        "route/files/account/$index.rs",
+        "route/files/account/me.json.rs",
+        "route/files/market/$index.rs",
+        "route/files/market/markets.json.rs",
+        "route/files/market/tickers.json.rs",
+        "route/files/orders/$index.rs",
+        "route/files/orders/drafts/$index.rs",
+        "route/files/orders/drafts/[id]/$index.rs",
+        "route/files/orders/drafts/[id]/confirm.rs",
+        "route/files/orders/drafts/[id]/draft.json.rs",
+        "route/files/orders/drafts/[id]/receipt.json.rs",
+        "route/files/orders/new.rs",
+        "route/files/settings/$index.rs",
+        "route/files/settings/api-credentials.rs",
+        "route/files/settings/status.json.rs",
+        "route/files/status.json.rs"
+      ],
+      "capabilities": [
+        "bloom:http",
+        "bloom:store"
+      ],
+      "declared_signing_intents": []
+    },
+    {
+      "petal": "near",
+      "revision": "4dc28dbe7a6d48435ff16dab7e24b33bd3d0b413",
+      "source_kind": "pinned_default_branch",
+      "source_url": "https://github.com/bloom-directory/bloom-petal-near/tree/4dc28dbe7a6d48435ff16dab7e24b33bd3d0b413",
+      "coverage_status": "partial",
+      "reading_scope": "Shared EVM native/ERC-20 source-transfer fields.",
+      "limits": "Deposit/refund identity, quote/deadline, destination route effects and settlement.",
+      "route_source_files": [
+        "route/files/$index.rs",
+        "route/files/meta/$index.rs",
+        "route/files/meta/route-contract.json.rs",
+        "route/files/settings/$index.rs",
+        "route/files/settings/api-key.rs",
+        "route/files/settings/status.json.rs",
+        "route/files/swaps/$index.rs",
+        "route/files/swaps/[wallet]/$index.rs",
+        "route/files/swaps/[wallet]/[index]/$index.rs",
+        "route/files/swaps/[wallet]/[index]/[id]/$index.rs",
+        "route/files/swaps/[wallet]/[index]/[id]/abandon.rs",
+        "route/files/swaps/[wallet]/[index]/[id]/approval.json.rs",
+        "route/files/swaps/[wallet]/[index]/[id]/confirm.rs",
+        "route/files/swaps/[wallet]/[index]/[id]/outbox.json.rs",
+        "route/files/swaps/[wallet]/[index]/[id]/plan.md.rs",
+        "route/files/swaps/[wallet]/[index]/[id]/policy_check.json.rs",
+        "route/files/swaps/[wallet]/[index]/[id]/quote.json.rs",
+        "route/files/swaps/[wallet]/[index]/[id]/receipt.json.rs",
+        "route/files/swaps/[wallet]/[index]/[id]/refresh.rs",
+        "route/files/swaps/[wallet]/[index]/[id]/request.json.rs",
+        "route/files/swaps/[wallet]/[index]/[id]/review_intent.json.rs",
+        "route/files/swaps/[wallet]/[index]/[id]/status.json.rs",
+        "route/files/swaps/[wallet]/[index]/latest.rs",
+        "route/files/swaps/[wallet]/[index]/new.rs",
+        "route/files/tokens.json.rs"
+      ],
+      "capabilities": [
+        "bloom:http",
+        "bloom:store",
+        "bloom:tx.outbox",
+        "bloom:chain",
+        "bloom:vfs.read"
+      ],
+      "declared_signing_intents": []
+    },
+    {
+      "petal": "feedback",
+      "revision": "b6aa2b64598a3cc7172e8136b34e3edddcddf2d4",
+      "source_kind": "pinned_default_branch",
+      "source_url": "https://github.com/bloom-directory/bloom-petal-feedback/tree/b6aa2b64598a3cc7172e8136b34e3edddcddf2d4",
+      "coverage_status": "not_applicable",
+      "reading_scope": "HTTP/store routes; no wallet signing or outbox authority.",
+      "limits": "Ordinary feedback consent remains separate.",
+      "route_source_files": [
+        "route/files/$index.rs",
+        "route/files/README.md.rs",
+        "route/files/receipts/$index.rs",
+        "route/files/receipts/[submission_id].json.rs",
+        "route/files/submit.json.rs"
+      ],
+      "capabilities": [
+        "bloom:http",
+        "bloom:store"
+      ],
+      "declared_signing_intents": []
+    }
+  ],
+  "evm_descriptors": [
+    {
+      "source_path": "crates/bloom-evm-clear-signing/catalogs/enso/router-v2.json",
+      "name": "Enso Router V2",
+      "context": {
+        "contract": {
+          "deployments": [
+            {
+              "chainId": 1,
+              "address": "0xf75584ef6673ad213a685a1b58cc0330b8ea22cf"
+            },
+            {
+              "chainId": 10,
+              "address": "0xf75584ef6673ad213a685a1b58cc0330b8ea22cf"
+            },
+            {
+              "chainId": 56,
+              "address": "0xf75584ef6673ad213a685a1b58cc0330b8ea22cf"
+            },
+            {
+              "chainId": 100,
+              "address": "0xf75584ef6673ad213a685a1b58cc0330b8ea22cf"
+            },
+            {
+              "chainId": 137,
+              "address": "0xf75584ef6673ad213a685a1b58cc0330b8ea22cf"
+            },
+            {
+              "chainId": 8453,
+              "address": "0xf75584ef6673ad213a685a1b58cc0330b8ea22cf"
+            },
+            {
+              "chainId": 42161,
+              "address": "0xf75584ef6673ad213a685a1b58cc0330b8ea22cf"
+            },
+            {
+              "chainId": 43114,
+              "address": "0xf75584ef6673ad213a685a1b58cc0330b8ea22cf"
+            }
+          ]
+        }
+      },
+      "functions": [
+        "routeSingle((uint8 tokenType,bytes data) tokenIn,bytes data)",
+        "routeMulti((uint8 tokenType,bytes data)[] tokensIn,bytes data)"
+      ],
+      "source_and_limits": "Enso Router V2 input envelopes only; Bloom ensoToken extension. Source: EnsoBuild/shortcuts-client-contracts 483408a3219451858abcd92c2f7b19a9783c14cc src/interfaces/IEnsoRouter.sol, src/router/EnsoRouter.sol and broadcast/EnsoRouterDeployer.s.sol/<chain>/run-latest.json. No runtime code or shortcut program attestation."
+    },
+    {
+      "source_path": "crates/bloom-evm-clear-signing/catalogs/morpho/bundler3.json",
+      "name": "Morpho Bundler3",
+      "context": {
+        "contract": {
+          "deployments": [
+            {
+              "chainId": 1,
+              "address": "0x6566194141eefa99Af43Bb5Aa71460Ca2Dc90245"
+            },
+            {
+              "chainId": 10,
+              "address": "0xFBCd3C258feB131D8E038F2A3a670A7bE0507C05"
+            },
+            {
+              "chainId": 137,
+              "address": "0x2d9C3A9E67c966C711208cc78b34fB9E9f8db589"
+            },
+            {
+              "chainId": 8453,
+              "address": "0x6BFd8137e702540E7A42B74178A4a49Ba43920C4"
+            },
+            {
+              "chainId": 42161,
+              "address": "0x1FA4431bC113D308beE1d46B0e98Cb805FB48C13"
+            }
+          ]
+        }
+      },
+      "functions": [
+        "multicall((address to, bytes data, uint256 value, bool skipRevert, bytes32 callbackHash)[] bundle)"
+      ],
+      "source_and_limits": "Derived from LedgerHQ/clear-signing-erc7730-registry registry/morpho/calldata-MorphoBundlerV3.json. Every call component is shown or fixed: no callbacks and no skipped reverts."
+    },
+    {
+      "source_path": "crates/bloom-evm-clear-signing/catalogs/morpho/general-adapter1.json",
+      "name": "Morpho GeneralAdapter1",
+      "context": {
+        "contract": {
+          "deployments": [
+            {
+              "chainId": 1,
+              "address": "0x4A6c312ec70E8747a587EE860a0353cd42Be0aE0"
+            },
+            {
+              "chainId": 10,
+              "address": "0x79481C87f24A3C4332442A2E9faaf675e5F141f0"
+            },
+            {
+              "chainId": 137,
+              "address": "0xB261B51938A9767406ef83bbFbaAFE16691b7047"
+            },
+            {
+              "chainId": 8453,
+              "address": "0xb98c948CFA24072e58935BC004a8A7b376AE746A"
+            },
+            {
+              "chainId": 42161,
+              "address": "0x9954aFB60BB5A222714c478ac86990F221788B88"
+            }
+          ]
+        }
+      },
+      "functions": [
+        "erc20TransferFrom(address token, address receiver, uint256 amount)",
+        "erc4626Deposit(address vault, uint256 assets, uint256 maxSharePriceE27, address receiver)"
+      ],
+      "source_and_limits": "Morpho GeneralAdapter1, as the Morpho Petal calls it through Bundler3."
+    },
+    {
+      "source_path": "crates/bloom-evm-clear-signing/catalogs/privacy-pools/entrypoint.json",
+      "name": "Privacy Pools Entrypoint",
+      "context": {
+        "contract": {
+          "deployments": [
+            {
+              "chainId": 1,
+              "address": "0x6818809eefce719e480a7526d76bd3e561526b46"
+            }
+          ]
+        }
+      },
+      "functions": [
+        "deposit(uint256 precommitment)"
+      ],
+      "source_and_limits": "Source: 0xbow-io/privacy-pools-core d494b63e79f33bb2b0c8ece6cdacdca465c3b884, packages/contracts/src/contracts. Mainnet addresses: bloom-petal-privacy-pools protocol.rs; listed bindings do not attest runtime code or proof validity."
+    },
+    {
+      "source_path": "crates/bloom-evm-clear-signing/catalogs/privacy-pools/eth-pool.json",
+      "name": "Privacy Pools ETH pool",
+      "context": {
+        "contract": {
+          "deployments": [
+            {
+              "chainId": 1,
+              "address": "0xf241d57c6debae225c0f2e6ea1529373c9a9c9fb"
+            }
+          ]
+        }
+      },
+      "functions": [
+        "withdraw((address processooor,bytes data) withdrawal,(uint256[2] pA,uint256[2][2] pB,uint256[2] pC,uint256[8] pubSignals) proof)"
+      ],
+      "source_and_limits": "Source: 0xbow-io/privacy-pools-core d494b63e79f33bb2b0c8ece6cdacdca465c3b884, packages/contracts/src/contracts. Mainnet addresses: bloom-petal-privacy-pools protocol.rs; listed bindings do not attest runtime code or proof validity."
+    },
+    {
+      "source_path": "crates/bloom-evm-clear-signing/catalogs/safe/create-call.json",
+      "name": "Safe CreateCall",
+      "context": {
+        "contract": {
+          "deployments": [
+            {
+              "chainId": 1,
+              "address": "0x7cbb62eaa69f79e6873cd1ecb2392971036cfaa4"
+            },
+            {
+              "chainId": 1,
+              "address": "0xb19d6ffc2182150f8eb585b79d4abcd7c5640a9d"
+            },
+            {
+              "chainId": 1,
+              "address": "0x9b35af71d77eaf8d7e40252370304687390a1a52"
+            },
+            {
+              "chainId": 1,
+              "address": "0x2ef5ecfbea521449e4de05edb1ce63b75eda90b4"
+            },
+            {
+              "chainId": 10,
+              "address": "0x7cbb62eaa69f79e6873cd1ecb2392971036cfaa4"
+            },
+            {
+              "chainId": 10,
+              "address": "0xb19d6ffc2182150f8eb585b79d4abcd7c5640a9d"
+            },
+            {
+              "chainId": 10,
+              "address": "0x9b35af71d77eaf8d7e40252370304687390a1a52"
+            },
+            {
+              "chainId": 10,
+              "address": "0x2ef5ecfbea521449e4de05edb1ce63b75eda90b4"
+            },
+            {
+              "chainId": 100,
+              "address": "0x7cbb62eaa69f79e6873cd1ecb2392971036cfaa4"
+            },
+            {
+              "chainId": 100,
+              "address": "0xb19d6ffc2182150f8eb585b79d4abcd7c5640a9d"
+            },
+            {
+              "chainId": 100,
+              "address": "0x9b35af71d77eaf8d7e40252370304687390a1a52"
+            },
+            {
+              "chainId": 100,
+              "address": "0x2ef5ecfbea521449e4de05edb1ce63b75eda90b4"
+            },
+            {
+              "chainId": 137,
+              "address": "0x7cbb62eaa69f79e6873cd1ecb2392971036cfaa4"
+            },
+            {
+              "chainId": 137,
+              "address": "0xb19d6ffc2182150f8eb585b79d4abcd7c5640a9d"
+            },
+            {
+              "chainId": 137,
+              "address": "0x9b35af71d77eaf8d7e40252370304687390a1a52"
+            },
+            {
+              "chainId": 137,
+              "address": "0x2ef5ecfbea521449e4de05edb1ce63b75eda90b4"
+            },
+            {
+              "chainId": 8453,
+              "address": "0x7cbb62eaa69f79e6873cd1ecb2392971036cfaa4"
+            },
+            {
+              "chainId": 8453,
+              "address": "0xb19d6ffc2182150f8eb585b79d4abcd7c5640a9d"
+            },
+            {
+              "chainId": 8453,
+              "address": "0x9b35af71d77eaf8d7e40252370304687390a1a52"
+            },
+            {
+              "chainId": 8453,
+              "address": "0x2ef5ecfbea521449e4de05edb1ce63b75eda90b4"
+            },
+            {
+              "chainId": 42161,
+              "address": "0x7cbb62eaa69f79e6873cd1ecb2392971036cfaa4"
+            },
+            {
+              "chainId": 42161,
+              "address": "0xb19d6ffc2182150f8eb585b79d4abcd7c5640a9d"
+            },
+            {
+              "chainId": 42161,
+              "address": "0x9b35af71d77eaf8d7e40252370304687390a1a52"
+            },
+            {
+              "chainId": 42161,
+              "address": "0x2ef5ecfbea521449e4de05edb1ce63b75eda90b4"
+            }
+          ]
+        }
+      },
+      "functions": [
+        "performCreate(uint256 value, bytes deploymentData)",
+        "performCreate2(uint256 value, bytes deploymentData, bytes32 salt)"
+      ],
+      "source_and_limits": "Safe's CreateCall library (1.3.0 twice, 1.4.1, 1.5.0), which a Safe delegatecalls to deploy a contract. Runtime code checked on each chain listed."
+    },
+    {
+      "source_path": "crates/bloom-evm-clear-signing/catalogs/safe/safe-proxy-factory.json",
+      "name": "Safe proxy factory",
+      "context": {
+        "$id": "SafeProxyFactory",
+        "contract": {
+          "deployments": [
+            {
+              "chainId": 1,
+              "address": "0xa6b71e26c5e0845f74c812102ca7114b6a896ab2"
+            },
+            {
+              "chainId": 1,
+              "address": "0xc22834581ebc8527d974f8a1c97e1bea4ef910bc"
+            },
+            {
+              "chainId": 1,
+              "address": "0x4e1dcf7ad4e460cfd30791ccc4f9c8a4f820ec67"
+            },
+            {
+              "chainId": 1,
+              "address": "0x14f2982d601c9458f93bd70b218933a6f8165e7b"
+            },
+            {
+              "chainId": 10,
+              "address": "0xa6b71e26c5e0845f74c812102ca7114b6a896ab2"
+            },
+            {
+              "chainId": 10,
+              "address": "0xc22834581ebc8527d974f8a1c97e1bea4ef910bc"
+            },
+            {
+              "chainId": 10,
+              "address": "0x4e1dcf7ad4e460cfd30791ccc4f9c8a4f820ec67"
+            },
+            {
+              "chainId": 10,
+              "address": "0x14f2982d601c9458f93bd70b218933a6f8165e7b"
+            },
+            {
+              "chainId": 100,
+              "address": "0xa6b71e26c5e0845f74c812102ca7114b6a896ab2"
+            },
+            {
+              "chainId": 100,
+              "address": "0xc22834581ebc8527d974f8a1c97e1bea4ef910bc"
+            },
+            {
+              "chainId": 100,
+              "address": "0x4e1dcf7ad4e460cfd30791ccc4f9c8a4f820ec67"
+            },
+            {
+              "chainId": 100,
+              "address": "0x14f2982d601c9458f93bd70b218933a6f8165e7b"
+            },
+            {
+              "chainId": 137,
+              "address": "0xa6b71e26c5e0845f74c812102ca7114b6a896ab2"
+            },
+            {
+              "chainId": 137,
+              "address": "0xc22834581ebc8527d974f8a1c97e1bea4ef910bc"
+            },
+            {
+              "chainId": 137,
+              "address": "0x4e1dcf7ad4e460cfd30791ccc4f9c8a4f820ec67"
+            },
+            {
+              "chainId": 137,
+              "address": "0x14f2982d601c9458f93bd70b218933a6f8165e7b"
+            },
+            {
+              "chainId": 8453,
+              "address": "0xa6b71e26c5e0845f74c812102ca7114b6a896ab2"
+            },
+            {
+              "chainId": 8453,
+              "address": "0xc22834581ebc8527d974f8a1c97e1bea4ef910bc"
+            },
+            {
+              "chainId": 8453,
+              "address": "0x4e1dcf7ad4e460cfd30791ccc4f9c8a4f820ec67"
+            },
+            {
+              "chainId": 8453,
+              "address": "0x14f2982d601c9458f93bd70b218933a6f8165e7b"
+            },
+            {
+              "chainId": 42161,
+              "address": "0xa6b71e26c5e0845f74c812102ca7114b6a896ab2"
+            },
+            {
+              "chainId": 42161,
+              "address": "0xc22834581ebc8527d974f8a1c97e1bea4ef910bc"
+            },
+            {
+              "chainId": 42161,
+              "address": "0x4e1dcf7ad4e460cfd30791ccc4f9c8a4f820ec67"
+            },
+            {
+              "chainId": 42161,
+              "address": "0x14f2982d601c9458f93bd70b218933a6f8165e7b"
+            }
+          ]
+        }
+      },
+      "functions": [
+        "createProxyWithNonce(address _singleton, bytes initializer, uint256 saltNonce)"
+      ],
+      "source_and_limits": "Bloom derivative of LedgerHQ/clear-signing-erc7730-registry registry/safe/common-SafeProxyFactory.json. The singleton is fixed to official Safe implementations by mustMatch."
+    },
+    {
+      "source_path": "crates/bloom-evm-clear-signing/catalogs/safe/safe.json",
+      "name": "Safe",
+      "context": {
+        "$id": "Safe",
+        "contract": {
+          "deployments": [
+            {
+              "chainId": 1,
+              "address": "0xd9db270c1b5e3bd161e8c8503c55ceabee709552"
+            },
+            {
+              "chainId": 1,
+              "address": "0x69f4d1788e39c87893c980c06edf4b7f686e2938"
+            },
+            {
+              "chainId": 1,
+              "address": "0x3e5c63644e683549055b9be8653de26e0b4cd36e"
+            },
+            {
+              "chainId": 1,
+              "address": "0xfb1bffc9d739b8d520daf37df666da4c687191ea"
+            },
+            {
+              "chainId": 1,
+              "address": "0x41675c099f32341bf84bfc5382af534df5c7461a"
+            },
+            {
+              "chainId": 1,
+              "address": "0x29fcb43b46531bca003ddc8fcb67ffe91900c762"
+            },
+            {
+              "chainId": 1,
+              "address": "0xff51a5898e281db6dfc7855790607438df2ca44b"
+            },
+            {
+              "chainId": 1,
+              "address": "0xedd160febbd92e350d4d398fb636302fccd67c7e"
+            },
+            {
+              "chainId": 10,
+              "address": "0xd9db270c1b5e3bd161e8c8503c55ceabee709552"
+            },
+            {
+              "chainId": 10,
+              "address": "0x69f4d1788e39c87893c980c06edf4b7f686e2938"
+            },
+            {
+              "chainId": 10,
+              "address": "0x3e5c63644e683549055b9be8653de26e0b4cd36e"
+            },
+            {
+              "chainId": 10,
+              "address": "0xfb1bffc9d739b8d520daf37df666da4c687191ea"
+            },
+            {
+              "chainId": 10,
+              "address": "0x41675c099f32341bf84bfc5382af534df5c7461a"
+            },
+            {
+              "chainId": 10,
+              "address": "0x29fcb43b46531bca003ddc8fcb67ffe91900c762"
+            },
+            {
+              "chainId": 10,
+              "address": "0xff51a5898e281db6dfc7855790607438df2ca44b"
+            },
+            {
+              "chainId": 10,
+              "address": "0xedd160febbd92e350d4d398fb636302fccd67c7e"
+            },
+            {
+              "chainId": 100,
+              "address": "0xd9db270c1b5e3bd161e8c8503c55ceabee709552"
+            },
+            {
+              "chainId": 100,
+              "address": "0x69f4d1788e39c87893c980c06edf4b7f686e2938"
+            },
+            {
+              "chainId": 100,
+              "address": "0x3e5c63644e683549055b9be8653de26e0b4cd36e"
+            },
+            {
+              "chainId": 100,
+              "address": "0xfb1bffc9d739b8d520daf37df666da4c687191ea"
+            },
+            {
+              "chainId": 100,
+              "address": "0x41675c099f32341bf84bfc5382af534df5c7461a"
+            },
+            {
+              "chainId": 100,
+              "address": "0x29fcb43b46531bca003ddc8fcb67ffe91900c762"
+            },
+            {
+              "chainId": 100,
+              "address": "0xff51a5898e281db6dfc7855790607438df2ca44b"
+            },
+            {
+              "chainId": 100,
+              "address": "0xedd160febbd92e350d4d398fb636302fccd67c7e"
+            },
+            {
+              "chainId": 137,
+              "address": "0xd9db270c1b5e3bd161e8c8503c55ceabee709552"
+            },
+            {
+              "chainId": 137,
+              "address": "0x69f4d1788e39c87893c980c06edf4b7f686e2938"
+            },
+            {
+              "chainId": 137,
+              "address": "0x3e5c63644e683549055b9be8653de26e0b4cd36e"
+            },
+            {
+              "chainId": 137,
+              "address": "0xfb1bffc9d739b8d520daf37df666da4c687191ea"
+            },
+            {
+              "chainId": 137,
+              "address": "0x41675c099f32341bf84bfc5382af534df5c7461a"
+            },
+            {
+              "chainId": 137,
+              "address": "0x29fcb43b46531bca003ddc8fcb67ffe91900c762"
+            },
+            {
+              "chainId": 137,
+              "address": "0xff51a5898e281db6dfc7855790607438df2ca44b"
+            },
+            {
+              "chainId": 137,
+              "address": "0xedd160febbd92e350d4d398fb636302fccd67c7e"
+            },
+            {
+              "chainId": 8453,
+              "address": "0xd9db270c1b5e3bd161e8c8503c55ceabee709552"
+            },
+            {
+              "chainId": 8453,
+              "address": "0x69f4d1788e39c87893c980c06edf4b7f686e2938"
+            },
+            {
+              "chainId": 8453,
+              "address": "0x3e5c63644e683549055b9be8653de26e0b4cd36e"
+            },
+            {
+              "chainId": 8453,
+              "address": "0xfb1bffc9d739b8d520daf37df666da4c687191ea"
+            },
+            {
+              "chainId": 8453,
+              "address": "0x41675c099f32341bf84bfc5382af534df5c7461a"
+            },
+            {
+              "chainId": 8453,
+              "address": "0x29fcb43b46531bca003ddc8fcb67ffe91900c762"
+            },
+            {
+              "chainId": 8453,
+              "address": "0xff51a5898e281db6dfc7855790607438df2ca44b"
+            },
+            {
+              "chainId": 8453,
+              "address": "0xedd160febbd92e350d4d398fb636302fccd67c7e"
+            },
+            {
+              "chainId": 42161,
+              "address": "0xd9db270c1b5e3bd161e8c8503c55ceabee709552"
+            },
+            {
+              "chainId": 42161,
+              "address": "0x69f4d1788e39c87893c980c06edf4b7f686e2938"
+            },
+            {
+              "chainId": 42161,
+              "address": "0x3e5c63644e683549055b9be8653de26e0b4cd36e"
+            },
+            {
+              "chainId": 42161,
+              "address": "0xfb1bffc9d739b8d520daf37df666da4c687191ea"
+            },
+            {
+              "chainId": 42161,
+              "address": "0x41675c099f32341bf84bfc5382af534df5c7461a"
+            },
+            {
+              "chainId": 42161,
+              "address": "0x29fcb43b46531bca003ddc8fcb67ffe91900c762"
+            },
+            {
+              "chainId": 42161,
+              "address": "0xff51a5898e281db6dfc7855790607438df2ca44b"
+            },
+            {
+              "chainId": 42161,
+              "address": "0xedd160febbd92e350d4d398fb636302fccd67c7e"
+            }
+          ]
+        }
+      },
+      "functions": [
+        "setup(address[] _owners, uint256 _threshold, address to, bytes data, address fallbackHandler, address paymentToken, uint256 payment, address paymentReceiver)",
+        "execTransaction(address to, uint256 value, bytes data, uint8 operation, uint256 safeTxGas, uint256 baseGas, uint256 gasPrice, address gasToken, address refundReceiver, bytes signatures)",
+        "addOwnerWithThreshold(address owner, uint256 _threshold)",
+        "removeOwner(address prevOwner, address owner, uint256 _threshold)",
+        "swapOwner(address prevOwner, address oldOwner, address newOwner)",
+        "changeThreshold(uint256 _threshold)"
+      ],
+      "source_and_limits": "Bloom derivative of LedgerHQ/clear-signing-erc7730-registry registry/safe/common-Safe.json. Delegatecalls, gas refunds, setup code and setup payments are fixed by mustMatch rather than shown."
+    },
+    {
+      "source_path": "crates/bloom-evm-clear-signing/catalogs/standards/conditional-tokens.json",
+      "name": "Conditional-token redemption interface",
+      "context": {
+        "contract": {}
+      },
+      "functions": [
+        "redeemPositions(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] indexSets)"
+      ],
+      "source_and_limits": "Gnosis ConditionalTokens redeemPositions ABI, also used by Polymarket collateral adapters. Unlisted addresses are structural readings; no market, collateral units or payout are inferred. Source: bloom-petal-polymarket a0177ae4e68f4a043df4db727fb3212e23ab7395 route/src/polymarket/wallet.rs."
+    },
+    {
+      "source_path": "crates/bloom-evm-clear-signing/catalogs/standards/erc4626.json",
+      "name": "ERC-4626 vault",
+      "context": {
+        "contract": {}
+      },
+      "functions": [
+        "deposit(uint256 assets, address receiver)",
+        "mint(uint256 shares, address receiver)",
+        "withdraw(uint256 assets, address receiver, address owner)",
+        "redeem(uint256 shares, address receiver, address owner)"
+      ],
+      "source_and_limits": "The ERC-4626 vault standard, read for any address no entry lists. Derived from LedgerHQ/clear-signing-erc7730-registry ercs/calldata-erc4626-vaults.json. Bloom's vaultAssetAmount extension uses exact compiled vault-to-underlying bindings; unknown vault assets and share amounts remain raw."
+    },
+    {
+      "source_path": "crates/bloom-evm-clear-signing/catalogs/standards/erc721-erc1155-operator.json",
+      "name": "ERC-721/ERC-1155 operator interface",
+      "context": {
+        "contract": {}
+      },
+      "functions": [
+        "setApprovalForAll(address operator, bool approved)"
+      ],
+      "source_and_limits": "ERC-721 / ERC-1155 common operator method; unlisted addresses are structural readings. Source: eips.ethereum.org/EIPS/eip-1155."
+    }
+  ],
+  "solana_programs": [
+    {
+      "address": "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+      "name": "Pump",
+      "instruction_layouts": [
+        "buy",
+        "buy_exact_quote_in_v2",
+        "buy_exact_quote_in_v3",
+        "buy_exact_sol_in",
+        "buy_v2",
+        "buy_v3",
+        "create_v2",
+        "sell",
+        "sell_v2",
+        "sell_v3"
+      ]
+    },
+    {
+      "address": "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA",
+      "name": "PumpSwap",
+      "instruction_layouts": [
+        "buy",
+        "buy_exact_quote_in",
+        "buy_exact_quote_in_v2",
+        "buy_v2",
+        "sell",
+        "sell_v2"
+      ]
+    }
+  ],
+  "solana_catalog_source": {
+    "repository": "pump-fun/pump-public-docs",
+    "revision": "639b87fb45c3adeffa6f7c4a1bf0cb85e392bf22"
+  },
+  "release_acceptance": "Not complete. PM issue 80 retains per-route effects, real owner/funded acceptance, fresh reviews, specific merge approvals, landed repins, two-login macOS and coordinated publication."
+}

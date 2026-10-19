@@ -473,6 +473,14 @@ Petal with the matching Broker if an older hash-only caller is refused; do not
 strip that witness or seek another owner ceremony for each session action.
 This check does not make Petal-local caps venue-enforced or prove fills.
 
+Pump buy, sell, token-account close and launch approvals bind the actual Solana
+message to the selected account. Only the recent blockhash can refresh without
+changing that review; changed amounts, instructions, accounts or programs need
+a new approval. Retry through the same Pump operation. Old opaque grants cannot
+satisfy the reviewed profile. Lookup contents, unknown mint units, program
+effects and settlement remain unverified; do not substitute tickers or claim
+that a decoded transaction proves the trade executed.
+
 Installed application documents and public routes live under `petals/<name>/`.
 Account-dependent routes explicitly select a wallet and index, for example
 `petals/enso/intents/<wallet>/<index>/new`. Follow each package's route tree;
