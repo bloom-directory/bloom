@@ -496,7 +496,7 @@ supplied. What fails this is noncanonical padding: the address argument
 occupies a 32-byte word whose twelve high-order bytes must be zero. Such a
 write is refused at staging with an error that begins `ERC-20 transfer
 calldata: type check failed for "(address,uint256)"`. Nothing is staged and
-no nonce is reserved: the check runs before Bloom takes the staging lock.
+no nonce is reserved: the check runs before the transaction is staged.
 Left-pad the address with zeros and stage again; retrying the same bytes fails
 the same way.
 

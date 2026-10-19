@@ -3042,7 +3042,7 @@ fn decode_petal_erc20_transfer(
     // to a contract Bloom already knows is a token. Anything else stays a
     // generic call with its bytes intact - and is not validated below either,
     // because Bloom will not be rebuilding it.
-    if !bloom_tx::tx_engine::is_known_token_address(reported_chain_id, requested_to) {
+    if bloom_tx::tx_engine::known_token(reported_chain_id, requested_to).is_none() {
         return Ok(None);
     }
     let calldata = parse_petal_hex_bytes(&request.data_hex, "data-hex")?;
@@ -3127,7 +3127,9 @@ fn petal_pending_request_matches(
             .and_then(|to| to.parse::<Address>().ok())
             == Some(requested_to)
         && staged.value_wei.parse::<U256>().ok() == Some(requested_value)
-        && calldata_bytes_equal(&staged.data_hex, &request.data_hex)
+        // `evm_tx_stage` accepts only lowercase canonical hex, and the engine
+        // stores calldata lowercase, so the strings compare exactly.
+        && staged.data_hex == request.data_hex
         && request.nonce.is_none_or(|nonce| staged.nonce == nonce)
         && request
             .max_fee_per_gas
@@ -3136,24 +3138,6 @@ fn petal_pending_request_matches(
         && request.max_priority_fee_per_gas.as_ref().is_none_or(|fee| {
             decimal_strings_equal(staged.max_priority_fee_per_gas.as_deref(), fee)
         })
-}
-
-/// Compare calldata by the bytes it denotes, not by its spelling.
-///
-/// A recognized ERC-20 transfer is stored as the calldata the engine
-/// regenerated, which is always lowercase, while the Petal's request keeps
-/// whatever case it sent. Comparing strings makes an identical retry miss its
-/// own pending row and stage a second transfer on the next nonce.
-fn calldata_bytes_equal(stored: &str, requested: &str) -> bool {
-    match (
-        parse_petal_hex_bytes(stored, "stored data-hex"),
-        parse_petal_hex_bytes(requested, "data-hex"),
-    ) {
-        (Ok(stored), Ok(requested)) => stored == requested,
-        // Neither side is guaranteed to parse; fall back to the literal
-        // comparison rather than treating two unparseable values as equal.
-        _ => stored == requested,
-    }
 }
 
 fn decimal_strings_equal(stored: Option<&str>, requested: &str) -> bool {
@@ -5776,10 +5760,11 @@ mod tests {
     }
 
     /// USDC on Ethereum: in the curated registry, so the classifier will look
-    /// at a call addressed to it. Anvil consults mainnet's list.
+    /// at a call addressed to it on mainnet.
     const KNOWN_TOKEN: &str = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
     /// Not in the registry: a contract Bloom knows nothing about.
     const UNKNOWN_CONTRACT: &str = "0x0000000000000000000000000000000000000010";
+    const MAINNET: u64 = 1;
     const ANVIL: u64 = 31337;
 
     fn petal_evm_request(to: &str, value_wei: &str, data_hex: String) -> EvmTransactionRequest {
@@ -5800,7 +5785,13 @@ mod tests {
         request: &EvmTransactionRequest,
         value: U256,
     ) -> Result<Option<(Address, U256)>, HostError> {
-        decode_petal_erc20_transfer(request, ANVIL, ANVIL, request.to.parse().unwrap(), value)
+        decode_petal_erc20_transfer(
+            request,
+            MAINNET,
+            MAINNET,
+            request.to.parse().unwrap(),
+            value,
+        )
     }
 
     fn canonical_transfer(recipient: Address, amount: u64) -> Vec<u8> {
@@ -5818,8 +5809,7 @@ mod tests {
     /// The registry is read by chain and the signature is for the id the node
     /// reports. When the two disagree a transfer stays generic, even to a
     /// token curated for the configured chain, rather than being typed for
-    /// one chain and signed for another. Anvil's alias to mainnet's list
-    /// applies to the reported id, which for a local fork is 31337 too.
+    /// one chain and signed for another.
     #[test]
     fn a_node_reporting_another_chain_leaves_a_curated_transfer_generic() {
         let recipient: Address = "0x0000000000000000000000000000000000000020"
@@ -5830,7 +5820,7 @@ mod tests {
         let classify = |spec: u64, reported: u64| {
             decode_petal_erc20_transfer(&request, spec, reported, to, U256::ZERO).unwrap()
         };
-        assert!(classify(ANVIL, ANVIL).is_some(), "agreeing ids: typed");
+        assert!(classify(MAINNET, MAINNET).is_some(), "agreeing ids: typed");
         assert!(
             classify(ANVIL, 1).is_none(),
             "node says mainnet, config says anvil"
@@ -5842,6 +5832,30 @@ mod tests {
         // Curated on the reported chain but not the configured one is still
         // a disagreement, not a lookup on the reported chain.
         assert!(classify(8453, 1).is_none());
+    }
+
+    /// Chain id 31337 does not prove a node forked mainnet: any code can sit at
+    /// mainnet USDC's address on a local Anvil. With both ids agreeing on
+    /// 31337 the call still stays generic, and it is not validated either,
+    /// because Bloom will not rebuild it.
+    #[test]
+    fn a_local_anvil_does_not_borrow_mainnet_tokens() {
+        let recipient: Address = "0x0000000000000000000000000000000000000020"
+            .parse()
+            .unwrap();
+        let to: Address = KNOWN_TOKEN.parse().unwrap();
+        let mut calldata = canonical_transfer(recipient, 1);
+        let request = petal_evm_request(KNOWN_TOKEN, "0", hex0x(&calldata));
+        assert_eq!(
+            decode_petal_erc20_transfer(&request, ANVIL, ANVIL, to, U256::ZERO).unwrap(),
+            None
+        );
+        calldata[4] = 1;
+        let dirty = petal_evm_request(KNOWN_TOKEN, "0", hex0x(&calldata));
+        assert_eq!(
+            decode_petal_erc20_transfer(&dirty, ANVIL, ANVIL, to, U256::ZERO).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -5951,28 +5965,6 @@ mod tests {
             matches!(error, HostError::Invalid(_)),
             "expected an invalid-payload refusal, got {error:?}"
         );
-    }
-
-    /// The engine stores the calldata it regenerated, always lowercase. An
-    /// identical retry that spelled its hex in uppercase has to find that same
-    /// pending row, or it stages a second transfer on the next nonce.
-    #[test]
-    fn calldata_comparison_ignores_hex_case_but_not_bytes() {
-        let calldata = canonical_transfer(
-            "0x0000000000000000000000000000000000000020"
-                .parse()
-                .unwrap(),
-            42,
-        );
-        let lower = hex0x(&calldata);
-        let upper = format!("0x{}", hex::encode_upper(&calldata));
-        assert!(calldata_bytes_equal(&lower, &upper));
-        assert!(calldata_bytes_equal(&lower, &lower));
-
-        let mut different = calldata;
-        different[35] ^= 1;
-        let different = hex0x(&different);
-        assert!(!calldata_bytes_equal(&lower, &different));
     }
 
     #[test]
