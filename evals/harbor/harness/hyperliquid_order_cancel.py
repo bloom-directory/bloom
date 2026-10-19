@@ -22,10 +22,14 @@ from typing import Any
 from .core import EvalDefinition, EvalError, EvalRunContext
 
 MAINNET_ACK = "PLACE_AND_CANCEL_BTC_MAINNET_UP_TO_11_USD"
-# The ceremony port is configurable per Triad (`--ceremony-port`), so accept
-# any loopback port; the path and token shape stay exact.
-CEREMONY_URL = re.compile(
-    r"http://localhost:[1-9][0-9]{0,4}/ceremony/[A-Za-z0-9_-]{43}"
+# The harness completes ceremonies with the authenticator seed, so it must only
+# ever follow the Triad's own ceremony origin. The port is configurable per
+# Triad (`--ceremony-port`); the operator records the origin the Machine
+# publishes and passes it here. Redaction alone stays broad.
+DEFAULT_CEREMONY_ORIGIN = "http://localhost:18734"
+CEREMONY_ORIGIN = re.compile(r"http://localhost:([1-9][0-9]{0,4})")
+ANY_CEREMONY_URL = re.compile(
+    r"http://localhost:[0-9]+/ceremony/[A-Za-z0-9_-]+"
 )
 WALLET = re.compile(r"0x[0-9a-f]{40}")
 WALLET_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
@@ -127,6 +131,20 @@ def wallet_account_projection(
     return owner.lower(), digest
 
 
+def ceremony_origin(value: str) -> str:
+    match = CEREMONY_ORIGIN.fullmatch(value)
+    if match is None or int(match.group(1)) > 65535:
+        raise EvalError("ceremony origin must be http://localhost:<port>")
+    return value
+
+
+def ceremony_url_pattern(origin: str) -> re.Pattern[str]:
+    return re.compile(
+        re.escape(ceremony_origin(origin))
+        + r"/ceremony/[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-])"
+    )
+
+
 class HyperliquidOrderCancelEval(EvalDefinition):
     name = "hyperliquid-order-cancel"
 
@@ -153,6 +171,9 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         self.provenance_catalog = Path(self.provenance_catalog_value)
         self.bloom_mount_value = self.env.get("BLOOM_EVAL_BLOOM_MOUNT", "").strip()
         self.bloom_mount = Path(self.bloom_mount_value)
+        self.ceremony_url = ceremony_url_pattern(
+            self.env.get("BLOOM_EVAL_CEREMONY_ORIGIN", DEFAULT_CEREMONY_ORIGIN)
+        )
         self.driver = Path(
             self.env.get(
                 "BLOOM_EVAL_DEBUG_DRIVER_BIN",
@@ -344,7 +365,7 @@ class HyperliquidOrderCancelEval(EvalDefinition):
             if record.get("status") == "awaiting_user" and isinstance(
                 ceremony_url, str
             ):
-                if CEREMONY_URL.fullmatch(ceremony_url) is None:
+                if self.ceremony_url.fullmatch(ceremony_url) is None:
                     raise EvalError(
                         "owner Petal key request has an invalid ceremony URL"
                     )
@@ -397,7 +418,7 @@ class HyperliquidOrderCancelEval(EvalDefinition):
             ceremony_url = record.get("ceremony_url")
             if not isinstance(ceremony_url, str):
                 continue
-            if CEREMONY_URL.fullmatch(ceremony_url) is None:
+            if self.ceremony_url.fullmatch(ceremony_url) is None:
                 raise EvalError(
                     "owner Petal signing request has an invalid ceremony URL"
                 )
@@ -407,7 +428,7 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         return matches[0] if matches else None
 
     def _redact_ceremony_urls(self, output: str) -> str:
-        return CEREMONY_URL.sub("[REDACTED_CEREMONY_URL]", output)
+        return ANY_CEREMONY_URL.sub("[REDACTED_CEREMONY_URL]", output)
 
     def _read_session_status(self, attempts: int = 3) -> Any | None:
         if self.session_base is None:
@@ -950,7 +971,7 @@ class HyperliquidOrderCancelEval(EvalDefinition):
                 )
                 if status_data is not None:
                     break
-                match = CEREMONY_URL.search(last_output)
+                match = self.ceremony_url.search(last_output)
                 ceremony_url = (
                     match.group(0)
                     if match is not None

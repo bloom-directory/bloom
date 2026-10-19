@@ -22,6 +22,7 @@ from .hyperliquid_order_cancel import (
     PACKAGE_HASH,
     WALLET_ID,
     HyperliquidOrderCancelEval,
+    ceremony_origin,
     wallet_account_projection,
 )
 
@@ -242,6 +243,23 @@ def safe_json(path: Path) -> Any:
         raise EvalError("required discovery input is unavailable or invalid") from error
 
 
+def mount_ceremony_origin(mount: Path) -> str:
+    """Return the ceremony origin the Machine publishes for this Triad."""
+    surfaces = safe_json(mount / "status/ceremonies.json")
+    origin = surfaces.get("local_origin") if isinstance(surfaces, dict) else None
+    if not isinstance(origin, str):
+        raise EvalError("Machine published no local ceremony origin")
+    return ceremony_origin(origin)
+
+
+def validate_ceremony_origin(state: dict[str, Any]) -> None:
+    recorded = state.get("ceremony_origin")
+    if not isinstance(recorded, str):
+        raise EvalError("operator state has no ceremony origin; re-run init")
+    if mount_ceremony_origin(Path(state["paths"]["bloom_mount"])) != recorded:
+        raise EvalError("ceremony origin changed; re-run init before creating authority")
+
+
 def expected_deny_policy(wallet_id: str) -> dict[str, Any]:
     return {
         "allowed_destinations": [],
@@ -323,6 +341,11 @@ def definition_env(state: dict[str, Any]) -> dict[str, str]:
         BLOOM_EVAL_LOCK_FILE=paths["lock_file"],
         BLOOM_EVAL_JOBS_DIR=paths["jobs_dir"],
         BLOOM_EVAL_MAINNET_ACK=MAINNET_ACK,
+        **(
+            {"BLOOM_EVAL_CEREMONY_ORIGIN": state["ceremony_origin"]}
+            if state.get("ceremony_origin")
+            else {}
+        ),
         **(
             {"BLOOM_EVAL_AGENT_NAME": state["agent_name"]}
             if state.get("agent_name")
@@ -889,6 +912,9 @@ def initialize(args: argparse.Namespace, repo_root: Path) -> None:
             "agent_name": (
                 "Optional stable venue agent name override; null uses deterministic derivation."
             ),
+            "ceremony_origin": (
+                "The Triad's local ceremony origin; the harness completes no other."
+            ),
             "recovery": (
                 "Protected state, policy-backup, summary, and marker locations."
             ),
@@ -900,6 +926,7 @@ def initialize(args: argparse.Namespace, repo_root: Path) -> None:
         "package_hash": package_hash,
         "model": args.model,
         "agent_name": args.agent_name,
+        "ceremony_origin": mount_ceremony_origin(mount),
         "next_sign_count": args.sign_count,
         "pending_policy_recovery": None,
         "paths": {
@@ -961,6 +988,11 @@ def status(store: StateStore, repo_root: Path) -> None:
         state.get("pending_policy_recovery") is None and not store.backup_path.exists()
     )
     checks["mount_active"] = os.path.ismount(state["paths"]["bloom_mount"])
+    try:
+        validate_ceremony_origin(state)
+        checks["ceremony_origin_current"] = True
+    except EvalError:
+        checks["ceremony_origin_current"] = False
     try:
         validate_lineage(state, repo_root)
         checks["lineage_current"] = True
@@ -1049,6 +1081,7 @@ def run_or_recover(
                 # prerequisites for restoring the exact digest-bound policy
                 # backup after a branch switch or rebuild.
                 validate_lineage(state, repo_root)
+                validate_ceremony_origin(state)
                 try:
                     phase = time.monotonic()
                     try:

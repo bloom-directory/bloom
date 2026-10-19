@@ -29,6 +29,7 @@ from harness.operator import (
     redact,
     require_no_pending_owner_requests,
     run_or_recover,
+    validate_ceremony_origin,
     validate_lineage,
 )
 
@@ -109,6 +110,7 @@ class OperatorStateTests(unittest.TestCase):
 
                 with (
                     mock.patch("harness.operator.validate_lineage"),
+                    mock.patch("harness.operator.validate_ceremony_origin"),
                     mock.patch("harness.operator.HyperliquidOrderCancelEval", return_value=definition),
                     mock.patch("harness.operator.PolicyLifecycle"),
                     mock.patch("harness.operator.run_eval", side_effect=run),
@@ -289,6 +291,7 @@ class OperatorStateTests(unittest.TestCase):
         policy = SimpleNamespace(activate=activate, restore=restore)
         with (
             mock.patch("harness.operator.validate_lineage"),
+            mock.patch("harness.operator.validate_ceremony_origin"),
             mock.patch(
                 "harness.operator.HyperliquidOrderCancelEval",
                 return_value=definition,
@@ -307,6 +310,34 @@ class OperatorStateTests(unittest.TestCase):
         self.assertFalse(authority_active)
         self.assertFalse(self.store.backup_path.exists())
         self.assertIsNone(self.store.read()["pending_policy_recovery"])
+
+
+    def test_ceremony_origin_must_match_the_machine_projection(self) -> None:
+        status = self.root / "mount/status"
+        status.mkdir(parents=True)
+
+        def publish(origin: object) -> None:
+            (status / "ceremonies.json").write_text(
+                json.dumps({"local_origin": origin, "stage": "unprovisioned"})
+            )
+
+        publish("http://localhost:28735")
+        with self.assertRaisesRegex(EvalError, "no ceremony origin"):
+            validate_ceremony_origin(self.state)
+        state = dict(self.state, ceremony_origin="http://localhost:28735")
+        validate_ceremony_origin(state)
+        self.assertEqual(
+            definition_env(state)["BLOOM_EVAL_CEREMONY_ORIGIN"],
+            "http://localhost:28735",
+        )
+        publish("http://localhost:18734")
+        with self.assertRaisesRegex(EvalError, "ceremony origin changed"):
+            validate_ceremony_origin(state)
+        for invalid in ("http://example.com:28735", None):
+            with self.subTest(origin=invalid):
+                publish(invalid)
+                with self.assertRaises(EvalError):
+                    validate_ceremony_origin(state)
 
 
 class FakePolicyDefinition:

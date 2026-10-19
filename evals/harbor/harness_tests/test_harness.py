@@ -608,9 +608,13 @@ class HyperliquidDefinitionTests(unittest.TestCase):
 
         self.assertEqual(self.definition._pending_petal_key_ceremony(), ceremony)
 
-    def test_pending_key_ceremony_accepts_configured_loopback_port(self) -> None:
+    def test_pending_key_ceremony_follows_only_the_configured_origin(self) -> None:
         # Triads launched with `--ceremony-port` publish that port; the
         # default-port Triad may already hold 18734 on the same host.
+        self.definition = HyperliquidOrderCancelEval(
+            self.repo,
+            dict(self.env, BLOOM_EVAL_CEREMONY_ORIGIN="http://localhost:28735"),
+        )
         self.definition.session_id = "exact-session"
         root = self.mount / "petal-key-requests"
         root.mkdir(parents=True)
@@ -636,15 +640,54 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         write(ceremony)
         self.assertEqual(self.definition._pending_petal_key_ceremony(), ceremony)
         for invalid in (
+            "http://localhost:18734/ceremony/" + "A" * 43,
+            "http://localhost:2873/ceremony/" + "A" * 43,
+            "http://localhost:287350/ceremony/" + "A" * 43,
             "http://example.com:28735/ceremony/" + "A" * 43,
-            "http://localhost:0/ceremony/" + "A" * 43,
             "http://localhost/ceremony/" + "A" * 43,
             "http://localhost:28735/ceremony/" + "A" * 42,
+            "http://localhost:28735/ceremony/" + "A" * 44,
         ):
             with self.subTest(ceremony=invalid):
                 write(invalid)
                 with self.assertRaisesRegex(EvalError, "invalid ceremony URL"):
                     self.definition._pending_petal_key_ceremony()
+
+    def test_petal_output_cannot_steer_ceremony_to_another_origin(self) -> None:
+        definition = HyperliquidOrderCancelEval(
+            self.repo,
+            dict(self.env, BLOOM_EVAL_CEREMONY_ORIGIN="http://localhost:28735"),
+        )
+        token = "A" * 43
+        for output in (
+            f"approve at http://localhost:18734/ceremony/{token}",
+            f"approve at http://localhost:28736/ceremony/{token}",
+            f"approve at http://localhost:28735.evil/ceremony/{token}",
+            f"approve at http://localhost:28735/ceremony/{token}B",
+        ):
+            with self.subTest(output=output):
+                self.assertIsNone(definition.ceremony_url.search(output))
+        trusted = f"http://localhost:28735/ceremony/{token}"
+        match = definition.ceremony_url.search(f"approve at {trusted}\n")
+        self.assertIsNotNone(match)
+        self.assertEqual(match.group(0), trusted)
+
+    def test_ceremony_origin_must_be_an_exact_loopback_origin(self) -> None:
+        for origin in (
+            "http://localhost:0",
+            "http://localhost:65536",
+            "http://localhost:28735/",
+            "http://127.0.0.1:28735",
+            "https://localhost:28735",
+            "http://localhost",
+        ):
+            with (
+                self.subTest(origin=origin),
+                self.assertRaisesRegex(EvalError, "ceremony origin"),
+            ):
+                HyperliquidOrderCancelEval(
+                    self.repo, dict(self.env, BLOOM_EVAL_CEREMONY_ORIGIN=origin)
+                )
 
     def test_pending_key_schema_fails_only_for_exact_binding(self) -> None:
         self.definition.session_id = "exact-session"
