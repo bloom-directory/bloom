@@ -805,9 +805,16 @@ impl TxEngine {
         })?;
         // An address-shaped hint carries no symbol, which is what a Petal-staged
         // transfer always supplies: it names the token by address because that
-        // is the only part of the calldata Bloom can verify.
+        // is the only part of the calldata Bloom can verify. Read `symbol()`
+        // from the same contract the decimals came from rather than showing the
+        // owner a truncated address where a token name belongs. A token that
+        // does not answer — a reverting or `bytes32` `symbol()` — keeps the
+        // short-address label, which is honest about what is known.
         let symbol = if symbol_hint.starts_with("0x") || symbol_hint.starts_with("0X") {
-            address_hint_symbol(chain_id, addr)
+            match chain.erc20_symbol(addr).await {
+                Ok(Some(symbol)) if is_displayable_symbol(&symbol) => symbol,
+                _ => short_addr_label(&addr),
+            }
         } else {
             symbol_hint.to_ascii_uppercase()
         };
@@ -1699,9 +1706,12 @@ impl TxEngine {
                     // hint only ever resolves through the same registry, so
                     // this is the one source for all three. Address rules
                     // still see the token through `policy_ctx.token`.
-                    policy_ctx.token_symbol = to
-                        .and_then(|to| registry_symbol(chain_id, to))
-                        .map(str::to_string);
+                    policy_ctx.token_symbol = to.and_then(|to| {
+                        bloom_proto::tokens::for_chain(registry_chain(chain_id))
+                            .iter()
+                            .find(|known| known.address.eq_ignore_ascii_case(&format!("{to:#x}")))
+                            .map(|known| known.symbol.to_string())
+                    });
                     if let Ok(rec) = t.recipient.parse::<Address>() {
                         policy_ctx.recipient = Some(rec);
                     }
@@ -5150,14 +5160,19 @@ fn parse_u256(s: &str) -> Result<U256, String> {
     U256::from_str_radix(t, 10).map_err(|e| format!("invalid uint256 '{s}': {e}"))
 }
 
-/// The label a plan shows for a token named by address: the curated
-/// registry's symbol for a listed token, and the short address otherwise. A
-/// contract's own `symbol()` is its claim about itself, and any contract can
-/// answer "USDC", so it never labels an amount an owner reads.
-fn address_hint_symbol(chain_id: u64, addr: Address) -> String {
-    registry_symbol(chain_id, addr)
-        .map(str::to_string)
-        .unwrap_or_else(|| short_addr_label(&addr))
+/// Whether a contract-supplied symbol can be shown beside an amount.
+///
+/// The string comes from an untrusted contract, so it is bounded and kept to
+/// printable, non-space ASCII. A token whose "symbol" is empty, oversized, or
+/// carries control characters, spaces or bidi marks gets the short-address
+/// label instead: a symbol is a label an owner reads next to a number, and a
+/// contract does not get to put arbitrary text there.
+fn is_displayable_symbol(symbol: &str) -> bool {
+    !symbol.is_empty()
+        && symbol.len() <= 16
+        && symbol
+            .chars()
+            .all(|c| c.is_ascii_graphic() && !matches!(c, '<' | '>' | '&'))
 }
 
 fn short_addr_label(a: &Address) -> String {
@@ -5178,17 +5193,6 @@ fn short_addr_label(a: &Address) -> String {
 /// mainnet's list, since that is what it forked.
 fn registry_chain(chain_id: u64) -> u64 {
     if chain_id == 31337 { 1 } else { chain_id }
-}
-
-/// The curated registry's symbol for `addr` on `chain_id`, by the same chain
-/// aliasing symbol resolution uses. `None` for a contract the registry does
-/// not list, whatever that contract says about itself.
-fn registry_symbol(chain_id: u64, addr: Address) -> Option<&'static str> {
-    let addr = format!("{addr:#x}");
-    bloom_proto::tokens::for_chain(registry_chain(chain_id))
-        .iter()
-        .find(|known| known.address.eq_ignore_ascii_case(&addr))
-        .map(|known| known.symbol)
 }
 
 /// Whether `addr` is a curated token on `chain_id`, by the same registry and
@@ -8993,24 +8997,21 @@ mod tests {
         assert_eq!(sym, "USDC");
     }
 
-    /// A token named by address is labelled from the curated registry, never
-    /// from its own `symbol()`: an unlisted contract shows its short address
-    /// even if it calls itself "USDC".
     #[test]
-    fn an_address_named_token_shows_the_registry_symbol_or_its_address() {
-        let usdc: Address = bloom_proto::tokens::resolve_symbol(1, "USDC")
-            .expect("mainnet USDC is curated")
-            .address
-            .parse()
-            .unwrap();
-        assert_eq!(address_hint_symbol(1, usdc), "USDC");
-        // Anvil reads mainnet's list.
-        assert_eq!(address_hint_symbol(31337, usdc), "USDC");
-        let unknown: Address = "0x1111111111111111111111111111111111111111"
-            .parse()
-            .unwrap();
-        assert_eq!(address_hint_symbol(1, unknown), short_addr_label(&unknown));
-        assert_eq!(registry_symbol(1, unknown), None);
+    fn a_contract_symbol_is_only_shown_when_it_is_a_label() {
+        // Real tokens.
+        assert!(is_displayable_symbol("USDC"));
+        assert!(is_displayable_symbol("DAI"));
+        assert!(is_displayable_symbol("WETH"));
+        // A contract does not get to put arbitrary text beside an amount.
+        assert!(!is_displayable_symbol(""));
+        assert!(!is_displayable_symbol(
+            "this is far too long to be a symbol"
+        ));
+        assert!(!is_displayable_symbol("US DC"));
+        assert!(!is_displayable_symbol("USD\u{202e}C"));
+        assert!(!is_displayable_symbol("USD\nC"));
+        assert!(!is_displayable_symbol("<b>USDC</b>"));
     }
 
     #[test]

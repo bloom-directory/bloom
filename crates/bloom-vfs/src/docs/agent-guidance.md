@@ -492,13 +492,14 @@ challenge either way.
 Because Bloom rebuilds that one shape, it must encode exactly. Calldata that
 is already ERC-20 transfer shaped — the `transfer` selector, exactly 68 bytes,
 no native value — has to decode and then re-encode back to the bytes you
-supplied. What fails this is noncanonical padding: the address argument
-occupies a 32-byte word whose twelve high-order bytes must be zero. Such a
-write is refused at staging with an error that begins `ERC-20 transfer
-calldata: type check failed for "(address,uint256)"`. Nothing is staged and
-no nonce is reserved: the check runs before Bloom takes the staging lock.
-Left-pad the address with zeros and stage again; retrying the same bytes fails
-the same way.
+supplied. In practice what fails this is noncanonical padding: the address
+argument occupies a 32-byte word whose twelve high-order bytes must be zero.
+Such a write is refused at staging, and the error begins `ERC-20 transfer
+calldata` — `… : type check failed for "(address,uint256)"` when the word is
+dirty, and `… is not canonical` when the bytes decode but do not round-trip.
+Nothing is staged and no nonce is reserved: the check runs before Bloom takes
+the staging lock. Left-pad the address with zeros and stage again; retrying
+the same bytes fails the same way.
 
 This is not a general rule about padding. A call Bloom leaves generic keeps
 the bytes you gave it and stages normally, even with that padding — including
