@@ -46,8 +46,10 @@ ls "$BLOOM/wallets/alice/0/chains/anvil/outbox/failed/"
 
 If confirmation requires fresh approval, read this exact pending action's
 `approval_challenge.json`. Check its wallet, action, intent, and expiry before
-forwarding the ceremony URL to the human. After approval, retry only the
-challenge's `retry_path`. Do not restage while approval is pending.
+forwarding the ceremony URL to the human. Re-read it while they approve: its
+`state` turns from `awaiting_ceremony` to `active` as soon as they finish. Then
+write `confirm` to the challenge's `retry_path`. Do not restage while approval
+is pending.
 
 
 Follow `$ID` into its resulting state and read its intent and receipt before
@@ -59,6 +61,55 @@ The explicit account-0 outbox above spends from account 0. For another account,
 verify `wallets/alice/<n>/account.json` and use
 `wallets/alice/<n>/chains/anvil/outbox/` throughout the same procedure.
 Numbered outboxes expose only actions staged by that account.
+
+## Deploying an EVM contract
+
+Stage direct creation with `kind: "deploy"` and complete hex initcode in `data`.
+Include linked library addresses and ABI-encoded constructor arguments in the
+initcode before staging. `value` is the constructor endowment. There is no `to`
+field; sending to the zero address is an ordinary call, not deployment.
+
+```sh
+# Build with the project's normal tools, then prepare a JSON intent:
+# {"kind":"deploy","data":"0x<complete-initcode>","value":"0","chain":"anvil"}
+# The placeholder above must be replaced with actual compiled initcode.
+cp deployment.json "$BLOOM/wallets/alice/0/chains/anvil/outbox/new.tx"
+ls "$BLOOM/wallets/alice/0/chains/anvil/outbox/pending/"
+```
+
+Read the selected pending entry's `plan.md`, then use its usual `confirm`
+flow and complete the Broker approval. The plan identifies CREATE, the
+initcode hash, and the address predicted from sender and nonce. After mining,
+`sent/<id>/receipt.json` records the actual `contract_address` on success.
+Constructor effects and resulting ownership are not inferred from bytecode.
+Creation remains subject to exact Broker approval; recipient allowlists do
+not grant deployment permission. Follow-up initialization calls are separate
+transactions and approvals. First add the numeric-chain policy opt-in through
+its normal ceremony: `{"chain":"evm-31337","destination":"exact"}` for Anvil.
+Machine and Broker must both support protocol 1.7.
+
+For an existing Foundry project, start the adapter in a separate terminal:
+
+```sh
+umask 077
+bloom deploy --wallet alice --chain anvil rpc > rpc.json
+# In the project terminal (use your script's path and contract name):
+forge script script/Deploy.s.sol:Deploy \
+  --rpc-url "$(jq -r .rpc_url rpc.json)" \
+  --sender "$(jq -r .from rpc.json)" --unlocked --broadcast --slow
+# Complete each owner ceremony printed by the adapter, then continue its ID:
+bloom deploy --wallet alice --chain anvil resume deploy-REPLACE_WITH_ID
+# Inspect after a timeout or interruption:
+bloom deploy --wallet alice --chain anvil list
+bloom deploy --wallet alice --chain anvil status deploy-REPLACE_WITH_ID
+```
+
+Keep `rpc.json` private and untracked. Scripts use the selected public sender
+and `vm.startBroadcast()`; remove private-key environment reads. Hardhat uses
+`accounts: "remote"` plus an ethers `NonceManager`; Ignition supplies nonces
+itself. Runnable examples and recovery instructions are in
+https://github.com/bloom-directory/bloom/tree/master/examples/evm-deploy.
+
 
 ## Creating a wallet
 
@@ -87,6 +138,22 @@ printf 'cancel\n' > "$BLOOM/wallets/registrations/main/cancel"
 
 Do not put a mnemonic, private key, passkey response, or PRF output in the
 mount. Those inputs stay inside the Broker-hosted browser ceremony.
+
+## Recovering a wallet
+
+```sh
+printf 'main\n' > "$BLOOM/wallets/recover"
+cat "$BLOOM/wallets/recoveries/main/status.json"
+# Open the complete ceremony_url in a browser and enter recovery material there.
+# Poll until ceremony_state is SUCCEEDED, then inspect:
+cat "$BLOOM/wallets/recoveries/main/result.json"
+```
+
+The write needs only the wallet name, even when Machine has no cached wallet
+inventory. A consumed one-use URL is removed from status. To cancel a pending
+ceremony, write `cancel` to `wallets/recoveries/main/cancel`; after cancellation
+or expiry, write the name to `wallets/recover` again for a new operation.
+Never write the recovery ID or secret into the mount or pass them as arguments.
 
 ## Solana account-aware reads and transfer
 

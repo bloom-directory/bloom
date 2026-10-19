@@ -25,6 +25,8 @@ tracing.workspace = true
 ed25519-dalek.workspace = true
 
 [dev-dependencies]
+# Released schema-1 reader used to verify persisted projection compatibility.
+schema1-broker-api = { package = "bloom-broker-api", git = "https://github.com/bloom-directory/bloom-broker.git", rev = "dd2add2b9d41540521d08c77d19fb467a2d8029e" }
 bloom-service-observability.workspace = true
 ed25519-dalek.workspace = true
 tempfile.workspace = true

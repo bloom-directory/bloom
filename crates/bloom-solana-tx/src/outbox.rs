@@ -729,9 +729,29 @@ impl SolanaOutbox {
         now_ms: u128,
         live_block_heights: &std::collections::HashMap<String, u64>,
     ) -> Result<usize, OutboxError> {
-        let mut count = 0;
+        let expired = self.expired_pending(now_ms, live_block_heights)?;
+        for entry in &expired {
+            let mut expired = entry.clone();
+            expired.staged.status = SolanaTxStatus::Expired;
+            let dir = self.transition(&expired, SolanaOutboxState::Failed)?;
+            expired.state = SolanaOutboxState::Failed;
+            expired.dir = dir;
+            self.rewrite_intent(&expired)?;
+        }
+        Ok(expired.len())
+    }
+
+    /// Pending entries [`Self::sweep_expired`] would expire, read without
+    /// changing anything, so a caller can tell whether a sweep would do any
+    /// work.
+    pub fn expired_pending(
+        &self,
+        now_ms: u128,
+        live_block_heights: &std::collections::HashMap<String, u64>,
+    ) -> Result<Vec<SolanaOutboxEntry>, OutboxError> {
+        let mut expired = Vec::new();
         if !self.inner.root.exists() {
-            return Ok(0);
+            return Ok(expired);
         }
         for w in fs::read_dir(&self.inner.root)? {
             let w = w?;
@@ -771,18 +791,12 @@ impl SolanaOutbox {
                         && now_ms >= entry.staged.expires_ms
                         && cluster_past_window
                     {
-                        let mut expired = entry.clone();
-                        expired.staged.status = SolanaTxStatus::Expired;
-                        let dir = self.transition(&expired, SolanaOutboxState::Failed)?;
-                        expired.state = SolanaOutboxState::Failed;
-                        expired.dir = dir;
-                        self.rewrite_intent(&expired)?;
-                        count += 1;
+                        expired.push(entry);
                     }
                 }
             }
         }
-        Ok(count)
+        Ok(expired)
     }
 }
 

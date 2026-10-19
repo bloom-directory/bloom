@@ -35,14 +35,14 @@ pub use chain::{
     default_endpoint_weight,
 };
 pub use config::{
-    Backend, BackendsConfig, Config, ConfigError, EtherscanConfig, MempoolChainConfig,
+    Backend, BackendsConfig, Config, ConfigError, EtherscanConfig, McpConfig, MempoolChainConfig,
     PrivateRpcChainConfig,
 };
 pub use defi_policy::{DefiPolicy, DefiRouteCtx, ReceiverClass, evaluate_defi_route};
 pub use home::{HomeDir, HomeError, HomeWritePermit};
 pub use intent::{
-    EnsoIntent, GasStrategy, INTENT_HASH_DOMAIN, RawIntent, RawIntentBody, ShellIntent, TxIntent,
-    ValueOrToken, intent_hash_of,
+    GasStrategy, INTENT_HASH_DOMAIN, RawIntent, RawIntentBody, ShellIntent, TxIntent, ValueOrToken,
+    intent_hash_of,
 };
 pub use plan::{NftAction, NftRef, PlanRender, StagedTx, TokenRef, TxActionKind, TxStatus};
 pub use policy::{

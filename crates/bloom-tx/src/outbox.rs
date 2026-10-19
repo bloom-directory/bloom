@@ -24,7 +24,7 @@ pub struct SentEntry {
     /// Parsed from `staged.tx_hash`; entries without a hash are skipped.
     pub hash: alloy::primitives::B256,
     pub from: alloy::primitives::Address,
-    pub to: alloy::primitives::Address,
+    pub to: Option<alloy::primitives::Address>,
     pub value: alloy::primitives::U256,
     /// Raw hex string from `staged.data_hex`.
     pub data: String,
@@ -53,6 +53,9 @@ pub struct MinedReceipt {
     pub tx_hash: String,
     #[serde(default)]
     pub block_number: Option<u64>,
+    /// Actual created address from the mined receipt; absent for calls and failures.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract_address: Option<String>,
     /// Decoded revert reason (best-effort) when `outcome == "reverted"`.
     #[serde(default)]
     pub revert_reason: Option<String>,
@@ -187,7 +190,7 @@ pub struct BroadcastAttempt {
     pub raw_tx_blake3: String,
     pub raw_tx_path: String,
     pub from: String,
-    pub to: String,
+    pub to: Option<String>,
     pub nonce: u64,
     pub chain_id: u64,
     pub created_ms: u128,
@@ -410,8 +413,25 @@ impl Outbox {
 
         // Project to central outbox if a projection is wired.
         if let Some(proj) = &self.inner.projection {
+            // A failed deployment can be submitted again with the same local
+            // content ID. Give its new attempt a separate central history.
+            let previous = match self.read(&staged.wallet, &staged.chain, &staged.id) {
+                Ok(entry) => Some(entry),
+                Err(OutboxError::NotFound(_)) => None,
+                Err(error) => return Err(error),
+            };
+            let local_id = match previous.as_ref() {
+                Some(entry) if entry.state == OutboxState::Failed => {
+                    format!(
+                        "{}-retry-{}",
+                        staged.id,
+                        entry.staged.action_id.as_deref().unwrap_or("legacy")
+                    )
+                }
+                _ => staged.id.clone(),
+            };
             let action_id = proj
-                .allocate_action_id("evm", &staged.id, &staged.wallet, staged.created_ms as u64)
+                .allocate_action_id("evm", &local_id, &staged.wallet, staged.created_ms as u64)
                 .map_err(OutboxError::Other)?;
             staged.action_id = Some(action_id.clone());
 
@@ -435,12 +455,15 @@ impl Outbox {
             .state_dir(&staged.wallet, &staged.chain, OutboxState::Pending)?
             .join(&staged.id);
         fs::create_dir_all(&dir)?;
-        fs::write(dir.join("intent.json"), serde_json::to_vec_pretty(&staged)?)?;
-        fs::write(dir.join("plan.md"), plan_md.as_bytes())?;
-        fs::write(
-            dir.join("policy_check.json"),
-            serde_json::to_vec_pretty(&staged.policy_checks)?,
+        self.write_artefact(&dir, "plan.md", plan_md.as_bytes())?;
+        self.write_artefact(
+            &dir,
+            "policy_check.json",
+            &serde_json::to_vec_pretty(&staged.policy_checks)?,
         )?;
+        // Publish the complete identity last; a retry can never observe a torn
+        // intent and reinterpret an already-staged deployment as a new one.
+        self.write_artefact(&dir, "intent.json", &serde_json::to_vec_pretty(&staged)?)?;
         Ok(dir)
     }
 
@@ -493,7 +516,11 @@ impl Outbox {
         attempt: &BroadcastAttempt,
     ) -> Result<PathBuf, OutboxError> {
         let path = entry.dir.join(kind.marker_name());
-        fs::write(&path, serde_json::to_vec_pretty(attempt)?)?;
+        self.write_artefact(
+            &entry.dir,
+            kind.marker_name(),
+            &serde_json::to_vec_pretty(attempt)?,
+        )?;
         Ok(path)
     }
 
@@ -515,17 +542,8 @@ impl Outbox {
         kind: BroadcastAttemptKind,
         raw: &[u8],
     ) -> Result<PathBuf, OutboxError> {
-        let path = entry.dir.join(kind.raw_name());
-        let mut opts = fs::OpenOptions::new();
-        opts.create(true).write(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let mut file = opts.open(&path)?;
-        file.write_all(raw)?;
-        Ok(path)
+        self.write_artefact(&entry.dir, kind.raw_name(), raw)?;
+        Ok(entry.dir.join(kind.raw_name()))
     }
 
     pub fn read_broadcast_raw_tx(
@@ -659,10 +677,13 @@ impl Outbox {
         for state in [OutboxState::Pending, OutboxState::Sent, OutboxState::Failed] {
             let dir = self.state_dir(wallet, chain, state)?.join(id);
             let intent = dir.join("intent.json");
-            if intent.exists() {
-                let staged: StagedTx = serde_json::from_slice(&fs::read(&intent)?)?;
-                return Ok(OutboxEntry { state, staged, dir });
-            }
+            let bytes = match fs::read(&intent) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            let staged: StagedTx = serde_json::from_slice(&bytes)?;
+            return Ok(OutboxEntry { state, staged, dir });
         }
         Err(OutboxError::NotFound(id.into()))
     }
@@ -744,10 +765,33 @@ impl Outbox {
         let target_parent = self.state_dir(&entry.staged.wallet, &entry.staged.chain, new_state)?;
         fs::create_dir_all(&target_parent)?;
         let target = target_parent.join(&entry.staged.id);
-        if target.exists() {
-            fs::remove_dir_all(&target)?;
+        // Preserve the previous attempt until both stores have transitioned.
+        // Successful retries retain its files outside the live state scans.
+        let previous = if target.exists() {
+            let archive = target_parent
+                .parent()
+                .unwrap()
+                .join("archive")
+                .join(&entry.staged.id);
+            fs::create_dir_all(&archive)?;
+            let attempt = tempfile::Builder::new()
+                .prefix("attempt-")
+                .tempdir_in(archive)?
+                .keep();
+            let backup = attempt.join("entry");
+            fs::rename(&target, &backup)?;
+            Some(backup)
+        } else {
+            None
+        };
+        if let Err(error) = fs::rename(&entry.dir, &target) {
+            if let Some(backup) = &previous {
+                fs::rename(backup, &target).map_err(|restore| OutboxError::Other(format!(
+                    "wallet transition failed: {error}; previous record remains at {}: {restore}", backup.display()
+                )))?;
+            }
+            return Err(error.into());
         }
-        fs::rename(&entry.dir, &target)?;
 
         // Project transition to central outbox.
         if let (Some(proj), Some(action_id)) = (&self.inner.projection, &entry.staged.action_id) {
@@ -764,7 +808,18 @@ impl Outbox {
             if let Err(e) = proj.transition_action(action_id, from_str, to_str) {
                 let rollback = fs::rename(&target, &entry.dir);
                 let rollback_detail = match rollback {
-                    Ok(()) => "wallet outbox transition rolled back".to_string(),
+                    Ok(()) => match &previous {
+                        Some(backup) => match fs::rename(backup, &target) {
+                            Ok(()) => {
+                                "wallet outbox transition and previous record restored".to_string()
+                            }
+                            Err(err) => format!(
+                                "pending restored; previous record remains at {}: {err}",
+                                backup.display()
+                            ),
+                        },
+                        None => "wallet outbox transition rolled back".to_string(),
+                    },
                     Err(err) => format!("wallet outbox rollback failed: {err}"),
                 };
                 return Err(OutboxError::Other(format!(
@@ -865,7 +920,11 @@ impl Outbox {
         if name.contains('/') || name.contains('\\') {
             return Err(OutboxError::InvalidId(name.into()));
         }
-        fs::write(dir.join(name), body)?;
+        let mut temp = tempfile::NamedTempFile::new_in(dir)?;
+        temp.write_all(body)?;
+        temp.as_file().sync_all()?;
+        temp.persist(dir.join(name)).map_err(|error| error.error)?;
+        fs::File::open(dir)?.sync_all()?;
         Ok(())
     }
 
@@ -927,28 +986,21 @@ impl Outbox {
         Ok(())
     }
 
-    /// Remove pending entries that have expired.
-    pub fn sweep_expired(&self, now_ms: u128) -> Result<usize, OutboxError> {
-        let mut count = 0;
+    /// Pending entries whose expiry has passed, read without changing
+    /// anything, so a caller can tell whether a sweep would do any work.
+    pub fn expired_pending(&self, now_ms: u128) -> Result<Vec<OutboxEntry>, OutboxError> {
+        let mut expired = Vec::new();
         if !self.inner.root.exists() {
-            return Ok(0);
+            return Ok(expired);
         }
         for w in fs::read_dir(&self.inner.root)? {
             let w = w?;
-            let wname = match w.file_name().into_string() {
-                Ok(n) => n,
-                Err(_) => continue,
-            };
-            if !w.file_type()?.is_dir() {
+            if w.file_name().into_string().is_err() || !w.file_type()?.is_dir() {
                 continue;
             }
             for c in fs::read_dir(w.path())? {
                 let c = c?;
-                let cname = match c.file_name().into_string() {
-                    Ok(n) => n,
-                    Err(_) => continue,
-                };
-                if !c.file_type()?.is_dir() {
+                if c.file_name().into_string().is_err() || !c.file_type()?.is_dir() {
                     continue;
                 }
                 let pending = c.path().join("pending");
@@ -963,39 +1015,46 @@ impl Outbox {
                     }
                     let staged: StagedTx = serde_json::from_slice(&fs::read(&intent_path)?)?;
                     if staged.expires_ms != 0 && now_ms >= staged.expires_ms {
-                        let entry = OutboxEntry {
+                        expired.push(OutboxEntry {
                             state: OutboxState::Pending,
-                            staged: staged.clone(),
+                            staged,
                             dir: ent.path(),
-                        };
-                        match self.transition(&entry, OutboxState::Failed) {
-                            Ok(_) => {
-                                tracing::debug!(
-                                    id = %staged.id,
-                                    wallet = %staged.wallet,
-                                    chain = %staged.chain,
-                                    expired_at = staged.expires_ms,
-                                    now_ms,
-                                    "outbox.sweep_expired"
-                                );
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    id = %staged.id,
-                                    wallet = %staged.wallet,
-                                    chain = %staged.chain,
-                                    error = %e,
-                                    "outbox.sweep_transition_failed"
-                                );
-                            }
-                        }
-                        count += 1;
+                        });
                     }
                 }
-                let _ = (wname.clone(), cname.clone());
             }
         }
-        Ok(count)
+        Ok(expired)
+    }
+
+    /// Remove pending entries that have expired.
+    pub fn sweep_expired(&self, now_ms: u128) -> Result<usize, OutboxError> {
+        let expired = self.expired_pending(now_ms)?;
+        for entry in &expired {
+            let staged = &entry.staged;
+            match self.transition(entry, OutboxState::Failed) {
+                Ok(_) => {
+                    tracing::debug!(
+                        id = %staged.id,
+                        wallet = %staged.wallet,
+                        chain = %staged.chain,
+                        expired_at = staged.expires_ms,
+                        now_ms,
+                        "outbox.sweep_expired"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        id = %staged.id,
+                        wallet = %staged.wallet,
+                        chain = %staged.chain,
+                        error = %e,
+                        "outbox.sweep_transition_failed"
+                    );
+                }
+            }
+        }
+        Ok(expired.len())
     }
 
     /// Sum the structured valuation of every staged tx for `wallet` whose
@@ -1086,7 +1145,10 @@ fn parse_sent_entry(
     let hash_str = staged.tx_hash.as_deref()?; // skip if no hash
     let hash: alloy::primitives::B256 = hash_str.parse().ok()?;
     let from: alloy::primitives::Address = staged.from.parse().ok()?;
-    let to: alloy::primitives::Address = staged.to.parse().ok()?;
+    let to = match staged.transaction_kind().ok()? {
+        alloy::primitives::TxKind::Call(address) => Some(address),
+        alloy::primitives::TxKind::Create => None,
+    };
     let value: alloy::primitives::U256 = staged.value_wei.parse().ok()?;
     let fees = if let Some(mfp) = staged.max_fee_per_gas.as_deref() {
         let max_fee_per_gas = mfp.parse::<u128>().ok()?;
@@ -1147,7 +1209,7 @@ mod tests {
             chain: "anvil".into(),
             chain_id: 31337,
             from: "0x0000000000000000000000000000000000000001".into(),
-            to: "0x0000000000000000000000000000000000000002".into(),
+            to: Some("0x0000000000000000000000000000000000000002".into()),
             value_wei: "0".into(),
             data_hex: "0x".into(),
             gas_limit: 21000,
@@ -1160,6 +1222,7 @@ mod tests {
             expires_ms: 0,
             status: TxStatus::Pending,
             action_kind: bloom_proto::TxActionKind::Unknown,
+            review_mode: None,
             tx_hash: None,
             token: None,
             nft: None,
@@ -1214,6 +1277,7 @@ mod tests {
             outcome: "success".into(),
             tx_hash: staged.tx_hash.clone().unwrap(),
             block_number: Some(123),
+            contract_address: None,
             revert_reason: None,
         };
         let se = &ob.walk_all_sent().unwrap()[0];
@@ -1730,6 +1794,96 @@ mod tests {
         ) -> Result<Vec<u8>, String> {
             Err("not found".into())
         }
+    }
+
+    #[test]
+    fn corrupt_previous_attempt_refuses_resubmission() {
+        let dir = tempfile::tempdir().unwrap();
+        let projection = Arc::new(MockProjection::new());
+        let outbox = Outbox::new_with_projection(dir.path(), projection.clone()).unwrap();
+        let staged = fake_staged("deploy-corrupt");
+        outbox.write_pending(&staged, "first").unwrap();
+        outbox.cancel("alice", "anvil", &staged.id).unwrap();
+        let previous = outbox.read("alice", "anvil", &staged.id).unwrap();
+        fs::write(previous.dir.join("intent.json"), b"invalid json").unwrap();
+        assert!(matches!(
+            outbox.write_pending(&staged, "retry"),
+            Err(OutboxError::Json(_))
+        ));
+        fs::remove_file(previous.dir.join("intent.json")).unwrap();
+        fs::create_dir(previous.dir.join("intent.json")).unwrap();
+        assert!(matches!(
+            outbox.write_pending(&staged, "retry"),
+            Err(OutboxError::Io(_))
+        ));
+        assert_eq!(projection.allocated.lock().unwrap().len(), 1);
+        assert!(
+            outbox
+                .list("alice", "anvil", OutboxState::Pending)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn failed_projection_restores_both_wallet_attempts() {
+        let dir = tempfile::tempdir().unwrap();
+        let projection = Arc::new(MockProjection::new());
+        let outbox = Outbox::new_with_projection(dir.path(), projection.clone()).unwrap();
+        let staged = fake_staged("deploy-rollback");
+        outbox.write_pending(&staged, "first").unwrap();
+        outbox.cancel("alice", "anvil", &staged.id).unwrap();
+        let failed = outbox.read("alice", "anvil", &staged.id).unwrap();
+        let previous_bytes = fs::read(failed.dir.join("intent.json")).unwrap();
+        outbox.write_pending(&staged, "retry").unwrap();
+        let pending = outbox.read("alice", "anvil", &staged.id).unwrap();
+        *projection.fail_transition.lock().unwrap() = Some("central store unavailable".into());
+        assert!(outbox.cancel("alice", "anvil", &staged.id).is_err());
+        assert_eq!(
+            fs::read(failed.dir.join("intent.json")).unwrap(),
+            previous_bytes
+        );
+        assert!(pending.dir.join("intent.json").exists());
+        assert_eq!(
+            outbox.read("alice", "anvil", &staged.id).unwrap().state,
+            OutboxState::Pending
+        );
+        *projection.fail_transition.lock().unwrap() = None;
+        outbox.cancel("alice", "anvil", &staged.id).unwrap();
+        let archive = dir.path().join("alice/anvil/archive").join(&staged.id);
+        assert!(fs::read_dir(archive).unwrap().any(|attempt| {
+            fs::read(attempt.unwrap().path().join("entry/intent.json"))
+                .ok()
+                .as_deref()
+                == Some(previous_bytes.as_slice())
+        }));
+    }
+
+    #[test]
+    fn discarded_identical_resubmission_has_a_fresh_central_action() {
+        let dir = tempfile::tempdir().unwrap();
+        let projection = Arc::new(MockProjection::new());
+        let outbox = Outbox::new_with_projection(dir.path(), projection.clone()).unwrap();
+        let staged = fake_staged("deploy-identical");
+        outbox.write_pending(&staged, "first attempt").unwrap();
+        let first = outbox
+            .read(&staged.wallet, &staged.chain, &staged.id)
+            .unwrap();
+        outbox.transition(&first, OutboxState::Failed).unwrap();
+        outbox.write_pending(&staged, "second attempt").unwrap();
+        let second = outbox
+            .read(&staged.wallet, &staged.chain, &staged.id)
+            .unwrap();
+        assert_ne!(first.staged.action_id, second.staged.action_id);
+        outbox.transition(&second, OutboxState::Failed).unwrap();
+        let transitions = projection.transitions.lock().unwrap();
+        assert_eq!(transitions.len(), 2);
+        assert_ne!(transitions[0].0, transitions[1].0);
+        let allocated = projection.allocated.lock().unwrap();
+        assert_ne!(
+            allocated[0].1, allocated[1].1,
+            "the central index must receive a fresh attempt identity"
+        );
     }
 
     #[test]
