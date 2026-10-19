@@ -188,6 +188,33 @@ remain bounded: Enso source inputs do not establish shortcut effects, and a
 Privacy Pools direct withdrawal does not establish ZK-proof validity or relay
 recipient semantics. Unknown content retains an explicit missing-coverage reason.
 
+### Pump Solana transaction review
+
+The four `pumpfun.buy`, `pumpfun.sell`, `pumpfun.close_token_account` and
+`pumpfun.launch` classes require one raw Ed25519 message and a one-operation,
+one-signature approval. Machine forwards the actual legacy or v0 message from
+the existing batch host call. An app-supplied review cannot replace it. Broker
+checks the selected Signer-derived fee payer and the actual message commitments,
+then reads supported Pump/PumpSwap, System, Compute Budget, ATA and SPL Token
+instructions from their bytes. Unknown instructions retain their raw data and
+coverage reason. Token amounts without trusted mint metadata stay in raw units;
+they never borrow another token's decimals or artwork.
+
+The owner approves the full message with only its recent blockhash excluded
+from the approval binding. Broker recovers that binding from the exact durable
+review manifest and checks it again before reserving authority or signing.
+Changing instructions, accounts, amounts, programs, lookup references or their
+order requires a new review. Machine includes the same binding in its durable
+request identity, so old opaque grants are replaced and blockhash-only retries
+retain the reviewed identity. No SDK ABI or native Solana proof digest changes.
+
+This is structural interpretation, with `MachineAsserted` claim assurance.
+It does not establish cluster identity, blockhash freshness, address-table
+contents, program code/CPI effects, token metadata, execution or settlement.
+The requested priority-fee ceiling is derived only when both compute-unit limit
+and price are present exactly once; it excludes base and program fees. Pump
+launch may include a separate mint cosigner outside this owner-signature call.
+
 Publish matching Gasless, Venice, Hyperliquid and Polymarket packages with the new services.
 Old hash-only caller packages cannot satisfy the required exact-message review.
 This is a coordinated package compatibility change, not a new SDK signing ABI

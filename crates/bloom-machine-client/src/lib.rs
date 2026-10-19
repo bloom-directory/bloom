@@ -1232,6 +1232,17 @@ impl MachineBrokerClient {
         request: ExactPayloadBatchSignRequest,
     ) -> Result<ExactPayloadSignOutcome, ProtocolError> {
         request.validate(true)?;
+        let pump_review = request.petal_use_claim.as_ref().is_some_and(|claim| {
+            bloom_broker_api::pumpfun_review_required(claim.operation_class.as_str())
+        });
+        if pump_review
+            && (request.preimages.len() != 1 || request.crypto_suite != CryptoSuite::Ed25519Message)
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::ClaimInvalid,
+                "Pump transaction review requires one Ed25519 message",
+            ));
+        }
         let claim = request.petal_use_claim.as_ref().ok_or_else(|| {
             ProtocolError::new(
                 ProtocolErrorCode::ClaimInvalid,
@@ -1369,14 +1380,22 @@ impl MachineBrokerClient {
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             evm_review_payloads: Vec::new(),
             safe_review_payloads: Vec::new(),
-            message_review_payloads: Vec::new(),
+            message_review_payloads: if pump_review {
+                request
+                    .preimages
+                    .iter()
+                    .map(|payload| Base64UrlBytes::from_bytes(payload))
+                    .collect()
+            } else {
+                Vec::new()
+            },
             operation_id: request.approval_operation_id,
             terms,
             canonical_plan_facts_digest: request.canonical_plan_facts_digest,
             petal_use_claim: Some(claim.clone()),
             system_use_claim: None,
-            // A reusable Petal batch carries no EVM review payloads, so
-            // there is no contract call to read either way.
+            // Pump's one-operation permission carries its actual message;
+            // Broker binds every byte except the refreshable blockhash.
         })
         .await
         .map(ExactPayloadSignOutcome::ApprovalRequired)
@@ -3641,6 +3660,8 @@ mod tests {
                         let supported_crypto_suites =
                             if returned_key_ref.locator.contains("unsupported-suite") {
                                 vec![]
+                            } else if returned_key_ref.key_spec == KeySpec::Ed25519 {
+                                vec![CryptoSuite::Ed25519Message]
                             } else {
                                 vec![
                                     CryptoSuite::Secp256k1Keccak256Recoverable,
@@ -4458,6 +4479,93 @@ mod tests {
             client.sign_exact_payload(request).await.unwrap(),
             ExactPayloadSignOutcome::ApprovalRequired(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn pump_batch_forwards_actual_message_instead_of_an_app_review() {
+        let mut key = key_ref();
+        key.key_spec = KeySpec::Ed25519;
+        let broker = Arc::new(MockBroker {
+            wallet: WalletPublic {
+                wallet_id: token("wallet"),
+                wallet_kind: token("local"),
+                root_key_ref: Some(key.clone()),
+                key_refs: vec![key],
+                policy_version: DecimalU64::new(7),
+                policy_digest: digest(7),
+                wallet_revocation_epoch: DecimalU64::new(2),
+            },
+            accounts: empty_accounts(),
+            requests: Mutex::new(vec![]),
+            corrupt_response: false,
+        });
+        let client = MachineBrokerClient::new(broker.clone());
+        // A native message is a transport fixture only, not Pump trade acceptance.
+        let payload: Vec<u8> = bloom_broker_api::solana_vectors::MESSAGE_HEX
+            .as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect();
+        for class in bloom_broker_api::PUMPFUN_REVIEW_OPERATION_CLASSES {
+            broker.requests.lock().unwrap().clear();
+            let mut request = exact_batch_request(vec![payload.clone()], None);
+            request.crypto_suite = CryptoSuite::Ed25519Message;
+            request.claimed_hashes = vec![Digest32::from_bytes(Sha256::digest(&payload).into())];
+            request.provenance = ProvenanceSubject::Petal {
+                package_hash: digest(80),
+                route: "r000021".into(),
+            };
+            request.petal_use_claim = Some(PetalUseClaim {
+                package_hash: digest(80),
+                route: "r000021".into(),
+                operation_class: token(class),
+                crypto_suite: request.crypto_suite,
+                payload_digest: petal_batch_payload_digest(&request.preimages),
+                ordered_hashes: request.claimed_hashes.clone(),
+                declared_debits: vec![],
+                declared_destinations: vec![],
+                declared_fee: DeclaredFee::None,
+                nonce: RequestNonce::from_bytes([81; 16]),
+                claim_assurance: bloom_broker_api::ClaimAssurance::MachineAsserted,
+            });
+            let mut excess = request.clone();
+            excess.preimages.push(payload.clone());
+            assert!(
+                client
+                    .sign_reusable_petal_payload_batch(excess)
+                    .await
+                    .is_err()
+            );
+            assert!(broker.requests.lock().unwrap().is_empty());
+            assert!(matches!(
+                client
+                    .sign_reusable_petal_payload_batch(request)
+                    .await
+                    .unwrap(),
+                ExactPayloadSignOutcome::ApprovalRequired(_)
+            ));
+            let captured = broker.requests.lock().unwrap();
+            let prepared = captured
+                .iter()
+                .find_map(|r| match r {
+                    MachineBrokerRequest::SealedApprovalPrepare(p) => Some(p),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(
+                prepared.message_review_payloads,
+                vec![Base64UrlBytes::from_bytes(&payload)]
+            );
+            assert!(prepared.evm_review_payloads.is_empty());
+            assert!(prepared.safe_review_payloads.is_empty());
+            assert!(matches!(
+                prepared.terms.selector,
+                ApprovalSelector::Petal { .. }
+            ));
+            assert_eq!(prepared.terms.limits.max_operations.get(), 1);
+        }
     }
 
     #[tokio::test]

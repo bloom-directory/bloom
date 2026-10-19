@@ -1115,6 +1115,7 @@ impl DaemonPetalHost {
         operation_class: &str,
         signature_count: usize,
         account_key: Option<&bloom_broker_api::KeyRef>,
+        review_binding: Option<&bloom_broker_api::Digest32>,
     ) -> Result<(String, PathBuf, PathBuf), HostError> {
         let root = self
             .petal_signing_state_root
@@ -1135,6 +1136,10 @@ impl DaemonPetalHost {
         ] {
             identity.update(&(part.len() as u64).to_be_bytes());
             identity.update(part);
+        }
+        if let Some(binding) = review_binding {
+            identity.update(b"solana-message-review/v1\0");
+            identity.update(binding.as_str().as_bytes());
         }
         let request_id = identity.finalize().to_hex().to_string();
         Ok((
@@ -2394,6 +2399,22 @@ impl PetalHost for DaemonPetalHost {
             package_hash: trusted_package_hash,
             route: context.route_id.clone(),
         };
+        let solana_review_binding =
+            if bloom_broker_api::pumpfun_review_required(&req.operation_class) {
+                if crypto_suite != bloom_broker_api::CryptoSuite::Ed25519Message
+                    || preimages.len() != 1
+                {
+                    return Err(HostError::Denied(
+                        "Pump transaction review requires one Ed25519 message".into(),
+                    ));
+                }
+                Some(
+                    bloom_broker_api::solana_message_binding(&preimages[0])
+                        .map_err(|error| HostError::Denied(error.to_string()))?,
+                )
+            } else {
+                None
+            };
         let (request_id, exact_state_path, owner_projection_path) = match req.selector {
             bloom_broker_api::PetalSignSelector::Exact => self.petal_signing_paths(
                 context,
@@ -2409,6 +2430,7 @@ impl PetalHost for DaemonPetalHost {
                 &req.operation_class,
                 preimages.len(),
                 account_key.as_ref(),
+                solana_review_binding.as_ref(),
             )?,
         };
         if req
@@ -2426,7 +2448,7 @@ impl PetalHost for DaemonPetalHost {
                 bloom_broker_api::Digest32::from_bytes(sha2::Sha256::digest(payload).into())
             })
             .collect::<Vec<_>>();
-        let canonical_facts = match req.selector {
+        let mut canonical_facts = match req.selector {
             bloom_broker_api::PetalSignSelector::Exact => serde_json::json!({
                 "schema": "bloom.machine.petal-exact-batch-facts.v1",
                 "request_id": request_id,
@@ -2459,6 +2481,9 @@ impl PetalHost for DaemonPetalHost {
                 "required_claim_assurance": claim.claim_assurance.level(),
             }),
         };
+        if let Some(binding) = solana_review_binding {
+            canonical_facts["solana_message_binding"] = serde_json::json!(binding);
+        }
         let catalog = self.provenance_catalog.clone().ok_or_else(|| {
             HostError::Backend("installer provenance catalog is not configured".into())
         })?;
@@ -9127,7 +9152,7 @@ allowed = ["bloom:vfs.read"]
                 )
                 .unwrap();
             let reusable = host
-                .petal_reusable_signing_paths(&context, "w", "test.intent", 1, Some(key))
+                .petal_reusable_signing_paths(&context, "w", "test.intent", 1, Some(key), None)
                 .unwrap();
             identities.push((exact, reusable));
         }
@@ -9142,7 +9167,57 @@ allowed = ["bloom:vfs.read"]
                 "w",
                 "test.intent",
                 1,
-                Some(&changed_locator)
+                Some(&changed_locator),
+                None
+            )
+            .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn solana_review_identity_excludes_blockhash_and_replaces_unreviewed_grants() {
+        let (_dir, daemon, _) = isolation_daemon().await;
+        let host = test_petal_host(&daemon)
+            .with_petal_signing_state_root(daemon.home.cache_dir().join("signing"));
+        let context = account_route_context("w", Some(0), None);
+        let payload = hex::decode(bloom_broker_api::solana_vectors::MESSAGE_HEX).unwrap();
+        let binding = bloom_broker_api::solana_message_binding(&payload).unwrap();
+        let original = host
+            .petal_reusable_signing_paths(&context, "w", "pumpfun.buy", 1, None, Some(&binding))
+            .unwrap();
+        let old = host
+            .petal_reusable_signing_paths(&context, "w", "pumpfun.buy", 1, None, None)
+            .unwrap();
+        assert_ne!(original, old, "old opaque grants must not be reused");
+        // The frozen fixture has three static accounts and one-byte count.
+        let mut fresh = payload.clone();
+        fresh[100..132].fill(0x55);
+        let fresh_binding = bloom_broker_api::solana_message_binding(&fresh).unwrap();
+        assert_eq!(binding, fresh_binding);
+        assert_eq!(
+            original,
+            host.petal_reusable_signing_paths(
+                &context,
+                "w",
+                "pumpfun.buy",
+                1,
+                None,
+                Some(&fresh_binding)
+            )
+            .unwrap()
+        );
+        let mut altered = payload;
+        *altered.last_mut().unwrap() ^= 1;
+        let altered_binding = bloom_broker_api::solana_message_binding(&altered).unwrap();
+        assert_ne!(
+            original,
+            host.petal_reusable_signing_paths(
+                &context,
+                "w",
+                "pumpfun.buy",
+                1,
+                None,
+                Some(&altered_binding)
             )
             .unwrap()
         );
