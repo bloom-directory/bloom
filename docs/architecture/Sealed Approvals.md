@@ -188,6 +188,12 @@ remain bounded: Enso source inputs do not establish shortcut effects, and a
 Privacy Pools direct withdrawal does not establish ZK-proof validity or relay
 recipient semantics. Unknown content retains an explicit missing-coverage reason.
 
+Enso Router V2 `safeRouteSingle`/`safeRouteMulti` also expose the actual receiver
+and requested token/native balance-increase minimums. Output units come from
+their own encoded token identity; native minimums never borrow transaction
+value. Empty output checks warn explicitly. These requested constraints do not
+prove code, shortcut effects, fees, received funds or settlement.
+
 ### Pump Solana transaction review
 
 The four `pumpfun.buy`, `pumpfun.sell`, `pumpfun.close_token_account` and
