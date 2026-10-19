@@ -6544,8 +6544,9 @@ mod tests {
             age_ms: 0,
             max_age_ms: 60_000,
         };
-        // An address-shaped hint: the symbol the plan shows comes from the
-        // chain, which here claims to be USDC.
+        // An address-shaped hint for an unlisted contract. The seeded metadata
+        // calls it USDC, as the contract's own `symbol()` would; policy must
+        // not take that as the token's symbol.
         let intent = || RawIntent {
             body: RawIntentBody::Send {
                 to: "0x2222222222222222222222222222222222222222".into(),
