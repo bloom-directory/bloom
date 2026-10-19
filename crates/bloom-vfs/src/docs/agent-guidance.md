@@ -467,6 +467,12 @@ exchange acceptance is not settlement. Unknown assets retain their exact
 identity/raw units. Delegated sessions use their existing bounded authority
 and do not imply independent owner review of every future trade.
 
+Hyperliquid delegated actions supply a complete use-time action witness so
+Broker can verify the signed preimage under the existing grant. Upgrade the
+Petal with the matching Broker if an older hash-only caller is refused; do not
+strip that witness or seek another owner ceremony for each session action.
+This check does not make Petal-local caps venue-enforced or prove fills.
+
 Installed application documents and public routes live under `petals/<name>/`.
 Account-dependent routes explicitly select a wallet and index, for example
 `petals/enso/intents/<wallet>/<index>/new`. Follow each package's route tree;

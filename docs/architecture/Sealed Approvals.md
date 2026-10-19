@@ -155,6 +155,14 @@ batch or reusable downgrades. This does not turn an existing delegated agent
 grant into a fresh owner ceremony for each future action. Full per-call
 interpretation and reusable scope enforcement are separate properties.
 
+Delegated `hyperliquid.agent_action` uses also forward the full ordered action
+witness through the existing `claim_assurance_evidence` channel. Broker
+reconstructs and checks the actual signing preimage before reserving authority
+or requesting a signature, including uses of older grants. The assurance stays
+`MachineAsserted`; local session caps, market identities and venue effects are
+not thereby verified. Matching Hyperliquid packages are required because old
+hash-only agent callers are refused. No per-trade owner ceremony is added.
+
 Polymarket's current caller uses the batch host API with one prepared record.
 Machine forwards that complete record for exact orders, wallet permissions and
 relayer batches; Broker reconstructs the ERC-7739 order or DepositWallet Batch.
