@@ -170,6 +170,14 @@ The outer exact preimage/hash, selected owner and every call remain bound.
 Unrecognized call contents remain explicit, and auxiliary draft labels never
 become signed facts. pUSD is a separate Polygon token, not Circle USDC.
 
+Polymarket orders remain exact approvals. The Trader persona proposed in
+Bloom #352 cannot submit `polymarket.order.poly1271` with a reusable selector.
+Do not remove the exact-review requirement to make that caller work. A future
+delegated trading profile needs a separate versioned class, Broker verification
+of each order against its approved bounds, and Signer-enforced usage limits.
+Until that profile exists and is tested across the services, the persona must
+use exact approval or leave automated Polymarket trading unavailable.
+
 CLOB authentication uses the distinct immutable `polymarket.clob_auth.v1`
 permission: one operation/signature, Polygon ClobAuthDomain version 1, selected
 owner, nonce zero, fixed wallet attestation and a timestamp within 300 seconds
@@ -214,6 +222,13 @@ order requires a new review. Machine includes the same binding in its durable
 request identity, so old opaque grants are replaced and blockhash-only retries
 retain the reviewed identity. No SDK ABI or native Solana proof digest changes.
 
+Blockhash refresh is permitted before the single signature is consumed. It is
+not permission to sign a second transaction after the first signature exists.
+Broker requires `max_operations = 1` and `max_signatures = 1`; the authority
+reservation and Signer's counters enforce those limits. A changed blockhash
+after signing must not receive another signature under that approval, even if
+the first transaction has not expired or its submission outcome is unknown.
+
 This is structural interpretation, with `MachineAsserted` claim assurance.
 It does not establish cluster identity, blockhash freshness, address-table
 contents, program code/CPI effects, token metadata, execution or settlement.
@@ -225,6 +240,35 @@ Publish matching Gasless, Venice, Hyperliquid and Polymarket packages with the n
 Old hash-only caller packages cannot satisfy the required exact-message review.
 This is a coordinated package compatibility change, not a new SDK signing ABI
 or a new wallet clear-signing mode.
+
+### Caller and catalog migration
+
+`reviewMode` is removed from intents, staged transactions and deploy requests.
+Callers must omit it; strict deploy request decoding rejects the obsolete
+field. There is no replacement opt-in flag. Broker derives the review from
+the actual transaction and the registered signing class, and known message
+classes require their full review envelopes.
+
+Before shipping this combination, publish the compatible Petal packages and
+update `github_source.rs` release commits, archives, package hashes, lineage
+predecessors and authority routes together. Existing wallets must approve the
+new package identities. A source branch or local package build is not a
+published catalog release. Keep required reviews enforced while those releases
+are pending; the old catalog is not compatible merely because Machine CI passes.
+
+When combining Bloom #322 and #293 with the compiled token catalog, policy
+symbols must resolve uniquely back to the same chain/address. Ambiguous tickers
+must not authorize multiple tokens. Typed pUSD funding checks the user's deposit
+wallet as recipient, not the pUSD contract. Use a specific recipient approval
+or an explicitly approved Petal destination rule; do not widen the default
+recipient allowlist to accommodate every deposit wallet.
+
+Candidate verification records are retained under
+[`tests/evidence`](../../tests/evidence). They record revisions and fixture
+limits, not blanket release acceptance. In particular, the
+[`route inventory`](../../tests/evidence/all-petal-route-coverage-2026-10-19.json)
+and [`Enso roundtrips`](../../tests/evidence/enso-route-review-2026-10-19.json)
+do not prove funded venue effects or physical-owner acceptance.
 
 Petals always submit complete payload bytes through a payload-bearing host
 call. Hash-only guest signing is unsupported. Machine may validate guest

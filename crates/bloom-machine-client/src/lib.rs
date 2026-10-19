@@ -2188,10 +2188,16 @@ impl ExactPayloadBatchSignRequest {
                 "CLOB authentication requires its one-signature versioned permission",
             ));
         }
-        if (reusable
+        if reusable
             && (self.message_review_payload.is_some()
-                || class.is_some_and(bloom_broker_api::message_review_requires_exact)))
-            || (!reusable && polymarket != self.message_review_payload.is_some())
+                || class.is_some_and(bloom_broker_api::message_review_requires_exact))
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::ClaimInvalid,
+                "Reviewed Petal messages require exact approval; reusable signing cannot carry an exact review envelope",
+            ));
+        }
+        if (!reusable && polymarket != self.message_review_payload.is_some())
             || self.message_review_payload.as_ref().is_some_and(|payload| {
                 payload.len() > bloom_broker_api::SINGLE_PAYLOAD_MAX_BYTES
                     || self.preimages.len() != 1
@@ -4349,7 +4355,15 @@ mod tests {
             assert!(request.validate(false).is_err());
             request.crypto_suite = CryptoSuite::Secp256k1Keccak256Recoverable;
             request.message_review_payload = None;
-            assert!(request.validate(true).is_err());
+            let error = request.validate(true).unwrap_err();
+            assert!(error.to_string().contains("require exact approval"));
+        }
+        // The same refusal applies outside Polymarket, including callers that
+        // omit the envelope while requesting a reusable approval.
+        for class in bloom_broker_api::MESSAGE_REVIEW_OPERATION_CLASSES {
+            request.petal_use_claim.as_mut().unwrap().operation_class = token(class);
+            let error = request.validate(true).unwrap_err();
+            assert!(error.to_string().contains("require exact approval"));
         }
         request.petal_use_claim.as_mut().unwrap().operation_class =
             token(bloom_broker_api::POLYMARKET_CLOB_AUTH_CLASS);
