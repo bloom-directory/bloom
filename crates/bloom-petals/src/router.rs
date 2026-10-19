@@ -170,10 +170,13 @@ impl PetalRouter {
         let result = self.observe_account_context(wallet, number).await;
         let mut cache = self.account_context_cache()?;
         let reuse = self.account_context_reuse;
+        cache
+            .entries
+            .retain(|_, entry| entry.observed.elapsed() <= reuse);
         // Only the newest observation of an account is kept, so a slow
         // success never overwrites a later refusal. One already older than the
-        // reuse window could not be reused, and neither could any entry it
-        // would replace.
+        // reuse window could not be reused, and every entry it could replace
+        // has been pruned.
         let superseded = cache
             .entries
             .get(&key)
@@ -1084,6 +1087,23 @@ mod tests {
         // observes again rather than reusing the account.
         assert!(router.account_context("alice", "0", false).await.is_err());
         assert_eq!(host.reads.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn expired_account_observations_are_pruned() {
+        let (_dir, runner) = runner();
+        let mut router = PetalRouter::new(runner, Arc::new(AccountHost));
+        router.account_context_reuse = Duration::from_millis(50);
+        router.account_context("alice", "0", false).await.unwrap();
+        router.account_context("alice", "1", false).await.unwrap();
+        assert_eq!(router.account_contexts.lock().unwrap().entries.len(), 2);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        router.account_context("alice", "1", false).await.unwrap();
+        let cache = router.account_contexts.lock().unwrap();
+        assert_eq!(
+            cache.entries.keys().collect::<Vec<_>>(),
+            [&("alice".to_owned(), 1)]
+        );
     }
 
     fn runner() -> (TempDir, PetalRunner) {
