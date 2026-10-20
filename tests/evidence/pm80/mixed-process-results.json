@@ -1,0 +1,59 @@
+{
+  "diagnostic_features": [
+    "triad-dev-harness"
+  ],
+  "cases": [
+    {
+      "name": "new-pair",
+      "compatible": true,
+      "wallet_read_exit": 0,
+      "refused_at_startup": false,
+      "authority_rows": {
+        "ceremonies.db:ceremony_sessions": 0,
+        "journal.db:approvals": 0,
+        "journal.db:ceremony_sessions": 0,
+        "journal.db:operations": 0,
+        "journal.db:pending_petal_key_scopes": 0,
+        "journal.db:petal_key_scopes": 0,
+        "journal.db:policies": 0
+      }
+    },
+    {
+      "name": "old-machine",
+      "compatible": false,
+      "wallet_read_exit": null,
+      "refused_at_startup": true,
+      "authority_rows": {
+        "ceremonies.db:ceremony_sessions": 0,
+        "journal.db:approvals": 0,
+        "journal.db:ceremony_sessions": 0,
+        "journal.db:operations": 0,
+        "journal.db:pending_petal_key_scopes": 0,
+        "journal.db:petal_key_scopes": 0,
+        "journal.db:policies": 0
+      }
+    },
+    {
+      "name": "old-broker",
+      "compatible": false,
+      "wallet_read_exit": null,
+      "refused_at_startup": true,
+      "authority_rows": {
+        "ceremonies.db:ceremony_sessions": 0,
+        "journal.db:approvals": 0,
+        "journal.db:ceremony_sessions": 0,
+        "journal.db:operations": 0,
+        "journal.db:pending_petal_key_scopes": 0,
+        "journal.db:petal_key_scopes": 0,
+        "journal.db:policies": 0
+      }
+    }
+  ],
+  "binary_sha256": {
+    "MACHINE": "7bcb36e276ad5de819b39f1a2f671ad9f25a906531b3973b5b23521d93b2dea7",
+    "BROKER": "ed95b79464ae52bd231029f9cd444e8a24f5da57341008b1856072d2fd24aaa2",
+    "RELEASED_MACHINE": "d54ea59b09e9280f0a02a97ace468504686133c22f7eb665d02345980e934eaa",
+    "RELEASED_BROKER": "4bf00c0efd1dab82a43c4c2838d86dafd4275315b379e9323e1c3d513591bc00",
+    "SIGNER": "0a3f0b747c80a6910457612d169d936de2d2b71bee3bef75b0997b4c21a00ab5"
+  }
+}
