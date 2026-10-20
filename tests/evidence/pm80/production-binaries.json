@@ -1,0 +1,33 @@
+{
+  "status": "production compilation only; signed bundle/conformance pending",
+  "binaries": [
+    {
+      "binary": "bloom",
+      "source_commit": "44fb83470c7d981b81a67abd9ed01420bcd85e36",
+      "version": "bloom 0.4.0\nbloom-daemon 0.4.0\nbloom-ipc 1 (compatible; cli 1, daemon 1)",
+      "architecture": "ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, for GNU/Linux 4.4.0, BuildID[sha1]=a3ba25b8f35950b4a721c8931b85e4d887390424, not stripped",
+      "sha256": "8c4b7e8bdeb5bb93d51f4f7afcf51e5546be174d063eb9210626979360f0fd00"
+    },
+    {
+      "binary": "bloom-broker",
+      "source_commit": "731defa43780d1b0ad06b0029f00c0b6b2fc48fa",
+      "version": "bloom-broker 0.1.0",
+      "architecture": "ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, for GNU/Linux 4.4.0, BuildID[sha1]=6f6a03f9d5e450d3ece9f56552b7cf26b83e8f3e, not stripped",
+      "sha256": "6a1fe2f18accd0cb49cffe0e6dc4ff78138fa39dcd584abe2078d4771e52295a"
+    },
+    {
+      "binary": "bloom-signer",
+      "source_commit": "bc88ad690757165ebf1978410ea5c7ec652215d3",
+      "version": "bloom-signer 0.1.0",
+      "architecture": "ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, for GNU/Linux 4.4.0, BuildID[sha1]=011a760661f6cc49a916938d62cd986322542e19, not stripped",
+      "sha256": "3c33dc559beed313c3ea34f429b5eb3fef83a04d72f22d8ecb5700ab7967c8f4"
+    },
+    {
+      "binary": "bloom-signer-migrate",
+      "source_commit": "bc88ad690757165ebf1978410ea5c7ec652215d3",
+      "version": "bloom-signer-migrate 0.1.0",
+      "architecture": "ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, for GNU/Linux 4.4.0, BuildID[sha1]=c5b9b209bf45250e729c4babf2d3328748e2051f, not stripped",
+      "sha256": "7c572fe9fbcac1922a1f1f593c81fc430d72e28ceb14e4fef0fcc92f37595b49"
+    }
+  ]
+}
