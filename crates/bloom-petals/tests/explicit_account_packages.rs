@@ -750,6 +750,7 @@ async fn real_signing_producers_reach_the_host_with_selected_account_and_full_wi
         serde_json::from_slice(&vfs.read(&status_path).await.unwrap()).unwrap();
     assert_eq!(read_only["stage"], "legacy_eoa");
     assert!(read_only["next_action"].is_null());
+    assert!(read_only.get("deposit_wallet_action").is_none());
     // A real persisted delegated session drives the actual compiled workflow.
     let key = bloom_broker_api::KeyRef {
         backend: bloom_broker_api::Token::new("local").unwrap(),

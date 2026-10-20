@@ -3,7 +3,7 @@
   "status": "partial; not release acceptance",
   "inputs": {
     "broker": "69e5f3e25aaa587dc267edbd701385f13a39d189",
-    "polymarket": "0c9c4348b72dec68985c1009911caa979d1219f2",
+    "polymarket": "49845083048e8e8345c18adf9011f040aaa49f6d",
     "hyperliquid": "17652ac832314a75b8b9b079cb5aacf74b498891",
     "enso": "fb2593b79bba9c1cddc4f6dce4b847d860dc4c52",
     "signer_release_baseline": "bc88ad690757165ebf1978410ea5c7ec652215d3"
@@ -19,7 +19,7 @@
   "package_candidates": [
     {
       "name": "polymarket",
-      "package_hash": "6ba548a5b5d695e02c8792627811c3f965aaf0e6e1c332566db90aa5c925c5d0",
+      "package_hash": "4da86018d922930bff42f025a06f56742f86f1f86926e9e42810fca2413fd405",
       "authority_routes": [
         {
           "route_id": "r000042",

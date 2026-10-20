@@ -38,7 +38,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           repository: bloom-directory/bloom-petal-polymarket
-          ref: 0c9c4348b72dec68985c1009911caa979d1219f2
+          ref: 49845083048e8e8345c18adf9011f040aaa49f6d
           path: .pm80-packages/polymarket
       - uses: actions/checkout@v6
         with:
