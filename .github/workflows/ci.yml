@@ -51,8 +51,17 @@ jobs:
           git init "$RUNNER_TEMP/pm80-broker"
           git -C "$RUNNER_TEMP/pm80-broker" fetch --depth=1 https://github.com/bloom-directory/bloom-broker.git "$broker_ref"
           git -C "$RUNNER_TEMP/pm80-broker" checkout --detach FETCH_HEAD
-          cmp "$RUNNER_TEMP/pm80-broker/crates/bloom-broker/tests/fixtures/hyperliquid-producer-cancel.json" crates/bloom-petals/tests/fixtures/hyperliquid-producer-cancel.json
-          cmp "$RUNNER_TEMP/pm80-broker/crates/bloom-broker/tests/fixtures/legacy-policy-removal.json" crates/bloom-machine-client/tests/fixtures/legacy-policy-removal.json
+          python3 - "$RUNNER_TEMP/pm80-broker" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+          broker = Path(sys.argv[1]) / "crates/bloom-broker/tests/fixtures"
+          for source, target in [
+              ("hyperliquid-producer-cancel.json", "crates/bloom-petals/tests/fixtures/hyperliquid-producer-cancel.json"),
+              ("legacy-policy-removal.json", "crates/bloom-machine-client/tests/fixtures/legacy-policy-removal.json"),
+          ]:
+              assert json.loads((broker / source).read_text()) == json.loads(Path(target).read_text()), source
+          PY
       - name: Install Rust and component tooling
         run: |
           rustup show
