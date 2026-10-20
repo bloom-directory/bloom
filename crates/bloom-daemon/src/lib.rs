@@ -3081,15 +3081,25 @@ fn decode_petal_erc20_transfer(
     // generic call with its bytes intact - and is not validated below either,
     // because Bloom will not be rebuilding it.
     if !declared_by_package
-        && !bloom_tx::tx_engine::is_known_token_address(reported_chain_id, requested_to)
+        && bloom_tx::tx_engine::known_token(reported_chain_id, requested_to).is_none()
     {
         return Ok(None);
     }
     let calldata = parse_petal_hex_bytes(&request.data_hex, "data-hex")?;
-    if calldata.len() != IERC20::transferCall::SELECTOR.len() + 64
-        || !calldata.starts_with(&IERC20::transferCall::SELECTOR)
-    {
+    if !calldata.starts_with(&IERC20::transferCall::SELECTOR) {
         return Ok(None);
+    }
+    // A registered token runs `transfer` whatever follows its two words:
+    // Solidity ignores trailing calldata. Left generic, a longer call would
+    // move the same tokens to the same recipient while policy checked the
+    // token contract in place of that recipient, so one extra byte would step
+    // around the recipient rule the canonical call is held to. Only the exact
+    // shape is typed; any other length under this selector is refused.
+    if calldata.len() != IERC20::transferCall::SELECTOR.len() + 64 {
+        return Err(HostError::Invalid(format!(
+            "ERC-20 transfer calldata to a registered token must be exactly 68 bytes, not {}",
+            calldata.len()
+        )));
     }
     // The engine rebuilds the call from the decoded fields, so anything the
     // decoder tolerates and drops would be a silent payload change. Validate
@@ -3158,8 +3168,12 @@ fn petal_pending_request_matches(
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or(u128::MAX);
+    // Scoped to the package, like confirm and inspection. A route that stages
+    // the step another route already staged (Morpho's `confirm` restaging
+    // after a lost outbox id) must find that entry, not stage a duplicate at
+    // the next nonce that needs its own approval.
     staged.expires_ms > now_ms
-        && staged.resolved_execution_origin() == *origin
+        && staged.resolved_execution_origin().same_package(origin)
         && staged.from.parse::<Address>().ok() == Some(requested_from)
         && staged
             .to
@@ -3167,7 +3181,9 @@ fn petal_pending_request_matches(
             .and_then(|to| to.parse::<Address>().ok())
             == Some(requested_to)
         && staged.value_wei.parse::<U256>().ok() == Some(requested_value)
-        && calldata_bytes_equal(&staged.data_hex, &request.data_hex)
+        // `evm_tx_stage` accepts only lowercase canonical hex, and the engine
+        // stores calldata lowercase, so the strings compare exactly.
+        && staged.data_hex == request.data_hex
         && request.nonce.is_none_or(|nonce| staged.nonce == nonce)
         && request
             .max_fee_per_gas
@@ -3176,24 +3192,6 @@ fn petal_pending_request_matches(
         && request.max_priority_fee_per_gas.as_ref().is_none_or(|fee| {
             decimal_strings_equal(staged.max_priority_fee_per_gas.as_deref(), fee)
         })
-}
-
-/// Compare calldata by the bytes it denotes, not by its spelling.
-///
-/// A recognized ERC-20 transfer is stored as the calldata the engine
-/// regenerated, which is always lowercase, while the Petal's request keeps
-/// whatever case it sent. Comparing strings makes an identical retry miss its
-/// own pending row and stage a second transfer on the next nonce.
-fn calldata_bytes_equal(stored: &str, requested: &str) -> bool {
-    match (
-        parse_petal_hex_bytes(stored, "stored data-hex"),
-        parse_petal_hex_bytes(requested, "data-hex"),
-    ) {
-        (Ok(stored), Ok(requested)) => stored == requested,
-        // Neither side is guaranteed to parse; fall back to the literal
-        // comparison rather than treating two unparseable values as equal.
-        _ => stored == requested,
-    }
 }
 
 fn decimal_strings_equal(stored: Option<&str>, requested: &str) -> bool {
@@ -5816,10 +5814,11 @@ mod tests {
     }
 
     /// USDC on Ethereum: in the curated registry, so the classifier will look
-    /// at a call addressed to it. Anvil consults mainnet's list.
+    /// at a call addressed to it on mainnet.
     const KNOWN_TOKEN: &str = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
     /// Not in the registry: a contract Bloom knows nothing about.
     const UNKNOWN_CONTRACT: &str = "0x0000000000000000000000000000000000000010";
+    const MAINNET: u64 = 1;
     const ANVIL: u64 = 31337;
 
     fn petal_evm_request(to: &str, value_wei: &str, data_hex: String) -> EvmTransactionRequest {
@@ -5842,8 +5841,8 @@ mod tests {
     ) -> Result<Option<(Address, U256)>, HostError> {
         decode_petal_erc20_transfer(
             request,
-            ANVIL,
-            ANVIL,
+            MAINNET,
+            MAINNET,
             request.to.parse().unwrap(),
             value,
             false,
@@ -5978,8 +5977,7 @@ decimals = 6
     /// The registry is read by chain and the signature is for the id the node
     /// reports. When the two disagree a transfer stays generic, even to a
     /// token curated for the configured chain, rather than being typed for
-    /// one chain and signed for another. Anvil's alias to mainnet's list
-    /// applies to the reported id, which for a local fork is 31337 too.
+    /// one chain and signed for another.
     #[test]
     fn a_node_reporting_another_chain_leaves_a_curated_transfer_generic() {
         let recipient: Address = "0x0000000000000000000000000000000000000020"
@@ -5990,7 +5988,7 @@ decimals = 6
         let classify = |spec: u64, reported: u64| {
             decode_petal_erc20_transfer(&request, spec, reported, to, U256::ZERO, false).unwrap()
         };
-        assert!(classify(ANVIL, ANVIL).is_some(), "agreeing ids: typed");
+        assert!(classify(MAINNET, MAINNET).is_some(), "agreeing ids: typed");
         assert!(
             classify(ANVIL, 1).is_none(),
             "node says mainnet, config says anvil"
@@ -6002,6 +6000,30 @@ decimals = 6
         // Curated on the reported chain but not the configured one is still
         // a disagreement, not a lookup on the reported chain.
         assert!(classify(8453, 1).is_none());
+    }
+
+    /// Chain id 31337 does not prove a node forked mainnet: any code can sit at
+    /// mainnet USDC's address on a local Anvil. With both ids agreeing on
+    /// 31337 the call still stays generic, and it is not validated either,
+    /// because Bloom will not rebuild it.
+    #[test]
+    fn a_local_anvil_does_not_borrow_mainnet_tokens() {
+        let recipient: Address = "0x0000000000000000000000000000000000000020"
+            .parse()
+            .unwrap();
+        let to: Address = KNOWN_TOKEN.parse().unwrap();
+        let mut calldata = canonical_transfer(recipient, 1);
+        let request = petal_evm_request(KNOWN_TOKEN, "0", hex0x(&calldata));
+        assert_eq!(
+            decode_petal_erc20_transfer(&request, ANVIL, ANVIL, to, U256::ZERO, false).unwrap(),
+            None
+        );
+        calldata[4] = 1;
+        let dirty = petal_evm_request(KNOWN_TOKEN, "0", hex0x(&calldata));
+        assert_eq!(
+            decode_petal_erc20_transfer(&dirty, ANVIL, ANVIL, to, U256::ZERO, false).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -6019,6 +6041,55 @@ decimals = 6
         let mut trailing = calldata;
         trailing.push(0);
         let request = petal_evm_request(KNOWN_TOKEN, "0", hex0x(&trailing));
+        assert!(matches!(
+            classify(&request, U256::ZERO),
+            Err(HostError::Invalid(_))
+        ));
+    }
+
+    /// The token ignores trailing calldata and runs the transfer anyway. Left
+    /// generic, the padded call would be checked against the token contract
+    /// instead of its recipient, so one byte would sidestep the recipient rule
+    /// the canonical call meets. Under the `transfer` selector, a registered
+    /// token gets the exact shape or a refusal, never a generic call.
+    #[test]
+    fn a_registered_token_transfer_of_any_other_length_is_refused_not_left_generic() {
+        let recipient: Address = "0x0000000000000000000000000000000000000020"
+            .parse()
+            .unwrap();
+        let canonical = canonical_transfer(recipient, 42);
+        let mut longer = canonical.clone();
+        longer.extend_from_slice(&[0; 32]);
+        for calldata in [
+            [canonical.as_slice(), &[0]].concat(),
+            longer,
+            canonical[..67].to_vec(),
+            IERC20::transferCall::SELECTOR.to_vec(),
+        ] {
+            let request = petal_evm_request(KNOWN_TOKEN, "0", hex0x(&calldata));
+            assert!(
+                matches!(classify(&request, U256::ZERO), Err(HostError::Invalid(_))),
+                "{} bytes under the transfer selector must be refused",
+                calldata.len()
+            );
+        }
+
+        // Another selector on the same token is not a transfer: it stays
+        // generic, bytes intact.
+        let approve = IERC20::approveCall {
+            spender: recipient,
+            amount: U256::from(42_u64),
+        }
+        .abi_encode();
+        let request = petal_evm_request(KNOWN_TOKEN, "0", hex0x(&approve));
+        assert_eq!(classify(&request, U256::ZERO).unwrap(), None);
+
+        // An unregistered contract is never rebuilt, so its length is its own.
+        let request = petal_evm_request(
+            UNKNOWN_CONTRACT,
+            "0",
+            hex0x(&[canonical.as_slice(), &[0]].concat()),
+        );
         assert_eq!(classify(&request, U256::ZERO).unwrap(), None);
     }
 
@@ -6111,28 +6182,6 @@ decimals = 6
             matches!(error, HostError::Invalid(_)),
             "expected an invalid-payload refusal, got {error:?}"
         );
-    }
-
-    /// The engine stores the calldata it regenerated, always lowercase. An
-    /// identical retry that spelled its hex in uppercase has to find that same
-    /// pending row, or it stages a second transfer on the next nonce.
-    #[test]
-    fn calldata_comparison_ignores_hex_case_but_not_bytes() {
-        let calldata = canonical_transfer(
-            "0x0000000000000000000000000000000000000020"
-                .parse()
-                .unwrap(),
-            42,
-        );
-        let lower = hex0x(&calldata);
-        let upper = format!("0x{}", hex::encode_upper(&calldata));
-        assert!(calldata_bytes_equal(&lower, &upper));
-        assert!(calldata_bytes_equal(&lower, &lower));
-
-        let mut different = calldata;
-        different[35] ^= 1;
-        let different = hex0x(&different);
-        assert!(!calldata_bytes_equal(&lower, &different));
     }
 
     #[test]
@@ -7698,6 +7747,39 @@ decimals = 6
             ),
             "the same request from another account must not reuse this outbox"
         );
+        // Reuse is scoped like confirm: another route of the same package
+        // finds the entry rather than staging a duplicate at the next nonce,
+        // while another digest or another Petal does not.
+        let mut other_route = origin.clone();
+        other_route.route_id = Some("r000099".into());
+        assert!(
+            petal_pending_request_matches(
+                &staged,
+                &request,
+                &other_route,
+                staged.from.parse().unwrap(),
+                staged.to.as_deref().unwrap().parse().unwrap(),
+                staged.value_wei.parse().unwrap(),
+            ),
+            "another route of the same package must reuse this outbox"
+        );
+        let mut other_digest = origin.clone();
+        other_digest.petal_digest = "c".repeat(64);
+        let mut other_petal = origin.clone();
+        other_petal.petal_id = "other".into();
+        for foreign in [other_digest, other_petal] {
+            assert!(
+                !petal_pending_request_matches(
+                    &staged,
+                    &request,
+                    &foreign,
+                    staged.from.parse().unwrap(),
+                    staged.to.as_deref().unwrap().parse().unwrap(),
+                    staged.value_wei.parse().unwrap(),
+                ),
+                "another package must not reuse this outbox: {foreign:?}"
+            );
+        }
         let mut equivalent_fee_request = request.clone();
         equivalent_fee_request.max_fee_per_gas = Some("00100".into());
         equivalent_fee_request.max_priority_fee_per_gas = Some("00010".into());
