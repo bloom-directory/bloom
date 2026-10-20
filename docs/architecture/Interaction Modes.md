@@ -187,12 +187,19 @@ state. Their installed package documentation defines their mounted routes.
   handed over: the decoder discards those bytes, and the re-encoded call would
   no longer be the call that was submitted.
 
+  The length is held exactly as well. A zero-value call to a registered token
+  under the `transfer` selector that is not exactly 68 bytes is **rejected at
+  staging**, not left generic. The token ignores trailing calldata and still
+  executes the transfer, but a generic call is checked against the token
+  contract rather than the recipient, so leaving it generic would let one extra
+  byte step around the recipient policy the canonical call meets.
+
   This applies only to that shape. A call the classifier does not recognise is
   untouched and still stages as a generic contract call with its bytes intact,
-  including one carrying nonzero native value, one whose calldata is any other
-  length, one bearing another selector, and one addressed to a contract outside
-  the registry — even when such a call contains the same noncanonical padding.
-  Those never reach the decoder, because Machine never rebuilds their calldata.
+  including one carrying nonzero native value, one bearing another selector,
+  and one addressed to a contract outside the registry — even when such a call
+  contains the same noncanonical padding or any other length. Those never
+  reach the decoder, because Machine never rebuilds their calldata.
 - Paid HTTP stages the selected challenge and payment payload, then obtains any
   required signature through Broker/Signer.
 - Installed Polymarket or Hyperliquid Petals use their package-defined mounted

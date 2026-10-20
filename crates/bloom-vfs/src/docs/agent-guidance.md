@@ -478,9 +478,9 @@ owner approval. One shape is different. A canonical ERC-20
 in Bloom's curated registry**, is decoded to its recipient and amount, and
 Bloom rebuilds the calldata from those two fields instead of forwarding the
 Petal's bytes. It is then classified as a token transfer, checked against
-wallet policy, and eligible for policy-bounded autonomy. Extra trailing
-calldata, a different selector, any nonzero native value, or a target contract
-the registry does not list keeps it generic, and so does a node whose reported
+wallet policy, and eligible for policy-bounded autonomy. A different selector,
+any nonzero native value, or a target contract the registry does not list
+keeps it generic, and so does a node whose reported
 chain id differs from the configured chain, since the registry is read by chain
 and the signature is for the reported id. The registry condition is what
 makes the classification mean anything: matching the selector only proves what
@@ -500,11 +500,20 @@ no nonce is reserved: the check runs before the transaction is staged.
 Left-pad the address with zeros and stage again; retrying the same bytes fails
 the same way.
 
+The length is held exactly too. A `transfer` call with no native value to a
+registered token that is longer or shorter than 68 bytes is refused at
+staging, with an error that ERC-20 transfer calldata to a registered token
+must be exactly 68 bytes. It is not left generic: the token ignores trailing
+calldata and would still make the transfer, while a generic call is checked
+against the token contract instead of the recipient. Drop any suffix, such as
+an attribution tag, and send exactly the selector and its two words.
+
 This is not a general rule about padding. A call Bloom leaves generic keeps
 the bytes you gave it and stages normally, even with that padding — including
-a call carrying nonzero native value, one of any other calldata length, one
-bearing another selector, and one addressed to a contract the registry does
-not list. Bloom only rejects what it would otherwise rewrite.
+a call carrying nonzero native value, one bearing another selector, and one
+addressed to a contract the registry does not list. Bloom rejects only what it
+would otherwise rewrite, and a transfer to a registered token in any other
+length.
 
 ## Local development chains
 

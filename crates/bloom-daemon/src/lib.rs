@@ -3046,10 +3046,20 @@ fn decode_petal_erc20_transfer(
         return Ok(None);
     }
     let calldata = parse_petal_hex_bytes(&request.data_hex, "data-hex")?;
-    if calldata.len() != IERC20::transferCall::SELECTOR.len() + 64
-        || !calldata.starts_with(&IERC20::transferCall::SELECTOR)
-    {
+    if !calldata.starts_with(&IERC20::transferCall::SELECTOR) {
         return Ok(None);
+    }
+    // A registered token runs `transfer` whatever follows its two words:
+    // Solidity ignores trailing calldata. Left generic, a longer call would
+    // move the same tokens to the same recipient while policy checked the
+    // token contract in place of that recipient, so one extra byte would step
+    // around the recipient rule the canonical call is held to. Only the exact
+    // shape is typed; any other length under this selector is refused.
+    if calldata.len() != IERC20::transferCall::SELECTOR.len() + 64 {
+        return Err(HostError::Invalid(format!(
+            "ERC-20 transfer calldata to a registered token must be exactly 68 bytes, not {}",
+            calldata.len()
+        )));
     }
     // The engine rebuilds the call from the decoded fields, so anything the
     // decoder tolerates and drops would be a silent payload change. Validate
@@ -3118,8 +3128,12 @@ fn petal_pending_request_matches(
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or(u128::MAX);
+    // Scoped to the package, like confirm and inspection. A route that stages
+    // the step another route already staged (Morpho's `confirm` restaging
+    // after a lost outbox id) must find that entry, not stage a duplicate at
+    // the next nonce that needs its own approval.
     staged.expires_ms > now_ms
-        && staged.resolved_execution_origin() == *origin
+        && staged.resolved_execution_origin().same_package(origin)
         && staged.from.parse::<Address>().ok() == Some(requested_from)
         && staged
             .to
@@ -5873,6 +5887,55 @@ mod tests {
         let mut trailing = calldata;
         trailing.push(0);
         let request = petal_evm_request(KNOWN_TOKEN, "0", hex0x(&trailing));
+        assert!(matches!(
+            classify(&request, U256::ZERO),
+            Err(HostError::Invalid(_))
+        ));
+    }
+
+    /// The token ignores trailing calldata and runs the transfer anyway. Left
+    /// generic, the padded call would be checked against the token contract
+    /// instead of its recipient, so one byte would sidestep the recipient rule
+    /// the canonical call meets. Under the `transfer` selector, a registered
+    /// token gets the exact shape or a refusal, never a generic call.
+    #[test]
+    fn a_registered_token_transfer_of_any_other_length_is_refused_not_left_generic() {
+        let recipient: Address = "0x0000000000000000000000000000000000000020"
+            .parse()
+            .unwrap();
+        let canonical = canonical_transfer(recipient, 42);
+        let mut longer = canonical.clone();
+        longer.extend_from_slice(&[0; 32]);
+        for calldata in [
+            [canonical.as_slice(), &[0]].concat(),
+            longer,
+            canonical[..67].to_vec(),
+            IERC20::transferCall::SELECTOR.to_vec(),
+        ] {
+            let request = petal_evm_request(KNOWN_TOKEN, "0", hex0x(&calldata));
+            assert!(
+                matches!(classify(&request, U256::ZERO), Err(HostError::Invalid(_))),
+                "{} bytes under the transfer selector must be refused",
+                calldata.len()
+            );
+        }
+
+        // Another selector on the same token is not a transfer: it stays
+        // generic, bytes intact.
+        let approve = IERC20::approveCall {
+            spender: recipient,
+            amount: U256::from(42_u64),
+        }
+        .abi_encode();
+        let request = petal_evm_request(KNOWN_TOKEN, "0", hex0x(&approve));
+        assert_eq!(classify(&request, U256::ZERO).unwrap(), None);
+
+        // An unregistered contract is never rebuilt, so its length is its own.
+        let request = petal_evm_request(
+            UNKNOWN_CONTRACT,
+            "0",
+            hex0x(&[canonical.as_slice(), &[0]].concat()),
+        );
         assert_eq!(classify(&request, U256::ZERO).unwrap(), None);
     }
 
@@ -7530,6 +7593,39 @@ mod tests {
             ),
             "the same request from another account must not reuse this outbox"
         );
+        // Reuse is scoped like confirm: another route of the same package
+        // finds the entry rather than staging a duplicate at the next nonce,
+        // while another digest or another Petal does not.
+        let mut other_route = origin.clone();
+        other_route.route_id = Some("r000099".into());
+        assert!(
+            petal_pending_request_matches(
+                &staged,
+                &request,
+                &other_route,
+                staged.from.parse().unwrap(),
+                staged.to.as_deref().unwrap().parse().unwrap(),
+                staged.value_wei.parse().unwrap(),
+            ),
+            "another route of the same package must reuse this outbox"
+        );
+        let mut other_digest = origin.clone();
+        other_digest.petal_digest = "c".repeat(64);
+        let mut other_petal = origin.clone();
+        other_petal.petal_id = "other".into();
+        for foreign in [other_digest, other_petal] {
+            assert!(
+                !petal_pending_request_matches(
+                    &staged,
+                    &request,
+                    &foreign,
+                    staged.from.parse().unwrap(),
+                    staged.to.as_deref().unwrap().parse().unwrap(),
+                    staged.value_wei.parse().unwrap(),
+                ),
+                "another package must not reuse this outbox: {foreign:?}"
+            );
+        }
         let mut equivalent_fee_request = request.clone();
         equivalent_fee_request.max_fee_per_gas = Some("00100".into());
         equivalent_fee_request.max_priority_fee_per_gas = Some("00010".into());
