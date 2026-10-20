@@ -472,36 +472,43 @@ payment by restaging it. A failed merchant retry still counts toward recorded
 spending.
 
 A Petal that stages an EVM transaction usually produces a generic contract
-call: Bloom cannot check what the calldata does, so the owner reviews it as an
-opaque call to the contract it is addressed to. One shape is different. A
+call: Bloom cannot check what the calldata does, so its staged plan describes
+an opaque call to the contract it is addressed to. One shape is different. A
 canonical ERC-20 `transfer(address,uint256)` call with no native value,
 **addressed to a token in Bloom's curated registry**, is decoded to its
 recipient and amount, and Bloom rebuilds the calldata from those two fields
 instead of forwarding the Petal's bytes. It is then classified as a token
-transfer: the plan the owner reviews names the token, the amount and the
+transfer: the staged plan (`plan.md`) names the token, the amount and the
 recipient, and the wallet's allowed destinations are checked against the
-**recipient**, not the token contract. A transfer to a recipient the wallet
-does not list as a destination fails when it is confirmed, even if the token
-contract is listed. A different selector, any nonzero native value, or a
-target contract the registry does not list keeps it generic, and so does a
-node whose reported chain id differs from the configured chain, since the
-registry is read by chain and the signature is for the reported id. The
-registry condition is what makes the classification mean anything: matching
-the selector only proves what the call looks like, and any contract can answer
-`decimals()` and `symbol()` while doing something else under that selector.
+**recipient**, not the token contract. A different selector, any nonzero
+native value, or a target contract the registry does not list keeps it
+generic, and so does a node whose reported chain id differs from the
+configured chain, since the registry is read by chain and the signature is
+for the reported id. The registry condition is what makes the classification
+mean anything: matching the selector only proves what the call looks like, and
+any contract can answer `decimals()` and `symbol()` while doing something else
+under that selector.
 
-Either way, a Petal-staged transaction needs a fresh owner approval. The
-policy Bloom applies to Petal staging carries the wallet's allowed
-destinations and nothing else: no agent autonomy, spending limits or token
-rules. Handle the ordinary approval challenge every time.
+The destination check runs once, when the transaction is staged, against the
+destinations the wallet allows at that moment. A recipient the wallet does not
+list shows as a failed `allowlists.recipients` check in the plan you get back,
+and confirming that entry fails, even if the token contract is listed. If the
+owner adds the recipient before you confirm, staging the same request again
+still returns the old pending entry, and confirming it fails; stage once more
+after that to get a fresh one.
+
+Either way, a Petal-staged transaction needs a fresh owner approval: Bloom
+signs it only through an exact approval the owner gives in the approval
+ceremony, which decodes the transaction bytes itself. Handle the ordinary
+approval challenge every time.
 
 Because Bloom rebuilds that one shape, it must encode exactly. Calldata that
 is already ERC-20 transfer shaped — the `transfer` selector, exactly 68 bytes,
 no native value — has to decode and then re-encode back to the bytes you
 supplied. What fails this is noncanonical padding: the address argument
 occupies a 32-byte word whose twelve high-order bytes must be zero. Such a
-write is refused at staging with an error that begins `ERC-20 transfer
-calldata: type check failed for "(address,uint256)"`. Nothing is staged and
+write is refused at staging with an error that begins `invalid: ERC-20
+transfer calldata: type check failed for "(address,uint256)"`. Nothing is staged and
 no nonce is reserved: the check runs before the transaction is staged.
 Left-pad the address with zeros and stage again; retrying the same bytes fails
 the same way.

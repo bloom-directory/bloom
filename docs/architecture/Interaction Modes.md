@@ -168,9 +168,11 @@ state. Their installed package documentation defines their mounted routes.
   canonical ERC-20 `transfer(address,uint256)` calls with zero native value,
   addressed to a token in Machine's curated registry, Machine decodes the
   recipient and amount, and reconstructs the calldata through the typed send
-  path. The plan then names the token, amount and recipient, and the wallet's
-  allowed destinations are checked against the decoded recipient rather than
-  the token contract.
+  path. Machine's staged plan then names the token, amount and recipient, and
+  Machine checks the wallet's allowed destinations against the decoded
+  recipient rather than the token contract. Broker's approval ceremony decodes
+  the same bytes independently and is unchanged: without clear signing it shows
+  a call to the token contract.
   Other calldata remains a generic contract call — including a transfer-shaped
   call to a contract the registry does not list. The selector proves the call's
   shape, not the contract's behaviour; only the registry establishes that the
@@ -181,12 +183,17 @@ state. Their installed package documentation defines their mounted routes.
 
   Petal staging and confirmation evaluate only the advisory policy that
   Machine derives from Broker's canonical policy, which carries the allowed
-  destinations and no agent autonomy, spending limits or token rules. A
-  Petal-staged transaction, typed or generic, therefore always needs fresh
-  owner review, and Broker enforces the canonical policy again before any
-  signature. Typed treatment also marks the calldata as verified, which
-  matters only where a policy with `under_policy` autonomy is evaluated; Petal
-  staging evaluates none today.
+  destinations and no agent autonomy, spending limits or token rules. Machine
+  runs that destination check once, at staging, and confirmation uses its
+  result. It is the only automated check of where a Petal's EVM call sends
+  value: Broker does not re-check allowed destinations for an EVM call, because
+  Machine's outbox signing carries no Petal or system claim for it to check.
+  What Broker enforces before signing is an exact Sealed Approval that the
+  owner activates in the ceremony for these bytes, made under the wallet's
+  current policy version. That is why every Petal-staged transaction, typed or
+  generic, needs fresh owner approval. Typed treatment also marks the calldata
+  as verified, which matters only where a policy with `under_policy` autonomy
+  is evaluated; Petal staging evaluates none today.
 
   Because Machine rebuilds the calldata from the decoded fields rather than
   forwarding the supplied bytes, that shape is held to an exact encoding.
