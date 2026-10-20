@@ -31,7 +31,7 @@ env:
 
 jobs:
   signing_producers:
-    name: compiled signing producer and Broker fixture boundary
+    name: compiled signing producers and real authorization boundary
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -78,10 +78,40 @@ jobs:
           BLOOM_PM80_HYPERLIQUID_ROOT: ${{ github.workspace }}/.pm80-packages/hyperliquid
           BLOOM_PM80_PACKAGE_RECORDS: ${{ runner.temp }}/pm80-package-records.json
         run: cargo test --locked -p bloom-petals --test explicit_account_packages real_signing_producers_reach_the_host_with_selected_account_and_full_witness -- --ignored --exact
+      - uses: actions/checkout@v6
+        with:
+          repository: bloom-directory/bloom-signer
+          ref: c17f4bf42404548e07fddc749c740b0a8eb01119
+          path: .pm80-packages/signer
+      - name: Prepare disposable Linux service manager
+        run: |
+          sudo loginctl enable-linger "$(id -un)"
+          sudo systemctl start "user@$(id -u).service"
+          echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus" >> "$GITHUB_ENV"
+      - name: Build exact developer-mode authority services
+        run: |
+          cargo test --locked --manifest-path "$RUNNER_TEMP/pm80-broker/Cargo.toml" -p bloom-broker --test w4_authority
+          cargo build --locked --manifest-path "$RUNNER_TEMP/pm80-broker/Cargo.toml" -p bloom-broker -p bloom-broker-debug-driver --features bloom-broker/triad-dev-harness
+          cargo build --locked --manifest-path .pm80-packages/signer/Cargo.toml -p bloom-signer --features triad-dev-harness
+          cargo build --locked -p bloom --no-default-features --features mount,triad-dev-harness
+      - name: Authorize installed account-1 authentication and exact continuation
+        env:
+          BLOOM_INTEGRATION_MACHINE_BIN: ${{ github.workspace }}/target/debug/bloom
+          BLOOM_INTEGRATION_BROKER_BIN: ${{ runner.temp }}/pm80-broker/target/debug/bloom-broker
+          BLOOM_INTEGRATION_DEBUG_DRIVER_BIN: ${{ runner.temp }}/pm80-broker/target/debug/bloom-broker-debug-driver
+          BLOOM_INTEGRATION_SIGNER_BIN: ${{ github.workspace }}/.pm80-packages/signer/target/debug/bloom-signer
+          BLOOM_PM80_POLYMARKET_ROOT: ${{ github.workspace }}/.pm80-packages/polymarket
+        run: |
+          run_root="$(mktemp -d /tmp/pm80-auth.XXXXXX)"
+          bash scripts/test-polymarket-authorization.sh "$run_root"
+          cp "$run_root/authorization-result.json" "$RUNNER_TEMP/pm80-authorization-result.json"
       - uses: actions/upload-artifact@v4
         with:
           name: signing-producer-package-records
-          path: ${{ runner.temp }}/pm80-package-records.json
+          path: |
+            ${{ runner.temp }}/pm80-package-records.json
+            ${{ runner.temp }}/pm80-authorization-result.json
 
   fmt:
     name: fmt
@@ -338,7 +368,7 @@ jobs:
       github.ref_name == 'triad-architecture'
     uses: ./.github/workflows/macos-unix-conformance.yml
     with:
-      broker_ref: 69e5f3e25aaa587dc267edbd701385f13a39d189
+      broker_ref: ff5e635d6e10fb28b39cc7bf25fc88c35f92de5a
       signer_ref: bc88ad690757165ebf1978410ea5c7ec652215d3
 
   linux_w0_isolation:

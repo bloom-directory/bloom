@@ -22,6 +22,9 @@ impl PetalHost for VenueFixture {
         self.machine.vfs_list(path).await
     }
     async fn vfs_read(&self, path: &str) -> Result<Vec<u8>, HostError> {
+        if path == "chains/polygon/chain_id" {
+            return Ok(b"137".to_vec());
+        }
         self.machine.vfs_read(path).await
     }
     async fn vfs_write(&self, path: &str, bytes: &[u8]) -> Result<(), HostError> {
@@ -42,11 +45,36 @@ impl PetalHost for VenueFixture {
         } else if request.url == "https://clob.polymarket.com/auth/api-key"
             && request.method == "POST"
         {
+            let signed = self.signed.lock().unwrap();
             assert_eq!(
-                self.signed.lock().unwrap().len(),
+                signed.len(),
                 1,
                 "credentials require a real completed signature"
             );
+            let (authorization, signatures) = &signed[0];
+            assert_eq!(authorization.payloads.len(), 1);
+            assert_eq!(signatures.len(), 1);
+            let signature = alloy::primitives::Signature::from_raw(&signatures[0]).unwrap();
+            let owner = signature
+                .recover_address_from_prehash(&alloy::primitives::B256::from(
+                    authorization.payloads[0].claimed_hash,
+                ))
+                .unwrap();
+            let header = |name: &str| {
+                let values = request
+                    .headers
+                    .iter()
+                    .filter(|(key, _)| key.eq_ignore_ascii_case(name))
+                    .map(|(_, value)| value.as_str())
+                    .collect::<Vec<_>>();
+                assert_eq!(values.len(), 1, "one {name} authentication header required");
+                values[0]
+            };
+            // Compare without including authentication values in assertion output.
+            assert!(header("POLY_ADDRESS") == format!("{owner:#x}"));
+            assert!(header("POLY_NONCE") == "0");
+            assert!(header("POLY_TIMESTAMP") == self.timestamp.load(Ordering::SeqCst).to_string());
+            assert!(header("POLY_SIGNATURE") == format!("0x{}", hex::encode(&signatures[0])));
             self.auth_posts.fetch_add(1, Ordering::SeqCst);
             br#"{"apiKey":"disposable-fixture","secret":"Zml4dHVyZQ==","passphrase":"disposable-fixture"}"#.to_vec()
         } else if request
@@ -344,7 +372,11 @@ async fn installed_account_one_auth_and_exact_continuation_use_real_authority() 
         )
         .build();
     let begin = VfsPath::parse("petals/polymarket/onboard/pm80-authorization/1/begin").unwrap();
-    assert!(vfs.write(&begin, b"begin").await.is_err());
+    let begin_error = vfs.write(&begin, b"begin").await.unwrap_err();
+    assert!(
+        !host.requests.lock().unwrap().is_empty(),
+        "begin failed before calling the signing host: {begin_error}"
+    );
     assert_eq!(host.auth_posts.load(Ordering::SeqCst), 0);
     let auth = pending(&state, "polymarket.clob_auth.v1");
     let first = host.requests.lock().unwrap()[0].clone();
@@ -399,9 +431,9 @@ async fn installed_account_one_auth_and_exact_continuation_use_real_authority() 
         exact["approval_id"]
     );
 
-    // Each mutation must fail through the real host before an existing grant
-    // can authorize a different account, installer subject or operation class.
-    for mutation in ["account", "class", "package", "route", "batch"] {
+    // These hinted substitutions test pending-request identity, not installer
+    // authorization or an upgrade from a real predecessor package.
+    for mutation in ["account", "class", "route", "batch"] {
         let mut changed = exact_request.clone();
         changed.approval_hint = Some(exact["request_id"].as_str().unwrap().to_owned());
         let mut claim: bloom_broker_api::PetalUseClaim =
@@ -418,10 +450,6 @@ async fn installed_account_one_auth_and_exact_continuation_use_real_authority() 
             "class" => {
                 changed.operation_class = "polymarket.clob_auth.v1".into();
                 claim.operation_class = Token::new(&changed.operation_class).unwrap();
-            }
-            "package" => {
-                context.package_hash = "99".repeat(32);
-                claim.package_hash = Digest32::new(context.package_hash.clone()).unwrap();
             }
             "route" => {
                 context.route_id = "old-route".into();
@@ -454,6 +482,34 @@ async fn installed_account_one_auth_and_exact_continuation_use_real_authority() 
         );
     }
     complete(exact["ceremony_url"].as_str().unwrap(), 5, None);
+    // With the exact grant approved and unconsumed, bypass the hint guard and
+    // require the installer-specific denial. A generic error is insufficient.
+    for mutation in ["class", "route"] {
+        let mut changed = exact_request.clone();
+        changed.approval_hint = None;
+        let mut claim: bloom_broker_api::PetalUseClaim =
+            serde_json::from_slice(&changed.petal_use_claim_jcs).unwrap();
+        if mutation == "class" {
+            changed.operation_class = "polymarket.unauthorized.v1".into();
+            claim.operation_class = Token::new(&changed.operation_class).unwrap();
+        } else {
+            changed.context.as_mut().unwrap().route_id = "unenrolled-route".into();
+            claim.route = "unenrolled-route".into();
+        }
+        changed.petal_use_claim_jcs = serde_jcs::to_vec(&claim).unwrap();
+        let expected = format!(
+            "installer provenance does not authorize {}",
+            changed.operation_class
+        );
+        let error = machine
+            .sign_payload_batch_outcome(changed)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains(&expected),
+            "{mutation} must reach installer authorization: {error}"
+        );
+    }
     // The fixture refuses the subsequent venue submission, after the actual
     // exact batch signature has traversed Broker and Signer successfully.
     let _ = vfs.write(&continuation, b"continue").await;
@@ -504,6 +560,23 @@ async fn installed_account_one_auth_and_exact_continuation_use_real_authority() 
         ),
         "cancelled owner approval cannot sign"
     );
+    // Unknown packages can initiate separate policy consent before installer
+    // authorization. Do this last: a retained policy proposal intentionally
+    // takes precedence over unrelated signing attempts on the same wallet.
+    let mut unknown_package = exact_request.clone();
+    unknown_package.approval_hint = None;
+    unknown_package.context.as_mut().unwrap().package_hash = "99".repeat(32);
+    let mut claim: bloom_broker_api::PetalUseClaim =
+        serde_json::from_slice(&unknown_package.petal_use_claim_jcs).unwrap();
+    claim.package_hash = Digest32::new("99".repeat(32)).unwrap();
+    unknown_package.petal_use_claim_jcs = serde_jcs::to_vec(&claim).unwrap();
+    assert!(
+        !matches!(
+            machine.sign_payload_batch_outcome(unknown_package).await,
+            Ok(PayloadBatchSignOutcome::Signatures(_))
+        ),
+        "an unknown package cannot use the approved grant"
+    );
     let signed = host.signed.lock().unwrap();
     assert_eq!(signed.len(), 2);
     assert_eq!(signed[1].0.operation_class, "polymarket.onboard");
@@ -513,6 +586,11 @@ async fn installed_account_one_auth_and_exact_continuation_use_real_authority() 
     );
     assert_eq!(signed[1].1[0].len(), 65);
     for (request, signatures) in signed.iter() {
+        assert_eq!(
+            request.payloads.len(),
+            signatures.len(),
+            "every requested payload must have exactly one signature"
+        );
         assert_eq!(
             request.signature_algorithm,
             "secp256k1-keccak256-recoverable"
@@ -533,8 +611,9 @@ async fn installed_account_one_auth_and_exact_continuation_use_real_authority() 
     let result = serde_json::json!({"schema":"bloom.pm80.authorization-boundary.v1", "package_hash":hash,
         "auth_route":auth_route,"continuation_route":exact_route,"account":1,
         "owner_key_fingerprint":account_one.public_key_fingerprint,
-        "auth_timestamp_refreshed":true,"auth_posts":1,"separate_exact_approval":true,
-        "signed_operations":2,"negative_substitutions":["account","class","package","route","batch"],
+        "auth_timestamp_refreshed":true,"auth_headers_validated":true,"auth_posts":1,"separate_exact_approval":true,
+        "signed_operations":2,"hint_substitutions":["account","class","route","batch"],
+        "installer_denials_without_hint":["class","route"],"unknown_package_cannot_sign":true,
         "cancelled_approval_cannot_sign":true,
         "limits":"disposable software owner; controlled venue/chain observations; no venue submission, funds or settlement"});
     std::fs::write(

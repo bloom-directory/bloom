@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Real installed-component authorization with a disposable software owner.
-# The stock launcher's cleanup removes only its fresh templates/runtime roots.
+# Retain temporary files for diagnosis without recursive cleanup.
 set -euo pipefail
 umask 077
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
@@ -41,7 +41,7 @@ cleanup() {
   exit "$status"
 }
 trap cleanup EXIT INT TERM
-bash "$repo_root/scripts/triad-dev-launch.sh" --services-only \
+bash "$repo_root/scripts/triad-dev-launch.sh" --services-only --retain-temporary-files \
   --developer-root "$run_root" --machine-socket "$run_root/m.sock" \
   --log-dir "$run_root/logs" --ready-file "$run_root/ready" \
   --ceremony-port "$(free_port)" --remote-upstream-port "$(free_port)" \
