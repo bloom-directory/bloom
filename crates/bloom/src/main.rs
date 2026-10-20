@@ -3784,6 +3784,10 @@ async fn run(cli: Cli) -> Result<()> {
                 } else {
                     default_policy::accept_setup_suggestions(&mut d.config.petals);
                 }
+                // Queue the chosen settings before anything is installed, so a
+                // run that stops part-way still writes them later.
+                default_policy::record_pending_setup_settings(d.home.root(), &d.config.petals)
+                    .context("queue the chosen Petal settings")?;
                 d.config.petals.setup_complete = true;
                 d.config
                     .save(&d.home.config_path())

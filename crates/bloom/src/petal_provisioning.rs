@@ -14,7 +14,8 @@ pub(crate) struct ProvisioningResult {
 pub(crate) enum ProvisioningOutcome {
     Current,
     Installed,
-    /// Replaced an older release, which starts with empty Petal settings.
+    /// Replaced an older release. Signed package lineage carries the old
+    /// release's settings forward; an update outside that lineage starts empty.
     Updated,
     Failed(String),
 }

@@ -999,6 +999,34 @@ fn init_runs_setup_once_even_when_the_config_already_exists() {
     assert!(config.petals.setup.is_empty(), "{:?}", config.petals.setup);
 }
 
+/// Setup queues the chosen settings before provisioning. Here provisioning
+/// fails, as a run that stops part-way would, so nothing is installed or
+/// written, and Polymarket's settings must stay queued for when `main`'s
+/// account exists rather than depend on a later step remembering them.
+#[test]
+fn an_interrupted_init_still_queues_the_chosen_petal_settings() {
+    let home = fresh_home();
+    bloom_cmd(home.path())
+        .env("HTTPS_PROXY", "http://127.0.0.1:1")
+        .env("https_proxy", "http://127.0.0.1:1")
+        .env("NO_PROXY", "")
+        .env("no_proxy", "")
+        .arg("init")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "provision canonical pre-installed Petals",
+        ));
+
+    let pending = home.path().join("pending-petal-settings");
+    assert!(
+        pending.join("polymarket").exists(),
+        "Polymarket's setup settings must stay queued after an interrupted init"
+    );
+    // Only Petals with setup settings are queued.
+    assert!(!pending.join("hyperliquid").exists());
+}
+
 /// A home that recorded choices before `setup_complete` existed (an earlier
 /// build of this setup) keeps them when `bloom init` runs setup again: a
 /// declined Petal stays declined and a custom value stays.

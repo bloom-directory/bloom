@@ -64,8 +64,10 @@ Agreed on 2026-09-14:
    spending, and the wallet policy only allows the chosen Petals.
 8. **Polymarket uses its existing settings:** trading turned on, with a daily
    limit of 100 pUSD.
-9. **Petal settings do not survive an update.** Bloom keeps the setup choices
-   in its config, writes them again after an update, and says so.
+9. **Petal settings survive an update.** Signed package lineage carries a
+   Petal's settings and receipts to its successor release (section 5). Bloom
+   writes setup's values after an update only when `main`'s account does not
+   exist yet, so nothing the owner wrote is replaced.
 10. **`bloom init` runs once.** Afterwards users add, update, or remove
     Petals. Setup is recorded when it finishes, so a run that was
     interrupted, or a config `bloom serve` created first, still gets setup
@@ -94,8 +96,10 @@ Agreed on 2026-09-14:
     allowing a Petal without its contracts leaves it installed but gated. Each
     catalog entry lists the fixed contracts its Petal transacts with, and the
     default policy proposes them in the same ceremony as the packages —
-    including the ceremony a Petal opens on its own first use, so no path
-    allows a Petal it cannot then use:
+    including the ceremony a chosen Petal opens on its own first use while
+    `main`'s policy is still the one wallet creation installed. After that a
+    Petal's own request adds only its package, and a destination it needs is
+    added with `bloom wallet update-policy`:
     - Enso: its router on every chain its shipped rules allow — one address
       on Arbitrum, Avalanche, Base, BNB Chain, Ethereum, Gnosis, HyperEVM,
       Optimism, and Polygon, a second on Linea, and a third shared by Arc,
@@ -209,7 +213,7 @@ is still proposed when chosen.
 
 Bloom's built-in catalog (`crates/bloom/src/github_source.rs`) holds each
 Petal's settings template next to its pinned release. For Polymarket that is
-`settings/{wallet}/venue.toml` with `enabled = true` and the daily limit.
+`settings/{wallet}/0/venue.toml` with `enabled = true` and the daily limit.
 Bloom substitutes the saved values, falling back to the catalog's
 suggestions, and writes the result through the Petal's own settings route,
 so it never interprets a Petal's settings format.
@@ -263,8 +267,9 @@ chosen Petals:
   Bloom's catalog pins: Hyperliquid v0.1.7 and Polymarket v0.1.6.
 - **`allowed_destinations`** lists the fixed contracts each chosen Petal
   transacts with (decision 13), from Bloom's catalog only; an edited config
-  cannot add any. Existing destinations are kept, and a wallet whose policy
-  already allows the packages is proposed the missing destinations.
+  cannot add any. Existing destinations are kept. Only a wallet's first
+  policy is proposed, so a destination added to the catalog later reaches an
+  existing wallet only through `bloom wallet update-policy`.
 - **Everything else** keeps the current defaults: approvals last at most 30
   days, and verifiers start empty.
 
@@ -275,7 +280,8 @@ chosen Petals:
 1. Launch the creation ceremony, as today.
 2. Ask Machine every two seconds where the default policy stands, through the
    `wallet_default_policy` Machine command, until the wallet exists or its
-   creation ceremony expires.
+   creation ceremony expires. A brief Broker or projection outage is waited
+   out within the same deadline rather than ending the command.
 3. Machine proposes every chosen, installed Petal together through the
    wallet's existing policy operation, the same pending-proposal flow the
    mounted `wallets/<wallet>/policy.json` uses. The command prints that
@@ -283,13 +289,18 @@ chosen Petals:
 4. Once the owner completes the ceremony, the next check commits the policy,
    and the command reports that `main` now allows the chosen Petals.
 
-On a new home `main` does not exist when `bloom init` runs, so its settings
-write is refused and leaves a retry marker. The first check after `main`
-appears writes the settings, but only while the Petal's settings route still
-reads exactly as it does before anything is written there (for Polymarket,
-its built-in `enabled = false` default). Anything else may be the owner's, so
-it stays: Machine clears the marker and logs the command that would apply
-setup's choice.
+Setup queues each chosen Petal's settings as a retry marker when the
+choices are saved, before anything is installed, so a `bloom init` that stops
+part-way still writes them later. On a new home `main` does not exist when
+`bloom init` runs, so its settings write is refused and the marker stays. The
+first check after `main` appears writes the settings, but only while the
+Petal's settings route still reads exactly as it does before anything is
+written there (for Polymarket, its built-in `enabled = false` and
+`allow_neg_risk = true` default). The check and the write are one step:
+Machine excludes every other write through its VFS between them, so an
+owner's edit made meanwhile is never replaced. Anything else there may be the
+owner's, so it stays: Machine clears the marker and logs the command that
+would apply setup's choice.
 
 If the owner stops the command, or the policy ceremony expires, the wallet
 still exists:
@@ -458,7 +469,7 @@ These need other repositories and are out of scope:
 |---|---|
 | Sign the policy inside the creation ceremony, for one ceremony in total | bloom-broker, bloom-signer |
 | Count Polymarket sells, add a total limit, and reset a count when its limit changes | bloom-petal-polymarket |
-| Keep Petal settings across updates | The stable installation slot in [Petal derived keys and package succession](./Petal%20derived%20key%20succession.md) |
+| Keep Petal settings across updates outside a signed package lineage | The stable installation slot in [Petal derived keys and package succession](./Petal%20derived%20key%20succession.md) |
 | Accept Bloom's `bsc` chain name so BNB Chain routes work | bloom-petal-enso |
 | Create Hyperliquid sessions with fewer ceremonies | [bloom#171](https://github.com/bloom-directory/bloom/issues/171) |
 | Agree one chain naming for policy destinations and typed persona sessions | bloom, bloom-broker ([bloom-broker#100](https://github.com/bloom-directory/bloom-broker/pull/100)) |
@@ -473,9 +484,12 @@ changes come next.
 
 - **Setup** (`crates/bloom/src/default_policy.rs`, `crates/bloom-proto`):
   the `bloom init` menu and its non-interactive form, settings templates in
-  the catalog, and choices saved under `[petals.setup]`. Settings are
-  written through each Petal's route by `bloom init`, and again whenever
-  `bloom init` or `bloom serve` installs or updates a chosen Petal.
+  the catalog, and choices saved under `[petals.setup]` together with a
+  queued settings write for each chosen Petal. Settings are written through
+  each Petal's route by `bloom init`, and by `bloom serve` when it installs a
+  chosen Petal. An update keeps the settings its signed package lineage
+  carries. A queued write that cannot be made yet is retried once `main`'s
+  account exists, only over the route's unset contents.
 - **Wallet creation** (`crates/bloom`): `bloom wallet new main` and
   `bloom wallet import main` wait for the wallet, then walk the owner
   through the default policy with the `wallet_default_policy` Machine
