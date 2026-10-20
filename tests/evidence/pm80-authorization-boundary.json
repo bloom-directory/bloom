@@ -1,0 +1,50 @@
+{
+  "schema": "bloom.pm80.authorization-boundary.v1",
+  "package_hash": "f30220de5c40ab0c897e99cd0e375b539b926b78874badddd1a25496a9bcf80d",
+  "auth_route": "r000042",
+  "continuation_route": "r000043",
+  "account": 1,
+  "owner_key_fingerprint": "fb5e7561a1d3879c047f7cd06dea82f277f8b8921d9614a633b7649c4521499b",
+  "auth_timestamp_refreshed": true,
+  "auth_headers_validated": true,
+  "auth_posts": 1,
+  "separate_exact_approval": true,
+  "signed_operations": 2,
+  "hint_substitutions": [
+    "account",
+    "class",
+    "route",
+    "batch"
+  ],
+  "installer_denials_without_hint": [
+    "class",
+    "route"
+  ],
+  "unknown_package_cannot_sign": true,
+  "cancelled_approval_cannot_sign": true,
+  "limits": "disposable software owner; controlled venue/chain observations; no venue submission, funds or settlement",
+  "verification": {
+    "machine": "c0ff23aed9ae9d2395b6b0d5ff0f17db45e12d51",
+    "broker": "ff5e635d6e10fb28b39cc7bf25fc88c35f92de5a",
+    "signer": "c17f4bf42404548e07fddc749c740b0a8eb01119",
+    "polymarket": "2055a0aa4ddc7a71ac08c5e2ec724037ba2feae8",
+    "executed": 1,
+    "passed": 1,
+    "failed": 0,
+    "ignored": 0,
+    "exit_status": 0,
+    "duration_seconds": 72.42,
+    "source_sha256": {
+      "crates/bloom-daemon/src/tests/polymarket_authorization.rs": "7956dbd3f16769b9da2d4b22a4541176c9f81e753782fbc22a12b3c818cde0ac",
+      "scripts/test-polymarket-authorization.sh": "bb77adf44d9e4fcf02d9954dd5b1531576ba45de6b182f0393c30dd66f178694"
+    }
+  },
+  "broker_authority_checks": {
+    "executed": 38,
+    "passed": 38,
+    "exit_status": 0,
+    "expiry": "expired_petal_authority_cannot_reserve_a_signature",
+    "catalog_replacement": "catalog_upgrade_retains_predecessor_but_refuses_its_existing_grant",
+    "limits": "Deterministic authority reservation and signed-catalog replacement tests; final installer package upgrade/catalog rollout still required."
+  }
+}
