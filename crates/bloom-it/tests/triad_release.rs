@@ -188,9 +188,11 @@ fn release_compatibility_declares_each_edge_without_a_global_protocol_range() {
     ] {
         assert!(compatibility.contains(&format!("{revision} = \"")));
     }
-    for component in ["machine", "broker", "signer"] {
+    for (component, current, downgrade_floor) in
+        [("machine", 2, 2), ("broker", 3, 3), ("signer", 2, 2)]
+    {
         assert!(compatibility.contains(&format!(
-            "[state.{component}]\ncurrent = 2\ndowngrade_floor = 2\nmigration_floor = 1"
+            "[state.{component}]\ncurrent = {current}\ndowngrade_floor = {downgrade_floor}\nmigration_floor = 1"
         )));
     }
 }
@@ -1558,11 +1560,16 @@ fn triad_bundle_is_reproducible_signed_and_self_verifying() {
     // (here a lowered Broker downgrade floor) fails both verifiers.
     let tampered = directory.path().join("tampered.tar.gz");
     let tampered_build = build_with_record(&staging, &tampered, &key, |record| {
-        record.replacen(
-            "[state.broker]\ncurrent = 2\ndowngrade_floor = 2",
-            "[state.broker]\ncurrent = 2\ndowngrade_floor = 1",
+        let tampered = record.replacen(
+            "[state.broker]\ncurrent = 3\ndowngrade_floor = 3",
+            "[state.broker]\ncurrent = 3\ndowngrade_floor = 2",
             1,
-        )
+        );
+        assert_ne!(
+            tampered, record,
+            "Broker downgrade-floor mutation did not apply"
+        );
+        tampered
     });
     assert!(
         tampered_build.status.success(),

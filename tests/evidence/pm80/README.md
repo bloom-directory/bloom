@@ -57,3 +57,15 @@ Optional `PLAYWRIGHT_MODULE` selects an already installed module;
 fixture transport at 390px and 1280px, checks primary summaries and expanded
 overflow, and records screenshots/results. It does not connect to a live
 ceremony, approve an operation or represent physical-owner acceptance.
+
+## Ownership transfer and CI follow-up
+
+`ci-after-takeover.json` records the first checks after all five existing PR
+writer claims were transferred and their candidates published. Broker,
+Signer and all three Petals passed. Machine's packaging tests still expected
+Broker state floor 2, and their tamper replacement did not alter the new
+floor-3 record. `logs/ci-packaging-failure.log.gz` preserves that failure.
+The correction checks the component-specific state floors and ensures a
+floor-3-to-2 tamper actually changes the record before testing rejection.
+The standalone compatibility test passes locally. The corrected PR head
+needs its own CI; this historical snapshot is not acceptance of a later head.

@@ -19,13 +19,37 @@ is recoverable from Machine commit `69e3c384f5f616decc2e7a1f75b7335b81b2c981`.
 | Polymarket | `c2902cdb514347abb51b4c10e259110903fe956a` | `finish-clear-signing-polymarket` |
 | Hyperliquid | `17652ac832314a75b8b9b079cb5aacf74b498891` | `finish-clear-signing-hyperliquid` |
 | Released Broker diagnostic fixture | `4885a77f7741f63aa04b131d091039716b14dffc` | `released-policy-fixture` |
-| Standalone Signer Rustls fix | `c17f4bf42404548e07fddc749c740b0a8eb01119` | `preserve-rustls-security-fix`, [draft PR #73](https://github.com/bloom-directory/bloom-signer/pull/73) |
+| Standalone Signer Rustls fix | `c17f4bf42404548e07fddc749c740b0a8eb01119` | `preserve-rustls-security-fix`, [PR #73](https://github.com/bloom-directory/bloom-signer/pull/73), ready for independent review |
 
 Repositories are under `https://github.com/bloom-directory/`, named respectively
 `bloom-broker`, `bloom`, `bloom-petal-enso`, `bloom-petal-polymarket`,
 and `bloom-petal-hyperliquid`. Checkouts are
 `worktrees/cs-plan-1020/<repository>/<branch>`. Machine evidence-only commits
 may follow its implementation checkpoint above without changing the tested runtime.
+
+The five existing PRs now contain these candidates. Machine's published PR
+head is `62345f5f3a581e6c1b608c6b39d970e30b772bd0`; commits after its runtime
+checkpoint preserve verification and takeover history. All five descriptions
+were replaced and read back exactly. Previous descriptions, including their
+historical evidence links, are preserved in
+`tests/evidence/pm80/pr-descriptions-before-takeover.json` at that head.
+Restoration commands and applied-body snapshots are retained in
+`/data/codex-scratch/user/pm80-pr-takeover-0sxfujwh/report.md`.
+
+Signer #73's workspace and supply-chain checks passed. It was marked ready
+for review; `bloom-worktree ready bloom-signer 73` correctly refuses because
+independent review is not approved. Broker #103's workspace and privileged
+listener-ownership checks passed at its current head, as did all three Petal
+package checks. Machine's current-head unit tests, external E2E, Solana
+lifecycle, Clippy, doctests, locked release compilation and Linux isolation
+passed. Its packaging suite exposed two stale test expectations: the contract
+still expected Broker floor 2, and its tamper fixture silently failed to
+replace the now-floor-3 record. The correction asserts Broker floor 3 and
+lowers the tampered floor to 2, with an explicit assertion that mutation
+occurred. The historical failed CI snapshot is retained in
+`tests/evidence/pm80/ci-after-takeover.json`; the corrected head requires its
+own checks. Skipped macOS checks are not conformance evidence. The
+post-transfer doctor still reports the baseline 4 errors and 30 warnings.
 
 The diagnostic fixture is based on released Broker
 `9f394aebbc9c04a6031de31a12385e5485f8ca9b`. Its production source, API source,
