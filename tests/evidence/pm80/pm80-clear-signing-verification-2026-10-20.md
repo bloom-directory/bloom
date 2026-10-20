@@ -1,8 +1,13 @@
 # PM80 clear-signing implementation and verification
 
 Implementation is published on isolated branches owned by `cs-plan-1020`.
-Existing PR heads were not overwritten, and nothing was merged or released.
+On October 20 the user authorized takeover of all existing work. The five PR
+writer claims were transferred and the prepared commits were fast-forwarded
+to their existing PR heads. Nothing was merged or released.
 This record supplements, rather than rewrites, the October 19 plan and original review.
+
+The [published evidence snapshot](https://github.com/bloom-directory/bloom/tree/69e3c384f5f616decc2e7a1f75b7335b81b2c981/tests/evidence/pm80)
+is recoverable from Machine commit `69e3c384f5f616decc2e7a1f75b7335b81b2c981`.
 
 ## Published candidates
 
@@ -132,13 +137,13 @@ and the stopped Machine home remain under `/tmp/cs-plan-1020-*` and
 
 ## Unmet landing and release gates
 
-1. Existing PR writer claims remain with other owners. Explicit writer-stop /
-   takeover assignment was requested; absent a reply, existing PR heads were
-   preserved. Integrate through their owners or transfer explicitly.
+1. Ownership transfer is complete: Broker #103, Machine #224, Enso #16,
+   Polymarket #21 and Hyperliquid #27 are owned by cs-plan-1020 and contain
+   the prepared commits. The user authorized takeover, not any merge.
 2. Obtain independent review of the combined candidates. No review approval
    was manufactured or bypassed. Privileged W0 remains a conformance gate.
-   Final GitHub refresh found all five original PR heads unchanged, OPEN and
-   REVIEW_REQUIRED; their earlier reviews do not approve these new branches.
+   All five PRs remain OPEN and REVIEW_REQUIRED. Their old green checks do
+   not verify the newly published heads; current CI runs are being recorded.
 3. Specific user approval is required for each merge. Land standalone Signer
    #73 first, then Broker before Machine;
    repin to the actual landed squash commit, then land dependent Petals and
