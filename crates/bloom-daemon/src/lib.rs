@@ -11,6 +11,10 @@ pub mod ipc;
 mod ens_resolver;
 mod price_oracle;
 
+#[cfg(all(test, feature = "triad-dev-harness"))]
+#[path = "tests/polymarket_authorization.rs"]
+mod polymarket_authorization;
+
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
