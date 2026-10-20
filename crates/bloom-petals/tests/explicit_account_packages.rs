@@ -110,11 +110,38 @@ impl PetalHost for AccountFixture {
                 body: b"1700000000".to_vec(),
             });
         }
+        if self.capture_signing.load(Ordering::SeqCst) && request.url.contains("/nonce?") {
+            return Ok(HttpResponse {
+                status: 200,
+                headers: vec![],
+                body: br#"{"nonce":"0"}"#.to_vec(),
+            });
+        }
         Err(HostError::Denied("fixture HTTP".into()))
     }
 
-    async fn chain_read(&self, _request: ChainRequest) -> Result<ChainResponse, HostError> {
+    async fn chain_read(&self, request: ChainRequest) -> Result<ChainResponse, HostError> {
         self.external_calls.fetch_add(1, Ordering::SeqCst);
+        if self.capture_signing.load(Ordering::SeqCst) {
+            let params: serde_json::Value = serde_json::from_str(&request.params_json).unwrap();
+            let value = match request.method.as_str() {
+                "eth_getCode" => "0x6000".to_owned(),
+                "eth_call" => {
+                    let data = params[0]["data"].as_str().unwrap();
+                    let word = match &data[..10] {
+                        "0x5c60da1b" | "0x1f264778" => 3u64,
+                        "0x70a08231" => 100,
+                        "0xdd62ed3e" | "0xe985e9c5" => 0,
+                        _ => return Err(HostError::Denied("unexpected fixture selector".into())),
+                    };
+                    format!("0x{word:064x}")
+                }
+                _ => return Err(HostError::Denied("unexpected fixture RPC".into())),
+            };
+            return Ok(ChainResponse {
+                result_json: serde_json::to_string(&value).unwrap(),
+            });
+        }
         Err(HostError::Denied("fixture chain RPC".into()))
     }
 
@@ -558,18 +585,31 @@ async fn real_signing_producers_reach_the_host_with_selected_account_and_full_wi
     let home = temporary.path();
     let store = PetalStore::open(home.join("petals/store")).unwrap();
     let mut hashes = BTreeMap::new();
+    let mut package_records = Vec::new();
     for (name, variable) in [
         ("polymarket", "BLOOM_PM80_POLYMARKET_ROOT"),
         ("hyperliquid", "BLOOM_PM80_HYPERLIQUID_ROOT"),
     ] {
         let root = PathBuf::from(std::env::var_os(variable).expect(variable));
         let prepared = bloom_petals::package::build_petal_package_dir(&root).unwrap();
-        for route in &prepared.route_index.routes {
-            if route.pattern.contains("/begin") || route.pattern.contains("/continue") {
-                eprintln!("{name} compiled route: {route:?}");
-            }
-        }
+        let authority: Vec<_> = prepared
+            .route_index
+            .routes
+            .iter()
+            .filter_map(|route| {
+                let mut classes = route.key_derive_operation_classes.clone();
+                if let Some(intent) = &route.install_metadata.sign_intent {
+                    classes.push(intent.clone());
+                }
+                classes.sort();
+                classes.dedup();
+                (!classes.is_empty()).then(|| serde_json::json!({
+                "route_id":route.route_id, "pattern":route.pattern, "operation_classes":classes,
+            }))
+            })
+            .collect();
         let (installed, _, _) = store.install_prepared_petal_package(prepared).unwrap();
+        package_records.push(serde_json::json!({"name":name,"package_hash":installed.hash,"authority_routes":authority}));
         hashes.insert(name, installed.hash);
     }
     let host = Arc::new(AccountFixture::default());
@@ -612,12 +652,29 @@ async fn real_signing_producers_reach_the_host_with_selected_account_and_full_wi
             true,
         )
         .unwrap();
-    let _ = vfs.write(&begin, b"begin").await;
+    vfs.write(&begin, b"begin").await.unwrap();
     assert_eq!(
         host.batch_sign_requests.lock().unwrap().len(),
         1,
         "stored credentials must not sign under begin"
     );
+    let continuation = mounted("polymarket", "onboard/alice/1/continue");
+    let continuation_result = vfs.write(&continuation, b"continue").await;
+    {
+        let requests = host.batch_sign_requests.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            2,
+            "continuation must prepare the separate exact batch: {continuation_result:?}"
+        );
+        assert_eq!(requests[1].operation_class, "polymarket.onboard");
+        assert_eq!(
+            requests[1].selector,
+            bloom_broker_api::PetalSignSelector::Exact
+        );
+        assert_eq!(requests[1].context.as_ref().unwrap().route_id, "r000043");
+        assert_eq!(requests[0].context.as_ref().unwrap().route_id, "r000042");
+    }
     // A real persisted delegated session drives the actual compiled workflow.
     let key = bloom_broker_api::KeyRef {
         backend: bloom_broker_api::Token::new("local").unwrap(),
@@ -688,5 +745,8 @@ async fn real_signing_producers_reach_the_host_with_selected_account_and_full_wi
             "witness":serde_json::from_slice::<serde_json::Value>(request.claim_assurance_evidence.as_ref().unwrap()).unwrap()
         })).collect();
         std::fs::write(path, serde_json::to_vec_pretty(&produced).unwrap()).unwrap();
+    }
+    if let Some(path) = std::env::var_os("BLOOM_PM80_PACKAGE_RECORDS") {
+        std::fs::write(path, serde_json::to_vec_pretty(&package_records).unwrap()).unwrap();
     }
 }
