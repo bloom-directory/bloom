@@ -3536,6 +3536,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn legacy_removal_diff_matches_broker_vector_without_other_authority_changes() {
+        let vector: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/legacy-policy-removal.json"))
+                .unwrap();
+        let current: bloom_broker_api::CanonicalWalletPolicy =
+            serde_json::from_value(vector["current"].clone()).unwrap();
+        let proposed: bloom_broker_api::CanonicalWalletPolicy =
+            serde_json::from_value(vector["proposed"].clone()).unwrap();
+        assert_eq!(
+            claimed_policy_authority_diff_digest(&current, &proposed)
+                .unwrap()
+                .as_str(),
+            "65f348e08a8ded736ad13843456a1afbaacf16bf5518147b1d7d900f703e7401"
+        );
+        let mut restored = proposed.clone();
+        restored.clear_signing = current.clear_signing.clone();
+        restored.required_verifiers = current.required_verifiers.clone();
+        assert_eq!(restored, current);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn idle_machine_broker_exchange_completes_with_margin_inside_sixty_seconds() {
         let completions = Arc::new(AtomicUsize::new(0));

@@ -616,6 +616,10 @@ async fn real_signing_producers_reach_the_host_with_selected_account_and_full_wi
     host.capture_signing.store(true, Ordering::SeqCst);
     let vfs = fixture_vfs(home, host.clone());
     let begin = mounted("polymarket", "onboard/alice/1/begin");
+    let status_path = mounted("polymarket", "onboard/alice/1/status.json");
+    let fresh: serde_json::Value =
+        serde_json::from_slice(&vfs.read(&status_path).await.unwrap()).unwrap();
+    assert_eq!(fresh["next_action"], "onboard/alice/1/begin");
     let begin_result = vfs.write(&begin, b"begin").await;
     {
         let requests = host.batch_sign_requests.lock().unwrap();
@@ -653,6 +657,9 @@ async fn real_signing_producers_reach_the_host_with_selected_account_and_full_wi
         )
         .unwrap();
     vfs.write(&begin, b"begin").await.unwrap();
+    let credentials_ready: serde_json::Value =
+        serde_json::from_slice(&vfs.read(&status_path).await.unwrap()).unwrap();
+    assert_eq!(credentials_ready["next_action"], "onboard/alice/1/continue");
     assert_eq!(
         host.batch_sign_requests.lock().unwrap().len(),
         1,
@@ -675,6 +682,74 @@ async fn real_signing_producers_reach_the_host_with_selected_account_and_full_wi
         assert_eq!(requests[1].context.as_ref().unwrap().route_id, "r000043");
         assert_eq!(requests[0].context.as_ref().unwrap().route_id, "r000042");
     }
+    let pending_keys = [
+        "state/onboard/alice/approval.json",
+        "state/onboard/alice/prepared_relayer_batch.json",
+    ];
+    let pending = pending_keys.map(|key| private.get(&hashes["polymarket"], key).unwrap());
+    for _ in 0..2 {
+        vfs.write(&begin, b"begin").await.unwrap();
+        for (key, expected) in pending_keys.iter().zip(&pending) {
+            assert_eq!(
+                &private.get(&hashes["polymarket"], key).unwrap(),
+                expected,
+                "begin must preserve the pending exact batch and approval"
+            );
+        }
+    }
+    assert_eq!(host.batch_sign_requests.lock().unwrap().len(), 2);
+    let awaiting: serde_json::Value =
+        serde_json::from_slice(&vfs.read(&status_path).await.unwrap()).unwrap();
+    assert_eq!(awaiting["next_action"], "onboard/alice/1/continue");
+    assert!(
+        awaiting["message"]
+            .as_str()
+            .unwrap()
+            .contains("existing owner approval")
+    );
+    // Old hint files cannot keep completed/read-only accounts actionable.
+    private
+        .put(
+            &hashes["polymarket"],
+            "state/onboard/alice/next_action.json",
+            br#"{"next_action":"stale continuation"}"#,
+            false,
+        )
+        .unwrap();
+    private.del(&hashes["polymarket"], pending_keys[0]).unwrap();
+    for stage in ["fund", "complete"] {
+        let status = serde_json::json!({"owner":"0x0000000000000000000000000000000000000002", "stage":stage});
+        private
+            .put(
+                &hashes["polymarket"],
+                "state/onboard/alice/status.json",
+                &serde_json::to_vec(&status).unwrap(),
+                false,
+            )
+            .unwrap();
+        let projected: serde_json::Value =
+            serde_json::from_slice(&vfs.read(&status_path).await.unwrap()).unwrap();
+        assert_eq!(
+            projected["next_action"],
+            if stage == "fund" {
+                serde_json::json!("fund/alice/1/new")
+            } else {
+                serde_json::Value::Null
+            }
+        );
+    }
+    private
+        .put(
+            &hashes["polymarket"],
+            "secrets/creds/relayer.json",
+            br#"{"legacy_eoa_mode":true}"#,
+            true,
+        )
+        .unwrap();
+    let read_only: serde_json::Value =
+        serde_json::from_slice(&vfs.read(&status_path).await.unwrap()).unwrap();
+    assert_eq!(read_only["stage"], "legacy_eoa");
+    assert!(read_only["next_action"].is_null());
     // A real persisted delegated session drives the actual compiled workflow.
     let key = bloom_broker_api::KeyRef {
         backend: bloom_broker_api::Token::new("local").unwrap(),
@@ -752,11 +827,18 @@ async fn real_signing_producers_reach_the_host_with_selected_account_and_full_wi
             1
         );
     }
-    if let Some(path) = std::env::var_os("BLOOM_PM80_PRODUCER_WITNESS") {
-        let produced: Vec<_> = requests.iter().map(|request| serde_json::json!({
+    let produced: Vec<_> = requests.iter().map(|request| serde_json::json!({
             "preimage_hex":hex::encode(&request.preimage), "hash_hex":hex::encode(request.claimed_hash),
             "witness":serde_json::from_slice::<serde_json::Value>(request.claim_assurance_evidence.as_ref().unwrap()).unwrap()
         })).collect();
+    let broker_fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/hyperliquid-producer-cancel.json")).unwrap();
+    assert_eq!(
+        serde_json::json!(produced),
+        broker_fixture,
+        "actual compiled producer witness/hash/preimage differs from the Broker reconstruction fixture"
+    );
+    if let Some(path) = std::env::var_os("BLOOM_PM80_PRODUCER_WITNESS") {
         std::fs::write(path, serde_json::to_vec_pretty(&produced).unwrap()).unwrap();
     }
     if let Some(path) = std::env::var_os("BLOOM_PM80_PACKAGE_RECORDS") {

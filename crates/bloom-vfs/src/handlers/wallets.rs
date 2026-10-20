@@ -6951,6 +6951,87 @@ value = "0""#,
     /// A stub Broker service: the Solana outbox read path never reaches it,
     /// so every method is a catch-all error.
     struct StubBroker;
+
+    #[tokio::test]
+    async fn policy_json_preserves_legacy_authority_until_explicit_removal_review() {
+        struct PolicyBroker {
+            baseline: SignedPolicySnapshot,
+            prepared: Mutex<Option<bloom_broker_api::PolicyUpdateRequest>>,
+        }
+        impl bloom_broker_api::MachineBrokerService for PolicyBroker {
+            fn dispatch<'a>(
+                &'a self,
+                request: MachineBrokerRequest,
+            ) -> bloom_broker_api::ServiceFuture<'a, MachineBrokerResponse> {
+                Box::pin(async move {
+                    match request {
+                        MachineBrokerRequest::PolicyRead(_) => {
+                            Ok(MachineBrokerResponse::PolicyRead(self.baseline.clone()))
+                        }
+                        MachineBrokerRequest::PolicyValidateUpdate(request) => {
+                            *self.prepared.lock().unwrap() = Some(request.clone());
+                            Ok(MachineBrokerResponse::PolicyValidateUpdate(
+                                bloom_broker_api::PolicyUpdatePrepareResponse {
+                                    operation_id: request.operation_id,
+                                    ceremony_kind: bloom_broker_api::CeremonyKind::PolicyUpdate,
+                                    ceremony_url: "https://example.invalid/legacy-removal-review"
+                                        .into(),
+                                    ceremony_expires_at_ms: DecimalU64::new(u64::MAX),
+                                    review_manifest_digest: digest(90),
+                                },
+                            ))
+                        }
+                        other => panic!("unexpected policy request: {other:?}"),
+                    }
+                })
+            }
+        }
+        let f = make_handler();
+        let mut vector: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../bloom-machine-client/tests/fixtures/legacy-policy-removal.json"
+        ))
+        .unwrap();
+        for field in ["current", "proposed"] {
+            vector[field]["wallet_id"] = serde_json::json!(f.wallet_name);
+        }
+        let current: CanonicalWalletPolicy =
+            serde_json::from_value(vector["current"].clone()).unwrap();
+        let proposed: CanonicalWalletPolicy =
+            serde_json::from_value(vector["proposed"].clone()).unwrap();
+        let bytes = serde_jcs::to_vec(&current).unwrap();
+        let mut projection = static_projection_value(f.wallet_addr);
+        projection.policy.canonical_policy = Base64UrlBytes::from_bytes(&bytes);
+        projection.policy.policy_digest = Digest32::from_bytes(sha2::Sha256::digest(&bytes).into());
+        let broker = Arc::new(PolicyBroker {
+            baseline: projection.policy.clone(),
+            prepared: Mutex::new(None),
+        });
+        let home = bloom_proto::HomeDir::at(f._tmp.path());
+        let handler = f
+            .handler
+            .with_broker(Some(MachineBrokerClient::new(broker.clone())))
+            .with_projection_reader(Arc::new(StaticProjection(projection)))
+            .with_home_write_permit(Arc::new(HomeWritePermit::acquire(&home).unwrap()));
+        let path = VfsPath::parse(&format!("/{}/policy.json", f.wallet_name)).unwrap();
+        assert_eq!(handler.read(&path).await.unwrap(), bytes);
+        let proposed_bytes = serde_jcs::to_vec(&proposed).unwrap();
+        assert!(matches!(
+            handler.write(&path, &proposed_bytes).await,
+            Err(HandlerError::PermissionDenied)
+        ));
+        let prepared = broker.prepared.lock().unwrap().clone().unwrap();
+        assert_eq!(prepared.proposed_canonical_policy.decode(), proposed_bytes);
+        assert_eq!(
+            prepared.authority_diff_digest.as_str(),
+            "65f348e08a8ded736ad13843456a1afbaacf16bf5518147b1d7d900f703e7401"
+        );
+        assert_eq!(
+            handler.read(&path).await.unwrap(),
+            bytes,
+            "staging must not remove signed policy authority"
+        );
+    }
+
     impl bloom_broker_api::MachineBrokerService for StubBroker {
         fn dispatch<'a>(
             &'a self,
