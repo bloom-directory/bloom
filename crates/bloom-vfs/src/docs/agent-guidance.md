@@ -472,22 +472,28 @@ payment by restaging it. A failed merchant retry still counts toward recorded
 spending.
 
 A Petal that stages an EVM transaction usually produces a generic contract
-call: Bloom cannot check what the calldata does, so it always needs a fresh
-owner approval. One shape is different. A canonical ERC-20
-`transfer(address,uint256)` call with no native value, **addressed to a token
-in Bloom's curated registry**, is decoded to its recipient and amount, and
-Bloom rebuilds the calldata from those two fields instead of forwarding the
-Petal's bytes. It is then classified as a token transfer, checked against
-wallet policy, and eligible for policy-bounded autonomy. A different selector,
-any nonzero native value, or a target contract the registry does not list
-keeps it generic, and so does a node whose reported
-chain id differs from the configured chain, since the registry is read by chain
-and the signature is for the reported id. The registry condition is what
-makes the classification mean anything: matching the selector only proves what
-the call looks like, and any contract can answer `decimals()` and `symbol()`
-while doing something else under that selector. Eligible does not mean
-automatic: the wallet's policy still decides, so handle the ordinary approval
-challenge either way.
+call: Bloom cannot check what the calldata does, so the owner reviews it as an
+opaque call to the contract it is addressed to. One shape is different. A
+canonical ERC-20 `transfer(address,uint256)` call with no native value,
+**addressed to a token in Bloom's curated registry**, is decoded to its
+recipient and amount, and Bloom rebuilds the calldata from those two fields
+instead of forwarding the Petal's bytes. It is then classified as a token
+transfer: the plan the owner reviews names the token, the amount and the
+recipient, and the wallet's allowed destinations are checked against the
+**recipient**, not the token contract. A transfer to a recipient the wallet
+does not list as a destination fails when it is confirmed, even if the token
+contract is listed. A different selector, any nonzero native value, or a
+target contract the registry does not list keeps it generic, and so does a
+node whose reported chain id differs from the configured chain, since the
+registry is read by chain and the signature is for the reported id. The
+registry condition is what makes the classification mean anything: matching
+the selector only proves what the call looks like, and any contract can answer
+`decimals()` and `symbol()` while doing something else under that selector.
+
+Either way, a Petal-staged transaction needs a fresh owner approval. The
+policy Bloom applies to Petal staging carries the wallet's allowed
+destinations and nothing else: no agent autonomy, spending limits or token
+rules. Handle the ordinary approval challenge every time.
 
 Because Bloom rebuilds that one shape, it must encode exactly. Calldata that
 is already ERC-20 transfer shaped — the `transfer` selector, exactly 68 bytes,

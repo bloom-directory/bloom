@@ -167,8 +167,10 @@ state. Their installed package documentation defines their mounted routes.
   it, and use Broker/Signer for the final payload signature. For Petal-originated
   canonical ERC-20 `transfer(address,uint256)` calls with zero native value,
   addressed to a token in Machine's curated registry, Machine decodes the
-  recipient and amount, reconstructs the calldata through the typed send path,
-  and evaluates token and recipient policy against those verified fields.
+  recipient and amount, and reconstructs the calldata through the typed send
+  path. The plan then names the token, amount and recipient, and the wallet's
+  allowed destinations are checked against the decoded recipient rather than
+  the token contract.
   Other calldata remains a generic contract call — including a transfer-shaped
   call to a contract the registry does not list. The selector proves the call's
   shape, not the contract's behaviour; only the registry establishes that the
@@ -176,6 +178,15 @@ state. Their installed package documentation defines their mounted routes.
   The registry is read for the chain the node reports, and only when that is
   the configured chain: a node reporting another id leaves every call generic,
   since a transfer typed for one chain would otherwise be signed for another.
+
+  Petal staging and confirmation evaluate only the advisory policy that
+  Machine derives from Broker's canonical policy, which carries the allowed
+  destinations and no agent autonomy, spending limits or token rules. A
+  Petal-staged transaction, typed or generic, therefore always needs fresh
+  owner review, and Broker enforces the canonical policy again before any
+  signature. Typed treatment also marks the calldata as verified, which
+  matters only where a policy with `under_policy` autonomy is evaluated; Petal
+  staging evaluates none today.
 
   Because Machine rebuilds the calldata from the decoded fields rather than
   forwarding the supplied bytes, that shape is held to an exact encoding.
