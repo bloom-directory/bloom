@@ -1273,7 +1273,7 @@ impl ViewsHandler {
             };
             if listing.len() > ACTION_SCAN_LIMIT {
                 incomplete = true;
-                listing.sort_by(|left, right| right.modified.cmp(&left.modified));
+                listing.sort_by_key(|entry| std::cmp::Reverse(entry.modified));
                 listing.truncate(ACTION_SCAN_LIMIT);
             }
             for entry in listing {
