@@ -48,8 +48,9 @@ hold and what needs them, plus `wallets`, `receive`, `activity`, `next-moves`,
 `contacts`, `policy`, `chains` and `markets`. Give them the file path and let
 the browser render it; do not paste the HTML into a transcript, and keep
 reading canonical values from the JSON leaves. When the answer must live
-inside chat itself, quote `views/briefing.md` — the same Today briefing as
-pasteable Markdown. These views observe only: their local script sorts and
+inside chat itself, quote `views/briefing.md` for Today only. A `show_bloom_*`
+tool already includes that page's text when the host has no widget. These
+views observe only: their local script sorts and
 selects, and nothing in them approves or executes an action. A person who
 wants them to look different edits `~/.bloom/skin.css` on the host. See
 `views/AGENTS.md`.

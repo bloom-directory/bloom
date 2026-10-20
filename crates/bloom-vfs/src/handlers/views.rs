@@ -107,6 +107,12 @@ const BALANCE_TIMEOUT: Duration = Duration::from_secs(8);
 /// An account still unread when it expires is reported, never shown as empty.
 const PORTFOLIO_BUDGET: Duration = Duration::from_secs(10);
 const PORTFOLIO_CONCURRENCY: usize = 8;
+/// One outbox state can accumulate every operation ever recorded. Read the
+/// newest directories and say the rest were omitted.
+const ACTION_SCAN_LIMIT: usize = 256;
+/// Mapped networks ask the provider together. Each call already stops on its
+/// own; the page waits for that one round, not once per chain.
+const NETWORK_LOOKUP_DEADLINE: Duration = Duration::from_secs(8);
 /// Keep the last successful native-balance observation briefly. A transient
 /// RPC failure must not make a wallet appear to lose funds between reloads;
 /// older observations expire rather than becoming an indefinite estimate.
@@ -441,7 +447,8 @@ impl ViewsHandler {
     }
 
     /// Run every account's balance reads, `PORTFOLIO_CONCURRENCY` at a time,
-    /// within `PORTFOLIO_BUDGET`. Holdings arrive in completion order; the
+    /// within `PORTFOLIO_BUDGET`. Only that many tasks exist, however many
+    /// accounts were projected. Holdings arrive as each read finishes; the
     /// caller sorts. An account that has not answered when the budget expires
     /// has every network it would have read marked unavailable and is counted
     /// in `accounts_unread`, so totals say they are partial.
@@ -453,64 +460,83 @@ impl ViewsHandler {
         solana_chains: &[String],
     ) {
         let deadline = tokio::time::Instant::now() + PORTFOLIO_BUDGET;
-        let slots = Arc::new(tokio::sync::Semaphore::new(PORTFOLIO_CONCURRENCY));
         let this = Arc::new(self.clone());
         let evm: Arc<[String]> = evm_chains.into();
         let solana: Arc<[String]> = solana_chains.into();
+        let jobs = Arc::new(jobs);
+        let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut reads = tokio::task::JoinSet::new();
-        for (index, job) in jobs.iter().cloned().enumerate() {
-            let (this, slots, evm, solana) =
-                (this.clone(), slots.clone(), evm.clone(), solana.clone());
+        let workers = PORTFOLIO_CONCURRENCY.min(jobs.len());
+        for _ in 0..workers {
+            let (this, evm, solana, jobs, next, tx) = (
+                this.clone(),
+                evm.clone(),
+                solana.clone(),
+                jobs.clone(),
+                next.clone(),
+                tx.clone(),
+            );
             reads.spawn(async move {
-                let _slot = slots.acquire_owned().await.ok()?;
-                let mut read = match job {
-                    BalanceJob::Evm {
-                        wallet,
-                        account,
-                        address,
-                    } => {
-                        let mut read = this.read_balances(&wallet, address, &evm).await;
-                        for holding in &mut read.holdings {
-                            holding.account = account.clone();
+                loop {
+                    if tokio::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if index >= jobs.len() {
+                        break;
+                    }
+                    let mut read = match &jobs[index] {
+                        BalanceJob::Evm {
+                            wallet,
+                            account,
+                            address,
+                        } => {
+                            let mut read = this.read_balances(wallet, *address, &evm).await;
+                            for holding in &mut read.holdings {
+                                holding.account.clone_from(account);
+                            }
+                            read
                         }
-                        read
+                        BalanceJob::Solana {
+                            wallet,
+                            account,
+                            address,
+                        } => {
+                            this.read_solana_balances(wallet, account, address, &solana)
+                                .await
+                        }
+                    };
+                    read.cached.sort();
+                    read.cached.dedup();
+                    if tx.send((index, read)).is_err() {
+                        break;
                     }
-                    BalanceJob::Solana {
-                        wallet,
-                        account,
-                        address,
-                    } => {
-                        this.read_solana_balances(&wallet, &account, &address, &solana)
-                            .await
-                    }
-                };
-                read.cached.sort();
-                read.cached.dedup();
-                Some((index, read))
+                }
             });
         }
+        drop(tx);
 
         let mut answered = vec![false; jobs.len()];
         loop {
-            match tokio::time::timeout_at(deadline, reads.join_next()).await {
-                Ok(Some(Ok(Some((index, read))))) => {
-                    answered[index] = true;
-                    portfolio.holdings.extend(read.holdings);
-                    portfolio.unavailable.extend(read.unavailable);
-                    portfolio.cached_balances.extend(read.cached);
-                }
-                // A failed read stays unanswered and is reported below.
-                Ok(Some(_)) => {}
+            let incoming = match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(incoming)) => Some(incoming),
                 Ok(None) => break,
                 Err(_) => {
                     tracing::debug!("views.portfolio_budget_expired");
                     reads.abort_all();
+                    while let Ok(incoming) = rx.try_recv() {
+                        Self::record_balance(portfolio, &mut answered, incoming);
+                    }
                     break;
                 }
+            };
+            if let Some(incoming) = incoming {
+                Self::record_balance(portfolio, &mut answered, incoming);
             }
         }
-        for (job, answered) in jobs.iter().zip(answered) {
-            if answered {
+        for (index, job) in jobs.iter().enumerate() {
+            if answered[index] {
                 continue;
             }
             let (wallet, account, address, chains) = match job {
@@ -540,6 +566,18 @@ impl ViewsHandler {
             }
             portfolio.accounts_unread += usize::from(has_unavailable);
         }
+    }
+
+    fn record_balance(
+        portfolio: &mut Portfolio,
+        answered: &mut [bool],
+        incoming: (usize, BalanceRead),
+    ) {
+        let (index, read) = incoming;
+        answered[index] = true;
+        portfolio.holdings.extend(read.holdings);
+        portfolio.unavailable.extend(read.unavailable);
+        portfolio.cached_balances.extend(read.cached);
     }
 
     /// Configured EVM chain names, one per chain id, in name order. This is
@@ -759,11 +797,12 @@ impl ViewsHandler {
     /// deliberately not made: no projection backs these addresses here, so
     /// they are reported as observations and never as wallets.
     async fn history_portfolio(&self, exclude: &[String]) -> Portfolio {
-        let chains = self.sorted_chains();
+        let evm_chains = self.distinct_evm_chains();
         let mut portfolio = Portfolio::default();
         let mut seen: Vec<String> = Vec::new();
         let (actions, incomplete) = self.actions().await;
         portfolio.activity_unavailable = incomplete;
+        let mut jobs = Vec::new();
         for action in actions {
             let Some(intent) = action.intent.as_ref() else {
                 continue;
@@ -791,20 +830,33 @@ impl ViewsHandler {
                 addresses: vec![from.clone()],
                 kind: "observed address".to_owned(),
             });
-            let read = self.read_balances(&label, address, &chains).await;
-            portfolio.holdings.extend(read.holdings);
-            portfolio.unavailable.extend(read.unavailable);
-            portfolio.cached_balances.extend(read.cached);
+            jobs.push(BalanceJob::Evm {
+                wallet: label,
+                account: String::new(),
+                address,
+            });
         }
+        // The same budget as projected accounts. One sender at a time would
+        // let a long history hold the daemon for a timeout per address.
+        self.read_all_balances(&mut portfolio, jobs, &evm_chains, &[])
+            .await;
         self.price(&mut portfolio).await;
         portfolio
     }
 
     /// Read a supported app leaf. Failed reads reduce coverage, never imply zero.
+    /// A route the Petal marks as side-effecting is not read: this page is
+    /// reached through `read_inert`, which only classifies the outer path.
     async fn petal_file(&self, path: &str, issues: &mut Vec<String>) -> Option<String> {
         tokio::task::yield_now().await;
         let petals = self.petals.as_ref()?;
         let parsed = VfsPath::parse(path).ok()?;
+        if Handler::is_read_side_effecting(petals.as_ref(), &parsed) {
+            issues.push(format!(
+                "{path}: skipped because the Petal marks this read as side-effecting"
+            ));
+            return None;
+        }
         match Handler::read(petals.as_ref(), &parsed).await {
             Ok(bytes) if bytes.len() <= 1_048_576 => match String::from_utf8(bytes) {
                 Ok(text) => Some(text),
@@ -1211,7 +1263,7 @@ impl ViewsHandler {
         let mut actions = Vec::new();
         let mut incomplete = false;
         for state in ACTION_STATES {
-            let listing = match Handler::list(&*self.outbox, &state_path(state)).await {
+            let mut listing = match Handler::list(&*self.outbox, &state_path(state)).await {
                 Ok(entries) => entries,
                 Err(error) => {
                     tracing::debug!(state = %state, error = %error, "views.outbox_list_unavailable");
@@ -1219,6 +1271,11 @@ impl ViewsHandler {
                     continue;
                 }
             };
+            if listing.len() > ACTION_SCAN_LIMIT {
+                incomplete = true;
+                listing.sort_by(|left, right| right.modified.cmp(&left.modified));
+                listing.truncate(ACTION_SCAN_LIMIT);
+            }
             for entry in listing {
                 let id = entry.name.clone();
                 let modified_ms = entry.modified.and_then(|time| {
@@ -1445,7 +1502,7 @@ impl ViewsHandler {
 
         let mut out = String::from("# Today briefing\n\n");
         if incomplete {
-            out.push_str("> Activity coverage incomplete. Some records could not be read; counts cover available records only.\n\n");
+            out.push_str("> Activity coverage incomplete. Some records were omitted or could not be read; counts cover available records only.\n\n");
         }
         out.push_str("Read-only — nothing here authorizes an action.\n\n");
         out.push_str(&format!(
@@ -1955,6 +2012,10 @@ impl ViewsHandler {
         // The wallets above are what Broker projects. These addresses are
         // what actually sent your recorded operations, and a reader looking
         // for "where is my money" is otherwise told nothing at all.
+        let history_notes = history.notices();
+        if !history_notes.is_empty() {
+            body.push_str(&history_notes);
+        }
         let observed = history.funded();
         if !observed.is_empty() {
             body.push_str(
@@ -2415,30 +2476,68 @@ impl ViewsHandler {
         )
     }
 
+    /// Fee and volume lookups for every mapped network, started together.
+    /// A chain that misses the deadline renders as unavailable.
+    async fn network_metrics(
+        &self,
+        pending: &[(Option<String>, Option<u64>, Option<&'static str>)],
+    ) -> Vec<(
+        Option<market_data::ChainVolume>,
+        Option<market_data::FeeSeries>,
+    )> {
+        let mut joins = tokio::task::JoinSet::new();
+        for (index, (_, _, slug)) in pending.iter().enumerate() {
+            let slug = slug.map(str::to_owned);
+            let market = self.market.clone();
+            joins.spawn(async move {
+                let (volume, fees) = match slug.as_deref() {
+                    Some(slug) => tokio::join!(market.volume(slug), market.fees(slug)),
+                    None => (None, None),
+                };
+                (index, volume, fees)
+            });
+        }
+        let mut results = vec![(None, None); pending.len()];
+        let deadline = tokio::time::Instant::now() + NETWORK_LOOKUP_DEADLINE;
+        loop {
+            match tokio::time::timeout_at(deadline, joins.join_next()).await {
+                Ok(Some(Ok((index, volume, fees)))) => results[index] = (volume, fees),
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => {
+                    tracing::debug!("views.network_lookup_deadline");
+                    joins.abort_all();
+                    break;
+                }
+            }
+        }
+        results
+    }
+
     /// One comparison surface for network usage and wallet balances.
     /// Fee history is disclosed per network, keeping the default view short.
     async fn render_chains(&self) -> String {
         let portfolio = self.portfolio().await;
-        let mut networks = Vec::new();
+        let mut pending = Vec::new();
         for chain in self.sorted_chains() {
             let Some(client) = self.chains.get(&chain) else {
                 continue;
             };
             let chain_id = client.spec().chain_id;
             let slug = market_data::chain_slug(chain_id);
-            let (volume, fees) = match slug {
-                Some(slug) => tokio::join!(self.market.volume(slug), self.market.fees(slug)),
-                None => (None, None),
-            };
-            networks.push((Some(chain), Some(chain_id), slug, volume, fees));
+            pending.push((Some(chain), Some(chain_id), slug));
         }
         // Solana's public network metrics do not depend on an EVM chain spec
         // or on whether Broker currently projects a Solana wallet account.
         // Keeping it here avoids inventing an EVM chain id merely to make the
         // public comparison complete.
-        let (solana_volume, solana_fees) =
-            tokio::join!(self.market.volume("solana"), self.market.fees("solana"));
-        networks.push((None, None, Some("solana"), solana_volume, solana_fees));
+        pending.push((None, None, Some("solana")));
+        let metrics = self.network_metrics(&pending).await;
+        let mut networks: Vec<_> = pending
+            .into_iter()
+            .zip(metrics)
+            .map(|((chain, chain_id, slug), (volume, fees))| (chain, chain_id, slug, volume, fees))
+            .collect();
         networks.sort_by(|a, b| {
             compare_optional_f64_desc(
                 a.4.as_ref().and_then(|f| f.total_all_time),
@@ -2885,7 +2984,7 @@ fn app_coverage_notice(issues: &[String]) -> String {
 
 fn activity_coverage_notice(incomplete: bool) -> &'static str {
     if incomplete {
-        "<p class=\"coverage-notice\"><strong>Activity coverage incomplete</strong> · Some records could not be read. Counts cover available records only.</p>"
+        "<p class=\"coverage-notice\"><strong>Activity coverage incomplete</strong> · Some records were omitted or could not be read. Counts cover available records only.</p>"
     } else {
         ""
     }
@@ -5385,6 +5484,49 @@ mod tests {
         }
     }
 
+    struct SideEffectingPetals {
+        hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Handler for SideEffectingPetals {
+        fn is_read_side_effecting(&self, path: &VfsPath) -> bool {
+            path.to_string_path().contains("clearinghouse")
+        }
+
+        async fn lookup(&self, _: &VfsPath) -> Result<Entry, HandlerError> {
+            Ok(Entry::dir(""))
+        }
+
+        async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+            self.hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(HandlerError::not_found(path.to_string_path()))
+        }
+
+        async fn list(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+            let text = path.to_string_path();
+            if text.is_empty() || text == "/" {
+                return Ok(vec![Entry::dir("hyperliquid")]);
+            }
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_side_effecting_petal_read_is_skipped() {
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handler = fixture()
+            .handler
+            .with_petals(Arc::new(SideEffectingPetals { hits: hits.clone() }));
+        let (positions, issues) = handler.petal_positions(&[ADDRESS.to_owned()]).await;
+        assert!(positions.is_empty());
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(
+            issues.iter().any(|issue| issue.contains("side-effecting")),
+            "{issues:?}"
+        );
+    }
+
     #[tokio::test]
     async fn app_collection_has_a_total_deadline() {
         let handler = fixture().handler.with_petals(Arc::new(HangingPetals));
@@ -5830,6 +5972,100 @@ mod tests {
                 .coverage_lines()
                 .iter()
                 .any(|line| line.starts_with("Balance reads ran out of time"))
+        );
+    }
+
+    #[tokio::test]
+    async fn historical_senders_share_one_balance_budget() {
+        let senders = PORTFOLIO_CONCURRENCY * 2 + 1;
+        let fixture = fixture();
+        for n in 0..senders {
+            let address = alloy::primitives::Address::repeat_byte((n + 1) as u8);
+            stage_files(
+                &fixture,
+                "sent",
+                &format!("hist-{n}"),
+                "# Sent\n",
+                &[("intent.json", &format!(r#"{{"from":"{address:#x}"}}"#))],
+            );
+        }
+        let mut spec = bloom_proto::ChainSpec::anvil_default();
+        spec.rpc_urls = vec![stalled_rpc().await];
+        let mut handler = fixture.handler;
+        handler.chains = ChainRegistry::new();
+        handler
+            .chains
+            .add(bloom_evm::ChainClient::new(spec).unwrap());
+        let started = std::time::Instant::now();
+        let portfolio = handler.history_portfolio(&[]).await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed <= PORTFOLIO_BUDGET + Duration::from_secs(2),
+            "historical reads took {elapsed:?}"
+        );
+        assert!(
+            portfolio.accounts_unread > 0,
+            "the budget must stop the fan-out"
+        );
+        assert!(
+            portfolio
+                .notices()
+                .contains("Balance reads ran out of time")
+        );
+    }
+
+    #[tokio::test]
+    async fn activity_scan_omits_records_past_the_limit() {
+        let fixture = fixture();
+        for n in 0..=ACTION_SCAN_LIMIT {
+            stage(&fixture, "sent", &format!("op-{n:04}"), "# Sent\n");
+        }
+        let (actions, incomplete) = fixture.handler.actions().await;
+        assert!(incomplete);
+        assert_eq!(actions.len(), ACTION_SCAN_LIMIT);
+        let html = render(&fixture.handler, ACTIVITY_HTML).await;
+        assert!(html.contains("Activity coverage incomplete"), "{html}");
+    }
+
+    #[tokio::test]
+    async fn network_page_waits_for_one_provider_round() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        let mut handler = fixture().handler;
+        handler.chains = ChainRegistry::new();
+        for (name, id) in [("ethereum", 1u64), ("base", 8453)] {
+            let mut spec = bloom_proto::ChainSpec::anvil_default();
+            spec.name = name.into();
+            spec.chain_id = id;
+            spec.rpc_urls = vec!["http://127.0.0.1:1".into()];
+            spec.display_name = Some(name.into());
+            handler
+                .chains
+                .add(bloom_evm::ChainClient::new(spec).unwrap());
+        }
+        handler.market = MarketData::with_base_url(&url);
+        let started = std::time::Instant::now();
+        let html = render(&handler, CHAINS_HTML).await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(12),
+            "serial timeouts would take much longer; took {elapsed:?}"
+        );
+        assert!(
+            html.contains("did not answer") || html.contains("unavailable"),
+            "{html}"
+        );
+        let started = std::time::Instant::now();
+        let _again = render(&handler, CHAINS_HTML).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "a failed provider must not be waited on again immediately"
         );
     }
 

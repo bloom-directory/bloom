@@ -768,6 +768,22 @@
     .bloom-widget .receiving-network,
     .bloom-widget .receiving-network-list,
     .bloom-widget .receiving-card > .external-link { display: none; }
+    .bloom-widget .receiving-unavailable {
+      display: block;
+      margin-top: 12px;
+      padding-top: 10px;
+      border-top: 1px solid var(--rule);
+      color: var(--muted);
+      font-size: var(--font-text-xs-size, 12px);
+      text-align: left;
+    }
+    .bloom-widget .receiving-unavailable h3 {
+      margin: 0 0 4px;
+      color: var(--ink);
+      font-size: var(--font-text-sm-size, 14px);
+    }
+    .bloom-widget .receiving-unavailable p,
+    .bloom-widget .receiving-unavailable small { display: block; margin: 0; }
     @media (max-width: 420px) {
       body.bloom-widget > main { padding: 15px 13px; }
       .bloom-widget .directory-row .wallet-worth > span { display: none; }
@@ -1009,8 +1025,8 @@
     for (const wallet of wallets) {
       const grid = wallet.querySelector(":scope > .grid");
       if (!grid) continue;
-      grid.querySelectorAll(".receiving-unavailable").forEach((card) => card.remove());
-      const cards = [...grid.querySelectorAll(":scope > .receiving-card")].filter((card) => card.querySelector(".address"));
+      const unavailable = [...grid.querySelectorAll(".receiving-unavailable")];
+      const cards = [...grid.querySelectorAll(":scope > .receiving-card")].filter((card) => card.querySelector(".address") && !card.classList.contains("receiving-unavailable"));
       if (!cards.length) continue;
       cards.sort((left, right) => {
         const leftFamily = left.querySelector("h3")?.textContent?.includes("Solana") ? 1 : 0;
@@ -1021,6 +1037,10 @@
         return accountNumberFromPath(leftPath) - accountNumberFromPath(rightPath);
       });
       cards.forEach((card) => grid.append(card));
+      unavailable.forEach((card) => {
+        card.hidden = false;
+        grid.append(card);
+      });
       const tabs = page.createElement("div");
       tabs.className = "receive-address-tabs";
       tabs.setAttribute("role", "tablist");
@@ -1378,7 +1398,13 @@
     if (receiveTab) {
       const wallet = receiveTab.closest(".receiving-wallet");
       wallet.querySelectorAll(".receive-address-tab").forEach((button) => button.setAttribute("aria-selected", String(button === receiveTab)));
-      wallet.querySelectorAll(".receiving-card").forEach((card) => { card.hidden = card.id !== receiveTab.dataset.receiveTarget; });
+      wallet.querySelectorAll(".receiving-card").forEach((card) => {
+        if (card.classList.contains("receiving-unavailable")) {
+          card.hidden = false;
+          return;
+        }
+        card.hidden = card.id !== receiveTab.dataset.receiveTarget;
+      });
       reportSize();
       return;
     }

@@ -89,12 +89,12 @@ host; the mount itself is read-only.
 ## What to tell a person
 
 Prefer the matching `show_bloom_*` MCP tool so a capable desktop host can
-render the view inline. If that tool is unavailable or the host cannot render
-MCP Apps, point the person at the file path and let the browser render it. For
-anything that must be said inside chat itself, quote `briefing.md` rather than
-summarizing from memory. Do not paste the HTML into a transcript, and do not
-re-render these pages yourself: the canonical values live in the sibling JSON
-leaves
+render the view inline. A host that cannot render MCP Apps receives that
+page's own text in the tool result, plus the browser path. `briefing.md` is
+only the Today briefing. Do not quote it for Receive, Activity, Contacts,
+Policy, Networks, or Markets. Do not paste the HTML into a transcript, and do
+not re-render these pages yourself: the canonical values live in the sibling
+JSON leaves
 (`wallets/<wallet>/addresses.json`, `wallets/<wallet>/chains/<chain>/balance.json`,
 `outbox/<state>/<action>/intent.json` and `result.json`).
 
@@ -130,6 +130,11 @@ These pages are deliberately narrow about what they claim:
 - App collection has a five-second total deadline, 1 MiB supported-leaf limit,
   256 entries per listing, and generic discovery limited to depth two,
   24 listings and 12 records per app. Truncation is disclosed, not completeness.
+  A Petal route that marks its read as side-effecting is skipped and named.
+- Balance reads for projected accounts and historical senders share one
+  ten-second budget and eight in-flight reads. A read that does not finish is
+  omitted and named. Activity opens at most 256 operations in each state;
+  older records are omitted and the page says coverage is incomplete.
 
 ## Boundaries
 

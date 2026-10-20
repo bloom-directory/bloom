@@ -1111,8 +1111,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn view_results_route_clients_without_apps_to_the_text_briefing() {
-        async fn note(capabilities: Value) -> String {
+    async fn view_results_for_clients_without_apps_quote_that_page() {
+        async fn note(name: &str, capabilities: Value) -> String {
+            // "hi" — the same bytes for the page and the skin. The note must
+            // quote the page, not send the model to the Today briefing.
             let (server, _) = server(Ok(json!({ "bytes_b64": "aGk=" })));
             server
                 .handle(json!({
@@ -1124,7 +1126,7 @@ mod tests {
             let response = server
                 .handle(json!({
                     "jsonrpc": "2.0", "id": 2, "method": "tools/call",
-                    "params": { "name": "show_bloom_wallets", "arguments": {} },
+                    "params": { "name": name, "arguments": {} },
                 }))
                 .await
                 .unwrap();
@@ -1139,13 +1141,30 @@ mod tests {
                 .to_owned()
         }
 
-        // Claude Code's initialize: no MCP Apps extension.
-        let text_only = note(json!({ "roots": { "listChanged": true }, "elicitation": {} })).await;
-        assert!(text_only.contains("/views/briefing.md"));
-        assert!(text_only.contains("views/wallets.html"));
+        let text_only = json!({ "roots": { "listChanged": true }, "elicitation": {} });
+        for tool in views::VIEW_TOOLS {
+            let note = note(tool.name, text_only.clone()).await;
+            assert!(
+                note.contains(&format!("views/{}", tool.page)),
+                "{name}: {note}",
+                name = tool.name
+            );
+            // "This" contains the letters hi, so match the page text itself.
+            assert!(note.contains("\n\nhi"), "{}: {note}", tool.name);
+            assert!(
+                !note.contains("/views/briefing.md"),
+                "{} must not substitute the Today briefing: {note}",
+                tool.name
+            );
+        }
 
-        let apps = note(json!({ "extensions": { APPS_EXTENSION: {} } })).await;
+        let apps = note(
+            "show_bloom_wallets",
+            json!({ "extensions": { APPS_EXTENSION: {} } }),
+        )
+        .await;
         assert!(!apps.contains("briefing"));
+        assert!(!apps.contains("hi"));
     }
 
     #[tokio::test]

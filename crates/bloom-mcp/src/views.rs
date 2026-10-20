@@ -161,8 +161,9 @@ pub async fn call(
     } else {
         format!(
             "This client did not declare MCP Apps support, so the {view} widget may not display. \
-             If the person cannot see it, read `/views/briefing.md` with `vfs_read` for a text \
-             summary, or open `{browser_path}` in a browser."
+             Open `{browser_path}` in a browser. The text below is this page, not the Today briefing.\n\n\
+             {}",
+            page_text(&html)
         )
     };
 
@@ -182,6 +183,125 @@ pub async fn call(
             },
         },
     }))
+}
+
+const PAGE_TEXT_LIMIT: usize = 16_000;
+
+/// Words of a rendered page, for a host that cannot show the widget.
+/// Scripts, styles, and QR artwork are dropped. The canonical HTML stays
+/// the only renderer; this is that page's text, not a second view.
+fn page_text(html: &str) -> String {
+    let mut text = String::new();
+    let mut rest = html;
+    while !rest.is_empty() {
+        let Some(start) = rest.find('<') else {
+            text.push_str(rest);
+            break;
+        };
+        text.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        if after.is_empty() {
+            text.push('<');
+            break;
+        }
+        if let Some(name) = ignored_block(after) {
+            if let Some(next) = skip_block(after, name) {
+                rest = next;
+                continue;
+            }
+        }
+        let end = after
+            .find('>')
+            .map(|index| index + 1)
+            .unwrap_or(after.len());
+        let tag = &after[..end.saturating_sub(1)];
+        let name = tag
+            .trim_start_matches('/')
+            .split_whitespace()
+            .next()
+            .unwrap_or("");
+        if name.eq_ignore_ascii_case("br") || (tag.starts_with('/') && is_block_end(name)) {
+            text.push('\n');
+        }
+        rest = &after[end..];
+    }
+    let text = decode_entities(&text);
+    let mut lines = Vec::new();
+    for line in text.split('\n') {
+        let line = line.split_whitespace().collect::<Vec<_>>().join(" ");
+        if !line.is_empty() {
+            lines.push(line);
+        }
+    }
+    let mut joined = lines.join("\n");
+    if joined.len() > PAGE_TEXT_LIMIT {
+        let mut end = PAGE_TEXT_LIMIT;
+        while end > 0 && !joined.is_char_boundary(end) {
+            end -= 1;
+        }
+        if let Some(boundary) = joined[..end]
+            .rfind('\n')
+            .or_else(|| joined[..end].rfind(' '))
+        {
+            end = boundary;
+        }
+        joined.truncate(end);
+        joined.push_str("\n\n[Page text truncated. Open the browser path for the rest.]");
+    }
+    joined
+}
+
+fn ignored_block(after: &str) -> Option<&'static str> {
+    for name in ["script", "style", "svg", "noscript"] {
+        if after.len() >= name.len()
+            && after[..name.len()].eq_ignore_ascii_case(name)
+            && after[name.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| !c.is_ascii_alphanumeric())
+        {
+            return Some(name);
+        }
+    }
+    None
+}
+
+fn skip_block<'a>(after: &'a str, name: &str) -> Option<&'a str> {
+    let close = format!("</{name}");
+    let end = after.to_ascii_lowercase().find(&close)?;
+    let rest = &after[end + close.len()..];
+    let gt = rest.find('>')?;
+    Some(&rest[gt + 1..])
+}
+
+fn is_block_end(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "p" | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "li"
+            | "tr"
+            | "section"
+            | "article"
+            | "div"
+            | "summary"
+            | "dt"
+            | "dd"
+            | "caption"
+            | "header"
+            | "footer"
+    )
+}
+
+fn decode_entities(text: &str) -> String {
+    text.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
 }
 
 fn validate_arguments(arguments: &Value) -> Result<(), ToolError> {
@@ -327,6 +447,27 @@ mod tests {
         );
         assert_eq!(app["_meta"]["openai/widgetAccessible"], true);
         assert_eq!(app["annotations"]["readOnlyHint"], true);
+    }
+
+    #[test]
+    fn page_text_keeps_the_words_and_drops_artwork() {
+        let html = "<main><h1>Receive</h1><svg><text>drop</text></svg>\
+                    <p>Address 0xabc &amp; more</p><script>alert(1)</script></main>";
+        let text = page_text(html);
+        assert!(text.contains("Receive"), "{text}");
+        assert!(text.contains("Address 0xabc & more"), "{text}");
+        assert!(!text.contains("drop"), "{text}");
+        assert!(!text.contains("alert"), "{text}");
+        assert!(!text.contains('<'), "{text}");
+    }
+
+    #[test]
+    fn receive_widget_keeps_unavailable_address_evidence() {
+        assert!(APP_TEMPLATE.contains("receiving-unavailable"));
+        assert!(
+            !APP_TEMPLATE.contains("receiving-unavailable\").forEach((card) => card.remove())")
+        );
+        assert!(APP_TEMPLATE.contains("classList.contains(\"receiving-unavailable\")"));
     }
 
     #[test]

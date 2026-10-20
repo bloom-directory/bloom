@@ -9,8 +9,10 @@
 //! missing leaves a panel saying so, and never becomes a zero: "no fee data
 //! for this chain" and "this chain collected no fees" are different claims.
 //!
-//! Results are cached for [`CACHE_TTL`], because a page renders on every read
-//! of the mount and these endpoints are neither fast nor unmetered.
+//! Successes are cached for [`CACHE_TTL`] and failures for
+//! [`NEGATIVE_CACHE_TTL`]. A page renders on every read of the mount, and
+//! these endpoints are neither fast nor unmetered. A hung provider must not
+//! stall every reload.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -24,6 +26,11 @@ const CACHE_TTL: Duration = Duration::from_secs(900);
 
 /// One upstream call's budget. A view must render even when a provider hangs.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(6);
+
+/// How long a failed provider answer is remembered. Short enough that a
+/// recovery shows up on a later reload, long enough that one hung source
+/// does not consume the page deadline again immediately.
+const NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(30);
 
 /// How many completed days of fee history a panel keeps. The provider returns
 /// a chain's entire history — thousands of points — which is an unreadable
@@ -103,11 +110,15 @@ enum Cached {
     Fees(FeeSeries),
     Volume(ChainVolume),
     Markets(Vec<TokenMarket>),
+    /// A failed or empty answer. Kept briefly so the next read does not wait
+    /// on the same provider again.
+    Miss,
 }
 
 struct Entry {
     value: Cached,
     fetched_at: Instant,
+    ttl: Duration,
 }
 
 /// Reader for public market context, with a cache in front of every source.
@@ -155,11 +166,16 @@ impl MarketData {
     /// drawing a part-day beside whole ones reads as a collapse in usage.
     pub async fn fees(&self, slug: &str) -> Option<FeeSeries> {
         let key = format!("fees:{slug}");
-        if let Some(Cached::Fees(series)) = self.cached(&key) {
-            return Some(series);
+        match self.cached(&key) {
+            Some(Cached::Fees(series)) => return Some(series),
+            Some(Cached::Miss) => return None,
+            _ => {}
         }
         let url = format!("{}/{slug}?dataType=dailyFees", self.fees_url);
-        let body: serde_json::Value = self.get_json(&url).await?;
+        let Some(body) = self.get_json::<serde_json::Value>(&url).await else {
+            self.store(key, Cached::Miss);
+            return None;
+        };
         let cutoff = start_of_utc_day(now_secs());
         let mut points: Vec<(u64, f64)> = body
             .get("totalDataChart")
@@ -204,14 +220,19 @@ impl MarketData {
     /// before, as the provider reports them.
     pub async fn volume(&self, slug: &str) -> Option<ChainVolume> {
         let key = format!("volume:{slug}");
-        if let Some(Cached::Volume(volume)) = self.cached(&key) {
-            return Some(volume);
+        match self.cached(&key) {
+            Some(Cached::Volume(volume)) => return Some(volume),
+            Some(Cached::Miss) => return None,
+            _ => {}
         }
         let url = format!(
             "{}/{slug}?excludeTotalDataChart=true&excludeTotalDataChartBreakdown=true",
             self.dexs_url
         );
-        let body: serde_json::Value = self.get_json(&url).await?;
+        let Some(body) = self.get_json::<serde_json::Value>(&url).await else {
+            self.store(key, Cached::Miss);
+            return None;
+        };
         let volume = ChainVolume {
             total_24h: body.get("total24h").and_then(|v| v.as_f64()),
             change_1d: body.get("change_1d").and_then(|v| v.as_f64()),
@@ -224,12 +245,23 @@ impl MarketData {
     /// dropped rather than shown as zero.
     pub async fn markets(&self) -> Option<Vec<TokenMarket>> {
         let key = "markets".to_owned();
-        if let Some(Cached::Markets(rows)) = self.cached(&key) {
-            return Some(rows);
+        match self.cached(&key) {
+            Some(Cached::Markets(rows)) => return Some(rows),
+            Some(Cached::Miss) => return None,
+            _ => {}
         }
-        let body: serde_json::Value = self.get_json(&self.markets_url.clone()).await?;
-        let rows: Vec<TokenMarket> = body
-            .as_array()?
+        let Some(body) = self
+            .get_json::<serde_json::Value>(&self.markets_url.clone())
+            .await
+        else {
+            self.store(key, Cached::Miss);
+            return None;
+        };
+        let Some(rows_json) = body.as_array() else {
+            self.store(key, Cached::Miss);
+            return None;
+        };
+        let rows: Vec<TokenMarket> = rows_json
             .iter()
             .filter_map(|row| {
                 Some(TokenMarket {
@@ -253,6 +285,7 @@ impl MarketData {
             })
             .collect();
         if rows.is_empty() {
+            self.store(key, Cached::Miss);
             return None;
         }
         self.store(key, Cached::Markets(rows.clone()));
@@ -288,15 +321,21 @@ impl MarketData {
     fn cached(&self, key: &str) -> Option<Cached> {
         let guard = self.cache.read();
         let entry = guard.get(key)?;
-        (entry.fetched_at.elapsed() <= CACHE_TTL).then(|| entry.value.clone())
+        (entry.fetched_at.elapsed() <= entry.ttl).then(|| entry.value.clone())
     }
 
     fn store(&self, key: String, value: Cached) {
+        let ttl = if matches!(value, Cached::Miss) {
+            NEGATIVE_CACHE_TTL
+        } else {
+            CACHE_TTL
+        };
         self.cache.write().insert(
             key,
             Entry {
                 value,
                 fetched_at: Instant::now(),
+                ttl,
             },
         );
     }
@@ -346,6 +385,32 @@ mod tests {
         // the cutoff a still-accruing day must fall on or after.
         assert_eq!(start_of_utc_day(86_400 + 43_200), 86_400);
         assert_eq!(start_of_utc_day(86_400), 86_400);
+    }
+
+    #[tokio::test]
+    async fn a_hanging_provider_is_not_asked_again_immediately() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        let market = MarketData::with_base_url(&url);
+        let started = Instant::now();
+        assert!(market.fees("ethereum").await.is_none());
+        let first = started.elapsed();
+        assert!(
+            first < REQUEST_TIMEOUT + Duration::from_secs(2),
+            "one call took {first:?}"
+        );
+        let started = Instant::now();
+        assert!(market.fees("ethereum").await.is_none());
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "failure was fetched again"
+        );
     }
 
     #[tokio::test]

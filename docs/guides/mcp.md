@@ -122,11 +122,12 @@ an operation. External explorer links are opened through the host.
 
 Clients that do not render MCP Apps ignore the UI metadata. When a client did
 not declare the `io.modelcontextprotocol/ui` extension at `initialize`, the
-result's text and `structuredContent.note` point the model to
-`/views/briefing.md` for a text summary and to the matching path under
-`views/` for a browser. Claude Code is such a client: it calls the tools but
-does not display widgets. ChatGPT renders widgets without declaring the
-extension, so the note only applies when the person cannot see the widget.
+result's text and `structuredContent.note` contain the words of the requested
+page and the matching path under `views/` for a browser. They do not substitute
+`/views/briefing.md`, which is only the Today briefing. Claude Code is such a
+client: it calls the tools but does not display widgets. ChatGPT renders
+widgets without declaring the extension, so the note only applies when the
+person cannot see the widget.
 
 ## Resources
 
