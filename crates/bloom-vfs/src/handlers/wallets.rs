@@ -4929,6 +4929,7 @@ mod tests {
             derivation: None,
         };
         let canonical = serde_jcs::to_vec(&CanonicalWalletPolicy {
+            clear_signing: None,
             wallet_id: wallet_id.clone(),
             maximum_approval_lifetime_ms: 300_000,
             allowed_petal_packages: Vec::new(),
@@ -5009,6 +5010,7 @@ mod tests {
             }),
         };
         let canonical = serde_jcs::to_vec(&CanonicalWalletPolicy {
+            clear_signing: None,
             wallet_id: wallet_id.clone(),
             maximum_approval_lifetime_ms: 300_000,
             allowed_petal_packages: Vec::new(),

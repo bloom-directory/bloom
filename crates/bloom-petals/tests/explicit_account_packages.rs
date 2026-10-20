@@ -22,6 +22,9 @@ use bloom_vfs::{Handler, Vfs};
 struct AccountFixture {
     account_one_missing: AtomicBool,
     external_calls: AtomicUsize,
+    capture_signing: AtomicBool,
+    sign_requests: std::sync::Mutex<Vec<PayloadSignRequest>>,
+    batch_sign_requests: std::sync::Mutex<Vec<bloom_petals::PayloadBatchSignRequest>>,
 }
 
 fn directory(name: &str) -> HostVfsEntry {
@@ -36,6 +39,21 @@ fn directory(name: &str) -> HostVfsEntry {
 
 #[async_trait]
 impl PetalHost for AccountFixture {
+    async fn sign_payload_batch_outcome(
+        &self,
+        request: bloom_petals::PayloadBatchSignRequest,
+    ) -> Result<bloom_petals::PayloadBatchSignOutcome, HostError> {
+        if !self.capture_signing.load(Ordering::SeqCst) {
+            return Err(HostError::Denied("fixture batch signing".into()));
+        }
+        self.batch_sign_requests.lock().unwrap().push(request);
+        Ok(bloom_petals::PayloadBatchSignOutcome::ApprovalPending(
+            bloom_petals::abi::ApprovalPending {
+                action_id: "55".repeat(32),
+                expires_ms: u64::MAX,
+            },
+        ))
+    }
     async fn vfs_lookup(&self, path: &str) -> Result<HostVfsEntry, HostError> {
         if matches!(path, "wallets" | "wallets/alice") {
             return Ok(directory(path.rsplit('/').next().unwrap()));
@@ -52,6 +70,9 @@ impl PetalHost for AccountFixture {
     }
 
     async fn vfs_read(&self, path: &str) -> Result<Vec<u8>, HostError> {
+        if self.capture_signing.load(Ordering::SeqCst) && path == "chains/polygon/chain_id" {
+            return Ok(b"137".to_vec());
+        }
         for index in [0, 1] {
             if path == format!("wallets/alice/{index}/account.json") {
                 if index == 1 && self.account_one_missing.load(Ordering::SeqCst) {
@@ -77,11 +98,18 @@ impl PetalHost for AccountFixture {
 
     async fn http_fetch(
         &self,
-        _request: HttpRequest,
+        request: HttpRequest,
         _policy: NetPolicy,
         _max: usize,
     ) -> Result<HttpResponse, HostError> {
         self.external_calls.fetch_add(1, Ordering::SeqCst);
+        if self.capture_signing.load(Ordering::SeqCst) && request.url.ends_with("/time") {
+            return Ok(HttpResponse {
+                status: 200,
+                headers: vec![],
+                body: b"1700000000".to_vec(),
+            });
+        }
         Err(HostError::Denied("fixture HTTP".into()))
     }
 
@@ -108,9 +136,18 @@ impl PetalHost for AccountFixture {
 
     async fn sign_payload_outcome(
         &self,
-        _request: PayloadSignRequest,
+        request: PayloadSignRequest,
     ) -> Result<SignOutcome, HostError> {
         self.external_calls.fetch_add(1, Ordering::SeqCst);
+        if self.capture_signing.load(Ordering::SeqCst) {
+            self.sign_requests.lock().unwrap().push(request);
+            return Ok(SignOutcome::ApprovalPending(
+                bloom_petals::abi::ApprovalPending {
+                    action_id: "55".repeat(32),
+                    expires_ms: u64::MAX,
+                },
+            ));
+        }
         Err(HostError::Denied("fixture signing".into()))
     }
 }
@@ -512,4 +549,144 @@ async fn installed_packages_keep_explicit_account_routes_and_private_state() {
     eprintln!(
         "installed WASM fixture: private settings, restart, secret permissions and no external side effects passed"
     );
+}
+
+#[tokio::test]
+#[ignore = "requires rebuilt packages via BLOOM_PM80_POLYMARKET_ROOT and BLOOM_PM80_HYPERLIQUID_ROOT"]
+async fn real_signing_producers_reach_the_host_with_selected_account_and_full_witness() {
+    let temporary = tempfile::Builder::new().prefix("cs-vm-").tempdir().unwrap();
+    let home = temporary.path();
+    let store = PetalStore::open(home.join("petals/store")).unwrap();
+    let mut hashes = BTreeMap::new();
+    for (name, variable) in [
+        ("polymarket", "BLOOM_PM80_POLYMARKET_ROOT"),
+        ("hyperliquid", "BLOOM_PM80_HYPERLIQUID_ROOT"),
+    ] {
+        let root = PathBuf::from(std::env::var_os(variable).expect(variable));
+        let prepared = bloom_petals::package::build_petal_package_dir(&root).unwrap();
+        for route in &prepared.route_index.routes {
+            if route.pattern.contains("/begin") || route.pattern.contains("/continue") {
+                eprintln!("{name} compiled route: {route:?}");
+            }
+        }
+        let (installed, _, _) = store.install_prepared_petal_package(prepared).unwrap();
+        hashes.insert(name, installed.hash);
+    }
+    let host = Arc::new(AccountFixture::default());
+    host.capture_signing.store(true, Ordering::SeqCst);
+    let vfs = fixture_vfs(home, host.clone());
+    let begin = mounted("polymarket", "onboard/alice/1/begin");
+    let begin_result = vfs.write(&begin, b"begin").await;
+    {
+        let requests = host.batch_sign_requests.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "fresh begin must emit CLOB auth: {begin_result:?}"
+        );
+        let request = &requests[0];
+        assert_eq!(request.operation_class, "polymarket.clob_auth.v1");
+        assert_eq!(
+            request
+                .context
+                .as_ref()
+                .unwrap()
+                .trusted_account()
+                .unwrap()
+                .number,
+            1
+        );
+        assert_eq!(
+            request.context.as_ref().unwrap().package_hash,
+            hashes["polymarket"]
+        );
+        assert!(request.action.is_some());
+    }
+    let private =
+        PrivateStore::open_account(store.private_account_data_root(), "alice", 1).unwrap();
+    private
+        .put(
+            &hashes["polymarket"],
+            "secrets/creds/alice/clob.json",
+            br#"{"apiKey":"fixture","secret":"fixture","passphrase":"fixture"}"#,
+            true,
+        )
+        .unwrap();
+    let _ = vfs.write(&begin, b"begin").await;
+    assert_eq!(
+        host.batch_sign_requests.lock().unwrap().len(),
+        1,
+        "stored credentials must not sign under begin"
+    );
+    // A real persisted delegated session drives the actual compiled workflow.
+    let key = bloom_broker_api::KeyRef {
+        backend: bloom_broker_api::Token::new("local").unwrap(),
+        backend_instance: bloom_broker_api::Token::new("fixture").unwrap(),
+        locator: "wallet/alice/petals/fixture-child".into(),
+        key_spec: bloom_broker_api::KeySpec::Secp256k1,
+        public_key_fingerprint: bloom_broker_api::Digest32::from_bytes([0x44; 32]),
+        derivation: None,
+    };
+    let session = serde_json::json!({
+        "schema":"bloom.hyperliquid_agent_session.v1", "network":"testnet", "wallet":"alice",
+        "owner_address":"0x0000000000000000000000000000000000000002", "id":"test",
+        "agent_address":"0x0000000000000000000000000000000000000003",
+        "key_ref_jcs":serde_jcs::to_vec(&key).unwrap(), "agent_name":"test",
+        "created_ms":1, "expires_ms":u64::MAX, "max_notional_usd":null, "max_leverage":3,
+        "assets":["0"], "stopped":false, "last_response":null, "last_error":null
+    });
+    private
+        .put(
+            &hashes["hyperliquid"],
+            "state/state/sessions/testnet/alice/test/session.json",
+            &serde_json::to_vec(&session).unwrap(),
+            false,
+        )
+        .unwrap();
+    let cancel = mounted(
+        "hyperliquid",
+        "testnet/agent_sessions/alice/1/test/cancel.json",
+    );
+    let mut cancellation_results = Vec::new();
+    for nonce in [123, 124] {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "action":{"type":"cancel","cancels":[{"a":0,"o":42}],"f":true}, "nonce":nonce
+        }))
+        .unwrap();
+        cancellation_results.push(vfs.write(&cancel, &body).await);
+    }
+    let requests = host.sign_requests.lock().unwrap();
+    assert_eq!(
+        requests.len(),
+        2,
+        "both delegated uses must reach the host: {cancellation_results:?}"
+    );
+    for request in requests.iter() {
+        assert_eq!(request.operation_class, "hyperliquid.agent_action");
+        assert_eq!(request.key_ref.as_ref(), Some(&key));
+        assert_eq!(request.claim_assurance_evidence, request.action);
+        assert!(
+            request
+                .claim_assurance_evidence
+                .as_ref()
+                .is_some_and(|bytes| !bytes.is_empty())
+        );
+        assert_eq!(
+            request
+                .context
+                .as_ref()
+                .unwrap()
+                .trusted_account()
+                .unwrap()
+                .number,
+            1
+        );
+    }
+    if let Some(path) = std::env::var_os("BLOOM_PM80_PRODUCER_WITNESS") {
+        let produced: Vec<_> = requests.iter().map(|request| serde_json::json!({
+            "preimage_hex":hex::encode(&request.preimage), "hash_hex":hex::encode(request.claimed_hash),
+            "witness":serde_json::from_slice::<serde_json::Value>(request.claim_assurance_evidence.as_ref().unwrap()).unwrap()
+        })).collect();
+        std::fs::write(path, serde_json::to_vec_pretty(&produced).unwrap()).unwrap();
+    }
 }

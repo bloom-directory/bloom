@@ -2915,6 +2915,8 @@ struct ClaimedPolicyAuthorityDiff {
     removed_destinations: Vec<ClaimedPolicyAuthorityDestination>,
     added_required_verifiers: Vec<ClaimedPolicyAuthorityVerifier>,
     removed_required_verifiers: Vec<ClaimedPolicyAuthorityVerifier>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    removed_legacy_clear_signing: Option<bloom_broker_api::LegacyClearSigningPolicy>,
 }
 
 #[derive(Clone, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -2993,6 +2995,9 @@ pub fn claimed_policy_authority_diff_digest(
         removed_destinations,
         added_required_verifiers,
         removed_required_verifiers,
+        removed_legacy_clear_signing: (current.clear_signing != proposed.clear_signing)
+            .then(|| current.clear_signing.clone())
+            .flatten(),
     };
     let mut hasher = Sha256::new();
     hasher.update(CLAIMED_POLICY_AUTHORITY_DIFF_DOMAIN);
@@ -3491,6 +3496,7 @@ mod tests {
     #[test]
     fn claimed_policy_authority_diff_digest_matches_reviewed_v1_vector() {
         let current = bloom_broker_api::CanonicalWalletPolicy {
+            clear_signing: None,
             wallet_id: Token::new("wallet").unwrap(),
             maximum_approval_lifetime_ms: 10,
             allowed_petal_packages: vec![
@@ -3508,6 +3514,7 @@ mod tests {
             }],
         };
         let proposed = bloom_broker_api::CanonicalWalletPolicy {
+            clear_signing: None,
             wallet_id: Token::new("wallet").unwrap(),
             maximum_approval_lifetime_ms: 20,
             allowed_petal_packages: vec![

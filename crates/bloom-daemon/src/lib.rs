@@ -8734,6 +8734,7 @@ ws_url = "wss://example.invalid"
 
         fn policy(&self) -> bloom_broker_api::SignedPolicySnapshot {
             let canonical = serde_json::to_vec(&bloom_broker_api::CanonicalWalletPolicy {
+                clear_signing: None,
                 wallet_id: bloom_broker_api::Token::new("w").unwrap(),
                 maximum_approval_lifetime_ms: 3_600_000,
                 allowed_petal_packages: Vec::new(),
