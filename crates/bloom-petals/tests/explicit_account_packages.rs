@@ -705,9 +705,22 @@ async fn real_signing_producers_reach_the_host_with_selected_account_and_full_wi
         "testnet/agent_sessions/alice/1/test/cancel.json",
     );
     let mut cancellation_results = Vec::new();
-    for nonce in [123, 124] {
+    for (nonce, action) in [
+        (
+            123,
+            serde_json::json!({"type":"cancel","cancels":[{"a":0,"o":42}]}),
+        ),
+        (
+            124,
+            serde_json::json!({"type":"cancel","cancels":[{"a":0,"o":42}],"f":true}),
+        ),
+        (
+            125,
+            serde_json::json!({"type":"cancelByCloid","cancels":[{"asset":0,"cloid":"0x00112233445566778899aabbccddeeff"}]}),
+        ),
+    ] {
         let body = serde_json::to_vec(&serde_json::json!({
-            "action":{"type":"cancel","cancels":[{"a":0,"o":42}],"f":true}, "nonce":nonce
+            "action":action, "nonce":nonce
         }))
         .unwrap();
         cancellation_results.push(vfs.write(&cancel, &body).await);
@@ -715,8 +728,8 @@ async fn real_signing_producers_reach_the_host_with_selected_account_and_full_wi
     let requests = host.sign_requests.lock().unwrap();
     assert_eq!(
         requests.len(),
-        2,
-        "both delegated uses must reach the host: {cancellation_results:?}"
+        3,
+        "normal, fast and client-ID cancellations must reach the host: {cancellation_results:?}"
     );
     for request in requests.iter() {
         assert_eq!(request.operation_class, "hyperliquid.agent_action");

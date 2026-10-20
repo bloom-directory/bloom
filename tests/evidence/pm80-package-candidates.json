@@ -1,10 +1,12 @@
 {
   "status": "candidate-only; not published release-catalog entries",
   "tooling_commit": "2beed2ff344ce2b0c112e07096027e1ae0404007",
-  "broker_commit": "55fe84d2cb1047eafa5da5092cd3703eeed32c41",
+  "package_builder_broker_commit": "be9e9da5a9123e9e9da394b753ee33f89b205d47",
+  "current_candidate_broker_commit": "731defa43780d1b0ad06b0029f00c0b6b2fc48fa",
   "signer_commit": "bc88ad690757165ebf1978410ea5c7ec652215d3",
-  "package_builder_machine_commit": "245dfc823e16a5a7bdb3076e5cb7015a88a8e327",
+  "package_builder_machine_base_commit": "245dfc823e16a5a7bdb3076e5cb7015a88a8e327",
   "limits": [
+    "Builder attribution uses its actual compile log: Machine base 245dfc82 plus the working-tree Broker be9e9da pin. Subsequent 55fe84d and 731defa changes do not change the API or package builder; composed hashes also match the final pinned component test.",
     "Machine-composed packages; CLI-only hashes are different and are not release inputs.",
     "Installed in an isolated Machine home; signing producer uses a component VM/host fixture.",
     "Final catalog activation requires landed service/Petal inputs and immutable published archives."
