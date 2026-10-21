@@ -24,7 +24,7 @@
   "cancelled_approval_cannot_sign": true,
   "limits": "disposable software owner; controlled venue/chain observations; no venue submission, funds or settlement",
   "verification": {
-    "machine": "c0ff23aed9ae9d2395b6b0d5ff0f17db45e12d51",
+    "machine": "46939ef4c235ee51d855e0bc72869f1ecb2786c0",
     "broker": "ff5e635d6e10fb28b39cc7bf25fc88c35f92de5a",
     "signer": "c17f4bf42404548e07fddc749c740b0a8eb01119",
     "polymarket": "2055a0aa4ddc7a71ac08c5e2ec724037ba2feae8",
@@ -33,11 +33,17 @@
     "failed": 0,
     "ignored": 0,
     "exit_status": 0,
-    "duration_seconds": 72.42,
+    "duration_seconds": 70.90,
     "source_sha256": {
-      "crates/bloom-daemon/src/tests/polymarket_authorization.rs": "7956dbd3f16769b9da2d4b22a4541176c9f81e753782fbc22a12b3c818cde0ac",
+      "crates/bloom-daemon/src/tests/polymarket_authorization.rs": "c40b2333224aa19b8e501435e66a07b1c800309daa2558825066b6cfa8c1d16d",
       "scripts/test-polymarket-authorization.sh": "bb77adf44d9e4fcf02d9954dd5b1531576ba45de6b182f0393c30dd66f178694"
     }
+  },
+  "ci_acceptance": {
+    "machine": "46939ef4c235ee51d855e0bc72869f1ecb2786c0",
+    "job": "https://github.com/bloom-directory/bloom/actions/runs/39522437222/job/118969208419",
+    "result": "passed",
+    "limits": "Controlled software-owner/service-boundary test; not final landed release, catalog upgrade or physical-owner acceptance."
   },
   "broker_authority_checks": {
     "executed": 38,
