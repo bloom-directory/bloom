@@ -590,9 +590,9 @@ pub(crate) mod tests {
     #[ignore = "real hosted Stripe test payments, no money; requires network"]
     async fn stripe_hosted_public_sandbox_payments() {
         for (case, (number, bank_action, expected)) in [
-            ("4242424242424242", None, "paid"),
+            ("4242424242424242", None, "payment_phrase"),
             ("4000000000000002", None, "declined"),
-            ("4000000000003220", Some("complete"), "paid"),
+            ("4000000000003220", Some("complete"), "payment_phrase"),
             ("4000002760003184", Some("fail"), "declined"),
         ]
         .into_iter()
@@ -897,9 +897,9 @@ pub(crate) mod tests {
             .unwrap();
         let sku = &products["data"][0]["skus"]["data"][0];
         for (case, (number, bank_action, expected)) in [
-            ("4242424242424242", None, "paid"),
+            ("4242424242424242", None, "payment_phrase"),
             ("4000000000000002", None, "declined"),
-            ("4000000000003220", Some("complete"), "paid"),
+            ("4000000000003220", Some("complete"), "payment_phrase"),
             ("4000002760003184", Some("fail"), "declined"),
         ]
         .into_iter()
@@ -1644,12 +1644,12 @@ pub(crate) mod tests {
         for (outcome, expected) in [
             (
                 "Order confirmed. Order ID FIXTURE-01 Total USD 3.99",
-                "paid",
+                "payment_phrase",
             ),
             ("Your card was declined", "declined"),
             (
                 "Thank you, Kyle! Your order is confirmed. Confirmation #FIX01 Total USD 3.99",
-                "paid",
+                "payment_phrase",
             ),
             (
                 "Your payment details couldn’t be verified. Check your card details and try again.",
@@ -1672,7 +1672,7 @@ pub(crate) mod tests {
                 .await
                 .unwrap();
             assert_eq!(outcome["state"], expected);
-            if expected == "paid" {
+            if expected == "payment_phrase" {
                 assert_eq!(outcome["merchant_reported_total_minor"], 399);
                 assert_eq!(outcome["currency"], "USD");
             }

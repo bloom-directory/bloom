@@ -1187,6 +1187,7 @@ impl CheckoutService {
                         continue;
                     };
                     let outcome = result["result"]["value"].clone();
+                    let is_top = context.parent_id.is_none();
                     if outcome["reason"] == "confirm_contact" && !copied_contact {
                         // Copy the contact email and phone already on the page into
                         // the re-entry fields; the human checks them and confirms.
@@ -1197,23 +1198,26 @@ impl CheckoutService {
                                 json!({"contextId":context.world,"expression":include_str!("confirm-contact.js"),"returnByValue":true})),
                         ).await;
                     }
-                    observed.push(outcome);
+                    observed.push((is_top, outcome));
                 }
+                let paid_allowed = matches!(status.state.as_str(), "submitted" | "needs_input");
                 let outcome = observed
                     .iter()
-                    .find(|outcome| {
-                        matches!(
-                            outcome["state"].as_str(),
-                            Some("booked" | "paid" | "declined")
-                        )
+                    .find_map(|(is_top, outcome)| {
+                        let terminal = match outcome["state"].as_str() {
+                            Some("booked" | "declined") => outcome["state"].as_str(),
+                            Some("payment_phrase") if *is_top && paid_allowed => Some("paid"),
+                            _ => None,
+                        }?;
+                        Some((terminal, outcome))
                     })
                     .or_else(|| {
                         observed
                             .iter()
-                            .find(|outcome| outcome["state"] == "needs_input")
+                            .find(|(_, outcome)| outcome["state"] == "needs_input")
+                            .map(|(_, outcome)| ("needs_input", outcome))
                     });
-                if let Some(outcome) = outcome {
-                    let state = outcome["state"].as_str().unwrap();
+                if let Some((state, outcome)) = outcome {
                     if state == "needs_input" {
                         // The page needs attention, but may already have sent
                         // payment. Do not infer a bank outcome from form text.
@@ -1230,8 +1234,12 @@ impl CheckoutService {
                             let _ = self.store.update(&status);
                         }
                     } else {
+                        let mut recorded = (*outcome).clone();
+                        if state == "paid" {
+                            recorded["state"] = json!("paid");
+                        }
                         status.state = state.into();
-                        status.outcome = serde_json::from_value(outcome.clone()).ok();
+                        status.outcome = serde_json::from_value(recorded).ok();
                         status.ceremony_url = None;
                         if self.store.update(&status).is_ok() && self.return_control().await.is_ok()
                         {
@@ -2052,8 +2060,8 @@ mod tests {
     async fn airline_confirmation_becomes_booked_with_its_code() {
         let (url, server) = crate::discovery::tests::fixture(
             "<p data-bloom-total-minor='21730759' data-bloom-currency='ARS'>Total ARS 217307.59</p>
-             <input autocomplete='cc-number'><input autocomplete='cc-exp'><input autocomplete='cc-csc'>
-             <button>Pagar</button><h1>Tu compra ha sido confirmada</h1><p>Código de reserva: AB12CD</p>".into(),
+             <h1>Tu compra ha sido confirmada</h1><p>Código de reserva: AB12CD</p>"
+                .into(),
         )
         .await;
         let root = tempfile::tempdir().unwrap().keep();
@@ -2070,7 +2078,6 @@ mod tests {
             .unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
         let tab = browser.handoff().await.unwrap();
-        let discovery = Discovery::read(&tab).await.unwrap();
         let service = Arc::new(
             CheckoutService::new(
                 browser,
@@ -2100,7 +2107,7 @@ mod tests {
             view_session: tab.session.clone(),
             seen_pages: std::collections::HashSet::from([tab.target.clone()]),
             tab,
-            discovery: Some(discovery),
+            discovery: None,
             recipient: None,
             capability: token.clone(),
             claimed: true,
@@ -2119,6 +2126,80 @@ mod tests {
         let private = service.private_state(&token).await.unwrap();
         assert_eq!(private["state"], "booked");
         assert_eq!(private["outcome"]["order_id"], "AB12CD");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn thank_you_with_live_card_fields_stays_manual_required() {
+        let (url, server) = crate::discovery::tests::fixture(
+            "<h1>Thank you for shopping</h1>
+             <input autocomplete='cc-number'><input autocomplete='cc-exp'><input autocomplete='cc-csc'>
+             <button>Pay</button>".into(),
+        )
+        .await;
+        let root = tempfile::tempdir().unwrap().keep();
+        let browser = Browser::launch(
+            &crate::test_chromium(),
+            &root.join("profile"),
+            &["--no-sandbox".into(), "--ignore-certificate-errors".into()],
+        )
+        .await
+        .unwrap();
+        browser
+            .browse(crate::browser::BrowseRequest::Open { url })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let tab = browser.handoff().await.unwrap();
+        let service = Arc::new(
+            CheckoutService::new(
+                browser,
+                &root.join("state.db"),
+                root.join("unused.sock"),
+                unsafe { libc::geteuid() },
+                47999,
+            )
+            .unwrap(),
+        );
+        let status = Status {
+            operation_id: "fixture-thanks".into(),
+            state: "manual_required".into(),
+            ceremony_url: None,
+            filled_fields: vec![],
+            outcome: None,
+        };
+        service
+            .store
+            .insert(&status, "card", "Fixture thanks")
+            .unwrap();
+        *service.private.lock().await = Some(PrivateCheckout {
+            operation_id: status.operation_id.clone(),
+            mode: Mode::Card,
+            view_target: tab.target.clone(),
+            view_session: tab.session.clone(),
+            seen_pages: std::collections::HashSet::from([tab.target.clone()]),
+            tab,
+            discovery: None,
+            recipient: None,
+            capability: hex_token(&[31; 32]),
+            claimed: true,
+            approved: true,
+            manual_submission: false,
+        });
+        let finished = tokio::time::timeout(
+            Duration::from_secs(3),
+            service.watch_outcome(status.operation_id.clone()),
+        )
+        .await;
+        assert!(
+            finished.is_err(),
+            "a thank-you on the card form closed the session"
+        );
+        assert_eq!(
+            service.store.get(&status.operation_id).unwrap().state,
+            "manual_required"
+        );
+        assert!(service.private.lock().await.is_some());
         server.abort();
     }
 

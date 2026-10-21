@@ -28,6 +28,8 @@
   const amounts=[...text.matchAll(/(?:total|amount paid|charged)\s*[:]?\s*([A-Z]{3})\s*([0-9]+)\.([0-9]{2})\b/gi)];
   const amount=amounts.length===1 ? amounts[0] : null;
   const total=amount ? Number(amount[2])*100+Number(amount[3]) : null;
-  return {state:'paid',source:'merchant-reported',confirmation_reached:true,order_id:id,
+  // A success phrase is not paid. Checkout accepts it only after a recorded
+  // submission, and only from the top document.
+  return {state:'payment_phrase',source:'merchant-reported',confirmation_reached:true,order_id:id,
     merchant_reported_total_minor:Number.isSafeInteger(total) ? total : null,currency:amount ? amount[1].toUpperCase() : null};
 })()
