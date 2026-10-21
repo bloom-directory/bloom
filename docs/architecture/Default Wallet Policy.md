@@ -233,7 +233,11 @@ upgraded from v0.3.x or one set up by an earlier build. Choices it already
 records are the suggestions: the menu suggests a Petal only if it was chosen
 and each value as saved, and the non-interactive form keeps them unchanged,
 so a declined Petal stays declined. With no recorded choices every Petal is
-suggested. Setup never replaces settings the owner may already hold. For a
+suggested. Setup never replaces settings the owner may already hold, and
+writes its own only over a settings route that still reads unset. An
+uninstall keeps a Petal's private data under its package hash, so a
+reinstall of the same release finds the owner's settings and keeps them; a
+different release starts empty and receives setup's settings. For a
 Petal that was already installed and is unchanged, `bloom init` writes setup
 settings only when Machine reports that `main`'s account does not exist. If
 the account exists, or its existence cannot be read (for example because
@@ -365,7 +369,7 @@ the last 24 hours. It does not count sells, and it has no total limit.
 |---|---|---|
 | Add a Petal with `bloom petals install` | Allow its package hash | Write Bloom's suggested settings, if it is a catalog Petal |
 | Update a Petal by installing a newer release | Replace the old package hash with the new one | Preserved through the signed package lineage; initial settings are written only when the wallet is known not to exist |
-| Remove a Petal with `bloom petals uninstall` | Remove its package hash | Removed with the package |
+| Remove a Petal with `bloom petals uninstall` | Remove its package hash | Kept on disk under the package hash; a reinstall of the same release finds them, and setup leaves them as they are |
 
 An update carries settings and trade receipts forward through the signed
 package lineage (`crates/bloom-petals/src/private_store.rs`). Bloom preserves
@@ -376,8 +380,10 @@ config; the owner can explicitly apply them later.
 
 Catalog Petals are installed and updated in two places: `bloom init`
 (`ensure_preinstalled_petals`) and every `bloom serve` start
-(`petal_provisioning::provision`). A fresh install receives the saved settings.
-An update receives them only when the default wallet is known not to exist.
+(`petal_provisioning::provision`). A fresh install receives the saved settings
+when its settings route still reads unset, which it does unless the same
+release was installed before and its settings kept. An update receives them
+only when the default wallet is known not to exist, and on the same terms.
 `bloom init` prints the outcome, and `bloom serve` logs it.
 
 Each change is one policy update ceremony. Changes waiting at the same time
@@ -536,11 +542,26 @@ Automated:
   and leaves runtime values unchanged.
 - `bloom init` on an existing config with a declined Petal and a custom cap
   keeps both.
-- The settings decision writes only for a Petal just installed or updated,
-  or when `main`'s account is reported absent. An existing account, or an
-  account read that fails for any reason other than "not found", keeps the
-  owner's settings. The integrated path (`init` against a live projection,
-  with Broker up and down) is checked on a developer triad, not in CI.
+- The settings decision writes for a Petal just installed, and for one
+  already installed or updated only when `main`'s account is reported
+  absent. An existing account, or an account read that fails for any reason
+  other than "not found", keeps the owner's settings. The integrated path
+  (`init` against a live projection, with Broker up and down) is checked on
+  a developer triad, not in CI.
+- Every setup write goes in only over the route's unset contents: a
+  reinstalled Petal's surviving settings, and an owner's write made while
+  the route is being checked, both stay. A direct VFS write during a paused
+  check lands after it, a write that writes back through the VFS is not
+  blocked by a waiting check, and a VFS that stays busy is left untouched
+  (`crates/bloom-vfs/src/router.rs`).
+- Setup queues exactly the writes an uninterrupted run would make, before
+  `setup_complete` is saved; an interrupted `bloom init` leaves them queued
+  (`crates/bloom/tests/cli.rs`). A rerun finishes a queued write once
+  `main` exists, and says how to make it when Broker cannot tell.
+- The wallet read and the policy step wait out Broker refusals that may
+  clear up (unavailable, rate-limited, over quota) and end on any other
+  error. The wait says once why it is polling, and its final message names
+  what to wait for.
 - Chosen Petals round-trip through `config.toml`, and an edited value that
   is not a positive amount cannot change a Petal's settings file.
 - The wait announces each ceremony once, stops when the policy is applied,
@@ -555,8 +576,13 @@ Automated:
 Manual, on the developer triad:
 
 - `bloom wallet new main` runs two ceremonies and commits a policy allowing
-  exactly the chosen packages, and `bloom wallet default-policy main`
-  resumes after an interruption.
+  exactly the chosen packages. `bloom wallet default-policy main` then
+  reports it applied without a new ceremony, finishes a queued settings
+  write without replacing the owner's, and proposes nothing once the owner
+  has changed the policy (`scripts/test-default-policy-e2e.sh`).
+- A chosen Petal's first signed action on `main` asks only for that
+  action's approval, while a wallet without the default policy is first
+  asked to allow the Petal's package.
 
 Next part:
 
