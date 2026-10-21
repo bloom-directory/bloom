@@ -452,7 +452,13 @@ async fn installed_supported_messages_use_real_installer_and_selected_account() 
         );
         let projected = read_json(&daemon.vfs, &projection_path).await;
         assert_eq!(projected["status"], "awaiting_owner_approval");
-        vfs.write(&path, b"sign").await.unwrap();
+        // Existing exact-signing semantics refuse an unapproved retry. Its
+        // pending owner projection and request identity must remain intact.
+        assert!(vfs.write(&path, b"sign").await.is_err());
+        {
+            let requests = host.single_requests.lock().unwrap();
+            assert_eq!(requests[requests.len() - 1], requests[requests.len() - 2]);
+        }
         let repeated = pending(&state, &class);
         assert!(awaiting["approval_id"] == repeated["approval_id"]);
         assert_eq!(host.single_signed.lock().unwrap().len(), position);
