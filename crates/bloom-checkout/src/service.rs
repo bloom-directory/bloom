@@ -254,6 +254,8 @@ pub struct CheckoutService {
     private: AsyncMutex<Option<PrivateCheckout>>,
     unlocking: AsyncMutex<Option<PendingUnlock>>,
     travelers: AsyncMutex<BTreeMap<String, UnlockedTraveler>>,
+    /// The one `fill_traveler` person for this browsing context.
+    journey_filler: AsyncMutex<Option<(String, String)>>,
     completed: Mutex<Option<CompletedView>>,
     broker_socket: PathBuf,
     broker_uid: u32,
@@ -304,6 +306,7 @@ impl CheckoutService {
             _ => bail!("Traveler metadata unavailable"),
         };
         let (context, origin) = self.browser.private_shopping_scope().await?;
+        self.forget_journey_filler_unless(&context).await;
         {
             let mut travelers = self.travelers.lock().await;
             prune_travelers(&mut travelers, &context, &origin);
@@ -473,6 +476,7 @@ impl CheckoutService {
                 ),
         );
         status.filled_fields = values.keys().cloned().collect();
+        self.forget_journey_filler_unless(&pending.context).await;
         prune_travelers(&mut travelers, &pending.context, &pending.origin);
         travelers.insert(
             pending.traveler_id,
@@ -532,6 +536,7 @@ impl CheckoutService {
             bail!("A checkout already has private control");
         }
         let (context, origin) = self.browser.shopping_scope().await?;
+        self.forget_journey_filler_unless(&context).await;
         let mut travelers = self.travelers.lock().await;
         let traveler = selected_traveler(&mut travelers, &context, &origin, traveler_id)?;
         let text = derived_traveler_value(&traveler.values, field)
@@ -563,9 +568,28 @@ impl CheckoutService {
             bail!("A checkout already has private control");
         }
         let (context, origin) = self.browser.shopping_scope().await?;
+        self.forget_journey_filler_unless(&context).await;
         let mut travelers = self.travelers.lock().await;
         let traveler = selected_traveler(&mut travelers, &context, &origin, traveler_id)?;
         let mut values = traveler.values.clone();
+        let fields = traveler.fields.clone();
+        let traveler_origin = traveler.origin.clone();
+        let traveler_context = traveler.context.clone();
+        let selected_id = match traveler_id {
+            Some(id) => id.to_owned(),
+            None => travelers
+                .keys()
+                .next()
+                .context("Unlock a saved traveler first")?
+                .clone(),
+        };
+        if let Some((saved_context, saved_id)) = self.journey_filler.lock().await.clone() {
+            if saved_context == context && saved_id != selected_id {
+                bail!(
+                    "fill_traveler already filled {saved_id} on this booking; use type_traveler with the person's id for each field."
+                );
+            }
+        }
         if let Some(phone) = values.get("phone").and_then(|p| formatted_phone(p)) {
             values.insert("phone".into(), zeroize::Zeroizing::new(phone));
         }
@@ -576,24 +600,30 @@ impl CheckoutService {
         }
         let filled = self
             .browser
-            .fill_traveler(
-                &traveler.origin,
-                &traveler.context,
-                &traveler.fields,
-                &values,
-            )
+            .fill_traveler(&traveler_origin, &traveler_context, &fields, &values)
             .await
             .inspect_err(|e| eprintln!("traveler fill refused: {e:#}"))?;
+        *self.journey_filler.lock().await = Some((context, selected_id));
         Ok(json!({"state":"filled","filled_fields":filled}))
+    }
+
+    /// A new browsing context drops the person `fill_traveler` already used.
+    async fn forget_journey_filler_unless(&self, context: &str) {
+        let mut filler = self.journey_filler.lock().await;
+        if filler.as_ref().is_some_and(|(saved, _)| saved != context) {
+            *filler = None;
+        }
     }
 
     async fn return_control(&self) -> Result<()> {
         self.travelers.lock().await.clear();
+        self.journey_filler.lock().await.take();
         self.browser.return_control().await
     }
 
     async fn return_control_at(&self, target: &str, url: Option<String>) -> Result<()> {
         self.travelers.lock().await.clear();
+        self.journey_filler.lock().await.take();
         self.browser.return_control_at(target, url).await
     }
 
@@ -614,6 +644,7 @@ impl CheckoutService {
             private: AsyncMutex::new(None),
             unlocking: AsyncMutex::new(None),
             travelers: AsyncMutex::new(BTreeMap::new()),
+            journey_filler: AsyncMutex::new(None),
             completed: Mutex::new(None),
             broker_socket,
             broker_uid,
@@ -2029,6 +2060,86 @@ mod tests {
         assert!(service.travelers.lock().await.is_empty());
         server.abort();
         let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn one_fill_traveler_person_per_booking() {
+        let (url, server) = crate::discovery::tests::fixture(
+            "<div><div>Given name</div><input autocomplete='given-name'></div>
+             <div><div>Document number</div><input aria-label='Document number'></div>"
+                .into(),
+        )
+        .await;
+        let root = tempfile::tempdir().unwrap();
+        let browser = Browser::launch(
+            &crate::test_chromium(),
+            &root.path().join("profile"),
+            &["--no-sandbox".into(), "--ignore-certificate-errors".into()],
+        )
+        .await
+        .unwrap();
+        browser
+            .browse(BrowseRequest::Open { url: url.clone() })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let service = CheckoutService::new(
+            browser.clone(),
+            &root.path().join("state.db"),
+            root.path().join("unused.sock"),
+            unsafe { libc::geteuid() },
+            47999,
+        )
+        .unwrap();
+        let (context, origin) = browser.shopping_scope().await.unwrap();
+        for (id, name, document) in [
+            ("person-a", "FixtureAlice", None),
+            ("person-b", "FixtureBob", Some("BDOC999")),
+        ] {
+            let mut values =
+                BTreeMap::from([("given_name".into(), zeroize::Zeroizing::new(name.into()))]);
+            let mut fields = vec![bloom_signer_api::TravelerField::GivenName];
+            if let Some(document) = document {
+                values.insert(
+                    "document_number".into(),
+                    zeroize::Zeroizing::new(document.into()),
+                );
+                fields.push(bloom_signer_api::TravelerField::DocumentNumber);
+            }
+            service.travelers.lock().await.insert(
+                id.into(),
+                UnlockedTraveler {
+                    operation_id: format!("{id}-unlock"),
+                    origin: origin.clone(),
+                    context: context.clone(),
+                    fields,
+                    values,
+                    expires: tokio::time::Instant::now() + Duration::from_secs(60),
+                },
+            );
+        }
+        let filled = service.fill_traveler(Some("person-a")).await.unwrap();
+        assert_eq!(filled["filled_fields"], json!(["given_name"]));
+        let error = service
+            .fill_traveler(Some("person-b"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "fill_traveler already filled person-a on this booking; use type_traveler with the person's id for each field."
+        );
+        let tab = browser.handoff().await.unwrap();
+        let values = tab
+            .cdp
+            .evaluate(
+                &tab.session,
+                "Array.from(document.querySelectorAll('input'), e => e.value)".into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(values, json!(["FixtureAlice", ""]));
+        server.abort();
     }
 
     #[tokio::test]

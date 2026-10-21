@@ -39,10 +39,13 @@ tool for this checkout.
   `born_on_year` or `born_on_dmy`.
   Snapshots show unlocked values as `[saved <field>]`; check each field holds
   the right placeholder, and never try to recover the values.
-  When a page contains multiple passenger blocks, use `type_traveler` with the
-  person's ID and fresh references to that person's specific fields. Automatic
-  filling of duplicate/ambiguous fields stays blocked. Use the payer/contact's
-  own approved ID for those fields; never substitute a passenger by position.
+  One `fill_traveler` person per booking. The same person may be filled again
+  on a later step. A different person is refused; use `type_traveler` with
+  that person's id for each field. When a page contains multiple passenger
+  blocks, use `type_traveler` with the person's ID and fresh references to
+  that person's specific fields. Automatic filling of duplicate or ambiguous
+  fields stays blocked. Use the payer or contact's own approved ID for those
+  fields.
   A new explicit open, private completion/handback or expiry ends the unlock.
   To cancel an outstanding unlock or revoke future fills from an unlocked
   record, write to its original `checkout/requests/<operation_id>/cancel`.
