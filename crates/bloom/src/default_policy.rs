@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
+use std::ops::ControlFlow;
 
 use anyhow::{Context, Result, bail};
 use bloom_daemon::Daemon;
@@ -306,26 +307,68 @@ fn mark_settings_pending(home: &std::path::Path, name: &str) {
     }
 }
 
-/// Queue every chosen Petal's setup settings when the choices are saved, before
-/// anything is installed. A `bloom init` that stops after installing a Petal
-/// but before writing its settings then still writes them once `main`'s
-/// account exists, where otherwise the next run would find setup done and the
-/// Petal unchanged, and write nothing. A failure here is returned so setup is
-/// not marked done with nothing queued.
-pub(crate) fn record_pending_setup_settings(
-    home: &std::path::Path,
-    petals: &PetalsConfig,
+/// Queue the setup settings this `bloom init` is about to write when the
+/// choices are saved, before anything is installed. A run that stops after
+/// installing a Petal but before writing its settings then still writes them
+/// once `main`'s account exists, where otherwise the next run would find setup
+/// done and the Petal unchanged, and write nothing. Only what an uninterrupted
+/// run would write is queued: a Petal that is already installed while `main`'s
+/// account exists, or may exist, keeps whatever settings it has, so its
+/// marker is cleared instead. A failure here is returned so setup is not
+/// marked done with nothing queued.
+pub(crate) async fn record_pending_setup_settings(
+    daemon: &Daemon,
+    owners_before: &BTreeMap<String, String>,
 ) -> Result<()> {
-    let dir = pending_settings_dir(home);
-    for name in petals.setup.keys() {
-        if setup_template(name).is_none() {
+    let petals = &daemon.config.petals;
+    let account = if petals
+        .setup
+        .keys()
+        .any(|name| setup_template(name).is_some() && owners_before.contains_key(name))
+    {
+        Some(default_account_presence(&daemon.vfs).await)
+    } else {
+        None
+    };
+    let dir = pending_settings_dir(daemon.home.root());
+    for (name, queue) in setup_settings_to_queue(petals, owners_before, account.as_ref()) {
+        if !queue {
+            clear_settings_pending(daemon.home.root(), &name);
             continue;
         }
         std::fs::create_dir_all(&dir)
-            .and_then(|()| std::fs::write(dir.join(name), b""))
-            .with_context(|| format!("queue {} setup settings", petal_label(name)))?;
+            .and_then(|()| std::fs::write(dir.join(&name), b""))
+            .with_context(|| format!("queue {} setup settings", petal_label(&name)))?;
     }
     Ok(())
+}
+
+/// For each chosen Petal with setup settings, whether first setup would write
+/// them, by the rule [`apply_setup_settings`] applies after provisioning. A
+/// Petal that is not installed yet is installed and written. `account` is
+/// read only when some such Petal is already installed; without it nothing
+/// installed is queued.
+fn setup_settings_to_queue(
+    petals: &PetalsConfig,
+    owners_before: &BTreeMap<String, String>,
+    account: Option<&AccountPresence>,
+) -> Vec<(String, bool)> {
+    petals
+        .setup
+        .keys()
+        .filter(|name| setup_template(name).is_some())
+        .map(|name| {
+            let was_installed = owners_before.contains_key(name);
+            let queue = match account {
+                Some(account) => {
+                    setup_settings_step(true, was_installed, false, account)
+                        == SetupSettingsStep::Write
+                }
+                None => !was_installed,
+            };
+            (name.clone(), queue)
+        })
+        .collect()
 }
 
 fn clear_settings_pending(home: &std::path::Path, name: &str) {
@@ -365,51 +408,70 @@ pub(crate) async fn apply_pending_settings(daemon: &Daemon) -> Vec<String> {
         if !owners.contains_key(&name) {
             continue;
         }
-        let Some(template) = setup_template(&name) else {
-            continue;
-        };
-        let attempt = async {
-            let settings =
-                render_petal_settings(&daemon.config.petals, &name, DEFAULT_POLICY_WALLET)?
-                    .context("Petal has no setup settings")?;
-            let path = bloom_vfs::VfsPath::parse(&settings.path)?;
-            let written = daemon
-                .vfs
-                .write_if_reads(&path, template.unset_body.as_bytes(), &settings.body)
-                .await
-                .with_context(|| {
-                    format!("write {} settings to {}", petal_label(&name), settings.path)
-                })?;
-            anyhow::Ok((settings, written))
-        }
-        .await;
-        match attempt {
-            Ok((settings, true)) => {
-                clear_settings_pending(daemon.home.root(), &name);
-                messages.push(settings_message(&name, &settings.summary, false));
-            }
-            Ok((settings, false)) => {
-                clear_settings_pending(daemon.home.root(), &name);
-                tracing::info!(
-                    petal = %name,
-                    message = %settings_not_written(
-                        &name,
-                        &settings,
-                        "settings were written there after setup, so they stay as they are"
-                    ),
-                    "petal.setup_settings_preserved"
-                );
-            }
-            Err(error) => {
-                tracing::warn!(
-                    petal = %name,
-                    error = %format!("{error:#}"),
-                    "petal.setup_settings_retry_failed"
-                );
-            }
-        }
+        messages.extend(
+            apply_queued_settings(
+                &daemon.vfs,
+                daemon.home.root(),
+                &daemon.config.petals,
+                &name,
+            )
+            .await,
+        );
     }
     messages
+}
+
+/// Make `name`'s queued setup write through `vfs`, and return its message if
+/// it wrote. The marker under `home` is cleared once the route has been
+/// checked, whether or not setup's settings went in, and kept when the check
+/// or the write failed.
+async fn apply_queued_settings(
+    vfs: &bloom_vfs::Vfs,
+    home: &std::path::Path,
+    petals: &PetalsConfig,
+    name: &str,
+) -> Option<String> {
+    let template = setup_template(name)?;
+    let attempt = async {
+        let settings = render_petal_settings(petals, name, DEFAULT_POLICY_WALLET)?
+            .context("Petal has no setup settings")?;
+        let path = bloom_vfs::VfsPath::parse(&settings.path)?;
+        let written = vfs
+            .write_if_reads(&path, template.unset_body.as_bytes(), &settings.body)
+            .await
+            .with_context(|| {
+                format!("write {} settings to {}", petal_label(name), settings.path)
+            })?;
+        anyhow::Ok((settings, written))
+    }
+    .await;
+    match attempt {
+        Ok((settings, true)) => {
+            clear_settings_pending(home, name);
+            Some(settings_message(name, &settings.summary, false))
+        }
+        Ok((settings, false)) => {
+            clear_settings_pending(home, name);
+            tracing::info!(
+                petal = %name,
+                message = %settings_not_written(
+                    name,
+                    &settings,
+                    "settings were written there after setup, so they stay as they are"
+                ),
+                "petal.setup_settings_preserved"
+            );
+            None
+        }
+        Err(error) => {
+            tracing::warn!(
+                petal = %name,
+                error = %format!("{error:#}"),
+                "petal.setup_settings_retry_failed"
+            );
+            None
+        }
+    }
 }
 
 /// Installed Petal owners by name.
@@ -450,47 +512,97 @@ pub(crate) async fn apply_setup_settings(
         };
         let previous = owners_before.get(name);
         let updated = previous.is_some_and(|previous| previous != installed);
-        let reason = match setup_settings_step(first_setup, previous.is_some(), updated, &account) {
-            SetupSettingsStep::Leave => continue,
-            SetupSettingsStep::Write => None,
-            SetupSettingsStep::KeepOwners => Some(format!(
-                "wallet {DEFAULT_POLICY_WALLET} already exists, so any settings the owner wrote stay as they are"
-            )),
-            SetupSettingsStep::Unverified => Some(format!(
-                "Bloom could not check whether wallet {DEFAULT_POLICY_WALLET} exists ({}), so it did not risk replacing settings the owner wrote",
-                match &account {
-                    AccountPresence::Unknown(error) => error.as_str(),
-                    _ => "unknown",
-                }
-            )),
-        };
-        if let Some(reason) = reason {
-            // Nothing deferred may later write what setup just declined to.
-            clear_settings_pending(daemon.home.root(), name);
-            messages.push(
-                match render_petal_settings(&daemon.config.petals, name, DEFAULT_POLICY_WALLET) {
-                    Ok(Some(settings)) => settings_not_written(name, &settings, &reason),
-                    Ok(None) => continue,
-                    Err(error) => format!("petal_settings_failed: {error:#}"),
-                },
-            );
-            continue;
-        }
-        match write_petal_settings(&daemon.vfs, &daemon.config.petals, name).await {
-            Ok(Some(summary)) => {
-                clear_settings_pending(daemon.home.root(), name);
-                messages.push(settings_message(name, &summary, updated));
-            }
-            Ok(None) => {}
-            Err(error) => {
-                mark_settings_pending(daemon.home.root(), name);
-                messages.push(format!(
-                    "petal_settings_failed: {error:#} (will retry once wallet {DEFAULT_POLICY_WALLET} exists)"
-                ));
-            }
-        }
+        let step = setup_settings_step(first_setup, previous.is_some(), updated, &account);
+        messages.extend(
+            settle_setup_settings(
+                &daemon.vfs,
+                daemon.home.root(),
+                &daemon.config.petals,
+                name,
+                step,
+                updated,
+                &account,
+            )
+            .await,
+        );
     }
     Ok(messages)
+}
+
+/// Carry out `step` for one installed, chosen Petal after `bloom init`
+/// provisioned it, and return what to tell the owner. `updated` says
+/// provisioning replaced an older release.
+async fn settle_setup_settings(
+    vfs: &bloom_vfs::Vfs,
+    home: &std::path::Path,
+    petals: &PetalsConfig,
+    name: &str,
+    step: SetupSettingsStep,
+    updated: bool,
+    account: &AccountPresence,
+) -> Option<String> {
+    let reason = match step {
+        SetupSettingsStep::Leave => {
+            return finish_interrupted_setup(vfs, home, petals, name, account).await;
+        }
+        SetupSettingsStep::Write => None,
+        SetupSettingsStep::KeepOwners => Some(format!(
+            "wallet {DEFAULT_POLICY_WALLET} already exists, so any settings the owner wrote stay as they are"
+        )),
+        SetupSettingsStep::Unverified => Some(format!(
+            "Bloom could not check whether wallet {DEFAULT_POLICY_WALLET} exists ({}), so it did not risk replacing settings the owner wrote",
+            match account {
+                AccountPresence::Unknown(error) => error.as_str(),
+                _ => "unknown",
+            }
+        )),
+    };
+    if let Some(reason) = reason {
+        // Nothing deferred may later write what setup just declined to.
+        clear_settings_pending(home, name);
+        return match render_petal_settings(petals, name, DEFAULT_POLICY_WALLET) {
+            Ok(Some(settings)) => Some(settings_not_written(name, &settings, &reason)),
+            Ok(None) => None,
+            Err(error) => Some(format!("petal_settings_failed: {error:#}")),
+        };
+    }
+    match write_petal_settings(vfs, petals, name).await {
+        Ok(Some(summary)) => {
+            clear_settings_pending(home, name);
+            Some(settings_message(name, &summary, updated))
+        }
+        Ok(None) => None,
+        Err(error) => {
+            mark_settings_pending(home, name);
+            Some(format!(
+                "petal_settings_failed: {error:#} (will retry once wallet {DEFAULT_POLICY_WALLET} exists)"
+            ))
+        }
+    }
+}
+
+/// Make the write an earlier `bloom init` queued for a Petal this run leaves
+/// alone, once `main`'s account exists. That run stopped after installing
+/// the Petal and before writing its settings, so the Petal now looks
+/// unchanged and nothing else would write them on a home whose `main`
+/// already exists: wallet creation, which otherwise applies queued writes,
+/// has already happened. As there, the write goes in only over the route's
+/// unset contents. Before `main` exists the marker stays for wallet creation.
+async fn finish_interrupted_setup(
+    vfs: &bloom_vfs::Vfs,
+    home: &std::path::Path,
+    petals: &PetalsConfig,
+    name: &str,
+    account: &AccountPresence,
+) -> Option<String> {
+    if *account != AccountPresence::Exists
+        || !pending_settings(home, petals)
+            .iter()
+            .any(|pending| pending == name)
+    {
+        return None;
+    }
+    apply_queued_settings(vfs, home, petals, name).await
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -648,8 +760,9 @@ pub(crate) fn proposes_chosen_petals_default() -> bool {
 pub(crate) enum DefaultPolicyStatus {
     /// None of the Petals chosen during setup is installed.
     NothingToAllow,
-    /// The wallet does not exist yet, or Machine could not read it. `reason`
-    /// carries Broker's message when the read failed for another cause.
+    /// The wallet does not exist yet, or Broker could not answer for now
+    /// while Machine read the wallet or proposed its policy: it was
+    /// unavailable, rate-limited or over quota. `reason` says which.
     WaitingForWallet {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
@@ -707,45 +820,23 @@ pub(crate) async fn advance_default_policy(
         return Ok(DefaultPolicyStatus::NothingToAllow);
     }
     let wallet_id = bloom_broker_api::Token::new(wallet.to_owned())?;
-    match daemon.wallet_projections.get_wallet(&wallet_id).await {
-        Ok(_) => {}
-        // The projection reader reports a well-formed wallet absent from the
-        // authoritative list this way.
-        Err(error) => match wallet_read_wait_reason(&error) {
-            Some(reason) => {
-                return Ok(DefaultPolicyStatus::WaitingForWallet {
-                    reason: Some(reason),
-                });
-            }
-            None => return Err(error.into()),
-        },
+    if let ControlFlow::Break(status) =
+        wallet_read_step(daemon.wallet_projections.get_wallet(&wallet_id).await)?
+    {
+        return Ok(status);
     }
     if wallet == DEFAULT_POLICY_WALLET {
         for message in apply_pending_settings(daemon).await {
             tracing::info!(%message, "petal.setup_settings_written");
         }
     }
-    let eligibility = match daemon
-        .ensure_default_policy(wallet, &packages, &destinations, owner_just_chose)
-        .await
-    {
-        Ok(eligibility) => eligibility,
-        Err(bloom_vfs::HandlerError::Backend(message))
-            if message.starts_with(bloom_vfs::handlers::wallets::POLICY_COORDINATION_BUSY) =>
-        {
-            return Ok(DefaultPolicyStatus::Busy);
-        }
-        // Broker could not answer the policy read: wait out the outage within
-        // the caller's deadline, as for the wallet read above.
-        Err(bloom_vfs::HandlerError::Backend(message))
-            if message
-                .starts_with(bloom_broker_api::ProtocolErrorCode::ServiceUnavailable.as_str()) =>
-        {
-            return Ok(DefaultPolicyStatus::WaitingForWallet {
-                reason: Some(message),
-            });
-        }
-        Err(error) => return Err(error.into()),
+    let eligibility = match policy_step(
+        daemon
+            .ensure_default_policy(wallet, &packages, &destinations, owner_just_chose)
+            .await,
+    )? {
+        ControlFlow::Continue(eligibility) => eligibility,
+        ControlFlow::Break(status) => return Ok(status),
     };
     Ok(match eligibility {
         bloom_machine_client::PetalEligibility::Allowed(_) => {
@@ -774,22 +865,84 @@ pub(crate) async fn advance_default_policy(
     })
 }
 
-/// Why a waiting command should keep polling after `get_wallet` failed, or
-/// `None` when the failure is final. The projection reader reports a wallet
-/// absent from the authoritative list as an invalid request, though other
-/// invalid requests look the same, so the message is kept. A retryable
-/// availability failure, such as Broker restarting just after the wallet
-/// ceremony, is waited out until the caller's deadline instead of ending it.
-fn wallet_read_wait_reason(error: &bloom_broker_api::ProtocolError) -> Option<String> {
-    use bloom_broker_api::{ProtocolErrorCode, RetryClass};
-    if error.code == ProtocolErrorCode::BackendInvalidRequest {
-        return Some(error.message.clone());
+/// How the wallet read leaves [`advance_default_policy`]: go on to the
+/// policy, stop with a status that keeps a waiting command polling, or end
+/// it with the error. The projection reader reports a wallet absent from the
+/// authoritative list as an invalid request, though other invalid requests
+/// look the same, so the message is kept. A Broker failure that may clear
+/// up, such as Broker restarting just after the wallet ceremony, is waited
+/// out until the caller's deadline instead of ending it.
+fn wallet_read_step<T>(
+    read: std::result::Result<T, bloom_broker_api::ProtocolError>,
+) -> Result<ControlFlow<DefaultPolicyStatus>> {
+    let error = match read {
+        Ok(_) => return Ok(ControlFlow::Continue(())),
+        Err(error) => error,
+    };
+    let reason = if error.code == bloom_broker_api::ProtocolErrorCode::BackendInvalidRequest {
+        error.message
+    } else if outage_retry(error.retry).is_some() {
+        error.to_string()
+    } else {
+        return Err(error.into());
+    };
+    Ok(ControlFlow::Break(DefaultPolicyStatus::WaitingForWallet {
+        reason: Some(reason),
+    }))
+}
+
+/// How the policy step leaves [`advance_default_policy`]: go on with its
+/// result, stop with a status that keeps a waiting command polling, or end it
+/// with the error. Broker failures that may clear up are waited out until the
+/// caller's deadline, by the same rule as the wallet read.
+fn policy_step<T>(
+    result: std::result::Result<T, bloom_vfs::HandlerError>,
+) -> Result<ControlFlow<DefaultPolicyStatus, T>> {
+    match result {
+        Ok(value) => Ok(ControlFlow::Continue(value)),
+        Err(bloom_vfs::HandlerError::Backend(message))
+            if message.starts_with(bloom_vfs::handlers::wallets::POLICY_COORDINATION_BUSY) =>
+        {
+            Ok(ControlFlow::Break(DefaultPolicyStatus::Busy))
+        }
+        Err(bloom_vfs::HandlerError::Backend(message)) if reported_outage(&message).is_some() => {
+            Ok(ControlFlow::Break(DefaultPolicyStatus::WaitingForWallet {
+                reason: Some(message),
+            }))
+        }
+        Err(error) => Err(error.into()),
     }
-    matches!(
-        error.retry,
-        RetryClass::SameOperation | RetryClass::AfterBackoff
-    )
-    .then(|| error.to_string())
+}
+
+/// `retry` when a Broker failure with it may clear up if the same request is
+/// made again: an unavailable service (`SameOperation`), or a rate limit or
+/// quota (`AfterBackoff`).
+fn outage_retry(retry: bloom_broker_api::RetryClass) -> Option<bloom_broker_api::RetryClass> {
+    use bloom_broker_api::RetryClass;
+    matches!(retry, RetryClass::SameOperation | RetryClass::AfterBackoff).then_some(retry)
+}
+
+/// The retry class of a Broker failure that may clear up, read from `message`
+/// as the VFS reports a [`bloom_broker_api::ProtocolError`]: its code, `: `,
+/// then its message.
+fn reported_outage(message: &str) -> Option<bloom_broker_api::RetryClass> {
+    message
+        .split_once(": ")
+        .and_then(|(code, _)| code.parse::<bloom_broker_api::ProtocolErrorCode>().ok())
+        .and_then(|code| outage_retry(code.contract().retry))
+}
+
+/// What to wait for before running `bloom wallet default-policy` again, after
+/// a wait for `wallet` ended on `reason`.
+fn wait_hint(wallet: &str, reason: Option<&str>) -> String {
+    use bloom_broker_api::RetryClass;
+    match reason.and_then(reported_outage) {
+        Some(RetryClass::AfterBackoff) => format!(
+            "once Broker accepts the request again, for example after another ceremony for {wallet} finishes"
+        ),
+        Some(_) => "once Bloom can reach Broker again".to_owned(),
+        None => "once it exists".to_owned(),
+    }
 }
 
 /// The chosen Petals `current` does not allow: its package, or any of the
@@ -844,6 +997,8 @@ pub(crate) struct DefaultPolicyWait {
     deadline_ms: u64,
     announced: Option<String>,
     announced_unrelated: Option<String>,
+    /// Whether a Broker refusal being waited out has been reported.
+    announced_wait: bool,
 }
 
 impl DefaultPolicyWait {
@@ -855,6 +1010,7 @@ impl DefaultPolicyWait {
             deadline_ms,
             announced: None,
             announced_unrelated: None,
+            announced_wait: false,
         }
     }
 
@@ -939,16 +1095,33 @@ impl DefaultPolicyWait {
             }
             DefaultPolicyStatus::WaitingForWallet { reason } => {
                 if now_ms < self.deadline_ms {
+                    // Say once why a Broker refusal is being waited out, so a
+                    // long wait is not silent.
+                    if let Some(reason) = reason
+                        && !self.announced_wait
+                        && reported_outage(reason).is_some()
+                    {
+                        writeln!(
+                            output,
+                            "default_policy: waiting for Broker ({reason}); retrying until it answers or this command stops waiting"
+                        )?;
+                        self.announced_wait = true;
+                    }
                     return Ok(WaitStep::Poll);
                 }
+                let hint = wait_hint(wallet, reason.as_deref());
                 match reason {
+                    Some(reason) if reported_outage(reason).is_some() => writeln!(
+                        output,
+                        "default_policy: stopped waiting for Broker ({reason}); {hint}, run `bloom wallet default-policy {wallet}`"
+                    )?,
                     Some(reason) => writeln!(
                         output,
-                        "default_policy: stopped waiting for wallet {wallet} ({reason}); once Bloom can read it, run `bloom wallet default-policy {wallet}`"
+                        "default_policy: stopped waiting for wallet {wallet} ({reason}); {hint}, run `bloom wallet default-policy {wallet}`"
                     )?,
                     None => writeln!(
                         output,
-                        "default_policy: stopped waiting for wallet {wallet}; once it exists, run `bloom wallet default-policy {wallet}`"
+                        "default_policy: stopped waiting for wallet {wallet}; {hint}, run `bloom wallet default-policy {wallet}`"
                     )?,
                 }
                 Ok(WaitStep::Stop)
@@ -1146,18 +1319,265 @@ mod tests {
     /// installed, so a `bloom init` that stops part-way still writes them once
     /// `main`'s account exists. Only Petals with setup settings are queued.
     #[test]
-    fn choosing_petals_queues_their_settings_before_provisioning() {
-        let home = tempfile::tempdir().unwrap();
+    fn choosing_petals_queues_only_the_settings_setup_would_write() {
         let petals = chosen_setup(&["polymarket", "hyperliquid", "enso"]);
-        record_pending_setup_settings(home.path(), &petals).unwrap();
+        let none = BTreeMap::new();
+        let installed = BTreeMap::from([("polymarket".to_owned(), "a".repeat(64))]);
+        // Only Polymarket has setup settings. Not installed yet, it is
+        // installed and written whatever the account.
+        assert_eq!(
+            setup_settings_to_queue(&petals, &none, None),
+            [("polymarket".to_owned(), true)]
+        );
+        assert_eq!(
+            setup_settings_to_queue(&petals, &none, Some(&AccountPresence::Exists)),
+            [("polymarket".to_owned(), true)]
+        );
+        // Already installed, it is written only while `main` is known not to
+        // exist; otherwise its marker is cleared, as an uninterrupted run
+        // leaves the owner's settings.
+        assert_eq!(
+            setup_settings_to_queue(&petals, &installed, Some(&AccountPresence::Absent)),
+            [("polymarket".to_owned(), true)]
+        );
+        for account in [
+            AccountPresence::Exists,
+            AccountPresence::Unknown("Broker is down".into()),
+        ] {
+            assert_eq!(
+                setup_settings_to_queue(&petals, &installed, Some(&account)),
+                [("polymarket".to_owned(), false)],
+                "{account:?}"
+            );
+        }
+        assert_eq!(
+            setup_settings_to_queue(&petals, &installed, None),
+            [("polymarket".to_owned(), false)]
+        );
+        assert!(setup_settings_to_queue(&chosen_setup(&["hyperliquid"]), &none, None).is_empty());
+    }
+
+    /// A Petal settings route for [`apply_queued_settings`]. A paused read
+    /// returns what it saw before the pause.
+    struct SettingsRoute {
+        value: tokio::sync::Mutex<Option<Vec<u8>>>,
+        pause_reads: std::sync::atomic::AtomicBool,
+        read_started: tokio::sync::Notify,
+        release_read: tokio::sync::Notify,
+    }
+
+    impl SettingsRoute {
+        /// `None` fails every read, as before `main`'s account exists.
+        fn holding(value: Option<&[u8]>) -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                value: tokio::sync::Mutex::new(value.map(<[u8]>::to_vec)),
+                pause_reads: std::sync::atomic::AtomicBool::new(false),
+                read_started: tokio::sync::Notify::new(),
+                release_read: tokio::sync::Notify::new(),
+            })
+        }
+
+        async fn value(&self) -> Option<Vec<u8>> {
+            self.value.lock().await.clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl bloom_vfs::Handler for SettingsRoute {
+        async fn lookup(
+            &self,
+            _path: &bloom_vfs::VfsPath,
+        ) -> std::result::Result<bloom_vfs::Entry, bloom_vfs::HandlerError> {
+            Ok(bloom_vfs::Entry::file("venue.toml"))
+        }
+
+        async fn read(
+            &self,
+            _path: &bloom_vfs::VfsPath,
+        ) -> std::result::Result<Vec<u8>, bloom_vfs::HandlerError> {
+            let value = self.value.lock().await.clone();
+            if self.pause_reads.load(std::sync::atomic::Ordering::SeqCst) {
+                self.read_started.notify_one();
+                self.release_read.notified().await;
+            }
+            value.ok_or_else(|| bloom_vfs::HandlerError::not_found("wallet main"))
+        }
+
+        async fn write(
+            &self,
+            _path: &bloom_vfs::VfsPath,
+            data: &[u8],
+        ) -> std::result::Result<(), bloom_vfs::HandlerError> {
+            *self.value.lock().await = Some(data.to_vec());
+            Ok(())
+        }
+    }
+
+    fn queued_polymarket(
+        route: &std::sync::Arc<SettingsRoute>,
+    ) -> (tempfile::TempDir, bloom_vfs::Vfs) {
+        let home = tempfile::tempdir().unwrap();
+        mark_settings_pending(home.path(), "polymarket");
+        let vfs = bloom_vfs::Vfs::builder()
+            .mount("petals", route.clone())
+            .build();
+        (home, vfs)
+    }
+
+    fn polymarket_setup_body() -> Vec<u8> {
+        render_petal_settings(&chosen_setup(&["polymarket"]), "polymarket", "main")
+            .unwrap()
+            .unwrap()
+            .body
+    }
+
+    #[tokio::test]
+    async fn a_queued_write_goes_in_only_over_unset_settings() {
+        let petals = chosen_setup(&["polymarket"]);
+        let unset = setup_template("polymarket").unwrap().unset_body.as_bytes();
+
+        let route = SettingsRoute::holding(Some(unset));
+        let (home, vfs) = queued_polymarket(&route);
+        let message = apply_queued_settings(&vfs, home.path(), &petals, "polymarket").await;
+        assert!(message.unwrap().starts_with("petal_settings: "));
+        assert_eq!(route.value().await.unwrap(), polymarket_setup_body());
+        assert!(pending_settings(home.path(), &petals).is_empty());
+
+        // The owner's settings stay, and nothing is queued any longer.
+        let route = SettingsRoute::holding(Some(b"enabled = false\n"));
+        let (home, vfs) = queued_polymarket(&route);
+        assert_eq!(
+            apply_queued_settings(&vfs, home.path(), &petals, "polymarket").await,
+            None
+        );
+        assert_eq!(route.value().await.unwrap(), b"enabled = false\n");
+        assert!(pending_settings(home.path(), &petals).is_empty());
+
+        // A route that cannot be read yet keeps the marker for next time.
+        let route = SettingsRoute::holding(None);
+        let (home, vfs) = queued_polymarket(&route);
+        assert_eq!(
+            apply_queued_settings(&vfs, home.path(), &petals, "polymarket").await,
+            None
+        );
+        assert_eq!(route.value().await, None);
         assert_eq!(pending_settings(home.path(), &petals), ["polymarket"]);
-        // Recording again leaves one marker.
-        record_pending_setup_settings(home.path(), &petals).unwrap();
-        assert_eq!(pending_settings(home.path(), &petals), ["polymarket"]);
-        // Nothing chosen with settings: nothing queued.
-        let fresh = tempfile::tempdir().unwrap();
-        record_pending_setup_settings(fresh.path(), &chosen_setup(&["hyperliquid"])).unwrap();
-        assert!(!pending_settings_dir(fresh.path()).exists());
+    }
+
+    /// A rerun of `bloom init` makes the write an interrupted run queued, but
+    /// only once `main` exists and only for a Petal with a marker.
+    #[tokio::test]
+    async fn a_rerun_of_setup_finishes_an_interrupted_settings_write() {
+        let petals = chosen_setup(&["polymarket"]);
+        let unset = setup_template("polymarket").unwrap().unset_body.as_bytes();
+        for account in [
+            AccountPresence::Absent,
+            AccountPresence::Unknown("Broker is down".into()),
+        ] {
+            let route = SettingsRoute::holding(Some(unset));
+            let (home, vfs) = queued_polymarket(&route);
+            let finished = settle_setup_settings(
+                &vfs,
+                home.path(),
+                &petals,
+                "polymarket",
+                SetupSettingsStep::Leave,
+                false,
+                &account,
+            )
+            .await;
+            assert_eq!(finished, None, "{account:?}");
+            assert_eq!(route.value().await.unwrap(), unset, "{account:?}");
+            assert_eq!(pending_settings(home.path(), &petals), ["polymarket"]);
+        }
+
+        let route = SettingsRoute::holding(Some(unset));
+        let (home, vfs) = queued_polymarket(&route);
+        let exists = AccountPresence::Exists;
+        let finished = settle_setup_settings(
+            &vfs,
+            home.path(),
+            &petals,
+            "polymarket",
+            SetupSettingsStep::Leave,
+            false,
+            &exists,
+        )
+        .await;
+        assert!(finished.unwrap().starts_with("petal_settings: "));
+        assert_eq!(route.value().await.unwrap(), polymarket_setup_body());
+        assert!(pending_settings(home.path(), &petals).is_empty());
+
+        // Nothing queued: nothing written, even over unset settings.
+        let route = SettingsRoute::holding(Some(unset));
+        let vfs = bloom_vfs::Vfs::builder()
+            .mount("petals", route.clone())
+            .build();
+        let home = tempfile::tempdir().unwrap();
+        let finished = settle_setup_settings(
+            &vfs,
+            home.path(),
+            &petals,
+            "polymarket",
+            SetupSettingsStep::Leave,
+            false,
+            &exists,
+        )
+        .await;
+        assert_eq!(finished, None);
+        assert_eq!(route.value().await.unwrap(), unset);
+    }
+
+    /// An owner's write that arrives while the queued write is checking the
+    /// route lands after it, so setup's settings never replace it.
+    #[tokio::test]
+    async fn a_queued_write_never_replaces_an_owner_write_made_during_its_check() {
+        let petals = chosen_setup(&["polymarket"]);
+        let unset = setup_template("polymarket").unwrap().unset_body.as_bytes();
+        let route = SettingsRoute::holding(Some(unset));
+        route
+            .pause_reads
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let (home, vfs) = queued_polymarket(&route);
+        let settings_path = render_petal_settings(&petals, "polymarket", "main")
+            .unwrap()
+            .unwrap()
+            .path;
+
+        let queued = {
+            let (vfs, home, petals) = (vfs.clone(), home.path().to_owned(), petals.clone());
+            tokio::spawn(
+                async move { apply_queued_settings(&vfs, &home, &petals, "polymarket").await },
+            )
+        };
+        route.read_started.notified().await;
+        let owner = {
+            let vfs = vfs.clone();
+            tokio::spawn(async move {
+                bloom_vfs::Handler::write(
+                    &vfs,
+                    &bloom_vfs::VfsPath::parse(&settings_path).unwrap(),
+                    b"enabled = false\n",
+                )
+                .await
+                .unwrap();
+            })
+        };
+        tokio::task::yield_now().await;
+        route.release_read.notify_one();
+
+        assert!(
+            queued.await.unwrap().is_some(),
+            "the check saw unset settings"
+        );
+        owner.await.unwrap();
+        assert_eq!(route.value().await.unwrap(), b"enabled = false\n");
+    }
+
+    fn waiting(reason: &str) -> ControlFlow<DefaultPolicyStatus> {
+        ControlFlow::Break(DefaultPolicyStatus::WaitingForWallet {
+            reason: Some(reason.to_owned()),
+        })
     }
 
     /// A brief outage keeps a waiting command polling until its deadline; a
@@ -1165,23 +1585,66 @@ mod tests {
     #[test]
     fn a_wallet_read_outage_is_waited_out() {
         use bloom_broker_api::{ProtocolError, ProtocolErrorCode};
-        let absent = ProtocolError::new(
-            ProtocolErrorCode::BackendInvalidRequest,
-            "wallet main not found",
+        let read = |code, message| wallet_read_step::<()>(Err(ProtocolError::new(code, message)));
+        assert_eq!(wallet_read_step(Ok(())).unwrap(), ControlFlow::Continue(()));
+        assert_eq!(
+            read(
+                ProtocolErrorCode::BackendInvalidRequest,
+                "wallet main not found"
+            )
+            .unwrap(),
+            waiting("wallet main not found")
         );
         assert_eq!(
-            wallet_read_wait_reason(&absent).as_deref(),
-            Some("wallet main not found")
+            read(ProtocolErrorCode::ServiceUnavailable, "Broker restarting").unwrap(),
+            waiting("SERVICE_UNAVAILABLE: Broker restarting")
         );
-        let outage = ProtocolError::new(ProtocolErrorCode::ServiceUnavailable, "Broker restarting");
         assert_eq!(
-            wallet_read_wait_reason(&outage).as_deref(),
-            Some("SERVICE_UNAVAILABLE: Broker restarting")
+            read(ProtocolErrorCode::QuotaExceeded, "slow down").unwrap(),
+            waiting("QUOTA_EXCEEDED: slow down")
         );
-        let rate_limited = ProtocolError::new(ProtocolErrorCode::QuotaExceeded, "slow down");
-        assert!(wallet_read_wait_reason(&rate_limited).is_some());
-        let refused = ProtocolError::new(ProtocolErrorCode::UnauthenticatedPeer, "who are you");
-        assert_eq!(wallet_read_wait_reason(&refused), None);
+        assert!(read(ProtocolErrorCode::UnauthenticatedPeer, "who are you").is_err());
+    }
+
+    /// The policy step waits out the same Broker failures as the wallet read,
+    /// as the VFS reports them.
+    #[test]
+    fn a_policy_read_outage_is_waited_out() {
+        use bloom_broker_api::{ProtocolError, ProtocolErrorCode};
+        let backend = |code, message| {
+            bloom_vfs::HandlerError::backend(ProtocolError::new(code, message).to_string())
+        };
+        assert_eq!(policy_step(Ok(7)).unwrap(), ControlFlow::Continue(7));
+        for code in [
+            ProtocolErrorCode::ServiceUnavailable,
+            ProtocolErrorCode::QuotaExceeded,
+            ProtocolErrorCode::CeremonyRateLimited,
+        ] {
+            assert_eq!(
+                policy_step::<()>(Err(backend(code, "try again"))).unwrap(),
+                waiting(&format!("{}: try again", code.as_str()))
+            );
+        }
+        assert_eq!(
+            policy_step::<()>(Err(bloom_vfs::HandlerError::backend(format!(
+                "{}: another command holds it",
+                bloom_vfs::handlers::wallets::POLICY_COORDINATION_BUSY
+            ))))
+            .unwrap(),
+            ControlFlow::Break(DefaultPolicyStatus::Busy)
+        );
+        for error in [
+            backend(ProtocolErrorCode::PolicyBaselineStale, "reread it"),
+            backend(
+                ProtocolErrorCode::BackendInvalidRequest,
+                "wallet main not found",
+            ),
+            bloom_vfs::HandlerError::backend("SERVICE_UNAVAILABLE"),
+            bloom_vfs::HandlerError::backend("the policy service: is down"),
+            bloom_vfs::HandlerError::invalid("SERVICE_UNAVAILABLE: not a Broker error"),
+        ] {
+            assert!(policy_step::<()>(Err(error)).is_err());
+        }
     }
 
     #[test]
@@ -1885,15 +2348,77 @@ mod tests {
         let mut wait = DefaultPolicyWait::new("main", 0);
         let mut output = Vec::new();
         let status = DefaultPolicyStatus::WaitingForWallet {
-            reason: Some("wallet projection is not trusted".into()),
+            reason: Some("SERVICE_UNAVAILABLE: Broker restarting".into()),
         };
         assert_eq!(
             wait.observe(&status, 10, &mut output).unwrap(),
             WaitStep::Stop
         );
         let output = String::from_utf8(output).unwrap();
-        assert!(output.contains("wallet projection is not trusted"));
-        assert!(output.contains("once Bloom can read it"), "{output}");
+        assert!(
+            output.contains("stopped waiting for Broker (SERVICE_UNAVAILABLE: Broker restarting)"),
+            "{output}"
+        );
+        assert!(
+            output.contains("once Bloom can reach Broker again"),
+            "{output}"
+        );
+
+        // A rate limit, such as another live ceremony, is not a read failure.
+        let mut wait = DefaultPolicyWait::new("main", 0);
+        let mut output = Vec::new();
+        let status = DefaultPolicyStatus::WaitingForWallet {
+            reason: Some("CEREMONY_RATE_LIMITED: wallet already has a live ceremony".into()),
+        };
+        wait.observe(&status, 10, &mut output).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(
+            output.contains("once Broker accepts the request again, for example after another ceremony for main finishes"),
+            "{output}"
+        );
+
+        // A wallet that never appeared is not an outage.
+        let mut wait = DefaultPolicyWait::new("main", 0);
+        let mut output = Vec::new();
+        let status = DefaultPolicyStatus::WaitingForWallet {
+            reason: Some("wallet main not found".into()),
+        };
+        wait.observe(&status, 10, &mut output).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(
+            output.contains("(wallet main not found); once it exists"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn wait_says_once_why_it_keeps_polling_through_a_broker_refusal() {
+        let mut wait = DefaultPolicyWait::new("main", 1_000);
+        let mut output = Vec::new();
+        let refused = |message: &str| DefaultPolicyStatus::WaitingForWallet {
+            reason: Some(message.into()),
+        };
+        for (status, now) in [
+            (refused("wallet main not found"), 10),
+            (refused("CEREMONY_RATE_LIMITED: retry after 900 ms"), 20),
+            (refused("CEREMONY_RATE_LIMITED: retry after 400 ms"), 30),
+            (refused("SERVICE_UNAVAILABLE: Broker restarting"), 40),
+        ] {
+            assert_eq!(
+                wait.observe(&status, now, &mut output).unwrap(),
+                WaitStep::Poll
+            );
+        }
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(
+            output.matches("default_policy: waiting for Broker").count(),
+            1,
+            "{output}"
+        );
+        assert!(
+            output.contains("(CEREMONY_RATE_LIMITED: retry after 900 ms)"),
+            "{output}"
+        );
     }
 
     #[test]

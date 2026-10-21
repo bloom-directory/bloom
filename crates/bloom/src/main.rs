@@ -3774,6 +3774,7 @@ async fn run(cli: Cli) -> Result<()> {
             // `bloom serve` does the same, so the file's presence says nothing
             // about setup. The marker is saved only together with the choices.
             let first_setup = !d.config.petals.setup_complete;
+            let owners_before = default_policy::petal_owners(&d)?;
             if first_setup {
                 if !structured_service_output() && default_policy::interactive_setup_available() {
                     default_policy::run_setup_menu(
@@ -3784,16 +3785,16 @@ async fn run(cli: Cli) -> Result<()> {
                 } else {
                     default_policy::accept_setup_suggestions(&mut d.config.petals);
                 }
-                // Queue the chosen settings before anything is installed, so a
-                // run that stops part-way still writes them later.
-                default_policy::record_pending_setup_settings(d.home.root(), &d.config.petals)
+                // Queue the settings this run will write before anything is
+                // installed, so a run that stops part-way still writes them later.
+                default_policy::record_pending_setup_settings(&d, &owners_before)
+                    .await
                     .context("queue the chosen Petal settings")?;
                 d.config.petals.setup_complete = true;
                 d.config
                     .save(&d.home.config_path())
                     .context("save setup choices")?;
             }
-            let owners_before = default_policy::petal_owners(&d)?;
             let preinstalled = github_source::ensure_preinstalled_petals(&home, &d)
                 .context("provision canonical pre-installed Petals")?;
             for message in default_policy::apply_setup_settings(&d, &owners_before, first_setup)

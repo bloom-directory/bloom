@@ -170,7 +170,7 @@ Agreed on 2026-09-14:
 | `bloom wallet new` | Returns the ceremony URL immediately. Nothing follows up once the owner completes it ([bloom#199](https://github.com/bloom-directory/bloom/issues/199)) |
 | `bloom init` | Installs Bloom's canonical Petals without asking anything. The CLI has no interactive prompts |
 | Petal changes | `bloom petals install` and `bloom petals uninstall` change installed packages but never propose a policy change |
-| Polymarket | Trading is off until its `settings/<wallet>/venue.toml` sets `enabled = true` |
+| Polymarket | Trading is off until its `settings/<wallet>/<index>/venue.toml` sets `enabled = true` |
 
 ## Design
 
@@ -238,7 +238,9 @@ Petal that was already installed and is unchanged, `bloom init` writes setup
 settings only when Machine reports that `main`'s account does not exist. If
 the account exists, or its existence cannot be read (for example because
 Broker is down), it writes nothing, clears any pending retry for that Petal,
-and prints the exact settings and the command that would apply them.
+and prints the exact settings and the command that would apply them. A
+later `bloom init` still finishes a write that an interrupted setup queued
+(section 3).
 
 ### 2. The default policy
 
@@ -269,7 +271,8 @@ chosen Petals:
   transacts with (decision 13), from Bloom's catalog only; an edited config
   cannot add any. Existing destinations are kept. Only a wallet's first
   policy is proposed, so a destination added to the catalog later reaches an
-  existing wallet only through `bloom wallet update-policy`.
+  existing wallet only through `bloom wallet update-policy`, or through a
+  flow that sets `owner_just_chose` (section 3).
 - **Everything else** keeps the current defaults: approvals last at most 30
   days, and verifiers start empty.
 
@@ -280,8 +283,12 @@ chosen Petals:
 1. Launch the creation ceremony, as today.
 2. Ask Machine every two seconds where the default policy stands, through the
    `wallet_default_policy` Machine command, until the wallet exists or its
-   creation ceremony expires. A brief Broker or projection outage is waited
-   out within the same deadline rather than ending the command.
+   creation ceremony expires. A Broker refusal that may clear up when the
+   same request is made again (unavailable, rate-limited or over quota, for
+   example while another ceremony for the wallet is open) is waited out
+   within the same deadline rather than ending the command. The command says
+   once that it is waiting, and if the deadline passes it names the refusal
+   and what to wait for before running it again.
 3. Machine proposes every chosen, installed Petal together through the
    wallet's existing policy operation, the same pending-proposal flow the
    mounted `wallets/<wallet>/policy.json` uses. The command prints that
@@ -289,18 +296,29 @@ chosen Petals:
 4. Once the owner completes the ceremony, the next check commits the policy,
    and the command reports that `main` now allows the chosen Petals.
 
-Setup queues each chosen Petal's settings as a retry marker when the
-choices are saved, before anything is installed, so a `bloom init` that stops
-part-way still writes them later. On a new home `main` does not exist when
-`bloom init` runs, so its settings write is refused and the marker stays. The
-first check after `main` appears writes the settings, but only while the
-Petal's settings route still reads exactly as it does before anything is
-written there (for Polymarket, its built-in `enabled = false` and
-`allow_neg_risk = true` default). The check and the write are one step:
-Machine excludes every other write through its VFS between them, so an
-owner's edit made meanwhile is never replaced. Anything else there may be the
-owner's, so it stays: Machine clears the marker and logs the command that
-would apply setup's choice.
+When the choices are saved, before anything is installed, setup queues a
+retry marker for each settings write it is about to make, so a `bloom init`
+that stops part-way still writes them later. It queues only what the run
+itself would write (section 1): a Petal that is not installed yet, or one
+already installed while `main`'s account is known not to exist. For an
+installed Petal whose account exists or cannot be checked, it clears any
+marker instead. On a new home `main` does not exist when `bloom init` runs,
+so its settings write is refused and the marker stays. The first check after
+`main` appears writes the settings: the wallet-creation flow's, `bloom wallet
+default-policy main`, or a rerun of `bloom init` once `main` exists. The last
+covers a home where `main` already existed, so no wallet creation follows; a
+rerun that updates the Petal instead keeps the settings it carries, clears
+the marker and prints the command (section 1). It
+writes them only while the Petal's settings route
+still reads exactly as it does before anything is written there (for
+Polymarket, its built-in `enabled = false` and `allow_neg_risk = true`
+default). The check and the write are one step: Machine excludes every other
+write through its VFS between them, so an owner's edit made meanwhile is
+never replaced. It never waits behind running writes for that, since a Petal
+that writes back through the VFS would then wait forever; while other writes
+keep the VFS busy, the marker stays for the next check. Anything else there
+may be the owner's, so it stays: Machine clears the marker and logs the
+command that would apply setup's choice.
 
 If the owner stops the command, or the policy ceremony expires, the wallet
 still exists:
@@ -485,11 +503,13 @@ changes come next.
 - **Setup** (`crates/bloom/src/default_policy.rs`, `crates/bloom-proto`):
   the `bloom init` menu and its non-interactive form, settings templates in
   the catalog, and choices saved under `[petals.setup]` together with a
-  queued settings write for each chosen Petal. Settings are written through
+  queued settings write for each chosen Petal setup will write. Settings are
+  written through
   each Petal's route by `bloom init`, and by `bloom serve` when it installs a
   chosen Petal. An update keeps the settings its signed package lineage
   carries. A queued write that cannot be made yet is retried once `main`'s
-  account exists, only over the route's unset contents.
+  account exists, by wallet creation, `bloom wallet default-policy` or a
+  rerun of `bloom init`, only over the route's unset contents.
 - **Wallet creation** (`crates/bloom`): `bloom wallet new main` and
   `bloom wallet import main` wait for the wallet, then walk the owner
   through the default policy with the `wallet_default_policy` Machine
