@@ -244,11 +244,21 @@ impl Browser {
     }
 
     pub(crate) fn redact(&self, values: impl IntoIterator<Item = (String, String)>) {
+        self.redact_min(values, 3);
+    }
+
+    /// `min_chars` is 3 for saved values. A birth year is the exception: a
+    /// two-digit year is still the person's year.
+    pub(crate) fn redact_min(
+        &self,
+        values: impl IntoIterator<Item = (String, String)>,
+        min_chars: usize,
+    ) {
         let mut redactions = self.redactions.write().unwrap();
         redactions.extend(
             values
                 .into_iter()
-                .filter(|(secret, _)| secret.chars().count() >= 3)
+                .filter(|(secret, _)| secret.chars().count() >= min_chars)
                 .map(|(secret, label)| (zeroize::Zeroizing::new(secret), label)),
         );
         // Longer values first, so a full name is replaced before its parts.

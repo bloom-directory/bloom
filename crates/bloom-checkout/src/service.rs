@@ -555,6 +555,7 @@ impl CheckoutService {
         let traveler = selected_traveler(&mut travelers, &context, &origin, traveler_id)?;
         let text = derived_traveler_value(&traveler.values, field)
             .context("That saved traveler field is not available")?;
+        Self::remember_sent(&self.browser, field, &text);
         if matches!(
             field,
             "gender" | "nationality" | "document_kind" | "document_country"
@@ -612,6 +613,7 @@ impl CheckoutService {
                 values.insert(field.into(), part);
             }
         }
+        Self::remember_fill(&self.browser, &values);
         let filled = self
             .browser
             .fill_traveler(&traveler_origin, &traveler_context, &fields, &values)
@@ -619,6 +621,39 @@ impl CheckoutService {
             .inspect_err(|e| eprintln!("traveler fill refused: {e:#}"))?;
         *self.journey_filler.lock().await = Some((context, selected_id));
         Ok(json!({"state":"filled","filled_fields":filled}))
+    }
+
+    /// Every string about to be typed, including the formatted phone and the
+    /// birth year a date control shows on its own.
+    fn remember_fill(browser: &Browser, values: &BTreeMap<String, zeroize::Zeroizing<String>>) {
+        for (field, value) in values {
+            Self::remember_sent(browser, field, value);
+        }
+        for field in [
+            "born_on_year",
+            "born_on_month",
+            "born_on_day",
+            "born_on_dmy",
+        ] {
+            if values.contains_key(field) {
+                continue;
+            }
+            if let Some(part) = derived_traveler_value(values, field) {
+                Self::remember_sent(browser, field, &part);
+            }
+        }
+    }
+
+    fn remember_sent(browser: &Browser, field: &str, value: &str) {
+        if value.is_empty() {
+            return;
+        }
+        let item = (value.to_owned(), format!("[saved {field}]"));
+        if field == "born_on_year" {
+            browser.redact_min([item], 1);
+        } else {
+            browser.redact([item]);
+        }
     }
 
     /// A new browsing context drops the person `fill_traveler` already used.
@@ -2205,6 +2240,82 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(values, json!(["FixtureAlice", ""]));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn filled_phone_and_birth_year_appear_only_as_placeholders() {
+        let (url, server) = crate::discovery::tests::fixture(
+            "<div>Fecha de Nacimiento <select aria-label='Año'><option value=''></option><option value='1990'>1990</option><option value='1991'>1991</option></select></div>
+             <input aria-label='Teléfono'>"
+                .into(),
+        )
+        .await;
+        let root = tempfile::tempdir().unwrap();
+        let browser = Browser::launch(
+            &crate::test_chromium(),
+            &root.path().join("profile"),
+            &["--no-sandbox".into(), "--ignore-certificate-errors".into()],
+        )
+        .await
+        .unwrap();
+        browser
+            .browse(BrowseRequest::Open { url: url.clone() })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let service = CheckoutService::new(
+            browser.clone(),
+            &root.path().join("state.db"),
+            root.path().join("unused.sock"),
+            unsafe { libc::geteuid() },
+            47999,
+        )
+        .unwrap();
+        let (context, origin) = browser.shopping_scope().await.unwrap();
+        service.travelers.lock().await.insert(
+            "person".into(),
+            UnlockedTraveler {
+                operation_id: "person-unlock".into(),
+                origin,
+                context,
+                fields: vec![
+                    bloom_signer_api::TravelerField::Phone,
+                    bloom_signer_api::TravelerField::BornOn,
+                ],
+                values: [
+                    (
+                        "phone".into(),
+                        zeroize::Zeroizing::new("+5491123456789".into()),
+                    ),
+                    (
+                        "born_on".into(),
+                        zeroize::Zeroizing::new("1990-05-07".into()),
+                    ),
+                ]
+                .into(),
+                expires: tokio::time::Instant::now() + Duration::from_secs(60),
+            },
+        );
+        let filled = service.fill_traveler(Some("person")).await.unwrap();
+        assert!(
+            filled["filled_fields"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|field| field == "phone")
+        );
+        let formatted = formatted_phone("+5491123456789").expect("saved phone formats");
+        let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+        let text = snapshot.to_string();
+        assert!(
+            !text.contains(&formatted),
+            "formatted phone {formatted} leaked: {text}"
+        );
+        assert!(!text.contains("+5491123456789"), "raw phone leaked: {text}");
+        assert!(!text.contains("1990"), "birth year leaked: {text}");
+        assert!(text.contains("[saved phone]"), "{text}");
+        assert!(text.contains("[saved born_on_year]"), "{text}");
         server.abort();
     }
 
