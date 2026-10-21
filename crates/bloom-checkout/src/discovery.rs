@@ -104,10 +104,6 @@ fn provider_hosts_card_fields(frame_origin: &str, top_origin: &str, fixture: boo
 /// any card field is filled. None when it cannot fit in 1 MiB.
 pub(crate) async fn order_preview(tab: &PrivateTab) -> Option<String> {
     use base64::Engine;
-    // The person's own browser shows the page; the review lists the fields.
-    if tab.extension.is_some() {
-        return None;
-    }
     let metrics = tab
         .cdp
         .call(Some(&tab.session), "Page.getLayoutMetrics", json!({}))
@@ -162,34 +158,26 @@ pub(crate) async fn order_preview(tab: &PrivateTab) -> Option<String> {
 /// Labels and values of every filled field on the merchant page, except
 /// card and password fields, for the human's review page only.
 pub(crate) async fn order_fields(tab: &PrivateTab) -> Value {
-    let fields = if tab.extension.is_some() {
-        run(tab, "", 0, Script::OrderFields).await.ok()
-    } else {
-        tab.cdp
-            .call(
-                Some(&tab.session),
-                "Runtime.evaluate",
-                json!({"expression":include_str!("order-fields.js"),"returnByValue":true}),
-            )
-            .await
-            .ok()
-            .map(|r| r["result"]["value"].clone())
-    };
+    let fields = tab
+        .cdp
+        .call(
+            Some(&tab.session),
+            "Runtime.evaluate",
+            json!({"expression":include_str!("order-fields.js"),"returnByValue":true}),
+        )
+        .await
+        .ok()
+        .map(|r| r["result"]["value"].clone());
     fields
         .and_then(|r| r.as_array().cloned())
         .map_or_else(|| json!([]), Value::Array)
 }
 
-/// Page scripts by name. Checkout's own browser evaluates them as source; the
-/// Bloom extension carries the same files and runs them by name.
+/// Page scripts checkout evaluates in its own browser.
 pub(crate) enum Script<'a> {
     Facts,
     Fields,
     Submit,
-    OrderFields,
-    ConfirmContact,
-    Attention,
-    AttentionOutcome,
     Valid,
     Fill {
         origin: &'a str,
@@ -204,19 +192,6 @@ impl Script<'_> {
             Script::Facts => include_str!("facts.js").into(),
             Script::Fields => include_str!("fields.js").into(),
             Script::Submit => include_str!("submit.js").into(),
-            Script::OrderFields => include_str!("order-fields.js").into(),
-            Script::ConfirmContact => include_str!("confirm-contact.js").into(),
-            Script::Attention => concat!(
-                include_str!("form-attention.js"),
-                ";globalThis.__bloomAttention()"
-            )
-            .into(),
-            Script::AttentionOutcome => concat!(
-                include_str!("form-attention.js"),
-                ";",
-                include_str!("outcome.js")
-            )
-            .into(),
             Script::Valid => format!("({})()", include_str!("payment-valid.js").trim()),
             Script::Fill {
                 origin,
@@ -230,55 +205,18 @@ impl Script<'_> {
             ),
         })
     }
-
-    fn command(&self) -> Value {
-        match self {
-            Script::Fill {
-                origin,
-                index,
-                value,
-            } => json!({"action":"script","name":"fill","args":[origin, index, value]}),
-            other => json!({"action":"script","name":match other {
-                Script::Facts => "facts",
-                Script::Fields => "fields",
-                Script::Submit => "submit",
-                Script::OrderFields => "orderFields",
-                Script::ConfirmContact => "confirmContact",
-                Script::Attention => "attention",
-                Script::AttentionOutcome => "attentionOutcome",
-                _ => "valid",
-            },"args":[]}),
-        }
-    }
 }
 
-/// Run a page script in the payment document: through the extension when the
-/// page is in the person's browser, else in checkout's browser `world`.
+/// Run a page script in the payment document, in checkout's browser `world`.
 pub(crate) async fn run(
     tab: &PrivateTab,
     session: &str,
     world: i64,
     script: Script<'_>,
 ) -> Result<Value> {
-    if let Some(link) = &tab.extension {
-        return link
-            .call(script.command())
-            .await
-            .map_err(|_| anyhow::anyhow!("Payment document changed"));
-    }
     // A fill expression carries a card value: wipe it after use.
     let expression = zeroize::Zeroizing::new(script.expression()?);
     evaluate(tab, session, world, expression.to_string()).await
-}
-
-/// The Bloom tab's current URL in the person's browser.
-pub(crate) async fn extension_url(tab: &PrivateTab) -> Result<String> {
-    let link = tab.extension.as_ref().context("No extension")?;
-    let location = link.call(json!({"action":"location"})).await?;
-    Ok(location["url"]
-        .as_str()
-        .context("Payment tab disappeared")?
-        .to_owned())
 }
 
 async fn evaluate(
@@ -340,36 +278,7 @@ impl Discovery {
         let mut frames = Vec::new();
         let mut candidates = Vec::new();
         let mut top_origin = None;
-        // In the person's browser the extension reaches the top document
-        // only, so card fields must be on the merchant's own page.
-        let contexts = if tab.extension.is_some() {
-            let origin = url::Url::parse(&extension_url(tab).await?)?
-                .origin()
-                .ascii_serialization();
-            if let Ok(facts) =
-                serde_json::from_value::<CheckoutFacts>(run(tab, "", 0, Script::Facts).await?)
-            {
-                candidates.push((String::new(), 0, facts));
-            }
-            if !site {
-                let fields: Vec<Field> =
-                    serde_json::from_value(run(tab, "", 0, Script::Fields).await?)
-                        .with_context(|| format!("Ambiguous payment fields in {origin}"))?;
-                if !fields.is_empty() {
-                    frames.push(Frame {
-                        session: String::new(),
-                        world: 0,
-                        origin: origin.clone(),
-                        fields,
-                        owners: Vec::new(),
-                    });
-                }
-            }
-            top_origin = Some(origin);
-            Vec::new()
-        } else {
-            tab.cdp.contexts(&tab.session, "bloom-payment").await?
-        };
+        let contexts = tab.cdp.contexts(&tab.session, "bloom-payment").await?;
         for (position, context) in contexts.iter().enumerate() {
             let url = &context.url;
             let origin = url::Url::parse(url)?.origin().ascii_serialization();
@@ -488,18 +397,14 @@ impl Discovery {
     }
 
     pub async fn recheck(&self, tab: &PrivateTab) -> Result<()> {
-        let url = if tab.extension.is_some() {
-            extension_url(tab).await?
-        } else {
-            let target = tab
-                .cdp
-                .call(None, "Target.getTargetInfo", json!({"targetId":tab.target}))
-                .await?;
-            target["targetInfo"]["url"]
-                .as_str()
-                .context("Payment tab disappeared")?
-                .to_owned()
-        };
+        let target = tab
+            .cdp
+            .call(None, "Target.getTargetInfo", json!({"targetId":tab.target}))
+            .await?;
+        let url = target["targetInfo"]["url"]
+            .as_str()
+            .context("Payment tab disappeared")?
+            .to_owned();
         if url::Url::parse(&url)?.origin().ascii_serialization() != self.facts.origin {
             bail!("Payment tab origin changed");
         }
@@ -568,9 +473,6 @@ impl Discovery {
     /// Whether private-view coordinates point at the exact pay control that
     /// discovery bound. Used to persist a manual retry before dispatching it.
     pub async fn is_submit_point(&self, tab: &PrivateTab, x: f64, y: f64) -> Result<bool> {
-        if tab.extension.is_some() {
-            return Ok(false);
-        }
         let result = evaluate(
             tab,
             &self.facts_session,

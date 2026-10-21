@@ -26,19 +26,12 @@ struct Args {
     machine_uid: u32,
     #[arg(long)]
     view_port: u16,
-    /// Socket for the Bloom browser extension's native messaging host.
-    #[arg(long)]
-    extension_socket: Option<PathBuf>,
     /// Exit cleanly when the session-bound Broker disappears (launchd lifecycle).
     #[arg(long)]
     follow_broker_lifecycle: bool,
     #[cfg(feature = "triad-dev-harness")]
     #[arg(long)]
     fixture_allow_insecure_tls: bool,
-    /// Synthetic development rehearsal only; not available in release builds.
-    #[cfg(feature = "triad-dev-harness")]
-    #[arg(long, requires = "extension_socket")]
-    development_extension_private: bool,
 }
 
 #[tokio::main]
@@ -64,18 +57,6 @@ async fn main() -> Result<()> {
     #[cfg(not(feature = "triad-dev-harness"))]
     let flags = Vec::new();
     let browser = Browser::launch(&args.chromium, &args.profile, &flags).await?;
-    #[cfg(feature = "triad-dev-harness")]
-    if args.development_extension_private {
-        browser.allow_development_extension_private();
-    }
-    if let Some(path) = args.extension_socket.clone() {
-        let browser = browser.clone();
-        tokio::spawn(async move {
-            if let Err(error) = bloom_checkout::extension::serve_extension(&path, browser).await {
-                eprintln!("extension socket stopped: {error}");
-            }
-        });
-    }
     let service = CheckoutService::new(
         browser,
         &args.state,
@@ -106,19 +87,4 @@ async fn main() -> Result<()> {
     };
     tokio::select! {result=api=>result?,result=viewer=>result?,_=tokio::signal::ctrl_c()=>{},_=lifecycle=>{}}
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use clap::CommandFactory;
-
-    #[test]
-    fn private_extension_opt_in_exists_only_in_development_builds() {
-        let command = Args::command();
-        let present = command
-            .get_arguments()
-            .any(|arg| arg.get_id() == "development_extension_private");
-        assert_eq!(present, cfg!(feature = "triad-dev-harness"));
-    }
 }

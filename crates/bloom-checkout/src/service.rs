@@ -867,8 +867,7 @@ impl CheckoutService {
                 let mut token = [0; 32];
                 rand::thread_rng().fill_bytes(&mut token);
                 let capability = hex_token(&token);
-                let challenge_url =
-                    challenge_url(self.view_port, &capability, tab.extension.is_some());
+                let challenge_url = challenge_url(self.view_port, &capability);
                 let request = match (&discovery, &recipient) {
                     (Some(discovery), Some(recipient)) => {
                         json!({"method":"prepare","operation_id":operation_id,"card_id":card_id,
@@ -1145,12 +1144,8 @@ fn same_token(expected: &str, received: &str) -> bool {
         == 0
 }
 
-fn challenge_url(view_port: u16, capability: &str, extension: bool) -> String {
-    if extension {
-        format!("http://localhost:{view_port}/extension")
-    } else {
-        format!("http://localhost:{view_port}/private?token={capability}")
-    }
+fn challenge_url(view_port: u16, capability: &str) -> String {
+    format!("http://localhost:{view_port}/private?token={capability}")
 }
 
 impl CheckoutService {
@@ -1266,39 +1261,14 @@ impl CheckoutService {
                     | "disclosure_unknown"
             ) {
                 let mut observed = Vec::new();
-                if tab.extension.is_some() {
-                    use crate::discovery::{Script, run};
-                    let outcome = tokio::time::timeout(
-                        Duration::from_secs(5),
-                        run(&tab, "", 0, Script::AttentionOutcome),
-                    )
-                    .await
-                    .ok()
-                    .and_then(Result::ok);
-                    if let Some(outcome) = outcome {
-                        if outcome["reason"] == "confirm_contact" && !copied_contact {
-                            copied_contact = true;
-                            let _ = tokio::time::timeout(
-                                Duration::from_secs(5),
-                                run(&tab, "", 0, Script::ConfirmContact),
-                            )
-                            .await;
-                        }
-                        observed.push(outcome);
-                    }
-                }
-                let contexts = if tab.extension.is_some() {
-                    Vec::new()
-                } else {
-                    tokio::time::timeout(
-                        Duration::from_secs(2),
-                        tab.cdp.contexts(&tab.session, "bloom-outcome"),
-                    )
-                    .await
-                    .ok()
-                    .and_then(Result::ok)
-                    .unwrap_or_default()
-                };
+                let contexts = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    tab.cdp.contexts(&tab.session, "bloom-outcome"),
+                )
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or_default();
                 for context in contexts {
                     let expression = concat!(
                         include_str!("form-attention.js"),
@@ -1807,9 +1777,6 @@ impl CheckoutService {
 }
 
 async fn tab_url(tab: &PrivateTab) -> Option<String> {
-    if tab.extension.is_some() {
-        return crate::discovery::extension_url(tab).await.ok();
-    }
     let info = tab
         .cdp
         .call(None, "Target.getTargetInfo", json!({"targetId":tab.target}))
@@ -1890,14 +1857,9 @@ const BROWSE_ERRORS: &[&str] = &[
     "Stale element reference; request a new snapshot",
     "Input exceeds limit",
     "Checkout has private control; shopping is paused",
-    "The Bloom extension is unavailable or busy",
-    "The Bloom extension disconnected",
-    "The Bloom extension did not answer",
-    "The Bloom extension has too many pending requests",
     "Saved traveler details are unlocked for another booking or website",
     "Choose traveler_id explicitly when multiple people are unlocked",
     "Unlock that saved traveler for this booking first",
-    "Private filling in the normal-profile extension is disabled; use the isolated checkout browser",
 ];
 
 #[cfg(test)]
@@ -2187,17 +2149,6 @@ mod tests {
         assert!(records.is_empty());
     }
 
-    #[test]
-    fn extension_checkout_keeps_the_person_in_the_bloom_tab() {
-        assert_eq!(
-            challenge_url(8123, "secret", true),
-            "http://localhost:8123/extension"
-        );
-        assert_eq!(
-            challenge_url(8123, "secret", false),
-            "http://localhost:8123/private?token=secret"
-        );
-    }
     #[tokio::test]
     async fn airline_confirmation_becomes_booked_with_its_code() {
         let (url, server) = crate::discovery::tests::fixture(

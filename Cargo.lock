@@ -2383,14 +2383,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bloom-browser-extension"
-version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-browser-extension.git?rev=a854bd3beb1ff4fcfb9b2c93d3fd789d80f2792c#a854bd3beb1ff4fcfb9b2c93d3fd789d80f2792c"
-dependencies = [
- "sha2 0.10.9",
-]
-
-[[package]]
 name = "bloom-checkout"
 version = "0.4.0"
 dependencies = [
@@ -2398,7 +2390,6 @@ dependencies = [
  "axum",
  "axum-server",
  "base64 0.22.1",
- "bloom-browser-extension",
  "bloom-checkout-api",
  "bloom-service-activation",
  "bloom-signer-api",

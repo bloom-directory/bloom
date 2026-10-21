@@ -73,42 +73,13 @@ Snapshot-redaction patterns use zeroizing storage and remain until the browser
 context is safely discarded, so expiry cannot expose values already in a DOM.
 Final itinerary/party review and binding remain a separate acceptance gate.
 
-## User browser extension
+## Booking sites that reject Bloom's browser
 
-The extension's manifest, background worker, content-script dispatcher and
-bundle assembly live in `bloom-directory/bloom-browser-extension`. Checkout
-pins that crate at an exact Git revision and supplies its generic DOM scripts
-to the bundler. The native messaging host and socket adapter remain here.
-There is no runtime source download or sibling-checkout dependency. The
-installed version hashes both extension assets and supplied DOM scripts.
-
-Flight search, itinerary selection, airline navigation instructions and the
-seller handoff live in `bloom-directory/bloom-petal-flights`. Its booking route
-uses the existing checkout VFS with declared read/write capabilities. Petals
-can orchestrate that public surface; they do not receive saved card/traveler
-plaintext or authorize disclosure. Merchant/provider origin allowlists stay
-with the components enforcing disclosure and extension permissions.
-
-The extension payment path currently inspects only the top document. Its
-JetSMART browsing permission does not prove Yuno iframe card support; the
-verified JetSMART purchase used checkout's own browser.
-
-A fresh Chromium profile fails Aerolíneas' passenger check even when it is
-headed and not marked as automated. The person's long-lived profile passes.
-Chrome refuses remote debugging of that default profile, so checkout reaches
-it only through this extension. Desktop clicks are not a checkout path.
-
-A Manifest V3 content-script extension connects to checkout through Chrome
-native messaging; it uses neither the debugger API nor a localhost web port.
-The extension creates and controls one tab, accepts only the Aerolíneas and
-JetSMART origins, and never reads other tabs. Flybondi is omitted: its origin
-no longer resolves to a server that can take a booking.
-
-Machine keeps the same browse and checkout API. Named, bundled page functions
-replace arbitrary script evaluation. Traveler and card values still cross the
-Broker and Signer ceremonies, are released for the approved origin, and are
-redacted from snapshots. The extension does not weaken payment discovery,
-fact rechecks, the single-submit rule or restart recovery.
+Airlines that reject a fresh browser are not bookable by Bloom. For those,
+Bloom gives the person the deep link and they book it themselves. Named
+cases include Aerolíneas Argentinas, American, SAS, SWISS, easyJet and
+United. JetSMART, Shopify and Stripe-hosted checkouts work in Bloom's own
+browser.
 
 ## Private view
 
@@ -130,43 +101,9 @@ Card and site-payment completion still close every private page and resume
 shopping in a fresh blank tab. Takeover buys nothing and releases no card;
 saved-card payment needs its separate approval for the exact merchant/total.
 
-The extension tab is already visible in the person's browser, so it is not
-mirrored into the private view. Approval follow-up instead tells the person to
-return to the Bloom tab for a bank check or correction.
-
-### Journey selection and installed-extension limit
-
-An explicit shopping `open` selects the extension only for origins in its
-pinned permissions, otherwise checkout's browser. Connecting an extension does
-not take over an existing journey. That journey retains its original connection
-through private execution; a disconnect or replacement fails rather than
-switching browsers or replaying payment. Completion closes only the extension's
-recorded tab before returning public control. Unsupported extension takeover
-resumption remains paused instead of exposing the private document.
-
 Every explicit open starts a new traveler-unlock context, even on the same
 origin. An approval returned for an earlier context is discarded. Private
 traveler actions recheck context and origin while holding the browsing lock.
-
-The native host registers in Linux Chrome/Chromium config directories or macOS
-Application Support directories. Its relay uses bounded JSON frames and queues;
-malformed/truncated/oversized input and lost connections fail closed. Platform
-registration follows [Chrome native messaging](https://developer.chrome.com/docs/extensions/develop/concepts/native-messaging).
-
-This is still a development connection, not installed extension acceptance.
-Release builds reject private extension handoff, traveler unlock and private
-fill regardless of connection state. Only a `triad-dev-harness` build exposes
-`--development-extension-private` for explicit synthetic rehearsal; that flag
-requires `--extension-socket`. It is not a production trust decision.
-Checkout currently accepts only its own UID on the extension socket; the
-installed browser uses the login UID, not the isolated checkout UID. Do not
-remove this check or open the socket to the login UID as a packaging shortcut.
-A login-UID check alone cannot distinguish Chrome's native host from Machine
-or another process running under that same login. A normal-profile browser is
-therefore a different trust boundary from checkout's isolated browser. Private
-installed-extension support needs a protected bridge or an explicit product
-decision accepting the trusted-login-browser limitation, with accurate claims
-and acceptance tests. Neither this change nor green fixture tests grants it.
 
 ## Durable states and recovery
 
@@ -204,7 +141,6 @@ after one use. Nothing persists a PRF output, CVC, or reusable grant.
 - Card ceremonies share Broker's anonymous quota of four per five minutes.
 - Take-over and site payment need the card passkey, so one card must be saved.
 - The private view is local; phone take-over needs a remote surface.
-- Sites that block a fresh browser need an allowlisted origin in the person's
-  existing profile. The extension does not make a refused connection or a dead
-  airline bookable. New origins stay off until a rehearsal in that profile
-  reaches payment and stops before Pay. The caller supplies the booking link.
+- Airlines that reject a fresh browser are not bookable by Bloom. Give the
+  person the deep link; they finish in their own browser. The caller supplies
+  the booking link.

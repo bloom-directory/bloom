@@ -108,23 +108,17 @@ and card, then enters CVC privately; the approval also lists entered fields
 and shows a screenshot when checkout owns the browser. Bloom fills and submits
 once. Bloom fills a saved card into fields hosted by a known payment
 provider (Stripe, Shopify, Adyen, Braintree, Yuno and others) or into the own
-checkout page of a listed merchant (Aerolíneas Argentinas). A bank challenge,
+checkout page of a listed merchant. A bank challenge,
 card fields anywhere else, or
 an unclear total goes to the human's private view; its URL and screenshots
 never appear in VFS. A manual
 fallback releases no saved card.
 
-Opening a supported airline journey while the Bloom extension is connected
-selects one allowlisted Bloom tab in the person's browser. Other sites use
-Bloom's browser. Connecting, replacing or disconnecting the extension must not
-move an active journey to another browser. That tab is the
-only way to drive the person's browser. Do not click or type through the
-desktop, and do not collect airline pages. Open the booking link you were
-given. A fresh profile fails checks the person's long-lived profile passes,
-and the extension does not bypass a site that refuses the connection. After
-approval, the person completes any bank check or correction in that tab; the
-follow-up page points them there instead of showing a duplicate private
-browser.
+Airlines that reject a fresh browser are not bookable by Bloom. Give the
+person the deep link and stop; they book it themselves. Named cases include
+Aerolíneas Argentinas, American, SAS, SWISS, easyJet and United. JetSMART,
+Shopify and Stripe-hosted checkouts work in Bloom's own browser. Do not click
+or type through the desktop. Open the booking link you were given.
 
 `filled` means fields were filled, not that payment succeeded. `booked`,
 `paid` and `declined` describe what the merchant reported; Bloom has not
@@ -140,10 +134,6 @@ closes, shopping resumes on a fresh tab.
 
 Protection depends on separate service principals. Root and root-equivalent
 access, including membership in the Docker group, is outside that claim.
-Private filling and checkout handoff through the normal-profile extension are
-disabled in release builds until that boundary is protected. A development
-rehearsal requires an explicit non-release opt-in. Its same-UID bridge
-does not establish isolation from other programs running as the login user.
 
 Machine exposes this VFS; Broker controls approval ceremonies and policy;
 Signer holds Bloom wallet keys and signs. Secret ceremony input belongs only

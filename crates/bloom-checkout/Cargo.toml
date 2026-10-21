@@ -9,7 +9,6 @@ license.workspace = true
 triad-dev-harness = []
 
 [dependencies]
-bloom-browser-extension = { git = "https://github.com/bloom-directory/bloom-browser-extension.git", rev = "a854bd3beb1ff4fcfb9b2c93d3fd789d80f2792c" }
 bloom-checkout-api.workspace = true
 bloom-service-activation.workspace = true
 anyhow.workspace = true
