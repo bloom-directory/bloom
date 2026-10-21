@@ -59,8 +59,11 @@
   </dict>
   <key>ThrottleInterval</key>
   <integer>5</integer>
+  <!-- Standard, not Background: this job answers the user's mount, CLI and
+       ceremony requests. Background throttles CPU and disk I/O so heavily that
+       verifying the audit journal at startup ran about 60 times slower. -->
   <key>ProcessType</key>
-  <string>Background</string>
+  <string>Standard</string>
   <key>WorkingDirectory</key>
   <string>@BLOOM_BROKER_STATE_DIR@</string>
   <key>SoftResourceLimits</key>

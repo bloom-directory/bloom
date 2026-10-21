@@ -449,8 +449,22 @@ remove_legacy_cli() {
   return 1
 }
 
+# A legacy wallet has finished migrating when its staging receipt names the
+# address the running Machine now reports for that wallet. Anything that cannot
+# be confirmed (no receipt, an unreadable one, a Machine that does not answer)
+# counts as not migrated, so its instructions are still shown.
+legacy_wallet_migrated() {
+  local wallet_name="$1" receipt="$2" staged current
+  $live || return 1
+  [[ -f "$receipt" && ! -L "$receipt" ]] || return 1
+  staged="$(/usr/bin/sudo -u "$login_user" -- /usr/bin/plutil -extract address raw -o - "$receipt" 2>/dev/null)" || return 1
+  [[ "$staged" =~ ^0x[0-9a-fA-F]{40}$ ]] || return 1
+  current="$(launchctl asuser "$login_uid" /usr/bin/sudo -u "$login_user" -H "$release_base/current/bloom" --home "$login_home/.bloom" -q wallet address "$wallet_name" 2>/dev/null)" || return 1
+  [[ "$(printf '%s' "$current" | tr 'A-F' 'a-f')" == "$(printf '%s' "$staged" | tr 'A-F' 'a-f')" ]]
+}
+
 report_legacy_wallet_migrations() {
-  local wallet_root wallet_dir kind_file kind wallet_name receipt
+  local wallet_root wallet_dir kind_file kind wallet_name receipt migrated=""
   local found_wallet=false found_supported=false
   resolve_login_home
   wallet_root="$login_home/.bloom/keystore"
@@ -490,6 +504,10 @@ report_legacy_wallet_migrations() {
 
     found_supported=true
     receipt="$login_home/.bloom/$wallet_name.triad-migration-receipt.json"
+    if legacy_wallet_migrated "$wallet_name" "$receipt"; then
+      migrated="${migrated:+$migrated, }$wallet_name"
+      continue
+    fi
     echo "Migrate legacy passkey wallet $wallet_name with these two commands. Only the staging command requires sudo:"
     printf '  sudo %q stage --source %q --config %q --source-uid %q --signer-uid %q --signer-gid %q --receipt %q\n' \
       "$release_base/current/bloom-signer-migrate" "$wallet_dir" \
@@ -497,6 +515,9 @@ report_legacy_wallet_migrations() {
       "$BLOOM_MACOS_SIGNER_GID" "$receipt"
     printf '  %q wallet migrate-passkey %q\n' "$cli_link" "$receipt"
   done
+  if [[ -n "$migrated" ]]; then
+    echo "Already migrated, no action needed: $migrated"
+  fi
   if ! $found_wallet; then
     echo "No legacy wallets were found in $wallet_root"
   elif ! $found_supported; then
@@ -885,14 +906,30 @@ reload_launchagent_job() {
   stop_launchd_job "gui/$uid/$label"; stop_launchd_job "user/$uid/$label"
   reload_launchd_job "user/$uid" "$label" "$plist"
 }
+# Machine verifies its whole audit journal before it listens, so a long-lived
+# install can take minutes to answer. Wait up to BLOOM_HEALTH_TIMEOUT_SECONDS
+# (default 600) and report progress; health_timed_out records a plain timeout.
+health_timed_out=false
 require_triad_health() {
-  local uid="$1" user="$2" digest="$3" home attempt
+  local uid="$1" user="$2" digest="$3" home timeout started last_report waited
+  health_timed_out=false
   home="$(dscl . -read "/Users/$user" NFSHomeDirectory | awk 'NR==1{sub(/^NFSHomeDirectory:[[:space:]]*/,"");print}')"
   [[ "$home" == /* && -d "$home" ]] || { echo "cannot resolve home for $user" >&2; return 1; }
-  # Full Machine startup can warm RPC/cache state well beyond ten seconds.
-  # Keep activation bounded while allowing a cold installed home to become ready.
-  for ((attempt=0; attempt<240; attempt++)); do launchctl asuser "$uid" /usr/bin/sudo -u "$user" -H "$release_base/current/bloom" --home "$home/.bloom" serve triad-health-check "$digest" >/dev/null 2>&1 && return 0; sleep 0.5; done
-  launchctl asuser "$uid" /usr/bin/sudo -u "$user" -H "$release_base/current/bloom" --home "$home/.bloom" serve triad-health-check "$digest"
+  timeout="${BLOOM_HEALTH_TIMEOUT_SECONDS:-600}"
+  [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || die "invalid Bloom health wait"
+  started=$SECONDS; last_report=$SECONDS
+  until launchctl asuser "$uid" /usr/bin/sudo -u "$user" -H "$release_base/current/bloom" --home "$home/.bloom" serve triad-health-check "$digest" >/dev/null 2>&1; do
+    waited=$((SECONDS - started))
+    if ((waited >= timeout)); then
+      launchctl asuser "$uid" /usr/bin/sudo -u "$user" -H "$release_base/current/bloom" --home "$home/.bloom" serve triad-health-check "$digest" && return 0
+      health_timed_out=true; return 1
+    fi
+    if ((SECONDS - last_report >= 30)); then
+      echo "Waiting for Bloom to start (${waited}s of up to ${timeout}s; Machine verifies its audit journal first)..." >&2
+      last_report=$SECONDS
+    fi
+    sleep 0.5
+  done
 }
 capture_activation_failure() {
   local evidence="${BLOOM_MACOS_W0_EVIDENCE_DIR:-}" service source_log
@@ -983,20 +1020,30 @@ rewrite_all_enrollments() {
   fi
 }
 
+# During a rollback (reload_all_on_timeout=true) a login that has not answered
+# yet does not stop the others from being reloaded; its UID is recorded in
+# health_timed_out_uids and the set still reports failure.
 reload_installed_set() {
-  local record uid; $live || return 0
-  reload_launchd_job system com.bloom.containment "$containment_plist" || return 1
+  local record uid; health_timed_out_uids=""; $live || return 0
+  # A hard failure is not a timeout, whatever an earlier login reported.
+  reload_failed() { health_timed_out=false; return 1; }
+  reload_launchd_job system com.bloom.containment "$containment_plist" || { reload_failed; return 1; }
   "$release_base/current/bloom" serve triad-pf-monitor-once 2>/dev/null ||
     echo "Bloom installed, but session lifecycle refresh is deferred" >&2
   for record in "$enrollments"/*.json; do
     [[ -f "$record" && ! -L "$record" ]] || continue
     uid="${record##*/}"; uid="${uid%.json}"
-    reload_launchagent_job "$uid" com.bloom.session "$root_prefix/Library/LaunchAgents/com.bloom.session.plist" || return 1
-    reload_launchd_job system "com.bloom.signer.$uid" "$root_prefix/Library/LaunchDaemons/com.bloom.signer.$uid.plist" || return 1
-    reload_launchd_job system "com.bloom.broker.$uid" "$root_prefix/Library/LaunchDaemons/com.bloom.broker.$uid.plist" || return 1
-    reload_launchagent_job "$uid" com.bloom.machine "$root_prefix/Library/LaunchAgents/com.bloom.machine.plist" || return 1
-    require_triad_health "$uid" "$(field "$record" login_user)" "$(field "$record" release_digest)" || return 1
+    reload_launchagent_job "$uid" com.bloom.session "$root_prefix/Library/LaunchAgents/com.bloom.session.plist" || { reload_failed; return 1; }
+    reload_launchd_job system "com.bloom.signer.$uid" "$root_prefix/Library/LaunchDaemons/com.bloom.signer.$uid.plist" || { reload_failed; return 1; }
+    reload_launchd_job system "com.bloom.broker.$uid" "$root_prefix/Library/LaunchDaemons/com.bloom.broker.$uid.plist" || { reload_failed; return 1; }
+    reload_launchagent_job "$uid" com.bloom.machine "$root_prefix/Library/LaunchAgents/com.bloom.machine.plist" || { reload_failed; return 1; }
+    if ! require_triad_health "$uid" "$(field "$record" login_user)" "$(field "$record" release_digest)"; then
+      # This login's own check set health_timed_out; keep it as reported.
+      [[ "${reload_all_on_timeout:-false}" == true && "${health_timed_out:-false}" == true ]] || return 1
+      health_timed_out_uids="${health_timed_out_uids:+$health_timed_out_uids, }$uid"
+    fi
   done
+  if [[ -n "$health_timed_out_uids" ]]; then health_timed_out=true; return 1; fi
 }
 
 activate_installed_set() {
@@ -1305,12 +1352,29 @@ upgrade_release() {
   rewrite_all_enrollments "$new" activating
   switch_release "$new"
   if ! reload_installed_set; then
-    echo "new Bloom release failed authenticated pre-activation health" >&2; stop_all_enrollments || true
+    if [[ "${health_timed_out:-false}" == true ]]; then
+      echo "new Bloom release did not report healthy within ${BLOOM_HEALTH_TIMEOUT_SECONDS:-600}s" >&2
+    else
+      echo "new Bloom release failed authenticated pre-activation health" >&2
+    fi
+    stop_all_enrollments || true
     if [[ "$upgrade_phase" == rollback_allowed ]]; then
       restore_macos_upgrade_state; switch_release "$old"
-      if reload_installed_set && activate_installed_set; then install_cli_link; rm -rf -- "$upgrade_transaction"; upgrade_transaction=""; upgrade_phase=""
-        echo "previous Bloom release restored after rollback-safe failure" >&2
+      # Judge the restore by its own health checks, not the candidate's, and
+      # reload every login even if one has not answered yet.
+      health_timed_out=false; reload_all_on_timeout=true
+      if reload_installed_set; then
+        if activate_installed_set; then install_cli_link; rm -rf -- "$upgrade_transaction"; upgrade_transaction=""; upgrade_phase=""
+          echo "previous Bloom release restored after rollback-safe failure" >&2
+        elif [[ "${health_timed_out:-false}" == true ]]; then
+          echo "previous Bloom release is reinstated, but its Machine did not report healthy within ${BLOOM_HEALTH_TIMEOUT_SECONDS:-600}s and was stopped. Rerunning this installer resumes the recorded upgrade." >&2
+        else echo "automatic restoration of the previous Bloom release failed" >&2; fi
+      elif [[ "${health_timed_out:-false}" == true ]]; then
+        # The old release is selected and its services are loaded; it only
+        # has not answered yet. Say so rather than reporting a failed restore.
+        echo "previous Bloom release is reinstated and its services are loaded for every login, but UID ${health_timed_out_uids:-?} did not report healthy within ${BLOOM_HEALTH_TIMEOUT_SECONDS:-600}s; it may still be starting. Rerunning this installer resumes the recorded upgrade." >&2
       else echo "automatic restoration of the previous Bloom release failed" >&2; fi
+      reload_all_on_timeout=false
     else
       rewrite_all_enrollments "$new" activating
       echo "state migration is forward-only; retry this candidate release" >&2

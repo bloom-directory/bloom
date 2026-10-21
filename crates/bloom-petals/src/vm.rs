@@ -228,6 +228,13 @@ impl PetalVm {
 
     pub fn new() -> Result<Self, PetalError> {
         let mut config = Config::new();
+        // Handle guest traps with signals on macOS, as on Linux. Wasmtime's
+        // Mach-port handler thread aborts the whole process when any caught
+        // signal (SIGCHLD, for one) interrupts its receive: wasmtime#14393,
+        // fixed upstream only from 50.0 (#14414). Bloom uses no Mach-port
+        // crash reporter, which is what that mode exists for. Revisit after
+        // upgrading to wasmtime 50 or later.
+        config.macos_use_mach_ports(false);
         config.async_support(true);
         config.consume_fuel(true);
         config.wasm_component_model(true);
