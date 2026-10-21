@@ -58,6 +58,8 @@ impl Store {
         conn.execute("UPDATE operations SET state='uncertain',status=json_set(status,'$.state','uncertain','$.ceremony_url',NULL) WHERE state IN ('submitted','needs_input','not_submitted')",[])?;
         conn.execute("UPDATE operations SET state='disclosure_unknown',status=json_set(status,'$.state','disclosure_unknown','$.ceremony_url',NULL) WHERE state IN ('release_started','filled','partially_filled')",[])?;
         conn.execute("UPDATE operations SET state='failed_before_release',status=json_set(status,'$.state','failed_before_release','$.ceremony_url',NULL) WHERE state IN ('requested','preparing','awaiting_approval','manual_required','human_control')",[])?;
+        // The unlocked values lived in memory. After a restart they are gone.
+        conn.execute("UPDATE operations SET state='expired',status=json_set(status,'$.state','expired','$.ceremony_url',NULL) WHERE state='unlocked'",[])?;
         Ok(Self(Mutex::new(conn)))
     }
     fn get(&self, id: &str) -> Result<Status> {
@@ -346,6 +348,7 @@ impl CheckoutService {
             ceremony_url: None,
             filled_fields: vec![],
             outcome: None,
+            paused: false,
         };
         self.store.insert(
             &status,
@@ -788,6 +791,7 @@ impl CheckoutService {
                     ceremony_url: None,
                     filled_fields: Vec::new(),
                     outcome: None,
+                    paused: false,
                 };
                 if matches!(mode, Mode::Card | Mode::Site) {
                     // Ask for payment only once the page accepts what was entered.
@@ -799,7 +803,10 @@ impl CheckoutService {
                         .filter_map(Value::as_str)
                         .collect();
                     if !errors.is_empty() || attention["invalid"].as_u64().unwrap_or(0) > 0 {
-                        eprintln!("payment refused over form errors: {attention}");
+                        eprintln!(
+                            "payment refused over form errors: {}",
+                            Self::form_error_count(&attention)
+                        );
                         bail!(
                             "The page shows form errors; fix them before payment: {}",
                             if errors.is_empty() {
@@ -1043,6 +1050,21 @@ impl CheckoutService {
                 }
                 return;
             }
+        }
+    }
+
+    /// The number of form-error strings. Their text can repeat what the person typed.
+    fn form_error_count(attention: &Value) -> usize {
+        attention["errors"]
+            .as_array()
+            .map(|errors| errors.len())
+            .unwrap_or(0)
+    }
+
+    fn mark_paused(&self, id: &str) {
+        if let Ok(mut status) = self.store.get(id) {
+            status.paused = true;
+            let _ = self.store.update(&status);
         }
     }
 
@@ -1388,10 +1410,8 @@ impl CheckoutService {
                         status.state = state.into();
                         status.outcome = serde_json::from_value(recorded).ok();
                         status.ceremony_url = None;
-                        if close
-                            && self.store.update(&status).is_ok()
-                            && self.return_control().await.is_ok()
-                        {
+                        let stored = self.store.update(&status).is_ok();
+                        if close && stored && self.return_control().await.is_ok() {
                             let mut private = self.private.lock().await;
                             if let Some(checkout) =
                                 private.as_ref().filter(|p| p.operation_id == id)
@@ -1399,6 +1419,9 @@ impl CheckoutService {
                                 self.retain_completed(checkout, status);
                                 *private = None;
                             }
+                        } else if close && stored {
+                            status.paused = true;
+                            let _ = self.store.update(&status);
                         } else {
                             let _ = self.store.update(&status);
                         }
@@ -1439,6 +1462,8 @@ impl CheckoutService {
                             *private = None;
                         }
                     }
+                } else {
+                    self.mark_paused(&id);
                 }
                 return;
             }
@@ -1983,6 +2008,7 @@ mod tests {
                     ceremony_url: None,
                     filled_fields: vec![],
                     outcome: None,
+                    paused: false,
                 },
                 "traveler",
                 "Synthetic pending unlock",
@@ -2127,6 +2153,7 @@ mod tests {
                     ceremony_url: None,
                     filled_fields: vec![],
                     outcome: None,
+                    paused: false,
                 },
                 "traveler",
                 "Synthetic approved person",
@@ -2402,6 +2429,7 @@ mod tests {
             ceremony_url: None,
             filled_fields: vec!["number".into(), "expiry".into(), "cvc".into()],
             outcome: None,
+            paused: false,
         };
         service
             .store
@@ -2431,9 +2459,80 @@ mod tests {
         let public = service.store.get(&status.operation_id).unwrap();
         assert_eq!(public.state, "booked");
         assert_eq!(public.outcome.unwrap().order_id.as_deref(), Some("AB12CD"));
+        assert!(!public.paused);
         let private = service.private_state(&token).await.unwrap();
         assert_eq!(private["state"], "booked");
         assert_eq!(private["outcome"]["order_id"], "AB12CD");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_return_keeps_booked_and_marks_shopping_paused() {
+        let (url, server) = crate::discovery::tests::fixture(
+            "<h1>Tu compra ha sido confirmada</h1><p>Código de reserva: AB12CD</p>".into(),
+        )
+        .await;
+        let root = tempfile::tempdir().unwrap().keep();
+        let browser = Browser::launch(
+            &crate::test_chromium(),
+            &root.join("profile"),
+            &["--no-sandbox".into(), "--ignore-certificate-errors".into()],
+        )
+        .await
+        .unwrap();
+        browser
+            .browse(crate::browser::BrowseRequest::Open { url })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let tab = browser.handoff().await.unwrap();
+        browser.lose_shopping_context().await;
+        let service = Arc::new(
+            CheckoutService::new(
+                browser,
+                &root.join("state.db"),
+                root.join("unused.sock"),
+                unsafe { libc::geteuid() },
+                47999,
+            )
+            .unwrap(),
+        );
+        let status = Status {
+            operation_id: "fixture-paused".into(),
+            state: "submitted".into(),
+            ceremony_url: None,
+            filled_fields: vec!["number".into()],
+            outcome: None,
+            paused: false,
+        };
+        service
+            .store
+            .insert(&status, "card", "Fixture flight")
+            .unwrap();
+        *service.private.lock().await = Some(PrivateCheckout {
+            operation_id: status.operation_id.clone(),
+            mode: Mode::Card,
+            view_target: tab.target.clone(),
+            view_session: tab.session.clone(),
+            seen_pages: std::collections::HashSet::from([tab.target.clone()]),
+            tab,
+            discovery: None,
+            recipient: None,
+            capability: hex_token(&[29; 32]),
+            claimed: true,
+            approved: true,
+            manual_submission: false,
+        });
+        tokio::time::timeout(
+            Duration::from_secs(4),
+            service.watch_outcome(status.operation_id.clone()),
+        )
+        .await
+        .unwrap();
+        let public = service.store.get(&status.operation_id).unwrap();
+        assert_eq!(public.state, "booked");
+        assert!(public.paused, "status.json must say shopping is paused");
+        assert!(service.private.lock().await.is_some());
         server.abort();
     }
 
@@ -2475,6 +2574,7 @@ mod tests {
             ceremony_url: None,
             filled_fields: vec![],
             outcome: None,
+            paused: false,
         };
         service
             .store
@@ -2549,6 +2649,7 @@ mod tests {
             ceremony_url: None,
             filled_fields: vec![],
             outcome: None,
+            paused: false,
         };
         service
             .store
@@ -2623,6 +2724,7 @@ mod tests {
             ceremony_url: None,
             filled_fields: vec!["number".into(), "expiry".into(), "cvc".into()],
             outcome: None,
+            paused: false,
         };
         service
             .store
@@ -3128,6 +3230,7 @@ mod tests {
                     ceremony_url: None,
                     filled_fields: vec![],
                     outcome: None,
+                    paused: false,
                 },
                 "card",
                 "Fixture prior",
@@ -3181,6 +3284,7 @@ mod tests {
                     ceremony_url: None,
                     filled_fields: vec![],
                     outcome: None,
+                    paused: false,
                 },
                 "card",
                 "Fixture open approval",
@@ -3212,6 +3316,7 @@ mod tests {
                 ceremony_url: None,
                 filled_fields: vec!["given_name".into()],
                 outcome: None,
+                paused: false,
             };
             store
                 .insert(&status, "traveler", "Fixture passenger")
@@ -3219,6 +3324,44 @@ mod tests {
         }
         let store = Store::open(&path).unwrap();
         assert_eq!(store.get("fixture").unwrap().state, "disclosure_unknown");
+    }
+
+    #[test]
+    fn unlocked_traveler_expires_on_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("state.db");
+        {
+            let store = Store::open(&path).unwrap();
+            let status = Status {
+                operation_id: "unlocked-traveler".into(),
+                state: "unlocked".into(),
+                ceremony_url: Some("http://localhost/unlocked".into()),
+                filled_fields: vec!["given_name".into()],
+                outcome: None,
+                paused: false,
+            };
+            store
+                .insert(&status, "traveler", "Fixture passenger")
+                .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let status = store.get("unlocked-traveler").unwrap();
+        assert_eq!(status.state, "expired");
+        assert!(status.ceremony_url.is_none());
+    }
+
+    #[test]
+    fn payment_refusal_log_counts_errors_without_page_text() {
+        let attention = json!({
+            "errors": ["ada@example.test is invalid", "Name is required"],
+            "invalid": 1
+        });
+        let line = format!(
+            "payment refused over form errors: {}",
+            CheckoutService::form_error_count(&attention)
+        );
+        assert_eq!(line, "payment refused over form errors: 2");
+        assert!(!line.contains("ada@example.test"), "{line}");
     }
     #[tokio::test]
     async fn private_view_requires_one_shot_claim_and_handles_bank_popup() {
@@ -3260,6 +3403,7 @@ mod tests {
             ceremony_url: None,
             filled_fields: Vec::new(),
             outcome: None,
+            paused: false,
         };
         service.store.insert(&status, "card", "test").unwrap();
         let token = hex_token(&[42; 32]);
@@ -3492,6 +3636,7 @@ mod tests {
             ceremony_url: None,
             filled_fields: Vec::new(),
             outcome: None,
+            paused: false,
         };
         service.store.insert(&status, "card", "test").unwrap();
         let token = hex_token(&[44; 32]);
@@ -3570,6 +3715,7 @@ mod tests {
             ceremony_url: None,
             filled_fields: Vec::new(),
             outcome: None,
+            paused: false,
         };
         store.insert(&status, "card", "Two socks").unwrap();
         store
@@ -3623,6 +3769,7 @@ mod tests {
             ceremony_url: None,
             filled_fields: vec!["number".into(), "expiry".into(), "cvc".into()],
             outcome: None,
+            paused: false,
         };
         reopened.insert(&submitted, "card", "Flight").unwrap();
         let mut needs_input = submitted.clone();

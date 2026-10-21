@@ -102,6 +102,13 @@ pub struct Status {
     pub ceremony_url: Option<String>,
     pub filled_fields: Vec<String>,
     pub outcome: Option<Outcome>,
+    /// Checkout could not hand the browser back, so shopping stays paused.
+    #[serde(default, skip_serializing_if = "skip_false")]
+    pub paused: bool,
+}
+
+fn skip_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Clone, Deserialize, Serialize)]

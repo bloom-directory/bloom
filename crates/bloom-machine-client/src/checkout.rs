@@ -3,6 +3,11 @@ use serde_json::Value;
 use std::{path::PathBuf, time::Duration};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
+/// One checkout call may read attention, the shopping tab, and the payment page.
+/// The page read is tried three times. Each browser command waits 30 seconds,
+/// approval intake waits 15, and closing a refused page waits 10.
+const CHECKOUT_CALL_TIMEOUT: Duration = Duration::from_secs(30 * (2 + 2 + 3 * 3 + 2) + 15 + 10);
+
 /// The client cannot request screenshots, selectors, card fields, or private URLs.
 #[derive(Clone)]
 pub struct CheckoutClient {
@@ -18,7 +23,7 @@ impl CheckoutClient {
         }
     }
     pub async fn call(&self, request: &Request) -> Result<Value, String> {
-        tokio::time::timeout(Duration::from_secs(45), self.exchange(request))
+        tokio::time::timeout(CHECKOUT_CALL_TIMEOUT, self.exchange(request))
             .await
             .map_err(|_| "Checkout response timed out; inspect status before retrying".to_owned())?
     }
@@ -132,5 +137,31 @@ mod tests {
             .unwrap_err(),
             "Stale element reference; request a new snapshot"
         );
+    }
+
+    #[tokio::test]
+    async fn slow_checkout_response_is_delivered() {
+        use std::os::unix::fs::MetadataExt;
+        let root = tempfile::tempdir().unwrap().keep();
+        let socket = root.join("api.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let uid = socket.metadata().unwrap().uid();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut input = String::new();
+            let _ = BufReader::new(reader).read_line(&mut input).await;
+            // A slow page read. A paused clock skips this socket read.
+            tokio::time::sleep(Duration::from_secs(46)).await;
+            let _ = writer
+                .write_all(b"{\"operation_id\":\"ab\",\"state\":\"requested\",\"ceremony_url\":null,\"filled_fields\":[],\"outcome\":null}\n")
+                .await;
+        });
+        let result = CheckoutClient::new(socket, uid)
+            .call(&Request::Status {
+                operation_id: "ab".into(),
+            })
+            .await;
+        assert!(result.is_ok(), "{result:?}");
     }
 }

@@ -570,6 +570,11 @@ impl Browser {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) async fn lose_shopping_context(&self) {
+        self.tab.lock().await.context = "missing-context".into();
+    }
+
     /// Discards the checkout's browsing context, including cookies and storage
     /// the merchant kept, so shopping never reopens a private session and may
     /// return to the booking site.
