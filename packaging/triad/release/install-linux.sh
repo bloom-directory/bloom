@@ -1653,11 +1653,7 @@ case "$action" in
 
     mkdir -p "$installed_config_root"
     chmod 0711 "$installed_config_root"
-    machine_environment="$installed_config_root/.machine-env.source.$$"
-    printf 'BLOOM_NFS_LISTEN=127.0.0.1:%s\nBLOOM_RELEASE_DIGEST=%s\n' \
-      "$nfs_port" "$release_digest" > "$machine_environment"
-    atomic_install "$machine_environment" "$installed_config_root/machine.env" 0644
-    rm -f -- "$machine_environment"
+    write_linux_machine_environment "$root" "$login_uid" "$nfs_port" "$release_digest"
     install_linux_mount_authorization \
       "$root" "$login_uid" "$login_gid" "$login_home" "$nfs_port"
 

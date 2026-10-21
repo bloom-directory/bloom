@@ -4035,7 +4035,11 @@ fn linux_upgrade_failure_restores_the_previous_unit_contract_before_restart() {
     assert!(enrollment.contains("\"state\":\"active\""));
     assert_eq!(
         fs::read_to_string(root.join("etc/bloom/1000/machine.env")).unwrap(),
-        format!("BLOOM_NFS_LISTEN=127.0.0.1:20000\nBLOOM_RELEASE_DIGEST={old_digest}\n")
+        format!(
+            "BLOOM_CHECKOUT_SOCKET=/run/bloom/1000/checkout/rpc/checkout.sock\n\
+             BLOOM_CHECKOUT_UID=65533\n\
+             BLOOM_NFS_LISTEN=127.0.0.1:20000\nBLOOM_RELEASE_DIGEST={old_digest}\n"
+        )
     );
     assert!(
         fs::read_to_string(root.join("etc/bloom/1000/broker/config.json"))
