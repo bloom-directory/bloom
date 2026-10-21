@@ -60,6 +60,31 @@ impl PetalHost for VenueFixture {
                     authorization.payloads[0].claimed_hash,
                 ))
                 .unwrap();
+            let prepared: serde_json::Value = serde_json::from_slice(
+                authorization
+                    .action
+                    .as_ref()
+                    .expect("auth keeps its prepared record"),
+            )
+            .unwrap();
+            let prepared = &prepared[0];
+            assert_eq!(
+                prepared["preimage"]["timestamp"].as_u64(),
+                Some(self.timestamp.load(Ordering::SeqCst))
+            );
+            assert_eq!(prepared["preimage"]["nonce"].as_u64(), Some(0));
+            assert!(
+                prepared["owner"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<alloy::primitives::Address>()
+                    .unwrap()
+                    == owner
+            );
+            assert!(
+                prepared["signing_preimage_hex"].as_str().unwrap()
+                    == hex::encode(&authorization.payloads[0].preimage)
+            );
             let header = |name: &str| {
                 let values = request
                     .headers
