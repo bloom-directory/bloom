@@ -76,13 +76,6 @@ capture_failure_evidence() {
       > "$evidence_dir/$service-launchctl.txt" 2>&1 || true
     chmod 0644 "$evidence_dir/$service-launchctl.txt" 2>/dev/null || true
   done
-  # Machine's packaged startup mounts its VFS before exposing IPC. Retain
-  # native mount diagnostics when that step prevents authenticated health.
-  /sbin/mount > "$evidence_dir/mounts.txt" 2>&1 || true
-  /usr/bin/nfsstat -m > "$evidence_dir/nfs-mounts.txt" 2>&1 || true
-  /usr/bin/log show --last 5m --style compact \
-    --predicate 'process == "mount_nfs"' \
-    > "$evidence_dir/mount-nfs.log" 2>&1 || true
   launchctl print "user/$login_uid/com.bloom.session" \
     > "$evidence_dir/session-launchctl.txt" 2>&1 || true
   chmod 0644 "$evidence_dir/session-launchctl.txt" 2>/dev/null || true

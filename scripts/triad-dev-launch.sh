@@ -349,7 +349,7 @@ if [ ! -f "${config_dir}/edge-manifest.json" ]; then
   chmod 0700 "$config_dir"
   "$bloom_bin" init triad-render-developer-enrollment \
     "$template_dir" "$config_dir" "$release_digest"
-  # Preserve generated scratch for inspection; no recursive cleanup in this launcher.
+  rm -rf -- "$template_dir"
 fi
 
 if [ ! -e "$authority_edge_history" ]; then
@@ -567,7 +567,10 @@ cleanup() {
     if [ -n "$pid" ]; then wait "$pid" 2>/dev/null || true; fi
   done
   rm -f -- "$machine_socket"
-  printf 'preserved developer runtime: %s\n' "$runtime_dir" >&2
+  case "$runtime_dir" in
+    "${developer_root}/runtime."*) rm -rf -- "$runtime_dir" ;;
+    *) printf 'refusing to remove unexpected runtime: %s\n' "$runtime_dir" >&2 ;;
+  esac
   exit "$status"
 }
 trap cleanup EXIT INT TERM HUP

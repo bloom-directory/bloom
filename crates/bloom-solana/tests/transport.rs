@@ -5,7 +5,7 @@
 use bloom_proto::EndpointSpec;
 use bloom_solana::{SolanaClient, SolanaRpcError, SolanaSpec};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A stub JSON-RPC server that answers a fixed set of methods.
 async fn spawn_stub() -> String {
@@ -338,7 +338,7 @@ async fn connection_errors_never_expose_url_credentials() {
 async fn retries_transient_http_failures() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let failures = Arc::new(AtomicI64::new(2));
+    let failures = Arc::new(AtomicU64::new(2));
     tokio::spawn(async move {
         loop {
             let Ok((mut socket, _)) = listener.accept().await else {
@@ -349,9 +349,8 @@ async fn retries_transient_http_failures() {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 let mut buf = vec![0u8; 8192];
                 let _ = socket.read(&mut buf).await.unwrap_or(0);
-                #[allow(deprecated)]
                 let remaining =
-                    failures.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
+                    failures.try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
                 let body = if remaining.is_ok() && remaining.unwrap() > 0 {
                     "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_string()
                 } else {
