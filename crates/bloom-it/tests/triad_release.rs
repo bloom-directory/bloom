@@ -5122,3 +5122,19 @@ fn linux_legacy_interrupted_upgrade_recovers_without_operator_intervention() {
         )
     );
 }
+#[test]
+fn macos_conformance_installs_checkout_browser_in_every_job() {
+    for name in [
+        "macos-unix-conformance.yml",
+        "macos-two-login-conformance.yml",
+    ] {
+        let workflow =
+            fs::read_to_string(workspace().join(".github/workflows").join(name)).unwrap();
+        for job in workflow.split("    runs-on:").skip(1) {
+            let chrome = job
+                .find("brew install --cask google-chrome")
+                .expect("each macOS job needs Chrome");
+            assert!(chrome < job.find("- name: Install Rust toolchain").unwrap());
+        }
+    }
+}

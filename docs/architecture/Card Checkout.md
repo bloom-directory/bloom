@@ -133,8 +133,10 @@ the approved total and the current status, so an agent can avoid buying twice.
 
 Card checkout is a custody ceremony, not a signing approval. Each card
 ceremony consumes one passkey approval for one operation; the release is bound
-to the operation ID and the recipient key, and the recipient key is discarded
-after one use. Nothing persists a PRF output, CVC, or reusable grant.
+to the operation ID and the recipient key. Signer permits one release per
+operation ID. Checkout generates a fresh recipient key for each operation and
+discards it after one use; Signer does not prevent recipient-key reuse across
+different operation IDs. Nothing persists a PRF output, CVC, or reusable grant.
 
 ## Limits
 

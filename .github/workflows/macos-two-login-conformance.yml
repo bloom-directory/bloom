@@ -92,6 +92,13 @@ jobs:
           repository: bloom-directory/bloom-signer
           ref: ${{ inputs.signer_ref || '47bd08b4d5c612335f7ae146917ed2004135fa10' }}
           path: bloom-signer
+      - name: Install checkout browser
+        shell: bash
+        run: |
+          if [[ ! -x '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' ]]; then
+            brew install --cask google-chrome
+          fi
+
       - name: Install Rust toolchain
         run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
 
