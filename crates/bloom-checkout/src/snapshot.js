@@ -32,7 +32,7 @@
     || (field(e) ? caption(e) || e.name : pictured(e)) || '').replace(/\s+/g, ' ').trim();
   // Card and password values never leave the page; checkout redacts saved
   // traveler values before the agent reads anything else.
-  const secret = e => BLOOM_CARD_SECRET(e, label(e));
+  const secret = BLOOM_CARD_SECRET;
   // Labels toggle their (often restyled and hidden) radio or checkbox.
   const control = e => e.matches(native) || (e.tagName === 'LABEL' && e.control);
   const candidates = [...document.querySelectorAll('body *')].filter(e =>
@@ -57,7 +57,7 @@
     label: label(e).slice(0, 200),
     context: context(e),
     type: e.type || null,
-    value: field(e) && e.type !== 'checkbox' && e.type !== 'radio' && !secret(e) ? String(e.value).slice(0, 200) : undefined,
+    value: field(e) && e.type !== 'checkbox' && e.type !== 'radio' && !secret(e, label(e)) ? String(e.value).slice(0, 200) : undefined,
     checked: e.type === 'checkbox' || e.type === 'radio' ? e.checked : undefined,
     options: e.tagName === 'SELECT' ? [...e.options].map(o => ({value: o.value, label: o.text})) : undefined
   }));
