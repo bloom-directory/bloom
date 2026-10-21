@@ -86,7 +86,7 @@ pub struct HistoryEntry {
     /// The total the human approved, when Bloom read one.
     pub total_minor: Option<u64>,
     pub currency: Option<String>,
-    pub status: Option<Status>,
+    pub status: Status,
 }
 
 #[derive(Clone, Deserialize, Serialize)]

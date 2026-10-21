@@ -1,4 +1,5 @@
 use crate::browser::PrivateTab;
+use crate::cdp::Cdp;
 use anyhow::{Context, Result, bail};
 use bloom_signer_api::CheckoutFacts;
 use serde::{Deserialize, Serialize};
@@ -91,13 +92,81 @@ const MERCHANT_CARD_ORIGINS: &[&str] = &[
 ];
 
 fn provider_hosts_card_fields(frame_origin: &str, top_origin: &str, fixture: bool) -> bool {
-    PROVIDER_FIELD_ORIGINS.contains(&frame_origin)
+    let known = PROVIDER_FIELD_ORIGINS.contains(&frame_origin)
         || (frame_origin == top_origin
             && (PROVIDER_PAGE_ORIGINS.contains(&frame_origin)
-                || MERCHANT_CARD_ORIGINS.contains(&frame_origin)))
-        || (fixture
-            && url::Url::parse(frame_origin)
-                .is_ok_and(|u| matches!(u.host_str(), Some("localhost" | "127.0.0.1"))))
+                || MERCHANT_CARD_ORIGINS.contains(&frame_origin)));
+    // Local fixture merchants are a test seam. Release builds never treat
+    // localhost as a payment provider.
+    #[cfg(test)]
+    let fixture_host = fixture
+        && url::Url::parse(frame_origin)
+            .is_ok_and(|u| matches!(u.host_str(), Some("localhost" | "127.0.0.1")));
+    #[cfg(not(test))]
+    let fixture_host = {
+        let _ = fixture;
+        false
+    };
+    known || fixture_host
+}
+
+/// Read the already-received Stripe bootstrap, never initialize a second
+/// Checkout Session. Bind it to this exact frame and document loader.
+pub(crate) async fn hosted_stripe_facts(
+    cdp: &Cdp,
+    session: &str,
+    frame: &str,
+    url: &str,
+) -> Result<Value> {
+    let url = url::Url::parse(url)?;
+    if url.origin().ascii_serialization() != "https://buy.stripe.com" {
+        bail!("Not a Stripe Payment Link");
+    }
+    let link = url.path().trim_start_matches('/');
+    let tree = cdp
+        .call(Some(session), "Page.getFrameTree", json!({}))
+        .await?;
+    let loader = tree["frameTree"]["frame"]["loaderId"]
+        .as_str()
+        .context("Missing checkout document identity")?;
+    let request = cdp
+        .processor_responses
+        .lock()
+        .iter()
+        .rev()
+        .find(|response| {
+            response.session == session
+                && response.frame == frame
+                && response.loader == loader
+                && response.link == link
+        })
+        .map(|response| response.request.clone())
+        .context("Missing current Stripe bootstrap")?;
+    let response = cdp
+        .call(
+            Some(session),
+            "Network.getResponseBody",
+            json!({"requestId":request}),
+        )
+        .await?;
+    if response["base64Encoded"] == true {
+        bail!("Unsupported Stripe bootstrap encoding");
+    }
+    let page: Value = serde_json::from_str(
+        response["body"]
+            .as_str()
+            .context("Missing Stripe bootstrap body")?,
+    )?;
+    if !matches!(page["mode"].as_str(), Some("payment" | "subscription"))
+        || !page["session_id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("cs_"))
+    {
+        bail!("Unbound Stripe checkout facts");
+    }
+    Ok(
+        json!({"total_minor":page["total_summary"]["due"],"currency":page["currency"].as_str().map(str::to_uppercase),"recurring":page["mode"]=="subscription","livemode":page["livemode"]}),
+    )
 }
 
 /// JPEG of the merchant's checkout page for the approval page, captured before
@@ -287,10 +356,8 @@ impl Discovery {
             if position == 0 {
                 top_origin = Some(origin.clone());
                 if origin == "https://buy.stripe.com" {
-                    let facts = tab
-                        .cdp
-                        .hosted_stripe_facts(&session, &context.frame_id, url)
-                        .await?;
+                    let facts =
+                        hosted_stripe_facts(&tab.cdp, &session, &context.frame_id, url).await?;
                     evaluate(tab,&session,world,format!("(()=>{{const facts={facts};if(globalThis.__bloomHostedStripeFacts){{if(JSON.stringify(globalThis.__bloomHostedStripeFacts)!==JSON.stringify(facts))throw Error('Facts changed');}}else Object.defineProperty(globalThis,'__bloomHostedStripeFacts',{{value:Object.freeze(facts),writable:false,configurable:false}});return true;}})()")).await?;
                 }
             }
@@ -350,11 +417,16 @@ impl Discovery {
         facts.origin = top_origin.context("Missing merchant origin")?;
         if frames.iter().any(|frame| {
             frame.fields.iter().any(|field| field.kind != "name")
-                && !provider_hosts_card_fields(
-                    &frame.origin,
-                    &facts.origin,
-                    tab.fixture_payment_hosts,
-                )
+                && !provider_hosts_card_fields(&frame.origin, &facts.origin, {
+                    #[cfg(test)]
+                    {
+                        tab.fixture_payment_hosts
+                    }
+                    #[cfg(not(test))]
+                    {
+                        false
+                    }
+                })
         }) {
             let found: Vec<String> = frames
                 .iter()
@@ -547,15 +619,14 @@ pub(crate) mod tests {
                 .call(Some(&tab.session), "Page.getFrameTree", json!({}))
                 .await
                 .unwrap();
-            let facts = tab
-                .cdp
-                .hosted_stripe_facts(
-                    &tab.session,
-                    tree["frameTree"]["frame"]["id"].as_str().unwrap(),
-                    "https://buy.stripe.com/test_28o7u4eQMcaUgWk8ww",
-                )
-                .await
-                .unwrap();
+            let facts = hosted_stripe_facts(
+                &tab.cdp,
+                &tab.session,
+                tree["frameTree"]["frame"]["id"].as_str().unwrap(),
+                "https://buy.stripe.com/test_28o7u4eQMcaUgWk8ww",
+            )
+            .await
+            .unwrap();
             assert_eq!(
                 facts["livemode"], false,
                 "Never fill or submit a live checkout in this test"

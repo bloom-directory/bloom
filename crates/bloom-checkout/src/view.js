@@ -47,7 +47,6 @@ document.getElementById('finish').addEventListener('click',()=>act({action:'fini
 const describe = state => ({
   submitted: 'Payment sent once. Waiting for the site to confirm it; do not click Pay again. Finish any bank or email check here.',
   needs_input: 'The site needs attention. A form error does not prove no charge. Check the merchant and your bank before attempting payment again.',
-  not_submitted: 'Bloom did not record a submission. Check the merchant and your bank before attempting payment again.',
   booked: 'The site confirmed the booking.' + (state.outcome?.order_id ? ` Booking code: ${state.outcome.order_id}.` : ' The booking code is in the confirmation email.'),
   paid: 'Done: the site confirmed the purchase.' + (state.outcome?.order_id ? ` Order code: ${state.outcome.order_id}.` : ''),
   declined: 'The payment was declined. Bloom will not try again.',

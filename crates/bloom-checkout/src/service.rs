@@ -1,3 +1,4 @@
+pub(crate) use crate::travelers::{derived_traveler_value, formatted_phone};
 use crate::{
     browser::{Browser, PrivateTab},
     discovery::Discovery,
@@ -116,22 +117,26 @@ impl Store {
         )?;
         let rows = query.query_map([], |r| {
             Ok((
-                HistoryEntry {
-                    created: r.get(0)?,
-                    kind: r.get(1)?,
-                    description: r.get(2)?,
-                    shop: r.get(3)?,
-                    total_minor: r.get(4)?,
-                    currency: r.get(5)?,
-                    status: None,
-                },
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
                 r.get::<_, String>(6)?,
             ))
         })?;
         rows.map(|row| {
-            let (mut entry, status) = row?;
-            entry.status = Some(serde_json::from_str(&status)?);
-            Ok(entry)
+            let (created, kind, description, shop, total_minor, currency, status) = row?;
+            Ok(HistoryEntry {
+                created,
+                kind,
+                description,
+                shop,
+                total_minor,
+                currency,
+                status: serde_json::from_str(&status)?,
+            })
         })
         .collect()
     }
@@ -205,9 +210,6 @@ struct UnlockedTraveler {
     expires: tokio::time::Instant,
 }
 
-// Nine passengers plus distinct payer, billing and booking contacts.
-const MAX_UNLOCKED_TRAVELERS: usize = 12;
-
 fn prune_travelers(
     travelers: &mut BTreeMap<String, UnlockedTraveler>,
     context: &str,
@@ -238,85 +240,6 @@ fn selected_traveler<'a>(
         .values()
         .next()
         .context("Unlock a saved traveler first")
-}
-
-/// Country calling codes, longest first, for numbers sites want without one.
-const CALLING_CODES: &[&str] = &[
-    "598", "595", "593", "591", "506", "507", "502", "503", "504", "505", "351", "353", "54", "55",
-    "56", "57", "58", "51", "52", "53", "34", "44", "49", "33", "39", "41", "31", "32", "61", "64",
-    "81", "82", "86", "91", "1", "7",
-];
-
-/// The saved phone in international format, grouped by the country's
-/// numbering plan ("+54 9 294 412-3456"), so a form's area-code and number
-/// fields can each take their part. None when the number does not parse.
-fn formatted_phone(raw: &str) -> Option<String> {
-    let number = phonenumber::parse(None, raw).ok()?;
-    phonenumber::is_valid(&number).then(|| {
-        number
-            .format()
-            .mode(phonenumber::Mode::International)
-            .to_string()
-    })
-}
-
-/// A saved value, or a form of it that booking forms ask for separately.
-fn derived_traveler_value(
-    values: &BTreeMap<String, zeroize::Zeroizing<String>>,
-    field: &str,
-) -> Option<zeroize::Zeroizing<String>> {
-    let date = |range: std::ops::Range<usize>| {
-        values
-            .get("born_on")
-            .and_then(|v| v.get(range))
-            .map(|s| zeroize::Zeroizing::new(s.to_owned()))
-    };
-    match field {
-        "phone_national" => {
-            let digits: String = values
-                .get("phone")?
-                .chars()
-                .filter(|c| c.is_ascii_digit())
-                .collect();
-            let international = values.get("phone")?.trim_start().starts_with('+');
-            let code = CALLING_CODES
-                .iter()
-                .find(|code| international && digits.starts_with(**code))
-                .map_or(0, |code| code.len());
-            Some(zeroize::Zeroizing::new(digits[code..].to_owned()))
-        }
-        "phone_area" | "phone_local" => {
-            let formatted = formatted_phone(values.get("phone")?)?;
-            let mut groups: Vec<&str> = formatted.split(' ').skip(1).collect();
-            if groups.first() == Some(&"9") && groups.len() > 2 {
-                groups.remove(0);
-            }
-            let area = groups.first()?.to_string();
-            let local: String = groups[1..]
-                .concat()
-                .chars()
-                .filter(|c| c.is_ascii_digit())
-                .collect();
-            Some(zeroize::Zeroizing::new(if field == "phone_area" {
-                area
-            } else {
-                local
-            }))
-        }
-        "born_on_year" => date(0..4),
-        "born_on_month" => date(5..7),
-        "born_on_day" => date(8..10),
-        "born_on_dmy" => {
-            let born = values.get("born_on")?;
-            Some(zeroize::Zeroizing::new(format!(
-                "{}/{}/{}",
-                born.get(8..10)?,
-                born.get(5..7)?,
-                born.get(0..4)?
-            )))
-        }
-        _ => values.get(field).cloned(),
-    }
 }
 
 struct CompletedView {
@@ -351,10 +274,7 @@ enum IntakeResponse {
         receipt: Option<Box<CustodyResult>>,
         output_aad: Option<CustodyOutputHpkeAad>,
     },
-    Error {
-        #[serde(rename = "message")]
-        _message: String,
-    },
+    Error,
 }
 
 impl CheckoutService {
@@ -389,9 +309,6 @@ impl CheckoutService {
             prune_travelers(&mut travelers, &context, &origin);
             if travelers.contains_key(&traveler_id) {
                 bail!("That traveler is already unlocked; select their traveler_id when filling");
-            }
-            if travelers.len() >= MAX_UNLOCKED_TRAVELERS {
-                bail!("This booking already has the maximum number of unlocked travelers");
             }
         }
         use rand::RngCore;
@@ -652,6 +569,11 @@ impl CheckoutService {
         if let Some(phone) = values.get("phone").and_then(|p| formatted_phone(p)) {
             values.insert("phone".into(), zeroize::Zeroizing::new(phone));
         }
+        for field in ["phone_national", "phone_area", "phone_local"] {
+            if let Some(part) = derived_traveler_value(&values, field) {
+                values.insert(field.into(), part);
+            }
+        }
         let filled = self
             .browser
             .fill_traveler(
@@ -685,10 +607,8 @@ impl CheckoutService {
         if view_port == 0 {
             bail!("Private view port must be explicit");
         }
-        let runtime =
-            tokio::runtime::Handle::try_current().context("Checkout needs an async runtime")?;
         let store = Store::open(state)?;
-        let service = Arc::new(Self {
+        Ok(Arc::new(Self {
             browser,
             store,
             private: AsyncMutex::new(None),
@@ -698,23 +618,7 @@ impl CheckoutService {
             broker_socket,
             broker_uid,
             view_port,
-        });
-        let weak = Arc::downgrade(&service);
-        runtime.spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                let Some(service) = weak.upgrade() else {
-                    break;
-                };
-                let now = tokio::time::Instant::now();
-                service
-                    .travelers
-                    .lock()
-                    .await
-                    .retain(|_, record| now < record.expires);
-            }
-        });
-        Ok(service)
+        }))
     }
 
     async fn intake(&self, request: Value) -> Result<IntakeResponse> {
@@ -738,7 +642,7 @@ impl CheckoutService {
             bail!("Checkout authorization response exceeds limit");
         }
         let response: IntakeResponse = serde_json::from_str(&line)?;
-        if let IntakeResponse::Error { .. } = response {
+        if let IntakeResponse::Error = response {
             bail!("Checkout authorization request rejected");
         }
         Ok(response)
@@ -2083,13 +1987,8 @@ mod tests {
             .get_mut("person-one")
             .unwrap()
             .expires = tokio::time::Instant::now();
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while service.travelers.lock().await.contains_key("person-one") {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("expired record was not erased without another fill request");
+        assert!(service.fill_traveler(Some("person-one")).await.is_err());
+        assert!(!service.travelers.lock().await.contains_key("person-one"));
         assert_eq!(service.travelers.lock().await.len(), 1);
         service.return_control().await.unwrap();
         assert!(service.travelers.lock().await.is_empty());
@@ -3153,7 +3052,7 @@ mod tests {
             (entry.total_minor, entry.currency.as_deref()),
             (Some(1250), Some("EUR"))
         );
-        assert_eq!(entry.status.as_ref().unwrap().state, "disclosure_unknown");
+        assert_eq!(entry.status.state, "disclosure_unknown");
         let submitted = Status {
             operation_id: "submitted-operation".into(),
             state: "submitted".into(),

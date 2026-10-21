@@ -11,6 +11,12 @@
   for (const mapping of order) {
   try {
     const e=binding.refs[mapping.index];
+    // choose is decided from the element before the readonly guard: a site
+    // list is often a read-only input that checkout already opened.
+    if (mapping.choose && e) {
+      mapping.choice = e.tagName === 'INPUT';
+      mapping.listOpen = mapping.choice;
+    }
     if (!e?.isConnected || e.ownerDocument !== document || e.disabled || (e.readOnly && !mapping.choice) || !e.getClientRects().length
         || (e.autocomplete || '').split(' ').some(s=>s.startsWith('cc-')) || e.type === 'password') throw Error('Traveler field changed');
     let value=values[mapping.field];
@@ -28,24 +34,20 @@
     if (mapping.field === 'gender') aliases.push(...(value === 'female' ? ['F','Femenino','Mujer'] : value === 'male' ? ['M','Masculino','Hombre'] : ['Unspecified','No especificado']));
     if (mapping.field === 'document_kind') aliases.push(...(value === 'passport' ? ['Passport','Pasaporte'] : ['National ID','DNI','Documento nacional']));
     if (mapping.field === 'phone' && mapping.part) {
-      // Split by how the number was saved: "+54 9 11 2345-6789" is country,
-      // mobile prefix, area and local number.
-      const groups = value.trim().split(/[\s.-]+/).map(g=>g.replace(/\D/g,'')).filter(Boolean);
-      if (value.trim().startsWith('+')) groups.shift();
-      if (groups[0] === '9' && groups.length > 2) groups.shift();
-      if (groups.length < 2) throw new Skip('phone saved without an area code group');
-      value = mapping.part === 'area' ? groups[0] : groups.slice(1).join('');
-    } else if (mapping.field === 'phone' && value.startsWith('+')) {
+      value = mapping.part === 'area' ? values.phone_area : values.phone_local;
+      if (typeof value !== 'string' || value === '') throw new Skip('phone saved without an area code group');
+      aliases = [value];
+    } else if (mapping.field === 'phone' && typeof values.phone_national === 'string') {
       // A country prefix shown by a neighbouring field ("Argentina (+54)")
-      // means the number goes in without it.
+      // means the number goes in without it. The split was made in checkout.
       for (let a = e.parentElement, depth = 0; a && depth < 4; a = a.parentElement, depth++) {
         const shown = [...a.querySelectorAll('input,select')].filter(o => o !== e)
           .map(o => o.tagName === 'SELECT' ? o.selectedOptions[0]?.text : o.value).join(' ') + ' ' + a.innerText;
-        const code = shown.match(/\(\+?(\d{1,3})\)|(?:^|\s)\+(\d{1,3})\b/);
-        if (!code) continue;
-        const digits = code[1] || code[2];
-        if (value.replace(/[^\d+]/g,'').startsWith('+' + digits)) value = value.replace(/[^\d+]/g,'').slice(digits.length + 1);
-        break;
+        if (/\(\+?\d{1,3}\)|\+\d{1,3}\b/.test(shown)) {
+          value = values.phone_national;
+          aliases = [value];
+          break;
+        }
       }
     }
     const spanish = /^es/i.test(document.documentElement.lang || navigator.language);

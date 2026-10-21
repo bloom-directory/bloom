@@ -35,6 +35,7 @@ pub struct Browser {
     cdp: Arc<Cdp>,
     tab: Mutex<Tab>,
     revoked: AtomicBool,
+    #[cfg(test)]
     fixture_payment_hosts: bool,
     /// Unlocked traveler values and their placeholders, removed from snapshots.
     redactions: std::sync::RwLock<Vec<(zeroize::Zeroizing<String>, String)>>,
@@ -46,7 +47,8 @@ pub(crate) struct PrivateTab {
     pub cdp: Arc<Cdp>,
     pub session: String,
     pub target: String,
-    /// Local fixture merchants count as payment providers (test TLS mode only).
+    /// Local fixture merchants count as payment providers (tests only).
+    #[cfg(test)]
     pub fixture_payment_hosts: bool,
 }
 
@@ -83,8 +85,8 @@ impl Browser {
         prefs["credentials_enable_service"] = json!(false);
         prefs["profile"]["password_manager_enabled"] = json!(false);
         std::fs::write(path, serde_json::to_vec(&prefs)?)?;
-        // Fixture TLS mode (developer harness and tests only) also accepts card
-        // fields served by local fixture merchants.
+        // Tests accept card fields served by local fixture merchants.
+        #[cfg(test)]
         let fixture_payment_hosts = test_flags
             .iter()
             .any(|f| f == "--ignore-certificate-errors");
@@ -93,6 +95,7 @@ impl Browser {
         Ok(Arc::new(Self {
             cdp,
             tab: Mutex::new(tab),
+            #[cfg(test)]
             fixture_payment_hosts,
             revoked: AtomicBool::new(false),
             redactions: std::sync::RwLock::new(Vec::new()),
@@ -369,52 +372,27 @@ impl Browser {
             )
             .await?;
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-        let expression = format!(
-            "(()=>{{const e=globalThis.__bloomRefs?.[{}];if(!e?.isConnected)throw Error('stale');\
-            globalThis.__bloomTravelerRefs={{document,refs:[e],nonce:'choose'}};\
-            const nonce='choose',origin=location.origin,mapped=[{{field:{},choice:e.tagName==='INPUT',listOpen:e.tagName==='INPUT',index:0}}],values={};\
-            return {};}})()",
+        let view = PrivateTab {
+            cdp: self.cdp.clone(),
+            session: binding.session.clone(),
+            target: tab.target.clone(),
+            #[cfg(test)]
+            fixture_payment_hosts: self.fixture_payment_hosts,
+        };
+        let filled = crate::travelers::TravelerDiscovery::fill_opened(
+            &view,
+            &binding.session,
+            binding.world,
             binding.index,
-            serde_json::to_string(field)?,
-            serde_json::to_string(&json!({ field: value }))?,
-            include_str!("traveler-fill.js")
-        );
-        let result = self
-            .cdp
-            .call(
-                Some(&binding.session),
-                "Runtime.evaluate",
-                json!({"contextId":binding.world,"expression":expression,
-                    "returnByValue":true,"awaitPromise":true,"userGesture":true}),
-            )
-            .await?;
-        // Field name and fixed reason only, for diagnosing site lists.
-        for skipped in result["result"]["value"]["skipped"]
-            .as_array()
-            .into_iter()
-            .flatten()
-        {
-            eprintln!(
-                "traveler choice not taken: {}",
-                skipped.as_str().unwrap_or("")
-            );
-        }
-        if let Some(details) = result.get("exceptionDetails") {
-            eprintln!(
-                "traveler choice failed: {}",
-                details["exception"]["description"]
-                    .as_str()
-                    .unwrap_or("")
-                    .lines()
-                    .next()
-                    .unwrap_or("")
-            );
-        }
-        if result.get("exceptionDetails").is_some()
-            || !result["result"]["value"]["filled"]
-                .as_array()
-                .is_some_and(|f| f.iter().any(|f| f == field))
-        {
+            field,
+            value,
+            origin,
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("That list did not take the saved value; choose it in the private view")
+        })?;
+        if !filled.iter().any(|filled_field| filled_field == field) {
             bail!("That list did not take the saved value; choose it in the private view");
         }
         Ok(())
@@ -437,6 +415,7 @@ impl Browser {
             cdp: self.cdp.clone(),
             session: tab.session.clone(),
             target: tab.target.clone(),
+            #[cfg(test)]
             fixture_payment_hosts: self.fixture_payment_hosts,
         };
         tab.refs.clear();
@@ -561,6 +540,7 @@ impl Browser {
             cdp: self.cdp.clone(),
             session: tab.session.clone(),
             target: tab.target.clone(),
+            #[cfg(test)]
             fixture_payment_hosts: self.fixture_payment_hosts,
         })
     }

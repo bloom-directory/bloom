@@ -13,6 +13,85 @@ pub(crate) struct TravelerDiscovery {
     mapped: Value,
 }
 
+/// Country calling codes, longest first, for numbers sites want without one.
+const CALLING_CODES: &[&str] = &[
+    "598", "595", "593", "591", "506", "507", "502", "503", "504", "505", "351", "353", "54", "55",
+    "56", "57", "58", "51", "52", "53", "34", "44", "49", "33", "39", "41", "31", "32", "61", "64",
+    "81", "82", "86", "91", "1", "7",
+];
+
+/// The saved phone in international format, grouped by the country's
+/// numbering plan ("+54 9 294 412-3456"), so a form's area-code and number
+/// fields can each take their part. None when the number does not parse.
+pub(crate) fn formatted_phone(raw: &str) -> Option<String> {
+    let number = phonenumber::parse(None, raw).ok()?;
+    phonenumber::is_valid(&number).then(|| {
+        number
+            .format()
+            .mode(phonenumber::Mode::International)
+            .to_string()
+    })
+}
+
+/// A saved value, or a form of it that booking forms ask for separately.
+pub(crate) fn derived_traveler_value(
+    values: &BTreeMap<String, Zeroizing<String>>,
+    field: &str,
+) -> Option<Zeroizing<String>> {
+    let date = |range: std::ops::Range<usize>| {
+        values
+            .get("born_on")
+            .and_then(|v| v.get(range))
+            .map(|s| Zeroizing::new(s.to_owned()))
+    };
+    match field {
+        "phone_national" => {
+            let digits: String = values
+                .get("phone")?
+                .chars()
+                .filter(|c| c.is_ascii_digit())
+                .collect();
+            let international = values.get("phone")?.trim_start().starts_with('+');
+            let code = CALLING_CODES
+                .iter()
+                .find(|code| international && digits.starts_with(**code))
+                .map_or(0, |code| code.len());
+            Some(Zeroizing::new(digits[code..].to_owned()))
+        }
+        "phone_area" | "phone_local" => {
+            let formatted = formatted_phone(values.get("phone")?)?;
+            let mut groups: Vec<&str> = formatted.split(' ').skip(1).collect();
+            if groups.first() == Some(&"9") && groups.len() > 2 {
+                groups.remove(0);
+            }
+            let area = groups.first()?.to_string();
+            let local: String = groups[1..]
+                .concat()
+                .chars()
+                .filter(|c| c.is_ascii_digit())
+                .collect();
+            Some(Zeroizing::new(if field == "phone_area" {
+                area
+            } else {
+                local
+            }))
+        }
+        "born_on_year" => date(0..4),
+        "born_on_month" => date(5..7),
+        "born_on_day" => date(8..10),
+        "born_on_dmy" => {
+            let born = values.get("born_on")?;
+            Some(Zeroizing::new(format!(
+                "{}/{}/{}",
+                born.get(8..10)?,
+                born.get(5..7)?,
+                born.get(0..4)?
+            )))
+        }
+        _ => values.get(field).cloned(),
+    }
+}
+
 async fn evaluate(
     tab: &PrivateTab,
     session: &str,
@@ -131,13 +210,66 @@ impl TravelerDiscovery {
             })
             .collect()
     }
+    /// Fill one list the agent already opened. The page decides whether the
+    /// control is a typed combobox; checkout does not format the fill script.
+    pub async fn fill_opened(
+        tab: &PrivateTab,
+        session: &str,
+        world: i64,
+        index: usize,
+        field: &str,
+        value: &str,
+        origin: &str,
+    ) -> Result<Vec<String>> {
+        use rand::RngCore;
+        let mut nonce = [0; 32];
+        rand::thread_rng().fill_bytes(&mut nonce);
+        let binding = Digest32::from_bytes(nonce);
+        let field_name: TravelerField = serde_json::from_value(json!(field))
+            .context("That saved traveler field is not available")?;
+        let prelude = format!(
+            "(()=>{{const e=globalThis.__bloomRefs?.[{index}];if(!e?.isConnected)throw Error('stale');globalThis.__bloomTravelerRefs={{document,refs:[e],nonce:{}}};return true;}})()",
+            serde_json::to_string(binding.as_str())?
+        );
+        evaluate(tab, session, world, prelude).await?;
+        let discovery = Self {
+            scope: TravelerFillScope {
+                origin: origin.to_owned(),
+                frame_origins: vec![origin.to_owned()],
+                document_binding: binding,
+                fields: vec![field_name],
+            },
+            session: session.to_owned(),
+            world,
+            mapped: json!([{ "field": field, "choose": true, "index": 0 }]),
+        };
+        let mut values = BTreeMap::new();
+        values.insert(field.to_owned(), Zeroizing::new(value.to_owned()));
+        discovery.fill(tab, &values).await
+    }
+
     pub async fn fill(
         &self,
         tab: &PrivateTab,
         values: &BTreeMap<String, Zeroizing<String>>,
     ) -> Result<Vec<String>> {
         let expected = self.field_names();
-        if values.len() != expected.len() || expected.iter().any(|f| !values.contains_key(f)) {
+        let derived = ["phone_national", "phone_area", "phone_local"];
+        let mut values = values.clone();
+        if values.contains_key("phone") {
+            for field in derived {
+                if !values.contains_key(field) {
+                    if let Some(part) = derived_traveler_value(&values, field) {
+                        values.insert(field.to_owned(), part);
+                    }
+                }
+            }
+        }
+        if expected.iter().any(|field| !values.contains_key(field))
+            || values
+                .keys()
+                .any(|key| !expected.contains(key) && !derived.contains(&key.as_str()))
+        {
             bail!("Traveler release field mismatch");
         }
         let expression = format!(
@@ -145,7 +277,7 @@ impl TravelerDiscovery {
             serde_json::to_string(self.scope.document_binding.as_str())?,
             serde_json::to_string(&self.scope.origin)?,
             self.mapped,
-            serde_json::to_string(values)?,
+            serde_json::to_string(&values)?,
             include_str!("traveler-fill.js")
         );
         let result = evaluate(tab, &self.session, self.world, expression).await?;
