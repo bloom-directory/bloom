@@ -76,7 +76,7 @@ impl PetalHost for VenueFixture {
             assert!(header("POLY_TIMESTAMP") == self.timestamp.load(Ordering::SeqCst).to_string());
             assert!(header("POLY_SIGNATURE") == format!("0x{}", hex::encode(&signatures[0])));
             self.auth_posts.fetch_add(1, Ordering::SeqCst);
-            br#"{"apiKey":"disposable-fixture","secret":"Zml4dHVyZQ==","passphrase":"disposable-fixture"}"#.to_vec()
+            include_bytes!("../../tests/fixtures/polymarket-credentials.json").to_vec()
         } else if request
             .url
             .starts_with("https://relayer-v2.polymarket.com/nonce?")
