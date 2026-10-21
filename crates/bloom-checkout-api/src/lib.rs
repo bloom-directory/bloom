@@ -68,6 +68,11 @@ pub enum Request {
     Cancel {
         operation_id: String,
     },
+    /// The person checked an unresolved shop with the merchant or bank.
+    /// The body is ignored. Refused while approval is still open.
+    Resolve {
+        operation_id: String,
+    },
     /// The 50 most recent checkout requests, newest first.
     History,
 }
@@ -108,6 +113,9 @@ pub struct Outcome {
     pub order_id: Option<String>,
     pub merchant_reported_total_minor: Option<u64>,
     pub currency: Option<String>,
+    /// Set when a person marks an unresolved result checked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]

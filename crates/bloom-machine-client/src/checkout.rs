@@ -63,6 +63,9 @@ impl CheckoutClient {
                     .map(|e| e.error.chars().take(200).collect())
                     .unwrap_or_else(|| "Checkout browsing is unavailable".into())),
             },
+            Request::Resolve { .. } => serde_json::from_str::<Status>(&line)
+                .and_then(serde_json::to_value)
+                .map_err(|_| "Checkout request rejected; inspect status before retrying".into()),
             Request::History => serde_json::from_str::<Vec<HistoryEntry>>(&line)
                 .and_then(serde_json::to_value)
                 .map_err(|_| "Checkout history unavailable".into()),

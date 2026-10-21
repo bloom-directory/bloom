@@ -109,5 +109,7 @@ Do not infer a charge outcome from a form error, timeout or closing the view.
 Older `not_submitted` records are also ambiguous and become `uncertain` on
 restart. `partially_filled`, `disclosure_unknown`, and `uncertain` require
 human inspection; never repeat the purchase automatically. Ask the human to
-check the merchant account or confirmation email. After private checkout
+check the merchant account or confirmation email, then write
+`checkout/requests/<operation_id>/resolve`. The file ignores the body. Bloom
+refuses another checkout at that shop until that write. After private checkout
 closes, shopping resumes on a fresh tab.

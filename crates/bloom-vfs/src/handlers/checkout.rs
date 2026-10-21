@@ -313,6 +313,10 @@ impl Handler for CheckoutHandler {
                 operation(id)?;
                 Ok(Entry::writable_file(s[2]))
             }
+            ["requests", id, "resolve"] => {
+                operation(id)?;
+                Ok(Entry::writable_file("resolve"))
+            }
             ["browse" | "requests", id, "out.json" | "status.json"] => {
                 operation(id)?;
                 Ok(Entry::file(s[2]))
@@ -435,6 +439,14 @@ impl Handler for CheckoutHandler {
                 .await?;
                 Ok(())
             }
+            ["requests", id, "resolve"] => {
+                operation(id)?;
+                self.call(Request::Resolve {
+                    operation_id: (*id).into(),
+                })
+                .await?;
+                Ok(())
+            }
             _ => Err(HandlerError::PermissionDenied),
         }
     }
@@ -466,6 +478,7 @@ impl Handler for CheckoutHandler {
                     Entry::writable_file("in.json"),
                     Entry::file("status.json"),
                     Entry::writable_file("cancel"),
+                    Entry::writable_file("resolve"),
                 ])
             }
             _ => Err(HandlerError::NotADir(path.to_string_path())),

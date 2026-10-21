@@ -103,6 +103,20 @@ impl Store {
         Ok(())
     }
     /// The shop and, when Bloom read one, the total the human approved.
+    fn unresolved(&self, shop: &str) -> Result<Option<String>> {
+        let conn = self.0.lock();
+        match conn.query_row(
+            "SELECT id FROM operations WHERE shop=?1 AND kind IN ('card','site') AND state IN \
+             ('submitted','needs_input','uncertain','disclosure_unknown','partially_filled','filled','release_started') \
+             LIMIT 1",
+            [shop],
+            |row| row.get(0),
+        ) {
+            Ok(id) => Ok(Some(id)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
     fn record_order(&self, id: &str, shop: Option<&str>, total: Option<(u64, &str)>) -> Result<()> {
         self.0.lock().execute(
             "UPDATE operations SET shop=?2,total_minor=?3,currency=?4 WHERE id=?1",
@@ -766,6 +780,15 @@ impl CheckoutService {
                     Mode::Site => "site",
                     Mode::TakeOver => "take_over",
                 };
+                if matches!(mode, Mode::Card | Mode::Site) {
+                    if let Ok((_, origin)) = self.browser.shopping_scope().await {
+                        if let Some(open) = self.store.unresolved(&origin)? {
+                            bail!(
+                                "{open}: ask the person to check the merchant or bank, then write resolve"
+                            );
+                        }
+                    }
+                }
                 self.store.insert(&status, kind, &agent_description)?;
                 let tab = self.browser.handoff().await?;
                 status.state = "preparing".into();
@@ -890,6 +913,49 @@ impl CheckoutService {
                 self.store.update(&status)?;
                 self.return_control().await?;
                 *private = None;
+                Ok(serde_json::to_value(status)?)
+            }
+            Request::Resolve { operation_id } => {
+                OperationId::new(&operation_id)
+                    .map_err(|_| anyhow::anyhow!("Invalid operation ID"))?;
+                if !matches!(self.store.kind(&operation_id)?.as_str(), "card" | "site") {
+                    bail!("That checkout has no unresolved result to check");
+                }
+                let mut status = self.store.get(&operation_id)?;
+                if matches!(status.state.as_str(), "requested" | "awaiting_approval") {
+                    bail!(
+                        "That checkout is still in progress; resolve is for a result the person must check"
+                    );
+                }
+                if !matches!(
+                    status.state.as_str(),
+                    "submitted"
+                        | "needs_input"
+                        | "uncertain"
+                        | "disclosure_unknown"
+                        | "partially_filled"
+                        | "filled"
+                        | "release_started"
+                ) {
+                    bail!("That checkout has no unresolved result to check");
+                }
+                let mut outcome = status
+                    .outcome
+                    .take()
+                    .unwrap_or(bloom_checkout_api::Outcome {
+                        state: "resolved".into(),
+                        source: "human".into(),
+                        confirmation_reached: false,
+                        order_id: None,
+                        merchant_reported_total_minor: None,
+                        currency: None,
+                        resolution: None,
+                    });
+                outcome.resolution = Some("human_checked".into());
+                status.state = "resolved".into();
+                status.ceremony_url = None;
+                status.outcome = Some(outcome);
+                self.store.update(&status)?;
                 Ok(serde_json::to_value(status)?)
             }
         }
@@ -2916,6 +2982,110 @@ mod tests {
         // Nothing was recorded or handed off: shopping goes on on the same page.
         assert!(service.store.get(&"c".repeat(64)).is_err());
         assert!(browser.browse(BrowseRequest::Snapshot).await.is_ok());
+        server.abort();
+    }
+    #[tokio::test]
+    async fn an_unresolved_shop_blocks_the_next_checkout_until_resolve() {
+        let (url, server) = crate::discovery::tests::fixture("<h1>Shop</h1>".into()).await;
+        let root = tempfile::tempdir().unwrap().keep();
+        let browser = Browser::launch(
+            &crate::test_chromium(),
+            &root.join("profile"),
+            &["--no-sandbox".into(), "--ignore-certificate-errors".into()],
+        )
+        .await
+        .unwrap();
+        browser.browse(BrowseRequest::Open { url }).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let service = CheckoutService::new(
+            browser.clone(),
+            &root.join("state.db"),
+            root.join("unused.sock"),
+            unsafe { libc::geteuid() },
+            47999,
+        )
+        .unwrap();
+        let (_, origin) = browser.shopping_scope().await.unwrap();
+        let prior = "a".repeat(64);
+        service
+            .store
+            .insert(
+                &Status {
+                    operation_id: prior.clone(),
+                    state: "uncertain".into(),
+                    ceremony_url: None,
+                    filled_fields: vec![],
+                    outcome: None,
+                },
+                "card",
+                "Fixture prior",
+            )
+            .unwrap();
+        service
+            .store
+            .record_order(&prior, Some(&origin), None)
+            .unwrap();
+        let blocked = service
+            .request(Request::Checkout {
+                operation_id: "b".repeat(64),
+                card_id: None,
+                agent_description: "Fixture again".into(),
+                take_over: false,
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            blocked.contains(&prior) && blocked.contains("write resolve"),
+            "{blocked}"
+        );
+        assert!(service.store.get(&"b".repeat(64)).is_err());
+        let resolved = service
+            .request(Request::Resolve {
+                operation_id: prior.clone(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(resolved["state"], "resolved");
+        assert_eq!(resolved["outcome"]["resolution"], "human_checked");
+        let again = service
+            .request(Request::Checkout {
+                operation_id: "c".repeat(64),
+                card_id: None,
+                agent_description: "Fixture after resolve".into(),
+                take_over: false,
+            })
+            .await
+            .unwrap();
+        assert_ne!(again["state"], "uncertain");
+        assert!(service.store.get(&"c".repeat(64)).is_ok());
+        let pending = "d".repeat(64);
+        service
+            .store
+            .insert(
+                &Status {
+                    operation_id: pending.clone(),
+                    state: "awaiting_approval".into(),
+                    ceremony_url: None,
+                    filled_fields: vec![],
+                    outcome: None,
+                },
+                "card",
+                "Fixture open approval",
+            )
+            .unwrap();
+        let refused = service
+            .request(Request::Resolve {
+                operation_id: pending.clone(),
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("still in progress"), "{refused}");
+        assert_eq!(
+            service.store.get(&pending).unwrap().state,
+            "awaiting_approval"
+        );
         server.abort();
     }
     #[test]
