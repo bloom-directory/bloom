@@ -3,6 +3,7 @@ pub mod browser;
 mod cdp;
 mod discovery;
 mod hpke;
+mod scripts;
 pub mod service;
 mod travelers;
 pub mod view;

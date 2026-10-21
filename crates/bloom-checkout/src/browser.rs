@@ -141,7 +141,7 @@ impl Browser {
                         continue;
                     }
                     let result=self.cdp.call(Some(&frame.session),"Runtime.evaluate",json!({
-                        "contextId":frame.world,"returnByValue":true,"expression":include_str!("snapshot.js")
+                        "contextId":frame.world,"returnByValue":true,"expression":crate::scripts::prepare(include_str!("snapshot.js"))
                     })).await?;
                     if result.get("exceptionDetails").is_some() {
                         bail!("Shopping document changed; request a new snapshot");
@@ -474,7 +474,7 @@ impl Browser {
         let world = binding.world;
         let expression = format!(
             "({})({index},{},{})",
-            include_str!("act.js"),
+            crate::scripts::prepare(include_str!("act.js")),
             serde_json::to_string(kind)?,
             serde_json::to_string(value)?
         );
@@ -486,7 +486,22 @@ impl Browser {
                 json!({"contextId":world,"expression":expression,"returnByValue":true,"userGesture":true}),
             )
             .await?;
-        if response.get("exceptionDetails").is_some() {
+        if let Some(details) = response.get("exceptionDetails") {
+            let description = details["exception"]["description"].as_str().unwrap_or("");
+            let text = details["text"].as_str().unwrap_or("");
+            let reason = if description.is_empty() {
+                text
+            } else {
+                description
+            };
+            if reason
+                .lines()
+                .next()
+                .unwrap_or("")
+                .contains("payment requires approval")
+            {
+                bail!("payment requires approval");
+            }
             bail!("Shopping document changed; request a new snapshot");
         }
         // Every action invalidates refs, including same-document replacement.
@@ -813,6 +828,67 @@ fn accessibility_text(tree: &Value) -> Result<String> {
 mod tests {
     use super::*;
     use axum::{Router, response::Html, routing::get};
+
+    #[tokio::test]
+    async fn comprar_and_kaufen_require_payment_approval() {
+        let root = tempfile::tempdir().unwrap();
+        let browser = Browser::launch(
+            &crate::test_chromium(),
+            &root.path().join("profile"),
+            &["--no-sandbox".into()],
+        )
+        .await
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let site = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/",
+                    get(|| async {
+                        Html("<button>Comprar</button><button>Kaufen</button><button>Continue</button>")
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        browser.browse(BrowseRequest::Open { url }).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+        let reference = |label: &str| {
+            snapshot["elements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|element| element["label"] == label)
+                .unwrap()["ref"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        for label in ["Comprar", "Kaufen"] {
+            let error = browser
+                .browse(BrowseRequest::Click {
+                    element_ref: reference(label),
+                })
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("payment requires approval"),
+                "{label}: {error}"
+            );
+        }
+        browser
+            .browse(BrowseRequest::Click {
+                element_ref: reference("Continue"),
+            })
+            .await
+            .unwrap();
+        site.abort();
+    }
 
     #[tokio::test]
     async fn opening_another_booking_on_the_same_origin_invalidates_traveler_scope() {

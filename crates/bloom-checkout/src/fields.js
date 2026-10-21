@@ -1,4 +1,5 @@
 (() => {
+  const secret = BLOOM_CARD_SECRET;
   const kind = e => {
     // Some sites caption a field with text beside it instead of a <label>.
     let caption = '';
@@ -15,8 +16,8 @@
     const autocomplete = e.autocomplete?.toLowerCase().split(' ').pop();
     const direct = {'cc-number':'number','cc-exp':'expiry','cc-exp-month':'month','cc-exp-year':'year','cc-csc':'cvc','cc-name':'name'};
     if (direct[autocomplete]) return direct[autocomplete];
-    if (/card.?number|cardnumber|numero de (la )?tarjeta|nro\.? de tarjeta/.test(label)) return 'number';
-    if (/cvc|cvv|security.?code|codigo de seguridad/.test(label)) return 'cvc';
+    if (secret(e, label) && /card.?number|cardnumber|numero de (la )?tarjeta|nro\.? de tarjeta/.test(label)) return 'number';
+    if (secret(e, label) && /cvc|cvv|security.?code|codigo de seguridad/.test(label)) return 'cvc';
     if (/expir.*month|vencimiento.*mes|^mes$/.test(label)) return 'month';
     if (/expir.*year|vencimiento.*ano|^ano$/.test(label)) return 'year';
     if (/expir|mm.?\/.?(yy|aa)|vencimiento|fecha de expiracion/.test(label)) return 'expiry';

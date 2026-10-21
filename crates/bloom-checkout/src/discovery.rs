@@ -258,8 +258,8 @@ pub(crate) enum Script<'a> {
 impl Script<'_> {
     fn expression(&self) -> Result<String> {
         Ok(match self {
-            Script::Facts => include_str!("facts.js").into(),
-            Script::Fields => include_str!("fields.js").into(),
+            Script::Facts => crate::scripts::prepare(include_str!("facts.js")),
+            Script::Fields => crate::scripts::prepare(include_str!("fields.js")),
             Script::Submit => include_str!("submit.js").into(),
             Script::Valid => format!("({})()", include_str!("payment-valid.js").trim()),
             Script::Fill {
@@ -1059,12 +1059,15 @@ pub(crate) mod tests {
         // An ordinary merchant cannot opt into the PCI exception by copying ids.
         assert!(
             tab.cdp
-                .evaluate(&tab.session, include_str!("fields.js").into())
+                .evaluate(
+                    &tab.session,
+                    crate::scripts::prepare(include_str!("fields.js"))
+                )
                 .await
                 .unwrap()
                 .is_null()
         );
-        let expression=include_str!("fields.js").replacen("(() => {", "(() => { const location={origin:'https://checkout.pci.shopifyinc.com',pathname:'/build/09497de/number-ltr.html'};",1);
+        let expression=crate::scripts::prepare(include_str!("fields.js")).replacen("(() => {", "(() => { const location={origin:'https://checkout.pci.shopifyinc.com',pathname:'/build/09497de/number-ltr.html'};",1);
         let fields = tab.cdp.evaluate(&tab.session, expression).await.unwrap();
         assert_eq!(fields, json!([{"kind":"number","index":0}]));
         assert_eq!(

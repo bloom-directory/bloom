@@ -1,0 +1,1 @@
+(e, label) => e.type === 'password' || /^cc-/.test((e.autocomplete || '').split(' ').at(-1)) || /card|tarjeta|cvc|cvv|security|seguridad|password|contrase/i.test(`${e.name || ''} ${e.id || ''} ${label || ''}`)

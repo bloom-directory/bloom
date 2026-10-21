@@ -1918,6 +1918,7 @@ const BROWSE_ERRORS: &[&str] = &[
     "Shopping document changed; request a new snapshot",
     "Invalid element reference",
     "Stale element reference; request a new snapshot",
+    "payment requires approval",
     "Input exceeds limit",
     "Checkout has private control; shopping is paused",
     "Saved traveler details are unlocked for another booking or website",

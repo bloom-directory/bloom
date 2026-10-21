@@ -32,8 +32,7 @@
     || (field(e) ? caption(e) || e.name : pictured(e)) || '').replace(/\s+/g, ' ').trim();
   // Card and password values never leave the page; checkout redacts saved
   // traveler values before the agent reads anything else.
-  const secret = e => e.type === 'password' || /^cc-/.test((e.autocomplete || '').split(' ').at(-1))
-    || /card|tarjeta|cvc|cvv|security|seguridad|password|contrase/i.test(`${e.name} ${e.id} ${label(e)}`);
+  const secret = e => BLOOM_CARD_SECRET(e, label(e));
   // Labels toggle their (often restyled and hidden) radio or checkbox.
   const control = e => e.matches(native) || (e.tagName === 'LABEL' && e.control);
   const candidates = [...document.querySelectorAll('body *')].filter(e =>
