@@ -1159,6 +1159,7 @@ impl CheckoutService {
                 status.state.as_str(),
                 "submitted"
                     | "needs_input"
+                    | "declined"
                     | "manual_required"
                     | "uncertain"
                     | "partially_filled"
@@ -1204,8 +1205,13 @@ impl CheckoutService {
                 let outcome = observed
                     .iter()
                     .find_map(|(is_top, outcome)| {
+                        let attempt = matches!(status.state.as_str(), "submitted" | "needs_input");
                         let terminal = match outcome["state"].as_str() {
-                            Some("booked" | "declined") => outcome["state"].as_str(),
+                            Some("booked") => Some("booked"),
+                            // Help text can say "payment failed" before anyone pays.
+                            Some("declined") if attempt || status.state == "declined" => {
+                                Some("declined")
+                            }
                             Some("payment_phrase") if *is_top && paid_allowed => Some("paid"),
                             _ => None,
                         }?;
@@ -1233,15 +1239,26 @@ impl CheckoutService {
                             status.ceremony_url = None;
                             let _ = self.store.update(&status);
                         }
+                    } else if state == "declined" {
+                        // Record the merchant decline and leave the pages up.
+                        if status.state != "declined" {
+                            status.state = "declined".into();
+                            status.outcome = serde_json::from_value((*outcome).clone()).ok();
+                            status.ceremony_url = None;
+                            let _ = self.store.update(&status);
+                        }
                     } else {
                         let mut recorded = (*outcome).clone();
                         if state == "paid" {
                             recorded["state"] = json!("paid");
                         }
+                        let close = matches!(status.state.as_str(), "submitted" | "needs_input");
                         status.state = state.into();
                         status.outcome = serde_json::from_value(recorded).ok();
                         status.ceremony_url = None;
-                        if self.store.update(&status).is_ok() && self.return_control().await.is_ok()
+                        if close
+                            && self.store.update(&status).is_ok()
+                            && self.return_control().await.is_ok()
                         {
                             let mut private = self.private.lock().await;
                             if let Some(checkout) =
@@ -1250,6 +1267,8 @@ impl CheckoutService {
                                 self.retain_completed(checkout, status);
                                 *private = None;
                             }
+                        } else {
+                            let _ = self.store.update(&status);
                         }
                         return;
                     }
@@ -2195,6 +2214,77 @@ mod tests {
             finished.is_err(),
             "a thank-you on the card form closed the session"
         );
+        assert_eq!(
+            service.store.get(&status.operation_id).unwrap().state,
+            "manual_required"
+        );
+        assert!(service.private.lock().await.is_some());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn payment_failed_help_text_keeps_manual_required() {
+        let (url, server) = crate::discovery::tests::fixture(
+            "<h1>Help</h1><p>If your payment failed, check the card and try again.</p>
+             <input autocomplete='cc-number'><button>Pay</button>"
+                .into(),
+        )
+        .await;
+        let root = tempfile::tempdir().unwrap().keep();
+        let browser = Browser::launch(
+            &crate::test_chromium(),
+            &root.join("profile"),
+            &["--no-sandbox".into(), "--ignore-certificate-errors".into()],
+        )
+        .await
+        .unwrap();
+        browser
+            .browse(crate::browser::BrowseRequest::Open { url })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let tab = browser.handoff().await.unwrap();
+        let service = Arc::new(
+            CheckoutService::new(
+                browser,
+                &root.join("state.db"),
+                root.join("unused.sock"),
+                unsafe { libc::geteuid() },
+                47999,
+            )
+            .unwrap(),
+        );
+        let status = Status {
+            operation_id: "fixture-faq".into(),
+            state: "manual_required".into(),
+            ceremony_url: None,
+            filled_fields: vec![],
+            outcome: None,
+        };
+        service
+            .store
+            .insert(&status, "card", "Fixture help")
+            .unwrap();
+        *service.private.lock().await = Some(PrivateCheckout {
+            operation_id: status.operation_id.clone(),
+            mode: Mode::Card,
+            view_target: tab.target.clone(),
+            view_session: tab.session.clone(),
+            seen_pages: std::collections::HashSet::from([tab.target.clone()]),
+            tab,
+            discovery: None,
+            recipient: None,
+            capability: hex_token(&[33; 32]),
+            claimed: true,
+            approved: true,
+            manual_submission: false,
+        });
+        let finished = tokio::time::timeout(
+            Duration::from_secs(3),
+            service.watch_outcome(status.operation_id.clone()),
+        )
+        .await;
+        assert!(finished.is_err(), "help text must not dispose the session");
         assert_eq!(
             service.store.get(&status.operation_id).unwrap().state,
             "manual_required"
