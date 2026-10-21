@@ -11,6 +11,27 @@ struct VenueFixture {
     requests: Mutex<Vec<PayloadBatchSignRequest>>,
     signed: Mutex<Vec<(PayloadBatchSignRequest, Vec<Vec<u8>>)>>,
     auth_posts: AtomicU64,
+    single_requests: Mutex<Vec<PayloadSignRequest>>,
+    single_signed: Mutex<Vec<(PayloadSignRequest, Vec<u8>)>>,
+}
+
+impl VenueFixture {
+    fn new(machine: Arc<DaemonPetalHost>) -> Self {
+        Self {
+            machine,
+            timestamp: AtomicU64::new(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+            ),
+            requests: Mutex::new(vec![]),
+            signed: Mutex::new(vec![]),
+            auth_posts: AtomicU64::new(0),
+            single_requests: Mutex::new(vec![]),
+            single_signed: Mutex::new(vec![]),
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -162,6 +183,20 @@ impl PetalHost for VenueFixture {
         }
         result
     }
+    async fn sign_payload_outcome(
+        &self,
+        request: PayloadSignRequest,
+    ) -> Result<SignOutcome, HostError> {
+        self.single_requests.lock().unwrap().push(request.clone());
+        let result = self.machine.sign_payload_outcome(request.clone()).await;
+        if let Ok(SignOutcome::Signature(signature)) = &result {
+            self.single_signed
+                .lock()
+                .unwrap()
+                .push((request, signature.clone()));
+        }
+        result
+    }
 }
 
 fn setting(name: &str) -> PathBuf {
@@ -214,9 +249,15 @@ fn pending(root: &Path, class: &str) -> serde_json::Value {
     matches.into_iter().next().unwrap()
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires disposable real services and installer enrollment; run scripts/test-polymarket-authorization.sh"]
-async fn installed_account_one_auth_and_exact_continuation_use_real_authority() {
+struct AuthorizationFixture {
+    home: HomeDir,
+    client: MachineBrokerClient,
+    catalog: bloom_broker_api::ProvenanceCatalog,
+    daemon: Daemon,
+    wallet: Token,
+}
+
+async fn account_one_fixture() -> AuthorizationFixture {
     use sha2::Digest as _;
     let root = setting("BLOOM_TRIAD_DEVELOPER_ROOT");
     let home = HomeDir::at(setting("BLOOM_HOME"));
@@ -288,6 +329,210 @@ async fn installed_account_one_auth_and_exact_continuation_use_real_authority() 
     );
     let allocated = read_json(&daemon.vfs, "wallets/pm80-authorization/new").await;
     assert_eq!(allocated["requests"][0]["number"], 1);
+    AuthorizationFixture {
+        home,
+        client,
+        catalog,
+        daemon,
+        wallet,
+    }
+}
+
+async fn approve_package(
+    daemon: &Daemon,
+    client: &MachineBrokerClient,
+    wallet: &Token,
+    hash: &str,
+    counter: u64,
+) {
+    let baseline = client.policy(wallet.clone()).await.unwrap();
+    let mut policy: bloom_broker_api::CanonicalWalletPolicy =
+        serde_json::from_slice(&baseline.canonical_policy.decode()).unwrap();
+    policy
+        .allowed_petal_packages
+        .push(Digest32::new(hash.to_owned()).unwrap());
+    let policy_bytes = serde_jcs::to_vec(&policy).unwrap();
+    let policy_path = VfsPath::parse("wallets/pm80-authorization/policy.json").unwrap();
+    assert!(daemon.vfs.write(&policy_path, &policy_bytes).await.is_err());
+    let review = read_json(
+        &daemon.vfs,
+        "wallets/pm80-authorization/policy-updates/latest/approval_challenge.json",
+    )
+    .await;
+    complete(review["ceremony_url"].as_str().unwrap(), counter, None);
+    daemon.vfs.write(&policy_path, &policy_bytes).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires built SDK conformance package and disposable services; use sdk-message runner case"]
+async fn installed_supported_messages_use_real_installer_and_selected_account() {
+    let AuthorizationFixture {
+        home,
+        client,
+        catalog,
+        daemon,
+        wallet,
+    } = account_one_fixture().await;
+    let owner: Address = String::from_utf8(
+        daemon
+            .vfs
+            .read(&VfsPath::parse("wallets/pm80-authorization/1/address.evm").unwrap())
+            .await
+            .unwrap(),
+    )
+    .unwrap()
+    .trim()
+    .parse()
+    .unwrap();
+    let package =
+        bloom_petals::package::build_petal_package_dir(setting("BLOOM_PM80_POLYMARKET_ROOT"))
+            .unwrap();
+    let hash = package.hash.clone();
+    for format in ["personal", "typed"] {
+        let route = package
+            .route_index
+            .routes
+            .iter()
+            .find(|r| r.pattern == format!("{format}/[wallet]/[index]/sign"))
+            .unwrap();
+        let record = catalog
+            .record(&bloom_broker_api::ProvenanceSubject::Petal {
+                package_hash: Digest32::new(hash.clone()).unwrap(),
+                route: route.route_id.clone(),
+            })
+            .unwrap();
+        assert!(
+            record
+                .operation_classes
+                .iter()
+                .any(|c| c.operation_class.as_str() == format!("conformance.{format}"))
+        );
+        assert!(!record.installer_signature.decode().is_empty());
+        assert!(record.petal_lineage.as_ref().unwrap().active);
+    }
+    let staged = daemon.petals.store().stage_petal_package(package).unwrap();
+    daemon
+        .petals
+        .install_staged_petal_package(staged, None, || Ok(()))
+        .unwrap();
+    approve_package(&daemon, &client, &wallet, &hash, 3).await;
+    let late = Arc::new(LateVfsHost::new());
+    late.set(Arc::new(daemon.vfs.clone()));
+    let state = home.cache_dir().join("petal-signing-requests");
+    let machine = Arc::new(
+        DaemonPetalHost::new(late, daemon.audit.clone())
+            .with_broker(Some(client.clone()))
+            .with_wallets(daemon.wallets.clone())
+            .with_petal_runner(daemon.petals.clone())
+            .with_provenance_catalog(Some(catalog))
+            .with_petal_signing_state_root(state.clone()),
+    );
+    let host = Arc::new(VenueFixture::new(machine.clone()));
+    let vfs = Vfs::builder()
+        .mount(
+            "petals",
+            Arc::new(PetalRouter::new(daemon.petals.clone(), host.clone())),
+        )
+        .build();
+    for (position, format) in ["personal", "typed"].into_iter().enumerate() {
+        let class = format!("conformance.{format}");
+        let path = VfsPath::parse(&format!(
+            "petals/conformance/{format}/pm80-authorization/1/sign"
+        ))
+        .unwrap();
+        let calls = host.single_requests.lock().unwrap().len();
+        assert!(vfs.write(&path, b"arbitrary message").await.is_err());
+        assert_eq!(host.single_requests.lock().unwrap().len(), calls);
+        vfs.write(&path, b"sign").await.unwrap();
+        assert_eq!(host.single_signed.lock().unwrap().len(), position);
+        let awaiting = pending(&state, &class);
+        let projection_path = format!(
+            "petal-signing-requests/{}.json",
+            awaiting["request_id"].as_str().unwrap()
+        );
+        let projected = read_json(&daemon.vfs, &projection_path).await;
+        assert_eq!(projected["status"], "awaiting_owner_approval");
+        vfs.write(&path, b"sign").await.unwrap();
+        let repeated = pending(&state, &class);
+        assert!(awaiting["approval_id"] == repeated["approval_id"]);
+        assert_eq!(host.single_signed.lock().unwrap().len(), position);
+        complete(
+            projected["ceremony_url"].as_str().unwrap(),
+            4 + position as u64,
+            None,
+        );
+        let mut changed = host.single_requests.lock().unwrap().last().unwrap().clone();
+        changed.approval_hint = None;
+        changed.operation_class = "conformance.forbidden".into();
+        let mut claim: bloom_broker_api::PetalUseClaim =
+            serde_json::from_slice(&changed.petal_use_claim_jcs).unwrap();
+        claim.operation_class = Token::new(&changed.operation_class).unwrap();
+        changed.petal_use_claim_jcs = serde_jcs::to_vec(&claim).unwrap();
+        match machine.sign_payload_outcome(changed).await {
+            Err(error) => assert!(
+                error
+                    .to_string()
+                    .contains("installer provenance does not authorize conformance.forbidden"),
+                "class substitution must reach installer authorization: {error}"
+            ),
+            Ok(_) => panic!("installer must reject a class absent from its signed catalog"),
+        }
+        vfs.write(&path, b"sign").await.unwrap();
+        assert_eq!(host.single_signed.lock().unwrap().len(), position + 1);
+        let signed = host.single_signed.lock().unwrap();
+        let (request, bytes) = signed.last().unwrap();
+        assert_eq!(
+            request
+                .context
+                .as_ref()
+                .unwrap()
+                .trusted_account()
+                .unwrap()
+                .number,
+            1
+        );
+        assert_eq!(request.operation_class, class);
+        assert_eq!(
+            request.signature_algorithm,
+            "secp256k1-keccak256-recoverable"
+        );
+        assert_eq!(bytes.len(), 65);
+        assert_eq!(
+            alloy::primitives::Signature::from_raw(bytes)
+                .unwrap()
+                .recover_address_from_prehash(&alloy::primitives::B256::from(request.claimed_hash))
+                .unwrap(),
+            owner
+        );
+        drop(signed);
+        assert_eq!(
+            read_json(&daemon.vfs, &projection_path).await["status"],
+            "signed"
+        );
+    }
+    assert_eq!(host.auth_posts.load(Ordering::SeqCst), 0);
+    let result = serde_json::json!({"schema":"bloom.sdk.authorization-boundary.v1",
+        "package_hash":hash,"account":1,"formats":["personal","typed"],
+        "authorized_in_test":true,"signed_operations":2,"installer_class_denials_without_hint":2,
+        "normal_owner_projection":true,"retry_identity_preserved":true,
+        "limits":"disposable software owner; no chain submission, funds, settlement or physical ceremony"});
+    std::fs::write(
+        setting("BLOOM_PM80_AUTHORIZATION_RESULT"),
+        serde_json::to_vec_pretty(&result).unwrap(),
+    )
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires disposable real services and installer enrollment; run scripts/test-polymarket-authorization.sh"]
+async fn installed_account_one_auth_and_exact_continuation_use_real_authority() {
+    let AuthorizationFixture {
+        home,
+        client,
+        catalog,
+        daemon,
+        wallet,
+    } = account_one_fixture().await;
     let accounts = client.wallet_accounts(wallet.clone()).await.unwrap();
     let account_one = accounts
         .accounts
@@ -350,22 +595,7 @@ async fn installed_account_one_auth_and_exact_continuation_use_real_authority() 
         .petals
         .install_staged_petal_package(staged, None, || Ok(()))
         .unwrap();
-    let baseline = client.policy(wallet.clone()).await.unwrap();
-    let mut policy: bloom_broker_api::CanonicalWalletPolicy =
-        serde_json::from_slice(&baseline.canonical_policy.decode()).unwrap();
-    policy
-        .allowed_petal_packages
-        .push(Digest32::new(hash.clone()).unwrap());
-    let policy_bytes = serde_jcs::to_vec(&policy).unwrap();
-    let policy_path = VfsPath::parse("wallets/pm80-authorization/policy.json").unwrap();
-    assert!(daemon.vfs.write(&policy_path, &policy_bytes).await.is_err());
-    let review = read_json(
-        &daemon.vfs,
-        "wallets/pm80-authorization/policy-updates/latest/approval_challenge.json",
-    )
-    .await;
-    complete(review["ceremony_url"].as_str().unwrap(), 3, None);
-    daemon.vfs.write(&policy_path, &policy_bytes).await.unwrap();
+    approve_package(&daemon, &client, &wallet, &hash, 3).await;
 
     let late = Arc::new(LateVfsHost::new());
     late.set(Arc::new(daemon.vfs.clone()));
@@ -378,18 +608,7 @@ async fn installed_account_one_auth_and_exact_continuation_use_real_authority() 
             .with_provenance_catalog(Some(catalog))
             .with_petal_signing_state_root(state.clone()),
     );
-    let host = Arc::new(VenueFixture {
-        machine: machine.clone(),
-        timestamp: AtomicU64::new(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
-        ),
-        requests: Mutex::new(vec![]),
-        signed: Mutex::new(vec![]),
-        auth_posts: AtomicU64::new(0),
-    });
+    let host = Arc::new(VenueFixture::new(machine.clone()));
     let vfs = Vfs::builder()
         .mount(
             "petals",
