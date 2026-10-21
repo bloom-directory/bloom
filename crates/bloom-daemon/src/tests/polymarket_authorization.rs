@@ -479,8 +479,7 @@ async fn installed_supported_messages_use_real_installer_and_selected_account() 
         }
         vfs.write(&path, b"sign").await.unwrap();
         assert_eq!(host.single_signed.lock().unwrap().len(), position + 1);
-        let signed = host.single_signed.lock().unwrap();
-        let (request, bytes) = signed.last().unwrap();
+        let (request, bytes) = host.single_signed.lock().unwrap().last().unwrap().clone();
         assert_eq!(
             request
                 .context
@@ -498,13 +497,12 @@ async fn installed_supported_messages_use_real_installer_and_selected_account() 
         );
         assert_eq!(bytes.len(), 65);
         assert_eq!(
-            alloy::primitives::Signature::from_raw(bytes)
+            alloy::primitives::Signature::from_raw(&bytes)
                 .unwrap()
                 .recover_address_from_prehash(&alloy::primitives::B256::from(request.claimed_hash))
                 .unwrap(),
             owner
         );
-        drop(signed);
         assert_eq!(
             read_json(&daemon.vfs, &projection_path).await["status"],
             "signed"
