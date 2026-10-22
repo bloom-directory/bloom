@@ -22,12 +22,12 @@ use crate::host::PetalHost;
 use crate::runner::{PETAL_DOCUMENT_NAMES, PetalRunner};
 use crate::vm::{COMPONENT_NOT_A_DIR_CODE, COMPONENT_UNSUPPORTED_CODE, RunOptions};
 
-/// How long name resolution (lookups and ancestor checks) may reuse a live
-/// account observation, matching the Machine's default wallet-projection reuse
-/// window. One mounted path traversal issues several lookups before its read;
-/// each live observation costs a Broker wallet refresh. Anything that returns
-/// data or acts observes the account afresh, so a cached observation is never
-/// authority.
+/// How long host-owned ancestor checks may reuse a live account observation,
+/// matching the Machine's default wallet-projection reuse window. One mounted
+/// path traversal checks the same ancestors several times; each live
+/// observation costs a Broker wallet refresh. Every guest dispatch, lookups
+/// included, observes the account afresh, so a cached observation never
+/// authorizes Petal code.
 const ACCOUNT_CONTEXT_REUSE: Duration = Duration::from_secs(1);
 
 /// Recent account observations, ordered by when each began. A refusal is
@@ -141,9 +141,10 @@ impl PetalRouter {
 
     /// Resolve the account a wallet-scoped route runs as. `account.json` is
     /// served on the live authority path, so every read is a Broker wallet
-    /// refresh. Reads, listings and writes (`live`) always observe it afresh;
-    /// lookups and ancestor checks, which only resolve names, reuse an
-    /// observation made in the last `account_context_reuse`.
+    /// refresh. Guest dispatches (`live`) always observe it afresh, because a
+    /// guest runs with its route's capabilities whatever the operation. Host-
+    /// owned ancestor checks, which run no guest, reuse an observation made in
+    /// the last `account_context_reuse`.
     async fn account_context(
         &self,
         wallet: &str,
@@ -376,10 +377,9 @@ impl PetalRouter {
                 {
                     return Err(HandlerError::PermissionDenied);
                 }
-                // Only name resolution may reuse a recent observation; a
-                // Petal returning data or acting runs as the live account.
-                let live = op != DispatchOp::Lookup;
-                let account = self.account_context(wallet, index, live).await?;
+                // The guest runs with its route's capabilities for every
+                // operation, lookups included, so it runs as the live account.
+                let account = self.account_context(wallet, index, true).await?;
                 self.dispatch_for_account(mount, op, path, body, &account, &execution)
                     .await
             }
@@ -1729,23 +1729,49 @@ name = "example"
     }
 
     #[tokio::test]
-    async fn only_name_resolution_reuses_a_recent_account_observation() {
-        use std::sync::atomic::Ordering;
+    async fn guest_lookups_never_run_on_a_cached_account() {
+        struct RetiringHost {
+            reads: std::sync::atomic::AtomicUsize,
+            retired: AtomicBool,
+        }
+        #[async_trait]
+        impl PetalHost for RetiringHost {
+            async fn vfs_lookup(&self, path: &str) -> Result<HostVfsEntry, HostError> {
+                AccountHost.vfs_lookup(path).await
+            }
+            async fn vfs_read(&self, path: &str) -> Result<Vec<u8>, HostError> {
+                self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if self.retired.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Ok(br#"{"schema":"bloom.account.v1","wallet":"alice","number":0,"freshness":"fresh","evm":{"state":"retired","public_key_fingerprint":"aa"},"solana":{"state":"missing"}}"#.to_vec());
+                }
+                AccountHost.vfs_read(path).await
+            }
+            async fn vfs_list(&self, path: &str) -> Result<Vec<HostVfsEntry>, HostError> {
+                AccountHost.vfs_list(path).await
+            }
+            async fn vfs_write(&self, path: &str, bytes: &[u8]) -> Result<(), HostError> {
+                AccountHost.vfs_write(path, bytes).await
+            }
+        }
         let (dir, runner) = runner();
         let package = dir.path().join("example-app");
         write_dynamic_dir_package(&package, false);
         runner.store().install_petal_package_dir(&package).unwrap();
-        let host = Arc::new(CountingAccountHost::default());
+        let host = Arc::new(RetiringHost {
+            reads: Default::default(),
+            retired: AtomicBool::new(false),
+        });
         let router = PetalRouter::new(runner, host.clone());
         let path = VfsPath::parse("example/intents/alice/0").unwrap();
         router.lookup(&path).await.unwrap();
-        assert_eq!(host.reads.load(Ordering::Relaxed), 1);
-        // Within the reuse window, a lookup resolves the name from the recent
-        // observation, but a listing returns data and observes afresh.
-        router.lookup(&path).await.unwrap();
-        assert_eq!(host.reads.load(Ordering::Relaxed), 1);
-        router.list(&path).await.unwrap();
-        assert_eq!(host.reads.load(Ordering::Relaxed), 2);
+        assert_eq!(host.reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // A guest lookup can use its route's capabilities, so even inside the
+        // reuse window it observes the account again and refuses a retirement
+        // before the guest runs.
+        host.retired
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(router.lookup(&path).await.is_err());
+        assert_eq!(host.reads.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[test]
