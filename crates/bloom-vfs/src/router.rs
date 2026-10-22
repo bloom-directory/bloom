@@ -1120,6 +1120,92 @@ mod tests {
         drop(running_write);
     }
 
+    struct ReviewReentrantTarget {
+        vfs: std::sync::OnceLock<Vfs>,
+        reenter_on_read: bool,
+        entered: Notify,
+    }
+
+    #[async_trait]
+    impl Handler for ReviewReentrantTarget {
+        async fn lookup(&self, _path: &VfsPath) -> Result<Entry, HandlerError> {
+            Ok(Entry::file("settings"))
+        }
+
+        async fn read(&self, _path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+            if self.reenter_on_read {
+                self.entered.notify_one();
+                self.vfs
+                    .get()
+                    .unwrap()
+                    .write(&VfsPath::parse("/other/settings").unwrap(), b"nested")
+                    .await?;
+            }
+            Ok(b"unset".to_vec())
+        }
+
+        async fn write(&self, _path: &VfsPath, data: &[u8]) -> Result<(), HandlerError> {
+            self.entered.notify_one();
+            self.vfs
+                .get()
+                .unwrap()
+                .write(&VfsPath::parse("/other/settings").unwrap(), data)
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn review_conditional_target_reentry_blocks_unrelated_writes() {
+        for reenter_on_read in [true, false] {
+            let target = Arc::new(ReviewReentrantTarget {
+                vfs: std::sync::OnceLock::new(),
+                reenter_on_read,
+                entered: Notify::new(),
+            });
+            let vfs = Vfs::builder()
+                .mount("target", target.clone())
+                .mount("other", SettingsHandler::holding(b"unset"))
+                .build();
+            assert!(target.vfs.set(vfs.clone()).is_ok());
+            let caller = vfs.clone();
+            let running = tokio::spawn(async move {
+                caller
+                    .write_if_reads(
+                        &VfsPath::parse("/target/settings").unwrap(),
+                        b"unset",
+                        b"setup",
+                    )
+                    .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(1), target.entered.notified())
+                .await
+                .unwrap();
+            assert!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    vfs.write(&VfsPath::parse("/other/settings").unwrap(), b"unrelated")
+                )
+                .await
+                .is_err()
+            );
+            assert!(!running.is_finished());
+            running.abort();
+            assert!(running.await.unwrap_err().is_cancelled());
+            assert!(
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    vfs.write(
+                        &VfsPath::parse("/other/settings").unwrap(),
+                        b"after cancellation"
+                    )
+                )
+                .await
+                .unwrap()
+                .is_ok()
+            );
+        }
+    }
+
     #[tokio::test]
     async fn dispatches_to_handler() {
         let vfs = Vfs::builder().mount("echo", Arc::new(EchoHandler)).build();

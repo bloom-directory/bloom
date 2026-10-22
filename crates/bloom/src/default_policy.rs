@@ -1471,6 +1471,58 @@ mod tests {
         (home, vfs)
     }
 
+    #[tokio::test]
+    async fn review_failed_retry_is_silent_and_applied_stops_waiting() {
+        let petals = chosen_setup(&["polymarket"]);
+        let route = SettingsRoute::holding(None);
+        let (home, vfs) = queued_polymarket(&route);
+        assert_eq!(
+            apply_queued_settings(&vfs, home.path(), &petals, "polymarket").await,
+            None
+        );
+        assert_eq!(pending_settings(home.path(), &petals), ["polymarket"]);
+        let mut wait = DefaultPolicyWait::new("main", 30_000);
+        let mut output = Vec::new();
+        let status = DefaultPolicyStatus::Applied {
+            petals: vec!["polymarket".into()],
+        };
+        assert_eq!(
+            wait.observe(&status, 0, &mut output).unwrap(),
+            WaitStep::Stop
+        );
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("main allows Polymarket"));
+        assert!(!output.contains("petal_settings_pending"));
+        assert!(!output.contains("bloom wallet default-policy"));
+    }
+
+    #[tokio::test]
+    async fn review_retry_promised_even_when_marker_cannot_be_saved() {
+        let petals = chosen_setup(&["polymarket"]);
+        let route = SettingsRoute::holding(None);
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(pending_settings_dir(home.path()), b"not a directory").unwrap();
+        let vfs = bloom_vfs::Vfs::builder().mount("petals", route).build();
+        let message = settle_setup_settings(
+            &vfs,
+            home.path(),
+            &petals,
+            "polymarket",
+            SetupSettingsStep::Write,
+            false,
+            &AccountPresence::Absent,
+        )
+        .await
+        .unwrap();
+        assert!(message.contains("will retry once wallet main exists"));
+        assert!(
+            !pending_settings_dir(home.path())
+                .join("polymarket")
+                .exists()
+        );
+        assert!(pending_settings(home.path(), &petals).is_empty());
+    }
+
     fn polymarket_setup_body() -> Vec<u8> {
         render_petal_settings(&chosen_setup(&["polymarket"]), "polymarket", "main")
             .unwrap()
