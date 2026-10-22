@@ -201,6 +201,105 @@ attempt that reached the Broker: gaps are valid, while reuse after an ambiguous
 transport result is unsafe. The protected backup and recovery marker are
 cleared only after the deny-by-default policy is visible again.
 
+### The authenticator counter sidecar
+
+The per-credential counter sidecar is the durable record of which WebAuthn
+counters have been spent. Broker rejects a reused counter as a replay, so the
+harness treats a counter as spent from the moment the debug driver could reach
+Broker, not once it returns: every counter a run may sign with is recorded in
+the sidecar *before* the driver is invoked. A run interrupted mid-assertion
+therefore leaves the counter recorded as consumed, which is the safe direction
+— a skipped counter is valid, a reused one is not.
+
+That guarantee depends entirely on the sidecar being writable. If its file is
+read-only, its directory is not writable, or the filesystem is full, a write
+that fails *after* an assertion has reached Broker leaves the counter spent at
+Broker but absent from the record, and the next run starts from a counter
+Broker will reject. Preflight therefore calls
+`EvalDefinition.require_counter_durability`, which takes the same lock a
+reservation takes and rewrites the recorded value as its own bytes (or, for a
+fresh record, creates and removes the temporary a real write would use). It
+proves the write can land while leaving the counter untouched, so the check
+itself can never make a run skip a counter. Under the operator lifecycle the
+same check also rewrites the operator state file through `StateStore.verify_writable`,
+because that file mirrors the record and must be writable too.
+
+Both live Hyperliquid evals share these methods, so the reservation and
+durability rules have a single definition rather than one copy per eval.
+
+A run started directly with `python -m harness <eval> <agent>` has no
+operator state file, so the sidecar is its only record: a mode-`0600` JSON file
+holding one integer, written through the same atomic temporary-then-rename the
+operator store uses. Without it a direct run advanced the counter in memory
+only, and the next process replayed a counter Broker had already accepted.
+
+The sidecar belongs to the authenticator, not to an eval or a checkout.
+Counters are spent per credential, so everything configured with the same seed
+-- both evals, direct runs from any clone or worktree of this repository, and
+the operator lifecycle -- shares one record at
+`~/.bloom/eval-counters/authenticator-<id>.counter.json`, where `<id>` is a
+truncated, domain-separated SHA-256 of the seed contents. The name identifies
+the credential without revealing the seed, and a copy of the same seed at
+another path maps to the same record. `BLOOM_EVAL_COUNTER_DIR` moves the
+directory, for tests or CI; the file name inside it is always derived from the
+credential, so no run can be pointed at a private counter file.
+
+Every reservation takes an exclusive lock on that `.lock` file, re-reads the
+record, signs with the larger of the recorded counter and the caller's
+candidate, and records the next one before the debug driver runs. Two evals or
+processes on the same authenticator therefore never sign with the same
+counter, even when they start together from the same configured value.
+
+On startup the harness takes the larger of `BLOOM_EVAL_AUTHENTICATOR_SIGN_COUNT`
+and the recorded value, so raising the environment counter is honoured while a
+recorded one is never rolled back. It then refuses to start unless enough valid
+counters remain for every ceremony the eval may spend, cleanup included: two
+for `hyperliquid-approve-builder-fee` (the grant and its mandatory revoke) and
+up to four for `hyperliquid-order-cancel`.
+
+That check alone is only advisory: two evals on one authenticator could both
+pass it near the top of the range, and one could then spend the counters the
+other's mandatory cleanup needs after its grant already exists. So the last
+step of preflight, immediately before any authority is created, reserves the
+run's whole budget atomically under the same lock and records the entire range
+as spent. The run signs only inside that range. Counters it never uses are
+skipped, which is safe; reuse is not. An eval that cannot reserve its full
+budget is refused before it can stage anything.
+
+WebAuthn counters are 32-bit, so the last usable one is `4294967295`. A run
+that reserves it records `4294967296` to mark the credential exhausted, and the
+next run is refused at preflight.
+
+The operator lifecycle reserves through the same record. Its policy ceremonies
+and its order-cancel run take counters from the shared sidecar under the same
+lock, and `next_sign_count` in the operator state file is kept as a mirror at or
+above everything reserved, so recovery still continues from a persisted counter
+that was never spent. An operator run and a direct run on the same
+authenticator therefore never sign with the same counter, whether they run one
+after the other or at the same time.
+
+### Builder-fee starting state
+
+`hyperliquid-approve-builder-fee` requires the dedicated wallet to have no
+existing approval for the configured builder: Hyperliquid's `maxBuilderFee`
+must read `0`. Cleanup revokes to zero rather than restoring a prior value, so
+a run from any nonzero baseline would erase that approval, and one at or above
+the target would also stop the venue-side check from attributing the change to
+the agent. Provision therefore refuses a nonzero baseline before staging
+anything.
+
+The harness completes only the ceremonies its own writes stage. An agent
+write whose body does not match the staged approval stages a second owner
+ceremony that nothing completes; cleanup ignores it when driving the revoke,
+so the venue still ends at zero, but the pending request remains and the next
+run refuses at preflight (`a prior approve_builder_fee ceremony is still
+awaiting owner action`) until that ceremony expires. Cleanup can leave the
+same kind of stray itself: when the signing-request listing is unreadable it
+submits the exact grant body once rather than risk leaving a grant live, and
+if no grant was live that write stages a ceremony nothing completes. A
+signing-request record that cannot be read is treated as an error rather than
+skipped, so neither guard can pass by overlooking a request.
+
 Each run writes a mode-`0600` JSON summary beside the operator state, under
 `harbor-summaries/`. It includes source lineage, installed package hash,
 Harbor/model configuration, reward, trial errors/retries, monotonic phase and
