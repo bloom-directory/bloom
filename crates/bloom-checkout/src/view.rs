@@ -120,3 +120,84 @@ async fn action(
         Err(_) => StatusCode::CONFLICT.into_response(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::browser::{BrowseRequest, Browser};
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn closed_private_page_hides_controls_and_preserves_outcome() {
+        for state in [None, Some(json!({"state":"paid","closed":true}))] {
+            let expected_message = if state.is_some() {
+                "site confirmed the purchase"
+            } else {
+                "Return to Bloom for the recorded outcome"
+            };
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+            let app = Router::new()
+                .route("/", get(|| async { Html(include_str!("view.html")) }))
+                .route(
+                    "/view.js",
+                    get(|| async {
+                        (
+                            [(header::CONTENT_TYPE, "application/javascript")],
+                            include_str!("view.js"),
+                        )
+                    }),
+                )
+                .route(
+                    "/state",
+                    get(move || {
+                        let state = state.clone();
+                        async move {
+                            match state {
+                                Some(state) => Json(state).into_response(),
+                                None => StatusCode::GONE.into_response(),
+                            }
+                        }
+                    }),
+                );
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let root = tempfile::tempdir().unwrap().keep();
+            let browser = Browser::launch(
+                &crate::test_chromium(),
+                &root.join("profile"),
+                &["--no-sandbox".into()],
+            )
+            .await
+            .unwrap();
+            browser.browse(BrowseRequest::Open { url }).await.unwrap();
+            let tab = browser.handoff().await.unwrap();
+            let result = tab.cdp.evaluate(&tab.session, r#"(async () => {
+                for (let i = 0; i < 100; i++) {
+                    if (!document.getElementById('status')?.textContent.includes('Waiting')) break;
+                    await new Promise(resolve => setTimeout(resolve, 20));
+                }
+                return {
+                    controlsHidden: document.getElementById('controls')?.hidden === true,
+                    visibleButtons: [...document.querySelectorAll('button')].filter(b => b.getClientRects().length).length,
+                    frameCleared: !document.getElementById('screen').hasAttribute('src'),
+                    status: document.getElementById('status').textContent,
+                    heading: document.getElementById('heading').textContent
+                };
+            })()"#.into()).await.unwrap();
+            assert_eq!(result["controlsHidden"], true, "{result}");
+            assert_eq!(result["visibleButtons"], 0, "{result}");
+            assert_eq!(result["frameCleared"], true, "{result}");
+            assert!(
+                result["status"]
+                    .as_str()
+                    .unwrap()
+                    .contains(expected_message),
+                "{result}"
+            );
+            assert_eq!(result["heading"], "Private checkout closed");
+            drop(tab);
+            drop(browser);
+            server.abort();
+        }
+    }
+}

@@ -1,9 +1,23 @@
 const screen = document.getElementById('screen');
 const status = document.getElementById('status');
 const pages = document.getElementById('pages');
+let closed = false;
+function closeView(message) {
+  closed = true;
+  document.title = 'Private checkout closed · Bloom';
+  document.getElementById('heading').textContent = 'Private checkout closed';
+  status.textContent = message;
+  document.getElementById('controls').hidden = true;
+  document.getElementById('controls').disabled = true;
+  document.getElementById('text').value = '';
+  pages.replaceChildren();
+  screen.hidden = true;
+  screen.removeAttribute('src');
+}
 screen.hidden = true;
-screen.addEventListener('load', () => { screen.hidden = false; });
+screen.addEventListener('load', () => { if (!closed) screen.hidden = false; });
 screen.addEventListener('error', () => {
+  if (closed) return;
   screen.hidden = true;
   status.textContent = 'Browser image unavailable. Wait for reconnection; do not repeat a payment.';
 });
@@ -12,6 +26,7 @@ pages.addEventListener('change',()=>act({action:'select_page',target:pages.value
 let queue = Promise.resolve();
 function act(action) {
   queue = queue.then(async () => {
+    if (closed) return;
     const response = await fetch('/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(action)});
     if (!response.ok) status.textContent = 'Action was not confirmed. Inspect the page before trying again.';
   }).catch(() => {});
@@ -56,7 +71,10 @@ const describe = state => ({
 async function refresh() {
   try {
     const response=await fetch('/state');
-    if (!response.ok) {status.textContent='Private checkout has closed. Return to Bloom for the outcome.';screen.hidden=true;screen.removeAttribute('src');return;}
+    if (!response.ok) {
+      closeView('Return to Bloom for the recorded outcome. Closing this view does not prove whether a payment succeeded. Do not pay again until you have checked.');
+      return;
+    }
     const state=await response.json();status.textContent=describe(state);
     if(state.state==='human_control'){
       document.getElementById('heading').textContent="Bloom's browser";
@@ -66,12 +84,12 @@ async function refresh() {
     }
     if(state.state==='needs_input') {
       document.getElementById('finish').textContent='Close without paying';
-      document.getElementById('note').textContent='Closing now records that the payment was not submitted.';
+      document.getElementById('note').textContent='A form error does not prove no payment was sent. Check the merchant and your bank before paying again.';
       document.getElementById('note').hidden=false;
     }
     if(state.closed) {
-      status.textContent=describe(state);
-      screen.hidden=true;screen.removeAttribute('src');return;
+      closeView(describe(state) + ' You can close this tab and return to Bloom.');
+      return;
     }
     pages.replaceChildren(...state.pages.map(page=>{const option=document.createElement('option');option.value=page.target;option.textContent=page.origin;option.selected=page.target===state.selected_page;return option;}));
     screen.src='/frame?refresh='+Date.now();

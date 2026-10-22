@@ -1,12 +1,72 @@
-<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width">
-<title>Bloom private checkout</title><style>body{font:16px system-ui;margin:24px;max-width:1100px}img{max-width:100%;border:1px solid #aaa}img:focus{outline:3px solid #36f}input,button{font:inherit;padding:8px;margin:6px}</style>
-<h1 id="heading">Private checkout</h1><p id="status">Waiting for checkout…</p>
-<p id="purpose">Use this view for bank authentication or to finish manually. The agent cannot see this view. Check the merchant and total before paying.</p>
-<img id="screen" tabindex="0" alt="Private checkout browser">
-<p>Click a field on the page, then type or paste.</p>
-<p><label>Page <select id="pages"></select></label></p>
-<form id="typing"><input id="text" type="password" autocomplete="off" placeholder="Or type hidden text here"><button>Send text</button></form>
-<button data-key="Tab">Tab</button><button data-key="Enter">Enter</button><button data-key="Backspace">Backspace</button>
-<button id="finish">Close checkout and return to shopping</button>
-<p id="note">Closing before the site confirms leaves the result unknown: check your email and bank before paying again.</p>
-<script src="/view.js"></script></html>
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bloom private checkout</title>
+<style>
+:root{color-scheme:light;font-family:"Avenir Next",Inter,system-ui,-apple-system,"Segoe UI",sans-serif;color:#15130f;background:#f7f6f3}
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+body{margin:0;font-size:16px;line-height:1.55;-webkit-font-smoothing:antialiased}
+main{max-width:1160px;margin:0 auto;padding:24px}
+.brand{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:24px;font-size:14px;color:#706757}
+.brand strong{color:#5e1a26;letter-spacing:-.02em}
+.panel{border:1px solid #e5e0d8;border-radius:12px;background:#fffefa;overflow:hidden}
+.summary{padding:32px}
+.eyebrow{margin:0 0 12px;color:#8a2a3a;font-size:14px}
+h1{margin:0;font-size:28px;line-height:1.25;letter-spacing:-.035em;font-weight:600}
+#status{margin:12px 0 0;max-width:65ch;color:#706757;overflow-wrap:anywhere}
+#controls{margin:0;padding:0;border:0;min-width:0}
+#purpose{margin:0;padding:0 32px 24px;max-width:80ch;color:#706757;font-size:14px}
+.browser{padding:24px 32px;background:#f0eee8;border-block:1px solid #e5e0d8}
+.page-picker{display:flex;align-items:center;gap:12px;margin-bottom:16px;font-size:14px;color:#706757}
+select{max-width:100%;min-width:0}
+#screen{display:block;max-width:100%;height:auto;border:1px solid #e5e0d8;border-radius:8px;background:white;margin:0 auto}
+#screen:focus-visible,input:focus-visible,button:focus-visible,select:focus-visible{outline:3px solid #8a2a3a;outline-offset:3px}
+.tools{padding:24px 32px}
+.hint{margin:0 0 16px;font-size:14px;color:#706757}
+input,button,select{font:inherit;border:1px solid #d6cfc3;border-radius:6px;padding:10px 14px;background:#fffefa;color:#15130f}
+button{cursor:pointer;font-weight:600}
+button:hover{background:#f0eee8}
+#typing{display:flex;gap:8px;flex-wrap:wrap}
+#text{flex:1;min-width:160px}
+.keys{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+.keys button{font-size:14px;min-width:64px}
+.footer{border-top:1px solid #e5e0d8;margin-top:24px;padding-top:24px;display:flex;align-items:center;gap:24px;flex-wrap:wrap}
+#finish{background:#8a2a3a;border-color:#8a2a3a;color:white}
+#finish:hover{background:#5e1a26}
+#note{margin:0;flex:1;min-width:200px;font-size:13px;color:#706757}
+@media(max-width:600px){main{padding:16px}.brand{align-items:flex-start}.brand span{text-align:right;font-size:12px}.summary{padding:24px}.browser,.tools{padding:20px}#purpose{padding-inline:24px}h1{font-size:25px}.footer{gap:16px}#typing button,#finish{width:100%}}
+</style>
+</head>
+<body>
+<main>
+<header class="brand"><strong>Bloom</strong><span>Private browser · visible only to you</span></header>
+<section class="panel" aria-labelledby="heading">
+<div class="summary">
+<p class="eyebrow">Private checkout</p>
+<h1 id="heading">Complete your checkout</h1>
+<p id="status" role="status" aria-live="polite">Waiting for checkout…</p>
+</div>
+<fieldset id="controls" aria-label="Private browser controls">
+<p id="purpose">Finish a bank check or complete checkout here. The agent cannot see this view. Check the merchant and total before paying.</p>
+<div class="browser">
+<label class="page-picker">Page <select id="pages" aria-label="Browser page"></select></label>
+<img id="screen" tabindex="0" alt="Private checkout browser" hidden>
+</div>
+<div class="tools">
+<p class="hint">Click a field in the browser above, then type or paste. You can also send hidden text below.</p>
+<form id="typing"><input id="text" type="password" autocomplete="off" aria-label="Hidden text for the selected browser field" placeholder="Type hidden text"><button>Send text</button></form>
+<div class="keys" aria-label="Browser keyboard"><button type="button" data-key="Tab">Tab</button><button type="button" data-key="Enter">Enter</button><button type="button" data-key="Backspace">Backspace</button></div>
+<div class="footer">
+<button type="button" id="finish">Close checkout and return to shopping</button>
+<p id="note">Closing before the site confirms leaves the result unknown. Check your email and bank before paying again.</p>
+</div>
+</div>
+</fieldset>
+</section>
+</main>
+<script src="/view.js"></script>
+</body>
+</html>
