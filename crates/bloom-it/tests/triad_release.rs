@@ -2182,6 +2182,11 @@ fn linux_installer_upgrade_rotation_and_confirmed_uninstall_are_staged_safely() 
             .exists()
     );
     assert!(
+        !root
+            .join("usr/lib/systemd/system/bloom-checkout@.service")
+            .exists()
+    );
+    assert!(
         !fs::read_to_string(root.join("etc/fstab"))
             .unwrap()
             .contains("x-bloom.login-uid=1000")
@@ -2478,6 +2483,18 @@ fn linux_installer_allocates_distinct_ports_and_rejects_mixed_release_sets() {
     );
     let fstab = fs::read_to_string(root.join("etc/fstab")).unwrap();
     assert!(fstab.contains("port=20000") && fstab.contains("port=20001"));
+    // Each login's checkout view needs its own localhost port.
+    for (uid, port) in [("1000", "11000"), ("2000", "12000")] {
+        assert!(
+            fs::read_to_string(root.join(format!("etc/bloom/{uid}/checkout.env")))
+                .unwrap()
+                .contains(&format!("BLOOM_CHECKOUT_VIEW_PORT={port}\n"))
+        );
+    }
+    let checkout_unit =
+        fs::read_to_string(root.join("usr/lib/systemd/system/bloom-checkout@.service")).unwrap();
+    assert!(checkout_unit.contains("--view-port ${BLOOM_CHECKOUT_VIEW_PORT}"));
+    assert!(!checkout_unit.contains("18736"));
 
     let installed_binary = root.join("usr/libexec/bloom/current/bloom-broker");
     let before = fs::read(&installed_binary).unwrap();
@@ -5352,4 +5369,45 @@ fn installers_wait_for_a_slow_machine_and_report_a_plain_timeout() {
     // restoring it failed.
     let installer = fs::read_to_string(release_script("install-macos.sh")).unwrap();
     assert!(installer.contains("previous Bloom release is reinstated and its services are loaded"));
+}
+
+#[test]
+fn linux_checkout_browser_skips_the_snap_shim_and_never_blocks_install() {
+    let directory = tempfile::tempdir().unwrap();
+    let bin = directory.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let write = |name: &str, body: &[u8]| {
+        let path = bin.join(name);
+        fs::write(&path, body).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    // Ubuntu's chromium is a wrapper that runs the Snap, which cannot start
+    // under NoNewPrivileges and ProtectHome.
+    write("chromium", b"#!/bin/sh\nexec /snap/bin/chromium \"$@\"\n");
+    let select = |path: &Path| {
+        let output = Command::new("bash")
+            .args([
+                "-c",
+                "set -euo pipefail\neval \"$(sed -n '/^linux_checkout_browser()/,/^}/p' \"$1\")\"\nPATH=\"$2\" linux_checkout_browser",
+                "select",
+            ])
+            .arg(release_script("install-linux.sh"))
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        String::from_utf8(output.stdout).unwrap()
+    };
+    assert_eq!(select(&bin), "");
+    write("google-chrome", b"\x7fELF fixture");
+    assert_eq!(select(&bin), format!("{}\n", bin.join("google-chrome").display()));
+
+    let installer = fs::read_to_string(release_script("install-linux.sh")).unwrap();
+    assert!(!installer.contains("Bloom checkout requires installed Chromium or Google Chrome"));
+    let unit = fs::read_to_string(
+        workspace().join("packaging/triad/linux/systemd/bloom-checkout@.service.in"),
+    )
+    .unwrap();
+    // Without a browser the unit is skipped, not failed, and Broker still starts.
+    assert!(unit.contains("ExecCondition=/usr/bin/test -n ${BLOOM_CHECKOUT_CHROMIUM}"));
 }

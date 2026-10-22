@@ -10,7 +10,9 @@ User=bloom-checkout-%i
 Group=bloom-checkout-%i
 UMask=0077
 EnvironmentFile=/etc/bloom/%i/checkout.env
-ExecStart=@BLOOM_CHECKOUT_BINARY@ --chromium ${BLOOM_CHECKOUT_CHROMIUM} --profile /var/lib/bloom/%i/checkout/profile --state /var/lib/bloom/%i/checkout/operations.sqlite3 --socket /run/bloom/%i/checkout/rpc/checkout.sock --broker-socket /run/bloom/%i/broker/checkout/intake.sock --broker-uid ${BLOOM_CHECKOUT_BROKER_UID} --machine-uid %i --view-port 18736
+# The installer leaves the browser empty when none can run here.
+ExecCondition=/usr/bin/test -n ${BLOOM_CHECKOUT_CHROMIUM}
+ExecStart=@BLOOM_CHECKOUT_BINARY@ --chromium ${BLOOM_CHECKOUT_CHROMIUM} --profile /var/lib/bloom/%i/checkout/profile --state /var/lib/bloom/%i/checkout/operations.sqlite3 --socket /run/bloom/%i/checkout/rpc/checkout.sock --broker-socket /run/bloom/%i/broker/checkout/intake.sock --broker-uid ${BLOOM_CHECKOUT_BROKER_UID} --machine-uid %i --view-port ${BLOOM_CHECKOUT_VIEW_PORT}
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=bloom-checkout-%i
