@@ -96,14 +96,20 @@ fallback releases no saved card.
 
 When an airline rejects Bloom's browser, try an agency seller on Google's
 booking page instead; give the person the link only when no seller opens.
-Prefer the airline when it loads, or an agency when the person asks. Open
-`google_flights_url`, select the itinerary matching the chosen airline, times
-and price, expand extra booking options, and read every “Continue to book
-with …” seller and price to the person. Click the airline first; on a block
-or empty page return to Google and try the first agency with a dated
-`known.opened` observation. Google's seller button carries the itinerary;
-never invent agency links. Recheck flights, dates, party, bags and final
-total at the seller before unlocking travelers or requesting payment.
+Use a requested agency directly; otherwise try the airline first. Open
+`google_flights_url` and match the chosen offer's flight numbers, airport-local
+dates and times, cabin and party; for round trips match both outbound and
+return. Report price changes rather than substituting another itinerary.
+Expand extra booking options and read every “Continue to book with …” seller
+and price to the person. On an airline block or empty page, return to Google
+and try agencies with dated `known.opened` observations first. If one blocks,
+try another listed agency without evasion; hand off only when none opens.
+If Back in the followed popup does not restore Google, reopen the original
+search URL and reselect the same itinerary. If an airline loads but loses
+the itinerary, recover the same flights there or ask before changing to an
+agency; a country chooser is not a block. Google's seller button carries
+the itinerary; never invent agency links. Recheck flights, dates, party, bags
+and final total at the seller before unlocking travelers or requesting payment.
 
 Explain agency trade-offs before approval: fees and upsells may raise the
 price. Changes and refunds go through the agency. An order confirmation can
