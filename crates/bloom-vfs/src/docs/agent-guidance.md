@@ -445,41 +445,50 @@ verify the committed policy and terminal status. Editing or reformatting the
 proposal creates a different request. Commands are in the policy-update
 walkthrough in `docs/examples.md`.
 
+## What the owner sees when approving
+
+The approval page shows Broker's own reading of the exact bytes to be signed:
+the action, account, assets and amounts, recipient and any limits it sets.
+Bloom does not take a Petal's description for this. Before forwarding the
+link, tell the human in one or two sentences what you asked for, so they can
+compare, and to cancel if the page shows anything else. Point out these if
+they appear:
+
+- **No output protection**: a swap with no enforced minimum output.
+- **Spending limit: Unlimited**: the spender can take any amount of that
+  token.
+- **Contract call Bloom cannot read**: the page shows exact bytes instead of
+  a reading. Approve only if the human expected exactly that call.
+
+An unknown token is shown by its address and raw units; never name it from a
+ticker you guessed. An approval proves what was signed, not that a quote was
+met, an order filled or funds arrived. Report outcomes from receipts and the
+Petal's status files.
+
 ## Petals and paid requests
 
-Known Gasless/Venice payment and login actions and owner-signed Hyperliquid
-actions require complete message-review envelopes from their installed Petal
-package. If an older package cannot prepare a readable approval, update it
-with the matching service release; never strip the review, substitute a hash,
-change accounts or switch to a reusable/batch path to avoid the refusal. Retry
-the exact same request after its own owner approval. Venice uses a fresh login
-proof for each later HTTP request. A login approval grants no payment authority.
+Petals send Broker the complete transaction or message to sign, bound to the
+account in the route path. If signing is refused because an installed Petal
+is older than the running Bloom services, install the package version that
+matches them. Do not work around the refusal by changing accounts, removing
+fields, or switching to a reusable or batch path. After the owner approves,
+retry the same request.
 
-Polymarket orders and wallet calls have exact reviews. Its CLOB login instead
-asks for one `polymarket.clob_auth.v1` authentication permission, whose actual
-message Broker verifies after the server timestamp refreshes. That permission
-can create API credentials with account API access; it cannot sign a payment,
-order or wallet batch. Old pending onboarding login grants need replacement.
-
-Readings have explicit limits: Enso input amounts do not prove its quoted
-output or shortcut effects; Privacy Pools proof words are not proof verification;
-exchange acceptance is not settlement. Unknown assets retain their exact
-identity/raw units. Delegated sessions use their existing bounded authority
-and do not imply independent owner review of every future trade.
-
-Hyperliquid delegated actions supply a complete use-time action witness so
-Broker can verify the signed preimage under the existing grant. Upgrade the
-Petal with the matching Broker if an older hash-only caller is refused; do not
-strip that witness or seek another owner ceremony for each session action.
-This check does not make Petal-local caps venue-enforced or prove fills.
-
-Pump buy, sell, token-account close and launch approvals bind the actual Solana
-message to the selected account. Only the recent blockhash can refresh without
-changing that review; changed amounts, instructions, accounts or programs need
-a new approval. Retry through the same Pump operation. Old opaque grants cannot
-satisfy the reviewed profile. Lookup contents, unknown mint units, program
-effects and settlement remain unverified; do not substitute tickers or claim
-that a decoded transaction proves the trade executed.
+- **Enso:** same-chain swaps carry an on-chain minimum output, stated in the
+  intent's `plan.md`. Cross-chain swaps report `destination_unverified` after
+  the source transaction succeeds; Bloom does not track the destination.
+- **Polymarket:** `begin` asks for a login approval that can only create
+  exchange credentials; it cannot sign payments, orders or wallet batches.
+  `continue` sets up the deposit wallet with its own exact approval. Read
+  `status.json` and follow `next_action`.
+- **Hyperliquid:** delegated trading sessions sign later actions without a
+  new prompt. The Petal's own session limits are local; the exchange does not
+  enforce them.
+- **Pump:** a refreshed recent blockhash keeps the existing approval; any
+  other change to the transaction needs a new one. Retry through the same Pump
+  operation.
+- **Venice:** a login approval grants no payment authority, and each later
+  request uses a fresh login proof.
 
 Installed application documents and public routes live under `petals/<name>/`.
 Account-dependent routes explicitly select a wallet and index, for example
