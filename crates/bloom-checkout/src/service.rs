@@ -205,6 +205,9 @@ struct PrivateCheckout {
     /// A human retry is an attempted payment even if the old validation text
     /// remains visible while the merchant processes it.
     manual_submission: bool,
+    /// Checkout pressed the pay button, or may have. Without this or a manual
+    /// submission, no page text can make the checkout paid or booked.
+    submitted: bool,
 }
 
 struct PendingUnlock {
@@ -904,6 +907,7 @@ impl CheckoutService {
                             claimed: false,
                             approved: false,
                             manual_submission: false,
+                            submitted: false,
                         });
                         let service = self.clone();
                         tokio::spawn(async move {
@@ -1098,12 +1102,13 @@ impl CheckoutService {
             status.state = "submitted".into();
             self.store.update(&status)?;
             match discovery.submit(&checkout.tab).await {
-                Ok(true) => {}
+                Ok(true) => checkout.submitted = true,
                 Ok(false) => {
                     status.state = "needs_input".into();
                     self.store.update(&status)?;
                 }
                 Err(_) => {
+                    checkout.submitted = true;
                     status.state = "uncertain".into();
                     self.store.update(&status)?;
                 }
@@ -1159,12 +1164,13 @@ impl CheckoutService {
         status.state = "submitted".into();
         self.store.update(&status)?;
         match discovery.submit(&checkout.tab).await {
-            Ok(true) => {}
+            Ok(true) => checkout.submitted = true,
             Ok(false) => {
                 status.state = "needs_input".into();
                 self.store.update(&status)?;
             }
             Err(_) => {
+                checkout.submitted = true;
                 status.state = "uncertain".into();
                 self.store.update(&status)?;
             }
@@ -1292,7 +1298,7 @@ impl CheckoutService {
             tokio::time::sleep(Duration::from_millis(500)).await;
             // Outcome polling must not own the private-view lock while Chromium
             // is slow. Copy the stable browser handles, then do bounded calls.
-            let (mode, tab, view_target) = {
+            let (mode, tab, view_target, submitted) = {
                 let private = self.private.lock().await;
                 let Some(checkout) = private.as_ref().filter(|p| p.operation_id == id) else {
                     return;
@@ -1301,6 +1307,7 @@ impl CheckoutService {
                     checkout.mode,
                     checkout.tab.clone(),
                     checkout.view_target.clone(),
+                    checkout.submitted || checkout.manual_submission,
                 )
             };
             let Ok(mut status) = self.store.get(&id) else {
@@ -1355,18 +1362,22 @@ impl CheckoutService {
                     }
                     observed.push((is_top, outcome));
                 }
-                let paid_allowed = matches!(status.state.as_str(), "submitted" | "needs_input");
+                let attempt = matches!(status.state.as_str(), "submitted" | "needs_input");
+                // Success text counts only from the top document, after checkout
+                // or the person pressed pay. "needs_input" alone may mean the
+                // pay button was never pressed.
+                let completed_allowed =
+                    status.state == "submitted" || (status.state == "needs_input" && submitted);
                 let outcome = observed
                     .iter()
                     .find_map(|(is_top, outcome)| {
-                        let attempt = matches!(status.state.as_str(), "submitted" | "needs_input");
                         let terminal = match outcome["state"].as_str() {
-                            Some("booked") => Some("booked"),
+                            Some("booked") if *is_top && completed_allowed => Some("booked"),
                             // Help text can say "payment failed" before anyone pays.
                             Some("declined") if attempt || status.state == "declined" => {
                                 Some("declined")
                             }
-                            Some("payment_phrase") if *is_top && paid_allowed => Some("paid"),
+                            Some("payment_phrase") if *is_top && completed_allowed => Some("paid"),
                             _ => None,
                         }?;
                         Some((terminal, outcome))
@@ -2392,6 +2403,106 @@ mod tests {
         assert!(records.is_empty());
     }
 
+    /// A claimed private card checkout on `html` in `state`, ready to watch.
+    async fn watched_checkout(
+        html: &str,
+        state: &str,
+        submitted: bool,
+        lose_shopping: bool,
+    ) -> (
+        Arc<CheckoutService>,
+        String,
+        String,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (url, server) = crate::discovery::tests::fixture(html.into()).await;
+        let root = tempfile::tempdir().unwrap().keep();
+        let browser = Browser::launch(
+            &crate::test_chromium(),
+            &root.join("profile"),
+            &["--no-sandbox".into(), "--ignore-certificate-errors".into()],
+        )
+        .await
+        .unwrap();
+        browser
+            .browse(crate::browser::BrowseRequest::Open { url })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let tab = browser.handoff().await.unwrap();
+        if lose_shopping {
+            browser.lose_shopping_context().await;
+        }
+        let service = CheckoutService::new(
+            browser,
+            &root.join("state.db"),
+            root.join("unused.sock"),
+            unsafe { libc::geteuid() },
+            47999,
+        )
+        .unwrap();
+        let status = Status {
+            operation_id: "fixture-outcome".into(),
+            state: state.into(),
+            ceremony_url: None,
+            filled_fields: vec!["number".into()],
+            outcome: None,
+            paused: false,
+        };
+        service
+            .store
+            .insert(&status, "card", "Fixture shop")
+            .unwrap();
+        let token = hex_token(&[31; 32]);
+        *service.private.lock().await = Some(PrivateCheckout {
+            operation_id: status.operation_id.clone(),
+            mode: Mode::Card,
+            view_target: tab.target.clone(),
+            view_session: tab.session.clone(),
+            seen_pages: std::collections::HashSet::from([tab.target.clone()]),
+            tab,
+            discovery: None,
+            recipient: None,
+            capability: token.clone(),
+            claimed: true,
+            approved: true,
+            manual_submission: false,
+            submitted,
+        });
+        (service, status.operation_id, token, server)
+    }
+
+    /// Watch for a few polls; the watcher keeps running until its deadline.
+    async fn watch_briefly(service: &Arc<CheckoutService>, id: &str) -> String {
+        let _ =
+            tokio::time::timeout(Duration::from_secs(3), service.watch_outcome(id.into())).await;
+        service.store.get(id).unwrap().state
+    }
+
+    #[tokio::test]
+    async fn payment_phrase_counts_only_after_a_recorded_submission() {
+        let page = "<h1>Thank you for your order</h1>";
+        let (service, id, _, server) = watched_checkout(page, "needs_input", false, false).await;
+        assert_eq!(watch_briefly(&service, &id).await, "needs_input");
+        server.abort();
+        let (service, id, _, server) = watched_checkout(page, "needs_input", true, false).await;
+        assert_eq!(watch_briefly(&service, &id).await, "paid");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn booking_phrase_needs_a_submission_and_the_top_document() {
+        let booked = "<h1>Tu compra ha sido confirmada</h1><p>Código de reserva: AB12CD</p>";
+        let framed = format!("<p>Checkout</p><iframe srcdoc='{booked}'></iframe>");
+        let (service, id, _, server) = watched_checkout(&framed, "submitted", true, false).await;
+        assert_eq!(watch_briefly(&service, &id).await, "submitted");
+        server.abort();
+        let (service, id, _, server) =
+            watched_checkout(booked, "manual_required", false, false).await;
+        assert_eq!(watch_briefly(&service, &id).await, "manual_required");
+        server.abort();
+    }
+
     #[tokio::test]
     async fn airline_confirmation_becomes_booked_with_its_code() {
         let (url, server) = crate::discovery::tests::fixture(
@@ -2450,6 +2561,7 @@ mod tests {
             claimed: true,
             approved: true,
             manual_submission: false,
+            submitted: false,
         });
         tokio::time::timeout(
             Duration::from_secs(4),
@@ -2523,6 +2635,7 @@ mod tests {
             claimed: true,
             approved: true,
             manual_submission: false,
+            submitted: false,
         });
         tokio::time::timeout(
             Duration::from_secs(4),
@@ -2594,6 +2707,7 @@ mod tests {
             claimed: true,
             approved: true,
             manual_submission: false,
+            submitted: false,
         });
         let finished = tokio::time::timeout(
             Duration::from_secs(3),
@@ -2669,6 +2783,7 @@ mod tests {
             claimed: true,
             approved: true,
             manual_submission: false,
+            submitted: false,
         });
         let finished = tokio::time::timeout(
             Duration::from_secs(3),
@@ -2745,6 +2860,7 @@ mod tests {
             claimed: true,
             approved: true,
             manual_submission: false,
+            submitted: false,
         });
         let watcher = tokio::spawn({
             let service = service.clone();
@@ -2838,6 +2954,7 @@ mod tests {
             claimed: true,
             approved: true,
             manual_submission: false,
+            submitted: false,
         });
         let started = tokio::time::Instant::now();
         let capture = {
@@ -3421,6 +3538,7 @@ mod tests {
             claimed: false,
             approved: false,
             manual_submission: false,
+            submitted: false,
         });
         let router = crate::view::router(service.clone());
         let viewer = tokio::spawn(async move {
@@ -3654,6 +3772,7 @@ mod tests {
             claimed: true,
             approved: true,
             manual_submission: false,
+            submitted: false,
         });
         service
             .private_action(&token, ViewAction::Click { x: 20., y: 15. })
