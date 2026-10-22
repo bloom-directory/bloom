@@ -18,6 +18,8 @@ struct ElementRef {
     session: String,
     world: i64,
     index: usize,
+    /// Origin of the frame holding the element when it was read.
+    origin: String,
 }
 
 struct Tab {
@@ -178,6 +180,7 @@ impl Browser {
                             session: frame.session.clone(),
                             world: frame.world,
                             index,
+                            origin: parsed.origin().ascii_serialization(),
                         });
                         elements.push(element);
                     }
@@ -326,6 +329,22 @@ impl Browser {
         Ok(())
     }
 
+    /// Saved values go only into frames of the unlocked website, never into
+    /// an embedded chat, ad or other third-party frame.
+    fn check_traveler_frame(tab: &Tab, reference: &str, origin: &str) -> Result<()> {
+        let index = reference
+            .split_once(':')
+            .and_then(|(_, index)| index.parse::<usize>().ok());
+        if let Some(binding) = index.and_then(|index| tab.refs.get(index))
+            && binding.origin != origin
+        {
+            bail!(
+                "That field is in an embedded frame from another website; type it in the private view"
+            );
+        }
+        Ok(())
+    }
+
     pub(crate) async fn type_traveler(
         &self,
         reference: &str,
@@ -337,6 +356,7 @@ impl Browser {
         let mut tab = self.tab.lock().await;
         self.available()?;
         self.check_traveler_scope(&tab, context, origin).await?;
+        Self::check_traveler_frame(&tab, reference, origin)?;
         self.act(&mut tab, reference, "type", value).await?;
         Ok(())
     }
@@ -355,6 +375,7 @@ impl Browser {
         let mut tab = self.tab.lock().await;
         self.available()?;
         self.check_traveler_scope(&tab, context, origin).await?;
+        Self::check_traveler_frame(&tab, reference, origin)?;
         let (generation, index) = reference
             .split_once(':')
             .context("Invalid element reference")?;
@@ -959,6 +980,67 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(value["result"]["value"], "");
+        site.abort();
+        let _ = site.await;
+    }
+
+    #[tokio::test]
+    async fn saved_traveler_values_never_go_into_another_origins_frame() {
+        let root = tempfile::tempdir().unwrap();
+        let browser = Browser::launch(
+            &crate::test_chromium(),
+            &root.path().join("profile"),
+            &["--no-sandbox".into()],
+        )
+        .await
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let url = format!("http://127.0.0.1:{port}/");
+        let origin = url.trim_end_matches('/').to_owned();
+        let page = format!(
+            "<label>Given name<input name='first_name'></label>\
+             <iframe src='http://localhost:{port}/chat' width=400 height=200></iframe>"
+        );
+        let site = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/", get(move || async move { Html(page) }))
+                    .route(
+                        "/chat",
+                        get(|| async { Html("<label>Chat message<input name='chat'></label>") }),
+                    ),
+            )
+            .await
+            .unwrap();
+        });
+        browser
+            .browse(BrowseRequest::Open { url: url.clone() })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let context = browser.shopping_context().await;
+        let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+        let chat = snapshot["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["frame_origin"] != origin.as_str() && e["role"] == "input")
+            .unwrap_or_else(|| panic!("no child frame input in {snapshot}"))["ref"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let error = browser
+            .type_traveler(&chat, "PRIVATE-FIXTURE", &context, &origin)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("embedded frame from another website"),
+            "{error}"
+        );
         site.abort();
         let _ = site.await;
     }

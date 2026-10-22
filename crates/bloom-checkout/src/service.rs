@@ -1949,6 +1949,7 @@ const BROWSE_ERRORS: &[&str] = &[
     "Saved traveler details are unlocked for another booking or website",
     "Choose traveler_id explicitly when multiple people are unlocked",
     "Unlock that saved traveler for this booking first",
+    "That field is in an embedded frame from another website; type it in the private view",
 ];
 
 #[cfg(test)]
