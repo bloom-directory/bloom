@@ -299,6 +299,23 @@ fn sweep_retires_signed_entry_that_was_never_broadcast() {
         .record_signature("alice", "solana-devnet", "0001-signed", "SIG1")
         .unwrap();
 
+    let candidates = outbox
+        .expired_pending(1000, &heights_past_window("solana-devnet", 999_999))
+        .unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert!(candidates[0].dir.join("intent.json").exists());
+    assert!(candidates[0].dir.join(".signature").exists());
+    assert!(
+        outbox
+            .read_in_state(
+                "alice",
+                "solana-devnet",
+                "0001-signed",
+                SolanaOutboxState::Failed
+            )
+            .is_err()
+    );
+
     assert_eq!(
         outbox
             .sweep_expired(1000, &heights_past_window("solana-devnet", 999_999))
