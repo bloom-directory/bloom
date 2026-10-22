@@ -38,12 +38,12 @@ jobs:
       - uses: actions/checkout@v6
         with:
           repository: bloom-directory/bloom-petal-polymarket
-          ref: 2055a0aa4ddc7a71ac08c5e2ec724037ba2feae8
+          ref: 60051e6bc992d6428a051c0dceefd95de5d09728
           path: .pm80-packages/polymarket
       - uses: actions/checkout@v6
         with:
           repository: bloom-directory/bloom-petal-hyperliquid
-          ref: 17652ac832314a75b8b9b079cb5aacf74b498891
+          ref: 0a90ead505a8d9580d7965805b87ade1b3c71895
           path: .pm80-packages/hyperliquid
       - name: Fetch the exact Broker fixture input
         run: |
@@ -368,7 +368,7 @@ jobs:
       github.ref_name == 'triad-architecture'
     uses: ./.github/workflows/macos-unix-conformance.yml
     with:
-      broker_ref: ff5e635d6e10fb28b39cc7bf25fc88c35f92de5a
+      broker_ref: 0fcad3291d0c8109264bdae33273d7c8566717ec
       signer_ref: bc88ad690757165ebf1978410ea5c7ec652215d3
 
   linux_w0_isolation:
