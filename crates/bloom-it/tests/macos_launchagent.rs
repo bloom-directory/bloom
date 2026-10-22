@@ -716,7 +716,9 @@ fn macos_checkout_logs_uses_a_per_login_port_and_cleans_up_its_accounts() {
     assert!(!plist.contains("/dev/null"));
     // Chrome needs a writable HOME; the hidden user's home is /var/empty.
     assert!(plist.contains("<key>HOME</key><string>@BLOOM_CHECKOUT_STATE@</string>"));
-    assert!(plist.contains("<string>--view-port</string><string>@BLOOM_CHECKOUT_VIEW_PORT@</string>"));
+    assert!(
+        plist.contains("<string>--view-port</string><string>@BLOOM_CHECKOUT_VIEW_PORT@</string>")
+    );
     assert!(!plist.contains("18736"));
 
     let installer =
@@ -756,5 +758,7 @@ fn macos_conformance_never_writes_into_live_audit_checkpoint_directories() {
         )));
     }
     assert!(script.contains("sudo -u \"$login_user\" test ! -x \"$broker_checkpoints\""));
-    assert!(script.contains("sudo -u \"bloom-signer-$login_uid\" test ! -x \"$broker_checkpoints\""));
+    assert!(
+        script.contains("sudo -u \"bloom-signer-$login_uid\" test ! -x \"$broker_checkpoints\"")
+    );
 }

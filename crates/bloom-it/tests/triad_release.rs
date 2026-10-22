@@ -5395,12 +5395,19 @@ fn linux_checkout_browser_skips_the_snap_shim_and_never_blocks_install() {
             .arg(path)
             .output()
             .unwrap();
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         String::from_utf8(output.stdout).unwrap()
     };
     assert_eq!(select(&bin), "");
     write("google-chrome", b"\x7fELF fixture");
-    assert_eq!(select(&bin), format!("{}\n", bin.join("google-chrome").display()));
+    assert_eq!(
+        select(&bin),
+        format!("{}\n", bin.join("google-chrome").display())
+    );
 
     let installer = fs::read_to_string(release_script("install-linux.sh")).unwrap();
     assert!(!installer.contains("Bloom checkout requires installed Chromium or Google Chrome"));
