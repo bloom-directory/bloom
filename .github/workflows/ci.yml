@@ -81,7 +81,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           repository: bloom-directory/bloom-signer
-          ref: c17f4bf42404548e07fddc749c740b0a8eb01119
+          ref: 56252a16e65a15dddd713cb260659ecbcd8bb2ce
           path: .pm80-packages/signer
       - name: Prepare disposable Linux service manager
         run: |
