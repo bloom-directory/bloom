@@ -15,15 +15,18 @@
     <string>--broker-socket</string><string>@BLOOM_CHECKOUT_INTAKE@</string>
     <string>--broker-uid</string><string>@BLOOM_BROKER_UID@</string>
     <string>--machine-uid</string><string>@LOGIN_UID@</string>
-    <string>--view-port</string><string>18736</string>
+    <string>--view-port</string><string>@BLOOM_CHECKOUT_VIEW_PORT@</string>
     <string>--follow-broker-lifecycle</string>
   </array>
+  <!-- launchd sets only PATH; Chrome needs a writable HOME and the hidden
+       user's home is /var/empty. -->
+  <key>EnvironmentVariables</key><dict><key>HOME</key><string>@BLOOM_CHECKOUT_STATE@</string></dict>
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
   <key>ThrottleInterval</key><integer>5</integer>
   <key>ProcessType</key><string>Background</string>
   <key>WorkingDirectory</key><string>@BLOOM_CHECKOUT_STATE@</string>
   <key>SoftResourceLimits</key><dict><key>Core</key><integer>0</integer><key>NumberOfFiles</key><integer>4096</integer></dict>
   <key>HardResourceLimits</key><dict><key>Core</key><integer>0</integer></dict>
-  <key>StandardOutPath</key><string>/dev/null</string>
-  <key>StandardErrorPath</key><string>/dev/null</string>
+  <key>StandardOutPath</key><string>@BLOOM_CHECKOUT_LOG@</string>
+  <key>StandardErrorPath</key><string>@BLOOM_CHECKOUT_LOG@</string>
 </dict></plist>
