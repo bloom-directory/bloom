@@ -89,7 +89,9 @@
   // Ryanair and Airbnb final pages, 2026-10-11). Labels may use non-breaking spaces.
   const pay = controls.filter(e => BLOOM_PAY_WORDS.test((e.innerText || e.value).replace(/\s+/g, ' ').trim()));
   if (pay.length !== 1) return null;
-  const explicit = [...document.querySelectorAll('[data-bloom-total-minor][data-bloom-currency]')].filter(visible);
+  // Test fixtures declare their total; a merchant page never chooses its own.
+  const fixture = BLOOM_FIXTURE_TOTALS && ['localhost', '127.0.0.1'].includes(location.hostname);
+  const explicit = fixture ? [...document.querySelectorAll('[data-bloom-total-minor][data-bloom-currency]')].filter(visible) : [];
   let total, currency;
   let processorRecurring = null;
   if (location.origin === 'https://buy.stripe.com') {

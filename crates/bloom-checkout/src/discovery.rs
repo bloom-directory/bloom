@@ -91,6 +91,17 @@ const MERCHANT_CARD_ORIGINS: &[&str] = &[
     "https://www.aerolineas.com.ar",
 ];
 
+/// Test browsers may read fixture merchants' declared totals; release builds never.
+fn fixture_totals(tab: &PrivateTab) -> bool {
+    #[cfg(test)]
+    return tab.fixture_payment_hosts;
+    #[cfg(not(test))]
+    {
+        let _ = tab;
+        false
+    }
+}
+
 fn provider_hosts_card_fields(frame_origin: &str, top_origin: &str, fixture: bool) -> bool {
     let known = PROVIDER_FIELD_ORIGINS.contains(&frame_origin)
         || (frame_origin == top_origin
@@ -244,7 +255,10 @@ pub(crate) async fn order_fields(tab: &PrivateTab) -> Value {
 
 /// Page scripts checkout evaluates in its own browser.
 pub(crate) enum Script<'a> {
-    Facts,
+    /// `fixture` honours the test-only total attribute on localhost pages.
+    Facts {
+        fixture: bool,
+    },
     Fields,
     Submit,
     Valid,
@@ -258,7 +272,8 @@ pub(crate) enum Script<'a> {
 impl Script<'_> {
     fn expression(&self) -> Result<String> {
         Ok(match self {
-            Script::Facts => crate::scripts::prepare(include_str!("facts.js")),
+            Script::Facts { fixture } => crate::scripts::prepare(include_str!("facts.js"))
+                .replace("BLOOM_FIXTURE_TOTALS", &fixture.to_string()),
             Script::Fields => crate::scripts::prepare(include_str!("fields.js")),
             Script::Submit => include_str!("submit.js").into(),
             Script::Valid => format!("({})()", include_str!("payment-valid.js").trim()),
@@ -365,7 +380,15 @@ impl Discovery {
                 || (origin == "https://js.stripe.com"
                     && url::Url::parse(url)?.path() == "/v3/embedded-checkout-inner.html")
             {
-                let candidate = run(tab, &session, world, Script::Facts).await?;
+                let candidate = run(
+                    tab,
+                    &session,
+                    world,
+                    Script::Facts {
+                        fixture: fixture_totals(tab),
+                    },
+                )
+                .await?;
                 if let Ok(facts) = serde_json::from_value::<CheckoutFacts>(candidate) {
                     candidates.push((session.clone(), world, facts));
                 }
@@ -481,7 +504,15 @@ impl Discovery {
             bail!("Payment tab origin changed");
         }
         let mut current: CheckoutFacts = serde_json::from_value(
-            run(tab, &self.facts_session, self.main_world, Script::Facts).await?,
+            run(
+                tab,
+                &self.facts_session,
+                self.main_world,
+                Script::Facts {
+                    fixture: fixture_totals(tab),
+                },
+            )
+            .await?,
         )
         .context("Payment facts changed")?;
         current.origin = self.facts.origin.clone();
@@ -1156,6 +1187,30 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(text, "Vielen Dank für Ihre Bestellung");
+        browser.return_control().await.unwrap();
+        server.abort();
+    }
+
+    /// A merchant page cannot pick the reviewed total with the fixture attribute.
+    #[tokio::test]
+    async fn merchant_total_attribute_is_ignored_outside_fixtures() {
+        let browser = browser().await;
+        let (url, server) = fixture(
+            "<!doctype html><p data-bloom-total-minor='1' data-bloom-currency='USD'>Total USD 399.00</p>\
+             <button>Pay</button>"
+                .into(),
+        )
+        .await;
+        let mut tab = open(&browser, url).await;
+        tab.fixture_payment_hosts = false;
+        let discovery = Discovery::read_site(&tab).await.unwrap();
+        assert_eq!(
+            (
+                discovery.facts.total_minor,
+                discovery.facts.currency.as_str()
+            ),
+            (39900, "USD")
+        );
         browser.return_control().await.unwrap();
         server.abort();
     }
