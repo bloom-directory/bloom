@@ -229,15 +229,23 @@ struct UnlockedTraveler {
     expires: tokio::time::Instant,
 }
 
+/// Drops travelers of another booking or past expiry; returns their unlock IDs.
 fn prune_travelers(
     travelers: &mut BTreeMap<String, UnlockedTraveler>,
     context: &str,
     origin: &str,
-) {
+) -> Vec<String> {
     let now = tokio::time::Instant::now();
+    let mut dropped = Vec::new();
     travelers.retain(|_, traveler| {
-        traveler.context == context && traveler.origin == origin && now < traveler.expires
+        let keep =
+            traveler.context == context && traveler.origin == origin && now < traveler.expires;
+        if !keep {
+            dropped.push(traveler.operation_id.clone());
+        }
+        keep
     });
+    dropped
 }
 
 fn selected_traveler<'a>(
@@ -328,7 +336,7 @@ impl CheckoutService {
         self.forget_journey_filler_unless(&context).await;
         {
             let mut travelers = self.travelers.lock().await;
-            prune_travelers(&mut travelers, &context, &origin);
+            self.prune(&mut travelers, &context, &origin);
             if travelers.contains_key(&traveler_id) {
                 bail!("That traveler is already unlocked; select their traveler_id when filling");
             }
@@ -497,7 +505,7 @@ impl CheckoutService {
         );
         status.filled_fields = values.keys().cloned().collect();
         self.forget_journey_filler_unless(&pending.context).await;
-        prune_travelers(&mut travelers, &pending.context, &pending.origin);
+        self.prune(&mut travelers, &pending.context, &pending.origin);
         travelers.insert(
             pending.traveler_id,
             UnlockedTraveler {
@@ -558,6 +566,7 @@ impl CheckoutService {
         let (context, origin) = self.browser.shopping_scope().await?;
         self.forget_journey_filler_unless(&context).await;
         let mut travelers = self.travelers.lock().await;
+        self.prune(&mut travelers, &context, &origin);
         let traveler = selected_traveler(&mut travelers, &context, &origin, traveler_id)?;
         let text = derived_traveler_value(&traveler.values, field)
             .context("That saved traveler field is not available")?;
@@ -591,6 +600,7 @@ impl CheckoutService {
         let (context, origin) = self.browser.shopping_scope().await?;
         self.forget_journey_filler_unless(&context).await;
         let mut travelers = self.travelers.lock().await;
+        self.prune(&mut travelers, &context, &origin);
         let traveler = selected_traveler(&mut travelers, &context, &origin, traveler_id)?;
         let mut values = traveler.values.clone();
         let fields = traveler.fields.clone();
@@ -670,14 +680,36 @@ impl CheckoutService {
         }
     }
 
+    /// Drop travelers outside this booking or past expiry; their unlocks end.
+    fn prune(
+        &self,
+        travelers: &mut BTreeMap<String, UnlockedTraveler>,
+        context: &str,
+        origin: &str,
+    ) {
+        for id in prune_travelers(travelers, context, origin) {
+            let _ = self.store.finish_traveler(&id, "expired");
+        }
+    }
+
+    /// Drop every unlocked traveler's values and end their unlocks.
+    async fn forget_travelers(&self) {
+        let dropped = std::mem::take(&mut *self.travelers.lock().await);
+        for traveler in dropped.into_values() {
+            let _ = self
+                .store
+                .finish_traveler(&traveler.operation_id, "expired");
+        }
+    }
+
     async fn return_control(&self) -> Result<()> {
-        self.travelers.lock().await.clear();
+        self.forget_travelers().await;
         self.journey_filler.lock().await.take();
         self.browser.return_control().await
     }
 
     async fn return_control_at(&self, target: &str, url: Option<String>) -> Result<()> {
-        self.travelers.lock().await.clear();
+        self.forget_travelers().await;
         self.journey_filler.lock().await.take();
         self.browser.return_control_at(target, url).await
     }
@@ -756,7 +788,7 @@ impl CheckoutService {
             }
             Request::Browse { request } => {
                 if matches!(request, BrowseRequest::Open { .. }) {
-                    self.travelers.lock().await.clear();
+                    self.forget_travelers().await;
                 }
                 self.browser.browse(request).await
             }
@@ -784,10 +816,17 @@ impl CheckoutService {
                 if agent_description.len() > 1024 {
                     bail!("Description exceeds limit");
                 }
+                let unlocking = self.unlocking.lock().await;
                 let mut private = self.private.lock().await;
                 if private.is_some() {
                     bail!("A checkout already has private control");
                 }
+                if unlocking.is_some() {
+                    bail!(
+                        "A saved traveler unlock is waiting for approval; finish or cancel it before payment"
+                    );
+                }
+                drop(unlocking);
                 let mut status = Status {
                     operation_id: operation_id.clone(),
                     state: "requested".into(),
@@ -834,8 +873,14 @@ impl CheckoutService {
                         }
                     }
                 }
-                self.store.insert(&status, kind, &agent_description)?;
+                if self.store.get(&operation_id).is_ok() {
+                    bail!("Operation ID already used");
+                }
                 let tab = self.browser.handoff().await?;
+                if let Err(error) = self.store.insert(&status, kind, &agent_description) {
+                    let _ = self.return_control().await;
+                    return Err(error);
+                }
                 status.state = "preparing".into();
                 self.store.update(&status)?;
                 let discovery = match mode {
@@ -1982,6 +2027,10 @@ const BROWSE_ERRORS: &[&str] = &[
     "Saved traveler details are unlocked for another booking or website",
     "Choose traveler_id explicitly when multiple people are unlocked",
     "Unlock that saved traveler for this booking first",
+    "Unlock a saved traveler first",
+    "That saved traveler field is not available",
+    "That list did not take the saved value; choose it in the private view",
+    "A checkout already has private control",
     "That field is in an embedded frame from another website; type it in the private view",
 ];
 
@@ -2522,6 +2571,162 @@ mod tests {
         let (service, id, _, server) =
             watched_checkout(booked, "manual_required", false, false).await;
         assert_eq!(watch_briefly(&service, &id).await, "manual_required");
+        server.abort();
+    }
+
+    /// A service shopping on `html`, with no private checkout.
+    async fn shopping_service(
+        html: &str,
+    ) -> (
+        Arc<CheckoutService>,
+        Arc<Browser>,
+        String,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (url, server) = crate::discovery::tests::fixture(html.into()).await;
+        let root = tempfile::tempdir().unwrap().keep();
+        let browser = Browser::launch(
+            &crate::test_chromium(),
+            &root.join("profile"),
+            &["--no-sandbox".into(), "--ignore-certificate-errors".into()],
+        )
+        .await
+        .unwrap();
+        browser
+            .browse(BrowseRequest::Open { url: url.clone() })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let service = CheckoutService::new(
+            browser.clone(),
+            &root.join("state.db"),
+            root.join("unused.sock"),
+            unsafe { libc::geteuid() },
+            47999,
+        )
+        .unwrap();
+        (service, browser, url, server)
+    }
+
+    /// An unlocked traveler on the current booking, recorded as `unlocked`.
+    async fn unlocked(service: &CheckoutService, id: &str, lifetime: Duration) {
+        let (context, origin) = service.browser.shopping_scope().await.unwrap();
+        let operation_id = format!("{id}-unlock");
+        service
+            .store
+            .insert(
+                &Status {
+                    operation_id: operation_id.clone(),
+                    state: "unlocked".into(),
+                    ceremony_url: None,
+                    filled_fields: vec![],
+                    outcome: None,
+                    paused: false,
+                },
+                "traveler",
+                "Synthetic unlock",
+            )
+            .unwrap();
+        service.travelers.lock().await.insert(
+            id.into(),
+            UnlockedTraveler {
+                operation_id,
+                origin,
+                context,
+                fields: vec![],
+                values: BTreeMap::new(),
+                expires: tokio::time::Instant::now() + lifetime,
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_traveler_values_end_their_unlock_as_expired() {
+        let (service, _browser, url, server) = shopping_service("<input>").await;
+        let state = |id: &str| service.store.get(&format!("{id}-unlock")).unwrap().state;
+        unlocked(&service, "opened", Duration::from_secs(60)).await;
+        service
+            .request(Request::Browse {
+                request: BrowseRequest::Open { url },
+            })
+            .await
+            .unwrap();
+        assert_eq!(state("opened"), "expired");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        unlocked(&service, "old", Duration::ZERO).await;
+        assert!(
+            service
+                .request(Request::Browse {
+                    request: BrowseRequest::TypeTraveler {
+                        element_ref: "0:0".into(),
+                        field: "given_name".into(),
+                        traveler_id: Some("old".into()),
+                    },
+                })
+                .await
+                .is_err()
+        );
+        assert_eq!(state("old"), "expired");
+        unlocked(&service, "returned", Duration::from_secs(60)).await;
+        service.return_control().await.unwrap();
+        assert_eq!(state("returned"), "expired");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn traveler_guidance_reaches_the_agent() {
+        let mut none = BTreeMap::new();
+        let Err(error) = selected_traveler(&mut none, "booking", "https://shop.example", None)
+        else {
+            panic!("no traveler is unlocked");
+        };
+        let error = error.to_string();
+        assert!(BROWSE_ERRORS.contains(&error.as_str()), "{error}");
+        assert!(BROWSE_ERRORS.contains(&"That saved traveler field is not available"));
+    }
+
+    #[tokio::test]
+    async fn checkout_waits_for_a_pending_traveler_unlock() {
+        let (service, _browser, _, server) = shopping_service("<button>Pay</button>").await;
+        let (context, origin) = service.browser.shopping_scope().await.unwrap();
+        *service.unlocking.lock().await = Some(PendingUnlock {
+            operation_id: "pending-unlock".into(),
+            traveler_id: "person".into(),
+            recipient: Recipient::generate(),
+            context,
+            origin,
+            fields: vec![],
+        });
+        let error = service
+            .request(Request::Checkout {
+                operation_id: "e".repeat(64),
+                card_id: None,
+                agent_description: "Fixture".into(),
+                take_over: true,
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("traveler"), "{error}");
+        assert!(service.store.get(&"e".repeat(64)).is_err());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_failed_handoff_leaves_no_requested_checkout() {
+        let (service, browser, _, server) = shopping_service("<button>Pay</button>").await;
+        let _held = browser.handoff().await.unwrap();
+        assert!(
+            service
+                .request(Request::Checkout {
+                    operation_id: "f".repeat(64),
+                    card_id: None,
+                    agent_description: "Fixture".into(),
+                    take_over: true,
+                })
+                .await
+                .is_err()
+        );
+        assert!(service.store.get(&"f".repeat(64)).is_err());
         server.abort();
     }
 
