@@ -22,10 +22,12 @@ use crate::host::PetalHost;
 use crate::runner::{PETAL_DOCUMENT_NAMES, PetalRunner};
 use crate::vm::{COMPONENT_NOT_A_DIR_CODE, COMPONENT_UNSUPPORTED_CODE, RunOptions};
 
-/// How long lookups, listings and plain reads may reuse a live account
-/// observation, matching the Machine's default wallet-projection reuse window.
-/// One mounted path traversal issues several lookups before its read; each
-/// live observation costs a full Broker wallet refresh.
+/// How long name resolution (lookups and ancestor checks) may reuse a live
+/// account observation, matching the Machine's default wallet-projection reuse
+/// window. One mounted path traversal issues several lookups before its read;
+/// each live observation costs a Broker wallet refresh. Anything that returns
+/// data or acts observes the account afresh, so a cached observation is never
+/// authority.
 const ACCOUNT_CONTEXT_REUSE: Duration = Duration::from_secs(1);
 
 /// Recent account observations, ordered by when each began. A refusal is
@@ -139,9 +141,9 @@ impl PetalRouter {
 
     /// Resolve the account a wallet-scoped route runs as. `account.json` is
     /// served on the live authority path, so every read is a Broker wallet
-    /// refresh. Writes and side-effecting reads (`live`) always observe it
-    /// afresh; lookups, listings and plain reads reuse an observation made in
-    /// the last `account_context_reuse`.
+    /// refresh. Reads, listings and writes (`live`) always observe it afresh;
+    /// lookups and ancestor checks, which only resolve names, reuse an
+    /// observation made in the last `account_context_reuse`.
     async fn account_context(
         &self,
         wallet: &str,
@@ -374,7 +376,9 @@ impl PetalRouter {
                 {
                     return Err(HandlerError::PermissionDenied);
                 }
-                let live = self.is_effect(mount, op, &path);
+                // Only name resolution may reuse a recent observation; a
+                // Petal returning data or acting runs as the live account.
+                let live = op != DispatchOp::Lookup;
                 let account = self.account_context(wallet, index, live).await?;
                 self.dispatch_for_account(mount, op, path, body, &account, &execution)
                     .await
@@ -1722,6 +1726,26 @@ name = "example"
                 .unwrap();
         }
         assert_eq!(host.reads.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn only_name_resolution_reuses_a_recent_account_observation() {
+        use std::sync::atomic::Ordering;
+        let (dir, runner) = runner();
+        let package = dir.path().join("example-app");
+        write_dynamic_dir_package(&package, false);
+        runner.store().install_petal_package_dir(&package).unwrap();
+        let host = Arc::new(CountingAccountHost::default());
+        let router = PetalRouter::new(runner, host.clone());
+        let path = VfsPath::parse("example/intents/alice/0").unwrap();
+        router.lookup(&path).await.unwrap();
+        assert_eq!(host.reads.load(Ordering::Relaxed), 1);
+        // Within the reuse window, a lookup resolves the name from the recent
+        // observation, but a listing returns data and observes afresh.
+        router.lookup(&path).await.unwrap();
+        assert_eq!(host.reads.load(Ordering::Relaxed), 1);
+        router.list(&path).await.unwrap();
+        assert_eq!(host.reads.load(Ordering::Relaxed), 2);
     }
 
     #[test]

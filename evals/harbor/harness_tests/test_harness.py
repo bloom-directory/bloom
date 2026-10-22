@@ -394,6 +394,7 @@ class HyperliquidDefinitionTests(unittest.TestCase):
             side_effect=[
                 {
                     "wallet": self.wallet_id,
+                    "schema": "bloom.account.v1",
                     "number": 0,
                     "evm": {"state": "active", "address": self.wallet},
                     "freshness": "fresh",
@@ -422,6 +423,7 @@ class HyperliquidDefinitionTests(unittest.TestCase):
             side_effect=[
                 {
                     "wallet": self.wallet_id,
+                    "schema": "bloom.account.v1",
                     "number": 0,
                     "evm": {"state": "active", "address": self.wallet},
                     "freshness": "fresh",
@@ -456,6 +458,7 @@ class HyperliquidDefinitionTests(unittest.TestCase):
             side_effect=[
                 {
                     "wallet": self.wallet_id,
+                    "schema": "bloom.account.v1",
                     "number": 0,
                     "evm": {"state": "active", "address": self.wallet},
                     "freshness": "fresh",
@@ -1303,6 +1306,11 @@ class WalletAccountOwnerTests(unittest.TestCase):
         for account in (
             {"wallet": "another-wallet"},
             {"number": 1},
+            {"number": False},
+            {"number": 0.0},
+            {"number": "0"},
+            {"schema": "bloom.account.v2"},
+            {"schema": None},
             {"evm": {"state": "retired", "address": self.OWNER.lower()}},
             {"evm": {"state": "active", "address": "not-an-address"}},
         ):

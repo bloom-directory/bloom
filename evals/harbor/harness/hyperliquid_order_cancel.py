@@ -100,10 +100,14 @@ def wallet_account_projection(
     """
     account = read_json(wallet_root / "0" / "account.json")
     evm = account.get("evm") if isinstance(account, dict) else None
+    number = account.get("number") if isinstance(account, dict) else None
     if (
         not isinstance(evm, dict)
+        or account.get("schema") != "bloom.account.v1"
         or account.get("wallet") != wallet_id
-        or account.get("number") != 0
+        # `False` and `0.0` compare equal to 0; only the integer is account 0.
+        or type(number) is not int
+        or number != 0
         or evm.get("state") != "active"
     ):
         raise EvalError("wallet account 0 projection is invalid for the selected wallet")
