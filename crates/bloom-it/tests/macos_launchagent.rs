@@ -740,3 +740,21 @@ fn macos_checkout_logs_uses_a_per_login_port_and_cleans_up_its_accounts() {
     assert!(!installer.contains("do dscl . -delete \"/Users/$name\"; done"));
     assert!(!installer.contains("do dscl . -delete \"/Groups/$name\"; done"));
 }
+
+#[test]
+fn macos_conformance_never_writes_into_live_audit_checkpoint_directories() {
+    // Broker and Signer read every file there on each decision; an empty
+    // probe file is malformed and latches the Triad read-only.
+    let script = fs::read_to_string(
+        workspace().join("tests/conformance/macos-unix-principals/run-disposable.sh"),
+    )
+    .unwrap();
+    assert!(!script.contains("audit-checkpoints/w0-private"));
+    for service in ["broker", "signer"] {
+        assert!(script.contains(&format!(
+            "{service}_checkpoints=\"/private/var/db/bloom/$login_uid/{service}/audit-checkpoints\""
+        )));
+    }
+    assert!(script.contains("sudo -u \"$login_user\" test ! -x \"$broker_checkpoints\""));
+    assert!(script.contains("sudo -u \"bloom-signer-$login_uid\" test ! -x \"$broker_checkpoints\""));
+}
