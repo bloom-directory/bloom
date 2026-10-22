@@ -967,6 +967,17 @@ impl CheckoutService {
                 if !matches!(self.store.kind(&operation_id)?.as_str(), "card" | "site") {
                     bail!("That checkout has no unresolved result to check");
                 }
+                if self
+                    .private
+                    .lock()
+                    .await
+                    .as_ref()
+                    .is_some_and(|checkout| checkout.operation_id == operation_id)
+                {
+                    bail!(
+                        "That checkout's private view is still open; the payment may still finish there. Resolve after the person closes it."
+                    );
+                }
                 let mut status = self.store.get(&operation_id)?;
                 if matches!(status.state.as_str(), "requested" | "awaiting_approval") {
                     bail!(
@@ -1189,6 +1200,15 @@ pub enum ViewAction {
     Scroll { x: f64, y: f64, delta_y: f64 },
     SelectPage { target: String },
     Finish,
+}
+
+/// The state a card or site checkout ends in when its private view closes:
+/// a recorded result stays; anything else is uncertain until checked.
+fn closing_state(current: &str) -> &str {
+    match current {
+        "paid" | "booked" | "declined" | "resolved" => current,
+        _ => "uncertain",
+    }
 }
 
 fn authorize_view(checkout: &PrivateCheckout, token: &str) -> Result<()> {
@@ -1460,10 +1480,11 @@ impl CheckoutService {
                     None
                 };
                 if self.return_control_at(&view_target, resume).await.is_ok() {
+                    let current = self.store.get(&id).map(|s| s.state).unwrap_or_default();
                     let final_state = if mode == Mode::TakeOver {
                         "returned"
                     } else {
-                        "uncertain"
+                        closing_state(&current)
                     };
                     self.set_state(&id, final_state);
                     if let Ok(status) = self.store.get(&id) {
@@ -1858,7 +1879,8 @@ impl CheckoutService {
                     self.return_control_at(&view_target, resume).await?;
                     self.set_state(&operation_id, "returned");
                 } else {
-                    self.set_state(&operation_id, "uncertain");
+                    let current = self.store.get(&operation_id)?.state;
+                    self.set_state(&operation_id, closing_state(&current));
                     self.return_control().await?;
                 }
                 let mut private = self.private.lock().await;
@@ -2442,7 +2464,7 @@ mod tests {
         )
         .unwrap();
         let status = Status {
-            operation_id: "fixture-outcome".into(),
+            operation_id: "d".repeat(64),
             state: state.into(),
             ceremony_url: None,
             filled_fields: vec!["number".into()],
@@ -2500,6 +2522,42 @@ mod tests {
         let (service, id, _, server) =
             watched_checkout(booked, "manual_required", false, false).await;
         assert_eq!(watch_briefly(&service, &id).await, "manual_required");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn finish_keeps_a_recorded_outcome() {
+        let booked = "<h1>Tu compra ha sido confirmada</h1><p>Código de reserva: AB12CD</p>";
+        let (service, id, token, server) = watched_checkout(booked, "submitted", true, true).await;
+        assert_eq!(watch_briefly(&service, &id).await, "booked");
+        assert!(service.store.get(&id).unwrap().paused);
+        let _ = service.private_action(&token, ViewAction::Finish).await;
+        assert_eq!(service.store.get(&id).unwrap().state, "booked");
+        server.abort();
+    }
+
+    #[test]
+    fn closing_without_a_result_is_uncertain_but_keeps_recorded_ones() {
+        for kept in ["paid", "booked", "declined", "resolved"] {
+            assert_eq!(closing_state(kept), kept);
+        }
+        for open in ["submitted", "needs_input", "manual_required", "filled"] {
+            assert_eq!(closing_state(open), "uncertain");
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_waits_until_the_private_view_closes() {
+        let page = "<h1>Bank check</h1>";
+        let (service, id, _, server) = watched_checkout(page, "needs_input", true, false).await;
+        let error = service
+            .request(Request::Resolve {
+                operation_id: id.clone(),
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("private view"), "{error}");
+        assert_eq!(service.store.get(&id).unwrap().state, "needs_input");
         server.abort();
     }
 
