@@ -5656,36 +5656,6 @@ mod tests {
     use bloom_vfs::handler::Entry;
     use bloom_vfs::handler::Handler;
 
-    #[test]
-    fn petal_http_transport_errors_preserve_cause_without_request_urls() {
-        for phase in ["send", "body"] {
-            let original = reqwest::Client::new()
-                .get("https://api.example.com")
-                .header("invalid\nheader", "fixture-value")
-                .build()
-                .unwrap_err()
-                .with_url("https://fixture-user:fixture-password@api.example.com/fixture-path-token?key=fixture-query-token".parse().unwrap());
-            assert!(original.to_string().contains("fixture-path-token"));
-            let message = petal_http_transport_error(phase, original).to_string();
-            for value in [
-                "fixture-user",
-                "fixture-password",
-                "fixture-path-token",
-                "fixture-query-token",
-            ] {
-                assert!(
-                    !message.contains(value),
-                    "request URL data must not reach guest errors"
-                );
-            }
-            assert!(message.contains(&format!("http_fetch {phase}:")));
-            assert!(
-                message.contains("builder error"),
-                "transport cause was discarded"
-            );
-        }
-    }
-
     #[cfg(feature = "mount")]
     #[test]
     fn mount_uses_the_configured_nfs_listener() {
@@ -9951,5 +9921,35 @@ allowed = ["bloom:vfs.read"]
             names.contains(&"unknown-eeeeeeeeeeee"),
             "an unmounted session renders under unknown-<hash prefix>: {names:?}"
         );
+    }
+
+    #[test]
+    fn petal_http_transport_errors_preserve_cause_without_request_urls() {
+        for phase in ["send", "body"] {
+            let original = reqwest::Client::new()
+                .get("https://api.example.com")
+                .header("invalid\nheader", "fixture-value")
+                .build()
+                .unwrap_err()
+                .with_url("https://fixture-user:fixture-password@api.example.com/fixture-path-token?key=fixture-query-token".parse().unwrap());
+            assert!(original.to_string().contains("fixture-path-token"));
+            let message = petal_http_transport_error(phase, original).to_string();
+            for value in [
+                "fixture-user",
+                "fixture-password",
+                "fixture-path-token",
+                "fixture-query-token",
+            ] {
+                assert!(
+                    !message.contains(value),
+                    "request URL data must not reach guest errors"
+                );
+            }
+            assert!(message.contains(&format!("http_fetch {phase}:")));
+            assert!(
+                message.contains("builder error"),
+                "transport cause was discarded"
+            );
+        }
     }
 }
