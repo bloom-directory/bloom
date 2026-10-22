@@ -704,3 +704,39 @@ report_legacy_wallet_migrations
         "{stdout}"
     );
 }
+
+#[test]
+fn macos_checkout_logs_uses_a_per_login_port_and_cleans_up_its_accounts() {
+    let plist = fs::read_to_string(
+        workspace().join("packaging/triad/macos/launchdaemons/com.bloom.checkout.plist.in"),
+    )
+    .unwrap();
+    // A crash before the socket exists must leave a readable reason.
+    assert!(plist.contains("<key>StandardErrorPath</key><string>@BLOOM_CHECKOUT_LOG@</string>"));
+    assert!(!plist.contains("/dev/null"));
+    // Chrome needs a writable HOME; the hidden user's home is /var/empty.
+    assert!(plist.contains("<key>HOME</key><string>@BLOOM_CHECKOUT_STATE@</string>"));
+    assert!(plist.contains("<string>--view-port</string><string>@BLOOM_CHECKOUT_VIEW_PORT@</string>"));
+    assert!(!plist.contains("18736"));
+
+    let installer =
+        fs::read_to_string(workspace().join("packaging/triad/release/install-macos.sh")).unwrap();
+    let linux =
+        fs::read_to_string(workspace().join("packaging/triad/release/install-linux.sh")).unwrap();
+    // Both platforms derive the same port from the login UID.
+    let derivation = "$((10000 + login_uid % 8000))";
+    assert!(installer.contains(&format!("checkout_view_port=\"{derivation}\"")));
+    assert!(linux.contains("$((10000 + uid % 8000))"));
+    assert!(installer.contains("-e \"s|@BLOOM_CHECKOUT_VIEW_PORT@|$checkout_view_port|g\""));
+    assert!(installer.contains("checkout_log=\"$log_root/checkout.log\""));
+    assert!(installer.contains("-e \"s|@BLOOM_CHECKOUT_LOG@|$checkout_log|g\""));
+    assert!(installer.contains("chown \"$checkout_user:$log_group\" \"$checkout_log\""));
+    assert!(installer.contains("for service in broker signer checkout; do"));
+
+    // Interrupted fresh installs recover every checkout group, and uninstall
+    // tolerates enrollments created before checkout existed.
+    let groups = "\"$broker_group\" \"$signer_group\" \"$machine_broker_group\" \"$broker_signer_group\" \"$revoke_group\" \"$checkout_group\" \"$machine_checkout_group\" \"$broker_checkout_group\" \"$log_group\"";
+    assert_eq!(installer.matches(groups).count(), 2);
+    assert!(!installer.contains("do dscl . -delete \"/Users/$name\"; done"));
+    assert!(!installer.contains("do dscl . -delete \"/Groups/$name\"; done"));
+}
