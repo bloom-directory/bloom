@@ -334,7 +334,7 @@ if [ ! -f "${config_dir}/edge-manifest.json" ]; then
   chmod 0700 "$config_dir"
   "$bloom_bin" init triad-render-developer-enrollment \
     "$template_dir" "$config_dir" "$release_digest"
-  rm -rf -- "$template_dir"
+  rm -r -- "$template_dir"
 fi
 
 if [ ! -e "$authority_edge_history" ]; then
@@ -545,7 +545,7 @@ cleanup() {
   done
   rm -f -- "$machine_socket"
   case "$runtime_dir" in
-    "${developer_root}/runtime."*) rm -rf -- "$runtime_dir" ;;
+    "${developer_root}/runtime."*) rm -r -- "$runtime_dir" ;;
     *) printf 'refusing to remove unexpected runtime: %s\n' "$runtime_dir" >&2 ;;
   esac
   exit "$status"

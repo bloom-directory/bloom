@@ -4,7 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import fcntl
+import json
 import os
+import re
+import secrets
+import socket
+import stat
+import subprocess
+import tempfile
+import threading
 import signal
 import time
 from abc import ABC, abstractmethod
@@ -40,6 +48,7 @@ AGENTS: dict[str, AgentSpec] = {
     # rather than a configuration error.
     "claude": AgentSpec("claude-code", "claude-sonnet-5"),
     "codex": AgentSpec("codex", "gpt-5.6-terra"),
+    "opencode": AgentSpec("opencode", "deepseek/deepseek-v4-flash"),
 }
 
 REASONING_EFFORT_ENV = "BLOOM_EVAL_REASONING_EFFORT"
