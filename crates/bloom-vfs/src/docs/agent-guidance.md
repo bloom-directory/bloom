@@ -365,9 +365,11 @@ human rather than retrying on your own.
 
 `bloom wallet confirm` exits 3 when owner approval is pending and 4 when
 confirmation has no recorded result yet. Exit 0 reports a recorded broadcast
-or a completed local discard. Use `--text cancel` to discard an unsigned
-pending entry; an already broadcast transaction needs `bloom wallet cancel`
-and its own approval. Dropping a reservation does not renumber later rows:
+or a completed local discard. To discard an unsigned pending entry, write
+`cancel` to its `confirm` file (`bloom wallet confirm --text cancel`); this
+works for Petal-staged entries too. The separate `cancel` file replaces an
+already broadcast transaction (`bloom wallet cancel`) and needs its own
+approval. Dropping a reservation does not renumber later rows:
 restage with an explicit nonce to fill a gap.
 
 `confirm.override` is not a general escape hatch. Use it only when the
