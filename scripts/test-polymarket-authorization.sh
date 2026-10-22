@@ -5,11 +5,7 @@ set -euo pipefail
 umask 077
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 run_root="${1:?usage: test-polymarket-authorization.sh FRESH_EMPTY_RUN_ROOT}"
-case "${2:-polymarket}" in
-  polymarket) test_name=installed_account_one_auth_and_exact_continuation_use_real_authority ;;
-  sdk-message) test_name=installed_supported_messages_use_real_installer_and_selected_account ;;
-  *) echo 'Expected polymarket or sdk-message case' >&2; exit 1 ;;
-esac
+test_name=installed_account_one_auth_and_exact_continuation_use_real_authority
 [[ "$run_root" == /tmp/pm80-auth.* ]] || { echo 'Expected a fresh /tmp/pm80-auth.* root' >&2; exit 1; }
 [ -d "$run_root" ] && [ ! -L "$run_root" ] || exit 1
 [ -z "$(find "$run_root" -mindepth 1 -maxdepth 1 -print -quit)" ] || { echo 'Run root must be empty' >&2; exit 1; }
