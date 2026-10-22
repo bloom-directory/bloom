@@ -1,9 +1,0 @@
-{
-  "package_hash": "5f26e7bbf7f507cfcf4c13645cf9f4f0c903d769c201e3e9d1f5c914b14fa2a3",
-  "routes": 5,
-  "declared_caps": [
-    "bloom:http",
-    "bloom:store"
-  ],
-  "no_sign_or_outbox": true
-}

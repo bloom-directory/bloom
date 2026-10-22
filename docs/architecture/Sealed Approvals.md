@@ -263,13 +263,6 @@ wallet as recipient, not the pUSD contract. Use a specific recipient approval
 or an explicitly approved Petal destination rule; do not widen the default
 recipient allowlist to accommodate every deposit wallet.
 
-Candidate verification records are retained under
-[`tests/evidence`](../../tests/evidence). They record revisions and fixture
-limits, not blanket release acceptance. In particular, the
-[`route inventory`](../../tests/evidence/all-petal-route-coverage-2026-10-19.json)
-and [`Enso roundtrips`](../../tests/evidence/enso-route-review-2026-10-19.json)
-do not prove funded venue effects or physical-owner acceptance.
-
 Petals always submit complete payload bytes through a payload-bearing host
 call. Hash-only guest signing is unsupported. Machine may validate guest
 capabilities and provenance, but only Broker can authorize and only Signer can
