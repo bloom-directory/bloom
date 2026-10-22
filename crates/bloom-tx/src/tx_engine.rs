@@ -173,10 +173,6 @@ pub enum TxEngineError {
     HomeWritePermit(String),
     #[error("tx '{id}' is in status {status}, expected pending or unmined sent")]
     InvalidTxStatus { id: String, status: String },
-    #[error(
-        "Enso quote is {age}s old (expires ~5 min) — re-run the intent for a fresh route, or write 'override' to broadcast anyway"
-    )]
-    EnsoQuoteStale { age: u64 },
     #[error("dependency '{dep_id}' not satisfied: {reason}")]
     DependencyNotSatisfied { dep_id: String, reason: String },
     #[error("pre-broadcast simulation reverted: {reason} — write 'override' to broadcast anyway")]
@@ -413,9 +409,7 @@ fn classify_action_kind(
         | RawIntentBody::NftApprove { .. }
         | RawIntentBody::NftApproveAll { .. } => TxActionKind::Approval,
         RawIntentBody::NftTransfer { .. } => TxActionKind::NftTransfer,
-        RawIntentBody::Call { .. } | RawIntentBody::Raw { .. } | RawIntentBody::Enso { .. } => {
-            TxActionKind::ContractCall
-        }
+        RawIntentBody::Call { .. } | RawIntentBody::Raw { .. } => TxActionKind::ContractCall,
     }
 }
 
@@ -1145,9 +1139,6 @@ impl TxEngine {
                     Some(nft_ref),
                 ))
             }
-            RawIntentBody::Enso { .. } => Err(TxEngineError::Unimplemented(
-                "Enso intents flow through the enso petal (not in tx stage path)".into(),
-            )),
         }
     }
 
@@ -1783,7 +1774,6 @@ impl TxEngine {
                     "creation requires exact Broker approval; constructor effects and ownership are unverified",
                 ));
             }
-            RawIntentBody::Enso { .. } => {}
         }
         // USD valuation is authoritative only when produced by the oracle.
         // Caller-supplied hints are deliberately ignored: they are not bound
@@ -2039,15 +2029,6 @@ impl TxEngine {
             return Err(TxEngineError::PolicyDenied);
         }
 
-        const ENSO_QUOTE_MAX_AGE_SECS: u64 = 300;
-        let now_secs = (now_ms() / 1000) as u64;
-        if let Some(age) = enso_quote_age_secs(&staged.data_hex, now_secs)
-            && age > ENSO_QUOTE_MAX_AGE_SECS
-            && !override_warnings
-        {
-            return Err(TxEngineError::EnsoQuoteStale { age });
-        }
-
         if !override_warnings {
             self.simulate_or_reject(&staged, chain).await?;
         }
@@ -2185,14 +2166,6 @@ impl TxEngine {
                 if policy_engine::has_warning(&staged.policy_checks) && !override_warnings {
                     return Err(TxEngineError::PolicyDenied);
                 }
-                const ENSO_QUOTE_MAX_AGE_SECS: u64 = 300;
-                if let Some(age) = enso_quote_age_secs(&staged.data_hex, (now / 1000) as u64)
-                    && age > ENSO_QUOTE_MAX_AGE_SECS
-                    && !override_warnings
-                {
-                    return Err(TxEngineError::EnsoQuoteStale { age });
-                }
-
                 if policy.private.enabled
                     && !matches!(
                         staged.chain_id,
@@ -2459,16 +2432,6 @@ impl TxEngine {
                 "tx.policy_denied"
             );
             return Err(TxEngineError::PolicyDenied);
-        }
-
-        // Enso quotes embed a ~5-minute deadline. Warn before wasting gas.
-        const ENSO_QUOTE_MAX_AGE_SECS: u64 = 300;
-        let now_secs = (now_ms() / 1000) as u64;
-        if let Some(age) = enso_quote_age_secs(&staged.data_hex, now_secs)
-            && age > ENSO_QUOTE_MAX_AGE_SECS
-            && !override_warnings
-        {
-            return Err(TxEngineError::EnsoQuoteStale { age });
         }
 
         // Pre-broadcast simulation first (no side effects): eth_call against
@@ -4206,8 +4169,6 @@ impl TxEngine {
     /// new (`to`, `value`, `data`) are derived from it via the same
     /// encoding pipeline `stage` uses, but the original nonce is
     /// preserved. Fees are bumped at least `bump_pct%` (floored at 10).
-    /// Enso-flavoured intents are rejected here for the same reason
-    /// they're rejected in stage — they go through the enso petal's HTTP path.
     #[allow(clippy::too_many_arguments)]
     pub async fn replace_with_intent(
         &self,
@@ -5002,37 +4963,6 @@ fn decode_data(s: &str) -> Result<Bytes, TxEngineError> {
     let s = s.strip_prefix("0x").unwrap_or(s);
     let v = hex::decode(s).map_err(|e| TxEngineError::Amount(format!("data: {e}")))?;
     Ok(Bytes::from(v))
-}
-
-/// Parse the Enso quote age in seconds from calldata, if present.
-/// Enso appends a raw JSON blob starting with `{"Source":"Enso` to every
-/// route calldata. Returns `None` for non-Enso calldata or parse failures.
-fn enso_quote_age_secs(data_hex: &str, now_secs: u64) -> Option<u64> {
-    let bytes = hex::decode(data_hex.trim_start_matches("0x")).ok()?;
-    const MARKER: &[u8] = b"{\"Source\":\"Enso";
-    let pos = bytes.windows(MARKER.len()).position(|w| w == MARKER)?;
-    // Marker found — try to extract timestamp.
-    let v: serde_json::Value = match serde_json::Deserializer::from_slice(&bytes[pos..])
-        .into_iter()
-        .next()
-    {
-        Some(Ok(val)) => val,
-        other => {
-            tracing::warn!(?other, "enso.calldata.marker_found_parse_failed");
-            return None;
-        }
-    };
-    let ts = match v["Timestamp"].as_u64() {
-        Some(t) => t,
-        None => {
-            tracing::warn!(enso_json = %v, "enso.calldata.timestamp_missing");
-            return None;
-        }
-    };
-    now_secs.checked_sub(ts).or_else(|| {
-        tracing::warn!(enso_ts = ts, now = now_secs, "enso.quote.future_timestamp");
-        None
-    })
 }
 
 fn now_ms() -> u128 {
@@ -9625,43 +9555,6 @@ mod tests {
             }
             other => panic!("expected PrivateNotSupportedOnChain, got {other:?}"),
         }
-    }
-
-    // -------------------------------------------------------------------
-    // enso_quote_age_secs
-    // -------------------------------------------------------------------
-
-    fn enso_hex(json: &str) -> String {
-        format!("0x{}", hex::encode(json.as_bytes()))
-    }
-
-    #[test]
-    fn enso_quote_age_parses_timestamp() {
-        let hex = enso_hex(r#"{"Source":"Enso","Timestamp":1700000000}"#);
-        assert_eq!(enso_quote_age_secs(&hex, 1700000300), Some(300));
-    }
-
-    #[test]
-    fn enso_quote_age_zero_for_current() {
-        let hex = enso_hex(r#"{"Source":"Enso","Timestamp":1700000000}"#);
-        assert_eq!(enso_quote_age_secs(&hex, 1700000000), Some(0));
-    }
-
-    #[test]
-    fn enso_quote_age_none_for_future() {
-        let hex = enso_hex(r#"{"Source":"Enso","Timestamp":1700000100}"#);
-        assert_eq!(enso_quote_age_secs(&hex, 1700000000), None);
-    }
-
-    #[test]
-    fn enso_quote_age_none_for_non_enso_calldata() {
-        assert_eq!(enso_quote_age_secs("0xdeadbeef", 1700000000), None);
-    }
-
-    #[test]
-    fn enso_quote_age_none_for_missing_timestamp() {
-        let hex = enso_hex(r#"{"Source":"Enso","Route":"0x1234"}"#);
-        assert_eq!(enso_quote_age_secs(&hex, 1700000000), None);
     }
 
     #[test]

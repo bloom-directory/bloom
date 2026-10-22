@@ -1070,28 +1070,21 @@ impl Outbox {
         Ok(())
     }
 
-    /// Remove pending entries that have expired.
-    pub fn sweep_expired(&self, now_ms: u128) -> Result<usize, OutboxError> {
-        let mut count = 0;
+    /// Pending entries needing expiry or interrupted-transition recovery,
+    /// read without changing anything so callers can audit before sweeping.
+    pub fn expired_pending(&self, now_ms: u128) -> Result<Vec<OutboxEntry>, OutboxError> {
+        let mut expired = Vec::new();
         if !self.inner.root.exists() {
-            return Ok(0);
+            return Ok(expired);
         }
         for w in fs::read_dir(&self.inner.root)? {
             let w = w?;
-            let wname = match w.file_name().into_string() {
-                Ok(n) => n,
-                Err(_) => continue,
-            };
-            if !w.file_type()?.is_dir() {
+            if w.file_name().into_string().is_err() || !w.file_type()?.is_dir() {
                 continue;
             }
             for c in fs::read_dir(w.path())? {
                 let c = c?;
-                let cname = match c.file_name().into_string() {
-                    Ok(n) => n,
-                    Err(_) => continue,
-                };
-                if !c.file_type()?.is_dir() {
+                if c.file_name().into_string().is_err() || !c.file_type()?.is_dir() {
                     continue;
                 }
                 let pending = c.path().join("pending");
@@ -1110,54 +1103,54 @@ impl Outbox {
                         staged: staged.clone(),
                         dir: ent.path(),
                     };
-                    if is_interrupted_transition(&entry) {
-                        if let Err(e) = self.finish_interrupted_transition(&entry) {
-                            tracing::warn!(
-                                id = %staged.id,
-                                wallet = %staged.wallet,
-                                chain = %staged.chain,
-                                error = %e,
-                                "outbox.finish_interrupted_transition_failed"
-                            );
-                        }
-                        continue;
-                    }
-                    if staged.expires_ms != 0 && now_ms >= staged.expires_ms {
-                        // Expiry is its own outcome: the entry was never
-                        // broadcast and now never will be. `Failed` with an
-                        // `expired.txt` beside it says that without claiming
-                        // someone cancelled it.
-                        match self
-                            .transition_with_status(&entry, OutboxState::Failed, TxStatus::Failed)
-                            .and_then(|dir| {
-                                fs::write(dir.join("expired.txt"), b"expired before approval")?;
-                                Ok(dir)
-                            }) {
-                            Ok(_) => {
-                                tracing::debug!(
-                                    id = %staged.id,
-                                    wallet = %staged.wallet,
-                                    chain = %staged.chain,
-                                    expired_at = staged.expires_ms,
-                                    now_ms,
-                                    "outbox.sweep_expired"
-                                );
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    id = %staged.id,
-                                    wallet = %staged.wallet,
-                                    chain = %staged.chain,
-                                    error = %e,
-                                    "outbox.sweep_transition_failed"
-                                );
-                            }
-                        }
-                        count += 1;
+                    if is_interrupted_transition(&entry)
+                        || (staged.expires_ms != 0 && now_ms >= staged.expires_ms)
+                    {
+                        expired.push(entry);
                     }
                 }
-                let _ = (wname.clone(), cname.clone());
             }
+        }
+        Ok(expired)
+    }
+
+    /// Remove pending entries that have expired.
+    pub fn sweep_expired(&self, now_ms: u128) -> Result<usize, OutboxError> {
+        let expired = self.expired_pending(now_ms)?;
+        let mut count = 0;
+        for entry in &expired {
+            let staged = &entry.staged;
+            if is_interrupted_transition(entry) {
+                self.finish_interrupted_transition(entry)?;
+                continue;
+            }
+            match self
+                .transition_with_status(entry, OutboxState::Failed, TxStatus::Failed)
+                .and_then(|dir| {
+                    fs::write(dir.join("expired.txt"), b"expired before approval")?;
+                    Ok(dir)
+                }) {
+                Ok(_) => {
+                    tracing::debug!(
+                        id = %staged.id,
+                        wallet = %staged.wallet,
+                        chain = %staged.chain,
+                        expired_at = staged.expires_ms,
+                        now_ms,
+                        "outbox.sweep_expired"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        id = %staged.id,
+                        wallet = %staged.wallet,
+                        chain = %staged.chain,
+                        error = %e,
+                        "outbox.sweep_transition_failed"
+                    );
+                }
+            }
+            count += 1;
         }
         Ok(count)
     }
@@ -1748,6 +1741,16 @@ mod tests {
         ob.write_pending(&fake_staged("denied"), "p").unwrap();
         let entry = ob.read("alice", "anvil", "denied").unwrap();
         ob.persist_status(&entry, TxStatus::Failed).unwrap();
+        // The daemon calls this before appending its audit intent. Discovery
+        // must not finish the move, even when no expiry deadline is set.
+        assert_eq!(ob.expired_pending(0).unwrap().len(), 1);
+        assert!(entry.dir.join("intent.json").exists());
+        assert!(
+            !ob.wallet_chain_dir("alice", "anvil")
+                .unwrap()
+                .join("failed/denied")
+                .exists()
+        );
         assert_eq!(ob.sweep_expired(0).unwrap(), 0);
         let entry = ob.read("alice", "anvil", "denied").unwrap();
         assert_eq!(entry.state, OutboxState::Failed);
