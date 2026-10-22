@@ -120,7 +120,7 @@ guarantees; hand off on a block without fingerprint spoofing, CAPTCHA
 solving or cookie import. American, SAS, SWISS, easyJet and United have
 blocked Bloom's browser; Aerolíneas reached its passenger page on 2026-10-13.
 JetSMART, Shopify and Stripe-hosted checkouts also work in Bloom's browser.
-Do not click or type through the desktop. Open the booking link you were given.
+Do not click or type through the desktop.
 
 `filled` means fields were filled, not that payment succeeded. `booked`,
 `paid` and `declined` describe what the merchant reported; Bloom has not
