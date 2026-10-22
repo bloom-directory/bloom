@@ -94,11 +94,27 @@ an unclear total goes to the human's private view; its URL and screenshots
 never appear in VFS. A manual
 fallback releases no saved card.
 
-Airlines that reject a fresh browser are not bookable by Bloom. Give the
-person the deep link and stop; they book it themselves. Named cases include
-Aerolíneas Argentinas, American, SAS, SWISS, easyJet and United. JetSMART,
-Shopify and Stripe-hosted checkouts work in Bloom's own browser. Do not click
-or type through the desktop. Open the booking link you were given.
+When an airline rejects Bloom's browser, try an agency seller on Google's
+booking page instead; give the person the link only when no seller opens.
+Prefer the airline when it loads, or an agency when the person asks. Open
+`google_flights_url`, select the itinerary matching the chosen airline, times
+and price, expand extra booking options, and read every “Continue to book
+with …” seller and price to the person. Click the airline first; on a block
+or empty page return to Google and try the first agency with a dated
+`known.opened` observation. Google's seller button carries the itinerary;
+never invent agency links. Recheck flights, dates, party, bags and final
+total at the seller before unlocking travelers or requesting payment.
+
+Explain agency trade-offs before approval: fees and upsells may raise the
+price. Changes and refunds go through the agency. An order confirmation can
+precede ticket issuance; expect the e-ticket later by email, and do not call
+an order number a paid ticket. Agencies may require stricter fraud checks.
+Record the agency as the shop. Reachability observations have dates, not
+guarantees; hand off on a block without fingerprint spoofing, CAPTCHA
+solving or cookie import. American, SAS, SWISS, easyJet and United have
+blocked Bloom's browser; Aerolíneas reached its passenger page on 2026-10-13.
+JetSMART, Shopify and Stripe-hosted checkouts also work in Bloom's browser.
+Do not click or type through the desktop. Open the booking link you were given.
 
 `filled` means fields were filled, not that payment succeeded. `booked`,
 `paid` and `declined` describe what the merchant reported; Bloom has not
