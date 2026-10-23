@@ -641,8 +641,13 @@ async fn settle_setup_settings(
         }
         Ok(SetupWrite::NoTemplate) => None,
         Err(error) => Some(match mark_settings_pending(home, name) {
-            Ok(()) => format!(
+            // Wallet creation makes the queued write once `main` exists.
+            Ok(()) if *account == AccountPresence::Absent => format!(
                 "petal_settings_failed: {error:#} (will retry once wallet {DEFAULT_POLICY_WALLET} exists)"
+            ),
+            // `main` exists, or may: no wallet creation follows to make it.
+            Ok(()) => format!(
+                "petal_settings_failed: {error:#}. The write is queued. To write them, run: bloom wallet default-policy {DEFAULT_POLICY_WALLET}"
             ),
             Err(marker_error) => retry_not_recorded(petals, name, &error, &marker_error),
         }),
@@ -1677,7 +1682,7 @@ mod tests {
     #[tokio::test]
     async fn a_retry_is_promised_only_once_it_is_queued() {
         let petals = chosen_setup(&["polymarket"]);
-        let write = |home: std::path::PathBuf| {
+        let write = |home: std::path::PathBuf, account: AccountPresence| {
             let petals = petals.clone();
             async move {
                 let vfs = bloom_vfs::Vfs::builder()
@@ -1690,7 +1695,7 @@ mod tests {
                     "polymarket",
                     SetupSettingsStep::Write,
                     false,
-                    &AccountPresence::Absent,
+                    &account,
                 )
                 .await
                 .unwrap()
@@ -1698,16 +1703,34 @@ mod tests {
         };
 
         let home = tempfile::tempdir().unwrap();
-        let message = write(home.path().to_owned()).await;
+        let message = write(home.path().to_owned(), AccountPresence::Absent).await;
         assert!(
             message.contains("will retry once wallet main exists"),
             "{message}"
         );
         assert_eq!(pending_settings(home.path(), &petals), ["polymarket"]);
 
+        // Where `main` exists, or may, no wallet creation follows to retry
+        // it, so the message names the command that does.
+        for account in [
+            AccountPresence::Exists,
+            AccountPresence::Unknown("Broker is down".into()),
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            let message = write(home.path().to_owned(), account).await;
+            assert!(
+                message.ends_with(
+                    "The write is queued. To write them, run: bloom wallet default-policy main"
+                ),
+                "{message}"
+            );
+            assert!(!message.contains("will retry"), "{message}");
+            assert_eq!(pending_settings(home.path(), &petals), ["polymarket"]);
+        }
+
         let home = tempfile::tempdir().unwrap();
         std::fs::write(pending_settings_dir(home.path()), b"not a directory").unwrap();
-        let message = write(home.path().to_owned()).await;
+        let message = write(home.path().to_owned(), AccountPresence::Absent).await;
         assert!(
             message.starts_with("petal_settings_not_written: "),
             "{message}"
