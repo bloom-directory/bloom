@@ -204,11 +204,11 @@ fn page_text(html: &str) -> String {
             text.push('<');
             break;
         }
-        if let Some(name) = ignored_block(after) {
-            if let Some(next) = skip_block(after, name) {
-                rest = next;
-                continue;
-            }
+        if let Some(name) = ignored_block(after)
+            && let Some(next) = skip_block(after, name)
+        {
+            rest = next;
+            continue;
         }
         let end = after
             .find('>')
