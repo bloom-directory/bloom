@@ -1,9 +1,15 @@
 import copy
 import importlib.util
+import json
+import os
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from harness.clarification import asks_for_selection
+from harness.core import EvalError, _agent_spec
+from harness.disposable import CeremonyDriver
 from harness.solana_transfer import matching_transfer
 
 ROOT = Path(__file__).parents[1]
@@ -13,6 +19,76 @@ spec = importlib.util.spec_from_file_location(
 )
 verifier = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(verifier)
+check_spec = importlib.util.spec_from_file_location(
+    "clarification_check", ROOT / "tasks/clarification-check.py"
+)
+checker = importlib.util.module_from_spec(check_spec)
+check_spec.loader.exec_module(checker)
+
+
+class HostBoundaryTests(unittest.TestCase):
+    def test_failed_driver_attempts_still_advance_the_counter(self):
+        with tempfile.TemporaryDirectory() as directory:
+            seed = Path(directory) / "seed"
+            seed.write_text("test-only-seed")
+            seed.chmod(0o600)
+            driver = CeremonyDriver(
+                Path("/usr/bin/false"), seed, "http://localhost:28735"
+            )
+            url = "http://localhost:28735/ceremony/" + "A" * 43
+            for count in (2, 3):
+                with self.assertRaises(EvalError):
+                    driver.complete(url)
+                self.assertEqual(driver.counter, count)
+            with self.assertRaises(EvalError):
+                driver.complete(url.replace("28735", "28736"))
+            self.assertEqual(driver.counter, 3)
+
+    def test_codex_auth_uses_a_path_instead_of_a_numeric_secret_flag(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".codex").mkdir()
+            auth = root / ".codex/auth.json"
+            auth.write_text("{}")
+            with (
+                mock.patch.dict(os.environ, {}, clear=True),
+                mock.patch("pathlib.Path.home", return_value=root),
+            ):
+                spec = _agent_spec("codex")
+            self.assertEqual(spec.env, {"CODEX_AUTH_JSON_PATH": str(auth)})
+
+    def test_absent_mount_and_staged_work_cannot_pass_as_no_pending_work(self):
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            mock.patch.dict(os.environ, {"BLOOM_EVAL_WALLET_ID": "harbor"}),
+        ):
+            root = Path(directory)
+            with self.assertRaises(FileNotFoundError):
+                checker.verify(root)
+            account = root / "wallets/harbor/0/account.json"
+            account.parent.mkdir(parents=True)
+            account.write_text(
+                json.dumps(
+                    {
+                        "schema": "bloom.account.v1",
+                        "wallet": "harbor",
+                        "number": 0,
+                        "freshness": "fresh",
+                        "evm": {"state": "active"},
+                    }
+                )
+            )
+            checker.verify(root)
+            for relative in (
+                "wallets/harbor/0/chains/ethereum/outbox/pending/one",
+                "wallets/harbor/policy-updates/pending/one",
+                "petals/polymarket/trade/harbor/0/drafts/one",
+            ):
+                pending = root / relative
+                pending.mkdir(parents=True)
+                with self.assertRaises(ValueError):
+                    checker.verify(root)
+                pending.rmdir()
 
 
 class ProposalTests(unittest.TestCase):
