@@ -21,6 +21,12 @@ LaunchDaemons:
 - `com.bloom.broker.LOGIN_UID`, running as `bloom-broker-LOGIN_UID`;
 - `com.bloom.signer.LOGIN_UID`, running as `bloom-signer-LOGIN_UID`.
 
+Broker, Signer and the Machine LaunchAgent run with launchd's `Standard`
+process type because they answer the user's mount, CLI and ceremony requests.
+`Background` throttles CPU and disk I/O heavily enough that Machine's startup
+verification of its audit journal ran about 60 times slower. The session and
+containment monitors remain `Background`.
+
 Each daemon explicitly binds its Unix sockets inside endpoint directories
 owned by that service UID. The directories use distinct edge groups and mode
 `0710`; a service validates this metadata before publishing a `0660` socket.
