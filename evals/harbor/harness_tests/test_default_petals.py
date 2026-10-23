@@ -21,7 +21,7 @@ class ProposalTests(unittest.TestCase):
             "wallet": "harbor",
             "condition_id": "0x" + "1" * 64,
             "token_id": "123",
-            "side": "buy",
+            "side": "BUY",
             "order_type": "GTC",
             "amount_micro": 5_000_000,
             "limit_price_micro": 10_000,

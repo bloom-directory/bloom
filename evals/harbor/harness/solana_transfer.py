@@ -129,6 +129,11 @@ class SolanaTransferEval(EvalDefinition):
             "account_fingerprint": child["public_key_fingerprint"],
             "account_derivation_path": child["path"],
         }
+        self.lineage = self.expected | {
+            "wallet": wallet,
+            "account": int(number),
+            "coverage": "settlement",
+        }
         self.triad._run(["solana", "airdrop", "2", source, "--url", self.triad.rpc_url])
         self.triad.set_policy(
             packages=[], destinations=[{"chain": "solana", "destination": destination}]

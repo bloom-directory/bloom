@@ -57,6 +57,13 @@ class DisposableHyperliquidEval(EvalDefinition):
         wallet = self.triad.wallet
         account = self.triad.read(f"/wallets/{wallet}/0/account.json")
         address = account["evm"]["address"].lower()
+        self.lineage = {
+            "package_hash": package,
+            "network": self.network,
+            "wallet": wallet,
+            "account": 0,
+            "address": address,
+        }
         metadata = self.triad.read(f"/petals/hyperliquid/{self.network}/perp_meta.json")
         universe = metadata.get("universe") if isinstance(metadata, dict) else None
         if not isinstance(universe, list):
@@ -172,13 +179,18 @@ class PolymarketProposalEval(EvalDefinition):
             "address": account["evm"]["address"].lower(),
             "condition_id": self.market["conditionId"],
             "token_id": str(self.market["clobTokenIds"][0]),
-            "side": "buy",
+            "side": "BUY",
             "order_type": "GTC",
             "amount_micro": 5_000_000,
             "limit_price_micro": 10_000,
             "size_micro": 500_000_000,
             "maker_micro": 5_000_000,
             "taker_micro": 500_000_000,
+        }
+        owner = self.triad.home / "petals/store/owners/polymarket.json"
+        self.lineage = expected | {
+            "package_hash": json.loads(owner.read_bytes())["hash"],
+            "coverage": "proposal",
         }
         self.jobs.mkdir(parents=True, exist_ok=True)
         task = self.jobs / self.trial

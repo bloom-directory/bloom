@@ -54,6 +54,16 @@ def main(argv: list[str] | None = None) -> int:
     else:
         definition = definitions[args.eval](repo)
     evidence = EvalEvidence()
+    source_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    source_diff = subprocess.run(
+        ["git", "diff", "--binary", "HEAD"], cwd=repo, capture_output=True, check=True
+    ).stdout
     timings: dict[str, float] = {}
     started = time.monotonic()
     failure = None
@@ -129,13 +139,11 @@ def main(argv: list[str] | None = None) -> int:
             "retained_root": str(definition.triad.root)
             if failure is not None
             else None,
-            "source_commit": subprocess.run(
-                ["git", "rev-parse", "HEAD"],
-                cwd=repo,
-                capture_output=True,
-                text=True,
-                check=True,
-            ).stdout.strip(),
+            "source_commit": source_commit,
+            "source_diff_sha256": hashlib.sha256(source_diff).hexdigest()
+            if source_diff
+            else None,
+            "lineage": getattr(definition, "lineage", None),
         }
         binaries = {}
         for role in ("MACHINE", "BROKER", "SIGNER", "DEBUG_DRIVER"):
