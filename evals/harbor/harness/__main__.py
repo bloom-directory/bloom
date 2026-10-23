@@ -158,6 +158,8 @@ def main(argv: list[str] | None = None) -> int:
             trials = evidence.result.trial_results
             if trials:
                 trial = trials[0]
+                if trial.exception_info is not None:
+                    summary["exception_type"] = trial.exception_info.exception_type
                 verifier = trial.verifier_result
                 summary["rewards"] = dict(verifier.rewards or {}) if verifier else {}
                 agent = trial.agent_result
