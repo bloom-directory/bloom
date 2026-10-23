@@ -164,6 +164,7 @@ from pathlib import Path
 
 from harbor.job_plan import JobPlan
 from harbor.agents.factory import AgentFactory
+from harbor.environments.factory import EnvironmentFactory
 from harbor.models.environment_type import EnvironmentType
 from harbor.models.job.config import JobConfig, RetryConfig
 from harbor.models.trial.config import AgentConfig, EnvironmentConfig, TaskConfig, VerifierConfig
@@ -208,5 +209,16 @@ image_agent = AgentFactory.create_agent_from_config(
     logs_dir=Path(os.environ["TMP_JOB_DIR"]) / "image-agent-api",
 )
 assert type(image_agent).__name__ == "ImageOpenCode"
+bloom_environment = EnvironmentFactory.create_environment_from_config(
+    EnvironmentConfig(import_path="harness.environment:BloomDockerEnvironment"),
+    environment_dir=Path("evals/harbor/tasks/hyperliquid-order-cancel/environment").resolve(),
+    environment_name="unstarted-api-smoke",
+    session_id="unstarted-api-smoke",
+    trial_paths=TrialPaths(Path(os.environ["TMP_JOB_DIR"]) / "environment-api"),
+    task_env_config=Task(Path("evals/harbor/tasks/hyperliquid-order-cancel").resolve()).config.environment,
+)
+assert type(bloom_environment).__name__ == "BloomDockerEnvironment"
+asyncio.run(bloom_environment._chown_to_host_user("/bloom", recursive=True))
+asyncio.run(bloom_environment._chown_to_host_user("/bloom/wallets/harbor/policy.json", recursive=True))
 PY
 printf '%s\n' 'Harbor eval static tests passed.'

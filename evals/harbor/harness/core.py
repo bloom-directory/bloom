@@ -169,6 +169,7 @@ async def run_harbor_job(context: EvalRunContext, agent: AgentSpec) -> Any:
         ],
         environment=EnvironmentConfig(
             type=EnvironmentType.DOCKER,
+            import_path="harness.environment:BloomDockerEnvironment",
             mounts=list(context.mounts),
             extra_docker_compose=list(context.extra_docker_compose),
         ),

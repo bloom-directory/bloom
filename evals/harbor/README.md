@@ -21,6 +21,9 @@ same live projections through the disposable Machine's IPC endpoint. This
 avoids slow mount path lookups during grading and records the actual reward
 inside Harbor, including the final clarification question. The agent still
 uses the ordinary mounted filesystem. Verification timeouts are unchanged.
+The Docker environment skips Harbor's recursive ownership repair for `/bloom`:
+its entries are live virtual projections, not host files. Log ownership repair
+still runs, and writable Bloom command routes stay writable.
 
 NEAR's positive swap-proposal task is not implemented yet. The real spike on
 the released v0.1.4 package rejected an unfunded fresh wallet before creating
