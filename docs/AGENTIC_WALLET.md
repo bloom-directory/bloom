@@ -70,6 +70,13 @@ bloom vfs cat /wallets/alice/0/chains/anvil/outbox/pending/<id>/plan.md
 
 ## Paid HTTP requests
 
+Solana x402 v2 exact USDC payments use the wallet's canonical account 0
+(`m/44'/501'/0'/0'`) through Broker/Signer, with a configured genesis-pinned
+RPC and a separate facilitator fee payer. Other Solana tokens and x402 v1
+are unsupported. The unsigned transaction is frozen before owner approval.
+If its blockhash expires, cancel the unpaid request and stage a fresh one;
+never restage an unresolved payment. No wallet keys enter the HTTP client.
+
 Bloom can make ordinary HTTP requests through the same filesystem model. If a
 server responds with an HTTP 402 payment challenge, Bloom stages a payment plan
 and waits for explicit confirmation before signing or spending. Agents should

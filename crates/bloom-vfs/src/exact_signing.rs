@@ -184,6 +184,31 @@ impl BrokerExactPayloadSigner {
         claimed_hash: Digest32,
         canonical_plan_facts: &serde_json::Value,
     ) -> Result<ExactPayloadOutcome, String> {
+        self.sign_or_prepare_with_suite(
+            state_path,
+            action_id,
+            wallet,
+            operation_class,
+            preimage,
+            claimed_hash,
+            CryptoSuite::Secp256k1Keccak256Recoverable,
+            canonical_plan_facts,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn sign_or_prepare_with_suite(
+        &self,
+        state_path: &Path,
+        action_id: &str,
+        wallet: &str,
+        operation_class: &str,
+        preimage: &[u8],
+        claimed_hash: Digest32,
+        crypto_suite: CryptoSuite,
+        canonical_plan_facts: &serde_json::Value,
+    ) -> Result<ExactPayloadOutcome, String> {
         let parent = state_path
             .parent()
             .ok_or_else(|| "exact signing state path has no parent".to_owned())?;
@@ -213,7 +238,7 @@ impl BrokerExactPayloadSigner {
                 operation_class,
                 preimage,
                 claimed_hash,
-                CryptoSuite::Secp256k1Keccak256Recoverable,
+                crypto_suite,
                 canonical_plan_facts,
                 None,
                 None,

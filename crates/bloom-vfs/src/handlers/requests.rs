@@ -837,7 +837,26 @@ impl RequestsHandler {
         // one signature allowance is consumed atomically inside host signing;
         // there is no separate bookkeeping consume around a direct signature.
         let action_id = self.request_action_id(id).await?;
-        let (wallet_address, account_key) = self.wallet_signing_account(&wallet).await?;
+        let is_solana = requirement
+            .network
+            .as_deref()
+            .is_some_and(|n| n.starts_with("solana:"));
+        let (wallet_address, solana_address, account_key) = if is_solana {
+            let wallet_id = bloom_broker_api::Token::new(wallet.clone())
+                .map_err(|e| HandlerError::invalid(e.to_string()))?;
+            let projection = self
+                .wallet_projections
+                .as_ref()
+                .ok_or_else(|| HandlerError::backend("wallet projection unavailable"))?
+                .get_wallet(&wallet_id)
+                .await
+                .map_err(|e| HandlerError::backend(e.to_string()))?;
+            let (address, key) = primary_solana_payment_account(&projection)?;
+            (alloy::primitives::Address::ZERO, Some(address), Some(key))
+        } else {
+            let (address, key) = self.wallet_signing_account(&wallet).await?;
+            (address, None, key)
+        };
         let policy_snapshot_digest = Some(sealed_inputs.policy_snapshot_digest);
         let host_signer = self.paid_http_host_signer(&wallet, &action_id, account_key);
         let facts = paid_http_x402_facts(
@@ -858,6 +877,7 @@ impl RequestsHandler {
                 requirement: &requirement,
                 rpc_resolver: self.paid_http_rpc_resolver.as_ref(),
                 wallet_address,
+                solana_address: solana_address.as_deref(),
                 host_signer: &host_signer,
                 facts: &facts,
                 draft_path: &pending.join("private/x402-unsigned-draft"),
@@ -939,6 +959,25 @@ fn primary_payment_account(
     Ok((address, selected))
 }
 
+fn primary_solana_payment_account(
+    projection: &bloom_machine_client::WalletProjection,
+) -> Result<(String, bloom_broker_api::KeyRef), HandlerError> {
+    use bloom_broker_api::{DerivationProfile, DerivationRef, KeyRole, KeySpec};
+    let mut keys = projection.keys.iter().filter(|key| {
+        key.role == KeyRole::Derived
+            && key.key_ref.key_spec == KeySpec::Ed25519
+            && matches!(&key.key_ref.derivation,
+                Some(DerivationRef::Bip39Multicurve {path, profile: DerivationProfile::Bip44SolanaSlip10Ed25519V1, ..}) if path == "m/44'/501'/0'/0'")
+    });
+    let key = keys
+        .next()
+        .ok_or_else(|| HandlerError::backend("wallet has no canonical Solana account"))?;
+    if keys.next().is_some() || key.addresses.len() != 1 {
+        return Err(HandlerError::backend("Solana payment account is ambiguous"));
+    }
+    Ok((key.addresses[0].clone(), key.key_ref.clone()))
+}
+
 /// Stub used when no Broker signer is wired. It never signs.
 struct UnwiredPaidHttpHostSigner;
 
@@ -978,6 +1017,30 @@ struct BrokerPaidHttpHostSigner {
 
 #[async_trait]
 impl PaidHttpHostSigner for BrokerPaidHttpHostSigner {
+    async fn sign_paid_http_solana_message(
+        &self,
+        message: &[u8],
+        facts: &PaidHttpSigningFacts,
+    ) -> Result<[u8; 64], String> {
+        use sha2::Digest;
+        let raw = self
+            .sign_payload(
+                PAID_HTTP_X402_SIGN_INTENT,
+                "solana-credential",
+                message,
+                sha2::Sha256::digest(message).into(),
+                facts,
+                bloom_broker_api::CryptoSuite::Ed25519Message,
+            )
+            .await?;
+        raw.try_into().map_err(|raw: Vec<u8>| {
+            format!(
+                "Broker Solana signature is {} bytes, expected 64",
+                raw.len()
+            )
+        })
+    }
+
     async fn sign_paid_http_payload(
         &self,
         intent: &str,
@@ -986,6 +1049,45 @@ impl PaidHttpHostSigner for BrokerPaidHttpHostSigner {
         signing_hash: [u8; 32],
         facts: &PaidHttpSigningFacts,
     ) -> Result<[u8; 65], String> {
+        let raw = self
+            .sign_payload(
+                intent,
+                signing_slot,
+                preimage,
+                signing_hash,
+                facts,
+                bloom_broker_api::CryptoSuite::Secp256k1Keccak256Recoverable,
+            )
+            .await?;
+        raw.try_into().map_err(|raw: Vec<u8>| {
+            format!(
+                "Broker paid-http signature is {} bytes, expected 65",
+                raw.len()
+            )
+        })
+    }
+
+    async fn sign_paid_http_hash(
+        &self,
+        _intent: &str,
+        _signing_hash: [u8; 32],
+        _facts: &PaidHttpSigningFacts,
+    ) -> Result<[u8; 65], String> {
+        Err("legacy hash-only paid-http signing is disabled".into())
+    }
+}
+
+impl BrokerPaidHttpHostSigner {
+    #[allow(clippy::too_many_arguments)]
+    async fn sign_payload(
+        &self,
+        intent: &str,
+        signing_slot: &str,
+        preimage: &[u8],
+        signing_hash: [u8; 32],
+        facts: &PaidHttpSigningFacts,
+        crypto_suite: bloom_broker_api::CryptoSuite,
+    ) -> Result<Vec<u8>, String> {
         let operation_class = match intent {
             PAID_HTTP_X402_SIGN_INTENT => "paid-http.x402",
             PAID_HTTP_MPP_SIGN_INTENT => "paid-http.mpp",
@@ -1003,13 +1105,14 @@ impl PaidHttpHostSigner for BrokerPaidHttpHostSigner {
         let facts_json = serde_json::to_value(facts).map_err(|error| error.to_string())?;
         match self
             .signer
-            .sign_or_prepare(
+            .sign_or_prepare_with_suite(
                 &state_path,
                 &signing_action_id,
                 &self.wallet,
                 operation_class,
                 preimage,
                 bloom_broker_api::Digest32::from_bytes(signing_hash),
+                crypto_suite,
                 &facts_json,
             )
             .await?
@@ -1035,25 +1138,10 @@ impl PaidHttpHostSigner for BrokerPaidHttpHostSigner {
                 Err("paid-http Broker approval required".into())
             }
             ExactPayloadOutcome::Signed(raw) => {
-                let signature = <[u8; 65]>::try_from(raw.as_slice()).map_err(|_| {
-                    format!(
-                        "Broker paid-http signature is {} bytes, expected 65",
-                        raw.len()
-                    )
-                })?;
                 let _ = fs::remove_file(request_dir.join(APPROVAL_CHALLENGE_FILE));
-                Ok(signature)
+                Ok(raw)
             }
         }
-    }
-
-    async fn sign_paid_http_hash(
-        &self,
-        _intent: &str,
-        _signing_hash: [u8; 32],
-        _facts: &PaidHttpSigningFacts,
-    ) -> Result<[u8; 65], String> {
-        Err("legacy hash-only paid-http signing is disabled".into())
     }
 }
 
@@ -1774,6 +1862,22 @@ fn render_plan(
     dry_run: bool,
 ) -> String {
     if let Some(ch) = challenge {
+        let cost = if ch
+            .network
+            .as_deref()
+            .is_some_and(|network| network.starts_with("solana:"))
+            && ch.asset.as_deref() == Some("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
+        {
+            ch.amount_usd.map(|usd| {
+                format!(
+                    "${} USDC ({} atomic units)",
+                    trim_money(usd),
+                    ch.amount.as_deref().unwrap_or("unknown")
+                )
+            })
+        } else {
+            None
+        };
         format!(
             "# Payment plan\n\nRequest: {} {}\nWallet: {}\nMerchant: {}\nPayment method: paid_http:{}/{}\nNetwork: {}\nAsset: {}\nCost now: {}\nPolicy: {}\n{}\nOn confirm: prepare a redacted {} credential and retry only when a signer/settlement backend is configured. No secret credential material will be written to the VFS.\nDry run: {}\n",
             req.method,
@@ -1784,7 +1888,8 @@ fn render_plan(
             paid_http_intent_label(&ch.intent),
             ch.network.as_deref().unwrap_or("unknown"),
             ch.asset.as_deref().unwrap_or("unknown"),
-            ch.amount.as_deref().unwrap_or("unknown"),
+            cost.as_deref()
+                .unwrap_or_else(|| ch.amount.as_deref().unwrap_or("unknown")),
             if checks.iter().any(|c| c.result == "deny") {
                 "denied"
             } else if checks.iter().any(|c| c.result == "warn") {
@@ -2361,6 +2466,42 @@ fn paid_http_sealed_subject(input: PaidHttpAuthSubject<'_>) -> PaidHttpSealedSub
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn solana_payment_selects_canonical_key_and_rejects_ambiguity() {
+        use bloom_broker_api::{DerivationProfile, DerivationRef, KeyRole, KeySpec, Token};
+        let (_, handler) = handler();
+        let mut projection = handler
+            .wallet_projections
+            .as_ref()
+            .unwrap()
+            .get_wallet(&Token::new("alice").unwrap())
+            .await
+            .unwrap();
+        assert!(primary_solana_payment_account(&projection).is_err());
+        let mut primary = projection.keys[0].clone();
+        primary.role = KeyRole::Derived;
+        primary.key_ref.key_spec = KeySpec::Ed25519;
+        primary.key_ref.derivation = Some(DerivationRef::Bip39Multicurve {
+            wallet_seed_ref: Token::new("seed").unwrap(),
+            profile: DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+            path: "m/44'/501'/0'/0'".into(),
+        });
+        primary.addresses = vec!["11111111111111111111111111111111".into()];
+        let mut other = primary.clone();
+        if let Some(DerivationRef::Bip39Multicurve { path, .. }) = &mut other.key_ref.derivation {
+            *path = "m/44'/501'/1'/0'".into();
+        }
+        projection.keys = vec![other, primary.clone()];
+        assert_eq!(
+            primary_solana_payment_account(&projection).unwrap(),
+            (primary.addresses[0].clone(), primary.key_ref.clone())
+        );
+        projection.keys.push(primary);
+        assert!(primary_solana_payment_account(&projection).is_err());
+        projection.keys.truncate(1);
+        assert!(primary_solana_payment_account(&projection).is_err());
+    }
 
     /// Paid requests run inside the router's audited effect window, so an
     /// unresponsive merchant must be ended by the client, not waited on.
