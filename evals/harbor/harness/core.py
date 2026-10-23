@@ -192,12 +192,18 @@ def _agent_spec(name: str) -> AgentSpec:
                 "CLAUDE_CODE_OAUTH_TOKEN"
             )
         if os.getenv("CLAUDE_CODE_OAUTH_TOKEN") and not os.getenv("ANTHROPIC_API_KEY"):
-            return AgentSpec(spec.harbor_name, spec.model, {"CLAUDE_FORCE_OAUTH": "1"})
+            return AgentSpec(
+                spec.harbor_name, spec.model, {"CLAUDE_FORCE_OAUTH": "yes"}
+            )
     if name == "codex" and not os.getenv("OPENAI_API_KEY"):
         auth_file = Path.home() / ".codex" / "auth.json"
         if not auth_file.is_file():
             raise EvalError("Codex auth is missing")
-        return AgentSpec(spec.harbor_name, spec.model, {"CODEX_FORCE_AUTH_JSON": "1"})
+        # Harbor treats AUTH-named env values as secrets and replaces every
+        # occurrence in artifacts. A flag of "1" corrupts numeric JSON fields.
+        return AgentSpec(
+            spec.harbor_name, spec.model, {"CODEX_AUTH_JSON_PATH": str(auth_file)}
+        )
     return spec
 
 
