@@ -135,6 +135,10 @@ assert task["task"]["name"] == "bloom/hyperliquid-order-cancel"
 assert task["environment"]["network_mode"] == "public"
 assert task["environment"]["docker_image"] == EVAL_IMAGE
 assert task["agent"]["timeout_sec"] == 900.0
+for path in Path("${repo_root}/evals/harbor/tasks").glob("*/task.toml"):
+    with path.open("rb") as handle:
+        config = tomllib.load(handle)
+    assert config["environment"]["docker_image"] == EVAL_IMAGE, path
 PY
 
 bash -n "${repo_root}/scripts/evals/run-harbor.sh"
@@ -144,6 +148,9 @@ git -C "$repo_root" check-ignore -q evals/harbor/operator-state.json
 grep -Fq '`bloom vfs`, the `bloom` executable' \
   "${task}/instruction.md"
 bash -n "${task}/tests/test.sh"
+for script in "${repo_root}"/evals/harbor/tasks/*/tests/test.sh; do
+  bash -n "$script"
+done
 PYTHONPATH="${repo_root}/evals/harbor" "${python_cmd[@]}" -m unittest discover \
   -s "${repo_root}/evals/harbor/harness_tests" -v
 
