@@ -156,6 +156,18 @@ impl ChainSpec {
         matches!(chain_id, 10 | 8453 | 11155420 | 84532)
     }
 
+    /// Chains with no native token. Tempo pays fees in stablecoins, and its
+    /// `eth_getBalance` answers a placeholder near 4.24e75 rather than a
+    /// holding, so no native balance may be read or shown there.
+    pub fn is_known_tokenless_chain_id(chain_id: u64) -> bool {
+        matches!(chain_id, 4217)
+    }
+
+    /// Whether `eth_getBalance` on this chain reports a real holding.
+    pub fn has_native_token(&self) -> bool {
+        !Self::is_known_tokenless_chain_id(self.chain_id)
+    }
+
     /// Infer `op_stack` from the chain ID when the field was absent in
     /// an older config file. Only upgrades falseâtrue for well-known
     /// OP-stack chain IDs; never downgrades.

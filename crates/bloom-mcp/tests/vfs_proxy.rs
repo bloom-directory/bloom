@@ -23,6 +23,35 @@ const RESERVED_NAME: &str = "odd name#1?q=100%.md";
 /// Larger than the daemon's 1 MiB read chunk, so the reply arrives as streamed
 /// `bloom.output` data rather than a single inline frame.
 const BIG_LEN: usize = 2 * 1024 * 1024 + 7;
+const DASHBOARD_HTML: &[u8] =
+    b"<!doctype html><html><head><title>Test</title></head><body><img src=\"icons/test.png\"></body></html>";
+
+struct DashboardHandler;
+
+#[async_trait]
+impl Handler for DashboardHandler {
+    async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
+        match path.segments().last().map(String::as_str) {
+            None => Ok(Entry::dir("views")),
+            Some(name) => Ok(Entry::read_only_file(name)),
+        }
+    }
+
+    async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+        match path
+            .segments()
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()[..]
+        {
+            ["bloom.css"] => Ok(b"body { color: black; }".to_vec()),
+            ["skin.css"] => Ok(Vec::new()),
+            ["icons", "test.png"] => Ok(vec![0x89, b'P', b'N', b'G']),
+            [page] if page.ends_with(".html") => Ok(DASHBOARD_HTML.to_vec()),
+            _ => Err(HandlerError::not_found(path.to_string_path())),
+        }
+    }
+}
 
 /// A handler with one of each thing the VFS can hold: a UTF-8 file, a binary
 /// file, an oversized file, a file whose name is full of URI metacharacters, a
@@ -214,6 +243,7 @@ impl Harness {
         let vfs = Vfs::builder()
             .mount("probe", probe.clone())
             .mount("wallets", outbox.clone())
+            .mount("views", Arc::new(DashboardHandler))
             .build();
         let ipc = IpcServer::new(vfs, "0.0.0-test", vec!["ethereum".into()]);
         let serving = ipc.clone();
@@ -738,6 +768,29 @@ async fn every_advertised_argument_reaches_the_daemon() {
 }
 
 #[tokio::test]
+async fn dashboard_tool_returns_widget_data_and_a_text_fallback() {
+    let harness = Harness::start().await;
+    let result = harness.ok_tool("show_bloom_wallets", json!({})).await;
+
+    assert!(
+        result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("views/wallets.html")
+    );
+    assert_eq!(result["structuredContent"]["view"], "wallets");
+    assert_eq!(
+        result["_meta"]["bloom/view"]["html"],
+        std::str::from_utf8(DASHBOARD_HTML).unwrap()
+    );
+    // Shared CSS and artwork ship once in the App resource, not per result.
+    assert!(result["_meta"]["bloom/view"].get("css").is_none());
+    assert!(result["_meta"]["bloom/view"].get("assets").is_none());
+
+    harness.stop().await;
+}
+
+#[tokio::test]
 async fn the_proxy_cannot_reach_non_vfs_daemon_methods() {
     let harness = Harness::start().await;
 
@@ -758,7 +811,15 @@ async fn the_proxy_cannot_reach_non_vfs_daemon_methods() {
             "vfs_read",
             "vfs_stat",
             "vfs_write",
-            "vfs_write_then_stat"
+            "vfs_write_then_stat",
+            "show_bloom_wallets",
+            "show_bloom_receive",
+            "show_bloom_activity",
+            "show_bloom_next_moves",
+            "show_bloom_contacts",
+            "show_bloom_policy",
+            "show_bloom_networks",
+            "show_bloom_markets",
         ]
     );
 
