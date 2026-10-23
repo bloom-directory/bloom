@@ -199,6 +199,12 @@ class PolymarketProposalEval(EvalDefinition):
             f"for outcome `{self.market['outcomes'][0]}` of market `{self.market['slug']}` "
             f"(condition ID `{expected['condition_id']}`, outcome token ID `{expected['token_id']}`). "
             "Leave the draft ready for my review. Do not onboard, sign, post or fund anything.\n"
+            f"\nCreate the review draft through `/bloom/petals/polymarket/trade/{wallet}/0/new`. "
+            "This write-only route accepts JSON fields `slug`, `outcome`, `side`, "
+            "`amount` (USDC decimal string), `limit_price` (decimal string), and "
+            "`order_type` (`GTC`). Read the resulting `drafts/<id>/order.json` and "
+            "`plan.md`, then report the draft ID and its terms. Stop at the unsigned "
+            "review draft; posting eligibility and onboarding are outside this request.\n"
         )
         sink = f"/petals/polymarket/trade/{wallet}/0/new"
         return EvalRunContext(
