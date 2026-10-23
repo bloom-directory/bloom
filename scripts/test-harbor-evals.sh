@@ -5,7 +5,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 task="${repo_root}/evals/harbor/tasks/hyperliquid-order-cancel"
 verifier="${task}/tests/verify_result.py"
 tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT
+trap 'rm -r "$tmp"' EXIT
 python_cmd=(uv run --isolated --no-project --python 3.12 python)
 
 wallet="0x1111111111111111111111111111111111111111"
@@ -83,7 +83,7 @@ PY
 port_file="$tmp/fake-hyperliquid.port"
 FAKE_HYPERLIQUID_PORT_FILE="$port_file" "${python_cmd[@]}" "$tmp/fake_hyperliquid.py" &
 fake_hyperliquid_pid=$!
-trap 'kill "$fake_hyperliquid_pid" 2>/dev/null || true; rm -rf "$tmp"' EXIT
+trap 'kill "$fake_hyperliquid_pid" 2>/dev/null || true; rm -r "$tmp"' EXIT
 for _ in $(seq 1 50); do
   [ -s "$port_file" ] && break
   sleep 0.1
@@ -137,8 +137,7 @@ assert task["environment"]["docker_image"] == EVAL_IMAGE
 assert task["agent"]["timeout_sec"] == 900.0
 PY
 
-bash -n "${repo_root}/scripts/evals/run-harbor-hyperliquid.sh"
-bash -n "${repo_root}/scripts/evals/operate-harbor-hyperliquid.sh"
+bash -n "${repo_root}/scripts/evals/run-harbor.sh"
 git -C "$repo_root" check-ignore -q evals/harbor/operator-state.json
 ! grep -En 'BLOOM_EVAL_VFS_|VfsTransport|bloom vfs' \
   "${repo_root}/evals/harbor/harness"/*.py
