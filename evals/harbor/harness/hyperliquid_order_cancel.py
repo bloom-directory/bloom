@@ -22,10 +22,8 @@ from typing import Any
 from .core import EvalDefinition, EvalError, EvalRunContext
 
 MAINNET_ACK = "PLACE_AND_CANCEL_BTC_MAINNET_UP_TO_11_USD"
-# The harness completes ceremonies with the authenticator seed, so it must only
-# ever follow the Triad's own ceremony origin. The port is configurable per
-# Triad (`--ceremony-port`); the operator records the origin the Machine
-# publishes and passes it here. Redaction alone stays broad.
+# Only follow the configured Triad origin when completing a ceremony;
+# redaction also covers URLs from other local development Triads.
 DEFAULT_CEREMONY_ORIGIN = "http://localhost:18734"
 CEREMONY_ORIGIN = re.compile(r"http://localhost:([1-9][0-9]{0,4})")
 ANY_CEREMONY_URL = re.compile(
@@ -74,7 +72,7 @@ STATUS_SETTLE_ATTEMPTS = 50
 STATUS_SETTLE_DELAY_SECONDS = 0.2
 EVAL_IMAGE = (
     "ghcr.io/bloom-directory/bloom-eval-agent-base@"
-    "sha256:20988c7f8a6751c25e0115c2136710a885bef69d245e077d2ae3b2cc2c0837fd"
+    "sha256:c1fa42378d25f356d791bc32b20e6e3898f1942368a765830d5419e446b81a7e"
 )
 EVAL_IMAGE_PULL_TIMEOUT_SECONDS = 600
 

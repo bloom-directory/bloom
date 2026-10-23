@@ -363,6 +363,13 @@ returns permission denied again. Once the ceremony can no longer be used,
 `ceremony_url` is withdrawn. For `expired`, `cancelled` or `refused`, tell the
 human rather than retrying on your own.
 
+A Solana transfer's blockhash lives about a minute from staging. Stage and
+inspect in one command and confirm in the next. While the owner approves,
+poll the challenge every few seconds in that same command and write `confirm`
+to `retry_path` as soon as `state` is `active`. If the blockhash still
+expires, restage through the action's own `restage` file, never by staging
+again. See the Solana walkthrough in `docs/examples.md`.
+
 `bloom wallet confirm` exits 3 when owner approval is pending and 4 when
 confirmation has no recorded result yet. Exit 0 reports a recorded broadcast
 or a completed local discard. Use `--text cancel` to discard an unsigned
