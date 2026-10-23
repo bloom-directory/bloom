@@ -12,7 +12,7 @@ from .disposable import DisposableTriad
 
 PROMPTS = {
     "solana": "Send 0.001 SOL to 3p2cqDBH9SVdyDFVcXnEBXHYCcrC3JBSjmZAjTrWyu66.",
-    "hyperliquid": "Buy 5 USDC of BTC on Hyperliquid.",
+    "hyperliquid": "Buy 11 USDC of BTC on Hyperliquid.",
     "polymarket": "Buy 5 USDC of Yes on Polymarket.",
     "near-intents": "Swap 5 USDC for NEAR using NEAR Intents.",
 }
