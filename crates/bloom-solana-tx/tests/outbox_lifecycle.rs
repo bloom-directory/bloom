@@ -290,13 +290,62 @@ fn sweep_requires_live_cluster_height_not_just_the_wall_estimate() {
 }
 
 #[test]
-fn sweep_does_not_reap_signed_pending_entry() {
+fn sweep_retires_signed_entry_that_was_never_broadcast() {
     let (_dir, outbox) = outbox();
     let mut signed = staged("0001-signed");
     signed.expires_ms = 500;
-    signed.signature =
-        Some("SIG1111111111111111111111111111111111111111111111111111111111111".into());
     outbox.write_pending(&signed, "plan").unwrap();
+    outbox
+        .record_signature("alice", "solana-devnet", "0001-signed", "SIG1")
+        .unwrap();
+
+    let candidates = outbox
+        .expired_pending(1000, &heights_past_window("solana-devnet", 999_999))
+        .unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert!(candidates[0].dir.join("intent.json").exists());
+    assert!(candidates[0].dir.join(".signature").exists());
+    assert!(
+        outbox
+            .read_in_state(
+                "alice",
+                "solana-devnet",
+                "0001-signed",
+                SolanaOutboxState::Failed
+            )
+            .is_err()
+    );
+
+    assert_eq!(
+        outbox
+            .sweep_expired(1000, &heights_past_window("solana-devnet", 999_999))
+            .unwrap(),
+        1
+    );
+    let entry = outbox
+        .read_in_state(
+            "alice",
+            "solana-devnet",
+            "0001-signed",
+            SolanaOutboxState::Failed,
+        )
+        .unwrap();
+    assert_eq!(entry.staged.status, SolanaTxStatus::Expired);
+    assert!(!entry.dir.join(".signature").exists());
+}
+
+#[test]
+fn sweep_keeps_pending_entry_with_a_broadcast_attempt() {
+    let (_dir, outbox) = outbox();
+    let mut marked = staged("0001-marked");
+    marked.expires_ms = 500;
+    outbox.write_pending(&marked, "plan").unwrap();
+    let entry = outbox
+        .read("alice", "solana-devnet", "0001-marked")
+        .unwrap();
+    outbox
+        .write_broadcast_attempt(&entry, "SIG1", b"signed-tx-bytes", 400)
+        .unwrap();
 
     assert_eq!(
         outbox
@@ -309,7 +358,7 @@ fn sweep_does_not_reap_signed_pending_entry() {
             .read_in_state(
                 "alice",
                 "solana-devnet",
-                "0001-signed",
+                "0001-marked",
                 SolanaOutboxState::Pending,
             )
             .is_ok()
