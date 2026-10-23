@@ -301,7 +301,9 @@ fn tag_release_builds_the_locked_triad_and_isolates_production_signing() {
 #[test]
 fn linux_aarch64_release_candidate_uses_locked_sources() {
     let workflow = fs::read_to_string(workspace().join(".github/workflows/release.yml")).unwrap();
-    assert!(workflow.contains("runs-on: ubuntu-24.04-arm"));
+    // Linux builds stay on 22.04 so the binaries run there (glibc 2.35).
+    assert!(workflow.contains("runs-on: ubuntu-22.04\n"));
+    assert!(workflow.contains("runs-on: ubuntu-22.04-arm"));
     assert!(workflow.contains("uname -m | grep -Fx aarch64"));
     assert!(workflow.contains("ref: ${{ needs.prepare.outputs.release_sha }}"));
     assert!(workflow.contains("name: triad-linux-aarch64-candidate"));

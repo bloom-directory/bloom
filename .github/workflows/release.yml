@@ -158,7 +158,8 @@ jobs:
   build:
     name: Build and test Linux x86_64 candidate
     needs: prepare
-    runs-on: ubuntu-24.04
+    # Oldest supported Ubuntu: binaries built here need glibc <= 2.35.
+    runs-on: ubuntu-22.04
     permissions:
       contents: read
     steps:
@@ -284,7 +285,8 @@ jobs:
   build-linux-aarch64:
     name: Build and test Linux aarch64 candidate
     needs: prepare
-    runs-on: ubuntu-24.04-arm
+    # Oldest supported Ubuntu: binaries built here need glibc <= 2.35.
+    runs-on: ubuntu-22.04-arm
     permissions:
       contents: read
     steps:

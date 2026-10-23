@@ -76,8 +76,10 @@ repository-wide formatting, Clippy, or test suites; those are independent CI
 source-quality gates. All targets emit the archive plus `.sha256`, `.sig`,
 and `.pub` sidecars.
 
-The release workflow builds Linux aarch64 natively on `ubuntu-24.04-arm` and
-macOS aarch64 on `macos-15` alongside Linux x86_64. A manual `dry_run=true`
+The release workflow builds Linux aarch64 natively on `ubuntu-22.04-arm` and
+macOS aarch64 on `macos-15` alongside Linux x86_64 on `ubuntu-22.04`. Linux
+builds stay on the oldest supported Ubuntu so the binaries run there: a
+build on 24.04 requires glibc 2.38+ and fails to start on 22.04. A manual `dry_run=true`
 dispatch uploads all three `test-unclaimed` candidates as Actions artifacts
 and cannot reach production
 signing or GitHub publication. Live candidate installation requires both a
