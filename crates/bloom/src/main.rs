@@ -4543,12 +4543,17 @@ async fn run(cli: Cli) -> Result<()> {
             let provisioning_context = server.petal_operation_context();
             let provisioning = Arc::new(std::sync::Mutex::new(None));
             let ready_provisioning = provisioning.clone();
+            let settings_retry = Arc::new(std::sync::Mutex::new(None));
+            let ready_settings_retry = settings_retry.clone();
             let ready_context = provisioning_context.clone();
             let ready_daemon = d.clone();
             let server = server.with_ready_callback(Arc::new(move || {
                 emit_machine_ready();
                 let daemon = ready_daemon.clone();
                 let context = ready_context.clone();
+                *ready_settings_retry.lock().expect("settings retry handle") = Some(tokio::spawn(
+                    default_policy::retry_queued_settings(daemon.clone()),
+                ));
                 *ready_provisioning.lock().expect("provisioning handle") =
                     Some(tokio::task::spawn_blocking(move || {
                         let results = petal_provisioning::provision(&daemon, &context);
@@ -4592,6 +4597,9 @@ async fn run(cli: Cli) -> Result<()> {
                 .await
                 .context("ipc serve");
             shutdown.abort();
+            if let Some(retry) = settings_retry.lock().expect("settings retry handle").take() {
+                retry.abort();
+            }
             provisioning_context.cancel();
             let provisioning_task = provisioning.lock().expect("provisioning handle").take();
             if let Some(task) = provisioning_task

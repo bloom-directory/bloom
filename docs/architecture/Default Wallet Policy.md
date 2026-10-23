@@ -309,20 +309,25 @@ installed Petal whose account exists or cannot be checked, it clears any
 marker instead. On a new home `main` does not exist when `bloom init` runs,
 so its settings write is refused and the marker stays. The first check after
 `main` appears writes the settings: the wallet-creation flow's, `bloom wallet
-default-policy main`, or a rerun of `bloom init` once `main` exists. The last
-covers a home where `main` already existed, so no wallet creation follows; a
-rerun that updates the Petal instead keeps the settings it carries, clears
-the marker and prints the command (section 1). It
-writes them only while the Petal's settings route
-still reads exactly as it does before anything is written there (for
-Polymarket, its built-in `enabled = false` and `allow_neg_risk = true`
-default). The check and the write are one step: Machine excludes every other
-write through its VFS between them, so an owner's edit made meanwhile is
-never replaced. It never waits behind running writes for that, since a Petal
-that writes back through the VFS would then wait forever; while other writes
-keep the VFS busy, the marker stays for the next check. Anything else there
-may be the owner's, so it stays: Machine clears the marker and logs the
-command that would apply setup's choice.
+default-policy main`, a rerun of `bloom init` once `main` exists, or `bloom
+serve`, which checks every 30 seconds while a write is queued, so a `main`
+an agent creates by writing `wallets/new` gets them too. A rerun of `bloom
+init` covers a home where `main` already existed, so no wallet creation
+follows; a rerun that updates the Petal instead keeps the settings it
+carries, clears the marker and prints the command (section 1). A queued
+write that fails stays queued, and a command that stops on an applied or
+changed policy names the command that retries it. It writes them only while
+the Petal's settings route still reads exactly as it does before anything is
+written there (for Polymarket, its built-in `enabled = false` and
+`allow_neg_risk = true` default). The route's handler makes the check and the
+write one step: the Petal router holds that Petal's write lock alone across
+the route's read, the comparison and the write, while ordinary writes to the
+Petal share it, so an owner's edit made meanwhile is never replaced. The VFS
+holds only the lock every ordinary write holds, so the route's callbacks can
+write elsewhere through it. If writes to the Petal keep running for two
+seconds, the check gives up and the marker stays for the next one. Anything
+else there may be the owner's, so it stays: Machine clears the marker and
+logs the command that would apply setup's choice.
 
 If the owner stops the command, or the policy ceremony expires, the wallet
 still exists:
@@ -514,8 +519,8 @@ changes come next.
   each Petal's route by `bloom init`, and by `bloom serve` when it installs a
   chosen Petal. An update keeps the settings its signed package lineage
   carries. A queued write that cannot be made yet is retried once `main`'s
-  account exists, by wallet creation, `bloom wallet default-policy` or a
-  rerun of `bloom init`, only over the route's unset contents.
+  account exists, by wallet creation, `bloom wallet default-policy`, a rerun
+  of `bloom init` or `bloom serve`, only over the route's unset contents.
 - **Wallet creation** (`crates/bloom`): `bloom wallet new main` and
   `bloom wallet import main` wait for the wallet, then walk the owner
   through the default policy with the `wallet_default_policy` Machine
@@ -551,9 +556,13 @@ Automated:
 - Every setup write goes in only over the route's unset contents: a
   reinstalled Petal's surviving settings, and an owner's write made while
   the route is being checked, both stay. A direct VFS write during a paused
-  check lands after it, a write that writes back through the VFS is not
-  blocked by a waiting check, and a VFS that stays busy is left untouched
-  (`crates/bloom-vfs/src/router.rs`).
+  check lands after it, a check's own callbacks and other writes can write
+  through the VFS meanwhile, and a check gives up untouched while writes to
+  its key keep running (`crates/bloom-vfs/src/router.rs`). The Petal router
+  holds a Petal alone for its check (`crates/bloom-petals/src/router.rs`).
+- A queued write that fails stays queued and is reported with the command
+  that retries it; one whose retry cannot be recorded says so and gives the
+  manual command. `bloom serve` makes a queued write once `main` exists.
 - Setup queues exactly the writes an uninterrupted run would make, before
   `setup_complete` is saved; an interrupted `bloom init` leaves them queued
   (`crates/bloom/tests/cli.rs`). A rerun finishes a queued write once

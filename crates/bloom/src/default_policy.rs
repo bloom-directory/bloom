@@ -490,6 +490,62 @@ async fn apply_queued_writes(
     outcome
 }
 
+/// How often `bloom serve` checks for queued setup writes it can make, and
+/// the longest it waits between checks while a write keeps failing.
+const QUEUED_SETTINGS_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
+const QUEUED_SETTINGS_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Make queued setup writes while `bloom serve` runs, so a `main` created any
+/// way, including by an agent writing `wallets/new`, gets setup's settings
+/// without `bloom wallet default-policy`. With nothing queued a check is one
+/// directory read. Broker is asked about `main` only while a write is queued,
+/// and checks slow down while a write keeps failing.
+pub(crate) async fn retry_queued_settings(daemon: Daemon) {
+    let mut wait = QUEUED_SETTINGS_RETRY;
+    loop {
+        tokio::time::sleep(wait).await;
+        if pending_settings(daemon.home.root(), &daemon.config.petals).is_empty() {
+            wait = QUEUED_SETTINGS_RETRY;
+            continue;
+        }
+        let owners = petal_owners(&daemon).unwrap_or_default();
+        let outcome = retry_queued_settings_once(
+            &daemon.vfs,
+            daemon.home.root(),
+            &daemon.config.petals,
+            &owners,
+        )
+        .await;
+        wait = match &outcome {
+            Some(outcome) if !outcome.still_queued.is_empty() => {
+                (wait * 2).min(QUEUED_SETTINGS_RETRY_MAX)
+            }
+            _ => QUEUED_SETTINGS_RETRY,
+        };
+        for message in outcome.into_iter().flat_map(|outcome| outcome.written) {
+            tracing::info!(%message, "petal.setup_settings_written");
+        }
+    }
+}
+
+/// One check: once `main`'s account exists, make the queued writes for
+/// installed Petals. `None` when nothing was tried.
+async fn retry_queued_settings_once(
+    vfs: &bloom_vfs::Vfs,
+    home: &std::path::Path,
+    petals: &PetalsConfig,
+    owners: &BTreeMap<String, String>,
+) -> Option<PendingSettings> {
+    if !pending_settings(home, petals)
+        .iter()
+        .any(|name| owners.contains_key(name))
+        || default_account_presence(vfs).await != AccountPresence::Exists
+    {
+        return None;
+    }
+    Some(apply_queued_writes(vfs, home, petals, owners).await)
+}
+
 /// What one queued setup write did.
 #[derive(Debug, PartialEq, Eq)]
 enum QueuedWrite {
@@ -1744,6 +1800,71 @@ mod tests {
             "{message}"
         );
         assert!(!message.contains("will retry"), "{message}");
+    }
+
+    /// `main`'s account as the wallet tree reports it.
+    struct AccountFile {
+        exists: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl bloom_vfs::Handler for AccountFile {
+        async fn lookup(
+            &self,
+            path: &bloom_vfs::VfsPath,
+        ) -> std::result::Result<bloom_vfs::Entry, bloom_vfs::HandlerError> {
+            Err(bloom_vfs::HandlerError::not_found(path.to_string_path()))
+        }
+
+        async fn read(
+            &self,
+            path: &bloom_vfs::VfsPath,
+        ) -> std::result::Result<Vec<u8>, bloom_vfs::HandlerError> {
+            if self.exists {
+                Ok(b"{}".to_vec())
+            } else {
+                Err(bloom_vfs::HandlerError::not_found(path.to_string_path()))
+            }
+        }
+    }
+
+    /// `bloom serve` makes a queued write once `main` exists, however it was
+    /// created, and leaves it queued until then.
+    #[tokio::test]
+    async fn serve_makes_a_queued_write_once_main_exists() {
+        let petals = chosen_setup(&["polymarket"]);
+        let unset = setup_template("polymarket").unwrap().unset_body.as_bytes();
+        let installed = BTreeMap::from([("polymarket".to_owned(), "a".repeat(64))]);
+        let check = |exists: bool, owners: BTreeMap<String, String>| {
+            let petals = petals.clone();
+            async move {
+                let route = SettingsRoute::holding(Some(unset));
+                let home = tempfile::tempdir().unwrap();
+                mark_settings_pending(home.path(), "polymarket").unwrap();
+                let vfs = bloom_vfs::Vfs::builder()
+                    .mount("petals", route.clone())
+                    .mount("wallets", std::sync::Arc::new(AccountFile { exists }))
+                    .build();
+                let outcome = retry_queued_settings_once(&vfs, home.path(), &petals, &owners).await;
+                let queued = pending_settings(home.path(), &petals);
+                (outcome, route.value().await.unwrap(), queued)
+            }
+        };
+
+        // Before `main` exists, and for a Petal not installed, nothing is tried.
+        for (exists, owners) in [(false, installed.clone()), (true, BTreeMap::new())] {
+            let (outcome, value, queued) = check(exists, owners).await;
+            assert_eq!(outcome, None);
+            assert_eq!(value, unset);
+            assert_eq!(queued, ["polymarket"]);
+        }
+
+        let (outcome, value, queued) = check(true, installed).await;
+        let outcome = outcome.unwrap();
+        assert_eq!(outcome.written.len(), 1, "{outcome:?}");
+        assert!(outcome.still_queued.is_empty());
+        assert_eq!(value, polymarket_setup_body());
+        assert!(queued.is_empty());
     }
 
     /// A rerun of `bloom init` makes the write an interrupted run queued, but
