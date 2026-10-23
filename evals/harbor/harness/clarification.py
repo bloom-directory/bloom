@@ -28,7 +28,12 @@ def asks_for_selection(trajectory, petal):
     if not isinstance(message, str) or "?" not in message:
         return False
     return bool(
-        re.search(r"\b(wallet|account)\b", message, re.IGNORECASE)
+        re.search(
+            r"\b(which|what|choose|select|specify|provide|confirm)\b",
+            message,
+            re.IGNORECASE,
+        )
+        and re.search(r"\b(wallet|account)\b", message, re.IGNORECASE)
         and (
             petal == "polymarket"
             or re.search(r"\b(chain|network|testnet|mainnet)\b", message, re.IGNORECASE)

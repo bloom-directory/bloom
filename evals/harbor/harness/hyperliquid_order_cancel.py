@@ -28,9 +28,7 @@ MAINNET_ACK = "PLACE_AND_CANCEL_BTC_MAINNET_UP_TO_11_USD"
 # publishes and passes it here. Redaction alone stays broad.
 DEFAULT_CEREMONY_ORIGIN = "http://localhost:18734"
 CEREMONY_ORIGIN = re.compile(r"http://localhost:([1-9][0-9]{0,4})")
-ANY_CEREMONY_URL = re.compile(
-    r"http://localhost:[0-9]+/ceremony/[A-Za-z0-9_-]+"
-)
+ANY_CEREMONY_URL = re.compile(r"http://localhost:[0-9]+/ceremony/[A-Za-z0-9_-]+")
 WALLET = re.compile(r"0x[0-9a-f]{40}")
 WALLET_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
 PACKAGE_HASH = re.compile(r"[0-9a-f]{64}")
@@ -110,7 +108,9 @@ def wallet_account_projection(
         or number != 0
         or evm.get("state") != "active"
     ):
-        raise EvalError("wallet account 0 projection is invalid for the selected wallet")
+        raise EvalError(
+            "wallet account 0 projection is invalid for the selected wallet"
+        )
     owner = evm.get("address")
     if not isinstance(owner, str) or WALLET.fullmatch(owner.lower()) is None:
         raise EvalError("wallet owner projection is invalid")
@@ -859,7 +859,10 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         self._require_bloom_mount_selection()
         if not WALLET.fullmatch(self.wallet):
             raise EvalError("BLOOM_EVAL_WALLET must be a lowercase 0x address")
-        if self.network == "mainnet" and self.env.get("BLOOM_EVAL_MAINNET_ACK") != MAINNET_ACK:
+        if (
+            self.network == "mainnet"
+            and self.env.get("BLOOM_EVAL_MAINNET_ACK") != MAINNET_ACK
+        ):
             raise EvalError(
                 f"set BLOOM_EVAL_MAINNET_ACK={MAINNET_ACK} to authorize this mainnet trial"
             )
@@ -932,7 +935,11 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         # Broker token, which must start with a lowercase letter, so a `0x…`
         # address fails deep inside signing as an unqualified permission error.
         self.session_base = (
-            self.network_root / "agent_sessions" / self.wallet_id / "0" / self.session_id
+            self.network_root
+            / "agent_sessions"
+            / self.wallet_id
+            / "0"
+            / self.session_id
         )
         request = {
             "id": self.session_id,
@@ -947,7 +954,9 @@ class HyperliquidOrderCancelEval(EvalDefinition):
             "assets": [str(self.asset_id)],
         }
         body = json.dumps(request, separators=(",", ":")).encode()
-        new_route = self.network_root / "agent_sessions" / self.wallet_id / "0" / "new.json"
+        new_route = (
+            self.network_root / "agent_sessions" / self.wallet_id / "0" / "new.json"
+        )
 
         first = self._write_route(new_route, body, SESSION_WRITE_TIMEOUT_SECONDS)
         output = (first.stdout + first.stderr).decode(errors="replace")

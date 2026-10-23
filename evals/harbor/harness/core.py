@@ -43,6 +43,8 @@ AGENTS: dict[str, AgentSpec] = {
     "opencode": AgentSpec("opencode", "deepseek/deepseek-v4-flash"),
 }
 
+AGENT_VERSIONS = {"claude-code": "2.1.245", "codex": "0.149.1", "opencode": "1.18.26"}
+
 REASONING_EFFORT_ENV = "BLOOM_EVAL_REASONING_EFFORT"
 REASONING_EFFORTS = ("low", "medium", "high", "xhigh")
 
@@ -144,6 +146,7 @@ async def run_harbor_job(context: EvalRunContext, agent: AgentSpec) -> Any:
     shared_env.update(agent.env)
     effort = reasoning_effort(agent.harbor_name)
     agent_kwargs = {"reasoning_effort": effort} if effort is not None else {}
+    agent_kwargs["version"] = AGENT_VERSIONS[agent.harbor_name]
     config = JobConfig(
         job_name=context.job_name,
         jobs_dir=context.jobs_dir,
@@ -208,7 +211,11 @@ def run_eval(
     evidence: EvalEvidence | None = None,
 ) -> Any:
     """Execute one provisioned eval and guarantee outer cleanup."""
-    agent = _agent_spec(agent_name) if harbor_runner is run_harbor_job else AGENTS[agent_name]
+    agent = (
+        _agent_spec(agent_name)
+        if harbor_runner is run_harbor_job
+        else AGENTS[agent_name]
+    )
     definition.lock_path.parent.mkdir(parents=True, exist_ok=True)
     timings = phase_timings if phase_timings is not None else {}
     evidence = evidence if evidence is not None else EvalEvidence()
