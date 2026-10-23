@@ -519,9 +519,23 @@ struct DirectorySnapshot {
     change: u64,
 }
 
+/// Why a directory listing is being loaded into the mount cache.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DirectoryFill {
+    /// READDIR enumeration, which must keep one verifier across its pages.
+    Readdir,
+    /// GETATTR revalidating the directory's `change`.
+    Revalidation,
+}
+
 struct MountDirectoryEntry {
     entries: Option<Arc<[Entry]>>,
     change: u64,
+    /// `change` was issued by GETATTR before any listing and carried onto
+    /// the first READDIR. Clients may hold LOOKUP results (including
+    /// negative ones) validated against it that the listing has since
+    /// outdated, so the next revalidation replaces it once.
+    change_predates_listing: bool,
     created_at: Instant,
     last_used_at: Instant,
     last_validated_at: Instant,
@@ -618,6 +632,7 @@ impl MountDirectoryCache {
             MountDirectoryEntry {
                 entries: None,
                 change,
+                change_predates_listing: false,
                 created_at: now,
                 last_used_at: now,
                 last_validated_at: now,
@@ -651,6 +666,7 @@ impl MountDirectoryCache {
         path: VfsPath,
         entries: Arc<[Entry]>,
         generation: u64,
+        fill: DirectoryFill,
     ) -> Arc<DirectorySnapshot> {
         let now = Instant::now();
         let mut cache = self.inner.lock();
@@ -666,9 +682,20 @@ impl MountDirectoryCache {
         let unchanged = existing
             .and_then(|entry| entry.entries.as_deref())
             .is_some_and(|current| directory_entries_equal(current, &entries));
+        let metadata_only = existing.is_some_and(|entry| entry.entries.is_none());
         // A metadata-only entry has not exposed a listing yet, so the first
         // READDIR must fill it under the same verifier allocated by GETATTR.
-        let preserve_change = existing.is_some_and(|entry| entry.entries.is_none()) || unchanged;
+        // That token predates the listing, though: a client may have cached
+        // a LOOKUP against it (including "not found") that the listing now
+        // contradicts. Revalidation therefore never adopts it; it issues a
+        // fresh token, once, so such clients drop what they cached.
+        let carried_to_readdir = metadata_only && fill == DirectoryFill::Readdir;
+        let preserve_change = carried_to_readdir
+            || (unchanged
+                && !(fill == DirectoryFill::Revalidation
+                    && existing.is_some_and(|entry| entry.change_predates_listing)));
+        let change_predates_listing = carried_to_readdir
+            || (preserve_change && existing.is_some_and(|entry| entry.change_predates_listing));
         let change = existing
             .filter(|_| preserve_change)
             .map(|entry| entry.change)
@@ -687,6 +714,7 @@ impl MountDirectoryCache {
             MountDirectoryEntry {
                 entries: Some(entries),
                 change,
+                change_predates_listing,
                 created_at,
                 last_used_at: now,
                 last_validated_at: now,
@@ -809,6 +837,11 @@ impl BloomFs {
         dir_path: &VfsPath,
         revalidate: bool,
     ) -> FsResult<Arc<DirectorySnapshot>> {
+        let fill = if revalidate {
+            DirectoryFill::Revalidation
+        } else {
+            DirectoryFill::Readdir
+        };
         if let Some(snapshot) = self.directory_cache.get(dir_path)
             && (!revalidate || !self.directory_cache.needs_revalidation(dir_path))
         {
@@ -842,6 +875,7 @@ impl BloomFs {
                             path.clone(),
                             Arc::from(entries),
                             generation,
+                            fill,
                         )),
                         Ok(Err(error)) => Err(map_err(error)),
                         Err(_) => {
@@ -3202,6 +3236,60 @@ mod tests {
             "directory change must move after a new entry is added; \
              otherwise the kernel will keep serving the cached empty listing"
         );
+    }
+
+    /// A client caches a failed LOOKUP against the directory's `change`.
+    /// When that token was issued before the adapter had listed the
+    /// directory, the first listing must not adopt it: the entry may have
+    /// appeared in between, and a client polling faster than the idle TTL
+    /// would otherwise keep its negative entry until the snapshot's max
+    /// age (observed: `policy-updates/latest` missing for 30 s).
+    #[tokio::test(start_paused = true)]
+    async fn dir_change_moves_after_entry_appears_behind_metadata_only_token() {
+        let h = MutableDirHandler::new();
+        let vfs = Vfs::builder().mount("box", h.clone()).build();
+        let fs = BloomFs::new(vfs);
+        let ctx = fake_ctx();
+        let box_dir = fs.lookup(&ctx, &BloomHandle::Root, "box").await.unwrap();
+        let pending = fs.lookup(&ctx, &box_dir, "pending").await.unwrap();
+        let before = fs.getattr(&ctx, &pending).await.unwrap().change;
+        assert!(fs.lookup(&ctx, &pending, "0001").await.is_err());
+        h.push("0001");
+        // Poll inside the idle TTL so the snapshot never expires.
+        tokio::time::advance(DIRECTORY_CACHE_REVALIDATE_INTERVAL + Duration::from_millis(1)).await;
+        let after = fs.getattr(&ctx, &pending).await.unwrap().change;
+        assert_ne!(
+            before, after,
+            "a change token issued before any listing must not survive the first listing"
+        );
+        fs.lookup(&ctx, &pending, "0001").await.unwrap();
+        tokio::time::advance(DIRECTORY_CACHE_REVALIDATE_INTERVAL + Duration::from_millis(1)).await;
+        assert_eq!(fs.getattr(&ctx, &pending).await.unwrap().change, after);
+    }
+
+    /// READDIR keeps the token GETATTR issued so one enumeration sees one
+    /// verifier, but the token predates the listing, so the next
+    /// revalidation replaces it once and then holds it stable.
+    #[tokio::test(start_paused = true)]
+    async fn readdir_filled_token_is_replaced_once_after_enumeration() {
+        let h = MutableDirHandler::new();
+        let vfs = Vfs::builder().mount("box", h.clone()).build();
+        let fs = BloomFs::new(vfs);
+        let ctx = fake_ctx();
+        let box_dir = fs.lookup(&ctx, &BloomHandle::Root, "box").await.unwrap();
+        let pending = fs.lookup(&ctx, &box_dir, "pending").await.unwrap();
+        let issued = fs.getattr(&ctx, &pending).await.unwrap().change;
+        assert!(fs.lookup(&ctx, &pending, "0001").await.is_err());
+        h.push("0001");
+        fs.readdir(&ctx, &pending, 0, u32::MAX, false)
+            .await
+            .unwrap();
+        assert_eq!(fs.getattr(&ctx, &pending).await.unwrap().change, issued);
+        tokio::time::advance(DIRECTORY_CACHE_REVALIDATE_INTERVAL + Duration::from_millis(1)).await;
+        let replaced = fs.getattr(&ctx, &pending).await.unwrap().change;
+        assert_ne!(replaced, issued);
+        tokio::time::advance(DIRECTORY_CACHE_REVALIDATE_INTERVAL + Duration::from_millis(1)).await;
+        assert_eq!(fs.getattr(&ctx, &pending).await.unwrap().change, replaced);
     }
 
     /// Two empty directories at different paths must not share a

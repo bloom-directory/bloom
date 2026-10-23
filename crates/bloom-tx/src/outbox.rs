@@ -988,28 +988,21 @@ impl Outbox {
         Ok(())
     }
 
-    /// Remove pending entries that have expired.
-    pub fn sweep_expired(&self, now_ms: u128) -> Result<usize, OutboxError> {
-        let mut count = 0;
+    /// Pending entries whose expiry has passed, read without changing
+    /// anything, so a caller can tell whether a sweep would do any work.
+    pub fn expired_pending(&self, now_ms: u128) -> Result<Vec<OutboxEntry>, OutboxError> {
+        let mut expired = Vec::new();
         if !self.inner.root.exists() {
-            return Ok(0);
+            return Ok(expired);
         }
         for w in fs::read_dir(&self.inner.root)? {
             let w = w?;
-            let wname = match w.file_name().into_string() {
-                Ok(n) => n,
-                Err(_) => continue,
-            };
-            if !w.file_type()?.is_dir() {
+            if w.file_name().into_string().is_err() || !w.file_type()?.is_dir() {
                 continue;
             }
             for c in fs::read_dir(w.path())? {
                 let c = c?;
-                let cname = match c.file_name().into_string() {
-                    Ok(n) => n,
-                    Err(_) => continue,
-                };
-                if !c.file_type()?.is_dir() {
+                if c.file_name().into_string().is_err() || !c.file_type()?.is_dir() {
                     continue;
                 }
                 let pending = c.path().join("pending");
@@ -1024,39 +1017,46 @@ impl Outbox {
                     }
                     let staged: StagedTx = serde_json::from_slice(&fs::read(&intent_path)?)?;
                     if staged.expires_ms != 0 && now_ms >= staged.expires_ms {
-                        let entry = OutboxEntry {
+                        expired.push(OutboxEntry {
                             state: OutboxState::Pending,
-                            staged: staged.clone(),
+                            staged,
                             dir: ent.path(),
-                        };
-                        match self.transition(&entry, OutboxState::Failed) {
-                            Ok(_) => {
-                                tracing::debug!(
-                                    id = %staged.id,
-                                    wallet = %staged.wallet,
-                                    chain = %staged.chain,
-                                    expired_at = staged.expires_ms,
-                                    now_ms,
-                                    "outbox.sweep_expired"
-                                );
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    id = %staged.id,
-                                    wallet = %staged.wallet,
-                                    chain = %staged.chain,
-                                    error = %e,
-                                    "outbox.sweep_transition_failed"
-                                );
-                            }
-                        }
-                        count += 1;
+                        });
                     }
                 }
-                let _ = (wname.clone(), cname.clone());
             }
         }
-        Ok(count)
+        Ok(expired)
+    }
+
+    /// Remove pending entries that have expired.
+    pub fn sweep_expired(&self, now_ms: u128) -> Result<usize, OutboxError> {
+        let expired = self.expired_pending(now_ms)?;
+        for entry in &expired {
+            let staged = &entry.staged;
+            match self.transition(entry, OutboxState::Failed) {
+                Ok(_) => {
+                    tracing::debug!(
+                        id = %staged.id,
+                        wallet = %staged.wallet,
+                        chain = %staged.chain,
+                        expired_at = staged.expires_ms,
+                        now_ms,
+                        "outbox.sweep_expired"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        id = %staged.id,
+                        wallet = %staged.wallet,
+                        chain = %staged.chain,
+                        error = %e,
+                        "outbox.sweep_transition_failed"
+                    );
+                }
+            }
+        }
+        Ok(expired.len())
     }
 
     /// Sum the structured valuation of every staged tx for `wallet` whose
