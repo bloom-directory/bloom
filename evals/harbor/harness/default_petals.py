@@ -193,6 +193,9 @@ class PolymarketProposalEval(EvalDefinition):
         self.jobs.mkdir(parents=True, exist_ok=True)
         task = self.jobs / self.trial
         shutil.copytree(self.repo / "evals/harbor/tasks" / self.name, task)
+        shutil.copy2(
+            self.repo / "evals/harbor/projection.py", task / "tests/projection.py"
+        )
         (task / "instruction.md").write_text(
             f"Using Bloom mounted at /bloom, prepare an unsigned GTC buy order from wallet `{wallet}` "
             f"account 0 on Polygon (chain ID 137): spend exactly 5 USDC at a limit price of 0.01 "
@@ -226,7 +229,7 @@ class PolymarketProposalEval(EvalDefinition):
                 },
             ],
             {},
-            {"BLOOM_EVAL_PROPOSAL": json.dumps(expected)},
+            self.triad.projection_env() | {"BLOOM_EVAL_PROPOSAL": json.dumps(expected)},
             host_verifier_root=self.triad.mount,
         )
 

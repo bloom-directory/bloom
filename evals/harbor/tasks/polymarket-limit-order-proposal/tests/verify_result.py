@@ -4,7 +4,8 @@
 import json
 import os
 import sys
-from pathlib import Path
+
+from projection import ProjectionReader
 
 
 def require(condition, message):
@@ -40,12 +41,10 @@ def validate(draft, expected):
 
 
 def verify(root=None):
-    root = root or Path(os.environ.get("BLOOM_EVAL_MOUNT_ROOT", "/bloom"))
+    reader = ProjectionReader(root)
     expected = json.loads(os.environ["BLOOM_EVAL_PROPOSAL"])
     wallet, number = expected["wallet"], expected["account"]
-    account = json.loads(
-        (root / f"wallets/{wallet}/{number}/account.json").read_bytes()
-    )
+    account = reader.read_json(f"wallets/{wallet}/{number}/account.json")
     require(
         account.get("schema") == "bloom.account.v1"
         and account.get("wallet") == wallet
@@ -61,21 +60,23 @@ def verify(root=None):
         "wrong account address",
     )
     require(
-        int((root / "chains/polygon/chain_id").read_text().strip())
-        == expected["chain_id"],
+        reader.read_json("chains/polygon/chain_id") == expected["chain_id"],
         "wrong chain ID",
     )
-    base = root / f"petals/polymarket/trade/{wallet}/{number}"
-    drafts = list((base / "drafts").iterdir())
+    base = f"petals/polymarket/trade/{wallet}/{number}"
+    drafts = reader.directories(base + "/drafts")
     require(len(drafts) == 1, "expected exactly one draft")
-    require(not list((base / "receipts").iterdir()), "unexpected posted receipt")
-    draft = json.loads((drafts[0] / "order.json").read_bytes())
+    require(not reader.directories(base + "/receipts"), "unexpected posted receipt")
+    draft = reader.read_json(base + f"/drafts/{drafts[0]}/order.json")
     validate(draft, expected)
 
 
 if __name__ == "__main__":
     try:
         verify()
-    except (OSError, ValueError, KeyError, TypeError) as error:
+    except (ValueError, KeyError, TypeError) as error:
         print(f"invalid Polymarket proposal: {error}", file=sys.stderr)
         raise SystemExit(1)
+    except OSError as error:
+        print(f"projection unavailable: {error}", file=sys.stderr)
+        raise SystemExit(2)
