@@ -18,6 +18,15 @@ class EvalError(RuntimeError):
     """A fail-closed evaluation error suitable for operator display."""
 
 
+@dataclass
+class EvalEvidence:
+    """Observed lifecycle evidence, retained even when the run raises."""
+
+    result: Any | None = None
+    cleanup_succeeded: bool | None = None
+    cleanup_error: str | None = None
+
+
 @dataclass(frozen=True)
 class AgentSpec:
     harbor_name: str
@@ -32,6 +41,23 @@ AGENTS: dict[str, AgentSpec] = {
     "claude": AgentSpec("claude-code", "claude-sonnet-5"),
     "codex": AgentSpec("codex", "gpt-5.6-terra"),
 }
+
+REASONING_EFFORT_ENV = "BLOOM_EVAL_REASONING_EFFORT"
+REASONING_EFFORTS = ("low", "medium", "high", "xhigh")
+
+
+def reasoning_effort(agent_name: str) -> str | None:
+    """The opt-in Codex reasoning effort; None keeps Harbor's default (high)."""
+    value = os.environ.get(REASONING_EFFORT_ENV)
+    if not value:
+        return None
+    if agent_name != "codex":
+        raise EvalError(f"{REASONING_EFFORT_ENV} applies only to the codex agent")
+    if value not in REASONING_EFFORTS:
+        raise EvalError(
+            f"{REASONING_EFFORT_ENV} must be one of: {', '.join(REASONING_EFFORTS)}"
+        )
+    return value
 
 
 @dataclass(frozen=True)
@@ -113,6 +139,8 @@ async def run_harbor_job(context: EvalRunContext, agent: AgentSpec) -> Any:
 
     shared_env = dict(context.agent_env)
     shared_env.update(agent.env)
+    effort = reasoning_effort(agent.harbor_name)
+    agent_kwargs = {"reasoning_effort": effort} if effort is not None else {}
     config = JobConfig(
         job_name=context.job_name,
         jobs_dir=context.jobs_dir,
@@ -125,6 +153,7 @@ async def run_harbor_job(context: EvalRunContext, agent: AgentSpec) -> Any:
                 model_name=agent.model,
                 n_concurrent=1,
                 env=shared_env,
+                kwargs=agent_kwargs,
             )
         ],
         environment=EnvironmentConfig(
@@ -172,11 +201,13 @@ def run_eval(
     harbor_runner: HarborRunner = run_harbor_job,
     acquire_lock: bool = True,
     phase_timings: dict[str, float] | None = None,
+    evidence: EvalEvidence | None = None,
 ) -> Any:
     """Execute one provisioned eval and guarantee outer cleanup."""
     agent = _agent_spec(agent_name)
     definition.lock_path.parent.mkdir(parents=True, exist_ok=True)
     timings = phase_timings if phase_timings is not None else {}
+    evidence = evidence if evidence is not None else EvalEvidence()
 
     def execute() -> Any:
         started = time.monotonic()
@@ -198,6 +229,7 @@ def run_eval(
             timings["authority_provisioning_seconds"] = time.monotonic() - started
             started = time.monotonic()
             result = asyncio.run(harbor_runner(context, agent))
+            evidence.result = result
             timings["harbor_seconds"] = time.monotonic() - started
             definition.validate_result(result)
         except BaseException as error:  # noqa: BLE001 -- cleanup must cover interrupts
@@ -208,8 +240,11 @@ def run_eval(
                 started = time.monotonic()
                 try:
                     definition.cleanup()
+                    evidence.cleanup_succeeded = True
                     timings["session_cleanup_seconds"] = time.monotonic() - started
                 except BaseException as cleanup_error:
+                    evidence.cleanup_succeeded = False
+                    evidence.cleanup_error = str(cleanup_error)
                     timings["session_cleanup_seconds"] = time.monotonic() - started
                     if run_error is not None:
                         raise EvalError(

@@ -249,6 +249,20 @@ again (see "Adding a passkey"); `result.json` lists the active credential. A
 cancelled or expired operation can be started again with a fresh write to
 `wallets/recover`.
 
+## Check passkeys before hosted approvals
+
+A localhost passkey cannot approve on the hosted relay domain, even in the same
+browser. Before a hosted signing or policy ceremony, check `status/ceremonies.json`
+and the wallet's `passkeys/` entries (`surface` and `state`). Relay readiness does
+not mean the wallet has an active remote passkey.
+
+If the wallet has only local passkeys, explain that hosted approvals require a
+remote passkey. With the human's agreement, refer to the "Adding a passkey"
+flow below to add a remote passkey to their existing wallet.
+
+Wait for enrollment `SUCCEEDED`, verify the remote passkey is active, then resume
+the original operation with its unchanged proposal or intent.
+
 ## Adding a passkey
 
 `wallets/<wallet>/passkeys/` lists the wallet's passkeys, one directory each,
