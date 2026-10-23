@@ -1,5 +1,6 @@
 """Ambiguous requests: a real agent question and no staged work."""
 
+import json
 import os
 import re
 import secrets
@@ -61,6 +62,15 @@ class ClarificationEval(EvalDefinition):
         self.triad.start()
         if self.petal != "solana":
             self.triad.require_petal(self.petal)
+        self.lineage = {
+            "coverage": "clarification",
+            "petal": self.petal,
+            "wallet": self.triad.wallet,
+            "account": 0,
+        }
+        if self.petal != "solana":
+            owner = self.triad.home / "petals/store/owners" / f"{self.petal}.json"
+            self.lineage["package_hash"] = json.loads(owner.read_bytes())["hash"]
         self.jobs.mkdir(parents=True, exist_ok=True)
         task = self.jobs / self.trial
         shutil.copytree(self.repo / "evals/harbor/tasks" / self.name, task)
