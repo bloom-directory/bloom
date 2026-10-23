@@ -29,6 +29,11 @@ pub struct PetalRouter {
     runtime_petals: BTreeMap<String, PetalRuntimeConfig>,
     audit: Option<Arc<AuditLog>>,
     audit_effect_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Writes to each Petal share its lock; a conditional write holds it
+    /// alone. Keyed by Petal rather than path, so a route reached by two
+    /// paths is still covered. A Petal cannot write under `petals/`, so its
+    /// own callbacks never wait on these.
+    write_locks: bloom_vfs::WriteLocks,
 }
 
 impl PetalRouter {
@@ -39,6 +44,7 @@ impl PetalRouter {
             runtime_petals: BTreeMap::new(),
             audit: None,
             audit_effect_lock: Arc::new(tokio::sync::Mutex::new(())),
+            write_locks: bloom_vfs::WriteLocks::default(),
         }
     }
 
@@ -337,6 +343,26 @@ fn map_host_err(error: crate::host::HostError) -> HandlerError {
 }
 
 impl PetalRouter {
+    /// Run a route's write; the caller holds the Petal's write lock.
+    async fn write_route(
+        &self,
+        mount: &str,
+        rest: String,
+        data: &[u8],
+        path: &VfsPath,
+    ) -> Result<(), HandlerError> {
+        match self
+            .dispatch(mount, DispatchOp::Write, rest, data.to_vec())
+            .await?
+        {
+            DispatchResponse::Write => Ok(()),
+            DispatchResponse::Error { code, message } => {
+                Err(dispatch_error(code, message, path.to_string_path()))
+            }
+            other => Err(unexpected_response("write", other)),
+        }
+    }
+
     /// Dispatch using the account identity resolved by the host from live core state.
     #[allow(clippy::too_many_arguments)]
     async fn dispatch_for_account(
@@ -569,16 +595,39 @@ impl Handler for PetalRouter {
         if rest.is_empty() || Self::is_petal_document(&rest) {
             return Err(HandlerError::PermissionDenied);
         }
-        match self
-            .dispatch(mount, DispatchOp::Write, rest, data.to_vec())
+        let _held = self.write_locks.shared(mount).await;
+        self.write_route(mount, rest, data, path).await
+    }
+
+    /// Read the route and write it only while it still reads `expected`,
+    /// holding the Petal's write lock alone so no other write to the Petal
+    /// lands in between.
+    async fn write_if_reads(
+        &self,
+        path: &VfsPath,
+        expected: &[u8],
+        data: &[u8],
+    ) -> Result<bool, HandlerError> {
+        let (mount, rest) = Self::mount_path(path)?;
+        if rest.is_empty() || Self::is_petal_document(&rest) {
+            return Err(HandlerError::PermissionDenied);
+        }
+        let _held = self.write_locks.exclusive(mount).await?;
+        let current = match self
+            .dispatch(mount, DispatchOp::Read, rest.clone(), Vec::new())
             .await?
         {
-            DispatchResponse::Write => Ok(()),
+            DispatchResponse::Read(bytes) => bytes,
             DispatchResponse::Error { code, message } => {
-                Err(dispatch_error(code, message, path.to_string_path()))
+                return Err(dispatch_error(code, message, path.to_string_path()));
             }
-            other => Err(unexpected_response("write", other)),
+            other => return Err(unexpected_response("read", other)),
+        };
+        if current != expected {
+            return Ok(false);
         }
+        self.write_route(mount, rest, data, path).await?;
+        Ok(true)
     }
 
     async fn list(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
@@ -967,6 +1016,66 @@ name = "example"
             "petal/example/operations/[wallet]/[index]/submit.wasm",
             &crate::package::route_fixtures::async_failing_write_route_component(),
         );
+    }
+
+    /// A conditional write checks what the route reads, never writes the
+    /// Petal root or its documents, and holds the Petal alone: it waits for
+    /// a write already running, then gives up, and an ordinary write waits
+    /// for it.
+    #[tokio::test]
+    async fn write_if_reads_checks_the_route_and_holds_the_petal_alone() {
+        let (dir, runner) = runner();
+        let package = dir.path().join("demo-app");
+        write_demo_package(&package);
+        runner.store().install_petal_package_dir(&package).unwrap();
+        let router = PetalRouter::new(runner, Arc::new(AccountHost));
+        let path = VfsPath::parse("/demo/hello.txt").unwrap();
+        let current = router.read(&path).await.unwrap();
+
+        assert!(
+            !router
+                .write_if_reads(&path, b"something else", b"new")
+                .await
+                .unwrap()
+        );
+        for refused in ["/demo", "/demo/README.md"] {
+            let error = router
+                .write_if_reads(&VfsPath::parse(refused).unwrap(), b"", b"new")
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, HandlerError::PermissionDenied),
+                "{refused}: {error}"
+            );
+        }
+
+        let running = router.write_locks.shared("demo").await;
+        let error = router
+            .write_if_reads(&path, &current, b"new")
+            .await
+            .unwrap_err();
+        assert!(matches!(error, HandlerError::Backend(_)), "{error}");
+        drop(running);
+
+        let checking = router.write_locks.exclusive("demo").await.unwrap();
+        let writer = router.clone();
+        let mut write = tokio::spawn(async move {
+            writer
+                .write(&VfsPath::parse("/demo/hello.txt").unwrap(), b"new")
+                .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut write)
+                .await
+                .is_err(),
+            "an ordinary write waits while a conditional write holds the Petal"
+        );
+        drop(checking);
+        tokio::time::timeout(std::time::Duration::from_secs(5), write)
+            .await
+            .expect("the write proceeds once the Petal is free")
+            .unwrap()
+            .ok();
     }
 
     #[tokio::test]

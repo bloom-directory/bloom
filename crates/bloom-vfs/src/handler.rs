@@ -241,6 +241,22 @@ pub trait Handler: Send + Sync {
         Err(HandlerError::PermissionDenied)
     }
 
+    /// Write `data` only if `path` reads exactly `expected` now, and report
+    /// whether it wrote. The check and the write must be one step against
+    /// every other write this handler accepts for `path`, which
+    /// [`crate::WriteLocks`] provides. Default: unsupported, writing nothing.
+    async fn write_if_reads(
+        &self,
+        path: &VfsPath,
+        _expected: &[u8],
+        _data: &[u8],
+    ) -> Result<bool, HandlerError> {
+        Err(HandlerError::Unsupported(format!(
+            "conditional write to {}",
+            path.to_string_path()
+        )))
+    }
+
     /// Prepare for a write-open before any bytes are accepted by the mount.
     ///
     /// Handlers that need user-visible failures for shell redirects should
