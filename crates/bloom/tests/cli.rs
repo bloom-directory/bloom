@@ -768,13 +768,26 @@ fn stop_ipc_server(
     server_thread.join().expect("ipc server thread panicked");
 }
 
-fn spawn_bloom_serve(home: &Path) -> std::process::Child {
+/// A `bloom serve` started by a test. Dropping it kills the daemon, so a test
+/// that panics before [`stop_bloom_serve`] does not leave it running.
+struct SpawnedServe(Option<std::process::Child>);
+
+impl Drop for SpawnedServe {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn spawn_bloom_serve(home: &Path) -> SpawnedServe {
     prepare_hermetic_machine_state(home);
     let binary = Command::cargo_bin("bloom")
         .expect("locate bloom binary")
         .get_program()
         .to_owned();
-    let mut child = std::process::Command::new(binary)
+    let child = std::process::Command::new(binary)
         .env("BLOOM_HOME", home)
         .env(
             "BLOOM_ENROLLMENT_ROOT",
@@ -805,6 +818,9 @@ fn spawn_bloom_serve(home: &Path) -> std::process::Child {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn bloom serve");
+    // Guard it before waiting, so a daemon that never binds is still killed.
+    let mut serve = SpawnedServe(Some(child));
+    let child = serve.0.as_mut().expect("just spawned");
     let socket = bloom_daemon::ipc::default_socket_path(home);
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while !ipc_endpoint_accepting(&socket) {
@@ -828,23 +844,27 @@ fn spawn_bloom_serve(home: &Path) -> std::process::Child {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
-    child
+    serve
 }
 
-fn stop_bloom_serve(home: &Path, mut child: std::process::Child) {
+/// Stops a daemon through its shutdown RPC. Until it has exited, the guard
+/// still owns it, so any panic here kills it on drop.
+fn stop_bloom_serve(home: &Path, mut serve: SpawnedServe) {
     bloom_cmd(home)
         .args(["ipc", "call", "shutdown"])
         .assert()
         .success();
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
+        let child = serve.0.as_mut().expect("bloom serve already stopped");
         if child.try_wait().unwrap().is_some() {
+            serve.0 = None;
             return;
         }
-        if std::time::Instant::now() >= deadline {
-            child.kill().expect("kill stuck bloom serve");
-            panic!("bloom serve did not stop after shutdown RPC");
-        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "bloom serve did not stop after shutdown RPC"
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
 }
@@ -1668,6 +1688,24 @@ fn lifecycle_commands_ignore_invalid_client_endpoint_configuration() {
     assert!(ipc_endpoint_accepting(&socket));
     child.kill().unwrap();
     child.wait().unwrap();
+}
+
+#[test]
+fn triad_health_check_uses_the_configured_client_endpoint() {
+    let home = fresh_home();
+    let configured_socket = home.path().join("run").join("custom-machine.sock");
+    let default_socket = bloom_daemon::ipc::default_socket_path(home.path());
+    let endpoint = format!("unix:{}", configured_socket.display());
+
+    bloom_cmd(home.path())
+        .env("BLOOM_RPC_ENDPOINT", endpoint)
+        .args(["serve", "triad-health-check", &"11".repeat(32)])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains(configured_socket.display().to_string())
+                .and(predicate::str::contains(default_socket.display().to_string()).not()),
+        );
 }
 
 #[test]
@@ -2508,9 +2546,9 @@ fn wallet_confirm_reports_the_pending_ceremony_url() {
         Vec::new(),
     );
     files.insert(
-        "/alice/0/chains/base/outbox/pending/0001-cafe/ceremony.json".to_string(),
+        "/alice/0/chains/base/outbox/pending/0001-cafe/approval_challenge.json".to_string(),
         format!(
-            "{{\"ceremony_url\":\"http://localhost:18734/c/secret\",\"ceremony_expires_at_ms\":\"{expires}\"}}"
+            "{{\"schema\":\"bloom.evm-approval-challenge/1\",\"state\":\"awaiting_ceremony\",\"ceremony_url\":\"http://localhost:18734/c/secret\",\"expiry_ms\":{expires}}}"
         )
         .into_bytes(),
     );
@@ -2590,9 +2628,9 @@ fn wallet_confirm_surfaces_unrelated_failures_despite_an_existing_ceremony() {
         + 180_000) as u64;
     let mut files = std::collections::HashMap::new();
     files.insert(
-        "/alice/0/chains/base/outbox/pending/0001-feed/ceremony.json".to_string(),
+        "/alice/0/chains/base/outbox/pending/0001-feed/approval_challenge.json".to_string(),
         format!(
-            "{{\"ceremony_url\":\"http://localhost:18734/c/old\",\"ceremony_expires_at_ms\":\"{expires}\"}}"
+            "{{\"schema\":\"bloom.evm-approval-challenge/1\",\"state\":\"awaiting_ceremony\",\"ceremony_url\":\"http://localhost:18734/c/old\",\"expiry_ms\":{expires}}}"
         )
         .into_bytes(),
     );

@@ -126,6 +126,35 @@ jobs:
             echo "dry_run=$DRY_RUN"
           } >> "$GITHUB_OUTPUT"
 
+      # Generated once, before any build, so dry runs show the changes for
+      # review and create and retry publish the same section.
+      - name: Generate release changes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ steps.meta.outputs.release_tag }}
+          SHA: ${{ steps.meta.outputs.release_sha }}
+        run: |
+          set -euo pipefail
+          git fetch --tags --force
+          mkdir -p release-notes
+          gh api --paginate "repos/$REPOSITORY/releases" \
+            --jq '.[] | select(.draft | not) | select(.prerelease | not) | .tag_name' \
+            > release-notes/published
+          packaging/triad/release/release-notes.sh changes \
+            --repo "$REPOSITORY" --tag "$TAG" --sha "$SHA" \
+            --published release-notes/published \
+            > release-notes/changes.md
+          cat release-notes/changes.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload release changes
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-notes
+          path: release-notes/changes.md
+          if-no-files-found: error
+          retention-days: 7
+
   build:
     name: Build and test Linux x86_64 candidate
     needs: prepare
@@ -444,6 +473,11 @@ jobs:
           name: triad-signed-release
           path: dist
 
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: release-notes
+          path: release-notes
+
       - name: Create or update GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -459,8 +493,8 @@ jobs:
             echo "::error::$TAG moved after the build"
             exit 1
           }
-          notes="$(mktemp)"
-          cat > "$notes" <<EOF
+          header="$(mktemp)"
+          cat > "$header" <<EOF
           ## Bloom v$VERSION
 
           This release contains signed Bloom triad bundles for Linux x86_64,
@@ -470,7 +504,36 @@ jobs:
           \`packaging/triad/release/bloom-release-v1.pub\` and the namespace
           \`bloom-release-archive-v1\`.
           EOF
-          if gh release view "$TAG" >/dev/null 2>&1; then
+          notes="$(mktemp)"
+          existing_body="$(mktemp)"
+          release_json="$(mktemp)"
+          release_error="$(mktemp)"
+          # Decide once whether the release exists. Only a 404 means it does
+          # not; any other failure stops here, so a transient error can never
+          # make a retry overwrite a maintainer's notes as if the body were new.
+          if gh api "repos/$REPOSITORY/releases/tags/$TAG" > "$release_json" 2> "$release_error"; then
+            release_exists=true
+            jq -r '.body // ""' "$release_json" > "$existing_body"
+          elif grep -q 'HTTP 404' "$release_error"; then
+            release_exists=false
+          else
+            cat "$release_error" >&2
+            echo "::error::could not read release $TAG"
+            exit 1
+          fi
+          # A retry keeps anything a maintainer added and replaces only the
+          # generated changes; a new or empty body starts from the header.
+          if grep -q '[^[:space:]]' "$existing_body"; then
+            packaging/triad/release/release-notes.sh splice \
+              --changes release-notes/changes.md \
+              --existing "$existing_body" \
+              --header "$header" > "$notes"
+          else
+            packaging/triad/release/release-notes.sh splice \
+              --changes release-notes/changes.md \
+              --header "$header" > "$notes"
+          fi
+          if [[ "$release_exists" == true ]]; then
             existing="$(mktemp -d)"
             gh release view "$TAG" --json assets --jq '.assets[].name' \
               > "$existing/names"
