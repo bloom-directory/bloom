@@ -21,6 +21,14 @@ use `docs/petals.md` to discover installed packages, then read that package's
 
 ## Authority and safety
 
+### Cards and online checkout
+
+When `cards/` is present, read `docs/checkout.md` before shopping. Never ask
+for card or traveler values in chat, shell, or VFS.
+
+Protection depends on separate service principals. Root and root-equivalent
+access, including membership in the Docker group, is outside that claim.
+
 Machine exposes this VFS; Broker controls approval ceremonies and policy;
 Signer holds Bloom wallet keys and signs. Secret ceremony input belongs only
 in the Broker-hosted browser flow, never a VFS write, shell argument,

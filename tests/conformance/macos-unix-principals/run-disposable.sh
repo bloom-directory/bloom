@@ -67,7 +67,7 @@ capture_failure_evidence() {
     --predicate 'subsystem == "com.bloom.triad"' \
     > "$evidence_dir/native-lifecycle.json" 2>&1 || true
   chmod 0644 "$evidence_dir/native-lifecycle.json" 2>/dev/null || true
-  for service in broker signer; do
+  for service in broker signer checkout; do
     source_log="/private/var/log/bloom/$login_uid/$service.jsonl"
     if [[ -f "$source_log" && ! -L "$source_log" ]]; then
       install -m 0644 "$source_log" "$evidence_dir/$service.log" || true
@@ -257,31 +257,21 @@ assert_metadata \
 
 broker_probe="/private/var/db/bloom/$login_uid/broker/w0-private"
 signer_probe="/private/var/db/bloom/$login_uid/signer/w0-private"
-broker_checkpoint_probe="/private/var/db/bloom/$login_uid/broker/audit-checkpoints/w0-private"
-signer_checkpoint_probe="/private/var/db/bloom/$login_uid/signer/audit-checkpoints/w0-private"
+# Never write probes into audit-checkpoints: Broker and Signer read every file
+# there on each decision, and an empty file latches the Triad read-only.
+# Checking that the directory cannot be traversed covers every file inside.
+broker_checkpoints="/private/var/db/bloom/$login_uid/broker/audit-checkpoints"
+signer_checkpoints="/private/var/db/bloom/$login_uid/signer/audit-checkpoints"
 install -o "bloom-broker-$login_uid" -g "bloom-broker-$login_uid" -m 0600 /dev/null "$broker_probe"
 install -o "bloom-signer-$login_uid" -g "bloom-signer-$login_uid" -m 0600 /dev/null "$signer_probe"
-install \
-  -o "bloom-broker-$login_uid" \
-  -g "bloom-broker-$login_uid" \
-  -m 0600 \
-  /dev/null \
-  "$broker_checkpoint_probe"
-install \
-  -o "bloom-signer-$login_uid" \
-  -g "bloom-signer-$login_uid" \
-  -m 0600 \
-  /dev/null \
-  "$signer_checkpoint_probe"
 sudo -u "$login_user" test ! -r "$broker_probe"
 sudo -u "$login_user" test ! -r "$signer_probe"
-sudo -u "$login_user" test ! -r "$broker_checkpoint_probe"
-sudo -u "$login_user" test ! -r "$signer_checkpoint_probe"
+sudo -u "$login_user" test ! -x "$broker_checkpoints"
+sudo -u "$login_user" test ! -x "$signer_checkpoints"
 sudo -u "bloom-broker-$login_uid" test ! -r "$signer_probe"
-sudo -u "bloom-broker-$login_uid" test ! -r "$signer_checkpoint_probe"
+sudo -u "bloom-broker-$login_uid" test ! -x "$signer_checkpoints"
 sudo -u "bloom-signer-$login_uid" test ! -r "$broker_probe"
-sudo -u "bloom-signer-$login_uid" test ! -r "$broker_checkpoint_probe"
-rm -f -- "$broker_checkpoint_probe" "$signer_checkpoint_probe"
+sudo -u "bloom-signer-$login_uid" test ! -x "$broker_checkpoints"
 sudo -u "$login_user" test ! -r \
   "/Library/Application Support/BloomTriad/config/$login_uid/installer/identity.json"
 sudo -u "$login_user" test ! -r \

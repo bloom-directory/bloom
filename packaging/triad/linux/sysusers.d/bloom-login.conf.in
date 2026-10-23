@@ -1,4 +1,11 @@
 # Render once per enabled interactive login.
+u bloom-checkout-@LOGIN_UID@ - "Bloom checkout for login UID @LOGIN_UID@" /var/lib/bloom/@LOGIN_UID@/checkout -
+g bloom-machine-checkout-@LOGIN_UID@ -
+g bloom-broker-checkout-@LOGIN_UID@ -
+m @LOGIN_USER@ bloom-machine-checkout-@LOGIN_UID@
+m bloom-checkout-@LOGIN_UID@ bloom-machine-checkout-@LOGIN_UID@
+m bloom-broker-@LOGIN_UID@ bloom-broker-checkout-@LOGIN_UID@
+m bloom-checkout-@LOGIN_UID@ bloom-broker-checkout-@LOGIN_UID@
 u bloom-broker-@LOGIN_UID@ - "Bloom Broker for login UID @LOGIN_UID@" /var/lib/bloom/@LOGIN_UID@/broker -
 u bloom-signer-@LOGIN_UID@ - "Bloom Signer for login UID @LOGIN_UID@" /var/lib/bloom/@LOGIN_UID@/signer -
 g bloom-machine-broker-@LOGIN_UID@ -
