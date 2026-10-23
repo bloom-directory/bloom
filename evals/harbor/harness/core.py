@@ -73,6 +73,8 @@ class EvalRunContext:
     agent_env: Mapping[str, str]
     verifier_env: Mapping[str, str]
     extra_docker_compose: Sequence[Path] = ()
+    host_verifier_root: Path | None = None
+    clarification_petal: str | None = None
 
 
 class EvalDefinition(ABC):
@@ -167,7 +169,18 @@ async def run_harbor_job(context: EvalRunContext, agent: AgentSpec) -> Any:
             mounts=list(context.mounts),
             extra_docker_compose=list(context.extra_docker_compose),
         ),
-        verifier=VerifierConfig(env=dict(context.verifier_env)),
+        verifier=VerifierConfig(
+            env=dict(context.verifier_env),
+            import_path="harness.host_verifier:HostProjectionVerifier"
+            if context.host_verifier_root
+            else None,
+            kwargs={
+                "mount_root": str(context.host_verifier_root),
+                "clarification_petal": context.clarification_petal,
+            }
+            if context.host_verifier_root
+            else {},
+        ),
         tasks=[TaskConfig(path=context.task_dir)],
     )
     job = await Job.create(config)

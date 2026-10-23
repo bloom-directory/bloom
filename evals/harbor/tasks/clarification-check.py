@@ -13,7 +13,8 @@ def entries(path):
         return []
 
 
-def verify(root=Path("/bloom")):
+def verify(root=None):
+    root = root or Path(os.environ.get("BLOOM_EVAL_MOUNT_ROOT", "/bloom"))
     wallet = os.environ["BLOOM_EVAL_WALLET_ID"]
     account = json.loads((root / f"wallets/{wallet}/0/account.json").read_bytes())
     if (

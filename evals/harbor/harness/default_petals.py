@@ -227,6 +227,7 @@ class PolymarketProposalEval(EvalDefinition):
             ],
             {},
             {"BLOOM_EVAL_PROPOSAL": json.dumps(expected)},
+            host_verifier_root=self.triad.mount,
         )
 
     def cleanup(self) -> None:
