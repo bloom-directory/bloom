@@ -17,6 +17,9 @@ from unittest import mock
 from harness import hyperliquid_order_cancel
 from harness.core import (
     AGENTS,
+    REASONING_EFFORT_ENV,
+    EvalEvidence,
+    reasoning_effort,
     AgentFailure,
     AgentSpec,
     TokenUsage,
@@ -269,6 +272,23 @@ class HarnessLifecycleTests(unittest.TestCase):
 
         with self.assertRaisesRegex(EvalError, "run failed.*cleanup also failed"):
             run_eval(definition, "codex", harbor_runner=runner)
+
+    def test_zero_reward_retains_result_with_successful_or_failed_cleanup(self) -> None:
+        for cleanup_fails in (False, True):
+            with self.subTest(cleanup_fails=cleanup_fails):
+                definition = FakeDefinition(self.root)
+                if cleanup_fails:
+                    definition.cleanup = mock.Mock(side_effect=EvalError("residual order"))
+                result = self.passing_result()
+                result.trial_results[0].verifier_result.rewards = {"reward": 0}
+                async def runner(_context, _agent):
+                    return result
+                evidence = EvalEvidence()
+                with self.assertRaisesRegex(EvalError, "passing reward"):
+                    run_eval(definition, "codex", harbor_runner=runner, evidence=evidence)
+                self.assertIs(evidence.result, result)
+                self.assertEqual(evidence.cleanup_succeeded, not cleanup_fails)
+                self.assertEqual(evidence.cleanup_error, "residual order" if cleanup_fails else None)
 
     def test_provider_error_is_reported_instead_of_aggregate_trial_count(self) -> None:
         definition = FakeDefinition(self.root)
@@ -671,10 +691,17 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         self.definition._read_json = mock.Mock(
             side_effect=[
                 {
-                    "owner": self.wallet,
-                    "policy_status": "broker_verified",
+                    "wallet": self.wallet_id,
+                    "schema": "bloom.account.v1",
+                    "number": 0,
+                    "evm": {"state": "active", "address": self.wallet},
                     "freshness": "fresh",
-                    "policy_digest": digest,
+                },
+                {
+                    "wallet": {"wallet_id": self.wallet_id},
+                    "verification": "authenticated_broker",
+                    "freshness": "fresh",
+                    "policy": {"policy_digest": digest},
                 },
                 policy,
             ]
@@ -693,10 +720,17 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         self.definition._read_json = mock.Mock(
             side_effect=[
                 {
-                    "owner": self.wallet,
-                    "policy_status": "broker_verified",
+                    "wallet": self.wallet_id,
+                    "schema": "bloom.account.v1",
+                    "number": 0,
+                    "evm": {"state": "active", "address": self.wallet},
                     "freshness": "fresh",
-                    "policy_digest": "d" * 64,
+                },
+                {
+                    "wallet": {"wallet_id": self.wallet_id},
+                    "verification": "authenticated_broker",
+                    "freshness": "fresh",
+                    "policy": {"policy_digest": "d" * 64},
                 },
                 policy,
             ]
@@ -721,10 +755,17 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         self.definition._read_json = mock.Mock(
             side_effect=[
                 {
-                    "owner": self.wallet,
-                    "policy_status": "broker_verified",
+                    "wallet": self.wallet_id,
+                    "schema": "bloom.account.v1",
+                    "number": 0,
+                    "evm": {"state": "active", "address": self.wallet},
                     "freshness": "fresh",
-                    "policy_digest": digest,
+                },
+                {
+                    "wallet": {"wallet_id": self.wallet_id},
+                    "verification": "authenticated_broker",
+                    "freshness": "fresh",
+                    "policy": {"policy_digest": digest},
                 },
                 policy,
             ]
@@ -840,7 +881,7 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         (root / ("d" * 64 + ".json")).write_text(
             json.dumps(
                 {
-                    "schema": "bloom.machine.petal-key-request.v2",
+                    "schema": "bloom.machine.petal-key-request.v3",
                     "key_slot": session_key_slot("exact-session"),
                     "scope": {
                         "wallet_id": self.wallet_id,
@@ -854,7 +895,7 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         (root / ("e" * 64 + ".json")).write_text(
             json.dumps(
                 {
-                    "schema": "bloom.machine.petal-key-request.v2",
+                    "schema": "bloom.machine.petal-key-request.v3",
                     "key_slot": session_key_slot("other-session"),
                     "scope": {
                         "wallet_id": self.wallet_id,
@@ -867,6 +908,114 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         )
 
         self.assertEqual(self.definition._pending_petal_key_ceremony(), ceremony)
+
+    def test_pending_key_ceremony_follows_only_the_configured_origin(self) -> None:
+        # Triads launched with `--ceremony-port` publish that port; the
+        # default-port Triad may already hold 18734 on the same host.
+        self.definition = HyperliquidOrderCancelEval(
+            self.repo,
+            dict(self.env, BLOOM_EVAL_CEREMONY_ORIGIN="http://localhost:28735"),
+        )
+        self.definition.session_id = "exact-session"
+        root = self.mount / "petal-key-requests"
+        root.mkdir(parents=True)
+        path = root / ("d" * 64 + ".json")
+
+        def write(ceremony: str) -> None:
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema": "bloom.machine.petal-key-request.v3",
+                        "key_slot": session_key_slot("exact-session"),
+                        "scope": {
+                            "wallet_id": self.wallet_id,
+                            "package_hash": self.package_hash,
+                        },
+                        "status": "awaiting_user",
+                        "ceremony_url": ceremony,
+                    }
+                )
+            )
+
+        ceremony = "http://localhost:28735/ceremony/" + "A" * 43
+        write(ceremony)
+        self.assertEqual(self.definition._pending_petal_key_ceremony(), ceremony)
+        for invalid in (
+            "http://localhost:18734/ceremony/" + "A" * 43,
+            "http://localhost:2873/ceremony/" + "A" * 43,
+            "http://localhost:287350/ceremony/" + "A" * 43,
+            "http://example.com:28735/ceremony/" + "A" * 43,
+            "http://localhost/ceremony/" + "A" * 43,
+            "http://localhost:28735/ceremony/" + "A" * 42,
+            "http://localhost:28735/ceremony/" + "A" * 44,
+        ):
+            with self.subTest(ceremony=invalid):
+                write(invalid)
+                with self.assertRaisesRegex(EvalError, "invalid ceremony URL"):
+                    self.definition._pending_petal_key_ceremony()
+
+    def test_petal_output_cannot_steer_ceremony_to_another_origin(self) -> None:
+        definition = HyperliquidOrderCancelEval(
+            self.repo,
+            dict(self.env, BLOOM_EVAL_CEREMONY_ORIGIN="http://localhost:28735"),
+        )
+        token = "A" * 43
+        for output in (
+            f"approve at http://localhost:18734/ceremony/{token}",
+            f"approve at http://localhost:28736/ceremony/{token}",
+            f"approve at http://localhost:28735.evil/ceremony/{token}",
+            f"approve at http://localhost:28735/ceremony/{token}B",
+        ):
+            with self.subTest(output=output):
+                self.assertIsNone(definition.ceremony_url.search(output))
+        trusted = f"http://localhost:28735/ceremony/{token}"
+        match = definition.ceremony_url.search(f"approve at {trusted}\n")
+        self.assertIsNotNone(match)
+        self.assertEqual(match.group(0), trusted)
+
+    def test_ceremony_origin_must_be_an_exact_loopback_origin(self) -> None:
+        for origin in (
+            "http://localhost:0",
+            "http://localhost:65536",
+            "http://localhost:28735/",
+            "http://127.0.0.1:28735",
+            "https://localhost:28735",
+            "http://localhost",
+        ):
+            with (
+                self.subTest(origin=origin),
+                self.assertRaisesRegex(EvalError, "ceremony origin"),
+            ):
+                HyperliquidOrderCancelEval(
+                    self.repo, dict(self.env, BLOOM_EVAL_CEREMONY_ORIGIN=origin)
+                )
+
+    def test_pending_key_schema_fails_only_for_exact_binding(self) -> None:
+        self.definition.session_id = "exact-session"
+        root = self.mount / "petal-key-requests"
+        root.mkdir(parents=True)
+        path = root / ("d" * 64 + ".json")
+        record = {
+            "schema": "bloom.machine.petal-key-request.v99",
+            "key_slot": session_key_slot("exact-session"),
+            "scope": {"wallet_id": self.wallet_id, "package_hash": self.package_hash},
+            "status": "awaiting_user",
+            "ceremony_url": "http://localhost:18734/ceremony/" + "A" * 43,
+        }
+        for schema in ("bloom.machine.petal-key-request.v3", "unknown"):
+            for mismatch in ("wallet_id", "package_hash", "key_slot"):
+                with self.subTest(schema=schema, mismatch=mismatch):
+                    other = copy.deepcopy(record)
+                    other["schema"] = schema
+                    target = other if mismatch == "key_slot" else other["scope"]
+                    target[mismatch] = "different"
+                    path.write_text(json.dumps(other))
+                    self.assertIsNone(self.definition._pending_petal_key_ceremony())
+        for schema in (record["schema"], "bloom.machine.petal-key-request.v2", None):
+            record["schema"] = schema
+            path.write_text(json.dumps(record))
+            with self.subTest(schema=schema), self.assertRaisesRegex(EvalError, "unsupported schema.*v3"):
+                self.definition._pending_petal_key_ceremony()
 
     def test_session_key_slot_is_a_case_sensitive_lowercase_broker_token(self) -> None:
         upper = session_key_slot("bloom-eval-codex-20260814T150000Z-0123456789abcdef")
@@ -1170,6 +1319,18 @@ class HyperliquidDefinitionTests(unittest.TestCase):
             call.args[0].name for call in self.definition._write_route.call_args_list
         ]
         self.assertEqual(routes, ["cancel_all", "stop"])
+        self.assertEqual(self.definition.cleanup_observations, {
+            "open_orders": 0, "positions": 0, "session_stopped": True,
+        })
+
+    def test_final_cleanup_read_failure_does_not_report_stale_zero_counts(self) -> None:
+        self.definition.cleanup_observations = {"open_orders": 0, "positions": 0}
+        self.definition._read_json = mock.Mock(side_effect=EvalError("I/O error"))
+        with self.assertRaisesRegex(EvalError, "I/O error"):
+            self.definition._require_no_orders_or_positions(record_cleanup=True)
+        self.assertEqual(self.definition.cleanup_observations, {
+            "open_orders": None, "positions": None,
+        })
 
     def test_cleanup_reports_failure_when_postcondition_never_settles(self) -> None:
         # Polling must not paper over a genuine failure: a budget that expires
@@ -1398,6 +1559,103 @@ class HyperliquidDefinitionTests(unittest.TestCase):
             ),
         ):
             self.definition._pull_eval_image()
+
+
+class WalletAccountOwnerTests(unittest.TestCase):
+    """The eval reads its wallet owner from the per-account layout (#282)."""
+
+    WALLET_ID = "bloom-eval-hyperliquid"
+    OWNER = "0x2425C1bDf231F37EBDEEEa462A3F00970F52f06a"
+
+    def wallet_root(self, *, account=None, projection=None) -> Path:
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(root, ignore_errors=True))
+        (root / "0").mkdir()
+        account_json = {
+            "schema": "bloom.account.v1",
+            "wallet": self.WALLET_ID,
+            "number": 0,
+            "evm": {"state": "active", "address": self.OWNER.lower()},
+            "freshness": "fresh",
+        }
+        account_json.update(account or {})
+        projection_json = {
+            "wallet": {"wallet_id": self.WALLET_ID},
+            "verification": "authenticated_broker",
+            "freshness": "fresh",
+            "policy": {"policy_digest": "a" * 64},
+        }
+        projection_json.update(projection or {})
+        (root / "0" / "account.json").write_text(json.dumps(account_json))
+        (root / "projection.json").write_text(json.dumps(projection_json))
+        return root
+
+    def owner(self, root: Path) -> str:
+        owner, digest = hyperliquid_order_cancel.wallet_account_projection(
+            lambda path: json.loads(path.read_text()), root, self.WALLET_ID
+        )
+        self.assertEqual(digest, "a" * 64)
+        return owner
+
+    def test_account_zero_owner_is_returned_lowercase(self) -> None:
+        self.assertEqual(self.owner(self.wallet_root()), self.OWNER.lower())
+
+    def test_refuses_an_account_that_is_not_this_wallets_active_account_zero(self) -> None:
+        for account in (
+            {"wallet": "another-wallet"},
+            {"number": 1},
+            {"number": False},
+            {"number": 0.0},
+            {"number": "0"},
+            {"schema": "bloom.account.v2"},
+            {"schema": None},
+            {"evm": {"state": "retired", "address": self.OWNER.lower()}},
+            {"evm": {"state": "active", "address": "not-an-address"}},
+        ):
+            with self.subTest(account=account), self.assertRaises(EvalError):
+                self.owner(self.wallet_root(account=account))
+
+    def test_refuses_a_projection_not_authenticated_by_broker_for_this_wallet(self) -> None:
+        for projection in (
+            {"verification": "cached"},
+            {"wallet": {"wallet_id": "another-wallet"}},
+            {"policy": {}},
+        ):
+            with self.subTest(projection=projection), self.assertRaises(EvalError):
+                self.owner(self.wallet_root(projection=projection))
+
+    def test_refuses_stale_projections(self) -> None:
+        for root in (
+            self.wallet_root(account={"freshness": "stale"}),
+            self.wallet_root(projection={"freshness": "stale"}),
+        ):
+            with self.subTest(root=root), self.assertRaises(EvalError):
+                self.owner(root)
+
+
+class ReasoningEffortTests(unittest.TestCase):
+    def test_unset_keeps_harbor_default(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(REASONING_EFFORT_ENV, None)
+            self.assertIsNone(reasoning_effort("codex"))
+            self.assertIsNone(reasoning_effort("claude"))
+
+    def test_codex_accepts_known_efforts(self) -> None:
+        for effort in ("low", "medium", "high", "xhigh"):
+            with mock.patch.dict(os.environ, {REASONING_EFFORT_ENV: effort}):
+                self.assertEqual(reasoning_effort("codex"), effort)
+
+    def test_unknown_effort_and_other_agents_are_refused(self) -> None:
+        with (
+            mock.patch.dict(os.environ, {REASONING_EFFORT_ENV: "max"}),
+            self.assertRaisesRegex(EvalError, "must be one of"),
+        ):
+            reasoning_effort("codex")
+        with (
+            mock.patch.dict(os.environ, {REASONING_EFFORT_ENV: "medium"}),
+            self.assertRaisesRegex(EvalError, "only to the codex agent"),
+        ):
+            reasoning_effort("claude")
 
 
 if __name__ == "__main__":

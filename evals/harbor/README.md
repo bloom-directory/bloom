@@ -163,6 +163,9 @@ wallet id, mount, and triad root. Initialization verifies a Broker-confirmed,
 deny-by-default, empty dedicated wallet; the installed Hyperliquid lineage; the
 source revisions of Bloom, Broker, Signer, and the Hyperliquid Petal; Bloom's
 pinned Petal contract revision; and hashes of the triad/debug-driver binaries.
+It also records the local ceremony origin the Machine publishes in
+`status/ceremonies.json`; the harness completes ceremonies only at that exact
+origin, and `run` refuses one that has changed since `init`.
 This command creates or refreshes the default handoff at
 `evals/harbor/operator-state.json`:
 
