@@ -124,6 +124,13 @@ class DisposableTriad:
     def cli(self, *args: str) -> str:
         return self._run([self.env["BLOOM_INTEGRATION_MACHINE_BIN"], *args])
 
+    def projection_env(self) -> dict[str, str]:
+        return {
+            "BLOOM_EVAL_PROJECTION_BIN": self.env["BLOOM_INTEGRATION_MACHINE_BIN"],
+            "BLOOM_EVAL_PROJECTION_HOME": str(self.home),
+            "BLOOM_EVAL_PROJECTION_RPC_ENDPOINT": self.env["BLOOM_RPC_ENDPOINT"],
+        }
+
     def read(self, path: str) -> Any:
         return json.loads(self.cli("vfs", "cat", path))
 

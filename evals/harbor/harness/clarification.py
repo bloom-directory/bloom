@@ -65,6 +65,9 @@ class ClarificationEval(EvalDefinition):
         task = self.jobs / self.trial
         shutil.copytree(self.repo / "evals/harbor/tasks" / self.name, task)
         shutil.copy2(
+            self.repo / "evals/harbor/projection.py", task / "tests/projection.py"
+        )
+        shutil.copy2(
             self.repo / "evals/harbor/tasks/clarification-check.py",
             task / "tests/clarification_check.py",
         )
@@ -78,7 +81,7 @@ class ClarificationEval(EvalDefinition):
             self.jobs,
             [{"type": "bind", "source": str(self.triad.mount), "target": "/bloom"}],
             {},
-            {"BLOOM_EVAL_WALLET_ID": self.triad.wallet},
+            self.triad.projection_env() | {"BLOOM_EVAL_WALLET_ID": self.triad.wallet},
             host_verifier_root=self.triad.mount,
             clarification_petal=self.petal,
         )

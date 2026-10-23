@@ -1,3 +1,3 @@
-from clarification_check import verify
+from clarification_check import main
 
-verify()
+raise SystemExit(main())
