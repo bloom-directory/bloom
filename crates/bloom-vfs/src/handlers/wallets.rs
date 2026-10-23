@@ -10025,7 +10025,10 @@ value = "0""#,
 
     #[tokio::test]
     async fn confirm_cancel_discards_pending_locally() {
-        let f = make_handler_with_chain(true);
+        let mut f = make_handler_with_chain(true);
+        f.handler.home_write_permit = Some(Arc::new(
+            HomeWritePermit::acquire(&bloom_proto::HomeDir::at(f._tmp.path())).unwrap(),
+        ));
         seed_pending(&f, "0001-test");
         let p = VfsPath::parse(&format!(
             "/{}/0/chains/anvil/outbox/pending/0001-test/confirm",
@@ -10049,7 +10052,10 @@ value = "0""#,
     async fn confirm_cancel_preserves_possible_signatures() {
         for marker in ["hash", "broadcast", "dispatched", "malformed"] {
             for control in ["confirm", "confirm.override"] {
-                let f = make_handler_with_chain(true);
+                let mut f = make_handler_with_chain(true);
+                f.handler.home_write_permit = Some(Arc::new(
+                    HomeWritePermit::acquire(&bloom_proto::HomeDir::at(f._tmp.path())).unwrap(),
+                ));
                 seed_pending(&f, "0001-test");
                 let entry = f
                     .handler
@@ -10086,7 +10092,7 @@ value = "0""#,
                             "schema": "bloom.machine-evm-signing.1", "action_id": "test",
                             "payload_digest": digest, "claimed_hash": digest,
                             "provenance_digest": digest, "canonical_plan_facts_digest": digest,
-                            "approval_operation_id": "approval", "signing_operation_id": "signing",
+                            "approval_operation_id": digest, "signing_operation_id": digest,
                             "request_nonce": "11".repeat(16), "issued_at_ms": "1", "expires_at_ms": "2",
                             "sign_dispatched": true
                         })).unwrap()).unwrap();
