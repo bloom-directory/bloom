@@ -204,10 +204,6 @@ def _agent_spec(name: str) -> AgentSpec:
                 "Claude auth is missing; set ANTHROPIC_API_KEY or "
                 "CLAUDE_CODE_OAUTH_TOKEN"
             )
-        if os.getenv("CLAUDE_CODE_OAUTH_TOKEN") and not os.getenv("ANTHROPIC_API_KEY"):
-            return AgentSpec(
-                spec.harbor_name, spec.model, {"CLAUDE_FORCE_OAUTH": "yes"}
-            )
     if name == "codex" and not os.getenv("OPENAI_API_KEY"):
         auth_file = Path.home() / ".codex" / "auth.json"
         if not auth_file.is_file():
