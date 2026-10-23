@@ -350,6 +350,8 @@ fn petal_review_payload<'a>(
     operation_class: &str,
     claimed_class: &str,
     action: Option<&'a [u8]>,
+    crypto_suite: bloom_broker_api::CryptoSuite,
+    preimage: &[u8],
 ) -> Result<Option<&'a [u8]>, HostError> {
     if operation_class != claimed_class {
         return Err(HostError::Invalid(
@@ -366,7 +368,11 @@ fn petal_review_payload<'a>(
                 .ok()
                 .is_some_and(|value| value["schema"] == "bloom.message.review.v1")
         });
-        if bloom_broker_api::MESSAGE_REVIEW_OPERATION_CLASSES.contains(&operation_class)
+        let signed_message = crypto_suite
+            == bloom_broker_api::CryptoSuite::Secp256k1Keccak256Recoverable
+            && preimage.first() == Some(&0x19);
+        if (bloom_broker_api::MESSAGE_REVIEW_OPERATION_CLASSES.contains(&operation_class)
+            || signed_message)
             && message.is_none()
         {
             return Err(HostError::Invalid(
@@ -2034,6 +2040,8 @@ impl PetalHost for DaemonPetalHost {
             &req.operation_class,
             claim.operation_class.as_str(),
             req.action.as_deref(),
+            crypto_suite,
+            &req.preimage,
         )?;
         let trusted_package_hash = bloom_broker_api::Digest32::new(context.package_hash.clone())
             .map_err(|error| HostError::Invalid(error.to_string()))?;
@@ -5766,6 +5774,15 @@ mod tests {
 
     #[test]
     fn safe_petal_review_mapping_rejects_class_substitution() {
+        let petal_review_payload = |operation, claim, action| {
+            super::petal_review_payload(
+                operation,
+                claim,
+                action,
+                bloom_broker_api::CryptoSuite::Secp256k1Keccak256Recoverable,
+                b"transaction",
+            )
+        };
         let safe = bloom_broker_api::SAFE_CONFIRM_OPERATION_CLASS;
         let envelope = b"safe review".as_slice();
         assert_eq!(
@@ -5791,6 +5808,15 @@ mod tests {
 
     #[test]
     fn message_review_mapping_keeps_full_envelopes_and_refuses_downgrades() {
+        let petal_review_payload = |operation, claim, action| {
+            super::petal_review_payload(
+                operation,
+                claim,
+                action,
+                bloom_broker_api::CryptoSuite::Secp256k1Keccak256Recoverable,
+                b"message",
+            )
+        };
         let envelope =
             br#"{"schema":"bloom.message.review.v1","kind":"personal","message":"exact text"}"#
                 .as_slice();
@@ -5812,6 +5838,43 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn unlisted_signed_messages_require_review_envelopes() {
+        use bloom_broker_api::CryptoSuite::*;
+        let envelope = br#"{"schema":"bloom.message.review.v1"}"#.as_slice();
+        for preimage in [
+            b"\x19\x01typed data".as_slice(),
+            b"\x19Ethereum Signed Message",
+            b"\x19",
+        ] {
+            for action in [None, Some(b"legacy action".as_slice())] {
+                assert!(matches!(
+                    petal_review_payload("custom.message", "custom.message", action,
+                        Secp256k1Keccak256Recoverable, preimage),
+                    Err(HostError::Invalid(message)) if message.contains("requires a message review envelope")
+                ));
+            }
+            assert_eq!(
+                petal_review_payload(
+                    "custom.message",
+                    "custom.message",
+                    Some(envelope),
+                    Secp256k1Keccak256Recoverable,
+                    preimage
+                )
+                .unwrap(),
+                Some(envelope)
+            );
+            for suite in [Ed25519Message, Secp256k1Sha256Recoverable] {
+                assert_eq!(
+                    petal_review_payload("custom.message", "custom.message", None, suite, preimage)
+                        .unwrap(),
+                    None
+                );
+            }
+        }
     }
 
     #[cfg(feature = "mount")]

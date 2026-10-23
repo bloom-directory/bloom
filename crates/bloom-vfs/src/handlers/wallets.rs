@@ -4439,10 +4439,8 @@ impl WalletsHandler {
                     ));
                 }
                 if confirm_text.eq_ignore_ascii_case("cancel") {
-                    self.write_permit()?;
                     self.tx_engine
-                        .outbox
-                        .cancel(wallet, chain, id)
+                        .discard_unsigned(self.write_permit()?, wallet, chain, id)
                         .map_err(err_be)?;
                     return Ok(());
                 }
@@ -10045,6 +10043,78 @@ value = "0""#,
         assert_eq!(entry.state, OutboxState::Failed);
         assert!(!entry.dir.join("broadcast_attempted.json").exists());
         assert!(!entry.dir.join("raw_tx").exists());
+    }
+
+    #[tokio::test]
+    async fn confirm_cancel_preserves_possible_signatures() {
+        for marker in ["hash", "broadcast", "dispatched", "malformed"] {
+            for control in ["confirm", "confirm.override"] {
+                let f = make_handler_with_chain(true);
+                seed_pending(&f, "0001-test");
+                let entry = f
+                    .handler
+                    .tx_engine
+                    .outbox
+                    .read(&f.wallet_name, "anvil", "0001-test")
+                    .unwrap();
+                match marker {
+                    "hash" => {
+                        let mut staged = entry.staged.clone();
+                        staged.tx_hash = Some(format!("0x{}", "11".repeat(32)));
+                        std::fs::write(
+                            entry.dir.join("intent.json"),
+                            serde_json::to_vec(&staged).unwrap(),
+                        )
+                        .unwrap();
+                    }
+                    "broadcast" => {
+                        std::fs::write(
+                            entry.dir.join("broadcast_attempted.json"),
+                            serde_json::to_vec(&serde_json::json!({
+                                "schema": "bloom.broadcast_attempted.v1", "tx_hash": "signed",
+                                "raw_tx_blake3": "digest", "raw_tx_path": "raw_tx",
+                                "from": entry.staged.from, "to": null, "nonce": 0,
+                                "chain_id": 31337, "created_ms": 0, "transport": "public_rpc"
+                            }))
+                            .unwrap(),
+                        )
+                        .unwrap();
+                    }
+                    "dispatched" => {
+                        let digest = "11".repeat(32);
+                        std::fs::write(entry.dir.join("ceremony.json"), serde_json::to_vec(&serde_json::json!({
+                            "schema": "bloom.machine-evm-signing.1", "action_id": "test",
+                            "payload_digest": digest, "claimed_hash": digest,
+                            "provenance_digest": digest, "canonical_plan_facts_digest": digest,
+                            "approval_operation_id": "approval", "signing_operation_id": "signing",
+                            "request_nonce": "11".repeat(16), "issued_at_ms": "1", "expires_at_ms": "2",
+                            "sign_dispatched": true
+                        })).unwrap()).unwrap();
+                    }
+                    _ => std::fs::write(entry.dir.join("ceremony.json"), b"invalid").unwrap(),
+                }
+                let path = VfsPath::parse(&format!(
+                    "/{}/0/chains/anvil/outbox/pending/0001-test/{control}",
+                    f.wallet_name
+                ))
+                .unwrap();
+                let error = f.handler.write(&path, b"cancel").await.unwrap_err();
+                if marker != "malformed" {
+                    assert!(
+                        error.to_string().contains("cannot discard"),
+                        "{marker}: {error}"
+                    );
+                }
+                let retained = f
+                    .handler
+                    .tx_engine
+                    .outbox
+                    .read(&f.wallet_name, "anvil", "0001-test")
+                    .unwrap();
+                assert_eq!(retained.state, OutboxState::Pending, "{marker}/{control}");
+                assert!(!retained.dir.join("cancel.txt").exists());
+            }
+        }
     }
 
     #[tokio::test]

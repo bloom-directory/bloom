@@ -4265,7 +4265,7 @@ mod tests {
     /// reviewed. Broker refused it for want of an approval, which is one
     /// barrier and not the one the architecture doc describes.
     #[test]
-    fn safe_confirmations_cannot_take_the_unreviewed_reusable_path() {
+    fn reviewed_signatures_cannot_take_the_unreviewed_reusable_path() {
         let payload = b"\x19\x01safe preimage".to_vec();
         let payload_digest = Digest32::from_bytes(Keccak256::digest(&payload).into());
         let build = |class: &str| TrustedPetalSignRequest {
@@ -4300,6 +4300,28 @@ mod tests {
 
         // An ordinary class still signs on this path.
         build("order.cancel").validate().unwrap();
+
+        for class in bloom_broker_api::MESSAGE_REVIEW_OPERATION_CLASSES
+            .iter()
+            .copied()
+            .filter(|class| bloom_broker_api::message_review_requires_exact(class))
+        {
+            for (operation, claim) in [
+                (class, class),
+                (class, "order.cancel"),
+                ("order.cancel", class),
+            ] {
+                let mut request = build(operation);
+                request.claim.operation_class = token(claim);
+                let error = request.validate().unwrap_err();
+                assert_eq!(
+                    error.code,
+                    ProtocolErrorCode::ClaimInvalid,
+                    "{operation}/{claim}"
+                );
+                assert!(error.message.contains("single-payload exact path"));
+            }
+        }
 
         // The Safe class is refused before any wire call, on the claim and on
         // the request, so neither half can be the one that carries it.

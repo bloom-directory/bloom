@@ -4291,6 +4291,35 @@ impl TxEngine {
         Ok(bumped)
     }
 
+    /// Discard only an unsigned pending entry, preserving any possible signature.
+    pub fn discard_unsigned(
+        &self,
+        permit: &HomeWritePermit,
+        wallet: &str,
+        chain: &str,
+        id: &str,
+    ) -> Result<(), TxEngineError> {
+        self.assert_write_permit(permit)?;
+        let entry = self
+            .outbox
+            .read_in_state(wallet, chain, id, OutboxState::Pending)?;
+        if entry.staged.tx_hash.is_some()
+            || self
+                .outbox
+                .read_broadcast_attempt(&entry, BroadcastAttemptKind::Confirm)?
+                .is_some()
+            || read_triad_signing_state(&entry.dir.join(TRIAD_SIGNING_STATE_FILE))?
+                .is_some_and(|state| state.sign_dispatched)
+        {
+            return Err(TxEngineError::ApprovalState(
+                "cannot discard a possibly signed transaction; reconcile it or use wallet cancel"
+                    .into(),
+            ));
+        }
+        self.outbox.cancel(wallet, chain, id)?;
+        Ok(())
+    }
+
     /// Issue a same-nonce self-send to cancel the original. The original
     /// must be either still staged in `pending/` or broadcast-but-unmined in
     /// `sent/`.

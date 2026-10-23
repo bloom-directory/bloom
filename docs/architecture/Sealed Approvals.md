@@ -246,8 +246,9 @@ or a new wallet clear-signing mode.
 `reviewMode` is removed from intents, staged transactions and deploy requests.
 Callers must omit it; strict deploy request decoding rejects the obsolete
 field. There is no replacement opt-in flag. Broker derives the review from
-the actual transaction and the registered signing class, and known message
-classes require their full review envelopes.
+the actual transaction and the registered signing class. Known message
+classes and every Keccak signing payload beginning with `0x19` require their
+full review envelopes, including messages under otherwise unlisted classes.
 
 Before shipping this combination, publish the compatible Petal packages and
 update `github_source.rs` release commits, archives, package hashes, lineage
@@ -255,6 +256,10 @@ predecessors and authority routes together. Existing wallets must approve the
 new package identities. A source branch or local package build is not a
 published catalog release. Keep required reviews enforced while those releases
 are pending; the old catalog is not compatible merely because Machine CI passes.
+Bloom #224 must remain unmergeable until the default Polymarket and Hyperliquid
+catalog pins select compatible published packages and Broker #103 has landed,
+with all Broker pins advanced to that landed commit. Polymarket v0.1.6 and
+Hyperliquid v0.1.7 do not satisfy this contract.
 
 When combining Bloom #322 and #293 with the compiled token catalog, policy
 symbols must resolve uniquely back to the same chain/address. Ambiguous tickers

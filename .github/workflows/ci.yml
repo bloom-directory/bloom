@@ -78,10 +78,18 @@ jobs:
           BLOOM_PM80_HYPERLIQUID_ROOT: ${{ github.workspace }}/.pm80-packages/hyperliquid
           BLOOM_PM80_PACKAGE_RECORDS: ${{ runner.temp }}/pm80-package-records.json
         run: cargo test --locked -p bloom-petals --test explicit_account_packages real_signing_producers_reach_the_host_with_selected_account_and_full_witness -- --ignored --exact
+      - name: Read the release Signer revision
+        id: release_signer
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import tomllib
+          with open("packaging/triad/release/compatibility-v1.toml", "rb") as source:
+              print("ref=" + tomllib.load(source)["revisions"]["signer_commit"])
+          PY
       - uses: actions/checkout@v6
         with:
           repository: bloom-directory/bloom-signer
-          ref: 56252a16e65a15dddd713cb260659ecbcd8bb2ce
+          ref: ${{ steps.release_signer.outputs.ref }}
           path: .pm80-packages/signer
       - name: Prepare disposable Linux service manager
         run: |
