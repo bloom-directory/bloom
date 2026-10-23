@@ -803,8 +803,11 @@ impl TxEngine {
                 bloom_proto::checksum_address(&addr)
             ))
         })?;
+        // An address-shaped hint carries no symbol, which is what a Petal-staged
+        // transfer always supplies: it names the token by address because that
+        // is the only part of the calldata Bloom can verify.
         let symbol = if symbol_hint.starts_with("0x") || symbol_hint.starts_with("0X") {
-            short_addr_label(&addr)
+            address_hint_symbol(chain_id, addr)
         } else {
             symbol_hint.to_ascii_uppercase()
         };
@@ -899,12 +902,22 @@ impl TxEngine {
                         amount,
                     };
                     let calldata = format!("0x{}", hex::encode(call.abi_encode()));
+                    // `TokenRef.amount` is what the plan prints as a token
+                    // amount, so it is always the human figure. A caller who
+                    // wrote base units gave us the unscaled integer; scaling it
+                    // back here keeps the two representations from disagreeing
+                    // by a factor of 10^decimals in front of an owner.
+                    let display_amount = if parsed.unit == "base" {
+                        bloom_proto::format_units(amount, meta.decimals)
+                    } else {
+                        parsed.number.clone()
+                    };
                     let token_ref = TokenRef {
                         address: bloom_proto::checksum_address(&meta.address),
                         symbol: meta.symbol.clone(),
                         decimals: meta.decimals,
                         recipient: bloom_proto::checksum_address(&to_addr),
-                        amount: parsed.number.clone(),
+                        amount: display_amount,
                         amount_base_units: Some(amount.to_string()),
                     };
                     Ok((
@@ -1677,7 +1690,18 @@ impl TxEngine {
                     policy_ctx.token = to;
                     policy_ctx.contract = to;
                     policy_ctx.destination_is_contract = true;
-                    policy_ctx.token_symbol = Some(t.symbol.clone());
+                    // A symbol rule matches the symbol the curated registry
+                    // gives this contract, and nothing else. A symbol read
+                    // off the contract is its own claim about itself - any
+                    // contract can return "USDC" - so it never satisfies a
+                    // rule, and a Petal always names a token by address, so
+                    // its hint carries no symbol either. A caller's symbol
+                    // hint only ever resolves through the same registry, so
+                    // this is the one source for all three. Address rules
+                    // still see the token through `policy_ctx.token`.
+                    policy_ctx.token_symbol = to
+                        .and_then(|to| known_token(chain_id, to))
+                        .map(|known| known.symbol.to_string());
                     if let Ok(rec) = t.recipient.parse::<Address>() {
                         policy_ctx.recipient = Some(rec);
                     }
@@ -5126,6 +5150,16 @@ fn parse_u256(s: &str) -> Result<U256, String> {
     U256::from_str_radix(t, 10).map_err(|e| format!("invalid uint256 '{s}': {e}"))
 }
 
+/// The label a plan shows for a token named by address: the curated
+/// registry's symbol for a listed token, and the short address otherwise. A
+/// contract's own `symbol()` is its claim about itself, and any contract can
+/// answer "USDC", so it never labels an amount an owner reads.
+fn address_hint_symbol(chain_id: u64, addr: Address) -> String {
+    known_token(chain_id, addr)
+        .map(|known| known.symbol.to_string())
+        .unwrap_or_else(|| short_addr_label(&addr))
+}
+
 fn short_addr_label(a: &Address) -> String {
     let s = format!("{a:#x}");
     if s.len() > 10 {
@@ -5135,14 +5169,32 @@ fn short_addr_label(a: &Address) -> String {
     }
 }
 
-/// Resolve a common ERC-20 symbol to its address via the shared
-/// `bloom_proto::tokens` table (the single source of truth across the send
-/// path, route path, and VFS token surface). Anvil mainnet forks share chain
-/// id 31337 with vanilla Anvil, so they reuse the Ethereum (id 1) majors; a
-/// caller can always pass a 0x address explicitly.
+/// The curated registry entry for `addr` on exactly `chain_id`, if any.
+///
+/// This one lookup decides both whether Bloom treats a contract as a token,
+/// which gives a transfer-shaped Petal call typed treatment, and which symbol
+/// plans and policy see, so the two cannot drift apart. A contract cannot put
+/// itself in the registry, and no chain borrows another chain's list: a chain
+/// id does not prove what a node forked. A node reporting 31337 may be a plain
+/// Anvil, an Anvil fork started with `--chain-id 31337`, or a Hardhat fork, and
+/// the id says nothing about what is deployed. A fork that keeps its source
+/// chain's id reads that chain's list; a chain with no entries of its own has
+/// no curated tokens.
+pub fn known_token(
+    chain_id: u64,
+    addr: Address,
+) -> Option<&'static bloom_proto::tokens::KnownToken> {
+    let addr = format!("{addr:#x}");
+    bloom_proto::tokens::for_chain(chain_id)
+        .iter()
+        .find(|known| known.address.eq_ignore_ascii_case(&addr))
+}
+
+/// Resolve a common ERC-20 symbol to its address in the shared
+/// `bloom_proto::tokens` registry for exactly `chain_id`, as `known_token`
+/// reads it. A caller can always pass a 0x address explicitly.
 fn lookup_known_token(chain_id: u64, symbol_upper: &str) -> Option<&'static str> {
-    let lookup_chain = if chain_id == 31337 { 1 } else { chain_id };
-    let hit = bloom_proto::tokens::resolve_symbol(lookup_chain, symbol_upper).map(|t| t.address);
+    let hit = bloom_proto::tokens::resolve_symbol(chain_id, symbol_upper).map(|t| t.address);
     if hit.is_none() {
         debug!(chain_id, symbol = symbol_upper, "tx.known_token_miss");
     }
@@ -5738,9 +5790,15 @@ mod tests {
     }
 
     fn stage_chain(url: &str) -> ChainClient {
+        stage_chain_on(url, "anvil", 31337)
+    }
+
+    /// `stage_chain` for another configured chain. The RPC fixture must report
+    /// the same id from `eth_chainId`.
+    fn stage_chain_on(url: &str, name: &str, chain_id: u64) -> ChainClient {
         let spec = ChainSpec {
-            name: "anvil".into(),
-            chain_id: 31337,
+            name: name.into(),
+            chain_id,
             rpc_urls: vec![url.into()],
             rpc_endpoints: Vec::new(),
             etherscan_api_url: None,
@@ -5757,12 +5815,26 @@ mod tests {
         url: &str,
         oracle: RecordingOracle,
     ) -> (TxEngine, tempfile::TempDir, HomeWritePermit, ChainClient) {
+        stage_fixture_on(oracle, stage_chain(url))
+    }
+
+    fn stage_fixture_on(
+        oracle: RecordingOracle,
+        chain: ChainClient,
+    ) -> (TxEngine, tempfile::TempDir, HomeWritePermit, ChainClient) {
         let dir = tempfile::tempdir().unwrap();
         let outbox = crate::outbox::Outbox::new(dir.path().join("outbox")).unwrap();
         let engine = TxEngine::new(outbox, 60_000).with_price_oracle(Arc::new(oracle));
         let permit = permit_for(&dir);
-        let chain = stage_chain(url);
         (engine, dir, permit, chain)
+    }
+
+    /// A stage RPC fixture whose node reports Ethereum mainnet, so the curated
+    /// registry has entries for it.
+    async fn spawn_mainnet_stage_rpc() -> String {
+        let mut responses = stage_rpc_responses(false);
+        responses.insert("eth_chainId".into(), vec!["\"0x1\"".into()]);
+        spawn_queued_rpc(responses).await
     }
 
     fn policy_with_usd_cap() -> Policy {
@@ -6392,6 +6464,330 @@ mod tests {
         assert_eq!(subject.total_value_usd_micro, Some(1_250_000));
         assert_eq!(calls.lock().len(), 1);
         assert_eq!(calls.lock()[0].1, "1250000");
+    }
+
+    /// A Petal stages base units, because it never converts a display amount.
+    /// The plan still has to print the human figure: `1250000 base` on a
+    /// six-decimal token is 1.25 tokens, and an owner reading `Transfer
+    /// 1250000 USDC` would misjudge it by a factor of a million.
+    #[tokio::test]
+    async fn base_unit_amounts_reach_the_plan_as_a_human_token_amount() {
+        let url = spawn_stage_rpc(false).await;
+        let oracle = RecordingOracle {
+            calls: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            usd_micro: 1_250_000,
+            age_ms: 0,
+            max_age_ms: 60_000,
+        };
+        let (engine, _dir, permit, chain) = stage_fixture(&url, oracle);
+        let token_addr: Address = "0x1111111111111111111111111111111111111111"
+            .parse()
+            .unwrap();
+        engine.token_cache.write().insert(
+            (31337, token_addr),
+            TokenMeta {
+                address: token_addr,
+                symbol: "USDC".into(),
+                decimals: 6,
+            },
+        );
+        let intent = RawIntent {
+            body: RawIntentBody::Send {
+                to: "0x2222222222222222222222222222222222222222".into(),
+                value: "0".into(),
+                token: Some(token_addr.to_string()),
+                amount: "1250000 base".into(),
+                data: None,
+            },
+            chain: Some("anvil".into()),
+            gas: bloom_proto::intent::GasStrategy::Auto,
+            nonce: None,
+            gas_limit_hint: None,
+            usd_value_hint: None,
+            review_mode: None,
+        };
+        let staged = engine
+            .stage(
+                &permit,
+                "alice",
+                "0x3333333333333333333333333333333333333333"
+                    .parse()
+                    .unwrap(),
+                intent,
+                &chain,
+                &policy_with_usd_cap(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(staged.action_kind, TxActionKind::Erc20Transfer);
+        let token = staged.token.as_ref().unwrap();
+        // Same transfer as `stage_erc20_transfer_uses_exact_base_units_for_oracle`,
+        // written in base units instead of a display amount: both records must
+        // come out identical.
+        assert_eq!(token.amount, "1.25");
+        assert_eq!(token.amount_base_units.as_deref(), Some("1250000"));
+        let plan = bloom_proto::PlanRender::render(&staged, "ETH", 18);
+        assert!(
+            plan.contains(
+                "Action: Transfer 1.25 USDC to 0x2222222222222222222222222222222222222222"
+            ),
+            "plan must print the human amount, got:\n{plan}"
+        );
+    }
+
+    /// A symbol read off the contract is the contract's word for itself. A
+    /// token rule written by symbol must not be satisfied by it - any
+    /// contract can return "USDC" - while the same rule written by address is
+    /// the owner's own word and passes.
+    #[tokio::test]
+    async fn a_contract_supplied_symbol_does_not_satisfy_a_symbol_rule() {
+        let url = spawn_stage_rpc(false).await;
+        let token_addr: Address = "0x1111111111111111111111111111111111111111"
+            .parse()
+            .unwrap();
+        let from: Address = "0x3333333333333333333333333333333333333333"
+            .parse()
+            .unwrap();
+        let oracle = || RecordingOracle {
+            calls: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            usd_micro: 1_250_000,
+            age_ms: 0,
+            max_age_ms: 60_000,
+        };
+        // An address-shaped hint for an unlisted contract. The seeded metadata
+        // calls it USDC, as the contract's own `symbol()` would; policy must
+        // not take that as the token's symbol.
+        let intent = || RawIntent {
+            body: RawIntentBody::Send {
+                to: "0x2222222222222222222222222222222222222222".into(),
+                value: "0".into(),
+                token: Some(format!("{token_addr:#x}")),
+                amount: "1250000 base".into(),
+                data: None,
+            },
+            chain: Some("anvil".into()),
+            gas: bloom_proto::intent::GasStrategy::Auto,
+            nonce: None,
+            gas_limit_hint: None,
+            usd_value_hint: None,
+            review_mode: None,
+        };
+        let seed = |engine: &TxEngine| {
+            engine.token_cache.write().insert(
+                (31337, token_addr),
+                TokenMeta {
+                    address: token_addr,
+                    symbol: "USDC".into(),
+                    decimals: 6,
+                },
+            );
+        };
+        let outcomes = |staged: &bloom_proto::StagedTx| -> Vec<bloom_proto::policy::PolicyOutcome> {
+            staged
+                .policy_checks
+                .iter()
+                .filter(|c| c.rule == "tokens.allow")
+                .map(|c| c.outcome)
+                .collect()
+        };
+
+        // Rule by symbol: the contract's "USDC" must not satisfy it.
+        let (engine, _dir, permit, chain) = stage_fixture(&url, oracle());
+        seed(&engine);
+        let mut policy = policy_with_usd_cap();
+        policy.tokens.allow.insert("USDC".into());
+        let staged = engine
+            .stage(&permit, "alice", from, intent(), &chain, &policy, None)
+            .await
+            .unwrap();
+        let by_symbol = outcomes(&staged);
+        assert!(
+            !by_symbol.is_empty()
+                && by_symbol
+                    .iter()
+                    .all(|o| *o == bloom_proto::policy::PolicyOutcome::Deny),
+            "a contract-supplied symbol must not pass a symbol rule, got {by_symbol:?}"
+        );
+
+        // Rule by address: the owner named this contract, and that passes.
+        // A fresh mock server: each fixture consumes the scripted responses.
+        let url = spawn_stage_rpc(false).await;
+        let (engine, _dir, permit, chain) = stage_fixture(&url, oracle());
+        seed(&engine);
+        let mut policy = policy_with_usd_cap();
+        policy.tokens.allow.insert(format!("{token_addr:#x}"));
+        let staged = engine
+            .stage(&permit, "alice", from, intent(), &chain, &policy, None)
+            .await
+            .unwrap();
+        assert!(
+            outcomes(&staged).contains(&bloom_proto::policy::PolicyOutcome::Pass),
+            "an address entry names the token and passes"
+        );
+    }
+
+    /// A Petal names a token by address, and the registry is the only word
+    /// for what that contract is. A curated token named by address must meet
+    /// a symbol rule exactly as if the owner had written the symbol: a deny
+    /// list naming it is a hard deny, an allow list naming it passes. The
+    /// same deny stays silent for a contract outside the registry, whatever
+    /// symbol it claims - the rule has nothing verified to match against -
+    /// and for mainnet's USDC address on a local Anvil, whose chain id says
+    /// nothing about what is deployed there.
+    #[tokio::test]
+    async fn a_registered_token_named_by_address_meets_symbol_rules() {
+        use bloom_proto::policy::PolicyOutcome;
+        let usdc: Address = bloom_proto::tokens::resolve_symbol(1, "USDC")
+            .expect("mainnet USDC is curated")
+            .address
+            .parse()
+            .unwrap();
+        let unknown: Address = "0x1111111111111111111111111111111111111111"
+            .parse()
+            .unwrap();
+        let from: Address = "0x3333333333333333333333333333333333333333"
+            .parse()
+            .unwrap();
+        let oracle = || RecordingOracle {
+            calls: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            usd_micro: 1_250_000,
+            age_ms: 0,
+            max_age_ms: 60_000,
+        };
+        // Address-shaped hints, as a classified Petal transfer stages them.
+        let intent = |token: Address, chain: &str| RawIntent {
+            body: RawIntentBody::Send {
+                to: "0x2222222222222222222222222222222222222222".into(),
+                value: "0".into(),
+                token: Some(format!("{token:#x}")),
+                amount: "1250000 base".into(),
+                data: None,
+            },
+            chain: Some(chain.into()),
+            gas: bloom_proto::intent::GasStrategy::Auto,
+            nonce: None,
+            gas_limit_hint: None,
+            usd_value_hint: None,
+            review_mode: None,
+        };
+        // Every contract here calls itself USDC; only mainnet's is curated.
+        let seed = |engine: &TxEngine, chain_id: u64, token: Address| {
+            engine.token_cache.write().insert(
+                (chain_id, token),
+                TokenMeta {
+                    address: token,
+                    symbol: "USDC".into(),
+                    decimals: 6,
+                },
+            );
+        };
+        let outcomes = |staged: &bloom_proto::StagedTx, rule: &str| -> Vec<PolicyOutcome> {
+            staged
+                .policy_checks
+                .iter()
+                .filter(|c| c.rule == rule)
+                .map(|c| c.outcome)
+                .collect()
+        };
+
+        let mainnet = |url: &str| stage_fixture_on(oracle(), stage_chain_on(url, "ethereum", 1));
+
+        // Curated token, denied by symbol: a hard deny.
+        let url = spawn_mainnet_stage_rpc().await;
+        let (engine, _dir, permit, chain) = mainnet(&url);
+        seed(&engine, 1, usdc);
+        let mut policy = policy_with_usd_cap();
+        policy.tokens.deny.insert("USDC".into());
+        let staged = engine
+            .stage(
+                &permit,
+                "alice",
+                from,
+                intent(usdc, "ethereum"),
+                &chain,
+                &policy,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            outcomes(&staged, "tokens.deny"),
+            vec![PolicyOutcome::Deny],
+            "a symbol deny must catch the curated token named by address"
+        );
+
+        // Curated token, allowed by symbol: passes.
+        let url = spawn_mainnet_stage_rpc().await;
+        let (engine, _dir, permit, chain) = mainnet(&url);
+        seed(&engine, 1, usdc);
+        let mut policy = policy_with_usd_cap();
+        policy.tokens.allow.insert("USDC".into());
+        let staged = engine
+            .stage(
+                &permit,
+                "alice",
+                from,
+                intent(usdc, "ethereum"),
+                &chain,
+                &policy,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            outcomes(&staged, "tokens.allow"),
+            vec![PolicyOutcome::Pass],
+            "a symbol allow must admit the curated token named by address"
+        );
+
+        // A contract outside the registry claiming USDC: the deny is silent.
+        let url = spawn_mainnet_stage_rpc().await;
+        let (engine, _dir, permit, chain) = mainnet(&url);
+        seed(&engine, 1, unknown);
+        let mut policy = policy_with_usd_cap();
+        policy.tokens.deny.insert("USDC".into());
+        let staged = engine
+            .stage(
+                &permit,
+                "alice",
+                from,
+                intent(unknown, "ethereum"),
+                &chain,
+                &policy,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            outcomes(&staged, "tokens.deny").is_empty(),
+            "a contract's own symbol must not be what a deny matches"
+        );
+
+        // Mainnet's USDC address on a local Anvil: nothing is curated there,
+        // so the deny is just as silent.
+        let url = spawn_stage_rpc(false).await;
+        let (engine, _dir, permit, chain) = stage_fixture(&url, oracle());
+        seed(&engine, 31337, usdc);
+        let mut policy = policy_with_usd_cap();
+        policy.tokens.deny.insert("USDC".into());
+        let staged = engine
+            .stage(
+                &permit,
+                "alice",
+                from,
+                intent(usdc, "anvil"),
+                &chain,
+                &policy,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            outcomes(&staged, "tokens.deny").is_empty(),
+            "a local Anvil must not borrow mainnet's registry"
+        );
     }
 
     #[tokio::test]
@@ -8652,6 +9048,32 @@ mod tests {
             "0xaf88d065e77c8cc2239327c5edb3a432268e5831"
         );
         assert_eq!(sym, "USDC");
+    }
+
+    /// A token named by address is labelled from the curated registry, never
+    /// from its own `symbol()`: an unlisted contract shows its short address
+    /// even if it calls itself "USDC".
+    #[test]
+    fn an_address_named_token_shows_the_registry_symbol_or_its_address() {
+        let usdc: Address = bloom_proto::tokens::resolve_symbol(1, "USDC")
+            .expect("mainnet USDC is curated")
+            .address
+            .parse()
+            .unwrap();
+        assert_eq!(address_hint_symbol(1, usdc), "USDC");
+        assert_eq!(known_token(1, usdc).map(|known| known.symbol), Some("USDC"));
+        // A local Anvil's chain id says nothing about what it forked, so
+        // mainnet's address is not curated there.
+        assert_eq!(address_hint_symbol(31337, usdc), short_addr_label(&usdc));
+        assert!(known_token(31337, usdc).is_none());
+        // Naming the token by symbol borrows nothing either.
+        assert!(lookup_known_token(1, "USDC").is_some());
+        assert!(lookup_known_token(31337, "USDC").is_none());
+        let unknown: Address = "0x1111111111111111111111111111111111111111"
+            .parse()
+            .unwrap();
+        assert_eq!(address_hint_symbol(1, unknown), short_addr_label(&unknown));
+        assert!(known_token(1, unknown).is_none());
     }
 
     #[test]

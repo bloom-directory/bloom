@@ -20,7 +20,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use alloy::network::TransactionBuilder;
 use alloy::primitives::{Address, Bytes, U256};
 use alloy::rpc::types::eth::TransactionRequest;
-use bloom_evm::{ChainClient, ChainRegistry};
+use alloy::sol_types::SolCall;
+use bloom_evm::{ChainClient, ChainRegistry, IERC20};
 
 use bloom_ens::EnsClient;
 use bloom_etherscan::EtherscanClient;
@@ -2629,6 +2630,23 @@ impl PetalHost for DaemonPetalHost {
                 );
             }
         }
+        // The registry is consulted by chain and the signature carries the id
+        // the node reports, not the configured one, so the classifier needs
+        // both. It is read here, after the pending scan, so that reusing an
+        // entry never needs the node; staging then reads the same cached
+        // value, and a node that cannot say which chain it is fails the
+        // stage rather than being guessed at.
+        let reported_chain_id = chain
+            .chain_id()
+            .await
+            .map_err(|error| HostError::Backend(format!("chain id for {}: {error}", req.chain)))?;
+        let typed_erc20_transfer = decode_petal_erc20_transfer(
+            &req,
+            chain.spec().chain_id,
+            reported_chain_id,
+            requested_to,
+            requested_value,
+        )?;
         let staged = service
             .tx_engine
             .stage_with_execution_origin_and_fee_overrides(
@@ -2636,10 +2654,19 @@ impl PetalHost for DaemonPetalHost {
                 &req.wallet,
                 wallet_address,
                 RawIntent {
-                    body: RawIntentBody::Raw {
-                        to: req.to,
-                        value: format!("{} wei", req.value_wei),
-                        data: req.data_hex,
+                    body: match typed_erc20_transfer {
+                        Some((recipient, amount)) => RawIntentBody::Send {
+                            to: bloom_proto::checksum_address(&recipient),
+                            value: "0".into(),
+                            token: Some(req.to),
+                            amount: format!("{amount} base"),
+                            data: None,
+                        },
+                        None => RawIntentBody::Raw {
+                            to: req.to,
+                            value: format!("{} wei", req.value_wei),
+                            data: req.data_hex,
+                        },
                     },
                     chain: Some(req.chain.clone()),
                     gas: GasStrategy::Auto,
@@ -2692,7 +2719,17 @@ impl PetalHost for DaemonPetalHost {
             .map_err(|e| HostError::NotFound(format!("outbox {outbox_id}: {e}")))?;
         self.authorize_petal_outbox_owner(context, &wallet, &entry.staged)
             .await?;
-        if entry.staged.resolved_execution_origin() != origin {
+        // Scoped to the package, like inspection: a Petal that stages from one
+        // route and confirms from another is the documented layout, and Morpho
+        // and Robinhood both use it. Route-binding made their confirm
+        // unreachable, so a multi-step deposit wedged at its first step. The
+        // digest is what establishes "this same trusted Petal"; the route id
+        // names a file inside one immutable artifact, not a principal.
+        if !entry
+            .staged
+            .resolved_execution_origin()
+            .same_package(&origin)
+        {
             return Err(HostError::Denied(
                 "outbox entry was not staged by this trusted Petal".into(),
             ));
@@ -2786,8 +2823,8 @@ impl PetalHost for DaemonPetalHost {
             .await?;
         // Inspection is read-only, so it is scoped to the package rather than
         // to the route that staged the entry: a Petal's status route must be
-        // able to reconcile what its execute route staged. Confirmation stays
-        // route-bound because it dispatches signing.
+        // able to reconcile what its execute route staged. Confirmation is
+        // scoped the same way; see `evm_tx_confirm` for why.
         if !entry
             .staged
             .resolved_execution_origin()
@@ -2973,6 +3010,74 @@ fn parse_petal_hex_bytes(value: &str, field: &str) -> Result<Vec<u8>, HostError>
     hex::decode(value).map_err(|e| HostError::Invalid(format!("{field}: {e}")))
 }
 
+/// Recognize the one contract-call shape whose policy semantics Bloom can
+/// verify without trusting Petal-authored labels: canonical ERC-20
+/// `transfer(address,uint256)`. The transaction engine reconstructs the
+/// calldata from these decoded fields and reads token metadata onchain before
+/// classifying it as an ERC-20 transfer. Everything else remains a generic
+/// contract call, as does any call when the node reports a chain id other
+/// than the configured one.
+fn decode_petal_erc20_transfer(
+    request: &EvmTransactionRequest,
+    spec_chain_id: u64,
+    reported_chain_id: u64,
+    requested_to: Address,
+    requested_value: U256,
+) -> Result<Option<(Address, U256)>, HostError> {
+    if !requested_value.is_zero() {
+        return Ok(None);
+    }
+    // The registry is read by chain, and the signature is for the id the
+    // node reports. If the two disagree, a token curated for the configured
+    // chain would be typed and priced under that chain's name while being
+    // signed for another. Nothing here can say which chain is meant, so the
+    // call stays generic with its bytes intact.
+    if reported_chain_id != spec_chain_id {
+        return Ok(None);
+    }
+    // The selector and ABI shape say what the call looks like, not what the
+    // contract at `to` does with it. Any contract can answer `decimals()`,
+    // return "USDC" from `symbol()`, and run something else entirely under
+    // 0xa9059cbb. Typed treatment vouches for semantics, so it is only given
+    // to a contract Bloom already knows is a token. Anything else stays a
+    // generic call with its bytes intact - and is not validated below either,
+    // because Bloom will not be rebuilding it.
+    if bloom_tx::tx_engine::known_token(reported_chain_id, requested_to).is_none() {
+        return Ok(None);
+    }
+    let calldata = parse_petal_hex_bytes(&request.data_hex, "data-hex")?;
+    if !calldata.starts_with(&IERC20::transferCall::SELECTOR) {
+        return Ok(None);
+    }
+    // A registered token runs `transfer` whatever follows its two words:
+    // Solidity ignores trailing calldata. Left generic, a longer call would
+    // move the same tokens to the same recipient while policy checked the
+    // token contract in place of that recipient, so one extra byte would step
+    // around the recipient rule the canonical call is held to. Only the exact
+    // shape is typed; any other length under this selector is refused.
+    if calldata.len() != IERC20::transferCall::SELECTOR.len() + 64 {
+        return Err(HostError::Invalid(format!(
+            "ERC-20 transfer calldata to a registered token must be exactly 68 bytes, not {}",
+            calldata.len()
+        )));
+    }
+    // The engine rebuilds the call from the decoded fields, so anything the
+    // decoder tolerates and drops would be a silent payload change. Validate
+    // the encoding, then require the re-encoding to reproduce the exact bytes:
+    // dirty padding in the address word fails both checks instead of being
+    // staged as a different transaction than the Petal handed over.
+    let call = IERC20::transferCall::abi_decode_validate(&calldata)
+        .map_err(|error| HostError::Invalid(format!("ERC-20 transfer calldata: {error}")))?;
+    if call.abi_encode() != calldata {
+        return Err(HostError::Invalid(
+            "ERC-20 transfer calldata is not canonical: re-encoding the decoded \
+             recipient and amount does not reproduce the supplied bytes"
+                .into(),
+        ));
+    }
+    Ok(Some((call.to, call.amount)))
+}
+
 /// Retain account-0 operation hashes exactly. Additional accounts bind the
 /// entire parent (or stop target) KeyRef, not a guest slot or display path.
 fn petal_scoped_identity(
@@ -3023,8 +3128,12 @@ fn petal_pending_request_matches(
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or(u128::MAX);
+    // Scoped to the package, like confirm and inspection. A route that stages
+    // the step another route already staged (Morpho's `confirm` restaging
+    // after a lost outbox id) must find that entry, not stage a duplicate at
+    // the next nonce that needs its own approval.
     staged.expires_ms > now_ms
-        && staged.resolved_execution_origin() == *origin
+        && staged.resolved_execution_origin().same_package(origin)
         && staged.from.parse::<Address>().ok() == Some(requested_from)
         && staged
             .to
@@ -3032,6 +3141,8 @@ fn petal_pending_request_matches(
             .and_then(|to| to.parse::<Address>().ok())
             == Some(requested_to)
         && staged.value_wei.parse::<U256>().ok() == Some(requested_value)
+        // `evm_tx_stage` accepts only lowercase canonical hex, and the engine
+        // stores calldata lowercase, so the strings compare exactly.
         && staged.data_hex == request.data_hex
         && request.nonce.is_none_or(|nonce| staged.nonce == nonce)
         && request
@@ -5662,6 +5773,270 @@ mod tests {
         assert!(configured_mount(&config, std::path::Path::new("/tmp/bloom-mount")).is_err());
     }
 
+    /// USDC on Ethereum: in the curated registry, so the classifier will look
+    /// at a call addressed to it on mainnet.
+    const KNOWN_TOKEN: &str = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
+    /// Not in the registry: a contract Bloom knows nothing about.
+    const UNKNOWN_CONTRACT: &str = "0x0000000000000000000000000000000000000010";
+    const MAINNET: u64 = 1;
+    const ANVIL: u64 = 31337;
+
+    fn petal_evm_request(to: &str, value_wei: &str, data_hex: String) -> EvmTransactionRequest {
+        EvmTransactionRequest {
+            wallet: "alice".into(),
+            chain: "anvil".into(),
+            to: to.into(),
+            value_wei: value_wei.into(),
+            data_hex,
+            nonce: None,
+            max_fee_per_gas: None,
+            max_priority_fee_per_gas: None,
+            context: None,
+        }
+    }
+
+    fn classify(
+        request: &EvmTransactionRequest,
+        value: U256,
+    ) -> Result<Option<(Address, U256)>, HostError> {
+        decode_petal_erc20_transfer(
+            request,
+            MAINNET,
+            MAINNET,
+            request.to.parse().unwrap(),
+            value,
+        )
+    }
+
+    fn canonical_transfer(recipient: Address, amount: u64) -> Vec<u8> {
+        IERC20::transferCall {
+            to: recipient,
+            amount: U256::from(amount),
+        }
+        .abi_encode()
+    }
+
+    fn hex0x(bytes: &[u8]) -> String {
+        format!("0x{}", hex::encode(bytes))
+    }
+
+    /// The registry is read by chain and the signature is for the id the node
+    /// reports. When the two disagree a transfer stays generic, even to a
+    /// token curated for the configured chain, rather than being typed for
+    /// one chain and signed for another.
+    #[test]
+    fn a_node_reporting_another_chain_leaves_a_curated_transfer_generic() {
+        let recipient: Address = "0x0000000000000000000000000000000000000020"
+            .parse()
+            .unwrap();
+        let request = petal_evm_request(KNOWN_TOKEN, "0", hex0x(&canonical_transfer(recipient, 1)));
+        let to: Address = KNOWN_TOKEN.parse().unwrap();
+        let classify = |spec: u64, reported: u64| {
+            decode_petal_erc20_transfer(&request, spec, reported, to, U256::ZERO).unwrap()
+        };
+        assert!(classify(MAINNET, MAINNET).is_some(), "agreeing ids: typed");
+        assert!(
+            classify(ANVIL, 1).is_none(),
+            "node says mainnet, config says anvil"
+        );
+        assert!(
+            classify(1, ANVIL).is_none(),
+            "node says anvil, config says mainnet"
+        );
+        // Curated on the reported chain but not the configured one is still
+        // a disagreement, not a lookup on the reported chain.
+        assert!(classify(8453, 1).is_none());
+    }
+
+    /// Chain id 31337 does not prove a node forked mainnet: any code can sit at
+    /// mainnet USDC's address on a local Anvil. With both ids agreeing on
+    /// 31337 the call still stays generic, and it is not validated either,
+    /// because Bloom will not rebuild it.
+    #[test]
+    fn a_local_anvil_does_not_borrow_mainnet_tokens() {
+        let recipient: Address = "0x0000000000000000000000000000000000000020"
+            .parse()
+            .unwrap();
+        let to: Address = KNOWN_TOKEN.parse().unwrap();
+        let mut calldata = canonical_transfer(recipient, 1);
+        let request = petal_evm_request(KNOWN_TOKEN, "0", hex0x(&calldata));
+        assert_eq!(
+            decode_petal_erc20_transfer(&request, ANVIL, ANVIL, to, U256::ZERO).unwrap(),
+            None
+        );
+        calldata[4] = 1;
+        let dirty = petal_evm_request(KNOWN_TOKEN, "0", hex0x(&calldata));
+        assert_eq!(
+            decode_petal_erc20_transfer(&dirty, ANVIL, ANVIL, to, U256::ZERO).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn petal_erc20_transfer_is_decoded_only_from_the_exact_canonical_shape() {
+        let recipient: Address = "0x0000000000000000000000000000000000000020"
+            .parse()
+            .unwrap();
+        let calldata = canonical_transfer(recipient, 42);
+        let request = petal_evm_request(KNOWN_TOKEN, "0", hex0x(&calldata));
+        assert_eq!(
+            classify(&request, U256::ZERO).unwrap(),
+            Some((recipient, U256::from(42_u64)))
+        );
+
+        let mut trailing = calldata;
+        trailing.push(0);
+        let request = petal_evm_request(KNOWN_TOKEN, "0", hex0x(&trailing));
+        assert!(matches!(
+            classify(&request, U256::ZERO),
+            Err(HostError::Invalid(_))
+        ));
+    }
+
+    /// The token ignores trailing calldata and runs the transfer anyway. Left
+    /// generic, the padded call would be checked against the token contract
+    /// instead of its recipient, so one byte would sidestep the recipient rule
+    /// the canonical call meets. Under the `transfer` selector, a registered
+    /// token gets the exact shape or a refusal, never a generic call.
+    #[test]
+    fn a_registered_token_transfer_of_any_other_length_is_refused_not_left_generic() {
+        let recipient: Address = "0x0000000000000000000000000000000000000020"
+            .parse()
+            .unwrap();
+        let canonical = canonical_transfer(recipient, 42);
+        let mut longer = canonical.clone();
+        longer.extend_from_slice(&[0; 32]);
+        for calldata in [
+            [canonical.as_slice(), &[0]].concat(),
+            longer,
+            canonical[..67].to_vec(),
+            IERC20::transferCall::SELECTOR.to_vec(),
+        ] {
+            let request = petal_evm_request(KNOWN_TOKEN, "0", hex0x(&calldata));
+            assert!(
+                matches!(classify(&request, U256::ZERO), Err(HostError::Invalid(_))),
+                "{} bytes under the transfer selector must be refused",
+                calldata.len()
+            );
+        }
+
+        // Another selector on the same token is not a transfer: it stays
+        // generic, bytes intact.
+        let approve = IERC20::approveCall {
+            spender: recipient,
+            amount: U256::from(42_u64),
+        }
+        .abi_encode();
+        let request = petal_evm_request(KNOWN_TOKEN, "0", hex0x(&approve));
+        assert_eq!(classify(&request, U256::ZERO).unwrap(), None);
+
+        // An unregistered contract is never rebuilt, so its length is its own.
+        let request = petal_evm_request(
+            UNKNOWN_CONTRACT,
+            "0",
+            hex0x(&[canonical.as_slice(), &[0]].concat()),
+        );
+        assert_eq!(classify(&request, U256::ZERO).unwrap(), None);
+    }
+
+    /// The selector and ABI shape say what a call looks like, not what the
+    /// contract does with it. A contract Bloom has never heard of can answer
+    /// `decimals()` and `symbol()` and run anything at all under 0xa9059cbb,
+    /// so it gets no typed treatment: the call stays generic, bytes intact,
+    /// and reaches the owner as the opaque contract call it is.
+    #[test]
+    fn a_transfer_shaped_call_to_an_unknown_contract_stays_generic() {
+        let recipient: Address = "0x0000000000000000000000000000000000000020"
+            .parse()
+            .unwrap();
+        let calldata = canonical_transfer(recipient, 42);
+        let request = petal_evm_request(UNKNOWN_CONTRACT, "0", hex0x(&calldata));
+        assert_eq!(
+            classify(&request, U256::ZERO).unwrap(),
+            None,
+            "a canonical transfer to an unregistered contract must not be promoted"
+        );
+    }
+
+    /// Bloom refuses only what it would otherwise rewrite. The same dirty
+    /// padding is an error on a known token, where Bloom rebuilds the call,
+    /// and nothing at all on an unknown contract, where it does not.
+    #[test]
+    fn an_unknown_contract_is_not_validated_because_it_is_not_rebuilt() {
+        let mut calldata = canonical_transfer(
+            "0x0000000000000000000000000000000000000020"
+                .parse()
+                .unwrap(),
+            42,
+        );
+        calldata[4] = 1;
+        let data_hex = hex0x(&calldata);
+
+        let unknown = petal_evm_request(UNKNOWN_CONTRACT, "0", data_hex.clone());
+        assert_eq!(
+            classify(&unknown, U256::ZERO).unwrap(),
+            None,
+            "generic, not an error: the bytes are forwarded untouched"
+        );
+
+        let known = petal_evm_request(KNOWN_TOKEN, "0", data_hex);
+        assert!(
+            matches!(classify(&known, U256::ZERO), Err(HostError::Invalid(_))),
+            "the same bytes are refused where Bloom would rebuild them"
+        );
+    }
+
+    /// The registry is matched by address bytes, so the spelling a Petal uses
+    /// for the token contract does not decide whether it is recognized.
+    #[test]
+    fn a_known_token_is_recognized_in_any_address_case() {
+        let recipient: Address = "0x0000000000000000000000000000000000000020"
+            .parse()
+            .unwrap();
+        let calldata = canonical_transfer(recipient, 7);
+        for spelling in [
+            KNOWN_TOKEN.to_string(),
+            KNOWN_TOKEN.to_ascii_uppercase().replacen("0X", "0x", 1),
+            bloom_proto::checksum_address(&KNOWN_TOKEN.parse().unwrap()),
+        ] {
+            let request = petal_evm_request(&spelling, "0", hex0x(&calldata));
+            assert_eq!(
+                classify(&request, U256::ZERO).unwrap(),
+                Some((recipient, U256::from(7_u64))),
+                "{spelling}"
+            );
+        }
+    }
+
+    /// `abi_decode` accepts a dirty address word and silently zeroes the
+    /// padding, so the engine would rebuild different bytes than the Petal
+    /// handed over. Refuse the call instead.
+    #[test]
+    fn noncanonical_address_padding_is_refused_rather_than_rewritten() {
+        let mut calldata = canonical_transfer(
+            "0x0000000000000000000000000000000000000020"
+                .parse()
+                .unwrap(),
+            42,
+        );
+        // First byte of the address word, which canonical encoding leaves zero.
+        calldata[4] = 1;
+        let request = petal_evm_request(KNOWN_TOKEN, "0", hex0x(&calldata));
+        let error =
+            classify(&request, U256::ZERO).expect_err("dirty address padding must not decode");
+        assert!(
+            matches!(error, HostError::Invalid(_)),
+            "expected an invalid-payload refusal, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn value_bearing_transfer_shaped_calls_remain_generic() {
+        let calldata = canonical_transfer(Address::ZERO, 1);
+        let request = petal_evm_request(KNOWN_TOKEN, "1", hex0x(&calldata));
+        assert_eq!(classify(&request, U256::from(1_u64)).unwrap(), None);
+    }
+
     #[test]
     fn batch_approval_requirement_preserves_owner_launch_fields() {
         let value = batch_confirmation_result_json(Err(TxEngineError::ApprovalRequired(
@@ -7218,6 +7593,39 @@ mod tests {
             ),
             "the same request from another account must not reuse this outbox"
         );
+        // Reuse is scoped like confirm: another route of the same package
+        // finds the entry rather than staging a duplicate at the next nonce,
+        // while another digest or another Petal does not.
+        let mut other_route = origin.clone();
+        other_route.route_id = Some("r000099".into());
+        assert!(
+            petal_pending_request_matches(
+                &staged,
+                &request,
+                &other_route,
+                staged.from.parse().unwrap(),
+                staged.to.as_deref().unwrap().parse().unwrap(),
+                staged.value_wei.parse().unwrap(),
+            ),
+            "another route of the same package must reuse this outbox"
+        );
+        let mut other_digest = origin.clone();
+        other_digest.petal_digest = "c".repeat(64);
+        let mut other_petal = origin.clone();
+        other_petal.petal_id = "other".into();
+        for foreign in [other_digest, other_petal] {
+            assert!(
+                !petal_pending_request_matches(
+                    &staged,
+                    &request,
+                    &foreign,
+                    staged.from.parse().unwrap(),
+                    staged.to.as_deref().unwrap().parse().unwrap(),
+                    staged.value_wei.parse().unwrap(),
+                ),
+                "another package must not reuse this outbox: {foreign:?}"
+            );
+        }
         let mut equivalent_fee_request = request.clone();
         equivalent_fee_request.max_fee_per_gas = Some("00100".into());
         equivalent_fee_request.max_priority_fee_per_gas = Some("00010".into());
