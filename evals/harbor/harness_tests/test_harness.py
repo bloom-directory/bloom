@@ -767,8 +767,6 @@ class HyperliquidDefinitionTests(unittest.TestCase):
             return None
 
         counters: list[str] = []
-        committed: list[int] = []
-        self.definition.counter_committed = committed.append
 
         def fake_run(cmd, **kwargs):
             del kwargs
@@ -797,12 +795,9 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         base = int(self.definition.sign_count_value)
         self.assertEqual(counters, [str(base), str(base + 1), str(base + 2)])
         self.assertEqual(self.definition.next_sign_count, base + 3)
-        self.assertEqual(committed, [base + 1, base + 2, base + 3])
 
-    def test_session_timeout_durably_reserves_next_counter_before_driver(self) -> None:
+    def test_session_timeout_reserves_next_counter_before_driver(self) -> None:
         ceremony = "http://localhost:18734/ceremony/" + "A" * 43
-        committed: list[int] = []
-        self.definition.counter_committed = committed.append
         self.definition._write_route = mock.Mock(
             return_value=SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
         )
@@ -826,7 +821,6 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         ):
             self.definition.provision("codex")
 
-        self.assertEqual(committed, [base + 1])
         self.assertEqual(self.definition.next_sign_count, base + 1)
         command = run.call_args.args[0]
         self.assertEqual(command[command.index("--sign-count") + 1], str(base))

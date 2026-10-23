@@ -4,15 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import fcntl
-import json
 import os
-import re
-import secrets
-import socket
-import stat
-import subprocess
-import tempfile
-import threading
 import signal
 import time
 from abc import ABC, abstractmethod
@@ -78,6 +70,7 @@ class EvalRunContext:
     mounts: Sequence[Mapping[str, Any]]
     agent_env: Mapping[str, str]
     verifier_env: Mapping[str, str]
+    extra_docker_compose: Sequence[Path] = ()
 
 
 class EvalDefinition(ABC):
@@ -88,6 +81,7 @@ class EvalDefinition(ABC):
     """
 
     name: str
+    failed: bool = False
 
     @property
     @abstractmethod
@@ -168,6 +162,7 @@ async def run_harbor_job(context: EvalRunContext, agent: AgentSpec) -> Any:
         environment=EnvironmentConfig(
             type=EnvironmentType.DOCKER,
             mounts=list(context.mounts),
+            extra_docker_compose=list(context.extra_docker_compose),
         ),
         verifier=VerifierConfig(env=dict(context.verifier_env)),
         tasks=[TaskConfig(path=context.task_dir)],
@@ -213,7 +208,7 @@ def run_eval(
     evidence: EvalEvidence | None = None,
 ) -> Any:
     """Execute one provisioned eval and guarantee outer cleanup."""
-    agent = _agent_spec(agent_name)
+    agent = _agent_spec(agent_name) if harbor_runner is run_harbor_job else AGENTS[agent_name]
     definition.lock_path.parent.mkdir(parents=True, exist_ok=True)
     timings = phase_timings if phase_timings is not None else {}
     evidence = evidence if evidence is not None else EvalEvidence()
@@ -243,6 +238,7 @@ def run_eval(
             definition.validate_result(result)
         except BaseException as error:  # noqa: BLE001 -- cleanup must cover interrupts
             run_error = error
+            definition.failed = True
         finally:
             signal.signal(signal.SIGTERM, previous_term_handler)
             if provision_started:

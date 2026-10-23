@@ -74,7 +74,7 @@ STATUS_SETTLE_ATTEMPTS = 50
 STATUS_SETTLE_DELAY_SECONDS = 0.2
 EVAL_IMAGE = (
     "ghcr.io/bloom-directory/bloom-eval-agent-base@"
-    "sha256:20988c7f8a6751c25e0115c2136710a885bef69d245e077d2ae3b2cc2c0837fd"
+    "sha256:c1fa42378d25f356d791bc32b20e6e3898f1942368a765830d5419e446b81a7e"
 )
 EVAL_IMAGE_PULL_TIMEOUT_SECONDS = 600
 
@@ -156,11 +156,15 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         self,
         repo_root: Path,
         environ: dict[str, str] | None = None,
-        *,
-        counter_committed: Callable[[int], None] | None = None,
     ) -> None:
         self.repo_root = repo_root.resolve()
         self.env = dict(os.environ if environ is None else environ)
+        self.network = self.env.get("BLOOM_EVAL_NETWORK", "mainnet")
+        if self.network not in ("mainnet", "testnet"):
+            raise EvalError("BLOOM_EVAL_NETWORK must be mainnet or testnet")
+        self.asset_id = int(self.env.get("BLOOM_EVAL_ASSET_ID", "0"))
+        if self.asset_id < 0:
+            raise EvalError("asset ID must be nonnegative")
         self.wallet = self.env.get("BLOOM_EVAL_WALLET", "")
         self.wallet_id = self.env.get("BLOOM_EVAL_WALLET_ID", "")
         self.agent_name_override = self.env.get("BLOOM_EVAL_AGENT_NAME", "").strip()
@@ -205,7 +209,6 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         self.session_id: str | None = None
         self.session_base: Path | None = None
         self.session_created = False
-        self.counter_committed = counter_committed
         self.phase_timings: dict[str, float] = {}
         self.cleanup_observations: dict[str, Any] = {}
 
@@ -228,7 +231,7 @@ class HyperliquidOrderCancelEval(EvalDefinition):
 
     @property
     def network_root(self) -> Path:
-        return self.bloom_mount / "petals/hyperliquid/mainnet"
+        return self.bloom_mount / "petals/hyperliquid" / self.network
 
     @property
     def user_root(self) -> Path:
@@ -856,7 +859,7 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         self._require_bloom_mount_selection()
         if not WALLET.fullmatch(self.wallet):
             raise EvalError("BLOOM_EVAL_WALLET must be a lowercase 0x address")
-        if self.env.get("BLOOM_EVAL_MAINNET_ACK") != MAINNET_ACK:
+        if self.network == "mainnet" and self.env.get("BLOOM_EVAL_MAINNET_ACK") != MAINNET_ACK:
             raise EvalError(
                 f"set BLOOM_EVAL_MAINNET_ACK={MAINNET_ACK} to authorize this mainnet trial"
             )
@@ -941,7 +944,7 @@ class HyperliquidOrderCancelEval(EvalDefinition):
             "duration_ms": 1_800_000,
             "max_notional_usd": "11",
             "max_leverage": 1,
-            "assets": ["0"],
+            "assets": [str(self.asset_id)],
         }
         body = json.dumps(request, separators=(",", ":")).encode()
         new_route = self.network_root / "agent_sessions" / self.wallet_id / "0" / "new.json"
@@ -1001,14 +1004,11 @@ class HyperliquidOrderCancelEval(EvalDefinition):
             # revision retried here on the theory that a freshly published
             # ceremony URL might not yet resolve; that theory was wrong, and the
             # retries turned one failure into three.
-            # Reserve the next counter durably before invoking the driver. The
+            # Reserve the next counter in memory before invoking the driver. The
             # assertion may reach Broker even when the local process times out
-            # or is interrupted, so persistence after subprocess completion is
-            # too late to guarantee that this counter will never be reused.
+            # or is interrupted. This credential is discarded with the Triad.
             attempted_counter = counter
             counter = attempted_counter + 1
-            if self.counter_committed is not None:
-                self.counter_committed(counter)
             self.next_sign_count = counter
             try:
                 completed = subprocess.run(
@@ -1063,7 +1063,7 @@ class HyperliquidOrderCancelEval(EvalDefinition):
             # enforce; the schema tag would be a useful addition to the
             # projection, but asserting a field the surface never emits is not a
             # check, it is an outage.
-            "network": "mainnet",
+            "network": self.network,
             # The session records the `[wallet]` route parameter, which is a
             # Bloom wallet id. The on-chain address is reported separately as
             # `agent_address`.
@@ -1071,7 +1071,7 @@ class HyperliquidOrderCancelEval(EvalDefinition):
             "id": self.session_id,
             "max_notional_usd": "11",
             "max_leverage": 1,
-            "assets": ["0"],
+            "assets": [str(self.asset_id)],
             "stopped": False,
         }
         if not isinstance(status_data, dict) or any(
@@ -1088,7 +1088,7 @@ class HyperliquidOrderCancelEval(EvalDefinition):
             }
         ]
         container_base = (
-            f"/bloom/petals/hyperliquid/mainnet/agent_sessions/{self.wallet_id}/0/"
+            f"/bloom/petals/hyperliquid/{self.network}/agent_sessions/{self.wallet_id}/0/"
             f"{self.session_id}"
         )
         mounts.extend(
@@ -1103,6 +1103,8 @@ class HyperliquidOrderCancelEval(EvalDefinition):
         # routes are addressed by wallet id; Hyperliquid account queries under
         # `users/[account]/` are addressed by the on-chain address.
         runtime_env = {
+            "BLOOM_EVAL_NETWORK": self.network,
+            "BLOOM_EVAL_ASSET_ID": str(self.asset_id),
             "BLOOM_EVAL_WALLET": self.wallet,
             "BLOOM_EVAL_WALLET_ID": self.wallet_id,
             "BLOOM_EVAL_SESSION_ID": self.session_id,

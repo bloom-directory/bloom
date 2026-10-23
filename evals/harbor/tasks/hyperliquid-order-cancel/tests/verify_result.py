@@ -72,7 +72,11 @@ def hyperliquid_btc_price_floor(value: Decimal) -> Decimal:
 
 def fetch_order_status(wallet: str, oid: str | int) -> object:
     """Read order status from Hyperliquid, outside the agent's report boundary."""
-    endpoint = os.environ.get("BLOOM_EVAL_HYPERLIQUID_INFO_URL", HYPERLIQUID_INFO_URL)
+    network = os.environ.get("BLOOM_EVAL_NETWORK", "mainnet")
+    require(network in ("mainnet", "testnet"), "invalid expected network")
+    default = ("https://api.hyperliquid-testnet.xyz/info" if network == "testnet"
+               else HYPERLIQUID_INFO_URL)
+    endpoint = os.environ.get("BLOOM_EVAL_HYPERLIQUID_INFO_URL", default)
     body = json.dumps(
         {"type": "orderStatus", "user": wallet, "oid": oid},
         separators=(",", ":"),
@@ -139,11 +143,12 @@ def validate(
     require(set(report) == required, "report fields do not exactly match the v1 schema")
     require(report["schema"] == SCHEMA, "wrong schema")
     require(report["status"] == "complete", "task is not complete")
-    require(report["network"] == "mainnet", "wrong network")
+    require(report["network"] == os.environ.get("BLOOM_EVAL_NETWORK", "mainnet"), "wrong network")
     require(isinstance(report["wallet"], str) and WALLET_RE.fullmatch(report["wallet"]) is not None, "invalid wallet")
     require(report["wallet"] == expected_wallet, "wrong wallet")
     require(report["session_id"] == expected_session, "wrong session")
-    require(report["asset"] == "BTC" and report["asset_id"] == 0, "wrong asset")
+    require(report["asset"] == "BTC" and type(report["asset_id"]) is int
+            and report["asset_id"] == int(os.environ.get("BLOOM_EVAL_ASSET_ID", "0")), "wrong asset")
     require(report["side"] == "buy", "wrong side")
     require(report["leverage"] == 1, "BTC leverage was not set to 1")
     require(report["post_only"] is True, "order was not post-only")
