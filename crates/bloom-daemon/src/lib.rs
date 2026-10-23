@@ -1783,7 +1783,7 @@ impl PetalHost for DaemonPetalHost {
                 builder = builder.header(name.as_str(), value.as_str());
             }
             let resp = builder.body(body.clone()).send().await.map_err(|e| {
-                let err = HostError::Backend(format!("http_fetch send: {e}"));
+                let err = petal_http_transport_error("send", e);
                 self.audited_http_error(&correlation_id, &method, &url, "error", None, None, err)
             })?;
             let status = resp.status().as_u16();
@@ -1899,7 +1899,7 @@ impl PetalHost for DaemonPetalHost {
             let mut stream = resp.bytes_stream();
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.map_err(|e| {
-                    let err = HostError::Backend(format!("http_fetch body: {e}"));
+                    let err = petal_http_transport_error("body", e);
                     self.audited_http_error(
                         &correlation_id,
                         &method,
@@ -3076,6 +3076,12 @@ fn petal_outbox_outcome(
         plan_md,
         approval_required,
     })
+}
+
+fn petal_http_transport_error(phase: &str, error: reqwest::Error) -> HostError {
+    // URLs can hold credentials in userinfo, paths or queries. Remove them
+    // from guest replies and audit error fields while retaining the cause.
+    HostError::Backend(format!("http_fetch {phase}: {}", error.without_url()))
 }
 
 fn resolve_redirect_target(current_url: &str, location: &str) -> Result<String, HostError> {
@@ -9915,5 +9921,35 @@ allowed = ["bloom:vfs.read"]
             names.contains(&"unknown-eeeeeeeeeeee"),
             "an unmounted session renders under unknown-<hash prefix>: {names:?}"
         );
+    }
+
+    #[test]
+    fn petal_http_transport_errors_preserve_cause_without_request_urls() {
+        for phase in ["send", "body"] {
+            let original = reqwest::Client::new()
+                .get("https://api.example.com")
+                .header("invalid\nheader", "fixture-value")
+                .build()
+                .unwrap_err()
+                .with_url("https://fixture-user:fixture-password@api.example.com/fixture-path-token?key=fixture-query-token".parse().unwrap());
+            assert!(original.to_string().contains("fixture-path-token"));
+            let message = petal_http_transport_error(phase, original).to_string();
+            for value in [
+                "fixture-user",
+                "fixture-password",
+                "fixture-path-token",
+                "fixture-query-token",
+            ] {
+                assert!(
+                    !message.contains(value),
+                    "request URL data must not reach guest errors"
+                );
+            }
+            assert!(message.contains(&format!("http_fetch {phase}:")));
+            assert!(
+                message.contains("builder error"),
+                "transport cause was discarded"
+            );
+        }
     }
 }

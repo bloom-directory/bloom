@@ -66,6 +66,11 @@ whether an earlier operation completed or whether retrying a write is safe.
   possibly submitted transaction, reconcile by its recorded hash or signature;
   never blindly restage or rebroadcast.
 
+Petal HTTP policy denials report method and host; request URL userinfo, paths
+and queries are omitted because they can contain credentials. Compare the
+reported target with the package's `[[net.allow]]` rules. HTTP transport errors
+retain their phase and cause with the request URL removed.
+
 If you write to a control file and then cannot find what you wrote, check
 whether the transfer moved to `sent/` or `failed/` before assuming the write
 was lost. Listing the wallet's outbox states is cheaper than re-issuing the

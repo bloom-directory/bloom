@@ -120,7 +120,11 @@ impl NetPolicy {
                 return Ok(());
             }
         }
-        Err(HostError::Denied(format!("{method} {host}{path}")))
+        // Paths can carry application credentials just like query parameters.
+        // Identify the rule to repair without returning request data.
+        Err(HostError::Denied(format!(
+            "{method} {host}: request not allowed by package network policy"
+        )))
     }
 }
 
@@ -358,6 +362,32 @@ host = "api.example.com"
 methods = ["GET", "POST"]
 paths = ["/markets*", "/auth/*", "/wallets/*/orders"]
 "#
+    }
+
+    #[test]
+    fn network_denials_do_not_echo_url_components() {
+        let policy = NetPolicy::from_manifest_toml(manifest_toml()).unwrap();
+        let failure = policy
+            .check(
+                "GET",
+                "https://fixture-user:fixture-password@api.example.com/private/fixture-path-token?key=fixture-query-token",
+            )
+            .unwrap_err();
+        assert!(matches!(failure, HostError::Denied(_)));
+        let message = failure.to_string();
+        for value in [
+            "fixture-user",
+            "fixture-password",
+            "fixture-path-token",
+            "fixture-query-token",
+        ] {
+            assert!(
+                !message.contains(value),
+                "URL components must not reach guest errors"
+            );
+        }
+        assert!(message.contains("GET"));
+        assert!(message.contains("api.example.com"));
     }
 
     #[test]
