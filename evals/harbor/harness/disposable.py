@@ -323,8 +323,13 @@ class DisposableTriad:
             raise EvalError("setup policy differs from its committed projection")
 
     def require_petal(self, name: str) -> str:
+        # Do not execute Petal routes while startup is installing packages:
+        # a busy VM rejects package changes. The owner record is published
+        # when the package commits; only then read its mounted documentation.
+        owner = self.home / "petals/store/owners" / f"{name}.json"
         return self._wait(
-            lambda: self.cli("vfs", "cat", f"/petals/{name}/README.md"),
+            lambda: owner.is_file()
+            and self.cli("vfs", "cat", f"/petals/{name}/README.md"),
             self.launcher,
             f"default Petal {name}",
         )
