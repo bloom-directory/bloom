@@ -13,7 +13,7 @@ use std::{
 use async_trait::async_trait;
 use bloom_broker_api::{
     CanonicalWalletPolicy, CeremonyKind, CeremonyState, CredentialPublic, CredentialState,
-    DerivationRef, Digest32, KeyPublic, KeyRequest, KeyRole, KeySpec, OperationId,
+    DerivationRef, Digest32, KeyPublic, KeyRef, KeyRequest, KeyRole, KeySpec, OperationId,
     OperationRequest, ProtocolError, ProtocolErrorCode, SignedPolicySnapshot, Token,
     WalletAccountsPublic, WalletPublic,
 };
@@ -389,6 +389,36 @@ impl CachedWalletProjectionReader {
             .map(|key| serde_json::to_string(&key.key_ref))
             .collect::<Result<BTreeSet<_>, _>>()
             .map_err(|error| invalid_projection(format!("encode Broker key reference: {error}")))?;
+        let mut undescribed = BTreeSet::new();
+        for key_ref in &wallet.key_refs {
+            let encoded = serde_json::to_string(key_ref).map_err(|error| {
+                invalid_projection(format!("encode wallet key reference: {error}"))
+            })?;
+            if !described.contains(&encoded) {
+                undescribed.insert(encoded);
+            }
+        }
+        // A root-key wallet's Petal keys are derived from its root. Describe
+        // them in one request rather than one `key.get_public` each, which
+        // grows with every Petal session the wallet has run. Only derived
+        // keys the wallet lists, held by the root's own backend instance, are
+        // taken; anything else falls through to the per-key reads below.
+        if !undescribed.is_empty()
+            && let Some(root) = &wallet.root_key_ref
+        {
+            for key in broker.derived_keys(root.clone()).await? {
+                if !is_derived_from_backend_of(&key, root) {
+                    continue;
+                }
+                let encoded = serde_json::to_string(&key.key_ref).map_err(|error| {
+                    invalid_projection(format!("encode derived key reference: {error}"))
+                })?;
+                if undescribed.remove(&encoded) {
+                    described.insert(encoded);
+                    keys.push(key);
+                }
+            }
+        }
         for key_ref in &wallet.key_refs {
             let encoded = serde_json::to_string(key_ref).map_err(|error| {
                 invalid_projection(format!("encode wallet key reference: {error}"))
@@ -1377,6 +1407,17 @@ fn unavailable(message: impl Into<String>) -> ProtocolError {
     ProtocolError::new(ProtocolErrorCode::ServiceUnavailable, message)
 }
 
+/// Whether a `key.list_derived` result describes a derived key held by the
+/// same backend instance as the wallet's root. The exact root a child descends
+/// from is named in a backend-specific form, so it is not checked here; a key
+/// that fails this is read on its own with `key.get_public`.
+fn is_derived_from_backend_of(key: &KeyPublic, root: &KeyRef) -> bool {
+    key.role == KeyRole::Derived
+        && key.key_ref.derivation.is_some()
+        && key.key_ref.backend == root.backend
+        && key.key_ref.backend_instance == root.backend_instance
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
@@ -1418,6 +1459,11 @@ mod tests {
         list_requests: std::sync::atomic::AtomicUsize,
         /// `wallet.get_public` calls, one per single-wallet refresh.
         get_requests: std::sync::atomic::AtomicUsize,
+        /// Keys `key.list_derived` reports for a wallet's root, by wallet.
+        derived: Mutex<BTreeMap<String, Vec<KeyPublic>>>,
+        /// `key.list_derived` and `key.get_public` calls.
+        derived_requests: std::sync::atomic::AtomicUsize,
+        key_requests: std::sync::atomic::AtomicUsize,
     }
 
     struct BlockingEmptyBroker {
@@ -1457,6 +1503,9 @@ mod tests {
                 accounts_errors: Mutex::new(BTreeMap::new()),
                 list_requests: 0.into(),
                 get_requests: 0.into(),
+                derived: Mutex::new(BTreeMap::new()),
+                derived_requests: 0.into(),
+                key_requests: 0.into(),
             }
         }
 
@@ -1591,10 +1640,148 @@ mod tests {
                             empty_wallet_accounts(wallet_id),
                         ))
                     }
+                    MachineBrokerRequest::KeyListDerived(KeyRequest { key_ref }) => {
+                        self.derived_requests.fetch_add(1, Ordering::SeqCst);
+                        let derived = self.derived.lock().unwrap();
+                        Ok(MachineBrokerResponse::KeyListDerived(
+                            wallets
+                                .iter()
+                                .find(|(_, value)| {
+                                    value.wallet.root_key_ref == Some(key_ref.clone())
+                                })
+                                .and_then(|(name, _)| derived.get(name).cloned())
+                                .unwrap_or_default(),
+                        ))
+                    }
+                    MachineBrokerRequest::KeyGetPublic(KeyRequest { key_ref }) => {
+                        self.key_requests.fetch_add(1, Ordering::SeqCst);
+                        self.derived
+                            .lock()
+                            .unwrap()
+                            .values()
+                            .flatten()
+                            .find(|key| key.key_ref == key_ref)
+                            .cloned()
+                            .map(MachineBrokerResponse::KeyGetPublic)
+                            .ok_or_else(|| invalid_projection("unknown fake key"))
+                    }
                     _ => Err(invalid_projection("unexpected fake Broker method")),
                 }
             })
         }
+    }
+
+    fn derived_key(index: u8) -> KeyPublic {
+        KeyPublic {
+            key_ref: KeyRef {
+                backend: token("local"),
+                backend_instance: token("primary"),
+                locator: format!("alice/petal-{index}"),
+                key_spec: KeySpec::Secp256k1,
+                public_key_fingerprint: Digest32::from_bytes([40 + index; 32]),
+                derivation: Some(DerivationRef::Bip32Secp256k1 {
+                    root_key_id: token("root"),
+                    path: format!("m/44'/60'/0'/18735/{index}"),
+                }),
+            },
+            role: KeyRole::Derived,
+            canonical_public_key: Base64UrlBytes::from_bytes(&[2; 33]),
+            addresses: Vec::new(),
+            supported_crypto_suites: vec![CryptoSuite::Secp256k1Keccak256Recoverable],
+        }
+    }
+
+    #[tokio::test]
+    async fn derived_keys_are_described_in_one_request() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut wallet = fixture(1);
+        let derived = (0..5).map(derived_key).collect::<Vec<_>>();
+        // The wallet lists four of the five derived keys plus one key the
+        // root enumeration does not report.
+        let unlisted = derived_key(9);
+        wallet
+            .wallet
+            .key_refs
+            .extend(derived[..4].iter().map(|key| key.key_ref.clone()));
+        wallet.wallet.key_refs.push(unlisted.key_ref.clone());
+        let broker = Arc::new(FakeBroker::new(wallet));
+        broker
+            .derived
+            .lock()
+            .unwrap()
+            .insert("alice".into(), derived.clone());
+        broker
+            .derived
+            .lock()
+            .unwrap()
+            .insert("other".into(), vec![unlisted.clone()]);
+        let reader = CachedWalletProjectionReader::new(
+            Some(MachineBrokerClient::new(broker.clone())),
+            FileProjectionStore::new(directory.path().join("wallets.json")),
+        )
+        .unwrap();
+
+        let projection = reader.get_wallet_authority(&token("alice")).await.unwrap();
+
+        assert_eq!(broker.derived_requests.load(Ordering::SeqCst), 1);
+        // Only the key the root enumeration missed is read on its own.
+        assert_eq!(broker.key_requests.load(Ordering::SeqCst), 1);
+        let projected = projection
+            .keys
+            .iter()
+            .map(|key| key.key_ref.clone())
+            .collect::<Vec<_>>();
+        for key in derived[..4].iter().chain([&unlisted]) {
+            assert!(projected.contains(&key.key_ref));
+        }
+        // A derived key the wallet does not list is never projected.
+        assert!(!projected.contains(&derived[4].key_ref));
+    }
+
+    #[tokio::test]
+    async fn listed_keys_the_root_enumeration_cannot_vouch_for_are_read_one_by_one() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut wallet = fixture(1);
+        let child = derived_key(0);
+        // Listed by the wallet and returned by the root enumeration, but not
+        // a derived key of the root's backend instance.
+        let mut underived = derived_key(1);
+        underived.key_ref.derivation = None;
+        let mut foreign = derived_key(2);
+        foreign.key_ref.backend_instance = token("elsewhere");
+        let batch = vec![child.clone(), underived.clone(), foreign.clone()];
+        wallet
+            .wallet
+            .key_refs
+            .extend(batch.iter().map(|key| key.key_ref.clone()));
+        let broker = Arc::new(FakeBroker::new(wallet));
+        broker.derived.lock().unwrap().insert("alice".into(), batch);
+        let reader = CachedWalletProjectionReader::new(
+            Some(MachineBrokerClient::new(broker.clone())),
+            FileProjectionStore::new(directory.path().join("wallets.json")),
+        )
+        .unwrap();
+
+        reader.get_wallet_authority(&token("alice")).await.unwrap();
+
+        assert_eq!(broker.derived_requests.load(Ordering::SeqCst), 1);
+        // Only the true child is taken from the batch; the other two are
+        // described by their own exact `key.get_public` request.
+        assert_eq!(broker.key_requests.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn fully_described_wallets_skip_the_derived_key_request() {
+        let directory = tempfile::tempdir().unwrap();
+        let broker = Arc::new(FakeBroker::new(fixture(1)));
+        let reader = CachedWalletProjectionReader::new(
+            Some(MachineBrokerClient::new(broker.clone())),
+            FileProjectionStore::new(directory.path().join("wallets.json")),
+        )
+        .unwrap();
+        reader.get_wallet_authority(&token("alice")).await.unwrap();
+        assert_eq!(broker.derived_requests.load(Ordering::SeqCst), 0);
+        assert_eq!(broker.key_requests.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

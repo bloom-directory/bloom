@@ -1397,6 +1397,7 @@ fn stage_macos_install_digest(
         .env("BLOOM_MACOS_REVOKE_GID", "260503")
         .env("BLOOM_MACOS_LOG_GID", "260504")
         .env("BLOOM_RELEASE_DIGEST", digest)
+        .env("BLOOM_HEALTH_TIMEOUT_SECONDS", "2")
         .output()
         .unwrap()
 }
@@ -3476,10 +3477,20 @@ write_state_schema() {{ printf 'machine=2\nbroker=2\nsigner=2\n' > "$product/sta
 reload_installed_set() {{
   count=$(cat "$ROOT/reload-count" 2>/dev/null || echo 0); count=$((count + 1)); echo "$count" > "$ROOT/reload-count"
   echo "reload $count" >> "$ROOT/log"
-  case "$SCENARIO" in rollback) [[ "$count" -gt 1 ]];; migration|resume_floor) return 1;; partial) return 0;; esac
+  case "$SCENARIO" in
+    rollback) [[ "$count" -gt 1 ]];;
+    migration|resume_floor) return 1;;
+    partial) return 0;;
+    # The candidate times out; then the restore's own reload either times
+    # out, succeeds, or fails without a timeout.
+    restore_timeout) health_timed_out=true; health_timed_out_uids="501, 502"; return 1;;
+    activation_timeout) [[ "$count" -gt 1 ]] || {{ health_timed_out=true; return 1; }};;
+    restore_failed) [[ "$count" -gt 1 ]] && return 1; health_timed_out=true; return 1;;
+  esac
 }}
 activate_installed_set() {{
   echo 'activate first-full-machine then second-fails' >> "$ROOT/log"
+  [[ "$SCENARIO" != activation_timeout ]] || {{ health_timed_out=true; return 1; }}
   [[ "$SCENARIO" != partial ]]
 }}
 if [[ "$SCENARIO" == resume_floor ]]; then
@@ -3502,6 +3513,9 @@ find "$ROOT" -name '*.new.*' -print > "$ROOT/stray"
         ("migration", "1", "2"),
         ("resume_floor", "1", "2"),
         ("partial", "2", "2"),
+        ("restore_timeout", "2", "2"),
+        ("activation_timeout", "2", "2"),
+        ("restore_failed", "2", "2"),
     ] {
         let directory = tempfile::tempdir().unwrap();
         let output = Command::new("bash")
@@ -3540,6 +3554,26 @@ find "$ROOT" -name '*.new.*' -print > "$ROOT/stray"
                 );
                 assert!(log.contains("state\nactivate first-full-machine then second-fails"));
                 assert!(log.ends_with("rewrite new activating\n"));
+            }
+            "restore_timeout" | "activation_timeout" | "restore_failed" => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(log.contains("restore\nswitch old"), "{log}");
+                assert!(
+                    transaction.exists(),
+                    "an unconfirmed restore keeps the journal"
+                );
+                let expected = match scenario {
+                    "restore_timeout" => {
+                        "services are loaded for every login, but UID 501, 502 did not report healthy"
+                    }
+                    "activation_timeout" => "did not report healthy within 600s and was stopped",
+                    _ => "automatic restoration of the previous Bloom release failed",
+                };
+                assert!(stderr.contains(expected), "{scenario}: {stderr}");
+                assert!(
+                    stderr.contains("did not report healthy within 600s\n"),
+                    "{scenario}: the candidate timed out: {stderr}"
+                );
             }
             _ => unreachable!(),
         }
@@ -3689,6 +3723,7 @@ fn run_linux_installer(root: &Path, args: &[&str]) -> std::process::Output {
     if args[0] == "install" {
         command.env("BLOOM_ALLOW_TEST_UNCLAIMED", "true");
     }
+    command.env("BLOOM_HEALTH_TIMEOUT_SECONDS", "2");
     command.output().unwrap()
 }
 
@@ -4997,4 +5032,184 @@ fn linux_legacy_interrupted_upgrade_recovers_without_operator_intervention() {
         fs::read_to_string(root.join("etc/bloom/1000/machine.env")).unwrap(),
         format!("BLOOM_NFS_LISTEN=127.0.0.1:20000\nBLOOM_RELEASE_DIGEST={new_digest}\n")
     );
+}
+
+#[test]
+fn macos_rollback_reloads_every_login_before_reporting_a_timeout() {
+    let source = fs::read_to_string(release_script("install-macos.sh")).unwrap();
+    let start = source
+        .find("# During a rollback (reload_all_on_timeout=true)")
+        .unwrap();
+    let end = start + source[start..].find("\n}\n").unwrap() + 3;
+    let function = &source[start..end];
+    let enrollments = tempfile::tempdir().unwrap();
+    for uid in ["501", "502", "503"] {
+        fs::write(enrollments.path().join(format!("{uid}.json")), "{}").unwrap();
+    }
+    let run = |reload_all: &str, fail_signer: &str| {
+        let harness = format!(
+            r#"set -Eeuo pipefail
+live=true; root_prefix=/unused; release_base=/unused; containment_plist=/unused
+enrollments='{enrollments}'
+# A Signer that fails to load for UID $FAIL_SIGNER is a hard failure.
+reload_launchd_job() {{ [ "$2" != "com.bloom.signer.${{FAIL_SIGNER:-none}}" ]; }}
+reload_launchagent_job() {{ echo "load $1/$2"; }}
+field() {{ echo fixture; }}
+# 501 and 503 have not answered yet; 502 is healthy.
+require_triad_health() {{ [ "$1" = 502 ] && return 0; health_timed_out=true; return 1; }}
+{function}
+reload_all_on_timeout={reload_all}
+if reload_installed_set; then echo healthy; else echo "timed_out=$health_timed_out uids=$health_timed_out_uids"; fi
+"#,
+            enrollments = enrollments.path().display(),
+        );
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg(harness)
+            .env("FAIL_SIGNER", fail_signer)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let rollback = run("true", "none");
+    assert!(
+        rollback.contains("load 503/com.bloom.machine"),
+        "{rollback}"
+    );
+    assert!(
+        rollback.ends_with("timed_out=true uids=501, 503\n"),
+        "{rollback}"
+    );
+    // Outside a rollback the first unanswered login still stops the set.
+    let candidate = run("false", "none");
+    assert!(!candidate.contains("load 502/"), "{candidate}");
+    assert!(candidate.ends_with("timed_out=true uids=\n"), "{candidate}");
+    // A hard failure after an earlier timeout is reported as a failure, not
+    // as every login loaded.
+    let mixed = run("true", "502");
+    assert!(!mixed.contains("load 503/"), "{mixed}");
+    assert!(mixed.ends_with("timed_out=false uids=501\n"), "{mixed}");
+}
+
+#[test]
+fn macos_health_check_never_inherits_an_earlier_timeout() {
+    let source = fs::read_to_string(release_script("install-macos.sh")).unwrap();
+    let start = source
+        .find("# Machine verifies its whole audit journal")
+        .unwrap();
+    let end = start + source[start..].find("\n}\n").unwrap() + 3;
+    let harness = format!(
+        r#"set -Eeuo pipefail
+die() {{ echo "$*" >&2; exit 65; }}
+release_base=/nonexistent
+dscl() {{ echo "NFSHomeDirectory: /nonexistent-home"; }}
+{function}
+health_timed_out=true
+if require_triad_health 502 bob digest; then echo healthy; else echo "timed_out=$health_timed_out"; fi
+"#,
+        function = &source[start..end],
+    );
+    let output = Command::new("bash")
+        .arg("-c")
+        .arg(harness)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    // An unresolvable home is a failure of its own, not an earlier timeout.
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "timed_out=false\n"
+    );
+}
+
+/// Runs one installer's health wait in bash with stubbed system tools; the
+/// health probe succeeds once it has been called `answer_after` times.
+fn run_health_wait(installer: &str, call: &str, answer_after: i64, timeout: &str) -> String {
+    run_health_wait_with_units(installer, call, answer_after, timeout, "1")
+}
+
+/// As [`run_health_wait`], with Linux units active only when `units_active`
+/// is "1".
+fn run_health_wait_with_units(
+    installer: &str,
+    call: &str,
+    answer_after: i64,
+    timeout: &str,
+    units_active: &str,
+) -> String {
+    let home = tempfile::tempdir().unwrap();
+    let harness = format!(
+        r#"set -Eeuo pipefail
+die() {{ echo "$*" >&2; exit 65; }}
+release_base=/nonexistent
+probes=0
+probe() {{ probes=$((probes + 1)); [ "$probes" -ge {answer_after} ]; }}
+dscl() {{ echo "NFSHomeDirectory: {home}"; }}
+getent() {{ echo "alice:x:501:501::{home}:/bin/sh"; }}
+launchctl() {{ probe; }}
+linux_release_units_active() {{ [ "${{UNITS_ACTIVE:-1}}" = 1 ]; }}
+runuser() {{ probe; }}
+eval "$(sed -n '/^# Machine verifies its whole audit journal/,/^}}$/p' '{installer}')"
+if BLOOM_HEALTH_TIMEOUT_SECONDS={timeout} {call}; then
+  echo "healthy after $probes probes"
+else
+  echo "unhealthy after $probes probes timed_out=${{health_timed_out:-n/a}}"
+fi
+"#,
+        home = home.path().display(),
+        installer = release_script(installer).display(),
+    );
+    let output = Command::new("bash")
+        .arg("-c")
+        .arg(harness)
+        .env("UNITS_ACTIVE", units_active)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    String::from_utf8(output.stdout).unwrap()
+}
+
+#[test]
+fn installers_wait_for_a_slow_machine_and_report_a_plain_timeout() {
+    for (installer, call) in [
+        ("install-macos.sh", "require_triad_health 501 alice digest"),
+        (
+            "install-linux.sh",
+            "require_linux_triad_health / 501 alice digest",
+        ),
+    ] {
+        // A Machine still verifying its journal answers after a few probes.
+        let answered = run_health_wait(installer, call, 4, "30");
+        assert!(
+            answered.starts_with("healthy after 4 probes"),
+            "{installer}: {answered}"
+        );
+        // One that never answers fails once the deadline passes.
+        let never = run_health_wait(installer, call, i64::MAX, "1");
+        assert!(never.starts_with("unhealthy"), "{installer}: {never}");
+    }
+    // Linux needs its units active as well as a healthy probe. With units
+    // that never start, the final diagnostic probe passing must not turn the
+    // timeout into success.
+    let units_down = run_health_wait_with_units(
+        "install-linux.sh",
+        "require_linux_triad_health / 501 alice digest",
+        1,
+        "1",
+        "0",
+    );
+    assert!(units_down.starts_with("unhealthy"), "{units_down}");
+    let macos = run_health_wait(
+        "install-macos.sh",
+        "require_triad_health 501 alice digest",
+        i64::MAX,
+        "1",
+    );
+    assert!(macos.contains("timed_out=true"), "{macos}");
+
+    // A timed-out rollback says the old release is reinstated, not that
+    // restoring it failed.
+    let installer = fs::read_to_string(release_script("install-macos.sh")).unwrap();
+    assert!(installer.contains("previous Bloom release is reinstated and its services are loaded"));
 }
