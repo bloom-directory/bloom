@@ -34,9 +34,7 @@ class DisposableHyperliquidEval(EvalDefinition):
     def lock_path(self) -> Path:
         # The imported wallet still shares venue state across disposable roots.
         # Serialize it even though Solana needs no cross-run recovery lock.
-        identity = str(self.mnemonic.resolve()) if self.mnemonic else "unconfigured"
-        digest = hashlib.sha256(identity.encode()).hexdigest()[:24]
-        return Path(f"/tmp/bloom-harbor-hyperliquid-{digest}.lock")
+        return Path("/tmp/bloom-harbor-hyperliquid.lock")
 
     def preflight(self) -> None:
         self.triad.preflight()
