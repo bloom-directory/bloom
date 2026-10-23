@@ -20,6 +20,25 @@ def verify(root=None):
         or account.get("evm", {}).get("state") != "active"
     ):
         raise ValueError("clarification fixture has no fresh active account")
+    for name in reader.directories("wallets/registrations"):
+        if name != wallet:
+            raise ValueError("agent requested another wallet before clarification")
+        registration = reader.read_json(f"wallets/registrations/{name}/status.json")
+        if (
+            registration.get("schema") != "bloom.machine-wallet-registration-projection.1"
+            or registration.get("requested_name") != wallet
+            or registration.get("ceremony_kind") != "wallet_registration"
+            or registration.get("ceremony_state") != "COMPLETED"
+        ):
+            raise ValueError("fixture wallet enrollment is not completed")
+    for path in (
+        "wallets/recoveries",
+        f"wallets/{wallet}/passkeys/enrollments",
+    ):
+        if reader.directories(path):
+            raise ValueError(
+                "agent requested wallet enrollment or recovery before clarification"
+            )
     for state in ("pending", "confirmed", "failed"):
         if reader.entries(f"wallets/{wallet}/policy-updates/{state}"):
             raise ValueError("agent changed wallet policy before clarification")

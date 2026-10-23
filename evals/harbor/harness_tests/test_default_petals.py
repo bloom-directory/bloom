@@ -79,10 +79,29 @@ class HostBoundaryTests(unittest.TestCase):
                 )
             )
             checker.verify(root)
+            registration = root / "wallets/registrations/harbor/status.json"
+            registration.parent.mkdir(parents=True)
+            completed = {
+                "schema": "bloom.machine-wallet-registration-projection.1",
+                "requested_name": "harbor",
+                "ceremony_kind": "wallet_registration",
+                "ceremony_state": "COMPLETED",
+            }
+            registration.write_text(json.dumps(completed))
+            checker.verify(root)
+            registration.write_text(
+                json.dumps(completed | {"ceremony_state": "AWAITING_USER"})
+            )
+            with self.assertRaises(ValueError):
+                checker.verify(root)
+            registration.write_text(json.dumps(completed))
             for relative in (
                 "wallets/harbor/0/chains/ethereum/outbox/pending/one",
                 "wallets/harbor/policy-updates/pending/one",
                 "petals/polymarket/trade/harbor/0/drafts/one",
+                "wallets/registrations/other",
+                "wallets/recoveries/harbor",
+                "wallets/harbor/passkeys/enrollments/one",
             ):
                 pending = root / relative
                 pending.mkdir(parents=True)

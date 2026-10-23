@@ -46,6 +46,8 @@ scripts/evals/run-harbor.sh near-intents-clarification opencode
 
 Agents are Claude Code, Codex and OpenCode. Harbor 0.21.0 and the shared agent
 image are pinned. The image digest includes eval-images#9's OpenCode 1.18.26.
+The OpenCode adapter uses that installed binary instead of downloading NVM
+and reinstalling the CLI during every trial.
 Existing agent authentication is handled by Harbor; never copy credentials
 into a task or the mounted Bloom tree. `BLOOM_EVAL_REASONING_EFFORT` optionally
 selects Codex reasoning effort using the existing supported values.

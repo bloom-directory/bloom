@@ -163,6 +163,7 @@ import os
 from pathlib import Path
 
 from harbor.job_plan import JobPlan
+from harbor.agents.factory import AgentFactory
 from harbor.models.environment_type import EnvironmentType
 from harbor.models.job.config import JobConfig, RetryConfig
 from harbor.models.trial.config import AgentConfig, EnvironmentConfig, TaskConfig, VerifierConfig
@@ -200,5 +201,12 @@ host_verifier = VerifierFactory.create_verifier_from_config(
     environment=None,
 )
 assert type(host_verifier).__name__ == "HostProjectionVerifier"
+image_agent = AgentFactory.create_agent_from_config(
+    AgentConfig(import_path="harness.image_opencode:ImageOpenCode",
+                model_name="deepseek/deepseek-v4-flash",
+                kwargs={"version": "1.18.26"}),
+    logs_dir=Path(os.environ["TMP_JOB_DIR"]) / "image-agent-api",
+)
+assert type(image_agent).__name__ == "ImageOpenCode"
 PY
 printf '%s\n' 'Harbor eval static tests passed.'

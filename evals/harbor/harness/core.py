@@ -157,7 +157,10 @@ async def run_harbor_job(context: EvalRunContext, agent: AgentSpec) -> Any:
         retry=RetryConfig(max_retries=0),
         agents=[
             AgentConfig(
-                name=agent.harbor_name,
+                name=None if agent.harbor_name == "opencode" else agent.harbor_name,
+                import_path="harness.image_opencode:ImageOpenCode"
+                if agent.harbor_name == "opencode"
+                else None,
                 model_name=agent.model,
                 n_concurrent=1,
                 env=shared_env,
@@ -198,12 +201,13 @@ def _agent_spec(name: str) -> AgentSpec:
             f"unsupported agent {name!r}; choose: {', '.join(AGENTS)}"
         ) from error
 
-    if name == "claude":
-        if not (os.getenv("ANTHROPIC_API_KEY") or os.getenv("CLAUDE_CODE_OAUTH_TOKEN")):
-            raise EvalError(
-                "Claude auth is missing; set ANTHROPIC_API_KEY or "
-                "CLAUDE_CODE_OAUTH_TOKEN"
-            )
+    if name == "claude" and not (
+        os.getenv("ANTHROPIC_API_KEY") or os.getenv("CLAUDE_CODE_OAUTH_TOKEN")
+    ):
+        raise EvalError(
+            "Claude auth is missing; set ANTHROPIC_API_KEY or "
+            "CLAUDE_CODE_OAUTH_TOKEN"
+        )
     if name == "codex" and not os.getenv("OPENAI_API_KEY"):
         auth_file = Path.home() / ".codex" / "auth.json"
         if not auth_file.is_file():
