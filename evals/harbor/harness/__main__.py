@@ -68,7 +68,7 @@ def main(argv: list[str] | None = None) -> int:
     started = time.monotonic()
     failure = None
     try:
-        kwargs = {}
+        kwargs = {"acquire_lock": isinstance(definition, DisposableHyperliquidEval)}
         if args.smoke:
             if not hasattr(definition, "smoke"):
                 raise EvalError("this task has no deterministic smoke")
