@@ -16,6 +16,12 @@ Clarification Petals are `solana`, `hyperliquid`, `polymarket` and `near-intents
 These cases require no funding. The host checks the actual Harbor trajectory;
 an agent-authored claim that it asked is not evidence.
 
+Proposal and clarification grading uses Harbor's host-verifier API to read the
+same live projections through the host mount. This avoids repeating the
+container's slow path lookups during grading and records the actual reward
+inside Harbor, including the final clarification question. The agent still
+uses the ordinary mounted filesystem. Verification timeouts are unchanged.
+
 NEAR's positive swap-proposal task is not implemented yet. The real spike on
 the released v0.1.4 package rejected an unfunded fresh wallet before creating
 a proposal: it requires native gas and the origin asset even when nothing is

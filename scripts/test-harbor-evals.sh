@@ -166,6 +166,9 @@ from harbor.job_plan import JobPlan
 from harbor.models.environment_type import EnvironmentType
 from harbor.models.job.config import JobConfig, RetryConfig
 from harbor.models.trial.config import AgentConfig, EnvironmentConfig, TaskConfig, VerifierConfig
+from harbor.models.task.task import Task
+from harbor.models.trial.paths import TrialPaths
+from harbor.verifier.factory import VerifierFactory
 
 config = JobConfig(
     job_name="api-smoke",
@@ -189,5 +192,13 @@ plan = asyncio.run(JobPlan.from_config(config))
 assert len(plan.trial_configs) == 1
 assert plan.trial_configs[0].task.path.name == "hyperliquid-order-cancel"
 assert plan.trial_configs[0].environment.mounts[0]["read_only"] is True
+host_verifier = VerifierFactory.create_verifier_from_config(
+    VerifierConfig(import_path="harness.host_verifier:HostProjectionVerifier",
+                   kwargs={"mount_root": "/tmp/unstarted-test-mount"}),
+    task=Task(Path("evals/harbor/tasks/polymarket-limit-order-proposal").resolve()),
+    trial_paths=TrialPaths(Path(os.environ["TMP_JOB_DIR"]) / "verifier-api"),
+    environment=None,
+)
+assert type(host_verifier).__name__ == "HostProjectionVerifier"
 PY
 printf '%s\n' 'Harbor eval static tests passed.'
