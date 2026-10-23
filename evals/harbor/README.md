@@ -17,8 +17,8 @@ These cases require no funding. The host checks the actual Harbor trajectory;
 an agent-authored claim that it asked is not evidence.
 
 Proposal and clarification grading uses Harbor's host-verifier API to read the
-same live projections through the host mount. This avoids repeating the
-container's slow path lookups during grading and records the actual reward
+same live projections through the disposable Machine's IPC endpoint. This
+avoids slow mount path lookups during grading and records the actual reward
 inside Harbor, including the final clarification question. The agent still
 uses the ordinary mounted filesystem. Verification timeouts are unchanged.
 
