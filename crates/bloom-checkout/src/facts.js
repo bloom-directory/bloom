@@ -6,7 +6,7 @@
   const symbols = [['US$','USD'],['U$S','USD'],['USD$','USD'],['R$','BRL'],['CA$','CAD'],['C$','CAD'],['MX$','MXN'],['AR$','ARS'],
     ['CLP$','CLP'],['COL$','COP'],['$U','UYU'],['S/.','PEN'],['S/','PEN'],['SFr.','CHF'],['SFr','CHF'],['Fr.','CHF'],['zł','PLN'],['€','EUR'],['£','GBP'],['$','$']];
   const dollars = new Set(['USD','CAD','MXN','ARS','CLP','COP','UYU','AUD','NZD','SGD','HKD']);
-  const currencyToken = /US\$|U\$S|USD\$|R\$|CA\$|C\$|MX\$|AR\$|CLP\$|COL\$|\$U|S\/\.?|SFr\.?|Fr\.|zł|[€£$]|\b[A-Z]{3}\b/gu;
+  const currencyToken = /US\$|U\$S|USD\$|R\$|CA\$|C\$|MX\$|AR\$|CLP\$|COL\$|\$U|S\/\.?|SFr\.?|Fr\.|zł|[€£$]|(?<!\p{L})[A-Z]{3}(?!\p{L})/gu;
   // Zalando renders "Gesamtsumme" and "inkl. MwSt." with no space between.
   const label = /^(precio total final|montant à payer|importo totale|precio total|total a pagar|total final|gesamtsumme\s*inkl\.\s*mwst\.|total à payer|importe total|montant total|total amount|total to pay|gesamtbetrag|totaalbedrag|grand total|order total|monto total|valor total|gesamtsumme|gesamtpreis|amount due|te betalen|do zapłaty|total due|total ttc|endbetrag|zu zahlen|totale|gesamt|totaal|total|summe|razem|suma)(?![\p{L}\p{N}])/iu;
   // An amount line holds only currency marks, digits, separators and spacing.
@@ -58,9 +58,13 @@
     return total ? {total, currency} : null;
   };
   const pageTotal = lines => {
+    // A converted display total is not the charge. Gotogate labels the actual
+    // charge separately; unclear or conflicting charge labels stay manual.
+    const chargeLabel = /^el precio se cobrar[aá] en(?![\p{L}\p{N}])/iu;
+    const amountLabel = lines.some(line => chargeLabel.test(line)) ? chargeLabel : label;
     const amounts = [];
     for (let i = 0; i < lines.length; i++) {
-      const match = lines[i].match(label);
+      const match = lines[i].match(amountLabel);
       if (!match) continue;
       const rest = lines[i].slice(match[0].length).replace(/\([^)]*\)/g, '').replace(/^[\s:]+/, '');
       if (!amountOnly(rest)) continue;

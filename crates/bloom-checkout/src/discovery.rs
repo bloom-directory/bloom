@@ -1377,6 +1377,47 @@ pub(crate) mod tests {
                 Some((5700, "BRL")),
             ),
             // A bare dollar with no declared currency or page region is unknown.
+            // Gotogate displays a converted total but charges the stated USD amount.
+            (
+                lines(
+                    "es-AR",
+                    "",
+                    &[
+                        "Importe total",
+                        "AR$1,322,517.54",
+                        "El precio se cobrará en:",
+                        "\u{202a}853USD\u{202c}",
+                    ],
+                    "Pagar",
+                ),
+                Some((85300, "USD")),
+            ),
+            (
+                lines(
+                    "es-AR",
+                    "",
+                    &[
+                        "Importe total AR$1,322,517.54",
+                        "El precio se cobrará en:",
+                        "importe pendiente",
+                    ],
+                    "Pagar",
+                ),
+                None,
+            ),
+            (
+                lines(
+                    "es-AR",
+                    "",
+                    &[
+                        "Importe total AR$1,322,517.54",
+                        "El precio se cobrará en: 853USD",
+                        "El precio se cobrará en: 854USD",
+                    ],
+                    "Pagar",
+                ),
+                None,
+            ),
             (lines("en", "", &["Total $10.00"], "Pay"), None),
             // Three-decimal currencies make "1.234" ambiguous.
             (lines("ar-KW", "", &["Total KWD 1.234"], "Pay"), None),
