@@ -1358,6 +1358,7 @@ mod tests {
               <link rel="stylesheet" href="EXTERNAL_STYLE">
               <style>.pick{cursor:pointer}.faded{opacity:0}</style>
               <div id="previous-step" style="height:0;overflow:hidden"></div>
+              <div id="earlier-step"></div>
               <div class="external"><span>Remote fare</span></div>
               <ul><li class="pick" id="city">Cordoba COR</li><li class="pick faded">Hidden city</li></ul>
               <div class="pick"><div>Noviembre 2026</div><div class="pick" id="day">04</div></div>
@@ -1367,6 +1368,8 @@ mod tests {
               <div class="pick" id="pay">Pagar</div>
               <script>
                 document.getElementById('previous-step').innerHTML = '<button>Old seat</button>'.repeat(310);
+                document.getElementById('earlier-step').innerHTML = '<button>Previous seat</button><br>'.repeat(310);
+                document.querySelector('.external').scrollIntoView();
                 for (const e of document.querySelectorAll('.pick,.external'))
                   e.addEventListener('click', () => document.title = 'clicked ' + e.innerText);
               </script>"#.replace("EXTERNAL_STYLE", &external_style);

@@ -52,7 +52,11 @@
     (control(e) || (pointer(e) && label(e))) &&
     visible(e) && !e.disabled && e.getAttribute('aria-disabled') !== 'true' && e.type !== 'hidden');
   // A styled container around other controls is layout, not a control.
-  const nodes = candidates.filter(e => control(e) || !candidates.some(o => o !== e && e.contains(o))).slice(0, 300);
+  // Retained earlier steps (for example, a seat map) can sit above the current
+  // form. Give current and following controls room before those earlier nodes.
+  const nodes = candidates.filter(e => control(e) || !candidates.some(o => o !== e && e.contains(o)))
+    .sort((a, b) => Number(a.getBoundingClientRect().bottom <= 0) - Number(b.getBoundingClientRect().bottom <= 0))
+    .slice(0, 300);
   // Repeated controls such as fare buttons or calendar days need their card
   // or month: the largest short block around the control.
   const context = e => {
