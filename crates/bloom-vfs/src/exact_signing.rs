@@ -25,6 +25,27 @@ const STATE_SCHEMA: &str = "bloom.machine_exact_signing.v1";
 const APPROVAL_TTL_MS: u64 = 5 * 60 * 1000;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+// Old daemon facts already committed to the exact action bytes. Backfill only
+// that authenticated local identity, never invent a new approval or sign ID.
+fn migrate_review_digest(
+    saved: &mut Option<Digest32>,
+    current: &Option<Digest32>,
+    saved_facts: &Digest32,
+    current_facts: &Digest32,
+    facts: &serde_json::Value,
+) {
+    if saved.is_none()
+        && saved_facts == current_facts
+        && let Some(digest) = current
+        && facts
+            .get("action_digest")
+            .and_then(serde_json::Value::as_str)
+            == Some(digest.as_str())
+    {
+        *saved = Some(digest.clone());
+    }
+}
+
 fn exact_claim_value_limits(claim: &PetalUseClaim) -> Result<Vec<ValueLimit>, String> {
     let mut totals = BTreeMap::<(String, String), alloy::primitives::U256>::new();
     let mut add = |chain: &Token, asset: &str, amount: &DecimalU256| -> Result<(), String> {
@@ -356,6 +377,13 @@ impl BrokerExactPayloadSigner {
             }
             Err(error) => return Err(format!("read exact signing state: {error}")),
         };
+        migrate_review_digest(
+            &mut state.review_payload_digest,
+            &review_payload_digest,
+            &state.canonical_plan_facts_digest,
+            &canonical_plan_facts_digest,
+            canonical_plan_facts,
+        );
         if state.schema != STATE_SCHEMA
             || state.action_id != action_id
             || state.wallet_id != wallet_id
@@ -775,6 +803,13 @@ impl BrokerExactPayloadSigner {
             }
             Err(error) => return Err(format!("read exact batch signing state: {error}")),
         };
+        migrate_review_digest(
+            &mut state.review_payload_digest,
+            &review_payload_digest,
+            &state.canonical_plan_facts_digest,
+            &canonical_plan_facts_digest,
+            canonical_plan_facts,
+        );
         if state.schema != STATE_SCHEMA
             || state.action_id != action_id
             || state.wallet_id != wallet_id
@@ -1541,6 +1576,7 @@ mod tests {
             claim_assurance: bloom_broker_api::ClaimAssurance::MachineAsserted,
         };
         let envelope = serde_json::to_vec(&serde_json::json!({"schema":schema})).unwrap();
+        let facts = serde_json::json!({"action_digest": hex::encode(Sha256::digest(&envelope))});
         let prepared_envelopes = || {
             broker
                 .requests
@@ -1573,7 +1609,7 @@ mod tests {
                     &[payload.to_vec()],
                     std::slice::from_ref(&ordered_hash),
                     CryptoSuite::Secp256k1Keccak256Recoverable,
-                    &serde_json::json!({}),
+                    &facts,
                     &subject,
                     &claim,
                     None,
@@ -1591,7 +1627,7 @@ mod tests {
                     payload,
                     ordered_hash.clone(),
                     CryptoSuite::Secp256k1Keccak256Recoverable,
-                    &serde_json::json!({}),
+                    &facts,
                     &subject,
                     &claim,
                     None,
@@ -1614,7 +1650,7 @@ mod tests {
                     &[payload.to_vec()],
                     std::slice::from_ref(&ordered_hash),
                     CryptoSuite::Secp256k1Keccak256Recoverable,
-                    &serde_json::json!({}),
+                    &facts,
                     &subject,
                     &claim,
                     None,
@@ -1633,7 +1669,7 @@ mod tests {
                     payload,
                     ordered_hash.clone(),
                     CryptoSuite::Secp256k1Keccak256Recoverable,
-                    &serde_json::json!({}),
+                    &facts,
                     &subject,
                     &claim,
                     None,
@@ -1655,8 +1691,20 @@ mod tests {
         let state_path = temporary.path().join("confirm.json");
         let saved = fs::read(&state_path).unwrap();
         let calls = broker.requests.lock().unwrap().len();
-        for witness in [Some(changed.as_slice()), None] {
-            let error = if batch {
+        for (migrate, witness) in [
+            (false, Some(changed.as_slice())),
+            (false, None),
+            (true, Some(envelope.as_slice())),
+        ] {
+            if migrate {
+                let mut legacy: serde_json::Value = serde_json::from_slice(&saved).unwrap();
+                legacy
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("review_payload_digest");
+                fs::write(&state_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+            }
+            let result = if batch {
                 signer
                     .sign_or_prepare_petal_batch(
                         &state_path,
@@ -1666,14 +1714,14 @@ mod tests {
                         &[payload.to_vec()],
                         std::slice::from_ref(&ordered_hash),
                         CryptoSuite::Secp256k1Keccak256Recoverable,
-                        &serde_json::json!({}),
+                        &facts,
                         &subject,
                         &claim,
                         None,
                         witness,
                     )
                     .await
-                    .unwrap_err()
+                    .map(|_| ())
             } else {
                 signer
                     .sign_or_prepare_petal(
@@ -1684,18 +1732,34 @@ mod tests {
                         payload,
                         ordered_hash.clone(),
                         CryptoSuite::Secp256k1Keccak256Recoverable,
-                        &serde_json::json!({}),
+                        &facts,
                         &subject,
                         &claim,
                         None,
                         witness,
                     )
                     .await
-                    .unwrap_err()
+                    .map(|_| ())
             };
-            assert!(error.contains("persisted operation identity"), "{error}");
-            assert_eq!(fs::read(&state_path).unwrap(), saved);
-            assert_eq!(broker.requests.lock().unwrap().len(), calls);
+            if migrate {
+                result.unwrap();
+                let migrated: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+                let original: serde_json::Value = serde_json::from_slice(&saved).unwrap();
+                for field in [
+                    "approval_id",
+                    "approval_operation_id",
+                    "signing_operation_id",
+                    "review_payload_digest",
+                ] {
+                    assert_eq!(migrated[field], original[field], "{field}");
+                }
+            } else {
+                let error = result.unwrap_err();
+                assert!(error.contains("persisted operation identity"), "{error}");
+                assert_eq!(fs::read(&state_path).unwrap(), saved);
+                assert_eq!(broker.requests.lock().unwrap().len(), calls);
+            }
         }
     }
 

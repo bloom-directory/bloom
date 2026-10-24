@@ -181,46 +181,15 @@ Single and batch exact signing states also bind the review envelope digest
 directly, independently of caller-supplied plan facts. Changing or dropping the
 envelope on retry fails without changing the saved approval or calling Broker.
 Older states without a digest remain usable for requests without an envelope;
-reviewed legacy states fail closed and are retained for reconciliation. They
-must not be deleted or silently reset to retry a potentially signed operation.
+reviewed legacy states migrate in place only when their saved facts digest
+matches the current facts and those facts contain the envelope's `action_digest`.
+This preserves approval and signing operation IDs, including lost-response
+recovery. Missing or inconsistent evidence fails closed and is retained for
+reconciliation; never delete or reset it to retry a potentially signed operation.
 
-The intended integration
-with [persona onboarding (#352)](https://github.com/bloom-directory/bloom/pull/352)
-supports either an exact approval or an explicitly approved bounded session.
-It reuses the shared accounting in
-[Broker #100](https://github.com/bloom-directory/bloom-broker/pull/100) and
-[Signer #68](https://github.com/bloom-directory/bloom-signer/pull/68), rather than
-introducing another session system. A new operation class is not inherently
-required: eligibility must depend on verified session terms and payloads,
-not a class name or the selected persona alone.
-
-This is an integration contract, not enabled session support in this branch:
-
-- Machine must carry the complete order review envelope through session
-  selection, signing and recovery. The persisted attempt identity must bind it
-  alongside the payload, claim, selected account and original approval. An
-  altered envelope must not recover an existing attempt as a new operation.
-- Broker must reconstruct the signed order from that envelope, bind the
-  selected signer and supported domain, and verify the charged asset and
-  quantity against the order before accepting session accounting. The declared
-  debit checks in [Polymarket #19](https://github.com/bloom-directory/bloom-petal-polymarket/pull/19)
-  are useful but do not replace Broker verification. BUY collateral and SELL
-  share units must not be treated as interchangeable spending capacity.
-- Reuse the approved per-action, rolling and lifetime budgets, expiry,
-  revocation and shared reservations. Retry, reactivation, cancellation and
-  uncertain submission must not reset or refund consumed authority. Recovering
-  a retained signature must not authorize a new signature.
-- Keep exact approval available when no eligible session exists. Never silently
-  widen a session or create a fresh attempt to evade its exhausted budget.
-  Invalid payloads remain errors, not candidates for less restrictive signing.
-
-Broker #100 currently predates the message verifier landed in Broker #103.
-Until their combined implementation verifies order economics and passes real
-Broker–Signer tests, keep the reusable-message rejection in place. Test altered
-envelopes, false debits, wrong accounts/domains, expiry, revocation, shared
-exhaustion and replay before enabling the session path. This does not require
-Josh's branch to change as part of #224, nor make #352 a prerequisite for
-shipping #224's exact approval path.
+Bounded persona trading is a separate integration; exact approval does not
+require it. Implementation dependencies and future session acceptance criteria
+are tracked in [PM #80](https://github.com/bloom-directory/pm/issues/80).
 
 CLOB authentication uses the distinct immutable `polymarket.clob_auth.v1`
 permission: one operation/signature, Polygon ClobAuthDomain version 1, selected
@@ -287,12 +256,26 @@ or a new wallet clear-signing mode.
 
 ### Caller and catalog migration
 
-`reviewMode` is removed from intents, staged transactions and deploy requests.
-Callers must omit it; strict deploy request decoding rejects the obsolete
-field. There is no replacement opt-in flag. Broker derives the review from
+`reviewMode` no longer selects signing authority. Deploy retains its deprecated
+`--review-mode` flag (with a warning) and `reviewMode` request field for one
+migration release. Saved deployment `review_mode` values remain part of their
+original submission identities; they do not control review. Other unknown
+deployment fields are still rejected. There is no replacement opt-in flag. Broker derives the review from
 the actual transaction and the registered signing class. Known message
 classes and every Keccak signing payload beginning with `0x19` require their
 full review envelopes, including messages under otherwise unlisted classes.
+Batches that cannot carry a review envelope must use the single-payload exact
+path instead. The separately verified CLOB login and Hyperliquid agent scopes
+retain their use-time witness contracts.
+
+Symbol lookup uses the pinned Broker catalog and refuses ambiguity. Comparing
+the previous five-chain table with this catalog leaves its existing addresses
+unchanged; Arbitrum's `USDT` is now named `USDT0` at
+`0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9`. Use `USDT0` or the address there.
+Existing WBTC and DAI entries still resolve. Symbols such as Ethereum LIT and
+Gnosis EURE/JPYC/USDC.E are ambiguous in the expanded catalog: use addresses.
+Approval amounts for unknown tokens use raw units, not contract-reported
+symbols or decimals.
 
 Before shipping this combination, publish the compatible Petal packages and
 update `github_source.rs` release commits, archives, package hashes, lineage

@@ -368,9 +368,7 @@ fn petal_review_payload<'a>(
                 .ok()
                 .is_some_and(|value| value["schema"] == "bloom.message.review.v1")
         });
-        let signed_message = crypto_suite
-            == bloom_broker_api::CryptoSuite::Secp256k1Keccak256Recoverable
-            && preimage.first() == Some(&0x19);
+        let signed_message = bloom_machine_client::is_signed_message(crypto_suite, preimage);
         if (bloom_broker_api::MESSAGE_REVIEW_OPERATION_CLASSES.contains(&operation_class)
             || signed_message)
             && message.is_none()
@@ -2334,6 +2332,16 @@ impl PetalHost for DaemonPetalHost {
                 )));
             }
         };
+        if review_payload.is_none()
+            && req.operation_class != bloom_broker_api::POLYMARKET_CLOB_AUTH_CLASS
+            && req
+                .payloads
+                .iter()
+                .any(|item| bloom_machine_client::is_signed_message(crypto_suite, &item.preimage))
+        {
+            return Err(HostError::Invalid(
+                "Signed-message batches require the single-payload exact path with a review envelope".into()));
+        }
         let account_key = self
             .account_owner(context, &req.wallet, crypto_suite, None)
             .await?;

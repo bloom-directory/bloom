@@ -6,6 +6,9 @@ use serde_json::Value;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeploymentTransaction {
+    /// Retained in saved identities for one migration release; never grants authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_mode: Option<String>,
     pub chain_id: u64,
     pub from: Address,
     pub to: Option<Address>,
@@ -53,6 +56,7 @@ impl DeploymentTransaction {
                 "chainId",
                 "type",
                 "accessList",
+                "reviewMode",
             ]
             .contains(&key.as_str())
             {
@@ -151,7 +155,18 @@ impl DeploymentTransaction {
         if gas == Some(0) {
             return Err("gas must be positive".into());
         }
+        let review_mode = o
+            .get("reviewMode")
+            .map(|value| {
+                value
+                    .as_str()
+                    .filter(|mode| matches!(*mode, "clear" | "opaque_exact"))
+                    .map(str::to_owned)
+                    .ok_or("invalid deprecated reviewMode")
+            })
+            .transpose()?;
         Ok(Self {
+            review_mode,
             chain_id,
             from,
             to,
@@ -219,5 +234,19 @@ mod tests {
         let mut call = base;
         call["to"] = json!(Address::ZERO);
         assert!(parse(call).unwrap().to.is_some());
+    }
+
+    #[test]
+    fn legacy_review_mode_preserves_saved_submission_identity() {
+        let tx =
+            parse(json!({"from":Address::ZERO,"data":"0x6000","nonce":"0x0","reviewMode":"clear"}))
+                .unwrap();
+        let bytes = serde_json::to_vec(&tx).unwrap();
+        let restored: DeploymentTransaction = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(restored.review_mode.as_deref(), Some("clear"));
+        assert_eq!(tx.id("alice", "anvil"), restored.id("alice", "anvil"));
+        let mut unknown = serde_json::to_value(&tx).unwrap();
+        unknown["other_field"] = json!(true);
+        assert!(serde_json::from_value::<DeploymentTransaction>(unknown).is_err());
     }
 }

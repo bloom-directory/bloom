@@ -438,7 +438,6 @@ rewrite_signer_config() {
     --argjson ceremony_port "$ceremony_port" \
     '.build_digest = $digest | .ceremony_port = $ceremony_port |
      .network_containment = null |
-     .ceremony_ttl_ms = 1800000 |
      .maximum_requests_per_window = 10000' "$source" > "$temporary"
   chmod 0600 "$temporary"
   mv -f "$temporary" "$source"

@@ -419,6 +419,9 @@ fn classify_action_kind(
 type NonceLocks =
     Arc<parking_lot::Mutex<HashMap<(String, String, Address), Arc<tokio::sync::Mutex<()>>>>>;
 
+type EntryLocks =
+    Arc<parking_lot::Mutex<HashMap<(String, String, String), Arc<tokio::sync::Mutex<()>>>>>;
+
 const TRIAD_SIGNING_STATE_FILE: &str = "ceremony.json";
 const TRIAD_BATCH_STATE_DIR: &str = ".batch-signing";
 const TRIAD_BATCH_STATE_FILE: &str = "ceremony.json";
@@ -511,6 +514,7 @@ pub struct TxEngine {
     /// microseconds only (HashMap lookup/insert); the inner
     /// `tokio::sync::Mutex` is the actual per-sender stage lock.
     nonce_locks: NonceLocks,
+    entry_locks: EntryLocks,
     triad_signing: Option<Arc<TriadSigningService>>,
 }
 
@@ -525,6 +529,7 @@ impl TxEngine {
             mempool_indexes: Arc::new(RwLock::new(BTreeMap::new())),
             private_rpcs: Arc::new(RwLock::new(BTreeMap::new())),
             nonce_locks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            entry_locks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             triad_signing: None,
         }
     }
@@ -571,6 +576,14 @@ impl TxEngine {
         self.nonce_locks
             .lock()
             .entry(key)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    fn entry_lock_for(&self, wallet: &str, chain: &str, id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.entry_locks
+            .lock()
+            .entry((wallet.into(), chain.into(), id.into()))
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
     }
@@ -1960,6 +1973,10 @@ impl TxEngine {
         override_warnings: bool,
     ) -> Result<(), TxEngineError> {
         self.assert_write_permit(permit)?;
+        let _entry_guard = self
+            .entry_lock_for(wallet, chain_name, id)
+            .lock_owned()
+            .await;
         let entry = self
             .outbox
             .read_in_state(wallet, chain_name, id, OutboxState::Pending)?;
@@ -1989,14 +2006,13 @@ impl TxEngine {
         let hard = policy_engine::has_hard_violation(&staged.policy_checks);
         if hard {
             staged.status = TxStatus::Failed;
-            let failed_dir = self
-                .outbox
-                .transition(&entry, crate::outbox::OutboxState::Failed)?;
             self.outbox.write_artefact(
-                &failed_dir,
+                &entry.dir,
                 "intent.json",
                 &serde_json::to_vec_pretty(&staged).map_err(OutboxError::from)?,
             )?;
+            self.outbox
+                .transition(&entry, crate::outbox::OutboxState::Failed)?;
             debug!(
                 id = %staged.id,
                 wallet,
@@ -2098,6 +2114,13 @@ impl TxEngine {
                     reference.chain, reference.id
                 )));
             }
+        }
+        // A deterministic order prevents deadlocks between overlapping batches.
+        let mut refs = unique.into_iter().collect::<Vec<_>>();
+        refs.sort();
+        let mut entry_guards = Vec::with_capacity(refs.len());
+        for (chain, id) in refs {
+            entry_guards.push(self.entry_lock_for(wallet, &chain, &id).lock_owned().await);
         }
         let parent_state_path =
             batch_signing_state_path(self.outbox.root(), wallet, &ordered_refs)?;
@@ -2356,6 +2379,10 @@ impl TxEngine {
         override_warnings: bool,
     ) -> Result<StagedTx, TxEngineError> {
         self.assert_write_permit(permit)?;
+        let _entry_guard = self
+            .entry_lock_for(wallet, chain_name, id)
+            .lock_owned()
+            .await;
         let entry = self
             .outbox
             .read_in_state(wallet, chain_name, id, OutboxState::Pending)?;
@@ -2394,14 +2421,13 @@ impl TxEngine {
         let hard = policy_engine::has_hard_violation(&staged.policy_checks);
         if hard {
             staged.status = TxStatus::Failed;
-            let failed_dir = self
-                .outbox
-                .transition(&entry, crate::outbox::OutboxState::Failed)?;
             self.outbox.write_artefact(
-                &failed_dir,
+                &entry.dir,
                 "intent.json",
                 &serde_json::to_vec_pretty(&staged).map_err(OutboxError::from)?,
             )?;
+            self.outbox
+                .transition(&entry, crate::outbox::OutboxState::Failed)?;
             debug!(
                 id = %staged.id,
                 wallet,
@@ -3115,10 +3141,9 @@ impl TxEngine {
         }
         let signing_preimage = Self::unsigned_signing_preimage(&prepared.unsigned);
         let signature = self
-            .host_sign_evm_hash(
+            .triad_sign_evm_payload(
                 entry,
                 staged,
-                chain,
                 action_kind,
                 &signing_preimage,
                 prepared.signing_hash,
@@ -3165,8 +3190,6 @@ impl TxEngine {
         Ok(signed.hash)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    #[cfg(test)]
     async fn triad_sign_evm_payload(
         &self,
         entry: &crate::outbox::OutboxEntry,
@@ -3174,26 +3197,6 @@ impl TxEngine {
         action_kind: EvmOutboxActionKind,
         signing_preimage: &[u8],
         signing_hash: B256,
-    ) -> Result<Signature, TxEngineError> {
-        self.triad_sign_evm_payload_with(
-            entry,
-            staged,
-            action_kind,
-            signing_preimage,
-            signing_hash,
-            None,
-        )
-        .await
-    }
-
-    async fn triad_sign_evm_payload_with(
-        &self,
-        entry: &crate::outbox::OutboxEntry,
-        staged: &StagedTx,
-        action_kind: EvmOutboxActionKind,
-        signing_preimage: &[u8],
-        signing_hash: B256,
-        reported_token: Option<bloom_broker_api::EvmReportedToken>,
     ) -> Result<Signature, TxEngineError> {
         let service = self.triad_signing.as_ref().ok_or_else(|| {
             TxEngineError::ApprovalServiceUnavailable(
@@ -3461,7 +3464,7 @@ impl TxEngine {
             provenance,
             &state,
             key.selector.clone(),
-            reported_token,
+            None,
         )?;
         if state.approval_id.is_some() {
             let expected_operation_digest = expected_evm_sign_operation_digest(
@@ -3853,27 +3856,6 @@ impl TxEngine {
         }
     }
 
-    async fn host_sign_evm_hash(
-        &self,
-        entry: &crate::outbox::OutboxEntry,
-        staged: &StagedTx,
-        chain: &ChainClient,
-        action_kind: EvmOutboxActionKind,
-        signing_preimage: &[u8],
-        signing_hash: B256,
-    ) -> Result<Signature, TxEngineError> {
-        let reported_token = reported_token(chain, staged).await;
-        self.triad_sign_evm_payload_with(
-            entry,
-            staged,
-            action_kind,
-            signing_preimage,
-            signing_hash,
-            reported_token,
-        )
-        .await
-    }
-
     /// Refuse to broadcast when a same-chain dependency has not mined
     /// successfully. Both "not yet confirmed" and "reverted/failed" are hard
     /// refusals: broadcasting a dependent tx before its predecessor confirms
@@ -4191,6 +4173,10 @@ impl TxEngine {
         policy: &Policy,
     ) -> Result<StagedTx, TxEngineError> {
         self.assert_write_permit(permit)?;
+        let _entry_guard = self
+            .entry_lock_for(wallet, chain_name, original_id)
+            .lock_owned()
+            .await;
         let bump = bump_pct.max(10);
         let entry = self.read_replaceable_entry(wallet, chain_name, original_id)?;
         let original = &entry.staged;
@@ -4300,6 +4286,14 @@ impl TxEngine {
         id: &str,
     ) -> Result<(), TxEngineError> {
         self.assert_write_permit(permit)?;
+        let _entry_guard = self
+            .entry_lock_for(wallet, chain, id)
+            .try_lock_owned()
+            .map_err(|_| {
+                TxEngineError::ApprovalState(
+                    "transaction operation in progress; retry after it completes".into(),
+                )
+            })?;
         let entry = self
             .outbox
             .read_in_state(wallet, chain, id, OutboxState::Pending)?;
@@ -4308,7 +4302,9 @@ impl TxEngine {
                 .outbox
                 .read_broadcast_attempt(&entry, BroadcastAttemptKind::Confirm)?
                 .is_some()
-            || read_triad_signing_state(&entry.dir.join(TRIAD_SIGNING_STATE_FILE))?
+            || read_triad_signing_state(&entry.dir.join(TRIAD_SIGNING_STATE_FILE))
+                .map_err(|error| TxEngineError::ApprovalState(format!(
+                    "cannot establish whether this transaction was signed: {error}; preserve ceremony.json, inspect the Broker operation and chain nonce, and restore the signing record from backup before retrying; do not delete the record")))?
                 .is_some_and(|state| state.sign_dispatched)
         {
             return Err(TxEngineError::ApprovalState(
@@ -4335,6 +4331,10 @@ impl TxEngine {
         policy: &Policy,
     ) -> Result<StagedTx, TxEngineError> {
         self.assert_write_permit(permit)?;
+        let _entry_guard = self
+            .entry_lock_for(wallet, chain_name, original_id)
+            .lock_owned()
+            .await;
         let bump = bump_pct.max(10);
         let entry = self.read_replaceable_entry(wallet, chain_name, original_id)?;
         if entry.state == OutboxState::Pending
@@ -4578,31 +4578,6 @@ async fn evm_signing_key(
             "more than one active derived EVM account of this wallet has address {from}"
         ))),
     }
-}
-
-/// What the called contract reports about itself when the call has the exact
-/// ERC-20 `transfer` or `approve` shape, so Broker can show a readable amount
-/// for a token it does not list. Broker labels it unverified; a contract that
-/// does not answer gets no report and the amount stays in raw units.
-async fn reported_token(
-    chain: &ChainClient,
-    staged: &StagedTx,
-) -> Option<bloom_broker_api::EvmReportedToken> {
-    let data = staged.data_hex.trim_start_matches("0x");
-    let erc20_shape =
-        data.len() == 136 && (data.starts_with("a9059cbb") || data.starts_with("095ea7b3"));
-    let to: Address = staged.to.as_deref()?.parse().ok()?;
-    if !erc20_shape
-        || bloom_broker_api::tokens_on(staged.chain_id)
-            .any(|token| token.address == format!("{to:#x}"))
-    {
-        return None;
-    }
-    Some(bloom_broker_api::EvmReportedToken {
-        address: format!("{to:#x}"),
-        decimals: chain.erc20_decimals(to).await.ok()??,
-        symbol: chain.erc20_symbol(to).await.ok()??,
-    })
 }
 
 fn exact_evm_sign_request(
@@ -6556,6 +6531,7 @@ mod tests {
         let (engine, _dir, permit, chain) = stage_fixture(&url, oracle);
         let from: Address = TEST_SIGNER_ADDRESS.parse().unwrap();
         let request = crate::deployment::DeploymentTransaction {
+            review_mode: None,
             chain_id: 31337,
             from,
             to: None,
@@ -6640,6 +6616,7 @@ mod tests {
         std::fs::create_dir_all(&orphan).unwrap();
 
         let request = crate::deployment::DeploymentTransaction {
+            review_mode: None,
             chain_id: 31337,
             from,
             to: None,
@@ -9292,6 +9269,39 @@ mod tests {
         let entry = engine.outbox.read("alice", "anvil", &staged.id).unwrap();
         assert_eq!(entry.state, OutboxState::Failed);
         assert_eq!(entry.staged.status, TxStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn discard_refuses_an_entry_held_by_confirmation() {
+        let (engine, _, dir) = fake_engine(60_000);
+        let permit = permit_for(&dir);
+        let staged = fake_staged_1559("0001-lock");
+        engine.outbox.write_pending(&staged, "p").unwrap();
+        let guard = engine
+            .entry_lock_for("alice", "anvil", &staged.id)
+            .lock_owned()
+            .await;
+        let other = engine.clone();
+        let error = other
+            .discard_unsigned(&permit, "alice", "anvil", &staged.id)
+            .unwrap_err();
+        assert!(error.to_string().contains("operation in progress"));
+        assert!(
+            engine
+                .outbox
+                .read_in_state("alice", "anvil", &staged.id, OutboxState::Pending)
+                .is_ok()
+        );
+        drop(guard);
+        other
+            .discard_unsigned(&permit, "alice", "anvil", &staged.id)
+            .unwrap();
+        assert!(
+            engine
+                .outbox
+                .read_in_state("alice", "anvil", &staged.id, OutboxState::Pending)
+                .is_err()
+        );
     }
 
     /// A soft-Warn check must block confirm() when no override sentinel is

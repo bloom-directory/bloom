@@ -371,6 +371,10 @@ works for Petal-staged entries too. The separate `cancel` file replaces an
 already broadcast transaction (`bloom wallet cancel`) and needs its own
 approval. Dropping a reservation does not renumber later rows:
 restage with an explicit nonce to fill a gap.
+Discard is refused while another operation is active or signing/broadcast may
+have occurred. An unreadable signing record is not proof that nothing signed:
+preserve it, inspect Broker operation status and the chain nonce, and restore
+the record from backup before retrying. Never delete it to force a fresh attempt.
 
 `confirm.override` is not a general escape hatch. Use it only when the
 inspected policy projection explicitly permits that control and the human has
@@ -472,7 +476,9 @@ Petal's status files.
 Petals send Broker the complete transaction or message to sign, bound to the
 account in the route path. If signing is refused because an installed Petal
 is older than the running Bloom services, install the package version that
-matches them. Do not work around the refusal by changing accounts, removing
+matches them once it has been published. If no compatible release exists,
+report the package rollout blocker; do not repeatedly reinstall the old release.
+Do not work around the refusal by changing accounts, removing
 fields, or switching to a reusable or batch path. After the owner approves,
 retry the same request.
 
@@ -482,13 +488,16 @@ retry the same request.
 - **Polymarket:** `begin` asks for a login approval that can only create
   exchange credentials; it cannot sign payments, orders or wallet batches.
   `continue` sets up the deposit wallet with its own exact approval. Read
-  `status.json` and follow `next_action`.
+  `status.json` and follow `next_action`. Each order currently needs exact
+  approval; selecting Trader or Degen does not itself authorize automatic orders.
 - **Hyperliquid:** delegated trading sessions sign later actions without a
   new prompt. The Petal's own session limits are local; the exchange does not
   enforce them.
 - **Pump:** a refreshed recent blockhash keeps the existing approval; any
   other change to the transaction needs a new one. Retry through the same Pump
-  operation.
+  operation. The approval permits one signature only. After signing, recover
+  that result and reconcile submission; do not request another signature with
+  a refreshed blockhash while the first transaction may still land.
 - **Venice:** a login approval grants no payment authority, and each later
   request uses a fresh login proof.
 
