@@ -117,9 +117,12 @@ precede ticket issuance; expect the e-ticket later by email, and do not call
 an order number a paid ticket. Agencies may require stricter fraud checks.
 Record the agency as the shop. Reachability observations have dates, not
 guarantees; hand off on a block without fingerprint spoofing, CAPTCHA
-solving or cookie import. American, SAS, SWISS, easyJet and United have
-blocked Bloom's browser; Aerolíneas reached its passenger page on 2026-10-13.
-JetSMART, Shopify and Stripe-hosted checkouts also work in Bloom's browser.
+solving or cookie import. Earlier airline homepage probes do not establish
+whether an itinerary can reach checkout today. Aerolíneas reached its passenger
+page but stopped at reCAPTCHA; JetSMART had a purchase on an earlier build.
+Neither result verifies the current build or another itinerary. Record the
+date, itinerary, last completed step and blocker when checking a seller.
+Reaching payment review does not prove a charge or an issued ticket.
 Do not click or type through the desktop.
 
 `filled` means fields were filled, not that payment succeeded. `booked`,

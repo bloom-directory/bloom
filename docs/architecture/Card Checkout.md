@@ -75,11 +75,17 @@ Final itinerary/party review and binding remain a separate acceptance gate.
 
 ## Booking sites that reject Bloom's browser
 
-Airlines that reject a fresh browser are not bookable by Bloom. For those,
-Bloom gives the person the deep link and they book it themselves. Named
-cases include Aerolíneas Argentinas, American, SAS, SWISS, easyJet and
-United. JetSMART, Shopify and Stripe-hosted checkouts work in Bloom's own
-browser.
+When an airline rejects Bloom's browser, the agent tries an agency selling
+the selected itinerary on Google's booking page. It reports the agency's
+price and booking terms before approval. If no listed seller works, it gives
+the person the booking link. No fingerprint spoofing, automated CAPTCHA
+solving or cookie import is used.
+
+Seller observations are dated evidence of a particular step and itinerary.
+A homepage loading does not prove checkout support; payment review does not
+prove a charge or ticket issuance. Earlier purchases do not verify a changed
+service combination. Current operator guidance lives in `docs/checkout.md`
+inside the VFS.
 
 ## Private view
 
@@ -143,6 +149,6 @@ different operation IDs. Nothing persists a PRF output, CVC, or reusable grant.
 - Card ceremonies share Broker's anonymous quota of four per five minutes.
 - Take-over and site payment need the card passkey, so one card must be saved.
 - The private view is local; phone take-over needs a remote surface.
-- Airlines that reject a fresh browser are not bookable by Bloom. Give the
-  person the deep link; they finish in their own browser. The caller supplies
-  the booking link.
+- Direct airline booking depends on the site's browser acceptance. Agency
+  fallback depends on a listed seller offering the selected itinerary; it
+  does not guarantee coverage for every airline or fare.
