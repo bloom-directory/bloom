@@ -283,6 +283,15 @@ predecessors and authority routes together. Existing wallets must approve the
 new package identities. A source branch or local package build is not a
 published catalog release. Keep required reviews enforced while those releases
 are pending; the old catalog is not compatible merely because Machine CI passes.
+Package publication must precede the Machine catalog update: after each Petal's
+own changes have landed and its package checks pass, its compatible immutable
+release may be tagged and published before Machine #224 merges. Publication
+does not install the package, switch the default catalog or deploy services.
+Then update the catalog pins, pass the required producer/authority tests and
+final-combination conformance, and deploy the coordinated service/package
+combination. Do not require #224 to merge before publishing its package inputs;
+that creates a circular release dependency. Older installations retain their
+pinned packages; upgraded wallets still require owner approval of new identities.
 Bloom #224 must remain unmergeable until the default Polymarket and Hyperliquid
 catalog pins select compatible published packages. Broker #103 has landed and
 this branch pins its landed commit `e2f55a7e291eff32d3d544f0f94dc770945bafd7`.
