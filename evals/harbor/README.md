@@ -37,8 +37,28 @@ or onboarding request as a swap proposal.
 Supply the exact four candidate binaries using
 `BLOOM_INTEGRATION_MACHINE_BIN`, `BLOOM_INTEGRATION_BROKER_BIN`,
 `BLOOM_INTEGRATION_SIGNER_BIN` and `BLOOM_INTEGRATION_DEBUG_DRIVER_BIN`.
-Build Machine, Broker and Signer with `triad-dev-harness`; Machine also needs
-`mount`. See `DEVELOPMENT.md` for launcher prerequisites and revision selection.
+Build all three services with the **release profile** and `triad-dev-harness`;
+Machine also needs `mount`. Point the variables above at those optimized
+executables, including the Broker debug driver's release-profile executable.
+For example, run the corresponding command in each selected checkout:
+
+```sh
+# Machine (default features include mount)
+cargo build --release --locked -p bloom --features triad-dev-harness
+# Broker and its software-authenticator driver
+cargo build --release --locked -p bloom-broker -p bloom-broker-debug-driver --features bloom-broker/triad-dev-harness
+# Signer (default features include the local backend)
+cargo build --release --locked -p bloom-signer --features triad-dev-harness
+```
+
+Debug Broker/Signer builds make authenticated account refreshes expensive.
+Mounted metadata lookups repeat those live refreshes: a controlled comparison
+of the same revisions measured 119 seconds for twelve Hyperliquid child stats
+with debug services and 2.8 seconds with all three services optimized. Optimizing
+only Machine still took 111 seconds. Keep custody freshness checks and task
+limits intact; use representative optimized services for agent timing.
+
+See `DEVELOPMENT.md` for launcher prerequisites and revision selection.
 The harness never selects or stops the installed custody Triad.
 
 ```sh
