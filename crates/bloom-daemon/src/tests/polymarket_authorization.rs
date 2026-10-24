@@ -171,10 +171,16 @@ impl PetalHost for VenueFixture {
         request: PayloadBatchSignRequest,
     ) -> Result<PayloadBatchSignOutcome, HostError> {
         self.requests.lock().unwrap().push(request.clone());
-        let result = self
-            .machine
-            .sign_payload_batch_outcome(request.clone())
-            .await;
+        // Keep the component's original request for producer assertions, but
+        // exercise a caller preferring reusable authority at the real boundary.
+        // Machine must still obtain exact approval with the complete witness.
+        let mut forwarded = request.clone();
+        if bloom_broker_api::POLYMARKET_REVIEW_OPERATION_CLASSES
+            .contains(&forwarded.operation_class.as_str())
+        {
+            forwarded.selector = bloom_broker_api::PetalSignSelector::Reusable;
+        }
+        let result = self.machine.sign_payload_batch_outcome(forwarded).await;
         if let Ok(PayloadBatchSignOutcome::Signatures(signatures)) = &result {
             self.signed
                 .lock()
@@ -699,6 +705,7 @@ async fn installed_account_one_auth_and_exact_continuation_use_real_authority() 
         "signed_operations":2,"hint_substitutions":["account","class","route","batch"],
         "installer_denials_without_hint":["class","route"],"unknown_package_cannot_sign":true,
         "cancelled_approval_cannot_sign":true,
+        "reviewed_reusable_preference_uses_exact_approval":true,
         "limits":"disposable software owner; controlled venue/chain observations; no venue submission, funds or settlement"});
     std::fs::write(
         setting("BLOOM_PM80_AUTHORIZATION_RESULT"),

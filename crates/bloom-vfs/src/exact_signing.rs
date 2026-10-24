@@ -106,6 +106,8 @@ struct ExactSigningState {
     crypto_suite: CryptoSuite,
     payload_digest: Digest32,
     claimed_hash: Digest32,
+    #[serde(default)]
+    review_payload_digest: Option<Digest32>,
     provenance_digest: Digest32,
     approval_operation_id: OperationId,
     signing_operation_id: OperationId,
@@ -128,6 +130,8 @@ struct ExactBatchSigningState {
     crypto_suite: CryptoSuite,
     payload_digests: Vec<Digest32>,
     claimed_hashes: Vec<Digest32>,
+    #[serde(default)]
+    review_payload_digest: Option<Digest32>,
     provenance_digest: Digest32,
     approval_operation_id: OperationId,
     signing_operation_id: OperationId,
@@ -318,6 +322,8 @@ impl BrokerExactPayloadSigner {
             .digest()
             .map_err(|error| format!("digest installer provenance: {error}"))?;
         let payload_digest = Digest32::from_bytes(Sha256::digest(preimage).into());
+        let review_payload_digest =
+            petal_review_payload.map(|bytes| Digest32::from_bytes(Sha256::digest(bytes).into()));
         let plan_bytes = serde_jcs::to_vec(canonical_plan_facts)
             .map_err(|error| format!("canonicalize exact signing facts: {error}"))?;
         let canonical_plan_facts_digest = Digest32::from_bytes(Sha256::digest(plan_bytes).into());
@@ -337,6 +343,7 @@ impl BrokerExactPayloadSigner {
                     crypto_suite,
                     payload_digest: payload_digest.clone(),
                     claimed_hash: claimed_hash.clone(),
+                    review_payload_digest: review_payload_digest.clone(),
                     provenance_digest: provenance_digest.clone(),
                     approval_operation_id: random_operation_id(),
                     signing_operation_id: random_operation_id(),
@@ -357,6 +364,7 @@ impl BrokerExactPayloadSigner {
             || state.crypto_suite != crypto_suite
             || state.payload_digest != payload_digest
             || state.claimed_hash != claimed_hash
+            || state.review_payload_digest != review_payload_digest
             || state.provenance_digest != provenance_digest
             || state.canonical_plan_facts_digest != canonical_plan_facts_digest
         {
@@ -733,6 +741,8 @@ impl BrokerExactPayloadSigner {
             .iter()
             .map(|payload| Digest32::from_bytes(Sha256::digest(payload).into()))
             .collect::<Vec<_>>();
+        let review_payload_digest =
+            message_review_payload.map(|bytes| Digest32::from_bytes(Sha256::digest(bytes).into()));
         let plan_bytes = serde_jcs::to_vec(canonical_plan_facts)
             .map_err(|error| format!("canonicalize exact batch signing facts: {error}"))?;
         let canonical_plan_facts_digest = Digest32::from_bytes(Sha256::digest(plan_bytes).into());
@@ -752,6 +762,7 @@ impl BrokerExactPayloadSigner {
                     crypto_suite,
                     payload_digests: payload_digests.clone(),
                     claimed_hashes: claimed_hashes.to_vec(),
+                    review_payload_digest: review_payload_digest.clone(),
                     provenance_digest: provenance_digest.clone(),
                     approval_operation_id: random_operation_id(),
                     signing_operation_id: random_operation_id(),
@@ -772,6 +783,7 @@ impl BrokerExactPayloadSigner {
             || state.crypto_suite != crypto_suite
             || state.payload_digests != payload_digests
             || state.claimed_hashes != claimed_hashes
+            || state.review_payload_digest != review_payload_digest
             || state.provenance_digest != provenance_digest
             || state.canonical_plan_facts_digest != canonical_plan_facts_digest
         {
@@ -1619,7 +1631,7 @@ mod tests {
                     "wallet",
                     class,
                     payload,
-                    ordered_hash,
+                    ordered_hash.clone(),
                     CryptoSuite::Secp256k1Keccak256Recoverable,
                     &serde_json::json!({}),
                     &subject,
@@ -1636,6 +1648,55 @@ mod tests {
             prepared_envelopes(),
             vec![vec![Base64UrlBytes::from_bytes(&envelope)]]
         );
+        // The signer binds the witness itself, even when its caller supplies
+        // unchanged plan facts. Neither replacing nor dropping it may reuse
+        // the saved approval, and rejection must leave that approval intact.
+        let changed = br#"{"schema":"changed"}"#;
+        let state_path = temporary.path().join("confirm.json");
+        let saved = fs::read(&state_path).unwrap();
+        let calls = broker.requests.lock().unwrap().len();
+        for witness in [Some(changed.as_slice()), None] {
+            let error = if batch {
+                signer
+                    .sign_or_prepare_petal_batch(
+                        &state_path,
+                        "confirm",
+                        "wallet",
+                        class,
+                        &[payload.to_vec()],
+                        std::slice::from_ref(&ordered_hash),
+                        CryptoSuite::Secp256k1Keccak256Recoverable,
+                        &serde_json::json!({}),
+                        &subject,
+                        &claim,
+                        None,
+                        witness,
+                    )
+                    .await
+                    .unwrap_err()
+            } else {
+                signer
+                    .sign_or_prepare_petal(
+                        &state_path,
+                        "confirm",
+                        "wallet",
+                        class,
+                        payload,
+                        ordered_hash.clone(),
+                        CryptoSuite::Secp256k1Keccak256Recoverable,
+                        &serde_json::json!({}),
+                        &subject,
+                        &claim,
+                        None,
+                        witness,
+                    )
+                    .await
+                    .unwrap_err()
+            };
+            assert!(error.contains("persisted operation identity"), "{error}");
+            assert_eq!(fs::read(&state_path).unwrap(), saved);
+            assert_eq!(broker.requests.lock().unwrap().len(), calls);
+        }
     }
 
     /// Builds the shared fixture: a petal exact signer whose provenance

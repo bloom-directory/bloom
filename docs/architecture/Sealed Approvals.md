@@ -170,7 +170,21 @@ The outer exact preimage/hash, selected owner and every call remain bound.
 Unrecognized call contents remain explicit, and auxiliary draft labels never
 become signed facts. pUSD is a separate Polygon token, not Circle USDC.
 
-Polymarket orders currently require exact approvals. The intended integration
+Polymarket orders currently require exact approvals. A reviewed batch requesting
+the reusable selector now steps up to exact approval before Machine derives
+its durable request identity or checks an approval hint. It must supply the
+same complete prepared record as an exact request. An old reusable approval
+hint cannot authorize this exact request. CLOB authentication keeps its separate
+one-use scope.
+
+Single and batch exact signing states also bind the review envelope digest
+directly, independently of caller-supplied plan facts. Changing or dropping the
+envelope on retry fails without changing the saved approval or calling Broker.
+Older states without a digest remain usable for requests without an envelope;
+reviewed legacy states fail closed and are retained for reconciliation. They
+must not be deleted or silently reset to retry a potentially signed operation.
+
+The intended integration
 with [persona onboarding (#352)](https://github.com/bloom-directory/bloom/pull/352)
 supports either an exact approval or an explicitly approved bounded session.
 It reuses the shared accounting in
