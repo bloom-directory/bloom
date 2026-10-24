@@ -227,3 +227,28 @@ class ClarificationTests(unittest.TestCase):
                 "solana",
             )
         )
+
+    def test_unrelated_questions_cannot_borrow_an_assumed_account_or_network(self):
+        for petal, message in (
+            (
+                "polymarket",
+                "I will use wallet harbor account 0. Which market should I buy?",
+            ),
+            (
+                "near-intents",
+                "I selected wallet harbor on mainnet. Which token do you want?",
+            ),
+            ("polymarket", "Which market should I buy using wallet harbor account 0?"),
+            ("hyperliquid", "Which wallet should I use on mainnet?"),
+        ):
+            with self.subTest(message=message):
+                self.assertFalse(asks_for_selection(self.trajectory(message), petal))
+        for message in (
+            "Which account should I use? Which network should I use?",
+            "What is the source wallet and network?",
+            "Which wallet should I use? Mainnet or testnet?",
+        ):
+            with self.subTest(message=message):
+                self.assertTrue(
+                    asks_for_selection(self.trajectory(message), "hyperliquid")
+                )

@@ -26,17 +26,38 @@ def asks_for_selection(trajectory, petal):
     message = messages[-1].get("message")
     if not isinstance(message, str) or "?" not in message:
         return False
-    return bool(
-        re.search(
+    requested = []
+    network_choice = False
+    for sentence in re.split(r"(?<=[.!?])\s+|\n+", message):
+        if "?" not in sentence:
+            continue
+        network_choice |= bool(
+            re.search(r"\bmainnet\b", sentence, re.IGNORECASE)
+            and re.search(r"\btestnet\b", sentence, re.IGNORECASE)
+        )
+        for ask in re.finditer(
             r"\b(which|what|choose|select|specify|provide|confirm)\b",
-            message,
+            sentence,
             re.IGNORECASE,
-        )
-        and re.search(r"\b(wallet|account)\b", message, re.IGNORECASE)
-        and (
-            petal == "polymarket"
-            or re.search(r"\b(chain|network|testnet|mainnet)\b", message, re.IGNORECASE)
-        )
+        ):
+            phrase = re.sub(
+                r"^\s+(is|are)\s+", " ", sentence[ask.end() :], flags=re.IGNORECASE
+            )
+            # Keep the requested noun phrase, not a later clause naming a
+            # default account/network: "Which market should I buy using ...?"
+            requested.append(
+                re.split(
+                    r"\b(should|would|shall|do|does|can|could|will|is|are|use|uses|using)\b",
+                    phrase,
+                    maxsplit=1,
+                    flags=re.IGNORECASE,
+                )[0]
+            )
+    subjects = " ".join(requested)
+    return bool(re.search(r"\b(wallet|account)\b", subjects, re.IGNORECASE)) and (
+        petal == "polymarket"
+        or network_choice
+        or bool(re.search(r"\b(chain|network)\b", subjects, re.IGNORECASE))
     )
 
 
