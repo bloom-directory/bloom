@@ -3,7 +3,13 @@
   if (!e || !e.isConnected || e.disabled || e.getAttribute('aria-disabled') === 'true' || !e.getClientRects().length) throw Error('stale');
   const label = (e.innerText || e.value || e.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
   if (kind === 'click' && BLOOM_PAY_WORDS.test(label)) throw Error('payment requires approval');
-  if (kind === 'click') e.click(); else {
+  if (kind === 'click') {
+    // Styled labels can cancel clicks on the label itself. Activate their
+    // associated checkbox/radio, as clicking the visible control would.
+    const target = e.tagName === 'LABEL' && ['checkbox', 'radio'].includes(e.control?.type) ? e.control : e;
+    if (target.disabled) throw Error('stale');
+    target.click();
+  } else {
     if ((e.autocomplete || '').split(' ').some(s => s.startsWith('cc-'))) throw Error('private payment input');
     if (kind === 'select' && e.tagName !== 'SELECT') throw Error('wrong field');
     if (kind === 'type' && !['INPUT', 'TEXTAREA'].includes(e.tagName)) throw Error('wrong field');

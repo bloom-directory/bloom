@@ -1362,7 +1362,7 @@ mod tests {
               <div class="pick"><div>Noviembre 2026</div><div class="pick" id="day">04</div></div>
               <div class="card">08:06 Cordoba 16:17 Bariloche<div class="pick fare">Tarifa desde $127.664,00</div></div>
               <div class="card">14:11 Cordoba 21:16 Bariloche<div class="pick fare">Tarifa desde $116.058,00</div></div>
-              <label><input type="radio" name="pass" style="display:none">Llevaré mi tarjeta de embarque<span class="pick">?</span></label>
+              <label onclick="if(event.target===this) event.preventDefault()"><input type="radio" name="pass" style="display:none">Llevaré mi tarjeta de embarque<span class="pick">?</span></label>
               <div class="pick" id="pay">Pagar</div>
               <script>
                 for (const e of document.querySelectorAll('.pick,.external'))
@@ -1419,6 +1419,7 @@ mod tests {
             .unwrap();
         assert_eq!(early["label"], "Tarifa desde $127.664,00");
         assert_eq!(find("Llevaré mi tarjeta de embarque?").len(), 1);
+        assert_eq!(find("Llevaré mi tarjeta de embarque?")[0]["checked"], false);
         browser
             .browse(BrowseRequest::Click {
                 element_ref: early["ref"].as_str().unwrap().into(),
@@ -1453,6 +1454,29 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("clicked Remote fare")
+        );
+        let radio = after["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["label"] == "Llevaré mi tarjeta de embarque?")
+            .unwrap()["ref"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        browser
+            .browse(BrowseRequest::Click { element_ref: radio })
+            .await
+            .unwrap();
+        let after = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+        assert_eq!(
+            after["elements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["label"] == "Llevaré mi tarjeta de embarque?")
+                .unwrap()["checked"],
+            true
         );
         let pay = after["elements"]
             .as_array()

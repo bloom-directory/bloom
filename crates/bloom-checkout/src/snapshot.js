@@ -55,13 +55,17 @@
     return found;
   };
   globalThis.__bloomRefs = nodes;
+  const checked = e => {
+    const input = e.tagName === 'LABEL' ? e.control : e;
+    return ['checkbox', 'radio'].includes(input?.type) ? input.checked : undefined;
+  };
   const elements = nodes.map(e => ({
     role: e.tagName.toLowerCase(),
     label: label(e).slice(0, 200),
     context: context(e),
     type: e.type || null,
     value: field(e) && e.type !== 'checkbox' && e.type !== 'radio' && !secret(e, label(e)) ? String(e.value).slice(0, 200) : undefined,
-    checked: e.type === 'checkbox' || e.type === 'radio' ? e.checked : undefined,
+    checked: checked(e),
     options: e.tagName === 'SELECT' ? [...e.options].map(o => ({value: o.value, label: o.text})) : undefined
   }));
   // Child frames are observed separately; their contents are never merged here.
