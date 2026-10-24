@@ -304,6 +304,11 @@ distinct developer root, Machine home, socket, log directory, ready file,
 mountpoint, and ceremony port. Suffixing each path with a candidate name is
 sufficient for state isolation.
 
+For disposable authorization tests, `--retain-temporary-files` keeps the
+launcher's generated template and runtime directories for diagnosis. Shutdown
+still stops only that candidate's services and removes its ready file and
+Machine socket. The test runner uses this option without recursive cleanup.
+
 Each candidate also needs its own ceremony port so two complete development
 triads, including passkey ceremonies, can run side by side while the installed
 custody triad keeps `18734`. Pass the port explicitly; the launcher uses

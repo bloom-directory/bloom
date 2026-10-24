@@ -4439,10 +4439,8 @@ impl WalletsHandler {
                     ));
                 }
                 if confirm_text.eq_ignore_ascii_case("cancel") {
-                    self.write_permit()?;
                     self.tx_engine
-                        .outbox
-                        .cancel(wallet, chain, id)
+                        .discard_unsigned(self.write_permit()?, wallet, chain, id)
                         .map_err(err_be)?;
                     return Ok(());
                 }
@@ -4929,12 +4927,12 @@ mod tests {
             derivation: None,
         };
         let canonical = serde_jcs::to_vec(&CanonicalWalletPolicy {
+            clear_signing: None,
             wallet_id: wallet_id.clone(),
             maximum_approval_lifetime_ms: 300_000,
             allowed_petal_packages: Vec::new(),
             allowed_destinations: Vec::new(),
             required_verifiers: Vec::new(),
-            clear_signing: None,
         })
         .unwrap();
         let policy_digest = Digest32::from_bytes(sha2::Sha256::digest(&canonical).into());
@@ -5010,12 +5008,12 @@ mod tests {
             }),
         };
         let canonical = serde_jcs::to_vec(&CanonicalWalletPolicy {
+            clear_signing: None,
             wallet_id: wallet_id.clone(),
             maximum_approval_lifetime_ms: 300_000,
             allowed_petal_packages: Vec::new(),
             allowed_destinations: Vec::new(),
             required_verifiers: Vec::new(),
-            clear_signing: None,
         })
         .unwrap();
         let policy_digest = Digest32::from_bytes(sha2::Sha256::digest(&canonical).into());
@@ -5741,7 +5739,6 @@ mod tests {
             expires_ms: u128::MAX,
             status: bloom_proto::TxStatus::Pending,
             action_kind: bloom_proto::TxActionKind::Unknown,
-            review_mode: None,
             tx_hash: None,
             token: None,
             nft: None,
@@ -6952,6 +6949,87 @@ value = "0""#,
     /// A stub Broker service: the Solana outbox read path never reaches it,
     /// so every method is a catch-all error.
     struct StubBroker;
+
+    #[tokio::test]
+    async fn policy_json_preserves_legacy_authority_until_explicit_removal_review() {
+        struct PolicyBroker {
+            baseline: SignedPolicySnapshot,
+            prepared: Mutex<Option<bloom_broker_api::PolicyUpdateRequest>>,
+        }
+        impl bloom_broker_api::MachineBrokerService for PolicyBroker {
+            fn dispatch<'a>(
+                &'a self,
+                request: MachineBrokerRequest,
+            ) -> bloom_broker_api::ServiceFuture<'a, MachineBrokerResponse> {
+                Box::pin(async move {
+                    match request {
+                        MachineBrokerRequest::PolicyRead(_) => {
+                            Ok(MachineBrokerResponse::PolicyRead(self.baseline.clone()))
+                        }
+                        MachineBrokerRequest::PolicyValidateUpdate(request) => {
+                            *self.prepared.lock().unwrap() = Some(request.clone());
+                            Ok(MachineBrokerResponse::PolicyValidateUpdate(
+                                bloom_broker_api::PolicyUpdatePrepareResponse {
+                                    operation_id: request.operation_id,
+                                    ceremony_kind: bloom_broker_api::CeremonyKind::PolicyUpdate,
+                                    ceremony_url: "https://example.invalid/legacy-removal-review"
+                                        .into(),
+                                    ceremony_expires_at_ms: DecimalU64::new(u64::MAX),
+                                    review_manifest_digest: digest(90),
+                                },
+                            ))
+                        }
+                        other => panic!("unexpected policy request: {other:?}"),
+                    }
+                })
+            }
+        }
+        let f = make_handler();
+        let mut vector: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../bloom-machine-client/tests/fixtures/legacy-policy-removal.json"
+        ))
+        .unwrap();
+        for field in ["current", "proposed"] {
+            vector[field]["wallet_id"] = serde_json::json!(f.wallet_name);
+        }
+        let current: CanonicalWalletPolicy =
+            serde_json::from_value(vector["current"].clone()).unwrap();
+        let proposed: CanonicalWalletPolicy =
+            serde_json::from_value(vector["proposed"].clone()).unwrap();
+        let bytes = serde_jcs::to_vec(&current).unwrap();
+        let mut projection = static_projection_value(f.wallet_addr);
+        projection.policy.canonical_policy = Base64UrlBytes::from_bytes(&bytes);
+        projection.policy.policy_digest = Digest32::from_bytes(sha2::Sha256::digest(&bytes).into());
+        let broker = Arc::new(PolicyBroker {
+            baseline: projection.policy.clone(),
+            prepared: Mutex::new(None),
+        });
+        let home = bloom_proto::HomeDir::at(f._tmp.path());
+        let handler = f
+            .handler
+            .with_broker(Some(MachineBrokerClient::new(broker.clone())))
+            .with_projection_reader(Arc::new(StaticProjection(projection)))
+            .with_home_write_permit(Arc::new(HomeWritePermit::acquire(&home).unwrap()));
+        let path = VfsPath::parse(&format!("/{}/policy.json", f.wallet_name)).unwrap();
+        assert_eq!(handler.read(&path).await.unwrap(), bytes);
+        let proposed_bytes = serde_jcs::to_vec(&proposed).unwrap();
+        assert!(matches!(
+            handler.write(&path, &proposed_bytes).await,
+            Err(HandlerError::PermissionDenied)
+        ));
+        let prepared = broker.prepared.lock().unwrap().clone().unwrap();
+        assert_eq!(prepared.proposed_canonical_policy.decode(), proposed_bytes);
+        assert_eq!(
+            prepared.authority_diff_digest.as_str(),
+            "65f348e08a8ded736ad13843456a1afbaacf16bf5518147b1d7d900f703e7401"
+        );
+        assert_eq!(
+            handler.read(&path).await.unwrap(),
+            bytes,
+            "staging must not remove signed policy authority"
+        );
+    }
+
     impl bloom_broker_api::MachineBrokerService for StubBroker {
         fn dispatch<'a>(
             &'a self,
@@ -7652,7 +7730,6 @@ value = "0""#,
             expires_ms: u128::MAX,
             status: bloom_proto::TxStatus::Pending,
             action_kind: bloom_proto::TxActionKind::Unknown,
-            review_mode: None,
             tx_hash: None,
             token: None,
             nft: None,
@@ -8800,14 +8877,16 @@ value = "0""#,
             .handler
             .with_broker(Some(MachineBrokerClient::new(broker.clone())));
         let request = ApprovalPrepareRequest {
+            evm_reported_token: None,
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             evm_review_payloads: Vec::new(),
+            safe_review_payloads: Vec::new(),
+            message_review_payloads: Vec::new(),
             operation_id: OperationId::from_bytes([30; 32]),
             terms: approval_terms("alice", None),
             canonical_plan_facts_digest: digest(31),
             petal_use_claim: None,
             system_use_claim: None,
-            requested_review_mode: None,
         };
         let path = VfsPath::parse("/alice/sealed-approvals/new.json").unwrap();
         f.handler
@@ -8849,14 +8928,16 @@ value = "0""#,
                 .handler
                 .with_broker(Some(MachineBrokerClient::new(broker.clone())));
             let request = ApprovalPrepareRequest {
+                evm_reported_token: None,
                 surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
                 evm_review_payloads: Vec::new(),
+                safe_review_payloads: Vec::new(),
+                message_review_payloads: Vec::new(),
                 operation_id: OperationId::from_bytes([30; 32]),
                 terms: approval_terms("alice", None),
                 canonical_plan_facts_digest: digest(31),
                 petal_use_claim: None,
                 system_use_claim: None,
-                requested_review_mode: None,
             };
             let path = VfsPath::parse("/alice/sealed-approvals/new.json").unwrap();
             f.handler
@@ -8883,14 +8964,16 @@ value = "0""#,
             .handler
             .with_broker(Some(MachineBrokerClient::new(broker.clone())));
         let request = ApprovalPrepareRequest {
+            evm_reported_token: None,
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             evm_review_payloads: Vec::new(),
+            safe_review_payloads: Vec::new(),
+            message_review_payloads: Vec::new(),
             operation_id: OperationId::from_bytes([30; 32]),
             terms: approval_terms("alice", None),
             canonical_plan_facts_digest: digest(31),
             petal_use_claim: None,
             system_use_claim: None,
-            requested_review_mode: None,
         };
         let path = VfsPath::parse("/alice/sealed-approvals/new.json").unwrap();
         f.handler
@@ -8916,14 +8999,16 @@ value = "0""#,
             .handler
             .with_broker(Some(MachineBrokerClient::new(broker)));
         let request = ApprovalPrepareRequest {
+            evm_reported_token: None,
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             evm_review_payloads: Vec::new(),
+            safe_review_payloads: Vec::new(),
+            message_review_payloads: Vec::new(),
             operation_id: OperationId::from_bytes([30; 32]),
             terms: approval_terms("alice", None),
             canonical_plan_facts_digest: digest(31),
             petal_use_claim: None,
             system_use_claim: None,
-            requested_review_mode: None,
         };
         let path = VfsPath::parse("/alice/sealed-approvals/new.json").unwrap();
 
@@ -9940,7 +10025,10 @@ value = "0""#,
 
     #[tokio::test]
     async fn confirm_cancel_discards_pending_locally() {
-        let f = make_handler_with_chain(true);
+        let mut f = make_handler_with_chain(true);
+        f.handler.home_write_permit = Some(Arc::new(
+            HomeWritePermit::acquire(&bloom_proto::HomeDir::at(f._tmp.path())).unwrap(),
+        ));
         seed_pending(&f, "0001-test");
         let p = VfsPath::parse(&format!(
             "/{}/0/chains/anvil/outbox/pending/0001-test/confirm",
@@ -9958,6 +10046,81 @@ value = "0""#,
         assert_eq!(entry.state, OutboxState::Failed);
         assert!(!entry.dir.join("broadcast_attempted.json").exists());
         assert!(!entry.dir.join("raw_tx").exists());
+    }
+
+    #[tokio::test]
+    async fn confirm_cancel_preserves_possible_signatures() {
+        for marker in ["hash", "broadcast", "dispatched", "malformed"] {
+            for control in ["confirm", "confirm.override"] {
+                let mut f = make_handler_with_chain(true);
+                f.handler.home_write_permit = Some(Arc::new(
+                    HomeWritePermit::acquire(&bloom_proto::HomeDir::at(f._tmp.path())).unwrap(),
+                ));
+                seed_pending(&f, "0001-test");
+                let entry = f
+                    .handler
+                    .tx_engine
+                    .outbox
+                    .read(&f.wallet_name, "anvil", "0001-test")
+                    .unwrap();
+                match marker {
+                    "hash" => {
+                        let mut staged = entry.staged.clone();
+                        staged.tx_hash = Some(format!("0x{}", "11".repeat(32)));
+                        std::fs::write(
+                            entry.dir.join("intent.json"),
+                            serde_json::to_vec(&staged).unwrap(),
+                        )
+                        .unwrap();
+                    }
+                    "broadcast" => {
+                        std::fs::write(
+                            entry.dir.join("broadcast_attempted.json"),
+                            serde_json::to_vec(&serde_json::json!({
+                                "schema": "bloom.broadcast_attempted.v1", "tx_hash": "signed",
+                                "raw_tx_blake3": "digest", "raw_tx_path": "raw_tx",
+                                "from": entry.staged.from, "to": null, "nonce": 0,
+                                "chain_id": 31337, "created_ms": 0, "transport": "public_rpc"
+                            }))
+                            .unwrap(),
+                        )
+                        .unwrap();
+                    }
+                    "dispatched" => {
+                        let digest = "11".repeat(32);
+                        std::fs::write(entry.dir.join("ceremony.json"), serde_json::to_vec(&serde_json::json!({
+                            "schema": "bloom.machine-evm-signing.1", "action_id": "test",
+                            "payload_digest": digest, "claimed_hash": digest,
+                            "provenance_digest": digest, "canonical_plan_facts_digest": digest,
+                            "approval_operation_id": digest, "signing_operation_id": digest,
+                            "request_nonce": "11".repeat(16), "issued_at_ms": "1", "expires_at_ms": "2",
+                            "sign_dispatched": true
+                        })).unwrap()).unwrap();
+                    }
+                    _ => std::fs::write(entry.dir.join("ceremony.json"), b"invalid").unwrap(),
+                }
+                let path = VfsPath::parse(&format!(
+                    "/{}/0/chains/anvil/outbox/pending/0001-test/{control}",
+                    f.wallet_name
+                ))
+                .unwrap();
+                let error = f.handler.write(&path, b"cancel").await.unwrap_err();
+                if marker != "malformed" {
+                    assert!(
+                        error.to_string().contains("cannot discard"),
+                        "{marker}: {error}"
+                    );
+                }
+                let retained = f
+                    .handler
+                    .tx_engine
+                    .outbox
+                    .read(&f.wallet_name, "anvil", "0001-test")
+                    .unwrap();
+                assert_eq!(retained.state, OutboxState::Pending, "{marker}/{control}");
+                assert!(!retained.dir.join("cancel.txt").exists());
+            }
+        }
     }
 
     #[tokio::test]

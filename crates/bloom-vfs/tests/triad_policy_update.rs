@@ -271,6 +271,7 @@ impl MachineBrokerService for BrokerFixture {
 
 fn policy(maximum_approval_lifetime_ms: u64) -> CanonicalWalletPolicy {
     CanonicalWalletPolicy {
+        clear_signing: None,
         wallet_id: Token::new("alice").unwrap(),
         maximum_approval_lifetime_ms,
         allowed_petal_packages: Vec::new(),
@@ -282,7 +283,6 @@ fn policy(maximum_approval_lifetime_ms: u64) -> CanonicalWalletPolicy {
             verifier_id: Token::new("human").unwrap(),
             verifier_digest: Digest32::from_bytes([4; 32]),
         }],
-        clear_signing: None,
     }
 }
 
