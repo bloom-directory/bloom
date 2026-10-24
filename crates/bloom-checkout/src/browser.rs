@@ -1357,6 +1357,7 @@ mod tests {
             let page = r#"<!doctype html>
               <link rel="stylesheet" href="EXTERNAL_STYLE">
               <style>.pick{cursor:pointer}.faded{opacity:0}</style>
+              <div id="previous-step" style="height:0;overflow:hidden"></div>
               <div class="external"><span>Remote fare</span></div>
               <ul><li class="pick" id="city">Cordoba COR</li><li class="pick faded">Hidden city</li></ul>
               <div class="pick"><div>Noviembre 2026</div><div class="pick" id="day">04</div></div>
@@ -1365,6 +1366,7 @@ mod tests {
               <label onclick="if(event.target===this) event.preventDefault()"><input type="radio" name="pass" style="display:none">Llevaré mi tarjeta de embarque<span class="pick">?</span></label>
               <div class="pick" id="pay">Pagar</div>
               <script>
+                document.getElementById('previous-step').innerHTML = '<button>Old seat</button>'.repeat(310);
                 for (const e of document.querySelectorAll('.pick,.external'))
                   e.addEventListener('click', () => document.title = 'clicked ' + e.innerText);
               </script>"#.replace("EXTERNAL_STYLE", &external_style);
@@ -1399,6 +1401,7 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(find("Cordoba COR").len(), 1);
+        assert!(find("Old seat").is_empty());
         assert_eq!(
             find("Remote fare").len(),
             1,

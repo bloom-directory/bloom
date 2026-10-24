@@ -1,5 +1,15 @@
 (() => {
-  const visible = e => e.getClientRects().length && e.checkVisibility({opacityProperty: true, visibilityProperty: true});
+  const visible = e => {
+    if (!e.getClientRects().length || !e.checkVisibility({opacityProperty: true, visibilityProperty: true})) return false;
+    // Previous steps can remain laid out inside a zero-height clipped panel.
+    // They must not consume the control limit ahead of the current form.
+    for (let parent = e.parentElement; parent; parent = parent.parentElement) {
+      const style = getComputedStyle(parent), clip = parent.getBoundingClientRect();
+      if (['hidden', 'clip'].includes(style.overflowX) && clip.width === 0) return false;
+      if (['hidden', 'clip'].includes(style.overflowY) && clip.height === 0) return false;
+    }
+    return true;
+  };
   const native = 'a[href],button,input,textarea,select,summary,[role="button"],[role="option"],[role="gridcell"],[role="radio"],[role="checkbox"],[role="tab"],[role="link"],[role="menuitem"],[role="switch"],[onclick],[ng-click],[data-ng-click]';
   // Script frameworks attach click handlers invisibly. A pointer cursor that a
   // page stylesheet assigns to the element itself marks those controls.
