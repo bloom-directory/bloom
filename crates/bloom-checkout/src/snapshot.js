@@ -13,7 +13,10 @@
   for (const sheet of document.styleSheets) { try { collect(sheet.cssRules); } catch {} }
   const valid = pointerRules.filter(s => { try { document.body.matches(s); return true; } catch { return false; } });
   const pointerSelector = valid.join(',');
-  const pointer = e => e.style.cursor === 'pointer' || (pointerSelector !== '' && e.matches(pointerSelector));
+  // Cross-origin stylesheets hide their rules, but computed styles remain
+  // readable. Ignore children that only inherit their parent's pointer.
+  const pointer = e => e.style.cursor === 'pointer' || (pointerSelector !== '' && e.matches(pointerSelector)) ||
+    (getComputedStyle(e).cursor === 'pointer' && (!e.parentElement || getComputedStyle(e.parentElement).cursor !== 'pointer'));
   const text = e => (e.innerText || '').replace(/\s+/g, ' ').trim();
   const field = e => e.matches('input,select,textarea');
   // Some sites caption a field with text beside it instead of a <label>: use

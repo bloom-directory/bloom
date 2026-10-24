@@ -1349,9 +1349,15 @@ mod tests {
         // Shaped like JetSMART: listeners attached by script, a pointer cursor
         // from the stylesheet, a pointer panel around day cells, identical
         // fare buttons told apart only by their card, and a restyled radio.
+        let external_style = format!(
+            "http://localhost:{}/external.css",
+            listener.local_addr().unwrap().port()
+        );
         let fixture = tokio::spawn(async move {
-            axum::serve(listener, Router::new().route("/", get(|| async { Html(r#"<!doctype html>
+            let page = r#"<!doctype html>
+              <link rel="stylesheet" href="EXTERNAL_STYLE">
               <style>.pick{cursor:pointer}.faded{opacity:0}</style>
+              <div class="external"><span>Remote fare</span></div>
               <ul><li class="pick" id="city">Cordoba COR</li><li class="pick faded">Hidden city</li></ul>
               <div class="pick"><div>Noviembre 2026</div><div class="pick" id="day">04</div></div>
               <div class="card">08:06 Cordoba 16:17 Bariloche<div class="pick fare">Tarifa desde $127.664,00</div></div>
@@ -1359,10 +1365,28 @@ mod tests {
               <label><input type="radio" name="pass" style="display:none">Llevaré mi tarjeta de embarque<span class="pick">?</span></label>
               <div class="pick" id="pay">Pagar</div>
               <script>
-                for (const e of document.querySelectorAll('.pick'))
+                for (const e of document.querySelectorAll('.pick,.external'))
                   e.addEventListener('click', () => document.title = 'clicked ' + e.innerText);
-              </script>"#) })))
-                .await.unwrap();
+              </script>"#.replace("EXTERNAL_STYLE", &external_style);
+            axum::serve(
+                listener,
+                Router::new()
+                    .route(
+                        "/",
+                        get(move || {
+                            let page = page.clone();
+                            async move { Html(page) }
+                        }),
+                    )
+                    .route(
+                        "/external.css",
+                        get(|| async {
+                            ([("content-type", "text/css")], ".external {cursor:pointer}")
+                        }),
+                    ),
+            )
+            .await
+            .unwrap();
         });
         browser.browse(BrowseRequest::Open { url }).await.unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1375,6 +1399,12 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(find("Cordoba COR").len(), 1);
+        assert_eq!(
+            find("Remote fare").len(),
+            1,
+            "cross-origin CSS control must be projected once, without its inherited span"
+        );
+        assert_eq!(find("Remote fare")[0]["role"], "div");
         assert!(find("Hidden city").is_empty());
         assert_eq!(find("04")[0]["context"], "Noviembre 2026 04");
         // The panel around the day is layout, not a control.
@@ -1401,6 +1431,28 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("clicked Tarifa desde $127.664,00")
+        );
+        let remote = after["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["label"] == "Remote fare")
+            .unwrap()["ref"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        browser
+            .browse(BrowseRequest::Click {
+                element_ref: remote,
+            })
+            .await
+            .unwrap();
+        let after = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+        assert!(
+            after["text"]
+                .as_str()
+                .unwrap()
+                .contains("clicked Remote fare")
         );
         let pay = after["elements"]
             .as_array()
