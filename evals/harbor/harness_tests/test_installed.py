@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 from harness.core import EvalError
-from harness.installed import InstalledWallet
+from harness.installed import InstalledProjection, InstalledWallet
 
 
 class Fixture:
@@ -21,6 +21,12 @@ class Fixture:
             "/outbox/pending": {"evm-foreign": "Dir"},
         }
         self.records = {
+            "/wallets/main/0/account.json": {
+                "wallet": "main",
+                "number": 0,
+                "freshness": "fresh",
+                "evm": {"state": "active", "address": InstalledWallet.expected_address},
+            },
             "/wallets/main/projection.json": {
                 "freshness": "fresh",
                 "wallet": {
@@ -48,6 +54,13 @@ class Fixture:
                 for state in ("pending", "sent", "failed"):
                     self.listings[root + "/" + state] = {}
         self.cancelled = []
+
+    def version(self):
+        return "fixture-0.4.0"
+
+    def refresh(self, session):
+        self.records[session + "/outbox.json"]["state"] = "failed"
+        self.records[session + "/status.json"]["state"] = "deposit_failed"
 
     def entries(self, path):
         return copy.deepcopy(self.listings[path])
@@ -152,6 +165,21 @@ class InstalledWalletTests(unittest.TestCase):
         self.guard.cancel_owned()
         self.assertEqual(self.reader.cancelled, [path])
         self.assertIn("evm-foreign", self.reader.listings["/outbox/pending"])
+        self.guard.close()
+        self.guard.begin()
+        self.assertEqual(self.guard.before["machine_version"], "fixture-0.4.0")
+        self.guard.cancel_owned()
+        self.assertEqual(self.reader.cancelled, [path])
+
+    def test_wrong_endpoint_or_main_address_refuses_start(self):
+        with self.assertRaisesRegex(EvalError, "endpoint differs"):
+            InstalledProjection(endpoint="unix:/tmp/another-machine.sock")
+        self.reader.records["/wallets/main/0/account.json"]["evm"]["address"] = (
+            "0x" + "1" * 40
+        )
+        with self.assertRaisesRegex(EvalError, "wrong main account"):
+            self.guard.begin()
+        self.assertEqual(self.reader.cancelled, [])
 
     def test_foreign_addition_after_snapshot_preserves_all_pending_work(self):
         self.guard.begin()

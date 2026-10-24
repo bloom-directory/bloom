@@ -16,13 +16,39 @@ from .core import EvalError
 class InstalledProjection:
     """Use the existing authenticated Machine connection, never its auth files."""
 
-    def __init__(self, binary="bloom"):
+    installed_home = Path("/home/user/.bloom")
+    installed_endpoint = "unix:/home/user/.bloom/run/bloom.sock"
+
+    def __init__(self, binary="/usr/bin/bloom", endpoint=None):
         self.binary = binary
+        if endpoint is not None and endpoint != self.installed_endpoint:
+            raise EvalError(
+                "installed-wallet endpoint differs from the intended Machine"
+            )
 
     def command(self, *args):
         try:
             result = subprocess.run(
-                [self.binary, "vfs", *args],
+                [
+                    self.binary,
+                    "--home",
+                    str(self.installed_home),
+                    "--connect",
+                    self.installed_endpoint,
+                    "vfs",
+                    *args,
+                ],
+                env={
+                    key: value
+                    for key, value in os.environ.items()
+                    if key
+                    not in {
+                        "BLOOM_HOME",
+                        "BLOOM_RPC_ENDPOINT",
+                        "BLOOM_BROKER_SOCKET",
+                        "BLOOM_SIGNER_SOCKET",
+                    }
+                },
                 capture_output=True,
                 text=True,
                 timeout=30,
@@ -61,6 +87,12 @@ class InstalledProjection:
     def cancel(self, pending_path):
         self.command("write", pending_path + "/cancel", "--data", "cancel")
 
+    def refresh(self, session_path):
+        self.command("write", session_path + "/refresh", "--data", "refresh")
+
+    def version(self):
+        return self.command("cat", "/status/version").strip()
+
 
 def digest(value):
     return hashlib.sha256(
@@ -72,6 +104,7 @@ class InstalledWallet:
     """A cooperative lock is not ownership: cleanup needs a trusted swap ID."""
 
     lock_path = Path("/tmp/bloom-harbor-installed-main.lock")
+    expected_address = "0x8d4fafba75a9dc50b4b296211509e856d2c6d081"
     terminal = frozenset(
         {
             "signed",
@@ -101,6 +134,18 @@ class InstalledWallet:
         )
 
     def snapshot(self):
+        version = self.reader.version()
+        account = self.reader.read_json("/wallets/main/0/account.json")
+        if (
+            account.get("freshness") != "fresh"
+            or account.get("wallet") != "main"
+            or account.get("number") != 0
+            or account.get("evm", {}).get("state") != "active"
+            or account.get("evm", {}).get("address", "").lower()
+            != self.expected_address
+            or not version
+        ):
+            raise EvalError("installed Machine has the wrong main account identity")
         projection = self.reader.read_json("/wallets/main/projection.json")
         wallet = projection.get("wallet", {})
         if (
@@ -170,6 +215,7 @@ class InstalledWallet:
                 path = root + "/" + name
                 sessions[path] = self.reader.read_json(path + "/status.json")
         return {
+            "machine_version": version,
             "policy": (
                 wallet["policy_version"],
                 wallet["policy_digest"],
@@ -207,7 +253,9 @@ class InstalledWallet:
         for record in snapshot["recoveries"].values():
             if str(record.get("ceremony_state", "")).lower() not in self.terminal:
                 raise EvalError("main already has a wallet ceremony")
-        for record in snapshot["sessions"].values():
+        for path, record in snapshot["sessions"].items():
+            if record.get("state") == "deposit_failed" and self.cancelled_session(path):
+                continue
             if record.get("state") not in {
                 "quote_failed",
                 "settled_success",
@@ -216,6 +264,25 @@ class InstalledWallet:
                 "abandoned",
             }:
                 raise EvalError("main already has unresolved NEAR swap work")
+
+    def cancelled_session(self, path):
+        record = self.reader.read_json(path + "/outbox.json")
+        root = record.get("outbox_root", "")
+        entry_id = record.get("id", "")
+        if (
+            not re.fullmatch(r"/wallets/main/[0-9]+/chains/[a-z0-9-]+/outbox", root)
+            or not re.fullmatch(r"[A-Za-z0-9_-]+", entry_id)
+            or record.get("state") != "failed"
+            or record.get("tx_hash") is not None
+        ):
+            return False
+        intent = self.reader.read_json(f"{root}/failed/{entry_id}/intent.json")
+        return (
+            intent.get("id") == entry_id
+            and intent.get("wallet") == "main"
+            and intent.get("status") == "cancelled"
+            and intent.get("tx_hash") is None
+        )
 
     def begin(self):
         descriptor = os.open(
@@ -226,6 +293,7 @@ class InstalledWallet:
             fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             self.before = self.snapshot()
             self.refuse_pending(self.before)
+            self.owned = {}
         except BaseException:
             self.close()
             raise
@@ -270,7 +338,14 @@ class InstalledWallet:
     def assert_only_owned_changes(self, current, *, cancelled=False):
         if self.before is None:
             raise EvalError("installed trial has no baseline")
-        for key in ("policy", "requests", "controls", "approvals", "recoveries"):
+        for key in (
+            "machine_version",
+            "policy",
+            "requests",
+            "controls",
+            "approvals",
+            "recoveries",
+        ):
             if current[key] != self.before[key]:
                 raise EvalError(
                     f"unrelated installed-wallet {key} changed; preserving work"
@@ -325,6 +400,20 @@ class InstalledWallet:
             intent = self.reader.read_json(terminal_path + "/intent.json")
             if intent.get("status") != "cancelled" or intent.get("tx_hash") is not None:
                 raise EvalError("trial entry did not cancel without broadcast")
+        # v0.1.4 status reads do not reconcile cancellation. Its supported
+        # refresh route inspects this cancelled entry and returns before any
+        # upstream submission when there is no origin transaction hash.
+        for session, _, _ in self.owned.values():
+            record = self.reader.read_json(session + "/outbox.json")
+            if record.get("tx_hash") is not None:
+                raise EvalError("owned swap acquired a hash; refusing refresh")
+            self.reader.refresh(session)
+            status = self.reader.read_json(session + "/status.json")
+            if status.get("state") != "deposit_failed" or not self.cancelled_session(
+                session
+            ):
+                raise EvalError("owned swap did not reconcile local cancellation")
+        self.assert_only_owned_changes(self.snapshot(), cancelled=True)
 
     def mounts(self):
         return [
