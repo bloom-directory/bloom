@@ -67,6 +67,8 @@ const PROVIDER_FIELD_ORIGINS: &[&str] = &[
     "https://paymentcomponent.booking.com",
     // Yuno secure fields (JetSMART's payment page, SDK checked 2026-10-14).
     "https://sdk-web-card.prod.y.uno",
+    // Etraveli secure fields observed on Gotogate's final payment page 2026-10-24.
+    "https://frontend-payments.payment-prod.etraveligroup.net",
 ];
 
 /// Provider-hosted checkout pages whose own document holds the card fields.
@@ -1453,6 +1455,21 @@ pub(crate) mod tests {
     async fn card_fields_go_to_payment_providers_or_the_merchant_page() {
         for (frame, top, allowed) in [
             ("https://js.stripe.com", "https://shop.example", true),
+            (
+                "https://frontend-payments.payment-prod.etraveligroup.net",
+                "https://ar.gotogate.com",
+                true,
+            ),
+            (
+                "https://frontend-payments.payment-prod.etraveligroup.net.evil.example",
+                "https://ar.gotogate.com",
+                false,
+            ),
+            (
+                "http://frontend-payments.payment-prod.etraveligroup.net",
+                "https://ar.gotogate.com",
+                false,
+            ),
             (
                 "https://checkout.stripe.com",
                 "https://checkout.stripe.com",
