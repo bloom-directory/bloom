@@ -170,13 +170,43 @@ The outer exact preimage/hash, selected owner and every call remain bound.
 Unrecognized call contents remain explicit, and auxiliary draft labels never
 become signed facts. pUSD is a separate Polygon token, not Circle USDC.
 
-Polymarket orders remain exact approvals. The Trader persona proposed in
-Bloom #352 cannot submit `polymarket.order.poly1271` with a reusable selector.
-Do not remove the exact-review requirement to make that caller work. A future
-delegated trading profile needs a separate versioned class, Broker verification
-of each order against its approved bounds, and Signer-enforced usage limits.
-Until that profile exists and is tested across the services, the persona must
-use exact approval or leave automated Polymarket trading unavailable.
+Polymarket orders currently require exact approvals. The intended integration
+with [persona onboarding (#352)](https://github.com/bloom-directory/bloom/pull/352)
+supports either an exact approval or an explicitly approved bounded session.
+It reuses the shared accounting in
+[Broker #100](https://github.com/bloom-directory/bloom-broker/pull/100) and
+[Signer #68](https://github.com/bloom-directory/bloom-signer/pull/68), rather than
+introducing another session system. A new operation class is not inherently
+required: eligibility must depend on verified session terms and payloads,
+not a class name or the selected persona alone.
+
+This is an integration contract, not enabled session support in this branch:
+
+- Machine must carry the complete order review envelope through session
+  selection, signing and recovery. The persisted attempt identity must bind it
+  alongside the payload, claim, selected account and original approval. An
+  altered envelope must not recover an existing attempt as a new operation.
+- Broker must reconstruct the signed order from that envelope, bind the
+  selected signer and supported domain, and verify the charged asset and
+  quantity against the order before accepting session accounting. The declared
+  debit checks in [Polymarket #19](https://github.com/bloom-directory/bloom-petal-polymarket/pull/19)
+  are useful but do not replace Broker verification. BUY collateral and SELL
+  share units must not be treated as interchangeable spending capacity.
+- Reuse the approved per-action, rolling and lifetime budgets, expiry,
+  revocation and shared reservations. Retry, reactivation, cancellation and
+  uncertain submission must not reset or refund consumed authority. Recovering
+  a retained signature must not authorize a new signature.
+- Keep exact approval available when no eligible session exists. Never silently
+  widen a session or create a fresh attempt to evade its exhausted budget.
+  Invalid payloads remain errors, not candidates for less restrictive signing.
+
+Broker #100 currently predates the message verifier landed in Broker #103.
+Until their combined implementation verifies order economics and passes real
+Broker–Signer tests, keep the reusable-message rejection in place. Test altered
+envelopes, false debits, wrong accounts/domains, expiry, revocation, shared
+exhaustion and replay before enabling the session path. This does not require
+Josh's branch to change as part of #224, nor make #352 a prerequisite for
+shipping #224's exact approval path.
 
 CLOB authentication uses the distinct immutable `polymarket.clob_auth.v1`
 permission: one operation/signature, Polygon ClobAuthDomain version 1, selected
@@ -257,9 +287,9 @@ new package identities. A source branch or local package build is not a
 published catalog release. Keep required reviews enforced while those releases
 are pending; the old catalog is not compatible merely because Machine CI passes.
 Bloom #224 must remain unmergeable until the default Polymarket and Hyperliquid
-catalog pins select compatible published packages and Broker #103 has landed,
-with all Broker pins advanced to that landed commit. Polymarket v0.1.6 and
-Hyperliquid v0.1.7 do not satisfy this contract.
+catalog pins select compatible published packages. Broker #103 has landed and
+this branch pins its landed commit `e2f55a7e291eff32d3d544f0f94dc770945bafd7`.
+Polymarket v0.1.6 and Hyperliquid v0.1.7 do not satisfy the package contract.
 
 When combining Bloom #322 and #293 with the compiled token catalog, policy
 symbols must resolve uniquely back to the same chain/address. Ambiguous tickers
