@@ -4,7 +4,7 @@ import json
 import re
 import shlex
 
-MOUNT = re.compile(r"/bloom(?=/|[\s\"'`]|$)")
+MOUNT = re.compile(r"/bloom(?=/|[\s\"'`;&|<>)]|$)")
 READ = re.compile(
     r"\b(?:cat|ls|find|rg|grep|sed|head|tail|stat|wc|readlink)\b[^;&|\n]*?/bloom(?:/|\b)"
 )

@@ -72,6 +72,18 @@ class CommandCountsTests(unittest.TestCase):
         self.assertEqual(result["agent_tool_calls"], 1)
         self.assertEqual(result["bloom_read_tool_calls"], 0)
 
+    def test_shell_operator_after_mount_keeps_relative_access_unknown(self):
+        for command in (
+            "cd /bloom; cat wallets/harbor/accounts.json",
+            "cd /bloom&&cat wallets/harbor/accounts.json",
+            "(cd /bloom); python3 inspect.py",
+        ):
+            with self.subTest(command=command):
+                result = self.counts(self.call("bash", command=command))
+                self.assertEqual(result["bloom_read_tool_calls"], 0)
+                self.assertEqual(result["bloom_write_tool_calls"], 0)
+                self.assertEqual(result["bloom_unclassified_tool_calls"], 1)
+
     def test_literal_copy_direction_counts_reads_and_writes(self):
         for command, read, write in (
             ('cp /tmp/order.json /bloom/order.json; rc=$?; echo "$rc"', 0, 1),
