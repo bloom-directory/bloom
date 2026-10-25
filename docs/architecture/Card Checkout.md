@@ -13,7 +13,7 @@ the approval page, or the human's private view of the browser.
   requests to Broker (cards) and to `bloom-checkout` (shopping), and re-parses
   every response into a closed public type before it reaches VFS.
 - **`bloom-checkout`** is its own principal. It owns a headless Chromium over a
-  CDP pipe or, when configured, one allowlisted tab in the person's browser.
+  CDP pipe, using Chromium's normal browser identity.
   It accepts Machine requests only from the Machine UID, reads checkout facts,
   fills a released card and clicks the pay button. Its operation store is a
   private SQLite file.
@@ -71,7 +71,12 @@ an unavailable Broker cannot preserve local fill access. Already disclosed
 page values cannot be recalled.
 Snapshot-redaction patterns use zeroizing storage and remain until the browser
 context is safely discarded, so expiry cannot expose values already in a DOM.
-Final itinerary/party review and binding remain a separate acceptance gate.
+Filled controls also carry private annotations in an isolated-world WeakMap;
+their public values become saved-field placeholders. This protects short date
+parts without replacing the same digits in prices or flight dates. Select
+values use this projection rather than duplicated accessibility-tree text.
+Known numeric and English full-date renderings are redacted in review text.
+Before payment approval, verify the itinerary, party, extras and final total.
 
 ## Booking sites that reject Bloom's browser
 
