@@ -92,7 +92,7 @@
   // Shopify de/fr/es/pt/it/en checkouts, common shop systems, and Booking.com,
   // Ryanair and Airbnb final pages, 2026-10-11). Labels may use non-breaking spaces.
   const pay = controls.filter(e => BLOOM_PAY_WORDS.test((e.innerText || e.value || '').replace(/\s+/g, ' ').trim()));
-  if (pay.length !== 1) return null;
+  if (pay.length !== 1) return {refusal:'pay_control_count'};
   // Test fixtures declare their total; a merchant page never chooses its own.
   const fixture = BLOOM_FIXTURE_TOTALS && ['localhost', '127.0.0.1'].includes(location.hostname);
   const explicit = fixture ? [...document.querySelectorAll('[data-bloom-total-minor][data-bloom-currency]')].filter(visible) : [];
@@ -125,7 +125,7 @@
     total = Number(explicit[0].dataset.bloomTotalMinor); currency = explicit[0].dataset.bloomCurrency;
   } else {
     const found = pageTotal(text.split('\n').map(line => line.trim()).filter(Boolean));
-    if (!found) return null;
+    if (!found) return {refusal:'total_or_currency'};
     ({total,currency} = found);
   }
   const selectors = [...document.querySelectorAll('select')].filter(e => visible(e) && /installment|cuotas|parcelas/i.test([e.name,e.id,e.labels?.[0]?.innerText].join(' ')));
@@ -139,14 +139,14 @@
     && document.querySelector('input#basic-creditCards[name=basic]')?.checked === true
     && [...document.querySelectorAll('input[name=basic]:checked')].length === 1;
   let installments = 1;
-  if (selectors.length > 1 || selectedCounts.size > 1) return null;
+  if (selectors.length > 1 || selectedCounts.size > 1) return {refusal:'installment_choice'};
   if (selectors.length === 1) {
     const match = selectors[0].selectedOptions[0]?.text.match(/^(\d+)\s*(?:x|installments?|cuotas|parcelas)\b/i);
-    if (!match) return null;
+    if (!match) return {refusal:'installment_choice'};
     installments = Number(match[1]);
   } else if (selectedCounts.size === 1) {
     installments = [...selectedCounts][0];
-  } else if (/installments?|cuotas|parcelas/i.test(text) && !shopifyCard) return null;
+  } else if (/installments?|cuotas|parcelas/i.test(text) && !shopifyCard) return {refusal:'installment_choice'};
   const recurring = processorRecurring ?? /\b(subscription|recurring|auto.?renew|monthly|annually|suscripci[oó]n)\b/i.test(text);
   globalThis.__bloomPayButton = pay[0];
   return {origin:location.origin,payment_frame_origins:[],total_minor:total,currency,installments,recurring};

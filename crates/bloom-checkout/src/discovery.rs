@@ -401,7 +401,10 @@ impl Discovery {
                     },
                 )
                 .await?;
-                if let Ok(facts) = serde_json::from_value::<CheckoutFacts>(candidate) {
+                // Script-owned reason codes, never merchant text or field values.
+                if let Some(reason) = candidate.get("refusal").and_then(Value::as_str) {
+                    eprintln!("payment facts need review: {reason}");
+                } else if let Ok(facts) = serde_json::from_value::<CheckoutFacts>(candidate) {
                     candidates.push((session.clone(), world, facts));
                 }
             }
