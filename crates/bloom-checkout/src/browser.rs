@@ -886,7 +886,7 @@ mod tests {
                 Router::new().route(
                     "/",
                     get(|| async {
-                        Html(r#"<button>Comprar</button><button>Kaufen</button><button onclick="document.title='unsafe booking'">Book Now</button><button onclick="document.title='unsafe purchase'">PURCHASE &amp; ACCEPT</button><span id="pay-name">Pay now</span><button aria-labelledby="pay-name" onmousedown="document.title='unsafe down'">Next</button><button onmousedown="this.textContent='Pay now'" onclick="document.title='unsafe click'">Proceed</button><button>Continue</button>"#)
+                        Html(r#"<button>Comprar</button><button>Kaufen</button><button onclick="document.title='unsafe booking'">Book Now</button><button onclick="document.title='unsafe purchase'">PURCHASE &amp; ACCEPT</button><button onclick="document.title='unsafe Turkish payment'">Öde</button><span id="pay-name">Pay now</span><button aria-labelledby="pay-name" onmousedown="document.title='unsafe down'">Next</button><button onmousedown="this.textContent='Pay now'" onclick="document.title='unsafe click'">Proceed</button><button>Ödeme Sayfasına Devam Et</button>"#)
                     }),
                 ),
             )
@@ -912,6 +912,7 @@ mod tests {
             "Kaufen",
             "Book Now",
             "PURCHASE & ACCEPT",
+            "Öde",
             "Pay now",
             "Proceed",
         ] {
@@ -929,7 +930,7 @@ mod tests {
         }
         browser
             .browse(BrowseRequest::Click {
-                element_ref: reference("Continue"),
+                element_ref: reference("Ödeme Sayfasına Devam Et"),
             })
             .await
             .unwrap();

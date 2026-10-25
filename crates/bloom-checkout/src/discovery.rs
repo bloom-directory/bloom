@@ -1324,6 +1324,14 @@ pub(crate) mod tests {
                 Some((580447, "HKD")),
             ),
             (
+                lines("tr-TR", "", &["Toplam miktar", "Alt toplam 2595 Türk Lirası", "Ödenecek miktar 2595 Türk Lirası"], "Öde"),
+                Some((259500, "TRY")),
+            ),
+            (
+                lines("tr-TR", "", &["Ödenecek miktar", "2595₺"], "Öde"),
+                Some((259500, "TRY")),
+            ),
+            (
                 lines("en-US", "", &["Total amount due (All passengers)", "$178.40"], "Pay now"),
                 Some((17840, "USD")),
             ),
