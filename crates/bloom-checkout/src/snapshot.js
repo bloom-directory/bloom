@@ -15,7 +15,8 @@
     }
     return true;
   };
-  const native = 'a[href],button,input,textarea,select,summary,[role="button"],[role="combobox"],[role="option"],[role="gridcell"],[role="radio"],[role="checkbox"],[role="tab"],[role="link"],[role="menuitem"],[role="switch"],[onclick],[ng-click],[data-ng-click]';
+  const nativeElements = 'a[href],button,input,textarea,select,summary';
+  const native = nativeElements + ',[role="button"],[role="combobox"],[role="option"],[role="gridcell"],[role="radio"],[role="checkbox"],[role="tab"],[role="link"],[role="menuitem"],[role="switch"],[onclick],[ng-click],[data-ng-click]';
   // Script frameworks attach click handlers invisibly. A pointer cursor that a
   // page stylesheet assigns to the element itself marks those controls.
   const pointerRules = [];
@@ -50,7 +51,8 @@
   const pictured = e => [...e.querySelectorAll('img[alt],[title]')].map(i => i.alt || i.title).filter(Boolean).join(' ');
   const namedBy = e => (e.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean)
     .map(id => e.getRootNode().getElementById(id)?.textContent || '').join(' ').trim();
-  const label = e => (namedBy(e) || e.getAttribute('aria-label') || (e.labels?.[0] && text(e.labels[0])) || (field(e) ? '' : text(e)) || e.placeholder
+  const label = e => (namedBy(e) || e.getAttribute('aria-label') || (e.labels?.[0] && text(e.labels[0]))
+    || (e.matches('input[type="button"],input[type="submit"],input[type="reset"]') ? e.value : '') || (field(e) ? '' : text(e)) || e.placeholder
     || (field(e) ? caption(e) || e.name : pictured(e)) || '').replace(/\s+/g, ' ').trim();
   // Card and password values never leave the page; checkout redacts saved
   // traveler values before the agent reads anything else.
@@ -70,7 +72,7 @@
   const nodes = candidates.filter(e => control(e) || !candidates.some(o => o !== e && e.contains(o)))
     .sort((a, b) => Number(a.getBoundingClientRect().bottom <= 0) - Number(b.getBoundingClientRect().bottom <= 0)
       // Dense pointer-based seat maps must leave room for actual form controls.
-      || Number(control(b)) - Number(control(a)))
+      || Number(b.matches(nativeElements)) - Number(a.matches(nativeElements)))
     .slice(0, 300)
     // Prioritize inclusion, not presentation: repeated passenger fields must
     // retain document order when focusing an input scrolls the page.

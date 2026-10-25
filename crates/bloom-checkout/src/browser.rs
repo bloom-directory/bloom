@@ -1358,8 +1358,8 @@ mod tests {
     #[tokio::test]
     async fn dense_seat_map_keeps_the_native_continue_control() {
         let (url, fixture) = crate::discovery::tests::fixture(format!(
-            "<!doctype html><style>.seat{{cursor:pointer}}</style>{}<button onclick=\"document.title='continued'\">Continue without seats</button>",
-            "<div class='seat'>Seat selection</div>".repeat(350)
+            "<!doctype html><style>.seat{{cursor:pointer}}</style>{}<input type='button' value='Continue without seats' onclick=\"document.title='continued'\">",
+            "<div class='seat' role='button' onclick=\"document.title='seat selected'\">Seat selection</div>".repeat(350)
         ))
         .await;
         let root = tempfile::tempdir().unwrap();
