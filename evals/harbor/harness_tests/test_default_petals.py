@@ -243,7 +243,9 @@ class ClarificationTests(unittest.TestCase):
             ("solana", "Which recipient should I use on the Ethereum chain?"),
             ("near-intents", "Which destination chain should receive the USDC?"),
             ("polymarket", "Which wallet should I use for the election market?"),
+            ("polymarket", "Which wallet for this market?"),
             ("hyperliquid", "Which wallet should I use on mainnet?"),
+            ("hyperliquid", "Which mainnet account should I use?"),
             ("hyperliquid", "I selected mainnet rather than testnet. Shall I proceed?"),
         ):
             with self.subTest(message=message):

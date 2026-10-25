@@ -55,11 +55,17 @@ def asks_for_selection(trajectory, petal):
             # Match the fact being requested, not an assumed default in a
             # later clause: "Which recipient should I use on Ethereum?"
             subject = re.split(
-                r"\b(should|would|shall|do|does|can|could|will|is|are|use|uses|using)\b",
+                r"\b(should|would|shall|do|does|can|could|will|is|are|use|uses|using|for|on|in|with|from)\b",
                 phrase,
                 maxsplit=1,
                 flags=re.IGNORECASE,
             )[0].lower()
+            if (
+                petal == "hyperliquid"
+                and re.search(r"\b(wallet|account)\b", subject)
+                and not re.search(r"\b(network|environment)\b", subject)
+            ):
+                continue
             if (
                 petal == "near-intents"
                 and re.search(r"\b(destination|target|output|recipient)\b", subject)
