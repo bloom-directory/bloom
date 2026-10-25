@@ -886,7 +886,7 @@ mod tests {
                 Router::new().route(
                     "/",
                     get(|| async {
-                        Html(r#"<button>Comprar</button><button>Kaufen</button><button onclick="document.title='unsafe booking'">Book Now</button><span id="pay-name">Pay now</span><button aria-labelledby="pay-name" onmousedown="document.title='unsafe down'">Next</button><button onmousedown="this.textContent='Pay now'" onclick="document.title='unsafe click'">Proceed</button><button>Continue</button>"#)
+                        Html(r#"<button>Comprar</button><button>Kaufen</button><button onclick="document.title='unsafe booking'">Book Now</button><button onclick="document.title='unsafe purchase'">PURCHASE &amp; ACCEPT</button><span id="pay-name">Pay now</span><button aria-labelledby="pay-name" onmousedown="document.title='unsafe down'">Next</button><button onmousedown="this.textContent='Pay now'" onclick="document.title='unsafe click'">Proceed</button><button>Continue</button>"#)
                     }),
                 ),
             )
@@ -907,7 +907,14 @@ mod tests {
                 .unwrap()
                 .to_owned()
         };
-        for label in ["Comprar", "Kaufen", "Book Now", "Pay now", "Proceed"] {
+        for label in [
+            "Comprar",
+            "Kaufen",
+            "Book Now",
+            "PURCHASE & ACCEPT",
+            "Pay now",
+            "Proceed",
+        ] {
             let error = browser
                 .browse(BrowseRequest::Click {
                     element_ref: reference(label),

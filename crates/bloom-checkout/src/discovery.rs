@@ -95,6 +95,8 @@ const MERCHANT_CARD_ORIGINS: &[&str] = &[
     "https://www.aerolineas.com.ar",
     // Jetabroad Singapore keeps expiry on its own reviewed payment page.
     "https://www.jetabroad.com.sg",
+    // Frontier's inline card fields on its final payment page, observed 2026-10-24.
+    "https://booking.flyfrontier.com",
 ];
 
 /// Test browsers may read fixture merchants' declared totals; release builds never.
@@ -1305,6 +1307,17 @@ pub(crate) mod tests {
                 lines("en-SG", "", &["Total", "SGD 977.27"], "Book Now"),
                 Some((97727, "SGD")),
             ),
+            (
+                lines(
+                    "en-US",
+                    "",
+                    &["Total Payment Due: $56.98"],
+                    "PURCHASE & ACCEPT",
+                )
+                .replace("<button>", "<a href='#'>")
+                .replace("</button>", "</a>"),
+                Some((5698, "USD")),
+            ),
             // Final pages seen on 2026-10-11: Booking.com, Ryanair,
             // Aerolíneas Argentinas and Zalando.
             (
@@ -1463,6 +1476,26 @@ pub(crate) mod tests {
     async fn card_fields_go_to_payment_providers_or_the_merchant_page() {
         for (frame, top, allowed) in [
             ("https://js.stripe.com", "https://shop.example", true),
+            (
+                "https://booking.flyfrontier.com",
+                "https://booking.flyfrontier.com",
+                true,
+            ),
+            (
+                "https://booking.flyfrontier.com",
+                "https://shop.example",
+                false,
+            ),
+            (
+                "https://booking.flyfrontier.com.evil.example",
+                "https://booking.flyfrontier.com.evil.example",
+                false,
+            ),
+            (
+                "http://booking.flyfrontier.com",
+                "http://booking.flyfrontier.com",
+                false,
+            ),
             (
                 "https://core.spreedly.com",
                 "https://www.jetabroad.com.sg",
