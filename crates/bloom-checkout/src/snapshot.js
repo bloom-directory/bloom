@@ -9,6 +9,7 @@
     // They must not consume the control limit ahead of the current form.
     for (let parent = e.parentElement; parent; parent = parent.parentElement) {
       const style = getComputedStyle(parent), clip = parent.getBoundingClientRect();
+      if (styledSelect && style.opacity === '0') return false;
       if (['hidden', 'clip'].includes(style.overflowX) && clip.width === 0) return false;
       if (['hidden', 'clip'].includes(style.overflowY) && clip.height === 0) return false;
     }

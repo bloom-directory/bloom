@@ -1369,6 +1369,7 @@ mod tests {
               <div id="slotted-pay"><span slot="label">Pay now</span></div>
               <label>Styled month<select aria-label="Styled month" style="opacity:0"><option value="">Month</option><option value="1">January</option></select></label>
               <select aria-label="Hidden styled month" aria-hidden="true" style="opacity:0"><option>Month</option></select>
+              <div style="opacity:0"><select aria-label="Inactive month"><option>Month</option></select></div>
               <span id="birth-month-label">Birth month</span>
               <div id="birth-month" role="combobox" tabindex="0" aria-labelledby="birth-month-label">Choose month</div>
               <ul><li class="pick" id="city">Cordoba COR</li><li class="pick faded">Hidden city</li></ul>
@@ -1420,6 +1421,7 @@ mod tests {
         assert_eq!(find("Cordoba COR").len(), 1);
         assert!(find("January").is_empty());
         assert!(find("Hidden styled month").is_empty());
+        assert!(find("Inactive month").is_empty());
         assert_eq!(
             find("Styled month")
                 .iter()
