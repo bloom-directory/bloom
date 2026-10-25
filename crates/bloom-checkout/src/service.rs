@@ -2574,6 +2574,28 @@ mod tests {
         server.abort();
     }
 
+    async fn wait_for_shopping_page(browser: &Browser, url: &str) {
+        let origin = url::Url::parse(url).unwrap().origin().ascii_serialization();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if browser
+                    .browse(BrowseRequest::Snapshot)
+                    .await
+                    .is_ok_and(|page| page["url"] == url)
+                    && browser
+                        .shopping_scope()
+                        .await
+                        .is_ok_and(|(_, site)| site == origin)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("fixture shopping page did not load");
+    }
+
     /// A service shopping on `html`, with no private checkout.
     async fn shopping_service(
         html: &str,
@@ -2596,7 +2618,7 @@ mod tests {
             .browse(BrowseRequest::Open { url: url.clone() })
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        wait_for_shopping_page(&browser, &url).await;
         let service = CheckoutService::new(
             browser.clone(),
             &root.join("state.db"),
@@ -2647,12 +2669,12 @@ mod tests {
         unlocked(&service, "opened", Duration::from_secs(60)).await;
         service
             .request(Request::Browse {
-                request: BrowseRequest::Open { url },
+                request: BrowseRequest::Open { url: url.clone() },
             })
             .await
             .unwrap();
         assert_eq!(state("opened"), "expired");
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        wait_for_shopping_page(&service.browser, &url).await;
         unlocked(&service, "old", Duration::ZERO).await;
         assert!(
             service
