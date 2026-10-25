@@ -1367,6 +1367,8 @@ mod tests {
               <div id="component"></div>
               <div id="slotted"><span slot="label">Continue as guest</span></div>
               <div id="slotted-pay"><span slot="label">Pay now</span></div>
+              <label>Styled month<select aria-label="Styled month" style="opacity:0"><option value="">Month</option><option value="1">January</option></select></label>
+              <select aria-label="Hidden styled month" aria-hidden="true" style="opacity:0"><option>Month</option></select>
               <span id="birth-month-label">Birth month</span>
               <div id="birth-month" role="combobox" tabindex="0" aria-labelledby="birth-month-label">Choose month</div>
               <ul><li class="pick" id="city">Cordoba COR</li><li class="pick faded">Hidden city</li></ul>
@@ -1417,6 +1419,14 @@ mod tests {
         };
         assert_eq!(find("Cordoba COR").len(), 1);
         assert!(find("January").is_empty());
+        assert!(find("Hidden styled month").is_empty());
+        assert_eq!(
+            find("Styled month")
+                .iter()
+                .filter(|e| e["role"] == "select")
+                .count(),
+            1
+        );
         assert_eq!(
             find("Continue as guest").len(),
             1,
@@ -1597,6 +1607,30 @@ mod tests {
                 "{label} did not expose {expected}: {snapshot}"
             );
         }
+        let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+        let month = snapshot["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["role"] == "select" && e["label"] == "Styled month")
+            .unwrap();
+        browser
+            .browse(BrowseRequest::Select {
+                element_ref: month["ref"].as_str().unwrap().into(),
+                value: "1".into(),
+            })
+            .await
+            .unwrap();
+        let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+        assert_eq!(
+            snapshot["elements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["role"] == "select" && e["label"] == "Styled month")
+                .unwrap()["value"],
+            "1"
+        );
         fixture.abort();
     }
 
@@ -1738,7 +1772,7 @@ mod tests {
             .await
             .unwrap();
         let agent = agent.as_str().unwrap();
-        assert!(agent.contains(" Chrome/") && !agent.contains("Headless"));
+        assert!(agent.contains(" HeadlessChrome/"));
         let reference = snapshot["elements"]
             .as_array()
             .unwrap()

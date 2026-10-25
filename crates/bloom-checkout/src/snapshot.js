@@ -1,6 +1,10 @@
 (() => {
   const visible = e => {
-    if (!e.getClientRects().length || !e.checkVisibility({opacityProperty: true, visibilityProperty: true})) return false;
+    // Styled native selects may be transparent over their visible caption.
+    // Keep named, focusable selects usable; don't expose decorative faded nodes.
+    const styledSelect = e.tagName === 'SELECT' && e.tabIndex >= 0 && !e.closest('[aria-hidden="true"]') &&
+      (e.labels?.length || e.getAttribute('aria-label') || e.getAttribute('aria-labelledby'));
+    if (!e.getClientRects().length || !e.checkVisibility({opacityProperty: !styledSelect, visibilityProperty: true})) return false;
     // Previous steps can remain laid out inside a zero-height clipped panel.
     // They must not consume the control limit ahead of the current form.
     for (let parent = e.parentElement; parent; parent = parent.parentElement) {
