@@ -74,10 +74,12 @@
   const containers = new Set();
   for (const e of candidates)
     for (let parent = e.parentElement; parent; parent = parent.parentElement) containers.add(parent);
+  const nativeControl = e => e.matches(nativeElements) || (e.tagName === 'LABEL' && Boolean(e.control));
   const nodes = candidates.filter(e => control(e) || !containers.has(e))
     .sort((a, b) => Number(a.getBoundingClientRect().bottom <= 0) - Number(b.getBoundingClientRect().bottom <= 0)
-      // Dense pointer-based seat maps must leave room for actual form controls.
-      || Number(b.matches(nativeElements)) - Number(a.matches(nativeElements)))
+      // Dense pointer-based seat maps must leave room for native controls,
+      // including labels that operate hidden native checkboxes and radios.
+      || Number(nativeControl(b)) - Number(nativeControl(a)))
     .slice(0, 300)
     // Prioritize inclusion, not presentation: repeated passenger fields must
     // retain document order when focusing an input scrolls the page.

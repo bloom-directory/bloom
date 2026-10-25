@@ -59,6 +59,8 @@ tool for this checkout.
 - A snapshot element may carry `context`, the short text around it. Use it
   to tell repeated controls apart, such as identical fare buttons on
   different flight cards or the same day number in two calendar months.
+  Large pages may report that text is limited to the listed controls;
+  those controls, including on-page filters, remain usable.
 - Use fresh snapshot refs after every action. The browser rejects direct
   card entry and recognizable payment submission through shopping controls.
 - A payment request is refused while the page shows form errors; take a

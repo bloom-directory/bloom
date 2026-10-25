@@ -17,7 +17,18 @@ use std::{
 };
 use tokio::sync::oneshot;
 
-type Replies = Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>;
+type Replies = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>;
+
+#[derive(Debug)]
+pub(crate) struct OversizedReply;
+
+impl std::fmt::Display for OversizedReply {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Checkout browser reply exceeds the size limit")
+    }
+}
+
+impl std::error::Error for OversizedReply {}
 
 pub(crate) struct ProcessorResponse {
     pub session: String,
@@ -277,6 +288,7 @@ impl Cdp {
             .name("checkout-cdp".into())
             .spawn(move || {
                 let mut frame = Vec::new();
+                let mut discarding = false;
                 let mut bytes = [0; 8192];
                 while let Ok(size) = reader.read(&mut bytes) {
                     if size == 0 {
@@ -284,6 +296,10 @@ impl Cdp {
                     }
                     for &byte in &bytes[..size] {
                         if byte == 0 {
+                            if discarding {
+                                discarding = false;
+                                continue;
+                            }
                             if let Ok(value) = serde_json::from_slice::<Value>(&frame) {
                                 if value["method"] == "Network.responseReceived" {
                                     let params = &value["params"];
@@ -330,15 +346,24 @@ impl Cdp {
                                 }
                                 if let Some(id) = value["id"].as_u64() {
                                     if let Some(reply) = replies.lock().remove(&id) {
-                                        let _ = reply.send(value);
+                                        let _ = reply.send(Ok(value));
                                     }
                                 }
                             }
                             frame.clear();
+                        } else if discarding {
+                            continue;
                         } else if frame.len() < 8 * 1024 * 1024 {
                             frame.push(byte);
                         } else {
-                            return;
+                            // Keep the bound, drain this frame, and leave the pipe
+                            // usable. Its reply cannot be matched safely until
+                            // parsed, so fail pending calls without retrying them.
+                            frame.clear();
+                            discarding = true;
+                            for (_, reply) in replies.lock().drain() {
+                                let _ = reply.send(Err(OversizedReply.into()));
+                            }
                         }
                     }
                 }
@@ -365,7 +390,7 @@ impl Cdp {
         self.replies.lock().remove(&id);
         let value = response
             .with_context(|| format!("Checkout browser timed out during {method}"))?
-            .context("Checkout browser disconnected")?;
+            .context("Checkout browser disconnected")??;
         if value.get("error").is_some() {
             bail!("Checkout browser command failed during {method}");
         }
@@ -399,5 +424,53 @@ impl Drop for Cdp {
         let child = self.child.get_mut();
         let _ = child.kill();
         let _ = child.wait();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn oversized_reply_does_not_disable_later_browser_commands() {
+        let root = tempfile::tempdir().unwrap().keep();
+        let cdp = Cdp::launch(&crate::test_chromium(), &root, &["--no-sandbox".into()]).unwrap();
+        let target = cdp
+            .call(None, "Target.createTarget", json!({"url":"about:blank"}))
+            .await
+            .unwrap();
+        let attached = cdp
+            .call(
+                None,
+                "Target.attachToTarget",
+                json!({"targetId":target["targetId"],"flatten":true}),
+            )
+            .await
+            .unwrap();
+        let session = attached["sessionId"].as_str().unwrap();
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            cdp.call(
+                Some(session),
+                "Runtime.evaluate",
+                json!({"expression":"'x'.repeat(9 * 1024 * 1024)","returnByValue":true}),
+            ),
+        )
+        .await
+        .expect("oversized replies must fail without waiting for the command timeout")
+        .unwrap_err();
+        assert!(error.to_string().contains("reply exceeds"), "{error:#}");
+        let next = tokio::time::timeout(
+            Duration::from_secs(5),
+            cdp.call(
+                Some(session),
+                "Runtime.evaluate",
+                json!({"expression":"42","returnByValue":true}),
+            ),
+        )
+        .await
+        .expect("the next browser command must remain usable")
+        .unwrap();
+        assert_eq!(next["result"]["value"], 42);
     }
 }

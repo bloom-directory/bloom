@@ -1,4 +1,4 @@
-use crate::cdp::Cdp;
+use crate::cdp::{Cdp, OversizedReply};
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use std::{
@@ -152,6 +152,10 @@ impl Browser {
                     if position == 0 {
                         url = snapshot["url"].as_str().unwrap_or("").into();
                     }
+                    let projected = snapshot["elements"]
+                        .as_array()
+                        .context("Missing shopping elements")?;
+                    let limit = if position == 0 { 300 } else { 20 };
                     let tree = self
                         .cdp
                         .call(
@@ -159,18 +163,33 @@ impl Browser {
                             "Accessibility.getFullAXTree",
                             json!({"frameId":frame.frame_id}),
                         )
-                        .await?;
-                    text.push_str(&accessibility_text(&tree)?);
+                        .await;
+                    match tree {
+                        Ok(tree) => text.push_str(&accessibility_text(&tree)?),
+                        Err(error) if error.is::<OversizedReply>() => {
+                            // The structured controls already contain the safe
+                            // labels and context. Keep those usable without an
+                            // unbounded outline or another text-reading surface.
+                            eprintln!("checkout accessibility outline exceeded the reply limit");
+                            text.push_str("Large page: text is limited to the listed controls.\n");
+                            for element in projected.iter().take(limit) {
+                                if let Some(label) = element["label"].as_str() {
+                                    text.push_str(label);
+                                    text.push('\n');
+                                }
+                                if let Some(context) = element["context"].as_str() {
+                                    text.push_str(context);
+                                    text.push('\n');
+                                }
+                            }
+                        }
+                        Err(error) => return Err(error),
+                    }
                     text.push('\n');
-                    for (index, element) in snapshot["elements"]
-                        .as_array()
-                        .context("Missing shopping elements")?
-                        .iter()
-                        .enumerate()
-                    {
+                    for (index, element) in projected.iter().enumerate() {
                         // A long page must not crowd out its payment and
                         // other embedded frames, which get their own share.
-                        if index >= if position == 0 { 300 } else { 20 } || elements.len() >= 400 {
+                        if index >= limit || elements.len() >= 400 {
                             break;
                         }
                         let mut element = element.clone();
@@ -897,6 +916,10 @@ mod tests {
                           <span id="pay-name">Pay now</span>
                           <button aria-labelledby="pay-name" onmousedown="document.title='unsafe down'">Next</button>
                           <button onmousedown="this.textContent='Pay now'" onclick="document.title='unsafe click'">Proceed</button>
+                          <label for="labelled-pay">Continue labelled payment</label>
+                          <input id="labelled-pay" type="submit" value="Pay now" style="display:none" onclick="document.title='unsafe labelled payment'">
+                          <label for="labelled-button">Review labelled payment</label>
+                          <button id="labelled-button" aria-label="Complete booking" style="display:none" onclick="document.title='unsafe labelled booking'">Confirm</button>
                           <button>Ödeme Sayfasına Devam Et</button>
                           <button>Tiếp theo: Thanh toán &gt;</button>
                           <button>Gå til betaling</button>
@@ -934,6 +957,8 @@ mod tests {
             "Fizetés",
             "Pay now",
             "Proceed",
+            "Continue labelled payment",
+            "Review labelled payment",
         ] {
             let error = browser
                 .browse(BrowseRequest::Click {
@@ -1395,6 +1420,80 @@ mod tests {
         .expect("shopping popup never became ready");
         assert!(popup["url"].as_str().unwrap().ends_with("/flight"));
         assert!(popup["text"].as_str().unwrap().contains("Flight AR1554"));
+        fixture.abort();
+    }
+
+    #[tokio::test]
+    async fn large_catalog_keeps_filters_private_fields_and_following_actions_usable() {
+        let rows = format!("<p>{}</p>", "x".repeat(1024)).repeat(4500);
+        let flights = (0..350)
+            .map(|i| format!("<button onclick=\"this.textContent='Selected fixture {i}'\">Select fixture {i}</button>"))
+            .collect::<String>();
+        let (url, fixture) = crate::discovery::tests::fixture(format!(
+            "<!doctype html><style>p{{white-space:nowrap}}</style>
+             <label><input type='checkbox' style='display:none'>Direct flights</label>
+             <input aria-label='Card number' autocomplete='cc-number' value='4242424242424242'>
+             <div>{flights}</div><div>{rows}</div>"
+        ))
+        .await;
+        let root = tempfile::tempdir().unwrap().keep();
+        let browser = Browser::launch(
+            &crate::test_chromium(),
+            &root.join("profile"),
+            &["--no-sandbox".into(), "--ignore-certificate-errors".into()],
+        )
+        .await
+        .unwrap();
+        browser.browse(BrowseRequest::Open { url }).await.unwrap();
+        let snapshot = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                match browser.browse(BrowseRequest::Snapshot).await {
+                    Ok(snapshot)
+                        if snapshot["elements"].as_array().is_some_and(|elements| {
+                            elements.iter().any(|e| e["label"] == "Select fixture 0")
+                        }) =>
+                    {
+                        break snapshot;
+                    }
+                    Ok(_) => {}
+                    Err(error)
+                        if error.to_string()
+                            == "Shopping document changed; request a new snapshot" => {}
+                    Err(error) => panic!("large catalog could not be read: {error:#}"),
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("large catalog never became readable");
+        let elements = snapshot["elements"].as_array().unwrap();
+        assert!(elements.len() <= 300);
+        assert!(elements.iter().any(|e| e["label"] == "Direct flights"));
+        assert!(!snapshot.to_string().contains("4242424242424242"));
+        assert!(
+            snapshot["text"]
+                .as_str()
+                .unwrap()
+                .contains("listed controls")
+        );
+        let select = elements
+            .iter()
+            .find(|e| e["label"] == "Select fixture 0")
+            .unwrap();
+        browser
+            .browse(BrowseRequest::Click {
+                element_ref: select["ref"].as_str().unwrap().into(),
+            })
+            .await
+            .unwrap();
+        let after = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+        assert!(
+            after["elements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["label"] == "Selected fixture 0")
+        );
         fixture.abort();
     }
 

@@ -82,6 +82,17 @@ values use this projection rather than duplicated accessibility-tree text.
 Known numeric and English full-date renderings are redacted in review text.
 Before payment approval, verify the itinerary, party, extras and final total.
 
+Public control projection removes styled layout containers with an ancestor
+walk, keeping large catalogs from triggering repeated scans of every control.
+Browser protocol replies remain bounded at 8 MiB. An oversized frame is drained
+and pending calls fail without replay, leaving later commands usable. When an
+accessibility outline exceeds that bound, public text reuses the existing
+bounded control labels and context; private-field value filtering still applies.
+Labels operating hidden native inputs retain their place alongside native
+controls, so result cards cannot crowd out the search filters.
+Public label activation also checks an associated submit/button control's
+payment labels before dispatching activation events.
+
 ## Booking sites that reject Bloom's browser
 
 When an airline rejects Bloom's browser, the agent tries an agency selling
