@@ -1358,6 +1358,26 @@ pub(crate) mod tests {
                 None,
             ),
             (
+                lines("hu-HU", "", &["Teljes összeg", "Részösszeg 28826 Forint", "Fizetendő összeg 28826 Forint"], "Fizetés"),
+                Some((2882600, "HUF")),
+            ),
+            (
+                lines("hu-HU", "", &["Fizetendő összeg", "28 826Ft"], "Fizetés"),
+                Some((2882600, "HUF")),
+            ),
+            (
+                lines("hu-HU", "", &["Fizetendő összeg 28826,50 Forint"], "Fizetés"),
+                Some((2882650, "HUF")),
+            ),
+            (
+                lines("es-CO", "", &["Total COL$123456,78"], "Pagar"),
+                Some((12345678, "COP")),
+            ),
+            (
+                lines("en", "", &["Total 1250 IQD"], "Pay"),
+                Some((1250000, "IQD")),
+            ),
+            (
                 lines("en-US", "", &["Total amount due (All passengers)", "$178.40"], "Pay now"),
                 Some((17840, "USD")),
             ),

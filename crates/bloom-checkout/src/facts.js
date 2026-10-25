@@ -3,12 +3,12 @@
   // the main European and American checkout languages; anything unclear
   // returns null so the human finishes in the private view.
   const isoCodes = new Set(Intl.supportedValuesOf('currency'));
-  const symbols = [['US$','USD'],['U$S','USD'],['USD$','USD'],['HK$','HKD'],['₺','TRY'],['Türk Lirası','TRY'],['Norske kroner','NOK'],['R$','BRL'],['CA$','CAD'],['C$','CAD'],['MX$','MXN'],['AR$','ARS'],
+  const symbols = [['US$','USD'],['U$S','USD'],['USD$','USD'],['HK$','HKD'],['₺','TRY'],['Türk Lirası','TRY'],['Norske kroner','NOK'],['Forint','HUF'],['Ft','HUF'],['R$','BRL'],['CA$','CAD'],['C$','CAD'],['MX$','MXN'],['AR$','ARS'],
     ['CLP$','CLP'],['COL$','COP'],['$U','UYU'],['S/.','PEN'],['S/','PEN'],['SFr.','CHF'],['SFr','CHF'],['Fr.','CHF'],['zł','PLN'],['€','EUR'],['£','GBP'],['$','$']];
   const dollars = new Set(['USD','CAD','MXN','ARS','CLP','COP','UYU','AUD','NZD','SGD','HKD']);
-  const currencyToken = /US\$|U\$S|USD\$|HK\$|₺|Türk Lirası|Norske kroner|R\$|CA\$|C\$|MX\$|AR\$|CLP\$|COL\$|\$U|S\/\.?|SFr\.?|Fr\.|zł|[€£$]|(?<!\p{L})[A-Z]{3}(?!\p{L})/gu;
+  const currencyToken = /US\$|U\$S|USD\$|HK\$|₺|Türk Lirası|Norske kroner|Forint|Ft|R\$|CA\$|C\$|MX\$|AR\$|CLP\$|COL\$|\$U|S\/\.?|SFr\.?|Fr\.|zł|[€£$]|(?<!\p{L})[A-Z]{3}(?!\p{L})/gu;
   // Zalando renders "Gesamtsumme" and "inkl. MwSt." with no space between.
-  const label = /^(precio total final|montant à payer|importo totale|precio total|total a pagar|total final|gesamtsumme\s*inkl\.\s*mwst\.|total à payer|importe total|montant total|total payment due|total amount due|total amount|total to pay|amount to pay|ödenecek miktar|số tiền cần thanh toán|tổng cộng|beløp å betale|gesamtbetrag|totaalbedrag|grand total|order total|monto total|valor total|gesamtsumme|gesamtpreis|amount due|te betalen|do zapłaty|total due|total ttc|endbetrag|zu zahlen|totale|gesamt|totaal|total|summe|razem|suma)(?![\p{L}\p{N}])/iu;
+  const label = /^(precio total final|montant à payer|importo totale|precio total|total a pagar|total final|gesamtsumme\s*inkl\.\s*mwst\.|total à payer|importe total|montant total|total payment due|total amount due|total amount|total to pay|amount to pay|ödenecek miktar|số tiền cần thanh toán|tổng cộng|beløp å betale|fizetendő összeg|gesamtbetrag|totaalbedrag|grand total|order total|monto total|valor total|gesamtsumme|gesamtpreis|amount due|te betalen|do zapłaty|total due|total ttc|endbetrag|zu zahlen|totale|gesamt|totaal|total|summe|razem|suma)(?![\p{L}\p{N}])/iu;
   // An amount line holds only currency marks, digits, separators and spacing.
   const amountOnly = line => !/\p{L}/u.test(line.replace(/\([^)]*\)/g, '').replace(currencyToken, ''));
   const declared = () => {
@@ -28,7 +28,12 @@
   };
   const minorUnits = (number, code) => {
     if (!isoCodes.has(code)) return null;
-    const scale = new Intl.NumberFormat('en', {style:'currency',currency:code}).resolvedOptions().maximumFractionDigits;
+    // ISO 4217 minor units (SIX list, 2026-09-17), not CLDR display digits.
+    const scale = ({
+      BIF:0,CLP:0,DJF:0,GNF:0,ISK:0,JPY:0,KMF:0,KRW:0,PYG:0,RWF:0,UGX:0,UYI:0,VND:0,VUV:0,XAF:0,XOF:0,XPF:0,
+      BHD:3,IQD:3,JOD:3,KWD:3,LYD:3,OMR:3,TND:3,
+      CLF:4,UYW:4,
+    })[code] ?? 2;
     let whole = number, fraction = '';
     const last = number.search(/[.,][^.,]*$/);
     const tail = last >= 0 ? number.slice(last + 1) : '';

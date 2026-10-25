@@ -44,6 +44,10 @@ Facts come from `facts.js`: exactly one visible pay button and one labelled
 total in a supported language and number format, or processor data for
 Stripe-hosted pages. If facts are unclear, the request falls back to a manual
 ceremony that releases no card, and the human finishes in the private view.
+Amounts use ISO 4217 minor units. Checkout conversion and Broker's approval
+display use those exponents, not the browser's currency display precision:
+for example, HUF28,826.50 is 2882650 minor units even when CLDR normally
+displays forints without fractions.
 A card is filled only into fields hosted by a known payment provider
 (`PROVIDER_FIELD_ORIGINS`); other pages go to the private view.
 
@@ -82,8 +86,10 @@ Before payment approval, verify the itinerary, party, extras and final total.
 
 When an airline rejects Bloom's browser, the agent tries an agency selling
 the selected itinerary on Google's booking page. It reports the agency's
-price and booking terms before approval. If no listed seller works, it gives
-the person the booking link. No fingerprint spoofing, automated CAPTCHA
+price and booking terms before approval. If no listed seller works, it may
+search a known agency's normal website for the same flights, verifying actual
+airports, local dates/times, cabin and party before unlocking travelers. If
+no matching offer works, it gives the person the booking link. No fingerprint spoofing, automated CAPTCHA
 solving or cookie import is used.
 
 Seller observations are dated evidence of a particular step and itinerary.

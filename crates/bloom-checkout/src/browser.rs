@@ -893,12 +893,15 @@ mod tests {
                           <button onclick="document.title='unsafe Turkish payment'">Öde</button>
                           <button onclick="document.title='unsafe Vietnamese payment'">Thanh toán Ngay</button>
                           <button onclick="document.title='unsafe Norwegian payment'">Betal</button>
+                          <button onclick="document.title='unsafe Hungarian payment'">Fizetés</button>
                           <span id="pay-name">Pay now</span>
                           <button aria-labelledby="pay-name" onmousedown="document.title='unsafe down'">Next</button>
                           <button onmousedown="this.textContent='Pay now'" onclick="document.title='unsafe click'">Proceed</button>
                           <button>Ödeme Sayfasına Devam Et</button>
                           <button>Tiếp theo: Thanh toán &gt;</button>
                           <button>Gå til betaling</button>
+                          <button>Tovább a fizetéshez</button>
+                          <button>Fizetési lehetőségek</button>
                         "#)
                     }),
                 ),
@@ -928,6 +931,7 @@ mod tests {
             "Öde",
             "Thanh toán Ngay",
             "Betal",
+            "Fizetés",
             "Pay now",
             "Proceed",
         ] {
@@ -947,6 +951,8 @@ mod tests {
             "Ödeme Sayfasına Devam Et",
             "Tiếp theo: Thanh toán >",
             "Gå til betaling",
+            "Tovább a fizetéshez",
+            "Fizetési lehetőségek",
         ] {
             let current = browser.browse(BrowseRequest::Snapshot).await.unwrap();
             let element_ref = current["elements"]
