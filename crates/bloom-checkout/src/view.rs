@@ -170,20 +170,29 @@ mod tests {
             .await
             .unwrap();
             browser.browse(BrowseRequest::Open { url }).await.unwrap();
-            let tab = browser.handoff().await.unwrap();
-            let result = tab.cdp.evaluate(&tab.session, r#"(async () => {
-                for (let i = 0; i < 100; i++) {
-                    if (!document.getElementById('status')?.textContent.includes('Waiting')) break;
-                    await new Promise(resolve => setTimeout(resolve, 20));
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    if let Ok(page) = browser.browse(BrowseRequest::Snapshot).await
+                        && page["text"].as_str().is_some_and(|text| {
+                            text.contains("Private checkout closed")
+                                && text.contains(expected_message)
+                        })
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
                 }
-                return {
+            })
+            .await
+            .expect("closed checkout fixture did not finish loading");
+            let tab = browser.handoff().await.unwrap();
+            let result = tab.cdp.evaluate(&tab.session, r#"({
                     controlsHidden: document.getElementById('controls')?.hidden === true,
                     visibleButtons: [...document.querySelectorAll('button')].filter(b => b.getClientRects().length).length,
                     frameCleared: !document.getElementById('screen').hasAttribute('src'),
                     status: document.getElementById('status').textContent,
                     heading: document.getElementById('heading').textContent
-                };
-            })()"#.into()).await.unwrap();
+                })"#.into()).await.unwrap();
             assert_eq!(result["controlsHidden"], true, "{result}");
             assert_eq!(result["visibleButtons"], 0, "{result}");
             assert_eq!(result["frameCleared"], true, "{result}");

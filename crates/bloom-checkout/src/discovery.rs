@@ -1769,6 +1769,14 @@ pub(crate) mod tests {
         let refused = outcome_of(&browser, "<input aria-label='Nombres *' value='Karen'><div class='error'>Debes completar todos los campos.</div>").await;
         assert_eq!(refused["state"], "needs_input");
         assert_eq!(refused["reason"], "form_errors");
+        let legend = outcome_of(&browser, "<p>All fields are required.</p><input required>").await;
+        assert_eq!(legend["state"], "waiting");
+        let required_error = outcome_of(
+            &browser,
+            "<p role='alert'>All fields are required.</p><input required>",
+        )
+        .await;
+        assert_eq!(required_error["state"], "needs_input");
         // A label that names a booking code field is not a confirmation.
         let form = outcome_of(
             &browser,

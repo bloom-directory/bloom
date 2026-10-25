@@ -1800,6 +1800,10 @@ mod tests {
             .await;
             tokio::time::sleep(Duration::from_secs(2)).await;
             if method == "Browser.crash" {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                while !tab.cdp.exited() && tokio::time::Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
                 assert!(
                     tab.cdp.exited(),
                     "Browser crash command must terminate the browser"
