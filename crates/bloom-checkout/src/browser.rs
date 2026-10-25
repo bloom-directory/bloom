@@ -1356,6 +1356,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dense_seat_map_keeps_the_native_continue_control() {
+        let (url, fixture) = crate::discovery::tests::fixture(format!(
+            "<!doctype html><style>.seat{{cursor:pointer}}</style>{}<button onclick=\"document.title='continued'\">Continue without seats</button>",
+            "<div class='seat'>Seat selection</div>".repeat(350)
+        ))
+        .await;
+        let root = tempfile::tempdir().unwrap();
+        let browser = Browser::launch(
+            &crate::test_chromium(),
+            &root.path().join("profile"),
+            &["--no-sandbox".into(), "--ignore-certificate-errors".into()],
+        )
+        .await
+        .unwrap();
+        browser.browse(BrowseRequest::Open { url }).await.unwrap();
+        let snapshot = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+                if snapshot["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Continue without seats")
+                {
+                    break snapshot;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let elements = snapshot["elements"].as_array().unwrap();
+        assert!(elements.len() <= 300);
+        let next = elements
+            .iter()
+            .find(|e| e["label"] == "Continue without seats")
+            .expect("seat-map controls must not crowd out the native Continue button");
+        browser
+            .browse(BrowseRequest::Click {
+                element_ref: next["ref"].as_str().unwrap().to_owned(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            browser.browse(BrowseRequest::Snapshot).await.unwrap()["text"]
+                .as_str()
+                .unwrap()
+                .contains("continued")
+        );
+        fixture.abort();
+    }
+
+    #[tokio::test]
     async fn script_styled_controls_are_projected_with_their_card() {
         let root = tempfile::tempdir().unwrap().keep();
         let browser = Browser::launch(

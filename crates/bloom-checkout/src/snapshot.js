@@ -68,7 +68,9 @@
   // form. Give current and following controls room before those earlier nodes.
   const order = new Map(candidates.map((e, i) => [e, i]));
   const nodes = candidates.filter(e => control(e) || !candidates.some(o => o !== e && e.contains(o)))
-    .sort((a, b) => Number(a.getBoundingClientRect().bottom <= 0) - Number(b.getBoundingClientRect().bottom <= 0))
+    .sort((a, b) => Number(a.getBoundingClientRect().bottom <= 0) - Number(b.getBoundingClientRect().bottom <= 0)
+      // Dense pointer-based seat maps must leave room for actual form controls.
+      || Number(control(b)) - Number(control(a)))
     .slice(0, 300)
     // Prioritize inclusion, not presentation: repeated passenger fields must
     // retain document order when focusing an input scrolls the page.
