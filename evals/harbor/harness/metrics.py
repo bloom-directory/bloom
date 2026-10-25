@@ -2,6 +2,7 @@
 
 import json
 import re
+import shlex
 
 MOUNT = re.compile(r"/bloom(?=/|[\s\"'`]|$)")
 READ = re.compile(
@@ -10,6 +11,31 @@ READ = re.compile(
 WRITE = re.compile(
     r"(?:>>?|\btee(?:\s+-\w+)*|\btouch|\btruncate|\bmkdir(?:\s+-\w+)*)\s*[\"']?/bloom(?:/|\b)"
 )
+
+
+def literal_copies(command):
+    """Only plain two-operand cp commands; never expand shell expressions."""
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>\n")
+    lexer.whitespace = " \t\r"
+    lexer.whitespace_split = True
+    try:
+        tokens = list(lexer)
+    except ValueError:
+        return
+    segment = []
+    for token in [*tokens, ";"]:
+        if token and set(token) <= set(";&|<>\n"):
+            if len(segment) == 3 and segment[0] == "cp":
+                source, destination = segment[1:]
+                if not any(
+                    re.search(r"[$`*?\[\]{}()]|(?:^|/)\.\.(?:/|$)", path)
+                    or path.startswith("-")
+                    for path in (source, destination)
+                ):
+                    yield source, destination
+            segment = []
+        else:
+            segment.append(token)
 
 
 def trajectory_counts(trajectory):
@@ -64,6 +90,11 @@ def trajectory_counts(trajectory):
                 )
                 read |= bool(READ.search(without_outputs))
                 write |= bool(WRITE.search(command))
+                for source, destination in literal_copies(command):
+                    read |= source == "/bloom" or source.startswith("/bloom/")
+                    write |= destination == "/bloom" or destination.startswith(
+                        "/bloom/"
+                    )
             counts["bloom_read_tool_calls"] += int(read)
             counts["bloom_write_tool_calls"] += int(write)
             counts["bloom_unclassified_tool_calls"] += int(not read and not write)

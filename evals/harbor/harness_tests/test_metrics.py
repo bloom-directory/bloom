@@ -71,3 +71,28 @@ class CommandCountsTests(unittest.TestCase):
         )
         self.assertEqual(result["agent_tool_calls"], 1)
         self.assertEqual(result["bloom_read_tool_calls"], 0)
+
+    def test_literal_copy_direction_counts_reads_and_writes(self):
+        for command, read, write in (
+            ('cp /tmp/order.json /bloom/order.json; rc=$?; echo "$rc"', 0, 1),
+            ('cp "/bloom/order.json" /tmp/order.json', 1, 0),
+            ("cp /bloom/source /bloom/destination", 1, 1),
+        ):
+            result = self.counts(self.call("bash", command=command))
+            with self.subTest(command=command):
+                self.assertEqual(result["bloom_read_tool_calls"], read)
+                self.assertEqual(result["bloom_write_tool_calls"], write)
+                self.assertEqual(result["bloom_unclassified_tool_calls"], 0)
+
+    def test_dynamic_copy_and_quoted_command_text_remain_unknown(self):
+        for command in (
+            'cp "$source" /bloom/new',
+            "cp /bloom/* /tmp/new",
+            'echo "cp /tmp/order /bloom/order"',
+            "cp -t /bloom/new /tmp/order",
+        ):
+            result = self.counts(self.call("bash", command=command))
+            with self.subTest(command=command):
+                self.assertEqual(result["bloom_read_tool_calls"], 0)
+                self.assertEqual(result["bloom_write_tool_calls"], 0)
+                self.assertEqual(result["bloom_unclassified_tool_calls"], 1)
