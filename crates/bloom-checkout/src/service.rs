@@ -709,6 +709,8 @@ impl CheckoutService {
                     forms.extend([
                         format!("{day} {name} {year}"),
                         format!("{day:02} {name} {year}"),
+                        format!("{day} {name},{year}"),
+                        format!("{day:02} {name},{year}"),
                         format!("{name} {day}, {year}"),
                     ]);
                 }
@@ -3327,7 +3329,7 @@ mod tests {
     #[tokio::test]
     async fn split_birth_dates_are_private_without_redacting_prices_or_flight_dates() {
         let (service, browser, _, server) = shopping_service(
-            "<p>Total USD 7.05</p><p>Flight 7 May</p><p>Passenger born 7 May 1990</p><label>Birth day<input autocomplete='bday-day'></label><label>Birth month<select aria-label='Birth month' autocomplete='bday-month'><option value=''></option><option value='5'>May</option><option value='6'>June</option></select></label><label>Birth year<input autocomplete='bday-year'></label><input aria-label='Manual day'>",
+            "<p>Total USD 7.05</p><p>Flight 7 May</p><p>Passenger born 7 May 1990</p><p>Jettzy Mr/07 May,1990/US</p><label>Birth day<input autocomplete='bday-day'></label><label>Birth month<select aria-label='Birth month' autocomplete='bday-month'><option value=''></option><option value='5'>May</option><option value='6'>June</option></select></label><label>Birth year<input autocomplete='bday-year'></label><input aria-label='Manual day'>",
         ).await;
         unlocked(&service, "fixture", Duration::from_secs(60)).await;
         {
@@ -3388,6 +3390,7 @@ mod tests {
         );
         assert!(!text.contains("combobox: Birth month"), "{text}");
         assert!(text.contains("Passenger born [saved born_on]"), "{text}");
+        assert!(text.contains("Jettzy Mr/[saved born_on]/US"), "{text}");
         let tab = browser.handoff().await.unwrap();
         let actual = tab
             .cdp
@@ -3696,6 +3699,22 @@ mod tests {
             )]
             .into()
         };
+        for (phone, national) in [
+            ("+60 12-345 6789", "123456789"),
+            ("+65 8123 4567", "81234567"),
+            ("+852 5123 4567", "51234567"),
+            ("+39 06 6988 0000", "0669880000"),
+            ("+1 202 555 0123", "2025550123"),
+            ("020 7946 0018", "02079460018"),
+        ] {
+            assert_eq!(
+                derived_traveler_value(&values(phone), "phone_national")
+                    .unwrap()
+                    .as_str(),
+                national,
+                "{phone}"
+            );
+        }
         // Argentine mobiles: 11 for Buenos Aires, three and four digit areas elsewhere.
         for (phone, area, local) in [
             ("+5492944123456", "294", "4123456"),

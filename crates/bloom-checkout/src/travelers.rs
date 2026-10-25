@@ -13,13 +13,6 @@ pub(crate) struct TravelerDiscovery {
     mapped: Value,
 }
 
-/// Country calling codes, longest first, for numbers sites want without one.
-const CALLING_CODES: &[&str] = &[
-    "598", "595", "593", "591", "506", "507", "502", "503", "504", "505", "351", "353", "54", "55",
-    "56", "57", "58", "51", "52", "53", "34", "44", "49", "33", "39", "41", "31", "32", "61", "64",
-    "81", "82", "86", "91", "1", "7",
-];
-
 /// The saved phone in international format, grouped by the country's
 /// numbering plan ("+54 9 294 412-3456"), so a form's area-code and number
 /// fields can each take their part. None when the number does not parse.
@@ -52,11 +45,16 @@ pub(crate) fn derived_traveler_value(
                 .filter(|c| c.is_ascii_digit())
                 .collect();
             let international = values.get("phone")?.trim_start().starts_with('+');
-            let code = CALLING_CODES
-                .iter()
-                .find(|code| international && digits.starts_with(**code))
-                .map_or(0, |code| code.len());
-            Some(Zeroizing::new(digits[code..].to_owned()))
+            let code = if international {
+                phonenumber::parse(None, values.get("phone")?)
+                    .ok()?
+                    .country()
+                    .code()
+                    .to_string()
+            } else {
+                String::new()
+            };
+            Some(Zeroizing::new(digits.strip_prefix(&code)?.to_owned()))
         }
         "phone_area" | "phone_local" => {
             let formatted = formatted_phone(values.get("phone")?)?;
