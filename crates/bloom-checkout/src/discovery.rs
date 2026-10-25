@@ -75,6 +75,10 @@ const PROVIDER_FIELD_ORIGINS: &[&str] = &[
 
 /// Provider-hosted checkout pages whose own document holds the card fields.
 const PROVIDER_PAGE_ORIGINS: &[&str] = &[
+    // Travomint hosted handoff, 2026-10-25. PayGlocal's payment privacy policy
+    // identifies payglocal.com and its subdomains; only this observed origin is allowed.
+    // https://payglocal.in/privacy-policy-for-payments-page
+    "https://api.payglocal.com",
     "https://checkout.stripe.com",
     "https://buy.stripe.com",
     "https://www.paypal.com",
@@ -1378,6 +1382,14 @@ pub(crate) mod tests {
                 Some((1250000, "IQD")),
             ),
             (
+                lines("en", "", &["Travomint", "PAYING", "$", "359.04", "CAD"], "Pay $ 359.04 CAD"),
+                Some((35904, "CAD")),
+            ),
+            (
+                lines("en", "", &["PAYING", "$359.04"], "Pay"),
+                None,
+            ),
+            (
                 lines("en-US", "", &["Total amount due (All passengers)", "$178.40"], "Pay now"),
                 Some((17840, "USD")),
             ),
@@ -1770,6 +1782,22 @@ pub(crate) mod tests {
                 "https://checkout.stripe.com",
                 "https://checkout.stripe.com",
                 true,
+            ),
+            (
+                "https://api.payglocal.com",
+                "https://api.payglocal.com",
+                true,
+            ),
+            ("https://api.payglocal.com", "https://shop.example", false),
+            (
+                "https://api.payglocal.com.evil.example",
+                "https://api.payglocal.com.evil.example",
+                false,
+            ),
+            (
+                "http://api.payglocal.com",
+                "http://api.payglocal.com",
+                false,
             ),
             // A listed merchant's own page, but not any HTTPS shop.
             (
