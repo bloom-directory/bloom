@@ -3144,7 +3144,7 @@ mod tests {
             "<p data-bloom-total-minor='399' data-bloom-currency='USD'>Total USD 3.99</p>
              <input autocomplete='cc-number'><input autocomplete='cc-exp'><input autocomplete='cc-csc'>
              <p>Debes completar todos los campos</p>
-             <button id='pay' onclick=\"setTimeout(()=>document.body.innerHTML='<h1>Tu compra ha sido confirmada</h1><p>Código de reserva: ZX98YU</p>',1200)\">Pagar</button>".into(),
+             <button id='pay' onclick=\"window.fixturePayCount=(window.fixturePayCount||0)+1\">Pagar</button>".into(),
         )
         .await;
         let root = tempfile::tempdir().unwrap().keep();
@@ -3243,7 +3243,23 @@ mod tests {
             "stale validation text must not authorize a second payment click"
         );
         assert!(service.private.lock().await.is_some());
-        tokio::time::timeout(Duration::from_secs(4), watcher)
+        // Confirm only after checking the pending state. A background browser's
+        // timer can be throttled on macOS; elapsed wall time is not the outcome.
+        let clicks = observer
+            .cdp
+            .evaluate(&observer.session, "window.fixturePayCount".into())
+            .await
+            .unwrap();
+        assert_eq!(clicks, json!(1));
+        observer
+            .cdp
+            .evaluate(
+                &observer.session,
+                "document.body.innerHTML='<h1>Tu compra ha sido confirmada</h1><p>Código de reserva: ZX98YU</p>'".into(),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), watcher)
             .await
             .unwrap()
             .unwrap();

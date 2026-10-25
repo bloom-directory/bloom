@@ -133,7 +133,8 @@ jobs:
         run: cargo test --manifest-path bloom-broker/Cargo.toml --workspace --locked
 
       - name: Verify checkout browser and crash protection on macOS
-        run: cargo test --manifest-path bloom/Cargo.toml -p bloom-checkout --lib --locked
+        # Each browser test launches Chrome; bound concurrency on the shared runner.
+        run: cargo test --manifest-path bloom/Cargo.toml -p bloom-checkout --lib --locked -- --test-threads=4
 
       - name: Upload verified macOS candidate
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
