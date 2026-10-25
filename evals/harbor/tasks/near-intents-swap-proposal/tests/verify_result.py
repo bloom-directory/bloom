@@ -133,6 +133,8 @@ def verify(root=None):
     sessions = reader.directories(base)
     require(len(sessions) == 1, "expected exactly one swap session")
     base += "/" + sessions[0]
+    status = reader.read_json(base + "/status.json")
+    require(status.get("state") == "staged", "swap is not staged for unsigned review")
     outbox = reader.read_json(base + "/outbox.json")
     request = reader.read_json(base + "/request.json")
     require(
@@ -174,7 +176,7 @@ def verify(root=None):
             )
     validate(
         request,
-        reader.read_json(base + "/status.json"),
+        status,
         outbox,
         reader.read_json(base + "/quote.json"),
         reader.read_json(root_path + f"/pending/{outbox['id']}/intent.json"),

@@ -196,3 +196,34 @@ class NearProposalTests(unittest.TestCase):
                 else:
                     with self.subTest(path=bad_path), self.assertRaises(ValueError):
                         verifier.verify(Path("fixture"))
+
+    def test_failed_or_quoted_swap_is_rejected_before_absent_outbox_read(self):
+        base = "petals/near-intents/swaps/harbor/0"
+        values = {
+            "chains/ethereum/chain_id": 1,
+            "wallets/harbor/0/account.json": {
+                "wallet": "harbor",
+                "number": 0,
+                "freshness": "fresh",
+                "evm": {"address": self.expected["address"]},
+            },
+        }
+        reader = mock.Mock()
+        reader.entries.return_value = {}
+        reader.directories.side_effect = lambda path: (
+            ["trial-session"] if path == base else []
+        )
+        reader.read_json.side_effect = values.__getitem__
+        for state in ("quote_failed", "quoted"):
+            values[base + "/trial-session/status.json"] = {"state": state}
+            with (
+                mock.patch.object(verifier, "ProjectionReader", return_value=reader),
+                mock.patch.dict(
+                    os.environ, {"BLOOM_EVAL_PROPOSAL": json.dumps(self.expected)}
+                ),
+            ):
+                with (
+                    self.subTest(state=state),
+                    self.assertRaisesRegex(ValueError, "not staged"),
+                ):
+                    verifier.verify(Path("fixture"))
