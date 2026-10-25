@@ -307,3 +307,18 @@ class ClarificationTests(unittest.TestCase):
             "I selected mainnet. Please provide funds.",
         ):
             self.assertFalse(asks_for_selection(self.trajectory(message), "solana"))
+
+    def test_conditional_chain_request_leaves_named_choices_unresolved(self):
+        for message in (
+            "Please fund the intended network and specify it if not Ethereum or Polygon.",
+            "Specify the chain unless Ethereum or Polygon.",
+            "If not Ethereum or Polygon, specify the chain.",
+        ):
+            with self.subTest(message=message):
+                self.assertFalse(
+                    asks_for_selection(
+                        self.trajectory(message),
+                        "solana",
+                        choices=("ethereum", "polygon", "arc"),
+                    )
+                )

@@ -35,6 +35,14 @@ def asks_for_selection(trajectory, petal, choices=()):
         return False
     words = MISSING_FACT_WORDS.get(petal, set())
     for sentence in re.split(r"(?<=[.!?])\s+|\n+", message):
+        conditional = re.search(r"\b(?:if\s+not|unless)\b(.+)", sentence, re.IGNORECASE)
+        if conditional and any(
+            re.search(r"\b" + re.escape(choice) + r"\b", conditional.group(1), re.IGNORECASE)
+            for choice in choices
+        ):
+            # Asking only outside named chains leaves the choice among them
+            # unresolved: "specify it if not Ethereum or Polygon".
+            continue
         if petal == "hyperliquid" and re.fullmatch(
             r"\s*(?:(?:do you (?:mean|want|prefer)|should I use|would you like|is it)\s+)?"
             r"(?:Hyperliquid\s+)?(?:mainnet or testnet|testnet or mainnet)\s*\??\s*",
