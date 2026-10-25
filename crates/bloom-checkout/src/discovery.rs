@@ -69,6 +69,8 @@ const PROVIDER_FIELD_ORIGINS: &[&str] = &[
     "https://sdk-web-card.prod.y.uno",
     // Etraveli secure fields observed on Gotogate's final payment page 2026-10-24.
     "https://frontend-payments.payment-prod.etraveligroup.net",
+    // Jetabroad number/CVC frames, observed 2026-10-24; Spreedly's documented iframe SDK origin.
+    "https://core.spreedly.com",
 ];
 
 /// Provider-hosted checkout pages whose own document holds the card fields.
@@ -91,6 +93,8 @@ const PROVIDER_PAGE_ORIGINS: &[&str] = &[
 const MERCHANT_CARD_ORIGINS: &[&str] = &[
     // Aerolíneas Argentinas' inline card form (card research 2026-10-13).
     "https://www.aerolineas.com.ar",
+    // Jetabroad Singapore keeps expiry on its own reviewed payment page.
+    "https://www.jetabroad.com.sg",
 ];
 
 /// Test browsers may read fixture merchants' declared totals; release builds never.
@@ -1459,6 +1463,36 @@ pub(crate) mod tests {
     async fn card_fields_go_to_payment_providers_or_the_merchant_page() {
         for (frame, top, allowed) in [
             ("https://js.stripe.com", "https://shop.example", true),
+            (
+                "https://core.spreedly.com",
+                "https://www.jetabroad.com.sg",
+                true,
+            ),
+            (
+                "https://core.spreedly.com.evil.example",
+                "https://www.jetabroad.com.sg",
+                false,
+            ),
+            (
+                "http://core.spreedly.com",
+                "https://www.jetabroad.com.sg",
+                false,
+            ),
+            (
+                "https://www.jetabroad.com.sg",
+                "https://www.jetabroad.com.sg",
+                true,
+            ),
+            (
+                "https://www.jetabroad.com.sg",
+                "https://shop.example",
+                false,
+            ),
+            (
+                "https://www.jetabroad.com.sg.evil.example",
+                "https://www.jetabroad.com.sg.evil.example",
+                false,
+            ),
             (
                 "https://frontend-payments.payment-prod.etraveligroup.net",
                 "https://ar.gotogate.com",
