@@ -503,6 +503,11 @@ impl CheckoutService {
                         }),
                 ),
         );
+        for field in ["born_on", "document_expiry"] {
+            if let Some(value) = values.get(field) {
+                Self::remember_sent(&self.browser, field, value);
+            }
+        }
         status.filled_fields = values.keys().cloned().collect();
         self.forget_journey_filler_unless(&pending.context).await;
         self.prune(&mut travelers, &pending.context, &pending.origin);
@@ -671,6 +676,49 @@ impl CheckoutService {
             return;
         }
         let item = (value.to_owned(), format!("[saved {field}]"));
+        // Review pages commonly spell the month rather than repeat the ISO
+        // value sent to their controls (Jetabroad: "1 Jan 1990").
+        if matches!(field, "born_on" | "document_expiry") {
+            let parts: Vec<_> = value.split('-').collect();
+            if let [year, month, day] = parts.as_slice()
+                && let (Ok(month), Ok(day)) = (month.parse::<usize>(), day.parse::<u8>())
+                && (1..=12).contains(&month)
+                && (1..=31).contains(&day)
+            {
+                let names = [
+                    "January",
+                    "February",
+                    "March",
+                    "April",
+                    "May",
+                    "June",
+                    "July",
+                    "August",
+                    "September",
+                    "October",
+                    "November",
+                    "December",
+                ];
+                let mut forms = vec![
+                    format!("{day}/{month}/{year}"),
+                    format!("{month}/{day}/{year}"),
+                    format!("{day:02}/{month:02}/{year}"),
+                    format!("{month:02}/{day:02}/{year}"),
+                ];
+                for name in [names[month - 1], &names[month - 1][..3]] {
+                    forms.extend([
+                        format!("{day} {name} {year}"),
+                        format!("{day:02} {name} {year}"),
+                        format!("{name} {day}, {year}"),
+                    ]);
+                }
+                browser.redact(
+                    forms
+                        .into_iter()
+                        .map(|form| (form, format!("[saved {field}]"))),
+                );
+            }
+        }
         if field == "born_on_year" {
             browser.redact_min([item], 1);
         } else {
@@ -3263,7 +3311,7 @@ mod tests {
     #[tokio::test]
     async fn split_birth_dates_are_private_without_redacting_prices_or_flight_dates() {
         let (service, browser, _, server) = shopping_service(
-            "<p>Total USD 7.05</p><p>Flight 7 May</p><label>Birth day<input autocomplete='bday-day'></label><label>Birth month<select aria-label='Birth month' autocomplete='bday-month'><option value=''></option><option value='5'>May</option><option value='6'>June</option></select></label><label>Birth year<input autocomplete='bday-year'></label><input aria-label='Manual day'>",
+            "<p>Total USD 7.05</p><p>Flight 7 May</p><p>Passenger born 7 May 1990</p><label>Birth day<input autocomplete='bday-day'></label><label>Birth month<select aria-label='Birth month' autocomplete='bday-month'><option value=''></option><option value='5'>May</option><option value='6'>June</option></select></label><label>Birth year<input autocomplete='bday-year'></label><input aria-label='Manual day'>",
         ).await;
         unlocked(&service, "fixture", Duration::from_secs(60)).await;
         {
@@ -3323,6 +3371,7 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("combobox: Birth month"), "{text}");
+        assert!(text.contains("Passenger born [saved born_on]"), "{text}");
         let tab = browser.handoff().await.unwrap();
         let actual = tab
             .cdp
