@@ -3598,7 +3598,34 @@ mod tests {
             .browse(BrowseRequest::Open { url: url.clone() })
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Navigation acknowledgement is not document readiness, especially
+        // when CI runs several browser fixtures together. Observe the expected
+        // form before binding its reference; never replay a field action.
+        let snapshot = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match browser.browse(BrowseRequest::Snapshot).await {
+                    Ok(snapshot)
+                        if snapshot["url"] == url
+                            && snapshot["elements"].as_array().is_some_and(|elements| {
+                                elements.iter().any(|e| e["label"] == "Documento")
+                            }) =>
+                    {
+                        break snapshot;
+                    }
+                    Ok(_) => {}
+                    Err(error)
+                        if matches!(
+                            error.to_string().as_str(),
+                            "Only ordinary shopping documents can be observed"
+                                | "Shopping document changed; request a new snapshot"
+                        ) => {}
+                    Err(error) => panic!("Fixture snapshot failed: {error:#}"),
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("The requested fixture form must load before traveler entry");
         let service = CheckoutService::new(
             browser.clone(),
             &root.join("state.db"),
@@ -3625,7 +3652,6 @@ mod tests {
                 expires: tokio::time::Instant::now() + Duration::from_secs(60),
             },
         );
-        let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
         let element_ref = snapshot["elements"]
             .as_array()
             .unwrap()
