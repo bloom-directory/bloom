@@ -1321,6 +1321,10 @@ pub(crate) mod tests {
                 Some((580447, "HKD")),
             ),
             (
+                lines("en-US", "", &["Total amount due (All passengers)", "$178.40"], "Pay now"),
+                Some((17840, "USD")),
+            ),
+            (
                 lines(
                     "en-US",
                     "",
