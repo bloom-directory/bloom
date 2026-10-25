@@ -3118,39 +3118,16 @@ mod tests {
 
     #[tokio::test]
     async fn form_error_stays_private_and_manual_pay_is_recorded_before_click() {
-        let (url, server) = crate::discovery::tests::fixture(
+        let (service, browser, _, server) = shopping_service(
             "<p data-bloom-total-minor='399' data-bloom-currency='USD'>Total USD 3.99</p>
              <input autocomplete='cc-number'><input autocomplete='cc-exp'><input autocomplete='cc-csc'>
              <p>Debes completar todos los campos</p>
-             <button id='pay' onclick=\"window.fixturePayCount=(window.fixturePayCount||0)+1\">Pagar</button>".into(),
+             <button id='pay' onclick=\"window.fixturePayCount=(window.fixturePayCount||0)+1\">Pagar</button>",
         )
         .await;
-        let root = tempfile::tempdir().unwrap().keep();
-        let browser = Browser::launch(
-            &crate::test_chromium(),
-            &root.join("profile"),
-            &["--no-sandbox".into(), "--ignore-certificate-errors".into()],
-        )
-        .await
-        .unwrap();
-        browser
-            .browse(crate::browser::BrowseRequest::Open { url })
-            .await
-            .unwrap();
-        tokio::time::sleep(Duration::from_millis(200)).await;
         let tab = browser.handoff().await.unwrap();
         let observer = tab.clone();
         let discovery = Discovery::read(&tab).await.unwrap();
-        let service = Arc::new(
-            CheckoutService::new(
-                browser,
-                &root.join("state.db"),
-                root.join("unused.sock"),
-                unsafe { libc::geteuid() },
-                47999,
-            )
-            .unwrap(),
-        );
         let status = Status {
             operation_id: "fixture-correction".into(),
             state: "submitted".into(),
