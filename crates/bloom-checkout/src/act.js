@@ -1,15 +1,32 @@
 (index, kind, value) => {
   const e = globalThis.__bloomRefs?.[index];
   if (!e || !e.isConnected || e.disabled || e.getAttribute('aria-disabled') === 'true' || !e.getClientRects().length) throw Error('stale');
-  const namedBy = (e.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean)
-    .map(id => e.getRootNode().getElementById(id)?.textContent || '').join(' ');
-  const labels = [e.innerText, e.value, e.getAttribute('aria-label'), namedBy];
-  if (kind === 'click' && labels.some(label => BLOOM_PAY_WORDS.test((label || '').replace(/\s+/g, ' ').trim()))) throw Error('payment requires approval');
+  const guardPayment = () => {
+    const namedBy = (e.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean)
+      .map(id => e.getRootNode().getElementById(id)?.textContent || '').join(' ');
+    const labels = [e.innerText, e.value, e.getAttribute('aria-label'), namedBy];
+    if (labels.some(label => BLOOM_PAY_WORDS.test((label || '').replace(/\s+/g, ' ').trim()))) throw Error('payment requires approval');
+  };
   if (kind === 'click') {
+    guardPayment();
     // Styled labels can cancel clicks on the label itself. Activate their
     // associated checkbox/radio, as clicking the visible control would.
     const target = e.tagName === 'LABEL' && ['checkbox', 'radio'].includes(e.control?.type) ? e.control : e;
     if (target.disabled) throw Error('stale');
+    // Custom lists often open on mouse-down, which HTMLElement.click omits.
+    // Keep the whole interaction bound to this node, not screen coordinates.
+    if (target === e) {
+      target.scrollIntoView({block: 'nearest', inline: 'nearest'});
+      const rect = target.getBoundingClientRect();
+      const mouse = {bubbles: true, composed: true, cancelable: true, view: window, button: 0,
+        clientX: rect.x + rect.width / 2, clientY: rect.y + rect.height / 2};
+      if (target.dispatchEvent(new MouseEvent('mousedown', {...mouse, buttons: 1}))) target.focus?.();
+      if (!target.isConnected || target.disabled) throw Error('stale');
+      guardPayment();
+      target.dispatchEvent(new MouseEvent('mouseup', {...mouse, buttons: 0}));
+      if (!target.isConnected || target.disabled) throw Error('stale');
+      guardPayment();
+    }
     target.click();
   } else {
     if ((e.autocomplete || '').split(' ').some(s => s.startsWith('cc-'))) throw Error('private payment input');

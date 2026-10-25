@@ -873,7 +873,7 @@ mod tests {
                 Router::new().route(
                     "/",
                     get(|| async {
-                        Html("<button>Comprar</button><button>Kaufen</button><span id='pay-name'>Pay now</span><button aria-labelledby='pay-name'>Next</button><button>Continue</button>")
+                        Html(r#"<button>Comprar</button><button>Kaufen</button><span id="pay-name">Pay now</span><button aria-labelledby="pay-name" onmousedown="document.title='unsafe down'">Next</button><button onmousedown="this.textContent='Pay now'" onclick="document.title='unsafe click'">Proceed</button><button>Continue</button>"#)
                     }),
                 ),
             )
@@ -894,7 +894,7 @@ mod tests {
                 .unwrap()
                 .to_owned()
         };
-        for label in ["Comprar", "Kaufen", "Pay now"] {
+        for label in ["Comprar", "Kaufen", "Pay now", "Proceed"] {
             let error = browser
                 .browse(BrowseRequest::Click {
                     element_ref: reference(label),
@@ -913,6 +913,8 @@ mod tests {
             })
             .await
             .unwrap();
+        let after = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+        assert!(!after["text"].as_str().unwrap().contains("unsafe"));
         site.abort();
     }
 
@@ -1364,7 +1366,7 @@ mod tests {
               <input aria-label="Passenger name" value="Second passenger">
               <div id="component"></div>
               <span id="birth-month-label">Birth month</span>
-              <div role="combobox" tabindex="0" aria-labelledby="birth-month-label" onclick="this.innerHTML='<div role=\"option\">January</div>'">Choose month</div>
+              <div id="birth-month" role="combobox" tabindex="0" aria-labelledby="birth-month-label">Choose month</div>
               <ul><li class="pick" id="city">Cordoba COR</li><li class="pick faded">Hidden city</li></ul>
               <div class="pick"><div>Noviembre 2026</div><div class="pick" id="day">04</div></div>
               <div class="card">08:06 Cordoba 16:17 Bariloche<div class="pick fare">Tarifa desde $127.664,00</div></div>
@@ -1372,6 +1374,7 @@ mod tests {
               <label onclick="if(event.target===this) event.preventDefault()"><input type="radio" name="pass" style="display:none">Llevaré mi tarjeta de embarque<span class="pick">?</span></label>
               <div class="pick" id="pay">Pagar</div>
               <script>
+                document.getElementById('birth-month').addEventListener('mousedown', e => e.currentTarget.innerHTML = '<div role="option">January</div>');
                 document.getElementById('component').attachShadow({mode:'open'}).innerHTML = '<label>Component passenger<input oninput="document.title=this.value"></label><button onclick="document.title=\'component continued\'">Component continue</button><input aria-label="Component card" autocomplete="cc-number" value="4242424242424242">';
                 document.getElementById('previous-step').innerHTML = '<button>Old seat</button>'.repeat(310);
                 document.getElementById('earlier-step').innerHTML = '<button>Previous seat</button><br>'.repeat(310);
@@ -1410,6 +1413,7 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(find("Cordoba COR").len(), 1);
+        assert!(find("January").is_empty());
         assert_eq!(
             find("Birth month").len(),
             1,
@@ -1570,7 +1574,15 @@ mod tests {
             };
             browser.browse(action).await.unwrap();
             let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
-            assert!(snapshot["text"].as_str().unwrap().contains(expected));
+            assert!(
+                snapshot["text"].as_str().unwrap().contains(expected)
+                    || snapshot["elements"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|e| e["label"] == expected),
+                "{label} did not expose {expected}: {snapshot}"
+            );
         }
         fixture.abort();
     }
