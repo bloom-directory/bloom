@@ -3,12 +3,12 @@
   // the main European and American checkout languages; anything unclear
   // returns null so the human finishes in the private view.
   const isoCodes = new Set(Intl.supportedValuesOf('currency'));
-  const symbols = [['US$','USD'],['U$S','USD'],['USD$','USD'],['R$','BRL'],['CA$','CAD'],['C$','CAD'],['MX$','MXN'],['AR$','ARS'],
+  const symbols = [['US$','USD'],['U$S','USD'],['USD$','USD'],['HK$','HKD'],['R$','BRL'],['CA$','CAD'],['C$','CAD'],['MX$','MXN'],['AR$','ARS'],
     ['CLP$','CLP'],['COL$','COP'],['$U','UYU'],['S/.','PEN'],['S/','PEN'],['SFr.','CHF'],['SFr','CHF'],['Fr.','CHF'],['zł','PLN'],['€','EUR'],['£','GBP'],['$','$']];
   const dollars = new Set(['USD','CAD','MXN','ARS','CLP','COP','UYU','AUD','NZD','SGD','HKD']);
-  const currencyToken = /US\$|U\$S|USD\$|R\$|CA\$|C\$|MX\$|AR\$|CLP\$|COL\$|\$U|S\/\.?|SFr\.?|Fr\.|zł|[€£$]|(?<!\p{L})[A-Z]{3}(?!\p{L})/gu;
+  const currencyToken = /US\$|U\$S|USD\$|HK\$|R\$|CA\$|C\$|MX\$|AR\$|CLP\$|COL\$|\$U|S\/\.?|SFr\.?|Fr\.|zł|[€£$]|(?<!\p{L})[A-Z]{3}(?!\p{L})/gu;
   // Zalando renders "Gesamtsumme" and "inkl. MwSt." with no space between.
-  const label = /^(precio total final|montant à payer|importo totale|precio total|total a pagar|total final|gesamtsumme\s*inkl\.\s*mwst\.|total à payer|importe total|montant total|total payment due|total amount|total to pay|gesamtbetrag|totaalbedrag|grand total|order total|monto total|valor total|gesamtsumme|gesamtpreis|amount due|te betalen|do zapłaty|total due|total ttc|endbetrag|zu zahlen|totale|gesamt|totaal|total|summe|razem|suma)(?![\p{L}\p{N}])/iu;
+  const label = /^(precio total final|montant à payer|importo totale|precio total|total a pagar|total final|gesamtsumme\s*inkl\.\s*mwst\.|total à payer|importe total|montant total|total payment due|total amount|total to pay|amount to pay|gesamtbetrag|totaalbedrag|grand total|order total|monto total|valor total|gesamtsumme|gesamtpreis|amount due|te betalen|do zapłaty|total due|total ttc|endbetrag|zu zahlen|totale|gesamt|totaal|total|summe|razem|suma)(?![\p{L}\p{N}])/iu;
   // An amount line holds only currency marks, digits, separators and spacing.
   const amountOnly = line => !/\p{L}/u.test(line.replace(/\([^)]*\)/g, '').replace(currencyToken, ''));
   const declared = () => {

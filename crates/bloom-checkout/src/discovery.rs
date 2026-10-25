@@ -97,6 +97,8 @@ const MERCHANT_CARD_ORIGINS: &[&str] = &[
     "https://www.jetabroad.com.sg",
     // Frontier's inline card fields on its final payment page, observed 2026-10-24.
     "https://booking.flyfrontier.com",
+    // Jettzy Hong Kong's inline card form, observed on Cathay Pacific review 2026-10-25.
+    "https://en.jettzy.com.hk",
 ];
 
 /// Test browsers may read fixture merchants' declared totals; release builds never.
@@ -1095,16 +1097,17 @@ pub(crate) mod tests {
         let (url, server) = fixture(html.into()).await;
         let browser = browser().await;
         let tab = open(&browser, url).await;
-        // An ordinary merchant cannot opt into the PCI exception by copying ids.
-        assert!(
+        // Off-screen alternatives are not receivers. Without the PCI exception
+        // this document exposes only a number field, not a complete card form.
+        assert_eq!(
             tab.cdp
                 .evaluate(
                     &tab.session,
                     crate::scripts::prepare(include_str!("fields.js"))
                 )
                 .await
-                .unwrap()
-                .is_null()
+                .unwrap(),
+            json!([{"kind":"number","index":0}])
         );
         let expression=crate::scripts::prepare(include_str!("fields.js")).replacen("(() => {", "(() => { const location={origin:'https://checkout.pci.shopifyinc.com',pathname:'/build/09497de/number-ltr.html'};",1);
         let fields = tab.cdp.evaluate(&tab.session, expression).await.unwrap();
@@ -1227,7 +1230,7 @@ pub(crate) mod tests {
     /// (Shopify de-CH, fr-CH, es-ES, pt-BR, en-US), plus formats used in
     /// Argentina, Chile, Switzerland and the UK, and cases that stay manual.
     #[tokio::test]
-    async fn fixture_totals_in_european_and_american_formats() {
+    async fn fixture_totals_in_localized_formats() {
         let browser = browser().await;
         let lines = |lang: &str, head: &str, lines: &[&str], button: &str| {
             let body: String = lines.iter().map(|l| format!("<div>{l}</div>")).collect();
@@ -1306,6 +1309,14 @@ pub(crate) mod tests {
             (
                 lines("en-SG", "", &["Total", "SGD 977.27"], "Book Now"),
                 Some((97727, "SGD")),
+            ),
+            (
+                lines("en-HK", "", &["Amount to pay:", "HK$", "5804.47"], "Pay Now"),
+                Some((580447, "HKD")),
+            ),
+            (
+                lines("en", "", &["Total HK$5804.47"], "Pay Now"),
+                Some((580447, "HKD")),
             ),
             (
                 lines(
@@ -1474,6 +1485,69 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn jettzy_expiry_aliases_are_scoped_and_inactive_alternatives_are_rechecked() {
+        let browser = browser().await;
+        let fields = "<label>Card Number<input autocomplete='cc-number'></label><div>Expiration Date<select name='validity_begin'><option value=''>Month</option><option value='12'>December</option></select><select name='validity_end'><option value=''>Year</option><option value='34'>2034</option></select></div><label>Security code<input autocomplete='cc-csc'></label>";
+        let (url, server) = fixture(merchant(
+            fields,
+            "<div id='alternative' hidden><input autocomplete='cc-number'></div>",
+            "Confirmed",
+        ))
+        .await;
+        let tab = open(&browser, url).await;
+        // Other merchants cannot opt into Jettzy's expiry aliases.
+        assert!(Discovery::read(&tab).await.is_err());
+        for (origin, count) in [
+            ("https://en.jettzy.com.hk.evil.example", 2),
+            ("http://en.jettzy.com.hk", 2),
+            ("https://en.jettzy.com.hk", 4),
+        ] {
+            let expression = crate::scripts::prepare(include_str!("fields.js")).replacen(
+                "(() => {",
+                &format!("(() => {{ const location={{origin:'{origin}'}};"),
+                1,
+            );
+            let fields = tab.cdp.evaluate(&tab.session, expression).await.unwrap();
+            assert_eq!(fields.as_array().unwrap().len(), count, "{origin}");
+        }
+        let fill = crate::scripts::prepare(include_str!("payment-fill.js"));
+        for (index, value) in ["4242424242424242", "12", "2034", "937"].iter().enumerate() {
+            tab.cdp
+                .evaluate(
+                    &tab.session,
+                    format!("({fill})(location.origin,{index},'{value}')"),
+                )
+                .await
+                .unwrap();
+        }
+        let selected = tab
+            .cdp
+            .evaluate(
+                &tab.session,
+                "[...document.querySelectorAll('select')].map(e=>e.value)".into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(selected, json!(["12", "34"]));
+        tab.cdp
+            .evaluate(
+                &tab.session,
+                "document.getElementById('alternative').hidden=false".into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            tab.cdp
+                .evaluate(&tab.session, "!!__bloomPaymentValid()".into())
+                .await
+                .unwrap(),
+            false
+        );
+        browser.return_control().await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn native_expiry_selects_use_the_displayed_year_and_refuse_ambiguity() {
         let browser = browser().await;
         let months = (1..=12)
@@ -1518,6 +1592,14 @@ pub(crate) mod tests {
     async fn card_fields_go_to_payment_providers_or_the_merchant_page() {
         for (frame, top, allowed) in [
             ("https://js.stripe.com", "https://shop.example", true),
+            ("https://en.jettzy.com.hk", "https://en.jettzy.com.hk", true),
+            ("https://en.jettzy.com.hk", "https://shop.example", false),
+            (
+                "https://en.jettzy.com.hk.evil.example",
+                "https://en.jettzy.com.hk.evil.example",
+                false,
+            ),
+            ("http://en.jettzy.com.hk", "http://en.jettzy.com.hk", false),
             (
                 "https://booking.flyfrontier.com",
                 "https://booking.flyfrontier.com",
@@ -2011,18 +2093,18 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn fixture_hidden_duplicate_and_navigation_fail_closed() {
+    async fn fixture_visible_duplicate_and_navigation_fail_closed() {
         let browser = browser().await;
-        for extra in [
-            "<input autocomplete='cc-number' hidden>",
+        let (url, server) = fixture(merchant(
+            &inputs(),
             "<input autocomplete='cc-number'>",
-        ] {
-            let (url, server) = fixture(merchant(&inputs(), extra, "Order confirmed")).await;
-            let tab = open(&browser, url).await;
-            assert!(Discovery::read(&tab).await.is_err());
-            browser.return_control().await.unwrap();
-            server.abort();
-        }
+            "Order confirmed",
+        ))
+        .await;
+        let tab = open(&browser, url).await;
+        assert!(Discovery::read(&tab).await.is_err());
+        browser.return_control().await.unwrap();
+        server.abort();
         let fields = inputs().replacen(
             "<input autocomplete='cc-number'>",
             "<input autocomplete='cc-number' oninput=\"location.href='about:blank'\">",
