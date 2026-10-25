@@ -498,6 +498,15 @@ impl Discovery {
                 || !((count("expiry") == 1 && count("month") == 0 && count("year") == 0)
                     || (count("expiry") == 0 && count("month") == 1 && count("year") == 1)))
         {
+            eprintln!(
+                "payment fields need review: number={},cvc={},name={},expiry={},month={},year={}",
+                count("number"),
+                count("cvc"),
+                count("name"),
+                count("expiry"),
+                count("month"),
+                count("year")
+            );
             bail!("Payment fields require human review");
         }
         Ok(Self {
