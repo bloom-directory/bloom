@@ -18,8 +18,8 @@
     if (direct[autocomplete]) return direct[autocomplete];
     if (secret(e, label) && /card.?number|cardnumber|numero de (la )?tarjeta|nro\.? de tarjeta/.test(label)) return 'number';
     if (secret(e, label) && /cvc|cvv|security.?code|codigo de seguridad/.test(label)) return 'cvc';
-    if (/expir.*month|vencimiento.*mes|^mes$/.test(label)) return 'month';
-    if (/expir.*year|vencimiento.*ano|^ano$/.test(label)) return 'year';
+    if (/expir.*month|month.*expir|vencimiento.*mes|mes.*vencimiento|^mes$/.test(label)) return 'month';
+    if (/expir.*year|year.*expir|vencimiento.*ano|ano.*vencimiento|^ano$/.test(label)) return 'year';
     if (/expir|mm.?\/.?(yy|aa)|vencimiento|fecha de expiracion/.test(label)) return 'expiry';
     if (/cardholder|name.?on.?card|titular|nombre (impreso|como figura|en la tarjeta)/.test(label)) return 'name';
     return null;
@@ -30,7 +30,7 @@
   const candidates = () => {
     // A read-only or disabled box takes no typing, so it is never a card field
     // (JetSMART shows one captioned like a security code beside its frames).
-    const all = [...document.querySelectorAll('input')].filter(e => !e.readOnly && !e.disabled && kind(e));
+    const all = [...document.querySelectorAll('input,select')].filter(e => !e.readOnly && !e.disabled && kind(e));
     if (!shopify) return all;
     // Shopify's named PCI frames include off-screen proxy inputs for the
     // other fields. Accept only the real field named by this frame's URL.

@@ -1474,6 +1474,47 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn native_expiry_selects_use_the_displayed_year_and_refuse_ambiguity() {
+        let browser = browser().await;
+        let months = (1..=12)
+            .map(|n| format!("<option value='{n}'>{n}</option>"))
+            .collect::<String>();
+        let (url, server) = fixture(merchant(
+            &format!("<input autocomplete='cc-number'><label>Expiration Date<select id='month'><option value='0'>month</option>{months}</select></label><label>Expiration year<select id='year'><option value='0'>year</option><option value='34'>2034</option></select></label><input autocomplete='cc-csc'>"),
+            "",
+            "Confirmed",
+        )).await;
+        let tab = open(&browser, url).await;
+        let discovery = Discovery::read(&tab).await.unwrap();
+        let mut input = card();
+        input.expiry_month = 3;
+        discovery.fill(&tab, &input, &mut Vec::new()).await.unwrap();
+        let selected = tab
+            .cdp
+            .evaluate(
+                &tab.session,
+                "[document.getElementById('month').value,document.getElementById('year').value]"
+                    .into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(selected, json!(["3", "34"]));
+        tab.cdp
+            .evaluate(
+                &tab.session,
+                "document.getElementById('year').add(new Option('2034','duplicate'))".into(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            discovery.fill(&tab, &input, &mut Vec::new()).await.is_err(),
+            "ambiguous expiry choice must not be guessed"
+        );
+        browser.return_control().await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn card_fields_go_to_payment_providers_or_the_merchant_page() {
         for (frame, top, allowed) in [
             ("https://js.stripe.com", "https://shop.example", true),
