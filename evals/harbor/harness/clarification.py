@@ -88,10 +88,6 @@ class ClarificationEval(EvalDefinition):
         )
         self.trial = self.name + "-" + secrets.token_hex(8)
 
-    @property
-    def lock_path(self):
-        return self.jobs / (self.trial + ".lock")
-
     def preflight(self):
         self.triad.preflight()
 

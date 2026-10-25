@@ -16,7 +16,7 @@ from types import SimpleNamespace
 
 from .clarification import PROMPTS, ClarificationEval
 from .core import AGENTS, EvalError, EvalEvidence, run_eval
-from .default_petals import DisposableHyperliquidEval, PolymarketProposalEval
+from .default_petals import PolymarketProposalEval
 from .disposable import CEREMONY
 from .solana_transfer import SolanaTransferEval
 
@@ -27,7 +27,6 @@ def parser() -> argparse.ArgumentParser:
         "eval",
         choices=(
             "solana-transfer",
-            "hyperliquid-order-cancel",
             "polymarket-limit-order-proposal",
             *(name + "-clarification" for name in PROMPTS),
         ),
@@ -46,7 +45,6 @@ def main(argv: list[str] | None = None) -> int:
     )
     definitions = {
         "solana-transfer": SolanaTransferEval,
-        "hyperliquid-order-cancel": DisposableHyperliquidEval,
         "polymarket-limit-order-proposal": PolymarketProposalEval,
     }
     if args.eval.endswith("-clarification"):
@@ -68,7 +66,7 @@ def main(argv: list[str] | None = None) -> int:
     started = time.monotonic()
     failure = None
     try:
-        kwargs = {"acquire_lock": isinstance(definition, DisposableHyperliquidEval)}
+        kwargs = {}
         if args.smoke:
             if not hasattr(definition, "smoke"):
                 raise EvalError("this task has no deterministic smoke")

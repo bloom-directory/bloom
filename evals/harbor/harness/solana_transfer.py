@@ -41,11 +41,6 @@ class SolanaTransferEval(EvalDefinition):
             self.env.get("BLOOM_EVAL_JOBS_DIR", str(repo / "evals/harbor/jobs"))
         )
 
-    @property
-    def lock_path(self) -> Path:
-        # Each trial has a separate chain and custody domain.
-        return self.jobs / ("solana-" + secrets.token_hex(8) + ".lock")
-
     def preflight(self) -> None:
         self.triad.preflight()
         for binary in ("solana-test-validator", "solana", "solana-keygen"):

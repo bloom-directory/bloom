@@ -1,122 +1,17 @@
-"""Disposable custody around the existing bounded Hyperliquid task."""
+"""Proposal coverage for default Petals on a disposable Triad."""
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import secrets
 import shutil
 import urllib.request
-from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 
 from .core import EvalDefinition, EvalError, EvalRunContext
-from .disposable import DisposableTriad, private_file
-from .hyperliquid_order_cancel import MAINNET_ACK, HyperliquidOrderCancelEval
-
-
-class DisposableHyperliquidEval(EvalDefinition):
-    name = "hyperliquid-order-cancel"
-
-    def __init__(self, repo: Path, environ: dict[str, str] | None = None) -> None:
-        self.repo = repo
-        self.env = dict(os.environ if environ is None else environ)
-        self.triad = DisposableTriad(repo, self.env)
-        testnet = self.env.get("BLOOM_EVAL_HYPERLIQUID_TESTNET_MNEMONIC_FILE")
-        mainnet = self.env.get("BLOOM_EVAL_HYPERLIQUID_MAINNET_MNEMONIC_FILE")
-        self.network = "testnet" if testnet else "mainnet"
-        self.mnemonic = Path(testnet or mainnet) if (testnet or mainnet) else None
-        self.definition: HyperliquidOrderCancelEval | None = None
-
-    @property
-    def lock_path(self) -> Path:
-        # The imported wallet still shares venue state across disposable roots.
-        # Serialize it even though Solana needs no cross-run recovery lock.
-        return Path("/tmp/bloom-harbor-hyperliquid.lock")
-
-    def preflight(self) -> None:
-        self.triad.preflight()
-        if self.mnemonic is None:
-            raise EvalError(
-                "provide a funded testnet mnemonic file via "
-                "BLOOM_EVAL_HYPERLIQUID_TESTNET_MNEMONIC_FILE, or the dedicated "
-                "mainnet fallback via BLOOM_EVAL_HYPERLIQUID_MAINNET_MNEMONIC_FILE"
-            )
-        private_file(self.mnemonic)
-
-    def provision(self, agent_name: str) -> EvalRunContext:
-        self.triad.start(mnemonic=self.mnemonic)
-        self.triad.require_petal("hyperliquid")
-        store = self.triad.home / "petals/store"
-        owner = store / "owners/hyperliquid.json"
-        package = json.loads(owner.read_bytes())["hash"]
-        wallet = self.triad.wallet
-        account = self.triad.read(f"/wallets/{wallet}/0/account.json")
-        address = account["evm"]["address"].lower()
-        self.lineage = {
-            "package_hash": package,
-            "network": self.network,
-            "wallet": wallet,
-            "account": 0,
-            "address": address,
-        }
-        metadata = self.triad.read(f"/petals/hyperliquid/{self.network}/perp_meta.json")
-        universe = metadata.get("universe") if isinstance(metadata, dict) else None
-        if not isinstance(universe, list):
-            raise EvalError("venue metadata has no asset universe")
-        btc = [
-            index
-            for index, asset in enumerate(universe)
-            if isinstance(asset, dict) and asset.get("name") == "BTC"
-        ]
-        if len(btc) != 1:
-            raise EvalError("venue must identify exactly one BTC asset")
-        self.triad.set_policy(packages=[package], destinations=[])
-        env = self.triad.env | {
-            "BLOOM_EVAL_NETWORK": self.network,
-            "BLOOM_EVAL_ASSET_ID": str(btc[0]),
-            "BLOOM_EVAL_WALLET": address,
-            "BLOOM_EVAL_WALLET_ID": wallet,
-            "BLOOM_EVAL_HYPERLIQUID_PACKAGE_HASH": package,
-            "BLOOM_EVAL_PETAL_OWNER_RECORD": str(owner),
-            "BLOOM_EVAL_PETAL_STORE": str(store),
-            "BLOOM_EVAL_PROVENANCE_CATALOG": str(
-                self.triad.root / "dev/config/provenance-catalog.json"
-            ),
-            "BLOOM_EVAL_BLOOM_MOUNT": str(self.triad.mount),
-            "BLOOM_EVAL_CEREMONY_ORIGIN": self.triad.origin,
-            "BLOOM_EVAL_DEBUG_DRIVER_BIN": str(self.triad.driver.binary),
-            "BLOOM_EVAL_AUTHENTICATOR_SEED_FILE": str(self.triad.driver.seed),
-            "BLOOM_EVAL_AUTHENTICATOR_SIGN_COUNT": str(self.triad.driver.counter),
-            "BLOOM_EVAL_AGENT_NAME": self.env.get("BLOOM_EVAL_AGENT_NAME")
-            or "be-" + hashlib.sha256(address.encode()).hexdigest()[:8],
-        }
-        if self.network == "mainnet":
-            env["BLOOM_EVAL_MAINNET_ACK"] = MAINNET_ACK
-        self.definition = HyperliquidOrderCancelEval(self.repo, env)
-        self.definition.preflight()
-        context = self.definition.provision(agent_name)
-        task = context.jobs_dir / (context.job_name + "-" + self.triad.root.name)
-        shutil.copytree(context.task_dir, task)
-        instruction = (task / "instruction.md").read_text()
-        instruction = instruction.replace("mainnet", self.network)
-        instruction = instruction.replace("asset ID `0`", f"asset ID `{btc[0]}`")
-        instruction = instruction.replace('"asset_id": 0', f'"asset_id": {btc[0]}')
-        (task / "instruction.md").write_text(instruction)
-        return replace(
-            context,
-            task_dir=task,
-            job_name=context.job_name + "-" + self.triad.root.name,
-        )
-
-    def cleanup(self) -> None:
-        # Venue cleanup must succeed before erasing the only local authority
-        # able to cancel a residual order or close a position.
-        if self.definition is not None:
-            self.definition.cleanup()
-        self.triad.close(preserve=self.failed)
+from .disposable import DisposableTriad
 
 
 class PolymarketProposalEval(EvalDefinition):
@@ -130,10 +25,6 @@ class PolymarketProposalEval(EvalDefinition):
             self.env.get("BLOOM_EVAL_JOBS_DIR", str(repo / "evals/harbor/jobs"))
         )
         self.trial = f"polymarket-proposal-{secrets.token_hex(8)}"
-
-    @property
-    def lock_path(self) -> Path:
-        return self.jobs / (self.trial + ".lock")
 
     def preflight(self) -> None:
         self.triad.preflight()

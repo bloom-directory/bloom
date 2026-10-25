@@ -1,8 +1,4 @@
-"""One real Triad and software authenticator per Harbor trial.
-
-Secrets remain on the host. Import phrases go only to Broker's ceremony
-driver; the Machine and the agent never receive them.
-"""
+"""One real Triad and software authenticator per Harbor trial."""
 
 from __future__ import annotations
 
@@ -12,7 +8,6 @@ import os
 import re
 import secrets
 import socket
-import stat
 import subprocess
 import tempfile
 import time
@@ -22,14 +17,6 @@ from typing import Any
 from .core import EvalError
 
 CEREMONY = re.compile(r"http://localhost:[0-9]+/ceremony/[A-Za-z0-9_-]{43}")
-
-
-def private_file(path: Path) -> None:
-    metadata = path.lstat()
-    if not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o600:
-        raise EvalError(f"{path} must be a regular file with mode 0600")
-    if metadata.st_uid != os.getuid() or metadata.st_size == 0:
-        raise EvalError(f"{path} must be nonempty and owned by the current user")
 
 
 def free_port() -> int:
@@ -45,7 +32,7 @@ class CeremonyDriver:
         self.binary, self.seed, self.origin = binary, seed, origin
         self.counter = 1
 
-    def complete(self, url: str, mnemonic: Path | None = None) -> dict[str, Any]:
+    def complete(self, url: str) -> dict[str, Any]:
         if CEREMONY.fullmatch(url) is None or not url.startswith(
             self.origin + "/ceremony/"
         ):
@@ -63,9 +50,6 @@ class CeremonyDriver:
             "--sign-count",
             str(used),
         ]
-        if mnemonic is not None:
-            private_file(mnemonic)
-            command.extend(["--mnemonic-file", str(mnemonic)])
         try:
             result = subprocess.run(
                 command, capture_output=True, timeout=45, check=False
@@ -176,11 +160,9 @@ class DisposableTriad:
         )
 
     def start(
-        self, *, solana: bool = False, mount: bool = True, mnemonic: Path | None = None
+        self, *, solana: bool = False, mount: bool = True
     ) -> None:
         self.preflight()
-        if mnemonic is not None:
-            private_file(mnemonic)
         self.root = Path(tempfile.mkdtemp(prefix="bhe-", dir="/tmp"))
         self.root.chmod(0o700)
         self.home = self.root / "dev/home"
@@ -296,12 +278,19 @@ class DisposableTriad:
                 command, env=self.env, stdout=log, stderr=subprocess.STDOUT
             )
         self._wait(lambda: (self.root / "ready").exists(), self.launcher, "Triad")
-        launch = self.cli("wallet", "import" if mnemonic else "new", "harbor")
+        launch = self.cli("wallet", "new", "harbor")
         url = CEREMONY.search(launch)
         if url is None:
             raise EvalError("wallet enrollment returned no ceremony")
-        result = self.driver.complete(url.group(), mnemonic)
+        result = self.driver.complete(url.group())
         self.wallet = result["wallet_id"]
+        # Optimized services return before the new wallet is projected.
+        self._wait(
+            lambda: self.read(f"/wallets/{self.wallet}/accounts.json")["accounts"],
+            self.launcher,
+            "wallet projection",
+            timeout=60,
+        )
 
     def set_policy(
         self, *, packages: list[str], destinations: list[dict[str, str]]
@@ -319,8 +308,15 @@ class DisposableTriad:
             raise EvalError("policy setup returned no exact operation and ceremony")
         self.driver.complete(url.group())
         self.cli("wallet", "commit-policy", operation[1])
-        if self.read(f"/wallets/{self.wallet}/policy.json") != policy:
-            raise EvalError("setup policy differs from its committed projection")
+        try:
+            self._wait(
+                lambda: self.read(f"/wallets/{self.wallet}/policy.json") == policy,
+                self.launcher,
+                "committed policy projection",
+                timeout=30,
+            )
+        except EvalError:
+            raise EvalError("setup policy differs from its committed projection") from None
 
     def require_petal(self, name: str) -> str:
         # Do not execute Petal routes while startup is installing packages:
