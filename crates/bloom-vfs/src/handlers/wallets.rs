@@ -2181,6 +2181,12 @@ impl WalletsHandler {
                 }
                 projection.ceremony_url = None;
                 projection.ceremony_expires_at_ms = None;
+                if let Some(projections) = &self.wallet_projections {
+                    projections
+                        .invalidate_wallet(&wallet_id)
+                        .await
+                        .map_err(|error| HandlerError::backend(error.to_string()))?;
+                }
                 write_atomic_json(&projection_path, &projection)?;
                 self.policy_update_transition(
                     wallet,

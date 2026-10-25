@@ -56,7 +56,7 @@ impl BrokerFixture {
             canonical_policy: Base64UrlBytes::from_bytes(state.proposed_policy.as_ref().unwrap()),
             policy_digest: state.proposed_digest.clone().unwrap(),
             policy_signing_key_id: Token::new("policy-key").unwrap(),
-            policy_verifying_key: Base64UrlBytes::from_bytes(&[4; 32]),
+            policy_verifying_key: self.baseline.policy_verifying_key.clone(),
             signer_signature: Base64UrlBytes::from_bytes(&[5; 64]),
         }
     }
@@ -645,6 +645,42 @@ async fn vfs_policy_write_prepares_then_commits_only_with_completed_custody_rece
             MachineBrokerRequest::WalletAccounts(_)
         ]
     ));
+}
+
+#[tokio::test]
+async fn committed_policy_is_visible_before_the_projection_cache_expires() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = broker_fixture(false);
+    let broker = MachineBrokerClient::new(fixture.clone());
+    let projections = Arc::new(
+        CachedWalletProjectionReader::new(
+            Some(broker.clone()),
+            FileProjectionStore::new(temp.path().join("wallets.json")),
+        )
+        .unwrap()
+        .with_max_age(std::time::Duration::from_secs(60)),
+    );
+    let home = HomeDir::at(temp.path().join("home"));
+    let handler = WalletsHandler::new(
+        bloom_evm::ChainRegistry::default(),
+        TxEngine::new(Outbox::new(temp.path().join("outbox")).unwrap(), 60_000),
+        AddressBook::default(),
+        projections,
+        temp.path().join("policy-updates"),
+    )
+    .with_broker(Some(broker))
+    .with_home_write_permit(Arc::new(HomeWritePermit::acquire(&home).unwrap()));
+    let path = VfsPath::parse("alice/policy.json").unwrap();
+    let before = handler.read(&path).await.unwrap();
+    let proposed = serde_jcs::to_vec(&policy(120_000)).unwrap();
+    assert_ne!(before, proposed);
+    assert!(matches!(
+        handler.write(&path, &proposed).await,
+        Err(HandlerError::PermissionDenied)
+    ));
+    fixture.complete.store(true, Ordering::SeqCst);
+    handler.write(&path, &proposed).await.unwrap();
+    assert_eq!(handler.read(&path).await.unwrap(), proposed);
 }
 
 #[tokio::test]
