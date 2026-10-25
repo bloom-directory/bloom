@@ -63,9 +63,9 @@
       field='document_expiry';part=datePart;
       if (!part && e.type !== 'date') continue;
     } else if (/nationality|nacionalidad/.test(label)) field='nationality';
-    else if (/issuing.?country|pais emisor|pais de emision|document.?country/.test(label)) field='document_country';
+    else if (/issuing.?country|pais emisor|pais de emision|document.?country|country of (?:passport|[il]d)\b/.test(label)) field='document_country';
     else if (/document.?type|tipo de documento|document.?kind/.test(label)) field='document_kind';
-    else if (/passport.?number|document.?number|(numero|nro)\.?.*documento|(numero|nro)\.?.*pasaporte/.test(label)) field='document_number';
+    else if (/passport(?:\s+or\s+[il]d)?[\s._-]*(?:number|no\b)|document.?number|(numero|nro)\.?.*documento|(numero|nro)\.?.*pasaporte/.test(label)) field='document_number';
     else if (ac === 'sex' || /gender|genero|sexo/.test(label)) field='gender';
     else if (ac === 'email' || e.type === 'email' || /email|e-mail|correo/.test(label)) field='email';
     else if (/area.?code|cod\.? ?area|areacode/.test(label)) { field='phone'; part='area'; }

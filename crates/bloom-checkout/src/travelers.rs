@@ -687,6 +687,58 @@ mod tests {
         server.abort();
     }
     #[tokio::test]
+    async fn passport_or_id_captions_fill_only_traveler_document_fields() {
+        for number_label in [
+            "Passport No.",
+            "Passport or ID number",
+            "Passport or lD number",
+        ] {
+            let (browser, server, _) = browser_at(&format!(
+                "<div>{number_label}<input></div>
+                 <div>Country of passport or lD<select><option value=''></option><option value='US'>United States</option></select></div>
+                 <div>Passport or lD expiration date<input type='date'></div>
+                 <fieldset><legend>Cardholder</legend><label>{number_label}<input></label></fieldset>"
+            ))
+            .await;
+            let tab = browser.handoff().await.unwrap();
+            let discovery = TravelerDiscovery::read(
+                &tab,
+                &[
+                    TravelerField::DocumentNumber,
+                    TravelerField::DocumentCountry,
+                    TravelerField::DocumentExpiry,
+                ],
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                discovery.field_names(),
+                ["document_number", "document_country", "document_expiry"],
+                "{number_label}"
+            );
+            let values = [
+                ("document_number", "X00000000"),
+                ("document_country", "US"),
+                ("document_expiry", "2034-01-01"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), Zeroizing::new(v.to_owned())))
+            .collect();
+            assert_eq!(discovery.fill(&tab, &values).await.unwrap().len(), 3);
+            let filled = tab
+                .cdp
+                .evaluate(
+                    &tab.session,
+                    "[...document.querySelectorAll('input,select')].map(e=>e.value)".into(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(filled, json!(["X00000000", "US", "2034-01-01", ""]));
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
     async fn split_dates_radios_and_typeahead_lists_are_filled() {
         // Shaped like Aerolíneas Argentinas' passenger form.
         let (browser, server, _) = browser_at(
