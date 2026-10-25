@@ -10,7 +10,7 @@
     }
     return true;
   };
-  const native = 'a[href],button,input,textarea,select,summary,[role="button"],[role="option"],[role="gridcell"],[role="radio"],[role="checkbox"],[role="tab"],[role="link"],[role="menuitem"],[role="switch"],[onclick],[ng-click],[data-ng-click]';
+  const native = 'a[href],button,input,textarea,select,summary,[role="button"],[role="combobox"],[role="option"],[role="gridcell"],[role="radio"],[role="checkbox"],[role="tab"],[role="link"],[role="menuitem"],[role="switch"],[onclick],[ng-click],[data-ng-click]';
   // Script frameworks attach click handlers invisibly. A pointer cursor that a
   // page stylesheet assigns to the element itself marks those controls.
   const pointerRules = [];
@@ -41,7 +41,9 @@
   };
   // Logo buttons (card brands, banks) name themselves only in image text.
   const pictured = e => [...e.querySelectorAll('img[alt],[title]')].map(i => i.alt || i.title).filter(Boolean).join(' ');
-  const label = e => (e.getAttribute('aria-label') || e.labels?.[0]?.innerText || (field(e) ? '' : e.innerText) || e.placeholder
+  const namedBy = e => (e.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean)
+    .map(id => e.getRootNode().getElementById(id)?.textContent || '').join(' ').trim();
+  const label = e => (namedBy(e) || e.getAttribute('aria-label') || e.labels?.[0]?.innerText || (field(e) ? '' : e.innerText) || e.placeholder
     || (field(e) ? caption(e) || e.name : pictured(e)) || '').replace(/\s+/g, ' ').trim();
   // Card and password values never leave the page; checkout redacts saved
   // traveler values before the agent reads anything else.

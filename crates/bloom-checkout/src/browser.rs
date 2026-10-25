@@ -873,7 +873,7 @@ mod tests {
                 Router::new().route(
                     "/",
                     get(|| async {
-                        Html("<button>Comprar</button><button>Kaufen</button><button>Continue</button>")
+                        Html("<button>Comprar</button><button>Kaufen</button><span id='pay-name'>Pay now</span><button aria-labelledby='pay-name'>Next</button><button>Continue</button>")
                     }),
                 ),
             )
@@ -894,7 +894,7 @@ mod tests {
                 .unwrap()
                 .to_owned()
         };
-        for label in ["Comprar", "Kaufen"] {
+        for label in ["Comprar", "Kaufen", "Pay now"] {
             let error = browser
                 .browse(BrowseRequest::Click {
                     element_ref: reference(label),
@@ -1363,6 +1363,8 @@ mod tests {
               <div class="external"><span>Remote fare</span></div>
               <input aria-label="Passenger name" value="Second passenger">
               <div id="component"></div>
+              <span id="birth-month-label">Birth month</span>
+              <div role="combobox" tabindex="0" aria-labelledby="birth-month-label" onclick="this.innerHTML='<div role=\"option\">January</div>'">Choose month</div>
               <ul><li class="pick" id="city">Cordoba COR</li><li class="pick faded">Hidden city</li></ul>
               <div class="pick"><div>Noviembre 2026</div><div class="pick" id="day">04</div></div>
               <div class="card">08:06 Cordoba 16:17 Bariloche<div class="pick fare">Tarifa desde $127.664,00</div></div>
@@ -1408,6 +1410,11 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(find("Cordoba COR").len(), 1);
+        assert_eq!(
+            find("Birth month").len(),
+            1,
+            "custom combobox must be exposed with its accessible name"
+        );
         assert_eq!(
             find("Component passenger")
                 .iter()
@@ -1542,6 +1549,7 @@ mod tests {
                 "FixtureShadow",
             ),
             ("Component continue", None, "component continued"),
+            ("Birth month", None, "January"),
         ] {
             let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
             let element_ref = snapshot["elements"]

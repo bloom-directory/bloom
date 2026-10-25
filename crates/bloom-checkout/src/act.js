@@ -1,8 +1,10 @@
 (index, kind, value) => {
   const e = globalThis.__bloomRefs?.[index];
   if (!e || !e.isConnected || e.disabled || e.getAttribute('aria-disabled') === 'true' || !e.getClientRects().length) throw Error('stale');
-  const label = (e.innerText || e.value || e.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
-  if (kind === 'click' && BLOOM_PAY_WORDS.test(label)) throw Error('payment requires approval');
+  const namedBy = (e.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean)
+    .map(id => e.getRootNode().getElementById(id)?.textContent || '').join(' ');
+  const labels = [e.innerText, e.value, e.getAttribute('aria-label'), namedBy];
+  if (kind === 'click' && labels.some(label => BLOOM_PAY_WORDS.test((label || '').replace(/\s+/g, ' ').trim()))) throw Error('payment requires approval');
   if (kind === 'click') {
     // Styled labels can cancel clicks on the label itself. Activate their
     // associated checkbox/radio, as clicking the visible control would.
