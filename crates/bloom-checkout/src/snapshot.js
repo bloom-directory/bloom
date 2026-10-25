@@ -27,7 +27,9 @@
   // readable. Ignore children that only inherit their parent's pointer.
   const pointer = e => e.style.cursor === 'pointer' || (pointerSelector !== '' && e.matches(pointerSelector)) ||
     (getComputedStyle(e).cursor === 'pointer' && (!e.parentElement || getComputedStyle(e.parentElement).cursor !== 'pointer'));
-  const text = e => (e.innerText || '').replace(/\s+/g, ' ').trim();
+  const slotted = e => [...e.querySelectorAll('slot')].flatMap(s => s.assignedNodes({flatten: true}))
+    .map(n => n.nodeType === Node.TEXT_NODE ? n.textContent : n.innerText || '').join(' ');
+  const text = e => (e.innerText || slotted(e)).replace(/\s+/g, ' ').trim();
   const field = e => e.matches('input,select,textarea');
   // Some sites caption a field with text beside it instead of a <label>: use
   // the text of the smallest wrapper holding only this field.
@@ -43,7 +45,7 @@
   const pictured = e => [...e.querySelectorAll('img[alt],[title]')].map(i => i.alt || i.title).filter(Boolean).join(' ');
   const namedBy = e => (e.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean)
     .map(id => e.getRootNode().getElementById(id)?.textContent || '').join(' ').trim();
-  const label = e => (namedBy(e) || e.getAttribute('aria-label') || e.labels?.[0]?.innerText || (field(e) ? '' : e.innerText) || e.placeholder
+  const label = e => (namedBy(e) || e.getAttribute('aria-label') || (e.labels?.[0] && text(e.labels[0])) || (field(e) ? '' : text(e)) || e.placeholder
     || (field(e) ? caption(e) || e.name : pictured(e)) || '').replace(/\s+/g, ' ').trim();
   // Card and password values never leave the page; checkout redacts saved
   // traveler values before the agent reads anything else.

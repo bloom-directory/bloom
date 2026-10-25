@@ -1365,6 +1365,8 @@ mod tests {
               <div class="external"><span>Remote fare</span></div>
               <input aria-label="Passenger name" value="Second passenger">
               <div id="component"></div>
+              <div id="slotted"><span slot="label">Continue as guest</span></div>
+              <div id="slotted-pay"><span slot="label">Pay now</span></div>
               <span id="birth-month-label">Birth month</span>
               <div id="birth-month" role="combobox" tabindex="0" aria-labelledby="birth-month-label">Choose month</div>
               <ul><li class="pick" id="city">Cordoba COR</li><li class="pick faded">Hidden city</li></ul>
@@ -1375,6 +1377,7 @@ mod tests {
               <div class="pick" id="pay">Pagar</div>
               <script>
                 document.getElementById('birth-month').addEventListener('mousedown', e => e.currentTarget.innerHTML = '<div role="option">January</div>');
+                for (const id of ['slotted', 'slotted-pay']) document.getElementById(id).attachShadow({mode:'open'}).innerHTML = '<button onclick="document.title=\'slotted clicked\'"><slot name="label"></slot></button>';
                 document.getElementById('component').attachShadow({mode:'open'}).innerHTML = '<label>Component passenger<input oninput="document.title=this.value"></label><button onclick="document.title=\'component continued\'">Component continue</button><input aria-label="Component card" autocomplete="cc-number" value="4242424242424242">';
                 document.getElementById('previous-step').innerHTML = '<button>Old seat</button>'.repeat(310);
                 document.getElementById('earlier-step').innerHTML = '<button>Previous seat</button><br>'.repeat(310);
@@ -1414,6 +1417,11 @@ mod tests {
         };
         assert_eq!(find("Cordoba COR").len(), 1);
         assert!(find("January").is_empty());
+        assert_eq!(
+            find("Continue as guest").len(),
+            1,
+            "slotted button needs its visible label"
+        );
         assert_eq!(
             find("Birth month").len(),
             1,
@@ -1514,21 +1522,25 @@ mod tests {
                 .unwrap()["checked"],
             true
         );
-        let pay = after["elements"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|e| e["label"] == "Pagar")
-            .unwrap()["ref"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        assert!(
-            browser
-                .browse(BrowseRequest::Click { element_ref: pay })
-                .await
-                .is_err()
-        );
+        for label in ["Pagar", "Pay now"] {
+            let pay = after["elements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["label"] == label)
+                .unwrap()["ref"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            assert!(
+                browser
+                    .browse(BrowseRequest::Click { element_ref: pay })
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("payment requires approval")
+            );
+        }
         let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
         let card = snapshot["elements"]
             .as_array()
@@ -1554,6 +1566,7 @@ mod tests {
             ),
             ("Component continue", None, "component continued"),
             ("Birth month", None, "January"),
+            ("Continue as guest", None, "slotted clicked"),
         ] {
             let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
             let element_ref = snapshot["elements"]

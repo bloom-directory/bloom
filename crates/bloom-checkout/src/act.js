@@ -4,7 +4,9 @@
   const guardPayment = () => {
     const namedBy = (e.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean)
       .map(id => e.getRootNode().getElementById(id)?.textContent || '').join(' ');
-    const labels = [e.innerText, e.value, e.getAttribute('aria-label'), namedBy];
+    const slotted = [...e.querySelectorAll('slot')].flatMap(s => s.assignedNodes({flatten: true}))
+      .map(n => n.nodeType === Node.TEXT_NODE ? n.textContent : n.innerText || '').join(' ');
+    const labels = [e.innerText, e.value, e.getAttribute('aria-label'), namedBy, slotted];
     if (labels.some(label => BLOOM_PAY_WORDS.test((label || '').replace(/\s+/g, ' ').trim()))) throw Error('payment requires approval');
   };
   if (kind === 'click') {
