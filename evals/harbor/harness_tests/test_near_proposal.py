@@ -221,9 +221,7 @@ class NearProposalTests(unittest.TestCase):
                 mock.patch.dict(
                     os.environ, {"BLOOM_EVAL_PROPOSAL": json.dumps(self.expected)}
                 ),
+                self.subTest(state=state),
+                self.assertRaisesRegex(ValueError, "not staged"),
             ):
-                with (
-                    self.subTest(state=state),
-                    self.assertRaisesRegex(ValueError, "not staged"),
-                ):
-                    verifier.verify(Path("fixture"))
+                verifier.verify(Path("fixture"))

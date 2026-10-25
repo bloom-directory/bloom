@@ -63,6 +63,8 @@ Teardown discards pending work with its disposable root. Anvil is required.
 
 Build Machine, Broker (with `bloom-broker-debug-driver`) and Signer with the
 release profile and `triad-dev-harness`, and export their paths:
+Run each service's Cargo build from that service's own repository checkout;
+then run the evaluation launcher from the Bloom checkout.
 
 ```sh
 cargo build --release --locked -p bloom --features triad-dev-harness
