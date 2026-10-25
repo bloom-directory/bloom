@@ -101,6 +101,8 @@ const MERCHANT_CARD_ORIGINS: &[&str] = &[
     "https://en.jettzy.com.hk",
     // Same inline form on the Malaysia site, observed on AirAsia review 2026-10-25.
     "https://www.jettzy.com.my",
+    // Vietnam Airlines review on the Vietnam site, observed 2026-10-25.
+    "https://www.jettzy.com.vn",
 ];
 
 /// Test browsers may read fixture merchants' declared totals; release builds never.
@@ -1332,6 +1334,10 @@ pub(crate) mod tests {
                 Some((259500, "TRY")),
             ),
             (
+                lines("vi-VN", "", &["Số tiền cần thanh toán:", "VND", "18062176", "Tổng cộng", "VND18062176"], "Thanh toán Ngay"),
+                Some((18062176, "VND")),
+            ),
+            (
                 lines("en-US", "", &["Total amount due (All passengers)", "$178.40"], "Pay now"),
                 Some((17840, "USD")),
             ),
@@ -1520,6 +1526,9 @@ pub(crate) mod tests {
             ("https://www.jettzy.com.my.evil.example", 2),
             ("http://www.jettzy.com.my", 2),
             ("https://www.jettzy.com.my", 4),
+            ("https://www.jettzy.com.vn", 4),
+            ("https://www.jettzy.com.vn.evil.example", 2),
+            ("http://www.jettzy.com.vn", 2),
             ("https://en.jettzy.com.hk", 4),
         ] {
             let expression = crate::scripts::prepare(include_str!("fields.js")).replacen(
@@ -1618,6 +1627,22 @@ pub(crate) mod tests {
                 true,
             ),
             ("https://www.jettzy.com.my", "https://shop.example", false),
+            (
+                "https://www.jettzy.com.vn",
+                "https://www.jettzy.com.vn",
+                true,
+            ),
+            ("https://www.jettzy.com.vn", "https://shop.example", false),
+            (
+                "https://www.jettzy.com.vn.evil.example",
+                "https://www.jettzy.com.vn.evil.example",
+                false,
+            ),
+            (
+                "http://www.jettzy.com.vn",
+                "http://www.jettzy.com.vn",
+                false,
+            ),
             (
                 "https://www.jettzy.com.my.evil.example",
                 "https://www.jettzy.com.my.evil.example",

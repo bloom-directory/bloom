@@ -886,7 +886,7 @@ mod tests {
                 Router::new().route(
                     "/",
                     get(|| async {
-                        Html(r#"<button>Comprar</button><button>Kaufen</button><button onclick="document.title='unsafe booking'">Book Now</button><button onclick="document.title='unsafe purchase'">PURCHASE &amp; ACCEPT</button><button onclick="document.title='unsafe Turkish payment'">Öde</button><span id="pay-name">Pay now</span><button aria-labelledby="pay-name" onmousedown="document.title='unsafe down'">Next</button><button onmousedown="this.textContent='Pay now'" onclick="document.title='unsafe click'">Proceed</button><button>Ödeme Sayfasına Devam Et</button>"#)
+                        Html(r#"<button>Comprar</button><button>Kaufen</button><button onclick="document.title='unsafe booking'">Book Now</button><button onclick="document.title='unsafe purchase'">PURCHASE &amp; ACCEPT</button><button onclick="document.title='unsafe Turkish payment'">Öde</button><button onclick="document.title='unsafe Vietnamese payment'">Thanh toán Ngay</button><span id="pay-name">Pay now</span><button aria-labelledby="pay-name" onmousedown="document.title='unsafe down'">Next</button><button onmousedown="this.textContent='Pay now'" onclick="document.title='unsafe click'">Proceed</button><button>Ödeme Sayfasına Devam Et</button><button>Tiếp theo: Thanh toán &gt;</button>"#)
                     }),
                 ),
             )
@@ -913,6 +913,7 @@ mod tests {
             "Book Now",
             "PURCHASE & ACCEPT",
             "Öde",
+            "Thanh toán Ngay",
             "Pay now",
             "Proceed",
         ] {
@@ -935,6 +936,21 @@ mod tests {
             .await
             .unwrap();
         let after = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+        let reference = after["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["label"] == "Tiếp theo: Thanh toán >")
+            .unwrap()["ref"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        browser
+            .browse(BrowseRequest::Click {
+                element_ref: reference,
+            })
+            .await
+            .unwrap();
         assert!(!after["text"].as_str().unwrap().contains("unsafe"));
         site.abort();
     }
