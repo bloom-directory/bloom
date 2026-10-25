@@ -1347,6 +1347,14 @@ pub(crate) mod tests {
                 Some((18062176, "VND")),
             ),
             (
+                lines("nb-NO", "", &["Totalt", "Delsum 568 Norske kroner", "Beløp å betale 568 Norske kroner"], "Betal"),
+                Some((56800, "NOK")),
+            ),
+            (
+                lines("nb-NO", "", &["Beløp å betale", "kr568"], "Betal"),
+                None,
+            ),
+            (
                 lines("en-US", "", &["Total amount due (All passengers)", "$178.40"], "Pay now"),
                 Some((17840, "USD")),
             ),

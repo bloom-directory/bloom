@@ -886,7 +886,20 @@ mod tests {
                 Router::new().route(
                     "/",
                     get(|| async {
-                        Html(r#"<button>Comprar</button><button>Kaufen</button><button onclick="document.title='unsafe booking'">Book Now</button><button onclick="document.title='unsafe purchase'">PURCHASE &amp; ACCEPT</button><button onclick="document.title='unsafe Turkish payment'">Öde</button><button onclick="document.title='unsafe Vietnamese payment'">Thanh toán Ngay</button><span id="pay-name">Pay now</span><button aria-labelledby="pay-name" onmousedown="document.title='unsafe down'">Next</button><button onmousedown="this.textContent='Pay now'" onclick="document.title='unsafe click'">Proceed</button><button>Ödeme Sayfasına Devam Et</button><button>Tiếp theo: Thanh toán &gt;</button>"#)
+                        Html(r#"
+                          <button>Comprar</button><button>Kaufen</button>
+                          <button onclick="document.title='unsafe booking'">Book Now</button>
+                          <button onclick="document.title='unsafe purchase'">PURCHASE &amp; ACCEPT</button>
+                          <button onclick="document.title='unsafe Turkish payment'">Öde</button>
+                          <button onclick="document.title='unsafe Vietnamese payment'">Thanh toán Ngay</button>
+                          <button onclick="document.title='unsafe Norwegian payment'">Betal</button>
+                          <span id="pay-name">Pay now</span>
+                          <button aria-labelledby="pay-name" onmousedown="document.title='unsafe down'">Next</button>
+                          <button onmousedown="this.textContent='Pay now'" onclick="document.title='unsafe click'">Proceed</button>
+                          <button>Ödeme Sayfasına Devam Et</button>
+                          <button>Tiếp theo: Thanh toán &gt;</button>
+                          <button>Gå til betaling</button>
+                        "#)
                     }),
                 ),
             )
@@ -914,6 +927,7 @@ mod tests {
             "PURCHASE & ACCEPT",
             "Öde",
             "Thanh toán Ngay",
+            "Betal",
             "Pay now",
             "Proceed",
         ] {
@@ -929,28 +943,27 @@ mod tests {
                 "{label}: {error}"
             );
         }
-        browser
-            .browse(BrowseRequest::Click {
-                element_ref: reference("Ödeme Sayfasına Devam Et"),
-            })
-            .await
-            .unwrap();
+        for label in [
+            "Ödeme Sayfasına Devam Et",
+            "Tiếp theo: Thanh toán >",
+            "Gå til betaling",
+        ] {
+            let current = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+            let element_ref = current["elements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["label"] == label)
+                .unwrap()["ref"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            browser
+                .browse(BrowseRequest::Click { element_ref })
+                .await
+                .unwrap();
+        }
         let after = browser.browse(BrowseRequest::Snapshot).await.unwrap();
-        let reference = after["elements"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|e| e["label"] == "Tiếp theo: Thanh toán >")
-            .unwrap()["ref"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        browser
-            .browse(BrowseRequest::Click {
-                element_ref: reference,
-            })
-            .await
-            .unwrap();
         assert!(!after["text"].as_str().unwrap().contains("unsafe"));
         site.abort();
     }
