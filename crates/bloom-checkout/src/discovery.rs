@@ -1297,6 +1297,10 @@ pub(crate) mod tests {
                 ),
                 Some((4800, "USD")),
             ),
+            (
+                lines("en-SG", "", &["Total", "SGD 977.27"], "Book Now"),
+                Some((97727, "SGD")),
+            ),
             // Final pages seen on 2026-10-11: Booking.com, Ryanair,
             // Aerolíneas Argentinas and Zalando.
             (
