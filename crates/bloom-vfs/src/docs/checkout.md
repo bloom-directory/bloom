@@ -94,22 +94,24 @@ an unclear total goes to the human's private view; its URL and screenshots
 never appear in VFS. A manual
 fallback releases no saved card.
 
-When an airline rejects Bloom's browser, try an agency seller on Google's
-booking page instead; give the person the link only when no seller opens.
 Use a requested agency directly; otherwise try the airline first. Open
-`google_flights_url` and match the chosen offer's flight numbers, airport-local
-dates and times, cabin and party; for round trips match both outbound and
-return. Report price changes rather than substituting another itinerary.
-Expand extra booking options and read every “Continue to book with …” seller
-and price to the person. On an airline block or empty page, return to Google
-and try agencies with dated `known.opened` observations first. If one blocks,
-try another listed agency without evasion; hand off only when none opens.
+`google_flights_url` and match the chosen offer's airports, flight numbers,
+airport-local dates and times, cabin and party; for round trips match both
+outbound and return. Report price changes rather than substituting another
+itinerary. Explain the chosen seller's final price and material trade-offs,
+including a substantially cheaper alternative.
+
+If the airline blocks, shows an empty page or loses the itinerary, recover
+the same flights there or try an agency on Google's booking page. Expand
+extra booking options and prioritize dated `known.opened` observations.
 If Back in the followed popup does not restore Google, reopen the original
-search URL and reselect the same itinerary. If an airline loads but loses
-the itinerary, recover the same flights there or ask before changing to an
-agency; a country chooser is not a block. Google's seller button carries
-the itinerary; never invent agency links. Recheck flights, dates, party, bags
-and final total at the seller before unlocking travelers or requesting payment.
+search URL and reselect the same itinerary. A country chooser is not a block.
+If no listed seller works, search a known agency's normal website for the
+same flights; never invent an agency itinerary URL or bypass a challenge.
+Verify the actual offer: partner links and search results can change airports,
+cabin or codeshare. Recheck dates/times, party, bags and final total before
+unlocking travelers or requesting payment. Conflicting dates or times require
+private review or another seller. Hand off when no matching offer works.
 
 Explain agency trade-offs before approval: fees and upsells may raise the
 price. Changes and refunds go through the agency. An order confirmation can
