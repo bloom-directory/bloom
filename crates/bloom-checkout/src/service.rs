@@ -3169,6 +3169,10 @@ mod tests {
         .await
         .unwrap();
         assert!(service.private.lock().await.is_some());
+        // The person sees the private view before clicking. Its capture also
+        // brings the handed-off tab forward; macOS can throttle native input
+        // to a background tab. Exercise that path rather than retrying a click.
+        assert!(!service.private_screenshot(&token).await.unwrap().is_empty());
         let point = observer
             .cdp
             .evaluate(
