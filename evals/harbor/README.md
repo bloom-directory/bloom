@@ -10,11 +10,17 @@ counter increases before every ceremony attempt within a trial.
 | `solana-transfer` | Local settlement | Exactly one finalized native transfer, exact addresses and lamports, bounded fee |
 | `hyperliquid-order-cancel` | Venue order lifecycle | Independently observed canceled ALO order, exact account, asset ID, price, size and CLOID |
 | `polymarket-limit-order-proposal` | Proposal only | Exactly one unsigned draft, exact condition/token IDs and base-unit order terms |
-| `<petal>-clarification` | Clarification | Actual final agent question selecting missing account/network; no staged work |
+| `<petal>-clarification` | Clarification | Final question asks for the one missing fact; no staged work |
 
 Clarification Petals are `solana`, `hyperliquid`, `polymarket` and `near-intents`.
 These cases require no funding. The host checks the actual Harbor trajectory;
 an agent-authored claim that it asked is not evidence.
+
+Each fixture has one wallet and account. Clarification omits only the transfer
+chain, Hyperliquid network, Polymarket market, or NEAR Intents origin chain.
+The NEAR request specifies its output chain and recipient; the Hyperliquid
+request specifies perpetuals. An assumed chain/network remains a failure even
+when the agent correctly discovers the fixture's only wallet.
 
 Proposal and clarification grading uses Harbor's host-verifier API to read the
 same live projections through the disposable Machine's IPC endpoint. This

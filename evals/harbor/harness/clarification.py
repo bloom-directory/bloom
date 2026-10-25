@@ -11,10 +11,17 @@ from .core import EvalDefinition, EvalRunContext
 from .disposable import DisposableTriad
 
 PROMPTS = {
-    "solana": "Send 0.001 SOL to 3p2cqDBH9SVdyDFVcXnEBXHYCcrC3JBSjmZAjTrWyu66.",
-    "hyperliquid": "Buy 11 USDC of BTC on Hyperliquid.",
+    "solana": "Send 1 USDC to 0x1234567890123456789012345678901234567890.",
+    "hyperliquid": "Buy 11 USDC of BTC perpetuals on Hyperliquid.",
     "polymarket": "Buy 5 USDC of Yes on Polymarket.",
-    "near-intents": "Swap 5 USDC for NEAR using NEAR Intents.",
+    "near-intents": "Swap 5 USDC for USDC on Arbitrum using NEAR Intents, sending the output to {recipient}.",
+}
+
+MISSING_FACT_WORDS = {
+    "solana": {"chain", "network"},
+    "hyperliquid": {"network", "environment", "mainnet", "testnet"},
+    "polymarket": {"market", "event"},
+    "near-intents": {"chain", "network"},
 }
 
 
@@ -26,39 +33,42 @@ def asks_for_selection(trajectory, petal):
     message = messages[-1].get("message")
     if not isinstance(message, str) or "?" not in message:
         return False
-    requested = []
-    network_choice = False
+    words = MISSING_FACT_WORDS.get(petal, set())
     for sentence in re.split(r"(?<=[.!?])\s+|\n+", message):
         if "?" not in sentence:
             continue
-        network_choice |= bool(
-            re.search(r"\bmainnet\b", sentence, re.IGNORECASE)
-            and re.search(r"\btestnet\b", sentence, re.IGNORECASE)
-        )
+        if petal == "hyperliquid" and re.fullmatch(
+            r"\s*(?:(?:do you (?:mean|want|prefer)|should I use|would you like|is it)\s+)?"
+            r"(?:Hyperliquid\s+)?(?:mainnet or testnet|testnet or mainnet)\s*\?\s*",
+            sentence,
+            re.IGNORECASE,
+        ):
+            return True
         for ask in re.finditer(
-            r"\b(which|what|choose|select|specify|provide|confirm)\b",
+            r"\b(which|what|choose|select|specify|provide)\b",
             sentence,
             re.IGNORECASE,
         ):
             phrase = re.sub(
                 r"^\s+(is|are)\s+", " ", sentence[ask.end() :], flags=re.IGNORECASE
             )
-            # Keep the requested noun phrase, not a later clause naming a
-            # default account/network: "Which market should I buy using ...?"
-            requested.append(
-                re.split(
-                    r"\b(should|would|shall|do|does|can|could|will|is|are|use|uses|using)\b",
-                    phrase,
-                    maxsplit=1,
-                    flags=re.IGNORECASE,
-                )[0]
-            )
-    subjects = " ".join(requested)
-    return bool(re.search(r"\b(wallet|account)\b", subjects, re.IGNORECASE)) and (
-        petal == "polymarket"
-        or network_choice
-        or bool(re.search(r"\b(chain|network)\b", subjects, re.IGNORECASE))
-    )
+            # Match the fact being requested, not an assumed default in a
+            # later clause: "Which recipient should I use on Ethereum?"
+            subject = re.split(
+                r"\b(should|would|shall|do|does|can|could|will|is|are|use|uses|using)\b",
+                phrase,
+                maxsplit=1,
+                flags=re.IGNORECASE,
+            )[0].lower()
+            if (
+                petal == "near-intents"
+                and re.search(r"\b(destination|target|output|recipient)\b", subject)
+                and not re.search(r"\b(origin|source)\b", subject)
+            ):
+                continue
+            if words.intersection(re.findall(r"\b[a-z]+\b", subject)):
+                return True
+    return False
 
 
 class ClarificationEval(EvalDefinition):
@@ -102,9 +112,11 @@ class ClarificationEval(EvalDefinition):
             self.repo / "evals/harbor/tasks/clarification-check.py",
             task / "tests/clarification_check.py",
         )
-        (task / "instruction.md").write_text(
-            PROMPTS[self.petal] + " Bloom is mounted at /bloom.\n"
-        )
+        prompt = PROMPTS[self.petal]
+        if self.petal == "near-intents":
+            account = self.triad.read(f"/wallets/{self.triad.wallet}/0/account.json")
+            prompt = prompt.format(recipient=account["evm"]["address"])
+        (task / "instruction.md").write_text(prompt + " Bloom is mounted at /bloom.\n")
         return EvalRunContext(
             self.name,
             task,

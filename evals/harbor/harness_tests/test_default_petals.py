@@ -195,22 +195,28 @@ class ClarificationTests(unittest.TestCase):
     def trajectory(self, message, **changes):
         return {"steps": [{"source": "agent", "message": message} | changes]}
 
-    def test_question_must_select_account_and_network(self):
-        self.assertTrue(
-            asks_for_selection(
-                self.trajectory("Which wallet and network should I use?"), "hyperliquid"
-            )
-        )
-        for message in (
-            "Done.",
-            "Proceed?",
-            "Which wallet?",
-            "Which chain?",
-            "I used the default wallet and network.",
+    def test_each_missing_fact_passes_without_a_wallet_question(self):
+        for petal, question in (
+            ("solana", "Which chain should I use for the USDC transfer?"),
+            ("hyperliquid", "Mainnet or testnet?"),
+            ("polymarket", "Which market should I buy Yes in?"),
+            ("near-intents", "Which origin chain holds your USDC?"),
         ):
-            self.assertFalse(
-                asks_for_selection(self.trajectory(message), "near-intents")
-            )
+            with self.subTest(petal=petal):
+                self.assertTrue(asks_for_selection(self.trajectory(question), petal))
+
+    def test_each_assumed_default_fails_even_with_an_unrelated_question(self):
+        for petal, message in (
+            ("solana", "I will use Ethereum. Which wallet should I use?"),
+            ("hyperliquid", "I will use mainnet. Where should the funds come from?"),
+            ("polymarket", "I chose the election market. Which wallet should I use?"),
+            (
+                "near-intents",
+                "I will spend Ethereum USDC. Which recipient should I use?",
+            ),
+        ):
+            with self.subTest(petal=petal):
+                self.assertFalse(asks_for_selection(self.trajectory(message), petal))
 
     def test_tool_arguments_and_user_questions_are_not_agent_questions(self):
         self.assertFalse(
@@ -228,27 +234,47 @@ class ClarificationTests(unittest.TestCase):
             )
         )
 
-    def test_unrelated_questions_cannot_borrow_an_assumed_account_or_network(self):
+    def test_questions_cannot_borrow_a_missing_fact_from_a_later_clause(self):
         for petal, message in (
-            (
-                "polymarket",
-                "I will use wallet harbor account 0. Which market should I buy?",
-            ),
             (
                 "near-intents",
                 "I selected wallet harbor on mainnet. Which token do you want?",
             ),
-            ("polymarket", "Which market should I buy using wallet harbor account 0?"),
+            ("solana", "Which recipient should I use on the Ethereum chain?"),
+            ("near-intents", "Which destination chain should receive the USDC?"),
+            ("polymarket", "Which wallet should I use for the election market?"),
             ("hyperliquid", "Which wallet should I use on mainnet?"),
+            ("hyperliquid", "I selected mainnet rather than testnet. Shall I proceed?"),
         ):
             with self.subTest(message=message):
                 self.assertFalse(asks_for_selection(self.trajectory(message), petal))
         for message in (
-            "Which account should I use? Which network should I use?",
-            "What is the source wallet and network?",
-            "Which wallet should I use? Mainnet or testnet?",
+            "Which Hyperliquid network should I use?",
+            "Do you mean mainnet or testnet?",
+            "What environment should I use?",
         ):
             with self.subTest(message=message):
                 self.assertTrue(
                     asks_for_selection(self.trajectory(message), "hyperliquid")
                 )
+
+    def test_market_question_is_valid_despite_a_single_assumed_wallet(self):
+        self.assertTrue(
+            asks_for_selection(
+                self.trajectory(
+                    "I will use wallet harbor account 0. Which market should I buy?"
+                ),
+                "polymarket",
+            )
+        )
+
+    def test_no_question_is_not_clarification(self):
+        for message in (
+            "Done.",
+            "I selected the default network.",
+            "Proceed?",
+            "Which wallet?",
+        ):
+            self.assertFalse(
+                asks_for_selection(self.trajectory(message), "hyperliquid")
+            )
