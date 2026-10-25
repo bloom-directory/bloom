@@ -1878,6 +1878,50 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn vietnamese_card_captions_are_recognized_and_masked() {
+        let browser = browser().await;
+        let (url, server) = fixture(merchant(
+            "<div>Số thẻ<input placeholder='0000 0000 0000 0000' value='4242424242424242'></div>
+             <div>Mã bảo mật<input placeholder='000' value='937'></div>
+             <div>Tên chủ thẻ<input placeholder='Tên chủ thẻ' value='Fixture Payer'></div>
+             <input autocomplete='cc-exp' value='12/34'>",
+            "",
+            "Confirmed",
+        ))
+        .await;
+        let tab = open(&browser, url).await;
+        let discovery = Discovery::read(&tab).await.unwrap();
+        assert_eq!(
+            discovery
+                .frames
+                .iter()
+                .flat_map(|f| &f.fields)
+                .map(|f| f.kind.as_str())
+                .collect::<Vec<_>>(),
+            vec!["number", "cvc", "name", "expiry"]
+        );
+        let snapshot = tab
+            .cdp
+            .evaluate(
+                &tab.session,
+                crate::scripts::prepare(include_str!("snapshot.js")),
+            )
+            .await
+            .unwrap();
+        assert!(
+            snapshot["elements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|e| e["role"] == "input")
+                .all(|e| e.get("value").is_none()),
+            "card values must be omitted even when numeric placeholders hide their captions"
+        );
+        browser.return_control().await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn read_only_and_contact_boxes_are_not_card_fields() {
         let browser = browser().await;
         let html = merchant(

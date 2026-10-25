@@ -98,7 +98,8 @@
     label: label(e).slice(0, 200),
     context: context(e),
     type: e.type || null,
-    value: field(e) && e.type !== 'checkbox' && e.type !== 'radio' && !secret(e, label(e)) ?
+    // Numeric placeholders can hide the adjacent card-field caption.
+    value: field(e) && e.type !== 'checkbox' && e.type !== 'radio' && !secret(e, /^\d[\d\s]*$/.test(label(e)) ? caption(e) : label(e)) ?
       (e.value && globalThis.__bloomPrivateFields?.has(e) ? `[saved ${globalThis.__bloomPrivateFields.get(e)}]` : String(e.value).slice(0, 200)) : undefined,
     checked: checked(e),
     options: e.tagName === 'SELECT' ? [...e.options].map(o => ({value: o.value, label: o.text})) : undefined

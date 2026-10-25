@@ -16,8 +16,8 @@
     const autocomplete = e.autocomplete?.toLowerCase().split(' ').pop();
     const direct = {'cc-number':'number','cc-exp':'expiry','cc-exp-month':'month','cc-exp-year':'year','cc-csc':'cvc','cc-name':'name'};
     if (direct[autocomplete]) return direct[autocomplete];
-    if (secret(e, label) && /card.?number|cardnumber|numero de (la )?tarjeta|nro\.? de tarjeta/.test(label)) return 'number';
-    if (secret(e, label) && /cvc|cvv|security.?code|codigo de seguridad/.test(label)) return 'cvc';
+    if (secret(e, label) && /card.?number|cardnumber|numero de (la )?tarjeta|nro\.? de tarjeta|\bso the\b/.test(label)) return 'number';
+    if (secret(e, label) && /cvc|cvv|security.?code|codigo de seguridad|\bma bao mat\b/.test(label)) return 'cvc';
     // Jettzy's reviewed inline form names these selects rather than labelling
     // each expiry part. Keep the aliases on the reviewed receiving origins.
     if (['https://en.jettzy.com.hk','https://www.jettzy.com.my','https://www.jettzy.com.vn'].includes(location.origin) && e instanceof HTMLSelectElement) {
@@ -27,7 +27,7 @@
     if (/expir.*month|month.*expir|vencimiento.*mes|mes.*vencimiento|^mes$/.test(label)) return 'month';
     if (/expir.*year|year.*expir|vencimiento.*ano|ano.*vencimiento|^ano$/.test(label)) return 'year';
     if (/expir|mm.?\/.?(yy|aa)|vencimiento|fecha de expiracion/.test(label)) return 'expiry';
-    if (/cardholder|name.?on.?card|titular|nombre (impreso|como figura|en la tarjeta)/.test(label)) return 'name';
+    if (/cardholder|name.?on.?card|titular|nombre (impreso|como figura|en la tarjeta)|\bten chu the\b/.test(label)) return 'name';
     return null;
   };
   const shopify = location.origin === 'https://checkout.pci.shopifyinc.com'
