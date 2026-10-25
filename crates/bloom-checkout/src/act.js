@@ -5,14 +5,14 @@
     const targets = [e];
     // Clicking a label can activate its submit/button control, even when that
     // control is hidden and the label itself says only "Continue".
-    if (e.tagName === 'LABEL' && e.control?.matches('button,input[type=submit],input[type=button]')) targets.push(e.control);
+    if (e.tagName === 'LABEL' && e.control?.matches('button,input[type=submit],input[type=button],input[type=image]')) targets.push(e.control);
     for (const target of targets) {
       if (target.disabled || target.getAttribute('aria-disabled') === 'true') throw Error('stale');
       const namedBy = (target.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean)
         .map(id => target.getRootNode().getElementById(id)?.textContent || '').join(' ');
       const slotted = [...target.querySelectorAll('slot')].flatMap(s => s.assignedNodes({flatten: true}))
         .map(n => n.nodeType === Node.TEXT_NODE ? n.textContent : n.innerText || '').join(' ');
-      const labels = [target.innerText, target.value, target.getAttribute('aria-label'), namedBy, slotted];
+      const labels = [target.innerText, target.value, target.getAttribute('aria-label'), target.getAttribute('alt'), namedBy, slotted];
       if (labels.some(label => BLOOM_PAY_WORDS.test((label || '').replace(/\s+/g, ' ').trim()))) throw Error('payment requires approval');
     }
   };

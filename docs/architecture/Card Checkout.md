@@ -91,7 +91,8 @@ bounded control labels and context; private-field value filtering still applies.
 Labels operating hidden native inputs retain their place alongside native
 controls, so result cards cannot crowd out the search filters.
 Public label activation also checks an associated submit/button control's
-payment labels before dispatching activation events.
+payment labels before dispatching activation events. Image submit controls
+and their labels use the image's alternative text for the same payment guard.
 
 ## Booking sites that reject Bloom's browser
 

@@ -920,6 +920,9 @@ mod tests {
                           <input id="labelled-pay" type="submit" value="Pay now" style="display:none" onclick="document.title='unsafe labelled payment'">
                           <label for="labelled-button">Review labelled payment</label>
                           <button id="labelled-button" aria-label="Complete booking" style="display:none" onclick="document.title='unsafe labelled booking'">Confirm</button>
+                          <input type="image" name="image-payment" alt="Pay now" style="width:40px;height:20px" onclick="document.title='unsafe image payment'">
+                          <label for="labelled-image">Continue image payment</label>
+                          <input id="labelled-image" type="image" alt="Pay now" style="display:none" onclick="document.title='unsafe labelled image payment'">
                           <button>Ödeme Sayfasına Devam Et</button>
                           <button>Tiếp theo: Thanh toán &gt;</button>
                           <button>Gå til betaling</button>
@@ -959,6 +962,8 @@ mod tests {
             "Proceed",
             "Continue labelled payment",
             "Review labelled payment",
+            "image-payment",
+            "Continue image payment",
         ] {
             let error = browser
                 .browse(BrowseRequest::Click {
