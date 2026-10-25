@@ -30,7 +30,13 @@ class HostProjectionVerifier(BaseVerifier):
             trajectory = json.loads(
                 (self.trial_paths.agent_dir / "trajectory.json").read_bytes()
             )
-            passed = asks_for_selection(trajectory, self.clarification_petal)
+            passed = asks_for_selection(
+                trajectory,
+                self.clarification_petal,
+                json.loads(
+                    self.override_env.get("BLOOM_EVAL_CLARIFICATION_CHOICES", "[]")
+                ),
+            )
         if passed:
             result = subprocess.run(
                 [sys.executable, str(self.task.paths.tests_dir / "verify_result.py")],

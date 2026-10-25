@@ -13,11 +13,13 @@ import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import unquote, urlparse
 
 from .clarification import PROMPTS, ClarificationEval
 from .core import AGENTS, EvalError, EvalEvidence, run_eval
 from .default_petals import PolymarketProposalEval
 from .disposable import CEREMONY
+from .metrics import trajectory_counts
 from .solana_transfer import SolanaTransferEval
 
 
@@ -142,6 +144,7 @@ def main(argv: list[str] | None = None) -> int:
             if source_diff
             else None,
             "lineage": getattr(definition, "lineage", None),
+            "commands": None,
         }
         binaries = {}
         for role in ("MACHINE", "BROKER", "SIGNER", "DEBUG_DRIVER"):
@@ -172,6 +175,16 @@ def main(argv: list[str] | None = None) -> int:
                         )
                     }
                 summary["trial_uri"] = str(trial.trial_uri)
+                uri = urlparse(str(trial.trial_uri))
+                if uri.scheme == "file":
+                    trajectory = Path(unquote(uri.path)) / "agent/trajectory.json"
+                    try:
+                        summary["commands"] = trajectory_counts(
+                            json.loads(trajectory.read_bytes())
+                        )
+                    except (OSError, ValueError, TypeError) as error:
+                        summary["commands"] = None
+                        summary["command_counts_error"] = type(error).__name__
         root = (
             Path(os.environ.get("BLOOM_EVAL_JOBS_DIR", str(repo / "evals/harbor/jobs")))
             / "summaries"

@@ -17,6 +17,11 @@ the Triad's own state; an agent's report is never evidence. Teardown removes
 the root. Failed trials keep it for diagnosis; it can hold ceremony
 capabilities, so never publish its raw logs.
 
+Roots live under `~/.cache/bloom-harbor` by default, or the short directory in
+`BLOOM_EVAL_ROOTS_DIR`. On this host they use `/data/codex-scratch/user/hb-1022`,
+so retained failures consume disk rather than RAM-backed `/tmp`. Keep the root
+short enough for Unix socket paths.
+
 | Task | Coverage | Passes when |
 | --- | --- | --- |
 | `solana-transfer` | Settlement on a local validator | exactly one finalized transfer: exact addresses and lamports, fee within the bound |
@@ -64,9 +69,19 @@ harness never touches the installed custody Triad.
 Each run writes a summary to `evals/harbor/jobs/summaries/` (or
 `$BLOOM_EVAL_JOBS_DIR`):
 - reward, coverage and any error;
-- tokens and phase timings;
+- agent tool-call counts, tokens and phase timings;
 - cleanup outcome;
 - source revision and binary hashes.
+
+Command counts use the same denominator for every agent: an agent tool call.
+A compound call counts once in each applicable read/write category. Bloom
+reads/writes are counted only when identifiable from tool arguments; opaque
+commands and relative paths remain unclassified. These are attempted calls,
+not shell-command totals, physical filesystem operations or RPC counts.
+Missing trajectories leave counts unavailable rather than inventing zeros.
+
+Clarification accepts a direct question or an explicit request to choose the
+missing fact; punctuation is immaterial. Asking for funds alone does not pass.
 
 Read the first trial of each task by hand before running batches. A 0 or a
 timeout is a failure.

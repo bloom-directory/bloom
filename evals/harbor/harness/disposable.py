@@ -159,11 +159,15 @@ class DisposableTriad:
             f"{label} did not become ready within {timeout}s; logs: {self.root}"
         )
 
-    def start(
-        self, *, solana: bool = False, mount: bool = True
-    ) -> None:
+    def start(self, *, solana: bool = False, mount: bool = True) -> None:
         self.preflight()
-        self.root = Path(tempfile.mkdtemp(prefix="bhe-", dir="/tmp"))
+        roots = Path(
+            self.env.get(
+                "BLOOM_EVAL_ROOTS_DIR", str(Path.home() / ".cache/bloom-harbor")
+            )
+        )
+        roots.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.root = Path(tempfile.mkdtemp(prefix="h-", dir=roots))
         self.root.chmod(0o700)
         self.home = self.root / "dev/home"
         self.mount = Path(
@@ -316,7 +320,9 @@ class DisposableTriad:
                 timeout=30,
             )
         except EvalError:
-            raise EvalError("setup policy differs from its committed projection") from None
+            raise EvalError(
+                "setup policy differs from its committed projection"
+            ) from None
 
     def require_petal(self, name: str) -> str:
         # Do not execute Petal routes while startup is installing packages:
@@ -324,8 +330,9 @@ class DisposableTriad:
         # when the package commits; only then read its mounted documentation.
         owner = self.home / "petals/store/owners" / f"{name}.json"
         return self._wait(
-            lambda: owner.is_file()
-            and self.cli("vfs", "cat", f"/petals/{name}/README.md"),
+            lambda: (
+                owner.is_file() and self.cli("vfs", "cat", f"/petals/{name}/README.md")
+            ),
             self.launcher,
             f"default Petal {name}",
         )

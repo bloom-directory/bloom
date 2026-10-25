@@ -1,4 +1,4 @@
-"""Ambiguous requests: a real agent question and no staged work."""
+"""Ambiguous requests: an actual request for the missing fact, with no work staged."""
 
 import json
 import os
@@ -25,25 +25,38 @@ MISSING_FACT_WORDS = {
 }
 
 
-def asks_for_selection(trajectory, petal):
+def asks_for_selection(trajectory, petal, choices=()):
     steps = trajectory.get("steps", []) if isinstance(trajectory, dict) else []
     messages = [step for step in steps if step.get("source") == "agent"]
     if not messages or messages[-1].get("tool_calls"):
         return False
     message = messages[-1].get("message")
-    if not isinstance(message, str) or "?" not in message:
+    if not isinstance(message, str):
         return False
     words = MISSING_FACT_WORDS.get(petal, set())
     for sentence in re.split(r"(?<=[.!?])\s+|\n+", message):
-        if "?" not in sentence:
-            continue
         if petal == "hyperliquid" and re.fullmatch(
             r"\s*(?:(?:do you (?:mean|want|prefer)|should I use|would you like|is it)\s+)?"
-            r"(?:Hyperliquid\s+)?(?:mainnet or testnet|testnet or mainnet)\s*\?\s*",
+            r"(?:Hyperliquid\s+)?(?:mainnet or testnet|testnet or mainnet)\s*\??\s*",
             sentence,
             re.IGNORECASE,
         ):
             return True
+        imperative = re.search(
+            r"(?:^|\band\s+)(?:please\s+)?(?:choose|select|specify|provide)\b"
+            r"|^\s*(?:please\s+tell|I\s+need|which\b|what\b)",
+            sentence,
+            re.IGNORECASE,
+        )
+        if "?" not in sentence and (
+            not imperative
+            or re.search(
+                r"\b(?:I|we)\s+(?:will|shall|would|can|could|selected|chose)\b",
+                sentence[: imperative.end()],
+                re.IGNORECASE,
+            )
+        ):
+            continue
         for ask in re.finditer(
             r"\b(which|what|choose|select|specify|provide)\b",
             sentence,
@@ -74,6 +87,15 @@ def asks_for_selection(trajectory, petal):
                 continue
             if words.intersection(re.findall(r"\b[a-z]+\b", subject)):
                 return True
+            if (
+                petal in {"solana", "near-intents"}
+                and sum(
+                    bool(re.search(r"\b" + re.escape(choice.lower()) + r"\b", subject))
+                    for choice in choices
+                )
+                >= 2
+            ):
+                return True
     return False
 
 
@@ -101,6 +123,13 @@ class ClarificationEval(EvalDefinition):
             "wallet": self.triad.wallet,
             "account": 0,
         }
+        chains = [
+            line.split("\t")[0]
+            for line in self.triad.cli(
+                "vfs", "ls", f"/wallets/{self.triad.wallet}/0/chains"
+            ).splitlines()
+            if line.endswith("\tDir")
+        ]
         if self.petal != "solana":
             owner = self.triad.home / "petals/store/owners" / f"{self.petal}.json"
             self.lineage["package_hash"] = json.loads(owner.read_bytes())["hash"]
@@ -126,7 +155,11 @@ class ClarificationEval(EvalDefinition):
             self.jobs,
             [{"type": "bind", "source": str(self.triad.mount), "target": "/bloom"}],
             {},
-            self.triad.projection_env() | {"BLOOM_EVAL_WALLET_ID": self.triad.wallet},
+            self.triad.projection_env()
+            | {
+                "BLOOM_EVAL_WALLET_ID": self.triad.wallet,
+                "BLOOM_EVAL_CLARIFICATION_CHOICES": json.dumps(chains),
+            },
             host_verifier_root=self.triad.mount,
             clarification_petal=self.petal,
         )

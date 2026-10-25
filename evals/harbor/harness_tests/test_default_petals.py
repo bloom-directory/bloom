@@ -280,3 +280,30 @@ class ClarificationTests(unittest.TestCase):
             self.assertFalse(
                 asks_for_selection(self.trajectory(message), "hyperliquid")
             )
+
+    def test_imperative_missing_fact_requests_need_no_question_mark(self):
+        for petal, message in (
+            ("solana", "Please specify the source chain before I proceed."),
+            ("hyperliquid", "Please choose the Hyperliquid network."),
+            ("polymarket", "Provide the market to buy Yes in."),
+            ("near-intents", "Specify the origin chain for your USDC."),
+        ):
+            self.assertTrue(asks_for_selection(self.trajectory(message), petal))
+        self.assertTrue(
+            asks_for_selection(
+                self.trajectory(
+                    "Fund the intended chain and specify Ethereum, Polygon, or Arc, then I can proceed."
+                ),
+                "solana",
+                choices=("ethereum", "polygon", "arc"),
+            )
+        )
+
+    def test_funding_requests_and_self_selection_statements_still_fail(self):
+        for message in (
+            "Fund the account on Ethereum before I proceed.",
+            "I will select the Ethereum chain.",
+            "I can choose a network myself.",
+            "I selected mainnet. Please provide funds.",
+        ):
+            self.assertFalse(asks_for_selection(self.trajectory(message), "solana"))
