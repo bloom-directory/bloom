@@ -1,6 +1,6 @@
 # Default Petal agent baseline
 
-in progress: 14 of 24 pairs manually reviewed. Every listed trajectory was manually reviewed after exact-path permission.
+in progress: 15 of 24 pairs manually reviewed. Every listed trajectory was manually reviewed after exact-path permission.
 
 | Task | Agent | Assessed/raw reward | Tool calls | Bloom R/W/? | Input/cache tokens | Output/reasoning/combined | Harbor/total seconds |
 | --- | --- | --- | ---: | --- | --- | --- | --- |
@@ -18,6 +18,7 @@ in progress: 14 of 24 pairs manually reviewed. Every listed trajectory was manua
 | polymarket-limit-order-proposal | opencode | 1.0/1.0 | 66 | 42/2/4 | 1893296/1805952 | 6066/9627/15693 | 404.76/496.85 |
 | solana-clarification | codex | 0/1.0 | 7 | 7/0/0 | 198758/167936 | 1878/unknown/unknown | 86.50/95.63 |
 | solana-clarification | opencode | 0.0/0.0 | 40 | 3/0/35 | 1671261/1618304 | 5227/4275/9502 | 321.40/330.61 |
+| solana-clarification | claude | 1.0/1.0 | 12 | 12/0/0 | 573647/545489 | 4344/unknown/unknown | 148.54/158.35 |
 
 Tool calls are the common denominator; categories count identifiable attempted calls and can overlap. `?` means Bloom calls with unclassified access. Input includes cached input; cache is shown separately, not added again. Raw usage is preserved in [the JSON](2026-10-25.json). Separate reasoning is reported only where observed through the OpenCode adapter; unknown is not zero. Provider token accounting may differ. Assessed/raw values retain historical grading corrections.
 
@@ -37,6 +38,7 @@ Tool calls are the common denominator; categories count identifiable attempted c
 - **polymarket-limit-order-proposal/opencode** (`polymarket-proposal-524f9c426926__S836pZk`): Initial max_price-only write silently produced no draft; broad diagnostics and external Petal source inspection revealed GTC limit_price/order_type. Corrected one draft after 66 tool calls; mounted schema/error feedback did not explain the omission.
 - **solana-clarification/codex** (`solana-clarification-f9fff038328__Fr7J8uA`): Balance/status fan-out before asking for the chain only if not Ethereum or Polygon, leaving that choice unresolved. Historical raw reward1 retained; corrected offline matcher assessment0, no LLM rerun.
 - **solana-clarification/opencode** (`solana-clarification-f1c1cb22dfa__z7smBuy`): Timed out after40calls of balance/token/status and unrelated Petal discovery instead of asking the missing chain; no final clarification. Relative-path scans dominate, so known Bloom read count is incomplete.
+- **solana-clarification/claude** (`solana-clarification-5c1214bf899__yVNDdxL`): Asked which chain with no staged work, after unnecessary balance/status/token checks; also raised funding and recipient reconfirmation before resolving the omitted chain. Fresh retry completed after the separate revoked-token interruption; its underlying cause remains unknown.
 
 ## Proposed follow-up PRs
 
