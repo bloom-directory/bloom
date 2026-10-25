@@ -245,7 +245,9 @@ def validate_proposal(requests, account, expected, review, trajectory, pending):
     # Hyperliquid's strict (T-2days,T+1day) nonce window, evaluated at the
     # trusted request creation time, so later offline grading is deterministic.
     if not issued - 2 * 86_400_000 < proof["committed_nonce"] < issued + 86_400_000:
-        raise ValueError("committed nonce is outside the venue validity window")
+        raise ValueError(
+            f"committed_nonce={proof['committed_nonce']} outside venue window; issued_at_ms={issued}"
+        )
     try:
         matches = matches_order(body, network, expected, issued)
     except (InvalidOperation, ValueError, TypeError):

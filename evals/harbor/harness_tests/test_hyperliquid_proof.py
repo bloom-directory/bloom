@@ -168,7 +168,10 @@ class HyperliquidProofTests(unittest.TestCase):
                 if valid:
                     validate_proposal(*self.proposal(body))
                 else:
-                    with self.assertRaises(ValueError):
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        f"committed_nonce={body['nonce']}.*issued_at_ms={self.nonce}",
+                    ):
                         validate_proposal(*self.proposal(body))
         args = self.proposal()
         del args[3]["review_manifest"]["issued_at_ms"]
