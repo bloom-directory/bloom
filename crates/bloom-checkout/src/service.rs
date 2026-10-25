@@ -3172,7 +3172,24 @@ mod tests {
         // The person sees the private view before clicking. Its capture also
         // brings the handed-off tab forward; macOS can throttle native input
         // to a background tab. Exercise that path rather than retrying a click.
-        assert!(!service.private_screenshot(&token).await.unwrap().is_empty());
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                match service.private_screenshot(&token).await {
+                    Ok(frame) => {
+                        assert!(!frame.is_empty());
+                        break;
+                    }
+                    // The private viewer refreshes frames every 800ms. Wait
+                    // for that read-only readiness; never retry the Pay click.
+                    Err(error) if error.to_string() == "Private page is still loading" => {
+                        tokio::time::sleep(Duration::from_millis(800)).await;
+                    }
+                    Err(error) => panic!("Private frame failed: {error:#}"),
+                }
+            }
+        })
+        .await
+        .expect("The private view must paint before the single payment click");
         let point = observer
             .cdp
             .evaluate(
