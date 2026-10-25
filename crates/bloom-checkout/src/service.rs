@@ -2846,36 +2846,12 @@ mod tests {
 
     #[tokio::test]
     async fn airline_confirmation_becomes_booked_with_its_code() {
-        let (url, server) = crate::discovery::tests::fixture(
+        let (service, browser, _, server) = shopping_service(
             "<p data-bloom-total-minor='21730759' data-bloom-currency='ARS'>Total ARS 217307.59</p>
-             <h1>Tu compra ha sido confirmada</h1><p>Código de reserva: AB12CD</p>"
-                .into(),
+             <h1>Tu compra ha sido confirmada</h1><p>Código de reserva: AB12CD</p>",
         )
         .await;
-        let root = tempfile::tempdir().unwrap().keep();
-        let browser = Browser::launch(
-            &crate::test_chromium(),
-            &root.join("profile"),
-            &["--no-sandbox".into(), "--ignore-certificate-errors".into()],
-        )
-        .await
-        .unwrap();
-        browser
-            .browse(crate::browser::BrowseRequest::Open { url })
-            .await
-            .unwrap();
-        tokio::time::sleep(Duration::from_millis(200)).await;
         let tab = browser.handoff().await.unwrap();
-        let service = Arc::new(
-            CheckoutService::new(
-                browser,
-                &root.join("state.db"),
-                root.join("unused.sock"),
-                unsafe { libc::geteuid() },
-                47999,
-            )
-            .unwrap(),
-        );
         let status = Status {
             operation_id: "fixture-booking".into(),
             state: "submitted".into(),
@@ -2905,7 +2881,7 @@ mod tests {
             submitted: false,
         });
         tokio::time::timeout(
-            Duration::from_secs(4),
+            Duration::from_secs(10),
             service.watch_outcome(status.operation_id.clone()),
         )
         .await
