@@ -1,6 +1,6 @@
 {
   "source_commit": "d0aea7852e67562f7797a8fdce96a6838cc9b37b",
-  "status": "in progress: 10 of 24 pairs manually reviewed",
+  "status": "in progress: 11 of 24 pairs manually reviewed",
   "review_rule": "Each raw trajectory requires exact-path permission and manual review before the next trial.",
   "counts": "Attempted tool calls; read/write bearing calls only when identifiable; unknown retained.",
   "trials": [
@@ -40,6 +40,11 @@
         "bloom_unclassified_tool_calls": 7
       },
       "measurement_commit": "f86e68adcdb6dd03836860b702ff333c79197fe6",
+      "token_comparison": {
+        "raw_output_tokens": 6696,
+        "separately_reported_reasoning_tokens": null,
+        "output_plus_separate_reasoning_tokens": null
+      },
       "fixture_lineage": {
         "wallet": "harbor",
         "account": 0,
@@ -108,6 +113,11 @@
         "bloom_unclassified_tool_calls": 6
       },
       "measurement_commit": "f86e68adcdb6dd03836860b702ff333c79197fe6",
+      "token_comparison": {
+        "raw_output_tokens": 52631,
+        "separately_reported_reasoning_tokens": null,
+        "output_plus_separate_reasoning_tokens": null
+      },
       "fixture_lineage": {
         "wallet": "harbor",
         "account": 0,
@@ -162,6 +172,11 @@
         "bloom_unclassified_tool_calls": 9
       },
       "measurement_commit": "f86e68adcdb6dd03836860b702ff333c79197fe6",
+      "token_comparison": {
+        "raw_output_tokens": 4946,
+        "separately_reported_reasoning_tokens": 5889,
+        "output_plus_separate_reasoning_tokens": 10835
+      },
       "fixture_lineage": {
         "wallet": "harbor",
         "account": 0,
@@ -221,6 +236,11 @@
         "corrected_assessment": 0,
         "basis": "Recorded quote_failed state rejects before absent outbox; actual request amount was 1 base unit rather than 1000000.",
         "live_replay": false
+      },
+      "token_comparison": {
+        "raw_output_tokens": 3406,
+        "separately_reported_reasoning_tokens": null,
+        "output_plus_separate_reasoning_tokens": null
       },
       "fixture_lineage": {
         "wallet": "harbor",
@@ -283,6 +303,11 @@
       "manual_review": "complete: tool actions and final reviewed with exact-path permission",
       "finding": "Missing unit explanation caused a failed 1-base-unit quote; retry with 1000000 succeeded. Three session-confirm writes after stale prepared reads advanced beyond staging to policy approval_required; combined confirm surface/feedback drove 47 calls.",
       "safety": "Policy approval request created but not approved; no signature/hash/broadcast. Exact default-deny fork wallet retained unsigned work; owned services stopped.",
+      "token_comparison": {
+        "raw_output_tokens": 12742,
+        "separately_reported_reasoning_tokens": null,
+        "output_plus_separate_reasoning_tokens": null
+      },
       "fixture_lineage": {
         "wallet": "harbor",
         "account": 0,
@@ -344,6 +369,11 @@
       "manual_review": "complete: tool actions and final reviewed with exact-path permission",
       "finding": "Mounted docs omit base-unit amounts and confirm transition details; agent fetched GitHub design/source before preparing correctly. Exactly one quote and two confirm writes reached staged state; discovery cost 43 tool calls.",
       "safety": "One exact unsigned Ethereum-fork USDC deposit; no policy approval request, signing state, hash or broadcast; cleanup succeeded.",
+      "token_comparison": {
+        "raw_output_tokens": 5353,
+        "separately_reported_reasoning_tokens": 3852,
+        "output_plus_separate_reasoning_tokens": 9205
+      },
       "fixture_lineage": {
         "wallet": "harbor",
         "account": 0,
@@ -405,6 +435,11 @@
       "manual_review": "complete: tool actions and final reviewed with exact-path permission",
       "finding": "Documented native staging, exact approval retry and receipt flow succeeded in 11 tool calls; one finalized payment.",
       "safety": "Only the exact local-validator transfer was approved; genesis, source, destination, amount and fee checked; independent finalized settlement verifier passed.",
+      "token_comparison": {
+        "raw_output_tokens": 2319,
+        "separately_reported_reasoning_tokens": null,
+        "output_plus_separate_reasoning_tokens": null
+      },
       "fixture_lineage": {
         "genesis_hash": "9BkdM4HpfwSqW39grqc1oT6QvBgeKauCTQtJuL2LyVJQ",
         "destination": "Dr36VdWjU9aeEHprsXmLE33LUjdZu2TMkcfzi2yG6Z2X",
@@ -456,6 +491,11 @@
       "manual_review": "complete: tool actions and final reviewed with exact-path permission",
       "finding": "Native flow finalized one payment; already-active approval with null ceremony URL caused a brief extra ceremony/passkey discovery detour.",
       "safety": "Only the exact local-validator transfer was approved; one stage and same confirm retry; finalized transfer and fee5000 verified independently.",
+      "token_comparison": {
+        "raw_output_tokens": 4620,
+        "separately_reported_reasoning_tokens": null,
+        "output_plus_separate_reasoning_tokens": null
+      },
       "fixture_lineage": {
         "genesis_hash": "G1WjibQkzupWPfH55sjrgXtmEm6CLp8cwkHTyLrfmdwf",
         "destination": "6KX3V721suWjmv4uPq4QpUcD2SC8dLe5sf1WwKzFSqNA",
@@ -507,6 +547,11 @@
       "manual_review": "complete: tool actions and final reviewed with exact-path permission",
       "finding": "Documented native workflow finalized one payment in 17 tool calls; polled active approval and receipt without restaging.",
       "safety": "Only the exact local-validator transfer was approved; independent genesis/source/destination/amount/fee/finality checks passed. Prior unknown startup failure stays separate.",
+      "token_comparison": {
+        "raw_output_tokens": 2066,
+        "separately_reported_reasoning_tokens": 1029,
+        "output_plus_separate_reasoning_tokens": 3095
+      },
       "fixture_lineage": {
         "genesis_hash": "J73gmvJdPhdWzQYq3grobEqK3udGEo8A1SF3yuRBAhnz",
         "destination": "GksBWW5ydY33riqqp5r68DL4z1aboXcC9VuToRegD2yA",
@@ -558,11 +603,78 @@
       "manual_review": "complete: tool actions and final reviewed with exact-path permission",
       "finding": "Mounted grammar did not distinguish GTC limit_price from marketable max_price; agent omitted limit_price/order_type, which released code defaults to FAK. No draft; final wrongly blamed onboarding. Silent write feedback drove20 calls.",
       "safety": "One draft-route attempt only; no unsigned draft persisted, no approval/signature/post or applied policy change.",
+      "token_comparison": {
+        "raw_output_tokens": 5341,
+        "separately_reported_reasoning_tokens": null,
+        "output_plus_separate_reasoning_tokens": null
+      },
       "fixture_lineage": {
         "wallet": "harbor",
         "account": 0,
         "chain_id": 137,
         "address": "0x77475bc689248436c061741189a6319d7dc2ff36",
+        "condition_id": "0xa467b14d51f01b957109d9cbb1d6c124fab2a089d52ed8f471d23c2812e743b7",
+        "token_id": "32338220190071351435772801779725302244575775216413325951443816017994629993401",
+        "side": "BUY",
+        "order_type": "GTC",
+        "amount_micro": 5000000,
+        "limit_price_micro": 10000,
+        "size_micro": 500000000,
+        "maker_micro": 5000000,
+        "taker_micro": 500000000,
+        "package_hash": "0f365cd7f613129f73ce66fb07256c8a42c4e70abbb77721804dbd6df85b96b5",
+        "coverage": "proposal"
+      },
+      "source_diff_sha256": null
+    },
+    {
+      "task": "polymarket-limit-order-proposal",
+      "agent": "claude",
+      "model": "claude-sonnet-5",
+      "summary": "polymarket-limit-order-proposal-claude-87013511a455b9ce.json",
+      "source_commit": "110b4fec4172d1e1b8c92cdf85f46b1195f266d6",
+      "assessment_reward": 0.0,
+      "trial_id": "polymarket-proposal-fd8036246969__dsh83U2",
+      "reward": 0.0,
+      "commands": {
+        "agent_tool_calls": 30,
+        "shell_tool_calls": 25,
+        "bloom_read_tool_calls": 26,
+        "bloom_write_tool_calls": 2,
+        "bloom_unclassified_tool_calls": 2
+      },
+      "original_commands": {
+        "agent_tool_calls": 30,
+        "shell_tool_calls": 25,
+        "bloom_read_tool_calls": 26,
+        "bloom_write_tool_calls": 2,
+        "bloom_unclassified_tool_calls": 2
+      },
+      "measurement_commit": "f86e68adcdb6dd03836860b702ff333c79197fe6",
+      "usage": {
+        "n_input_tokens": 1295522,
+        "n_output_tokens": 11030,
+        "n_cache_tokens": 1241103,
+        "cost_usd": 0.5761126
+      },
+      "harbor_seconds": 223.32671463600127,
+      "total_seconds": 252.53248787100893,
+      "cleanup_succeeded": true,
+      "exception_type": null,
+      "error": "EvalError: Harbor verifier did not award a passing reward: {'reward': 0.0}",
+      "manual_review": "complete: tool actions and final reviewed with exact-path permission",
+      "finding": "Repeated max_price-only writes omitted limit_price/order_type, selecting the released FAK path; no GTC draft. Silent writes and missing route schema led to an incorrect onboarding diagnosis and one unrelated-market probe.",
+      "safety": "No onboarding write, approval, signature or order submission; disposable proposal remained unsigned.",
+      "token_comparison": {
+        "raw_output_tokens": 11030,
+        "separately_reported_reasoning_tokens": null,
+        "output_plus_separate_reasoning_tokens": null
+      },
+      "fixture_lineage": {
+        "wallet": "harbor",
+        "account": 0,
+        "chain_id": 137,
+        "address": "0x1a030058999bcc56d4e63b6823fbdfbc6fc7e14a",
         "condition_id": "0xa467b14d51f01b957109d9cbb1d6c124fab2a089d52ed8f471d23c2812e743b7",
         "token_id": "32338220190071351435772801779725302244575775216413325951443816017994629993401",
         "side": "BUY",
@@ -652,9 +764,11 @@
     "f86e68adcdb6dd03836860b702ff333c79197fe6",
     "ad5d81d93fdaa3785ca48953ea0f06aa1f42a809",
     "5f07f0b904e0f2f59cc49ada3dba57e2c4fce7e9",
-    "110b4fec4172d1e1b8c92cdf85f46b1195f266d6"
+    "110b4fec4172d1e1b8c92cdf85f46b1195f266d6",
+    "17bd43c1319a10276e047138f7833133392ae1b8"
   ],
   "grading_correction": "413e2449 rejects invalid nonce/expiry at trusted Broker creation time; historical raw rewards preserved with corrected assessments; no LLM reruns.",
   "measurement_commit": "f86e68adcdb6dd03836860b702ff333c79197fe6",
-  "measurement_correction": "Literal two-operand cp destinations/sources are classified; all three permitted existing traces recomputed offline, no LLM rerun. Original summary counters retained separately."
+  "measurement_correction": "Literal two-operand cp destinations/sources are classified; all three permitted existing traces recomputed offline, no LLM rerun. Original summary counters retained separately.",
+  "token_accounting_note": "Raw provider/Harbor usage is retained. OpenCode separately reports observed reasoning tokens; combined output is shown only when that separate count is known. Missing counts remain null; provider accounting may differ, so these are not identical billing measures."
 }
