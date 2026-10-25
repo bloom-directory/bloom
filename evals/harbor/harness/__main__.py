@@ -17,7 +17,11 @@ from urllib.parse import unquote, urlparse
 
 from .clarification import PROMPTS, ClarificationEval
 from .core import AGENTS, EvalError, EvalEvidence, run_eval
-from .default_petals import PolymarketProposalEval
+from .default_petals import (
+    HyperliquidProposalEval,
+    NearIntentsProposalEval,
+    PolymarketProposalEval,
+)
 from .disposable import CEREMONY
 from .metrics import trajectory_counts
 from .solana_transfer import SolanaTransferEval
@@ -30,6 +34,8 @@ def parser() -> argparse.ArgumentParser:
         choices=(
             "solana-transfer",
             "polymarket-limit-order-proposal",
+            "hyperliquid-order-proposal",
+            "near-intents-swap-proposal",
             *(name + "-clarification" for name in PROMPTS),
         ),
     )
@@ -48,6 +54,8 @@ def main(argv: list[str] | None = None) -> int:
     definitions = {
         "solana-transfer": SolanaTransferEval,
         "polymarket-limit-order-proposal": PolymarketProposalEval,
+        "hyperliquid-order-proposal": HyperliquidProposalEval,
+        "near-intents-swap-proposal": NearIntentsProposalEval,
     }
     if args.eval.endswith("-clarification"):
         definition = ClarificationEval(repo, args.eval.removesuffix("-clarification"))

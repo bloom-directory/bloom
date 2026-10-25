@@ -7,4 +7,4 @@ if [ "$#" -lt 2 ]; then
 fi
 export BLOOM_EVAL_REPO_ROOT="$repo_root"
 export PYTHONPATH="${repo_root}/evals/harbor${PYTHONPATH:+:${PYTHONPATH}}"
-exec uv run --isolated --no-project --python 3.12 --with harbor==0.21.0 python -m harness "$@"
+exec uv run --isolated --no-project --python 3.12 --with-requirements "$repo_root/evals/harbor/requirements.txt" python -m harness "$@"

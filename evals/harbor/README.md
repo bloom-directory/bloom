@@ -26,6 +26,8 @@ short enough for Unix socket paths.
 | --- | --- | --- |
 | `solana-transfer` | Settlement on a local validator | exactly one finalized transfer: exact addresses and lamports, fee within the bound |
 | `polymarket-limit-order-proposal` | Proposal | exactly one unsigned draft: exact condition and token IDs, integer amounts |
+| `hyperliquid-order-proposal` | Proposal on testnet | exactly one owner approval request, with BTC buy, limit, size and post-only terms proven against Broker commitments |
+| `near-intents-swap-proposal` | Proposal on an Ethereum fork | one verified 1 USDC Ethereum→Arbitrum quote and its exact unsigned USDC deposit |
 | `<petal>-clarification` | Clarification | the agent's last message asks for the one missing fact, and nothing was staged |
 
 Clarification exists for `solana` (missing chain), `hyperliquid` (missing
@@ -33,8 +35,23 @@ network), `polymarket` (missing market) and `near-intents` (missing origin
 chain).
 
 **Proposal coverage proves that the agent prepared the right operation, not
-that it settles.** The harness approves nothing, and only the stage route is
-writable. Only Solana's local validator exercises signing and settlement.
+that it settles.** No proposal is approved, signed or submitted. Only Solana's
+local validator exercises signing and settlement.
+
+Hyperliquid uses an unfunded fresh wallet and its released owner-order route.
+Literal request candidates from tool arguments/observations are untrusted
+witnesses: the verifier reconstructs the released MessagePack/EIP-712 payload
+and matches both Broker selectors and the payload-batch claim before grading
+terms. A missing provable witness is an observability error, not an incorrect
+order. Equivalent decimals and optional CLOIDs are accepted when committed.
+
+NEAR uses Anvil chain 1 with only a localhost Ethereum RPC, 0.05 fork ETH and
+5 fork USDC. The real 1Click service supplies the quote. The released route
+combines prepare and stage under a session `confirm` file, so only the fresh
+wallet's `swaps/<wallet>/0` namespace is writable over the read-only base.
+Two unsigned transitions reach staging; no authenticator is exposed. Extra
+sessions, outbox work, approval requests or signing state fail verification.
+Teardown discards pending work with its disposable root. Anvil is required.
 
 ## Run one trial
 

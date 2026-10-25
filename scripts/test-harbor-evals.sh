@@ -12,13 +12,13 @@ for script in "${evals}"/tasks/*/tests/test.sh; do
   bash -n "$script"
 done
 
-PYTHONPATH="$evals" uv run --isolated --no-project --python 3.12 python -m unittest \
+PYTHONPATH="$evals" uv run --isolated --no-project --python 3.12 --with-requirements "$evals/requirements.txt" python -m unittest \
   discover -s "${evals}/harness_tests" -v
 
 # Every task uses the one digest-pinned agent image, and the harness's Harbor
 # extension points load under the exact Harbor version the launcher uses.
 TMP_JOB_DIR="$tmp" PYTHONPATH="$evals" EVALS="$evals" \
-  uv run --isolated --no-project --python 3.12 --with harbor==0.21.0 python - <<'PY'
+  uv run --isolated --no-project --python 3.12 --with-requirements "$evals/requirements.txt" python - <<'PY'
 import asyncio
 import os
 import tomllib

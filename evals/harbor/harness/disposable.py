@@ -11,8 +11,11 @@ import socket
 import subprocess
 import tempfile
 import time
+import urllib.request
 from pathlib import Path
 from typing import Any
+
+import tomllib
 
 from .core import EvalError
 
@@ -76,6 +79,9 @@ class DisposableTriad:
         self.root: Path | None = None
         self.launcher: subprocess.Popen[bytes] | None = None
         self.validator: subprocess.Popen[bytes] | None = None
+        self.fork: subprocess.Popen[bytes] | None = None
+        self.ethereum_rpc_url = ""
+        self.fork_info = None
         self.driver: CeremonyDriver | None = None
         self.rpc_url = ""
         self.genesis = ""
@@ -121,6 +127,29 @@ class DisposableTriad:
     def write(self, path: str, body: str) -> None:
         self.cli("vfs", "write", path, "--data", body)
 
+    def fork_rpc(self, method: str, *params):
+        if self.fork is None or not self.ethereum_rpc_url.startswith(
+            "http://127.0.0.1:"
+        ):
+            raise EvalError("fork RPC requires the owned local Anvil instance")
+        request = urllib.request.Request(
+            self.ethereum_rpc_url,
+            data=json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": method,
+                    "params": params,
+                }
+            ).encode(),
+            headers={"content-type": "application/json"},
+        )
+        with urllib.request.urlopen(request, timeout=30) as response:
+            result = json.load(response)
+        if "error" in result or "result" not in result:
+            raise EvalError(f"local fork RPC {method} failed")
+        return result["result"]
+
     def write_mounted(self, path: str, body: str) -> bool:
         writer = (
             "import os,sys; f=open(sys.argv[1],'wb',buffering=0); "
@@ -159,7 +188,9 @@ class DisposableTriad:
             f"{label} did not become ready within {timeout}s; logs: {self.root}"
         )
 
-    def start(self, *, solana: bool = False, mount: bool = True) -> None:
+    def start(
+        self, *, solana: bool = False, mount: bool = True, ethereum_fork: bool = False
+    ) -> None:
         self.preflight()
         roots = Path(
             self.env.get(
@@ -204,11 +235,39 @@ class DisposableTriad:
         self.driver = CeremonyDriver(
             Path(self.env["BLOOM_INTEGRATION_DEBUG_DRIVER_BIN"]), seed, self.origin
         )
+        ethereum_rpc = "https://ethereum-rpc.publicnode.com"
+        if ethereum_fork:
+            self.ethereum_rpc_url = f"http://127.0.0.1:{free_port()}"
+            with (self.root / "anvil.log").open("wb") as log:
+                self.fork = subprocess.Popen(
+                    [
+                        "anvil",
+                        "--host",
+                        "127.0.0.1",
+                        "--port",
+                        self.ethereum_rpc_url.rsplit(":", 1)[1],
+                        "--fork-url",
+                        ethereum_rpc,
+                        "--chain-id",
+                        "1",
+                        "--accounts",
+                        "0",
+                        "--silent",
+                    ],
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                )
+            self._wait(
+                lambda: self.fork_rpc("eth_chainId") == "0x1",
+                self.fork,
+                "Ethereum fork",
+            )
+            ethereum_rpc = self.ethereum_rpc_url
         config = f'nfs_listen_addr = "127.0.0.1:{free_port()}"\n'
         # Use an explicit public chain set, never copy an operator config.
         config += (
             'default_chain = "ethereum"\n[chains.ethereum]\nname = "ethereum"\n'
-            'chain_id = 1\nrpc_urls = ["https://ethereum-rpc.publicnode.com"]\n'
+            f'chain_id = 1\nrpc_urls = ["{ethereum_rpc}"]\n'
             'display_name = "Ethereum"\nnative_symbol = "ETH"\nnative_decimals = 18\n'
             '[chains.polygon]\nname = "polygon"\nchain_id = 137\n'
             'rpc_urls = ["https://polygon-bor-rpc.publicnode.com"]\n'
@@ -295,6 +354,49 @@ class DisposableTriad:
             "wallet projection",
             timeout=60,
         )
+        if ethereum_fork:
+            configured = tomllib.loads((self.home / "config.toml").read_text())
+            address = self.read(f"/wallets/{self.wallet}/0/account.json")["evm"][
+                "address"
+            ]
+            usdc = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+            self.fork_rpc("anvil_setBalance", address, hex(5 * 10**16))
+            self.fork_rpc("anvil_dealERC20", address, usdc, hex(5_000_000))
+            balance_call = {
+                "to": usdc,
+                "data": "0x70a08231" + address[2:].rjust(64, "0"),
+            }
+            self.fork_info = {
+                "chain_id": int(self.fork_rpc("eth_chainId"), 16),
+                "rpc_url": self.ethereum_rpc_url,
+                "selected_ethereum_rpc_url": self.cli(
+                    "vfs", "cat", "/status/chains/ethereum/rpc_url"
+                ).strip(),
+                "configured_ethereum_rpc_urls": configured["chains"]["ethereum"][
+                    "rpc_urls"
+                ],
+                "eth_wei": int(self.fork_rpc("eth_getBalance", address, "latest"), 16),
+                "usdc_base_units": int(
+                    self.fork_rpc("eth_call", balance_call, "latest"), 16
+                ),
+                "anvil_version": self._run(["anvil", "--version"]).splitlines()[0],
+            }
+            checks = {
+                "configured RPC pool": self.fork_info["configured_ethereum_rpc_urls"]
+                == [self.ethereum_rpc_url],
+                "chain ID": configured["chains"]["ethereum"]["chain_id"]
+                == self.fork_info["chain_id"]
+                == 1,
+                "selected RPC": self.fork_info["selected_ethereum_rpc_url"].rstrip("/")
+                == self.ethereum_rpc_url.rstrip("/"),
+                "ETH balance": self.fork_info["eth_wei"] == 5 * 10**16,
+                "USDC balance": self.fork_info["usdc_base_units"] == 5_000_000,
+            }
+            if not all(checks.values()):
+                raise EvalError(
+                    "Ethereum fork differs: "
+                    + ", ".join(key for key, valid in checks.items() if not valid)
+                )
 
     def set_policy(
         self, *, packages: list[str], destinations: list[dict[str, str]]
@@ -339,7 +441,7 @@ class DisposableTriad:
 
     def close(self, *, preserve: bool = False) -> None:
         failures = []
-        for process in (self.launcher, self.validator):
+        for process in (self.launcher, self.validator, self.fork):
             if process is not None and process.poll() is None:
                 process.terminate()
                 try:

@@ -21,7 +21,14 @@ class HostProjectionVerifier(BaseVerifier):
 
     def _check(self):
         env = (
-            os.environ | self.override_env | {"BLOOM_EVAL_MOUNT_ROOT": self.mount_root}
+            os.environ
+            | self.override_env
+            | {
+                "BLOOM_EVAL_MOUNT_ROOT": self.mount_root,
+                "BLOOM_EVAL_TRAJECTORY_FILE": str(
+                    self.trial_paths.agent_dir / "trajectory.json"
+                ),
+            }
         )
         directory = self.trial_paths.verifier_dir
         directory.mkdir(parents=True, exist_ok=True)
