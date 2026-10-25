@@ -1031,7 +1031,11 @@ assert_mounted_effect_denied \
   "$approval_audit_start"
 run_login_with_deadline \
   "$work/approval-after.log" \
-  /bin/cat "$mount_dir/wallets/$wallet_id/sealed-approvals/new.json"
+  /bin/cat "$mount_dir/wallets/$wallet_id/sealed-approvals/new.json" || {
+  cat "$work/approval-after.log" >&2
+  echo "packaged Machine could not read the approval request after its denied mutation" >&2
+  exit 1
+}
 /usr/bin/python3 - "$work/approval-after.log" <<'PY'
 import json
 import pathlib

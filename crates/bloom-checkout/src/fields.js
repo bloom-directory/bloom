@@ -19,8 +19,8 @@
     if (secret(e, label) && /card.?number|cardnumber|numero de (la )?tarjeta|nro\.? de tarjeta/.test(label)) return 'number';
     if (secret(e, label) && /cvc|cvv|security.?code|codigo de seguridad/.test(label)) return 'cvc';
     // Jettzy's reviewed inline form names these selects rather than labelling
-    // each expiry part. Keep the aliases on that exact receiving origin.
-    if (location.origin === 'https://en.jettzy.com.hk' && e instanceof HTMLSelectElement) {
+    // each expiry part. Keep the aliases on the reviewed receiving origins.
+    if (['https://en.jettzy.com.hk','https://www.jettzy.com.my'].includes(location.origin) && e instanceof HTMLSelectElement) {
       if ([e.name,e.id].includes('validity_begin')) return 'month';
       if ([e.name,e.id].includes('validity_end')) return 'year';
     }

@@ -99,6 +99,8 @@ const MERCHANT_CARD_ORIGINS: &[&str] = &[
     "https://booking.flyfrontier.com",
     // Jettzy Hong Kong's inline card form, observed on Cathay Pacific review 2026-10-25.
     "https://en.jettzy.com.hk",
+    // Same inline form on the Malaysia site, observed on AirAsia review 2026-10-25.
+    "https://www.jettzy.com.my",
 ];
 
 /// Test browsers may read fixture merchants' declared totals; release builds never.
@@ -1500,6 +1502,9 @@ pub(crate) mod tests {
         for (origin, count) in [
             ("https://en.jettzy.com.hk.evil.example", 2),
             ("http://en.jettzy.com.hk", 2),
+            ("https://www.jettzy.com.my.evil.example", 2),
+            ("http://www.jettzy.com.my", 2),
+            ("https://www.jettzy.com.my", 4),
             ("https://en.jettzy.com.hk", 4),
         ] {
             let expression = crate::scripts::prepare(include_str!("fields.js")).replacen(
@@ -1592,6 +1597,22 @@ pub(crate) mod tests {
     async fn card_fields_go_to_payment_providers_or_the_merchant_page() {
         for (frame, top, allowed) in [
             ("https://js.stripe.com", "https://shop.example", true),
+            (
+                "https://www.jettzy.com.my",
+                "https://www.jettzy.com.my",
+                true,
+            ),
+            ("https://www.jettzy.com.my", "https://shop.example", false),
+            (
+                "https://www.jettzy.com.my.evil.example",
+                "https://www.jettzy.com.my.evil.example",
+                false,
+            ),
+            (
+                "http://www.jettzy.com.my",
+                "http://www.jettzy.com.my",
+                false,
+            ),
             ("https://en.jettzy.com.hk", "https://en.jettzy.com.hk", true),
             ("https://en.jettzy.com.hk", "https://shop.example", false),
             (
