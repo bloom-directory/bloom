@@ -879,19 +879,22 @@ pub(crate) mod tests {
         .unwrap()
     }
     async fn open(browser: &Browser, url: String) -> PrivateTab {
+        let parsed = format!(
+            "location.href === {} && document.readyState !== 'loading'",
+            serde_json::to_string(&url).unwrap()
+        );
         browser.browse(BrowseRequest::Open { url }).await.unwrap();
         let tab = browser.handoff().await.unwrap();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        while tab
+        while !tab
             .cdp
-            .evaluate(&tab.session, "document.readyState".into())
+            .evaluate(&tab.session, parsed.clone())
             .await
-            .unwrap()
-            == "loading"
+            .is_ok_and(|ready| ready == true)
         {
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "page was not parsed"
+                "requested fixture page was not parsed"
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
