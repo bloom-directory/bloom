@@ -1,4 +1,4 @@
-(index, kind, value) => {
+(index, kind, value, savedField) => {
   const e = globalThis.__bloomRefs?.[index];
   if (!e || !e.isConnected || e.disabled || e.getAttribute('aria-disabled') === 'true' || !e.getClientRects().length) throw Error('stale');
   const guardPayment = () => {
@@ -34,6 +34,7 @@
     if ((e.autocomplete || '').split(' ').some(s => s.startsWith('cc-'))) throw Error('private payment input');
     if (kind === 'select' && e.tagName !== 'SELECT') throw Error('wrong field');
     if (kind === 'type' && !['INPUT', 'TEXTAREA'].includes(e.tagName)) throw Error('wrong field');
+    if (savedField) (globalThis.__bloomPrivateFields ||= new WeakMap()).set(e, savedField);
     if (kind === 'type') {
       // Native editing updates controlled inputs and fires their input
       // handlers. Focus and insertion run in one call so navigation cannot

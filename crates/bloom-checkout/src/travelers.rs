@@ -175,10 +175,9 @@ impl TravelerDiscovery {
         let mut nonce = [0; 32];
         rand::thread_rng().fill_bytes(&mut nonce);
         let binding = Digest32::from_bytes(nonce);
-        let contexts = tab
-            .cdp
-            .contexts(&tab.session, "bloom-traveler-private")
-            .await?;
+        // Share private field annotations with snapshots in an isolated world;
+        // neither the merchant's scripts nor the agent can read this map.
+        let contexts = tab.cdp.contexts(&tab.session, "bloom-shopping").await?;
         let root = contexts
             .iter()
             .find(|c| c.parent_id.is_none())

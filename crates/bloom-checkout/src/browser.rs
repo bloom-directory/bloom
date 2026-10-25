@@ -207,13 +207,14 @@ impl Browser {
                 Ok(json!({"state":"navigated"}))
             }
             BrowseRequest::Click { element_ref } => {
-                self.act(&mut tab, &element_ref, "click", "").await
+                self.act(&mut tab, &element_ref, "click", "", None).await
             }
             BrowseRequest::Type { element_ref, text } => {
-                self.act(&mut tab, &element_ref, "type", &text).await
+                self.act(&mut tab, &element_ref, "type", &text, None).await
             }
             BrowseRequest::Select { element_ref, value } => {
-                self.act(&mut tab, &element_ref, "select", &value).await
+                self.act(&mut tab, &element_ref, "select", &value, None)
+                    .await
             }
             BrowseRequest::FillTraveler { .. } | BrowseRequest::TypeTraveler { .. } => {
                 bail!("Unlock a saved traveler first")
@@ -348,6 +349,7 @@ impl Browser {
     pub(crate) async fn type_traveler(
         &self,
         reference: &str,
+        field: &str,
         value: &str,
         context: &str,
         origin: &str,
@@ -357,7 +359,8 @@ impl Browser {
         self.available()?;
         self.check_traveler_scope(&tab, context, origin).await?;
         Self::check_traveler_frame(&tab, reference, origin)?;
-        self.act(&mut tab, reference, "type", value).await?;
+        self.act(&mut tab, reference, "type", value, Some(field))
+            .await?;
         Ok(())
     }
 
@@ -475,7 +478,14 @@ impl Browser {
         Ok(filled)
     }
 
-    async fn act(&self, tab: &mut Tab, reference: &str, kind: &str, value: &str) -> Result<Value> {
+    async fn act(
+        &self,
+        tab: &mut Tab,
+        reference: &str,
+        kind: &str,
+        value: &str,
+        saved_field: Option<&str>,
+    ) -> Result<Value> {
         let (generation, index) = reference
             .split_once(':')
             .context("Invalid element reference")?;
@@ -494,10 +504,11 @@ impl Browser {
         let index = binding.index;
         let world = binding.world;
         let expression = format!(
-            "({})({index},{},{})",
+            "({})({index},{},{},{})",
             crate::scripts::prepare(include_str!("act.js")),
             serde_json::to_string(kind)?,
-            serde_json::to_string(value)?
+            serde_json::to_string(value)?,
+            serde_json::to_string(&saved_field)?
         );
         let response = self
             .cdp
@@ -808,12 +819,14 @@ fn accessibility_text(tree: &Value) -> Result<String> {
         .as_array()
         .context("Missing accessibility tree")?;
     let mut hidden = std::collections::HashSet::new();
+    // Values and select options come from the controlled element projection.
+    // AX can repeat a selected birth month outside that value's redaction.
     let mut queue = nodes
         .iter()
         .filter(|n| {
             matches!(
                 n["role"]["value"].as_str(),
-                Some("textbox" | "searchbox" | "Iframe" | "IframePresentational")
+                Some("textbox" | "searchbox" | "combobox" | "Iframe" | "IframePresentational")
             )
         })
         .filter_map(|n| n["nodeId"].as_str().map(str::to_owned))
@@ -962,7 +975,13 @@ mod tests {
             .as_str()
             .unwrap();
         let error = browser
-            .type_traveler(reference, "PRIVATE-FIXTURE", &old_context, origin)
+            .type_traveler(
+                reference,
+                "given_name",
+                "PRIVATE-FIXTURE",
+                &old_context,
+                origin,
+            )
             .await
             .unwrap_err();
         assert!(error.to_string().contains("another booking"));
@@ -1034,7 +1053,7 @@ mod tests {
             .unwrap()
             .to_owned();
         let error = browser
-            .type_traveler(&chat, "PRIVATE-FIXTURE", &context, &origin)
+            .type_traveler(&chat, "given_name", "PRIVATE-FIXTURE", &context, &origin)
             .await
             .unwrap_err();
         assert!(

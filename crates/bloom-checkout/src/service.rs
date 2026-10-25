@@ -587,7 +587,13 @@ impl CheckoutService {
                 .await?;
         } else {
             self.browser
-                .type_traveler(&element_ref, &text, &traveler.context, &traveler.origin)
+                .type_traveler(
+                    &element_ref,
+                    field,
+                    &text,
+                    &traveler.context,
+                    &traveler.origin,
+                )
                 .await?;
         }
         Ok(json!({"state":"typed","filled_fields":[field]}))
@@ -3255,6 +3261,82 @@ mod tests {
         server.abort();
     }
     #[tokio::test]
+    async fn split_birth_dates_are_private_without_redacting_prices_or_flight_dates() {
+        let (service, browser, _, server) = shopping_service(
+            "<p>Total USD 7.05</p><p>Flight 7 May</p><label>Birth day<input autocomplete='bday-day'></label><label>Birth month<select aria-label='Birth month' autocomplete='bday-month'><option value=''></option><option value='5'>May</option><option value='6'>June</option></select></label><label>Birth year<input autocomplete='bday-year'></label><input aria-label='Manual day'>",
+        ).await;
+        unlocked(&service, "fixture", Duration::from_secs(60)).await;
+        {
+            let mut travelers = service.travelers.lock().await;
+            let traveler = travelers.get_mut("fixture").unwrap();
+            traveler.fields = vec![bloom_signer_api::TravelerField::BornOn];
+            traveler.values.insert(
+                "born_on".into(),
+                zeroize::Zeroizing::new("1990-05-07".into()),
+            );
+        }
+        service.fill_traveler(Some("fixture")).await.unwrap();
+        let page = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+        let manual = page["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["role"] == "input" && e["label"] == "Manual day")
+            .unwrap()["ref"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        service
+            .type_traveler(manual, "born_on_day", Some("fixture"))
+            .await
+            .unwrap();
+        let page = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+        for (label, expected) in [
+            ("Birth day", "[saved born_on_day]"),
+            ("Birth month", "[saved born_on_month]"),
+            ("Birth year", "[saved born_on_year]"),
+            ("Manual day", "[saved born_on_day]"),
+        ] {
+            let control = page["elements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| {
+                    matches!(e["role"].as_str(), Some("input" | "select")) && e["label"] == label
+                })
+                .unwrap();
+            assert_eq!(control["value"], expected, "{label}");
+            assert!(
+                control["ref"]
+                    .as_str()
+                    .unwrap()
+                    .split_once(':')
+                    .unwrap()
+                    .0
+                    .parse::<u64>()
+                    .is_ok()
+            );
+        }
+        let text = page["text"].as_str().unwrap();
+        assert!(
+            text.contains("Total USD 7.05") && text.contains("Flight 7 May"),
+            "{text}"
+        );
+        assert!(!text.contains("combobox: Birth month"), "{text}");
+        let tab = browser.handoff().await.unwrap();
+        let actual = tab
+            .cdp
+            .evaluate(
+                &tab.session,
+                "[...document.querySelectorAll('input,select')].map(e=>e.value)".into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(actual, json!(["7", "5", "1990", "07"]));
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn typed_traveler_values_reach_the_chosen_field_but_not_the_agent() {
         let (url, server) = crate::discovery::tests::fixture(
             "<div><div>Teléfono *</div><input name='n1'></div><div><div>Nacimiento</div><input name='n2'></div>".into(),
@@ -3436,7 +3518,15 @@ mod tests {
             .find(|e| e["label"] == "Documento")
             .unwrap()
             .clone();
-        assert_eq!(documento["value"], "PAS");
+        assert_eq!(documento["value"], "[saved document_kind]");
+        let tab = browser.handoff().await.unwrap();
+        assert_eq!(
+            tab.cdp
+                .evaluate(&tab.session, "document.getElementById('doc').value".into())
+                .await
+                .unwrap(),
+            "PAS"
+        );
         server.abort();
     }
     #[tokio::test]
@@ -3521,7 +3611,15 @@ mod tests {
             .find(|e| e["label"] == "Documento")
             .unwrap()
             .clone();
-        assert_eq!(documento["value"], "PAS");
+        assert_eq!(documento["value"], "[saved document_kind]");
+        let tab = browser.handoff().await.unwrap();
+        assert_eq!(
+            tab.cdp
+                .evaluate(&tab.session, "document.getElementById('doc').value".into())
+                .await
+                .unwrap(),
+            "PAS"
+        );
         server.abort();
     }
     #[test]

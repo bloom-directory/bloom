@@ -21,6 +21,7 @@
         || (e.autocomplete || '').split(' ').some(s=>s.startsWith('cc-')) || e.type === 'password') throw Error('Traveler field changed');
     let value=values[mapping.field];
     if (typeof value !== 'string') throw Error('Traveler field unavailable');
+    (globalThis.__bloomPrivateFields ||= new WeakMap()).set(e, mapping.field + (mapping.part ? '_' + mapping.part : ''));
     let aliases = [value];
     if (['born_on','document_expiry'].includes(mapping.field) && mapping.part) {
       value = String(Number(value.slice(mapping.part === 'year' ? 0 : mapping.part === 'month' ? 5 : 8,
