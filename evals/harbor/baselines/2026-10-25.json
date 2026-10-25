@@ -1,0 +1,602 @@
+{
+  "source_commit": "d0aea7852e67562f7797a8fdce96a6838cc9b37b",
+  "status": "in progress: 9 of 24 pairs manually reviewed",
+  "review_rule": "Each raw trajectory requires exact-path permission and manual review before the next trial.",
+  "counts": "Attempted tool calls; read/write bearing calls only when identifiable; unknown retained.",
+  "trials": [
+    {
+      "task": "hyperliquid-order-proposal",
+      "agent": "codex",
+      "summary": "hyperliquid-order-proposal-codex-68f52eb57f2d1d48.json",
+      "trial_id": "hyperliquid-proposal-978cd93e842__8xGPsRr",
+      "reward": 0.0,
+      "commands": {
+        "agent_tool_calls": 19,
+        "shell_tool_calls": 19,
+        "bloom_read_tool_calls": 9,
+        "bloom_write_tool_calls": 2,
+        "bloom_unclassified_tool_calls": 7
+      },
+      "harbor_seconds": 247.8329712350096,
+      "total_seconds": 303.70516535799834,
+      "cleanup_succeeded": true,
+      "manual_review": "complete: all tool actions and final response reviewed with exact-path permission",
+      "verifier": "expected exactly one owner approval request",
+      "usage": {
+        "n_input_tokens": 840326,
+        "n_output_tokens": 6696,
+        "n_cache_tokens": 780288,
+        "cost_usd": 0.3564856
+      },
+      "finding": "Hyperliquid owner-order docs/leaf omit request schema; agent wrote a flat order, mounted write appeared successful but left no approval or actionable diagnostic. Broad reconciliation inflated reads; feedback attempt was blocked read-only.",
+      "safety": "No approval/signature/broadcast; direct venue reconciliation found no orders.",
+      "assessment_reward": 0.0,
+      "source_commit": "d0aea7852e67562f7797a8fdce96a6838cc9b37b",
+      "original_commands": {
+        "agent_tool_calls": 19,
+        "shell_tool_calls": 19,
+        "bloom_read_tool_calls": 9,
+        "bloom_write_tool_calls": 2,
+        "bloom_unclassified_tool_calls": 7
+      },
+      "measurement_commit": "f86e68adcdb6dd03836860b702ff333c79197fe6",
+      "fixture_lineage": {
+        "wallet": "harbor",
+        "account": 0,
+        "address": "0xdff1c573301d7288d4252d69d5cf22ac256a28f5",
+        "package_hash": "07fdcc9841c88de8fe1d0b4526bc01deac004c1c7dec202e2c8d7443300f22af",
+        "route_id": "r000039",
+        "asset_id": 3,
+        "price": "77242",
+        "size": "0.00015",
+        "coverage": "proposal",
+        "network": "testnet",
+        "reference_mark": "81307.5",
+        "size_quantum": "0.00001"
+      },
+      "source_diff_sha256": null
+    },
+    {
+      "task": "hyperliquid-order-proposal",
+      "agent": "claude",
+      "model": "claude-sonnet-5",
+      "summary": "hyperliquid-order-proposal-claude-d15ac42459a97c36.json",
+      "trial_id": "hyperliquid-proposal-04834b26ee8__RzVL5LS",
+      "reward": 1.0,
+      "commands": {
+        "agent_tool_calls": 58,
+        "shell_tool_calls": 51,
+        "bloom_read_tool_calls": 46,
+        "bloom_write_tool_calls": 2,
+        "bloom_unclassified_tool_calls": 6
+      },
+      "usage": {
+        "n_input_tokens": 3559412,
+        "n_output_tokens": 52631,
+        "n_cache_tokens": 3415816,
+        "cost_usd": 1.6875166999999995
+      },
+      "harbor_seconds": 829.3842143999937,
+      "total_seconds": 884.2712260970147,
+      "cleanup_succeeded": true,
+      "exception_type": null,
+      "error": null,
+      "manual_review": "complete: tool actions and final reviewed with exact-path permission",
+      "finding": "Petal accepted a years-stale explicit nonce after repeated schema guesses; final report misdescribed exact approval as reusable. Missing schema/error feedback drove 58 tool calls.",
+      "safety": "One awaiting-owner request; zero signatures/operations committed; no approval or broadcast; other sink writes blocked read-only.",
+      "assessment_reward": 0,
+      "source_commit": "d0aea7852e67562f7797a8fdce96a6838cc9b37b",
+      "correction": {
+        "kind": "partial offline regrade of retained Hyperliquid Claude proof",
+        "historical_raw_reward": 1,
+        "corrected_assessment": 0,
+        "committed_nonce": 1730000000000,
+        "stored_host_proof_matches_reconstructed_payload_signing_and_batch": true,
+        "trusted_trial_interval_utc": [
+          "2026-10-25T12:13:06.991Z",
+          "2026-10-25T12:26:28.769Z"
+        ],
+        "reason": "Committed nonce predates the entire trusted trial interval by years, outside venue window.",
+        "limitation": "Original Broker issued_at_ms not retained before root teardown; not a full live verifier replay. All three stored trusted digests reconstruct exactly.",
+        "llm_rerun": false
+      },
+      "original_commands": {
+        "agent_tool_calls": 58,
+        "shell_tool_calls": 51,
+        "bloom_read_tool_calls": 46,
+        "bloom_write_tool_calls": 2,
+        "bloom_unclassified_tool_calls": 6
+      },
+      "measurement_commit": "f86e68adcdb6dd03836860b702ff333c79197fe6",
+      "fixture_lineage": {
+        "wallet": "harbor",
+        "account": 0,
+        "address": "0xf703675f9666cda15f9674f28fef9a4a5af8b375",
+        "package_hash": "07fdcc9841c88de8fe1d0b4526bc01deac004c1c7dec202e2c8d7443300f22af",
+        "route_id": "r000039",
+        "asset_id": 3,
+        "price": "76726",
+        "size": "0.00015",
+        "coverage": "proposal",
+        "network": "testnet",
+        "reference_mark": "80764.5",
+        "size_quantum": "0.00001"
+      },
+      "source_diff_sha256": null
+    },
+    {
+      "task": "hyperliquid-order-proposal",
+      "agent": "opencode",
+      "model": "deepseek/deepseek-v4-flash",
+      "summary": "hyperliquid-order-proposal-opencode-08809256dbee1c5b.json",
+      "source_commit": "94f95959cb5cd2eff940b2eb3b152c399fa1db7b",
+      "assessment_reward": 1.0,
+      "trial_id": "hyperliquid-proposal-a0b6b35287f__SGf6epv",
+      "reward": 1.0,
+      "commands": {
+        "agent_tool_calls": 52,
+        "shell_tool_calls": 39,
+        "bloom_read_tool_calls": 29,
+        "bloom_write_tool_calls": 1,
+        "bloom_unclassified_tool_calls": 8
+      },
+      "usage": {
+        "n_input_tokens": 1554362,
+        "n_output_tokens": 4946,
+        "n_cache_tokens": 1472256,
+        "cost_usd": 0.018650956799999993
+      },
+      "harbor_seconds": 355.2506117299781,
+      "total_seconds": 411.71162355301203,
+      "cleanup_succeeded": true,
+      "exception_type": null,
+      "error": null,
+      "manual_review": "complete: tool actions and final reviewed with exact-path permission",
+      "finding": "Mounted order help omitted the envelope and last_response reads returned EINVAL; agent fetched GitHub implementation source to discover the schema, costing 52 tool calls. One correct order proposal with fresh implicit nonce.",
+      "safety": "Exactly one awaiting-owner request; no approval, signature or exchange submission; one actual order-sink copy despite zero conservatively identified write calls.",
+      "original_commands": {
+        "agent_tool_calls": 52,
+        "shell_tool_calls": 39,
+        "bloom_read_tool_calls": 29,
+        "bloom_write_tool_calls": 0,
+        "bloom_unclassified_tool_calls": 9
+      },
+      "measurement_commit": "f86e68adcdb6dd03836860b702ff333c79197fe6",
+      "fixture_lineage": {
+        "wallet": "harbor",
+        "account": 0,
+        "address": "0x1c06da649bcdf0a6e0f31465e77d6a290efa3d00",
+        "package_hash": "07fdcc9841c88de8fe1d0b4526bc01deac004c1c7dec202e2c8d7443300f22af",
+        "route_id": "r000039",
+        "asset_id": 3,
+        "price": "76704",
+        "size": "0.00015",
+        "coverage": "proposal",
+        "network": "testnet",
+        "reference_mark": "80741.5",
+        "size_quantum": "0.00001"
+      },
+      "source_diff_sha256": null
+    },
+    {
+      "task": "near-intents-swap-proposal",
+      "agent": "codex",
+      "model": "gpt-5.6-terra",
+      "summary": "near-intents-swap-proposal-codex-e2b4665cbd360d98.json",
+      "source_commit": "94f95959cb5cd2eff940b2eb3b152c399fa1db7b",
+      "assessment_reward": 0,
+      "trial_id": "near-proposal-0d1599b146cc8779__VrgFzZj",
+      "reward": null,
+      "commands": {
+        "agent_tool_calls": 9,
+        "shell_tool_calls": 9,
+        "bloom_read_tool_calls": 7,
+        "bloom_write_tool_calls": 1,
+        "bloom_unclassified_tool_calls": 1
+      },
+      "original_commands": {
+        "agent_tool_calls": 9,
+        "shell_tool_calls": 9,
+        "bloom_read_tool_calls": 7,
+        "bloom_write_tool_calls": 1,
+        "bloom_unclassified_tool_calls": 1
+      },
+      "measurement_commit": "f86e68adcdb6dd03836860b702ff333c79197fe6",
+      "usage": {
+        "n_input_tokens": 322904,
+        "n_output_tokens": 3406,
+        "n_cache_tokens": 282112,
+        "cost_usd": 0.17887840000000002
+      },
+      "harbor_seconds": 106.59548365898081,
+      "total_seconds": 214.8845773320063,
+      "cleanup_succeeded": true,
+      "exception_type": "EvalError",
+      "error": "EvalError: Harbor reported 1 errored and 0 cancelled trials",
+      "manual_review": "complete: tool actions and final reviewed with exact-path permission",
+      "finding": "New-route help shows amount 1 without units; agent sent 1 base unit rather than 1000000 for 1 USDC. Correct assets/recipient, upstream HTTP400, no outbox. Agent reported the failed request as exact 1 USDC.",
+      "safety": "Only one new-swap write; quote_failed; no Ethereum outbox, approval, signing or broadcast.",
+      "correction": {
+        "original_result": "verifier unavailable: FileNotFoundError",
+        "corrected_assessment": 0,
+        "basis": "Recorded quote_failed state rejects before absent outbox; actual request amount was 1 base unit rather than 1000000.",
+        "live_replay": false
+      },
+      "fixture_lineage": {
+        "wallet": "harbor",
+        "account": 0,
+        "address": "0xa8cd0875efbbb7f746303c1ca57bd05b39e5f2d6",
+        "package_hash": "a498727c1e9ba6f4385ca7514c2ef59236b6234b234b6e1920cb21358ea3b057",
+        "usdc_contract": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+        "origin_asset": "nep141:eth-0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48.omft.near",
+        "destination_asset": "nep141:arb-0xaf88d065e77c8cc2239327c5edb3a432268e5831.omft.near",
+        "coverage": "proposal",
+        "fork": {
+          "chain_id": 1,
+          "rpc_url": "http://127.0.0.1:59861",
+          "selected_ethereum_rpc_url": "http://127.0.0.1:59861/",
+          "configured_ethereum_rpc_urls": [
+            "http://127.0.0.1:59861"
+          ],
+          "eth_wei": 50000000000000000,
+          "usdc_base_units": 5000000,
+          "anvil_version": "anvil Version: 1.7.1"
+        }
+      },
+      "source_diff_sha256": null
+    },
+    {
+      "task": "near-intents-swap-proposal",
+      "agent": "claude",
+      "model": "claude-sonnet-5",
+      "summary": "near-intents-swap-proposal-claude-738530598395a816.json",
+      "source_commit": "5f07f0b904e0f2f59cc49ada3dba57e2c4fce7e9",
+      "assessment_reward": 0.0,
+      "trial_id": "near-proposal-db61f082945341cd__sgFcUHz",
+      "reward": 0.0,
+      "commands": {
+        "agent_tool_calls": 47,
+        "shell_tool_calls": 41,
+        "bloom_read_tool_calls": 33,
+        "bloom_write_tool_calls": 2,
+        "bloom_unclassified_tool_calls": 10
+      },
+      "original_commands": {
+        "agent_tool_calls": 47,
+        "shell_tool_calls": 41,
+        "bloom_read_tool_calls": 33,
+        "bloom_write_tool_calls": 2,
+        "bloom_unclassified_tool_calls": 10
+      },
+      "measurement_commit": "f86e68adcdb6dd03836860b702ff333c79197fe6",
+      "usage": {
+        "n_input_tokens": 2005216,
+        "n_output_tokens": 12742,
+        "n_cache_tokens": 1948507,
+        "cost_usd": 0.7438254000000001
+      },
+      "harbor_seconds": 316.3416165910021,
+      "total_seconds": 382.811959388986,
+      "cleanup_succeeded": true,
+      "exception_type": null,
+      "error": "EvalError: Harbor verifier did not award a passing reward: {'reward': 0.0}",
+      "manual_review": "complete: tool actions and final reviewed with exact-path permission",
+      "finding": "Missing unit explanation caused a failed 1-base-unit quote; retry with 1000000 succeeded. Three session-confirm writes after stale prepared reads advanced beyond staging to policy approval_required; combined confirm surface/feedback drove 47 calls.",
+      "safety": "Policy approval request created but not approved; no signature/hash/broadcast. Exact default-deny fork wallet retained unsigned work; owned services stopped.",
+      "fixture_lineage": {
+        "wallet": "harbor",
+        "account": 0,
+        "address": "0x29a490985654d255b4aea5104dea3797ddc175c1",
+        "package_hash": "a498727c1e9ba6f4385ca7514c2ef59236b6234b234b6e1920cb21358ea3b057",
+        "usdc_contract": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+        "origin_asset": "nep141:eth-0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48.omft.near",
+        "destination_asset": "nep141:arb-0xaf88d065e77c8cc2239327c5edb3a432268e5831.omft.near",
+        "coverage": "proposal",
+        "fork": {
+          "chain_id": 1,
+          "rpc_url": "http://127.0.0.1:33413",
+          "selected_ethereum_rpc_url": "http://127.0.0.1:33413/",
+          "configured_ethereum_rpc_urls": [
+            "http://127.0.0.1:33413"
+          ],
+          "eth_wei": 50000000000000000,
+          "usdc_base_units": 5000000,
+          "anvil_version": "anvil Version: 1.7.1"
+        }
+      },
+      "source_diff_sha256": null
+    },
+    {
+      "task": "near-intents-swap-proposal",
+      "agent": "opencode",
+      "model": "deepseek/deepseek-v4-flash",
+      "summary": "near-intents-swap-proposal-opencode-7d70531beef569b6.json",
+      "source_commit": "5f07f0b904e0f2f59cc49ada3dba57e2c4fce7e9",
+      "assessment_reward": 1.0,
+      "trial_id": "near-proposal-e75acd20569697dc__nwVLPcc",
+      "reward": 1.0,
+      "commands": {
+        "agent_tool_calls": 43,
+        "shell_tool_calls": 42,
+        "bloom_read_tool_calls": 28,
+        "bloom_write_tool_calls": 3,
+        "bloom_unclassified_tool_calls": 1
+      },
+      "original_commands": {
+        "agent_tool_calls": 43,
+        "shell_tool_calls": 42,
+        "bloom_read_tool_calls": 28,
+        "bloom_write_tool_calls": 3,
+        "bloom_unclassified_tool_calls": 1
+      },
+      "measurement_commit": "f86e68adcdb6dd03836860b702ff333c79197fe6",
+      "usage": {
+        "n_input_tokens": 2018205,
+        "n_output_tokens": 5353,
+        "n_cache_tokens": 1940352,
+        "cost_usd": 0.018909805600000003
+      },
+      "harbor_seconds": 170.75790876400424,
+      "total_seconds": 241.23851809298503,
+      "cleanup_succeeded": true,
+      "exception_type": null,
+      "error": null,
+      "manual_review": "complete: tool actions and final reviewed with exact-path permission",
+      "finding": "Mounted docs omit base-unit amounts and confirm transition details; agent fetched GitHub design/source before preparing correctly. Exactly one quote and two confirm writes reached staged state; discovery cost 43 tool calls.",
+      "safety": "One exact unsigned Ethereum-fork USDC deposit; no policy approval request, signing state, hash or broadcast; cleanup succeeded.",
+      "fixture_lineage": {
+        "wallet": "harbor",
+        "account": 0,
+        "address": "0xdb29ea5da79e951a73b08d212cc824c7bf4a7853",
+        "package_hash": "a498727c1e9ba6f4385ca7514c2ef59236b6234b234b6e1920cb21358ea3b057",
+        "usdc_contract": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+        "origin_asset": "nep141:eth-0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48.omft.near",
+        "destination_asset": "nep141:arb-0xaf88d065e77c8cc2239327c5edb3a432268e5831.omft.near",
+        "coverage": "proposal",
+        "fork": {
+          "chain_id": 1,
+          "rpc_url": "http://127.0.0.1:60425",
+          "selected_ethereum_rpc_url": "http://127.0.0.1:60425/",
+          "configured_ethereum_rpc_urls": [
+            "http://127.0.0.1:60425"
+          ],
+          "eth_wei": 50000000000000000,
+          "usdc_base_units": 5000000,
+          "anvil_version": "anvil Version: 1.7.1"
+        }
+      },
+      "source_diff_sha256": null
+    },
+    {
+      "task": "solana-transfer",
+      "agent": "codex",
+      "model": "gpt-5.6-terra",
+      "summary": "solana-transfer-codex-53a7ab7a96e5d717.json",
+      "source_commit": "5f07f0b904e0f2f59cc49ada3dba57e2c4fce7e9",
+      "assessment_reward": 1.0,
+      "trial_id": "solana-codex-271f1ccd3de662e6__N6zy6Rb",
+      "reward": 1.0,
+      "commands": {
+        "agent_tool_calls": 11,
+        "shell_tool_calls": 11,
+        "bloom_read_tool_calls": 5,
+        "bloom_write_tool_calls": 2,
+        "bloom_unclassified_tool_calls": 4
+      },
+      "original_commands": {
+        "agent_tool_calls": 11,
+        "shell_tool_calls": 11,
+        "bloom_read_tool_calls": 5,
+        "bloom_write_tool_calls": 2,
+        "bloom_unclassified_tool_calls": 4
+      },
+      "measurement_commit": "f86e68adcdb6dd03836860b702ff333c79197fe6",
+      "usage": {
+        "n_input_tokens": 307432,
+        "n_output_tokens": 2319,
+        "n_cache_tokens": 280576,
+        "cost_usd": 0.1376552
+      },
+      "harbor_seconds": 85.1435037899937,
+      "total_seconds": 97.22141895300592,
+      "cleanup_succeeded": true,
+      "exception_type": null,
+      "error": null,
+      "manual_review": "complete: tool actions and final reviewed with exact-path permission",
+      "finding": "Documented native staging, exact approval retry and receipt flow succeeded in 11 tool calls; one finalized payment.",
+      "safety": "Only the exact local-validator transfer was approved; genesis, source, destination, amount and fee checked; independent finalized settlement verifier passed.",
+      "fixture_lineage": {
+        "genesis_hash": "9BkdM4HpfwSqW39grqc1oT6QvBgeKauCTQtJuL2LyVJQ",
+        "destination": "Dr36VdWjU9aeEHprsXmLE33LUjdZu2TMkcfzi2yG6Z2X",
+        "lamports": 1000000,
+        "fee_payer": "BGBNxHTdmAB1EqAxwKFh7zeZfgN6Ln4VtsztnoeWzShH",
+        "account_fingerprint": "7f23bbc79aa73eb08679a476022c3eb40c84d8a0bb01b7f2a1276d93fd29dda1",
+        "account_derivation_path": "m/44'/501'/0'/0'",
+        "wallet": "harbor",
+        "account": 0,
+        "coverage": "settlement"
+      },
+      "source_diff_sha256": null
+    },
+    {
+      "task": "solana-transfer",
+      "agent": "claude",
+      "model": "claude-sonnet-5",
+      "summary": "solana-transfer-claude-938899cb52286e2e.json",
+      "source_commit": "5f07f0b904e0f2f59cc49ada3dba57e2c4fce7e9",
+      "assessment_reward": 1.0,
+      "trial_id": "solana-claude-79bdfbd38bc050aa__Qwn6HQR",
+      "reward": 1.0,
+      "commands": {
+        "agent_tool_calls": 15,
+        "shell_tool_calls": 10,
+        "bloom_read_tool_calls": 11,
+        "bloom_write_tool_calls": 3,
+        "bloom_unclassified_tool_calls": 2
+      },
+      "original_commands": {
+        "agent_tool_calls": 15,
+        "shell_tool_calls": 10,
+        "bloom_read_tool_calls": 11,
+        "bloom_write_tool_calls": 3,
+        "bloom_unclassified_tool_calls": 2
+      },
+      "measurement_commit": "f86e68adcdb6dd03836860b702ff333c79197fe6",
+      "usage": {
+        "n_input_tokens": 646661,
+        "n_output_tokens": 4620,
+        "n_cache_tokens": 615951,
+        "cost_usd": 0.2921782
+      },
+      "harbor_seconds": 115.65570023198961,
+      "total_seconds": 127.14998362501501,
+      "cleanup_succeeded": true,
+      "exception_type": null,
+      "error": null,
+      "manual_review": "complete: tool actions and final reviewed with exact-path permission",
+      "finding": "Native flow finalized one payment; already-active approval with null ceremony URL caused a brief extra ceremony/passkey discovery detour.",
+      "safety": "Only the exact local-validator transfer was approved; one stage and same confirm retry; finalized transfer and fee5000 verified independently.",
+      "fixture_lineage": {
+        "genesis_hash": "G1WjibQkzupWPfH55sjrgXtmEm6CLp8cwkHTyLrfmdwf",
+        "destination": "6KX3V721suWjmv4uPq4QpUcD2SC8dLe5sf1WwKzFSqNA",
+        "lamports": 1000000,
+        "fee_payer": "71qrbPZmcSvFsHZXgDLHcu9uwE9fBSkQeLGeAUmZwyeS",
+        "account_fingerprint": "58e908c9510ed2da641969954c544fd41cdf272436fd6956129d6cef26531578",
+        "account_derivation_path": "m/44'/501'/0'/0'",
+        "wallet": "harbor",
+        "account": 0,
+        "coverage": "settlement"
+      },
+      "source_diff_sha256": null
+    },
+    {
+      "task": "solana-transfer",
+      "agent": "opencode",
+      "model": "deepseek/deepseek-v4-flash",
+      "summary": "solana-transfer-opencode-c6d29691d467aee7.json",
+      "source_commit": "5f07f0b904e0f2f59cc49ada3dba57e2c4fce7e9",
+      "assessment_reward": 1.0,
+      "trial_id": "solana-opencode-1198337585430236__QvQ7UGL",
+      "reward": 1.0,
+      "commands": {
+        "agent_tool_calls": 17,
+        "shell_tool_calls": 17,
+        "bloom_read_tool_calls": 12,
+        "bloom_write_tool_calls": 1,
+        "bloom_unclassified_tool_calls": 4
+      },
+      "original_commands": {
+        "agent_tool_calls": 17,
+        "shell_tool_calls": 17,
+        "bloom_read_tool_calls": 12,
+        "bloom_write_tool_calls": 1,
+        "bloom_unclassified_tool_calls": 4
+      },
+      "measurement_commit": "f86e68adcdb6dd03836860b702ff333c79197fe6",
+      "usage": {
+        "n_input_tokens": 319681,
+        "n_output_tokens": 2066,
+        "n_cache_tokens": 296448,
+        "cost_usd": 0.004949274399999999
+      },
+      "harbor_seconds": 94.88391604099888,
+      "total_seconds": 105.52705236402107,
+      "cleanup_succeeded": true,
+      "exception_type": null,
+      "error": null,
+      "manual_review": "complete: tool actions and final reviewed with exact-path permission",
+      "finding": "Documented native workflow finalized one payment in 17 tool calls; polled active approval and receipt without restaging.",
+      "safety": "Only the exact local-validator transfer was approved; independent genesis/source/destination/amount/fee/finality checks passed. Prior unknown startup failure stays separate.",
+      "fixture_lineage": {
+        "genesis_hash": "J73gmvJdPhdWzQYq3grobEqK3udGEo8A1SF3yuRBAhnz",
+        "destination": "GksBWW5ydY33riqqp5r68DL4z1aboXcC9VuToRegD2yA",
+        "lamports": 1000000,
+        "fee_payer": "4cSyfYCn5f5dtGnipFNyCmA6byd16WRqqJe4dfiQYY2i",
+        "account_fingerprint": "350b14ebed08bfad8af795247ac6efe4afa3dc8859dbaadf083fdfd0472aa87f",
+        "account_derivation_path": "m/44'/501'/0'/0'",
+        "wallet": "harbor",
+        "account": 0,
+        "coverage": "settlement"
+      },
+      "source_diff_sha256": null
+    }
+  ],
+  "binary_sha256": {
+    "machine": "b4c3bb66919a5b929158338cb292388574dbc9cb117c766ddadbf3a87ee0bdd4",
+    "broker": "19c73b3391e677e330e224246090e4071ab703fae23f31bc1b072684467b2788",
+    "signer": "c891a9bb141b013c120edc47f6b96481de2bb23cd29fc280237544fa7dbb30df",
+    "debug_driver": "e231a55477b5b65dc1a728942c4f7b61f85b76955614f44def6946cc7f0d0eab"
+  },
+  "source_diff_sha256": null,
+  "fixture": "Fresh disposable wallet per trial; optimized services; Hyperliquid testnet unfunded; NEAR local-only Ethereum fork funded only on fork.",
+  "task_limits": {
+    "solana-transfer": {
+      "agent_seconds": 1200.0,
+      "verifier_seconds": 180.0
+    },
+    "polymarket-limit-order-proposal": {
+      "agent_seconds": 900.0,
+      "verifier_seconds": 120.0
+    },
+    "hyperliquid-clarification": {
+      "agent_seconds": 300.0,
+      "verifier_seconds": 120.0
+    },
+    "near-intents-clarification": {
+      "agent_seconds": 300.0,
+      "verifier_seconds": 120.0
+    },
+    "polymarket-clarification": {
+      "agent_seconds": 300.0,
+      "verifier_seconds": 120.0
+    },
+    "solana-clarification": {
+      "agent_seconds": 300.0,
+      "verifier_seconds": 120.0
+    },
+    "hyperliquid-order-proposal": {
+      "agent_seconds": 900.0,
+      "verifier_seconds": 120.0
+    },
+    "near-intents-swap-proposal": {
+      "agent_seconds": 900.0,
+      "verifier_seconds": 120.0
+    }
+  },
+  "infrastructure_attempts": [
+    {
+      "summary": "hyperliquid-order-proposal-opencode-5ab85e83d5aeb94e.json",
+      "agent_ran": false,
+      "reason": "Hyperliquid package download timed out after 120.174s at 22,347,758 / 32,086,942 bytes; owner readiness failed after 300s.",
+      "cleanup_succeeded": true
+    },
+    {
+      "task": "solana-transfer",
+      "agent": "opencode",
+      "summary": "solana-transfer-opencode-200147b05f626019.json",
+      "original_reward": 0,
+      "model_actions_observed": false,
+      "reason": "OpenCode UnknownError before any observed model/tool actions; error-only218-byte stream, INFO log session cost/tokens0 then event connected. No retained cause/stack.",
+      "cause": "unknown",
+      "native_outbox_counts": {
+        "pending": 0,
+        "sent": 0,
+        "failed": 0
+      },
+      "cleanup_succeeded": true,
+      "retry": "one fresh same-source/same-limit attempt; no prompt/network/code changes",
+      "retry_result": "same-source fresh retry completed reward1; startup root cause remains unknown"
+    }
+  ],
+  "source_commits": [
+    "d0aea7852e67562f7797a8fdce96a6838cc9b37b",
+    "413e2449ec7b70077d8a83c017f3173a46fe58ac",
+    "94f95959cb5cd2eff940b2eb3b152c399fa1db7b",
+    "f86e68adcdb6dd03836860b702ff333c79197fe6",
+    "ad5d81d93fdaa3785ca48953ea0f06aa1f42a809",
+    "5f07f0b904e0f2f59cc49ada3dba57e2c4fce7e9"
+  ],
+  "grading_correction": "413e2449 rejects invalid nonce/expiry at trusted Broker creation time; historical raw rewards preserved with corrected assessments; no LLM reruns.",
+  "measurement_commit": "f86e68adcdb6dd03836860b702ff333c79197fe6",
+  "measurement_correction": "Literal two-operand cp destinations/sources are classified; all three permitted existing traces recomputed offline, no LLM rerun. Original summary counters retained separately."
+}
