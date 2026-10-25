@@ -1358,8 +1358,10 @@ mod tests {
               <link rel="stylesheet" href="EXTERNAL_STYLE">
               <style>.pick{cursor:pointer}.faded{opacity:0}</style>
               <div id="previous-step" style="height:0;overflow:hidden"></div>
+              <input aria-label="Passenger name" value="First passenger">
               <div id="earlier-step"></div>
               <div class="external"><span>Remote fare</span></div>
+              <input aria-label="Passenger name" value="Second passenger">
               <ul><li class="pick" id="city">Cordoba COR</li><li class="pick faded">Hidden city</li></ul>
               <div class="pick"><div>Noviembre 2026</div><div class="pick" id="day">04</div></div>
               <div class="card">08:06 Cordoba 16:17 Bariloche<div class="pick fare">Tarifa desde $127.664,00</div></div>
@@ -1405,6 +1407,14 @@ mod tests {
         };
         assert_eq!(find("Cordoba COR").len(), 1);
         assert!(find("Old seat").is_empty());
+        assert_eq!(
+            find("Passenger name")
+                .iter()
+                .map(|e| e["value"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["First passenger", "Second passenger"],
+            "scrolling must not reorder repeated passenger fields"
+        );
         assert_eq!(
             find("Remote fare").len(),
             1,
