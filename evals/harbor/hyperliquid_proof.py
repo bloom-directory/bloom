@@ -7,7 +7,6 @@ Trajectory JSON is only a witness. It earns nothing until every trusted digest m
 import hashlib
 import json
 import re
-import time
 from decimal import Decimal, InvalidOperation
 
 import msgpack
@@ -163,6 +162,8 @@ def prove_body(request, manifest, trajectory, pending):
                         body,
                         network,
                         {
+                            "committed_nonce": nonce,
+                            "issued_at_ms": manifest.get("issued_at_ms"),
                             "payload_sha256": payload,
                             "signing_hash": signing_hash,
                             "batch_digest": batch,
@@ -178,7 +179,7 @@ def prove_body(request, manifest, trajectory, pending):
     raise Unavailable("pending order has no commitment-verifiable JSON witness/nonce")
 
 
-def matches_order(body, network, expected):
+def matches_order(body, network, expected, issued_at_ms):
     action = canonical_action(body)
     if (
         network != "testnet"
@@ -190,7 +191,7 @@ def matches_order(body, network, expected):
             body.get("expiresAfter") is not None
             and (
                 type(body["expiresAfter"]) is not int
-                or body["expiresAfter"] <= time.time() * 1000
+                or body["expiresAfter"] <= issued_at_ms
             )
         )
     ):
@@ -231,8 +232,22 @@ def validate_proposal(requests, account, expected, review, trajectory, pending):
     body, network, proof = prove_body(
         request, review["review_manifest"], trajectory, pending
     )
+    issued = proof["issued_at_ms"]
+    if (
+        not isinstance(issued, (str, int))
+        or isinstance(issued, bool)
+        or not str(issued).isdigit()
+    ):
+        raise Unavailable("Broker manifest has no valid issuance timestamp")
+    issued = int(issued)
+    if not 0 <= issued < 2**64:
+        raise Unavailable("Broker issuance timestamp is not u64")
+    # Hyperliquid's strict (T-2days,T+1day) nonce window, evaluated at the
+    # trusted request creation time, so later offline grading is deterministic.
+    if not issued - 2 * 86_400_000 < proof["committed_nonce"] < issued + 86_400_000:
+        raise ValueError("committed nonce is outside the venue validity window")
     try:
-        matches = matches_order(body, network, expected)
+        matches = matches_order(body, network, expected, issued)
     except (InvalidOperation, ValueError, TypeError):
         matches = False
     if not matches:

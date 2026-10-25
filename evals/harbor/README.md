@@ -44,6 +44,12 @@ witnesses: the verifier reconstructs the released MessagePack/EIP-712 payload
 and matches both Broker selectors and the payload-batch claim before grading
 terms. A missing provable witness is an observability error, not an incorrect
 order. Equivalent decimals and optional CLOIDs are accepted when committed.
+The committed nonce must fall strictly within two days before and one day
+after the signed Broker manifest's issuance time, following the venue's
+[nonce rules](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/nonces-and-api-wallets).
+Optional expiry must also be later than that issuance time. Using this trusted
+preparation timestamp keeps offline grading deterministic; it does not prove
+the order would still be valid when submitted later.
 
 NEAR uses Anvil chain 1 with only a localhost Ethereum RPC, 0.05 fork ETH and
 5 fork USDC. The real 1Click service supplies the quote. The released route

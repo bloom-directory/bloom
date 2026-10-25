@@ -1,6 +1,5 @@
 import copy
 import json
-import time
 import unittest
 
 from hyperliquid_proof import Unavailable, commitments, validate_proposal
@@ -54,6 +53,7 @@ class HyperliquidProofTests(unittest.TestCase):
             status="awaiting_owner_approval",
         )
         manifest = {
+            "issued_at_ms": str(self.nonce),
             "approval_id": request["approval_id"],
             "exact_payload_digests": [payload],
             "exact_hashes": [signing_hash],
@@ -137,11 +137,43 @@ class HyperliquidProofTests(unittest.TestCase):
 
     def test_committed_future_expiry_passes_but_expired_order_fails(self):
         body = copy.deepcopy(self.body)
-        body["expiresAfter"] = int(time.time() * 1000) + 60_000
+        body["expiresAfter"] = self.nonce + 60_000
         validate_proposal(*self.proposal(body))
-        body["expiresAfter"] = 1
-        with self.assertRaises(ValueError):
-            validate_proposal(*self.proposal(body))
+        for expiry, valid in (
+            (self.nonce - 1, False),
+            (self.nonce, False),
+            (self.nonce + 1, True),
+        ):
+            body["expiresAfter"] = expiry
+            with self.subTest(expiry=expiry):
+                if valid:
+                    validate_proposal(*self.proposal(body))
+                else:
+                    with self.assertRaises(ValueError):
+                        validate_proposal(*self.proposal(body))
+
+    def test_nonce_window_is_strict_and_relative_to_trusted_issuance(self):
+        for offset, valid in (
+            (-172800001, False),
+            (-172800000, False),
+            (-172799999, True),
+            (86399999, True),
+            (86400000, False),
+            (86400001, False),
+            (-62888375157, False),
+        ):
+            body = copy.deepcopy(self.body)
+            body["nonce"] = self.nonce + offset
+            with self.subTest(offset=offset):
+                if valid:
+                    validate_proposal(*self.proposal(body))
+                else:
+                    with self.assertRaises(ValueError):
+                        validate_proposal(*self.proposal(body))
+        args = self.proposal()
+        del args[3]["review_manifest"]["issued_at_ms"]
+        with self.assertRaises(Unavailable):
+            validate_proposal(*args)
 
     def test_missing_duplicate_wrong_account_and_advanced_requests_fail(self):
         for count in (0, 2):
