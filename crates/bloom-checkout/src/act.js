@@ -18,9 +18,9 @@
       // handlers. Focus and insertion run in one call so navigation cannot
       // redirect a later insertion.
       e.focus();
-      if (!e.isConnected || document.activeElement !== e || (e.autocomplete || '').split(' ').some(s => s.startsWith('cc-'))) throw Error('stale');
+      if (!e.isConnected || e.getRootNode().activeElement !== e || (e.autocomplete || '').split(' ').some(s => s.startsWith('cc-'))) throw Error('stale');
       e.select();
-      if (!e.isConnected || document.activeElement !== e || (e.autocomplete || '').split(' ').some(s => s.startsWith('cc-'))) throw Error('stale');
+      if (!e.isConnected || e.getRootNode().activeElement !== e || (e.autocomplete || '').split(' ').some(s => s.startsWith('cc-'))) throw Error('stale');
       if (!document.execCommand('insertText', false, value)) throw Error('input unsupported');
       e.dispatchEvent(new KeyboardEvent('keyup', {key: value.slice(-1), bubbles: true}));
     } else {

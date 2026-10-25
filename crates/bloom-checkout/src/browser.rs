@@ -1362,6 +1362,7 @@ mod tests {
               <div id="earlier-step"></div>
               <div class="external"><span>Remote fare</span></div>
               <input aria-label="Passenger name" value="Second passenger">
+              <div id="component"></div>
               <ul><li class="pick" id="city">Cordoba COR</li><li class="pick faded">Hidden city</li></ul>
               <div class="pick"><div>Noviembre 2026</div><div class="pick" id="day">04</div></div>
               <div class="card">08:06 Cordoba 16:17 Bariloche<div class="pick fare">Tarifa desde $127.664,00</div></div>
@@ -1369,6 +1370,7 @@ mod tests {
               <label onclick="if(event.target===this) event.preventDefault()"><input type="radio" name="pass" style="display:none">Llevaré mi tarjeta de embarque<span class="pick">?</span></label>
               <div class="pick" id="pay">Pagar</div>
               <script>
+                document.getElementById('component').attachShadow({mode:'open'}).innerHTML = '<label>Component passenger<input oninput="document.title=this.value"></label><button onclick="document.title=\'component continued\'">Component continue</button><input aria-label="Component card" autocomplete="cc-number" value="4242424242424242">';
                 document.getElementById('previous-step').innerHTML = '<button>Old seat</button>'.repeat(310);
                 document.getElementById('earlier-step').innerHTML = '<button>Previous seat</button><br>'.repeat(310);
                 document.querySelector('.external').scrollIntoView();
@@ -1406,6 +1408,13 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(find("Cordoba COR").len(), 1);
+        assert_eq!(
+            find("Component passenger")
+                .iter()
+                .filter(|e| e["role"] == "input")
+                .count(),
+            1
+        );
         assert!(find("Old seat").is_empty());
         assert_eq!(
             find("Passenger name")
@@ -1509,6 +1518,52 @@ mod tests {
                 .await
                 .is_err()
         );
+        let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+        let card = snapshot["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["label"] == "Component card")
+            .unwrap();
+        assert!(card.get("value").is_none());
+        assert!(
+            browser
+                .browse(BrowseRequest::Type {
+                    element_ref: card["ref"].as_str().unwrap().into(),
+                    text: "4242424242424242".into(),
+                })
+                .await
+                .is_err()
+        );
+        for (label, typed, expected) in [
+            (
+                "Component passenger",
+                Some("FixtureShadow"),
+                "FixtureShadow",
+            ),
+            ("Component continue", None, "component continued"),
+        ] {
+            let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+            let element_ref = snapshot["elements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["label"] == label && e["role"] != "label")
+                .unwrap()["ref"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let action = match typed {
+                Some(text) => BrowseRequest::Type {
+                    element_ref,
+                    text: text.into(),
+                },
+                None => BrowseRequest::Click { element_ref },
+            };
+            browser.browse(action).await.unwrap();
+            let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+            assert!(snapshot["text"].as_str().unwrap().contains(expected));
+        }
         fixture.abort();
     }
 

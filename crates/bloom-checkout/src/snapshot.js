@@ -48,18 +48,22 @@
   const secret = BLOOM_CARD_SECRET;
   // Labels toggle their (often restyled and hidden) radio or checkbox.
   const control = e => e.matches(native) || (e.tagName === 'LABEL' && e.control);
-  const candidates = [...document.querySelectorAll('body *')].filter(e =>
+  // Open web components contain ordinary controls outside document selectors.
+  const descendants = root => [...root.querySelectorAll('*')].flatMap(e =>
+    [e, ...(e.shadowRoot ? descendants(e.shadowRoot) : [])]);
+  const candidates = descendants(document.body).filter(e =>
     (control(e) || (pointer(e) && label(e))) &&
     visible(e) && !e.disabled && e.getAttribute('aria-disabled') !== 'true' && e.type !== 'hidden');
   // A styled container around other controls is layout, not a control.
   // Retained earlier steps (for example, a seat map) can sit above the current
   // form. Give current and following controls room before those earlier nodes.
+  const order = new Map(candidates.map((e, i) => [e, i]));
   const nodes = candidates.filter(e => control(e) || !candidates.some(o => o !== e && e.contains(o)))
     .sort((a, b) => Number(a.getBoundingClientRect().bottom <= 0) - Number(b.getBoundingClientRect().bottom <= 0))
     .slice(0, 300)
     // Prioritize inclusion, not presentation: repeated passenger fields must
     // retain document order when focusing an input scrolls the page.
-    .sort((a, b) => a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1);
+    .sort((a, b) => order.get(a) - order.get(b));
   // Repeated controls such as fare buttons or calendar days need their card
   // or month: the largest short block around the control.
   const context = e => {
