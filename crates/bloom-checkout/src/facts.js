@@ -91,7 +91,7 @@
   // The one final payment button, in the main checkout languages (observed on
   // Shopify de/fr/es/pt/it/en checkouts, common shop systems, and Booking.com,
   // Ryanair and Airbnb final pages, 2026-10-11). Labels may use non-breaking spaces.
-  const pay = controls.filter(e => BLOOM_PAY_WORDS.test((e.innerText || e.value).replace(/\s+/g, ' ').trim()));
+  const pay = controls.filter(e => BLOOM_PAY_WORDS.test((e.innerText || e.value || '').replace(/\s+/g, ' ').trim()));
   if (pay.length !== 1) return null;
   // Test fixtures declare their total; a merchant page never chooses its own.
   const fixture = BLOOM_FIXTURE_TOTALS && ['localhost', '127.0.0.1'].includes(location.hostname);

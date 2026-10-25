@@ -1315,7 +1315,8 @@ pub(crate) mod tests {
                     "PURCHASE & ACCEPT",
                 )
                 .replace("<button>", "<a href='#'>")
-                .replace("</button>", "</a>"),
+                .replace("</button>", "</a>")
+                .replace("<body>", "<body><a href='#' aria-label='Logo' style='display:block;width:20px;height:20px'></a>"),
                 Some((5698, "USD")),
             ),
             // Final pages seen on 2026-10-11: Booking.com, Ryanair,
