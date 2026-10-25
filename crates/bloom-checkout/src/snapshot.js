@@ -69,7 +69,12 @@
   // Retained earlier steps (for example, a seat map) can sit above the current
   // form. Give current and following controls room before those earlier nodes.
   const order = new Map(candidates.map((e, i) => [e, i]));
-  const nodes = candidates.filter(e => control(e) || !candidates.some(o => o !== e && e.contains(o)))
+  // Mark containers once instead of comparing every pair of controls. Large
+  // flight catalogs otherwise keep the renderer busy past the read timeout.
+  const containers = new Set();
+  for (const e of candidates)
+    for (let parent = e.parentElement; parent; parent = parent.parentElement) containers.add(parent);
+  const nodes = candidates.filter(e => control(e) || !containers.has(e))
     .sort((a, b) => Number(a.getBoundingClientRect().bottom <= 0) - Number(b.getBoundingClientRect().bottom <= 0)
       // Dense pointer-based seat maps must leave room for actual form controls.
       || Number(b.matches(nativeElements)) - Number(a.matches(nativeElements)))
