@@ -3458,11 +3458,14 @@ impl TxEngine {
         let outcome = match service.broker.sign_exact_payload(request).await {
             Ok(outcome) => outcome,
             Err(error) => {
-                // Replace a permanently refused lineage only when no durable
-                // effect occurred. Retryable and ambiguous failures retain it.
+                // Replace a permanently refused lineage only when nothing durable
+                // remains. Retryable and ambiguous failures retain it.
                 if state.approval_id.is_some()
                     && error.code.contract().retry == RetryClass::Never
-                    && error.code.contract().durable_effect == DurableEffect::None
+                    && matches!(
+                        error.code.contract().durable_effect,
+                        DurableEffect::None | DurableEffect::ReservationReleased
+                    )
                 {
                     // Approval and operation IDs are immutable: clearing only
                     // the dispatch marker would reuse the same dead request.
@@ -3828,7 +3831,10 @@ impl TxEngine {
                 // ambiguous outcomes, replace definite permanent refusals.
                 if state.approval_id.is_some()
                     && error.code.contract().retry == RetryClass::Never
-                    && error.code.contract().durable_effect == DurableEffect::None
+                    && matches!(
+                        error.code.contract().durable_effect,
+                        DurableEffect::None | DurableEffect::ReservationReleased
+                    )
                 {
                     state = new_state()?;
                     write_triad_batch_signing_state(&state_path, &state)?;
@@ -7927,7 +7933,10 @@ mod tests {
         // Recoverable and ambiguous errors must not mint another approval.
         for code in ProtocolErrorCode::ALL.into_iter().filter(|code| {
             code.contract().retry != RetryClass::Never
-                || code.contract().durable_effect != DurableEffect::None
+                || !matches!(
+                    code.contract().durable_effect,
+                    DurableEffect::None | DurableEffect::ReservationReleased
+                )
         }) {
             *fixture.deny_sign.lock() = Some(code);
             assert!(
@@ -7955,7 +7964,7 @@ mod tests {
         // The simulated QUOTA_EXCEEDED above makes the Machine client refuse
         // requests locally for its initial 250 ms backoff.
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        *fixture.deny_sign.lock() = Some(ProtocolErrorCode::ClaimInvalid);
+        *fixture.deny_sign.lock() = Some(ProtocolErrorCode::LimitExceededValue);
         assert!(matches!(
             engine
                 .triad_sign_evm_payload(
@@ -7971,9 +7980,11 @@ mod tests {
 
         let state = read_triad_signing_state(&state_path).unwrap().unwrap();
         assert_eq!(
-            ProtocolErrorCode::ClaimInvalid.contract().durable_effect,
-            DurableEffect::None,
-            "the premise of this test is the Broker promising nothing durable happened"
+            ProtocolErrorCode::LimitExceededValue
+                .contract()
+                .durable_effect,
+            DurableEffect::ReservationReleased,
+            "the premise of this test is the Broker releasing the reservation, so nothing durable remains"
         );
         // Regression: only this marker was cleared. The stale approval and
         // operation IDs still wedged both retry and cancellation.
@@ -8325,7 +8336,10 @@ mod tests {
         fixture.active.store(true, Ordering::SeqCst);
         for code in ProtocolErrorCode::ALL.into_iter().filter(|code| {
             code.contract().retry != RetryClass::Never
-                || code.contract().durable_effect != DurableEffect::None
+                || !matches!(
+                    code.contract().durable_effect,
+                    DurableEffect::None | DurableEffect::ReservationReleased
+                )
         }) {
             *fixture.deny_sign.lock() = Some(code);
             assert!(
@@ -8349,7 +8363,7 @@ mod tests {
         // The simulated QUOTA_EXCEEDED above makes the Machine client refuse
         // requests locally for its initial 250 ms backoff.
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        *fixture.deny_sign.lock() = Some(ProtocolErrorCode::ClaimInvalid);
+        *fixture.deny_sign.lock() = Some(ProtocolErrorCode::LimitExceededValue);
         assert!(matches!(
             engine
                 .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
@@ -8361,9 +8375,11 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            ProtocolErrorCode::ClaimInvalid.contract().durable_effect,
-            DurableEffect::None,
-            "the premise of this test is the Broker promising nothing durable happened"
+            ProtocolErrorCode::LimitExceededValue
+                .contract()
+                .durable_effect,
+            DurableEffect::ReservationReleased,
+            "the premise of this test is the Broker releasing the reservation, so nothing durable remains"
         );
         // Regression: only this marker was cleared. The batch then reused its
         // dead approval and immutable operation ID forever.
