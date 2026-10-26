@@ -1,6 +1,6 @@
 # Default Petal agent baseline
 
-in progress: 17 of 24 pairs manually reviewed. Every listed trajectory was manually reviewed after exact-path permission.
+in progress: 18 of 24 pairs manually reviewed. Every listed trajectory was manually reviewed after exact-path permission.
 
 | Task | Agent | Assessed/raw reward | Tool calls | Bloom R/W/? | Input/cache tokens | Output/reasoning/combined | Harbor/total seconds |
 | --- | --- | --- | ---: | --- | --- | --- | --- |
@@ -21,6 +21,7 @@ in progress: 17 of 24 pairs manually reviewed. Every listed trajectory was manua
 | solana-clarification | opencode | 0.0/0.0 | 40 | 3/0/35 | 1671261/1618304 | 5227/4275/9502 | 321.40/330.61 |
 | hyperliquid-clarification | codex | 0.0/0.0 | 16 | 7/0/0 | 728061/658176 | 4472/unknown/unknown | 229.17/354.71 |
 | hyperliquid-clarification | claude | 0.0/0.0 | 16 | 16/0/0 | 825892/788501 | 5034/unknown/unknown | 137.02/204.75 |
+| hyperliquid-clarification | opencode | 0.0/0.0 | 48 | 38/0/2 | 1311508/1238912 | 4757/9720/14477 | 263.85/320.31 |
 
 Tool calls are the common denominator; categories count identifiable attempted calls and can overlap. `?` means Bloom calls with unclassified access. Input includes cached input; cache is shown separately, not added again. Raw usage is preserved in [the JSON](2026-10-25.json). Separate reasoning is reported only where observed through the OpenCode adapter; unknown is not zero. Provider token accounting may differ. Assessed/raw values retain historical grading corrections.
 
@@ -43,6 +44,7 @@ Tool calls are the common denominator; categories count identifiable attempted c
 - **solana-clarification/opencode** (`solana-clarification-f1c1cb22dfa__z7smBuy`): Timed out after40calls of balance/token/status and unrelated Petal discovery instead of asking the missing chain; no final clarification. Relative-path scans dominate, so known Bloom read count is incomplete.
 - **hyperliquid-clarification/codex** (`hyperliquid-clarification-2fec02__aVtTsBf`): Assumed mainnet, inspected account/market and external schema instead of asking mainnet versus testnet, then requested funding only. Missing network remained unresolved; discovery and balance checks inflated16calls.
 - **hyperliquid-clarification/claude** (`hyperliquid-clarification-3a89a3__xFRrfbV`): Recognized mainnet/testnet routes but inspected mainnet balances and policy instead of asking which network; final offered funding/policy changes or another account. Missing network remained unresolved after16readcalls.
+- **hyperliquid-clarification/opencode** (`hyperliquid-clarification-53ce98__d8yGiBb`): Inspected both networks, balances, unrelated chains and external source across48calls, then asked only for funding instead of mainnet versus testnet. Missing network remained unresolved; broad discovery consumed263.85s.
 
 ## Proposed follow-up PRs
 
