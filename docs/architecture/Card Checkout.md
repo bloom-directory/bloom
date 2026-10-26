@@ -80,6 +80,9 @@ their public values become saved-field placeholders. This protects short date
 parts without replacing the same digits in prices or flight dates. Select
 values use this projection rather than duplicated accessibility-tree text.
 Known numeric and English full-date renderings are redacted in review text.
+Names remain private at any length and after Unicode case changes. Short ASCII
+tokens match whole words. Filtering changes merchant text, labels and values;
+protocol keys, control references, roles, types and frame origins remain exact.
 Before payment approval, verify the itinerary, party, extras and final total.
 
 Public control projection removes styled layout containers with an ancestor

@@ -241,37 +241,73 @@ impl Browser {
         }
     }
 
-    /// Replace each saved value, in any ASCII letter case, with its placeholder.
-    fn redacted(&self, value: Value) -> Result<Value> {
+    /// Mask merchant strings without changing control references or protocol metadata.
+    fn redacted(&self, mut value: Value) -> Result<Value> {
         let redactions = self.redactions.read().unwrap();
-        let mut text = serde_json::to_string(&value)?;
         for (secret, label) in redactions.iter() {
-            let escaped = serde_json::to_string(secret.as_str())?;
-            let needle = escaped[1..escaped.len() - 1].to_ascii_lowercase();
-            for variant in [needle.clone(), secret.to_uppercase()] {
-                let mut out = String::with_capacity(text.len());
-                let lower = text.to_ascii_lowercase();
-                let mut last = 0;
-                for (start, _) in lower.match_indices(&variant.to_ascii_lowercase()) {
-                    if start >= last {
-                        out.push_str(&text[last..start]);
-                        out.push_str(label);
-                        last = start + variant.len();
+            // Explicit case conversions also cover multi-character mappings
+            // such as Straße -> STRASSE and İpek -> i + combining dot + pek.
+            let variants = [
+                secret.to_string(),
+                secret.to_uppercase(),
+                secret.to_lowercase(),
+            ];
+            let alternatives = variants
+                .iter()
+                .map(|s| regex::escape(s))
+                .collect::<Vec<_>>()
+                .join("|");
+            // Short ASCII names and year fragments are whole tokens, so Li
+            // does not hide "airline" and 90 does not hide part of 1990.
+            let pattern = if secret.is_ascii() && secret.chars().count() < 3 {
+                format!(r"\b(?:{alternatives})\b")
+            } else {
+                format!("(?:{alternatives})")
+            };
+            let pattern = regex::RegexBuilder::new(&pattern)
+                .case_insensitive(true)
+                .build()?;
+            let replace = |value: &mut Value| {
+                if let Value::String(text) = value {
+                    *text = pattern
+                        .replace_all(text, regex::NoExpand(label))
+                        .into_owned();
+                }
+            };
+            for key in ["url", "text"] {
+                if let Some(value) = value.get_mut(key) {
+                    replace(value);
+                }
+            }
+            if let Some(elements) = value.get_mut("elements").and_then(Value::as_array_mut) {
+                for element in elements {
+                    for key in ["label", "context", "value"] {
+                        if let Some(value) = element.get_mut(key) {
+                            replace(value);
+                        }
+                    }
+                    if let Some(options) = element.get_mut("options").and_then(Value::as_array_mut)
+                    {
+                        for option in options {
+                            for key in ["label", "value"] {
+                                if let Some(value) = option.get_mut(key) {
+                                    replace(value);
+                                }
+                            }
+                        }
                     }
                 }
-                out.push_str(&text[last..]);
-                text = out;
             }
         }
-        Ok(serde_json::from_str(&text)?)
+        Ok(value)
     }
 
     pub(crate) fn redact(&self, values: impl IntoIterator<Item = (String, String)>) {
         self.redact_min(values, 3);
     }
 
-    /// `min_chars` is 3 for saved values. A birth year is the exception: a
-    /// two-digit year is still the person's year.
+    /// Most saved values use three characters; names and displayed birth-year
+    /// fragments also need protection when they are shorter.
     pub(crate) fn redact_min(
         &self,
         values: impl IntoIterator<Item = (String, String)>,
@@ -886,6 +922,52 @@ fn accessibility_text(tree: &Value) -> Result<String> {
 mod tests {
     use super::*;
     use axum::{Router, response::Html, routing::get};
+
+    #[tokio::test]
+    async fn short_private_tokens_do_not_change_control_metadata_or_other_words() {
+        let root = tempfile::tempdir().unwrap();
+        let browser = Browser::launch(
+            &crate::test_chromium(),
+            &root.path().join("profile"),
+            &["--no-sandbox".into()],
+        )
+        .await
+        .unwrap();
+        browser.redact_min(
+            [
+                ("Li".into(), "[saved family_name]".into()),
+                ("90".into(), "[saved born_on_year]".into()),
+            ],
+            1,
+        );
+        let snapshot = browser
+            .redacted(json!({
+                "url":"https://airline.example/",
+                "text":"Passenger Li, year 90; choose an airline",
+                "elements":[{
+                    "ref":"90:90", "role":"li", "type":"text",
+                    "frame_origin":"https://li.example",
+                    "label":"Li", "context":"Airline review for Li",
+                    "value":"Li", "options":[{"value":"Li","label":"Li"}]
+                }]
+            }))
+            .unwrap();
+        serde_json::from_value::<bloom_checkout_api::BrowseResponse>(snapshot.clone()).unwrap();
+        assert_eq!(
+            snapshot["text"],
+            "Passenger [saved family_name], year [saved born_on_year]; choose an airline"
+        );
+        let element = &snapshot["elements"][0];
+        assert_eq!(element["ref"], "90:90");
+        assert_eq!(element["role"], "li");
+        assert_eq!(element["type"], "text");
+        assert_eq!(element["frame_origin"], "https://li.example");
+        assert_eq!(element["label"], "[saved family_name]");
+        assert_eq!(element["context"], "Airline review for [saved family_name]");
+        assert_eq!(element["value"], "[saved family_name]");
+        assert_eq!(element["options"][0]["label"], "[saved family_name]");
+        assert_eq!(element["options"][0]["value"], "[saved family_name]");
+    }
 
     #[tokio::test]
     async fn comprar_and_kaufen_require_payment_approval() {

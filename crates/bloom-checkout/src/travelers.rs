@@ -687,6 +687,62 @@ mod tests {
         server.abort();
     }
     #[tokio::test]
+    async fn saved_accented_names_stay_private_when_the_merchant_changes_case() {
+        for (name, shown, render) in [
+            ("Élodie", "élodie", "value.toLowerCase()"),
+            ("Straße", "STRASSE", "value.toUpperCase()"),
+            ("İpek", "i\u{307}pek", "value.toLowerCase()"),
+            (
+                "élodie zoë",
+                "Élodie Zoë",
+                "value.split(' ').map(word=>word[0].toUpperCase()+word.slice(1)).join(' ')",
+            ),
+        ] {
+            let (browser, server, url) = browser_at(&format!(
+                "<label>First name<input autocomplete='given-name'></label>
+                 <p id='echo'></p><button id='next'>Continue</button>
+                 <script>document.querySelector('input').addEventListener('input',event=>{{
+                   const value=event.target.value, shown={render};
+                   echo.textContent='Passenger '+shown;document.title=shown;
+                   document.getElementById('next').setAttribute('aria-label','Continue for '+shown);
+                 }});</script>"
+            ))
+            .await;
+            let origin = url::Url::parse(&url)
+                .unwrap()
+                .origin()
+                .ascii_serialization();
+            let values = [("given_name".into(), Zeroizing::new(name.to_owned()))].into();
+            browser.redact([(name.to_owned(), "[saved given_name]".into())]);
+            let filled = browser
+                .fill_traveler(
+                    &origin,
+                    &browser.shopping_context().await,
+                    &[TravelerField::GivenName],
+                    &values,
+                )
+                .await
+                .unwrap();
+            assert_eq!(filled, ["given_name"]);
+            let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+            serde_json::from_value::<bloom_checkout_api::BrowseResponse>(snapshot.clone()).unwrap();
+            let snapshot = snapshot.to_string();
+            assert!(
+                !snapshot.contains(shown),
+                "Saved name escaped redaction: {snapshot}"
+            );
+            assert!(
+                snapshot.contains("Passenger [saved given_name]"),
+                "{snapshot}"
+            );
+            assert!(
+                snapshot.contains("Continue for [saved given_name]"),
+                "{snapshot}"
+            );
+            server.abort();
+        }
+    }
+    #[tokio::test]
     async fn passport_or_id_captions_fill_only_traveler_document_fields() {
         for number_label in [
             "Passport No.",

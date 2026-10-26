@@ -721,7 +721,8 @@ impl CheckoutService {
                 );
             }
         }
-        if field == "born_on_year" {
+        // Names remain identifying even when they contain only one character.
+        if matches!(field, "born_on_year" | "given_name" | "family_name") {
             browser.redact_min([item], 1);
         } else {
             browser.redact([item]);
@@ -2100,7 +2101,10 @@ mod tests {
             "<fieldset><legend>Passenger one</legend><input aria-label='Passenger one given name' autocomplete='given-name'></fieldset>
              <fieldset><legend>Passenger two</legend><input aria-label='Passenger two given name' autocomplete='given-name'></fieldset>
              <fieldset><legend>Cardholder</legend><input aria-label='Payer given name' autocomplete='given-name'></fieldset>
-             <input type='email' aria-label='Contact email'>".into(),
+             <input type='email' aria-label='Contact email'><p id='echo'></p>
+             <script>document.addEventListener('input',()=>{
+               echo.textContent=Array.from(document.querySelectorAll('input'),e=>e.value).join(' ');
+             });</script>".into(),
         ).await;
         let root = tempfile::tempdir().unwrap();
         let browser = Browser::launch(
@@ -2178,8 +2182,8 @@ mod tests {
         // These records stand in for three independently approved releases.
         // There is no Broker fixture here and no claim of ceremony acceptance.
         for (id, name, email) in [
-            ("person-one", "FixtureAlice", "alice@example.test"),
-            ("person-two", "FixtureBob", "bob@example.test"),
+            ("person-one", "Li", "alice@example.test"),
+            ("person-two", "李", "bob@example.test"),
             ("payer", "FixtureCasey", "payer@example.test"),
         ] {
             browser.redact([
@@ -2265,6 +2269,8 @@ mod tests {
         for element in snapshot["elements"].as_array().unwrap() {
             assert!(element["value"].as_str().unwrap().starts_with("[saved "));
         }
+        assert!(!snapshot["text"].as_str().unwrap().contains("Li"));
+        assert!(!snapshot["text"].as_str().unwrap().contains('李'));
         let tab = browser.handoff().await.unwrap();
         let actual = tab
             .cdp
@@ -2276,12 +2282,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             actual,
-            json!([
-                "FixtureAlice",
-                "FixtureBob",
-                "FixtureCasey",
-                "payer@example.test"
-            ])
+            json!(["Li", "李", "FixtureCasey", "payer@example.test"])
         );
         service
             .store
