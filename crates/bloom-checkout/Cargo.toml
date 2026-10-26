@@ -24,7 +24,7 @@ serde_json.workspace = true
 tokio.workspace = true
 url.workspace = true
 zeroize.workspace = true
-bloom-signer-api = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "45b04a0f0964e0c3863ca7692167c66fcff5ed79" }
+bloom-signer-api = { git = "https://github.com/bloom-directory/bloom-signer.git", rev = "c695384c2cf9609a4f13f2fdddc76cfcdca2d5ea" }
 hpke = { version = "0.14", default-features = false, features = ["alloc", "getrandom", "x25519", "chacha"] }
 rusqlite.workspace = true
 phonenumber = "0.3"

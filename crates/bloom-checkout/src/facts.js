@@ -168,6 +168,61 @@
     installments = [...selectedCounts][0];
   } else if (/installments?|cuotas|parcelas/i.test(text) && !shopifyCard) return {refusal:'installment_choice'};
   const recurring = processorRecurring ?? /\b(subscription|recurring|auto.?renew|monthly|annually|suscripci[oó]n)\b/i.test(text);
+  // A trial price hides what a subscription really costs. Read the ongoing
+  // price the page prints as "<amount> per <period>", and the day it starts
+  // when the page writes a date no reader could take two ways. Anything less
+  // clear stays unset: the review says only what the page is plain about.
+  const periodWords = {month:'month',months:'month',monthly:'month',mo:'month',mes:'month',meses:'month',mensual:'month',monat:'month',monate:'month',monatlich:'month',mois:'month',mensuel:'month',mese:'month',mesi:'month',mensile:'month',
+    year:'year',years:'year',yearly:'year',annually:'year',annual:'year',yr:'year','año':'year','años':'year',anual:'year',jahr:'year',jahre:'year','jährlich':'year',an:'year',annuel:'year',anno:'year',anni:'year',annuale:'year',
+    week:'week',weeks:'week',weekly:'week',semana:'week',semanal:'week',woche:'week','wöchentlich':'week',semaine:'week',settimana:'week',
+    day:'day',days:'day',daily:'day','día':'day',dias:'day',diario:'day',tag:'day','täglich':'day',jour:'day',giorno:'day'};
+  const period = new RegExp(`^\\s*(?:\\/|per|every|each|a|an|al|por|pro|par|the|ogni)?\\s*(${Object.keys(periodWords).join('|')})(?![\\p{L}\\p{N}])`, 'iu');
+  const money = new RegExp(`(?:${currencyToken.source})\\s*\\d[\\d.,'’\\u00a0\\u202f ]*|\\d[\\d.,'’\\u00a0\\u202f ]*\\s*(?:${currencyToken.source})`, 'gu');
+  const renewalPrice = () => {
+    const found = new Map();
+    for (const match of text.matchAll(money)) {
+      const after = text.slice(match.index + match[0].length, match.index + match[0].length + 24);
+      const unit = after.match(period);
+      if (!unit) continue;
+      const priced = parseAmount(match[0]);
+      if (!priced || priced.currency !== currency) continue;
+      found.set(`${priced.total}/${periodWords[unit[1].toLowerCase()]}`,
+        {renewal_minor: priced.total, renewal_period: periodWords[unit[1].toLowerCase()]});
+    }
+    // Two different ongoing prices on one page is a plan chooser, not a fact.
+    return found.size === 1 ? [...found.values()][0] : null;
+  };
+  const months = ['january','february','march','april','may','june','july','august','september','october','november','december'];
+  const iso = (year, month, day) =>
+    `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+  const renewalDate = () => {
+    const dates = new Set();
+    const named = months.join('|');
+    for (const sentence of text.split(/[.\n]/)) {
+      if (!/\b(then|thereafter|starting|starts|start|begins|beginning|renews|renewal|first charge|next charge|after (?:the )?(?:trial|free)|danach|luego|despu[ée]s|ensuite|a partir del|à partir du|ab dem)\b/iu.test(sentence)) continue;
+      for (const match of sentence.matchAll(/\b(\d{4})-(\d{2})-(\d{2})\b/g)) dates.add(iso(match[1], Number(match[2]), Number(match[3])));
+      for (const match of sentence.matchAll(new RegExp(`\\b(\\d{1,2})(?:st|nd|rd|th)?\\s+(${named})\\w*,?\\s+(\\d{4})\\b`, 'gi')))
+        dates.add(iso(match[3], months.indexOf(match[2].toLowerCase()) + 1, Number(match[1])));
+      for (const match of sentence.matchAll(new RegExp(`\\b(${named})\\w*\\s+(\\d{1,2})(?:st|nd|rd|th)?,?\\s+(\\d{4})\\b`, 'gi')))
+        dates.add(iso(match[3], months.indexOf(match[1].toLowerCase()) + 1, Number(match[2])));
+      // 11/25/2026 and 25/11/2026 are the same day only because 25 cannot be
+      // a month. 05/06/2026 could be either, so it is not a date here.
+      for (const match of sentence.matchAll(/\b(\d{1,2})[\/.](\d{1,2})[\/.](\d{4})\b/g)) {
+        const [first, second] = [Number(match[1]), Number(match[2])];
+        if ((first > 12) === (second > 12)) continue;
+        dates.add(first > 12 ? iso(match[3], second, first) : iso(match[3], first, second));
+      }
+    }
+    return dates.size === 1 ? [...dates][0] : null;
+  };
+  let renewal = {};
+  if (recurring) {
+    const price = renewalPrice();
+    if (price) {
+      const starts = renewalDate();
+      renewal = starts ? {...price, renewal_starts_on: starts} : price;
+    }
+  }
   globalThis.__bloomPayButton = pay[0];
-  return {origin:location.origin,payment_frame_origins:[],total_minor:total,currency,installments,recurring};
+  return {origin:location.origin,payment_frame_origins:[],total_minor:total,currency,installments,recurring,...renewal};
 })()
