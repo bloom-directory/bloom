@@ -19,6 +19,25 @@ in `docs/examples.md` before using an unfamiliar write surface. For Petal work,
 use `docs/petals.md` to discover installed packages, then read that package's
 `README.md` and `AGENTS.md` before using its routes.
 
+To find where an account's funds are, read
+`wallets/<wallet>/<n>/holdings.json`. It lists the account's non-zero native
+and well-known token balances on every configured chain; a chain that could
+not be read appears under `errors` instead. Tokens outside
+`chains/<chain>/addresses/<address>/tokens/known.json` are not checked.
+
+## When the request leaves something out
+
+Infer the wallet, account, chain and network from state, and ask only when
+the request is still ambiguous:
+
+- If there is only one wallet or account, use it.
+- If `holdings.json` shows the asset on only one chain, use that chain.
+- Use the chain a Petal documents as its default, and mainnet unless the
+  request names a testnet.
+- If two or more choices remain plausible, ask one question that names them.
+
+Report a failed or partially completed action as a failure, never as done.
+
 ## Authority and safety
 
 Machine exposes this VFS; Broker controls approval ceremonies and policy;

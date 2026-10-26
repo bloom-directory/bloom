@@ -26,6 +26,7 @@
 //! - `wallets/<wallet>/<n>/address.sol`                             — the account's Solana address, if it has a Solana key
 //! - `wallets/<wallet>/<n>/address.sol.qr.{svg,png}`                — scannable QR images of that address
 //! - `wallets/<wallet>/<n>/public_key`                              — canonical public key hex (EVM key, else Solana)
+//! - `wallets/<wallet>/<n>/holdings.json`                           — non-zero native and known-token balances on every chain
 //! - `wallets/<wallet>/<n>/chains/<chain>/{balance,balance.raw,balance.json}` — native balance of account n
 //! - `wallets/<wallet>/<n>/chains/<evm-chain>/nonce`
 //! - `wallets/<wallet>/<n>/chains/<evm-chain>/{pending_external.jsonl,nonce_conflicts.json}` — mempool views of account n's address
@@ -3338,6 +3339,11 @@ impl Handler for WalletsHandler {
     fn cache_ttl(&self, path: &VfsPath) -> Option<std::time::Duration> {
         // Chain leaves exist only under a numbered account.
         match path.segments() {
+            [_, number, leaf]
+                if parse_account_segment(number).is_some() && leaf == "holdings.json" =>
+            {
+                Some(super::balances::LIVE_BALANCE_TTL)
+            }
             [_, number, s, _, leaf]
                 if parse_account_segment(number).is_some()
                     && s == "chains"
@@ -10956,6 +10962,141 @@ value = "0""#,
             ),
             "wallet-root chains must be absent"
         );
+    }
+
+    /// An EVM node for chain id 1 holding no ETH and 2.5 USDC.
+    async fn spawn_usdc_only_evm_node() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let usdc = bloom_proto::tokens::for_chain(1)
+            .iter()
+            .find(|token| token.symbol == "USDC")
+            .unwrap()
+            .address
+            .to_ascii_lowercase();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let usdc = usdc.clone();
+                tokio::spawn(async move {
+                    let mut bytes = Vec::new();
+                    let mut chunk = [0; 4096];
+                    let request: serde_json::Value = loop {
+                        let len = socket.read(&mut chunk).await.unwrap_or(0);
+                        if len == 0 {
+                            return;
+                        }
+                        bytes.extend_from_slice(&chunk[..len]);
+                        if let Some((_, body)) =
+                            String::from_utf8_lossy(&bytes).split_once("\r\n\r\n")
+                            && let Ok(request) = serde_json::from_str(body)
+                        {
+                            break request;
+                        }
+                    };
+                    let word = |value: u64| format!("0x{value:064x}");
+                    let result = match request["method"].as_str().unwrap_or_default() {
+                        "eth_chainId" => serde_json::json!("0x1"),
+                        "eth_getBalance" => serde_json::json!("0x0"),
+                        "eth_call" => {
+                            let to = request["params"][0]["to"].as_str().unwrap_or_default();
+                            let held = if to.eq_ignore_ascii_case(&usdc) {
+                                2_500_000
+                            } else {
+                                0
+                            };
+                            serde_json::json!(word(held))
+                        }
+                        method => panic!("unexpected holdings RPC {method}"),
+                    };
+                    let body =
+                        serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":result})
+                            .to_string();
+                    let _ = socket.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await;
+                });
+            }
+        });
+        endpoint
+    }
+
+    /// `<n>/holdings.json` reads every chain the account lists: zero
+    /// balances are left out, known tokens are included, and a chain that
+    /// cannot be reached is recorded under `errors` instead of failing the
+    /// whole read.
+    #[tokio::test]
+    async fn holdings_list_nonzero_balances_and_record_unreachable_chains() {
+        let f = make_handler();
+        let chain = |name: &str, chain_id: u64, url: String| {
+            bloom_evm::ChainClient::new(bloom_proto::ChainSpec {
+                name: name.into(),
+                chain_id,
+                rpc_urls: vec![url],
+                rpc_endpoints: Vec::new(),
+                etherscan_api_url: None,
+                display_name: None,
+                native_symbol: "ETH".into(),
+                native_decimals: 18,
+                legacy_tx: false,
+                op_stack: false,
+            })
+            .unwrap()
+        };
+        f.handler
+            .chains
+            .add(chain("ethereum", 1, spawn_usdc_only_evm_node().await));
+        f.handler
+            .chains
+            .add(chain("arc", 5042002, "http://127.0.0.1:1".into()));
+        let accounts = vec![
+            derived_account(
+                bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1,
+                "m/44'/60'/0'/0/0",
+                0xaa,
+                &format!("{:#x}", f.wallet_addr),
+            ),
+            derived_account(
+                bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+                "m/44'/501'/0'/0'",
+                0xbb,
+                &bs58::encode([0xbb_u8; 32]).into_string(),
+            ),
+        ];
+        let handler = f
+            .handler
+            .clone()
+            .with_projection_reader(bip39_projection(f.wallet_addr, accounts))
+            .with_solana_reads(solana_read_registry(spawn_solana_node().await));
+        let w = &f.wallet_name;
+
+        let listed = handler.list(&vfs(format!("/{w}/0"))).await.unwrap();
+        assert!(listed.iter().any(|entry| entry.name == "holdings.json"));
+        let body = handler
+            .read(&vfs(format!("/{w}/0/holdings.json")))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let held: Vec<(&str, &str, &str)> = v["holdings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| {
+                (
+                    h["chain"].as_str().unwrap(),
+                    h["symbol"].as_str().unwrap(),
+                    h["display"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            held,
+            [
+                ("ethereum", "USDC", "2.5 USDC"),
+                ("solana-devnet", "SOL", "1.5 SOL"),
+            ],
+            "zero ETH and zero tokens must be omitted: {v}"
+        );
+        let errors = v["errors"].as_object().unwrap();
+        assert_eq!(errors.keys().collect::<Vec<_>>(), ["arc"], "{v}");
     }
 
     // ---- errno semantics -------------------------------------------------
