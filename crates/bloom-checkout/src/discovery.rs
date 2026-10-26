@@ -1858,6 +1858,41 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn cardholder_instructions_are_not_pre_payment_errors() {
+        let browser = browser().await;
+        for (markup, errors) in [
+            (
+                "<p>Please enter the full name exactly as it appears on the card</p>",
+                0,
+            ),
+            (
+                "<p role='alert'>Please enter the full name exactly as it appears on the card</p>",
+                1,
+            ),
+            (
+                "<p class='field-error'>Please enter the full name exactly as it appears on the card</p>",
+                1,
+            ),
+            ("<p>Please enter your passport number</p>", 1),
+        ] {
+            let (url, server) = fixture(format!(
+                "<label>Cardholder name<input autocomplete='cc-name'></label>{markup}"
+            ))
+            .await;
+            let _tab = open(&browser, url).await;
+            let attention = browser.page_attention().await.unwrap();
+            assert_eq!(
+                attention["errors"].as_array().unwrap().len(),
+                errors,
+                "{attention}"
+            );
+            assert_eq!(attention["invalid"], 0);
+            browser.return_control().await.unwrap();
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
     async fn airline_outcomes_read_booking_codes_and_requests_for_attention() {
         let browser = browser().await;
         // A synthetic merchant confirmation, not live JetSMART acceptance.

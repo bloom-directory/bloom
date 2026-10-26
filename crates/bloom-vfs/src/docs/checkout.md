@@ -65,6 +65,8 @@ tool for this checkout.
   card entry and recognizable payment submission through shopping controls.
 - A payment request is refused while the page shows form errors; take a
   snapshot, fix what it marks, and request again.
+- For a saved-card payment, select the shop's debit/credit-card option so
+  its card fields are visible before requesting payment approval.
 - Once checkout is ready, write `checkout/requests/<new-64-hex-id>/in.json`
   with `card_id` and `agent_description`. That description is shown as agent
   text, not verified purchase facts. Read `status.json`, forward its ceremony

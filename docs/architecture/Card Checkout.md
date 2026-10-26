@@ -34,6 +34,11 @@ every later checkout approval uses. Signer never persists a CVC.
 
 An agent writes `checkout/requests/<operation_id>/in.json`.
 
+For saved-card checkout, select the merchant's card option before requesting
+approval. Visible form errors block the request. Plain cardholder-entry hints
+do not count as failed validation; the same text marked as an alert or error,
+and fields marked invalid, still block it.
+
 | Request | Mode | What the approval binds | After approval |
 |---|---|---|---|
 | `card_id` | Card | origin, payment-frame origins, total, currency, installments, recurring, card | Signer releases card + CVC to the recipient key; checkout rechecks the facts, fills provider fields, submits once |

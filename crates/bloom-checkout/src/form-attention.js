@@ -12,9 +12,9 @@ globalThis.__bloomAttention = () => {
     .map(e => [e, e.textContent.replace(/\s+/g, ' ').trim()])
     // The site's request to re-enter contact details is an instruction, not an error.
     .filter(([e, t]) => t && t.length < 160 && !reentry.test(t) && (strong.test(t) || (weak.test(t) && errorish(e))))
-    // A plain required-fields legend is not a failed validation. Keep the
-    // same words when the merchant marks them as an alert or error.
-    .filter(([e, t]) => !/^all fields are required[.!]?$/i.test(t) || errorish(e))
+    // Plain legends and card-entry hints are not failed validation. Card
+    // fields are still empty before approval. Keep marked alerts/errors.
+    .filter(([e, t]) => !/^(?:all fields are required|please enter the full name exactly as it appears on the card)[.!]?$/i.test(t) || errorish(e))
     .map(([, t]) => t);
   const invalid = [...document.querySelectorAll('input[aria-invalid=true],select[aria-invalid=true],textarea[aria-invalid=true]')].filter(visible).length;
   const confirmContact = reentry.test(document.body.innerText);
