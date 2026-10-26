@@ -1512,7 +1512,9 @@ mod tests {
 
     #[tokio::test]
     async fn large_catalog_keeps_filters_private_fields_and_following_actions_usable() {
-        let rows = format!("<p>{}</p>", "x".repeat(1024)).repeat(4500);
+        // Text alone exceeds the pipe limit: platform accessibility trees
+        // differ in whether they repeat it in inline-text nodes.
+        let rows = format!("<p>{}</p>", "x".repeat(2048)).repeat(4500);
         let flights = (0..350)
             .map(|i| format!("<button onclick=\"this.textContent='Selected fixture {i}'\">Select fixture {i}</button>"))
             .collect::<String>();
