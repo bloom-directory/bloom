@@ -4742,7 +4742,7 @@ fn expected_evm_sign_operation_digest(
         TxEngineError::ApprovalState("active exact signing is missing its approval ID".into())
     })?;
     SignOperationIdentity {
-        session_accounting_digest: None,
+
         operation_id: state.signing_operation_id.clone(),
         approval_id,
         key_ref,
@@ -4936,7 +4936,7 @@ fn expected_evm_batch_sign_operation_digest(
         TxEngineError::ApprovalState("active exact batch is missing its approval ID".into())
     })?;
     SignOperationIdentity {
-        session_accounting_digest: None,
+
         operation_id: state.signing_operation_id.clone(),
         approval_id,
         key_ref,

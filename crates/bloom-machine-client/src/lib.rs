@@ -86,8 +86,6 @@ pub struct SignOperationIdentity {
     pub claim_assurance_digest: Option<Digest32>,
     pub policy_version: DecimalU64,
     pub policy_digest: Digest32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_accounting_digest: Option<Digest32>,
 }
 
 impl SignOperationIdentity {
@@ -688,7 +686,7 @@ impl MachineBrokerClient {
                 ),
             };
         let operation_digest = SignOperationIdentity {
-            session_accounting_digest: None,
+
             operation_id: operation_id.clone(),
             approval_id: approval_id.clone(),
             key_ref: key_ref.clone(),
@@ -915,7 +913,7 @@ impl MachineBrokerClient {
 
         if let Some(approval_id) = request.approval_id {
             let operation_digest = SignOperationIdentity {
-                session_accounting_digest: None,
+
                 operation_id: request.signing_operation_id.clone(),
                 approval_id: approval_id.clone(),
                 key_ref: key_ref.clone(),
@@ -1100,7 +1098,7 @@ impl MachineBrokerClient {
 
         if let Some(approval_id) = request.approval_id {
             let operation_digest = SignOperationIdentity {
-                session_accounting_digest: None,
+
                 operation_id: request.signing_operation_id.clone(),
                 approval_id: approval_id.clone(),
                 key_ref: key_ref.clone(),
@@ -1275,7 +1273,7 @@ impl MachineBrokerClient {
 
         if let Some(approval_id) = request.approval_id {
             let operation_digest = SignOperationIdentity {
-                session_accounting_digest: None,
+
                 operation_id: request.signing_operation_id.clone(),
                 approval_id: approval_id.clone(),
                 key_ref: key_ref.clone(),
@@ -3921,7 +3919,7 @@ mod tests {
             assert!(exact_sign_request.claim_assurance_evidence.is_none());
             assert_ne!(exact_sign_request.operation_id, reusable_operation_id);
             let expected_exact_digest = SignOperationIdentity {
-                session_accounting_digest: None,
+
                 operation_id: exact_sign_request.operation_id.clone(),
                 approval_id: digest(50),
                 key_ref: delegated_key_ref.clone(),

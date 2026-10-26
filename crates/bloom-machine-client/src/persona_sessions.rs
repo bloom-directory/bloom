@@ -667,9 +667,8 @@ impl MachineBrokerClient {
         };
         let terms = &record.proposal.terms;
         let approval_id = terms.approval_id()?;
-        let accounting = session_accounting(terms, claim, system_use)?;
         let operation_digest = SignOperationIdentity {
-            session_accounting_digest: Some(accounting.digest()),
+
             operation_id: operation_id.clone(),
             approval_id: approval_id.clone(),
             key_ref: key_ref.clone(),
