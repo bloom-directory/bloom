@@ -166,7 +166,13 @@ state. Their installed package documentation defines their mounted routes.
 - EVM transactions stage unsigned bytes, obtain approval when policy requires
   it, and use Broker/Signer for the final payload signature.
 - Paid HTTP stages the selected challenge and payment payload, then obtains any
-  required signature through Broker/Signer.
+  required signature through Broker/Signer. Solana x402 v2 exact USDC uses
+  the canonical account-0 Ed25519 key and a genesis-pinned configured RPC.
+  Machine builds a checked transfer and freezes its blockhash and nonce before
+  approval. Broker's existing exact selector binds the message bytes and key;
+  SPL transfer semantics are Machine-described, not Broker proof-verified.
+  Expired unsigned requests must be cancelled and restaged, while unresolved
+  payment attempts retain their existing receipt and cannot be resubmitted.
 - Installed Polymarket or Hyperliquid Petals use their package-defined mounted
   interface and generic Petal-scoped approval and sub-key mechanisms.
 - Policy update uses `policy.validate_update`, the shared `policy_update`

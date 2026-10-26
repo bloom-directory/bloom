@@ -35,6 +35,8 @@ use x402_types::proto::{self, OriginalJson};
 use x402_types::scheme::client::X402SchemeClient;
 use x402_types::util::Base64Bytes;
 
+mod solana;
+
 /// The `sign-hash` intent string every x402 host signature is authorized under.
 pub const X402_SIGN_INTENT: &str = "x402.sign";
 
@@ -55,6 +57,8 @@ pub struct X402SignContext<'a> {
     pub rpc_resolver: &'a dyn PaidHttpChainRpcResolver,
     /// EVM owner address of `wallet` (public; fills the x402 `from` field).
     pub wallet_address: Address,
+    /// Exact Solana account selected from the authenticated wallet projection.
+    pub solana_address: Option<&'a str>,
     /// Host signing seam. Signing is gated on a live paid-HTTP Sealed Approval
     /// grant and never exposes key material to this crate.
     pub host_signer: &'a Arc<dyn PaidHttpHostSigner>,
@@ -134,6 +138,14 @@ impl X402PaymentSigner for HostX402PaymentSigner {
         &self,
         ctx: &X402SignContext<'_>,
     ) -> Result<X402PaymentCredential, String> {
+        if ctx
+            .requirement
+            .network
+            .as_deref()
+            .is_some_and(|n| n.starts_with("solana:"))
+        {
+            return solana::sign(ctx).await;
+        }
         let payment_required = parse_payment_required(ctx.challenge)?;
         let observed_hash = Arc::new(Mutex::new(None));
         let adapter = DraftSigner {
@@ -783,6 +795,7 @@ mod tests {
                     requirement: &requirement,
                     rpc_resolver: &EmptyPaidHttpChainRpcResolver,
                     wallet_address: Address::repeat_byte(0x11),
+                    solana_address: None,
                     host_signer: &host_trait,
                     facts: &facts,
                     draft_path: &draft,
@@ -817,6 +830,7 @@ mod tests {
                 requirement: &requirement,
                 rpc_resolver: &EmptyPaidHttpChainRpcResolver,
                 wallet_address: Address::repeat_byte(0x11),
+                solana_address: None,
                 host_signer: &host_trait,
                 facts: &facts,
                 draft_path: &draft,
