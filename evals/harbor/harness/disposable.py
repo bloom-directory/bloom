@@ -122,9 +122,6 @@ class DisposableTriad:
     def read(self, path: str) -> Any:
         return json.loads(self.cli("vfs", "cat", path))
 
-    def write(self, path: str, body: str) -> None:
-        self.cli("vfs", "write", path, "--data", body)
-
     def fork_rpc(self, method: str, *params):
         if self.fork is None or not self.ethereum_rpc_url.startswith(
             "http://127.0.0.1:"
@@ -186,9 +183,7 @@ class DisposableTriad:
             f"{label} did not become ready within {timeout}s; logs: {self.root}"
         )
 
-    def start(
-        self, *, solana: bool = False, mount: bool = True, ethereum_fork: bool = False
-    ) -> None:
+    def start(self, *, solana: bool = False, ethereum_fork: bool = False) -> None:
         self.preflight()
         roots = Path(
             self.env.get(
@@ -202,7 +197,7 @@ class DisposableTriad:
         self.mount = Path(
             self.env.get("BLOOM_EVAL_MOUNTPOINT", str(self.root / "mount"))
         )
-        if mount and self.mount != self.root / "mount":
+        if self.mount != self.root / "mount":
             if (
                 not self.mount.is_absolute()
                 or self.mount.is_symlink()
@@ -331,9 +326,9 @@ class DisposableTriad:
             str(self.root / "ready"),
             "--ceremony-port",
             self.origin.rsplit(":", 1)[1],
+            "--mount",
+            str(self.mount),
         ]
-        if mount:
-            command.extend(["--mount", str(self.mount)])
         with (self.root / "launcher.log").open("wb") as log:
             self.launcher = subprocess.Popen(
                 command, env=self.env, stdout=log, stderr=subprocess.STDOUT
