@@ -85,6 +85,12 @@ tokens match whole words. Filtering changes merchant text, labels and values;
 protocol keys, control references, roles, types and frame origins remain exact.
 Before payment approval, verify the itinerary, party, extras and final total.
 
+Phone fill derives a country and calling code from the approved international
+number. A neighboring country selector is changed before entering national
+digits; the selector alone never counts as a filled phone. An ambiguous or
+unchanged conflicting code leaves the number for private input. No additional
+saved traveler fields are required.
+
 Public control projection removes styled layout containers with an ancestor
 walk, keeping large catalogs from triggering repeated scans of every control.
 Browser protocol replies remain bounded at 8 MiB. An oversized frame is drained

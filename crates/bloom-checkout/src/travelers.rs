@@ -38,6 +38,18 @@ pub(crate) fn derived_traveler_value(
             .map(|s| Zeroizing::new(s.to_owned()))
     };
     match field {
+        "phone_country" | "phone_calling_code" => {
+            let raw = values.get("phone")?;
+            if !raw.trim_start().starts_with('+') {
+                return None;
+            }
+            let number = phonenumber::parse(None, raw).ok()?;
+            Some(Zeroizing::new(if field == "phone_country" {
+                number.country().id()?.as_ref().to_owned()
+            } else {
+                number.country().code().to_string()
+            }))
+        }
         "phone_national" => {
             let digits: String = values
                 .get("phone")?
@@ -251,7 +263,13 @@ impl TravelerDiscovery {
         values: &BTreeMap<String, Zeroizing<String>>,
     ) -> Result<Vec<String>> {
         let expected = self.field_names();
-        let derived = ["phone_national", "phone_area", "phone_local"];
+        let derived = [
+            "phone_national",
+            "phone_area",
+            "phone_local",
+            "phone_country",
+            "phone_calling_code",
+        ];
         let mut values = values.clone();
         if values.contains_key("phone") {
             for field in derived {
@@ -870,6 +888,122 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(shown, json!("7"));
+        server.abort();
+    }
+    #[tokio::test]
+    async fn a_phone_country_list_uses_the_saved_international_number() {
+        // The country is shown in a placeholder, as on Jettzy. An unrelated
+        // US option already on the page must not be mistaken for this list.
+        let (browser, server, _) = browser_at(
+            "<div role='option'>United States of America</div>
+             <div><input id='country' readonly placeholder='60 Malaysia' aria-label='Calling code'>
+             <div id='countries' hidden><div role='option' id='us'>1 United States of America</div>
+             <div role='option'>1 Canada</div></div>
+             <input id='phone' type='tel' aria-label='Phone' pattern='[0-9]{10}'></div>
+             <script>country.onclick=()=>countries.hidden=false;
+             us.onclick=()=>{country.placeholder='1 United States of America';countries.hidden=true;};</script>",
+        )
+        .await;
+        let tab = browser.handoff().await.unwrap();
+        let discovery = TravelerDiscovery::read(&tab, &[TravelerField::Phone])
+            .await
+            .unwrap();
+        let values = [(
+            "phone".to_owned(),
+            Zeroizing::new("+12025550123".to_owned()),
+        )]
+        .into_iter()
+        .collect();
+        assert_eq!(discovery.fill(&tab, &values).await.unwrap(), ["phone"]);
+        assert_eq!(
+            tab.cdp
+                .evaluate(&tab.session, "[country.placeholder,phone.value]".into())
+                .await
+                .unwrap(),
+            json!(["1 United States of America", "2025550123"])
+        );
+        server.abort();
+    }
+    #[tokio::test]
+    async fn a_native_phone_country_select_uses_the_saved_number() {
+        let (browser, server, _) = browser_at(
+            "<div><select id='country' aria-label='Calling code'>
+             <option value='MY'>Malaysia (+60)</option><option value='US'>United States (+1)</option>
+             <option value='CA'>Canada (+1)</option></select>
+             <input id='phone' type='tel' aria-label='Phone' pattern='[0-9]{10}'></div>",
+        ).await;
+        let tab = browser.handoff().await.unwrap();
+        let discovery = TravelerDiscovery::read(&tab, &[TravelerField::Phone])
+            .await
+            .unwrap();
+        let values = [(
+            "phone".to_owned(),
+            Zeroizing::new("+12025550123".to_owned()),
+        )]
+        .into_iter()
+        .collect();
+        assert_eq!(discovery.fill(&tab, &values).await.unwrap(), ["phone"]);
+        assert_eq!(
+            tab.cdp
+                .evaluate(&tab.session, "[country.value,phone.value]".into())
+                .await
+                .unwrap(),
+            json!(["US", "2025550123"])
+        );
+        server.abort();
+    }
+    #[tokio::test]
+    async fn an_ambiguous_phone_prefix_does_not_receive_a_number() {
+        let (browser, server, _) = browser_at(
+            "<div><input readonly value='Malaysia (+60)'><input readonly value='Canada (+1)'>
+             <input id='phone' type='tel' aria-label='Phone'></div>",
+        )
+        .await;
+        let tab = browser.handoff().await.unwrap();
+        let discovery = TravelerDiscovery::read(&tab, &[TravelerField::Phone])
+            .await
+            .unwrap();
+        let values = [(
+            "phone".to_owned(),
+            Zeroizing::new("+12025550123".to_owned()),
+        )]
+        .into_iter()
+        .collect();
+        assert!(discovery.fill(&tab, &values).await.unwrap().is_empty());
+        assert_eq!(
+            tab.cdp
+                .evaluate(&tab.session, "phone.value".into())
+                .await
+                .unwrap(),
+            json!("")
+        );
+        server.abort();
+    }
+    #[tokio::test]
+    async fn an_editable_fixed_phone_prefix_is_left_for_private_input() {
+        let (browser, server, _) = browser_at(
+            "<div><input id='prefix' value='Malaysia (+60)'>
+             <input id='phone' type='tel' aria-label='Phone'></div>",
+        )
+        .await;
+        let tab = browser.handoff().await.unwrap();
+        let discovery = TravelerDiscovery::read(&tab, &[TravelerField::Phone])
+            .await
+            .unwrap();
+        let values = [(
+            "phone".to_owned(),
+            Zeroizing::new("+12025550123".to_owned()),
+        )]
+        .into_iter()
+        .collect();
+        assert!(discovery.fill(&tab, &values).await.unwrap().is_empty());
+        assert_eq!(
+            tab.cdp
+                .evaluate(&tab.session, "[prefix.value,phone.value]".into())
+                .await
+                .unwrap(),
+            json!(["Malaysia (+60)", ""])
+        );
         server.abort();
     }
     #[tokio::test]

@@ -5,9 +5,34 @@
   const filled = [], skipped = [];
   // A site list that does not take the value is left for the agent's type_traveler.
   class Skip extends Error {}
+  const shownValue = e => e.tagName === 'SELECT' ? e.selectedOptions[0]?.text || ''
+    : e.value || e.getAttribute('placeholder') || e.getAttribute('aria-label') || '';
+  const callingCode = e => {
+    const text = shownValue(e).trim();
+    return text.match(/^\+?(\d{1,3})\s+\p{L}/u)?.[1]
+      || text.match(/\(\+?(\d{1,3})\)/)?.[1]
+      || text.match(/^\+(\d{1,3})$/)?.[1];
+  };
+  const phonePrefix = e => {
+    for (let a = e.parentElement, depth = 0; a && depth < 4; a = a.parentElement, depth++) {
+      const fields = [...a.querySelectorAll('input,select')].filter(o => o !== e && !o.disabled
+        && o.getClientRects().length && callingCode(o));
+      if (fields.length) return fields;
+    }
+    return [];
+  };
   // Date widgets may clear the day when the month or year changes: day last.
   const dateDay = m => ['born_on','document_expiry'].includes(m.field) && m.part === 'day';
-  const order = [...mapped.filter(m => !dateDay(m)), ...mapped.filter(dateDay)];
+  const order = [...mapped.filter(m => !dateDay(m)), ...mapped.filter(dateDay)].flatMap(m => {
+    if (m.field !== 'phone' || !values.phone_country || !values.phone_calling_code) return [m];
+    const prefixes = phonePrefix(binding.refs[m.index]);
+    if (prefixes.length !== 1) return [m];
+    const prefix = prefixes[0];
+    if (callingCode(prefix) === values.phone_calling_code) return [m];
+    const index = binding.refs.push(prefix) - 1;
+    return [{field:'phone',part:'country',index,
+      choice:prefix.tagName === 'INPUT' && (prefix.readOnly || prefix.getAttribute('role') === 'combobox')}, m];
+  });
   for (const mapping of order) {
   try {
     const e=binding.refs[mapping.index];
@@ -23,6 +48,12 @@
     if (typeof value !== 'string') throw Error('Traveler field unavailable');
     (globalThis.__bloomPrivateFields ||= new WeakMap()).set(e, mapping.field + (mapping.part ? '_' + mapping.part : ''));
     let aliases = [value];
+    if (mapping.field === 'phone' && mapping.part !== 'country' && values.phone_calling_code) {
+      const prefixes = phonePrefix(e);
+      if (prefixes.length > 1) throw new Skip('phone calling code is ambiguous');
+      if (prefixes.length && callingCode(prefixes[0]) !== values.phone_calling_code)
+        throw new Skip('phone calling code does not match');
+    }
     if (['born_on','document_expiry'].includes(mapping.field) && mapping.part) {
       value = String(Number(value.slice(mapping.part === 'year' ? 0 : mapping.part === 'month' ? 5 : 8,
         mapping.part === 'year' ? 4 : mapping.part === 'month' ? 7 : 10)));
@@ -34,21 +65,21 @@
     }
     if (mapping.field === 'gender') aliases.push(...(value === 'female' ? ['F','Femenino','Mujer'] : value === 'male' ? ['M','Masculino','Hombre'] : ['Unspecified','No especificado']));
     if (mapping.field === 'document_kind') aliases.push(...(value === 'passport' ? ['Passport','Pasaporte'] : ['National ID','DNI','Documento nacional']));
-    if (mapping.field === 'phone' && mapping.part) {
+    if (mapping.field === 'phone' && mapping.part === 'country') {
+      if (e.tagName !== 'SELECT' && !mapping.choice) throw new Skip('phone calling code needs private input');
+      value = values.phone_country;
+      aliases = [value, new Intl.DisplayNames([document.documentElement.lang || 'en'],{type:'region'}).of(value)];
+    } else if (mapping.field === 'phone' && mapping.part) {
       value = mapping.part === 'area' ? values.phone_area : values.phone_local;
       if (typeof value !== 'string' || value === '') throw new Skip('phone saved without an area code group');
       aliases = [value];
     } else if (mapping.field === 'phone' && typeof values.phone_national === 'string') {
-      // A country prefix shown by a neighbouring field ("Argentina (+54)")
-      // means the number goes in without it. The split was made in checkout.
-      for (let a = e.parentElement, depth = 0; a && depth < 4; a = a.parentElement, depth++) {
-        const shown = [...a.querySelectorAll('input,select')].filter(o => o !== e)
-          .map(o => o.tagName === 'SELECT' ? o.selectedOptions[0]?.text : o.value).join(' ') + ' ' + a.innerText;
-        if (/\(\+?\d{1,3}\)|\+\d{1,3}\b/.test(shown)) {
-          value = values.phone_national;
-          aliases = [value];
-          break;
-        }
+      const [prefix] = phonePrefix(e);
+      if (prefix) {
+        if (values.phone_calling_code && callingCode(prefix) !== values.phone_calling_code)
+          throw new Skip('phone calling code does not match');
+        value = values.phone_national;
+        aliases = [value];
       }
     }
     const spanish = /^es/i.test(document.documentElement.lang || navigator.language);
@@ -66,7 +97,7 @@
       // The site draws its own list. Open it (read-only input) or filter it by
       // typing the name (editable input), then click the one new option naming
       // this value; options already on the page, like a country menu, never count.
-      let typed = ['born_on','document_expiry'].includes(mapping.field) ? value : ['nationality','document_country'].includes(mapping.field) ? aliases.at(-1)
+      let typed = ['born_on','document_expiry'].includes(mapping.field) ? value : ['nationality','document_country'].includes(mapping.field) || mapping.part === 'country' ? aliases.at(-1)
         : mapping.field === 'document_kind' ? (value === 'passport' ? (spanish ? 'Pasaporte' : 'Passport') : (spanish ? 'DNI' : 'National ID'))
         : value === 'female' ? (spanish ? 'Femenino' : 'Female') : value === 'male' ? (spanish ? 'Masculino' : 'Male') : value;
       const names = o => [o.dataset.testValue, o.dataset.value, o.getAttribute('value'), o.innerText].filter(t => t != null).map(normalize);
@@ -84,7 +115,7 @@
         return found.some(optionLike) ? found.filter(optionLike) : found;
       };
       // A read-only list may already sit in the page, hidden or clipped.
-      const before = new Set(e.readOnly || mapping.listOpen ? [] : candidates());
+      const before = new Set(mapping.part !== 'country' && (e.readOnly || mapping.listOpen) ? [] : candidates());
       // A month list may use numbers or names: try the number, then the name.
       // listOpen: checkout already opened the list with a real click.
       const attempts = mapping.listOpen ? [null] : e.readOnly ? [typed] : mapping.part === 'month' ? [typed, aliases.at(-1)]
@@ -145,9 +176,12 @@
       const closed = !option.isConnected || !option.getClientRects().length;
       // A field may show the option's code ("PAS" for "PAS - Pasaporte").
       const abbreviated = taken.length > 1 && chosen.startsWith(taken) && /^\W/.test(chosen.slice(taken.length));
-      if ((!e.readOnly && !closed) || (!aliases.some(a => normalize(a) === taken) && taken !== chosen && !abbreviated && !shownBeside)) throw new Skip('not taken by the field');
+      const phoneCountryTaken = mapping.part === 'country' && callingCode(e) === values.phone_calling_code;
+      if ((!e.readOnly && !closed) || (!phoneCountryTaken && !aliases.some(a => normalize(a) === taken) && taken !== chosen && !abbreviated && !shownBeside)) throw new Skip('not taken by the field');
     } else if (e.tagName === 'SELECT') {
-      const matches = [...e.options].filter(o=>!o.disabled && aliases.some(a=>normalize(a)===normalize(o.value) || normalize(a)===normalize(o.text)));
+      const matches = [...e.options].filter(o=>!o.disabled && aliases.some(a=>normalize(a)===normalize(o.value) || normalize(a)===normalize(o.text)
+        || (mapping.part === 'country' && normalize(a).length > 2
+          && normalize(o.text).replace(/^\+?\d{1,3}\s+|\s*\(\+?\d{1,3}\)$/g,'') === normalize(a))));
       if (matches.length !== 1) throw Error('Traveler choice needs private input');
       Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value').set.call(e,matches[0].value);
       e.dispatchEvent(new Event('input',{bubbles:true}));
@@ -166,7 +200,7 @@
     if (document.activeElement === e) e.blur();
     await new Promise(r => setTimeout(r, 25));
     if (!e.checkValidity() || e.getAttribute('aria-invalid') === 'true') throw new Skip('field rejected by page');
-    filled.push(mapping.field);
+    if (mapping.part !== 'country') filled.push(mapping.field);
   } catch (error) {
     if (!(error instanceof Skip)) throw error;
     const e = binding.refs[mapping.index];
