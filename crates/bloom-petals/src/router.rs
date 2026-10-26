@@ -686,12 +686,15 @@ impl Handler for PetalRouter {
         if rest.is_empty() || rest == LAST_ERROR || Self::is_petal_document(&rest) {
             return Err(HandlerError::PermissionDenied);
         }
+        // dispatch_error drops a -2 message, so keep the Petal's own reason.
+        let mut reason = String::new();
         let result = match self
             .dispatch(mount, DispatchOp::Write, rest.clone(), data.to_vec())
             .await
         {
             Ok(DispatchResponse::Write) => Ok(()),
             Ok(DispatchResponse::Error { code, message }) => {
+                reason.clone_from(&message);
                 Err(dispatch_error(code, message, path.to_string_path()))
             }
             Ok(other) => Err(unexpected_response("write", other)),
@@ -704,7 +707,7 @@ impl Handler for PetalRouter {
                     mount.to_owned(),
                     serde_json::to_vec_pretty(&serde_json::json!({
                         "path": rest,
-                        "error": error.to_string(),
+                        "error": if reason.is_empty() { error.to_string() } else { reason },
                     }))
                     .unwrap_or_default(),
                 ),
@@ -1824,15 +1827,13 @@ name = "example"
                 .unwrap()
         ));
 
+        // A -2 refusal reaches the mount as a bare EACCES; its reason must survive.
         let error = vfs.write(&failing, b"payload").await.unwrap_err();
-        assert!(
-            error.to_string().contains("component route write"),
-            "unexpected write error: {error}"
-        );
+        assert!(matches!(error, HandlerError::PermissionDenied), "{error}");
         let record: serde_json::Value =
             serde_json::from_slice(&vfs.read(&last_error).await.unwrap()).unwrap();
         assert_eq!(record["path"], "operations/alice/0/submit");
-        assert_eq!(record["error"], error.to_string());
+        assert_eq!(record["error"], crate::package::route_fixtures::DENY_REASON);
         assert_eq!(vfs.lookup(&last_error).await.unwrap().mode, 0o444);
         assert!(listed(
             vfs.list(&VfsPath::parse("/petals/example").unwrap())

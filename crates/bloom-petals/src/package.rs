@@ -4493,6 +4493,7 @@ pub(crate) mod route_fixtures {
     const WRITE_RESULT: u32 = 1408;
     const EMPTY_LIST_PTR: u32 = 2048;
     const ENTRY_NAME: &str = "alice";
+    pub(crate) const DENY_REASON: &str = "approval required";
     pub(crate) const LOOKUP_ENTRY_SIZE: u64 = 7;
 
     /// Builds a directory (`$index`) route component whose `metadata`
@@ -4567,8 +4568,7 @@ pub(crate) mod route_fixtures {
     }
 
     /// Builds a writable route which advertises asynchronous writes but
-    /// traps from its write handler. This exercises error propagation at the
-    /// VFS/router boundary without depending on a host capability failure.
+    /// refuses every write with `denied(DENY_REASON)`.
     pub(crate) fn async_failing_write_route_component() -> Vec<u8> {
         build_dynamic_dir_route_component(
             false,
@@ -4606,7 +4606,7 @@ pub(crate) mod route_fixtures {
         side_effecting_read: bool,
         include_list: bool,
         write_async: bool,
-        trap_write: bool,
+        deny_write: bool,
         file_route: bool,
     ) -> Vec<u8> {
         // String table for the metadata cap names and the lookup entry name.
@@ -4618,6 +4618,8 @@ pub(crate) mod route_fixtures {
         }
         let name_ptr = STRINGS_BASE + strings.len() as u32;
         strings.extend_from_slice(ENTRY_NAME.as_bytes());
+        let reason_ptr = STRINGS_BASE + strings.len() as u32;
+        strings.extend_from_slice(DENY_REASON.as_bytes());
         let caps_array = (STRINGS_BASE + strings.len() as u32 + 3) & !3;
         let mut caps_array_bytes = Vec::new();
         for (ptr, len) in &cap_locs {
@@ -4650,7 +4652,13 @@ pub(crate) mod route_fixtures {
         // with empty ok lists, and result<_, route-error> ok.
         let mut empty_list = vec![0u8; 16];
         empty_list[4..8].copy_from_slice(&EMPTY_LIST_PTR.to_le_bytes());
-        let write = vec![0u8; 16];
+        let mut write = vec![0u8; 16];
+        if deny_write {
+            write[0] = 1; // err
+            write[4] = 2; // route-error case "denied"
+            write[8..12].copy_from_slice(&reason_ptr.to_le_bytes());
+            write[12..16].copy_from_slice(&(DENY_REASON.len() as u32).to_le_bytes());
+        }
 
         let store_import = if import_store {
             r#"
@@ -4712,13 +4720,6 @@ pub(crate) mod route_fixtures {
             r#"(alias core export $main-instance "list" (core func $core-list))"#
         } else {
             ""
-        };
-        let core_write_func = if trap_write {
-            r#"(func $write (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)
-      unreachable)"#
-        } else {
-            r#"(func $write (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)
-      i32.const 1408)"#
         };
         let component_list_export = if include_list {
             r#"(type $entry-list (list $entry-import))
@@ -4789,7 +4790,8 @@ pub(crate) mod route_fixtures {
     {core_list_func}
     (func $read (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)
       i32.const {READ_RESULT})
-    {core_write_func}
+    (func $write (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)
+      i32.const 1408)
     (export "memory" (memory 0))
     (export "cabi_realloc" (func $realloc))
     (export "metadata" (func $metadata))
