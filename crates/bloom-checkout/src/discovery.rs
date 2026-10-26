@@ -1264,6 +1264,22 @@ pub(crate) mod tests {
         };
         let cases = [
             (
+                lines("de-DE", "", &["Gesamtsumme", "Zwischensumme", "€ 99,99", "Zu zahlender Betrag", "€ 99,99"], "Bezahlen"),
+                Some((9999, "EUR")),
+            ),
+            (
+                lines("de-DE", "", &["Gesamtsumme", "€ 100,99", "Zu zahlender Betrag", "€ 99,99"], "Bezahlen"),
+                None,
+            ),
+            (
+                lines("de-DE", "", &["Gesamtsumme EUR", "Zwischensumme", "€ 99,99", "Zu zahlender Betrag", "€ 99,99"], "Bezahlen"),
+                None,
+            ),
+            (
+                lines("de-DE", "", &["Gesamtsumme", "Zwischensumme", "€ 99,99", "Zu zahlender Betrag"], "Bezahlen"),
+                None,
+            ),
+            (
                 lines(
                     "de-CH",
                     "",

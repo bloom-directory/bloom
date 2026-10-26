@@ -8,7 +8,7 @@
   const dollars = new Set(['USD','CAD','MXN','ARS','CLP','COP','UYU','AUD','NZD','SGD','HKD']);
   const currencyToken = /US\$|U\$S|USD\$|HK\$|₺|Türk Lirası|Norske kroner|Forint|Ft|R\$|CA\$|C\$|MX\$|AR\$|CLP\$|COL\$|\$U|S\/\.?|SFr\.?|Fr\.|zł|[€£$]|(?<!\p{L})[A-Z]{3}(?!\p{L})/gu;
   // Zalando renders "Gesamtsumme" and "inkl. MwSt." with no space between.
-  const label = /^(precio total final|montant à payer|importo totale|precio total|total a pagar|total final|gesamtsumme\s*inkl\.\s*mwst\.|total à payer|importe total|montant total|total payment due|total amount due|total amount|total to pay|amount to pay|ödenecek miktar|số tiền cần thanh toán|tổng cộng|beløp å betale|fizetendő összeg|paying|gesamtbetrag|totaalbedrag|grand total|order total|monto total|valor total|gesamtsumme|gesamtpreis|amount due|te betalen|do zapłaty|total due|total ttc|endbetrag|zu zahlen|totale|gesamt|totaal|total|summe|razem|suma)(?![\p{L}\p{N}])/iu;
+  const label = /^(precio total final|montant à payer|importo totale|precio total|total a pagar|total final|gesamtsumme\s*inkl\.\s*mwst\.|total à payer|importe total|montant total|total payment due|total amount due|total amount|total to pay|amount to pay|zu zahlender betrag|ödenecek miktar|số tiền cần thanh toán|tổng cộng|beløp å betale|fizetendő összeg|paying|gesamtbetrag|totaalbedrag|grand total|order total|monto total|valor total|gesamtsumme|gesamtpreis|amount due|te betalen|do zapłaty|total due|total ttc|endbetrag|zu zahlen|totale|gesamt|totaal|total|summe|razem|suma)(?![\p{L}\p{N}])/iu;
   // An amount line holds only currency marks, digits, separators and spacing.
   const amountOnly = line => !/\p{L}/u.test(line.replace(/\([^)]*\)/g, '').replace(currencyToken, ''));
   const declared = () => {
@@ -78,7 +78,8 @@
       const rest = lines[i].slice(match[0].length).replace(/\([^)]*\)/g, '').replace(/^[\s:]+/, '');
       // A price-breakdown heading has no amount of its own. Keep the actual
       // labelled totals below it, including their disagreement checks.
-      if (!rest && /^total amount\s*:?$/i.test(lines[i]) && /^subtotal/i.test(lines[i + 1] || '')) continue;
+      if (!rest && ((/^total amount\s*:?$/i.test(lines[i]) && /^subtotal/i.test(lines[i + 1] || '')) ||
+          (/^gesamtsumme\s*:?$/i.test(lines[i]) && /^zwischensumme/i.test(lines[i + 1] || '')))) continue;
       if (!amountOnly(rest)) continue;
       const segment = [rest];
       // Take the amount from the next lines, then at most one currency line
