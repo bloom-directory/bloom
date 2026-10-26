@@ -1,6 +1,6 @@
 # Default Petal agent baseline
 
-in progress: 21 of 24 pairs manually reviewed. Every listed trajectory was manually reviewed after exact-path permission.
+in progress: 22 of 24 pairs manually reviewed. Every listed trajectory was manually reviewed after exact-path permission.
 
 | Task | Agent | Assessed/raw reward | Tool calls | Bloom R/W/? | Input/cache tokens | Output/reasoning/combined | Harbor/total seconds |
 | --- | --- | --- | ---: | --- | --- | --- | --- |
@@ -25,6 +25,7 @@ in progress: 21 of 24 pairs manually reviewed. Every listed trajectory was manua
 | polymarket-clarification | codex | 0.0/0.0 | 14 | 11/2/2 | 494627/443904 | 4223/unknown/unknown | 174.76/233.78 |
 | polymarket-clarification | claude | 1.0/1.0 | 13 | 13/0/0 | 533128/497702 | 4265/unknown/unknown | 112.62/167.67 |
 | polymarket-clarification | opencode | 1.0/1.0 | 35 | 27/0/4 | 703127/641536 | 3800/8496/12296 | 172.72/204.84 |
+| near-intents-clarification | codex | 0.0/0.0 | 8 | 8/0/0 | 236201/207616 | 2210/unknown/unknown | 115.22/182.52 |
 
 Tool calls are the common denominator; categories count identifiable attempted calls and can overlap. `?` means Bloom calls with unclassified access. Input includes cached input; cache is shown separately, not added again. Raw usage is preserved in [the JSON](2026-10-25.json). Separate reasoning is reported only where observed through the OpenCode adapter; unknown is not zero. Provider token accounting may differ. Assessed/raw values retain historical grading corrections.
 
@@ -51,6 +52,7 @@ Tool calls are the common denominator; categories count identifiable attempted c
 - **polymarket-clarification/codex** (`polymarket-clarification-77a2112__gQepubv`): Did not ask which market; pursued onboarding, venue enablement and a pending wallet policy approval instead. Discovery/onboarding guidance displaced missing-market clarification and created work before selection.
 - **polymarket-clarification/claude** (`polymarket-clarification-1e13d2b__LARWaFc`): Asked which market without staging, but only after broad account/onboarding/balance discovery; final added setup/funding discussion before the user selected a market.
 - **polymarket-clarification/opencode** (`polymarket-clarification-1d2f9db__btyhUpp`): Eventually asked which market without staging, after broad account/onboarding/search, unrelated environment/log discovery and enumerating cached markets. Missing-market question was delayed by discovery friction.
+- **near-intents-clarification/codex** (`near-intents-clarification-ea45d__GQMjfzo`): Treated destination Arbitrum as the origin and requested Arbitrum configuration instead of asking which chain holds the input USDC; origin/destination discovery failed after8reads.
 
 ## Proposed follow-up PRs
 
