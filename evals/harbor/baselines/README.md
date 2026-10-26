@@ -1,6 +1,6 @@
 # Default Petal agent baseline
 
-in progress: 18 of 24 pairs manually reviewed. Every listed trajectory was manually reviewed after exact-path permission.
+in progress: 21 of 24 pairs manually reviewed. Every listed trajectory was manually reviewed after exact-path permission.
 
 | Task | Agent | Assessed/raw reward | Tool calls | Bloom R/W/? | Input/cache tokens | Output/reasoning/combined | Harbor/total seconds |
 | --- | --- | --- | ---: | --- | --- | --- | --- |
@@ -22,6 +22,9 @@ in progress: 18 of 24 pairs manually reviewed. Every listed trajectory was manua
 | hyperliquid-clarification | codex | 0.0/0.0 | 16 | 7/0/0 | 728061/658176 | 4472/unknown/unknown | 229.17/354.71 |
 | hyperliquid-clarification | claude | 0.0/0.0 | 16 | 16/0/0 | 825892/788501 | 5034/unknown/unknown | 137.02/204.75 |
 | hyperliquid-clarification | opencode | 0.0/0.0 | 48 | 38/0/2 | 1311508/1238912 | 4757/9720/14477 | 263.85/320.31 |
+| polymarket-clarification | codex | 0.0/0.0 | 14 | 11/2/2 | 494627/443904 | 4223/unknown/unknown | 174.76/233.78 |
+| polymarket-clarification | claude | 1.0/1.0 | 13 | 13/0/0 | 533128/497702 | 4265/unknown/unknown | 112.62/167.67 |
+| polymarket-clarification | opencode | 1.0/1.0 | 35 | 27/0/4 | 703127/641536 | 3800/8496/12296 | 172.72/204.84 |
 
 Tool calls are the common denominator; categories count identifiable attempted calls and can overlap. `?` means Bloom calls with unclassified access. Input includes cached input; cache is shown separately, not added again. Raw usage is preserved in [the JSON](2026-10-25.json). Separate reasoning is reported only where observed through the OpenCode adapter; unknown is not zero. Provider token accounting may differ. Assessed/raw values retain historical grading corrections.
 
@@ -45,11 +48,14 @@ Tool calls are the common denominator; categories count identifiable attempted c
 - **hyperliquid-clarification/codex** (`hyperliquid-clarification-2fec02__aVtTsBf`): Assumed mainnet, inspected account/market and external schema instead of asking mainnet versus testnet, then requested funding only. Missing network remained unresolved; discovery and balance checks inflated16calls.
 - **hyperliquid-clarification/claude** (`hyperliquid-clarification-3a89a3__xFRrfbV`): Recognized mainnet/testnet routes but inspected mainnet balances and policy instead of asking which network; final offered funding/policy changes or another account. Missing network remained unresolved after16readcalls.
 - **hyperliquid-clarification/opencode** (`hyperliquid-clarification-53ce98__d8yGiBb`): Inspected both networks, balances, unrelated chains and external source across48calls, then asked only for funding instead of mainnet versus testnet. Missing network remained unresolved; broad discovery consumed263.85s.
+- **polymarket-clarification/codex** (`polymarket-clarification-77a2112__gQepubv`): Did not ask which market; pursued onboarding, venue enablement and a pending wallet policy approval instead. Discovery/onboarding guidance displaced missing-market clarification and created work before selection.
+- **polymarket-clarification/claude** (`polymarket-clarification-1e13d2b__LARWaFc`): Asked which market without staging, but only after broad account/onboarding/balance discovery; final added setup/funding discussion before the user selected a market.
+- **polymarket-clarification/opencode** (`polymarket-clarification-1d2f9db__btyhUpp`): Eventually asked which market without staging, after broad account/onboarding/search, unrelated environment/log discovery and enumerating cached markets. Missing-market question was delayed by discovery friction.
 
 ## Proposed follow-up PRs
 
 1. Publish complete request schemas and units at writable leaves. HL action envelopes, NEAR base units and PM GTC fields required guessing or external source discovery.
 2. Surface rejected mounted writes and their durable result. Successful-looking writes left no proposal or actionable error, triggering repeated probes and false onboarding diagnoses; coordinate with [the separate VFS fix](https://github.com/bloom-directory/bloom/pull/370).
-3. Explain approval scope and validate signing inputs before owner review. The HL Petal accepted a years-stale nonce; exact approval was misreported as reusable, and NEAR session transitions made an extra approval request easy to initiate.
+3. Make missing chain/network/market selection precede defaults and balance scans. Solana and all Hyperliquid clarification failures show funding/schema discovery replacing the required question or consuming the deadline.
 
-Infrastructure interruptions are retained separately in the JSON, including any partial model actions; they are not completed scored pairs.
+The JSON separately retains two zero-model-action provisioning/startup attempts and one authentication interruption after 14 reads. They are not completed capability pairs; the partial actions are preserved, not treated as a zero-action startup.
