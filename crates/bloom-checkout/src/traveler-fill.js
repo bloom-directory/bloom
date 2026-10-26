@@ -21,6 +21,13 @@
     }
     return [];
   };
+  const fixedPhoneCode = e => {
+    for (let a = e.parentElement, depth = 0; a && depth < 4; a = a.parentElement, depth++) {
+      const codes = [...new Set([...a.innerText.matchAll(/\(\+?(\d{1,3})\)|\+(\d{1,3})\b/g)]
+        .map(m => m[1] || m[2]))];
+      if (codes.length) return codes.length === 1 ? codes[0] : 'ambiguous';
+    }
+  };
   // Date widgets may clear the day when the month or year changes: day last.
   const dateDay = m => ['born_on','document_expiry'].includes(m.field) && m.part === 'day';
   const order = [...mapped.filter(m => !dateDay(m)), ...mapped.filter(dateDay)].flatMap(m => {
@@ -53,6 +60,8 @@
       if (prefixes.length > 1) throw new Skip('phone calling code is ambiguous');
       if (prefixes.length && callingCode(prefixes[0]) !== values.phone_calling_code)
         throw new Skip('phone calling code does not match');
+      if (!prefixes.length && fixedPhoneCode(e) && fixedPhoneCode(e) !== values.phone_calling_code)
+        throw new Skip('phone calling code does not match');
     }
     if (['born_on','document_expiry'].includes(mapping.field) && mapping.part) {
       value = String(Number(value.slice(mapping.part === 'year' ? 0 : mapping.part === 'month' ? 5 : 8,
@@ -75,8 +84,8 @@
       aliases = [value];
     } else if (mapping.field === 'phone' && typeof values.phone_national === 'string') {
       const [prefix] = phonePrefix(e);
-      if (prefix) {
-        if (values.phone_calling_code && callingCode(prefix) !== values.phone_calling_code)
+      if (prefix || fixedPhoneCode(e)) {
+        if (prefix && values.phone_calling_code && callingCode(prefix) !== values.phone_calling_code)
           throw new Skip('phone calling code does not match');
         value = values.phone_national;
         aliases = [value];

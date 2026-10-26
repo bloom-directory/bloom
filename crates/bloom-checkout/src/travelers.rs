@@ -1007,6 +1007,37 @@ mod tests {
         server.abort();
     }
     #[tokio::test]
+    async fn a_fixed_text_phone_prefix_must_match_the_saved_number() {
+        for (code, expected) in [("+1", "2025550123"), ("+60", "")] {
+            let (browser, server, _) = browser_at(&format!(
+                "<div><span>{code}</span><input id='phone' type='tel' aria-label='Phone'></div>"
+            ))
+            .await;
+            let tab = browser.handoff().await.unwrap();
+            let discovery = TravelerDiscovery::read(&tab, &[TravelerField::Phone])
+                .await
+                .unwrap();
+            let values = [(
+                "phone".to_owned(),
+                Zeroizing::new("+12025550123".to_owned()),
+            )]
+            .into_iter()
+            .collect();
+            assert_eq!(
+                discovery.fill(&tab, &values).await.unwrap().is_empty(),
+                expected.is_empty()
+            );
+            assert_eq!(
+                tab.cdp
+                    .evaluate(&tab.session, "phone.value".into())
+                    .await
+                    .unwrap(),
+                json!(expected)
+            );
+            server.abort();
+        }
+    }
+    #[tokio::test]
     async fn earlier_filled_steps_do_not_count_as_a_second_person() {
         // Shaped like JetSMART's payment page: the filled passenger step stays
         // in the document above the empty contact form.
