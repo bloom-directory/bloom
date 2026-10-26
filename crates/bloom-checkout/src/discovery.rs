@@ -1350,6 +1350,26 @@ pub(crate) mod tests {
                 Some((97727, "SGD")),
             ),
             (
+                lines("en", "", &["Total", "$131.99", "Starting at $12/mo with Affirm", "Prices quoted in USD incl. taxes and fees"], "Book Now"),
+                Some((13199, "USD")),
+            ),
+            (
+                lines("en-US", "", &["Total", "$131.99", "Prices quoted in CAD incl. taxes and fees"], "Book Now"),
+                Some((13199, "CAD")),
+            ),
+            (
+                lines("en-US", "<meta itemprop='priceCurrency' content='USD'>", &["Total", "$131.99", "Prices quoted in CAD incl. taxes and fees"], "Book Now"),
+                None,
+            ),
+            (
+                lines("en-US", "", &["Total", "$131.99", "Prices quoted in USD incl. taxes and fees", "Prices quoted in CAD incl. taxes and fees"], "Book Now"),
+                None,
+            ),
+            (
+                lines("en", "", &["Total", "$131.99", "Prices quoted in XXX incl. taxes and fees"], "Book Now"),
+                None,
+            ),
+            (
                 lines("en-HK", "", &["Amount to pay:", "HK$", "5804.47"], "Pay Now"),
                 Some((580447, "HKD")),
             ),

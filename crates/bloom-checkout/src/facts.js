@@ -17,11 +17,14 @@
     for (const script of document.querySelectorAll('script[type="application/ld+json"]')) {
       for (const match of script.textContent.matchAll(/"priceCurrency"\s*:\s*"([A-Za-z]{3})"/g)) codes.add(match[1].toUpperCase());
     }
-    return codes.size === 1 ? [...codes][0] : null;
+    // Ovago states the currency separately from its bare-dollar total.
+    for (const match of document.body.innerText.matchAll(/^Prices quoted in ([A-Z]{3}) incl\. taxes and fees[ \t]*$/gm)) codes.add(match[1]);
+    return codes;
   };
   const dollarCurrency = () => {
-    const page = declared();
-    if (page) return page;
+    const codes = declared();
+    // Conflicting or invalid declarations must not fall back to language.
+    if (codes.size) return codes.size === 1 && dollars.has([...codes][0]) ? [...codes][0] : null;
     // A bare "$" otherwise follows the page language's region (es-AR, en-US, ...).
     const region = (document.documentElement.lang || '').split('-')[1]?.toUpperCase();
     return {US:'USD',CA:'CAD',MX:'MXN',AR:'ARS',CL:'CLP',CO:'COP',UY:'UYU'}[region] || null;

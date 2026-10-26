@@ -51,6 +51,9 @@ Stripe-hosted pages. If facts are unclear, the request falls back to a manual
 ceremony that releases no card, and the human finishes in the private view.
 An unpriced "Total amount" heading before a subtotal breakdown supplies no
 charge. A priced total is still required; conflicting priced totals stay manual.
+For bare-dollar totals, the explicit "Prices quoted in USD incl. taxes and
+fees" format supplies the currency. Conflicting declarations stay manual;
+they do not fall back to the page language.
 Amounts use ISO 4217 minor units. Checkout conversion and Broker's approval
 display use those exponents, not the browser's currency display precision:
 for example, HUF28,826.50 is 2882650 minor units even when CLDR normally
