@@ -2000,9 +2000,6 @@ impl TxEngine {
         let hard = policy_engine::has_hard_violation(&staged.policy_checks);
         if hard {
             staged.status = TxStatus::Failed;
-            // Persist the denial, not just the move: a reader that sees this
-            // entry must be told it failed policy rather than left to guess
-            // from the directory it landed in.
             self.outbox.transition_with_status(
                 &entry,
                 crate::outbox::OutboxState::Failed,
@@ -2405,9 +2402,6 @@ impl TxEngine {
         let hard = policy_engine::has_hard_violation(&staged.policy_checks);
         if hard {
             staged.status = TxStatus::Failed;
-            // Persist the denial, not just the move: a reader that sees this
-            // entry must be told it failed policy rather than left to guess
-            // from the directory it landed in.
             self.outbox.transition_with_status(
                 &entry,
                 crate::outbox::OutboxState::Failed,
@@ -4366,10 +4360,7 @@ impl TxEngine {
         let _ = self
             .outbox
             .remove_broadcast_raw_tx(&entry, BroadcastAttemptKind::CancelReplacement);
-        // The replacement took the account nonce, so the original can never
-        // be sent. Its own intent.json records that, rather than only the
-        // separate cancel_intent.json: a reader of the original entry is the
-        // one who needs to know, and it was still marked pending.
+        // The replacement took the nonce; the original can never be sent.
         if entry.state != OutboxState::Failed
             && let Err(e) =
                 self.outbox
