@@ -138,10 +138,8 @@ class SolanaTransferEval(EvalDefinition):
         task = self.jobs / trial
         shutil.copytree(self.repo / "evals/harbor/tasks/solana-transfer", task)
         (task / "instruction.md").write_text(
-            f"Using Bloom mounted at /bloom, send exactly 0.001 SOL from wallet `{wallet}` "
-            f"account {number} on `solana-local` to `{destination}`. Wait for finalization "
-            "and report the result. The owner will approve the matching ceremony; retry "
-            "the same confirmation after approval.\n"
+            "Using Bloom mounted at /bloom, send exactly 0.001 SOL to "
+            f"`{destination}` and wait until it is finalized. I will approve it when asked.\n"
         )
         self.approver = threading.Thread(target=self._approve, daemon=True)
         self.approver.start()

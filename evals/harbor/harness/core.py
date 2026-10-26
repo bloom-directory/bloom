@@ -200,8 +200,7 @@ def _agent_spec(name: str) -> AgentSpec:
         os.getenv("ANTHROPIC_API_KEY") or os.getenv("CLAUDE_CODE_OAUTH_TOKEN")
     ):
         raise EvalError(
-            "Claude auth is missing; set ANTHROPIC_API_KEY or "
-            "CLAUDE_CODE_OAUTH_TOKEN"
+            "Claude auth is missing; set ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN"
         )
     if name == "codex" and not os.getenv("OPENAI_API_KEY"):
         auth_file = Path.home() / ".codex" / "auth.json"

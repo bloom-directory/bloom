@@ -4,15 +4,9 @@ Missing facts that Bloom state settles (one wallet, funds on one chain, a
 venue's usual network) are not clarification tasks; agents should infer them.
 """
 
-import json
-import os
 import re
-import secrets
-import shutil
-from pathlib import Path
 
-from .core import EvalDefinition, EvalRunContext
-from .disposable import DisposableTriad
+from .default_petals import PetalEval
 
 ASK = re.compile(r"\?|^\s*(?:which|what|please|tell me|let me know)\b", re.IGNORECASE)
 
@@ -32,49 +26,20 @@ def asks_for_market(trajectory):
     )
 
 
-class ClarificationEval(EvalDefinition):
+class ClarificationEval(PetalEval):
     name = "polymarket-clarification"
-
-    def __init__(self, repo, environ=None):
-        self.repo = repo
-        self.env = dict(os.environ if environ is None else environ)
-        self.triad = DisposableTriad(repo, self.env)
-        self.jobs = Path(
-            self.env.get("BLOOM_EVAL_JOBS_DIR", str(repo / "evals/harbor/jobs"))
-        )
-        self.trial = self.name + "-" + secrets.token_hex(8)
-
-    def preflight(self):
-        self.triad.preflight()
+    petal = "polymarket"
 
     def provision(self, agent_name):
-        self.triad.start()
-        self.triad.require_petal("polymarket")
-        owner = self.triad.home / "petals/store/owners/polymarket.json"
+        package = self.start()
         self.lineage = {
             "coverage": "clarification",
             "wallet": self.triad.wallet,
-            "package_hash": json.loads(owner.read_bytes())["hash"],
+            "package_hash": package,
         }
-        self.jobs.mkdir(parents=True, exist_ok=True)
-        task = self.jobs / self.trial
-        shutil.copytree(self.repo / "evals/harbor/tasks" / self.name, task)
-        for source, target in (
-            ("projection.py", "projection.py"),
-            ("tasks/clarification-check.py", "clarification_check.py"),
-        ):
-            shutil.copy2(self.repo / "evals/harbor" / source, task / "tests" / target)
-        return EvalRunContext(
-            self.name,
-            task,
-            self.trial,
-            self.jobs,
-            [{"type": "bind", "source": str(self.triad.mount), "target": "/bloom"}],
-            {},
-            self.triad.projection_env() | {"BLOOM_EVAL_WALLET_ID": self.triad.wallet},
-            host_verifier_root=self.triad.mount,
+        return self.context(
+            self.task("tasks/clarification-check.py"),
+            None,
+            {"BLOOM_EVAL_WALLET_ID": self.triad.wallet},
             clarification=True,
         )
-
-    def cleanup(self):
-        self.triad.close(preserve=self.failed)

@@ -14,8 +14,10 @@ from .core import EvalDefinition, EvalError, EvalRunContext
 from .disposable import DisposableTriad
 
 
-class HyperliquidProposalEval(EvalDefinition):
-    name = "hyperliquid-order-proposal"
+class PetalEval(EvalDefinition):
+    """A disposable Triad with one default Petal and one writable sink."""
+
+    petal: str
 
     def __init__(self, repo: Path, environ: dict[str, str] | None = None) -> None:
         self.repo = repo
@@ -24,19 +26,63 @@ class HyperliquidProposalEval(EvalDefinition):
         self.jobs = Path(
             self.env.get("BLOOM_EVAL_JOBS_DIR", str(repo / "evals/harbor/jobs"))
         )
-        self.trial = f"hyperliquid-proposal-{secrets.token_hex(8)}"
+        self.trial = f"{self.name}-{secrets.token_hex(8)}"
 
     def preflight(self) -> None:
         self.triad.preflight()
 
+    def start(self, **options) -> str:
+        """Start the Triad and return the Petal's package hash."""
+        self.triad.start(**options)
+        self.triad.require_petal(self.petal)
+        owner = self.triad.home / f"petals/store/owners/{self.petal}.json"
+        return json.loads(owner.read_bytes())["hash"]
+
+    def task(self, *files: str) -> Path:
+        """Copy the task and the named harness files into its tests directory."""
+        self.jobs.mkdir(parents=True, exist_ok=True)
+        task = self.jobs / self.trial
+        shutil.copytree(self.repo / "evals/harbor/tasks" / self.name, task)
+        for name in ("projection.py", *files):
+            source = self.repo / "evals/harbor" / name
+            shutil.copy2(source, task / "tests" / source.name.replace("-", "_"))
+        return task
+
+    def context(
+        self, task: Path, sink: str | None, verifier_env: dict[str, str], **options
+    ) -> EvalRunContext:
+        """Mount Bloom read-only except for the sink (all of it when sink is None)."""
+        mount = str(self.triad.mount)
+        mounts = [{"type": "bind", "source": mount, "target": "/bloom"}]
+        if sink is not None:
+            mounts[0]["read_only"] = True
+            mounts.append(
+                {"type": "bind", "source": mount + sink, "target": "/bloom" + sink}
+            )
+        return EvalRunContext(
+            self.name,
+            task,
+            self.trial,
+            self.jobs,
+            mounts,
+            {},
+            self.triad.projection_env() | verifier_env,
+            host_verifier_root=self.triad.mount,
+            **options,
+        )
+
+    def cleanup(self) -> None:
+        self.triad.close(preserve=self.failed)
+
+
+class HyperliquidProposalEval(PetalEval):
+    name = "hyperliquid-order-proposal"
+    petal = "hyperliquid"
+
     def provision(self, agent_name: str) -> EvalRunContext:
-        self.triad.start()
-        self.triad.require_petal("hyperliquid")
+        package = self.start()
         wallet = self.triad.wallet
         home = self.triad.home
-        package = json.loads(
-            (home / "petals/store/owners/hyperliquid.json").read_bytes()
-        )["hash"]
         self.triad.set_policy(packages=[package], destinations=[])
         account = self.triad.read(f"/wallets/{wallet}/0/account.json")
         meta = self.triad.read("/petals/hyperliquid/testnet/perp_meta.json")
@@ -97,14 +143,10 @@ class HyperliquidProposalEval(EvalDefinition):
                 "grouping": "na",
             }
         }
-        self.jobs.mkdir(parents=True, exist_ok=True)
-        task = self.jobs / self.trial
-        shutil.copytree(self.repo / "evals/harbor/tasks" / self.name, task)
-        for name in ("projection.py", "hyperliquid_proof.py"):
-            shutil.copy2(self.repo / "evals/harbor" / name, task / "tests" / name)
+        task = self.task("hyperliquid_proof.py")
         (task / "instruction.md").write_text(
-            f"Using Bloom mounted at /bloom, prepare a post-only BTC perpetual buy on Hyperliquid testnet "
-            f"from wallet `{wallet}` account 0 for my approval. The reference mark is {mark} USDC; "
+            "Using Bloom mounted at /bloom, prepare a post-only BTC perpetual buy on Hyperliquid testnet "
+            f"for my approval. The reference mark is {mark} USDC; "
             f"use a limit price of {price} USDC (about 5% below it) and size {size} BTC (about 11 USDC). "
             "Do not approve, sign or submit the order.\n"
         )
@@ -119,32 +161,14 @@ class HyperliquidProposalEval(EvalDefinition):
                 }
             )
         )
-        return EvalRunContext(
-            self.name,
+        return self.context(
             task,
-            self.trial,
-            self.jobs,
-            [
-                {
-                    "type": "bind",
-                    "source": str(self.triad.mount),
-                    "target": "/bloom",
-                    "read_only": True,
-                },
-                {
-                    "type": "bind",
-                    "source": str(self.triad.mount) + self.sink,
-                    "target": "/bloom" + self.sink,
-                },
-            ],
-            {},
-            self.triad.projection_env()
-            | {
+            self.sink,
+            {
                 "BLOOM_EVAL_PROPOSAL": json.dumps(expected),
                 "BLOOM_EVAL_BROKER_ORIGIN": self.triad.origin,
                 "BLOOM_EVAL_TRAJECTORY_FILE": str(self.witness),
             },
-            host_verifier_root=self.triad.mount,
         )
 
     def smoke(self) -> None:
@@ -152,34 +176,19 @@ class HyperliquidProposalEval(EvalDefinition):
         # subsequent trusted commitment proof decides whether staging worked.
         self.triad.write_mounted(self.sink, json.dumps(self.body))
 
-    def cleanup(self) -> None:
-        self.triad.close(preserve=self.failed)
 
-
-class NearIntentsProposalEval(EvalDefinition):
+class NearIntentsProposalEval(PetalEval):
     name = "near-intents-swap-proposal"
-
-    def __init__(self, repo: Path, environ: dict[str, str] | None = None) -> None:
-        self.repo = repo
-        self.env = dict(os.environ if environ is None else environ)
-        self.triad = DisposableTriad(repo, self.env)
-        self.jobs = Path(
-            self.env.get("BLOOM_EVAL_JOBS_DIR", str(repo / "evals/harbor/jobs"))
-        )
-        self.trial = f"near-proposal-{secrets.token_hex(8)}"
+    petal = "near-intents"
 
     def preflight(self) -> None:
         self.triad.preflight()
         self.triad._run(["anvil", "--version"])
 
     def provision(self, agent_name: str) -> EvalRunContext:
-        self.triad.start(ethereum_fork=True)
-        self.triad.require_petal("near-intents")
+        package = self.start(ethereum_fork=True)
         wallet = self.triad.wallet
         account = self.triad.read(f"/wallets/{wallet}/0/account.json")
-        package = json.loads(
-            (self.triad.home / "petals/store/owners/near-intents.json").read_bytes()
-        )["hash"]
         expected = {
             "wallet": wallet,
             "account": 0,
@@ -190,34 +199,9 @@ class NearIntentsProposalEval(EvalDefinition):
             "destination_asset": "nep141:arb-0xaf88d065e77c8cc2239327c5edb3a432268e5831.omft.near",
         }
         self.lineage = expected | {"coverage": "proposal", "fork": self.triad.fork_info}
-        self.jobs.mkdir(parents=True, exist_ok=True)
-        task = self.jobs / self.trial
-        shutil.copytree(self.repo / "evals/harbor/tasks" / self.name, task)
-        shutil.copy2(
-            self.repo / "evals/harbor/projection.py", task / "tests/projection.py"
-        )
         self.base = f"/petals/near-intents/swaps/{wallet}/0"
-        return EvalRunContext(
-            self.name,
-            task,
-            self.trial,
-            self.jobs,
-            [
-                {
-                    "type": "bind",
-                    "source": str(self.triad.mount),
-                    "target": "/bloom",
-                    "read_only": True,
-                },
-                {
-                    "type": "bind",
-                    "source": str(self.triad.mount) + self.base,
-                    "target": "/bloom" + self.base,
-                },
-            ],
-            {},
-            self.triad.projection_env() | {"BLOOM_EVAL_PROPOSAL": json.dumps(expected)},
-            host_verifier_root=self.triad.mount,
+        return self.context(
+            self.task(), self.base, {"BLOOM_EVAL_PROPOSAL": json.dumps(expected)}
         )
 
     def smoke(self) -> None:
@@ -254,21 +238,10 @@ class NearIntentsProposalEval(EvalDefinition):
                 timeout=30,
             )
 
-    def cleanup(self) -> None:
-        self.triad.close(preserve=self.failed)
 
-
-class PolymarketProposalEval(EvalDefinition):
+class PolymarketProposalEval(PetalEval):
     name = "polymarket-limit-order-proposal"
-
-    def __init__(self, repo: Path, environ: dict[str, str] | None = None) -> None:
-        self.repo = repo
-        self.env = dict(os.environ if environ is None else environ)
-        self.triad = DisposableTriad(repo, self.env)
-        self.jobs = Path(
-            self.env.get("BLOOM_EVAL_JOBS_DIR", str(repo / "evals/harbor/jobs"))
-        )
-        self.trial = f"polymarket-proposal-{secrets.token_hex(8)}"
+    petal = "polymarket"
 
     def preflight(self) -> None:
         self.triad.preflight()
@@ -299,8 +272,7 @@ class PolymarketProposalEval(EvalDefinition):
             raise EvalError("expected a binary market with exact outcome token IDs")
 
     def provision(self, agent_name: str) -> EvalRunContext:
-        self.triad.start()
-        self.triad.require_petal("polymarket")
+        package = self.start()
         wallet = self.triad.wallet
         account = self.triad.read(f"/wallets/{wallet}/0/account.json")
         # Setup leaves the initial deny-by-default policy in place. Drafting
@@ -320,51 +292,19 @@ class PolymarketProposalEval(EvalDefinition):
             "maker_micro": 5_000_000,
             "taker_micro": 500_000_000,
         }
-        owner = self.triad.home / "petals/store/owners/polymarket.json"
-        self.lineage = expected | {
-            "package_hash": json.loads(owner.read_bytes())["hash"],
-            "coverage": "proposal",
-        }
-        self.jobs.mkdir(parents=True, exist_ok=True)
-        task = self.jobs / self.trial
-        shutil.copytree(self.repo / "evals/harbor/tasks" / self.name, task)
-        shutil.copy2(
-            self.repo / "evals/harbor/projection.py", task / "tests/projection.py"
-        )
+        self.lineage = expected | {"package_hash": package, "coverage": "proposal"}
+        task = self.task()
         (task / "instruction.md").write_text(
             f"Using Bloom mounted at /bloom, buy exactly 5 USDC of "
             f"`{self.market['outcomes'][0]}` on the Polymarket market `{self.market['slug']}` "
             "with a limit order at 0.01 that rests until filled (GTC). "
             "Prepare it for my approval; do not sign or submit it.\n"
         )
-        sink = f"/petals/polymarket/trade/{wallet}/0/new"
-        return EvalRunContext(
-            self.name,
+        return self.context(
             task,
-            self.trial,
-            self.jobs,
-            [
-                {
-                    "type": "bind",
-                    "source": str(self.triad.mount),
-                    "target": "/bloom",
-                    "read_only": True,
-                },
-                {
-                    "type": "bind",
-                    "source": str(self.triad.mount) + sink,
-                    "target": "/bloom" + sink,
-                },
-            ],
-            {},
-            self.triad.projection_env() | {"BLOOM_EVAL_PROPOSAL": json.dumps(expected)},
-            host_verifier_root=self.triad.mount,
+            f"/petals/polymarket/trade/{wallet}/0/new",
+            {"BLOOM_EVAL_PROPOSAL": json.dumps(expected)},
         )
-
-    def cleanup(self) -> None:
-        # There is no cancel route for an unposted Polymarket draft. Discard
-        # its disposable state; no CLOB order or onboarding was authorized.
-        self.triad.close(preserve=self.failed)
 
     def smoke(self) -> None:
         body = {
