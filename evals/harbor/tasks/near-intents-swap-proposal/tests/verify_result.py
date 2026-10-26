@@ -130,8 +130,14 @@ def verify(root=None):
         "unexpected sealed approval",
     )
     base = f"petals/near-intents/swaps/{wallet}/0"
-    sessions = reader.directories(base)
-    require(len(sessions) == 1, "expected exactly one swap session")
+    # A retry after a failed quote is correct behavior; only live sessions count.
+    sessions = [
+        name
+        for name in reader.directories(base)
+        if reader.read_json(f"{base}/{name}/status.json").get("state")
+        not in ("quote_failed", "abandoned")
+    ]
+    require(len(sessions) == 1, "expected exactly one staged swap session")
     base += "/" + sessions[0]
     status = reader.read_json(base + "/status.json")
     require(status.get("state") == "staged", "swap is not staged for unsigned review")

@@ -162,6 +162,7 @@ class NearProposalTests(unittest.TestCase):
                 },
             }
         )
+        values[f"{base}/extra/status.json"] = {"state": "quoted"}
         reader = mock.Mock()
         reader.read_json.side_effect = values.__getitem__
         for bad_path in (
@@ -222,6 +223,45 @@ class NearProposalTests(unittest.TestCase):
                     os.environ, {"BLOOM_EVAL_PROPOSAL": json.dumps(self.expected)}
                 ),
                 self.subTest(state=state),
-                self.assertRaisesRegex(ValueError, "not staged"),
+                self.assertRaisesRegex(ValueError, "staged"),
             ):
                 verifier.verify(Path("fixture"))
+
+    def test_a_retry_after_a_failed_quote_passes(self):
+        base = "petals/near-intents/swaps/harbor/0"
+        pending = "wallets/harbor/0/chains/ethereum/outbox/pending"
+        values = {
+            f"{base}/trial-session/{name}.json": value
+            for name, value in (
+                ("request", self.request),
+                ("status", self.status),
+                ("outbox", self.outbox),
+                ("quote", self.quote),
+            )
+        } | {
+            f"{base}/failed/status.json": {"state": "quote_failed"},
+            f"{base}/dropped/status.json": {"state": "abandoned"},
+            pending + "/entry/intent.json": self.intent,
+            "chains/ethereum/chain_id": 1,
+            "wallets/harbor/0/account.json": {
+                "wallet": "harbor",
+                "number": 0,
+                "freshness": "fresh",
+                "evm": {"address": self.expected["address"]},
+            },
+        }
+        reader = mock.Mock()
+        reader.read_json.side_effect = values.__getitem__
+        reader.entries.return_value = {}
+        reader.directories.side_effect = lambda path: {
+            base: ["failed", "trial-session", "dropped"],
+            pending: ["entry"],
+            "wallets/harbor/0/chains": ["ethereum"],
+        }.get(path, [])
+        with (
+            mock.patch.object(verifier, "ProjectionReader", return_value=reader),
+            mock.patch.dict(
+                os.environ, {"BLOOM_EVAL_PROPOSAL": json.dumps(self.expected)}
+            ),
+        ):
+            verifier.verify(Path("fixture"))
