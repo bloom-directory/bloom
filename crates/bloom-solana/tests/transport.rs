@@ -349,8 +349,6 @@ async fn retries_transient_http_failures() {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 let mut buf = vec![0u8; 8192];
                 let _ = socket.read(&mut buf).await.unwrap_or(0);
-                // Keep the pinned Rust 1.96 API across newer stable CI.
-                #[allow(deprecated)]
                 let remaining =
                     failures.try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
                 let body = if remaining.is_ok() && remaining.unwrap() > 0 {
