@@ -5,7 +5,6 @@
 //! Petal route artifact.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -29,6 +28,11 @@ use crate::vm::{COMPONENT_NOT_A_DIR_CODE, COMPONENT_UNSUPPORTED_CODE, RunOptions
 /// included, observes the account afresh, so a cached observation never
 /// authorizes Petal code.
 const ACCOUNT_CONTEXT_REUSE: Duration = Duration::from_secs(1);
+
+/// Why the last write to a Petal failed. A mount reports a failed write only
+/// as an errno, so the Petal's message is kept at `petals/<name>/last_error.json`
+/// until a later write to that Petal succeeds.
+const LAST_ERROR: &str = "last_error.json";
 
 /// Recent account observations, ordered by when each began. A refusal is
 /// kept (as `None`) rather than removed, so an older observation that
@@ -54,6 +58,7 @@ pub struct PetalRouter {
     audit_effect_lock: Arc<tokio::sync::Mutex<()>>,
     account_contexts: Arc<Mutex<AccountContextCache>>,
     account_context_reuse: Duration,
+    last_errors: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
 }
 
 impl PetalRouter {
@@ -66,17 +71,12 @@ impl PetalRouter {
             audit_effect_lock: Arc::new(tokio::sync::Mutex::new(())),
             account_contexts: Arc::new(Mutex::new(AccountContextCache::default())),
             account_context_reuse: ACCOUNT_CONTEXT_REUSE,
+            last_errors: Arc::default(),
         }
     }
 
     pub fn with_audit(mut self, audit: Arc<AuditLog>) -> Self {
         self.audit = Some(audit);
-        self
-    }
-
-    /// Retained temporarily for daemon API compatibility. Petal writes are
-    /// synchronous in this iteration so VFS callers receive execution errors.
-    pub fn with_async_write_switch(self, _enabled: Arc<AtomicBool>) -> Self {
         self
     }
 
@@ -131,6 +131,10 @@ impl PetalRouter {
 
     fn is_petal_document(path: &str) -> bool {
         PETAL_DOCUMENT_NAMES.contains(&path)
+    }
+
+    fn last_error(&self, mount: &str) -> Option<Vec<u8>> {
+        self.last_errors.lock().ok()?.get(mount).cloned()
     }
 
     fn add_petal_documents(mut entries: Vec<Entry>) -> Vec<Entry> {
@@ -257,7 +261,8 @@ impl PetalRouter {
 
     fn metadata_route_path(&self, path: &VfsPath, _op: DispatchOp) -> Option<(String, String)> {
         let (mount, rest) = Self::mount_path(path).ok()?;
-        (self.is_petal(mount) && !Self::is_petal_document(&rest)).then(|| (mount.to_owned(), rest))
+        (self.is_petal(mount) && rest != LAST_ERROR && !Self::is_petal_document(&rest))
+            .then(|| (mount.to_owned(), rest))
     }
 
     async fn validate_ancestor(&self, mount: &str, path: &str) -> Result<(), HandlerError> {
@@ -612,6 +617,14 @@ impl Handler for PetalRouter {
         if rest.is_empty() {
             return Ok(Entry::dir(mount));
         }
+        if rest == LAST_ERROR {
+            let bytes = self
+                .last_error(mount)
+                .ok_or_else(|| HandlerError::not_found(path.to_string_path()))?;
+            let mut entry = Entry::read_only_file(LAST_ERROR);
+            entry.size = bytes.len() as u64;
+            return Ok(entry);
+        }
         if Self::is_petal_document(&rest) {
             let bytes = self
                 .runner
@@ -645,6 +658,11 @@ impl Handler for PetalRouter {
 
     async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
         let (mount, rest) = Self::mount_path(path)?;
+        if rest == LAST_ERROR {
+            return self
+                .last_error(mount)
+                .ok_or_else(|| HandlerError::not_found(path.to_string_path()));
+        }
         if Self::is_petal_document(&rest) {
             return self
                 .runner
@@ -665,19 +683,34 @@ impl Handler for PetalRouter {
 
     async fn write(&self, path: &VfsPath, data: &[u8]) -> Result<(), HandlerError> {
         let (mount, rest) = Self::mount_path(path)?;
-        if rest.is_empty() || Self::is_petal_document(&rest) {
+        if rest.is_empty() || rest == LAST_ERROR || Self::is_petal_document(&rest) {
             return Err(HandlerError::PermissionDenied);
         }
-        match self
-            .dispatch(mount, DispatchOp::Write, rest, data.to_vec())
-            .await?
+        let result = match self
+            .dispatch(mount, DispatchOp::Write, rest.clone(), data.to_vec())
+            .await
         {
-            DispatchResponse::Write => Ok(()),
-            DispatchResponse::Error { code, message } => {
+            Ok(DispatchResponse::Write) => Ok(()),
+            Ok(DispatchResponse::Error { code, message }) => {
                 Err(dispatch_error(code, message, path.to_string_path()))
             }
-            other => Err(unexpected_response("write", other)),
+            Ok(other) => Err(unexpected_response("write", other)),
+            Err(error) => Err(error),
+        };
+        if let Ok(mut last_errors) = self.last_errors.lock() {
+            match &result {
+                Ok(()) => last_errors.remove(mount),
+                Err(error) => last_errors.insert(
+                    mount.to_owned(),
+                    serde_json::to_vec_pretty(&serde_json::json!({
+                        "path": rest,
+                        "error": error.to_string(),
+                    }))
+                    .unwrap_or_default(),
+                ),
+            };
         }
+        result
     }
 
     async fn list(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
@@ -723,7 +756,12 @@ impl Handler for PetalRouter {
             }
         }
         Ok(if rest.is_empty() {
-            Self::add_petal_documents(entries)
+            let mut entries = Self::add_petal_documents(entries);
+            if self.last_error(mount).is_some() {
+                entries.retain(|entry| entry.name != LAST_ERROR);
+                entries.push(Entry::read_only_file(LAST_ERROR));
+            }
+            entries
         } else {
             entries
         })
@@ -752,20 +790,6 @@ impl Handler for PetalRouter {
                 .petal_route_effective_metadata(&mount, DispatchOp::Read, &rest)
                 .ok()
                 .map(|(_, metadata)| metadata.side_effecting_read)
-                .unwrap_or(false);
-        }
-        false
-    }
-
-    fn is_async_write_command(&self, path: &VfsPath) -> bool {
-        if let Some((mount, rest)) = self.metadata_route_path(path, DispatchOp::Write) {
-            return self
-                .runner
-                .petal_route_effective_metadata(&mount, DispatchOp::Write, &rest)
-                .ok()
-                .map(|(route, metadata)| {
-                    route.route.install_metadata.write_async || metadata.write_async
-                })
                 .unwrap_or(false);
         }
         false
@@ -889,6 +913,7 @@ fn map_petal_err(e: PetalError) -> HandlerError {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
 
     use bloom_vfs::{Handler, Vfs, VfsPath};
     use tempfile::TempDir;
@@ -1270,7 +1295,6 @@ name = "example"
             assert_eq!(entry.size, contents.len() as u64);
             assert_eq!(entry.mode, 0o444);
             assert_eq!(vfs.read(&path).await.unwrap(), contents);
-            assert!(!vfs.is_async_write_command(&path));
             assert!(matches!(
                 vfs.write(&path, b"replace").await,
                 Err(HandlerError::PermissionDenied)
@@ -1286,37 +1310,6 @@ name = "example"
                 router.cache_ttl(&VfsPath::parse(&format!("/example/{name}")).unwrap()),
                 None
             );
-        }
-    }
-
-    #[tokio::test]
-    async fn package_documents_are_not_async_guest_commands() {
-        let (dir, runner) = runner();
-        let package = dir.path().join("example-app");
-        write_async_failing_package(&package);
-        std::fs::rename(
-            package.join("petal/example/operations/[wallet]/[index]/submit.wasm"),
-            package.join("petal/example/operations/[wallet]/[index]/submit-old.wasm"),
-        )
-        .unwrap();
-        // Even explicit guest documentation routes cannot override the host's
-        // repository documents or attach their command/cache metadata.
-        for name in PETAL_DOCUMENT_NAMES {
-            write_package_file(
-                &package,
-                &format!("petal/example/{name}.wasm"),
-                &crate::package::route_fixtures::async_failing_write_route_component(),
-            );
-        }
-        runner.store().install_petal_package_dir(&package).unwrap();
-        let router = PetalRouter::new(runner, Arc::new(DenyHost));
-        assert!(router.is_async_write_command(
-            &VfsPath::parse("/example/operations/alice/0/submit-old").unwrap()
-        ));
-        for name in PETAL_DOCUMENT_NAMES {
-            let path = VfsPath::parse(&format!("/example/{name}")).unwrap();
-            assert!(!router.is_async_write_command(&path));
-            assert_eq!(router.cache_ttl(&path), None);
         }
     }
 
@@ -1805,27 +1798,53 @@ name = "example"
     }
 
     #[tokio::test]
-    async fn write_async_route_errors_are_returned_to_the_vfs_caller() {
+    async fn write_errors_are_returned_and_kept_in_last_error() {
         let (dir, runner) = runner();
         let package = dir.path().join("example-app");
+        // The failing route declares write_async; Bloom must still wait for it.
         write_async_failing_package(&package);
-        runner.store().install_petal_package_dir(&package).unwrap();
-
-        // A true switch used to detach this write and return Ok immediately.
-        // The compatibility method is now deliberately a no-op.
-        let router = PetalRouter::new(runner, Arc::new(AccountHost))
-            .with_async_write_switch(Arc::new(AtomicBool::new(true)));
-        let vfs = Vfs::builder().mount("petals", Arc::new(router)).build();
-        let path = VfsPath::parse("/petals/example/operations/alice/0/submit").unwrap();
-        assert!(
-            vfs.is_async_write_command(&path),
-            "mounted component writes must not return handler failures through macOS NFS"
+        write_package_file(
+            &package,
+            "petal/example/operations/[wallet]/[index]/accept.wasm",
+            &crate::package::route_fixtures::accepting_write_route_component(),
         );
+        runner.store().install_petal_package_dir(&package).unwrap();
+        let router = PetalRouter::new(runner, Arc::new(AccountHost));
+        let vfs = Vfs::builder().mount("petals", Arc::new(router)).build();
+        let failing = VfsPath::parse("/petals/example/operations/alice/0/submit").unwrap();
+        let accepting = VfsPath::parse("/petals/example/operations/alice/0/accept").unwrap();
+        let last_error = VfsPath::parse("/petals/example/last_error.json").unwrap();
+        let listed = |entries: Vec<Entry>| entries.iter().any(|e| e.name == LAST_ERROR);
 
-        let error = vfs.write(&path, b"payload").await.unwrap_err();
+        assert!(!vfs.is_async_write_command(&failing));
+        assert!(vfs.lookup(&last_error).await.is_err());
+        assert!(!listed(
+            vfs.list(&VfsPath::parse("/petals/example").unwrap())
+                .await
+                .unwrap()
+        ));
+
+        let error = vfs.write(&failing, b"payload").await.unwrap_err();
         assert!(
             error.to_string().contains("component route write"),
             "unexpected write error: {error}"
         );
+        let record: serde_json::Value =
+            serde_json::from_slice(&vfs.read(&last_error).await.unwrap()).unwrap();
+        assert_eq!(record["path"], "operations/alice/0/submit");
+        assert_eq!(record["error"], error.to_string());
+        assert_eq!(vfs.lookup(&last_error).await.unwrap().mode, 0o444);
+        assert!(listed(
+            vfs.list(&VfsPath::parse("/petals/example").unwrap())
+                .await
+                .unwrap()
+        ));
+        assert!(matches!(
+            vfs.write(&last_error, b"{}").await,
+            Err(HandlerError::PermissionDenied)
+        ));
+
+        vfs.write(&accepting, b"payload").await.unwrap();
+        assert!(vfs.lookup(&last_error).await.is_err());
     }
 }

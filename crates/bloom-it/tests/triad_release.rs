@@ -1888,7 +1888,7 @@ fn linux_installer_upgrade_rotation_and_confirmed_uninstall_are_staged_safely() 
     assert!(machine_unit.contains("ExecStart=/usr/bin/bloom serve --mount %h/bloom"));
     let fstab = fs::read_to_string(root.join("etc/fstab")).unwrap();
     assert!(fstab.contains(
-        "127.0.0.1:/ /home/alice/bloom nfs4 noauto,user,nosuid,nodev,noexec,actimeo=0,vers=4.1,proto=tcp,port=20000,rsize=65536,wsize=65536,timeo=10 0 0 # x-bloom.login-uid=1000"
+        "127.0.0.1:/ /home/alice/bloom nfs4 noauto,user,nosuid,nodev,noexec,actimeo=0,sync,vers=4.1,proto=tcp,port=20000,rsize=65536,wsize=65536,timeo=10 0 0 # x-bloom.login-uid=1000"
     ));
     assert_eq!(
         fs::read_to_string(root.join("etc/bloom/1000/machine.env")).unwrap(),

@@ -4583,6 +4583,20 @@ pub(crate) mod route_fixtures {
         )
     }
 
+    pub(crate) fn accepting_write_route_component() -> Vec<u8> {
+        build_dynamic_dir_route_component(
+            false,
+            FixtureVfsImport::None,
+            &[],
+            None,
+            false,
+            true,
+            false,
+            false,
+            true,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn build_dynamic_dir_route_component(
         import_store: bool,

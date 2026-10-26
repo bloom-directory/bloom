@@ -275,7 +275,7 @@ install_linux_mount_authorization() {
     echo "Bloom NFS port is outside the enrolled range" >&2
     return 65
   }
-  printf '127.0.0.1:/ %s nfs4 noauto,user,nosuid,nodev,noexec,actimeo=0,vers=4.1,proto=tcp,port=%s,rsize=65536,wsize=65536,timeo=10 0 0 # %s\n' \
+  printf '127.0.0.1:/ %s nfs4 noauto,user,nosuid,nodev,noexec,actimeo=0,sync,vers=4.1,proto=tcp,port=%s,rsize=65536,wsize=65536,timeo=10 0 0 # %s\n' \
     "$escaped_mount_path" "$nfs_port" "$marker" >> "$replacement"
   mv -f "$replacement" "$fstab"
 }
