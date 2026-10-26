@@ -91,6 +91,11 @@ harness never touches the installed custody Triad.
 
 ## Results
 
+The [2026-10-25 baseline](baselines/README.md) records all 24 manually reviewed
+task/agent pairs, their rewards, attempted calls, tokens, timings and Bloom
+findings. Historical raw rewards, offline corrections and infrastructure
+interruptions remain separate in the linked JSON.
+
 Each run writes a summary to `evals/harbor/jobs/summaries/` (or
 `$BLOOM_EVAL_JOBS_DIR`):
 - reward, coverage and any error;
@@ -108,8 +113,8 @@ Missing trajectories leave counts unavailable rather than inventing zeros.
 Clarification accepts a direct question or an explicit request to choose the
 missing fact; punctuation is immaterial. Asking for funds alone does not pass.
 
-Read the first trial of each task by hand before running batches. A 0 or a
-timeout is a failure.
+Run baseline trials one at a time and review each trajectory by hand before
+the next pair. A 0 or a timeout is a failure.
 
 ```sh
 scripts/test-harbor-evals.sh                                   # static checks
