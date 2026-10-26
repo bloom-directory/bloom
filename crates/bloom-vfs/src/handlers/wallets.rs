@@ -10964,8 +10964,9 @@ value = "0""#,
         );
     }
 
-    /// An EVM node for chain id 1 holding no ETH and 2.5 USDC.
-    async fn spawn_usdc_only_evm_node() -> String {
+    /// An EVM node for chain id 1 holding no ETH and 2.5 USDC, whose DAI
+    /// `balanceOf` fails. Returns its URL and a count of requests served.
+    async fn spawn_usdc_only_evm_node() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let usdc = bloom_proto::tokens::for_chain(1)
             .iter()
@@ -10973,10 +10974,18 @@ value = "0""#,
             .unwrap()
             .address
             .to_ascii_lowercase();
+        let dai = bloom_proto::tokens::for_chain(1)
+            .iter()
+            .find(|token| token.symbol == "DAI")
+            .unwrap()
+            .address;
+        let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = served.clone();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let usdc = usdc.clone();
                 tokio::spawn(async move {
                     let mut bytes = Vec::new();
@@ -10995,11 +11004,18 @@ value = "0""#,
                         }
                     };
                     let word = |value: u64| format!("0x{value:064x}");
+                    let to = request["params"][0]["to"].as_str().unwrap_or_default();
                     let result = match request["method"].as_str().unwrap_or_default() {
                         "eth_chainId" => serde_json::json!("0x1"),
                         "eth_getBalance" => serde_json::json!("0x0"),
+                        "eth_call" if to.eq_ignore_ascii_case(dai) => {
+                            let body = serde_json::json!({"jsonrpc":"2.0","id":request["id"],
+                                "error":{"code":3,"message":"execution reverted"}})
+                            .to_string();
+                            let _ = socket.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await;
+                            return;
+                        }
                         "eth_call" => {
-                            let to = request["params"][0]["to"].as_str().unwrap_or_default();
                             let held = if to.eq_ignore_ascii_case(&usdc) {
                                 2_500_000
                             } else {
@@ -11016,7 +11032,7 @@ value = "0""#,
                 });
             }
         });
-        endpoint
+        (endpoint, served)
     }
 
     /// `<n>/holdings.json` reads every chain the account lists: zero
@@ -11041,9 +11057,8 @@ value = "0""#,
             })
             .unwrap()
         };
-        f.handler
-            .chains
-            .add(chain("ethereum", 1, spawn_usdc_only_evm_node().await));
+        let (ethereum, served) = spawn_usdc_only_evm_node().await;
+        f.handler.chains.add(chain("ethereum", 1, ethereum));
         f.handler
             .chains
             .add(chain("arc", 5042002, "http://127.0.0.1:1".into()));
@@ -11068,8 +11083,15 @@ value = "0""#,
             .with_solana_reads(solana_read_registry(spawn_solana_node().await));
         let w = &f.wallet_name;
 
+        // Listing the account and looking the file up (what `ls -l` asks
+        // the handler for) read no chain.
         let listed = handler.list(&vfs(format!("/{w}/0"))).await.unwrap();
         assert!(listed.iter().any(|entry| entry.name == "holdings.json"));
+        handler
+            .lookup(&vfs(format!("/{w}/0/holdings.json")))
+            .await
+            .unwrap();
+        assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 0);
         let body = handler
             .read(&vfs(format!("/{w}/0/holdings.json")))
             .await
@@ -11095,8 +11117,15 @@ value = "0""#,
             ],
             "zero ETH and zero tokens must be omitted: {v}"
         );
+        // The unreachable chain fails as a whole; the failed DAI read keeps
+        // the rest of ethereum's holdings.
         let errors = v["errors"].as_object().unwrap();
-        assert_eq!(errors.keys().collect::<Vec<_>>(), ["arc"], "{v}");
+        assert_eq!(
+            errors.keys().collect::<Vec<_>>(),
+            ["arc", "ethereum"],
+            "{v}"
+        );
+        assert_eq!(errors["ethereum"], "could not read DAI", "{v}");
     }
 
     // ---- errno semantics -------------------------------------------------

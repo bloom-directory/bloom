@@ -23,7 +23,8 @@ To find where an account's funds are, read
 `wallets/<wallet>/<n>/holdings.json`. It lists the account's non-zero native
 and well-known token balances on every configured chain; a chain that could
 not be read appears under `errors` instead. Tokens outside
-`chains/<chain>/addresses/<address>/tokens/known.json` are not checked.
+`chains/<chain>/addresses/<address>/tokens/known.json` are not checked, and on
+Solana chains it shows SOL only, not SPL tokens.
 
 ## When the request leaves something out
 

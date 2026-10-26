@@ -488,7 +488,13 @@ impl WalletsHandler {
         let mut errors = serde_json::Map::new();
         for (chain, read) in reads {
             match read {
-                Ok(found) => holdings.extend(found),
+                Ok((found, unread)) => {
+                    holdings.extend(found);
+                    if !unread.is_empty() {
+                        let message = format!("could not read {}", unread.join(", "));
+                        errors.insert(chain.clone(), message.into());
+                    }
+                }
                 Err(error) => {
                     errors.insert(chain.clone(), error.to_string().into());
                 }
@@ -502,15 +508,18 @@ impl WalletsHandler {
     }
 
     /// One chain's non-zero balances for `holdings.json`: the native asset,
-    /// plus the curated tokens of `tokens/known.json` on EVM chains.
+    /// plus the curated tokens of `tokens/known.json` on EVM chains, and the
+    /// symbols of tokens whose balance could not be read. A failed native
+    /// read fails the chain.
     async fn chain_holdings(
         &self,
         view: &AccountView,
         chain: &str,
-    ) -> Result<Vec<serde_json::Value>, HandlerError> {
+    ) -> Result<(Vec<serde_json::Value>, Vec<&'static str>), HandlerError> {
         use crate::handlers::balances::{SOL_DECIMALS, SOL_SYMBOL, amount_fields};
         use alloy::primitives::U256;
         let mut found = Vec::new();
+        let mut unread = Vec::new();
         if self.is_solana_chain(chain) {
             let (_, account) = Self::solana_family(view, chain)?;
             let lamports = self.solana_balance(chain, &account.address).await?;
@@ -539,20 +548,17 @@ impl WalletsHandler {
             ));
             for token in bloom_proto::tokens::for_chain(spec.chain_id) {
                 let contract: alloy::primitives::Address = token.address.parse().map_err(err_be)?;
-                let raw = client
-                    .erc20_balance(contract, holder)
-                    .await
-                    .map_err(err_be)?
-                    .ok_or_else(|| {
-                        HandlerError::backend(format!("{} balanceOf failed", token.symbol))
-                    })?;
+                let Ok(Some(raw)) = client.erc20_balance(contract, holder).await else {
+                    unread.push(token.symbol);
+                    continue;
+                };
                 let mut held = amount_fields(chain, "erc20", token.symbol, token.decimals, raw);
                 held["address"] = bloom_proto::checksum_address(&contract).into();
                 found.push(held);
             }
         }
         found.retain(|held| held["raw"] != "0");
-        Ok(found)
+        Ok((found, unread))
     }
 
     pub(super) async fn lookup_account(
