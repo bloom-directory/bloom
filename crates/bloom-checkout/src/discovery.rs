@@ -1330,6 +1330,22 @@ pub(crate) mod tests {
                 Some((4800, "USD")),
             ),
             (
+                lines("en-CA", "", &["Total amount", "Subtotal", "CA$275.75", "Amount to pay", "CA$275.75"], "Pay"),
+                Some((27575, "CAD")),
+            ),
+            (
+                lines("en-CA", "", &["Total amount", "CA$276.75", "Amount to pay", "CA$275.75"], "Pay"),
+                None,
+            ),
+            (
+                lines("en-CA", "", &["Total amount CAD", "Subtotal", "CA$275.75", "Amount to pay", "CA$275.75"], "Pay"),
+                None,
+            ),
+            (
+                lines("en-CA", "", &["Total amount", "Subtotal", "CA$275.75", "Amount to pay"], "Pay"),
+                None,
+            ),
+            (
                 lines("en-SG", "", &["Total", "SGD 977.27"], "Book Now"),
                 Some((97727, "SGD")),
             ),

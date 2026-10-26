@@ -62,6 +62,7 @@
     const total = minorUnits(numbers[0].replace(/[\u00a0\u202f ]/g, ' '), currency);
     return total ? {total, currency} : null;
   };
+  let totalRefusal = 'total_or_currency';
   const pageTotal = lines => {
     // A converted display total is not the charge. Gotogate labels the actual
     // charge separately; unclear or conflicting charge labels stay manual.
@@ -72,6 +73,9 @@
       const match = lines[i].match(amountLabel);
       if (!match) continue;
       const rest = lines[i].slice(match[0].length).replace(/\([^)]*\)/g, '').replace(/^[\s:]+/, '');
+      // A price-breakdown heading has no amount of its own. Keep the actual
+      // labelled totals below it, including their disagreement checks.
+      if (!rest && /^total amount\s*:?$/i.test(lines[i]) && /^subtotal/i.test(lines[i + 1] || '')) continue;
       if (!amountOnly(rest)) continue;
       const segment = [rest];
       // Take the amount from the next lines, then at most one currency line
@@ -82,12 +86,13 @@
         segment.push(lines[j]);
         if (priced) break;
       }
-      if (/\d/.test(segment.join(' ')) === false) return null;
+      if (/\d/.test(segment.join(' ')) === false) { totalRefusal = 'total_without_amount'; return null; }
       const amount = parseAmount(segment.join(' '));
       if (!amount) return null;
       amounts.push(amount);
     }
-    if (!amounts.length || amounts.some(a => a.total !== amounts[0].total || a.currency !== amounts[0].currency)) return null;
+    if (!amounts.length) { totalRefusal = 'total_not_found'; return null; }
+    if (amounts.some(a => a.total !== amounts[0].total || a.currency !== amounts[0].currency)) { totalRefusal = 'conflicting_totals'; return null; }
     return amounts[0];
   };
   const visible = e => e.getClientRects().length && getComputedStyle(e).visibility === 'visible';
@@ -130,7 +135,7 @@
     total = Number(explicit[0].dataset.bloomTotalMinor); currency = explicit[0].dataset.bloomCurrency;
   } else {
     const found = pageTotal(text.split('\n').map(line => line.trim()).filter(Boolean));
-    if (!found) return {refusal:'total_or_currency'};
+    if (!found) return {refusal:totalRefusal};
     ({total,currency} = found);
   }
   const selectors = [...document.querySelectorAll('select')].filter(e => visible(e) && /installment|cuotas|parcelas/i.test([e.name,e.id,e.labels?.[0]?.innerText].join(' ')));

@@ -49,6 +49,8 @@ Facts come from `facts.js`: exactly one visible pay button and one labelled
 total in a supported language and number format, or processor data for
 Stripe-hosted pages. If facts are unclear, the request falls back to a manual
 ceremony that releases no card, and the human finishes in the private view.
+An unpriced "Total amount" heading before a subtotal breakdown supplies no
+charge. A priced total is still required; conflicting priced totals stay manual.
 Amounts use ISO 4217 minor units. Checkout conversion and Broker's approval
 display use those exponents, not the browser's currency display precision:
 for example, HUF28,826.50 is 2882650 minor units even when CLDR normally
