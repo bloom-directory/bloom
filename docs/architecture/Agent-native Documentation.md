@@ -72,12 +72,6 @@ hint file and no per-directory README duplication of global contracts.
 
 ## Per-surface documentation
 
-Guest-visible HTTP errors are a diagnostic boundary: policy denials identify
-method and host while omitting URL userinfo, paths and queries. Transport
-failures retain their cause with the request URL removed before entering guest
-replies or the audit error field. These strings must remain safe when an SDK
-preserves their explanation instead of reducing them to a status code.
-
 Built-in handlers embed read-only, handler-local documentation, while external
 Petals expose package-defined route documentation under `/petals/<name>/`.
 For example, an installed Polymarket Petal exposes `/petals/polymarket/README.md`,
