@@ -121,7 +121,7 @@ class HarnessLifecycleTests(unittest.TestCase):
                     definition.cleanup = mock.Mock(side_effect=EvalError("residual order"))
                 result = self.passing_result()
                 result.trial_results[0].verifier_result.rewards = {"reward": 0}
-                async def runner(_context, _agent):
+                async def runner(_context, _agent, result=result):
                     return result
                 evidence = EvalEvidence()
                 with self.assertRaisesRegex(EvalError, "passing reward"):

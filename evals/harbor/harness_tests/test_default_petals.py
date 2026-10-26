@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from harness.clarification import asks_for_selection
+from harness.clarification import asks_for_market
 from harness.core import EvalError, _agent_spec
 from harness.disposable import CeremonyDriver
 from harness.solana_transfer import matching_transfer
@@ -195,158 +195,33 @@ class ClarificationTests(unittest.TestCase):
     def trajectory(self, message, **changes):
         return {"steps": [{"source": "agent", "message": message} | changes]}
 
-    def test_each_missing_fact_passes_without_a_wallet_question(self):
-        for petal, question in (
-            ("solana", "Which chain should I use for the USDC transfer?"),
-            ("hyperliquid", "Mainnet or testnet?"),
-            ("polymarket", "Which market should I buy Yes in?"),
-            ("near-intents", "Which origin chain holds your USDC?"),
+    def test_asking_which_market_passes(self):
+        for message in (
+            "Which market should I buy Yes in?",
+            "Please tell me the market you mean.",
+            "I found several sports events. Which one?\nWhich event do you want",
         ):
-            with self.subTest(petal=petal):
-                self.assertTrue(asks_for_selection(self.trajectory(question), petal))
+            with self.subTest(message=message):
+                self.assertTrue(asks_for_market(self.trajectory(message)))
 
-    def test_each_assumed_default_fails_even_with_an_unrelated_question(self):
-        for petal, message in (
-            ("solana", "I will use Ethereum. Which wallet should I use?"),
-            ("hyperliquid", "I will use mainnet. Where should the funds come from?"),
-            ("polymarket", "I chose the election market. Which wallet should I use?"),
-            (
-                "near-intents",
-                "I will spend Ethereum USDC. Which recipient should I use?",
-            ),
+    def test_other_questions_or_assumed_markets_fail(self):
+        for message in (
+            "I chose the election market. Which wallet should I use?",
+            "Should I fund the wallet with USDC first?",
+            "I placed the order in the top market.",
         ):
-            with self.subTest(petal=petal):
-                self.assertFalse(asks_for_selection(self.trajectory(message), petal))
+            with self.subTest(message=message):
+                self.assertFalse(asks_for_market(self.trajectory(message)))
 
-    def test_tool_arguments_and_user_questions_are_not_agent_questions(self):
+    def test_only_the_agents_final_message_counts(self):
         self.assertFalse(
-            asks_for_selection(
+            asks_for_market(
                 self.trajectory(
-                    "Which account and chain?", tool_calls=[{"function_name": "bash"}]
-                ),
-                "solana",
+                    "Which market?", tool_calls=[{"function_name": "bash"}]
+                )
             )
         )
         self.assertFalse(
-            asks_for_selection(
-                {"steps": [{"source": "user", "message": "Which wallet and chain?"}]},
-                "solana",
-            )
+            asks_for_market({"steps": [{"source": "user", "message": "Which market?"}]})
         )
 
-    def test_questions_cannot_borrow_a_missing_fact_from_a_later_clause(self):
-        for petal, message in (
-            (
-                "near-intents",
-                "I selected wallet harbor on mainnet. Which token do you want?",
-            ),
-            ("solana", "Which recipient should I use on the Ethereum chain?"),
-            ("near-intents", "Which destination chain should receive the USDC?"),
-            ("polymarket", "Which wallet should I use for the election market?"),
-            ("polymarket", "Which wallet for this market?"),
-            ("hyperliquid", "Which wallet should I use on mainnet?"),
-            ("hyperliquid", "Which mainnet account should I use?"),
-            ("hyperliquid", "I selected mainnet rather than testnet. Shall I proceed?"),
-        ):
-            with self.subTest(message=message):
-                self.assertFalse(asks_for_selection(self.trajectory(message), petal))
-        for message in (
-            "Which Hyperliquid network should I use?",
-            "Do you mean mainnet or testnet?",
-            "What environment should I use?",
-        ):
-            with self.subTest(message=message):
-                self.assertTrue(
-                    asks_for_selection(self.trajectory(message), "hyperliquid")
-                )
-
-    def test_market_question_is_valid_despite_a_single_assumed_wallet(self):
-        self.assertTrue(
-            asks_for_selection(
-                self.trajectory(
-                    "I will use wallet harbor account 0. Which market should I buy?"
-                ),
-                "polymarket",
-            )
-        )
-
-    def test_no_question_is_not_clarification(self):
-        for message in (
-            "Done.",
-            "I selected the default network.",
-            "Proceed?",
-            "Which wallet?",
-        ):
-            self.assertFalse(
-                asks_for_selection(self.trajectory(message), "hyperliquid")
-            )
-
-    def test_imperative_missing_fact_requests_need_no_question_mark(self):
-        for petal, message in (
-            ("solana", "Please specify the source chain before I proceed."),
-            ("hyperliquid", "Please choose the Hyperliquid network."),
-            ("polymarket", "Provide the market to buy Yes in."),
-            ("near-intents", "Specify the origin chain for your USDC."),
-        ):
-            self.assertTrue(asks_for_selection(self.trajectory(message), petal))
-        self.assertTrue(
-            asks_for_selection(
-                self.trajectory(
-                    "Fund the intended chain and specify Ethereum, Polygon, or Arc, then I can proceed."
-                ),
-                "solana",
-                choices=("ethereum", "polygon", "arc"),
-            )
-        )
-
-    def test_funding_requests_and_self_selection_statements_still_fail(self):
-        for message in (
-            "Fund the account on Ethereum before I proceed.",
-            "I will select the Ethereum chain.",
-            "I can choose a network myself.",
-            "I selected mainnet. Please provide funds.",
-        ):
-            self.assertFalse(asks_for_selection(self.trajectory(message), "solana"))
-
-    def test_conditional_chain_request_leaves_named_choices_unresolved(self):
-        for message in (
-            "Please fund the intended network and specify it if not Ethereum or Polygon.",
-            "Specify the chain unless Ethereum or Polygon.",
-            "If not Ethereum or Polygon, specify the chain.",
-        ):
-            with self.subTest(message=message):
-                self.assertFalse(
-                    asks_for_selection(
-                        self.trajectory(message),
-                        "solana",
-                        choices=("ethereum", "polygon", "arc"),
-                    )
-                )
-
-    def test_tell_me_requests_need_the_missing_fact_as_their_subject(self):
-        for petal, message in (
-            ("solana", "Tell me the chain."),
-            ("hyperliquid", "Please tell me the network."),
-            ("polymarket", "Tell me the market."),
-            (
-                "near-intents",
-                "Fund a supported origin chain with USDC + gas and tell me the source chain, or have the operator add Arbitrum.",
-            ),
-        ):
-            with self.subTest(petal=petal):
-                self.assertTrue(asks_for_selection(self.trajectory(message), petal))
-        for petal, message in (
-            ("solana", "Tell me the wallet to use on the Ethereum chain."),
-            ("hyperliquid", "Tell me the funding plan for the mainnet network."),
-            ("near-intents", "Tell me how to fund the Ethereum origin chain."),
-            ("near-intents", "Tell me the destination chain."),
-            ("solana", "Tell me the chain if not Ethereum or Polygon."),
-        ):
-            with self.subTest(message=message):
-                self.assertFalse(
-                    asks_for_selection(
-                        self.trajectory(message),
-                        petal,
-                        choices=("ethereum", "polygon", "arc"),
-                    )
-                )

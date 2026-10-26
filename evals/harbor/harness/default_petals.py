@@ -196,12 +196,6 @@ class NearIntentsProposalEval(EvalDefinition):
         shutil.copy2(
             self.repo / "evals/harbor/projection.py", task / "tests/projection.py"
         )
-        (task / "instruction.md").write_text(
-            f"Using Bloom mounted at /bloom, prepare a swap of exactly 1 USDC on Ethereum "
-            f"to USDC on Arbitrum via NEAR Intents, from wallet `{wallet}` account 0 "
-            f"to the same address `{expected['address']}`. Stage the deposit transaction "
-            "for my review; leave it unsigned and unsubmitted.\n"
-        )
         self.base = f"/petals/near-intents/swaps/{wallet}/0"
         return EvalRunContext(
             self.name,
@@ -338,11 +332,10 @@ class PolymarketProposalEval(EvalDefinition):
             self.repo / "evals/harbor/projection.py", task / "tests/projection.py"
         )
         (task / "instruction.md").write_text(
-            f"Using Bloom mounted at /bloom, prepare an unsigned GTC buy order from wallet `{wallet}` "
-            f"account 0 on Polygon (chain ID 137): spend exactly 5 USDC at a limit price of 0.01 "
-            f"for outcome `{self.market['outcomes'][0]}` of market `{self.market['slug']}` "
-            f"(condition ID `{expected['condition_id']}`, outcome token ID `{expected['token_id']}`). "
-            "Prepare it for my review; do not sign or submit it.\n"
+            f"Using Bloom mounted at /bloom, buy exactly 5 USDC of "
+            f"`{self.market['outcomes'][0]}` on the Polymarket market `{self.market['slug']}` "
+            "with a limit order at 0.01 that rests until filled (GTC). "
+            "Prepare it for my approval; do not sign or submit it.\n"
         )
         sink = f"/petals/polymarket/trade/{wallet}/0/new"
         return EvalRunContext(

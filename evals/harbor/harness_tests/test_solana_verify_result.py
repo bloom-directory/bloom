@@ -89,10 +89,12 @@ class SolanaVerifierTests(unittest.TestCase):
         def fake_rpc(method: str, _params: list[object]) -> object:
             return responses[method]
 
-        with mock.patch.dict(os.environ, environment or {}, clear=False):
-            with mock.patch.object(verify_result, "rpc", side_effect=fake_rpc):
-                with mock.patch.object(verify_result.sys, "argv", ["verify_result.py"]):
-                    return verify_result.main()
+        with (
+            mock.patch.dict(os.environ, environment or {}, clear=False),
+            mock.patch.object(verify_result, "rpc", side_effect=fake_rpc),
+            mock.patch.object(verify_result.sys, "argv", ["verify_result.py"]),
+        ):
+            return verify_result.main()
 
     def test_the_exact_finalized_transfer_passes(self) -> None:
         self.assertEqual(self.run_verifier(), 0)

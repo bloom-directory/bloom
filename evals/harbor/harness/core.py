@@ -73,7 +73,7 @@ class EvalRunContext:
     verifier_env: Mapping[str, str]
     extra_docker_compose: Sequence[Path] = ()
     host_verifier_root: Path | None = None
-    clarification_petal: str | None = None
+    clarification: bool = False
 
 
 class EvalDefinition(ABC):
@@ -174,7 +174,7 @@ async def run_harbor_job(context: EvalRunContext, agent: AgentSpec) -> Any:
             else None,
             kwargs={
                 "mount_root": str(context.host_verifier_root),
-                "clarification_petal": context.clarification_petal,
+                "clarification": context.clarification,
             }
             if context.host_verifier_root
             else {},

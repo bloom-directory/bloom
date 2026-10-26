@@ -15,7 +15,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import unquote, urlparse
 
-from .clarification import PROMPTS, ClarificationEval
+from .clarification import ClarificationEval
 from .core import AGENTS, EvalError, EvalEvidence, run_eval
 from .default_petals import (
     HyperliquidProposalEval,
@@ -23,22 +23,20 @@ from .default_petals import (
     PolymarketProposalEval,
 )
 from .disposable import CEREMONY
-from .metrics import trajectory_counts
 from .solana_transfer import SolanaTransferEval
+
+DEFINITIONS = {
+    "solana-transfer": SolanaTransferEval,
+    "polymarket-limit-order-proposal": PolymarketProposalEval,
+    "hyperliquid-order-proposal": HyperliquidProposalEval,
+    "near-intents-swap-proposal": NearIntentsProposalEval,
+    "polymarket-clarification": ClarificationEval,
+}
 
 
 def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(description="Run one real Bloom Harbor trial")
-    value.add_argument(
-        "eval",
-        choices=(
-            "solana-transfer",
-            "polymarket-limit-order-proposal",
-            "hyperliquid-order-proposal",
-            "near-intents-swap-proposal",
-            *(name + "-clarification" for name in PROMPTS),
-        ),
-    )
+    value.add_argument("eval", choices=tuple(DEFINITIONS))
     value.add_argument("agent", choices=tuple(AGENTS))
     value.add_argument(
         "--smoke", action="store_true", help="exercise real services without an LLM"
@@ -51,16 +49,7 @@ def main(argv: list[str] | None = None) -> int:
     repo = Path(
         os.environ.get("BLOOM_EVAL_REPO_ROOT", Path(__file__).resolve().parents[3])
     )
-    definitions = {
-        "solana-transfer": SolanaTransferEval,
-        "polymarket-limit-order-proposal": PolymarketProposalEval,
-        "hyperliquid-order-proposal": HyperliquidProposalEval,
-        "near-intents-swap-proposal": NearIntentsProposalEval,
-    }
-    if args.eval.endswith("-clarification"):
-        definition = ClarificationEval(repo, args.eval.removesuffix("-clarification"))
-    else:
-        definition = definitions[args.eval](repo)
+    definition = DEFINITIONS[args.eval](repo)
     evidence = EvalEvidence()
     source_commit = subprocess.run(
         ["git", "rev-parse", "HEAD"],
@@ -152,7 +141,7 @@ def main(argv: list[str] | None = None) -> int:
             if source_diff
             else None,
             "lineage": getattr(definition, "lineage", None),
-            "commands": None,
+            "tool_calls": None,
         }
         binaries = {}
         for role in ("MACHINE", "BROKER", "SIGNER", "DEBUG_DRIVER"):
@@ -187,12 +176,15 @@ def main(argv: list[str] | None = None) -> int:
                 if uri.scheme == "file":
                     trajectory = Path(unquote(uri.path)) / "agent/trajectory.json"
                     try:
-                        summary["commands"] = trajectory_counts(
-                            json.loads(trajectory.read_bytes())
+                        steps = json.loads(trajectory.read_bytes())["steps"]
+                        summary["tool_calls"] = sum(
+                            len(step.get("tool_calls") or [])
+                            for step in steps
+                            if step.get("source") == "agent"
                         )
-                    except (OSError, ValueError, TypeError) as error:
-                        summary["commands"] = None
-                        summary["command_counts_error"] = type(error).__name__
+                    except (OSError, ValueError, TypeError, KeyError) as error:
+                        summary["tool_calls"] = None
+                        summary["tool_calls_error"] = type(error).__name__
         root = (
             Path(os.environ.get("BLOOM_EVAL_JOBS_DIR", str(repo / "evals/harbor/jobs")))
             / "summaries"

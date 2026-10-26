@@ -9,15 +9,15 @@ import sys
 from harbor.models.verifier.result import VerifierResult
 from harbor.verifier.base import BaseVerifier
 
-from .clarification import asks_for_selection
+from .clarification import asks_for_market
 from .core import EvalError
 
 
 class HostProjectionVerifier(BaseVerifier):
-    def __init__(self, *, mount_root, clarification_petal=None, **kwargs):
+    def __init__(self, *, mount_root, clarification=False, **kwargs):
         super().__init__(**kwargs)
         self.mount_root = mount_root
-        self.clarification_petal = clarification_petal
+        self.clarification = clarification
 
     def _check(self):
         env = (
@@ -33,16 +33,11 @@ class HostProjectionVerifier(BaseVerifier):
         directory = self.trial_paths.verifier_dir
         directory.mkdir(parents=True, exist_ok=True)
         passed = True
-        if self.clarification_petal:
-            trajectory = json.loads(
-                (self.trial_paths.agent_dir / "trajectory.json").read_bytes()
-            )
-            passed = asks_for_selection(
-                trajectory,
-                self.clarification_petal,
+        if self.clarification:
+            passed = asks_for_market(
                 json.loads(
-                    self.override_env.get("BLOOM_EVAL_CLARIFICATION_CHOICES", "[]")
-                ),
+                    (self.trial_paths.agent_dir / "trajectory.json").read_bytes()
+                )
             )
         if passed:
             result = subprocess.run(

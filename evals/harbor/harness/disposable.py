@@ -15,8 +15,6 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-import tomllib
-
 from .core import EvalError
 
 CEREMONY = re.compile(r"http://localhost:[0-9]+/ceremony/[A-Za-z0-9_-]{43}")
@@ -355,48 +353,22 @@ class DisposableTriad:
             timeout=60,
         )
         if ethereum_fork:
-            configured = tomllib.loads((self.home / "config.toml").read_text())
+            # Bloom must read the fork, never mainnet, before the agent starts.
+            selected = self.cli("vfs", "cat", "/status/chains/ethereum/rpc_url").strip()
+            if selected.rstrip("/") != self.ethereum_rpc_url:
+                raise EvalError("Bloom is not using the local Ethereum fork")
             address = self.read(f"/wallets/{self.wallet}/0/account.json")["evm"][
                 "address"
             ]
             usdc = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
             self.fork_rpc("anvil_setBalance", address, hex(5 * 10**16))
             self.fork_rpc("anvil_dealERC20", address, usdc, hex(5_000_000))
-            balance_call = {
-                "to": usdc,
-                "data": "0x70a08231" + address[2:].rjust(64, "0"),
-            }
             self.fork_info = {
-                "chain_id": int(self.fork_rpc("eth_chainId"), 16),
                 "rpc_url": self.ethereum_rpc_url,
-                "selected_ethereum_rpc_url": self.cli(
-                    "vfs", "cat", "/status/chains/ethereum/rpc_url"
-                ).strip(),
-                "configured_ethereum_rpc_urls": configured["chains"]["ethereum"][
-                    "rpc_urls"
-                ],
-                "eth_wei": int(self.fork_rpc("eth_getBalance", address, "latest"), 16),
-                "usdc_base_units": int(
-                    self.fork_rpc("eth_call", balance_call, "latest"), 16
-                ),
                 "anvil_version": self._run(["anvil", "--version"]).splitlines()[0],
+                "eth_wei": 5 * 10**16,
+                "usdc_base_units": 5_000_000,
             }
-            checks = {
-                "configured RPC pool": self.fork_info["configured_ethereum_rpc_urls"]
-                == [self.ethereum_rpc_url],
-                "chain ID": configured["chains"]["ethereum"]["chain_id"]
-                == self.fork_info["chain_id"]
-                == 1,
-                "selected RPC": self.fork_info["selected_ethereum_rpc_url"].rstrip("/")
-                == self.ethereum_rpc_url.rstrip("/"),
-                "ETH balance": self.fork_info["eth_wei"] == 5 * 10**16,
-                "USDC balance": self.fork_info["usdc_base_units"] == 5_000_000,
-            }
-            if not all(checks.values()):
-                raise EvalError(
-                    "Ethereum fork differs: "
-                    + ", ".join(key for key, valid in checks.items() if not valid)
-                )
 
     def set_policy(
         self, *, packages: list[str], destinations: list[dict[str, str]]

@@ -1,1 +1,1 @@
-The host supplies an ambiguous user request for this trial.
+Buy 5 USDC of Yes on Polymarket. Bloom is mounted at /bloom.

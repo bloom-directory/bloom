@@ -1,1 +1,1 @@
-Using Bloom mounted at /bloom, prepare a swap of 1 USDC on Ethereum to USDC on Arbitrum, to the same wallet address, for my review. Leave the deposit unsigned and unsubmitted.
+Using Bloom mounted at /bloom, swap exactly 1 USDC to USDC on Arbitrum with NEAR Intents, sent to my same address. Prepare it for my approval; do not sign or submit it.
