@@ -322,3 +322,31 @@ class ClarificationTests(unittest.TestCase):
                         choices=("ethereum", "polygon", "arc"),
                     )
                 )
+
+    def test_tell_me_requests_need_the_missing_fact_as_their_subject(self):
+        for petal, message in (
+            ("solana", "Tell me the chain."),
+            ("hyperliquid", "Please tell me the network."),
+            ("polymarket", "Tell me the market."),
+            (
+                "near-intents",
+                "Fund a supported origin chain with USDC + gas and tell me the source chain, or have the operator add Arbitrum.",
+            ),
+        ):
+            with self.subTest(petal=petal):
+                self.assertTrue(asks_for_selection(self.trajectory(message), petal))
+        for petal, message in (
+            ("solana", "Tell me the wallet to use on the Ethereum chain."),
+            ("hyperliquid", "Tell me the funding plan for the mainnet network."),
+            ("near-intents", "Tell me how to fund the Ethereum origin chain."),
+            ("near-intents", "Tell me the destination chain."),
+            ("solana", "Tell me the chain if not Ethereum or Polygon."),
+        ):
+            with self.subTest(message=message):
+                self.assertFalse(
+                    asks_for_selection(
+                        self.trajectory(message),
+                        petal,
+                        choices=("ethereum", "polygon", "arc"),
+                    )
+                )

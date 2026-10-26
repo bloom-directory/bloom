@@ -51,7 +51,7 @@ def asks_for_selection(trajectory, petal, choices=()):
         ):
             return True
         imperative = re.search(
-            r"(?:^|\band\s+)(?:please\s+)?(?:choose|select|specify|provide)\b"
+            r"(?:^|\band\s+)(?:please\s+)?(?:choose|select|specify|provide|tell\s+me)\b"
             r"|^\s*(?:please\s+tell|I\s+need|which\b|what\b)",
             sentence,
             re.IGNORECASE,
@@ -66,13 +66,20 @@ def asks_for_selection(trajectory, petal, choices=()):
         ):
             continue
         for ask in re.finditer(
-            r"\b(which|what|choose|select|specify|provide)\b",
+            r"\b(which|what|choose|select|specify|provide|tell\s+me)\b",
             sentence,
             re.IGNORECASE,
         ):
             phrase = re.sub(
                 r"^\s+(is|are)\s+", " ", sentence[ask.end() :], flags=re.IGNORECASE
             )
+            if ask.group(0).lower().startswith("tell") and not re.match(
+                r"\s*(?:(?:the|your)\s+)?(?:(?:source|origin|input)\s+)?"
+                r"(?:chain|network|environment|market|event)\b",
+                phrase,
+                re.IGNORECASE,
+            ):
+                continue
             # Match the fact being requested, not an assumed default in a
             # later clause: "Which recipient should I use on Ethereum?"
             subject = re.split(
