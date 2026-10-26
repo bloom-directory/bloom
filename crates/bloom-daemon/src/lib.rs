@@ -4640,7 +4640,7 @@ impl Daemon {
                     broker.clone(),
                 )) as _,
             )
-            .mount("petals", petal_router.clone() as _)
+            .mount("petals", petal_router as _)
             .mount(
                 "chains",
                 Arc::new(
@@ -4702,12 +4702,9 @@ impl Daemon {
                         chains.clone(),
                         views_prices,
                         central_outbox_handler.clone(),
-                        bloom_vfs::handlers::MarketData::new(),
                     )
                     .with_address_book(address_book_arc.clone())
-                    .with_petals(petal_router.clone())
-                    .with_solana_reads(solana_chain_registry.clone())
-                    .with_skin(home.skin_path()),
+                    .with_solana_reads(solana_chain_registry.clone()),
                 ) as _,
             )
             .mount("outbox", central_outbox_handler.clone() as _)

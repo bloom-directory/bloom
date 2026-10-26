@@ -40,20 +40,14 @@ Treat every write as an operation. Writes may stage work, begin a ceremony,
 consume reusable authority, or broadcast after authorization. Read the target
 directory and inspect the resulting projection before retrying or continuing.
 
-When a person — rather than an agent — needs to see their wallet, prefer the
-matching read-only `show_bloom_*` MCP tool when it is available. MCP Apps
-hosts render that view inline. Otherwise, `views/` holds the same pages to
-open in a browser straight from the mount: `views/index.html` for what they
-hold and what needs them, plus `wallets`, `receive`, `activity`, `next-moves`,
-`contacts`, `policy`, `chains` and `markets`. Give them the file path and let
-the browser render it; do not paste the HTML into a transcript, and keep
-reading canonical values from the JSON leaves. When the answer must live
-inside chat itself, quote `views/briefing.md` for Today only. A `show_bloom_*`
-tool already includes that page's text when the host has no widget. These
-views observe only: their local script sorts and
-selects, and nothing in them approves or executes an action. A person who
-wants them to look different edits `~/.bloom/skin.css` on the host. See
-`views/AGENTS.md`.
+When a person — rather than an agent — needs to see their wallet, `views/`
+holds read-only pages to open in a browser straight from the mount:
+`views/wallets.html` for native balances, `views/receive.html` for receiving
+addresses with QR codes, and `views/activity.html` for staged and recorded
+operations. Give them the file path and let the browser render it; do not
+paste the HTML into a transcript, and keep reading canonical values from the
+JSON leaves. These views observe only: nothing in them approves or executes an
+action. See `views/AGENTS.md`.
 
 ## What an error means
 

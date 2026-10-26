@@ -600,19 +600,6 @@ const ADDRESS_FILES_CORE: &[&str] = &[
     "code",
     "is_contract",
 ];
-fn is_native_balance_file(name: &str) -> bool {
-    matches!(name, "balance" | "balance.raw" | "balance.json")
-}
-
-/// Tempo and similar chains have no native token, so a native balance file
-/// would only repeat the node's placeholder. Token balances still work.
-fn no_native_token(spec: &bloom_proto::ChainSpec) -> HandlerError {
-    HandlerError::not_found(format!(
-        "{} has no native token; read token balances under tokens/",
-        spec.display_name.as_deref().unwrap_or(&spec.name)
-    ))
-}
-
 const ADDRESS_FILES_ETHERSCAN: &[&str] = &["txs", "internal_txs", "erc20_txs", "erc721_txs"];
 /// Files that need an ENS-capable chain to be wired into the handler.
 const ADDRESS_FILES_ENS: &[&str] = &["ens"];
@@ -863,9 +850,7 @@ impl ChainsHandler {
                 3 => Ok(Entry::dir(&segs[2])),
                 4 => {
                     let f = segs[3].as_str();
-                    if is_native_balance_file(f) && !client.spec().has_native_token() {
-                        Err(no_native_token(client.spec()))
-                    } else if ADDRESS_FILES_CORE.contains(&f) {
+                    if ADDRESS_FILES_CORE.contains(&f) {
                         Ok(Entry::file(f))
                     } else if ADDRESS_FILES_ETHERSCAN.contains(&f) {
                         // Surface only mounts when address_history is
@@ -999,9 +984,6 @@ impl ChainsHandler {
             "addresses" if segs.len() == 4 => {
                 let addr = parse_addr(&segs[2])?;
                 let spec = client.spec();
-                if is_native_balance_file(&segs[3]) && !spec.has_native_token() {
-                    return Err(no_native_token(spec));
-                }
                 match segs[3].as_str() {
                     "balance" => {
                         let bal = client.balance(addr).await.map_err(err_be)?;
@@ -1362,9 +1344,6 @@ impl ChainsHandler {
             "addresses" if segs.len() == 4 => {
                 let addr = parse_addr(&segs[2])?;
                 let spec = client.spec().clone();
-                if is_native_balance_file(&segs[3]) && !spec.has_native_token() {
-                    return Err(no_native_token(&spec));
-                }
                 let session = client.open_session_at(block_number).await.map_err(err_be)?;
                 match segs[3].as_str() {
                     "balance" => {
@@ -1479,12 +1458,8 @@ impl ChainsHandler {
             2 if segs[1] == "gas" => Ok(vec![Entry::file("current.json")]),
             3 if segs[1] == "addresses" => {
                 // /chains/<chain>/addresses/<addr>
-                let native = client.spec().has_native_token();
-                let mut entries: Vec<Entry> = ADDRESS_FILES_CORE
-                    .iter()
-                    .filter(|n| native || !is_native_balance_file(n))
-                    .map(|n| Entry::file(n))
-                    .collect();
+                let mut entries: Vec<Entry> =
+                    ADDRESS_FILES_CORE.iter().map(|n| Entry::file(n)).collect();
                 entries.push(Entry::dir("tokens"));
                 entries.push(Entry::dir("nfts"));
                 if self.address_history_ready() {
@@ -1982,42 +1957,6 @@ mod tests {
     fn etherscan_to(addr: SocketAddr) -> Arc<EtherscanClient> {
         let url = Url::parse(&format!("http://{addr}/api")).unwrap();
         Arc::new(EtherscanClient::with_base_url("test_key".into(), url))
-    }
-
-    #[tokio::test]
-    async fn a_chain_without_a_native_token_has_no_native_balance_files() {
-        let spec = ChainSpec {
-            name: "tempo".into(),
-            chain_id: 4217,
-            rpc_urls: vec!["http://127.0.0.1:1".into()],
-            display_name: Some("Tempo Mainnet".into()),
-            ..ChainSpec::anvil_default()
-        };
-        let reg = ChainRegistry::default();
-        reg.add(ChainClient::new(spec).unwrap());
-        let h = ChainsHandler::new(reg);
-        let dir = format!("/tempo/addresses/{:#x}", alloy::primitives::Address::ZERO);
-
-        let names: Vec<String> = h
-            .list(&VfsPath::parse(&dir).unwrap())
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|entry| entry.name)
-            .collect();
-        assert!(names.contains(&"tokens".to_owned()), "{names:?}");
-        assert!(
-            !names.iter().any(|name| name.starts_with("balance")),
-            "{names:?}"
-        );
-
-        // No RPC is attempted: the endpoint is unreachable, yet the answer
-        // is the explanation rather than a backend error.
-        let error = h
-            .read(&VfsPath::parse(&format!("{dir}/balance")).unwrap())
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("no native token"), "{error}");
     }
 
     #[tokio::test]
