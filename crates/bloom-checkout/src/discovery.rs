@@ -1947,16 +1947,19 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn subscription_renewal_terms_are_read_when_the_page_states_them() {
         let browser = browser().await;
-        let page = |lines: &[&str]| {
+        let page = |lang: &str, lines: &[&str]| {
             let body: String = lines.iter().map(|l| format!("<div>{l}</div>")).collect();
             format!(
-                "<!doctype html><html lang='en'><body>{body}{}<button>Pay</button></body></html>",
+                "<!doctype html><html lang='{lang}'><body>{body}{}<button>Pay</button></body></html>",
                 inputs()
             )
         };
-        for (lines, expected) in [
+        // A bare "$" renewal needs the page's region, exactly as the charge
+        // total does, so each page states its language.
+        for (lang, lines, expected) in [
             // A trial, its ongoing price and the day it starts.
             (
+                "en",
                 &[
                     "Premium Individual subscription",
                     "Total USD 1.00",
@@ -1964,8 +1967,24 @@ pub(crate) mod tests {
                 ][..],
                 Some((1299, "month", Some("2026-11-25"))),
             ),
+            // Spotify's own words, from its US Premium page on 2026-10-26,
+            // over a paid introductory charge. The offer-end date in the next
+            // sentence is not the renewal date, so no date is claimed. A page
+            // whose charge today is 0.00 stays manual: Bloom has no approved
+            // amount for it, which is its own decision to make, not this one.
+            (
+                "en-US",
+                &[
+                    "Premium Individual subscription",
+                    "Total USD 1.00",
+                    "then $12.99 per month after",
+                    "Offer ends November 1, 2026",
+                ][..],
+                Some((1299, "month", None)),
+            ),
             // Full price from the start: the period is still worth stating.
             (
+                "en",
                 &[
                     "Standard plan",
                     "Total USD 17.99",
@@ -1975,6 +1994,7 @@ pub(crate) mod tests {
             ),
             // 05/06 is May or June depending on the reader, so it is not a date.
             (
+                "en",
                 &[
                     "Premium subscription",
                     "Total USD 1.00",
@@ -1984,6 +2004,7 @@ pub(crate) mod tests {
             ),
             // A plan chooser states two ongoing prices; neither is the fact.
             (
+                "en",
                 &[
                     "Choose your subscription",
                     "Total USD 1.00",
@@ -1993,9 +2014,9 @@ pub(crate) mod tests {
                 None,
             ),
             // Nothing recurring: no renewal to read.
-            (&["One flight to Mumbai", "Total USD 1.00"][..], None),
+            ("en", &["One flight to Mumbai", "Total USD 1.00"][..], None),
         ] {
-            let (url, server) = fixture(page(lines)).await;
+            let (url, server) = fixture(page(lang, lines)).await;
             let tab = open(&browser, url).await;
             let facts = Discovery::read(&tab).await.unwrap().facts;
             assert_eq!(
@@ -2011,7 +2032,7 @@ pub(crate) mod tests {
                     expected.map(|(_, period, _)| period.to_owned()),
                     expected.and_then(|(_, _, date)| date.map(str::to_owned)),
                 ),
-                "{lines:?}"
+                "{lang} {lines:?}"
             );
             browser.return_control().await.unwrap();
             server.abort();
