@@ -83,19 +83,34 @@ const WALLET_CONTROL_DIR: &str = ".control";
 /// before the approved retry landed.
 const POLICY_UPDATE_STATES: &[&str] = &["pending", "confirmed", "failed"];
 
-fn is_recovery_start_path(segs: &[String], legacy_wallet: bool) -> bool {
-    matches!(segs, [name] if name == "recover" && !legacy_wallet)
-        || matches!(segs, [control, name] if control == WALLET_CONTROL_DIR && name == "recover")
+fn is_recovery_start_path(segs: &[String]) -> bool {
+    matches!(segs, [control, name] if control == WALLET_CONTROL_DIR && name == "recover")
 }
 
-fn recovery_control_tail(segs: &[String], legacy_wallet: bool) -> Option<&[String]> {
+fn recovery_control_tail(segs: &[String]) -> Option<&[String]> {
     match segs {
-        [root, tail @ ..] if root == "recoveries" && !legacy_wallet => Some(tail),
         [control, root, tail @ ..] if control == WALLET_CONTROL_DIR && root == "recoveries" => {
             Some(tail)
         }
         _ => None,
     }
+}
+
+/// `new` and `registrations` share the root with wallet directories;
+/// recovery controls live under `.control`, which no wallet name can spell.
+fn validate_wallet_name(name: &str) -> Result<(), HandlerError> {
+    if matches!(name, "new" | "registrations")
+        || name.is_empty()
+        || name.len() > 64
+        || !name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+    {
+        return Err(HandlerError::invalid(
+            "wallet name must be 1-64 ASCII alphanumeric, '-' or '_' characters",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
@@ -525,23 +540,6 @@ impl WalletsHandler {
         Self::map_wallet_projection(wallet, projections.get_wallet_authority(&wallet_id).await)
     }
 
-    async fn legacy_reserved_wallet(&self, segs: &[String]) -> Result<bool, HandlerError> {
-        let Some(name) = segs
-            .first()
-            .filter(|name| matches!(name.as_str(), "recover" | "recoveries"))
-        else {
-            return Ok(false);
-        };
-        match self.wallet_projection_navigation(name).await {
-            Ok(_) => Ok(true),
-            Err(HandlerError::NotFound(_)) => Ok(false),
-            Err(HandlerError::Backend(message)) if message.contains("SERVICE_UNAVAILABLE") => {
-                Ok(false)
-            }
-            Err(error) => Err(error),
-        }
-    }
-
     fn map_wallet_projection(
         wallet: &str,
         result: Result<WalletProjection, bloom_broker_api::ProtocolError>,
@@ -783,16 +781,7 @@ impl WalletsHandler {
             }
         };
         let requested_name = request.name.as_str();
-        if requested_name.is_empty()
-            || requested_name.len() > 64
-            || !requested_name.chars().all(|character| {
-                character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
-            })
-        {
-            return Err(HandlerError::invalid(
-                "wallet name must be 1-64 ASCII alphanumeric, '-' or '_' characters",
-            ));
-        }
+        validate_wallet_name(requested_name)?;
         let wallet_id = bloom_broker_api::Token::new(requested_name.to_owned())
             .map_err(|error| HandlerError::invalid(error.to_string()))?;
         let mut existing_records = self
@@ -1174,19 +1163,7 @@ impl WalletsHandler {
             }
         };
         let requested_name = request.name.as_str();
-        if matches!(
-            requested_name,
-            "new" | "registrations" | "recover" | "recoveries"
-        ) || requested_name.is_empty()
-            || requested_name.len() > 64
-            || !requested_name.chars().all(|character| {
-                character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
-            })
-        {
-            return Err(HandlerError::invalid(
-                "wallet name must be 1-64 ASCII alphanumeric, '-' or '_' characters",
-            ));
-        }
+        validate_wallet_name(requested_name)?;
         let wallet_id = bloom_broker_api::Token::new(requested_name.to_owned())
             .map_err(|error| HandlerError::invalid(error.to_string()))?;
         let mut existing_records = self
@@ -3431,17 +3408,16 @@ impl WalletsHandler {
         if segs.is_empty() {
             return Ok(Entry::dir(""));
         }
-        let legacy_wallet = self.legacy_reserved_wallet(segs).await?;
         if segs.len() == 1 && segs[0] == WALLET_CONTROL_DIR {
             return Ok(Entry::dir(WALLET_CONTROL_DIR));
         }
         if segs.len() == 1 && segs[0] == "new" {
             return Ok(Entry::writable_file("new"));
         }
-        if is_recovery_start_path(segs, legacy_wallet) {
+        if is_recovery_start_path(segs) {
             return Ok(Entry::writable_file("recover"));
         }
-        if let Some(tail) = recovery_control_tail(segs, legacy_wallet) {
+        if let Some(tail) = recovery_control_tail(segs) {
             return match tail {
                 [] => Ok(Entry::dir("recoveries")),
                 [requested_name] => {
@@ -3614,20 +3590,16 @@ impl WalletsHandler {
         if segs.is_empty() {
             return Err(HandlerError::NotAFile(path.to_string_path()));
         }
-        let legacy_wallet = self.legacy_reserved_wallet(segs).await?;
         if segs.len() == 1 && segs[0] == WALLET_CONTROL_DIR {
             return Err(HandlerError::NotAFile(path.to_string_path()));
         }
         if segs.len() == 1 && segs[0] == "new" {
             return Ok(b"Write a wallet name matching [A-Za-z0-9_-]{1,64}.\n".to_vec());
         }
-        if is_recovery_start_path(segs, legacy_wallet) {
+        if is_recovery_start_path(segs) {
             return Ok(b"Write the wallet name to start browser-only recovery.\n".to_vec());
         }
-        if segs.len() == 1
-            && segs[0] != "registrations"
-            && (segs[0] != "recoveries" || legacy_wallet)
-        {
+        if segs.len() == 1 && segs[0] != "registrations" {
             // Reading a wallet directory is EISDIR, but only if the wallet is
             // there. Answering "is a directory" for a name that does not exist
             // tells the caller the opposite of the truth.
@@ -3653,7 +3625,7 @@ impl WalletsHandler {
                 _ => Err(HandlerError::NotAFile(path.to_string_path())),
             };
         }
-        if let Some(tail) = recovery_control_tail(segs, legacy_wallet) {
+        if let Some(tail) = recovery_control_tail(segs) {
             return match tail {
                 [requested_name, leaf] if leaf == "status.json" => {
                     let projection = self.recovery_projection(requested_name).await?;
@@ -3772,16 +3744,15 @@ impl WalletsHandler {
         if segs.is_empty() {
             return Err(HandlerError::PermissionDenied);
         }
-        let legacy_wallet = self.legacy_reserved_wallet(segs).await?;
         if segs.len() == 1 && segs[0] == "new" {
             self.write_permit()?;
             return self.prepare_wallet_registration(data).await;
         }
-        if is_recovery_start_path(segs, legacy_wallet) {
+        if is_recovery_start_path(segs) {
             self.write_permit()?;
             return self.prepare_wallet_recovery(data).await;
         }
-        if let Some(tail) = recovery_control_tail(segs, legacy_wallet) {
+        if let Some(tail) = recovery_control_tail(segs) {
             if let [requested_name, leaf] = tail
                 && leaf == "cancel"
             {
@@ -3893,27 +3864,18 @@ impl WalletsHandler {
                 .into_iter()
                 .map(|projection| Entry::dir(projection.wallet.wallet_id.as_str()))
                 .collect();
-            let has_recover = out.iter().any(|entry| entry.name == "recover");
-            let has_recoveries = out.iter().any(|entry| entry.name == "recoveries");
             out.push(Entry::writable_file("new"));
             out.push(Entry::dir("registrations"));
             out.push(Entry::dir(WALLET_CONTROL_DIR));
-            if !has_recover {
-                out.push(Entry::writable_file("recover"));
-            }
-            if !has_recoveries {
-                out.push(Entry::dir("recoveries"));
-            }
             return Ok(out);
         }
-        let legacy_wallet = self.legacy_reserved_wallet(segs).await?;
         if segs.len() == 1 && segs[0] == WALLET_CONTROL_DIR {
             return Ok(vec![
                 Entry::writable_file("recover"),
                 Entry::dir("recoveries"),
             ]);
         }
-        if let Some(tail) = recovery_control_tail(segs, legacy_wallet) {
+        if let Some(tail) = recovery_control_tail(segs) {
             return match tail {
                 [] => Ok(self
                     .recovery_names()?
@@ -7777,8 +7739,6 @@ value = "0""#,
         assert!(names.contains(&"new"));
         assert!(names.contains(&"registrations"));
         assert!(names.contains(&WALLET_CONTROL_DIR));
-        assert!(names.contains(&"recover"));
-        assert!(names.contains(&"recoveries"));
     }
 
     #[tokio::test]
@@ -7837,16 +7797,7 @@ value = "0""#,
         f.handler.wallet_projections = Some(Arc::new(UnavailableProjection));
         let entries = f.handler.list(&VfsPath::parse("/").unwrap()).await.unwrap();
         let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
-        assert_eq!(
-            names,
-            [
-                "new",
-                "registrations",
-                WALLET_CONTROL_DIR,
-                "recover",
-                "recoveries"
-            ]
-        );
+        assert_eq!(names, ["new", "registrations", WALLET_CONTROL_DIR]);
     }
 
     #[tokio::test]
@@ -7889,8 +7840,7 @@ value = "0""#,
             .list(&VfsPath::parse("/").unwrap())
             .await
             .unwrap();
-        assert!(root.iter().any(|entry| entry.name == "recover"));
-        assert!(root.iter().any(|entry| entry.name == "recoveries"));
+        assert!(root.iter().any(|entry| entry.name == WALLET_CONTROL_DIR));
         let recover = VfsPath::parse("/.control/recover").unwrap();
         for body in [
             br#"{"name":"lost","recovery_secret":"forbidden"}"#.as_slice(),
@@ -7926,7 +7876,7 @@ value = "0""#,
             attempted_ids,
             [pending.operation_id.clone(), pending.operation_id]
         );
-        let status_path = VfsPath::parse("/recoveries/lost/status.json").unwrap();
+        let status_path = VfsPath::parse("/.control/recoveries/lost/status.json").unwrap();
         let initial: serde_json::Value =
             serde_json::from_slice(&fixture.handler.read(&status_path).await.unwrap()).unwrap();
         assert_eq!(initial["requested_name"], "lost");
@@ -7980,7 +7930,7 @@ value = "0""#,
             assert!(matches!(
                 fixture
                     .handler
-                    .read(&VfsPath::parse("/recoveries/lost/result.json").unwrap())
+                    .read(&VfsPath::parse("/.control/recoveries/lost/result.json").unwrap())
                     .await,
                 Err(HandlerError::NotFound(_))
             ));
@@ -7989,14 +7939,14 @@ value = "0""#,
         assert!(
             fixture
                 .handler
-                .lookup(&VfsPath::parse("/recoveries/lost/cancel").unwrap())
+                .lookup(&VfsPath::parse("/.control/recoveries/lost/cancel").unwrap())
                 .await
                 .is_ok()
         );
         fixture
             .handler
             .write(
-                &VfsPath::parse("/recoveries/lost/cancel").unwrap(),
+                &VfsPath::parse("/.control/recoveries/lost/cancel").unwrap(),
                 b"cancel\n",
             )
             .await
@@ -8027,7 +7977,7 @@ value = "0""#,
         let result: serde_json::Value = serde_json::from_slice(
             &fixture
                 .handler
-                .read(&VfsPath::parse("/recoveries/lost/result.json").unwrap())
+                .read(&VfsPath::parse("/.control/recoveries/lost/result.json").unwrap())
                 .await
                 .unwrap(),
         )
@@ -8035,6 +7985,37 @@ value = "0""#,
         assert_eq!(result["ceremony_kind"], "wallet_recovery");
         assert_eq!(result["operation_id"], completed["operation_id"]);
         assert!(result.get("encrypted_browser_result").is_none());
+    }
+
+    #[tokio::test]
+    async fn legacy_wallets_named_recover_or_recoveries_can_be_recovered() {
+        let mut fixture = make_handler();
+        let broker = Arc::new(RegistrationBroker {
+            requests: Mutex::new(Vec::new()),
+            state: Mutex::new(CeremonyState::AwaitingUser),
+            omit_ceremony_url: Mutex::new(false),
+            status_error: Mutex::new(None),
+            lose_recovery_prepare_response_once: Mutex::new(false),
+            pause_status_once: Mutex::new(false),
+            status_entered: tokio::sync::Notify::new(),
+            status_release: tokio::sync::Notify::new(),
+        });
+        fixture.handler = fixture
+            .handler
+            .with_broker(Some(MachineBrokerClient::new(broker)));
+        let recover = VfsPath::parse("/.control/recover").unwrap();
+        for name in ["recover", "recoveries"] {
+            fixture
+                .handler
+                .write(&recover, name.as_bytes())
+                .await
+                .unwrap();
+            let status =
+                VfsPath::parse(&format!("/.control/recoveries/{name}/status.json")).unwrap();
+            let status: serde_json::Value =
+                serde_json::from_slice(&fixture.handler.read(&status).await.unwrap()).unwrap();
+            assert_eq!(status["requested_name"], name);
+        }
     }
 
     #[tokio::test]
@@ -8053,7 +8034,7 @@ value = "0""#,
         fixture.handler = fixture
             .handler
             .with_broker(Some(MachineBrokerClient::new(broker.clone())));
-        let recover = VfsPath::parse("/recover").unwrap();
+        let recover = VfsPath::parse("/.control/recover").unwrap();
         assert!(fixture.handler.write(&recover, b"lost").await.is_err());
         let old_intent: WalletRecoveryIntent =
             read_json(fixture.handler.recovery_intent_path("lost")).unwrap();
@@ -8086,7 +8067,7 @@ value = "0""#,
         fixture.handler = fixture
             .handler
             .with_broker(Some(MachineBrokerClient::new(broker.clone())));
-        let recover = VfsPath::parse("/recover").unwrap();
+        let recover = VfsPath::parse("/.control/recover").unwrap();
         // Broker refuses the remote surface; the intent stays, because a
         // failed prepare cannot prove Signer holds no operation.
         assert!(
@@ -8157,7 +8138,7 @@ value = "0""#,
         fixture.handler = fixture
             .handler
             .with_broker(Some(MachineBrokerClient::new(broker.clone())));
-        let recover = VfsPath::parse("/recover").unwrap();
+        let recover = VfsPath::parse("/.control/recover").unwrap();
         fixture.handler.write(&recover, b"lost").await.unwrap();
         let old_id = fixture
             .handler
@@ -8170,7 +8151,7 @@ value = "0""#,
         let status_handler = fixture.handler.clone();
         let status_task = tokio::spawn(async move {
             status_handler
-                .read(&VfsPath::parse("/recoveries/lost/status.json").unwrap())
+                .read(&VfsPath::parse("/.control/recoveries/lost/status.json").unwrap())
                 .await
         });
         entered.await;
@@ -8178,7 +8159,7 @@ value = "0""#,
         let prepare_handler = fixture.handler.clone();
         let mut prepare_task = tokio::spawn(async move {
             prepare_handler
-                .write(&VfsPath::parse("/recover").unwrap(), b"lost")
+                .write(&VfsPath::parse("/.control/recover").unwrap(), b"lost")
                 .await
         });
         assert!(
@@ -8528,6 +8509,8 @@ value = "0""#,
 
         for body in [
             &b" \n\t"[..],
+            b"new",
+            b"registrations",
             b"main/sub",
             br#"{"schema":"bloom.wallet-registration-request.1","requested_name":"main"}"#,
             &[0xff],

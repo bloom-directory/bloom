@@ -247,8 +247,7 @@ active passkey, and every other passkey, on any device, is revoked. Tell the
 human that their other devices can no longer approve until they add passkeys
 again (see "Adding a passkey"); `result.json` lists the active credential. A
 cancelled or expired operation can be started again with a fresh write to
-`wallets/.control/recover`. The top-level `recover` and `recoveries`
-aliases remain available when no legacy wallet owns those names.
+`wallets/.control/recover`.
 
 ## Check passkeys before hosted approvals
 

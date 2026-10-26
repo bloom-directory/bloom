@@ -106,8 +106,7 @@ complete the human ceremony, then check `COMPLETED` and `result.json`.
 Mnemonic and raw-key input stays in the Broker-hosted browser ceremony.
 Recovery ID and secret input likewise stays in the Browser ceremony; start it
 with only the wallet name at `wallets/.control/recover`, then inspect
-`wallets/.control/recoveries/<petname>/status.json`. The former top-level
-paths remain aliases unless a legacy wallet already owns either name.
+`wallets/.control/recoveries/<petname>/status.json`.
 
 For a transaction requiring fresh approval, inspect the same action's
 `approval_challenge.json`, verify its identity and expiry, and retry its exact

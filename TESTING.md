@@ -156,7 +156,7 @@ NFS mount. See [hosted-relay developer acceptance](./DEVELOPMENT.md#hosted-relay
 for provisioning and trust pins. Real-browser/passkey acceptance remains a
 separate check.
 
-Add `BLOOM_REMOTE_RECOVERY_E2E=1` to test `/wallets/recover`, pending-operation
+Add `BLOOM_REMOTE_RECOVERY_E2E=1` to test `/wallets/.control/recover`, pending-operation
 reuse, recovery-factor rotation, and approval with the replacement passkey.
 The test also checks that public recovery initiation returns 404 and `/`
 redirects to `https://bloom.directory` with an empty body while ceremonies still

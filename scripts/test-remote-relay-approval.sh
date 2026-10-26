@@ -96,11 +96,11 @@ operation="$(sed -n 's/^operation_id: //p' "$run_dir/policy.txt")"
 cli wallet commit-policy "$operation" > "$run_dir/policy-commit.json"
 printf 'PASS remote policy authorization\n'
 if [ "${BLOOM_REMOTE_RECOVERY_E2E:-0}" = 1 ]; then
-  recovery_path="/wallets/recoveries/$wallet"
-  write_vfs /wallets/recover "$wallet" > /dev/null
+  recovery_path="/wallets/.control/recoveries/$wallet"
+  write_vfs /wallets/.control/recover "$wallet" > /dev/null
   read_vfs "$recovery_path/status.json" > "$run_dir/recovery-status.json"
   recovery_operation="$(jq -er '.operation_id' "$run_dir/recovery-status.json")"
-  write_vfs /wallets/recover "$wallet" > /dev/null
+  write_vfs /wallets/.control/recover "$wallet" > /dev/null
   [ "$(read_vfs "$recovery_path/status.json" | jq -er '.operation_id')" = "$recovery_operation" ]
   recovery_url="$(jq -er '.ceremony_url' "$run_dir/recovery-status.json")"
   [[ "$recovery_url" =~ ^https://[a-z2-7]{26}\.relay\.bloom\.directory/ceremony/\#cap=[A-Za-z0-9_-]{43}$ ]]
