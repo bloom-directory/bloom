@@ -68,8 +68,7 @@ accounting package to be published and adopted in the installer catalog; the
 currently pinned v0.1.6 package supplies no positive debit claims and therefore
 falls back to exact approval. Publishing that package and updating its immutable
 release/hash pins are separate rollout gates. Other Petal classes, SELL shares,
-builder fees, funding and withdrawals retain exact review or require an explicit
-separately reviewed proposal.
+builder fees, funding and withdrawals retain exact review.
 
 Profiles allow at most 4,096 signed actions/signatures across a session. Daily
 caps use a rolling 24-hour window measured when signing authority is reserved;
@@ -105,19 +104,31 @@ without being overwritten. Existing settings reconcile the obligation as
 preserved; genuine backend failures keep it pending. Ordinary Petal writes
 retain their existing editing behavior. This path changes no guest ABI.
 
-Typed native EVM sessions currently cover Ethereum (chain 1), Polygon (137)
-and local development chains (31337). Other EVM networks, including OP Stack
-chains, retain exact approval because additional network fees are not covered
-by the current maximum-gas-fee projection. Solana retains exact approval.
+Native transfers retain exact approval. The experimental `SystemSession`
+selector is refused, including explicit `--proposal` files. The first release
+reuses the existing Petal selector for fee-free Polymarket BUYs; it does not add
+a new wallet-wide signature authority.
 
-Native sessions use explicit reviewed asset/fee unit limits, not automatic USD
-pricing. A complete frozen proposal can be submitted with
-`bloom wallet persona activate main --account 0 --proposal file.json`.
+Broker owns economic accounting. The complete descriptor remains in Broker's
+approval metadata and signed review and is committed through the existing
+opaque request nonce. Signer receives ordinary Petal Sealed Approval terms and
+enforces its existing structural counters, expiry, revocation and replay; it
+has no asset-conversion or shared spending ledger. Machine forwards the full
+order witness on use and preserves it in its durable retry identity. Broker
+reconstructs the signed order and checks that its gross maker amount equals
+the charged pUSD debit. This checks signing terms, not settlement or a live USD
+valuation, and does not contain the economic impact of a compromised Broker.
+
+The extension negotiates Machine–Broker 1.9 while preserving Broker–Signer
+1.6. The combined Polymarket clear-signing/accounting package must be published
+and pinned before default onboarding can consume it. Other message operations
+keep their existing exact-approval path.
 
 Local grants are boot-bound. A saved preference does not rearm them after
 logout/restart. An orphaned grant requires inspection and explicit stop before
 fresh reviewed activation; repeating activation does not reset a consumed
-budget. Selective Signer archive restore disables grouped grants and permanently
-blocks their unrecovered budget descriptors. New session authority needs a
-fresh owner-reviewed descriptor. Ordinary SQLite reopening retains usage, and
-completed signing results remain recoverable after stop/revocation.
+budget. Broker's journal is the economic source of truth; Signer backups do
+not contain that journal. Keep its history and existing audit/recovery fences.
+Completed signing results remain recoverable after stop/revocation. Confirmed
+remote revocations are recorded locally, so repeated stop does not resubmit
+already-completed revocations with a new server timestamp.

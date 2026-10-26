@@ -22,6 +22,9 @@ use bloom_vfs::{Handler, Vfs};
 struct AccountFixture {
     account_one_missing: AtomicBool,
     external_calls: AtomicUsize,
+    capture_signing: AtomicBool,
+    sign_requests: std::sync::Mutex<Vec<PayloadSignRequest>>,
+    batch_sign_requests: std::sync::Mutex<Vec<bloom_petals::PayloadBatchSignRequest>>,
 }
 
 fn directory(name: &str) -> HostVfsEntry {
@@ -36,6 +39,21 @@ fn directory(name: &str) -> HostVfsEntry {
 
 #[async_trait]
 impl PetalHost for AccountFixture {
+    async fn sign_payload_batch_outcome(
+        &self,
+        request: bloom_petals::PayloadBatchSignRequest,
+    ) -> Result<bloom_petals::PayloadBatchSignOutcome, HostError> {
+        if !self.capture_signing.load(Ordering::SeqCst) {
+            return Err(HostError::Denied("fixture batch signing".into()));
+        }
+        self.batch_sign_requests.lock().unwrap().push(request);
+        Ok(bloom_petals::PayloadBatchSignOutcome::ApprovalPending(
+            bloom_petals::abi::ApprovalPending {
+                action_id: "55".repeat(32),
+                expires_ms: u64::MAX,
+            },
+        ))
+    }
     async fn vfs_lookup(&self, path: &str) -> Result<HostVfsEntry, HostError> {
         if matches!(path, "wallets" | "wallets/alice") {
             return Ok(directory(path.rsplit('/').next().unwrap()));
@@ -52,6 +70,9 @@ impl PetalHost for AccountFixture {
     }
 
     async fn vfs_read(&self, path: &str) -> Result<Vec<u8>, HostError> {
+        if self.capture_signing.load(Ordering::SeqCst) && path == "chains/polygon/chain_id" {
+            return Ok(b"137".to_vec());
+        }
         for index in [0, 1] {
             if path == format!("wallets/alice/{index}/account.json") {
                 if index == 1 && self.account_one_missing.load(Ordering::SeqCst) {
@@ -77,16 +98,50 @@ impl PetalHost for AccountFixture {
 
     async fn http_fetch(
         &self,
-        _request: HttpRequest,
+        request: HttpRequest,
         _policy: NetPolicy,
         _max: usize,
     ) -> Result<HttpResponse, HostError> {
         self.external_calls.fetch_add(1, Ordering::SeqCst);
+        if self.capture_signing.load(Ordering::SeqCst) && request.url.ends_with("/time") {
+            return Ok(HttpResponse {
+                status: 200,
+                headers: vec![],
+                body: b"1700000000".to_vec(),
+            });
+        }
+        if self.capture_signing.load(Ordering::SeqCst) && request.url.contains("/nonce?") {
+            return Ok(HttpResponse {
+                status: 200,
+                headers: vec![],
+                body: br#"{"nonce":"0"}"#.to_vec(),
+            });
+        }
         Err(HostError::Denied("fixture HTTP".into()))
     }
 
-    async fn chain_read(&self, _request: ChainRequest) -> Result<ChainResponse, HostError> {
+    async fn chain_read(&self, request: ChainRequest) -> Result<ChainResponse, HostError> {
         self.external_calls.fetch_add(1, Ordering::SeqCst);
+        if self.capture_signing.load(Ordering::SeqCst) {
+            let params: serde_json::Value = serde_json::from_str(&request.params_json).unwrap();
+            let value = match request.method.as_str() {
+                "eth_getCode" => "0x6000".to_owned(),
+                "eth_call" => {
+                    let data = params[0]["data"].as_str().unwrap();
+                    let word = match &data[..10] {
+                        "0x5c60da1b" | "0x1f264778" => 3u64,
+                        "0x70a08231" => 100,
+                        "0xdd62ed3e" | "0xe985e9c5" => 0,
+                        _ => return Err(HostError::Denied("unexpected fixture selector".into())),
+                    };
+                    format!("0x{word:064x}")
+                }
+                _ => return Err(HostError::Denied("unexpected fixture RPC".into())),
+            };
+            return Ok(ChainResponse {
+                result_json: serde_json::to_string(&value).unwrap(),
+            });
+        }
         Err(HostError::Denied("fixture chain RPC".into()))
     }
 
@@ -108,9 +163,18 @@ impl PetalHost for AccountFixture {
 
     async fn sign_payload_outcome(
         &self,
-        _request: PayloadSignRequest,
+        request: PayloadSignRequest,
     ) -> Result<SignOutcome, HostError> {
         self.external_calls.fetch_add(1, Ordering::SeqCst);
+        if self.capture_signing.load(Ordering::SeqCst) {
+            self.sign_requests.lock().unwrap().push(request);
+            return Ok(SignOutcome::ApprovalPending(
+                bloom_petals::abi::ApprovalPending {
+                    action_id: "55".repeat(32),
+                    expires_ms: u64::MAX,
+                },
+            ));
+        }
         Err(HostError::Denied("fixture signing".into()))
     }
 }
@@ -512,4 +576,273 @@ async fn installed_packages_keep_explicit_account_routes_and_private_state() {
     eprintln!(
         "installed WASM fixture: private settings, restart, secret permissions and no external side effects passed"
     );
+}
+
+#[tokio::test]
+#[ignore = "requires rebuilt packages via BLOOM_PM80_POLYMARKET_ROOT and BLOOM_PM80_HYPERLIQUID_ROOT"]
+async fn real_signing_producers_reach_the_host_with_selected_account_and_full_witness() {
+    let temporary = tempfile::Builder::new().prefix("cs-vm-").tempdir().unwrap();
+    let home = temporary.path();
+    let store = PetalStore::open(home.join("petals/store")).unwrap();
+    let mut hashes = BTreeMap::new();
+    let mut package_records = Vec::new();
+    for (name, variable) in [
+        ("polymarket", "BLOOM_PM80_POLYMARKET_ROOT"),
+        ("hyperliquid", "BLOOM_PM80_HYPERLIQUID_ROOT"),
+    ] {
+        let root = PathBuf::from(std::env::var_os(variable).expect(variable));
+        let prepared = bloom_petals::package::build_petal_package_dir(&root).unwrap();
+        let authority: Vec<_> = prepared
+            .route_index
+            .routes
+            .iter()
+            .filter_map(|route| {
+                let mut classes = route.key_derive_operation_classes.clone();
+                if let Some(intent) = &route.install_metadata.sign_intent {
+                    classes.push(intent.clone());
+                }
+                classes.sort();
+                classes.dedup();
+                (!classes.is_empty()).then(|| serde_json::json!({
+                "route_id":route.route_id, "pattern":route.pattern, "operation_classes":classes,
+            }))
+            })
+            .collect();
+        let (installed, _, _) = store.install_prepared_petal_package(prepared).unwrap();
+        package_records.push(serde_json::json!({"name":name,"package_hash":installed.hash,"authority_routes":authority}));
+        hashes.insert(name, installed.hash);
+    }
+    let host = Arc::new(AccountFixture::default());
+    host.capture_signing.store(true, Ordering::SeqCst);
+    let vfs = fixture_vfs(home, host.clone());
+    let begin = mounted("polymarket", "onboard/alice/1/begin");
+    let status_path = mounted("polymarket", "onboard/alice/1/status.json");
+    let fresh: serde_json::Value =
+        serde_json::from_slice(&vfs.read(&status_path).await.unwrap()).unwrap();
+    assert_eq!(fresh["next_action"], "onboard/alice/1/begin");
+    let begin_result = vfs.write(&begin, b"begin").await;
+    {
+        let requests = host.batch_sign_requests.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "fresh begin must emit CLOB auth: {begin_result:?}"
+        );
+        let request = &requests[0];
+        assert_eq!(request.operation_class, "polymarket.clob_auth.v1");
+        assert_eq!(
+            request
+                .context
+                .as_ref()
+                .unwrap()
+                .trusted_account()
+                .unwrap()
+                .number,
+            1
+        );
+        assert_eq!(
+            request.context.as_ref().unwrap().package_hash,
+            hashes["polymarket"]
+        );
+        assert!(request.action.is_some());
+    }
+    let private =
+        PrivateStore::open_account(store.private_account_data_root(), "alice", 1).unwrap();
+    private
+        .put(
+            &hashes["polymarket"],
+            "secrets/creds/alice/clob.json",
+            br#"{"apiKey":"fixture","secret":"fixture","passphrase":"fixture"}"#,
+            true,
+        )
+        .unwrap();
+    vfs.write(&begin, b"begin").await.unwrap();
+    let credentials_ready: serde_json::Value =
+        serde_json::from_slice(&vfs.read(&status_path).await.unwrap()).unwrap();
+    assert_eq!(credentials_ready["next_action"], "onboard/alice/1/continue");
+    assert_eq!(
+        host.batch_sign_requests.lock().unwrap().len(),
+        1,
+        "stored credentials must not sign under begin"
+    );
+    let continuation = mounted("polymarket", "onboard/alice/1/continue");
+    let continuation_result = vfs.write(&continuation, b"continue").await;
+    {
+        let requests = host.batch_sign_requests.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            2,
+            "continuation must prepare the separate exact batch: {continuation_result:?}"
+        );
+        assert_eq!(requests[1].operation_class, "polymarket.onboard");
+        assert_eq!(
+            requests[1].selector,
+            bloom_broker_api::PetalSignSelector::Exact
+        );
+        assert_eq!(requests[1].context.as_ref().unwrap().route_id, "r000043");
+        assert_eq!(requests[0].context.as_ref().unwrap().route_id, "r000042");
+    }
+    let pending_keys = [
+        "state/onboard/alice/approval.json",
+        "state/onboard/alice/prepared_relayer_batch.json",
+    ];
+    let pending = pending_keys.map(|key| private.get(&hashes["polymarket"], key).unwrap());
+    for _ in 0..2 {
+        vfs.write(&begin, b"begin").await.unwrap();
+        for (key, expected) in pending_keys.iter().zip(&pending) {
+            assert_eq!(
+                &private.get(&hashes["polymarket"], key).unwrap(),
+                expected,
+                "begin must preserve the pending exact batch and approval"
+            );
+        }
+    }
+    assert_eq!(host.batch_sign_requests.lock().unwrap().len(), 2);
+    let awaiting: serde_json::Value =
+        serde_json::from_slice(&vfs.read(&status_path).await.unwrap()).unwrap();
+    assert_eq!(awaiting["next_action"], "onboard/alice/1/continue");
+    assert!(
+        awaiting["message"]
+            .as_str()
+            .unwrap()
+            .contains("existing owner approval")
+    );
+    // Old hint files cannot keep completed/read-only accounts actionable.
+    private
+        .put(
+            &hashes["polymarket"],
+            "state/onboard/alice/next_action.json",
+            br#"{"next_action":"stale continuation"}"#,
+            false,
+        )
+        .unwrap();
+    private.del(&hashes["polymarket"], pending_keys[0]).unwrap();
+    for stage in ["fund", "complete"] {
+        let status = serde_json::json!({"owner":"0x0000000000000000000000000000000000000002", "stage":stage});
+        private
+            .put(
+                &hashes["polymarket"],
+                "state/onboard/alice/status.json",
+                &serde_json::to_vec(&status).unwrap(),
+                false,
+            )
+            .unwrap();
+        let projected: serde_json::Value =
+            serde_json::from_slice(&vfs.read(&status_path).await.unwrap()).unwrap();
+        assert_eq!(
+            projected["next_action"],
+            if stage == "fund" {
+                serde_json::json!("fund/alice/1/new")
+            } else {
+                serde_json::Value::Null
+            }
+        );
+    }
+    private
+        .put(
+            &hashes["polymarket"],
+            "secrets/creds/relayer.json",
+            br#"{"legacy_eoa_mode":true}"#,
+            true,
+        )
+        .unwrap();
+    let read_only: serde_json::Value =
+        serde_json::from_slice(&vfs.read(&status_path).await.unwrap()).unwrap();
+    assert_eq!(read_only["stage"], "legacy_eoa");
+    assert!(read_only["next_action"].is_null());
+    assert!(read_only.get("deposit_wallet_action").is_none());
+    // A real persisted delegated session drives the actual compiled workflow.
+    let key = bloom_broker_api::KeyRef {
+        backend: bloom_broker_api::Token::new("local").unwrap(),
+        backend_instance: bloom_broker_api::Token::new("fixture").unwrap(),
+        locator: "wallet/alice/petals/fixture-child".into(),
+        key_spec: bloom_broker_api::KeySpec::Secp256k1,
+        public_key_fingerprint: bloom_broker_api::Digest32::from_bytes([0x44; 32]),
+        derivation: None,
+    };
+    let session = serde_json::json!({
+        "schema":"bloom.hyperliquid_agent_session.v1", "network":"testnet", "wallet":"alice",
+        "owner_address":"0x0000000000000000000000000000000000000002", "id":"test",
+        "agent_address":"0x0000000000000000000000000000000000000003",
+        "key_ref_jcs":serde_jcs::to_vec(&key).unwrap(), "agent_name":"test",
+        "created_ms":1, "expires_ms":u64::MAX, "max_notional_usd":null, "max_leverage":3,
+        "assets":["0"], "stopped":false, "last_response":null, "last_error":null
+    });
+    private
+        .put(
+            &hashes["hyperliquid"],
+            "state/state/sessions/testnet/alice/test/session.json",
+            &serde_json::to_vec(&session).unwrap(),
+            false,
+        )
+        .unwrap();
+    let cancel = mounted(
+        "hyperliquid",
+        "testnet/agent_sessions/alice/1/test/cancel.json",
+    );
+    let mut cancellation_results = Vec::new();
+    for (nonce, action) in [
+        (
+            123,
+            serde_json::json!({"type":"cancel","cancels":[{"a":0,"o":42}]}),
+        ),
+        (
+            124,
+            serde_json::json!({"type":"cancel","cancels":[{"a":0,"o":42}],"f":true}),
+        ),
+        (
+            125,
+            serde_json::json!({"type":"cancelByCloid","cancels":[{"asset":0,"cloid":"0x00112233445566778899aabbccddeeff"}]}),
+        ),
+    ] {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "action":action, "nonce":nonce
+        }))
+        .unwrap();
+        cancellation_results.push(vfs.write(&cancel, &body).await);
+    }
+    let requests = host.sign_requests.lock().unwrap();
+    assert_eq!(
+        requests.len(),
+        3,
+        "normal, fast and client-ID cancellations must reach the host: {cancellation_results:?}"
+    );
+    for request in requests.iter() {
+        assert_eq!(request.operation_class, "hyperliquid.agent_action");
+        assert_eq!(request.key_ref.as_ref(), Some(&key));
+        assert_eq!(request.claim_assurance_evidence, request.action);
+        assert!(
+            request
+                .claim_assurance_evidence
+                .as_ref()
+                .is_some_and(|bytes| !bytes.is_empty())
+        );
+        assert_eq!(
+            request
+                .context
+                .as_ref()
+                .unwrap()
+                .trusted_account()
+                .unwrap()
+                .number,
+            1
+        );
+    }
+    let produced: Vec<_> = requests.iter().map(|request| serde_json::json!({
+            "preimage_hex":hex::encode(&request.preimage), "hash_hex":hex::encode(request.claimed_hash),
+            "witness":serde_json::from_slice::<serde_json::Value>(request.claim_assurance_evidence.as_ref().unwrap()).unwrap()
+        })).collect();
+    let broker_fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/hyperliquid-producer-cancel.json")).unwrap();
+    assert_eq!(
+        serde_json::json!(produced),
+        broker_fixture,
+        "actual compiled producer witness/hash/preimage differs from the Broker reconstruction fixture"
+    );
+    if let Some(path) = std::env::var_os("BLOOM_PM80_PRODUCER_WITNESS") {
+        std::fs::write(path, serde_json::to_vec_pretty(&produced).unwrap()).unwrap();
+    }
+    if let Some(path) = std::env::var_os("BLOOM_PM80_PACKAGE_RECORDS") {
+        std::fs::write(path, serde_json::to_vec_pretty(&package_records).unwrap()).unwrap();
+    }
 }

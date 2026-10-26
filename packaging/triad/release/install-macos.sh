@@ -29,7 +29,9 @@ payload_scratch=""
 created_users=""
 created_groups=""
 upgrade_transaction=""
+upgrade_transaction_scratch=""
 upgrade_old_digest=""
+upgrade_phase=""
 restore_pending=false
 legacy_cli_removed=false
 pf_cleanup_scratch=""
@@ -42,6 +44,7 @@ cleanup() {
   fi
   [[ -z "$scratch" || ! -d "$scratch" ]] || rm -rf -- "$scratch"
   [[ -z "$payload_scratch" || ! -d "$payload_scratch" ]] || rm -rf -- "$payload_scratch"
+  [[ -z "$upgrade_transaction_scratch" || ! -d "$upgrade_transaction_scratch" ]] || rm -rf -- "$upgrade_transaction_scratch"
   if ((rc != 0)) && $live; then
     rollback_failed=false
     for user in $created_users; do
@@ -71,11 +74,13 @@ root_and_uid() {
   fi
 }
 
-require_native_macos_mount() {
+# Installed Bloom always mounts ~/bloom through native NFSv4.1, which macOS
+# supports from version 26; there is no installed configuration without it.
+require_supported_macos() {
   local version="$1"
   [[ "$version" =~ ^([1-9][0-9]*)(\.[0-9]+)*$ ]] &&
     ((${BASH_REMATCH[1]} >= 26)) ||
-    die "Installed Bloom mounting requires macOS 26 or later for NFSv4.1; found '$version'. The unmounted CLI does not require this native mount."
+    die "Bloom requires macOS 26 or later; this Mac runs macOS '$version'. Bloom mounts ~/bloom over NFSv4.1, which earlier macOS versions do not support. Update macOS, then run the installer again."
 }
 
 lock_installer() {
@@ -296,6 +301,7 @@ render() {
     -e "s|@BLOOM_SIGNER_SOCKET@|$runtime/broker-signer/signer.sock|g" \
     -e "s|@BLOOM_BROKER_CONTROL_SOCKET@|$runtime/revoke/broker/control.sock|g" \
     -e "s|@BLOOM_SIGNER_CONTROL_SOCKET@|$runtime/revoke/signer/control.sock|g" \
+    -e "s|@BLOOM_SIGNER_ADMIN_SOCKET@|$runtime/signer-admin/admin.sock|g" \
     -e "s|@BLOOM_SESSION_SOCKET@|$runtime/session/session.sock|g" \
     -e "s|@BLOOM_BROKER_STARTUP_STATUS@|$runtime/status/broker-startup.json|g" \
     -e "s|@BLOOM_CONTAINMENT_STATUS@|$runtime/containment/status.json|g" \
@@ -406,8 +412,22 @@ remove_legacy_cli() {
   return 1
 }
 
+# A legacy wallet has finished migrating when its staging receipt names the
+# address the running Machine now reports for that wallet. Anything that cannot
+# be confirmed (no receipt, an unreadable one, a Machine that does not answer)
+# counts as not migrated, so its instructions are still shown.
+legacy_wallet_migrated() {
+  local wallet_name="$1" receipt="$2" staged current
+  $live || return 1
+  [[ -f "$receipt" && ! -L "$receipt" ]] || return 1
+  staged="$(/usr/bin/sudo -u "$login_user" -- /usr/bin/plutil -extract address raw -o - "$receipt" 2>/dev/null)" || return 1
+  [[ "$staged" =~ ^0x[0-9a-fA-F]{40}$ ]] || return 1
+  current="$(launchctl asuser "$login_uid" /usr/bin/sudo -u "$login_user" -H "$release_base/current/bloom" --home "$login_home/.bloom" -q wallet address "$wallet_name" 2>/dev/null)" || return 1
+  [[ "$(printf '%s' "$current" | tr 'A-F' 'a-f')" == "$(printf '%s' "$staged" | tr 'A-F' 'a-f')" ]]
+}
+
 report_legacy_wallet_migrations() {
-  local wallet_root wallet_dir kind_file kind wallet_name receipt
+  local wallet_root wallet_dir kind_file kind wallet_name receipt migrated=""
   local found_wallet=false found_supported=false
   resolve_login_home
   wallet_root="$login_home/.bloom/keystore"
@@ -447,6 +467,10 @@ report_legacy_wallet_migrations() {
 
     found_supported=true
     receipt="$login_home/.bloom/$wallet_name.triad-migration-receipt.json"
+    if legacy_wallet_migrated "$wallet_name" "$receipt"; then
+      migrated="${migrated:+$migrated, }$wallet_name"
+      continue
+    fi
     echo "Migrate legacy passkey wallet $wallet_name with these two commands. Only the staging command requires sudo:"
     printf '  sudo %q stage --source %q --config %q --source-uid %q --signer-uid %q --signer-gid %q --receipt %q\n' \
       "$release_base/current/bloom-signer-migrate" "$wallet_dir" \
@@ -454,6 +478,9 @@ report_legacy_wallet_migrations() {
       "$BLOOM_MACOS_SIGNER_GID" "$receipt"
     printf '  %q wallet migrate-passkey %q\n' "$cli_link" "$receipt"
   done
+  if [[ -n "$migrated" ]]; then
+    echo "Already migrated, no action needed: $migrated"
+  fi
   if ! $found_wallet; then
     echo "No legacy wallets were found in $wallet_root"
   elif ! $found_supported; then
@@ -628,14 +655,16 @@ preflight_compatibility() {
   grep -Fx 'schema = "bloom.triad-compatibility/1"' "$compatibility" >/dev/null || die "unsupported or malformed compatibility metadata"
   candidate_machine_state=""; candidate_broker_state=""; candidate_signer_state=""
   candidate_machine_floor=""; candidate_broker_floor=""; candidate_signer_floor=""
+  candidate_machine_migration_floor=""; candidate_broker_migration_floor=""; candidate_signer_migration_floor=""
   for component in machine broker signer; do
     current="$(compat_field "state.$component" current)"
     floor="$(compat_field "state.$component" downgrade_floor)"
-    [[ "$current" =~ ^[1-9][0-9]*$ && "$floor" =~ ^[1-9][0-9]*$ && "$floor" -le "$current" ]] || die "malformed $component state compatibility metadata"
+    migration_floor="$(compat_field "state.$component" migration_floor)"
+    [[ "$current" =~ ^[1-9][0-9]*$ && "$floor" =~ ^[1-9][0-9]*$ && "$migration_floor" =~ ^[1-9][0-9]*$ && "$migration_floor" -le "$floor" && "$floor" -le "$current" ]] || die "malformed $component state compatibility metadata"
     case "$component" in
-      machine) candidate_machine_state="$current"; candidate_machine_floor="$floor" ;;
-      broker) candidate_broker_state="$current"; candidate_broker_floor="$floor" ;;
-      signer) candidate_signer_state="$current"; candidate_signer_floor="$floor" ;;
+      machine) candidate_machine_state="$current"; candidate_machine_floor="$floor"; candidate_machine_migration_floor="$migration_floor" ;;
+      broker) candidate_broker_state="$current"; candidate_broker_floor="$floor"; candidate_broker_migration_floor="$migration_floor" ;;
+      signer) candidate_signer_state="$current"; candidate_signer_floor="$floor"; candidate_signer_migration_floor="$migration_floor" ;;
     esac
   done
   for dependency in broker_commit signer_commit service_runtime_commit petal_contract_commit; do
@@ -645,16 +674,22 @@ preflight_compatibility() {
   state_record="$product/state-schema"
   if [[ -e "$state_record" ]]; then
     [[ -f "$state_record" && ! -L "$state_record" ]] || die "installed state-schema record is unsafe"
+    state_rows=0; seen_machine=false; seen_broker=false; seen_signer=false
     while IFS='=' read -r component installed; do
       [[ "$component" =~ ^(machine|broker|signer)$ && "$installed" =~ ^[1-9][0-9]*$ ]] || die "installed state-schema record is malformed"
       case "$component" in
-        machine) candidate="$candidate_machine_state"; floor="$candidate_machine_floor" ;;
-        broker) candidate="$candidate_broker_state"; floor="$candidate_broker_floor" ;;
-        signer) candidate="$candidate_signer_state"; floor="$candidate_signer_floor" ;;
+        machine) ! $seen_machine || die "installed state-schema record has duplicate machine"; seen_machine=true; candidate="$candidate_machine_state"; floor="$candidate_machine_migration_floor" ;;
+        broker) ! $seen_broker || die "installed state-schema record has duplicate broker"; seen_broker=true; candidate="$candidate_broker_state"; floor="$candidate_broker_migration_floor" ;;
+        signer) ! $seen_signer || die "installed state-schema record has duplicate signer"; seen_signer=true; candidate="$candidate_signer_state"; floor="$candidate_signer_migration_floor" ;;
       esac
+      state_rows=$((state_rows + 1))
+      # The source versions a candidate can migrate are independent of which
+      # older readers may run after migration. Never treat downgrade_floor as
+      # an upgrade prerequisite; all schema downgrades remain rejected here.
       ((candidate >= installed)) || die "$component state-schema downgrade rejected before activation"
       ((installed >= floor)) || die "$component installed state is below the candidate migration floor"
     done < "$state_record"
+    ((state_rows == 3)) && $seen_machine && $seen_broker && $seen_signer || die "installed state-schema record is incomplete"
   fi
 }
 
@@ -703,15 +738,16 @@ install_config() {
   mkdir -p "$enrollments" "$broker_config" "$signer_config" "$machine_config" "$session_config" "$installer_config" \
     "$broker_state/audit-checkpoints" "$signer_state/audit-checkpoints" "$machine_state/audit-checkpoints" \
     "$runtime/machine-broker" "$runtime/broker-signer" "$runtime/revoke/broker" "$runtime/revoke/signer" \
-    "$runtime/session" "$runtime/containment" "$runtime/status" "$variable/log/bloom" "$log_root"
+    "$installer_config/admin" "$runtime/signer-admin" "$runtime/session" "$runtime/containment" "$runtime/status" "$variable/log/bloom" "$log_root"
   for directory in "$enrollments" "$broker_config" "$signer_config" "$machine_config" "$session_config" \
-    "$installer_config" "$broker_state" "$signer_state" "$machine_state" "$broker_state/audit-checkpoints" \
+    "$installer_config" "$installer_config/admin" "$broker_state" "$signer_state" "$machine_state" "$broker_state/audit-checkpoints" \
     "$signer_state/audit-checkpoints" "$machine_state/audit-checkpoints" "$runtime" "$runtime/machine-broker" \
     "$runtime/broker-signer" "$runtime/revoke" "$runtime/revoke/broker" "$runtime/revoke/signer" "$runtime/session" \
-    "$runtime/containment" "$runtime/status" "$variable/log/bloom" "$log_root"; do
+    "$runtime/signer-admin" "$runtime/containment" "$runtime/status" "$variable/log/bloom" "$log_root"; do
     [[ -d "$directory" && ! -L "$directory" ]] || die "security directory is missing or substituted: $directory"
   done
   chmod 0711 "$config" "$runtime" "$runtime/revoke"
+  chmod 0700 "$runtime/signer-admin" "$installer_config/admin"
   chmod 0700 "$broker_config" "$signer_config" "$machine_config" "$session_config" "$installer_config" \
     "$broker_state" "$signer_state" "$machine_state" "$broker_state/audit-checkpoints" \
     "$signer_state/audit-checkpoints" "$machine_state/audit-checkpoints"
@@ -746,6 +782,10 @@ install_config() {
     chmod 0644 "$config/"{machine-audit-history,authority-edge-history,provenance-catalog}.json
   else
     [[ -f "$broker_config/identity.json" && -f "$signer_config/identity.json" ]] || die "installed custody metadata is incomplete"
+  fi
+  if $live; then
+    "$release_base/releases/$BLOOM_RELEASE_DIGEST/bloom" init triad-install-relay-trust \
+      "$payload/installer/relay" "$config" "$BLOOM_MACOS_SIGNER_UID"
   fi
 }
 
@@ -785,6 +825,7 @@ secure_ownership() {
   chown -R root:wheel "$installer_config"; chown root:wheel "$config/edge-manifest.json" "$config/"*.json
   chown root:wheel "$runtime" "$runtime/containment" "$runtime/revoke"
   chown "$broker_user:$machine_broker_group" "$runtime/machine-broker" "$runtime/status"
+  chown "$signer_user:$signer_group" "$runtime/signer-admin"
   chown "$signer_user:$broker_signer_group" "$runtime/broker-signer"
   chown "$broker_user:$revoke_group" "$runtime/revoke/broker"; chown "$signer_user:$revoke_group" "$runtime/revoke/signer"
   chown root:"$log_group" "$log_root"
@@ -813,14 +854,30 @@ reload_launchagent_job() {
   stop_launchd_job "gui/$uid/$label"; stop_launchd_job "user/$uid/$label"
   reload_launchd_job "user/$uid" "$label" "$plist"
 }
+# Machine verifies its whole audit journal before it listens, so a long-lived
+# install can take minutes to answer. Wait up to BLOOM_HEALTH_TIMEOUT_SECONDS
+# (default 600) and report progress; health_timed_out records a plain timeout.
+health_timed_out=false
 require_triad_health() {
-  local uid="$1" user="$2" digest="$3" home attempt
+  local uid="$1" user="$2" digest="$3" home timeout started last_report waited
+  health_timed_out=false
   home="$(dscl . -read "/Users/$user" NFSHomeDirectory | awk 'NR==1{sub(/^NFSHomeDirectory:[[:space:]]*/,"");print}')"
   [[ "$home" == /* && -d "$home" ]] || { echo "cannot resolve home for $user" >&2; return 1; }
-  # Full Machine startup can warm RPC/cache state well beyond ten seconds.
-  # Keep activation bounded while allowing a cold installed home to become ready.
-  for ((attempt=0; attempt<240; attempt++)); do launchctl asuser "$uid" /usr/bin/sudo -u "$user" -H "$release_base/current/bloom" --home "$home/.bloom" serve triad-health-check "$digest" >/dev/null 2>&1 && return 0; sleep 0.5; done
-  launchctl asuser "$uid" /usr/bin/sudo -u "$user" -H "$release_base/current/bloom" --home "$home/.bloom" serve triad-health-check "$digest"
+  timeout="${BLOOM_HEALTH_TIMEOUT_SECONDS:-600}"
+  [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || die "invalid Bloom health wait"
+  started=$SECONDS; last_report=$SECONDS
+  until launchctl asuser "$uid" /usr/bin/sudo -u "$user" -H "$release_base/current/bloom" --home "$home/.bloom" serve triad-health-check "$digest" >/dev/null 2>&1; do
+    waited=$((SECONDS - started))
+    if ((waited >= timeout)); then
+      launchctl asuser "$uid" /usr/bin/sudo -u "$user" -H "$release_base/current/bloom" --home "$home/.bloom" serve triad-health-check "$digest" && return 0
+      health_timed_out=true; return 1
+    fi
+    if ((SECONDS - last_report >= 30)); then
+      echo "Waiting for Bloom to start (${waited}s of up to ${timeout}s; Machine verifies its audit journal first)..." >&2
+      last_report=$SECONDS
+    fi
+    sleep 0.5
+  done
 }
 capture_activation_failure() {
   local evidence="${BLOOM_MACOS_W0_EVIDENCE_DIR:-}" service source_log
@@ -909,20 +966,30 @@ rewrite_all_enrollments() {
   fi
 }
 
+# During a rollback (reload_all_on_timeout=true) a login that has not answered
+# yet does not stop the others from being reloaded; its UID is recorded in
+# health_timed_out_uids and the set still reports failure.
 reload_installed_set() {
-  local record uid; $live || return 0
-  reload_launchd_job system com.bloom.containment "$containment_plist" || return 1
+  local record uid; health_timed_out_uids=""; $live || return 0
+  # A hard failure is not a timeout, whatever an earlier login reported.
+  reload_failed() { health_timed_out=false; return 1; }
+  reload_launchd_job system com.bloom.containment "$containment_plist" || { reload_failed; return 1; }
   "$release_base/current/bloom" serve triad-pf-monitor-once 2>/dev/null ||
     echo "Bloom installed, but session lifecycle refresh is deferred" >&2
   for record in "$enrollments"/*.json; do
     [[ -f "$record" && ! -L "$record" ]] || continue
     uid="${record##*/}"; uid="${uid%.json}"
-    reload_launchagent_job "$uid" com.bloom.session "$root_prefix/Library/LaunchAgents/com.bloom.session.plist" || return 1
-    reload_launchd_job system "com.bloom.signer.$uid" "$root_prefix/Library/LaunchDaemons/com.bloom.signer.$uid.plist" || return 1
-    reload_launchd_job system "com.bloom.broker.$uid" "$root_prefix/Library/LaunchDaemons/com.bloom.broker.$uid.plist" || return 1
-    reload_launchagent_job "$uid" com.bloom.machine "$root_prefix/Library/LaunchAgents/com.bloom.machine.plist" || return 1
-    require_triad_health "$uid" "$(field "$record" login_user)" "$(field "$record" release_digest)" || return 1
+    reload_launchagent_job "$uid" com.bloom.session "$root_prefix/Library/LaunchAgents/com.bloom.session.plist" || { reload_failed; return 1; }
+    reload_launchd_job system "com.bloom.signer.$uid" "$root_prefix/Library/LaunchDaemons/com.bloom.signer.$uid.plist" || { reload_failed; return 1; }
+    reload_launchd_job system "com.bloom.broker.$uid" "$root_prefix/Library/LaunchDaemons/com.bloom.broker.$uid.plist" || { reload_failed; return 1; }
+    reload_launchagent_job "$uid" com.bloom.machine "$root_prefix/Library/LaunchAgents/com.bloom.machine.plist" || { reload_failed; return 1; }
+    if ! require_triad_health "$uid" "$(field "$record" login_user)" "$(field "$record" release_digest)"; then
+      # This login's own check set health_timed_out; keep it as reported.
+      [[ "${reload_all_on_timeout:-false}" == true && "${health_timed_out:-false}" == true ]] || return 1
+      health_timed_out_uids="${health_timed_out_uids:+$health_timed_out_uids, }$uid"
+    fi
   done
+  if [[ -n "$health_timed_out_uids" ]]; then health_timed_out=true; return 1; fi
 }
 
 activate_installed_set() {
@@ -1005,23 +1072,178 @@ restore_macos_upgrade_state() {
   fi
 }
 
+installed_state_requires_forward_only() {
+  local component installed floor seen=0 seen_machine=false seen_broker=false seen_signer=false
+  [[ -f "$product/state-schema" && ! -L "$product/state-schema" ]] || return 0
+  while IFS='=' read -r component installed; do
+    case "$component" in
+      machine) ! $seen_machine || return 0; seen_machine=true; floor="$candidate_machine_floor" ;;
+      broker) ! $seen_broker || return 0; seen_broker=true; floor="$candidate_broker_floor" ;;
+      signer) ! $seen_signer || return 0; seen_signer=true; floor="$candidate_signer_floor" ;;
+      *) return 0 ;;
+    esac
+    seen=$((seen + 1))
+    ((installed >= floor)) || return 0
+  done < "$product/state-schema"
+  ((seen == 3)) && $seen_machine && $seen_broker && $seen_signer || return 0
+  return 1
+}
+
+write_upgrade_phase() {
+  local phase="$1" temporary="$upgrade_transaction/phase.new.$$"
+  [[ "$phase" == rollback_allowed || "$phase" == forward_only || "$phase" == committed ]] ||
+    die "invalid macOS upgrade phase"
+  printf '%s\n' "$phase" > "$temporary"
+  chmod 0600 "$temporary"; $live && chown root:wheel "$temporary"
+  mv -f "$temporary" "$upgrade_transaction/phase"
+  sync
+  upgrade_phase="$phase"
+}
+
+write_transaction_schema_watermark() {
+  local path="$1" machine="$2" broker="$3" signer="$4" temporary
+  temporary="${path}.new.$$"
+  printf 'machine=%s\nbroker=%s\nsigner=%s\n' "$machine" "$broker" "$signer" > "$temporary"
+  chmod 0600 "$temporary"; $live && chown root:wheel "$temporary"
+  mv -f "$temporary" "$path"
+}
+
+candidate_meets_schema_watermark() {
+  local path="$1" component required candidate seen=0 seen_machine=false seen_broker=false seen_signer=false
+  [[ -f "$path" && ! -L "$path" ]] || return 1
+  while IFS='=' read -r component required; do
+    case "$component" in
+      machine) ! $seen_machine || return 1; seen_machine=true; candidate="$candidate_machine_state" ;;
+      broker) ! $seen_broker || return 1; seen_broker=true; candidate="$candidate_broker_state" ;;
+      signer) ! $seen_signer || return 1; seen_signer=true; candidate="$candidate_signer_state" ;;
+      *) return 1 ;;
+    esac
+    seen=$((seen + 1))
+    [[ "$required" =~ ^[1-9][0-9]*$ ]] && ((candidate >= required)) || return 1
+  done < "$path"
+  ((seen == 3)) && $seen_machine && $seen_broker && $seen_signer
+}
+
+candidate_advances_schema_watermark() {
+  local path="$1" component required candidate
+  while IFS='=' read -r component required; do
+    case "$component" in
+      machine) candidate="$candidate_machine_state" ;;
+      broker) candidate="$candidate_broker_state" ;;
+      signer) candidate="$candidate_signer_state" ;;
+      *) return 0 ;;
+    esac
+    ((candidate > required)) && return 0
+  done < "$path"
+  return 1
+}
+
 find_interrupted_upgrade() {
-  local recorded_old recorded_new
+  local recorded_schema recorded_old recorded_new
   upgrade_transaction="$product/upgrade-transaction"
-  [[ -e "$upgrade_transaction" ]] || { upgrade_transaction=""; upgrade_old_digest=""; return 0; }
+  [[ -e "$upgrade_transaction" ]] || { upgrade_transaction=""; upgrade_old_digest=""; upgrade_phase=""; return 0; }
   [[ -d "$upgrade_transaction" && ! -L "$upgrade_transaction" ]] || die "invalid interrupted Bloom upgrade"
-  grep -Fx bloom.macos-upgrade-transaction.2 "$upgrade_transaction/schema" >/dev/null || die "invalid interrupted Bloom upgrade"
+  recorded_schema="$(<"$upgrade_transaction/schema")"
+  [[ "$recorded_schema" == bloom.macos-upgrade-transaction.2 || "$recorded_schema" == bloom.macos-upgrade-transaction.3 ]] || die "invalid interrupted Bloom upgrade"
   recorded_old="$(<"$upgrade_transaction/old-digest")"
   recorded_new="$(<"$upgrade_transaction/new-digest")"
   [[ "$recorded_old" =~ ^[0-9a-f]{64}$ && "$recorded_new" =~ ^[0-9a-f]{64}$ ]] || die "invalid interrupted Bloom upgrade"
   [[ -f "$upgrade_transaction/rollback-state.tar" && ! -L "$upgrade_transaction/rollback-state.tar" ]] || die "invalid interrupted Bloom upgrade"
+  if [[ "$recorded_schema" == bloom.macos-upgrade-transaction.2 ]]; then
+    # Version 2 could have reached full Machine activation before interruption,
+    # but recorded no point of no return. Resume it only in the forward direction.
+    [[ "$recorded_new" == "$BLOOM_RELEASE_DIGEST" ]] ||
+      die "legacy interrupted upgrade requires its exact recorded candidate"
+    write_upgrade_phase forward_only
+    if [[ -f "$product/state-schema" && ! -L "$product/state-schema" ]]; then
+      cp "$product/state-schema" "$upgrade_transaction/source-state-schema"
+      chmod 0600 "$upgrade_transaction/source-state-schema"; $live && chown root:wheel "$upgrade_transaction/source-state-schema"
+    else
+      write_transaction_schema_watermark "$upgrade_transaction/source-state-schema" \
+        "$candidate_machine_state" "$candidate_broker_state" "$candidate_signer_state"
+    fi
+    write_transaction_schema_watermark "$upgrade_transaction/target-state-schema" \
+      "$candidate_machine_state" "$candidate_broker_state" "$candidate_signer_state"
+    printf '%s\n' bloom.macos-upgrade-transaction.3 > "$upgrade_transaction/schema"
+    chmod 0600 "$upgrade_transaction/schema"; $live && chown root:wheel "$upgrade_transaction/schema"; sync
+  else
+    [[ -f "$upgrade_transaction/phase" && ! -L "$upgrade_transaction/phase" ]] || die "invalid interrupted Bloom upgrade"
+    upgrade_phase="$(<"$upgrade_transaction/phase")"
+    [[ "$upgrade_phase" == rollback_allowed || "$upgrade_phase" == forward_only || "$upgrade_phase" == committed ]] || die "invalid interrupted Bloom upgrade"
+    [[ -f "$upgrade_transaction/source-state-schema" && ! -L "$upgrade_transaction/source-state-schema" ]] || die "invalid interrupted Bloom upgrade"
+    if [[ "$upgrade_phase" == rollback_allowed ]] &&
+       ! cmp -s "$product/state-schema" "$upgrade_transaction/source-state-schema"; then
+      write_upgrade_phase forward_only
+    fi
+  fi
+  candidate_meets_schema_watermark "$upgrade_transaction/target-state-schema" ||
+    die "candidate state schema is below the interrupted upgrade target"
   upgrade_old_digest="$recorded_old"
   echo "resuming interrupted Bloom macOS upgrade toward the requested release" >&2
 }
 
+provision_remote_ceremonies() {
+  $live || return 0
+  local signer status_file provision_timeout poll_interval deadline started_at last_report desired effective tls_ready routing_ready stage elapsed
+  signer="$release_base/current/bloom-signer"
+  provision_timeout="${BLOOM_RELAY_PROVISION_TIMEOUT_SECONDS:-600}"
+  poll_interval="${BLOOM_RELAY_PROVISION_POLL_SECONDS:-5}"
+  [[ "$provision_timeout" =~ ^[0-9]+$ && "$poll_interval" =~ ^[0-9]+$ ]] || die "invalid relay provisioning wait configuration"
+  started_at="$SECONDS"
+  deadline=$((started_at + provision_timeout))
+  echo "Preparing hosted ceremony relay (up to ${provision_timeout}s; DNS and certificate issuance can take several minutes)..." >&2
+  if "$signer" admin provision --login-uid "$login_uid"; then
+    echo "Hosted ceremony provisioning command completed." >&2
+    return 0
+  fi
+
+  last_report=-1
+  status_file="$(mktemp "$runtime/relay-status.XXXXXX")" || die "could not create temporary relay status file"
+  chmod 0600 "$status_file"
+  # A failed provisioning response may already have made the relay ready.
+  # Read status once even when provisioning consumed the polling budget.
+  while :; do
+    if ! "$signer" admin status --login-uid "$login_uid" >"$status_file"; then
+      echo "Could not read hosted relay status; localhost remains available." >&2
+      rm -f "$status_file"
+      echo "Retry: sudo '$signer' admin provision --login-uid $login_uid" >&2
+      return 0
+    fi
+    desired="$(field "$status_file" desired_mode 2>/dev/null || true)"
+    effective="$(field "$status_file" effective_mode 2>/dev/null || true)"
+    tls_ready="$(field "$status_file" remote_tls_ready 2>/dev/null || true)"
+    routing_ready="$(field "$status_file" remote_routing_ready 2>/dev/null || true)"
+    stage="$(field "$status_file" stage 2>/dev/null || true)"
+    elapsed=$((SECONDS - started_at))
+    if [[ "$desired" == remote_enabled && "$effective" == remote_enabled && "$tls_ready" == true && "$routing_ready" == true ]]; then
+      rm -f "$status_file"
+      echo "Hosted ceremony relay is ready (TLS and routing ready after ${elapsed}s)." >&2
+      return 0
+    fi
+    if [[ "$desired" == localhost_only ]]; then
+      rm -f "$status_file"
+      echo "Hosted ceremonies are configured but disabled (localhost-only mode is unchanged)." >&2
+      return 0
+    fi
+    if [[ "$stage" == unprovisioned ]]; then
+      rm -f "$status_file"
+      echo "Hosted relay has no completed installation assignment; localhost remains available. Check the relay assignment, then retry: sudo '$signer' admin provision --login-uid $login_uid" >&2
+      return 0
+    fi
+    if (( elapsed - last_report >= 15 )); then
+      echo "Hosted relay is still provisioning after ${elapsed}s (stage=${stage:-unknown}, TLS=${tls_ready:-unknown}, routing=${routing_ready:-unknown})." >&2
+      last_report="$elapsed"
+    fi
+    (( SECONDS >= deadline )) && break
+    sleep "$poll_interval"
+  done
+  rm -f "$status_file"
+  echo "Hosted relay is still pending after ${provision_timeout}s; localhost remains available. Retry: sudo '$signer' admin provision --login-uid $login_uid" >&2
+}
+
 upgrade_release() {
   local old="$1" new="$2"
-  local record uid
+  local record uid transaction_final
   if $live; then
     for record in "$enrollments"/*.json; do
       [[ -f "$record" && ! -L "$record" ]] || continue
@@ -1030,36 +1252,99 @@ upgrade_release() {
         die "all enrolled Bloom users must be logged in before a shared release upgrade"
     done
   fi
-  upgrade_transaction="$product/upgrade-transaction"
-  if [[ ! -e "$upgrade_transaction" ]]; then
-    mkdir -m 0700 "$upgrade_transaction"
+  transaction_final="$product/upgrade-transaction"
+  upgrade_transaction="$transaction_final"
+  if [[ ! -e "$transaction_final" ]]; then
+    upgrade_transaction_scratch="${transaction_final}.new.$$"
+    mkdir -m 0700 "$upgrade_transaction_scratch"
+    upgrade_transaction="$upgrade_transaction_scratch"
+    printf '%s\n' bloom.macos-upgrade-transaction.3 >"$upgrade_transaction/schema"
+    printf '%s\n' "$old" >"$upgrade_transaction/old-digest"
+    printf '%s\n' "$new" >"$upgrade_transaction/new-digest"
+    cp "$product/state-schema" "$upgrade_transaction/source-state-schema"
+    chmod 0600 "$upgrade_transaction/source-state-schema"; $live && chown root:wheel "$upgrade_transaction/source-state-schema"
+    write_transaction_schema_watermark "$upgrade_transaction/target-state-schema" \
+      "$candidate_machine_state" "$candidate_broker_state" "$candidate_signer_state"
+    snapshot_macos_upgrade_state
+    if installed_state_requires_forward_only; then
+      write_upgrade_phase forward_only
+    else
+      write_upgrade_phase rollback_allowed
+    fi
+    chmod 0600 "$upgrade_transaction"/*; $live && chown -R root:wheel "$upgrade_transaction"; sync
+    mv "$upgrade_transaction" "$transaction_final"
+    upgrade_transaction="$transaction_final"; upgrade_transaction_scratch=""; sync
+  else
+    [[ "$(<"$upgrade_transaction/old-digest")" == "$old" ]] ||
+      die "interrupted macOS upgrade does not match the original release"
+    if [[ "$upgrade_phase" == rollback_allowed ]] && installed_state_requires_forward_only; then
+      write_upgrade_phase forward_only
+    fi
+    if candidate_advances_schema_watermark "$upgrade_transaction/target-state-schema"; then
+      [[ "$upgrade_phase" == committed ]] || write_upgrade_phase forward_only
+      write_transaction_schema_watermark "$upgrade_transaction/target-state-schema" \
+        "$candidate_machine_state" "$candidate_broker_state" "$candidate_signer_state"
+      sync
+    fi
+    if [[ "$(<"$upgrade_transaction/new-digest")" != "$new" ]]; then
+      temporary="$upgrade_transaction/new-digest.new.$$"
+      printf '%s\n' "$new" > "$temporary"; chmod 0600 "$temporary"; $live && chown root:wheel "$temporary"
+      mv -f "$temporary" "$upgrade_transaction/new-digest"; sync
+    fi
   fi
   [[ -d "$upgrade_transaction" && ! -L "$upgrade_transaction" ]] || die "invalid interrupted Bloom upgrade"
-  printf '%s\n' bloom.macos-upgrade-transaction.2 >"$upgrade_transaction/schema"
-  printf '%s\n' "$old" >"$upgrade_transaction/old-digest"
-  printf '%s\n' "$new" >"$upgrade_transaction/new-digest"
-  if [[ ! -e "$upgrade_transaction/rollback-state.tar" ]]; then snapshot_macos_upgrade_state; fi
   chmod 0600 "$upgrade_transaction"/*; $live && chown -R root:wheel "$upgrade_transaction"; sync
   stop_all_enrollments
   rewrite_all_enrollments "$new" activating
   switch_release "$new"
-  if ! reload_installed_set || ! activate_installed_set; then
-    echo "new Bloom release failed authenticated activation; restoring $old" >&2; stop_all_enrollments || true
-    restore_macos_upgrade_state; switch_release "$old"
-    if reload_installed_set && activate_installed_set; then install_cli_link; rm -rf -- "$upgrade_transaction"; upgrade_transaction=""
-      echo "previous Bloom release restored after failed activation" >&2
-    else echo "automatic restoration of the previous Bloom release failed" >&2; fi
+  if ! reload_installed_set; then
+    if [[ "${health_timed_out:-false}" == true ]]; then
+      echo "new Bloom release did not report healthy within ${BLOOM_HEALTH_TIMEOUT_SECONDS:-600}s" >&2
+    else
+      echo "new Bloom release failed authenticated pre-activation health" >&2
+    fi
+    stop_all_enrollments || true
+    if [[ "$upgrade_phase" == rollback_allowed ]]; then
+      restore_macos_upgrade_state; switch_release "$old"
+      # Judge the restore by its own health checks, not the candidate's, and
+      # reload every login even if one has not answered yet.
+      health_timed_out=false; reload_all_on_timeout=true
+      if reload_installed_set; then
+        if activate_installed_set; then install_cli_link; rm -rf -- "$upgrade_transaction"; upgrade_transaction=""; upgrade_phase=""
+          echo "previous Bloom release restored after rollback-safe failure" >&2
+        elif [[ "${health_timed_out:-false}" == true ]]; then
+          echo "previous Bloom release is reinstated, but its Machine did not report healthy within ${BLOOM_HEALTH_TIMEOUT_SECONDS:-600}s and was stopped. Rerunning this installer resumes the recorded upgrade." >&2
+        else echo "automatic restoration of the previous Bloom release failed" >&2; fi
+      elif [[ "${health_timed_out:-false}" == true ]]; then
+        # The old release is selected and its services are loaded; it only
+        # has not answered yet. Say so rather than reporting a failed restore.
+        echo "previous Bloom release is reinstated and its services are loaded for every login, but UID ${health_timed_out_uids:-?} did not report healthy within ${BLOOM_HEALTH_TIMEOUT_SECONDS:-600}s; it may still be starting. Rerunning this installer resumes the recorded upgrade." >&2
+      else echo "automatic restoration of the previous Bloom release failed" >&2; fi
+      reload_all_on_timeout=false
+    else
+      rewrite_all_enrollments "$new" activating
+      echo "state migration is forward-only; retry this candidate release" >&2
+    fi
+    return 1
+  fi
+  # No old binary may run after this marker: full Machine startup can write
+  # schema-2 cache fields and expose the candidate to user mutations.
+  write_upgrade_phase committed
+  write_state_schema
+  if ! activate_installed_set; then
+    echo "new Bloom release failed full activation after the forward-only commit" >&2
+    stop_all_enrollments || true
+    rewrite_all_enrollments "$new" activating
     return 1
   fi
   install_cli_link
-  write_state_schema
-  rm -rf -- "$upgrade_transaction"; upgrade_transaction=""; upgrade_old_digest=""
+  rm -rf -- "$upgrade_transaction"; upgrade_transaction=""; upgrade_old_digest=""; upgrade_phase=""
 }
 
 case "$action" in
   install|restore)
     [[ $# -eq 4 ]] || usage; root_and_uid "$1" "$2"; login_user="$3"; payload="$(cd "$4" && pwd -P)"
-    $live && require_native_macos_mount "$(/usr/bin/sw_vers -productVersion)"
+    $live && require_supported_macos "$(/usr/bin/sw_vers -productVersion)"
     [[ "$login_user" =~ ^[a-z_][a-z0-9_-]*$ ]] || { echo "unsafe LOGIN_USER" >&2; exit 64; }
     $live && { lock_installer; [[ "$(id -u "$login_user")" == "$login_uid" ]] || die "LOGIN_USER does not match LOGIN_UID"; launchctl print "gui/$login_uid" >/dev/null 2>&1 || die "LOGIN_USER has no active GUI domain"; snapshot_live_payload; }
     requested_uid="$login_uid"; requested_user="$login_user"; load_names; paths; verify_payload; preflight_compatibility; prepare_verified_payload_for_execution
@@ -1093,21 +1378,23 @@ case "$action" in
     fi
     $live && $fresh && allocate_accounts
     install_release
-    if [[ "$had_active" == true && "$shared_digest" != "$BLOOM_RELEASE_DIGEST" && "$restoring" == false ]]; then
-      upgrade_release "$shared_digest" "$BLOOM_RELEASE_DIGEST"
-      login_uid="$requested_uid"; login_user="$requested_user"; load_names; paths; load_ids
-      remove_legacy_cli || die "Bloom is healthy, but legacy CLI cleanup failed; remove ~/.local/bin/bloom and retry"
-      report_legacy_wallet_migrations
-      cleanup_legacy_pf
-      echo "Bloom macOS release upgraded atomically"
-      exit 0
-    fi
     if [[ -n "$upgrade_transaction" ]]; then
       upgrade_release "$upgrade_old_digest" "$BLOOM_RELEASE_DIGEST"
       login_uid="$requested_uid"; login_user="$requested_user"; load_names; paths; load_ids
       remove_legacy_cli || die "Bloom is healthy, but legacy CLI cleanup failed; remove ~/.local/bin/bloom and retry"
       report_legacy_wallet_migrations
       cleanup_legacy_pf
+      provision_remote_ceremonies
+      echo "Bloom macOS release upgraded atomically"
+      exit 0
+    fi
+    if [[ "$had_active" == true && "$shared_digest" != "$BLOOM_RELEASE_DIGEST" && "$restoring" == false ]]; then
+      upgrade_release "$shared_digest" "$BLOOM_RELEASE_DIGEST"
+      login_uid="$requested_uid"; login_user="$requested_user"; load_names; paths; load_ids
+      remove_legacy_cli || die "Bloom is healthy, but legacy CLI cleanup failed; remove ~/.local/bin/bloom and retry"
+      report_legacy_wallet_migrations
+      cleanup_legacy_pf
+      provision_remote_ceremonies
       echo "Bloom macOS release upgraded atomically"
       exit 0
     fi
@@ -1123,9 +1410,10 @@ case "$action" in
     if $restoring; then rm -f "$retained"; restore_pending=false; fi
     remove_legacy_cli || die "Bloom is healthy, but legacy CLI cleanup failed; remove ~/.local/bin/bloom and retry"
     report_legacy_wallet_migrations
+    provision_remote_ceremonies
     if $fresh; then
-      # This plist is outside LaunchAgents: only this fresh enrollment's active
-      # GUI domain loads it, once. launchd runs the browser as the login user.
+      # Keep this outside LaunchAgents: only the fresh enrollment's active
+      # GUI domain loads it once, with the browser running as the login user.
       render "$payload/installer/macos/launchagents/com.bloom.onboarding.plist.in" "$onboarding_plist" 0644
       if $live; then
         chmod 0755 "$(dirname "$onboarding_plist")"

@@ -47,8 +47,6 @@ struct LooseIntent {
     #[serde(default)]
     amount: Option<String>,
     #[serde(default)]
-    intent: Option<String>,
-    #[serde(default)]
     chain: Option<String>,
     #[serde(default)]
     gas: Option<String>,
@@ -69,8 +67,6 @@ struct LooseIntent {
     approved: Option<bool>,
     #[serde(default)]
     usd_value_hint: Option<String>,
-    #[serde(default)]
-    review_mode: Option<String>,
 }
 
 impl LooseIntent {
@@ -83,8 +79,6 @@ impl LooseIntent {
                     Some("approve".into())
                 } else if self.contract.is_some() && self.method.is_some() {
                     Some("call".into())
-                } else if self.intent.is_some() {
-                    Some("enso".into())
                 } else if self.to.is_some() {
                     if self
                         .data
@@ -159,7 +153,6 @@ impl LooseIntent {
                     || self.args.is_some()
                     || self.amount.is_some()
                     || self.spender.is_some()
-                    || self.intent.is_some()
                     || self.operator.is_some()
                     || self.token_id.is_some()
                     || self.standard.is_some()
@@ -183,9 +176,6 @@ impl LooseIntent {
                     value: self.value.unwrap_or_default(),
                 }
             }
-            "enso" => RawIntentBody::Enso {
-                intent: self.intent.ok_or(ParseError::Ambiguous)?,
-            },
             "approve" => RawIntentBody::Approve {
                 token: self.token.ok_or(ParseError::Ambiguous)?,
                 spender: self.spender.ok_or(ParseError::Ambiguous)?,
@@ -231,7 +221,6 @@ impl LooseIntent {
             nonce: self.nonce,
             gas_limit_hint: None,
             usd_value_hint: self.usd_value_hint,
-            review_mode: self.review_mode,
         })
     }
 }
@@ -295,7 +284,6 @@ pub fn parse(input: &str) -> Result<RawIntent, ParseError> {
             nonce: None,
             gas_limit_hint: None,
             usd_value_hint: None,
-            review_mode: None,
         });
     }
     if s.starts_with("nft ") {
@@ -418,7 +406,6 @@ fn parse_nft_shell(line: &str) -> Result<RawIntent, ParseError> {
         nonce: None,
         gas_limit_hint: None,
         usd_value_hint: None,
-        review_mode: None,
     })
 }
 
@@ -560,12 +547,6 @@ value = "0"
         )
         .unwrap();
         assert!(matches!(r.body, RawIntentBody::Call { .. }));
-    }
-
-    #[test]
-    fn json_enso() {
-        let r = parse(r#"{"kind":"enso","intent":"swap 1 ETH to USDC"}"#).unwrap();
-        assert!(matches!(r.body, RawIntentBody::Enso { .. }));
     }
 
     #[test]

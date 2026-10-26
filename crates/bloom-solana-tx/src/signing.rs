@@ -194,9 +194,8 @@ impl SolanaTransferSigner {
             },
         };
         let request = ExactPayloadSignRequest {
-            // Solana's live genesis/freshness cannot be established solely
-            // from these bytes; keep this path under exact owner review.
             session_use: None,
+            evm_reported_token: None,
             wallet_id: Token::new(wallet_id).map_err(|e| e.to_string())?,
             preimage,
             claimed_hash,
@@ -220,10 +219,11 @@ impl SolanaTransferSigner {
             petal_use_claim: None,
             system_use_claim: Some(system_use_claim),
             claim_assurance_evidence: Some(message_bytes.to_vec()),
+            safe_review_payload: None,
+            message_review_payload: None,
             account_key_ref,
             // Solana, not EVM: there is no contract call for the EVM review
             // to read, in either mode.
-            requested_review_mode: None,
             approval_value_limits: vec![ValueLimit {
                 asset: AssetId {
                     chain: Token::new("solana").map_err(|e| e.to_string())?,

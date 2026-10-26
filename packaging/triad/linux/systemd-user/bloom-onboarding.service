@@ -8,6 +8,7 @@ PartOf=graphical-session.target
 [Service]
 Type=simple
 EnvironmentFile=/etc/bloom/%U/machine.env
+Environment=BLOOM_LOG_OUTPUT=json-stderr
 ExecStart=/usr/bin/bloom onboard --if-needed
 Restart=no
 RuntimeMaxSec=30min

@@ -173,10 +173,6 @@ pub enum TxEngineError {
     HomeWritePermit(String),
     #[error("tx '{id}' is in status {status}, expected pending or unmined sent")]
     InvalidTxStatus { id: String, status: String },
-    #[error(
-        "Enso quote is {age}s old (expires ~5 min) — re-run the intent for a fresh route, or write 'override' to broadcast anyway"
-    )]
-    EnsoQuoteStale { age: u64 },
     #[error("dependency '{dep_id}' not satisfied: {reason}")]
     DependencyNotSatisfied { dep_id: String, reason: String },
     #[error("pre-broadcast simulation reverted: {reason} — write 'override' to broadcast anyway")]
@@ -413,9 +409,7 @@ fn classify_action_kind(
         | RawIntentBody::NftApprove { .. }
         | RawIntentBody::NftApproveAll { .. } => TxActionKind::Approval,
         RawIntentBody::NftTransfer { .. } => TxActionKind::NftTransfer,
-        RawIntentBody::Call { .. } | RawIntentBody::Raw { .. } | RawIntentBody::Enso { .. } => {
-            TxActionKind::ContractCall
-        }
+        RawIntentBody::Call { .. } | RawIntentBody::Raw { .. } => TxActionKind::ContractCall,
     }
 }
 
@@ -424,6 +418,9 @@ fn classify_action_kind(
 /// Inner lock: `tokio` async mutex (held for the stage critical section).
 type NonceLocks =
     Arc<parking_lot::Mutex<HashMap<(String, String, Address), Arc<tokio::sync::Mutex<()>>>>>;
+
+type EntryLocks =
+    Arc<parking_lot::Mutex<HashMap<(String, String, String), Arc<tokio::sync::Mutex<()>>>>>;
 
 const TRIAD_SIGNING_STATE_FILE: &str = "ceremony.json";
 const TRIAD_BATCH_STATE_DIR: &str = ".batch-signing";
@@ -517,6 +514,7 @@ pub struct TxEngine {
     /// microseconds only (HashMap lookup/insert); the inner
     /// `tokio::sync::Mutex` is the actual per-sender stage lock.
     nonce_locks: NonceLocks,
+    entry_locks: EntryLocks,
     triad_signing: Option<Arc<TriadSigningService>>,
 }
 
@@ -531,6 +529,7 @@ impl TxEngine {
             mempool_indexes: Arc::new(RwLock::new(BTreeMap::new())),
             private_rpcs: Arc::new(RwLock::new(BTreeMap::new())),
             nonce_locks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            entry_locks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             triad_signing: None,
         }
     }
@@ -577,6 +576,14 @@ impl TxEngine {
         self.nonce_locks
             .lock()
             .entry(key)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    fn entry_lock_for(&self, wallet: &str, chain: &str, id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.entry_locks
+            .lock()
+            .entry((wallet.into(), chain.into(), id.into()))
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
     }
@@ -787,7 +794,8 @@ impl TxEngine {
             return Ok((addr, upper));
         }
         Err(TxEngineError::Token(format!(
-            "unknown token '{token}' on chain id {chain_id}"
+            "unknown token '{token}' on chain id {chain_id}: pass its 0x address \
+             (tokens/known.json lists the tokens Bloom knows by symbol)"
         )))
     }
 
@@ -1145,9 +1153,6 @@ impl TxEngine {
                     Some(nft_ref),
                 ))
             }
-            RawIntentBody::Enso { .. } => Err(TxEngineError::Unimplemented(
-                "Enso intents flow through the enso petal (not in tx stage path)".into(),
-            )),
         }
     }
 
@@ -1246,10 +1251,6 @@ impl TxEngine {
                 nonce: request.nonce,
                 gas_limit_hint: request.gas,
                 usd_value_hint: None,
-                // Contract creation carries initcode, not a call to an
-                // existing described contract, so it keeps the exact
-                // envelope review either way.
-                review_mode: request.review_mode.clone(),
             },
             &selected_chain,
             policy,
@@ -1374,10 +1375,6 @@ impl TxEngine {
                 .validate()
                 .map_err(TxEngineError::ApprovalConstruction)?;
         }
-        // Reject an unknown review mode before reserving a nonce or writing
-        // a pending entry; signing-time validation would otherwise fail the
-        // row only after staging side effects.
-        parse_review_mode(intent.review_mode.as_deref())?;
         // Only creation lacks a recipient. A deployment grant must leave
         // sends, calls, spenders and operators under the ordinary allowlist.
         let mut creation_policy;
@@ -1791,7 +1788,6 @@ impl TxEngine {
                     "creation requires exact Broker approval; constructor effects and ownership are unverified",
                 ));
             }
-            RawIntentBody::Enso { .. } => {}
         }
         // USD valuation is authoritative only when produced by the oracle.
         // Caller-supplied hints are deliberately ignored: they are not bound
@@ -1934,10 +1930,6 @@ impl TxEngine {
             },
             status: TxStatus::Pending,
             action_kind,
-            // The owner's choice is recorded with the immutable row, so the
-            // mode at signing is the one staging was reviewed under and not
-            // whatever a later caller asks for.
-            review_mode: intent.review_mode.clone(),
             tx_hash: None,
             token: token_for_plan,
             nft: nft_for_plan,
@@ -1989,6 +1981,10 @@ impl TxEngine {
         override_warnings: bool,
     ) -> Result<(), TxEngineError> {
         self.assert_write_permit(permit)?;
+        let _entry_guard = self
+            .entry_lock_for(wallet, chain_name, id)
+            .lock_owned()
+            .await;
         let entry = self
             .outbox
             .read_in_state(wallet, chain_name, id, OutboxState::Pending)?;
@@ -2018,6 +2014,11 @@ impl TxEngine {
         let hard = policy_engine::has_hard_violation(&staged.policy_checks);
         if hard {
             staged.status = TxStatus::Failed;
+            self.outbox.write_artefact(
+                &entry.dir,
+                "intent.json",
+                &serde_json::to_vec_pretty(&staged).map_err(OutboxError::from)?,
+            )?;
             self.outbox
                 .transition(&entry, crate::outbox::OutboxState::Failed)?;
             debug!(
@@ -2039,15 +2040,6 @@ impl TxEngine {
                 "tx.policy_denied"
             );
             return Err(TxEngineError::PolicyDenied);
-        }
-
-        const ENSO_QUOTE_MAX_AGE_SECS: u64 = 300;
-        let now_secs = (now_ms() / 1000) as u64;
-        if let Some(age) = enso_quote_age_secs(&staged.data_hex, now_secs)
-            && age > ENSO_QUOTE_MAX_AGE_SECS
-            && !override_warnings
-        {
-            return Err(TxEngineError::EnsoQuoteStale { age });
         }
 
         if !override_warnings {
@@ -2131,6 +2123,13 @@ impl TxEngine {
                 )));
             }
         }
+        // A deterministic order prevents deadlocks between overlapping batches.
+        let mut refs = unique.into_iter().collect::<Vec<_>>();
+        refs.sort();
+        let mut entry_guards = Vec::with_capacity(refs.len());
+        for (chain, id) in refs {
+            entry_guards.push(self.entry_lock_for(wallet, &chain, &id).lock_owned().await);
+        }
         let parent_state_path =
             batch_signing_state_path(self.outbox.root(), wallet, &ordered_refs)?;
         // The batch projection is the recovery authority for approval, signing,
@@ -2187,14 +2186,6 @@ impl TxEngine {
                 if policy_engine::has_warning(&staged.policy_checks) && !override_warnings {
                     return Err(TxEngineError::PolicyDenied);
                 }
-                const ENSO_QUOTE_MAX_AGE_SECS: u64 = 300;
-                if let Some(age) = enso_quote_age_secs(&staged.data_hex, (now / 1000) as u64)
-                    && age > ENSO_QUOTE_MAX_AGE_SECS
-                    && !override_warnings
-                {
-                    return Err(TxEngineError::EnsoQuoteStale { age });
-                }
-
                 if policy.private.enabled
                     && !matches!(
                         staged.chain_id,
@@ -2396,6 +2387,10 @@ impl TxEngine {
         override_warnings: bool,
     ) -> Result<StagedTx, TxEngineError> {
         self.assert_write_permit(permit)?;
+        let _entry_guard = self
+            .entry_lock_for(wallet, chain_name, id)
+            .lock_owned()
+            .await;
         let entry = self
             .outbox
             .read_in_state(wallet, chain_name, id, OutboxState::Pending)?;
@@ -2434,6 +2429,11 @@ impl TxEngine {
         let hard = policy_engine::has_hard_violation(&staged.policy_checks);
         if hard {
             staged.status = TxStatus::Failed;
+            self.outbox.write_artefact(
+                &entry.dir,
+                "intent.json",
+                &serde_json::to_vec_pretty(&staged).map_err(OutboxError::from)?,
+            )?;
             self.outbox
                 .transition(&entry, crate::outbox::OutboxState::Failed)?;
             debug!(
@@ -2455,16 +2455,6 @@ impl TxEngine {
                 "tx.policy_denied"
             );
             return Err(TxEngineError::PolicyDenied);
-        }
-
-        // Enso quotes embed a ~5-minute deadline. Warn before wasting gas.
-        const ENSO_QUOTE_MAX_AGE_SECS: u64 = 300;
-        let now_secs = (now_ms() / 1000) as u64;
-        if let Some(age) = enso_quote_age_secs(&staged.data_hex, now_secs)
-            && age > ENSO_QUOTE_MAX_AGE_SECS
-            && !override_warnings
-        {
-            return Err(TxEngineError::EnsoQuoteStale { age });
         }
 
         // Pre-broadcast simulation first (no side effects): eth_call against
@@ -3159,7 +3149,7 @@ impl TxEngine {
         }
         let signing_preimage = Self::unsigned_signing_preimage(&prepared.unsigned);
         let signature = self
-            .host_sign_evm_hash(
+            .triad_sign_evm_payload(
                 entry,
                 staged,
                 action_kind,
@@ -3208,7 +3198,6 @@ impl TxEngine {
         Ok(signed.hash)
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn triad_sign_evm_payload(
         &self,
         entry: &crate::outbox::OutboxEntry,
@@ -3495,6 +3484,7 @@ impl TxEngine {
             provenance,
             &state,
             key.selector.clone(),
+            None,
         )?;
         if state.approval_id.is_some() {
             let expected_operation_digest = expected_evm_sign_operation_digest(
@@ -3822,20 +3812,8 @@ impl TxEngine {
             .await
             .map_err(protocol_signing_error)?;
         let key = evm_signing_key(&service.broker, &wallet_public, sender).await?;
-        // Broker reviews a batch under one mode. Members that were staged
-        // asking for different reviews are refused here rather than sent for
-        // Broker to reject, because the disagreement is in this outbox.
-        let batch_review_mode = requested_review_mode(&staged_plans[0])?;
-        for staged in &staged_plans[1..] {
-            if requested_review_mode(staged)? != batch_review_mode {
-                return Err(TxEngineError::ApprovalDenied(
-                    "a transaction batch must be reviewed one way; its members ask for different \
-                     reviews. Confirm them separately."
-                        .into(),
-                ));
-            }
-        }
         let request = ExactPayloadBatchSignRequest {
+            message_review_payload: None,
             wallet_id: Token::new(wallet.to_string())
                 .map_err(|error| TxEngineError::ApprovalConstruction(error.to_string()))?,
             preimages: preimages.to_vec(),
@@ -3850,7 +3828,6 @@ impl TxEngine {
             issued_at_ms: state.issued_at_ms.clone(),
             expires_at_ms: state.expires_at_ms.clone(),
             canonical_plan_facts_digest: state.canonical_plan_facts_digest.clone(),
-            requested_review_mode: batch_review_mode,
             approval_id: state.approval_id.clone(),
             account_key_ref: key.selector.clone(),
             petal_use_claim: None,
@@ -3905,18 +3882,6 @@ impl TxEngine {
                 Ok(result)
             }
         }
-    }
-
-    async fn host_sign_evm_hash(
-        &self,
-        entry: &crate::outbox::OutboxEntry,
-        staged: &StagedTx,
-        action_kind: EvmOutboxActionKind,
-        signing_preimage: &[u8],
-        signing_hash: B256,
-    ) -> Result<Signature, TxEngineError> {
-        self.triad_sign_evm_payload(entry, staged, action_kind, signing_preimage, signing_hash)
-            .await
     }
 
     /// Refuse to broadcast when a same-chain dependency has not mined
@@ -4222,8 +4187,6 @@ impl TxEngine {
     /// new (`to`, `value`, `data`) are derived from it via the same
     /// encoding pipeline `stage` uses, but the original nonce is
     /// preserved. Fees are bumped at least `bump_pct%` (floored at 10).
-    /// Enso-flavoured intents are rejected here for the same reason
-    /// they're rejected in stage — they go through the enso petal's HTTP path.
     #[allow(clippy::too_many_arguments)]
     pub async fn replace_with_intent(
         &self,
@@ -4238,6 +4201,10 @@ impl TxEngine {
         policy: &Policy,
     ) -> Result<StagedTx, TxEngineError> {
         self.assert_write_permit(permit)?;
+        let _entry_guard = self
+            .entry_lock_for(wallet, chain_name, original_id)
+            .lock_owned()
+            .await;
         let bump = bump_pct.max(10);
         let entry = self.read_replaceable_entry(wallet, chain_name, original_id)?;
         let original = &entry.staged;
@@ -4338,6 +4305,45 @@ impl TxEngine {
         Ok(bumped)
     }
 
+    /// Discard only an unsigned pending entry, preserving any possible signature.
+    pub fn discard_unsigned(
+        &self,
+        permit: &HomeWritePermit,
+        wallet: &str,
+        chain: &str,
+        id: &str,
+    ) -> Result<(), TxEngineError> {
+        self.assert_write_permit(permit)?;
+        let _entry_guard = self
+            .entry_lock_for(wallet, chain, id)
+            .try_lock_owned()
+            .map_err(|_| {
+                TxEngineError::ApprovalState(
+                    "transaction operation in progress; retry after it completes".into(),
+                )
+            })?;
+        let entry = self
+            .outbox
+            .read_in_state(wallet, chain, id, OutboxState::Pending)?;
+        if entry.staged.tx_hash.is_some()
+            || self
+                .outbox
+                .read_broadcast_attempt(&entry, BroadcastAttemptKind::Confirm)?
+                .is_some()
+            || read_triad_signing_state(&entry.dir.join(TRIAD_SIGNING_STATE_FILE))
+                .map_err(|error| TxEngineError::ApprovalState(format!(
+                    "cannot establish whether this transaction was signed: {error}; preserve ceremony.json, inspect the Broker operation and chain nonce, and restore the signing record from backup before retrying; do not delete the record")))?
+                .is_some_and(|state| state.sign_dispatched)
+        {
+            return Err(TxEngineError::ApprovalState(
+                "cannot discard a possibly signed transaction; reconcile it or use wallet cancel"
+                    .into(),
+            ));
+        }
+        self.outbox.cancel(wallet, chain, id)?;
+        Ok(())
+    }
+
     /// Issue a same-nonce self-send to cancel the original. The original
     /// must be either still staged in `pending/` or broadcast-but-unmined in
     /// `sent/`.
@@ -4353,6 +4359,10 @@ impl TxEngine {
         policy: &Policy,
     ) -> Result<StagedTx, TxEngineError> {
         self.assert_write_permit(permit)?;
+        let _entry_guard = self
+            .entry_lock_for(wallet, chain_name, original_id)
+            .lock_owned()
+            .await;
         let bump = bump_pct.max(10);
         let entry = self.read_replaceable_entry(wallet, chain_name, original_id)?;
         if entry.state == OutboxState::Pending
@@ -4598,105 +4608,6 @@ async fn evm_signing_key(
     }
 }
 
-/// Parse a review mode named by an intent or a staged row.
-///
-/// An unrecognised value is an error rather than a default: a row asking for
-/// a mode this build does not know must not be prepared under some other
-/// one, because the difference is exactly what the owner will be shown.
-fn parse_review_mode(
-    mode: Option<&str>,
-) -> Result<Option<bloom_broker_api::ReviewMode>, TxEngineError> {
-    match mode {
-        None => Ok(None),
-        Some("clear") => Ok(Some(bloom_broker_api::ReviewMode::Clear)),
-        Some("opaque_exact") => Ok(Some(bloom_broker_api::ReviewMode::OpaqueExact)),
-        Some(other) => Err(TxEngineError::ApprovalConstruction(format!(
-            "unknown review mode `{other}`; use `clear`, `opaque_exact`, or omit it"
-        ))),
-    }
-}
-
-/// The review the staged row asked for.
-fn requested_review_mode(
-    staged: &StagedTx,
-) -> Result<Option<bloom_broker_api::ReviewMode>, TxEngineError> {
-    parse_review_mode(staged.review_mode.as_deref())
-}
-
-fn native_evm_session_use(
-    staged: &StagedTx,
-) -> Result<Option<bloom_broker_api::SystemSessionUse>, TxEngineError> {
-    use bloom_broker_api::{
-        AssetId, DecimalU256, SystemSessionAction, SystemSessionChain, SystemSessionUse,
-    };
-    // This projection accounts for gas_limit * maximum_gas_price only. L2
-    // execution can charge additional fees, so those networks retain exact
-    // review until every possible debit can be independently bounded.
-    if !matches!(staged.chain_id, 1 | 137 | 31337) {
-        return Ok(None);
-    }
-    let parse = |value: &str| {
-        DecimalU256::parse(value.to_owned())
-            .map_err(|error| TxEngineError::ApprovalConstruction(error.to_string()))
-    };
-    let (action, token, recipient, amount) = match staged.action_kind {
-        bloom_proto::TxActionKind::NativeTransfer => {
-            let Some(to) = &staged.to else {
-                return Ok(None);
-            };
-            (
-                SystemSessionAction::NativeTransfer,
-                None,
-                to.clone(),
-                parse(&staged.value_wei)?,
-            )
-        }
-        bloom_proto::TxActionKind::Erc20Transfer => {
-            let Some(token) = &staged.token else {
-                return Ok(None);
-            };
-            let Some(amount) = &token.amount_base_units else {
-                return Ok(None);
-            };
-            (
-                SystemSessionAction::Erc20Transfer,
-                Some(AssetId {
-                    chain: Token::new(format!("evm-{}", staged.chain_id))
-                        .map_err(|error| protocol_signing_error(error.into()))?,
-                    asset: token.address.to_ascii_lowercase(),
-                }),
-                token.recipient.clone(),
-                parse(amount)?,
-            )
-        }
-        _ => return Ok(None),
-    };
-    let Some(price) = staged
-        .gas_price
-        .as_ref()
-        .or(staged.max_fee_per_gas.as_ref())
-    else {
-        return Ok(None);
-    };
-    let fee = price
-        .parse::<U256>()
-        .map_err(|error| TxEngineError::ApprovalConstruction(error.to_string()))?
-        .checked_mul(U256::from(staged.gas_limit))
-        .ok_or_else(|| TxEngineError::ApprovalConstruction("session fee exceeds uint256".into()))?;
-    Ok(Some(SystemSessionUse {
-        action,
-        chain: SystemSessionChain::Evm {
-            chain: Token::new(format!("evm-{}", staged.chain_id))
-                .map_err(|error| protocol_signing_error(error.into()))?,
-            chain_id: DecimalU64::new(staged.chain_id),
-        },
-        token,
-        recipient: recipient.to_ascii_lowercase(),
-        amount,
-        maximum_fee: parse(&fee.to_string())?,
-    }))
-}
-
 fn exact_evm_sign_request(
     staged: &StagedTx,
     signing_preimage: &[u8],
@@ -4704,9 +4615,10 @@ fn exact_evm_sign_request(
     provenance: &ProvenanceRecord,
     state: &TriadEvmSigningState,
     account_key_ref: Option<bloom_broker_api::KeyRef>,
+    evm_reported_token: Option<bloom_broker_api::EvmReportedToken>,
 ) -> Result<ExactPayloadSignRequest, TxEngineError> {
     Ok(ExactPayloadSignRequest {
-        session_use: native_evm_session_use(staged)?,
+        session_use: None,
         wallet_id: Token::new(staged.wallet.clone())
             .map_err(|error| TxEngineError::ApprovalConstruction(error.to_string()))?,
         preimage: signing_preimage.to_vec(),
@@ -4721,12 +4633,14 @@ fn exact_evm_sign_request(
         issued_at_ms: state.issued_at_ms.clone(),
         expires_at_ms: state.expires_at_ms.clone(),
         canonical_plan_facts_digest: state.canonical_plan_facts_digest.clone(),
-        requested_review_mode: requested_review_mode(staged)?,
         approval_id: state.approval_id.clone(),
         account_key_ref,
         petal_use_claim: None,
         system_use_claim: None,
         claim_assurance_evidence: None,
+        safe_review_payload: None,
+        message_review_payload: None,
+        evm_reported_token,
         approval_value_limits: Vec::new(),
     })
 }
@@ -4742,7 +4656,6 @@ fn expected_evm_sign_operation_digest(
         TxEngineError::ApprovalState("active exact signing is missing its approval ID".into())
     })?;
     SignOperationIdentity {
-
         operation_id: state.signing_operation_id.clone(),
         approval_id,
         key_ref,
@@ -4936,7 +4849,6 @@ fn expected_evm_batch_sign_operation_digest(
         TxEngineError::ApprovalState("active exact batch is missing its approval ID".into())
     })?;
     SignOperationIdentity {
-
         operation_id: state.signing_operation_id.clone(),
         approval_id,
         key_ref,
@@ -5089,37 +5001,6 @@ fn decode_data(s: &str) -> Result<Bytes, TxEngineError> {
     let s = s.strip_prefix("0x").unwrap_or(s);
     let v = hex::decode(s).map_err(|e| TxEngineError::Amount(format!("data: {e}")))?;
     Ok(Bytes::from(v))
-}
-
-/// Parse the Enso quote age in seconds from calldata, if present.
-/// Enso appends a raw JSON blob starting with `{"Source":"Enso` to every
-/// route calldata. Returns `None` for non-Enso calldata or parse failures.
-fn enso_quote_age_secs(data_hex: &str, now_secs: u64) -> Option<u64> {
-    let bytes = hex::decode(data_hex.trim_start_matches("0x")).ok()?;
-    const MARKER: &[u8] = b"{\"Source\":\"Enso";
-    let pos = bytes.windows(MARKER.len()).position(|w| w == MARKER)?;
-    // Marker found — try to extract timestamp.
-    let v: serde_json::Value = match serde_json::Deserializer::from_slice(&bytes[pos..])
-        .into_iter()
-        .next()
-    {
-        Some(Ok(val)) => val,
-        other => {
-            tracing::warn!(?other, "enso.calldata.marker_found_parse_failed");
-            return None;
-        }
-    };
-    let ts = match v["Timestamp"].as_u64() {
-        Some(t) => t,
-        None => {
-            tracing::warn!(enso_json = %v, "enso.calldata.timestamp_missing");
-            return None;
-        }
-    };
-    now_secs.checked_sub(ts).or_else(|| {
-        tracing::warn!(enso_ts = ts, now = now_secs, "enso.quote.future_timestamp");
-        None
-    })
 }
 
 fn now_ms() -> u128 {
@@ -5310,14 +5191,15 @@ fn short_addr_label(a: &Address) -> String {
     }
 }
 
-/// Resolve a common ERC-20 symbol to its address via the shared
-/// `bloom_proto::tokens` table (the single source of truth across the send
-/// path, route path, and VFS token surface). Anvil mainnet forks share chain
+/// Resolve an ERC-20 symbol to its address via the token list Broker also
+/// compiles in, so a symbol resolves to the token Broker names on the
+/// approval page. An ambiguous symbol resolves to nothing. Anvil mainnet forks share chain
 /// id 31337 with vanilla Anvil, so they reuse the Ethereum (id 1) majors; a
 /// caller can always pass a 0x address explicitly.
 fn lookup_known_token(chain_id: u64, symbol_upper: &str) -> Option<&'static str> {
     let lookup_chain = if chain_id == 31337 { 1 } else { chain_id };
-    let hit = bloom_proto::tokens::resolve_symbol(lookup_chain, symbol_upper).map(|t| t.address);
+    let hit = bloom_broker_api::token_by_symbol(lookup_chain, symbol_upper)
+        .map(|token| token.address.as_str());
     if hit.is_none() {
         debug!(chain_id, symbol = symbol_upper, "tx.known_token_miss");
     }
@@ -5968,7 +5850,6 @@ mod tests {
             nonce: None,
             gas_limit_hint: None,
             usd_value_hint: usd_hint.map(str::to_string),
-            review_mode: None,
         }
     }
 
@@ -6011,7 +5892,6 @@ mod tests {
             expires_ms: 0,
             status: TxStatus::Pending,
             action_kind: TxActionKind::Unknown,
-            review_mode: None,
             tx_hash: None,
             token: None,
             nft: None,
@@ -6021,58 +5901,6 @@ mod tests {
             action_id: None,
             execution_origin: None,
         }
-    }
-
-    #[test]
-    fn persona_projection_requires_typed_transfer_and_includes_maximum_network_fee() {
-        let mut staged = fake_staged_1559("persona");
-        assert!(
-            native_evm_session_use(&staged).unwrap().is_none(),
-            "historical unknown actions require exact review"
-        );
-        staged.action_kind = TxActionKind::NativeTransfer;
-        staged.value_wei = "12345".into();
-        let action = native_evm_session_use(&staged).unwrap().unwrap();
-        assert_eq!(
-            action.chain.chain().as_str(),
-            format!("evm-{}", staged.chain_id)
-        );
-        assert_eq!(action.amount.as_str(), "12345");
-        assert_eq!(action.maximum_fee.as_str(), "2100000");
-        let supported_chain = staged.chain_id;
-        for chain_id in [8453, 10] {
-            staged.chain_id = chain_id;
-            assert!(
-                native_evm_session_use(&staged).unwrap().is_none(),
-                "OP Stack fees require exact review before a session attempt is journaled"
-            );
-        }
-        staged.chain_id = supported_chain;
-        staged.action_kind = TxActionKind::ContractCall;
-        assert!(
-            native_evm_session_use(&staged).unwrap().is_none(),
-            "arbitrary calldata must not borrow transfer authority"
-        );
-        staged.action_kind = TxActionKind::Erc20Transfer;
-        staged.token = Some(TokenRef {
-            address: "0x0000000000000000000000000000000000000003".into(),
-            recipient: "0x0000000000000000000000000000000000000002".into(),
-            symbol: "USDC".into(),
-            decimals: 6,
-            amount: "1".into(),
-            amount_base_units: None,
-        });
-        assert!(
-            native_evm_session_use(&staged).unwrap().is_none(),
-            "display amounts are not signing authority"
-        );
-        staged.token.as_mut().unwrap().amount_base_units = Some("1000000".into());
-        let action = native_evm_session_use(&staged).unwrap().unwrap();
-        assert_eq!(action.amount.as_str(), "1000000");
-        assert_eq!(
-            action.token.unwrap().asset,
-            "0x0000000000000000000000000000000000000003"
-        );
     }
 
     /// The VFS outbox is the surface the deployment docs point an agent at,
@@ -6590,7 +6418,6 @@ mod tests {
             nonce: None,
             gas_limit_hint: None,
             usd_value_hint: None,
-            review_mode: None,
         };
         let staged = engine
             .stage(
@@ -6713,62 +6540,6 @@ mod tests {
             decision,
             bloom_proto::AutonomyDecision::ApprovedAutonomous { .. }
         ));
-    }
-
-    #[tokio::test]
-    async fn stage_rejects_unknown_review_mode_before_any_write() {
-        let url = spawn_stage_rpc(true).await;
-        let oracle = RecordingOracle {
-            calls: Arc::new(parking_lot::Mutex::new(Vec::new())),
-            usd_micro: 42_000_000,
-            age_ms: 0,
-            max_age_ms: 60_000,
-        };
-        let (engine, _dir, permit, chain) = stage_fixture(&url, oracle);
-        let from: Address = TEST_SIGNER_ADDRESS.parse().unwrap();
-        let body = r#"{"kind":"deploy","data":"0x60006000f3","value":"123 wei"}"#;
-        let mut intent = crate::intent_parser::parse(body).unwrap();
-        intent.review_mode = Some("Clear".into());
-        let error = engine
-            .stage(
-                &permit,
-                "alice",
-                from,
-                intent,
-                &chain,
-                &Policy::default(),
-                None,
-            )
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(&error, TxEngineError::ApprovalConstruction(reason) if reason.contains("unknown review mode")),
-            "{error:?}"
-        );
-        // The rejection happens before any nonce reservation or outbox write.
-        assert!(
-            engine
-                .outbox
-                .list("alice", "anvil", OutboxState::Pending)
-                .unwrap()
-                .is_empty()
-        );
-        // A known mode still stages.
-        let mut intent = crate::intent_parser::parse(body).unwrap();
-        intent.review_mode = Some("opaque_exact".into());
-        let staged = engine
-            .stage(
-                &permit,
-                "alice",
-                from,
-                intent,
-                &chain,
-                &Policy::default(),
-                None,
-            )
-            .await
-            .unwrap();
-        assert_eq!(staged.review_mode.as_deref(), Some("opaque_exact"));
     }
 
     #[tokio::test]
@@ -6961,7 +6732,6 @@ mod tests {
             nonce: None,
             gas_limit_hint: None,
             usd_value_hint: Some("999999".into()),
-            review_mode: None,
         };
         let staged = engine
             .stage(
@@ -7006,7 +6776,6 @@ mod tests {
             nonce: None,
             gas_limit_hint: None,
             usd_value_hint: Some("999999".into()),
-            review_mode: None,
         };
         let staged = engine
             .stage_with_oracle_valuation_target(
@@ -9514,6 +9283,54 @@ mod tests {
             crate::outbox::OutboxState::Failed,
             "tx must be Failed after hard deny"
         );
+        assert_eq!(entry.staged.status, TxStatus::Failed);
+
+        // The mounted confirm path prepares before it submits. It must expose
+        // the same terminal outcome to a Petal reconciling its execution.
+        staged.id = "0002-prepare".into();
+        engine.outbox.write_pending(&staged, "p").unwrap();
+        let result = engine
+            .prepare_confirm_write_open(
+                &permit, "alice", "anvil", &staged.id, &chain, &policy, false,
+            )
+            .await;
+        assert!(matches!(result, Err(TxEngineError::PolicyDenied)));
+        let entry = engine.outbox.read("alice", "anvil", &staged.id).unwrap();
+        assert_eq!(entry.state, OutboxState::Failed);
+        assert_eq!(entry.staged.status, TxStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn discard_refuses_an_entry_held_by_confirmation() {
+        let (engine, _, dir) = fake_engine(60_000);
+        let permit = permit_for(&dir);
+        let staged = fake_staged_1559("0001-lock");
+        engine.outbox.write_pending(&staged, "p").unwrap();
+        let guard = engine
+            .entry_lock_for("alice", "anvil", &staged.id)
+            .lock_owned()
+            .await;
+        let other = engine.clone();
+        let error = other
+            .discard_unsigned(&permit, "alice", "anvil", &staged.id)
+            .unwrap_err();
+        assert!(error.to_string().contains("operation in progress"));
+        assert!(
+            engine
+                .outbox
+                .read_in_state("alice", "anvil", &staged.id, OutboxState::Pending)
+                .is_ok()
+        );
+        drop(guard);
+        other
+            .discard_unsigned(&permit, "alice", "anvil", &staged.id)
+            .unwrap();
+        assert!(
+            engine
+                .outbox
+                .read_in_state("alice", "anvil", &staged.id, OutboxState::Pending)
+                .is_err()
+        );
     }
 
     /// A soft-Warn check must block confirm() when no override sentinel is
@@ -9764,43 +9581,6 @@ mod tests {
             }
             other => panic!("expected PrivateNotSupportedOnChain, got {other:?}"),
         }
-    }
-
-    // -------------------------------------------------------------------
-    // enso_quote_age_secs
-    // -------------------------------------------------------------------
-
-    fn enso_hex(json: &str) -> String {
-        format!("0x{}", hex::encode(json.as_bytes()))
-    }
-
-    #[test]
-    fn enso_quote_age_parses_timestamp() {
-        let hex = enso_hex(r#"{"Source":"Enso","Timestamp":1700000000}"#);
-        assert_eq!(enso_quote_age_secs(&hex, 1700000300), Some(300));
-    }
-
-    #[test]
-    fn enso_quote_age_zero_for_current() {
-        let hex = enso_hex(r#"{"Source":"Enso","Timestamp":1700000000}"#);
-        assert_eq!(enso_quote_age_secs(&hex, 1700000000), Some(0));
-    }
-
-    #[test]
-    fn enso_quote_age_none_for_future() {
-        let hex = enso_hex(r#"{"Source":"Enso","Timestamp":1700000100}"#);
-        assert_eq!(enso_quote_age_secs(&hex, 1700000000), None);
-    }
-
-    #[test]
-    fn enso_quote_age_none_for_non_enso_calldata() {
-        assert_eq!(enso_quote_age_secs("0xdeadbeef", 1700000000), None);
-    }
-
-    #[test]
-    fn enso_quote_age_none_for_missing_timestamp() {
-        let hex = enso_hex(r#"{"Source":"Enso","Route":"0x1234"}"#);
-        assert_eq!(enso_quote_age_secs(&hex, 1700000000), None);
     }
 
     #[test]

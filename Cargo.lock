@@ -2195,7 +2195,7 @@ dependencies = [
 
 [[package]]
 name = "bloom"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "alloy 2.0.5",
  "anyhow",
@@ -2204,7 +2204,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "blake3",
- "bloom-broker-api",
+ "bloom-broker-api 0.1.0 (git+https://github.com/bloom-directory/bloom-broker.git?rev=556f6b3966f373a2eb2381355aabf3c619b485b7)",
  "bloom-daemon",
  "bloom-evm",
  "bloom-machine-client",
@@ -2249,7 +2249,7 @@ name = "bloom-audit-checkpoint"
 version = "0.1.3"
 source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=ad0072512bb97fb4eb68d249ce785ea3ea4a49ab#ad0072512bb97fb4eb68d249ce785ea3ea4a49ab"
 dependencies = [
- "bloom-rpc-wire",
+ "bloom-rpc-wire 0.1.3 (git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=ad0072512bb97fb4eb68d249ce785ea3ea4a49ab)",
  "ed25519-dalek",
  "hex",
  "rustix 1.1.4",
@@ -2263,10 +2263,22 @@ dependencies = [
 [[package]]
 name = "bloom-broker-api"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-broker.git?rev=76064587c0da42974fdc9b70d33b8834400f7c4a#76064587c0da42974fdc9b70d33b8834400f7c4a"
+source = "git+https://github.com/bloom-directory/bloom-broker.git?rev=556f6b3966f373a2eb2381355aabf3c619b485b7#556f6b3966f373a2eb2381355aabf3c619b485b7"
 dependencies = [
- "bloom-rpc-wire",
+ "bloom-rpc-wire 0.1.3 (git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=ad0072512bb97fb4eb68d249ce785ea3ea4a49ab)",
  "num-bigint",
+ "serde",
+ "serde_jcs",
+ "serde_json",
+ "sha2 0.11.0",
+]
+
+[[package]]
+name = "bloom-broker-api"
+version = "0.1.0"
+source = "git+https://github.com/bloom-directory/bloom-broker.git?rev=dd2add2b9d41540521d08c77d19fb467a2d8029e#dd2add2b9d41540521d08c77d19fb467a2d8029e"
+dependencies = [
+ "bloom-rpc-wire 0.1.3 (git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=5db670e1b7507deabfdcf451be8b5d315c1c9d91)",
  "serde",
  "serde_jcs",
  "sha2 0.11.0",
@@ -2274,14 +2286,14 @@ dependencies = [
 
 [[package]]
 name = "bloom-daemon"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "alloy 2.0.5",
  "anyhow",
  "async-trait",
  "base64 0.22.1",
  "blake3",
- "bloom-broker-api",
+ "bloom-broker-api 0.1.0 (git+https://github.com/bloom-directory/bloom-broker.git?rev=556f6b3966f373a2eb2381355aabf3c619b485b7)",
  "bloom-ens",
  "bloom-etherscan",
  "bloom-evm",
@@ -2322,7 +2334,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-ens"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "alloy 2.0.5",
  "bloom-evm",
@@ -2337,7 +2349,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-etherscan"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "alloy 2.0.5",
  "async-trait",
@@ -2355,7 +2367,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-evm"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "alloy 2.0.5",
  "bloom-proto",
@@ -2373,14 +2385,14 @@ dependencies = [
 
 [[package]]
 name = "bloom-it"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "alloy 2.0.5",
  "alloy-signer-local 2.0.5",
  "anyhow",
  "async-trait",
  "base64 0.22.1",
- "bloom-broker-api",
+ "bloom-broker-api 0.1.0 (git+https://github.com/bloom-directory/bloom-broker.git?rev=556f6b3966f373a2eb2381355aabf3c619b485b7)",
  "bloom-daemon",
  "bloom-evm",
  "bloom-machine-client",
@@ -2409,10 +2421,10 @@ dependencies = [
 
 [[package]]
 name = "bloom-machine"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "anyhow",
- "bloom-broker-api",
+ "bloom-broker-api 0.1.0 (git+https://github.com/bloom-directory/bloom-broker.git?rev=556f6b3966f373a2eb2381355aabf3c619b485b7)",
  "bloom-machine-client",
  "clap",
  "hex",
@@ -2426,12 +2438,13 @@ dependencies = [
 
 [[package]]
 name = "bloom-machine-client"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "bloom-audit-checkpoint",
- "bloom-broker-api",
- "bloom-rpc-wire",
+ "bloom-broker-api 0.1.0 (git+https://github.com/bloom-directory/bloom-broker.git?rev=556f6b3966f373a2eb2381355aabf3c619b485b7)",
+ "bloom-broker-api 0.1.0 (git+https://github.com/bloom-directory/bloom-broker.git?rev=dd2add2b9d41540521d08c77d19fb467a2d8029e)",
+ "bloom-rpc-wire 0.1.3 (git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=ad0072512bb97fb4eb68d249ce785ea3ea4a49ab)",
  "bloom-service-observability",
  "bloom-triad-local-transport",
  "ed25519-dalek",
@@ -2450,7 +2463,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-mcp"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2468,7 +2481,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-mempool"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "alloy 2.0.5",
  "alloy-signer-local 2.0.5",
@@ -2490,7 +2503,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-mount"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "bloom-vfs",
@@ -2507,7 +2520,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-paid-http"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2522,7 +2535,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-paid-mpp"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "alloy 2.0.5",
  "async-trait",
@@ -2539,7 +2552,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-paid-x402"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "alloy 2.0.5",
  "async-trait",
@@ -2565,12 +2578,12 @@ dependencies = [
 
 [[package]]
 name = "bloom-petals"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
  "blake3",
- "bloom-broker-api",
+ "bloom-broker-api 0.1.0 (git+https://github.com/bloom-directory/bloom-broker.git?rev=556f6b3966f373a2eb2381355aabf3c619b485b7)",
  "bloom-petal-contract",
  "bloom-proto",
  "bloom-vfs",
@@ -2600,7 +2613,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-prices"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "parking_lot",
  "reqwest 0.12.28",
@@ -2613,7 +2626,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-proto"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "alloy 2.0.5",
  "blake3",
@@ -2635,7 +2648,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-revert"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "alloy 2.0.5",
  "alloy-dyn-abi",
@@ -2657,7 +2670,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-rpc"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "alloy 2.0.5",
  "bloom-proto",
@@ -2674,11 +2687,26 @@ dependencies = [
 
 [[package]]
 name = "bloom-rpc-common"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "parking_lot",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "bloom-rpc-wire"
+version = "0.1.3"
+source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=5db670e1b7507deabfdcf451be8b5d315c1c9d91#5db670e1b7507deabfdcf451be8b5d315c1c9d91"
+dependencies = [
+ "base64 0.22.1",
+ "ed25519-dalek",
+ "hex",
+ "serde",
+ "serde_jcs",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -2701,7 +2729,7 @@ name = "bloom-service-activation"
 version = "0.1.3"
 source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=ad0072512bb97fb4eb68d249ce785ea3ea4a49ab#ad0072512bb97fb4eb68d249ce785ea3ea4a49ab"
 dependencies = [
- "bloom-rpc-wire",
+ "bloom-rpc-wire 0.1.3 (git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=ad0072512bb97fb4eb68d249ce785ea3ea4a49ab)",
  "libc",
  "thiserror 2.0.18",
 ]
@@ -2720,12 +2748,11 @@ dependencies = [
 [[package]]
 name = "bloom-signer-api"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=27c3fef2f5b9225d55f1ad542223c824128c8e9e#27c3fef2f5b9225d55f1ad542223c824128c8e9e"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=8e40390b9cd350d178a90878b478eeb1189b5f62#8e40390b9cd350d178a90878b478eeb1189b5f62"
 dependencies = [
- "bloom-rpc-wire",
+ "bloom-rpc-wire 0.1.3 (git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=ad0072512bb97fb4eb68d249ce785ea3ea4a49ab)",
  "ed25519-dalek",
  "hex",
- "num-bigint",
  "serde",
  "serde_jcs",
  "serde_json",
@@ -2736,7 +2763,7 @@ dependencies = [
 [[package]]
 name = "bloom-signer-derive"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=27c3fef2f5b9225d55f1ad542223c824128c8e9e#27c3fef2f5b9225d55f1ad542223c824128c8e9e"
+source = "git+https://github.com/bloom-directory/bloom-signer.git?rev=8e40390b9cd350d178a90878b478eeb1189b5f62#8e40390b9cd350d178a90878b478eeb1189b5f62"
 dependencies = [
  "bip39",
  "ed25519-dalek",
@@ -2752,7 +2779,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-solana"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "bloom-proto",
  "bloom-rpc-common",
@@ -2767,12 +2794,12 @@ dependencies = [
 
 [[package]]
 name = "bloom-solana-tx"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
  "blake3",
- "bloom-broker-api",
+ "bloom-broker-api 0.1.0 (git+https://github.com/bloom-directory/bloom-broker.git?rev=556f6b3966f373a2eb2381355aabf3c619b485b7)",
  "bloom-machine-client",
  "bloom-proto",
  "bloom-solana",
@@ -2796,7 +2823,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-tools"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "alloy 2.0.5",
  "alloy-dyn-abi",
@@ -2813,7 +2840,7 @@ name = "bloom-triad-local-transport"
 version = "0.1.3"
 source = "git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=ad0072512bb97fb4eb68d249ce785ea3ea4a49ab#ad0072512bb97fb4eb68d249ce785ea3ea4a49ab"
 dependencies = [
- "bloom-rpc-wire",
+ "bloom-rpc-wire 0.1.3 (git+https://github.com/bloom-directory/bloom-service-runtime.git?rev=ad0072512bb97fb4eb68d249ce785ea3ea4a49ab)",
  "bloom-trusted-time",
  "ed25519-dalek",
  "hex",
@@ -2838,7 +2865,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-tx"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "alloy 2.0.5",
  "alloy-signer-local 2.0.5",
@@ -2846,7 +2873,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "blake3",
- "bloom-broker-api",
+ "bloom-broker-api 0.1.0 (git+https://github.com/bloom-directory/bloom-broker.git?rev=556f6b3966f373a2eb2381355aabf3c619b485b7)",
  "bloom-evm",
  "bloom-machine-client",
  "bloom-mempool",
@@ -2870,7 +2897,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-update"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "parking_lot",
  "reqwest 0.12.28",
@@ -2885,13 +2912,13 @@ dependencies = [
 
 [[package]]
 name = "bloom-vfs"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "alloy 2.0.5",
  "async-trait",
  "base64 0.22.1",
  "blake3",
- "bloom-broker-api",
+ "bloom-broker-api 0.1.0 (git+https://github.com/bloom-directory/bloom-broker.git?rev=556f6b3966f373a2eb2381355aabf3c619b485b7)",
  "bloom-ens",
  "bloom-etherscan",
  "bloom-evm",
@@ -2934,7 +2961,7 @@ dependencies = [
 
 [[package]]
 name = "bloom-watch"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "alloy 2.0.5",
  "anyhow",
@@ -4277,7 +4304,7 @@ checksum = "edd0f118536f44f5ccd48bcb8b111bdc3de888b58c74639dfb034a357d0f206d"
 [[package]]
 name = "embednfs"
 version = "0.4.1"
-source = "git+https://github.com/bloom-directory/embednfs.git?rev=ac1bcb92c5d6342239595cafd1284858e40300a6#ac1bcb92c5d6342239595cafd1284858e40300a6"
+source = "git+https://github.com/bloom-directory/embednfs.git?rev=09660bef6e41385f73120efe0083bcd0351aa921#09660bef6e41385f73120efe0083bcd0351aa921"
 dependencies = [
  "async-trait",
  "bytes",
@@ -4291,7 +4318,7 @@ dependencies = [
 [[package]]
 name = "embednfs-proto"
 version = "0.4.1"
-source = "git+https://github.com/bloom-directory/embednfs.git?rev=ac1bcb92c5d6342239595cafd1284858e40300a6#ac1bcb92c5d6342239595cafd1284858e40300a6"
+source = "git+https://github.com/bloom-directory/embednfs.git?rev=09660bef6e41385f73120efe0083bcd0351aa921#09660bef6e41385f73120efe0083bcd0351aa921"
 dependencies = [
  "bytes",
  "num-derive",
@@ -5252,7 +5279,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
- "webpki-roots 1.0.7",
+ "webpki-roots 1.0.10",
 ]
 
 [[package]]
@@ -7216,7 +7243,7 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-streams",
  "web-sys",
- "webpki-roots 1.0.7",
+ "webpki-roots 1.0.10",
 ]
 
 [[package]]
@@ -7991,9 +8018,9 @@ checksum = "f87165f0995f63a9fbeea62b64d10b4d9d8e78ec6d7d51fb2125fda7bb36788f"
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.15"
+version = "0.103.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
+checksum = "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281"
 dependencies = [
  "aws-lc-rs",
  "ring",
@@ -10408,9 +10435,9 @@ dependencies = [
 
 [[package]]
 name = "webpki-root-certs"
-version = "1.0.7"
+version = "1.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f31141ce3fc3e300ae89b78c0dd67f9708061d1d2eda54b8209346fd6be9a92c"
+checksum = "58ec80e73fd8baf57bf0d9615554c75348bda990d6d5bbeab964dd068319fecb"
 dependencies = [
  "rustls-pki-types",
 ]
@@ -10421,14 +10448,14 @@ version = "0.26.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
 dependencies = [
- "webpki-roots 1.0.7",
+ "webpki-roots 1.0.10",
 ]
 
 [[package]]
 name = "webpki-roots"
-version = "1.0.7"
+version = "1.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "52f5ee44c96cf55f1b349600768e3ece3a8f26010c05265ab73f945bb1a2eb9d"
+checksum = "1c1c8e20c8a38fc7d65abfe74eb7280e4aa667e8eec8bc84996d2874810748d9"
 dependencies = [
  "rustls-pki-types",
 ]

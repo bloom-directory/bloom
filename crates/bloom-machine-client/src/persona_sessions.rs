@@ -1,5 +1,5 @@
 //! Public persona grant orchestration. Authority and all spending reservations
-//! remain in Broker/Signer; these files contain public terms and retry identities.
+//! remain in Broker; Signer enforces structural signing limits; these files contain public terms and retry identities.
 
 use super::*;
 use fs2::FileExt;
@@ -31,6 +31,8 @@ struct SessionRecord {
     disabled: bool,
     #[serde(default)]
     revoke_request: Option<RevokeRequest>,
+    #[serde(default)]
+    revoke_confirmed: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -335,6 +337,7 @@ impl MachineBrokerClient {
                     proposal,
                     disabled: false,
                     revoke_request: None,
+                    revoke_confirmed: false,
                 };
                 atomic_json(&path, &record)?;
                 record
@@ -359,7 +362,9 @@ impl MachineBrokerClient {
                         .clone(),
                     petal_use_claim: None,
                     system_use_claim: None,
-                    requested_review_mode: None,
+                    safe_review_payloads: vec![],
+                    message_review_payloads: vec![],
+                    evm_reported_token: None,
                     evm_review_payloads: Vec::new(),
                 })
                 .await?;
@@ -467,12 +472,42 @@ impl MachineBrokerClient {
                 });
             }
             atomic_json(&grant_path(root, &id), &record)?;
-            stopped.push(record.revoke_request.expect("frozen above"));
+            // A local receipt is only a cache hint: confirm the remote state
+            // before skipping a revocation, even when a prior stop succeeded.
+            let remotely_revoked = record.revoke_confirmed
+                && self.approval_status(id.clone()).await.is_ok_and(|status| {
+                    status.approval_id == id
+                        && &status.wallet_id == wallet
+                        && status.state == ApprovalLifecycleState::Revoked
+                });
+            if !remotely_revoked {
+                stopped.push((id, record.revoke_request.expect("frozen above")));
+            }
         }
         let mut failures = Vec::new();
-        for request in stopped {
-            if let Err(error) = self.revoke_approval(request).await {
-                failures.push(error.code.as_str());
+        for (id, request) in stopped {
+            let confirmed = match self.revoke_approval(request).await {
+                Ok(_) => true,
+                Err(error) => match self.approval_status(id.clone()).await {
+                    Ok(status)
+                        if status.approval_id == id
+                            && &status.wallet_id == wallet
+                            && status.state == ApprovalLifecycleState::Revoked =>
+                    {
+                        true
+                    }
+                    _ => {
+                        failures.push(error.code.as_str());
+                        false
+                    }
+                },
+            };
+            if confirmed {
+                let path = grant_path(root, &id);
+                let mut record: SessionRecord =
+                    read_json(&path)?.ok_or_else(|| io_error("stopped grant disappeared"))?;
+                record.revoke_confirmed = true;
+                atomic_json(&path, &record)?;
             }
         }
         if !failures.is_empty() {
@@ -547,7 +582,10 @@ impl MachineBrokerClient {
             request.petal_use_claim.as_ref(),
             None,
             None,
-            request.claim_assurance_evidence.as_deref(),
+            request
+                .message_review_payload
+                .as_deref()
+                .or(request.claim_assurance_evidence.as_deref()),
             &request.signing_operation_id,
             &request.preimages,
             true,
@@ -571,6 +609,14 @@ impl MachineBrokerClient {
         preimages: &[Vec<u8>],
         batch: bool,
     ) -> Result<Option<SigningResult>, ProtocolError> {
+        if system_use.is_some()
+            || system_claim.is_some()
+            || claim
+                .is_none_or(|claim| claim.operation_class.as_str() != "polymarket.order.poly1271")
+            || evidence.is_none()
+        {
+            return Ok(None);
+        }
         let Some(root) = &self.persona_session_root else {
             return Ok(None);
         };
@@ -668,7 +714,6 @@ impl MachineBrokerClient {
         let terms = &record.proposal.terms;
         let approval_id = terms.approval_id()?;
         let operation_digest = SignOperationIdentity {
-
             operation_id: operation_id.clone(),
             approval_id: approval_id.clone(),
             key_ref: key_ref.clone(),
@@ -838,8 +883,8 @@ fn records(root: &Path) -> Result<Vec<SessionRecord>, ProtocolError> {
 mod tests {
     use super::*;
     use bloom_broker_api::{
-        AssetId, DecimalU256, KeySpec, NormalizedSignature, OperationState, SessionValueCeiling,
-        SystemSessionAction, SystemSessionChain, SystemSessionScope, SystemSessionUse,
+        AssetId, DecimalU256, KeySpec, NormalizedSignature, OperationState, SystemSessionAction,
+        SystemSessionChain, SystemSessionUse,
     };
     use std::{collections::BTreeMap, sync::Mutex};
 
@@ -872,36 +917,25 @@ mod tests {
     }
     fn proposal() -> PersonaSessionProposal {
         let asset = AssetId {
-            chain: token("evm-1"),
-            asset: "native".into(),
+            chain: token("polygon"),
+            asset: "pusd".into(),
         };
         let terms = SealedApprovalTerms {
             session_budget: None,
-            subject: ApprovalSubject::System {
-                component_id: token("bloom-machine"),
-                operation_class: token("evm.tx.confirm"),
+            subject: ApprovalSubject::Petal {
+                package_hash: digest(4),
+                route: "trade/wallet/0/new".into(),
+                agent_id: None,
             },
             wallet_id: token("wallet"),
             key_ref: key(),
             allowed_crypto_suites: vec![CryptoSuite::Secp256k1Keccak256Recoverable],
-            selector: ApprovalSelector::SystemSession {
-                scope: SystemSessionScope {
-                    component_id: token("bloom-machine"),
-                    actions: vec![SystemSessionAction::NativeTransfer],
-                    chains: vec![SystemSessionChain::Evm {
-                        chain: token("evm-1"),
-                        chain_id: DecimalU64::new(1),
-                    }],
-                    destinations: vec![bloom_broker_api::PolicyDestination {
-                        chain: token("evm-1"),
-                        destination: "0x0000000000000000000000000000000000000002".into(),
-                    }],
-                    tokens: vec![],
-                    per_action_value_limits: vec![SessionValueCeiling {
-                        asset: asset.clone(),
-                        maximum: DecimalU256::parse("100").unwrap(),
-                    }],
-                },
+            selector: ApprovalSelector::Petal {
+                package_hash: digest(4),
+                route: "trade/wallet/0/new".into(),
+                allowed_operation_classes: vec![token("polymarket.order.poly1271")],
+                route_grants: vec![],
+                required_claim_assurance: bloom_broker_api::ClaimAssuranceLevel::MachineAsserted,
             },
             limits: ApprovalLimits {
                 max_operations: DecimalU64::new(10),
@@ -1099,10 +1133,22 @@ mod tests {
                 proposal,
                 disabled: false,
                 revoke_request: None,
+                revoke_confirmed: false,
             },
         )
         .unwrap();
         (directory, client, broker)
+    }
+    fn use_claim(payload: &[u8], chain: u64) -> PetalUseClaim {
+        PetalUseClaim {
+            package_hash: digest(4), route: "trade/wallet/0/new".into(), operation_class: token("polymarket.order.poly1271"),
+            crypto_suite: CryptoSuite::Secp256k1Keccak256Recoverable,
+            payload_digest: petal_batch_payload_digest(&[payload.to_vec()]),
+            ordered_hashes: vec![suite_hash(CryptoSuite::Secp256k1Keccak256Recoverable,payload)],
+            declared_debits: serde_json::from_value(serde_json::json!([{"asset":{"chain":if chain==1 {"polygon"} else {"ethereum"},"asset":"pusd"},"amount":"10"}])).unwrap(),
+            declared_destinations:vec![], declared_fee:bloom_broker_api::DeclaredFee::None,
+            nonce:RequestNonce::from_bytes([1;16]), claim_assurance:bloom_broker_api::ClaimAssurance::MachineAsserted,
+        }
     }
     async fn sign(
         client: &MachineBrokerClient,
@@ -1110,20 +1156,25 @@ mod tests {
         payload: &[u8],
         action: &SystemSessionUse,
     ) -> Result<Option<SigningResult>, ProtocolError> {
+        let chain = match &action.chain {
+            SystemSessionChain::Evm { chain_id, .. } => chain_id.get(),
+            _ => 0,
+        };
+        let claim = use_claim(payload, chain);
         client
             .try_persona_sign_payloads(
                 &token("wallet"),
                 &key(),
                 CryptoSuite::Secp256k1Keccak256Recoverable,
-                &ProvenanceSubject::System {
-                    component_id: token("bloom-machine"),
-                    operation_class: token("evm.tx.confirm"),
+                &ProvenanceSubject::Petal {
+                    package_hash: digest(4),
+                    route: "trade/wallet/0/new".into(),
                 },
                 &digest(83),
+                Some(&claim),
                 None,
                 None,
-                Some(action),
-                None,
+                Some(b"retained prepared order witness"),
                 &OperationId::from_bytes([operation; 32]),
                 &[payload.to_vec()],
                 false,
@@ -1210,14 +1261,15 @@ mod tests {
         let (_directory, client, broker) = fixture();
         let payload = b"source-preserved native transaction".to_vec();
         let request = ExactPayloadSignRequest {
-            session_use: Some(action(1)),
+            session_use: None,
+            evm_reported_token: None,
             wallet_id: token("wallet"),
             claimed_hash: suite_hash(CryptoSuite::Secp256k1Keccak256Recoverable, &payload),
-            preimage: payload,
+            preimage: payload.clone(),
             crypto_suite: CryptoSuite::Secp256k1Keccak256Recoverable,
-            provenance: ProvenanceSubject::System {
-                component_id: token("bloom-machine"),
-                operation_class: token("evm.tx.confirm"),
+            provenance: ProvenanceSubject::Petal {
+                package_hash: digest(4),
+                route: "trade/wallet/0/new".into(),
             },
             provenance_digest: digest(83),
             activation_mode: None,
@@ -1228,12 +1280,13 @@ mod tests {
             expires_at_ms: DecimalU64::new(2000),
             canonical_plan_facts_digest: digest(9),
             approval_id: None,
-            petal_use_claim: None,
+            petal_use_claim: Some(use_claim(&payload, 1)),
             system_use_claim: None,
-            claim_assurance_evidence: None,
+            claim_assurance_evidence: Some(b"retained prepared order witness".to_vec()),
             approval_value_limits: vec![],
             account_key_ref: None,
-            requested_review_mode: None,
+            safe_review_payload: None,
+            message_review_payload: Some(b"retained prepared order witness".to_vec()),
         };
         assert!(matches!(
             client.sign_exact_payload(request.clone()).await.unwrap(),
@@ -1246,6 +1299,68 @@ mod tests {
             ExactPayloadSignOutcome::Signed(_)
         ));
         assert_eq!(broker.0.lock().unwrap().signatures, 1);
+    }
+
+    #[tokio::test]
+    async fn repeated_stop_skips_confirmed_remote_revocations() {
+        let (directory, client, broker) = fixture();
+        client
+            .stop_persona_sessions(&token("wallet"), "pause")
+            .await
+            .unwrap();
+        client
+            .stop_persona_sessions(&token("wallet"), "pause again")
+            .await
+            .unwrap();
+        assert!(!broker.0.lock().unwrap().active);
+        assert!(records(directory.path()).unwrap()[0].revoke_confirmed);
+    }
+
+    #[tokio::test]
+    async fn cached_stop_receipt_cannot_hide_a_live_remote_grant() {
+        let (directory, client, broker) = fixture();
+        let mut record = records(directory.path()).unwrap().remove(0);
+        record.revoke_confirmed = true;
+        atomic_json(
+            &grant_path(
+                directory.path(),
+                &record.proposal.terms.approval_id().unwrap(),
+            ),
+            &record,
+        )
+        .unwrap();
+        client
+            .stop_persona_sessions(&token("wallet"), "pause")
+            .await
+            .unwrap();
+        assert!(!broker.0.lock().unwrap().active);
+    }
+
+    #[tokio::test]
+    async fn native_transfers_do_not_borrow_a_petal_session() {
+        let (_, client, broker) = fixture();
+        let result = client
+            .try_persona_sign_payloads(
+                &token("wallet"),
+                &key(),
+                CryptoSuite::Secp256k1Keccak256Recoverable,
+                &ProvenanceSubject::System {
+                    component_id: token("bloom-machine"),
+                    operation_class: token("evm.tx.confirm"),
+                },
+                &digest(83),
+                None,
+                None,
+                Some(&action(1)),
+                None,
+                &OperationId::from_bytes([7; 32]),
+                &[b"native".to_vec()],
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(result.is_none());
+        assert_eq!(broker.0.lock().unwrap().signatures, 0);
     }
 
     #[tokio::test]

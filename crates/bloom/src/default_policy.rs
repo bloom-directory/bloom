@@ -1274,12 +1274,14 @@ pub(crate) async fn create_wallet_then_default_policy(
     endpoint: &crate::ResolvedEndpoint,
     name: String,
     kind: bloom_daemon::ipc::MachineCustodyKind,
+    local: bool,
 ) -> Result<()> {
     let output = crate::machine_command(
         endpoint,
         bloom_daemon::ipc::MachineCommand::WalletCustody {
             name: name.clone(),
             kind,
+            local,
         },
     )
     .await?;

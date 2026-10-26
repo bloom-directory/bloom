@@ -50,6 +50,7 @@ pub struct ExactSigningBrokerFixture {
 impl ExactSigningBrokerFixture {
     fn policy_snapshot(&self, wallet_id: Token) -> SignedPolicySnapshot {
         let canonical_policy = serde_json::to_vec(&CanonicalWalletPolicy {
+            clear_signing: None,
             wallet_id: wallet_id.clone(),
             maximum_approval_lifetime_ms: 3_600_000,
             allowed_petal_packages: Vec::new(),
@@ -77,7 +78,6 @@ impl ExactSigningBrokerFixture {
                 }]
             },
             required_verifiers: Vec::new(),
-            clear_signing: None,
         })
         .unwrap();
         let policy_digest = Digest32::from_bytes(Sha256::digest(&canonical_policy).into());
