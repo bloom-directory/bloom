@@ -138,6 +138,12 @@ code the site showed; a reference alone does not prove payment or ticket issue.
 `needs_input` means the page needs attention, not that no payment was submitted.
 Do not infer a charge outcome from a form error, timeout or closing the view.
 `paused` means checkout could not hand the browser back, so shopping stays paused.
+`reason` says why Bloom left the payment to the person: `facts_unreadable` for
+a total or currency it could not read, `fields_unsupported` for card fields in
+an unexpected shape, `receiving_origin_unreviewed` for a frame that would
+receive the card and is not a reviewed payment host. The first two can change
+with the page: reach the real payment step, let it finish loading and request
+payment again. The third needs the person, or another seller.
 Older `not_submitted` records are also ambiguous and become `uncertain` on
 restart. `partially_filled`, `disclosure_unknown`, and `uncertain` require
 human inspection; never repeat the purchase automatically. Ask the human to

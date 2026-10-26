@@ -5,7 +5,7 @@ use crate::{
     hpke::Recipient,
 };
 use anyhow::{Context, Result, bail};
-use bloom_checkout_api::BrowseRequest;
+use bloom_checkout_api::{BrowseRequest, PreparationReason};
 use bloom_signer_api::{
     CardOperationState, CardOperationStatus, CustodyOutputHpkeAad, CustodyResult, Digest32,
     OperationId, Token, TravelerFillScope,
@@ -360,6 +360,7 @@ impl CheckoutService {
             filled_fields: vec![],
             outcome: None,
             paused: false,
+            reason: None,
         };
         self.store.insert(
             &status,
@@ -891,6 +892,7 @@ impl CheckoutService {
                     filled_fields: Vec::new(),
                     outcome: None,
                     paused: false,
+                    reason: None,
                 };
                 if matches!(mode, Mode::Card | Mode::Site) {
                     // Ask for payment only once the page accepts what was entered.
@@ -940,17 +942,22 @@ impl CheckoutService {
                 }
                 status.state = "preparing".into();
                 self.store.update(&status)?;
-                let discovery = match mode {
-                    Mode::Card => match Discovery::read(&tab).await {
-                        Ok(discovery) => Some(discovery),
-                        // The reason is generic text, never page or card content.
-                        Err(error) => {
-                            eprintln!("payment page needs the private view: {error:#}");
-                            None
-                        }
-                    },
-                    Mode::Site => Discovery::read_site(&tab).await.ok(),
+                let read = match mode {
+                    Mode::Card => Some(Discovery::read(&tab).await),
+                    Mode::Site => Some(Discovery::read_site(&tab).await),
                     Mode::TakeOver => None,
+                };
+                let discovery = match read {
+                    Some(Ok(discovery)) => Some(discovery),
+                    // The agent learns the code Checkout chose, never page,
+                    // merchant or card content.
+                    Some(Err(error)) => {
+                        eprintln!("payment page needs the private view: {error:#}");
+                        status.reason = error.downcast_ref::<PreparationReason>().copied();
+                        self.store.update(&status)?;
+                        None
+                    }
+                    None => None,
                 };
                 let shop = match &discovery {
                     Some(discovery) => Some(discovery.facts.origin.clone()),
@@ -2152,6 +2159,7 @@ mod tests {
                     filled_fields: vec![],
                     outcome: None,
                     paused: false,
+                    reason: None,
                 },
                 "traveler",
                 "Synthetic pending unlock",
@@ -2294,6 +2302,7 @@ mod tests {
                     filled_fields: vec![],
                     outcome: None,
                     paused: false,
+                    reason: None,
                 },
                 "traveler",
                 "Synthetic approved person",
@@ -2576,6 +2585,7 @@ mod tests {
             filled_fields: vec!["number".into()],
             outcome: None,
             paused: false,
+            reason: None,
         };
         service
             .store
@@ -2701,6 +2711,7 @@ mod tests {
                     filled_fields: vec![],
                     outcome: None,
                     paused: false,
+                    reason: None,
                 },
                 "traveler",
                 "Synthetic unlock",
@@ -2860,6 +2871,7 @@ mod tests {
             filled_fields: vec!["number".into(), "expiry".into(), "cvc".into()],
             outcome: None,
             paused: false,
+            reason: None,
         };
         service
             .store
@@ -2935,6 +2947,7 @@ mod tests {
             filled_fields: vec!["number".into()],
             outcome: None,
             paused: false,
+            reason: None,
         };
         service
             .store
@@ -3007,6 +3020,7 @@ mod tests {
             filled_fields: vec![],
             outcome: None,
             paused: false,
+            reason: None,
         };
         service
             .store
@@ -3083,6 +3097,7 @@ mod tests {
             filled_fields: vec![],
             outcome: None,
             paused: false,
+            reason: None,
         };
         service
             .store
@@ -3136,6 +3151,7 @@ mod tests {
             filled_fields: vec!["number".into(), "expiry".into(), "cvc".into()],
             outcome: None,
             paused: false,
+            reason: None,
         };
         service
             .store
@@ -3817,6 +3833,7 @@ mod tests {
                     filled_fields: vec![],
                     outcome: None,
                     paused: false,
+                    reason: None,
                 },
                 "card",
                 "Fixture prior",
@@ -3871,6 +3888,7 @@ mod tests {
                     filled_fields: vec![],
                     outcome: None,
                     paused: false,
+                    reason: None,
                 },
                 "card",
                 "Fixture open approval",
@@ -3903,6 +3921,7 @@ mod tests {
                 filled_fields: vec!["given_name".into()],
                 outcome: None,
                 paused: false,
+                reason: None,
             };
             store
                 .insert(&status, "traveler", "Fixture passenger")
@@ -3925,6 +3944,7 @@ mod tests {
                 filled_fields: vec!["given_name".into()],
                 outcome: None,
                 paused: false,
+                reason: None,
             };
             store
                 .insert(&status, "traveler", "Fixture passenger")
@@ -3990,6 +4010,7 @@ mod tests {
             filled_fields: Vec::new(),
             outcome: None,
             paused: false,
+            reason: None,
         };
         service.store.insert(&status, "card", "test").unwrap();
         let token = hex_token(&[42; 32]);
@@ -4224,6 +4245,7 @@ mod tests {
             filled_fields: Vec::new(),
             outcome: None,
             paused: false,
+            reason: None,
         };
         service.store.insert(&status, "card", "test").unwrap();
         let token = hex_token(&[44; 32]);
@@ -4304,6 +4326,7 @@ mod tests {
             filled_fields: Vec::new(),
             outcome: None,
             paused: false,
+            reason: None,
         };
         store.insert(&status, "card", "Two socks").unwrap();
         store
@@ -4358,6 +4381,7 @@ mod tests {
             filled_fields: vec!["number".into(), "expiry".into(), "cvc".into()],
             outcome: None,
             paused: false,
+            reason: None,
         };
         reopened.insert(&submitted, "card", "Flight").unwrap();
         let mut needs_input = submitted.clone();

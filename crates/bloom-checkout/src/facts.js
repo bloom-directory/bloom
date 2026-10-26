@@ -40,10 +40,16 @@
     let whole = number, fraction = '';
     const last = number.search(/[.,][^.,]*$/);
     const tail = last >= 0 ? number.slice(last + 1) : '';
+    const head = last >= 0 ? number.slice(0, last) : number;
     // A final '.' or ',' followed by 1..scale digits is decimal; three digits
-    // are always grouping for currencies with fewer than three decimals.
-    if (last >= 0 && /^\d+$/.test(tail) && tail.length <= scale && tail.length !== 3) {
-      whole = number.slice(0, last); fraction = tail;
+    // are always grouping for currencies with fewer than three decimals. For
+    // three-decimal currencies a three-digit tail is decimal when the whole
+    // part groups with a different separator ("IQD 1,250.125"); a lone
+    // separator ("KWD 1.234") stays ambiguous and finishes in the private view.
+    const unambiguous = tail.length === 3 && scale >= 3
+      && /[.,'\u2019 ]/.test(head) && !head.includes(number[last]);
+    if (last >= 0 && /^\d+$/.test(tail) && (tail.length <= scale && tail.length !== 3 || unambiguous)) {
+      whole = head; fraction = tail;
     } else if (scale >= 3 && last >= 0) return null;
     const grouping = [...new Set(whole.replace(/\d/g, ''))];
     if (grouping.length > 1 || (fraction && grouping[0] === number[last])) return null;

@@ -105,7 +105,38 @@ pub struct Status {
     /// Checkout could not hand the browser back, so shopping stays paused.
     #[serde(default, skip_serializing_if = "skip_false")]
     pub paused: bool,
+    /// Why Checkout left the payment to the person, when it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<PreparationReason>,
 }
+
+/// Why Checkout could not prepare the payment itself, so the person finishes
+/// it in the private view. The codes belong to Checkout: no merchant text,
+/// field value or saved value reaches the agent through them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreparationReason {
+    /// The page's total or currency could not be read without ambiguity.
+    FactsUnreadable,
+    /// The card fields are missing, duplicated or in an unexpected shape.
+    FieldsUnsupported,
+    /// A frame that would receive the card is not a reviewed payment host.
+    ReceivingOriginUnreviewed,
+}
+
+impl std::fmt::Display for PreparationReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::FactsUnreadable => "facts_unreadable",
+            Self::FieldsUnsupported => "fields_unsupported",
+            Self::ReceivingOriginUnreviewed => "receiving_origin_unreviewed",
+        })
+    }
+}
+
+// Carried on the preparation error so the service can report the code without
+// reading the message.
+impl std::error::Error for PreparationReason {}
 
 fn skip_false(value: &bool) -> bool {
     !*value

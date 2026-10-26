@@ -1,6 +1,7 @@
 use crate::browser::PrivateTab;
 use crate::cdp::Cdp;
 use anyhow::{Context, Result, bail};
+use bloom_checkout_api::PreparationReason;
 use bloom_signer_api::CheckoutFacts;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -455,7 +456,8 @@ impl Discovery {
             }
         }
         if candidates.len() != 1 {
-            bail!("Payment facts require human review");
+            return Err(anyhow::Error::new(PreparationReason::FactsUnreadable)
+                .context("Payment facts require human review"));
         }
         let (facts_session, main_world, mut facts) = candidates.remove(0);
         facts.origin = top_origin.context("Missing merchant origin")?;
@@ -480,14 +482,18 @@ impl Discovery {
                 })
                 .collect();
             eprintln!("card fields found: {}", found.join("; "));
-            bail!("Card fields are not hosted by a known payment provider");
+            return Err(
+                anyhow::Error::new(PreparationReason::ReceivingOriginUnreviewed)
+                    .context("Card fields are not hosted by a known payment provider"),
+            );
         }
         facts.payment_frame_origins = frames.iter().map(|f| f.origin.clone()).collect();
         facts.payment_frame_origins.sort();
         facts.payment_frame_origins.dedup();
-        facts
-            .validate()
-            .map_err(|_| anyhow::anyhow!("Payment facts require human review"))?;
+        facts.validate().map_err(|_| {
+            anyhow::Error::new(PreparationReason::FactsUnreadable)
+                .context("Payment facts require human review")
+        })?;
         let count = |kind: &str| {
             frames
                 .iter()
@@ -511,7 +517,8 @@ impl Discovery {
                 count("month"),
                 count("year")
             );
-            bail!("Payment fields require human review");
+            return Err(anyhow::Error::new(PreparationReason::FieldsUnsupported)
+                .context("Payment fields require human review"));
         }
         Ok(Self {
             facts,
@@ -1581,8 +1588,17 @@ pub(crate) mod tests {
                 None,
             ),
             (lines("en", "", &["Total $10.00"], "Pay"), None),
-            // Three-decimal currencies make "1.234" ambiguous.
+            // Three-decimal currencies make "1.234" ambiguous, while mixed
+            // grouping and decimal separators are not.
             (lines("ar-KW", "", &["Total KWD 1.234"], "Pay"), None),
+            (
+                lines("en", "", &["Total IQD 1,250.125"], "Pay"),
+                Some((1250125, "IQD")),
+            ),
+            (
+                lines("ar-BH", "", &["Total BHD 1.250,125"], "Pay"),
+                Some((1250125, "BHD")),
+            ),
             (lines("en", "", &["Total EUR $5.00"], "Pay"), None),
             (
                 lines("en", "", &["Total USD 10.00", "Total USD 12.00"], "Pay"),
@@ -1886,6 +1902,43 @@ pub(crate) mod tests {
         );
         browser.return_control().await.unwrap();
         server.abort();
+    }
+
+    /// The agent is told which bounded code sent the payment to the private
+    /// view, so it can tell a page it could fix from an unreviewed receiver.
+    #[tokio::test]
+    async fn preparation_reasons_name_the_fallback() {
+        let browser = browser().await;
+        let no_total = format!(
+            "<!doctype html><h1>Fixture merchant</h1><div>Flight to Mumbai</div>{}<button>Pay</button>",
+            inputs()
+        );
+        let two_numbers = merchant(
+            &format!("<input autocomplete='cc-number'>{}", inputs()),
+            "",
+            "Order confirmed",
+        );
+        for (html, reviewed_host, expected) in [
+            (no_total, true, PreparationReason::FactsUnreadable),
+            (two_numbers, true, PreparationReason::FieldsUnsupported),
+            (
+                merchant(&inputs(), "", "Order confirmed"),
+                false,
+                PreparationReason::ReceivingOriginUnreviewed,
+            ),
+        ] {
+            let (url, server) = fixture(html.clone()).await;
+            let mut tab = open(&browser, url).await;
+            tab.fixture_payment_hosts = reviewed_host;
+            let error = Discovery::read(&tab).await.err().unwrap();
+            assert_eq!(
+                error.downcast_ref::<PreparationReason>().copied(),
+                Some(expected),
+                "{html}: {error:#}"
+            );
+            browser.return_control().await.unwrap();
+            server.abort();
+        }
     }
 
     async fn outcome_of(browser: &Browser, html: &str) -> Value {
