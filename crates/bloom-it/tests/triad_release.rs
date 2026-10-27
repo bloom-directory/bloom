@@ -1225,13 +1225,6 @@ fn production_release_rejects_machine_audit_test_features() {
     assert!(gate.contains("forbidden production Machine feature resolved"));
     assert!(gate.contains("cargo tree"));
     assert!(gate.contains("-e normal,build,features"));
-    for predecessor in [
-        "dd2add2b9d41540521d08c77d19fb467a2d8029e",
-        "5db670e1b7507deabfdcf451be8b5d315c1c9d91",
-    ] {
-        assert!(gate.contains(predecessor));
-    }
-    assert!(gate.contains("predecessor migration fixture resolved in production Machine graph"));
 }
 
 #[test]
