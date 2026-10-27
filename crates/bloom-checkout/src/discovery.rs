@@ -2015,6 +2015,16 @@ pub(crate) mod tests {
             ),
             // Nothing recurring: no renewal to read.
             ("en", &["One flight to Mumbai", "Total USD 1.00"][..], None),
+            // Spotify's headline offer: nothing today, the real price later.
+            (
+                "en-US",
+                &[
+                    "Premium Individual subscription",
+                    "Total USD 0.00",
+                    "Free for 2 months, then $12.99 per month starting 2026-12-25",
+                ][..],
+                Some((1299, "month", Some("2026-12-25"))),
+            ),
         ] {
             let (url, server) = fixture(page(lang, lines)).await;
             let tab = open(&browser, url).await;
@@ -2034,6 +2044,59 @@ pub(crate) mod tests {
                 ),
                 "{lang} {lines:?}"
             );
+            browser.return_control().await.unwrap();
+            server.abort();
+        }
+    }
+
+    /// A charge of nothing is approvable only as a subscription: the renewal
+    /// terms are what the person is agreeing to. A page with no amount and no
+    /// subscription has nothing to approve and stays manual.
+    #[tokio::test]
+    async fn a_zero_charge_needs_the_subscription_it_belongs_to() {
+        let browser = browser().await;
+        for (lines, total) in [
+            (
+                &[
+                    "Premium Individual subscription",
+                    "Total USD 0.00",
+                    "Free for 2 months, then $12.99 per month",
+                ][..],
+                Some(0),
+            ),
+            // No subscription anywhere on the page: nothing to approve.
+            (&["Gift registry", "Total USD 0.00"][..], None),
+            // Says it recurs, but never says what it will cost.
+            (
+                &[
+                    "Membership subscription",
+                    "Total USD 0.00",
+                    "Cancel anytime",
+                ][..],
+                None,
+            ),
+        ] {
+            let body: String = lines.iter().map(|l| format!("<div>{l}</div>")).collect();
+            let (url, server) = fixture(format!(
+                "<!doctype html><html lang='en-US'><body>{body}{}<button>Pay</button></body></html>",
+                inputs()
+            ))
+            .await;
+            let tab = open(&browser, url).await;
+            let read = Discovery::read(&tab).await;
+            assert_eq!(
+                read.as_ref().ok().map(|d| d.facts.total_minor),
+                total,
+                "{lines:?}"
+            );
+            if total.is_none() {
+                let error = read.err().unwrap();
+                assert_eq!(
+                    error.downcast_ref::<PreparationReason>().copied(),
+                    Some(PreparationReason::FactsUnreadable),
+                    "{lines:?}"
+                );
+            }
             browser.return_control().await.unwrap();
             server.abort();
         }
