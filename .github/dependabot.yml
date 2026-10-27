@@ -5,6 +5,10 @@ updates:
     schedule:
       interval: weekly
       day: monday
+    # Exact `=` pins move by hand; Dependabot would rewrite them.
+    ignore:
+      - dependency-name: "wasmtime*"
+      - dependency-name: tempo-alloy
     groups:
       cargo-minor-and-patch:
         update-types:
