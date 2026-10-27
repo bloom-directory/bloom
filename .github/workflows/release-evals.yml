@@ -203,8 +203,6 @@ jobs:
     needs: [build, evals]
     if: always() && needs.build.result == 'success'
     runs-on: ubuntu-latest
-    env:
-      TASKS: ${{ env.TASKS }}
     permissions:
       contents: read
       pull-requests: write
