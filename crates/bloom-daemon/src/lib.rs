@@ -3080,8 +3080,22 @@ fn petal_outbox_outcome(
 
 fn petal_http_transport_error(phase: &str, error: reqwest::Error) -> HostError {
     // URLs can hold credentials in userinfo, paths or queries. Remove them
-    // from guest replies and audit error fields while retaining the cause.
-    HostError::Backend(format!("http_fetch {phase}: {}", error.without_url()))
+    // from guest replies and audit error fields. reqwest's Display prints only
+    // the error kind, so append the source chain (DNS, connect, TLS, timeout)
+    // and scrub the URL from it in case a source repeats it.
+    let url = error.url().map(|url| url.to_string());
+    let error = error.without_url();
+    let mut message = format!("http_fetch {phase}: {error}");
+    let mut source = std::error::Error::source(&error);
+    while let Some(cause) = source {
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    if let Some(url) = url {
+        message = message.replace(&url, "<url>");
+    }
+    HostError::Backend(message)
 }
 
 fn resolve_redirect_target(current_url: &str, location: &str) -> Result<String, HostError> {
@@ -9946,10 +9960,33 @@ allowed = ["bloom:vfs.read"]
                 );
             }
             assert!(message.contains(&format!("http_fetch {phase}:")));
-            assert!(
-                message.contains("builder error"),
-                "transport cause was discarded"
-            );
+            assert!(message.contains("builder error"), "error kind was dropped");
         }
+    }
+
+    #[tokio::test]
+    async fn petal_http_transport_errors_keep_the_connect_cause() {
+        let closed_port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let url = format!(
+            "http://fixture-user:fixture-password@127.0.0.1:{closed_port}/fixture-path-token?key=fixture-query-token"
+        );
+        let original = reqwest::Client::new().get(&url).send().await.unwrap_err();
+        let message = petal_http_transport_error("send", original).to_string();
+        for value in [
+            "fixture-user",
+            "fixture-password",
+            "fixture-path-token",
+            "fixture-query-token",
+        ] {
+            assert!(!message.contains(value), "URL data leaked: {message}");
+        }
+        assert!(
+            message.contains("Connection refused"),
+            "transport cause was dropped: {message}"
+        );
     }
 }

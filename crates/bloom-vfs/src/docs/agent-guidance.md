@@ -66,10 +66,12 @@ whether an earlier operation completed or whether retrying a write is safe.
   possibly submitted transaction, reconcile by its recorded hash or signature;
   never blindly restage or rebroadcast.
 
-Petal HTTP policy denials report method and host; request URL userinfo, paths
-and queries are omitted because they can contain credentials. Compare the
-reported target with the package's `[[net.allow]]` rules. HTTP transport errors
-retain their phase and cause with the request URL removed.
+Petal HTTP policy denials report only method and host; request URL userinfo,
+paths and queries are omitted because they can contain credentials. Rules
+match host, method and path, so when the reported method and host match a
+`[[net.allow]]` rule, the denied part is the request path. HTTP transport errors
+report their phase and underlying cause (DNS, connect, TLS, timeout) with the
+request URL removed.
 
 If you write to a control file and then cannot find what you wrote, check
 whether the transfer moved to `sent/` or `failed/` before assuming the write
