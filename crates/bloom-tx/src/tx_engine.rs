@@ -4356,8 +4356,10 @@ impl TxEngine {
         let _ = self
             .outbox
             .remove_broadcast_raw_tx(&entry, BroadcastAttemptKind::CancelReplacement);
-        // The replacement took the nonce; the original can never be sent.
-        if entry.state != OutboxState::Failed
+        // Broadcast does not settle the nonce race. Keep a sent original
+        // visible to the reconciler so it can record a receipt if it wins.
+        if original.tx_hash.is_none()
+            && entry.state != OutboxState::Failed
             && let Err(e) = self
                 .outbox
                 .transition_with_status(&entry, TxStatus::Cancelled)
@@ -5930,6 +5932,60 @@ mod tests {
             "{:?}",
             staged.policy_checks
         );
+    }
+
+    #[tokio::test]
+    async fn cancel_replacement_keeps_sent_original_available_for_reconciliation() {
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        let mut staged = fake_staged_1559("cancel-race");
+        staged.created_ms = now_ms();
+        outbox.write_pending(&staged, "original").unwrap();
+        let pending = outbox.read("alice", "anvil", &staged.id).unwrap();
+        outbox
+            .transition_with_status(&pending, TxStatus::Sent)
+            .unwrap();
+        let sent = outbox.read("alice", "anvil", &staged.id).unwrap();
+        staged.status = TxStatus::Sent;
+        staged.tx_hash = Some(format!("{:#x}", B256::repeat_byte(1)));
+        outbox
+            .write_artefact(
+                &sent.dir,
+                "intent.json",
+                &serde_json::to_vec(&staged).unwrap(),
+            )
+            .unwrap();
+        let (engine, _, broker) = triad_batch_fixture(outbox.clone(), true, false);
+        let mut catalog = triad_catalog();
+        let mut cancel_record = catalog.records[0].clone();
+        cancel_record.subject = ProvenanceSubject::System {
+            component_id: Token::new("bloom-machine").unwrap(),
+            operation_class: Token::new("transaction.cancel").unwrap(),
+        };
+        cancel_record.operation_classes[0].operation_class =
+            Token::new("transaction.cancel").unwrap();
+        catalog.records.push(cancel_record);
+        let engine = engine.with_triad_signing(broker, catalog).unwrap();
+        let chain = stage_chain(&spawn_batch_rpc(None).await);
+        let permit = permit_for(&directory);
+        let policy = Policy::default();
+        let result = engine
+            .cancel(&permit, "alice", "anvil", &staged.id, &chain, 15, &policy)
+            .await;
+        if matches!(result, Err(TxEngineError::ApprovalRequired(_))) {
+            engine
+                .cancel(&permit, "alice", "anvil", &staged.id, &chain, 15, &policy)
+                .await
+                .unwrap();
+        } else {
+            result.unwrap();
+        }
+        let original = outbox.read("alice", "anvil", &staged.id).unwrap();
+        assert_eq!(original.state, OutboxState::Sent);
+        assert_eq!(original.staged.status, TxStatus::Sent);
+        assert_eq!(original.staged.tx_hash, staged.tx_hash);
+        assert!(original.dir.join("cancel_tx_hash").exists());
+        assert!(original.dir.join("cancel_intent.json").exists());
     }
 
     #[tokio::test]

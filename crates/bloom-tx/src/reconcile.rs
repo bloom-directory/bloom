@@ -853,6 +853,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn original_receipt_is_recorded_when_it_beats_a_cancel_replacement() {
+        let (_directory, outbox) = sent_outbox();
+        let entry = outbox.read("alice", "anvil", "tx-1").unwrap();
+        outbox
+            .write_artefact(
+                &entry.dir,
+                "cancel_tx_hash",
+                format!("{:#x}", alloy::primitives::B256::repeat_byte(8)).as_bytes(),
+            )
+            .unwrap();
+        let audit_directory = tempfile::tempdir().unwrap();
+        let audit = Arc::new(AuditLog::open(audit_directory.path().join("audit.jsonl")).unwrap());
+        let rpc = MockRpc::new(Some(1), mined_receipt());
+        let chains = ChainRegistry::default();
+        chains.add(mock_chain(rpc).await);
+        let reconciler = Reconciler::new(outbox.clone(), chains, audit);
+        assert_eq!(reconciler.tick().await, 1);
+        assert!(
+            outbox
+                .read_receipt("alice", "anvil", "tx-1")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
     async fn a_provider_without_nonces_still_reconciles() {
         let (_directory, outbox) = sent_outbox();
         let audit_directory = tempfile::tempdir().unwrap();
