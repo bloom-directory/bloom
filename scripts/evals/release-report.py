@@ -113,7 +113,9 @@ def main(argv: list[str]) -> int:
     print("## Release evals\n")
     for agent, v in verdicts.items():
         smoke = "smoke pass" if v["smoke"] else "smoke FAILED" if v["smoke"] is False else "no smoke"
-        line = f"- **{agent}**: {smoke} · {v['passed']}/{v['tasks']} tasks (baseline {v['base']}/{v['tasks']})"
+        line = f"- **{agent}**: {smoke} · " + (
+            f"{v['passed']}/{v['tasks']} tasks (baseline {v['base']}/{v['tasks']})" if v["tasks"] else "no trials (no model key)"
+        )
         if v["config"]:
             line += f" · config error: {v['config']}"
             failures.append(f"{agent} could not authenticate: {v['config']}")

@@ -8,9 +8,10 @@ name: Release evals
 # regression against evals/harbor/baselines/README.md; everything else is a
 # number for the release reviewer. A failed trial is retried once, so one
 # nondeterministic miss does not fail a release. Runs on release-proposal PRs
-# and on dispatch. Model credentials come from the
-# ANTHROPIC_API_KEY, OPENAI_API_KEY and DEEPSEEK_API_KEY repository secrets;
-# use dedicated revocable keys, the agent container sees them.
+# and on dispatch. Model credentials come from the ANTHROPIC_API_KEY (or
+# CLAUDE_CODE_OAUTH_TOKEN), OPENAI_API_KEY and DEEPSEEK_API_KEY repository
+# secrets; use dedicated revocable keys, the agent container sees them. An
+# agent without a key runs the smoke only and the report says so.
 
 on:
   workflow_dispatch:
@@ -154,9 +155,19 @@ jobs:
       - name: Run every task with ${{ matrix.agent }}
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
         run: |
+          case "${{ matrix.agent }}" in
+            claude) key="${ANTHROPIC_API_KEY}${CLAUDE_CODE_OAUTH_TOKEN}" ;;
+            codex) key="$OPENAI_API_KEY" ;;
+            opencode) key="$DEEPSEEK_API_KEY" ;;
+          esac
+          if [ -z "$key" ]; then
+            echo "::notice::no model key for ${{ matrix.agent }}; smoke only"
+            exit 0
+          fi
           for task in solana-transfer hyperliquid-order-proposal polymarket-limit-order-proposal near-intents-swap-proposal polymarket-clarification; do
             scripts/evals/run-harbor.sh "$task" "${{ matrix.agent }}" ||
               scripts/evals/run-harbor.sh "$task" "${{ matrix.agent }}" ||

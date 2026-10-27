@@ -103,6 +103,11 @@ class ReleaseReportTest(unittest.TestCase):
         self.assertNotIn("REGRESSION", out)
         self.assertIn("config error: EvalError: Codex auth is missing", out)
 
+    def test_smoke_only_passes_and_says_why(self):
+        code, out = self.run_report(summary("solana-transfer", "codex", smoke=True))
+        self.assertEqual(code, 0)
+        self.assertIn("- **codex**: smoke pass · no trials (no model key)", out)
+
     def test_smoke_failure_fails(self):
         code, out = self.run_report(summary("solana-transfer", "codex", smoke=True, passed=False))
         self.assertEqual(code, 1)
