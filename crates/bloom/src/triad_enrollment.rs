@@ -1679,7 +1679,7 @@ mod tests {
             ),
             (
                 "hyperliquid",
-                "b29c7afb88ec9d2df774b18dad2699ec169100eeeedbcefca02ea0cc3712a188",
+                "07fdcc9841c88de8fe1d0b4526bc01deac004c1c7dec202e2c8d7443300f22af",
             ),
             (
                 "tolly",
@@ -1701,7 +1701,7 @@ mod tests {
                         &["5df5a1377dc4d70c71e47ffe6827e691e1f5868543b752dc8d19a500284e5fa6"]
                     }
                     "hyperliquid" => {
-                        &["b29c7afb88ec9d2df774b18dad2699ec169100eeeedbcefca02ea0cc3712a188"]
+                        &["07fdcc9841c88de8fe1d0b4526bc01deac004c1c7dec202e2c8d7443300f22af"]
                     }
                     _ => &["f50f9f6f55eca103c11ed40d424311c6e5863ff5046231f57f58822d1aac6709"],
                 },

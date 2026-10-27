@@ -76,73 +76,6 @@ const BASELINE_POLYMARKET_AUTHORITY_ROUTES: &[PetalAuthorityRoute] = &[
     },
 ];
 
-const BASELINE_HYPERLIQUID_AUTHORITY_ROUTES: &[PetalAuthorityRoute] = &[
-    PetalAuthorityRoute {
-        route_id: "r000008",
-        operation_classes: &["hyperliquid.agent_action"],
-    },
-    PetalAuthorityRoute {
-        route_id: "r000009",
-        operation_classes: &["hyperliquid.agent_action"],
-    },
-    PetalAuthorityRoute {
-        route_id: "r000010",
-        operation_classes: &["hyperliquid.agent_action"],
-    },
-    PetalAuthorityRoute {
-        route_id: "r000013",
-        operation_classes: &["hyperliquid.agent_action"],
-    },
-    PetalAuthorityRoute {
-        route_id: "r000019",
-        operation_classes: &["hyperliquid.agent_action"],
-    },
-    PetalAuthorityRoute {
-        route_id: "r000023",
-        operation_classes: &["hyperliquid.agent_action"],
-    },
-    PetalAuthorityRoute {
-        route_id: "r000025",
-        operation_classes: &["hyperliquid.approve_agent", "hyperliquid.agent_action"],
-    },
-    PetalAuthorityRoute {
-        route_id: "r000035",
-        operation_classes: &["hyperliquid.cancel"],
-    },
-    PetalAuthorityRoute {
-        route_id: "r000036",
-        operation_classes: &["hyperliquid.cancel_by_cloid"],
-    },
-    PetalAuthorityRoute {
-        route_id: "r000038",
-        operation_classes: &["hyperliquid.order"],
-    },
-    PetalAuthorityRoute {
-        route_id: "r000040",
-        operation_classes: &["hyperliquid.schedule_cancel"],
-    },
-    PetalAuthorityRoute {
-        route_id: "r000041",
-        operation_classes: &["hyperliquid.usd_send"],
-    },
-    PetalAuthorityRoute {
-        route_id: "r000042",
-        operation_classes: &["hyperliquid.update_leverage"],
-    },
-    PetalAuthorityRoute {
-        route_id: "r000043",
-        operation_classes: &["hyperliquid.usd_class_transfer"],
-    },
-    PetalAuthorityRoute {
-        route_id: "r000044",
-        operation_classes: &["hyperliquid.usd_send"],
-    },
-    PetalAuthorityRoute {
-        route_id: "r000045",
-        operation_classes: &["hyperliquid.withdraw"],
-    },
-];
-
 // Keep baseline declarations when successor pins change so the executing
 // daemon can still verify the outgoing release until activation completes.
 const POLYMARKET_AUTHORITY_ROUTES: &[PetalAuthorityRoute] = &[
@@ -167,7 +100,7 @@ const POLYMARKET_AUTHORITY_ROUTES: &[PetalAuthorityRoute] = &[
         operation_classes: &["polymarket.relayer_batch"],
     },
 ];
-const HYPERLIQUID_AUTHORITY_ROUTES: &[PetalAuthorityRoute] = &[
+const BASELINE_HYPERLIQUID_AUTHORITY_ROUTES: &[PetalAuthorityRoute] = &[
     PetalAuthorityRoute {
         route_id: "r000008",
         operation_classes: &["hyperliquid.agent_action"],
@@ -234,6 +167,73 @@ const HYPERLIQUID_AUTHORITY_ROUTES: &[PetalAuthorityRoute] = &[
     },
 ];
 
+const HYPERLIQUID_AUTHORITY_ROUTES: &[PetalAuthorityRoute] = &[
+    PetalAuthorityRoute {
+        route_id: "r000008",
+        operation_classes: &["hyperliquid.agent_action"],
+    },
+    PetalAuthorityRoute {
+        route_id: "r000009",
+        operation_classes: &["hyperliquid.agent_action"],
+    },
+    PetalAuthorityRoute {
+        route_id: "r000010",
+        operation_classes: &["hyperliquid.agent_action"],
+    },
+    PetalAuthorityRoute {
+        route_id: "r000013",
+        operation_classes: &["hyperliquid.agent_action"],
+    },
+    PetalAuthorityRoute {
+        route_id: "r000019",
+        operation_classes: &["hyperliquid.agent_action"],
+    },
+    PetalAuthorityRoute {
+        route_id: "r000022",
+        operation_classes: &["hyperliquid.agent_action"],
+    },
+    PetalAuthorityRoute {
+        route_id: "r000024",
+        operation_classes: &["hyperliquid.agent_action", "hyperliquid.approve_agent"],
+    },
+    PetalAuthorityRoute {
+        route_id: "r000035",
+        operation_classes: &["hyperliquid.cancel"],
+    },
+    PetalAuthorityRoute {
+        route_id: "r000036",
+        operation_classes: &["hyperliquid.cancel_by_cloid"],
+    },
+    PetalAuthorityRoute {
+        route_id: "r000038",
+        operation_classes: &["hyperliquid.order"],
+    },
+    PetalAuthorityRoute {
+        route_id: "r000040",
+        operation_classes: &["hyperliquid.schedule_cancel"],
+    },
+    PetalAuthorityRoute {
+        route_id: "r000041",
+        operation_classes: &["hyperliquid.usd_send"],
+    },
+    PetalAuthorityRoute {
+        route_id: "r000042",
+        operation_classes: &["hyperliquid.update_leverage"],
+    },
+    PetalAuthorityRoute {
+        route_id: "r000043",
+        operation_classes: &["hyperliquid.usd_class_transfer"],
+    },
+    PetalAuthorityRoute {
+        route_id: "r000044",
+        operation_classes: &["hyperliquid.usd_send"],
+    },
+    PetalAuthorityRoute {
+        route_id: "r000045",
+        operation_classes: &["hyperliquid.withdraw"],
+    },
+];
+
 pub(crate) struct ReleaseLineagePredecessor {
     pub hash: &'static str,
     pub authority_routes: &'static [PetalAuthorityRoute],
@@ -246,7 +246,7 @@ pub(crate) fn release_lineage_predecessor(name: &str) -> Option<ReleaseLineagePr
             BASELINE_POLYMARKET_AUTHORITY_ROUTES,
         ),
         "hyperliquid" => (
-            "b29c7afb88ec9d2df774b18dad2699ec169100eeeedbcefca02ea0cc3712a188",
+            "07fdcc9841c88de8fe1d0b4526bc01deac004c1c7dec202e2c8d7443300f22af",
             BASELINE_HYPERLIQUID_AUTHORITY_ROUTES,
         ),
         "enso" => (
@@ -295,17 +295,18 @@ const PREINSTALLED_POLYMARKET: PreinstalledPetal = PreinstalledPetal {
 const PREINSTALLED_HYPERLIQUID: PreinstalledPetal = PreinstalledPetal {
     name: "hyperliquid",
     repository: "https://github.com/bloom-directory/bloom-petal-hyperliquid",
-    commit: "b91901befd8f7a98c859c1166117a5c35fddbf87",
-    release_tag: "v0.1.7",
-    archive: "hyperliquid-v0.1.7.petal.tar.gz",
-    expected_hash: Some("07fdcc9841c88de8fe1d0b4526bc01deac004c1c7dec202e2c8d7443300f22af"),
-    archive_sha256: "b42e501422c8e737dfa9f9ae1ab89ea9c8071edee1243f02b5db8bc5b19c3645",
-    tooling_commit: "864a80b407387871bae06aabe77b91865e55f7bc",
+    commit: "d815a5dc812479ef83362d753ccb31a477ef5a65",
+    release_tag: "v0.1.8",
+    archive: "hyperliquid-v0.1.8.petal.tar.gz",
+    expected_hash: Some("ff5424e09d5a6548798e5cc8df7c0241d6e69976341cabe83813323979a57660"),
+    archive_sha256: "9ca9dbd7945ee421ea5dc065714ed0553b36f2c5144f55a13e43ef8b151de85f",
+    tooling_commit: "2beed2ff344ce2b0c112e07096027e1ae0404007",
     petal_abi: "bloom.petal-host/payload-signing-v1",
     default_eligible: true,
     lineage_id: Some("pln1_gyksmg4h5sqeu4pic5cg5xuwhhh3pokli3vc62btxjvi3lkwaykq"),
-    release_sequence: 2,
+    release_sequence: 3,
     predecessor_package_hashes: &[
+        "07fdcc9841c88de8fe1d0b4526bc01deac004c1c7dec202e2c8d7443300f22af",
         "b29c7afb88ec9d2df774b18dad2699ec169100eeeedbcefca02ea0cc3712a188",
     ],
     authority_routes: HYPERLIQUID_AUTHORITY_ROUTES,
