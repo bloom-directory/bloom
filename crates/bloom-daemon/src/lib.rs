@@ -968,6 +968,7 @@ impl DaemonPetalHost {
         let prepared = broker
             .prepare_approval(bloom_broker_api::ApprovalPrepareRequest {
                 surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
+                safe_review_payloads: Vec::new(),
                 evm_review_payloads: Vec::new(),
                 operation_id,
                 terms,
