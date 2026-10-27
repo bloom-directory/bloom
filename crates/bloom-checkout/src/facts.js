@@ -55,7 +55,7 @@
     if (grouping.length > 1 || (fraction && grouping[0] === number[last])) return null;
     if (grouping.length === 1 && !new RegExp(`^\\d{1,3}(?:[${grouping[0]}]\\d{3})+$`).test(whole)) return null;
     const minor = Number(whole.replace(/\D/g, '')) * 10 ** scale + Number(fraction.padEnd(scale, '0') || 0);
-    return Number.isSafeInteger(minor) && minor > 0 ? minor : null;
+    return Number.isSafeInteger(minor) && minor >= 0 ? minor : null;
   };
   const parseAmount = segment => {
     segment = segment.replace(/(\d)[.,][–-]+/g, '$1');
@@ -69,7 +69,7 @@
     const currency = iso[0] || (codes.has('$') ? dollarCurrency() : null);
     if (!currency) return null;
     const total = minorUnits(numbers[0].replace(/[\u00a0\u202f ]/g, ' '), currency);
-    return total ? {total, currency} : null;
+    return total === null ? null : {total, currency};
   };
   let totalRefusal = 'total_or_currency';
   const pageTotal = lines => {
@@ -192,7 +192,7 @@
       const unit = after.match(period);
       if (!unit) continue;
       const priced = parseAmount(match[0]);
-      if (!priced || priced.currency !== currency) continue;
+      if (!priced || !priced.total || priced.currency !== currency) continue;
       found.set(`${priced.total}/${periodWords[unit[1].toLowerCase()]}`,
         {renewal_minor: priced.total, renewal_period: periodWords[unit[1].toLowerCase()]});
     }
@@ -230,6 +230,10 @@
       renewal = starts ? {...price, renewal_starts_on: starts} : price;
     }
   }
+  // Nothing to charge today is only meaningful as a subscription that starts
+  // later: the renewal terms are what the person would be approving. Without
+  // them there is no amount on this page to approve at all.
+  if (!total && !renewal.renewal_minor) { totalRefusal = 'total_not_found'; return {refusal: totalRefusal}; }
   globalThis.__bloomPayButton = pay[0];
   return {origin:location.origin,payment_frame_origins:[],total_minor:total,currency,installments,recurring,...renewal};
 })()
