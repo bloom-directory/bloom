@@ -3,16 +3,12 @@
 from __future__ import annotations
 
 import json
-import os
-import secrets
 import shutil
-import threading
 import time
-from pathlib import Path
 from typing import Any
 
-from .core import EvalDefinition, EvalError, EvalRunContext
-from .disposable import DisposableTriad
+from .core import EvalError, EvalRunContext
+from .transfer import TransferEval
 
 
 def matching_transfer(intent: Any, expected: dict[str, Any], fee_limit: int) -> bool:
@@ -27,19 +23,8 @@ def matching_transfer(intent: Any, expected: dict[str, Any], fee_limit: int) -> 
     )
 
 
-class SolanaTransferEval(EvalDefinition):
+class SolanaTransferEval(TransferEval):
     name = "solana-transfer"
-
-    def __init__(self, repo: Path, environ: dict[str, str] | None = None) -> None:
-        self.repo = repo
-        self.env = dict(os.environ if environ is None else environ)
-        self.triad = DisposableTriad(repo, self.env)
-        self.stop = threading.Event()
-        self.approver: threading.Thread | None = None
-        self.approval_error: BaseException | None = None
-        self.jobs = Path(
-            self.env.get("BLOOM_EVAL_JOBS_DIR", str(repo / "evals/harbor/jobs"))
-        )
 
     def preflight(self) -> None:
         self.triad.preflight()
@@ -47,41 +32,22 @@ class SolanaTransferEval(EvalDefinition):
             if shutil.which(binary) is None:
                 raise EvalError(f"{binary} is required")
 
-    def _approve(self) -> None:
-        approved: str | None = None
-        deadline = time.monotonic() + 3600
-        try:
-            while not self.stop.wait(0.2):
-                if time.monotonic() >= deadline:
-                    raise EvalError("transfer approver timed out")
-                pending = (
-                    self.triad.home
-                    / ".solana-outbox"
-                    / self.triad.wallet
-                    / "solana-local/pending"
-                )
-                entries = list(pending.iterdir()) if pending.exists() else []
-                if len(entries) > 1:
-                    raise EvalError("more than one pending transfer")
-                for entry in entries:
-                    if approved is not None and entry.name != approved:
-                        raise EvalError("a second transfer was staged after approval")
-                    try:
-                        intent = json.loads((entry / "intent.json").read_bytes())
-                        challenge = json.loads(
-                            (entry / "approval_challenge.json").read_bytes()
-                        )
-                    except FileNotFoundError:
-                        continue
-                    if not matching_transfer(intent, self.expected, self.fee_limit):
-                        raise EvalError(
-                            "pending transfer differs from the authorized contract"
-                        )
-                    if approved is None:
-                        self.triad.driver.complete(challenge["ceremony_url"])
-                        approved = entry.name
-        except Exception as error:  # noqa: BLE001 -- propagate worker errors to the owning trial
-            self.approval_error = error
+    def pending(self) -> list[tuple[str, Any, Any]]:
+        directory = (
+            self.triad.home / ".solana-outbox" / self.triad.wallet / "solana-local/pending"
+        )
+        entries = []
+        for entry in list(directory.iterdir()) if directory.exists() else []:
+            try:
+                intent = json.loads((entry / "intent.json").read_bytes())
+                challenge = json.loads((entry / "approval_challenge.json").read_bytes())
+            except FileNotFoundError:
+                intent = challenge = None
+            entries.append((entry.name, intent, challenge))
+        return entries
+
+    def matches(self, intent: Any) -> bool:
+        return matching_transfer(intent, self.expected, self.fee_limit)
 
     def provision(self, agent_name: str) -> EvalRunContext:
         self.triad.start(solana=True)
@@ -133,57 +99,28 @@ class SolanaTransferEval(EvalDefinition):
         self.triad.set_policy(
             packages=[], destinations=[{"chain": "solana", "destination": destination}]
         )
-        self.jobs.mkdir(parents=True, exist_ok=True)
-        trial = f"solana-{agent_name}-{secrets.token_hex(8)}"
-        task = self.jobs / trial
-        shutil.copytree(self.repo / "evals/harbor/tasks/solana-transfer", task)
-        shutil.copy2(self.repo / "evals/harbor/projection.py", task / "tests")
-        (task / "instruction.md").write_text(
+        trial, task = self.task(
+            agent_name,
             "Using Bloom mounted at /bloom, send exactly 0.001 SOL to "
-            f"`{destination}` and wait until it is finalized. I will approve it when asked.\n"
+            f"`{destination}` and wait until it is finalized. I will approve it when asked.\n",
         )
-        self.approver = threading.Thread(target=self._approve, daemon=True)
-        self.approver.start()
-        verifier_env = {
-            "BLOOM_EVAL_SOLANA_SOURCE": source,
-            "BLOOM_EVAL_SOLANA_WALLET_ID": wallet,
-            "BLOOM_EVAL_SOLANA_ACCOUNT": number,
-            "BLOOM_EVAL_SOLANA_CHAIN": "solana-local",
-            "BLOOM_EVAL_SOLANA_DESTINATION": destination,
-            "BLOOM_EVAL_SOLANA_LAMPORTS": str(self.lamports),
-            "BLOOM_EVAL_SOLANA_MAX_FEE_LAMPORTS": str(self.fee_limit),
-            "BLOOM_EVAL_SOLANA_RPC_URL": self.triad.rpc_url,
-            "BLOOM_EVAL_SOLANA_GENESIS": self.triad.genesis,
-        }
-        return EvalRunContext(
-            self.name,
-            task,
+        self.start_approver()
+        return self.context(
             trial,
-            self.jobs,
-            [
-                {
-                    "type": "bind",
-                    "source": str(self.triad.mount),
-                    "target": "/bloom",
-                    "read_only": True,
-                },
-                {
-                    "type": "bind",
-                    "source": str(self.triad.mount) + self.base,
-                    "target": "/bloom" + self.base,
-                },
-            ],
-            {},
-            self.triad.projection_env() | verifier_env,
-            # Grade on the host: the agent container keeps Docker's isolated
-            # network and never reaches the loopback validator or NFS export.
-            host_verifier_root=self.triad.mount,
+            task,
+            self.base,
+            {
+                "BLOOM_EVAL_SOLANA_SOURCE": source,
+                "BLOOM_EVAL_SOLANA_WALLET_ID": wallet,
+                "BLOOM_EVAL_SOLANA_ACCOUNT": number,
+                "BLOOM_EVAL_SOLANA_CHAIN": "solana-local",
+                "BLOOM_EVAL_SOLANA_DESTINATION": destination,
+                "BLOOM_EVAL_SOLANA_LAMPORTS": str(self.lamports),
+                "BLOOM_EVAL_SOLANA_MAX_FEE_LAMPORTS": str(self.fee_limit),
+                "BLOOM_EVAL_SOLANA_RPC_URL": self.triad.rpc_url,
+                "BLOOM_EVAL_SOLANA_GENESIS": self.triad.genesis,
+            },
         )
-
-    def validate_result(self, result: Any) -> None:
-        if self.approval_error is not None:
-            raise EvalError(f"transfer approver failed: {self.approval_error}")
-        super().validate_result(result)
 
     def smoke(self) -> None:
         body = json.dumps(
@@ -206,22 +143,3 @@ class SolanaTransferEval(EvalDefinition):
                 return
             time.sleep(0.5)
         raise EvalError("smoke confirmation timed out")
-
-    def cleanup(self) -> None:
-        self.stop.set()
-        hung = False
-        if self.approver is not None:
-            self.approver.join(timeout=60)
-            hung = self.approver.is_alive()
-        errors = []
-        # Always stop the services; a hung approver preserves the root for inspection.
-        try:
-            self.triad.close(preserve=self.failed or hung)
-        except EvalError as error:
-            errors.append(str(error))
-        if hung:
-            errors.append("transfer approver did not stop; its Triad root is preserved")
-        if self.approval_error is not None:
-            errors.append(f"transfer approver failed: {self.approval_error}")
-        if errors:
-            raise EvalError("; ".join(errors))

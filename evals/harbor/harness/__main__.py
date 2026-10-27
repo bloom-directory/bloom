@@ -23,10 +23,13 @@ from .default_petals import (
     PolymarketProposalEval,
 )
 from .disposable import CEREMONY
+from .evm_transfer import EvmTransferDeniedEval, EvmTransferEval
 from .solana_transfer import SolanaTransferEval
 
 DEFINITIONS = {
     "solana-transfer": SolanaTransferEval,
+    "evm-transfer": EvmTransferEval,
+    "evm-transfer-denied": EvmTransferDeniedEval,
     "polymarket-limit-order-proposal": PolymarketProposalEval,
     "hyperliquid-order-proposal": HyperliquidProposalEval,
     "near-intents-swap-proposal": NearIntentsProposalEval,
@@ -121,13 +124,7 @@ def main(argv: list[str] | None = None) -> int:
             "agent": args.agent,
             "model": AGENTS[args.agent].model,
             "run_kind": "deterministic-smoke" if args.smoke else "Harbor-agent-trial",
-            "coverage": (
-                "clarification"
-                if args.eval.endswith("-clarification")
-                else "proposal"
-                if args.eval.endswith("-proposal")
-                else "settlement"
-            ),
+            "coverage": definition.coverage,
             "passed": failure is None,
             "error": failure,
             "cleanup_succeeded": evidence.cleanup_succeeded,

@@ -33,6 +33,7 @@ def asks_for_market(trajectory):
 class ClarificationEval(PetalEval):
     name = "polymarket-clarification"
     petal = "polymarket"
+    coverage = "clarification"
 
     def provision(self, agent_name):
         package = self.start()

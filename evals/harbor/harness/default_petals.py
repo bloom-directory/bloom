@@ -18,6 +18,7 @@ class PetalEval(EvalDefinition):
     """A disposable Triad with one default Petal and one writable sink."""
 
     petal: str
+    coverage = "proposal"
 
     def __init__(self, repo: Path, environ: dict[str, str] | None = None) -> None:
         self.repo = repo
