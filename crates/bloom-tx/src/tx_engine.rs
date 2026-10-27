@@ -3464,7 +3464,6 @@ impl TxEngine {
             provenance,
             &state,
             key.selector.clone(),
-            None,
         )?;
         if state.approval_id.is_some() {
             let expected_operation_digest = expected_evm_sign_operation_digest(
@@ -4587,7 +4586,6 @@ fn exact_evm_sign_request(
     provenance: &ProvenanceRecord,
     state: &TriadEvmSigningState,
     account_key_ref: Option<bloom_broker_api::KeyRef>,
-    evm_reported_token: Option<bloom_broker_api::EvmReportedToken>,
 ) -> Result<ExactPayloadSignRequest, TxEngineError> {
     Ok(ExactPayloadSignRequest {
         wallet_id: Token::new(staged.wallet.clone())
@@ -4611,9 +4609,22 @@ fn exact_evm_sign_request(
         claim_assurance_evidence: None,
         safe_review_payload: None,
         message_review_payload: None,
-        evm_reported_token,
+        evm_reported_token: reported_token(staged),
         approval_value_limits: Vec::new(),
     })
+}
+
+/// What the staged token contract reported about itself. Broker shows it as
+/// a marked claim when the token is not in its catalog.
+fn reported_token(staged: &StagedTx) -> Option<bloom_broker_api::EvmReportedToken> {
+    staged
+        .token
+        .as_ref()
+        .map(|token| bloom_broker_api::EvmReportedToken {
+            address: token.address.to_ascii_lowercase(),
+            symbol: token.symbol.clone(),
+            decimals: token.decimals,
+        })
 }
 
 fn expected_evm_sign_operation_digest(
@@ -5840,6 +5851,28 @@ mod tests {
         assert_eq!(
             classify_action_kind(&body, false, false),
             TxActionKind::NativeTransfer
+        );
+    }
+
+    #[test]
+    fn staged_token_is_reported_to_the_broker() {
+        let mut staged = fake_staged_1559("token");
+        assert_eq!(reported_token(&staged), None);
+        staged.token = Some(TokenRef {
+            address: "0xAbCd000000000000000000000000000000000001".into(),
+            symbol: "TKN".into(),
+            decimals: 6,
+            recipient: "0x0000000000000000000000000000000000000002".into(),
+            amount: "1".into(),
+            amount_base_units: None,
+        });
+        assert_eq!(
+            reported_token(&staged),
+            Some(bloom_broker_api::EvmReportedToken {
+                address: "0xabcd000000000000000000000000000000000001".into(),
+                symbol: "TKN".into(),
+                decimals: 6,
+            })
         );
     }
 
