@@ -6,17 +6,23 @@ file as the VFS root and keep all paths mount-relative.
 
 ## Start with discovery
 
-Do not assume a wallet, chain, Petal, or action exists. Inspect the live mount:
+Discover paths by listing the relevant directory; do not assume a wallet,
+chain, Petal, or action exists. Read only what the task needs. Ask a necessary
+question before surveying unrelated state.
+
+Group independent reads of known paths in one shell tool call. For example,
+after discovering a Petal, read its two operating documents together:
 
 ```sh
-ls
-cat next.md
-cat docs/README.md
+cat petals/<name>/README.md petals/<name>/AGENTS.md
 ```
 
-`next.md` summarizes actions needing attention. Read the relevant walkthrough
-in `docs/examples.md` before using an unfamiliar write surface. For Petal work,
-use `docs/petals.md` to discover installed packages, then read that package's
+Reuse unchanged documentation. Inspect an operation's result before choosing
+the next write.
+
+`next.md` summarizes actions needing attention; read it when that is the task.
+Use `cat docs/README.md` to find documentation, `docs/examples.md` for an unfamiliar
+write surface, and `docs/petals.md` for Petal discovery. Read a Petal's
 `README.md` and `AGENTS.md` before using its routes.
 
 ## Authority and safety
