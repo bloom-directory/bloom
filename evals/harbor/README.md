@@ -91,7 +91,7 @@ Use optimized services. Debug Broker and Signer builds make every mounted
 read slow: twelve reads took 119 s with debug services and 2.8 s optimized,
 which turns agent timing into a measure of the build.
 
-Agents are `claude-opus`, `claude-sonnet`, `codex` and `opencode`, using the host's existing
+Agents are `claude-opus`, `codex`, `opencode` and, by dispatch only, `claude-sonnet`, using the host's existing
 authentication. Harbor 0.21.0 and the agent image are pinned. Every task uses
 the same image digest. `BLOOM_EVAL_REASONING_EFFORT` selects Codex reasoning
 effort.

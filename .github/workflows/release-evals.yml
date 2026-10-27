@@ -17,8 +17,8 @@ on:
   workflow_dispatch:
     inputs:
       agents:
-        description: 'Comma-separated agents to run (claude-opus, claude-sonnet, codex, opencode).'
-        default: 'claude-opus,claude-sonnet,codex,opencode'
+        description: 'Comma-separated agents to run: claude-opus, codex, opencode by default; claude-sonnet on request.'
+        default: 'claude-opus,codex,opencode'
   pull_request:
 
 concurrency:
@@ -47,7 +47,7 @@ jobs:
       - name: Select agents
         id: select
         env:
-          AGENTS: ${{ inputs.agents || 'claude-opus,claude-sonnet,codex,opencode' }}
+          AGENTS: ${{ inputs.agents || 'claude-opus,codex,opencode' }}
         run: echo "agents=$(printf '%s' "$AGENTS" | jq -Rc 'split(",") | map(select(length > 0))')" >> "$GITHUB_OUTPUT"
       - name: Read the release matrix pins
         id: pins
