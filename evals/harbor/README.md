@@ -124,6 +124,11 @@ scripts/test-harbor-evals.sh                                   # static checks
 scripts/evals/run-harbor.sh solana-transfer codex --smoke      # real services, no LLM
 ```
 
-CI runs the Solana smoke on every push as `real-triad Solana smoke`
-(`.github/workflows/ci.yml`): the Machine from the checkout with the Broker
-and Signer the release matrix pins.
+The `Release evals` workflow (`.github/workflows/release-evals.yml`) runs the
+whole thing before a release: it builds the Machine from the ref with the
+Broker and Signer the release matrix pins, smokes them, then runs every task
+with every agent and reports reward, tool calls, tokens and time. It fails
+only on a smoke failure or a regression against the baseline. It runs on
+`release-proposal/*` PRs, on PRs labeled `release-evals`, and by dispatch.
+Model keys are the `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` and `DEEPSEEK_API_KEY`
+repository secrets; the agent container sees them, so use dedicated keys.
