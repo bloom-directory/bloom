@@ -839,9 +839,6 @@ async fn real_signing_producers_reach_the_host_with_selected_account_and_full_wi
         broker_fixture,
         "actual compiled producer witness/hash/preimage differs from the Broker reconstruction fixture"
     );
-    if let Some(path) = std::env::var_os("BLOOM_PM80_PRODUCER_WITNESS") {
-        std::fs::write(path, serde_json::to_vec_pretty(&produced).unwrap()).unwrap();
-    }
     if let Some(path) = std::env::var_os("BLOOM_PM80_PACKAGE_RECORDS") {
         std::fs::write(path, serde_json::to_vec_pretty(&package_records).unwrap()).unwrap();
     }
