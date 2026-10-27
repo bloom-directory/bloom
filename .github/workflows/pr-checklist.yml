@@ -69,6 +69,9 @@ jobs:
               commit = re.search(r'^\s*commit: "([0-9a-f]{40})"', record[1], re.M)
               assert commit, f"{name} must use an immutable source commit"
               print(f"{name}_ref={commit[1]}")
+              tooling = re.search(r'^\s*tooling_commit: "([0-9a-f]{40})"', record[1], re.M)
+              assert tooling, f"{name} must pin its Petal CLI commit"
+              print(f"{name}_tooling={tooling[1]}")
           PY
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
@@ -104,9 +107,11 @@ jobs:
       - uses: bytecodealliance/actions/wasm-tools/setup@9152e710e9f7182e4c29ad218e4f335a7b203613 # v1
       - name: Build the pinned real signing components
         run: |
-          cargo install --git https://github.com/bloom-directory/petal --rev 2beed2ff344ce2b0c112e07096027e1ae0404007 --locked bloom-petal-cli
-          PETAL_BIN="$(command -v petal)" bash .pm80-packages/polymarket/scripts/build.sh
-          PETAL_BIN="$(command -v petal)" bash .pm80-packages/hyperliquid/scripts/build.sh
+          for pair in polymarket=${{ steps.catalog.outputs.polymarket_tooling }} hyperliquid=${{ steps.catalog.outputs.hyperliquid_tooling }}; do
+            name="${pair%%=*}" rev="${pair#*=}"
+            cargo install --git https://github.com/bloom-directory/petal --rev "$rev" --locked --root "$RUNNER_TEMP/petal-$rev" bloom-petal-cli
+            PETAL_BIN="$RUNNER_TEMP/petal-$rev/bin/petal" bash ".pm80-packages/$name/scripts/build.sh"
+          done
       - name: Verify actual component emissions, pending batch preservation and Broker witness agreement
         env:
           BLOOM_PM80_POLYMARKET_ROOT: ${{ github.workspace }}/.pm80-packages/polymarket
