@@ -171,7 +171,10 @@
   } else if (selectedCounts.size === 1) {
     installments = [...selectedCounts][0];
   } else if (/installments?|cuotas|parcelas/i.test(text) && !shopifyCard) return {refusal:'installment_choice'};
-  const recurring = processorRecurring ?? /\b(subscription|recurring|auto.?renew|monthly|annually|suscripci[oó]n)\b/i.test(text);
+  // The words a checkout uses to say it recurs, in the languages the rest of
+  // this reader already covers. A German page saying "Abonnement" is as plain
+  // as an English one saying "subscription".
+  const recurring = processorRecurring ?? /\b(subscriptions?|recurring|auto.?renew(?:s|al|ing)?|renews|monthly|annually|suscripci[oó]n|abonnements?|abonament|abbonamento|assinatura|mensual(?:idad)?|mensuel(?:le)?|mensile|monatlich|j[äa]hrlich|anual|annuel(?:le)?|annuale)\b/iu.test(text);
   // A trial price hides what a subscription really costs. Read the ongoing
   // price the page prints as "<amount> per <period>", and the day it starts
   // when the page writes a date no reader could take two ways. Anything less

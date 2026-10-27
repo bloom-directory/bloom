@@ -1993,6 +1993,37 @@ pub(crate) mod tests {
                 ][..],
                 Some((1599, "month", None)),
             ),
+            // Hulu's terms line, read on 2026-10-26: the period is abbreviated
+            // and the sentence runs on into the cancellation terms.
+            (
+                "en-US",
+                &[
+                    "Hulu (with ads) + Live TV subscription",
+                    "Total USD 1.00",
+                    "$99.99/mo. after 3-day free trial unless canceled. Cancel anytime.",
+                ][..],
+                Some((9999, "month", None)),
+            ),
+            // The same offer in German and French, where the decimal comma
+            // and the period word both change.
+            (
+                "de-DE",
+                &[
+                    "Premium Abonnement",
+                    "Gesamtsumme EUR 1,00",
+                    "danach 12,99 EUR/Monat",
+                ][..],
+                Some((1299, "month", None)),
+            ),
+            (
+                "fr-FR",
+                &[
+                    "Abonnement Premium",
+                    "Total EUR 1,00",
+                    "puis 12,99 EUR par mois",
+                ][..],
+                Some((1299, "month", None)),
+            ),
             // Full price from the start: the period is still worth stating.
             (
                 "en",
