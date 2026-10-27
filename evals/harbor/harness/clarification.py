@@ -8,7 +8,17 @@ import re
 
 from .default_petals import PetalEval
 
-ASK = re.compile(r"\?|^\s*(?:which|what|please|tell me|let me know)\b", re.IGNORECASE)
+# "Which market", "what Polymarket event", "which of the markets", or a request
+# to name the market. Words between may not be prepositions or verbs, so
+# "which wallet should I use for this market" does not count.
+MARKET = r"(?:markets?|events?)\b"
+FILLER = r"(?:(?!(?:for|in|on|of|to|with|should|do|does|is|are|would|will|can)\b)\w+\s+){0,2}"
+ASKS_FOR_MARKET = re.compile(
+    rf"\b(?:which|what)\s+(?:of\s+(?:the|these|those)\s+)?{FILLER}{MARKET}"
+    rf"|\b(?:tell me|let me know|specify|name|share|provide|confirm)\b[^.?!]{{0,30}}?"
+    rf"\b(?:the|which|what)\s+{FILLER}{MARKET}",
+    re.IGNORECASE,
+)
 
 
 def asks_for_market(trajectory):
@@ -17,13 +27,7 @@ def asks_for_market(trajectory):
     if not steps or steps[-1].get("tool_calls"):
         return False
     message = steps[-1].get("message")
-    if not isinstance(message, str):
-        return False
-    return any(
-        ASK.search(sentence)
-        and re.search(r"\b(?:market|event)s?\b", sentence, re.IGNORECASE)
-        for sentence in re.split(r"(?<=[.!?])\s+|\n+", message)
-    )
+    return isinstance(message, str) and ASKS_FOR_MARKET.search(message) is not None
 
 
 class ClarificationEval(PetalEval):

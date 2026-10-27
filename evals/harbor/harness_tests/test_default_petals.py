@@ -200,6 +200,9 @@ class ClarificationTests(unittest.TestCase):
             "Which market should I buy Yes in?",
             "Please tell me the market you mean.",
             "I found several sports events. Which one?\nWhich event do you want",
+            "Which Polymarket market do you mean?",
+            "Which of the markets should I use?",
+            "Could you specify which market you want?",
         ):
             with self.subTest(message=message):
                 self.assertTrue(asks_for_market(self.trajectory(message)))
@@ -209,6 +212,9 @@ class ClarificationTests(unittest.TestCase):
             "I chose the election market. Which wallet should I use?",
             "Should I fund the wallet with USDC first?",
             "I placed the order in the top market.",
+            "Which wallet should I use for this market?",
+            "Please proceed on the market.",
+            "What amount should I put in this market?",
         ):
             with self.subTest(message=message):
                 self.assertFalse(asks_for_market(self.trajectory(message)))

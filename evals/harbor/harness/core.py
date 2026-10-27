@@ -71,7 +71,6 @@ class EvalRunContext:
     mounts: Sequence[Mapping[str, Any]]
     agent_env: Mapping[str, str]
     verifier_env: Mapping[str, str]
-    extra_docker_compose: Sequence[Path] = ()
     host_verifier_root: Path | None = None
     clarification: bool = False
 
@@ -165,7 +164,6 @@ async def run_harbor_job(context: EvalRunContext, agent: AgentSpec) -> Any:
             type=EnvironmentType.DOCKER,
             import_path="harness.environment:BloomDockerEnvironment",
             mounts=list(context.mounts),
-            extra_docker_compose=list(context.extra_docker_compose),
         ),
         verifier=VerifierConfig(
             env=dict(context.verifier_env),

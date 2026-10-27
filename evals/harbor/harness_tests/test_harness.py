@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,6 +19,7 @@ from harness.core import (
     reasoning_effort,
     run_eval,
 )
+from harness.disposable import DisposableTriad
 
 
 class FakeDefinition(EvalDefinition):
@@ -154,6 +157,36 @@ class ReasoningEffortTests(unittest.TestCase):
             self.assertRaisesRegex(EvalError, "only to the codex agent"),
         ):
             reasoning_effort("claude")
+
+
+class TeardownTests(unittest.TestCase):
+    def test_stuck_launcher_and_child_are_killed_and_root_kept(self):
+        # A launcher that ignores SIGTERM while waiting on a child.
+        launcher = subprocess.Popen(
+            ["bash", "-c", "trap '' TERM; sleep 300 & echo $!; wait"],
+            stdout=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        child = int(launcher.stdout.readline())
+        launcher.stdout.close()
+        with tempfile.TemporaryDirectory() as directory:
+            triad = DisposableTriad(Path(directory))
+            triad.stop_timeout = 0.5
+            triad.root = Path(directory) / "root"
+            triad.root.mkdir()
+            triad.launcher = launcher
+            triad.mount_lock = open(Path(directory) / "lock", "w")
+            with self.assertRaisesRegex(EvalError, "ignored SIGTERM.*preserving"):
+                triad.close()
+            self.assertIsNotNone(launcher.poll())
+            self.assertIsNone(triad.mount_lock)
+            self.assertTrue(triad.root.is_dir())
+        for _ in range(50):
+            if not Path(f"/proc/{child}").exists():
+                break
+            time.sleep(0.1)
+        self.assertFalse(Path(f"/proc/{child}").exists(), "child survived teardown")
 
 
 if __name__ == "__main__":

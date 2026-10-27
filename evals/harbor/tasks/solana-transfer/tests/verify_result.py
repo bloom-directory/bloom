@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Grade a native SOL transfer from independent on-chain evidence."""
+"""Grade a native SOL transfer from independent on-chain evidence.
+
+Runs on the trusted host: the agent container has no route to the validator.
+"""
 
 from __future__ import annotations
 
@@ -10,6 +13,8 @@ import sys
 import urllib.error
 import urllib.request
 from typing import Any
+
+from projection import ProjectionReader
 
 BASE58 = "[1-9A-HJ-NP-Za-km-z]"
 ADDRESS_RE = re.compile(f"^{BASE58}{{32,44}}$")
@@ -69,6 +74,15 @@ def rpc(method: str, params: list[Any]) -> Any:
 
 
 def verify() -> None:
+    outbox = (
+        f"wallets/{need('BLOOM_EVAL_SOLANA_WALLET_ID')}/"
+        f"{need('BLOOM_EVAL_SOLANA_ACCOUNT')}/chains/"
+        f"{need('BLOOM_EVAL_SOLANA_CHAIN')}/outbox"
+    )
+    reader = ProjectionReader()
+    # A missing listing is not evidence that pending is empty.
+    require("pending" in reader.entries(outbox), "outbox has no pending listing")
+    require(not reader.entries(outbox + "/pending"), "a transfer is still pending")
     genesis = os.environ.get("BLOOM_EVAL_SOLANA_GENESIS")
     if genesis is not None:
         require(rpc("getGenesisHash", []) == genesis, "validator genesis differs from this trial")
@@ -168,6 +182,9 @@ def main() -> int:
     except InvalidTransfer as error:
         print(f"invalid Bloom transfer: {error}", file=sys.stderr)
         return 1
+    except OSError as error:
+        print(f"projection unavailable: {error}", file=sys.stderr)
+        return 2
     return 0
 
 

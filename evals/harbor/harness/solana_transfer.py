@@ -137,6 +137,7 @@ class SolanaTransferEval(EvalDefinition):
         trial = f"solana-{agent_name}-{secrets.token_hex(8)}"
         task = self.jobs / trial
         shutil.copytree(self.repo / "evals/harbor/tasks/solana-transfer", task)
+        shutil.copy2(self.repo / "evals/harbor/projection.py", task / "tests")
         (task / "instruction.md").write_text(
             "Using Bloom mounted at /bloom, send exactly 0.001 SOL to "
             f"`{destination}` and wait until it is finalized. I will approve it when asked.\n"
@@ -173,11 +174,10 @@ class SolanaTransferEval(EvalDefinition):
                 },
             ],
             {},
-            verifier_env,
-            [
-                self.repo
-                / "evals/harbor/tasks/solana-transfer/docker-compose.local.yaml"
-            ],
+            self.triad.projection_env() | verifier_env,
+            # Grade on the host: the agent container keeps Docker's isolated
+            # network and never reaches the loopback validator or NFS export.
+            host_verifier_root=self.triad.mount,
         )
 
     def validate_result(self, result: Any) -> None:

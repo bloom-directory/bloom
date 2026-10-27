@@ -7,6 +7,7 @@ import copy
 import importlib.util
 import io
 import os
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -31,7 +32,11 @@ ENV = {
     "BLOOM_EVAL_SOLANA_DESTINATION": DESTINATION,
     "BLOOM_EVAL_SOLANA_LAMPORTS": str(LAMPORTS),
     "BLOOM_EVAL_SOLANA_MAX_FEE_LAMPORTS": "10000",
+    "BLOOM_EVAL_SOLANA_WALLET_ID": "w",
+    "BLOOM_EVAL_SOLANA_ACCOUNT": "1",
+    "BLOOM_EVAL_SOLANA_CHAIN": "solana-local",
 }
+OUTBOX = "wallets/w/1/chains/solana-local/outbox"
 
 
 def signatures_result(count: int = 1, err: object = None) -> list[dict[str, object]]:
@@ -64,9 +69,24 @@ def transaction_result(**overrides: object) -> dict[str, object]:
 
 class SolanaVerifierTests(unittest.TestCase):
     def setUp(self) -> None:
-        environment = mock.patch.dict(os.environ, ENV, clear=False)
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.mount = Path(directory.name)
+        (self.mount / OUTBOX / "pending").mkdir(parents=True)
+        environment = mock.patch.dict(
+            os.environ, ENV | {"BLOOM_EVAL_MOUNT_ROOT": str(self.mount)}, clear=False
+        )
         environment.start()
         self.addCleanup(environment.stop)
+        os.environ.pop("BLOOM_EVAL_PROJECTION_RPC_ENDPOINT", None)
+
+    def test_a_pending_transfer_is_rejected(self) -> None:
+        (self.mount / OUTBOX / "pending/op1").mkdir()
+        self.assertEqual(self.run_verifier(), 1)
+
+    def test_a_missing_pending_listing_is_rejected(self) -> None:
+        (self.mount / OUTBOX / "pending").rmdir()
+        self.assertEqual(self.run_verifier(), 1)
 
     def run_verifier(
         self,

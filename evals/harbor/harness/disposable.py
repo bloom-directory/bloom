@@ -7,6 +7,7 @@ import json
 import os
 import re
 import secrets
+import signal
 import socket
 import subprocess
 import tempfile
@@ -71,6 +72,8 @@ class CeremonyDriver:
 
 
 class DisposableTriad:
+    stop_timeout = 45
+
     def __init__(self, repo: Path, env: dict[str, str] | None = None) -> None:
         self.repo = repo
         self.env = dict(os.environ if env is None else env)
@@ -249,6 +252,7 @@ class DisposableTriad:
                     ],
                     stdout=log,
                     stderr=subprocess.STDOUT,
+                    start_new_session=True,
                 )
             self._wait(
                 lambda: self.fork_rpc("eth_chainId") == "0x1",
@@ -286,6 +290,7 @@ class DisposableTriad:
                     ],
                     stdout=log,
                     stderr=subprocess.STDOUT,
+                    start_new_session=True,
                 )
             self.genesis = self._wait(
                 lambda: self._run(
@@ -330,8 +335,13 @@ class DisposableTriad:
             str(self.mount),
         ]
         with (self.root / "launcher.log").open("wb") as log:
+            # Its own process group, so teardown can kill exactly its children.
             self.launcher = subprocess.Popen(
-                command, env=self.env, stdout=log, stderr=subprocess.STDOUT
+                command,
+                env=self.env,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
             )
         self._wait(lambda: (self.root / "ready").exists(), self.launcher, "Triad")
         launch = self.cli("wallet", "new", "harbor")
@@ -412,14 +422,21 @@ class DisposableTriad:
             if process is not None and process.poll() is None:
                 process.terminate()
                 try:
-                    process.wait(timeout=45)
+                    process.wait(timeout=self.stop_timeout)
                 except subprocess.TimeoutExpired:
-                    failures.append(f"owned process {process.pid} did not stop")
-        if failures:
-            raise EvalError("; ".join(failures))
+                    # Kill its whole group: a launcher stuck waiting on a
+                    # child would otherwise leave both running.
+                    failures.append(f"owned process {process.pid} ignored SIGTERM")
+                    os.killpg(process.pid, signal.SIGKILL)
+                    try:
+                        process.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        failures.append(f"owned process {process.pid} survived SIGKILL")
         if self.mount_lock is not None:
             self.mount_lock.close()
             self.mount_lock = None
+        if failures:
+            raise EvalError("; ".join(failures) + f"; preserving {self.root}")
         if self.root is not None and not preserve:
             if os.path.ismount(self.mount):
                 raise EvalError(

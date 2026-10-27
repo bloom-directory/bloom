@@ -13,7 +13,9 @@ before and after each change.
 Each trial starts a real, disposable Machine–Broker–Signer Triad with a fresh
 wallet and software passkey, mounts its VFS at `/bloom` in the agent
 container, and runs one Harbor agent. A trusted host-side verifier then reads
-the Triad's own state; an agent's report is never evidence. Teardown removes
+the Triad's own state; an agent's report is never evidence. The agent
+container stays on Docker's bridge network, so it cannot reach host loopback
+services such as the local validator or the Machine's NFS export. Teardown removes
 the root. Failed trials keep it for diagnosis; it can hold ceremony
 capabilities, so never publish its raw logs.
 
@@ -52,10 +54,14 @@ after the signed Broker manifest's issuance time, following the venue's
 Optional expiry must also be later than that issuance time. Using this trusted
 preparation timestamp keeps offline grading deterministic; it does not prove
 the order would still be valid when submitted later.
-This reconstruction exists only because released v0.1.7 shows the Broker a
-digest, not the order. Once Bloom pins a release with
-[hyperliquid#27](https://github.com/bloom-directory/bloom-petal-hyperliquid/pull/27),
-grade the order from the Broker review and delete `hyperliquid_proof.py`.
+This reconstruction exists only because v0.1.7, the release Bloom master
+preinstalls, shows the Broker a digest, not the order. Hyperliquid v0.1.8
+forwards the full action
+([hyperliquid#27](https://github.com/bloom-directory/bloom-petal-hyperliquid/pull/27)),
+but Bloom pins it only in
+[bloom#224](https://github.com/bloom-directory/bloom/pull/224). Once that
+lands, grade the order from the Broker review and delete
+`hyperliquid_proof.py`, its tests, and `msgpack` and `pycryptodome`.
 
 NEAR uses Anvil chain 1 with only a localhost Ethereum RPC, 0.05 fork ETH and
 5 fork USDC. The real 1Click service supplies the quote. The released route
