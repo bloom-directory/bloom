@@ -5,11 +5,20 @@ updates:
     schedule:
       interval: weekly
       day: monday
-    # Exact `=` pins move by hand; Dependabot would rewrite them.
     ignore:
+      # Wasmtime 36 is an LTS line: take its patch and security releases,
+      # move to a new minor or major by hand.
       - dependency-name: "wasmtime*"
+        update-types:
+          - version-update:semver-major
+          - version-update:semver-minor
+      # Exact `=1.8.0` pin in bloom-paid-mpp; moves by hand.
       - dependency-name: tempo-alloy
     groups:
+      # First matching group wins, so wasmtime and wasmtime-wasi move together.
+      wasmtime:
+        patterns:
+          - "wasmtime*"
       cargo-minor-and-patch:
         update-types:
           - minor
@@ -24,8 +33,3 @@ updates:
         update-types:
           - minor
           - patch
-  - package-ecosystem: docker
-    directory: /
-    schedule:
-      interval: weekly
-      day: monday
