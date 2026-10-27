@@ -98,6 +98,14 @@ an unclear total goes to the human's private view; its URL and screenshots
 never appear in VFS. A manual
 fallback releases no saved card.
 
+For a subscription, the approval states the ongoing price, how often it
+recurs and the day it starts, whenever the page says them plainly. Tell the
+person what those terms are before asking for approval: a trial price is not
+what the subscription costs. A page offering several plans states several
+ongoing prices, so Bloom claims none of them; say which plan is selected and
+what it renews at. Bloom cannot cap what a merchant charges after a card is
+on file, and cancelling is done with the merchant, not through Bloom.
+
 Use a requested agency directly; otherwise try the airline first. Open
 `google_flights_url` and match the chosen offer's airports, flight numbers,
 airport-local dates and times, cabin and party; for round trips match both
