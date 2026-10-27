@@ -316,6 +316,7 @@ pub trait AccountPetalMount: Send + Sync {
 pub struct DefaultPolicySetup {
     pub packages: Vec<bloom_broker_api::Digest32>,
     pub destinations: Vec<bloom_broker_api::PolicyDestination>,
+    pub standing_allowances: bool,
 }
 
 pub type DefaultPolicyPackages =
@@ -1964,6 +1965,17 @@ impl WalletsHandler {
         packages: &[bloom_broker_api::Digest32],
         destinations: &[bloom_broker_api::PolicyDestination],
     ) -> Result<bloom_machine_client::PetalEligibility, HandlerError> {
+        self.ensure_petal_packages_allowed_standing(wallet, packages, destinations, false)
+            .await
+    }
+
+    pub async fn ensure_petal_packages_allowed_standing(
+        &self,
+        wallet: &str,
+        packages: &[bloom_broker_api::Digest32],
+        destinations: &[bloom_broker_api::PolicyDestination],
+        standing: bool,
+    ) -> Result<bloom_machine_client::PetalEligibility, HandlerError> {
         if packages.is_empty() {
             return Err(HandlerError::invalid("no Petal packages to allow"));
         }
@@ -1972,7 +1984,10 @@ impl WalletsHandler {
             packages,
             packages,
             destinations,
-            &DefaultPolicySetup::default(),
+            &DefaultPolicySetup {
+                standing_allowances: standing,
+                ..Default::default()
+            },
         )
         .await
     }
@@ -2053,9 +2068,12 @@ impl WalletsHandler {
                 "Broker eligibility policy has invalid wallet, digest, or canonical bytes",
             ));
         }
-        if required
-            .iter()
-            .all(|package| policy.allowed_petal_packages.contains(package))
+        if (!first_proposal.standing_allowances
+            || policy.maximum_approval_lifetime_ms
+                == bloom_broker_api::STANDING_APPROVAL_POLICY_LIFETIME_MS)
+            && required
+                .iter()
+                .all(|package| policy.allowed_petal_packages.contains(package))
             && destinations
                 .iter()
                 .all(|destination| policy.allowed_destinations.contains(destination))
@@ -2074,10 +2092,14 @@ impl WalletsHandler {
             additions.extend_from_slice(&first_proposal.packages);
             proposed_destinations.extend_from_slice(&first_proposal.destinations);
         }
-        let proposed = policy_with_destinations(
+        let mut proposed = policy_with_destinations(
             &policy_with_packages(&policy, &additions),
             &proposed_destinations,
         );
+        if first_proposal.standing_allowances {
+            proposed.maximum_approval_lifetime_ms =
+                bloom_broker_api::STANDING_APPROVAL_POLICY_LIFETIME_MS;
+        }
         let proposed_bytes = serde_jcs::to_vec(&proposed).map_err(err_be)?;
         match self
             .write_wallet_policy_update_locked(wallet, &proposed_bytes, Some(&current))

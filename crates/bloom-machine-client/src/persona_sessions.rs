@@ -27,8 +27,19 @@ pub struct PersonaSessionProposal {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PersonaSessionSelection {
+    /// Explicit raw-unit overrides, especially native gas and assets without a preset.
+    #[serde(default)]
+    pub token_allowances: Vec<PersonaTokenAllowance>,
     pub assets: Vec<bloom_broker_api::AssetId>,
     pub members: Vec<PersonaSessionMember>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PersonaTokenAllowance {
+    pub asset: bloom_broker_api::AssetId,
+    pub per_action: bloom_broker_api::DecimalU256,
+    pub per_window: bloom_broker_api::DecimalU256,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,6 +66,8 @@ struct SessionRecord {
     revoke_confirmed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_fallback_code: Option<ProtocolErrorCode>,
+    #[serde(default)]
+    rearm_operation_id: Option<OperationId>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -222,7 +235,7 @@ fn selector_matches(
                 terms
                     .session_budget
                     .as_ref()
-                    .and_then(|budget| budget.usd_policy.as_ref())
+                    .and_then(|budget| budget.token_policy.as_ref())
                     .map_or_else(
                         || {
                             terms
@@ -266,48 +279,6 @@ fn selector_matches(
 }
 
 impl MachineBrokerClient {
-    pub async fn session_prices(
-        &self,
-        assets: Vec<bloom_broker_api::AssetId>,
-    ) -> Result<bloom_broker_api::SessionPricesResponse, ProtocolError> {
-        match self
-            .request(MachineBrokerRequest::SessionPrices(
-                bloom_broker_api::SessionPricesRequest {
-                    assets: assets.clone(),
-                },
-            ))
-            .await?
-        {
-            MachineBrokerResponse::SessionPrices(response) => {
-                if response.assets.len() != assets.len()
-                    || response.quotes.len() != assets.len()
-                    || assets.iter().any(|asset| {
-                        response
-                            .assets
-                            .iter()
-                            .filter(|entry| &entry.asset == asset)
-                            .count()
-                            != 1
-                            || response
-                                .quotes
-                                .iter()
-                                .filter(|quote| &quote.asset == asset)
-                                .count()
-                                != 1
-                    })
-                    || response.assets.iter().any(|entry| {
-                        bloom_broker_api::approved_session_asset(&entry.asset).as_ref()
-                            != Some(entry)
-                    })
-                {
-                    return Err(response_mismatch("session.prices asset identities"));
-                }
-                Ok(response)
-            }
-            _ => Err(response_mismatch("session.prices")),
-        }
-    }
-
     /// Read the source-pinned identity recorded before a session sign was sent.
     /// This lets native orchestrators reconcile instead of rotating their
     /// operation identity when a response or process was lost.
@@ -405,6 +376,7 @@ impl MachineBrokerClient {
                         revoke_request: None,
                         revoke_confirmed: false,
                         last_fallback_code: None,
+                        rearm_operation_id: None,
                     },
                 )?;
             }
@@ -484,6 +456,7 @@ impl MachineBrokerClient {
                     revoke_request: None,
                     revoke_confirmed: false,
                     last_fallback_code: None,
+                    rearm_operation_id: None,
                 };
                 atomic_json(&path, &record)?;
                 record
@@ -517,6 +490,84 @@ impl MachineBrokerClient {
             }
             Err(error) => return Err(error),
         }
+        self.persona_status_for(&record).await
+    }
+
+    /// Owner-requested unlock of unchanged standing terms. A rearm never
+    /// creates a grant, rotates an economic budget or resets a counter.
+    pub async fn rearm_persona_session(
+        &self,
+        wallet: &Token,
+        approval: Option<&Digest32>,
+        new_operation: OperationId,
+    ) -> Result<PersonaSessionStatus, ProtocolError> {
+        let root = self
+            .persona_session_root
+            .as_ref()
+            .ok_or_else(|| io_error("session store is not configured"))?;
+        let _gate = self.persona_session_gate.lock().await;
+        let _lock = store_lock(root)?;
+        let mut record = records(root)?
+            .into_iter()
+            .find(|r| {
+                !r.disabled
+                    && &r.proposal.terms.wallet_id == wallet
+                    && approval.is_none_or(|id| r.proposal.terms.approval_id().as_ref() == Ok(id))
+            })
+            .ok_or_else(|| io_error("no matching standing persona permission"))?;
+        let status = self.persona_status_for(&record).await?;
+        if status.authority.state != ApprovalLifecycleState::Active
+            || record.proposal.terms.expires_at_ms.get() != u64::MAX
+            || !matches!(
+                record.proposal.terms.activation_mode,
+                bloom_broker_api::ActivationMode::DurableLocal { .. }
+            )
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::ApprovalRevoked,
+                "only an active standing local permission can be rearmed",
+            ));
+        }
+        if status.authority.ceremony_url.is_some() {
+            return Ok(status);
+        }
+        let operation = if let Some(op) = record.rearm_operation_id.clone() {
+            match self.ceremony_status(op.clone()).await {
+                Ok(prior)
+                    if matches!(
+                        prior.state,
+                        bloom_broker_api::CeremonyState::Succeeded
+                            | bloom_broker_api::CeremonyState::Completed
+                            | bloom_broker_api::CeremonyState::Cancelled
+                            | bloom_broker_api::CeremonyState::Expired
+                            | bloom_broker_api::CeremonyState::Failed
+                            | bloom_broker_api::CeremonyState::AlreadyRegistered
+                    ) =>
+                {
+                    new_operation
+                }
+                Ok(_) => op,
+                Err(error) if error.code == ProtocolErrorCode::ApprovalNotFound => op,
+                Err(error) => return Err(error),
+            }
+        } else {
+            new_operation
+        };
+        record.rearm_operation_id = Some(operation.clone());
+        atomic_json(&grant_path(root, &status.approval_id), &record)?;
+        self.prepare_approval(ApprovalPrepareRequest {
+            surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
+            operation_id: operation,
+            terms: record.proposal.terms.clone(),
+            canonical_plan_facts_digest: record.proposal.canonical_plan_facts_digest.clone(),
+            petal_use_claim: None,
+            system_use_claim: None,
+            safe_review_payloads: vec![],
+            message_review_payloads: vec![],
+            evm_reported_token: None,
+            evm_review_payloads: vec![],
+        })
+        .await?;
         self.persona_status_for(&record).await
     }
 
@@ -629,7 +680,7 @@ impl MachineBrokerClient {
         for record in &retained {
             if &record.proposal.terms.wallet_id == wallet
                 && let Some(budget) = &record.proposal.terms.session_budget
-                && budget.usd_policy.is_some()
+                && budget.token_policy.is_some()
             {
                 let budget_id = budget.budget_id()?;
                 let path = root
@@ -662,7 +713,7 @@ impl MachineBrokerClient {
             }
             record.disabled = true;
             if let Some(budget) = &record.proposal.terms.session_budget
-                && budget.usd_policy.is_some()
+                && budget.token_policy.is_some()
             {
                 let id = budget.budget_id()?;
                 pools.insert(id.as_str().to_owned(), id);
@@ -841,7 +892,7 @@ impl MachineBrokerClient {
         batch: bool,
     ) -> Result<Option<SigningResult>, ProtocolError> {
         // Selection is structural. Broker owns profile-specific verification,
-        // economic admission and all pricing; unrelated Petals need no global
+        // economic admission; unrelated Petals need no global
         // application-name gate or fabricated witness.
         if !matches!(
             (provenance, claim, system_use),
@@ -908,7 +959,7 @@ impl MachineBrokerClient {
                 if terms
                     .session_budget
                     .as_ref()
-                    .is_some_and(|b| b.usd_policy.is_some())
+                    .is_some_and(|b| b.token_policy.is_some())
                     && claim.is_some_and(|c| {
                         c.economic_effects.as_ref().is_none_or(|e| {
                             e.permission_effect != bloom_broker_api::SessionPermissionEffect::None
@@ -929,7 +980,7 @@ impl MachineBrokerClient {
                     // exact step-up without pinning a doomed session attempt.
                     continue;
                 }
-                // Do not convert quantities locally. A priced asset need not
+                // Do not convert quantities locally. An allowed token need not
                 // have a nominal conversion; only Broker can admit its value.
                 let id = terms.approval_id()?;
                 let status = self.approval_status(id.clone()).await?;
@@ -1083,14 +1134,8 @@ impl MachineBrokerClient {
                     && recovery_status
                         .as_ref()
                         .is_err_and(|status| status.code == ProtocolErrorCode::ApprovalNotFound);
-                if native_exact_stepup
-                    || matches!(
-                        error.code,
-                        ProtocolErrorCode::PriceUnavailable | ProtocolErrorCode::PriceStale
-                    )
-                {
-                    // Price denials precede reservation/signing; native denials
-                    // above additionally prove no retained operation exists.
+                if native_exact_stepup {
+                    // Native step-up additionally proves no retained operation exists.
                     // Retain source identity while making the fallback durable.
                     let mut attempt: SigningAttempt =
                         read_json(&path)?.ok_or_else(|| io_error("missing frozen attempt"))?;
@@ -1143,6 +1188,7 @@ fn records(root: &Path) -> Result<Vec<SessionRecord>, ProtocolError> {
                                     revoke_request: None,
                                     revoke_confirmed: false,
                                     last_fallback_code: None,
+                                    rearm_operation_id: None,
                                 },
                             )?;
                         }
@@ -1171,7 +1217,7 @@ fn records(root: &Path) -> Result<Vec<SessionRecord>, ProtocolError> {
             let mut record = read_json::<SessionRecord>(&path)?
                 .ok_or_else(|| io_error("grant disappeared during discovery"))?;
             if let Some(budget) = &record.proposal.terms.session_budget
-                && budget.usd_policy.is_some()
+                && budget.token_policy.is_some()
                 && root
                     .join("stops")
                     .join(format!("{}.json", budget.budget_id()?.as_str()))
@@ -1297,7 +1343,7 @@ mod tests {
         preparations: usize,
         lose_next_response: bool,
         fail_wallet_reads: bool,
-        reject_price: bool,
+        reject_limit: bool,
         native_refusal: bool,
         retain_native_refusal: bool,
         status_unavailable: bool,
@@ -1458,10 +1504,10 @@ mod tests {
                                 "native RPC context unavailable; exact approval required",
                             ));
                         }
-                        if state.reject_price {
+                        if state.reject_limit {
                             return Err(ProtocolError::new(
-                                ProtocolErrorCode::PriceUnavailable,
-                                "no fresh quote; no reservation/signature",
+                                ProtocolErrorCode::LimitExceededValue,
+                                "token allowance exceeded; no reservation/signature",
                             ));
                         }
                         if !state.active {
@@ -1548,7 +1594,7 @@ mod tests {
             preparations: 0,
             lose_next_response: false,
             fail_wallet_reads: false,
-            reject_price: false,
+            reject_limit: false,
             native_refusal: false,
             retain_native_refusal: false,
             status_unavailable: false,
@@ -1567,6 +1613,7 @@ mod tests {
                 revoke_request: None,
                 revoke_confirmed: false,
                 last_fallback_code: None,
+                rearm_operation_id: None,
             },
         )
         .unwrap();
@@ -1656,8 +1703,8 @@ mod tests {
             asset: "native".into(),
         };
         record.proposal.terms.session_budget = Some(SessionBudget {
-            usd_policy: Some(SessionUsdPolicy {
-                schema_version: 2,
+            token_policy: Some(SessionTokenPolicy {
+                schema_version: 3,
                 budget_nonce: RequestNonce::from_bytes([63; 16]),
                 member_scope_digests: vec![scope_digest.clone()],
                 member_backstop_allocations: vec![SessionMemberAllocation {
@@ -1666,7 +1713,6 @@ mod tests {
                 }],
                 member_templates: vec![template.clone()],
                 assets: vec![approved_session_asset(&asset).unwrap()],
-                pricing_policy_digest: session_pricing_policy_digest(),
             }),
             wallet_id: template.wallet_id.clone(),
             policy_version: template.policy_version.clone(),
@@ -1674,12 +1720,6 @@ mod tests {
             wallet_revocation_epoch: template.wallet_revocation_epoch.clone(),
             member_keys: vec![template.key_ref.clone()],
             limits: template.limits.clone(),
-            nominal_asset_scales: vec![],
-            nominal_limits: SessionNominalLimits {
-                per_action: DecimalU256::parse("1000000").unwrap(),
-                lifetime: DecimalU256::parse("100000000").unwrap(),
-                rolling_windows: vec![],
-            },
             per_action_value_limits: vec![SessionValueCeiling {
                 asset,
                 maximum: DecimalU256::parse("1000").unwrap(),
@@ -1862,9 +1902,9 @@ mod tests {
         limits.value_limits.clear();
         limits.max_operations = DecimalU64::new(limits.max_operations.get() * 2);
         limits.max_signatures = DecimalU64::new(limits.max_signatures.get() * 2);
-        let budget = SessionBudget {
-            usd_policy: Some(SessionUsdPolicy {
-                schema_version: 2,
+        let mut budget = SessionBudget {
+            token_policy: Some(SessionTokenPolicy {
+                schema_version: 3,
                 budget_nonce: RequestNonce::from_bytes([55; 16]),
                 member_scope_digests: members
                     .iter()
@@ -1882,7 +1922,6 @@ mod tests {
                     .iter()
                     .map(|a| approved_session_asset(a).unwrap())
                     .collect(),
-                pricing_policy_digest: session_pricing_policy_digest(),
             }),
             wallet_id: token("wallet"),
             policy_version: original.terms.policy_version.clone(),
@@ -1890,12 +1929,6 @@ mod tests {
             wallet_revocation_epoch: original.terms.wallet_revocation_epoch.clone(),
             member_keys: proposals.iter().map(|p| p.terms.key_ref.clone()).collect(),
             limits,
-            nominal_asset_scales: vec![],
-            nominal_limits: SessionNominalLimits {
-                per_action: DecimalU256::parse("100000000").unwrap(),
-                lifetime: DecimalU256::parse("1000000000").unwrap(),
-                rolling_windows: vec![],
-            },
             per_action_value_limits: assets
                 .iter()
                 .map(|a| SessionValueCeiling {
@@ -1906,6 +1939,14 @@ mod tests {
             not_before_ms: original.terms.not_before_ms,
             expires_at_ms: original.terms.expires_at_ms,
         };
+        budget.limits.value_limits = assets
+            .iter()
+            .map(|asset| bloom_broker_api::ValueLimit {
+                asset: asset.clone(),
+                lifetime: DecimalU256::parse("10000000000000000000").unwrap(),
+                rolling_windows: vec![],
+            })
+            .collect();
         budget.validate().unwrap();
         for p in &mut proposals {
             p.terms.session_budget = Some(budget.clone());
@@ -2048,37 +2089,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_price_falls_back_durably_without_repricing_or_signing() {
+    async fn token_denial_does_not_rotate_authority_or_create_signatures() {
         let (directory, client, broker) = fixture();
-        broker.0.lock().unwrap().reject_price = true;
-        assert!(
-            sign(&client, 21, b"unpriced", &action(1))
+        broker.0.lock().unwrap().reject_limit = true;
+        assert_eq!(
+            sign(&client, 21, b"limited", &action(1))
                 .await
-                .unwrap()
-                .is_none()
+                .unwrap_err()
+                .code,
+            ProtocolErrorCode::LimitExceededValue
         );
-        assert!(
-            read_json::<SigningAttempt>(&attempt_path(
-                directory.path(),
-                &OperationId::from_bytes([21; 32])
-            ))
-            .unwrap()
-            .unwrap()
-            .exact_fallback
-        );
-        assert!(
-            client
-                .persona_operation_digest(&OperationId::from_bytes([21; 32]))
-                .unwrap()
-                .is_none()
-        );
-        broker.0.lock().unwrap().reject_price = false;
-        assert!(
-            sign(&client, 21, b"unpriced", &action(1))
-                .await
-                .unwrap()
-                .is_none()
-        );
+        let attempt = read_json::<SigningAttempt>(&attempt_path(
+            directory.path(),
+            &OperationId::from_bytes([21; 32]),
+        ))
+        .unwrap()
+        .unwrap();
+        assert!(!attempt.exact_fallback);
         assert_eq!(broker.0.lock().unwrap().signatures, 0);
         assert_eq!(
             sign(&client, 21, b"changed", &action(1))
@@ -2087,57 +2114,14 @@ mod tests {
                 .code,
             ProtocolErrorCode::OperationIdConflict
         );
-    }
-
-    #[test]
-    fn member_account_is_the_hardened_account_not_the_evm_address_index() {
-        let mut child = key();
-        child.derivation = Some(bloom_broker_api::DerivationRef::Bip39Multicurve {
-            wallet_seed_ref: token("seed"),
-            profile: bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1,
-            path: "m/44'/60'/7'/0/9".into(),
-        });
-        assert_eq!(owner_account_number(&child), Some(7));
-        child.derivation = Some(bloom_broker_api::DerivationRef::Bip39Multicurve {
-            wallet_seed_ref: token("seed"),
-            profile: bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1,
-            path: "m/44'/501'/7'/0'".into(),
-        });
-        assert_eq!(owner_account_number(&child), Some(7));
-    }
-
-    #[test]
-    fn generic_contexts_bind_exact_host_account_and_order() {
-        let mut claim = use_claim(b"first", 1);
-        claim.economic_effects = Some(bloom_broker_api::EconomicEffectsV1 {
-            schema_version: 1,
-            payload_contexts: vec![bloom_broker_api::SessionPayloadContext {
-                payload_index: 0,
-                network: token("polygon"),
-                spending_accounts: vec![],
-            }],
-            permission_effect: bloom_broker_api::SessionPermissionEffect::None,
-        });
-        bind_economic_contexts(Some(&mut claim), &key(), 1).unwrap();
-        assert_eq!(
-            claim.economic_effects.as_ref().unwrap().payload_contexts[0].spending_accounts,
-            vec![key()]
+        broker.0.lock().unwrap().reject_limit = false;
+        assert!(
+            sign(&client, 21, b"limited", &action(1))
+                .await
+                .unwrap()
+                .is_some()
         );
-        let mut other = key();
-        other.locator = "different".into();
-        assert_eq!(
-            bind_economic_contexts(Some(&mut claim), &other, 1)
-                .unwrap_err()
-                .code,
-            ProtocolErrorCode::ClaimInvalid
-        );
-        claim.economic_effects.as_mut().unwrap().payload_contexts[0].payload_index = 1;
-        assert!(bind_economic_contexts(Some(&mut claim), &key(), 1).is_err());
-        claim.economic_effects.as_mut().unwrap().payload_contexts[0].payload_index = 0;
-        claim.economic_effects.as_mut().unwrap().payload_contexts[0].network =
-            token("wrong-network");
-        assert!(bind_economic_contexts(Some(&mut claim), &key(), 1).is_err());
-        assert!(bind_economic_contexts(Some(&mut claim), &key(), 2).is_err());
+        assert_eq!(broker.0.lock().unwrap().signatures, 1);
     }
 
     #[tokio::test]

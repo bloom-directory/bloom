@@ -72,30 +72,11 @@ pub(crate) fn interactive_setup_available() -> bool {
 pub(crate) fn select_persona(
     saved: &mut Option<PersonaConfig>,
     preset: Option<PersonaPreset>,
-    per_action: Option<&str>,
-    daily: Option<&str>,
-    duration: Option<u64>,
 ) -> Result<()> {
-    if preset.is_none() && (per_action.is_some() || daily.is_some() || duration.is_some()) {
-        bail!("persona limits require an explicit --persona selection");
-    }
     let Some(preset) = preset else {
         return Ok(());
     };
-    let mut proposal = saved
-        .as_ref()
-        .filter(|saved| saved.preset == preset)
-        .cloned()
-        .unwrap_or_else(|| PersonaConfig::suggested(preset));
-    if let Some(value) = per_action {
-        proposal.per_action_usd_micros = persona_usd_micros(value)?;
-    }
-    if let Some(value) = daily {
-        proposal.daily_usd_micros = persona_usd_micros(value)?;
-    }
-    if let Some(value) = duration {
-        proposal.session_duration_secs = value;
-    }
+    let proposal = PersonaConfig::suggested(preset);
     proposal.validate().map_err(anyhow::Error::msg)?;
     *saved = Some(proposal);
     Ok(())
@@ -104,9 +85,6 @@ pub(crate) fn select_persona(
 pub(crate) fn save_persona_preferences(
     home: &bloom_proto::HomeDir,
     preset: PersonaPreset,
-    per_action: Option<&str>,
-    daily: Option<&str>,
-    duration: Option<u64>,
 ) -> Result<PersonaConfig> {
     // IPC config edits run inside the sole daemon/home owner. Serialize them
     // with each other and atomically replace the latest complete config.
@@ -116,13 +94,7 @@ pub(crate) fn save_persona_preferences(
         .map_err(|_| anyhow::anyhow!("persona preference lock poisoned"))?;
     let path = home.config_path();
     let mut config = bloom_proto::Config::load(&path)?;
-    select_persona(
-        &mut config.persona,
-        Some(preset),
-        per_action,
-        daily,
-        duration,
-    )?;
+    select_persona(&mut config.persona, Some(preset))?;
     config.validate()?;
     let temporary = tempfile::NamedTempFile::new_in(home.root())?;
     config.save(temporary.path())?;
@@ -134,19 +106,6 @@ pub(crate) fn save_persona_preferences(
         .expect("explicit selection records a persona"))
 }
 
-fn persona_usd_micros(value: &str) -> Result<u64> {
-    if !is_setup_amount(value) {
-        bail!("persona USD cap must be a positive decimal with at most six fractional digits");
-    }
-    let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
-    let whole: u64 = whole.parse().context("persona cap is too large")?;
-    let fraction: u64 = format!("{fraction:0<6}").parse()?;
-    whole
-        .checked_mul(1_000_000)
-        .and_then(|whole| whole.checked_add(fraction))
-        .context("persona cap is too large")
-}
-
 pub(crate) fn run_persona_menu(
     saved: &mut Option<PersonaConfig>,
     input: &mut impl BufRead,
@@ -154,10 +113,13 @@ pub(crate) fn run_persona_menu(
 ) -> Result<()> {
     writeln!(
         output,
-        "Persona for main/account 0: Custodian reviews each transaction; Trader or Degen proposes an owner-approved reusable session."
+        "Persona for main/account 0: Institutional reviews each transaction; Trader or Degen proposes an owner-approved reusable session."
     )?;
     loop {
-        write!(output, "Choose custodian, trader or degen [custodian]: ")?;
+        write!(
+            output,
+            "Choose institutional, trader or degen [institutional]: "
+        )?;
         output.flush()?;
         let answer = read_answer(input)?.unwrap_or_default();
         let answer = if answer.is_empty() {
@@ -167,7 +129,7 @@ pub(crate) fn run_persona_menu(
         };
         match answer.parse::<PersonaPreset>() {
             Ok(preset) => {
-                select_persona(saved, Some(preset), None, None, None)?;
+                select_persona(saved, Some(preset))?;
                 writeln!(output, "{}", persona_message(saved.as_ref()))?;
                 return Ok(());
             }
@@ -180,16 +142,12 @@ pub(crate) fn persona_message(persona: Option<&PersonaConfig>) -> String {
     let default = PersonaConfig::default();
     let persona = persona.unwrap_or(&default);
     if persona.preset == PersonaPreset::Custodian {
-        "persona: custodian; current transaction approval behavior retained".into()
+        "persona: institutional; current transaction approval behavior retained".into()
     } else {
         format!(
-            "persona: {}; proposed ${}.{:06}/action, ${}.{:06}/day for covered stablecoin collateral (not total-wallet USD coverage), {} seconds; no session is active until its exact account, packages, classes, assets, destinations and limits are reviewed and approved",
+            "persona: {}; independent token allowances per rolling {} hours, until revoked; approve the exact accounts, apps and token amounts before automatic spending",
             persona.preset.as_str(),
-            persona.per_action_usd_micros / 1_000_000,
-            persona.per_action_usd_micros % 1_000_000,
-            persona.daily_usd_micros / 1_000_000,
-            persona.daily_usd_micros % 1_000_000,
-            persona.session_duration_secs
+            persona.window_secs / 3600
         )
     }
 }
@@ -285,21 +243,17 @@ fn suggested_venue_limit(
     petal: &str,
     value: &str,
 ) -> Option<String> {
-    let profile = persona.filter(|profile| profile.preset != PersonaPreset::Custodian)?;
     if petal != "polymarket" || value != "max_daily_usd" {
         return None;
     }
-    let amount = format!(
-        "{}.{:06}",
-        profile.daily_usd_micros / 1_000_000,
-        profile.daily_usd_micros % 1_000_000
-    );
-    Some(
-        amount
-            .trim_end_matches('0')
-            .trim_end_matches('.')
-            .to_owned(),
-    )
+    // This existing venue setting is a pUSD order-cost ceiling despite its
+    // historic name. Seed fresh settings from the token quantity, never a
+    // price. For Degen the Broker's seven-day limit remains stricter; saved
+    // owner settings are still preserved by the setup merge.
+    let profile = persona?;
+    profile
+        .token_amounts("pUSD")
+        .map(|(_, total)| total.to_owned())
 }
 
 fn ask_yes_no(
@@ -1304,7 +1258,7 @@ pub(crate) async fn create_wallet_then_default_policy(
         .await?;
         if session.stdout.trim_start().starts_with('[') {
             println!(
-                "persona coverage: default activation proposes priced Polymarket BUY on the selected account; use --selection to review generic Petal/native members sharing one USD pool. Approve the returned scope URL, then run `bloom wallet persona activate main --account 0` to reconcile it."
+                "persona coverage: automatic Polymarket BUY uses recurring pUSD amounts on the selected account. Other certified Petal/native scopes have independent token allowances. Approve the returned scope URL, then repeat activation to reconcile it."
             );
         }
         crate::print_machine_command_output(&session)?;
@@ -1500,43 +1454,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn persona_selection_preserves_legacy_and_custom_limits_without_explicit_change() {
-        let mut legacy = None;
-        select_persona(&mut legacy, None, None, None, None).unwrap();
-        assert_eq!(legacy, None);
-        select_persona(
-            &mut legacy,
-            Some(PersonaPreset::Trader),
-            Some("12.5"),
-            Some("50"),
-            Some(600),
-        )
-        .unwrap();
-        let choice = legacy.clone();
-        select_persona(&mut legacy, None, None, None, None).unwrap();
-        assert_eq!(legacy, choice);
-        assert_eq!(legacy.as_ref().unwrap().per_action_usd_micros, 12_500_000);
-        select_persona(&mut legacy, Some(PersonaPreset::Trader), None, None, None).unwrap();
-        assert_eq!(legacy, choice);
-        assert!(select_persona(&mut legacy, None, Some("10"), None, None).is_err());
-        assert!(
-            select_persona(
-                &mut legacy,
-                Some(PersonaPreset::Trader),
-                Some("51"),
-                None,
-                None
-            )
-            .is_err()
-        );
-        assert_eq!(
-            legacy, choice,
-            "a rejected proposal must not change saved choices"
-        );
+    fn persona_selection_preserves_unspecified_choices_and_uses_token_windows() {
+        let mut saved = None;
+        select_persona(&mut saved, None).unwrap();
+        assert_eq!(saved, None);
+        select_persona(&mut saved, Some(PersonaPreset::Trader)).unwrap();
+        let choice = saved.clone();
+        select_persona(&mut saved, None).unwrap();
+        assert_eq!(saved, choice);
+        assert_eq!(saved.as_ref().unwrap().window_secs, 86400);
+        select_persona(&mut saved, Some(PersonaPreset::Degen)).unwrap();
+        assert_eq!(saved.unwrap().window_secs, 604800);
     }
 
     #[test]
-    fn persona_suggestions_align_fresh_venue_cap_but_preserve_saved_owner_choice() {
+    fn persona_token_limits_do_not_rewrite_venue_settings_or_saved_owner_choice() {
         let trader = PersonaConfig::suggested(PersonaPreset::Trader);
         let mut fresh = PetalsConfig::default();
         accept_setup_suggestions(&mut fresh, Some(&trader));

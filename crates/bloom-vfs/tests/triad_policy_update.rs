@@ -886,6 +886,7 @@ async fn default_wallet_first_proposal_allows_setup_packages_together() {
         Arc::new(move |wallet: &str| {
             if wallet == "alice" {
                 Ok(bloom_vfs::handlers::DefaultPolicySetup {
+                    standing_allowances: false,
                     packages: vec![chosen.clone()],
                     destinations: vec![setup_destination()],
                 })
@@ -999,6 +1000,7 @@ async fn setup_packages_join_only_a_wallets_first_policy_proposal() {
         let chosen = chosen.clone();
         Arc::new(move |_wallet: &str| {
             Ok(bloom_vfs::handlers::DefaultPolicySetup {
+                standing_allowances: false,
                 packages: vec![chosen.clone()],
                 destinations: vec![setup_destination()],
             })
@@ -1045,6 +1047,7 @@ async fn revoking_every_petal_does_not_bring_the_setup_proposal_back() {
     let requested = Digest32::from_bytes([7; 32]);
     let defaults: bloom_vfs::handlers::DefaultPolicyPackages = Arc::new(|_wallet: &str| {
         Ok(bloom_vfs::handlers::DefaultPolicySetup {
+            standing_allowances: false,
             packages: vec![Digest32::from_bytes([8; 32]), Digest32::from_bytes([9; 32])],
             destinations: vec![setup_destination()],
         })

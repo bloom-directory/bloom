@@ -743,17 +743,11 @@ pub enum MachineCommand {
     OnboardingSetup {
         wallet: String,
         preset: bloom_proto::persona::PersonaPreset,
-        per_action_usd: Option<String>,
-        daily_usd: Option<String>,
-        session_duration_secs: Option<u64>,
         petals: Vec<String>,
     },
     PersonaPreferencesSet {
         wallet: String,
         preset: bloom_proto::persona::PersonaPreset,
-        per_action_usd: Option<String>,
-        daily_usd: Option<String>,
-        session_duration_secs: Option<u64>,
     },
     PersonaSessionActivateConfigured {
         wallet: String,
@@ -766,6 +760,10 @@ pub enum MachineCommand {
     },
     PersonaSessions {
         wallet: String,
+    },
+    PersonaSessionsRearm {
+        wallet: String,
+        approval: Option<String>,
     },
     PersonaSessionsStop {
         wallet: String,

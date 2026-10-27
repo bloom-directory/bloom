@@ -33,12 +33,6 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(90);
 #[serde(deny_unknown_fields)]
 pub(super) struct SetupRequest {
     pub persona: PersonaPreset,
-    #[serde(default)]
-    pub per_action_usd: Option<String>,
-    #[serde(default)]
-    pub daily_usd: Option<String>,
-    #[serde(default)]
-    pub session_duration_secs: Option<u64>,
     pub petals: Vec<String>,
 }
 
@@ -320,10 +314,10 @@ async fn state_snapshot(state: &AppState) -> Result<Value> {
     } else {
         None
     };
-    let persona_limits = config.as_ref().and_then(|c| c.persona.as_ref()).map(|p| {
-        let decimal = |n: u64| format!("{}.{:06}", n / 1_000_000, n % 1_000_000);
-        json!({"per_action_usd":decimal(p.per_action_usd_micros),"daily_usd":decimal(p.daily_usd_micros),"session_duration_secs":p.session_duration_secs.to_string()})
-    });
+    let persona_limits = config
+        .as_ref()
+        .and_then(|c| c.persona.as_ref())
+        .map(|p| json!({"window_secs":p.window_secs.to_string()}));
     let config = json!({"exists":exists, "persona_limits":persona_limits, "setup_complete":config.as_ref().is_some_and(|c| c.petals.setup_complete), "persona":config.as_ref().and_then(|c| c.persona.as_ref()), "petals":config.as_ref().map(|c| c.petals.setup.keys().cloned().collect::<Vec<_>>()).unwrap_or_default()});
     let mut wallets = observe(state, MachineCommand::WalletList).await;
     let mut available = wallets["available"].as_bool().unwrap_or(false);
@@ -382,7 +376,9 @@ async fn state_snapshot(state: &AppState) -> Result<Value> {
     } else {
         None
     };
-    let ceremony_url = sessions.get("data").and_then(find_ceremony_url);
+    let ceremony_url = sessions
+        .get("data")
+        .and_then(|value| find_ceremony_url(value, &state.broker_origin));
     let catalog = crate::default_policy::menu_petals()
         .into_iter()
         .map(|id| json!({"label":crate::default_policy::petal_label(&id),"id":id}))
@@ -395,12 +391,12 @@ async fn state_snapshot(state: &AppState) -> Result<Value> {
 async fn observe(state: &AppState, command: MachineCommand) -> Value {
     match execute(state, command).await {
         Ok(output) if output.exit_code == 0 => {
-            let mut value = command_result(output);
+            let mut value = command_result(output, &state.broker_origin);
             value["available"] = json!(true);
             value
         }
         Ok(output) => {
-            let mut value = command_result(output);
+            let mut value = command_result(output, &state.broker_origin);
             value["available"] = json!(false);
             value["error"] = value["stderr"].clone();
             value
@@ -484,24 +480,24 @@ async fn discover_wallets(state: &AppState) -> Result<Vec<WalletChoice>> {
     parse_wallet_choices(&output.stdout)
 }
 
-async fn require_existing_wallet(state: &AppState) -> Result<String, Response> {
+async fn require_existing_wallet(state: &AppState) -> Result<String, Box<Response>> {
     let choices = discover_wallets(state).await.map_err(|error| {
-        api_error(
+        Box::new(api_error(
             StatusCode::BAD_GATEWAY,
             &format!("Cannot discover existing Bloom wallets: {error:#}"),
-        )
+        ))
     })?;
     if choices.is_empty() {
-        return Err(api_error(
+        return Err(Box::new(api_error(
             StatusCode::CONFLICT,
             "No Bloom wallet is available in this installation. Use your existing Bloom installation.",
-        ));
+        )));
     }
     choose_wallet(&choices, state.selected_wallet.lock().await.as_deref()).ok_or_else(|| {
-        api_error(
+        Box::new(api_error(
             StatusCode::CONFLICT,
             "Select an existing Bloom wallet before continuing",
-        )
+        ))
     })
 }
 
@@ -509,7 +505,7 @@ async fn setup(State(state): State<App>, Json(request): Json<SetupRequest>) -> R
     let _guard = state.mutations.lock().await;
     let wallet = match require_existing_wallet(&state).await {
         Ok(wallet) => wallet,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     match crate::configure_browser_setup(&state.home, &state.endpoint, &wallet, request).await {
         Ok(value) => Json(value).into_response(),
@@ -563,7 +559,7 @@ async fn action(State(state): State<App>, Json(request): Json<ActionRequest>) ->
     }
     let wallet = match require_existing_wallet(&state).await {
         Ok(wallet) => wallet,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let command = match request.action {
         Action::Policy => MachineCommand::WalletDefaultPolicy { name: wallet },
@@ -579,31 +575,39 @@ async fn action(State(state): State<App>, Json(request): Json<ActionRequest>) ->
         Action::SelectWallet | Action::Refresh => unreachable!("handled above"),
     };
     match execute(&state, command).await {
-        Ok(output) => Json(command_result(output)).into_response(),
+        Ok(output) => Json(command_result(output, &state.broker_origin)).into_response(),
         Err(error) => api_error(StatusCode::BAD_GATEWAY, &format!("{error:#}")),
     }
 }
 
-fn command_result(output: MachineCommandOutput) -> Value {
+fn command_result(output: MachineCommandOutput, broker_origin: &str) -> Value {
     let data = serde_json::from_str::<Value>(output.stdout.trim()).ok();
-    let ceremony_url = data.as_ref().and_then(find_ceremony_url).or_else(|| {
-        // Some authenticated command responses use an explicitly named text field.
-        output.stdout.lines().find_map(|line| {
-            line.strip_prefix("ceremony_url: ")
-                .and_then(valid_ceremony_url)
-        })
-    });
+    let ceremony_url = data
+        .as_ref()
+        .and_then(|value| find_ceremony_url(value, broker_origin))
+        .or_else(|| {
+            // Some authenticated command responses use an explicitly named text field.
+            output.stdout.lines().find_map(|line| {
+                line.strip_prefix("ceremony_url: ")
+                    .and_then(|value| valid_ceremony_url(value, broker_origin))
+            })
+        });
     json!({"stdout":output.stdout,"stderr":output.stderr,"exit_code":output.exit_code,"data":data,"ceremony_url":ceremony_url})
 }
 
-fn find_ceremony_url(value: &Value) -> Option<String> {
+fn find_ceremony_url(value: &Value, broker_origin: &str) -> Option<String> {
     match value {
         Value::Object(map) => map
             .get("ceremony_url")
             .and_then(Value::as_str)
-            .and_then(valid_ceremony_url)
-            .or_else(|| map.values().find_map(find_ceremony_url)),
-        Value::Array(values) => values.iter().find_map(find_ceremony_url),
+            .and_then(|value| valid_ceremony_url(value, broker_origin))
+            .or_else(|| {
+                map.values()
+                    .find_map(|value| find_ceremony_url(value, broker_origin))
+            }),
+        Value::Array(values) => values
+            .iter()
+            .find_map(|value| find_ceremony_url(value, broker_origin)),
         _ => None,
     }
 }
@@ -620,12 +624,14 @@ fn expected_ceremony_port() -> u16 {
     18734
 }
 
-fn valid_ceremony_url(value: &str) -> Option<String> {
+fn valid_ceremony_url(value: &str, broker_origin: &str) -> Option<String> {
+    let expected = url::Url::parse(broker_origin).ok()?;
     let url = url::Url::parse(value).ok()?;
     let token = url.path().strip_prefix("/ceremony/")?;
     (url.scheme() == "http"
         && matches!(url.host_str(), Some("127.0.0.1" | "localhost"))
-        && url.port() == Some(expected_ceremony_port())
+        && url.port().is_some()
+        && url.port() == expected.port()
         && url.username().is_empty()
         && url.password().is_none()
         && url.query().is_none()
@@ -935,20 +941,49 @@ mod tests {
         assert_eq!(state["sessions"]["available"], false);
         assert!(!server.home.path().join("config.toml").exists());
         assert!(
-            find_ceremony_url(&json!({"link":"http://127.0.0.1:18734/ceremony/token"})).is_none()
+            find_ceremony_url(
+                &json!({"link":"http://127.0.0.1:18734/ceremony/token"}),
+                "http://localhost:18734"
+            )
+            .is_none()
         );
         assert!(
-            find_ceremony_url(&json!({"ceremony_url":"https://attacker.example/ceremony/token"}))
-                .is_none()
+            find_ceremony_url(
+                &json!({"ceremony_url":"https://attacker.example/ceremony/token"}),
+                "http://localhost:18734"
+            )
+            .is_none()
         );
         assert_eq!(
             find_ceremony_url(
-                &json!({"nested":[{"ceremony_url":"http://127.0.0.1:18734/ceremony/token"}]})
+                &json!({"nested":[{"ceremony_url":"http://127.0.0.1:18734/ceremony/token"}]}),
+                "http://localhost:18734"
             )
             .as_deref(),
             Some("http://127.0.0.1:18734/ceremony/token")
         );
     }
+    #[test]
+    fn policy_link_validation_follows_the_connection_not_the_default_port() {
+        let origin = "http://localhost:28745";
+        let output = MachineCommandOutput { stdout: json!({"state":"awaiting_owner","ceremony_url":"http://localhost:28745/ceremony/token"}).to_string(), stderr:String::new(), exit_code:0 };
+        let result = command_result(output, origin);
+        assert_eq!(
+            result["ceremony_url"],
+            "http://localhost:28745/ceremony/token"
+        );
+        for rejected in [
+            "http://localhost:18734/ceremony/token",
+            "http://localhost:28746/ceremony/token",
+            "https://attacker.example/ceremony/token",
+            "http://localhost:28745/ceremony/token#x",
+            "http://user@localhost:28745/ceremony/token",
+        ] {
+            assert!(valid_ceremony_url(rejected, origin).is_none());
+        }
+        assert!(valid_ceremony_url("http://127.0.0.1:28745/ceremony/token", origin).is_some());
+    }
+
     #[test]
     fn existing_wallet_discovery_requires_fresh_unambiguous_membership() {
         let none = parse_wallet_choices("").unwrap();

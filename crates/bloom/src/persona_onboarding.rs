@@ -9,8 +9,8 @@ use sha2::{Digest as _, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const ORDER_CLASS: &str = "polymarket.order.poly1271";
-const DAY_MS: u64 = 86_400_000;
-const MAX_SIGNATURES: u64 = 4096;
+const U256_MAX: &str =
+    "115792089237316195423570985008687907853269984665640564039457584007913129639935";
 
 /// Convenience selection for the first reference Petal on an explicit account.
 /// Arbitrary certified Petal/native selections use compile_selection below.
@@ -28,7 +28,7 @@ pub(crate) async fn compile_proposals(
     }
     profile.validate().map_err(anyhow::Error::msg)?;
     if profile.preset == PersonaPreset::Custodian {
-        bail!("Custodian has no reusable session to activate");
+        bail!("Institutional has no reusable session to activate");
     }
     let broker = daemon.broker_client().context("Broker unavailable")?;
     let wallet_id = Token::new(wallet.to_owned())?;
@@ -46,13 +46,6 @@ pub(crate) async fn compile_proposals(
         serde_json::from_slice(&snapshot.canonical_policy.decode())?;
     if policy.wallet_id != wallet_id {
         bail!("policy wallet differs from selected wallet");
-    }
-    let duration_ms = profile
-        .session_duration_secs
-        .checked_mul(1000)
-        .context("session duration overflow")?;
-    if duration_ms > policy.maximum_approval_lifetime_ms {
-        bail!("requested session duration exceeds the signed wallet lifetime ceiling");
     }
     let suite = CryptoSuite::Secp256k1Keccak256Recoverable;
     let key_ref = if let Some(root) = descriptor.root_key_ref.as_ref() {
@@ -150,63 +143,34 @@ pub(crate) async fn compile_proposals(
         route_grants: route_grants.clone(),
         required_claim_assurance: ClaimAssuranceLevel::MachineAsserted,
     };
-    let now_ms = u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())?;
-    let terms = SealedApprovalTerms {
-        subject: ApprovalSubject::Petal {
-            package_hash,
-            route: primary.route.clone(),
-            agent_id: None,
-        },
-        wallet_id,
-        key_ref: key_ref.clone(),
-        allowed_crypto_suites: vec![suite],
-        selector,
-        limits: ApprovalLimits {
-            max_operations: DecimalU64::new(MAX_SIGNATURES),
-            max_signatures: DecimalU64::new(MAX_SIGNATURES),
-            operation_rate_limits: vec![],
-            signature_rate_limits: vec![],
-            value_limits: vec![],
-        },
-        activation_mode: if key_ref.backend.as_str() == "local" {
-            ActivationMode::BootBound
-        } else {
-            ActivationMode::BackendManaged
-        },
-        wallet_revocation_epoch: descriptor.wallet_revocation_epoch,
-        policy_version: descriptor.policy_version,
-        policy_digest: descriptor.policy_digest,
-        provenance_digest: primary.provenance_digest.clone(),
-        request_nonce: RequestNonce::from_bytes(rand::random()),
-        issued_at_ms: DecimalU64::new(now_ms),
-        not_before_ms: DecimalU64::new(now_ms),
-        expires_at_ms: DecimalU64::new(now_ms.checked_add(duration_ms).context("expiry overflow")?),
-        renewal_of: None,
-        session_budget: None,
-    };
     compile_selection(
         daemon,
         wallet,
         PersonaSessionSelection {
+            token_allowances: vec![],
             assets: vec![AssetId {
                 chain: Token::new("evm-137")?,
                 asset: "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb".into(),
             }],
             members: vec![PersonaSessionMember {
                 account,
-                key_ref: terms.key_ref,
-                subject: terms.subject,
-                selector: terms.selector,
-                provenance_digest: terms.provenance_digest,
-                allowed_crypto_suites: terms.allowed_crypto_suites,
+                key_ref,
+                subject: ApprovalSubject::Petal {
+                    package_hash,
+                    route: primary.route.clone(),
+                    agent_id: None,
+                },
+                selector,
+                provenance_digest: primary.provenance_digest.clone(),
+                allowed_crypto_suites: vec![suite],
             }],
         },
     )
     .await
 }
 
-/// Compile an explicitly selected set of native/Petal members into one reviewed
-/// pool. Quotes are Broker observations; no Petal or Machine price is accepted.
+/// Compile explicit native/Petal selections into independent token allowances.
+/// Each exact deployment uses raw units; no price enters authority.
 pub(crate) async fn compile_selection(
     daemon: &Daemon,
     wallet: &str,
@@ -217,14 +181,14 @@ pub(crate) async fn compile_selection(
         .unwrap_or_default();
     profile.validate().map_err(anyhow::Error::msg)?;
     if profile.preset == PersonaPreset::Custodian {
-        bail!("Custodian retains individual owner approval");
+        bail!("Institutional retains individual owner approval");
     }
     if selection.members.is_empty()
         || selection.members.len() > 128
         || selection.assets.is_empty()
         || selection.assets.len() > 128
     {
-        bail!("select 1–128 members and priced assets");
+        bail!("select 1–128 members and tokens");
     }
     let broker = daemon.broker_client().context("Broker unavailable")?;
     let wallet_id = Token::new(wallet)?;
@@ -238,23 +202,44 @@ pub(crate) async fn compile_selection(
     let policy: CanonicalWalletPolicy =
         serde_json::from_slice(&snapshot.canonical_policy.decode())?;
     let now = u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())?;
-    let duration = profile
-        .session_duration_secs
-        .checked_mul(1000)
-        .context("session duration overflow")?;
-    if duration > policy.maximum_approval_lifetime_ms {
-        bail!("session exceeds wallet approval lifetime");
+    if policy.maximum_approval_lifetime_ms != STANDING_APPROVAL_POLICY_LIFETIME_MS {
+        bail!(
+            "wallet policy does not permit standing token allowances; review the updated policy first"
+        );
     }
-    let expiry = now
-        .checked_add(duration)
-        .context("session expiry overflow")?;
-    let count = u64::try_from(selection.members.len())?;
-    let allocation = MAX_SIGNATURES / count;
-    if allocation < 2 {
-        bail!("too many session members for structural backstops");
+    let expiry = u64::MAX;
+    let assets = selection
+        .assets
+        .iter()
+        .map(|a| {
+            approved_session_asset(a).context("token identity has no reviewed display metadata")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if selection.token_allowances.iter().enumerate().any(|(i, v)| {
+        !selection.assets.contains(&v.asset)
+            || selection.token_allowances[..i]
+                .iter()
+                .any(|x| x.asset == v.asset)
+    }) {
+        bail!("explicit token allowances must name unique selected assets");
     }
+    let token_limits = assets.iter().map(|asset| {
+        let (action,rolling)=if let Some(explicit)=selection.token_allowances.iter().find(|v|v.asset==asset.asset) {
+            (explicit.per_action.clone(),explicit.per_window.clone())
+        } else {
+            let (action,rolling)=profile.token_amounts(&asset.symbol).context("token needs an explicit raw-unit allowance; native gas is never inferred from token prices")?;
+            (token_units(action,asset.decimals)?,token_units(rolling,asset.decimals)?)
+        };
+        use std::str::FromStr;
+        if action.as_str()=="0" || rolling.as_str()=="0" || num_bigint::BigUint::from_str(action.as_str())? > num_bigint::BigUint::from_str(rolling.as_str())? {bail!("token allowance must be positive and per-action must not exceed rolling capacity");}
+        Ok((SessionValueCeiling {asset:asset.asset.clone(),maximum:action},ValueLimit {asset:asset.asset.clone(),lifetime:DecimalU256::parse(U256_MAX)?,rolling_windows:vec![ValueWindow {maximum:rolling,duration_ms:DecimalU64::new(profile.window_secs*1000)}]}))
+    }).collect::<Result<Vec<_>>>()?;
+    let caps = token_limits
+        .iter()
+        .map(|(a, _)| a.clone())
+        .collect::<Vec<_>>();
     // Activation retries resume the complete frozen pool, including exhausted
-    // members; quoting again must never manufacture replacement authority.
+    // members; retrying must never manufacture replacement authority.
     let existing = daemon.persona_sessions(wallet).await?;
     let active = existing
         .iter()
@@ -281,18 +266,16 @@ pub(crate) async fn compile_selection(
                         && s.terms.policy_digest == descriptor.policy_digest
                         && s.persona == profile.preset.as_str()
                         && s.terms.session_budget.as_ref().is_some_and(|b| {
-                            b.usd_policy.as_ref().is_some_and(|p| {
+                            b.token_policy.as_ref().is_some_and(|p| {
                                 p.assets.len() == selection.assets.len()
                                     && p.assets.iter().all(|a| selection.assets.contains(&a.asset))
-                            }) && b.nominal_limits.per_action.as_str()
-                                == profile.per_action_usd_micros.to_string()
-                                && b.nominal_limits.rolling_windows.iter().any(|w| {
-                                    w.duration_ms.get() == DAY_MS
-                                        && w.maximum.as_str()
-                                            == profile.daily_usd_micros.to_string()
-                                })
-                                && b.expires_at_ms.get().checked_sub(b.not_before_ms.get())
-                                    == Some(duration)
+                            }) && b.per_action_value_limits == caps
+                                && b.limits.value_limits
+                                    == token_limits
+                                        .iter()
+                                        .map(|(_, v)| v.clone())
+                                        .collect::<Vec<_>>()
+                                && b.expires_at_ms.get() == u64::MAX
                         })
                 })
             });
@@ -303,45 +286,50 @@ pub(crate) async fn compile_selection(
                 .collect();
         }
         bail!(
-            "a different session is retained; stop it before reviewing changed members, assets or pricing"
+            "a different session is retained; stop it before reviewing changed members or tokens"
         );
     }
-    let pricing = broker.session_prices(selection.assets.clone()).await?;
-    let caps = pricing
-        .assets
-        .iter()
-        .map(|asset| {
-            let quote = pricing
-                .quotes
-                .iter()
-                .find(|q| q.asset == asset.asset)
-                .context("Broker omitted review quote")?;
-            Ok(SessionValueCeiling {
-                asset: asset.asset.clone(),
-                maximum: raw_cap(
-                    profile.per_action_usd_micros,
-                    asset.decimals,
-                    &quote.price_usd,
-                )?,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let lifetime = profile
-        .daily_usd_micros
-        .checked_mul(
-            duration
-                .checked_add(DAY_MS - 1)
-                .context("duration overflow")?
-                / DAY_MS,
-        )
-        .context("lifetime USD overflow")?;
     let limits = ApprovalLimits {
-        max_operations: DecimalU64::new(allocation),
-        max_signatures: DecimalU64::new(allocation),
-        operation_rate_limits: vec![],
-        signature_rate_limits: vec![],
+        max_operations: DecimalU64::new(u64::MAX),
+        max_signatures: DecimalU64::new(u64::MAX),
+        operation_rate_limits: vec![SlidingWindow {
+            duration_ms: DecimalU64::new(60_000),
+            maximum: DecimalU64::new(120),
+        }],
+        signature_rate_limits: vec![SlidingWindow {
+            duration_ms: DecimalU64::new(60_000),
+            maximum: DecimalU64::new(512),
+        }],
         value_limits: vec![],
     };
+    // A single Petal/account owns each independent allowance. All its reviewed
+    // routes share that allowance; duplicate members cannot multiply it.
+    for (index, member) in selection.members.iter().enumerate() {
+        if selection.members[..index].iter().any(|other| {
+            other.key_ref == member.key_ref
+                && match (&other.subject, &member.subject) {
+                    (
+                        ApprovalSubject::Petal {
+                            package_hash: a, ..
+                        },
+                        ApprovalSubject::Petal {
+                            package_hash: b, ..
+                        },
+                    ) => a == b,
+                    (
+                        ApprovalSubject::System {
+                            component_id: a, ..
+                        },
+                        ApprovalSubject::System {
+                            component_id: b, ..
+                        },
+                    ) => a == b,
+                    _ => false,
+                }
+        }) {
+            bail!("combine routes into one allowance per Petal and account");
+        }
+    }
     let mut templates = Vec::new();
     for member in selection.members {
         if !descriptor.key_refs.contains(&member.key_ref)
@@ -351,8 +339,8 @@ pub(crate) async fn compile_selection(
         }
         let mut selector = member.selector;
         if let ApprovalSelector::SystemSession { scope } = &mut selector {
-            // Reviewed recipients come from explicit selection. Suggested raw
-            // caps use the review price once and are immutable afterwards.
+            // Reviewed recipients come from explicit selection. Raw caps use
+            // the selected token quantities and are immutable after approval.
             if scope.per_action_value_limits.is_empty() {
                 scope.per_action_value_limits = caps
                     .iter()
@@ -376,7 +364,10 @@ pub(crate) async fn compile_selection(
             selector,
             limits: limits.clone(),
             activation_mode: if member.key_ref.backend.as_str() == "local" {
-                ActivationMode::BootBound
+                ActivationMode::DurableLocal {
+                    provider_tier: Token::new("local-passkey")?,
+                    maximum_rearm_until_ms: DecimalU64::new(u64::MAX),
+                }
             } else {
                 ActivationMode::BackendManaged
             },
@@ -392,75 +383,67 @@ pub(crate) async fn compile_selection(
         };
         templates.push((member.account, terms));
     }
-    let mut member_templates = templates
-        .iter()
-        .map(|(_, terms)| terms.clone())
-        .collect::<Vec<_>>();
-    member_templates.sort_by_key(|terms| {
-        session_member_scope_digest(terms)
-            .expect("validated serializable terms")
-            .as_str()
-            .to_owned()
-    });
-    let mut allocations = templates
-        .iter()
-        .map(|(_, t)| {
-            Ok(SessionMemberAllocation {
-                scope_digest: session_member_scope_digest(t)?,
-                limits: t.limits.clone(),
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    allocations.sort_by(|a, b| a.scope_digest.as_str().cmp(b.scope_digest.as_str()));
-    let mut keys = templates
-        .iter()
-        .map(|(_, t)| t.key_ref.clone())
-        .collect::<Vec<_>>();
-    keys.sort_by_key(|key| serde_jcs::to_vec(key).unwrap_or_default());
-    keys.dedup();
-    let mut pool_limits = limits;
-    pool_limits.max_operations = DecimalU64::new(allocation * count);
-    pool_limits.max_signatures = DecimalU64::new(allocation * count);
-    let budget = SessionBudget {
-        usd_policy: Some(SessionUsdPolicy {
-            schema_version: 2,
-            budget_nonce: RequestNonce::from_bytes(rand::random()),
-            member_scope_digests: allocations.iter().map(|a| a.scope_digest.clone()).collect(),
-            member_backstop_allocations: allocations,
-            member_templates,
-            assets: pricing.assets,
-            pricing_policy_digest: session_pricing_policy_digest(),
-        }),
-        wallet_id,
-        policy_version: descriptor.policy_version,
-        policy_digest: descriptor.policy_digest,
-        wallet_revocation_epoch: descriptor.wallet_revocation_epoch,
-        member_keys: keys,
-        limits: pool_limits,
-        nominal_asset_scales: vec![],
-        nominal_limits: SessionNominalLimits {
-            per_action: DecimalU256::parse(profile.per_action_usd_micros.to_string())?,
-            lifetime: DecimalU256::parse(lifetime.to_string())?,
-            rolling_windows: vec![ValueWindow {
-                maximum: DecimalU256::parse(profile.daily_usd_micros.to_string())?,
-                duration_ms: DecimalU64::new(DAY_MS),
-            }],
-        },
-        per_action_value_limits: caps,
-        not_before_ms: DecimalU64::new(now),
-        expires_at_ms: DecimalU64::new(expiry),
-    };
-    budget.validate()?;
     let proposals = templates
         .into_iter()
         .map(|(account, mut terms)| {
-            terms.session_budget = Some(budget.clone());
+            let scope = session_member_scope_digest(&terms)?;
+            let mut budget = SessionBudget {
+                token_policy: Some(SessionTokenPolicy {
+                    schema_version: 3,
+                    budget_nonce: RequestNonce::from_bytes(rand::random()),
+                    member_scope_digests: vec![scope.clone()],
+                    member_templates: vec![terms.clone()],
+                    member_backstop_allocations: vec![SessionMemberAllocation {
+                        scope_digest: scope,
+                        limits: terms.limits.clone(),
+                    }],
+                    assets: assets.clone(),
+                }),
+                wallet_id: wallet_id.clone(),
+                policy_version: descriptor.policy_version.clone(),
+                policy_digest: descriptor.policy_digest.clone(),
+                wallet_revocation_epoch: descriptor.wallet_revocation_epoch.clone(),
+                member_keys: vec![terms.key_ref.clone()],
+                limits: terms.limits.clone(),
+                per_action_value_limits: caps.clone(),
+                not_before_ms: DecimalU64::new(now),
+                expires_at_ms: DecimalU64::new(expiry),
+            };
+            budget.limits.value_limits = token_limits.iter().map(|(_, v)| v.clone()).collect();
+            budget.validate()?;
+            terms.session_budget = Some(budget);
             terms.validate()?;
             proposal(profile.preset, account, terms)
         })
         .collect::<Result<Vec<_>>>()?;
     broker.stage_persona_sessions(&proposals).await?;
     Ok(proposals)
+}
+
+fn token_units(value: &str, decimals: u8) -> Result<DecimalU256> {
+    let mut parts = value.split('.');
+    let whole = parts.next().unwrap_or("");
+    let fraction = parts.next().unwrap_or("");
+    if whole.is_empty()
+        || parts.next().is_some()
+        || fraction.len() > decimals as usize
+        || decimals > 77
+        || !whole
+            .bytes()
+            .chain(fraction.bytes())
+            .all(|b| b.is_ascii_digit())
+    {
+        bail!("invalid token amount precision");
+    }
+    let raw = format!(
+        "{whole}{fraction}{}",
+        "0".repeat(decimals as usize - fraction.len())
+    );
+    let raw = raw.trim_start_matches('0');
+    if raw.is_empty() {
+        bail!("token allowance must be positive");
+    }
+    Ok(DecimalU256::parse(raw)?)
 }
 
 fn selection_scope_matches(stored: &ApprovalSelector, selected: &ApprovalSelector) -> bool {
@@ -475,37 +458,6 @@ fn selection_scope_matches(stored: &ApprovalSelector, selected: &ApprovalSelecto
         }
         _ => stored == selected,
     }
-}
-
-fn raw_cap(microdollars: u64, decimals: u8, price: &str) -> Result<DecimalU256> {
-    // Invert the review quote exactly; round down so the suggested cap cannot
-    // exceed the reviewed per-action USD amount through rounding.
-    use num_bigint::BigUint;
-    let mut p = price.split('.');
-    let whole = p.next().unwrap_or("");
-    let fraction = p.next().unwrap_or("");
-    if p.next().is_some()
-        || whole.is_empty()
-        || !whole
-            .bytes()
-            .chain(fraction.bytes())
-            .all(|b| b.is_ascii_digit())
-        || fraction.len() > 36
-        || decimals > 77
-    {
-        bail!("invalid Broker review price");
-    }
-    let price: BigUint = format!("{whole}{fraction}").parse()?;
-    if price == BigUint::from(0u8) {
-        bail!("zero Broker review price");
-    }
-    let raw = BigUint::from(microdollars)
-        * BigUint::from(10u8).pow(decimals as u32 + fraction.len() as u32)
-        / (price * BigUint::from(1_000_000u64));
-    if raw == BigUint::from(0u8) {
-        bail!("USD limit cannot fund one raw asset unit");
-    }
-    Ok(DecimalU256::parse(raw.to_string())?)
 }
 
 fn proposal(
@@ -556,15 +508,14 @@ mod tests {
     }
 
     #[test]
-    fn fixed_raw_caps_use_review_price_and_round_down() {
+    fn exact_token_amounts_never_use_market_prices() {
+        assert_eq!(token_units("100", 6).unwrap().as_str(), "100000000");
         assert_eq!(
-            raw_cap(100_000_000, 6, "0.999417").unwrap().as_str(),
-            "100058334"
+            token_units("0.025", 18).unwrap().as_str(),
+            "25000000000000000"
         );
-        assert_eq!(raw_cap(1_000_000, 9, "3").unwrap().as_str(), "333333333");
-        assert!(raw_cap(1, 0, "10").is_err());
-        assert!(raw_cap(1_000_000, 6, "0").is_err());
-        assert!(raw_cap(1_000_000, 6, "NaN").is_err());
-        assert!(raw_cap(1_000_000, 6, "1e3").is_err());
+        for value in ["0", "NaN", "1e3", "-1", "0.0000001"] {
+            assert!(token_units(value, 6).is_err());
+        }
     }
 }

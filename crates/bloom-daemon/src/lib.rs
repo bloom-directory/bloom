@@ -5208,7 +5208,15 @@ impl Daemon {
         destinations: &[bloom_broker_api::PolicyDestination],
     ) -> Result<bloom_machine_client::PetalEligibility, bloom_vfs::HandlerError> {
         self.wallets
-            .ensure_petal_packages_allowed(wallet, packages, destinations)
+            .ensure_petal_packages_allowed_standing(
+                wallet,
+                packages,
+                destinations,
+                bloom_proto::Config::load(&self.home.config_path())
+                    .map_err(|e| bloom_vfs::HandlerError::backend(e.to_string()))?
+                    .persona
+                    .is_some_and(|p| p.preset != bloom_proto::persona::PersonaPreset::Custodian),
+            )
             .await
     }
 

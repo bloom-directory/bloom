@@ -108,5 +108,23 @@
         "ed25519-message"
       ]
     }
+  ],
+  "token_allowances": [
+    {
+      "asset": {
+        "chain": "evm-1",
+        "asset": "native"
+      },
+      "per_action": "10000000000000000",
+      "per_window": "100000000000000000"
+    },
+    {
+      "asset": {
+        "chain": "solana-mainnet",
+        "asset": "native"
+      },
+      "per_action": "10000000",
+      "per_window": "100000000"
+    }
   ]
 }
