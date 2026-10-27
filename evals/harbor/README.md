@@ -131,6 +131,8 @@ with every agent and reports reward, tool calls, tokens and time against the
 baseline. A failed trial runs once more. It fails only on a smoke failure, an
 agent that cannot authenticate, or a regression against the baseline. It
 runs on `release-proposal/*` PRs and by dispatch.
-Model keys are the `ANTHROPIC_API_KEY` (or `CLAUDE_CODE_OAUTH_TOKEN`),
-`OPENAI_API_KEY` and `DEEPSEEK_API_KEY` repository secrets; the agent container
-sees them, so use dedicated keys. An agent without a key runs the smoke only.
+Model credentials are repository secrets, OAuth where the agent supports it:
+`CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`) or `ANTHROPIC_API_KEY`;
+`CODEX_AUTH_JSON` (the contents of `~/.codex/auth.json` after `codex login`) or
+`OPENAI_API_KEY`; `DEEPSEEK_API_KEY`. The agent container sees them, so use
+dedicated credentials. An agent without one runs the smoke only.
