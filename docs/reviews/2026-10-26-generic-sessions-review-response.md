@@ -74,9 +74,9 @@ retain their existing installer-certified System owner-approval path; the
 Petal-only review envelope requirement still applies to arbitrary Petal
 messages. Neither change makes opaque System signing eligible for USD sessions.
 
-At the candidate pins above, `cargo test --workspace --locked` passed 2,101
-checks with 12 documented service/artifact-dependent ignores, including all 69
-release metadata/authority checks. The final Machine client suite covers 92
+At the candidate pins above, `cargo test --workspace --locked` passed 2,106
+checks with 13 documented service/artifact-dependent ignores, including all 69
+release metadata/authority checks. The final Machine client suite covers 93
 cases, including durable pool stop identity, absence-checked native fallback,
 and two unrelated EVM/SVM Petals through the public host signing adapter.
 These fixtures do not replace physical-passkey or installed principal-isolation

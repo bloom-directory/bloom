@@ -536,6 +536,15 @@ impl Outbox {
         Ok(Some(serde_json::from_slice(&fs::read(path)?)?))
     }
 
+    pub fn has_broadcast_attempt(&self, entry: &OutboxEntry) -> Result<bool, OutboxError> {
+        for kind in BroadcastAttemptKind::ALL {
+            if self.read_broadcast_attempt(entry, kind)?.is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub fn write_broadcast_raw_tx(
         &self,
         entry: &OutboxEntry,

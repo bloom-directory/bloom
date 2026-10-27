@@ -4549,6 +4549,22 @@ mod tests {
         assert!(exact_request(vec![0x19, 0x01], None).validate().is_err());
     }
 
+    #[test]
+    fn system_signed_message_needs_no_envelope_and_cannot_carry_one() {
+        let mut request = exact_request(vec![0x19, 0x01], None);
+        request.provenance = ProvenanceSubject::System {
+            component_id: token("bloom-machine"),
+            operation_class: token("paid-http.x402"),
+        };
+        request.validate().unwrap();
+        // Broker refuses message envelopes on non-Petal subjects.
+        request.message_review_payload = Some(br#"{"schema":"bloom.message.review.v1"}"#.to_vec());
+        assert_eq!(
+            request.validate().unwrap_err().code,
+            ProtocolErrorCode::ClaimInvalid
+        );
+    }
+
     /// The batch path refused the Safe class; the reusable single-payload
     /// path did not, and it is the one a Petal reaches for any selector that
     /// is not `Exact`. That request has no Safe envelope field at all, and

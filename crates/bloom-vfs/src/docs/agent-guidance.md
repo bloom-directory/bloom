@@ -427,6 +427,15 @@ broaden, renew, or revoke authority itself. If fresh approval is required, use
 the central action's `approval_challenge.json` and `retry_path`; do not
 invent a Petal-local approval flow.
 
+An owner-approved persona session can cover selected native transfers and
+certified Petal actions across EVM/SVM accounts. Every member must be active
+before the shared dollar pool is usable. Check the exact account, asset,
+recipient and raw-unit scope; a persona preference alone grants nothing.
+Broker charges gross spending and maximum wallet-paid costs using approved
+prices at most 15 minutes old. Unsupported or unpriced actions keep ordinary
+owner approval. Retry the same staged action after approval; never restage an
+uncertain signature to obtain another budget or bypass a stopped pool.
+
 For a native Solana transfer, the challenge is projected beside the pending
 wallet transfer instead:
 
@@ -499,13 +508,12 @@ Petal's status files.
 ## Petals and paid requests
 
 Petals send Broker the complete transaction or message to sign, bound to the
-account in the route path. If signing is refused because an installed Petal
-is older than the running Bloom services, install the package version that
-matches them once it has been published. If no compatible release exists,
-report the package rollout blocker; do not repeatedly reinstall the old release.
-Do not work around the refusal by changing accounts, removing
-fields, or switching to a reusable or batch path. After the owner approves,
-retry the same request.
+account in the route path. If a Petal write fails with a bare "permission
+denied" and no ceremony link, stop and report the route and the error; do not
+reinstall the Petal or retry. Do not work around the refusal by changing
+accounts, removing fields, or switching to a reusable or batch path. When a
+write returns a ceremony link, retry the same request after the owner
+approves.
 
 - **Enso:** same-chain swaps carry an on-chain minimum output, stated in the
   intent's `plan.md`. Cross-chain swaps report `destination_unverified` after

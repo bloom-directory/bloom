@@ -127,7 +127,7 @@ struct ExactSigningState {
     crypto_suite: CryptoSuite,
     payload_digest: Digest32,
     claimed_hash: Digest32,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     review_payload_digest: Option<Digest32>,
     provenance_digest: Digest32,
     approval_operation_id: OperationId,
@@ -151,7 +151,7 @@ struct ExactBatchSigningState {
     crypto_suite: CryptoSuite,
     payload_digests: Vec<Digest32>,
     claimed_hashes: Vec<Digest32>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     review_payload_digest: Option<Digest32>,
     provenance_digest: Digest32,
     approval_operation_id: OperationId,
@@ -1995,6 +1995,60 @@ mod tests {
                 .any(|record| matches!(record, MachineBrokerRequest::SigningSign(_))),
             "the refusal must happen at signing, not before it"
         );
+    }
+
+    /// Released v0.4.0 Machine reads this same schema with
+    /// `deny_unknown_fields`; state without a review digest must not carry
+    /// the key, or a rollback cannot read it.
+    #[test]
+    fn digestless_state_omits_review_payload_digest() {
+        let single = ExactSigningState {
+            schema: STATE_SCHEMA.into(),
+            action_id: "confirm".into(),
+            wallet_id: token("wallet"),
+            account_key_ref: None,
+            operation_class: token("class"),
+            crypto_suite: CryptoSuite::Secp256k1Keccak256Recoverable,
+            payload_digest: digest(1),
+            claimed_hash: digest(2),
+            review_payload_digest: None,
+            provenance_digest: digest(3),
+            approval_operation_id: random_operation_id(),
+            signing_operation_id: random_operation_id(),
+            request_nonce: random_request_nonce(),
+            issued_at_ms: DecimalU64::new(1),
+            expires_at_ms: DecimalU64::new(2),
+            canonical_plan_facts_digest: digest(4),
+            approval_id: None,
+        };
+        let batch = ExactBatchSigningState {
+            schema: single.schema.clone(),
+            action_id: single.action_id.clone(),
+            wallet_id: single.wallet_id.clone(),
+            account_key_ref: None,
+            operation_class: single.operation_class.clone(),
+            crypto_suite: single.crypto_suite,
+            payload_digests: vec![digest(1)],
+            claimed_hashes: vec![digest(2)],
+            review_payload_digest: None,
+            provenance_digest: digest(3),
+            approval_operation_id: random_operation_id(),
+            signing_operation_id: random_operation_id(),
+            request_nonce: random_request_nonce(),
+            issued_at_ms: DecimalU64::new(1),
+            expires_at_ms: DecimalU64::new(2),
+            canonical_plan_facts_digest: digest(4),
+            approval_id: None,
+        };
+        for value in [
+            serde_json::to_value(&single).unwrap(),
+            serde_json::to_value(&batch).unwrap(),
+        ] {
+            assert!(value.get("review_payload_digest").is_none(), "{value}");
+        }
+        let mut with_digest = single;
+        with_digest.review_payload_digest = Some(digest(5));
+        assert!(serde_json::to_value(&with_digest).unwrap()["review_payload_digest"].is_string());
     }
 
     fn token(value: &str) -> Token {

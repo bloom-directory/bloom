@@ -2037,6 +2037,27 @@ mod tests {
         }
     }
 
+    /// The producer gate's source-built packages must carry the route
+    /// authority table the installer enforces for the catalog entry. Their
+    /// hash is not compared: releases build with the floating stable Rust of
+    /// release day, so a source build does not reproduce expected_hash.
+    #[test]
+    #[ignore = "requires rebuilt packages via BLOOM_PM80_POLYMARKET_ROOT and BLOOM_PM80_HYPERLIQUID_ROOT"]
+    fn source_built_signing_packages_match_catalog_authority() {
+        for (name, variable) in [
+            ("polymarket", "BLOOM_PM80_POLYMARKET_ROOT"),
+            ("hyperliquid", "BLOOM_PM80_HYPERLIQUID_ROOT"),
+        ] {
+            let entry = preinstalled_petal(name).unwrap();
+            let package = bloom_petals::package::build_petal_package_dir(
+                std::env::var_os(variable).expect(variable),
+            )
+            .unwrap();
+            validate_release_authority(entry, &package)
+                .unwrap_or_else(|error| panic!("{name}: {error:#}"));
+        }
+    }
+
     #[test]
     fn built_in_entries_are_immutable_and_incompatible_petals_are_absent() {
         let near = preinstalled_petal("near-intents").unwrap();

@@ -216,6 +216,12 @@ jobs:
           cargo nextest run --archive-file target/nextest-archive.tar.zst \
             -E 'package(bloom-it) and (binary(anvil_e2e) or binary(erc20_e2e))' \
             --no-fail-fast
+          # Machine-to-Broker exact signing (x402, MPP, policy update). Only the
+          # dispatch-only macOS W0 job ran it before, so Linux PRs missed breaks.
+          cargo nextest run --archive-file target/nextest-archive.tar.zst \
+            -E 'package(bloom-vfs) and binary(triad_policy_update)' \
+            --no-tests=fail \
+            --no-fail-fast
       # The triad release binary asserts the content of the packaged
       # installers, launcher, and release gates. It was previously not run at
       # all, so a launcher change could silently invalidate its assertions.
