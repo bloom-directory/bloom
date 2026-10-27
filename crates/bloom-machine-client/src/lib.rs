@@ -2236,7 +2236,7 @@ impl ExactPayloadBatchSignRequest {
         {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::ClaimInvalid,
-                "Polymarket exact batches require one recoverable Keccak payload and its complete review envelope",
+                "only Polymarket exact batches carry a review envelope, and each needs exactly one recoverable Keccak payload with its complete envelope",
             ));
         }
         if self.expires_at_ms.get() <= self.issued_at_ms.get() {
