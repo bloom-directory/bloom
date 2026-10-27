@@ -31,6 +31,8 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
+  # The release matrix; the report fails any cell without a summary.
+  TASKS: solana-transfer hyperliquid-order-proposal polymarket-limit-order-proposal near-intents-swap-proposal polymarket-clarification
 
 jobs:
   build:
@@ -44,14 +46,19 @@ jobs:
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: "true"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           path: bloom
       - name: Select agents
         id: select
         env:
           AGENTS: ${{ inputs.agents || 'claude-opus,codex,opencode' }}
-        run: echo "agents=$(printf '%s' "$AGENTS" | jq -Rc 'split(",") | map(select(length > 0))')" >> "$GITHUB_OUTPUT"
+        run: |
+          agents="$(printf '%s' "$AGENTS" | jq -Rc 'split(",") | map(select(length > 0))')"
+          # Agent names reach shell steps below; accept only the harness's names.
+          jq -e 'all(.[]; IN("claude-opus", "claude-sonnet", "codex", "opencode")) and length > 0' <<<"$agents" >/dev/null ||
+            { echo "::error::agents must be a comma-separated subset of claude-opus, claude-sonnet, codex, opencode"; exit 1; }
+          echo "agents=$agents" >> "$GITHUB_OUTPUT"
       - name: Read the release matrix pins
         id: pins
         working-directory: bloom
@@ -63,13 +70,13 @@ jobs:
           echo "broker=$broker" >> "$GITHUB_OUTPUT"
           echo "signer=$signer" >> "$GITHUB_OUTPUT"
       - name: Check out the pinned Broker
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: bloom-directory/bloom-broker
           ref: ${{ steps.pins.outputs.broker }}
           path: bloom-broker
       - name: Check out the pinned Signer
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: bloom-directory/bloom-signer
           ref: ${{ steps.pins.outputs.signer }}
@@ -78,9 +85,9 @@ jobs:
         working-directory: bloom
         run: rustup show
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: |
             bloom
@@ -95,7 +102,7 @@ jobs:
           mkdir -p triad-bin
           cp bloom/target/release/bloom bloom-broker/target/release/bloom-broker \
              bloom-broker/target/release/bloom-broker-debug-driver bloom-signer/target/release/bloom-signer triad-bin/
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: triad-dev-binaries
           path: triad-bin
@@ -115,23 +122,24 @@ jobs:
       matrix:
         agent: ${{ fromJSON(needs.build.outputs.agents) }}
     env:
+      AGENT: ${{ matrix.agent }}
       BLOOM_INTEGRATION_MACHINE_BIN: ${{ github.workspace }}/triad-bin/bloom
       BLOOM_INTEGRATION_BROKER_BIN: ${{ github.workspace }}/triad-bin/bloom-broker
       BLOOM_INTEGRATION_SIGNER_BIN: ${{ github.workspace }}/triad-bin/bloom-signer
       BLOOM_INTEGRATION_DEBUG_DRIVER_BIN: ${{ github.workspace }}/triad-bin/bloom-broker-debug-driver
       BLOOM_EVAL_JOBS_DIR: ${{ github.workspace }}/harbor-jobs
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: triad-dev-binaries
           path: triad-bin
       - run: chmod +x triad-bin/*
-      - uses: astral-sh/setup-uv@v7
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
       - name: Install Foundry
-        uses: foundry-rs/foundry-toolchain@v1
+        uses: foundry-rs/foundry-toolchain@dba66c27052e63476d886f22216e119ba7e615bf # v1
         with:
-          version: stable
+          version: v1.7.1
       - name: Install pinned agave v3.0.0 validator
         run: |
           curl -sSL -o /tmp/agave-install.sh https://release.anza.xyz/v3.0.0/install
@@ -151,11 +159,11 @@ jobs:
           done
           XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user show-environment >/dev/null
       - name: Smoke the real Triad without a model
-        run: scripts/evals/run-harbor.sh solana-transfer ${{ matrix.agent }} --smoke
+        run: scripts/evals/run-harbor.sh solana-transfer "$AGENT" --smoke
       # One task at a time, as the baseline procedure requires. A failed
       # trial runs once more; the report keeps the better attempt. Nothing
       # here is fatal, so the report sees every task.
-      - name: Run every task with ${{ matrix.agent }}
+      - name: Run every task with the selected agent
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
@@ -166,21 +174,24 @@ jobs:
           if [ -n "$CODEX_AUTH_JSON" ] && [ -z "$OPENAI_API_KEY" ]; then
             (umask 077 && mkdir -p ~/.codex && printf '%s' "$CODEX_AUTH_JSON" > ~/.codex/auth.json)
           fi
-          case "${{ matrix.agent }}" in
+          case "$AGENT" in
             claude-*) key="${ANTHROPIC_API_KEY}${CLAUDE_CODE_OAUTH_TOKEN}" ;;
             codex) key="${OPENAI_API_KEY}${CODEX_AUTH_JSON}" ;;
             opencode) key="$DEEPSEEK_API_KEY" ;;
           esac
           if [ -z "$key" ]; then
-            echo "::notice::no model key for ${{ matrix.agent }}; smoke only"
+            # The report requires this marker to accept an agent with no trials.
+            mkdir -p "$BLOOM_EVAL_JOBS_DIR/summaries"
+            : > "$BLOOM_EVAL_JOBS_DIR/summaries/$AGENT.no-model-key"
+            echo "::warning::no model key for $AGENT; smoke only, no trials"
             exit 0
           fi
-          for task in solana-transfer hyperliquid-order-proposal polymarket-limit-order-proposal near-intents-swap-proposal polymarket-clarification; do
-            scripts/evals/run-harbor.sh "$task" "${{ matrix.agent }}" ||
-              scripts/evals/run-harbor.sh "$task" "${{ matrix.agent }}" ||
-              echo "::warning::$task with ${{ matrix.agent }} failed twice"
+          for task in $TASKS; do
+            scripts/evals/run-harbor.sh "$task" "$AGENT" ||
+              scripts/evals/run-harbor.sh "$task" "$AGENT" ||
+              echo "::warning::$task with $AGENT failed twice"
           done
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:
           name: trials-${{ matrix.agent }}
@@ -192,12 +203,14 @@ jobs:
     needs: [build, evals]
     if: always() && needs.build.result == 'success'
     runs-on: ubuntu-latest
+    env:
+      TASKS: ${{ env.TASKS }}
     permissions:
       contents: read
       pull-requests: write
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: trials-*
           path: trials
@@ -205,8 +218,10 @@ jobs:
         id: report
         env:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          AGENTS: ${{ join(fromJSON(needs.build.outputs.agents), ',') }}
         run: |
-          python3 scripts/evals/release-report.py evals/harbor/baselines/README.md trials/*/summaries > report.md || echo "failed=true" >> "$GITHUB_OUTPUT"
+          python3 scripts/evals/release-report.py --agents "$AGENTS" --tasks "$TASKS" \
+            evals/harbor/baselines/README.md trials/*/summaries > report.md || echo "failed=true" >> "$GITHUB_OUTPUT"
           cat report.md >> "$GITHUB_STEP_SUMMARY"
       - name: Comment on the pull request
         if: github.event_name == 'pull_request'

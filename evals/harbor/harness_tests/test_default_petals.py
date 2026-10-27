@@ -230,4 +230,3 @@ class ClarificationTests(unittest.TestCase):
         self.assertFalse(
             asks_for_market({"steps": [{"source": "user", "message": "Which market?"}]})
         )
-

@@ -39,20 +39,22 @@ def summary(task, agent, *, smoke=False, passed=True, reward=1, error=None, tria
 
 
 class ReleaseReportTest(unittest.TestCase):
-    def run_report(self, *summaries, trajectory=None):
+    def run_report(self, *summaries, trajectory=None, flags=(), markers=()):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "README.md").write_text(BASELINE)
             (root / "jobs/summaries").mkdir(parents=True)
             for n, s in enumerate(summaries):
                 (root / "jobs/summaries" / f"{n}.json").write_text(json.dumps(s))
+            for agent in markers:
+                (root / "jobs/summaries" / f"{agent}.no-model-key").touch()
             if trajectory:
                 name, steps = trajectory
                 (root / "jobs" / name / "agent").mkdir(parents=True)
                 (root / "jobs" / name / "agent/trajectory.json").write_text(json.dumps({"steps": steps}))
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
-                code = report.main([str(root / "README.md"), str(root / "jobs/summaries")])
+                code = report.main([*flags, str(root / "README.md"), str(root / "jobs/summaries")])
             return code, out.getvalue()
 
     def test_passing_run_leads_with_the_verdict_and_baseline_deltas(self):
@@ -117,6 +119,47 @@ class ReleaseReportTest(unittest.TestCase):
         code, out = self.run_report(summary("solana-transfer", "codex", smoke=True, passed=False))
         self.assertEqual(code, 1)
         self.assertIn("smoke FAILED", out)
+
+    def test_cleanup_failure_with_full_reward_fails(self):
+        s = summary("solana-transfer", "opencode")
+        s["passed"], s["error"] = False, "EvalError: cleanup failed"
+        code, out = self.run_report(s)
+        self.assertEqual(code, 1)
+        self.assertIn("REGRESSION, passed in baseline. failed: EvalError: cleanup failed", out)
+
+    def test_missing_expected_cell_fails(self):
+        flags = ("--agents", "opencode", "--tasks", "solana-transfer polymarket-clarification")
+        code, out = self.run_report(summary("solana-transfer", "opencode", smoke=True), summary("solana-transfer", "opencode"), flags=flags)
+        self.assertEqual(code, 1)
+        self.assertIn("| polymarket-clarification | opencode | – | – | – | – | 0 | MISSING: no summary", out)
+        self.assertIn("- polymarket-clarification with opencode: no summary", out)
+
+    def test_no_model_key_marker_excuses_missing_trials(self):
+        flags = ("--agents", "codex", "--tasks", "solana-transfer")
+        code, out = self.run_report(summary("solana-transfer", "codex", smoke=True), flags=flags, markers=("codex",))
+        self.assertEqual(code, 0)
+        self.assertIn("- **codex**: smoke pass · no trials (no model key)", out)
+
+    def test_expected_agent_without_trials_or_marker_fails(self):
+        flags = ("--agents", "codex", "--tasks", "solana-transfer")
+        code, out = self.run_report(summary("solana-transfer", "codex", smoke=True), flags=flags)
+        self.assertEqual(code, 1)
+        self.assertIn("- solana-transfer with codex: no summary", out)
+
+    def test_missing_smoke_fails(self):
+        code, out = self.run_report(summary("solana-transfer", "codex"), flags=("--agents", "codex", "--tasks", "solana-transfer"))
+        self.assertEqual(code, 1)
+        self.assertIn("- codex: no smoke summary", out)
+
+    def test_workflow_matrix_matches_the_harness(self):
+        from harness.__main__ import AGENTS, DEFINITIONS
+
+        workflow = (SCRIPT.parents[2] / ".github/workflows/release-evals.yml").read_text()
+        tasks_line = next(line for line in workflow.splitlines() if line.startswith("  TASKS:"))
+        self.assertEqual(set(tasks_line.split(":", 1)[1].split()), set(DEFINITIONS))
+        allowlist = next(line for line in workflow.splitlines() if "IN(" in line)
+        for agent in AGENTS:
+            self.assertIn(f'"{agent}"', allowlist)
 
     def test_no_summaries_fails(self):
         self.assertEqual(self.run_report()[0], 1)

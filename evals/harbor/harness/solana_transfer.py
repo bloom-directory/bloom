@@ -209,10 +209,19 @@ class SolanaTransferEval(EvalDefinition):
 
     def cleanup(self) -> None:
         self.stop.set()
+        hung = False
         if self.approver is not None:
             self.approver.join(timeout=60)
-            if self.approver.is_alive():
-                raise EvalError("transfer approver did not stop; preserving its Triad")
-        self.triad.close(preserve=self.failed)
+            hung = self.approver.is_alive()
+        errors = []
+        # Always stop the services; a hung approver preserves the root for inspection.
+        try:
+            self.triad.close(preserve=self.failed or hung)
+        except EvalError as error:
+            errors.append(str(error))
+        if hung:
+            errors.append("transfer approver did not stop; its Triad root is preserved")
         if self.approval_error is not None:
-            raise EvalError(f"transfer approver failed: {self.approval_error}")
+            errors.append(f"transfer approver failed: {self.approval_error}")
+        if errors:
+            raise EvalError("; ".join(errors))
