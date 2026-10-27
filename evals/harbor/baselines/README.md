@@ -1,6 +1,6 @@
 # Default Petal agent baseline
 
-One trial per task and agent on Bloom master 83a94b82 with optimized services, reviewed by hand. Prompts give only the user's facts. The clarification task ran 2026-10-25; the rest ran 2026-10-26. Petals are the pinned releases: Hyperliquid v0.1.7, Polymarket v0.1.6 and NEAR Intents v0.1.4. Input tokens include cached input.
+One trial per task and agent on Bloom master 83a94b82 with optimized services, reviewed by hand. Prompts give only the user's facts. The clarification task ran 2026-10-25; the rest ran 2026-10-26. Petals are the pinned releases: Hyperliquid v0.1.7, Polymarket v0.1.6 and NEAR Intents v0.1.4. Input tokens include cached input. The `claude` rows ran Claude Code on Sonnet 5; that agent is now `claude-opus` (Opus 5.5) and `claude-sonnet` (Sonnet 5.5), neither of which has a baseline row yet, so the release report does not gate them until one is recorded.
 
 | Task | Agent | Reward | Tool calls | Input / cached tokens | Output tokens | Seconds |
 | --- | --- | ---: | ---: | --- | ---: | ---: |

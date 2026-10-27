@@ -77,7 +77,7 @@ def main(argv: list[str]) -> int:
     for (agent, is_trial, task), attempts in sorted(cells.items()):
         s = next((a for a in attempts if passed(a)), attempts[-1])
         ok = passed(s)
-        v = verdicts.setdefault(agent, {"smoke": None, "passed": 0, "tasks": 0, "base": 0, "config": None})
+        v = verdicts.setdefault(agent, {"smoke": None, "passed": 0, "tasks": 0, "base": 0, "baselined": False, "config": None})
         note = ""
         if not is_trial:
             v["smoke"] = ok
@@ -88,6 +88,7 @@ def main(argv: list[str]) -> int:
             v["tasks"] += 1
             v["passed"] += ok
             v["base"] += base.get((task, agent), {}).get("passed", False)
+            v["baselined"] |= (task, agent) in base
             error = s.get("error") or ""
             if AUTH in error:
                 v["config"] = error
@@ -114,7 +115,8 @@ def main(argv: list[str]) -> int:
     for agent, v in verdicts.items():
         smoke = "smoke pass" if v["smoke"] else "smoke FAILED" if v["smoke"] is False else "no smoke"
         line = f"- **{agent}**: {smoke} · " + (
-            f"{v['passed']}/{v['tasks']} tasks (baseline {v['base']}/{v['tasks']})" if v["tasks"] else "no trials (no model key)"
+            f"{v['passed']}/{v['tasks']} tasks ({'baseline ' + str(v['base']) + '/' + str(v['tasks']) if v['baselined'] else 'no baseline'})"
+            if v["tasks"] else "no trials (no model key)"
         )
         if v["config"]:
             line += f" · config error: {v['config']}"

@@ -139,7 +139,7 @@ class ReasoningEffortTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop(REASONING_EFFORT_ENV, None)
             self.assertIsNone(reasoning_effort("codex"))
-            self.assertIsNone(reasoning_effort("claude"))
+            self.assertIsNone(reasoning_effort("claude-opus"))
 
     def test_codex_accepts_known_efforts(self) -> None:
         for effort in ("low", "medium", "high", "xhigh"):
@@ -156,7 +156,7 @@ class ReasoningEffortTests(unittest.TestCase):
             mock.patch.dict(os.environ, {REASONING_EFFORT_ENV: "medium"}),
             self.assertRaisesRegex(EvalError, "only to the codex agent"),
         ):
-            reasoning_effort("claude")
+            reasoning_effort("claude-opus")
 
 
 class TeardownTests(unittest.TestCase):

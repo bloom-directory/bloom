@@ -17,8 +17,8 @@ on:
   workflow_dispatch:
     inputs:
       agents:
-        description: 'Comma-separated agents to run (claude, codex, opencode).'
-        default: 'claude,codex,opencode'
+        description: 'Comma-separated agents to run (claude-opus, claude-sonnet, codex, opencode).'
+        default: 'claude-opus,claude-sonnet,codex,opencode'
   pull_request:
 
 concurrency:
@@ -47,7 +47,7 @@ jobs:
       - name: Select agents
         id: select
         env:
-          AGENTS: ${{ inputs.agents || 'claude,codex,opencode' }}
+          AGENTS: ${{ inputs.agents || 'claude-opus,claude-sonnet,codex,opencode' }}
         run: echo "agents=$(printf '%s' "$AGENTS" | jq -Rc 'split(",") | map(select(length > 0))')" >> "$GITHUB_OUTPUT"
       - name: Read the release matrix pins
         id: pins
@@ -160,7 +160,7 @@ jobs:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
         run: |
           case "${{ matrix.agent }}" in
-            claude) key="${ANTHROPIC_API_KEY}${CLAUDE_CODE_OAUTH_TOKEN}" ;;
+            claude-*) key="${ANTHROPIC_API_KEY}${CLAUDE_CODE_OAUTH_TOKEN}" ;;
             codex) key="$OPENAI_API_KEY" ;;
             opencode) key="$DEEPSEEK_API_KEY" ;;
           esac

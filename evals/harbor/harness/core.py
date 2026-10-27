@@ -37,7 +37,11 @@ AGENTS: dict[str, AgentSpec] = {
     # Model ids are the API's, not the marketing names: "sonnet-5" is rejected
     # with a 404 unrecognized_model, which surfaces as an errored Harbor trial
     # rather than a configuration error.
-    "claude": AgentSpec("claude-code", "claude-sonnet-5"),
+    # Two Claude rows on purpose. Opus is what a paying Claude Code user runs,
+    # so it answers "does Bloom work for the agent people have". Sonnet is the
+    # weaker instrument that exposes missing docs a stronger model reads past.
+    "claude-opus": AgentSpec("claude-code", "claude-opus-5-5"),
+    "claude-sonnet": AgentSpec("claude-code", "claude-sonnet-5-5"),
     "codex": AgentSpec("codex", "gpt-5.6-terra"),
     "opencode": AgentSpec("opencode", "deepseek/deepseek-v4-flash"),
 }
@@ -194,7 +198,7 @@ def _agent_spec(name: str) -> AgentSpec:
             f"unsupported agent {name!r}; choose: {', '.join(AGENTS)}"
         ) from error
 
-    if name == "claude" and not (
+    if spec.harbor_name == "claude-code" and not (
         os.getenv("ANTHROPIC_API_KEY") or os.getenv("CLAUDE_CODE_OAUTH_TOKEN")
     ):
         raise EvalError(
