@@ -4963,16 +4963,14 @@ fn write_triad_signing_state(
     result.map_err(|error| TxEngineError::Outbox(error.into()))
 }
 
+/// Only a refusal the Broker says never to retry is a denial; confirm discards
+/// the staged transaction on a denial. A rate limit, quota, stale baseline or
+/// clock repair is temporary, so the transaction is kept for the next confirm.
 fn protocol_signing_error(error: bloom_broker_api::ProtocolError) -> TxEngineError {
-    match error.code {
-        bloom_broker_api::ProtocolErrorCode::ServiceUnavailable => {
-            TxEngineError::ApprovalServiceUnavailable(format!(
-                "{}: {}",
-                error.code.as_str(),
-                error.message
-            ))
-        }
-        _ => TxEngineError::ApprovalDenied(format!("{}: {}", error.code.as_str(), error.message)),
+    let reason = format!("{}: {}", error.code.as_str(), error.message);
+    match error.code.contract().retry {
+        bloom_broker_api::RetryClass::Never => TxEngineError::ApprovalDenied(reason),
+        _ => TxEngineError::ApprovalServiceUnavailable(reason),
     }
 }
 
@@ -9386,6 +9384,31 @@ mod tests {
                 "{kind:?}"
             );
         }
+    }
+
+    /// Confirm discards the staged transaction on `ApprovalDenied`, so a
+    /// temporary Broker refusal must never be classified as one.
+    #[test]
+    fn temporary_broker_refusals_keep_the_staged_transaction() {
+        use bloom_broker_api::{ProtocolError, ProtocolErrorCode as Code};
+        for code in [
+            Code::CeremonyRateLimited,
+            Code::QuotaExceeded,
+            Code::PolicyBaselineStale,
+            Code::ServiceUnavailable,
+        ] {
+            assert!(
+                matches!(
+                    protocol_signing_error(ProtocolError::new(code, "later")),
+                    TxEngineError::ApprovalServiceUnavailable(_)
+                ),
+                "{code:?}"
+            );
+        }
+        assert!(matches!(
+            protocol_signing_error(ProtocolError::new(Code::LimitExceededValue, "no")),
+            TxEngineError::ApprovalDenied(_)
+        ));
     }
 
     #[test]

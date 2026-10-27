@@ -41,6 +41,7 @@ struct BrokerFixture {
     available: AtomicBool,
     complete: AtomicBool,
     lose_prepare_response_once: AtomicBool,
+    rate_limit_prepare_once: AtomicBool,
     ceremony_state_override: parking_lot::Mutex<Option<CeremonyState>>,
     requests: parking_lot::Mutex<Vec<MachineBrokerRequest>>,
     state: parking_lot::Mutex<FixtureState>,
@@ -167,6 +168,14 @@ impl MachineBrokerService for BrokerFixture {
                     };
                     Ok(MachineBrokerResponse::PolicyRead(snapshot))
                 }
+                MachineBrokerRequest::PolicyValidateUpdate(_)
+                    if self.rate_limit_prepare_once.swap(false, Ordering::SeqCst) =>
+                {
+                    Err(ProtocolError::new(
+                        ProtocolErrorCode::CeremonyRateLimited,
+                        "another ceremony is open for this wallet",
+                    ))
+                }
                 MachineBrokerRequest::PolicyValidateUpdate(request) => {
                     self.state.lock().operation_id = Some(request.operation_id.clone());
                     self.state.lock().proposed_policy =
@@ -292,6 +301,7 @@ fn broker_fixture(lose_prepare_response_once: bool) -> Arc<BrokerFixture> {
         available: AtomicBool::new(true),
         complete: AtomicBool::new(false),
         lose_prepare_response_once: AtomicBool::new(lose_prepare_response_once),
+        rate_limit_prepare_once: AtomicBool::new(false),
         ceremony_state_override: parking_lot::Mutex::new(None),
         requests: parking_lot::Mutex::new(Vec::new()),
         state: parking_lot::Mutex::new(FixtureState {
@@ -487,6 +497,60 @@ async fn vfs_policy_prepare_response_loss_reconciles_the_persisted_operation_id(
             MachineBrokerRequest::PolicyValidateUpdate(_)
         ]
     ));
+}
+
+/// A rate-limited prepare opened no ceremony, so nothing may stay pending:
+/// a pending row with no ceremony could not be cancelled and would block
+/// every later policy write.
+#[tokio::test]
+async fn vfs_policy_rate_limited_prepare_leaves_nothing_pending() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = broker_fixture(false);
+    fixture
+        .rate_limit_prepare_once
+        .store(true, Ordering::SeqCst);
+    let service: Arc<dyn MachineBrokerService> = fixture.clone();
+    let home = HomeDir::at(temp.path().join("home"));
+    let handler = WalletsHandler::new(
+        bloom_evm::ChainRegistry::default(),
+        TxEngine::new(Outbox::new(temp.path().join("outbox")).unwrap(), 60_000),
+        AddressBook::default(),
+        projection_reader(
+            temp.path().join("cache/rate-limit-wallets.json"),
+            Some(MachineBrokerClient::new(service.clone())),
+        ),
+        temp.path().join("machine-policy-projections"),
+    )
+    .with_broker(Some(MachineBrokerClient::new(service)))
+    .with_home_write_permit(Arc::new(HomeWritePermit::acquire(&home).unwrap()));
+    let write_path = VfsPath::parse("alice/policy.json").unwrap();
+    let proposed = serde_json::to_vec_pretty(&policy(120_000)).unwrap();
+    let updates = temp
+        .path()
+        .join("machine-policy-projections/alice/policy-updates");
+
+    let refused = handler.write(&write_path, &proposed).await.unwrap_err();
+    assert!(
+        matches!(refused, HandlerError::Backend(ref message) if message.contains("CEREMONY_RATE_LIMITED")),
+        "{refused:?}"
+    );
+    assert_eq!(
+        std::fs::read_dir(updates.join("pending")).unwrap().count(),
+        0
+    );
+    assert_eq!(
+        std::fs::read_dir(updates.join("failed")).unwrap().count(),
+        1
+    );
+
+    assert!(matches!(
+        handler.write(&write_path, &proposed).await,
+        Err(HandlerError::PermissionDenied)
+    ));
+    assert_eq!(
+        std::fs::read_dir(updates.join("pending")).unwrap().count(),
+        1
+    );
 }
 
 #[tokio::test]

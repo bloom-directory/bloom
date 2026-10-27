@@ -2109,7 +2109,7 @@ impl WalletsHandler {
             let prepared = broker
                 .validate_policy_update(projection.request(proposed_bytes))
                 .await
-                .map_err(|error| HandlerError::backend(error.to_string()))?;
+                .map_err(|error| self.policy_prepare_refused(wallet, operation_id, error))?;
             projection.adopt_prepare(prepared)?;
             write_atomic_json(&projection_path, &projection)?;
             return Err(HandlerError::PermissionDenied);
@@ -2347,7 +2347,7 @@ impl WalletsHandler {
         let prepared = broker
             .validate_policy_update(projection.request(&proposed_bytes))
             .await
-            .map_err(|error| HandlerError::backend(error.to_string()))?;
+            .map_err(|error| self.policy_prepare_refused(wallet, operation_id.as_str(), error))?;
         projection.adopt_prepare(prepared)?;
         write_atomic_json(&projection_path, &projection)?;
         Err(HandlerError::PermissionDenied)
@@ -2426,6 +2426,27 @@ impl WalletsHandler {
     /// failure is logged but never overrides an already-decided install/error
     /// outcome. In production the Broker/Signer receipt is authoritative and
     /// this move changes only Machine's workflow projection.
+    /// A rate limit or quota refusal means the Broker opened no ceremony, so
+    /// the pending proposal has nothing to approve or cancel. Left in
+    /// `pending/` it would block every later policy write; move it to
+    /// `failed/` and return the Broker's reason.
+    fn policy_prepare_refused(
+        &self,
+        wallet: &str,
+        operation_id: &str,
+        error: bloom_broker_api::ProtocolError,
+    ) -> HandlerError {
+        if matches!(
+            error.code,
+            ProtocolErrorCode::CeremonyRateLimited | ProtocolErrorCode::QuotaExceeded
+        ) && let Err(io) =
+            self.policy_update_transition(wallet, operation_id, "pending", "failed")
+        {
+            return HandlerError::from(io);
+        }
+        HandlerError::backend(error.to_string())
+    }
+
     fn policy_update_transition(
         &self,
         wallet: &str,
