@@ -120,7 +120,13 @@ impl PetalHost for VenueFixture {
             assert!(header("POLY_ADDRESS") == format!("{owner:#x}"));
             assert!(header("POLY_NONCE") == "0");
             assert!(header("POLY_TIMESTAMP") == self.timestamp.load(Ordering::SeqCst).to_string());
-            assert!(header("POLY_SIGNATURE") == format!("0x{}", hex::encode(&signatures[0])));
+            // The Petal sends the signature as Polymarket's clients do, with
+            // the recovery byte as 27 or 28.
+            let mut sent = signatures[0].clone();
+            if sent[64] < 27 {
+                sent[64] += 27;
+            }
+            assert!(header("POLY_SIGNATURE") == format!("0x{}", hex::encode(&sent)));
             self.auth_posts.fetch_add(1, Ordering::SeqCst);
             include_bytes!("../../tests/fixtures/polymarket-credentials.json").to_vec()
         } else if request
