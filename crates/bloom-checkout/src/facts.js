@@ -106,7 +106,11 @@
     return amounts[0];
   };
   const visible = e => e.getClientRects().length && getComputedStyle(e).visibility === 'visible';
-  const text = document.body.innerText;
+  // YouTube prints "$8.99\u200b/month": a zero-width space between the amount
+  // and its period. These characters are invisible to the reader, carry no
+  // meaning, and are not whitespace to a regular expression, so they come
+  // out before anything is matched against the page.
+  const text = document.body.innerText.replace(/[\u00ad\u200b-\u200d\u2060\ufeff]/g, '');
   const controls = [...document.querySelectorAll('button,input[type=submit],input[type=button],a,[role=button]')].filter(visible);
   // The one final payment button, in the main checkout languages (observed on
   // Shopify de/fr/es/pt/it/en checkouts, common shop systems, and Booking.com,
