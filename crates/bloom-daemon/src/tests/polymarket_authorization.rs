@@ -586,7 +586,9 @@ async fn installed_account_one_auth_and_exact_continuation_use_real_authority() 
         let mut claim: bloom_broker_api::PetalUseClaim =
             serde_json::from_slice(&changed.petal_use_claim_jcs).unwrap();
         if mutation == "class" {
-            changed.operation_class = "polymarket.unauthorized.v1".into();
+            // A reviewed Polymarket class passes the signed-message batch
+            // gate, so only the installer's per-route authorization refuses it.
+            changed.operation_class = "polymarket.order.poly1271".into();
             claim.operation_class = Token::new(&changed.operation_class).unwrap();
         } else {
             changed.context.as_mut().unwrap().route_id = "unenrolled-route".into();
