@@ -66,12 +66,16 @@ whether an earlier operation completed or whether retrying a write is safe.
   possibly submitted transaction, reconcile by its recorded hash or signature;
   never blindly restage or rebroadcast.
 
-Petal HTTP policy denials report only method and host; request URL userinfo,
-paths and queries are omitted because they can contain credentials. Rules
-match host, method and path, so when the reported method and host match a
-`[[net.allow]]` rule, the denied part is the request path. HTTP transport errors
-report their phase and underlying cause (DNS, connect, TLS, timeout) with the
-request URL removed.
+Petal HTTP errors never include URL userinfo, paths or queries, because they
+can contain credentials. A policy denial is one of:
+
+- `net.fetch requires https`;
+- `net.fetch disallows non-default https port <port>`;
+- `<METHOD> <host>: <host|method|path> not allowed by package network policy`,
+  naming the part of the request no `[[net.allow]]` rule permits.
+
+Transport errors read `http_fetch <send|body>: <METHOD> <host>: <cause>`, where
+the cause is the underlying DNS, connect, TLS or timeout error.
 
 If you write to a control file and then cannot find what you wrote, check
 whether the transfer moved to `sent/` or `failed/` before assuming the write
