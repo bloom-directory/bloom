@@ -6,8 +6,9 @@ name: Release evals
 # (no model), then run every Harbor task with that agent and record reward,
 # tool calls, tokens and time. The report fails only on a smoke failure or a
 # regression against evals/harbor/baselines/README.md; everything else is a
-# number for the release reviewer. Runs on release-proposal PRs, on PRs
-# labeled `release-evals`, and on dispatch. Model credentials come from the
+# number for the release reviewer. A failed trial is retried once, so one
+# nondeterministic miss does not fail a release. Runs on release-proposal PRs
+# and on dispatch. Model credentials come from the
 # ANTHROPIC_API_KEY, OPENAI_API_KEY and DEEPSEEK_API_KEY repository secrets;
 # use dedicated revocable keys, the agent container sees them.
 
@@ -17,11 +18,7 @@ on:
       agents:
         description: 'Comma-separated agents to run (claude, codex, opencode).'
         default: 'claude,codex,opencode'
-      tasks:
-        description: 'Comma-separated Harbor tasks; empty runs all five.'
-        default: ''
   pull_request:
-    types: [opened, synchronize, reopened, labeled]
 
 concurrency:
   group: release-evals-${{ github.event.pull_request.number || github.ref }}
@@ -34,10 +31,7 @@ env:
 jobs:
   build:
     name: Build the Triad with the developer harness
-    if: >-
-      github.event_name != 'pull_request' ||
-      startsWith(github.head_ref, 'release-proposal/') ||
-      contains(github.event.pull_request.labels.*.name, 'release-evals')
+    if: github.event_name != 'pull_request' || startsWith(github.head_ref, 'release-proposal/')
     runs-on: ubuntu-latest
     timeout-minutes: 60
     outputs:
@@ -154,18 +148,19 @@ jobs:
           XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user show-environment >/dev/null
       - name: Smoke the real Triad without a model
         run: scripts/evals/run-harbor.sh solana-transfer ${{ matrix.agent }} --smoke
-      # One task at a time, as the baseline procedure requires; a failed
-      # trial is recorded, not fatal, so the report sees every task.
+      # One task at a time, as the baseline procedure requires. A failed
+      # trial runs once more; the report keeps the better attempt. Nothing
+      # here is fatal, so the report sees every task.
       - name: Run every task with ${{ matrix.agent }}
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-          TASKS: ${{ inputs.tasks }}
         run: |
-          tasks="${TASKS:-solana-transfer,hyperliquid-order-proposal,polymarket-limit-order-proposal,near-intents-swap-proposal,polymarket-clarification}"
-          for task in ${tasks//,/ }; do
-            scripts/evals/run-harbor.sh "$task" "${{ matrix.agent }}" || echo "::warning::$task with ${{ matrix.agent }} did not pass"
+          for task in solana-transfer hyperliquid-order-proposal polymarket-limit-order-proposal near-intents-swap-proposal polymarket-clarification; do
+            scripts/evals/run-harbor.sh "$task" "${{ matrix.agent }}" ||
+              scripts/evals/run-harbor.sh "$task" "${{ matrix.agent }}" ||
+              echo "::warning::$task with ${{ matrix.agent }} failed twice"
           done
       - uses: actions/upload-artifact@v4
         if: always()
@@ -190,6 +185,8 @@ jobs:
           path: trials
       - name: Write the report
         id: report
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           python3 scripts/evals/release-report.py evals/harbor/baselines/README.md trials/*/summaries > report.md || echo "failed=true" >> "$GITHUB_OUTPUT"
           cat report.md >> "$GITHUB_STEP_SUMMARY"

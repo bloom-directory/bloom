@@ -127,8 +127,9 @@ scripts/evals/run-harbor.sh solana-transfer codex --smoke      # real services, 
 The `Release evals` workflow (`.github/workflows/release-evals.yml`) runs the
 whole thing before a release: it builds the Machine from the ref with the
 Broker and Signer the release matrix pins, smokes them, then runs every task
-with every agent and reports reward, tool calls, tokens and time. It fails
-only on a smoke failure or a regression against the baseline. It runs on
-`release-proposal/*` PRs, on PRs labeled `release-evals`, and by dispatch.
+with every agent and reports reward, tool calls, tokens and time against the
+baseline. A failed trial runs once more. It fails only on a smoke failure, an
+agent that cannot authenticate, or a regression against the baseline. It
+runs on `release-proposal/*` PRs and by dispatch.
 Model keys are the `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` and `DEEPSEEK_API_KEY`
 repository secrets; the agent container sees them, so use dedicated keys.

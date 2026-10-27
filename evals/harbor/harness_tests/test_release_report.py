@@ -1,4 +1,4 @@
-"""The release report fails only on smoke failures and baseline regressions."""
+"""The release report fails only on smoke failures, auth errors and regressions."""
 
 from __future__ import annotations
 
@@ -15,56 +15,98 @@ SPEC = importlib.util.spec_from_file_location("release_report", SCRIPT)
 report = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(report)
 
-BASELINE = "| Task | Agent | Reward |\n| --- | --- | ---: |\n| solana-transfer | opencode | 1 |\n| solana-transfer | codex | 0 |\n"
+BASELINE = (
+    "| Task | Agent | Reward | Tool calls | Input / cached tokens | Output tokens | Seconds |\n"
+    "| --- | --- | ---: | ---: | --- | ---: | ---: |\n"
+    "| solana-transfer | opencode | 1 | 19 | 486,150 / 463,104 | 2,681 | 110 |\n"
+    "| solana-transfer | codex | 0 | 6 | 157,247 / 135,424 | 1,594 | 78 |\n"
+)
 
 
-def summary(task, agent, *, smoke=False, passed=True, reward=1):
+def summary(task, agent, *, smoke=False, passed=True, reward=1, error=None, trial=None):
     return {
         "task": task,
         "agent": agent,
         "run_kind": "deterministic-smoke" if smoke else "Harbor-agent-trial",
         "passed": passed,
-        "error": None if passed else "EvalError: boom",
+        "error": error if error else None if passed else "EvalError: boom",
         "rewards": {} if smoke else {"reward": reward},
         "usage": None if smoke else {"n_input_tokens": 1200, "n_cache_tokens": 1000, "n_output_tokens": 30},
-        "tool_calls": None if smoke else 7,
+        "tool_calls": None if smoke else 17,
         "timings": {"total_seconds": 12.5},
+        "trial_uri": f"file:///runner/harbor-jobs/{trial}" if trial else None,
     }
 
 
 class ReleaseReportTest(unittest.TestCase):
-    def run_report(self, *summaries):
+    def run_report(self, *summaries, trajectory=None):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "README.md").write_text(BASELINE)
-            (root / "s").mkdir()
+            (root / "jobs/summaries").mkdir(parents=True)
             for n, s in enumerate(summaries):
-                (root / "s" / f"{n}.json").write_text(json.dumps(s))
+                (root / "jobs/summaries" / f"{n}.json").write_text(json.dumps(s))
+            if trajectory:
+                name, steps = trajectory
+                (root / "jobs" / name / "agent").mkdir(parents=True)
+                (root / "jobs" / name / "agent/trajectory.json").write_text(json.dumps({"steps": steps}))
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
-                code = report.main([str(root / "README.md"), str(root / "s")])
+                code = report.main([str(root / "README.md"), str(root / "jobs/summaries")])
             return code, out.getvalue()
 
-    def test_passing_run_is_a_table(self):
+    def test_passing_run_leads_with_the_verdict_and_baseline_deltas(self):
         code, out = self.run_report(summary("solana-transfer", "opencode", smoke=True), summary("solana-transfer", "opencode"))
         self.assertEqual(code, 0)
+        self.assertIn("- **opencode**: smoke pass · 1/1 tasks (baseline 1/1)", out)
         self.assertIn("| solana-transfer | opencode | pass |", out)
-        self.assertIn("| solana-transfer | opencode | 1 | 7 | 1,200 / 1,000 | 30 | 12 |", out)
+        self.assertIn("| solana-transfer | opencode | 1 | 17 (19) | 1,200 / 1,000 | 30 | 12 (110) |", out)
+        self.assertNotIn("Failed", out)
 
-    def test_regression_fails(self):
-        code, out = self.run_report(summary("solana-transfer", "opencode", passed=False, reward=0))
+    def test_regression_fails_and_quotes_the_agent(self):
+        code, out = self.run_report(
+            summary("solana-transfer", "opencode", passed=False, reward=0, trial="t1"),
+            trajectory=("t1", [{"source": "user", "message": "do it"}, {"source": "agent", "message": "I could  not find\nthe funds | sorry"}]),
+        )
         self.assertEqual(code, 1)
         self.assertIn("REGRESSION", out)
+        self.assertIn("Agent: “I could not find the funds \\| sorry”", out)
+        self.assertIn("- solana-transfer with opencode passed in the baseline and failed now", out)
+
+    def test_retry_keeps_the_passing_attempt(self):
+        code, out = self.run_report(
+            summary("solana-transfer", "opencode", passed=False, reward=0),
+            summary("solana-transfer", "opencode"),
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("passed on retry", out)
+        self.assertNotIn("REGRESSION", out)
+
+    def test_two_failures_is_one_regression(self):
+        code, out = self.run_report(
+            summary("solana-transfer", "opencode", passed=False, reward=0),
+            summary("solana-transfer", "opencode", passed=False, reward=0),
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("REGRESSION, passed in baseline. failed twice", out)
+        self.assertEqual(out.count("passed in the baseline and failed now"), 1)
 
     def test_baseline_failure_is_not_a_regression(self):
         code, out = self.run_report(summary("solana-transfer", "codex", passed=False, reward=0))
         self.assertEqual(code, 0)
         self.assertNotIn("REGRESSION", out)
+        self.assertIn("- **codex**: no smoke · 0/1 tasks (baseline 0/1)", out)
+
+    def test_auth_error_is_a_config_error_not_a_regression(self):
+        code, out = self.run_report(summary("solana-transfer", "opencode", passed=False, reward=None, error="EvalError: Codex auth is missing"))
+        self.assertEqual(code, 1)
+        self.assertNotIn("REGRESSION", out)
+        self.assertIn("config error: EvalError: Codex auth is missing", out)
 
     def test_smoke_failure_fails(self):
         code, out = self.run_report(summary("solana-transfer", "codex", smoke=True, passed=False))
         self.assertEqual(code, 1)
-        self.assertIn("smoke failed", out)
+        self.assertIn("smoke FAILED", out)
 
     def test_no_summaries_fails(self):
         self.assertEqual(self.run_report()[0], 1)
