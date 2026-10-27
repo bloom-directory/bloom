@@ -2319,7 +2319,10 @@ impl ExactPayloadSignRequest {
                 || bloom_broker_api::POLYMARKET_REVIEW_OPERATION_CLASSES
                     .contains(&claim.operation_class.as_str())
         });
-        if (message_required || is_signed_message(self.crypto_suite, &self.preimage))
+        // Machine builds System messages (x402, MPP) itself, so no Petal can
+        // label them; Broker reviews message envelopes for Petal subjects only.
+        let system = matches!(self.provenance, ProvenanceSubject::System { .. });
+        if (message_required || (!system && is_signed_message(self.crypto_suite, &self.preimage)))
             && self.message_review_payload.is_none()
             && !safe_operation
         {
@@ -4327,6 +4330,22 @@ mod tests {
             request.validate(false).unwrap();
         }
         assert!(exact_request(vec![0x19, 0x01], None).validate().is_err());
+    }
+
+    #[test]
+    fn system_signed_message_needs_no_envelope_and_cannot_carry_one() {
+        let mut request = exact_request(vec![0x19, 0x01], None);
+        request.provenance = ProvenanceSubject::System {
+            component_id: token("bloom-machine"),
+            operation_class: token("paid-http.x402"),
+        };
+        request.validate().unwrap();
+        // Broker refuses message envelopes on non-Petal subjects.
+        request.message_review_payload = Some(br#"{"schema":"bloom.message.review.v1"}"#.to_vec());
+        assert_eq!(
+            request.validate().unwrap_err().code,
+            ProtocolErrorCode::ClaimInvalid
+        );
     }
 
     /// The batch path refused the Safe class; the reusable single-payload
