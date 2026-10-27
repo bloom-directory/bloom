@@ -403,3 +403,99 @@ jobs:
       - name: Show sccache stats
         if: always()
         run: sccache --show-stats
+
+  # The one real-service gate: the Machine from this checkout, with the Broker
+  # and Signer the release matrix pins, enrolls a wallet, stages a Solana
+  # transfer, holds it for approval and settles it on a local validator. The
+  # Harbor smoke drives it with no model, no Docker and no venue.
+  real_triad_smoke:
+    name: real-triad Solana smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          path: bloom
+      - name: Read the release matrix pins
+        id: pins
+        working-directory: bloom
+        run: |
+          matrix=packaging/triad/release/compatibility-v1.toml
+          broker="$(sed -n -E 's/^broker_commit = "([0-9a-f]{40})"$/\1/p' "$matrix")"
+          signer="$(sed -n -E 's/^signer_commit = "([0-9a-f]{40})"$/\1/p' "$matrix")"
+          [[ -n "$broker" && -n "$signer" ]] || { echo "::error::$matrix must pin full Broker and Signer commits"; exit 1; }
+          echo "broker=$broker" >> "$GITHUB_OUTPUT"
+          echo "signer=$signer" >> "$GITHUB_OUTPUT"
+      - name: Check out the pinned Broker
+        uses: actions/checkout@v6
+        with:
+          repository: bloom-directory/bloom-broker
+          ref: ${{ steps.pins.outputs.broker }}
+          path: bloom-broker
+      - name: Check out the pinned Signer
+        uses: actions/checkout@v6
+        with:
+          repository: bloom-directory/bloom-signer
+          ref: ${{ steps.pins.outputs.signer }}
+          path: bloom-signer
+      - name: Install Rust toolchain
+        working-directory: bloom
+        run: rustup show
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            bloom
+            bloom-broker
+            bloom-signer
+          cache-targets: false
+      - uses: astral-sh/setup-uv@v7
+      - name: Install pinned agave v3.0.0 validator
+        run: |
+          curl -sSL -o /tmp/agave-install.sh https://release.anza.xyz/v3.0.0/install
+          echo "7d588d188cb9ea550434cabc62a9927cf75de22e1aeb2a87f2352071812944fb  /tmp/agave-install.sh" | sha256sum -c -
+          sh /tmp/agave-install.sh v3.0.0
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+      # The developer launcher runs the services as systemd user units and
+      # mounts the Machine over loopback NFS with a noninteractive sudo rule;
+      # the runner's unrestricted sudo satisfies that rule.
+      - name: Install the launcher's Linux prerequisites
+        run: |
+          sudo apt-get update && sudo apt-get install -y nfs-common
+          sudo loginctl enable-linger "$(id -un)"
+          for _ in $(seq 1 30); do
+            [ -S "/run/user/$(id -u)/bus" ] && break
+            sleep 1
+          done
+          XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user show-environment >/dev/null
+      - name: Build the three services with the developer harness
+        run: |
+          (cd bloom && cargo build --release --locked -p bloom --features triad-dev-harness)
+          (cd bloom-broker && cargo build --release --locked -p bloom-broker -p bloom-broker-debug-driver --features bloom-broker/triad-dev-harness)
+          (cd bloom-signer && cargo build --release --locked -p bloom-signer --features triad-dev-harness)
+      - name: Run the Solana transfer smoke against the real Triad
+        working-directory: bloom
+        env:
+          BLOOM_INTEGRATION_MACHINE_BIN: ${{ github.workspace }}/bloom/target/release/bloom
+          BLOOM_INTEGRATION_BROKER_BIN: ${{ github.workspace }}/bloom-broker/target/release/bloom-broker
+          BLOOM_INTEGRATION_SIGNER_BIN: ${{ github.workspace }}/bloom-signer/target/release/bloom-signer
+          BLOOM_INTEGRATION_DEBUG_DRIVER_BIN: ${{ github.workspace }}/bloom-broker/target/release/bloom-broker-debug-driver
+          BLOOM_EVAL_JOBS_DIR: ${{ runner.temp }}/harbor-jobs
+        run: scripts/evals/run-harbor.sh solana-transfer codex --smoke
+      - name: Upload the smoke summary and service logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: real-triad-smoke
+          path: |
+            ${{ runner.temp }}/harbor-jobs/summaries
+            ~/.cache/bloom-harbor/**/*.log
+          if-no-files-found: ignore
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats

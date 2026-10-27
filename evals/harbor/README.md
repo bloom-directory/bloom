@@ -117,3 +117,7 @@ the next pair. A 0 or a timeout is a failure.
 scripts/test-harbor-evals.sh                                   # static checks
 scripts/evals/run-harbor.sh solana-transfer codex --smoke      # real services, no LLM
 ```
+
+CI runs the Solana smoke on every push as `real-triad Solana smoke`
+(`.github/workflows/ci.yml`): the Machine from the checkout with the Broker
+and Signer the release matrix pins.
