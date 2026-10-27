@@ -9,4 +9,9 @@ ignore = [
   { id = "RUSTSEC-2025-0141", reason = "bincode 1 is unmaintained, no known vulnerability; required by solana-instruction" },
   { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained, no known vulnerability; compile-time macro only" },
   { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2 is unmaintained, no known vulnerability; compile-time macro only" },
+  # Unmaintained crates reached only through heimdall-rs, behind the optional
+  # `bytecode-decompile` feature that release builds do not enable.
+  { id = "RUSTSEC-2025-0012", reason = "backoff unmaintained; heimdall-only (bytecode-decompile feature)" },
+  { id = "RUSTSEC-2024-0384", reason = "instant unmaintained; heimdall-only (bytecode-decompile feature)" },
+  { id = "RUSTSEC-2025-0119", reason = "number_prefix unmaintained; heimdall-only (bytecode-decompile feature)" },
 ]
