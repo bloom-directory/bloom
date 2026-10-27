@@ -1982,6 +1982,17 @@ pub(crate) mod tests {
                 ][..],
                 Some((1299, "month", None)),
             ),
+            // YouTube Premium's own markup, read on 2026-10-26: a zero-width
+            // space sits between the amount and its period.
+            (
+                "en-US",
+                &[
+                    "Premium subscription",
+                    "Total USD 1.00",
+                    "then $15.99\u{200b}/month",
+                ][..],
+                Some((1599, "month", None)),
+            ),
             // Full price from the start: the period is still worth stating.
             (
                 "en",
