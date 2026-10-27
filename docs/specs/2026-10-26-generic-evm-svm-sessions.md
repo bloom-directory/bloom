@@ -411,7 +411,7 @@ Usage is USD 152, leaving USD 48 for that rolling window. Later incoming proceed
 ## 14. Implementation and release gates
 
 The implementation candidate selects Machine–Broker API 1.10 at Broker
-`b4fef97dd1ebbf18c42d0cdda36a7b1681e9bd83` and structural Broker–Signer API 1.8
+`3157b1f25876905b54a70ee6cdf678db60daa088` and structural Broker–Signer API 1.8
 at Signer `70a698fb0b122394070c6c2089422fc1461c159f`. These are PR candidate
 pins, not a claim of deployed service or published compatible Petal artifacts.
 

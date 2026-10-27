@@ -1069,6 +1069,7 @@ struct LegacyMigrationLaunch {
 #[derive(Clone)]
 struct DaemonMachineCommands {
     home: HomeDir,
+    endpoint: ResolvedEndpoint,
     daemon: Daemon,
 }
 
@@ -1157,7 +1158,36 @@ impl MachineCommandService for DaemonMachineCommands {
                 }
                 MachineCommandEventClass::Read => {}
             }
-            let result = execute_machine_command(&self.home, &self.daemon, command).await;
+            let continue_wallet = match &command {
+                MachineCommand::WalletCustody {
+                    name,
+                    kind: MachineCustodyKind::New,
+                    ..
+                } if !browser_setup_choices_saved(&self.home)
+                    .map_err(machine_error_from_anyhow)? =>
+                {
+                    Some(name.clone())
+                }
+                _ => None,
+            };
+            let mut result = execute_machine_command(&self.home, &self.daemon, command).await;
+            if let (Some(wallet), Ok(output)) = (continue_wallet, &mut result)
+                && output.exit_code == 0
+                && browser_onboarding::attach_wallet_continue(
+                    self.home.clone(),
+                    self.endpoint.clone(),
+                    wallet,
+                    &mut output.stdout,
+                )
+                .await
+                .is_err()
+            {
+                // Creation already succeeded. A UI-link failure must not invite
+                // the caller to repeat the wallet registration operation.
+                output
+                    .stderr
+                    .push_str("Continue setup with `bloom onboard`.\n");
+            }
             match class {
                 MachineCommandEventClass::DurableMutation => {
                     emit_machine_mutation_rejection_if_needed(
@@ -5029,6 +5059,7 @@ async fn run(cli: Cli) -> Result<()> {
                 )
                 .with_machine_commands(Arc::new(DaemonMachineCommands {
                     home: home.clone(),
+                    endpoint: endpoint.clone(),
                     daemon: d.clone(),
                 }));
             let provisioning_context = server.petal_operation_context();

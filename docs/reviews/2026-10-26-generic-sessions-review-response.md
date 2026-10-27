@@ -61,7 +61,7 @@ part of integration. Publishing/adopting the new immutable Polymarket artifact,
 physical-passkey rehearsal and installed Linux/macOS conformance remain release
 steps. The currently pinned old package is deliberately not relabeled effects-v1.
 
-Candidate integration pins: Broker `b4fef97dd1ebbf18c42d0cdda36a7b1681e9bd83`
+Candidate integration pins: Broker `3157b1f25876905b54a70ee6cdf678db60daa088`
 (API 1.10), Signer `70a698fb0b122394070c6c2089422fc1461c159f` (API 1.8).
 Machine Cargo, lockfile, compatibility matrix and conformance workflows select
 these exact commits. Existing ordinary Petal SDK opaque claim transport is
@@ -74,10 +74,23 @@ retain their existing installer-certified System owner-approval path; the
 Petal-only review envelope requirement still applies to arbitrary Petal
 messages. Neither change makes opaque System signing eligible for USD sessions.
 
-At the candidate pins above, `cargo test --workspace --locked` passed 2,106
-checks with 13 documented service/artifact-dependent ignores, including all 69
-release metadata/authority checks. The final Machine client suite covers 93
-cases, including durable pool stop identity, absence-checked native fallback,
-and two unrelated EVM/SVM Petals through the public host signing adapter.
-These fixtures do not replace physical-passkey or installed principal-isolation
-conformance before release.
+Earlier candidate validation recorded 2,106 workspace checks with 13
+service/artifact-dependent ignores, including 69 release metadata/authority
+checks and 93 Machine client cases. That historical run predates the subsequent
+local integration fixes; it is not a full-workspace rerun at the pins above.
+
+Local wallet creation now offers **Continue setup** when persona preferences
+have not been saved. Machine starts the existing expiring loopback bridge and
+carries its connection in the registration URL fragment. The wallet page keeps
+it in tab-scoped storage; Broker and Signer receive no new authority or API.
+The picker preselects the created wallet and retains its existing authenticated
+wallet-discovery and approval checks. Hosted ceremony links are unchanged.
+
+The continuation change passed all 136 Machine CLI tests (2 ignores), including
+a live origin-bound bridge regression, Broker's wallet-button and wizard Node
+regressions, the focused release compatibility check, and both service builds.
+Strict Machine Clippy encounters the pre-existing `result_large_err` warning
+on `require_existing_wallet`; with that one lint allowed, it passes. Git fixture
+checks ran with signing/editor settings overridden only for the test process.
+These checks do not replace physical-passkey walkthrough or installed
+principal-isolation conformance before release.

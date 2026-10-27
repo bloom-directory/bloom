@@ -102,6 +102,56 @@ pub(super) async fn run(home: HomeDir, endpoint: ResolvedEndpoint, no_open: bool
     if !no_open && let Err(error) = open_browser(&url) {
         eprintln!("Could not open the browser: {error}. Open the local URL above.");
     }
+    serve(listener, state, base).await
+}
+
+/// The authenticated Machine registration response carries this connection only
+/// in the browser fragment. Broker and Signer never receive the capability.
+pub(super) async fn attach_wallet_continue(
+    home: HomeDir,
+    endpoint: ResolvedEndpoint,
+    wallet: String,
+    output: &mut String,
+) -> Result<()> {
+    let Some(raw) = output
+        .lines()
+        .find_map(|line| line.strip_prefix("ceremony_url: "))
+    else {
+        return Ok(());
+    };
+    let mut ceremony = url::Url::parse(raw)?;
+    // Hosted ceremonies cannot reach this host's loopback onboarding bridge.
+    if ceremony.scheme() != "http"
+        || ceremony.host_str() != Some("localhost")
+        || ceremony.port().is_none()
+        || ceremony.fragment().is_some()
+        || ceremony.query().is_some()
+    {
+        return Ok(());
+    }
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
+    let mut secret = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut secret);
+    let base = format!("/onboarding/{}/", hex::encode(secret));
+    let mut state = app_state(home, endpoint, listener.local_addr()?.to_string());
+    let initial = Arc::get_mut(&mut state).expect("new onboarding state");
+    initial.broker_origin = ceremony.origin().ascii_serialization();
+    *initial.selected_wallet.get_mut() = Some(wallet);
+    let bridge = format!("{}{base}", state.origin);
+    let fragment = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("setup", &bridge)
+        .finish();
+    ceremony.set_fragment(Some(&fragment));
+    *output = output.replacen(raw, ceremony.as_str(), 1);
+    tokio::spawn(async move {
+        if serve(listener, state, base).await.is_err() {
+            tracing::warn!("wallet onboarding connection stopped unexpectedly");
+        }
+    });
+    Ok(())
+}
+
+async fn serve(listener: tokio::net::TcpListener, state: App, base: String) -> Result<()> {
     let shutdown_state = state.clone();
     axum::serve(listener, router(state, &base))
         .with_graceful_shutdown(async move {
@@ -666,6 +716,59 @@ mod tests {
         stream.read_to_string(&mut response).await.unwrap();
         response
     }
+    #[tokio::test]
+    async fn wallet_continue_uses_a_fragment_and_a_live_origin_bound_bridge() {
+        let home = tempfile::tempdir().unwrap();
+        let token = "A".repeat(43);
+        let original = format!("ceremony_url: http://localhost:28744/ceremony/{token}\n");
+        let mut output = original.clone();
+        attach_wallet_continue(
+            HomeDir::at(home.path()),
+            ResolvedEndpoint::explicit_socket(home.path().join("absent.sock")),
+            "new-wallet".into(),
+            &mut output,
+        )
+        .await
+        .unwrap();
+        let url = url::Url::parse(output.trim().strip_prefix("ceremony_url: ").unwrap()).unwrap();
+        assert_eq!(url.path(), format!("/ceremony/{token}"));
+        assert!(url.query().is_none());
+        let params =
+            url::form_urlencoded::parse(url.fragment().unwrap().as_bytes()).collect::<Vec<_>>();
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0].0, "setup");
+        let bridge = url::Url::parse(&params[0].1).unwrap();
+        assert_eq!(bridge.host_str(), Some("127.0.0.1"));
+        assert_eq!(bridge.path().len(), "/onboarding/".len() + 64 + 1);
+        let address = format!("127.0.0.1:{}", bridge.port().unwrap());
+        for (origin, expected) in [
+            ("http://localhost:28744", "HTTP/1.1 200"),
+            ("https://attacker.example", "HTTP/1.1 403"),
+        ] {
+            let mut stream = tokio::net::TcpStream::connect(&address).await.unwrap();
+            stream.write_all(format!("GET {}api/state HTTP/1.1\r\nHost: {address}\r\nOrigin: {origin}\r\nConnection: close\r\n\r\n", bridge.path()).as_bytes()).await.unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).await.unwrap();
+            assert!(response.starts_with(expected), "unexpected bridge response");
+        }
+        // GET only observes; neither a home config nor custody is initialized.
+        assert!(!home.path().join("config.toml").exists());
+        let mut remote = format!("ceremony_url: https://approval.example/ceremony/{token}\n");
+        let before = remote.clone();
+        attach_wallet_continue(
+            HomeDir::at(home.path()),
+            ResolvedEndpoint::explicit_socket(home.path().join("absent.sock")),
+            "new-wallet".into(),
+            &mut remote,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            remote, before,
+            "hosted surfaces must not receive a loopback connection"
+        );
+    }
+
     #[tokio::test]
     async fn broker_bridge_cors_is_exact_and_bootstrap_keeps_capability_in_fragment() {
         let server = server().await;
