@@ -61,7 +61,7 @@ part of integration. Publishing/adopting the new immutable Polymarket artifact,
 physical-passkey rehearsal and installed Linux/macOS conformance remain release
 steps. The currently pinned old package is deliberately not relabeled effects-v1.
 
-Candidate integration pins: Broker `53372d2f979d89538decf21928fb82d312720dc7`
+Candidate integration pins: Broker `b4fef97dd1ebbf18c42d0cdda36a7b1681e9bd83`
 (API 1.10), Signer `70a698fb0b122394070c6c2089422fc1461c159f` (API 1.8).
 Machine Cargo, lockfile, compatibility matrix and conformance workflows select
 these exact commits. Existing ordinary Petal SDK opaque claim transport is
