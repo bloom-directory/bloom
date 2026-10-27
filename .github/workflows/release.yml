@@ -169,7 +169,7 @@ jobs:
         run: &install-build-tools |
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            build-essential ca-certificates cmake curl file git perl pkg-config
+            build-essential ca-certificates cmake curl file git openssh-client perl pkg-config
           curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
