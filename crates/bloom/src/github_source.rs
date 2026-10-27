@@ -45,32 +45,69 @@ pub(crate) struct PreinstalledPetal {
     pub release_sequence: u64,
     pub predecessor_package_hashes: &'static [&'static str],
     pub authority_routes: &'static [PetalAuthorityRoute],
+    /// Settings `bloom init` writes into this Petal's own settings route.
+    pub setup: Option<&'static PetalSetupTemplate>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PetalAuthorityRoute {
+    /// Release-certified generic effects contract; old packages stay ineligible.
+    pub economic_effects_schema: Option<u16>,
     pub route_id: &'static str,
     pub operation_classes: &'static [&'static str],
 }
 
+/// A settings file setup writes through the Petal's own route. Bloom only
+/// substitutes the owner's values; the Petal owns the format and enforcement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PetalSetupTemplate {
+    /// Petal-relative route; `{wallet}` is the default-policy wallet.
+    pub path: &'static str,
+    /// File body; each `{name}` is replaced by the value of that name.
+    pub body: &'static str,
+    pub values: &'static [PetalSetupValue],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PetalSetupValue {
+    pub name: &'static str,
+    pub prompt: &'static str,
+    pub default: &'static str,
+}
+
+const POLYMARKET_SETUP: PetalSetupTemplate = PetalSetupTemplate {
+    path: "settings/{wallet}/0/venue.toml",
+    body: "enabled = true\nmax_daily_usd = \"{max_daily_usd}\"\n",
+    values: &[PetalSetupValue {
+        name: "max_daily_usd",
+        prompt: "Polymarket daily buy limit in pUSD",
+        default: "100",
+    }],
+};
+
 const BASELINE_POLYMARKET_AUTHORITY_ROUTES: &[PetalAuthorityRoute] = &[
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000036",
         operation_classes: &["polymarket.onboard"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000050",
         operation_classes: &["polymarket.relayer_batch"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000058",
         operation_classes: &["polymarket.relayer_batch"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000077",
         operation_classes: &["polymarket.order.poly1271"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000094",
         operation_classes: &["polymarket.relayer_batch"],
     },
@@ -78,66 +115,82 @@ const BASELINE_POLYMARKET_AUTHORITY_ROUTES: &[PetalAuthorityRoute] = &[
 
 const BASELINE_HYPERLIQUID_AUTHORITY_ROUTES: &[PetalAuthorityRoute] = &[
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000008",
         operation_classes: &["hyperliquid.agent_action"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000009",
         operation_classes: &["hyperliquid.agent_action"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000010",
         operation_classes: &["hyperliquid.agent_action"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000013",
         operation_classes: &["hyperliquid.agent_action"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000019",
         operation_classes: &["hyperliquid.agent_action"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000023",
         operation_classes: &["hyperliquid.agent_action"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000025",
         operation_classes: &["hyperliquid.approve_agent", "hyperliquid.agent_action"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000035",
         operation_classes: &["hyperliquid.cancel"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000036",
         operation_classes: &["hyperliquid.cancel_by_cloid"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000038",
         operation_classes: &["hyperliquid.order"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000040",
         operation_classes: &["hyperliquid.schedule_cancel"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000041",
         operation_classes: &["hyperliquid.usd_send"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000042",
         operation_classes: &["hyperliquid.update_leverage"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000043",
         operation_classes: &["hyperliquid.usd_class_transfer"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000044",
         operation_classes: &["hyperliquid.usd_send"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000045",
         operation_classes: &["hyperliquid.withdraw"],
     },
@@ -147,88 +200,109 @@ const BASELINE_HYPERLIQUID_AUTHORITY_ROUTES: &[PetalAuthorityRoute] = &[
 // daemon can still verify the outgoing release until activation completes.
 const POLYMARKET_AUTHORITY_ROUTES: &[PetalAuthorityRoute] = &[
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000042",
         operation_classes: &["polymarket.onboard"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000058",
         operation_classes: &["polymarket.relayer_batch"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000067",
         operation_classes: &["polymarket.relayer_batch"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000088",
         operation_classes: &["polymarket.order.poly1271"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000106",
         operation_classes: &["polymarket.relayer_batch"],
     },
 ];
 const HYPERLIQUID_AUTHORITY_ROUTES: &[PetalAuthorityRoute] = &[
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000008",
         operation_classes: &["hyperliquid.agent_action"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000009",
         operation_classes: &["hyperliquid.agent_action"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000010",
         operation_classes: &["hyperliquid.agent_action"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000013",
         operation_classes: &["hyperliquid.agent_action"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000019",
         operation_classes: &["hyperliquid.agent_action"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000023",
         operation_classes: &["hyperliquid.agent_action"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000025",
         operation_classes: &["hyperliquid.agent_action", "hyperliquid.approve_agent"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000036",
         operation_classes: &["hyperliquid.cancel"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000037",
         operation_classes: &["hyperliquid.cancel_by_cloid"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000039",
         operation_classes: &["hyperliquid.order"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000041",
         operation_classes: &["hyperliquid.schedule_cancel"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000042",
         operation_classes: &["hyperliquid.usd_send"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000043",
         operation_classes: &["hyperliquid.update_leverage"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000044",
         operation_classes: &["hyperliquid.usd_class_transfer"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000045",
         operation_classes: &["hyperliquid.usd_send"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000046",
         operation_classes: &["hyperliquid.withdraw"],
     },
@@ -290,6 +364,7 @@ const PREINSTALLED_POLYMARKET: PreinstalledPetal = PreinstalledPetal {
         "5df5a1377dc4d70c71e47ffe6827e691e1f5868543b752dc8d19a500284e5fa6",
     ],
     authority_routes: POLYMARKET_AUTHORITY_ROUTES,
+    setup: Some(&POLYMARKET_SETUP),
 };
 
 const PREINSTALLED_HYPERLIQUID: PreinstalledPetal = PreinstalledPetal {
@@ -309,6 +384,7 @@ const PREINSTALLED_HYPERLIQUID: PreinstalledPetal = PreinstalledPetal {
         "b29c7afb88ec9d2df774b18dad2699ec169100eeeedbcefca02ea0cc3712a188",
     ],
     authority_routes: HYPERLIQUID_AUTHORITY_ROUTES,
+    setup: None,
 };
 
 const PREINSTALLED_NEAR_INTENTS: PreinstalledPetal = PreinstalledPetal {
@@ -328,6 +404,7 @@ const PREINSTALLED_NEAR_INTENTS: PreinstalledPetal = PreinstalledPetal {
         "ac2ccab59f36ee863843f92aaf0c975c00dbf32b246df5ccbb79757093785921",
     ],
     authority_routes: &[],
+    setup: None,
 };
 
 const PREINSTALLED_FEEDBACK: PreinstalledPetal = PreinstalledPetal {
@@ -345,6 +422,7 @@ const PREINSTALLED_FEEDBACK: PreinstalledPetal = PreinstalledPetal {
     release_sequence: 1,
     predecessor_package_hashes: &[],
     authority_routes: &[],
+    setup: None,
 };
 
 const PREINSTALLED_ENSO: PreinstalledPetal = PreinstalledPetal {
@@ -364,6 +442,7 @@ const PREINSTALLED_ENSO: PreinstalledPetal = PreinstalledPetal {
         "97650f327691f01bc4591cde25253d1e20010643e700674cc9759cd1366876b9",
     ],
     authority_routes: &[],
+    setup: None,
 };
 
 const PREINSTALLED_GASLESS: PreinstalledPetal = PreinstalledPetal {
@@ -381,6 +460,7 @@ const PREINSTALLED_GASLESS: PreinstalledPetal = PreinstalledPetal {
     release_sequence: 0,
     predecessor_package_hashes: &[],
     authority_routes: &[],
+    setup: None,
 };
 
 const PREINSTALLED_PRIVACY_POOLS: PreinstalledPetal = PreinstalledPetal {
@@ -398,6 +478,7 @@ const PREINSTALLED_PRIVACY_POOLS: PreinstalledPetal = PreinstalledPetal {
     release_sequence: 0,
     predecessor_package_hashes: &[],
     authority_routes: &[],
+    setup: None,
 };
 
 const PREINSTALLED_VENICE_X402: PreinstalledPetal = PreinstalledPetal {
@@ -415,6 +496,7 @@ const PREINSTALLED_VENICE_X402: PreinstalledPetal = PreinstalledPetal {
     release_sequence: 0,
     predecessor_package_hashes: &[],
     authority_routes: &[],
+    setup: None,
 };
 
 const PREINSTALLED_TOLLY: PreinstalledPetal = PreinstalledPetal {
@@ -432,6 +514,7 @@ const PREINSTALLED_TOLLY: PreinstalledPetal = PreinstalledPetal {
     release_sequence: 1,
     predecessor_package_hashes: &[],
     authority_routes: &[],
+    setup: None,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2162,6 +2245,7 @@ mod tests {
             release_sequence: 0,
             predecessor_package_hashes: &[],
             authority_routes: &[],
+            setup: None,
         }
     }
 
@@ -2238,6 +2322,7 @@ mod tests {
                 active: true,
             }),
             operation_classes: vec![ProvenanceOperationClass {
+                economic_effects_schema: None,
                 operation_class: Token::new("petal.run").unwrap(),
                 fee_asset: None,
             }],
@@ -2504,7 +2589,8 @@ mod tests {
         assert!(
             matches!(&results[0].outcome, ProvisioningOutcome::Failed(message) if message.contains("offline"))
         );
-        assert_eq!(results[1].outcome, ProvisioningOutcome::Installed);
+        // The fixture replaces an older installed release.
+        assert_eq!(results[1].outcome, ProvisioningOutcome::Updated);
         let results = provision_with(
             &daemon,
             &context,
@@ -2701,6 +2787,7 @@ mod tests {
             release_sequence: 0,
             predecessor_package_hashes: &[],
             authority_routes: &[],
+            setup: None,
         };
         let release = PetalReleaseManifest {
             schema: "bloom.petal.release.v1".into(),

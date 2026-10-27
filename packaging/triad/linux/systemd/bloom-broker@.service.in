@@ -49,7 +49,8 @@ RemoveIPC=yes
 CapabilityBoundingSet=
 AmbientCapabilities=
 LimitCORE=0
-# Broker owns outbound authenticated relay HTTPS, ACME and DNS resolution, so
+# Broker owns outbound relay HTTPS, ACME, DNS, CoinGecko/DefiLlama pricing and
+# api.mainnet-beta.solana.com native SOL validation, so
 # egress is not IP-restricted. Binding is: the ceremony listeners arrive from
 # the bloom-broker-ceremony sockets and authority RPC is Unix-only, so Broker
 # itself may bind only its loopback hosted-relay upstream (default port 18735).

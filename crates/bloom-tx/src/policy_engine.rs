@@ -42,6 +42,11 @@ pub struct AddressContext {
     /// any USD-cap checks (so a missing oracle never silently passes a
     /// dollar-denominated rule).
     pub usd_value: Option<f64>,
+    /// The Petal that staged this transaction, as `petal:<name>`, when one
+    /// did. A wallet policy may allow a Petal to choose its own destination by
+    /// listing that same string, which is the only way to permit a destination
+    /// that differs per transaction (a swap venue's per-quote deposit address).
+    pub staged_by_petal: Option<String>,
     /// USD already spent by this wallet in the trailing 24h window
     /// (sum of historical staged tx `usd_value` for ids past their
     /// pending state). `None` when the rolling window can't be
@@ -230,13 +235,24 @@ pub fn evaluate(
         ctx.token,
         ListMode::Allow,
     );
-    check_lists(
-        &mut out,
-        "allowlists.recipients",
-        &policy.allowlists.recipients,
-        ctx.recipient,
-        ListMode::Allow,
-    );
+    // A Petal the policy trusts with its own destinations satisfies the
+    // recipient allow-list for the transaction it staged. Everything else on
+    // this wallet, including transactions the owner stages by hand, is still
+    // matched against the listed addresses.
+    match petal_destination_entry(policy, &ctx) {
+        Some(entry) => out.push(PolicyCheck::hard(
+            "allowlists.recipients",
+            PolicyOutcome::Pass,
+            format!("destination chosen by {entry}, which wallet policy allows"),
+        )),
+        None => check_lists(
+            &mut out,
+            "allowlists.recipients",
+            &policy.allowlists.recipients,
+            ctx.recipient,
+            ListMode::Allow,
+        ),
+    }
 
     // ----- spec §6.3 legacy `[contracts]` / `[tokens]` blocks ---------------
     // The spec describes:
@@ -350,6 +366,20 @@ enum ListMode {
     Deny,
 }
 
+/// The `petal:<name>` allow-list entry covering this transaction, if any.
+fn petal_destination_entry(policy: &Policy, ctx: &AddressContext) -> Option<String> {
+    let staged_by = ctx.staged_by_petal.as_deref()?.trim();
+    if staged_by.is_empty() || !staged_by.starts_with("petal:") {
+        return None;
+    }
+    policy
+        .allowlists
+        .recipients
+        .iter()
+        .find(|entry| entry.trim().eq_ignore_ascii_case(staged_by))
+        .cloned()
+}
+
 fn check_lists(
     out: &mut Vec<PolicyCheck>,
     rule: &str,
@@ -417,6 +447,106 @@ mod tests {
 
     fn addr(s: &str) -> Address {
         s.parse().unwrap()
+    }
+
+    fn policy_allowing(destinations: &[&str]) -> Policy {
+        Policy {
+            allowlists: PolicyLists {
+                recipients: destinations.iter().map(|entry| entry.to_string()).collect(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn staged_by(petal: Option<&str>, recipient: &str) -> AddressContext {
+        AddressContext {
+            recipient: Some(addr(recipient)),
+            staged_by_petal: petal.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    const DEPOSIT: &str = "0x000000000000000000000000000000000000dead";
+
+    #[test]
+    fn a_named_petal_may_choose_its_own_destination() {
+        let policy = policy_allowing(&["petal:near-intents"]);
+        let checks = evaluate(
+            &policy,
+            "arbitrum",
+            U256::ZERO,
+            18,
+            staged_by(Some("petal:near-intents"), DEPOSIT),
+        );
+        assert!(!has_hard_violation(&checks));
+        assert!(
+            checks
+                .iter()
+                .any(|check| check.rule == "allowlists.recipients"
+                    && check.message.contains("petal:near-intents"))
+        );
+    }
+
+    #[test]
+    fn another_petal_and_a_hand_staged_transaction_still_match_addresses() {
+        let policy = policy_allowing(&["petal:near-intents"]);
+        // A different Petal is not covered by this entry.
+        assert!(has_hard_violation(&evaluate(
+            &policy,
+            "arbitrum",
+            U256::ZERO,
+            18,
+            staged_by(Some("petal:enso"), DEPOSIT),
+        )));
+        // Nor is a transaction the owner staged by hand.
+        assert!(has_hard_violation(&evaluate(
+            &policy,
+            "arbitrum",
+            U256::ZERO,
+            18,
+            staged_by(None, DEPOSIT),
+        )));
+        // A listed address still passes on its own merits.
+        let with_address = policy_allowing(&["petal:near-intents", DEPOSIT]);
+        assert!(!has_hard_violation(&evaluate(
+            &policy_allowing(&[DEPOSIT]),
+            "arbitrum",
+            U256::ZERO,
+            18,
+            staged_by(None, DEPOSIT),
+        )));
+        assert!(!has_hard_violation(&evaluate(
+            &with_address,
+            "arbitrum",
+            U256::ZERO,
+            18,
+            staged_by(Some("petal:enso"), DEPOSIT),
+        )));
+    }
+
+    #[test]
+    fn a_petal_entry_the_policy_does_not_carry_grants_nothing() {
+        // The wallet allows only a literal address; the Petal's own claim about
+        // itself must not widen anything.
+        let policy = policy_allowing(&["0x0000000000000000000000000000000000000001"]);
+        assert!(has_hard_violation(&evaluate(
+            &policy,
+            "arbitrum",
+            U256::ZERO,
+            18,
+            staged_by(Some("petal:near-intents"), DEPOSIT),
+        )));
+        // An empty or malformed origin is never treated as a Petal entry.
+        for origin in ["", "   ", "near-intents", "PETAL"] {
+            assert!(has_hard_violation(&evaluate(
+                &policy_allowing(&["petal:near-intents", origin]),
+                "arbitrum",
+                U256::ZERO,
+                18,
+                staged_by(Some(origin), DEPOSIT),
+            )));
+        }
     }
 
     #[test]

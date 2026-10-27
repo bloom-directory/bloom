@@ -40,6 +40,31 @@ Treat every write as an operation. Writes may stage work, begin a ceremony,
 consume reusable authority, or broadcast after authorization. Read the target
 directory and inspect the resulting projection before retrying or continuing.
 
+## Persona sessions
+
+Custodian, Trader and Degen are onboarding preferences. A saved preference or
+policy allowance does not activate signing authority. A covered confirm may
+consume a live owner-approved session without a new ceremony; use the same
+staging, review and outcome-reconciliation surfaces as usual.
+
+The first automatic profile scope is fee-free Polymarket BUY orders on
+main/account 0, with positive pUSD debit claims from the updated package.
+Other apps, SELL shares, builder fees and unsupported assets require separate
+review. Explicit native transfer sessions currently support Ethereum, Polygon
+and local chain 31337 with reviewed asset and fee unit limits. Other networks
+and Solana retain exact approval. Venue settings may impose tighter limits.
+
+Owner onboarding opens through `bloom init` or `bloom onboard` after install.
+The local browser delegates wallet and permission review to Broker ceremonies.
+If the CLI is available, `bloom wallet persona status main` reports grants,
+expiry and shared usage. Owner-requested changes use `bloom wallet persona set`
+and `activate`; `stop` disables local discovery before remote revocation.
+Never change a profile, revoke Broker authority, reset a budget or rotate an operation ID
+merely to work around a denial. A consumed, expired or unavailable grant is not
+authority for a replacement signature. Reconcile the original operation first;
+forward any required fresh ceremony to the owner. Recovering a completed
+signature after revocation authorizes no new action.
+
 ## What an error means
 
 Use the error class to decide what to inspect. An error alone does not establish
@@ -401,6 +426,15 @@ relying on it. A Petal may request use of a Sealed Approval, but it cannot mint,
 broaden, renew, or revoke authority itself. If fresh approval is required, use
 the central action's `approval_challenge.json` and `retry_path`; do not
 invent a Petal-local approval flow.
+
+An owner-approved persona session can cover selected native transfers and
+certified Petal actions across EVM/SVM accounts. Every member must be active
+before the shared dollar pool is usable. Check the exact account, asset,
+recipient and raw-unit scope; a persona preference alone grants nothing.
+Broker charges gross spending and maximum wallet-paid costs using approved
+prices at most 15 minutes old. Unsupported or unpriced actions keep ordinary
+owner approval. Retry the same staged action after approval; never restage an
+uncertain signature to obtain another budget or bypass a stopped pool.
 
 For a native Solana transfer, the challenge is projected beside the pending
 wallet transfer instead:

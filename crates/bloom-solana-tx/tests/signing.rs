@@ -219,6 +219,7 @@ fn catalog() -> ProvenanceCatalog {
             publisher: token("bloom-installer"),
             petal_lineage: None,
             operation_classes: vec![ProvenanceOperationClass {
+                economic_effects_schema: None,
                 operation_class: token("solana.native-transfer"),
                 fee_asset: Some(bloom_broker_api::ProvenanceFeeAsset {
                     chain: token("solana"),

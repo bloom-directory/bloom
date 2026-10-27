@@ -1386,6 +1386,7 @@ namespaces = ["settings"]
                 active,
             }),
             operation_classes: vec![ProvenanceOperationClass {
+                economic_effects_schema: None,
                 operation_class: Token::new("petal.run").unwrap(),
                 fee_asset: None,
             }],

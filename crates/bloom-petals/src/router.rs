@@ -52,6 +52,8 @@ pub struct PetalRouter {
     runtime_petals: BTreeMap<String, PetalRuntimeConfig>,
     audit: Option<Arc<AuditLog>>,
     audit_effect_lock: Arc<tokio::sync::Mutex<()>>,
+    initialize_only_store: bool,
+    initialize_package_hash: Option<String>,
     account_contexts: Arc<Mutex<AccountContextCache>>,
     account_context_reuse: Duration,
 }
@@ -64,6 +66,8 @@ impl PetalRouter {
             runtime_petals: BTreeMap::new(),
             audit: None,
             audit_effect_lock: Arc::new(tokio::sync::Mutex::new(())),
+            initialize_only_store: false,
+            initialize_package_hash: None,
             account_contexts: Arc::new(Mutex::new(AccountContextCache::default())),
             account_context_reuse: ACCOUNT_CONTEXT_REUSE,
         }
@@ -102,7 +106,10 @@ impl PetalRouter {
 
     fn run_options(&self, mount: &str) -> RunOptions {
         let Some(app) = self.runtime_petals.get(mount) else {
-            return RunOptions::default();
+            return RunOptions {
+                private_store_initialize_only: self.initialize_only_store,
+                ..RunOptions::default()
+            };
         };
         let mut runtime_settings = app.values.clone();
         runtime_settings.extend(
@@ -111,6 +118,7 @@ impl PetalRouter {
                 .map(|(key, value)| (format!("endpoint.{key}"), value.clone())),
         );
         RunOptions {
+            private_store_initialize_only: self.initialize_only_store,
             runtime_settings,
             endpoint_bindings: app.endpoints.clone(),
             ..RunOptions::default()
@@ -484,6 +492,17 @@ impl PetalRouter {
         account: Option<&AccountPetalContext>,
         execution: &tokio::sync::RwLockReadGuard<'_, ()>,
     ) -> Result<DispatchResponse, HandlerError> {
+        if let Some(expected) = &self.initialize_package_hash {
+            let matched = self
+                .runner
+                .petal_route(mount, op, &path)
+                .map_err(map_petal_err)?;
+            if &matched.hash != expected {
+                return Err(HandlerError::invalid(
+                    "setup package changed; review settings before retrying",
+                ));
+            }
+        }
         // Lookup, list, and ordinary reads are filesystem observations, not
         // security effects. Auditing them both misstates the event stream and
         // makes a single mounted path traversal append (and authenticate) many
@@ -601,6 +620,17 @@ impl PetalRouter {
 
 #[async_trait]
 impl Handler for PetalRouter {
+    async fn write_if_absent(
+        &self,
+        path: &VfsPath,
+        data: &[u8],
+        package_hash: &str,
+    ) -> Result<(), HandlerError> {
+        let mut initialize = self.clone();
+        initialize.initialize_only_store = true;
+        initialize.initialize_package_hash = Some(package_hash.to_owned());
+        initialize.write(path, data).await
+    }
     async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
         if path.segments().is_empty() {
             return Ok(Entry::dir(""));

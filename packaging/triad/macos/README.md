@@ -145,6 +145,12 @@ condition. A failed fresh install removes Directory Service records
 created by that invocation. An interrupted upgrade retains its forward intent
 so the next invocation can finish the same convergence safely.
 
+Generic session pricing/validation adds Broker HTTPS dependencies on
+`api.coingecko.com`, `coins.llama.fi` and `api.mainnet-beta.solana.com`.
+No price keys or pricing proxy are configured. Signer gains no HTTP client or
+pricing/network responsibility; the platform's existing enforcement limits
+below remain unchanged.
+
 Broker and Signer have `network_containment: null`. No PF rules are installed
 or enabled. Successful install, repair, upgrade and restore remove legacy Bloom
 anchors from disk and flush only their live filter rules. Uninstall scopes that
@@ -181,3 +187,18 @@ diagnostic files.
 Each daemon also has a small bounded `SERVICE-bootstrap.log` launchd stderr
 fallback. It is only for fixed, sanitized initialization failures that happen
 before the canonical app writer is available; routine events never use it.
+
+## First browser setup
+
+After a fresh enrollment passes authenticated runtime health, the installer
+submits a one-shot `bloom onboard --if-needed` LaunchAgent to the enrolled
+login's active GUI domain. launchd runs it as that login, so the browser and
+setup server never run as root. Its plist lives under
+`/Library/Application Support/BloomTriad/onboarding/LOGIN_UID.plist`, outside
+the automatically loaded LaunchAgents directory. It has no keepalive and is
+not submitted during repair, upgrade, or custody restore.
+
+The installer prints `bloom onboard` for opening or resuming the actual setup
+page later. Run it as the enrolled login without `sudo`. Saving persona and
+app choices is separate from completing the wallet, policy, and session owner
+reviews shown on that page. Reopening setup inspects their current status.

@@ -399,7 +399,13 @@ impl BrokerExactPayloadSigner {
             return Err("exact signing retry differs from its persisted operation identity".into());
         }
         let now = now_ms()?;
-        if state.expires_at_ms.get() <= now {
+        if state.expires_at_ms.get() <= now
+            && self
+                .broker
+                .persona_operation_digest(&state.signing_operation_id)
+                .map_err(|error| error.to_string())?
+                .is_none()
+        {
             state.approval_operation_id = random_operation_id();
             state.signing_operation_id = random_operation_id();
             state.request_nonce = random_request_nonce();
@@ -413,6 +419,7 @@ impl BrokerExactPayloadSigner {
             .transpose()?
             .unwrap_or_default();
         let mut request = ExactPayloadSignRequest {
+            session_use: None,
             evm_reported_token: None,
             wallet_id,
             preimage: preimage.to_vec(),
@@ -675,7 +682,13 @@ impl BrokerExactPayloadSigner {
             );
         }
         let now = now_ms()?;
-        if state.expires_at_ms.get() <= now {
+        if state.expires_at_ms.get() <= now
+            && self
+                .broker
+                .persona_operation_digest(&state.signing_operation_id)
+                .map_err(|error| error.to_string())?
+                .is_none()
+        {
             state.approval_operation_id = random_operation_id();
             state.signing_operation_id = random_operation_id();
             state.request_nonce = random_request_nonce();
@@ -827,7 +840,13 @@ impl BrokerExactPayloadSigner {
             );
         }
         let now = now_ms()?;
-        if state.expires_at_ms.get() <= now {
+        if state.expires_at_ms.get() <= now
+            && self
+                .broker
+                .persona_operation_digest(&state.signing_operation_id)
+                .map_err(|error| error.to_string())?
+                .is_none()
+        {
             state.approval_operation_id = random_operation_id();
             state.signing_operation_id = random_operation_id();
             state.request_nonce = random_request_nonce();
@@ -1221,6 +1240,7 @@ mod tests {
                     publisher: token("bloom-installer"),
                     petal_lineage: None,
                     operation_classes: vec![ProvenanceOperationClass {
+                        economic_effects_schema: None,
                         operation_class: token("transaction.confirm"),
                         fee_asset: None,
                     }],
@@ -1316,6 +1336,7 @@ mod tests {
                     publisher: token("bloom-installer"),
                     petal_lineage: None,
                     operation_classes: vec![ProvenanceOperationClass {
+                        economic_effects_schema: None,
                         operation_class: token("order.place"),
                         fee_asset: None,
                     }],
@@ -1337,6 +1358,7 @@ mod tests {
             Digest32::from_bytes(digest.finalize().into())
         };
         let claim = PetalUseClaim {
+            economic_effects: None,
             package_hash,
             route: "orders/place".into(),
             operation_class: token("order.place"),
@@ -1544,6 +1566,7 @@ mod tests {
                     publisher: token("bloom-installer"),
                     petal_lineage: None,
                     operation_classes: vec![ProvenanceOperationClass {
+                        economic_effects_schema: None,
                         operation_class: token(class),
                         fee_asset: None,
                     }],
@@ -1556,6 +1579,7 @@ mod tests {
         let payload = b"\x19\x01safe preimage";
         let ordered_hash = Digest32::from_bytes(alloy::primitives::keccak256(payload).into());
         let claim = PetalUseClaim {
+            economic_effects: None,
             package_hash,
             route: "transactions/confirm".into(),
             operation_class: token(class),
@@ -1790,6 +1814,7 @@ mod tests {
                     publisher: token("bloom-installer"),
                     petal_lineage: None,
                     operation_classes: vec![ProvenanceOperationClass {
+                        economic_effects_schema: None,
                         operation_class: token("fixture.withdraw"),
                         fee_asset: class_fee_asset,
                     }],
@@ -1802,6 +1827,7 @@ mod tests {
         let payload = b"exact withdraw payload";
         let ordered_hash = Digest32::from_bytes(Sha256::digest(payload).into());
         let claim = PetalUseClaim {
+            economic_effects: None,
             package_hash,
             route: "withdraw/request".into(),
             operation_class: token("fixture.withdraw"),

@@ -249,7 +249,7 @@ recover_interrupted_fresh_accounts() {
 }
 
 verify_payload() {
-  for path in bin/bloom bin/bloom-broker bin/bloom-signer bin/bloom-signer-migrate PLATFORM_CLAIM; do [[ -f "$payload/$path" ]] || die "payload missing $path"; done
+  for path in bin/bloom bin/bloom-broker bin/bloom-signer bin/bloom-signer-migrate PLATFORM_CLAIM installer/macos/launchagents/com.bloom.onboarding.plist.in; do [[ -f "$payload/$path" ]] || die "payload missing $path"; done
   claim="$(<"$payload/PLATFORM_CLAIM")"
   if $live; then
     case "$claim" in
@@ -328,6 +328,7 @@ paths() {
   containment_plist="$root_prefix/Library/LaunchDaemons/com.bloom.containment.plist"
   session_plist="$root_prefix/Library/LaunchAgents/com.bloom.session.plist"
   machine_plist="$root_prefix/Library/LaunchAgents/com.bloom.machine.plist"
+  onboarding_plist="$product/onboarding/$login_uid.plist"
   pf_anchor="$root_prefix/etc/pf.anchors/com.bloom.triad.$login_uid"
   newsyslog_config="$root_prefix/etc/newsyslog.d/bloom-$login_uid.conf"
 }
@@ -609,7 +610,7 @@ disable_legacy_network_guard() {
 # This installer creates no anchors; successful activation owns their cleanup.
 rollback_failed_restore() {
   if $live; then
-    for label in "gui/$login_uid/com.bloom.machine" "user/$login_uid/com.bloom.machine" "system/com.bloom.broker.$login_uid" "system/com.bloom.signer.$login_uid" "gui/$login_uid/com.bloom.session" "user/$login_uid/com.bloom.session"; do
+    for label in "gui/$login_uid/com.bloom.onboarding" "gui/$login_uid/com.bloom.machine" "user/$login_uid/com.bloom.machine" "system/com.bloom.broker.$login_uid" "system/com.bloom.signer.$login_uid" "gui/$login_uid/com.bloom.session" "user/$login_uid/com.bloom.session"; do
       launchctl bootout "$label" 2>/dev/null || true
     done
   fi
@@ -619,7 +620,7 @@ rollback_failed_restore() {
   restore_pending=false
 }
 rollback_failed_fresh() {
-  for label in "gui/$login_uid/com.bloom.machine" "user/$login_uid/com.bloom.machine" "system/com.bloom.broker.$login_uid" "system/com.bloom.signer.$login_uid" "gui/$login_uid/com.bloom.session" "user/$login_uid/com.bloom.session"; do launchctl bootout "$label" 2>/dev/null || true; done
+  for label in "gui/$login_uid/com.bloom.onboarding" "gui/$login_uid/com.bloom.machine" "user/$login_uid/com.bloom.machine" "system/com.bloom.broker.$login_uid" "system/com.bloom.signer.$login_uid" "gui/$login_uid/com.bloom.session" "user/$login_uid/com.bloom.session"; do launchctl bootout "$label" 2>/dev/null || true; done
   rm -f "$broker_plist" "$signer_plist" "$newsyslog_config" "$enrollment"
   rm -rf "$config" "$variable/db/bloom/$login_uid" "$runtime" "$log_root"
   has_active_enrollments || { launchctl bootout system/com.bloom.containment 2>/dev/null || true; rm -f "$containment_plist" "$session_plist" "$machine_plist"; remove_cli_link; }
@@ -1410,6 +1411,18 @@ case "$action" in
     remove_legacy_cli || die "Bloom is healthy, but legacy CLI cleanup failed; remove ~/.local/bin/bloom and retry"
     report_legacy_wallet_migrations
     provision_remote_ceremonies
+    if $fresh; then
+      # Keep this outside LaunchAgents: only the fresh enrollment's active
+      # GUI domain loads it once, with the browser running as the login user.
+      render "$payload/installer/macos/launchagents/com.bloom.onboarding.plist.in" "$onboarding_plist" 0644
+      if $live; then
+        chmod 0755 "$(dirname "$onboarding_plist")"
+        chown root:wheel "$(dirname "$onboarding_plist")" "$onboarding_plist"
+        launchctl bootstrap "gui/$login_uid" "$onboarding_plist" ||
+          echo "Browser onboarding could not start; as $login_user run: bloom onboard (without sudo)." >&2
+      fi
+    fi
+    echo "As $login_user, run: bloom onboard (without sudo) to open or resume browser setup."
     if $restoring; then echo "Bloom macOS retained custody restored"; else echo "Bloom macOS enrollment installed or repaired"; fi
     ;;
   uninstall)
@@ -1423,10 +1436,10 @@ case "$action" in
     [[ -f "$record" && ! -L "$record" ]] || die "enrollment or retained custody record missing"
     enrollment="$record"; login_user="$(field "$record" login_user)"; BLOOM_RELEASE_DIGEST="$(field "$record" release_digest)"; load_ids
     if $live; then
-      for label in "gui/$login_uid/com.bloom.machine" "user/$login_uid/com.bloom.machine" "system/com.bloom.broker.$login_uid" "system/com.bloom.signer.$login_uid" "gui/$login_uid/com.bloom.session" "user/$login_uid/com.bloom.session"; do stop_launchd_job "$label"; done
+      for label in "gui/$login_uid/com.bloom.onboarding" "gui/$login_uid/com.bloom.machine" "user/$login_uid/com.bloom.machine" "system/com.bloom.broker.$login_uid" "system/com.bloom.signer.$login_uid" "gui/$login_uid/com.bloom.session" "user/$login_uid/com.bloom.session"; do stop_launchd_job "$label"; done
     fi
     cleanup_legacy_pf "$login_uid"
-    rm -f "$broker_plist" "$signer_plist" "$pf_anchor" "$newsyslog_config"
+    rm -f "$broker_plist" "$signer_plist" "$pf_anchor" "$newsyslog_config" "$onboarding_plist"
     if $retain; then
       mkdir -p "$product/retained"; enrollment="$retained"; write_enrollment retained
       rm -f "$enrollments/$login_uid.json"; rm -rf "$runtime" "$log_root"

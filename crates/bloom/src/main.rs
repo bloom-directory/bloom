@@ -9,15 +9,19 @@
 mod commands {
     pub mod qr;
 }
+mod browser_onboarding;
+mod default_policy;
 mod deploy;
 mod github_source;
 mod macos_runtime;
+mod persona_onboarding;
 mod petal_provisioning;
 mod pf_monitor;
 mod session_sentinel;
 mod triad_enrollment;
 mod triad_relay_setup;
 
+use std::io::Read as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -1286,6 +1290,37 @@ fn machine_command_event_fields(
             Some(operation_id.clone()),
             MachineCommandEventClass::DurableMutation,
         ),
+        MachineCommand::WalletDefaultPolicy { .. } => {
+            ("default_policy", None, MachineCommandEventClass::Prepared)
+        }
+        MachineCommand::OnboardingSetup { .. } => (
+            "onboarding_setup",
+            None,
+            MachineCommandEventClass::DurableMutation,
+        ),
+        MachineCommand::PersonaPreferencesSet { .. } => (
+            "persona_preferences_set",
+            None,
+            MachineCommandEventClass::DurableMutation,
+        ),
+        MachineCommand::PersonaSessionPrepare { proposal } => (
+            "persona_session_prepare",
+            Some(proposal.prepare_operation_id.as_str().to_owned()),
+            MachineCommandEventClass::Prepared,
+        ),
+        MachineCommand::PersonaSessionActivateConfigured { .. } => (
+            "persona_session_activate",
+            None,
+            MachineCommandEventClass::Prepared,
+        ),
+        MachineCommand::PersonaSessions { .. } => {
+            ("persona_sessions", None, MachineCommandEventClass::Read)
+        }
+        MachineCommand::PersonaSessionsStop { .. } => (
+            "persona_sessions_stop",
+            None,
+            MachineCommandEventClass::DurableMutation,
+        ),
         MachineCommand::WalletOutboxCancel { id, .. } => (
             "wallet_outbox_cancel",
             Some(id.clone()),
@@ -1363,12 +1398,17 @@ fn machine_error_from_protocol(
             MachineErrorKind::Conflict
         }
         Code::ServiceUnavailable
+        | Code::PriceUnavailable
+        | Code::PriceStale
         | Code::AssuranceUnavailable
         | Code::ClockUntrusted
         | Code::ClockRollback
         | Code::BackendUnsupported => MachineErrorKind::Unavailable,
         Code::AmbiguousProviderEffect => MachineErrorKind::Internal,
         Code::UnauthenticatedPeer
+        | Code::AssetUnsupported
+        | Code::EffectsUnsupported
+        | Code::PoolInactive
         | Code::ApprovalExpired
         | Code::ApprovalRevoked
         | Code::ApprovalRearmRequired
@@ -1766,6 +1806,138 @@ async fn execute_machine_command(
         }
         MachineCommand::WalletPolicyCommit { operation_id } => {
             commit_policy_update(home, machine_broker()?, operation_id).await?
+        }
+        MachineCommand::WalletDefaultPolicy { name } => {
+            validate_wallet_name(&name).map_err(|error| {
+                machine_error(
+                    MachineErrorKind::InvalidParams,
+                    format!("wallet name must be a safe single path segment: {error:#}"),
+                )
+            })?;
+            let status = default_policy::advance_default_policy(daemon, &name).await?;
+            format!("{}\n", serde_json::to_string(&status)?)
+        }
+        MachineCommand::OnboardingSetup {
+            wallet,
+            preset,
+            per_action_usd,
+            daily_usd,
+            session_duration_secs,
+            petals,
+        } => {
+            let result = apply_browser_setup(
+                daemon,
+                &wallet,
+                preset,
+                per_action_usd.as_deref(),
+                daily_usd.as_deref(),
+                session_duration_secs,
+                &petals,
+            )
+            .await?;
+            format!("{}\n", serde_json::to_string(&result)?)
+        }
+        MachineCommand::PersonaPreferencesSet {
+            wallet,
+            preset,
+            per_action_usd,
+            daily_usd,
+            session_duration_secs,
+        } => {
+            let _transition = default_policy::PERSONA_TRANSITION.lock().await;
+            validate_wallet_name(&wallet)?;
+            daemon
+                .wallet_projections
+                .get_wallet(&bloom_broker_api::Token::new(wallet.clone())?)
+                .await?;
+            let earlier = bloom_proto::Config::load(&daemon.home.config_path())?.persona;
+            let mut preview = earlier.clone();
+            default_policy::select_persona(
+                &mut preview,
+                Some(preset),
+                per_action_usd.as_deref(),
+                daily_usd.as_deref(),
+                session_duration_secs,
+            )?;
+            if earlier != preview || preset == bloom_proto::persona::PersonaPreset::Custodian {
+                daemon
+                    .stop_persona_sessions(&wallet, "owner changed persona profile")
+                    .await?;
+            }
+            let profile = default_policy::save_persona_preferences(
+                &daemon.home,
+                preset,
+                per_action_usd.as_deref(),
+                daily_usd.as_deref(),
+                session_duration_secs,
+            )?;
+            format!(
+                "{}\nnext: bloom wallet persona activate {} --account 0\n",
+                default_policy::persona_message(Some(&profile)),
+                wallet
+            )
+        }
+        MachineCommand::PersonaSessionPrepare { proposal } => {
+            let _transition = default_policy::PERSONA_TRANSITION.lock().await;
+            let status = daemon.prepare_persona_session(*proposal).await?;
+            format!("{}\n", serde_json::to_string(&status)?)
+        }
+        MachineCommand::PersonaSessionActivateConfigured {
+            wallet,
+            account,
+            selection,
+        } => {
+            let _transition = default_policy::PERSONA_TRANSITION.lock().await;
+            validate_wallet_name(&wallet)?;
+            let configured = bloom_proto::Config::load(&daemon.home.config_path())?.persona;
+            let Some(profile) = configured else {
+                return Ok(MachineCommandOutput {
+                    stdout: "persona_sessions: legacy choices retained; select a persona explicitly to propose authority changes\n".into(),
+                    stderr: String::new(), exit_code: 0,
+                });
+            };
+            if profile.preset == bloom_proto::persona::PersonaPreset::Custodian {
+                let wallet = bloom_broker_api::Token::new(wallet)?;
+                daemon
+                    .stop_persona_sessions(wallet.as_str(), "custodian selected")
+                    .await?;
+                "persona_sessions: stopped; custodian retains transaction approvals\n".into()
+            } else {
+                let proposals = match selection {
+                    Some(selection) => {
+                        persona_onboarding::compile_selection(daemon, &wallet, selection).await?
+                    }
+                    None => persona_onboarding::compile_proposals(daemon, &wallet, account).await?,
+                };
+                let mut statuses = Vec::new();
+                for proposal in proposals {
+                    let status = daemon.prepare_persona_session(proposal).await?;
+                    let active =
+                        status.authority.state == bloom_broker_api::ApprovalLifecycleState::Active;
+                    statuses.push(status);
+                    // Broker has one owner ceremony slot per wallet. Return its
+                    // current URL before preparing another scope; retries resume.
+                    if !active {
+                        break;
+                    }
+                }
+                format!("{}\n", serde_json::to_string(&statuses)?)
+            }
+        }
+        MachineCommand::PersonaSessions { wallet } => {
+            let wallet = bloom_broker_api::Token::new(wallet)?;
+            format!(
+                "{}\n",
+                serde_json::to_string(&daemon.persona_sessions(wallet.as_str()).await?)?
+            )
+        }
+        MachineCommand::PersonaSessionsStop { wallet, reason } => {
+            let _transition = default_policy::PERSONA_TRANSITION.lock().await;
+            let wallet = bloom_broker_api::Token::new(wallet)?;
+            daemon
+                .stop_persona_sessions(wallet.as_str(), &reason)
+                .await?;
+            "persona_sessions: stopped\n".into()
         }
         MachineCommand::WalletOutboxCancel {
             wallet,
@@ -2664,14 +2836,71 @@ enum Cmd {
     /// current update-checker state.
     #[command(subcommand)]
     Update(UpdateCmd),
+    /// Open persona configuration for an existing Bloom wallet.
+    Onboard {
+        /// Print the local URL without opening the default browser.
+        #[arg(long)]
+        no_open: bool,
+        /// Skip the automatic welcome once persona and setup choices are saved.
+        #[arg(long)]
+        if_needed: bool,
+    },
     /// Initialise ~/.bloom with default config + dirs.
     Init {
+        /// Use terminal/scripted setup instead of browser onboarding.
+        #[arg(long)]
+        no_browser: bool,
+        /// Explicit onboarding suggestion; saving it does not activate authority.
+        #[arg(long, value_parser = ["custodian", "trader", "degen"])]
+        persona: Option<String>,
+        #[arg(long, requires = "persona")]
+        persona_per_action_usd: Option<String>,
+        #[arg(long, requires = "persona")]
+        persona_daily_usd: Option<String>,
+        #[arg(long, requires = "persona")]
+        persona_session_seconds: Option<u64>,
         #[command(subcommand)]
         internal: Option<InitInternal>,
     },
 
     /// Print a shell completion script.
     Completions { shell: Shell },
+}
+
+#[derive(Subcommand, Debug)]
+enum PersonaCmd {
+    /// Save reviewed suggestions; authority changes still require activation.
+    Set {
+        wallet: String,
+        #[arg(value_parser = ["custodian", "trader", "degen"])]
+        preset: String,
+        #[arg(long)]
+        per_action_usd: Option<String>,
+        #[arg(long)]
+        daily_usd: Option<String>,
+        #[arg(long)]
+        session_seconds: Option<u64>,
+    },
+    /// Compile exact scope from fresh authority and prepare owner activation.
+    Activate {
+        wallet: String,
+        #[arg(long, default_value_t = 0)]
+        account: u32,
+        /// Explicit reviewed frozen terms. For scope compilation use --selection.
+        #[arg(long, conflicts_with = "selection")]
+        proposal: Option<PathBuf>,
+        /// Public member scopes and priced asset identities for one shared pool.
+        #[arg(long)]
+        selection: Option<PathBuf>,
+    },
+    /// List scopes, expiry and remaining authority from Broker.
+    Status { wallet: String },
+    /// Revoke persona sessions for a wallet.
+    Stop {
+        wallet: String,
+        #[arg(long, default_value = "owner paused persona")]
+        reason: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -2885,6 +3114,12 @@ enum WalletCmd {
         #[arg(long)]
         local: bool,
     },
+    /// Approve the default policy for a wallet: one policy ceremony that allows
+    /// the Petals chosen during setup. `new` and `import` run it for `main`.
+    DefaultPolicy { name: String },
+    /// Activate, inspect or stop owner-approved persona sessions.
+    #[command(subcommand)]
+    Persona(PersonaCmd),
     /// Convert a staged v1 passkey wallet into Signer-owned Triad custody.
     /// The receipt contains public binding data only; Machine never opens the
     /// legacy wallet directory.
@@ -3488,6 +3723,124 @@ async fn ipc_read_to_stdout(endpoint: &ResolvedEndpoint, path: &str, context: &s
     Ok(())
 }
 
+fn browser_setup_choices_saved(home: &HomeDir) -> Result<bool> {
+    if !home.config_path().exists() {
+        return Ok(false);
+    }
+    let config = bloom_proto::Config::load(&home.config_path())?;
+    Ok(config.petals.setup_complete && config.persona.is_some())
+}
+
+async fn configure_browser_setup(
+    _home: &HomeDir,
+    endpoint: &ResolvedEndpoint,
+    wallet: &str,
+    request: browser_onboarding::SetupRequest,
+) -> Result<serde_json::Value> {
+    let output = machine_command(
+        endpoint,
+        MachineCommand::OnboardingSetup {
+            wallet: wallet.to_owned(),
+            preset: request.persona,
+            per_action_usd: request.per_action_usd,
+            daily_usd: request.daily_usd,
+            session_duration_secs: request.session_duration_secs,
+            petals: request.petals,
+        },
+    )
+    .await
+    .context("persona setup requires your existing running Bloom installation")?;
+    anyhow::ensure!(output.exit_code == 0, "{}", output.stderr);
+    serde_json::from_str(output.stdout.trim()).context("decode persona setup result")
+}
+
+fn save_browser_config(home: &HomeDir, config: &bloom_proto::Config) -> Result<()> {
+    let temporary = tempfile::NamedTempFile::new_in(home.root())?;
+    config.save(temporary.path())?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist(home.config_path())
+        .map_err(|error| error.error)?;
+    std::fs::File::open(home.root())?.sync_all()?;
+    Ok(())
+}
+
+async fn apply_browser_setup(
+    daemon: &Daemon,
+    wallet: &str,
+    preset: bloom_proto::persona::PersonaPreset,
+    per_action: Option<&str>,
+    daily: Option<&str>,
+    duration: Option<u64>,
+    chosen_petals: &[String],
+) -> Result<serde_json::Value> {
+    let _transition = default_policy::PERSONA_TRANSITION.lock().await;
+    validate_wallet_name(wallet)?;
+    let wallets = daemon.wallet_projections.list_wallets().await?;
+    anyhow::ensure!(
+        wallets
+            .iter()
+            .any(|entry| entry.wallet.wallet_id.as_str() == wallet),
+        "selected Bloom wallet is no longer available"
+    );
+    let mut config = bloom_proto::Config::load(&daemon.home.config_path())?;
+    let previous = config.clone();
+    default_policy::select_persona(
+        &mut config.persona,
+        Some(preset),
+        per_action,
+        daily,
+        duration,
+    )?;
+    let allowed = default_policy::menu_petals();
+    anyhow::ensure!(
+        chosen_petals.len() <= allowed.len(),
+        "too many selected Petals"
+    );
+    let mut unique = std::collections::BTreeSet::new();
+    for name in chosen_petals {
+        anyhow::ensure!(
+            allowed.contains(name) && unique.insert(name),
+            "unknown or repeated setup Petal"
+        );
+    }
+    // Preserve owner values; fill only new choices using the same catalog defaults
+    // as terminal setup. A persona change never silently widens venue settings.
+    let mut suggestions = bloom_proto::config::PetalsConfig::default();
+    default_policy::accept_setup_suggestions(&mut suggestions, config.persona.as_ref());
+    config
+        .petals
+        .setup
+        .retain(|name, _| chosen_petals.contains(name));
+    for name in chosen_petals {
+        if !config.petals.setup.contains_key(name)
+            && let Some(values) = suggestions.setup.remove(name)
+        {
+            config.petals.setup.insert(name.clone(), values);
+        }
+    }
+    config.petals.setup_complete = previous.petals.setup_complete;
+    config.validate()?;
+    if previous.persona != config.persona || previous.petals.setup != config.petals.setup {
+        for projection in &wallets {
+            daemon
+                .stop_persona_sessions(
+                    projection.wallet.wallet_id.as_str(),
+                    "owner changed persona preferences",
+                )
+                .await?;
+        }
+    }
+    // Persona setup changes suggestions and approval scopes only. Existing
+    // wallet custody, packages and per-wallet venue settings stay with their
+    // normal lifecycle; no first-wallet provisioning or settings are replayed.
+    config.petals.setup_complete = true;
+    save_browser_config(&daemon.home, &config)?;
+    Ok(
+        serde_json::json!({"setup_complete":true,"wallet":wallet,"persona":config.persona,"petals":config.petals.setup}),
+    )
+}
+
 async fn machine_command(
     endpoint: &ResolvedEndpoint,
     command: MachineCommand,
@@ -3504,6 +3857,10 @@ async fn machine_command(
 
 async fn call_machine_command(endpoint: &ResolvedEndpoint, command: MachineCommand) -> Result<()> {
     let output = machine_command(endpoint, command).await?;
+    print_machine_command_output(&output)
+}
+
+fn print_machine_command_output(output: &MachineCommandOutput) -> Result<()> {
     std::io::Write::write_all(&mut std::io::stdout(), output.stdout.as_bytes())?;
     std::io::Write::write_all(&mut std::io::stderr(), output.stderr.as_bytes())?;
     if output.exit_code != 0 {
@@ -3643,7 +4000,20 @@ async fn run(cli: Cli) -> Result<()> {
     }
 
     match cli.cmd.context("a command is required")? {
-        Cmd::Init { internal } => {
+        Cmd::Onboard { no_open, if_needed } => {
+            if if_needed && browser_setup_choices_saved(&home)? {
+                return Ok(());
+            }
+            browser_onboarding::run(home, client_endpoint, no_open).await
+        }
+        Cmd::Init {
+            no_browser,
+            internal,
+            persona,
+            persona_per_action_usd,
+            persona_daily_usd,
+            persona_session_seconds,
+        } => {
             if let Some(internal) = internal {
                 return match internal {
                     #[cfg(feature = "triad-dev-harness")]
@@ -3741,17 +4111,105 @@ async fn run(cli: Cli) -> Result<()> {
                     .context("Bloom macOS identity rotation generation failed"),
                 };
             }
+            if !no_browser && persona.is_none() && !structured_service_output() {
+                return browser_onboarding::run(home, client_endpoint, false).await;
+            }
             if !structured_service_output() {
                 eprintln!("{ALPHA_DISCLOSURE}");
             }
-            let (_home_permit, d) = build_write_daemon(home.clone()).context("init daemon")?;
+            let (_home_permit, mut d) = build_write_daemon(home.clone()).context("init daemon")?;
+            // Building the daemon writes a default config when none exists, and
+            // `bloom serve` does the same, so the file's presence says nothing
+            // about setup. The marker is saved only together with the choices.
+            let first_setup = !d.config.petals.setup_complete;
+            let previous_persona = d.config.persona.clone();
+            default_policy::select_persona(
+                &mut d.config.persona,
+                persona
+                    .as_deref()
+                    .map(str::parse)
+                    .transpose()
+                    .map_err(anyhow::Error::msg)?,
+                persona_per_action_usd.as_deref(),
+                persona_daily_usd.as_deref(),
+                persona_session_seconds,
+            )?;
+            if persona.is_none() && first_setup && d.config.persona.is_none() {
+                if !no_browser
+                    && !structured_service_output()
+                    && default_policy::interactive_setup_available()
+                {
+                    default_policy::run_persona_menu(
+                        &mut d.config.persona,
+                        &mut std::io::stdin().lock(),
+                        &mut std::io::stdout(),
+                    )?;
+                } else {
+                    d.config.persona = Some(bloom_proto::persona::PersonaConfig::default());
+                }
+            }
+            if persona.is_some()
+                && previous_persona.is_some()
+                && previous_persona != d.config.persona
+            {
+                d.stop_persona_sessions(
+                    bloom_proto::config::DEFAULT_POLICY_WALLET,
+                    "owner changed persona during init",
+                )
+                .await?;
+            }
+            if first_setup {
+                if !no_browser
+                    && !structured_service_output()
+                    && default_policy::interactive_setup_available()
+                {
+                    default_policy::run_setup_menu(
+                        &mut d.config.petals,
+                        d.config.persona.as_ref(),
+                        &mut std::io::stdin().lock(),
+                        &mut std::io::stdout(),
+                    )?;
+                } else {
+                    default_policy::accept_setup_suggestions(
+                        &mut d.config.petals,
+                        d.config.persona.as_ref(),
+                    );
+                }
+                d.config.petals.setup_complete = true;
+                d.config
+                    .save(&d.home.config_path())
+                    .context("save setup choices")?;
+            }
+            d.config
+                .save(&d.home.config_path())
+                .context("save persona proposal")?;
+            let owners_before = default_policy::petal_owners(&d)?;
+            default_policy::record_setup_settings_obligations(&d, &owners_before, first_setup)
+                .await?;
             let preinstalled = github_source::ensure_preinstalled_petals(&home, &d)
                 .context("provision canonical pre-installed Petals")?;
+            for message in default_policy::apply_setup_settings(&d, &owners_before, first_setup)
+                .await
+                .context("write Petal settings chosen during setup")?
+            {
+                println!("{message}");
+            }
             println!("home: {}", d.home.root().display());
             println!("config: {}", d.home.config_path().display());
             println!("chains: {:?}", d.chains.list_names());
             println!("preinstalled_petals: {preinstalled:?}");
+            println!(
+                "{}",
+                default_policy::persona_message(d.config.persona.as_ref())
+            );
             println!("next: bloom wallet new main");
+            if d.config.persona.as_ref().is_some_and(|persona| {
+                persona.preset != bloom_proto::persona::PersonaPreset::Custodian
+            }) {
+                println!(
+                    "after wallet and policy approval: bloom wallet persona activate main --account 0; approve each proposed scope, then repeat until all are active"
+                );
+            }
             println!("then: bloom wallet address main --qr");
             println!("packaged Linux mount: systemctl --user status bloom-machine.service");
             println!("standalone mount: mkdir -p ~/bloom && bloom serve --mount ~/bloom");
@@ -3937,13 +4395,11 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Cmd::Wallet(WalletCmd::New { name, local }) => {
-            call_machine_command(
+            default_policy::create_wallet_then_default_policy(
                 &client_endpoint,
-                MachineCommand::WalletCustody {
-                    name,
-                    kind: MachineCustodyKind::New,
-                    local,
-                },
+                name,
+                MachineCustodyKind::New,
+                local,
             )
             .await
         }
@@ -3952,13 +4408,21 @@ async fn run(cli: Cli) -> Result<()> {
             raw_private_key,
             local,
         }) => {
-            call_machine_command(
+            default_policy::create_wallet_then_default_policy(
                 &client_endpoint,
-                MachineCommand::WalletCustody {
-                    name,
-                    kind: wallet_import_kind(raw_private_key),
-                    local,
-                },
+                name,
+                wallet_import_kind(raw_private_key),
+                local,
+            )
+            .await
+        }
+        Cmd::Wallet(WalletCmd::DefaultPolicy { name }) => {
+            // Wait out a policy lock another command holds; a ceremony this
+            // command opens extends the deadline to its own expiry.
+            default_policy::wait_for_default_policy(
+                &client_endpoint,
+                &name,
+                current_unix_ms().saturating_add(default_policy::POLICY_LOCK_GRACE_MS),
             )
             .await
         }
@@ -3995,6 +4459,95 @@ async fn run(cli: Cli) -> Result<()> {
                 MachineCommand::WalletMigrate {
                     receipt: serde_json::from_value(serde_json::to_value(receipt)?)?,
                 },
+            )
+            .await
+        }
+        Cmd::Wallet(WalletCmd::Persona(PersonaCmd::Set {
+            wallet,
+            preset,
+            per_action_usd,
+            daily_usd,
+            session_seconds,
+        })) => {
+            call_machine_command(
+                &client_endpoint,
+                MachineCommand::PersonaPreferencesSet {
+                    wallet,
+                    preset: preset.parse().map_err(anyhow::Error::msg)?,
+                    per_action_usd,
+                    daily_usd,
+                    session_duration_secs: session_seconds,
+                },
+            )
+            .await
+        }
+        Cmd::Wallet(WalletCmd::Persona(PersonaCmd::Activate {
+            wallet,
+            account,
+            proposal,
+            selection,
+        })) => {
+            if let Some(path) = proposal {
+                let mut file =
+                    std::fs::File::open(&path).context("open reviewed persona proposal")?;
+                if !file.metadata()?.is_file() {
+                    anyhow::bail!("persona proposal must be a regular file");
+                }
+                let mut bytes = Vec::new();
+                (&mut file).take(262_145).read_to_end(&mut bytes)?;
+                if bytes.len() > 262_144 {
+                    anyhow::bail!("persona proposal exceeds 256 KiB");
+                }
+                let proposal: bloom_machine_client::PersonaSessionProposal =
+                    serde_json::from_slice(&bytes)
+                        .context("decode reviewed frozen persona proposal")?;
+                if proposal.terms.wallet_id.as_str() != wallet || proposal.account != account {
+                    anyhow::bail!("proposal wallet/account differs from the selected route");
+                }
+                return call_machine_command(
+                    &client_endpoint,
+                    MachineCommand::PersonaSessionPrepare {
+                        proposal: Box::new(proposal),
+                    },
+                )
+                .await;
+            }
+            let selection = selection
+                .map(|path| -> anyhow::Result<_> {
+                    let mut file = std::fs::File::open(path).context("open session selection")?;
+                    if !file.metadata()?.is_file() {
+                        anyhow::bail!("session selection must be a regular file");
+                    }
+                    let mut bytes = Vec::new();
+                    (&mut file).take(262_145).read_to_end(&mut bytes)?;
+                    if bytes.len() > 262_144 {
+                        anyhow::bail!("session selection exceeds 256 KiB");
+                    }
+                    Ok(serde_json::from_slice::<
+                        bloom_machine_client::PersonaSessionSelection,
+                    >(&bytes)?)
+                })
+                .transpose()?;
+            println!(
+                "persona coverage: Broker prices approved assets against the shared USD pool. Approve each returned member ceremony, then repeat activation to reconcile. Unsupported actions retain owner approval."
+            );
+            call_machine_command(
+                &client_endpoint,
+                MachineCommand::PersonaSessionActivateConfigured {
+                    wallet,
+                    account,
+                    selection,
+                },
+            )
+            .await
+        }
+        Cmd::Wallet(WalletCmd::Persona(PersonaCmd::Status { wallet })) => {
+            call_machine_command(&client_endpoint, MachineCommand::PersonaSessions { wallet }).await
+        }
+        Cmd::Wallet(WalletCmd::Persona(PersonaCmd::Stop { wallet, reason })) => {
+            call_machine_command(
+                &client_endpoint,
+                MachineCommand::PersonaSessionsStop { wallet, reason },
             )
             .await
         }
@@ -4489,7 +5042,9 @@ async fn run(cli: Cli) -> Result<()> {
                 let context = ready_context.clone();
                 *ready_provisioning.lock().expect("provisioning handle") =
                     Some(tokio::task::spawn_blocking(move || {
-                        petal_provisioning::provision(&daemon, &context)
+                        let results = petal_provisioning::provision(&daemon, &context);
+                        default_policy::apply_provisioned_settings(&daemon, &results);
+                        results
                     }));
             }));
             // Start audited and durable background effects only after every
@@ -5149,6 +5704,36 @@ mod tests {
 
     use async_trait::async_trait;
     use clap::Parser as _;
+
+    #[test]
+    fn persona_cli_requires_explicit_preset_for_limits_and_exposes_lifecycle() {
+        assert!(Cli::try_parse_from(["bloom", "init", "--persona-daily-usd", "500"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "bloom",
+                "init",
+                "--persona",
+                "trader",
+                "--persona-daily-usd",
+                "500"
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "bloom",
+                "wallet",
+                "persona",
+                "activate",
+                "main",
+                "--account",
+                "0"
+            ])
+            .is_ok()
+        );
+        assert!(Cli::try_parse_from(["bloom", "wallet", "persona", "status", "main"]).is_ok());
+        assert!(Cli::try_parse_from(["bloom", "wallet", "persona", "stop", "main"]).is_ok());
+    }
     use tracing::info;
     use tracing_subscriber::prelude::*;
 

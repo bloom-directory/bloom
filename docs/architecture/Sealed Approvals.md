@@ -77,6 +77,37 @@ The canonical approval is durable in Broker. Signer stores the enforcement
 projection it independently needs. Machine stores only public status and
 launch projections; deleting or altering them cannot authorize a signature.
 
+## Persona session selectors and shared accounting
+
+Persona metadata never confers authority. The Machine session resolver uses
+activated concrete `SealedApprovalTerms` and fresh wallet/key/policy/provenance
+bindings, preserving exact one-operation helpers. Unsupported actions continue
+through exact review. See [Persona Onboarding](Persona%20Onboarding.md) for the
+initial coverage and rollout gates.
+
+`SystemSession` adds typed native/canonical ERC20 transfer scope. Broker decodes
+the entire canonical preimage and checks the chain, recipient, token, amount and
+maximum encoded fee. Signer independently checks the authenticated projection,
+selector and counters without becoming a transaction parser. Current support
+is Ethereum1, Polygon137 and local31337. Other fee models and Solana require
+exact approval until their full fee/cluster facts can be established.
+
+An optional signed `SessionBudget` descriptor binds wallet, policy, epoch,
+member keys, validity, count/rate limits, raw asset ceilings and reviewed nominal
+collateral scales. Its canonical digest identifies a shared budget across
+member grants. Per-action, rolling and lifetime limits reserve atomically in
+both Broker and Signer. Reserved, committed and ambiguous operations remain
+charged; only authoritatively released reservations stop counting. Nominal
+stablecoin units do not establish fiat value, and unknown assets never count
+as free. Signing replays include the accounting digest in operation identity
+and recover the same result without another reservation.
+
+Normal SQLite reopening retains the shared ledger. Selective Signer archive
+restore disables grouped grants and durably blocks unrecovered budget IDs,
+including identical-descriptor renewal. Fresh owner-reviewed authority needs
+a new descriptor; cached completed results remain recoverable. Public proposal
+journals contain no signing secrets, PRF output or decrypted grants.
+
 ## Petal claims and trust boundary
 
 Each reusable Petal signing operation carries a normalized `PetalUseClaim`
@@ -427,3 +458,19 @@ Broker and Signer methods. A foreground client may deliberately open the
 Broker-provided URL. A mounted write never opens a browser; it projects the URL
 for the expecting client to open or forward. See
 [`Interaction Modes.md`](./Interaction%20Modes.md).
+
+## Broker-owned persona accounting
+
+Reusable persona authority uses the existing Petal Sealed Approval selector.
+Broker alone interprets, reserves and journals session asset amounts, nominal
+conversion conventions and shared spending limits. Signer receives its existing
+structural enforcement projection; no economic session descriptor, ledger or
+native-session selector crosses the south edge. Its existing opaque request
+nonce commits the Broker descriptor, and the signed Broker review displays it.
+
+The first compiler covers fee-free Polymarket BUY orders only. Each signing use
+carries the complete prepared witness. Broker reconstructs the actual preimage
+and matches its gross maker amount to the charged `polygon:pusd` debit before
+reserving. SELLs and other actions do not borrow that authority. These checks
+establish signing terms, not settlement or economic containment of a compromised
+Broker. Machine retains the witness in its immutable retry identity.

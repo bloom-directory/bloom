@@ -366,6 +366,7 @@ async fn solana_expired_blockhash_fails_closed_then_restages() -> Result<()> {
         publisher: tok("bloom-installer"),
         petal_lineage: None,
         operation_classes: vec![ProvenanceOperationClass {
+            economic_effects_schema: None,
             operation_class: tok(op),
             fee_asset: Some(ProvenanceFeeAsset {
                 chain: tok(chain),

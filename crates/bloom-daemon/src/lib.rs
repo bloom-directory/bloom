@@ -945,6 +945,7 @@ impl DaemonPetalHost {
         let request_nonce = bloom_broker_api::RequestNonce::new(&request_nonce_hex[..32])
             .map_err(|error| HostError::Invalid(error.to_string()))?;
         let terms = bloom_broker_api::SealedApprovalTerms {
+            session_budget: None,
             subject: bloom_broker_api::ApprovalSubject::Petal {
                 package_hash: scope.package_hash.clone(),
                 route: scope.route.clone(),
@@ -2299,9 +2300,9 @@ impl PetalHost for DaemonPetalHost {
             if bytes.len() > bloom_broker_api::SINGLE_PAYLOAD_MAX_BYTES
                 || req.payloads.len() != 1
                 || req.signature_algorithm != "secp256k1-keccak256-recoverable"
-                || !serde_json::from_slice::<serde_json::Value>(bytes)
+                || serde_json::from_slice::<serde_json::Value>(bytes)
                     .ok()
-                    .is_some_and(|value| value.as_array().is_some_and(|items| items.len() == 1))
+                    .is_none_or(|value| value.as_array().is_none_or(|items| items.len() != 1))
             {
                 return Err(HostError::Invalid("Polymarket exact signing requires one bounded prepared record and one recoverable Keccak payload".into()));
             }
@@ -3901,9 +3902,24 @@ impl AccountPetalMount for AccountPetals {
     }
 }
 
+/// The fixed contracts a chosen Petal transacts with, as Broker policy
+/// destinations. The table lives in Bloom's source, never in config.
+fn default_policy_destinations(name: &str) -> Vec<bloom_broker_api::PolicyDestination> {
+    bloom_proto::petal_destinations::for_petal(name)
+        .iter()
+        .filter_map(|destination| {
+            Some(bloom_broker_api::PolicyDestination {
+                chain: bloom_broker_api::Token::new(destination.chain.to_owned()).ok()?,
+                destination: destination.destination.to_owned(),
+            })
+        })
+        .collect()
+}
+
 /// All wired-up state the daemon owns. Cheap to clone (everything is
 /// behind Arc/clone-safe inner types).
 #[derive(Clone)]
+
 pub struct Daemon {
     deployment_locks: Arc<deployment::DeploymentLocks>,
     pub home: HomeDir,
@@ -3917,6 +3933,7 @@ pub struct Daemon {
     /// Command handlers must reuse this client rather than reopening the
     /// Machine journal and creating a second, stale in-memory head.
     pub machine_broker: Option<MachineBrokerClient>,
+    persona_provenance_catalog: Option<bloom_broker_api::ProvenanceCatalog>,
     pub wallet_projections: Arc<dyn WalletProjectionReader>,
     wallets: Arc<WalletsHandler>,
     pub vfs: Vfs,
@@ -4174,6 +4191,9 @@ impl Daemon {
         provenance_catalog: Option<bloom_broker_api::ProvenanceCatalog>,
     ) -> Result<Self, DaemonError> {
         home.ensure()?;
+        let broker = broker.map(|client| {
+            client.with_persona_session_store(home.cache_dir().join("persona-sessions"))
+        });
 
         // Before anything can serve or scan these projections, retire the
         // ceremonies a previous run left advertised.
@@ -4676,6 +4696,54 @@ impl Daemon {
             })),
         );
 
+        // Build the petals runtime: content-addressed store under
+        // `~/.bloom/petals/store`, name registry under
+        // `~/.bloom/petals/registry`, and a wasmtime engine. Petal
+        // packages are exposed under `petals/`.
+        let petals_root = home.root().join("petals");
+        let petal_store = PetalStore::open(petals_root.join("store"))
+            .map_err(|e| DaemonError::Audit(format!("petals store: {e}")))?;
+
+        // The default-policy wallet's first Petal proposal also allows every
+        // installed Petal chosen during setup.
+        let default_policy_packages: bloom_vfs::handlers::DefaultPolicyPackages = {
+            // Browser setup updates choices through this daemon's IPC writer.
+            // Read the current durable selection for every proposal so a running
+            // daemon never reintroduces an integration the owner deselected.
+            let setup_config_path = home.config_path();
+            let store = petal_store.clone();
+            Arc::new(move |wallet: &str| {
+                if wallet != bloom_proto::config::DEFAULT_POLICY_WALLET {
+                    return Ok(bloom_vfs::handlers::DefaultPolicySetup::default());
+                }
+                let current = Config::load(&setup_config_path).map_err(|error| {
+                    bloom_vfs::HandlerError::Backend(format!(
+                        "cannot read current setup choices before policy proposal: {error}"
+                    ))
+                })?;
+                let mut setup = bloom_vfs::handlers::DefaultPolicySetup::default();
+                for name in current.petals.setup.keys() {
+                    let installed = match store.resolve_petal_owner(name) {
+                        Ok(installed) => installed,
+                        Err(error) => {
+                            warn!(
+                                petal = %name,
+                                error = %error,
+                                "petal.default_policy_owner_unreadable"
+                            );
+                            continue;
+                        }
+                    };
+                    let Some(hash) = installed else { continue };
+                    let Ok(package) = bloom_broker_api::Digest32::new(hash) else {
+                        continue;
+                    };
+                    setup.packages.push(package);
+                    setup.destinations.extend(default_policy_destinations(name));
+                }
+                Ok(setup)
+            })
+        };
         let wallets_handler = Arc::new(
             WalletsHandler::new(
                 chains.clone(),
@@ -4689,16 +4757,9 @@ impl Daemon {
             .with_home_write_permit_opt(home_write_permit.clone())
             .with_mempool_indexes(mempool_indexes.clone())
             .with_solana(solana_engines)
-            .with_solana_reads(solana_chain_registry.clone()),
+            .with_solana_reads(solana_chain_registry.clone())
+            .with_default_policy_packages(default_policy_packages),
         );
-
-        // Build the petals runtime: content-addressed store under
-        // `~/.bloom/petals/store`, name registry under
-        // `~/.bloom/petals/registry`, and a wasmtime engine. Petal
-        // packages are exposed under `petals/`.
-        let petals_root = home.root().join("petals");
-        let petal_store = PetalStore::open(petals_root.join("store"))
-            .map_err(|e| DaemonError::Audit(format!("petals store: {e}")))?;
         let petal_registry = Arc::new(
             NameRegistry::open(petals_root.join("registry"))
                 .map_err(|e| DaemonError::Audit(format!("petals registry: {e}")))?,
@@ -5058,6 +5119,7 @@ impl Daemon {
             address_book: address_book_arc,
             audit: audit_arc,
             machine_broker: broker,
+            persona_provenance_catalog: provenance_catalog,
             wallet_projections,
             wallets: wallets_handler,
             vfs,
@@ -5080,6 +5142,74 @@ impl Daemon {
     /// callers must not construct a second edge over the same Machine journal.
     pub fn broker_client(&self) -> Option<MachineBrokerClient> {
         self.machine_broker.clone()
+    }
+
+    pub fn persona_provenance_catalog(&self) -> Option<bloom_broker_api::ProvenanceCatalog> {
+        self.persona_provenance_catalog.clone()
+    }
+
+    pub async fn prepare_persona_session(
+        &self,
+        proposal: bloom_machine_client::PersonaSessionProposal,
+    ) -> Result<bloom_machine_client::PersonaSessionStatus, bloom_broker_api::ProtocolError> {
+        self.machine_broker
+            .as_ref()
+            .ok_or_else(|| {
+                bloom_broker_api::ProtocolError::new(
+                    bloom_broker_api::ProtocolErrorCode::ServiceUnavailable,
+                    "Broker is unavailable for persona activation",
+                )
+            })?
+            .prepare_persona_session(proposal)
+            .await
+    }
+
+    pub async fn persona_sessions(
+        &self,
+        wallet: &str,
+    ) -> Result<Vec<bloom_machine_client::PersonaSessionStatus>, bloom_broker_api::ProtocolError>
+    {
+        self.machine_broker
+            .as_ref()
+            .ok_or_else(|| {
+                bloom_broker_api::ProtocolError::new(
+                    bloom_broker_api::ProtocolErrorCode::ServiceUnavailable,
+                    "Broker is unavailable for persona status",
+                )
+            })?
+            .persona_sessions(&bloom_broker_api::Token::new(wallet.to_owned())?)
+            .await
+    }
+
+    pub async fn stop_persona_sessions(
+        &self,
+        wallet: &str,
+        reason: &str,
+    ) -> Result<(), bloom_broker_api::ProtocolError> {
+        self.machine_broker
+            .as_ref()
+            .ok_or_else(|| {
+                bloom_broker_api::ProtocolError::new(
+                    bloom_broker_api::ProtocolErrorCode::ServiceUnavailable,
+                    "Broker is unavailable for persona revocation",
+                )
+            })?
+            .stop_persona_sessions(&bloom_broker_api::Token::new(wallet.to_owned())?, reason)
+            .await
+    }
+
+    /// Propose every package in `packages` and every destination in
+    /// `destinations` together through the wallet's existing policy operation.
+    /// `Allowed` means the policy allows all of them.
+    pub async fn ensure_default_policy(
+        &self,
+        wallet: &str,
+        packages: &[bloom_broker_api::Digest32],
+        destinations: &[bloom_broker_api::PolicyDestination],
+    ) -> Result<bloom_machine_client::PetalEligibility, bloom_vfs::HandlerError> {
+        self.wallets
+            .ensure_petal_packages_allowed(wallet, packages, destinations)
+            .await
     }
 
     /// Idempotent: ensure background workers are running. Already
@@ -6664,6 +6794,7 @@ mod tests {
                 active: true,
             }),
             operation_classes: vec![bloom_broker_api::ProvenanceOperationClass {
+                economic_effects_schema: None,
                 operation_class: bloom_broker_api::Token::new("exchange-agent").unwrap(),
                 fee_asset: None,
             }],
@@ -6845,6 +6976,7 @@ mod tests {
                 subject: subject.clone(),
                 publisher: bloom_broker_api::Token::new("fixture-publisher").unwrap(),
                 operation_classes: vec![bloom_broker_api::ProvenanceOperationClass {
+                    economic_effects_schema: None,
                     operation_class: bloom_broker_api::Token::new("order.place").unwrap(),
                     fee_asset: None,
                 }],
@@ -6877,6 +7009,7 @@ mod tests {
             bloom_broker_api::Digest32::from_bytes(digest.finalize().into())
         };
         let claim = bloom_broker_api::PetalUseClaim {
+            economic_effects: None,
             package_hash: bloom_broker_api::Digest32::from_bytes([0xbb; 32]),
             route: context.route_id.clone(),
             operation_class: bloom_broker_api::Token::new("order.place").unwrap(),
@@ -7023,6 +7156,7 @@ mod tests {
                 },
                 publisher: bloom_broker_api::Token::new("fixture-publisher").unwrap(),
                 operation_classes: vec![bloom_broker_api::ProvenanceOperationClass {
+                    economic_effects_schema: None,
                     operation_class: bloom_broker_api::Token::new(class).unwrap(),
                     fee_asset: None,
                 }],
@@ -7069,6 +7203,7 @@ mod tests {
             bloom_broker_api::Digest32::from_bytes(digest.finalize().into())
         };
         let claim = bloom_broker_api::PetalUseClaim {
+            economic_effects: None,
             package_hash: bloom_broker_api::Digest32::from_bytes([0xbb; 32]),
             route: context.route_id.clone(),
             operation_class: bloom_broker_api::Token::new(class).unwrap(),
@@ -7862,6 +7997,7 @@ mod tests {
                     publisher: bloom_broker_api::Token::new("bloom-installer").unwrap(),
                     petal_lineage: None,
                     operation_classes: vec![bloom_broker_api::ProvenanceOperationClass {
+                        economic_effects_schema: None,
                         operation_class: bloom_broker_api::Token::new("transaction.confirm")
                             .unwrap(),
                         fee_asset: Some(bloom_broker_api::ProvenanceFeeAsset {
@@ -7881,6 +8017,7 @@ mod tests {
                     publisher: bloom_broker_api::Token::new("bloom-installer").unwrap(),
                     petal_lineage: None,
                     operation_classes: vec![bloom_broker_api::ProvenanceOperationClass {
+                        economic_effects_schema: None,
                         operation_class: bloom_broker_api::Token::new("solana.native-transfer")
                             .unwrap(),
                         fee_asset: Some(bloom_broker_api::ProvenanceFeeAsset {
@@ -9242,6 +9379,7 @@ allowed = ["bloom:vfs.read"]
             })
             .collect::<Vec<_>>();
         let claim = bloom_broker_api::PetalUseClaim {
+            economic_effects: None,
             package_hash: bloom_broker_api::Digest32::new("ab".repeat(32)).unwrap(),
             route: "r000001".into(),
             operation_class: bloom_broker_api::Token::new("test.intent").unwrap(),

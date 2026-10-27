@@ -536,6 +536,7 @@ fn developer_route_operation_classes(
         .into_iter()
         .map(|operation_class| {
             Ok(ProvenanceOperationClass {
+                economic_effects_schema: route.economic_effects_schema,
                 operation_class: Token::new(operation_class)?,
                 fee_asset: None,
             })
@@ -1208,6 +1209,7 @@ fn append_release_lineage_record(
                 .iter()
                 .map(|class| {
                     Ok(ProvenanceOperationClass {
+                        economic_effects_schema: route.economic_effects_schema,
                         operation_class: Token::new(*class)?,
                         fee_asset: None,
                     })

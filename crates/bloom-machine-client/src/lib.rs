@@ -6,10 +6,16 @@
 
 #![forbid(unsafe_code)]
 
+mod persona_sessions;
 mod petal_eligibility;
+pub use persona_sessions::{
+    PersonaSessionMember, PersonaSessionProposal, PersonaSessionSelection, PersonaSessionStatus,
+};
 mod projection;
 
-pub use petal_eligibility::{PendingPolicyUpdate, PetalEligibility, policy_with_package};
+pub use petal_eligibility::{
+    PendingPolicyUpdate, PetalEligibility, policy_with_destinations, policy_with_packages,
+};
 
 pub use projection::{
     CachedWalletProjectionReader, FileProjectionStore, ProjectionFreshness, ProjectionVerification,
@@ -437,6 +443,8 @@ pub struct MachineBrokerClient {
     service: Arc<dyn MachineBrokerService>,
     local_identity: Option<LocalIdentity>,
     unix_service: Option<Arc<UnixMachineBrokerService>>,
+    persona_session_root: Option<Arc<PathBuf>>,
+    persona_session_gate: Arc<tokio::sync::Mutex<()>>,
     quota_backoff: Arc<QuotaBackoff>,
 }
 
@@ -446,6 +454,8 @@ impl MachineBrokerClient {
             service,
             local_identity: None,
             unix_service: None,
+            persona_session_root: None,
+            persona_session_gate: Arc::new(tokio::sync::Mutex::new(())),
             quota_backoff: Arc::default(),
         }
     }
@@ -464,6 +474,8 @@ impl MachineBrokerClient {
             service: unix_service.clone(),
             local_identity: Some(identity),
             unix_service: Some(unix_service),
+            persona_session_root: None,
+            persona_session_gate: Arc::new(tokio::sync::Mutex::new(())),
             quota_backoff: Arc::default(),
         }
     }
@@ -644,7 +656,7 @@ impl MachineBrokerClient {
 
     async fn sign_petal_payload_for_key(
         &self,
-        request: TrustedPetalSignRequest,
+        mut request: TrustedPetalSignRequest,
         selected_key_ref: Option<KeyRef>,
     ) -> Result<SigningResult, ProtocolError> {
         request.validate()?;
@@ -680,6 +692,7 @@ impl MachineBrokerClient {
             }
             None => unique_key_for_suite(&wallet.key_refs, request.crypto_suite)?,
         };
+        bind_economic_contexts(Some(&mut request.claim), &key_ref, 1)?;
         let payload_digest = Digest32::from_bytes(Sha256::digest(&request.preimage).into());
         let claim_payload_digest =
             petal_batch_payload_digest(std::slice::from_ref(&request.preimage));
@@ -741,6 +754,7 @@ impl MachineBrokerClient {
         }
         .digest()?;
         self.sign(MachineSignRequest {
+            session_use: None,
             operation_id,
             operation_digest,
             approval_id,
@@ -824,6 +838,26 @@ impl MachineBrokerClient {
             .collect()
     }
 
+    async fn resolve_effects_key(
+        &self,
+        wallet: &Token,
+        suite: CryptoSuite,
+        selected: Option<&KeyRef>,
+        operation: &OperationId,
+    ) -> Result<KeyRef, ProtocolError> {
+        if let Some(key) = self.persona_recovery_key(operation)? {
+            if selected.is_some_and(|candidate| candidate != &key) {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::KeyrefMismatch,
+                    "economic context retry changed its selected account",
+                ));
+            }
+            return Ok(key);
+        }
+        let wallet = self.wallet(wallet.clone()).await?;
+        self.verified_signing_key(&wallet, suite, selected).await
+    }
+
     /// Prepare or execute one exact payload-bearing Machine/CLI operation.
     ///
     /// The caller persists the returned approval ID and reuses the exact
@@ -832,10 +866,24 @@ impl MachineBrokerClient {
     /// the approval and sign operation.
     pub async fn sign_exact_payload(
         &self,
-        request: ExactPayloadSignRequest,
+        mut request: ExactPayloadSignRequest,
     ) -> Result<ExactPayloadSignOutcome, ProtocolError> {
         request.validate()?;
-        let wallet = self.wallet(request.wallet_id.clone()).await?;
+        if request
+            .petal_use_claim
+            .as_ref()
+            .is_some_and(|c| c.economic_effects.is_some())
+        {
+            let key = self
+                .resolve_effects_key(
+                    &request.wallet_id,
+                    request.crypto_suite,
+                    request.account_key_ref.as_ref(),
+                    &request.signing_operation_id,
+                )
+                .await?;
+            bind_economic_contexts(request.petal_use_claim.as_mut(), &key, 1)?;
+        }
         let payload_digest = Digest32::from_bytes(Sha256::digest(&request.preimage).into());
         let ordered_hash = suite_hash(request.crypto_suite, &request.preimage);
         if request.claimed_hash != ordered_hash {
@@ -928,6 +976,13 @@ impl MachineBrokerClient {
                 }
                 (Some(_), Some(_)) => unreachable!("mutual exclusion checked above"),
             };
+        if request.approval_id.is_none()
+            && let Some(key) = self.persona_recovery_key(&request.signing_operation_id)?
+            && let Some(result) = self.try_persona_sign(&request, &key).await?
+        {
+            return Ok(ExactPayloadSignOutcome::Signed(result));
+        }
+        let wallet = self.wallet(request.wallet_id.clone()).await?;
         let key_ref = self
             .verified_signing_key(
                 &wallet,
@@ -935,6 +990,14 @@ impl MachineBrokerClient {
                 request.account_key_ref.as_ref(),
             )
             .await?;
+        // Recheck after the fresh wallet/key read: a changing projection may
+        // not move an already account-bound economic declaration to another key.
+        bind_economic_contexts(request.petal_use_claim.as_mut(), &key_ref, 1)?;
+        if request.approval_id.is_none()
+            && let Some(result) = self.try_persona_sign(&request, &key_ref).await?
+        {
+            return Ok(ExactPayloadSignOutcome::Signed(result));
+        }
         let activation_mode = request
             .activation_mode
             .clone()
@@ -956,6 +1019,7 @@ impl MachineBrokerClient {
             .digest()?;
             return self
                 .sign(MachineSignRequest {
+                    session_use: None,
                     operation_id: request.signing_operation_id,
                     operation_digest,
                     approval_id,
@@ -977,6 +1041,7 @@ impl MachineBrokerClient {
         }
 
         let terms = SealedApprovalTerms {
+            session_budget: None,
             subject: approval_subject(&request.provenance),
             wallet_id: request.wallet_id,
             key_ref,
@@ -1043,10 +1108,28 @@ impl MachineBrokerClient {
     /// operation digest.
     pub async fn sign_exact_payload_batch(
         &self,
-        request: ExactPayloadBatchSignRequest,
+        mut request: ExactPayloadBatchSignRequest,
     ) -> Result<ExactPayloadSignOutcome, ProtocolError> {
         request.validate(false)?;
-        let wallet = self.wallet(request.wallet_id.clone()).await?;
+        if request
+            .petal_use_claim
+            .as_ref()
+            .is_some_and(|c| c.economic_effects.is_some())
+        {
+            let key = self
+                .resolve_effects_key(
+                    &request.wallet_id,
+                    request.crypto_suite,
+                    request.account_key_ref.as_ref(),
+                    &request.signing_operation_id,
+                )
+                .await?;
+            bind_economic_contexts(
+                request.petal_use_claim.as_mut(),
+                &key,
+                request.preimages.len(),
+            )?;
+        }
         let ordered_payload_digests = request
             .preimages
             .iter()
@@ -1107,6 +1190,13 @@ impl MachineBrokerClient {
                 (None, None)
             }
         };
+        if request.approval_id.is_none()
+            && let Some(key) = self.persona_recovery_key(&request.signing_operation_id)?
+            && let Some(result) = self.try_persona_sign_batch(&request, &key).await?
+        {
+            return Ok(ExactPayloadSignOutcome::Signed(result));
+        }
+        let wallet = self.wallet(request.wallet_id.clone()).await?;
         let key_ref = self
             .verified_signing_key(
                 &wallet,
@@ -1114,6 +1204,16 @@ impl MachineBrokerClient {
                 request.account_key_ref.as_ref(),
             )
             .await?;
+        bind_economic_contexts(
+            request.petal_use_claim.as_mut(),
+            &key_ref,
+            request.preimages.len(),
+        )?;
+        if request.approval_id.is_none()
+            && let Some(result) = self.try_persona_sign_batch(&request, &key_ref).await?
+        {
+            return Ok(ExactPayloadSignOutcome::Signed(result));
+        }
         let activation_mode = request
             .activation_mode
             .clone()
@@ -1135,6 +1235,7 @@ impl MachineBrokerClient {
             .digest()?;
             return self
                 .sign_batch(MachineSignRequest {
+                    session_use: None,
                     operation_id: request.signing_operation_id,
                     operation_digest,
                     approval_id,
@@ -1166,6 +1267,7 @@ impl MachineBrokerClient {
             )
         })?;
         let terms = SealedApprovalTerms {
+            session_budget: None,
             subject: approval_subject(&request.provenance),
             wallet_id: request.wallet_id,
             key_ref,
@@ -1282,6 +1384,12 @@ impl MachineBrokerClient {
                 "reusable Petal batch claim does not match provenance or payloads",
             ));
         }
+        if request.approval_id.is_none()
+            && let Some(key) = self.persona_recovery_key(&request.signing_operation_id)?
+            && let Some(result) = self.try_persona_sign_batch(&request, &key).await?
+        {
+            return Ok(ExactPayloadSignOutcome::Signed(result));
+        }
         let wallet = self.wallet(request.wallet_id.clone()).await?;
         let key_ref = self
             .verified_signing_key(
@@ -1290,6 +1398,11 @@ impl MachineBrokerClient {
                 request.account_key_ref.as_ref(),
             )
             .await?;
+        if request.approval_id.is_none()
+            && let Some(result) = self.try_persona_sign_batch(&request, &key_ref).await?
+        {
+            return Ok(ExactPayloadSignOutcome::Signed(result));
+        }
         let activation_mode = request
             .activation_mode
             .clone()
@@ -1313,6 +1426,7 @@ impl MachineBrokerClient {
             .digest()?;
             return self
                 .sign_batch(MachineSignRequest {
+                    session_use: None,
                     operation_id: request.signing_operation_id,
                     operation_digest,
                     approval_id,
@@ -1345,6 +1459,7 @@ impl MachineBrokerClient {
         })?;
         let operation_class = claim.operation_class.clone();
         let terms = SealedApprovalTerms {
+            session_budget: None,
             subject: approval_subject(&request.provenance),
             wallet_id: request.wallet_id,
             key_ref,
@@ -2102,6 +2217,48 @@ impl ExpectedSigningResult {
     }
 }
 
+/// Fill the SDK's empty account placeholders from the host's exact selected key.
+/// A supplied different account, duplicate/missing index or cross-network debit
+/// is never silently overwritten. This canonical claim is then retry-bound.
+fn bind_economic_contexts(
+    claim: Option<&mut PetalUseClaim>,
+    key: &KeyRef,
+    payload_count: usize,
+) -> Result<(), ProtocolError> {
+    let Some(claim) = claim else {
+        return Ok(());
+    };
+    let Some(effects) = &mut claim.economic_effects else {
+        return Ok(());
+    };
+    let invalid = || {
+        ProtocolError::new(
+            ProtocolErrorCode::ClaimInvalid,
+            "economic effects require one ordered network/account context per payload",
+        )
+    };
+    if effects.schema_version != 1 || effects.payload_contexts.len() != payload_count {
+        return Err(invalid());
+    }
+    for (index, context) in effects.payload_contexts.iter_mut().enumerate() {
+        if context.payload_index as usize != index
+            || (!context.spending_accounts.is_empty() && context.spending_accounts != [key.clone()])
+        {
+            return Err(invalid());
+        }
+        context.spending_accounts = vec![key.clone()];
+    }
+    if claim.declared_debits.iter().any(|debit| {
+        !effects
+            .payload_contexts
+            .iter()
+            .any(|context| context.network == debit.asset.chain)
+    }) {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug)]
 pub struct TrustedPetalSignRequest {
     pub wallet_id: Token,
@@ -2120,6 +2277,9 @@ pub struct TrustedPetalSignRequest {
 
 #[derive(Clone, Debug)]
 pub struct ExactPayloadSignRequest {
+    /// Semantic projection of a typed native session action. Broker verifies
+    /// it against the complete payload; opaque or unsupported actions omit it.
+    pub session_use: Option<bloom_broker_api::SystemSessionUse>,
     pub wallet_id: Token,
     pub preimage: Vec<u8>,
     pub claimed_hash: Digest32,
@@ -2319,12 +2479,23 @@ impl ExactPayloadSignRequest {
                 || bloom_broker_api::POLYMARKET_REVIEW_OPERATION_CLASSES
                     .contains(&claim.operation_class.as_str())
         });
-        // Machine builds System messages (x402, MPP) itself, so no Petal can
-        // label them; Broker reviews message envelopes for Petal subjects only.
-        let system = matches!(self.provenance, ProvenanceSubject::System { .. });
-        if (message_required || (!system && is_signed_message(self.crypto_suite, &self.preimage)))
+        // Paid HTTP has an installer-certified System exact-approval path.
+        // Its EIP-712 payment payload is not a Petal message and cannot carry
+        // a Petal review envelope. Keep this exception tied to those two
+        // existing classes; it never authorizes reusable or native sessions.
+        let exact_paid_http = self.petal_use_claim.is_none()
+            && self.system_use_claim.is_none()
+            && self.session_use.is_none()
+            && matches!(
+                &self.provenance,
+                ProvenanceSubject::System { component_id, operation_class }
+                    if component_id.as_str() == "bloom-machine"
+                        && matches!(operation_class.as_str(), "paid-http.x402" | "paid-http.mpp")
+            );
+        if (message_required || is_signed_message(self.crypto_suite, &self.preimage))
             && self.message_review_payload.is_none()
             && !safe_operation
+            && !exact_paid_http
         {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::ClaimInvalid,
@@ -3851,6 +4022,7 @@ mod tests {
                     }
                     MachineBrokerRequest::SealedApprovalLimitState(request) => Ok(
                         MachineBrokerResponse::SealedApprovalLimitState(ApprovalLimitState {
+                            session_budget_state: None,
                             approval_id: request.id,
                             committed_operations: DecimalU64::new(1),
                             reserved_operations: DecimalU64::new(2),
@@ -4019,6 +4191,7 @@ mod tests {
             operation_class: token("order.place"),
             selector: bloom_broker_api::PetalSignSelector::Reusable,
             claim: PetalUseClaim {
+                economic_effects: None,
                 package_hash: digest(40),
                 route: "orders/place".into(),
                 operation_class: token("order.place"),
@@ -4091,6 +4264,7 @@ mod tests {
             operation_class: token("order.cancel"),
             selector: bloom_broker_api::PetalSignSelector::Reusable,
             claim: PetalUseClaim {
+                economic_effects: None,
                 package_hash: digest(40),
                 route: "orders/cancel".into(),
                 operation_class: token("order.cancel"),
@@ -4210,6 +4384,7 @@ mod tests {
 
     fn exact_request(payload: Vec<u8>, approval_id: Option<Digest32>) -> ExactPayloadSignRequest {
         ExactPayloadSignRequest {
+            session_use: None,
             evm_reported_token: None,
             wallet_id: token("wallet"),
             claimed_hash: Digest32::from_bytes(Keccak256::digest(&payload).into()),
@@ -4239,9 +4414,50 @@ mod tests {
     }
 
     #[test]
+    fn only_existing_paid_http_system_exact_routes_skip_petal_message_envelopes() {
+        let mut request = exact_request(vec![0x19, 0x01], None);
+        assert_eq!(
+            request.validate().unwrap_err().code,
+            ProtocolErrorCode::ClaimInvalid
+        );
+        request.provenance = ProvenanceSubject::Petal {
+            package_hash: digest(70),
+            route: "generic/opaque-signature".into(),
+        };
+        assert_eq!(
+            request.validate().unwrap_err().code,
+            ProtocolErrorCode::ClaimInvalid
+        );
+        for class in ["paid-http.x402", "paid-http.mpp"] {
+            request.provenance = ProvenanceSubject::System {
+                component_id: token("bloom-machine"),
+                operation_class: token(class),
+            };
+            request.validate().unwrap();
+        }
+        request.provenance = ProvenanceSubject::System {
+            component_id: token("bloom-machine"),
+            operation_class: token("arbitrary.message"),
+        };
+        assert_eq!(
+            request.validate().unwrap_err().code,
+            ProtocolErrorCode::ClaimInvalid
+        );
+        request.provenance = ProvenanceSubject::System {
+            component_id: token("other-component"),
+            operation_class: token("paid-http.x402"),
+        };
+        assert_eq!(
+            request.validate().unwrap_err().code,
+            ProtocolErrorCode::ClaimInvalid
+        );
+    }
+
+    #[test]
     fn safe_exact_request_requires_a_bounded_semantic_review_envelope() {
         let mut request = exact_request(vec![0x19, 0x01], None);
         request.petal_use_claim = Some(PetalUseClaim {
+            economic_effects: None,
             package_hash: digest(70),
             route: "transactions/wallet/one/confirm.json".into(),
             operation_class: token("safe.transaction.confirm"),
@@ -4293,6 +4509,7 @@ mod tests {
         // prepared with an empty safe_review_payloads, so a Safe confirmation
         // here would reach the owner with no Safe decoding at all.
         request.petal_use_claim = Some(PetalUseClaim {
+            economic_effects: None,
             package_hash: digest(80),
             route: "transactions/wallet/one/confirm.json".into(),
             operation_class: token("safe.transaction.confirm"),
@@ -4367,6 +4584,7 @@ mod tests {
             operation_class: token(class),
             selector: bloom_broker_api::PetalSignSelector::Reusable,
             claim: PetalUseClaim {
+                economic_effects: None,
                 package_hash: digest(40),
                 route: "transactions/wallet/one/confirm.json".into(),
                 operation_class: token(class),
@@ -4475,6 +4693,7 @@ mod tests {
     fn polymarket_exact_batch_requires_review_and_cannot_be_downgraded() {
         let mut request = exact_batch_request(vec![vec![0x19, 0x01]], None);
         request.petal_use_claim = Some(PetalUseClaim {
+            economic_effects: None,
             package_hash: digest(70),
             route: "orders/wallet/0/submit.json".into(),
             operation_class: token("polymarket.order.poly1271"),
@@ -4624,6 +4843,7 @@ mod tests {
         };
         request.activation_mode = None;
         request.petal_use_claim = Some(PetalUseClaim {
+            economic_effects: None,
             package_hash,
             route,
             operation_class: token("fixture.approve_agent"),
@@ -4680,6 +4900,7 @@ mod tests {
                 route: "r000021".into(),
             };
             request.petal_use_claim = Some(PetalUseClaim {
+                economic_effects: None,
                 package_hash: digest(80),
                 route: "r000021".into(),
                 operation_class: token(class),
@@ -4887,7 +5108,7 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.code, ProtocolErrorCode::SelectorMismatch);
-        assert_eq!(broker.requests.lock().unwrap().len(), 1);
+        assert!(broker.requests.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -4913,7 +5134,7 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.code, ProtocolErrorCode::SelectorMismatch);
-        assert_eq!(broker.requests.lock().unwrap().len(), 1);
+        assert!(broker.requests.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -4943,6 +5164,7 @@ mod tests {
                 operation_class: token("order.place"),
                 selector: bloom_broker_api::PetalSignSelector::Reusable,
                 claim: PetalUseClaim {
+                    economic_effects: None,
                     package_hash: digest(41),
                     route: "forged/route".into(),
                     operation_class: token("order.place"),
@@ -5194,6 +5416,7 @@ mod tests {
                 operation_class: token("order.place"),
                 selector: bloom_broker_api::PetalSignSelector::Reusable,
                 claim: PetalUseClaim {
+                    economic_effects: None,
                     package_hash: digest(40),
                     route: "orders/place".into(),
                     operation_class: token("order.place"),
@@ -5316,6 +5539,7 @@ mod tests {
 
     fn approval_terms(wallet: &str, renewal_of: Option<Digest32>) -> SealedApprovalTerms {
         SealedApprovalTerms {
+            session_budget: None,
             subject: ApprovalSubject::Cli {
                 client_id: token("bloom-cli"),
                 command_class: token("test.approval"),

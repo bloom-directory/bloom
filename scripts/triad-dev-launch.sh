@@ -374,18 +374,25 @@ if [ "$install_authority_fixture" -eq 1 ]; then
   ' "${config_dir}/provenance-catalog.json" >/dev/null ||
     die "developer enrollment predates the current fixture; create a fresh developer root"
 fi
-hyperliquid_package="${BLOOM_TRIAD_DEV_HYPERLIQUID_PACKAGE:-}"
-if [ -n "$hyperliquid_package" ]; then
-  [ -d "$hyperliquid_package" ] ||
-    die "integration Petal package is missing: $hyperliquid_package"
+# Enroll every local integration package before either authority service
+# loads its installer-signed catalog. Installation after Machine starts must
+# resolve to these same built package bytes.
+for integration_petal in \
+  "${BLOOM_TRIAD_DEV_POLYMARKET_PACKAGE:-}" \
+  "${BLOOM_TRIAD_DEV_HYPERLIQUID_PACKAGE:-}"
+do
+  [ -n "$integration_petal" ] || continue
+  [ -d "$integration_petal" ] ||
+    die "integration Petal package is missing: $integration_petal"
   if [ "$build_integration_petals" -eq 1 ]; then
-    [ -x "${hyperliquid_package}/scripts/build.sh" ] ||
-      die "integration Petal build script is missing: ${hyperliquid_package}/scripts/build.sh"
-    (cd "$hyperliquid_package" && scripts/build.sh)
+    [ -x "${integration_petal}/scripts/build.sh" ] ||
+      die "integration Petal build script is missing: ${integration_petal}/scripts/build.sh"
+    (cd "$integration_petal" && scripts/build.sh)
   fi
   "$bloom_bin" init triad-enroll-developer-petal-provenance \
-    "$config_dir" "$hyperliquid_package"
-fi
+    "$config_dir" "$integration_petal"
+done
+
 mkdir -p "${developer_root}/state/broker" "${developer_root}/state/signer"
 chmod 0700 "${developer_root}/state" \
   "${developer_root}/state/broker" "${developer_root}/state/signer"
