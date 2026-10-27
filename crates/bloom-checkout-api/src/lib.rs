@@ -91,6 +91,15 @@ pub struct HistoryEntry {
     /// The total the human approved, when Bloom read one.
     pub total_minor: Option<u64>,
     pub currency: Option<String>,
+    /// What the shop charges once any trial or intro price ends, and how
+    /// often, when the page stated it and the human approved those terms.
+    /// Bloom cannot cap what the shop takes later; cancelling is done with
+    /// the shop.
+    pub renewal_minor: Option<u64>,
+    /// `day`, `week`, `month` or `year`.
+    pub renewal_period: Option<String>,
+    /// The first date that price applies, `YYYY-MM-DD`.
+    pub renewal_starts_on: Option<String>,
     pub status: Status,
 }
 

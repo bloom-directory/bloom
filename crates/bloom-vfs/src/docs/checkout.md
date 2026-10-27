@@ -85,7 +85,11 @@ tool for this checkout.
 - Cancellation is a write to the request's `cancel` file, only before release.
 - Read `checkout/history.json` for the 50 latest requests: time, kind, shop,
   approved total and final status. Check it before buying again at the same
-  shop so nothing is ordered twice.
+  shop so nothing is ordered twice. A subscription also carries the terms the
+  person approved, `renewal_minor`, `renewal_period` and `renewal_starts_on`,
+  so this is where to answer what they are still paying for and when it next
+  charges. A renewal the person approved elsewhere is not here, and no entry
+  proves the shop has not changed its price since.
 
 The human approves website, total, currency, installments, recurring status,
 and card, then enters CVC privately; the approval also lists entered fields
@@ -101,7 +105,9 @@ fallback releases no saved card.
 For a subscription, the approval states the ongoing price, how often it
 recurs and the day it starts, whenever the page says them plainly. Tell the
 person what those terms are before asking for approval: a trial price is not
-what the subscription costs. A page offering several plans states several
+what the subscription costs. To stop one, cancel it on the shop's own site in
+this browser, with a take-over if it needs a login; Bloom holds no
+subscription of its own and cancelling is never a payment request. A page offering several plans states several
 ongoing prices, so Bloom claims none of them; say which plan is selected and
 what it renews at. Bloom cannot cap what a merchant charges after a card is
 on file, and cancelling is done with the merchant, not through Bloom.

@@ -7,8 +7,8 @@ use crate::{
 use anyhow::{Context, Result, bail};
 use bloom_checkout_api::{BrowseRequest, PreparationReason};
 use bloom_signer_api::{
-    CardOperationState, CardOperationStatus, CustodyOutputHpkeAad, CustodyResult, Digest32,
-    OperationId, Token, TravelerFillScope,
+    CardOperationState, CardOperationStatus, CheckoutFacts, CustodyOutputHpkeAad, CustodyResult,
+    Digest32, OperationId, RenewalPeriod, Token, TravelerFillScope,
 };
 use parking_lot::Mutex;
 use rusqlite::{Connection, params};
@@ -32,6 +32,20 @@ pub use bloom_checkout_api::{HistoryEntry, Request, Status};
 const APPROVAL_RESULT_WAIT: Duration = Duration::from_secs(15 * 60 + 30);
 
 struct Store(Mutex<Connection>);
+/// The ongoing price, period and start date to keep for a subscription. A
+/// price without a period is not a subscription Bloom can describe, so it
+/// keeps nothing rather than half of it.
+fn renewal_terms(facts: &CheckoutFacts) -> Option<(u64, &str, Option<&str>)> {
+    let minor = facts.renewal_minor?;
+    let period = match facts.renewal_period? {
+        RenewalPeriod::Day => "day",
+        RenewalPeriod::Week => "week",
+        RenewalPeriod::Month => "month",
+        RenewalPeriod::Year => "year",
+    };
+    Some((minor, period, facts.renewal_starts_on.as_deref()))
+}
+
 impl Store {
     fn open(path: &Path) -> Result<Self> {
         if path.exists() {
@@ -51,7 +65,17 @@ impl Store {
                 .open(path)?;
         }
         let conn = Connection::open(path)?;
-        conn.execute_batch("PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS operations(id TEXT PRIMARY KEY,state TEXT NOT NULL,status TEXT NOT NULL,created INTEGER NOT NULL,kind TEXT NOT NULL,description TEXT NOT NULL,shop TEXT,total_minor INTEGER,currency TEXT);")?;
+        conn.execute_batch("PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS operations(id TEXT PRIMARY KEY,state TEXT NOT NULL,status TEXT NOT NULL,created INTEGER NOT NULL,kind TEXT NOT NULL,description TEXT NOT NULL,shop TEXT,total_minor INTEGER,currency TEXT,renewal_minor INTEGER,renewal_period TEXT,renewal_starts_on TEXT);")?;
+        // A store written before renewal terms were recorded has the earlier
+        // columns. Adding them keeps its history readable; the rows stay null,
+        // which reads the same as a purchase that did not recur.
+        for column in [
+            "renewal_minor INTEGER",
+            "renewal_period TEXT",
+            "renewal_starts_on TEXT",
+        ] {
+            let _ = conn.execute(&format!("ALTER TABLE operations ADD COLUMN {column}"), []);
+        }
         // A lost recipient cannot be reconstructed. Interrupted disclosure is never retried.
         // Form errors can arrive after a pay click. Older versions incorrectly
         // converted them to not_submitted; neither state proves no charge.
@@ -119,17 +143,34 @@ impl Store {
             Err(error) => Err(error.into()),
         }
     }
-    fn record_order(&self, id: &str, shop: Option<&str>, total: Option<(u64, &str)>) -> Result<()> {
+    /// `renewal` is the ongoing price, its period and the date it starts, as
+    /// the human approved them. It is what makes a subscription findable later,
+    /// since the shop never tells Bloom about a renewal it charges.
+    fn record_order(
+        &self,
+        id: &str,
+        shop: Option<&str>,
+        total: Option<(u64, &str)>,
+        renewal: Option<(u64, &str, Option<&str>)>,
+    ) -> Result<()> {
         self.0.lock().execute(
-            "UPDATE operations SET shop=?2,total_minor=?3,currency=?4 WHERE id=?1",
-            params![id, shop, total.map(|t| t.0), total.map(|t| t.1)],
+            "UPDATE operations SET shop=?2,total_minor=?3,currency=?4,renewal_minor=?5,renewal_period=?6,renewal_starts_on=?7 WHERE id=?1",
+            params![
+                id,
+                shop,
+                total.map(|t| t.0),
+                total.map(|t| t.1),
+                renewal.map(|r| r.0),
+                renewal.map(|r| r.1),
+                renewal.and_then(|r| r.2)
+            ],
         )?;
         Ok(())
     }
     fn history(&self) -> Result<Vec<HistoryEntry>> {
         let conn = self.0.lock();
         let mut query = conn.prepare(
-            "SELECT created,kind,description,shop,total_minor,currency,status FROM operations ORDER BY created DESC,rowid DESC LIMIT 50",
+            "SELECT created,kind,description,shop,total_minor,currency,renewal_minor,renewal_period,renewal_starts_on,status FROM operations ORDER BY created DESC,rowid DESC LIMIT 50",
         )?;
         let rows = query.query_map([], |r| {
             Ok((
@@ -139,11 +180,25 @@ impl Store {
                 r.get(3)?,
                 r.get(4)?,
                 r.get(5)?,
-                r.get::<_, String>(6)?,
+                r.get(6)?,
+                r.get(7)?,
+                r.get(8)?,
+                r.get::<_, String>(9)?,
             ))
         })?;
         rows.map(|row| {
-            let (created, kind, description, shop, total_minor, currency, status) = row?;
+            let (
+                created,
+                kind,
+                description,
+                shop,
+                total_minor,
+                currency,
+                renewal_minor,
+                renewal_period,
+                renewal_starts_on,
+                status,
+            ) = row?;
             Ok(HistoryEntry {
                 created,
                 kind,
@@ -151,6 +206,9 @@ impl Store {
                 shop,
                 total_minor,
                 currency,
+                renewal_minor,
+                renewal_period,
+                renewal_starts_on,
                 status: serde_json::from_str(&status)?,
             })
         })
@@ -368,7 +426,7 @@ impl CheckoutService {
             &format!("Unlock {} for {}", metadata.label, origin),
         )?;
         self.store
-            .record_order(&operation_id, Some(&origin), None)?;
+            .record_order(&operation_id, Some(&origin), None, None)?;
         let recipient = Recipient::generate();
         let challenge_url = format!("http://localhost:{}/unlocked", self.view_port);
         let response = self
@@ -972,6 +1030,7 @@ impl CheckoutService {
                     discovery
                         .as_ref()
                         .map(|d| (d.facts.total_minor, d.facts.currency.as_str())),
+                    discovery.as_ref().and_then(|d| renewal_terms(&d.facts)),
                 )?;
                 let recipient =
                     (mode == Mode::Card && discovery.is_some()).then(Recipient::generate);
@@ -2101,6 +2160,56 @@ const BROWSE_ERRORS: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn facts() -> CheckoutFacts {
+        CheckoutFacts {
+            origin: "https://shop.example".into(),
+            payment_frame_origins: Vec::new(),
+            total_minor: 100,
+            currency: "USD".into(),
+            installments: 1,
+            recurring: true,
+            renewal_minor: None,
+            renewal_period: None,
+            renewal_starts_on: None,
+        }
+    }
+
+    #[test]
+    fn every_renewal_period_is_recorded_and_a_price_alone_is_not() {
+        for (period, name) in [
+            (RenewalPeriod::Day, "day"),
+            (RenewalPeriod::Week, "week"),
+            (RenewalPeriod::Month, "month"),
+            (RenewalPeriod::Year, "year"),
+        ] {
+            let subscription = CheckoutFacts {
+                renewal_minor: Some(1299),
+                renewal_period: Some(period),
+                renewal_starts_on: Some("2026-11-25".into()),
+                ..facts()
+            };
+            assert_eq!(
+                renewal_terms(&subscription),
+                Some((1299, name, Some("2026-11-25")))
+            );
+        }
+        // A renewal with no stated start date is still worth keeping: the
+        // price and the period are what tell a person what they signed up for.
+        let undated = CheckoutFacts {
+            renewal_minor: Some(1299),
+            renewal_period: Some(RenewalPeriod::Month),
+            ..facts()
+        };
+        assert_eq!(renewal_terms(&undated), Some((1299, "month", None)));
+        // Half a renewal describes nothing, and a plain purchase has none.
+        let half = CheckoutFacts {
+            renewal_minor: Some(1299),
+            ..facts()
+        };
+        assert_eq!(renewal_terms(&half), None);
+        assert_eq!(renewal_terms(&facts()), None);
+    }
 
     #[tokio::test]
     async fn multiple_travelers_and_a_different_payer_require_explicit_records_and_targets() {
@@ -3841,7 +3950,7 @@ mod tests {
             .unwrap();
         service
             .store
-            .record_order(&prior, Some(&origin), None)
+            .record_order(&prior, Some(&origin), None, None)
             .unwrap();
         let blocked = service
             .request(Request::Checkout {
@@ -4334,6 +4443,7 @@ mod tests {
                 "synthetic-operation",
                 Some("https://shop.example"),
                 Some((1250, "EUR")),
+                Some((1299, "month", Some("2026-11-25"))),
             )
             .unwrap();
         let workers = (0..8)
@@ -4372,6 +4482,17 @@ mod tests {
         assert_eq!(
             (entry.total_minor, entry.currency.as_deref()),
             (Some(1250), Some("EUR"))
+        );
+        // What the shop charges later is the only record of it: the shop never
+        // tells Bloom about a renewal, so a history that forgets the terms
+        // cannot answer "what am I still paying for".
+        assert_eq!(
+            (
+                entry.renewal_minor,
+                entry.renewal_period.as_deref(),
+                entry.renewal_starts_on.as_deref()
+            ),
+            (Some(1299), Some("month"), Some("2026-11-25"))
         );
         assert_eq!(entry.status.state, "disclosure_unknown");
         let submitted = Status {
