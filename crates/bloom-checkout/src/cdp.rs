@@ -447,8 +447,13 @@ mod tests {
     #[tokio::test]
     async fn oversized_reply_does_not_disable_later_browser_commands() {
         let root = tempfile::tempdir().unwrap().keep();
-        let cdp =
-            Cdp::launch(&crate::test_chromium(), &root, &["--no-sandbox".into()], false).unwrap();
+        let cdp = Cdp::launch(
+            &crate::test_chromium(),
+            &root,
+            &["--no-sandbox".into()],
+            false,
+        )
+        .unwrap();
         let target = cdp
             .call(None, "Target.createTarget", json!({"url":"about:blank"}))
             .await
