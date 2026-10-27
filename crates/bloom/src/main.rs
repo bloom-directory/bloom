@@ -2906,7 +2906,7 @@ enum PersonaCmd {
         /// Explicit reviewed frozen terms. For scope compilation use --selection.
         #[arg(long, conflicts_with = "selection")]
         proposal: Option<PathBuf>,
-        /// Public member scopes and priced asset identities for one shared pool.
+        /// Public member scopes, token identities and exact token allowances.
         #[arg(long)]
         selection: Option<PathBuf>,
     },
