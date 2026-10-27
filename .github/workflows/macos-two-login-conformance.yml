@@ -12,7 +12,7 @@ on:
         description: Public bloom-signer ref
         required: false
         type: string
-        default: b898d03712309ec1cc5f9027275ba1b6d28b6e53
+        default: 74e097a566f1bd08f5f43a7e847d3958b6386a3a
       login_uid_a:
         description: First active GUI login UID
         required: true
@@ -38,7 +38,7 @@ on:
       signer_ref:
         description: Public bloom-signer ref
         required: true
-        default: b898d03712309ec1cc5f9027275ba1b6d28b6e53
+        default: 74e097a566f1bd08f5f43a7e847d3958b6386a3a
       login_uid_a:
         description: First active GUI login UID
         required: true
@@ -76,7 +76,7 @@ jobs:
         shell: bash
         env:
           BROKER_REF: ${{ inputs.broker_ref || '4dd1b58b7217cdcb0a1238c5ee70febbc1cf95a4' }}
-          SIGNER_REF: ${{ inputs.signer_ref || 'b898d03712309ec1cc5f9027275ba1b6d28b6e53' }}
+          SIGNER_REF: ${{ inputs.signer_ref || '74e097a566f1bd08f5f43a7e847d3958b6386a3a' }}
         run: |
           [[ "$BROKER_REF" =~ ^[0-9a-f]{40}$ ]]
           [[ "$SIGNER_REF" =~ ^[0-9a-f]{40}$ ]]
@@ -90,7 +90,7 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           repository: bloom-directory/bloom-signer
-          ref: ${{ inputs.signer_ref || 'b898d03712309ec1cc5f9027275ba1b6d28b6e53' }}
+          ref: ${{ inputs.signer_ref || '74e097a566f1bd08f5f43a7e847d3958b6386a3a' }}
           path: bloom-signer
       - name: Install checkout browser
         shell: bash
