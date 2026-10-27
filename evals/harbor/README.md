@@ -128,11 +128,14 @@ The `Release evals` workflow (`.github/workflows/release-evals.yml`) runs the
 whole thing before a release: it builds the Machine from the ref with the
 Broker and Signer the release matrix pins, smokes them, then runs every task
 with every agent and reports reward, tool calls, tokens and time against the
-baseline. A failed trial runs once more. It fails only on a smoke failure, an
-agent that cannot authenticate, or a regression against the baseline. It
+baseline. A failed trial runs once more. It fails on a smoke failure, a
+missing result, an agent that cannot authenticate, or a regression against
+the baseline. It
 runs on `release-proposal/*` PRs and by dispatch.
 Model credentials are repository secrets, OAuth where the agent supports it:
 `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`) or `ANTHROPIC_API_KEY`;
 `CODEX_AUTH_JSON` (the contents of `~/.codex/auth.json` after `codex login`) or
 `OPENAI_API_KEY`; `DEEPSEEK_API_KEY`. The agent container sees them, so use
-dedicated credentials. An agent without one runs the smoke only.
+dedicated credentials. A selected agent without one fails the run.
+`requirements.txt` is the full resolved dependency set; edit `requirements.in`
+and regenerate it with the command in its header.

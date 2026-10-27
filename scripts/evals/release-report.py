@@ -7,9 +7,7 @@ Prints a verdict per agent, then every trial in a collapsed table with the
 baseline's number in parentheses. A cell run more than once keeps its best
 attempt. Exits 1 when a smoke did not pass, an agent could not authenticate,
 an expected cell has no summary, or an agent that passed a task in the
-baseline no longer does. An expected agent with no trials passes only when
-the workflow left `<agent>.no-model-key` beside its summaries. RUN_URL, when
-set, links the artifacts.
+baseline no longer does. RUN_URL, when set, links the artifacts.
 """
 
 import json
@@ -75,18 +73,16 @@ def main(argv: list[str]) -> int:
         return 2
     base = baseline(Path(argv[0]))
     cells: dict[tuple, list] = {}
-    skipped = set()
     for root in argv[1:]:
         for path in sorted(Path(root).glob("*.json")):
             s = json.loads(path.read_text())
             s["_root"] = Path(root).parent
             cells.setdefault((s["agent"], s["run_kind"] != "deterministic-smoke", s["task"]), []).append(s)
-        skipped.update(path.name.removesuffix(".no-model-key") for path in Path(root).glob("*.no-model-key"))
     verdicts, failures, rows = {}, [], []
     for agent in expected_agents:
         if (agent, False, "solana-transfer") not in cells:
             failures.append(f"{agent}: no smoke summary")
-        for task in expected_tasks if agent not in skipped else []:
+        for task in expected_tasks:
             if (agent, True, task) not in cells:
                 cells[(agent, True, task)] = [{"task": task, "agent": agent, "run_kind": "Harbor-agent-trial", "passed": False,
                                               "error": "no summary: the trial never wrote one", "rewards": {}, "usage": None,
@@ -136,7 +132,7 @@ def main(argv: list[str]) -> int:
         smoke = "smoke pass" if v["smoke"] else "smoke FAILED" if v["smoke"] is False else "no smoke"
         line = f"- **{agent}**: {smoke} · " + (
             f"{v['passed']}/{v['tasks']} tasks ({'baseline ' + str(v['base']) + '/' + str(v['tasks']) if v['baselined'] else 'no baseline'})"
-            if v["tasks"] else "no trials (no model key)"
+            if v["tasks"] else "no trials"
         )
         if v["config"]:
             line += f" · config error: {v['config']}"

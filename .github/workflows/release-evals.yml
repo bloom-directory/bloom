@@ -4,8 +4,8 @@ name: Release evals
 # selected agent: build the Machine from this ref with the Broker and Signer
 # the release matrix pins, prove the three services with the Solana smoke
 # (no model), then run every Harbor task with that agent and record reward,
-# tool calls, tokens and time. The report fails only on a smoke failure or a
-# regression against evals/harbor/baselines/README.md; everything else is a
+# tool calls, tokens and time. The report fails on a smoke failure, a missing
+# result or a regression against evals/harbor/baselines/README.md; the rest is a
 # number for the release reviewer. A failed trial is retried once, so one
 # nondeterministic miss does not fail a release. Runs on release-proposal PRs
 # and on dispatch. Model credentials are repository secrets, OAuth where the
@@ -13,7 +13,7 @@ name: Release evals
 # ANTHROPIC_API_KEY for Claude Code; CODEX_AUTH_JSON (the contents of
 # ~/.codex/auth.json from `codex login`) or OPENAI_API_KEY for Codex;
 # DEEPSEEK_API_KEY for OpenCode. The agent container sees them, so use
-# dedicated revocable credentials. An agent without one runs the smoke only
+# dedicated revocable credentials. A selected agent without one fails the run
 # and the report says so.
 
 on:
@@ -180,11 +180,8 @@ jobs:
             opencode) key="$DEEPSEEK_API_KEY" ;;
           esac
           if [ -z "$key" ]; then
-            # The report requires this marker to accept an agent with no trials.
-            mkdir -p "$BLOOM_EVAL_JOBS_DIR/summaries"
-            : > "$BLOOM_EVAL_JOBS_DIR/summaries/$AGENT.no-model-key"
-            echo "::warning::no model key for $AGENT; smoke only, no trials"
-            exit 0
+            echo "::error::no model credential for $AGENT"
+            exit 1
           fi
           for task in $TASKS; do
             scripts/evals/run-harbor.sh "$task" "$AGENT" ||

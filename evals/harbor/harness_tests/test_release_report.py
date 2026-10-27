@@ -39,15 +39,13 @@ def summary(task, agent, *, smoke=False, passed=True, reward=1, error=None, tria
 
 
 class ReleaseReportTest(unittest.TestCase):
-    def run_report(self, *summaries, trajectory=None, flags=(), markers=()):
+    def run_report(self, *summaries, trajectory=None, flags=()):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "README.md").write_text(BASELINE)
             (root / "jobs/summaries").mkdir(parents=True)
             for n, s in enumerate(summaries):
                 (root / "jobs/summaries" / f"{n}.json").write_text(json.dumps(s))
-            for agent in markers:
-                (root / "jobs/summaries" / f"{agent}.no-model-key").touch()
             if trajectory:
                 name, steps = trajectory
                 (root / "jobs" / name / "agent").mkdir(parents=True)
@@ -110,11 +108,6 @@ class ReleaseReportTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("- **claude-opus**: no smoke · 0/1 tasks (no baseline)", out)
 
-    def test_smoke_only_passes_and_says_why(self):
-        code, out = self.run_report(summary("solana-transfer", "codex", smoke=True))
-        self.assertEqual(code, 0)
-        self.assertIn("- **codex**: smoke pass · no trials (no model key)", out)
-
     def test_smoke_failure_fails(self):
         code, out = self.run_report(summary("solana-transfer", "codex", smoke=True, passed=False))
         self.assertEqual(code, 1)
@@ -134,16 +127,11 @@ class ReleaseReportTest(unittest.TestCase):
         self.assertIn("| polymarket-clarification | opencode | – | – | – | – | 0 | MISSING: no summary", out)
         self.assertIn("- polymarket-clarification with opencode: no summary", out)
 
-    def test_no_model_key_marker_excuses_missing_trials(self):
-        flags = ("--agents", "codex", "--tasks", "solana-transfer")
-        code, out = self.run_report(summary("solana-transfer", "codex", smoke=True), flags=flags, markers=("codex",))
-        self.assertEqual(code, 0)
-        self.assertIn("- **codex**: smoke pass · no trials (no model key)", out)
-
-    def test_expected_agent_without_trials_or_marker_fails(self):
+    def test_smoke_without_trials_fails(self):
         flags = ("--agents", "codex", "--tasks", "solana-transfer")
         code, out = self.run_report(summary("solana-transfer", "codex", smoke=True), flags=flags)
         self.assertEqual(code, 1)
+        self.assertIn("- **codex**: smoke pass · 0/1 tasks", out)
         self.assertIn("- solana-transfer with codex: no summary", out)
 
     def test_missing_smoke_fails(self):
