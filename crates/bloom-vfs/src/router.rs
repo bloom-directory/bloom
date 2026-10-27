@@ -359,17 +359,18 @@ impl Vfs {
         Handler::lookup(self, projection_path).await
     }
 
-    /// Write `data` to `path` only if `path` reads exactly `expected` now, and
-    /// return whether it wrote. The handler mounted at `path` does the check
-    /// and the write as one step against its own writes (see
-    /// [`crate::WriteLocks`]); this VFS holds only the lock every ordinary
-    /// write holds, so a handler callback that writes elsewhere through it is
-    /// not held up. A handler that cannot do this refuses, writing nothing.
-    /// The write is audited like any other, whether or not it went in.
-    pub async fn write_if_reads(
+    /// Write `data` to `path` only while its handler stores nothing under
+    /// `key` for it, and return whether it wrote (see
+    /// [`Handler::write_if_absent`]). The handler does the check and the
+    /// write as one step against its own writes (see [`crate::WriteLocks`]);
+    /// this VFS holds only the lock every ordinary write holds, so a handler
+    /// callback that writes elsewhere through it is not held up. A handler
+    /// that cannot do this refuses, writing nothing. The write is audited like
+    /// any other, whether or not it went in.
+    pub async fn write_if_absent(
         &self,
         path: &VfsPath,
-        expected: &[u8],
+        key: &str,
         data: &[u8],
     ) -> Result<bool, HandlerError> {
         let _capture_guard = self.identity_capture_lock.read().await;
@@ -381,21 +382,21 @@ impl Vfs {
         let rest = path.shift();
         let effect = self.begin_effect(AUDIT_KIND_WRITE, path, data).await?;
         let correlation = effect.as_ref().map(|e| e.correlation_id.as_str());
-        let write_result = h.write_if_reads(&rest, expected, data).await;
+        let write_result = h.write_if_absent(&rest, key, data).await;
         match &write_result {
             Ok(written) => self.finish_effect(
                 AUDIT_KIND_WRITE,
                 path,
                 correlation,
                 "ok",
-                serde_json::json!({"conditional": true, "written": written}),
+                serde_json::json!({"if_absent": key, "written": written}),
             )?,
             Err(error) => self.finish_effect(
                 AUDIT_KIND_WRITE,
                 path,
                 correlation,
                 "error",
-                serde_json::json!({"conditional": true, "error": error.to_string()}),
+                serde_json::json!({"if_absent": key, "error": error.to_string()}),
             )?,
         }
         if let Some(effect) = &effect {
@@ -919,25 +920,37 @@ mod tests {
 
     /// A settings file whose read can be held open, to land a write between
     /// a compare-and-write's check and its write.
-    /// A settings route whose conditional write keeps its check and write
-    /// together with [`crate::WriteLocks`], as the Petal router does.
+    /// A settings route that reads `unset` while nothing is stored, and whose
+    /// conditional write keeps its check and write together with
+    /// [`crate::WriteLocks`], as the Petal router does.
     struct SettingsHandler {
-        value: Mutex<Vec<u8>>,
+        stored: Mutex<Option<Vec<u8>>>,
         locks: crate::WriteLocks,
-        pause_reads: std::sync::atomic::AtomicBool,
-        read_started: Notify,
-        release_read: Notify,
+        pause_checks: std::sync::atomic::AtomicBool,
+        check_started: Notify,
+        release_check: Notify,
     }
 
     impl SettingsHandler {
-        fn holding(value: &[u8]) -> Arc<Self> {
+        fn holding(stored: Option<&[u8]>) -> Arc<Self> {
             Arc::new(Self {
-                value: Mutex::new(value.to_vec()),
+                stored: Mutex::new(stored.map(<[u8]>::to_vec)),
                 locks: crate::WriteLocks::default(),
-                pause_reads: std::sync::atomic::AtomicBool::new(false),
-                read_started: Notify::new(),
-                release_read: Notify::new(),
+                pause_checks: std::sync::atomic::AtomicBool::new(false),
+                check_started: Notify::new(),
+                release_check: Notify::new(),
             })
+        }
+
+        /// A paused check returns what it saw before the pause, so a write
+        /// landing during the pause makes it stale.
+        async fn is_stored(&self) -> bool {
+            let stored = self.stored.lock().await.is_some();
+            if self.pause_checks.load(std::sync::atomic::Ordering::SeqCst) {
+                self.check_started.notify_one();
+                self.release_check.notified().await;
+            }
+            stored
         }
     }
 
@@ -947,74 +960,75 @@ mod tests {
             Ok(Entry::file("settings"))
         }
 
-        /// A paused read returns what it saw before the pause, so a write
-        /// landing during the pause makes the check stale.
         async fn read(&self, _path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
-            let value = self.value.lock().await.clone();
-            if self.pause_reads.load(std::sync::atomic::Ordering::SeqCst) {
-                self.read_started.notify_one();
-                self.release_read.notified().await;
-            }
-            Ok(value)
+            Ok(self
+                .stored
+                .lock()
+                .await
+                .clone()
+                .unwrap_or_else(|| b"unset".to_vec()))
         }
 
         async fn write(&self, path: &VfsPath, data: &[u8]) -> Result<(), HandlerError> {
             let _held = self.locks.shared(&path.to_string_path()).await;
-            *self.value.lock().await = data.to_vec();
+            *self.stored.lock().await = Some(data.to_vec());
             Ok(())
         }
 
-        async fn write_if_reads(
+        async fn write_if_absent(
             &self,
             path: &VfsPath,
-            expected: &[u8],
+            _key: &str,
             data: &[u8],
         ) -> Result<bool, HandlerError> {
             let _held = self.locks.exclusive(&path.to_string_path()).await?;
-            if self.read(path).await? != expected {
+            if self.is_stored().await {
                 return Ok(false);
             }
-            *self.value.lock().await = data.to_vec();
+            *self.stored.lock().await = Some(data.to_vec());
             Ok(true)
         }
     }
 
     #[tokio::test]
-    async fn write_if_reads_writes_only_over_the_expected_bytes() {
-        let handler = SettingsHandler::holding(b"unset");
+    async fn write_if_absent_writes_only_while_nothing_is_stored() {
+        let handler = SettingsHandler::holding(None);
         let vfs = Vfs::builder().mount("petal", handler.clone()).build();
         let path = VfsPath::parse("/petal/settings").unwrap();
 
-        assert!(vfs.write_if_reads(&path, b"unset", b"setup").await.unwrap());
-        assert_eq!(&*handler.value.lock().await, b"setup");
-        // Something else is there now, so nothing is written over it.
-        assert!(!vfs.write_if_reads(&path, b"unset", b"again").await.unwrap());
-        assert_eq!(&*handler.value.lock().await, b"setup");
+        assert!(vfs.write_if_absent(&path, "key", b"setup").await.unwrap());
+        assert_eq!(handler.stored.lock().await.as_deref(), Some(&b"setup"[..]));
+        // Something is stored now, so nothing is written over it.
+        assert!(!vfs.write_if_absent(&path, "key", b"again").await.unwrap());
+        assert_eq!(handler.stored.lock().await.as_deref(), Some(&b"setup"[..]));
+
+        // A stored value that reads exactly like the default still counts.
+        let handler = SettingsHandler::holding(Some(b"unset"));
+        let vfs = Vfs::builder().mount("petal", handler.clone()).build();
+        assert_eq!(vfs.read(&path).await.unwrap(), b"unset");
+        assert!(!vfs.write_if_absent(&path, "key", b"setup").await.unwrap());
+        assert_eq!(handler.stored.lock().await.as_deref(), Some(&b"unset"[..]));
     }
 
     /// The check and the write are one step: a write that arrives while the
-    /// check is reading waits for it, so it is not replaced by the
-    /// compare-and-write's value.
+    /// check is running waits for it, so it is not replaced by the
+    /// conditional write's value.
     #[tokio::test]
-    async fn write_if_reads_excludes_direct_vfs_writes_between_check_and_write() {
-        let handler = SettingsHandler::holding(b"unset");
+    async fn write_if_absent_excludes_direct_vfs_writes_between_check_and_write() {
+        let handler = SettingsHandler::holding(None);
         handler
-            .pause_reads
+            .pause_checks
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let vfs = Vfs::builder().mount("petal", handler.clone()).build();
         let checking_vfs = vfs.clone();
         let checking = tokio::spawn(async move {
             checking_vfs
-                .write_if_reads(
-                    &VfsPath::parse("/petal/settings").unwrap(),
-                    b"unset",
-                    b"setup",
-                )
+                .write_if_absent(&VfsPath::parse("/petal/settings").unwrap(), "key", b"setup")
                 .await
                 .unwrap()
         });
 
-        handler.read_started.notified().await;
+        handler.check_started.notified().await;
         let owner_vfs = vfs.clone();
         let owner = tokio::spawn(async move {
             owner_vfs
@@ -1023,24 +1037,24 @@ mod tests {
                 .unwrap();
         });
         tokio::task::yield_now().await;
-        handler.release_read.notify_one();
+        handler.release_check.notify_one();
 
-        assert!(checking.await.unwrap(), "the check saw the unset bytes");
+        assert!(checking.await.unwrap(), "the check found nothing stored");
         owner.await.unwrap();
         assert_eq!(
-            &*handler.value.lock().await,
-            b"owner",
-            "the owner's write lands after the compare-and-write, not under it"
+            handler.stored.lock().await.as_deref(),
+            Some(&b"owner"[..]),
+            "the owner's write lands after the conditional write, not under it"
         );
     }
 
-    /// A conditional write's own read or write callback that writes
+    /// A conditional write's own check or write callback that writes
     /// elsewhere through the VFS, as a Petal route may, while it holds the
     /// check.
     struct ReentrantTarget {
         vfs: std::sync::OnceLock<Vfs>,
         locks: crate::WriteLocks,
-        reenter_on_read: bool,
+        reenter_on_check: bool,
         entered: Notify,
         release: Notify,
     }
@@ -1063,29 +1077,22 @@ mod tests {
             Ok(Entry::file("settings"))
         }
 
-        async fn read(&self, _path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
-            if self.reenter_on_read {
-                self.write_elsewhere(b"nested").await?;
-            }
-            Ok(b"unset".to_vec())
-        }
-
         async fn write(&self, _path: &VfsPath, data: &[u8]) -> Result<(), HandlerError> {
-            if !self.reenter_on_read {
+            if !self.reenter_on_check {
                 self.write_elsewhere(data).await?;
             }
             Ok(())
         }
 
-        async fn write_if_reads(
+        async fn write_if_absent(
             &self,
             path: &VfsPath,
-            expected: &[u8],
+            _key: &str,
             data: &[u8],
         ) -> Result<bool, HandlerError> {
             let _held = self.locks.exclusive(&path.to_string_path()).await?;
-            if self.read(path).await? != expected {
-                return Ok(false);
+            if self.reenter_on_check {
+                self.write_elsewhere(b"nested").await?;
             }
             self.write(path, data).await?;
             Ok(true)
@@ -1096,16 +1103,16 @@ mod tests {
     /// checks and writes, so the handler's callbacks can write elsewhere
     /// through it, and so can everything else meanwhile.
     #[tokio::test]
-    async fn write_if_reads_callbacks_and_other_writes_are_not_held_up() {
-        for reenter_on_read in [true, false] {
+    async fn write_if_absent_callbacks_and_other_writes_are_not_held_up() {
+        for reenter_on_check in [true, false] {
             let target = Arc::new(ReentrantTarget {
                 vfs: std::sync::OnceLock::new(),
                 locks: crate::WriteLocks::default(),
-                reenter_on_read,
+                reenter_on_check,
                 entered: Notify::new(),
                 release: Notify::new(),
             });
-            let other = SettingsHandler::holding(b"unset");
+            let other = SettingsHandler::holding(None);
             let vfs = Vfs::builder()
                 .mount("target", target.clone())
                 .mount("other", other.clone())
@@ -1114,9 +1121,9 @@ mod tests {
             let caller = vfs.clone();
             let running = tokio::spawn(async move {
                 caller
-                    .write_if_reads(
+                    .write_if_absent(
                         &VfsPath::parse("/target/settings").unwrap(),
-                        b"unset",
+                        "key",
                         b"setup",
                     )
                     .await
@@ -1137,13 +1144,13 @@ mod tests {
                 .expect("the callback's own write through the VFS completes")
                 .unwrap()
                 .unwrap();
-            assert!(written, "reenter_on_read={reenter_on_read}");
+            assert!(written, "reenter_on_check={reenter_on_check}");
         }
     }
 
     #[tokio::test]
-    async fn write_if_reads_gives_up_without_writing_while_writes_keep_running() {
-        let handler = SettingsHandler::holding(b"unset");
+    async fn write_if_absent_gives_up_without_writing_while_writes_keep_running() {
+        let handler = SettingsHandler::holding(None);
         let vfs = Vfs::builder().mount("petal", handler.clone()).build();
         // The handler keys its writes by the path under its mount.
         let key = VfsPath::parse("/petal/settings")
@@ -1153,23 +1160,19 @@ mod tests {
         let running_write = handler.locks.shared(&key).await;
 
         let error = vfs
-            .write_if_reads(
-                &VfsPath::parse("/petal/settings").unwrap(),
-                b"unset",
-                b"setup",
-            )
+            .write_if_absent(&VfsPath::parse("/petal/settings").unwrap(), "key", b"setup")
             .await
             .unwrap_err();
         assert!(matches!(error, HandlerError::Backend(_)), "{error}");
-        assert_eq!(&*handler.value.lock().await, b"unset");
+        assert_eq!(*handler.stored.lock().await, None);
         drop(running_write);
     }
 
     #[tokio::test]
-    async fn write_if_reads_is_refused_by_a_handler_without_one() {
+    async fn write_if_absent_is_refused_by_a_handler_without_one() {
         let vfs = Vfs::builder().mount("echo", Arc::new(EchoHandler)).build();
         let error = vfs
-            .write_if_reads(&VfsPath::parse("/echo/hello").unwrap(), b"", b"x")
+            .write_if_absent(&VfsPath::parse("/echo/hello").unwrap(), "key", b"x")
             .await
             .unwrap_err();
         assert!(matches!(error, HandlerError::Unsupported(_)), "{error}");

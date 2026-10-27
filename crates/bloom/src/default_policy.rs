@@ -282,12 +282,14 @@ pub(crate) enum SetupWrite {
 }
 
 /// Write a Petal's setup settings through its own settings route, but only
-/// while the route still reads its unset contents. Settings can be there
-/// before setup writes, even for a Petal that was just installed: an
-/// uninstall keeps a Petal's private data, so reinstalling the same release
-/// finds the owner's settings again. The check and the write are one step
-/// ([`bloom_vfs::Vfs::write_if_reads`]), so an owner's edit made meanwhile is
-/// never replaced either.
+/// while the Petal stores nothing for them. Settings can be there before
+/// setup writes, even for a Petal that was just installed: an uninstall
+/// keeps a Petal's private data, so reinstalling the same release finds the
+/// owner's settings again. Whether anything is stored decides, not what the
+/// route reads, since the route reads the same default when nothing is
+/// stored as when the owner saved exactly that. The check and the write are
+/// one step ([`bloom_vfs::Vfs::write_if_absent`]), so an owner's edit made
+/// meanwhile is never replaced either.
 pub(crate) async fn write_petal_settings(
     vfs: &bloom_vfs::Vfs,
     petals: &PetalsConfig,
@@ -300,8 +302,11 @@ pub(crate) async fn write_petal_settings(
         return Ok(SetupWrite::NoTemplate);
     };
     let path = bloom_vfs::VfsPath::parse(&settings.path)?;
+    let key = template
+        .store_key
+        .replace("{wallet}", DEFAULT_POLICY_WALLET);
     let written = vfs
-        .write_if_reads(&path, template.unset_body.as_bytes(), &settings.body)
+        .write_if_absent(&path, &key, &settings.body)
         .await
         .with_context(|| format!("write {} settings to {}", petal_label(name), settings.path))?;
     Ok(if written {
@@ -442,10 +447,10 @@ fn pending_settings(home: &std::path::Path, petals: &PetalsConfig) -> Vec<String
 }
 
 /// Write the settings that an earlier attempt could not, now that the default
-/// wallet exists. The write goes ahead only while the Petal's settings route
-/// still reads its unset contents, and that check and the write are one step
-/// no other write through Machine can land between. Anything else there may be
-/// the owner's, so it stays and the marker is cleared. A write that cannot be
+/// wallet exists. The write goes ahead only while the Petal stores nothing
+/// for its settings, and that check and the write are one step no other write
+/// through Machine can land between. Anything stored may be the owner's, even
+/// if it reads like the default, so it stays and the marker is cleared. A write that cannot be
 /// made yet, as before the account exists, keeps its marker for next time.
 pub(crate) async fn apply_pending_settings(daemon: &Daemon) -> PendingSettings {
     let owners = petal_owners(daemon).unwrap_or_default();
@@ -715,8 +720,8 @@ async fn settle_setup_settings(
 /// the Petal and before writing its settings, so the Petal now looks
 /// unchanged and nothing else would write them on a home whose `main`
 /// already exists: wallet creation, which otherwise applies queued writes,
-/// has already happened. As there, the write goes in only over the route's
-/// unset contents. Before `main` exists the marker stays for wallet creation.
+/// has already happened. As there, the write goes in only while nothing is
+/// stored. Before `main` exists the marker stays for wallet creation.
 /// A write still queued after this run, because Broker could not say
 /// whether `main` exists or the write failed, is reported with the command
 /// that makes it, since nothing on such a home would make it on its own.
@@ -1495,30 +1500,22 @@ mod tests {
         clear_settings_pending(home.path(), "polymarket");
     }
 
-    /// `unset_body` is what the pinned Polymarket release's settings route
-    /// reads before anything is written there. A deferred setup write goes
-    /// ahead only over exactly those bytes, so a catalog bump must re-check
-    /// them against the new release's `read_venue_config`, or every deferred
-    /// write would be kept as if the owner had written it.
+    /// `store_key` is where the pinned Polymarket release stores a wallet's
+    /// venue settings. A setup write goes ahead only while nothing is stored
+    /// there, so a catalog bump must re-check it against the new release's
+    /// `venue_config_key`, or setup would write over settings it cannot see.
     #[test]
-    fn the_unset_polymarket_settings_are_pinned_with_their_release() {
+    fn the_polymarket_settings_key_is_pinned_with_its_release() {
         let entry = github_source::preinstalled_petal("polymarket").unwrap();
         assert_eq!(
             entry.expected_hash,
             Some("0f365cd7f613129f73ce66fb07256c8a42c4e70abbb77721804dbd6df85b96b5"),
-            "re-check unset_body against the new release, then update both"
+            "re-check store_key against the new release, then update both"
         );
-        let template = setup_template("polymarket").unwrap();
         assert_eq!(
-            template.unset_body,
-            "enabled = false\nallow_neg_risk = true\n"
+            setup_template("polymarket").unwrap().store_key,
+            "settings/{wallet}/venue.toml"
         );
-        // Setup's own settings never read as unset, so a written choice is
-        // never mistaken for an empty route.
-        let written = render_petal_settings(&chosen_setup(&["polymarket"]), "polymarket", "main")
-            .unwrap()
-            .unwrap();
-        assert_ne!(written.body, template.unset_body.as_bytes());
     }
 
     /// Choosing Petals queues each one's settings before anything is
@@ -1563,10 +1560,16 @@ mod tests {
         assert!(setup_settings_to_queue(&chosen_setup(&["hyperliquid"]), &none, None).is_empty());
     }
 
-    /// A Petal settings route for [`apply_queued_settings`]. A paused read
-    /// returns what it saw before the pause.
+    /// What the pinned Polymarket settings route reads while nothing is stored.
+    const UNSET: &[u8] = b"enabled = false\nallow_neg_risk = true\n";
+
+    /// A Polymarket settings route: it reads [`UNSET`] while nothing is stored,
+    /// and its conditional write checks whether anything is stored, as the
+    /// Petal router does, keeping the check and the write together.
     struct SettingsRoute {
-        value: tokio::sync::Mutex<Option<Vec<u8>>>,
+        /// Whether `main`'s account exists; the route fails without it.
+        account: bool,
+        stored: tokio::sync::Mutex<Option<Vec<u8>>>,
         locks: bloom_vfs::WriteLocks,
         pause_reads: std::sync::atomic::AtomicBool,
         read_started: tokio::sync::Notify,
@@ -1574,10 +1577,25 @@ mod tests {
     }
 
     impl SettingsRoute {
-        /// `None` fails every read, as before `main`'s account exists.
+        /// `None` fails every read and write, as before `main`'s account
+        /// exists. [`UNSET`] means nothing is stored yet; anything else is
+        /// stored.
         fn holding(value: Option<&[u8]>) -> std::sync::Arc<Self> {
+            Self::with(
+                value.is_some(),
+                value.filter(|value| *value != UNSET).map(<[u8]>::to_vec),
+            )
+        }
+
+        /// `value` is stored, even if it reads exactly like [`UNSET`].
+        fn storing(value: &[u8]) -> std::sync::Arc<Self> {
+            Self::with(true, Some(value.to_vec()))
+        }
+
+        fn with(account: bool, stored: Option<Vec<u8>>) -> std::sync::Arc<Self> {
             std::sync::Arc::new(Self {
-                value: tokio::sync::Mutex::new(value.map(<[u8]>::to_vec)),
+                account,
+                stored: tokio::sync::Mutex::new(stored),
                 locks: bloom_vfs::WriteLocks::default(),
                 pause_reads: std::sync::atomic::AtomicBool::new(false),
                 read_started: tokio::sync::Notify::new(),
@@ -1585,8 +1603,20 @@ mod tests {
             })
         }
 
+        /// What the route reads, or `None` without the account.
         async fn value(&self) -> Option<Vec<u8>> {
-            self.value.lock().await.clone()
+            self.account.then_some(())?;
+            Some(
+                self.stored
+                    .lock()
+                    .await
+                    .clone()
+                    .unwrap_or_else(|| UNSET.to_vec()),
+            )
+        }
+
+        fn no_account() -> bloom_vfs::HandlerError {
+            bloom_vfs::HandlerError::not_found("wallet main")
         }
     }
 
@@ -1603,12 +1633,7 @@ mod tests {
             &self,
             _path: &bloom_vfs::VfsPath,
         ) -> std::result::Result<Vec<u8>, bloom_vfs::HandlerError> {
-            let value = self.value.lock().await.clone();
-            if self.pause_reads.load(std::sync::atomic::Ordering::SeqCst) {
-                self.read_started.notify_one();
-                self.release_read.notified().await;
-            }
-            value.ok_or_else(|| bloom_vfs::HandlerError::not_found("wallet main"))
+            self.value().await.ok_or_else(Self::no_account)
         }
 
         async fn write(
@@ -1617,21 +1642,34 @@ mod tests {
             data: &[u8],
         ) -> std::result::Result<(), bloom_vfs::HandlerError> {
             let _held = self.locks.shared(&path.to_string_path()).await;
-            *self.value.lock().await = Some(data.to_vec());
+            if !self.account {
+                return Err(Self::no_account());
+            }
+            *self.stored.lock().await = Some(data.to_vec());
             Ok(())
         }
 
-        async fn write_if_reads(
+        /// A paused check returns what it saw before the pause, so a write
+        /// landing during the pause makes it stale.
+        async fn write_if_absent(
             &self,
             path: &bloom_vfs::VfsPath,
-            expected: &[u8],
+            _key: &str,
             data: &[u8],
         ) -> std::result::Result<bool, bloom_vfs::HandlerError> {
             let _held = self.locks.exclusive(&path.to_string_path()).await?;
-            if bloom_vfs::Handler::read(self, path).await? != expected {
+            if !self.account {
+                return Err(Self::no_account());
+            }
+            let stored = self.stored.lock().await.is_some();
+            if self.pause_reads.load(std::sync::atomic::Ordering::SeqCst) {
+                self.read_started.notify_one();
+                self.release_read.notified().await;
+            }
+            if stored {
                 return Ok(false);
             }
-            *self.value.lock().await = Some(data.to_vec());
+            *self.stored.lock().await = Some(data.to_vec());
             Ok(true)
         }
     }
@@ -1657,7 +1695,7 @@ mod tests {
     #[tokio::test]
     async fn a_queued_write_goes_in_only_over_unset_settings() {
         let petals = chosen_setup(&["polymarket"]);
-        let unset = setup_template("polymarket").unwrap().unset_body.as_bytes();
+        let unset = UNSET;
 
         let route = SettingsRoute::holding(Some(unset));
         let (home, vfs) = queued_polymarket(&route);
@@ -1688,6 +1726,44 @@ mod tests {
         ));
         assert_eq!(route.value().await, None);
         assert_eq!(pending_settings(home.path(), &petals), ["polymarket"]);
+    }
+
+    /// Settings the owner saved are kept even when they read exactly like the
+    /// route's default: what is stored decides, not what the route reads.
+    /// This covers a reinstall of the same release, which finds the owner's
+    /// saved settings again.
+    #[tokio::test]
+    async fn an_explicitly_saved_default_is_never_replaced() {
+        let petals = chosen_setup(&["polymarket"]);
+
+        let route = SettingsRoute::storing(UNSET);
+        let (home, vfs) = queued_polymarket(&route);
+        assert_eq!(route.value().await.unwrap(), UNSET);
+        assert_eq!(
+            apply_queued_settings(&vfs, home.path(), &petals, "polymarket").await,
+            QueuedWrite::Settled
+        );
+        assert_eq!(*route.stored.lock().await, Some(UNSET.to_vec()));
+        assert!(pending_settings(home.path(), &petals).is_empty());
+
+        let route = SettingsRoute::storing(UNSET);
+        let (home, vfs) = queued_polymarket(&route);
+        let message = settle_setup_settings(
+            &vfs,
+            home.path(),
+            &petals,
+            "polymarket",
+            SetupSettingsStep::Write,
+            false,
+            &AccountPresence::Exists,
+        )
+        .await
+        .unwrap();
+        assert!(
+            message.starts_with("petal_settings_not_written: "),
+            "{message}"
+        );
+        assert_eq!(*route.stored.lock().await, Some(UNSET.to_vec()));
     }
 
     /// A queued write that fails stays queued, and the command that stops once
@@ -1833,7 +1909,7 @@ mod tests {
     #[tokio::test]
     async fn serve_makes_a_queued_write_once_main_exists() {
         let petals = chosen_setup(&["polymarket"]);
-        let unset = setup_template("polymarket").unwrap().unset_body.as_bytes();
+        let unset = UNSET;
         let installed = BTreeMap::from([("polymarket".to_owned(), "a".repeat(64))]);
         let check = |exists: bool, owners: BTreeMap<String, String>| {
             let petals = petals.clone();
@@ -1872,7 +1948,7 @@ mod tests {
     #[tokio::test]
     async fn a_rerun_of_setup_finishes_an_interrupted_settings_write() {
         let petals = chosen_setup(&["polymarket"]);
-        let unset = setup_template("polymarket").unwrap().unset_body.as_bytes();
+        let unset = UNSET;
         // Before `main` exists, wallet creation writes it, so nothing is said.
         // When Broker cannot say, the write stays queued and the owner is told
         // how to make it.
@@ -1974,7 +2050,7 @@ mod tests {
     #[tokio::test]
     async fn setup_never_replaces_settings_a_reinstalled_petal_still_holds() {
         let petals = chosen_setup(&["polymarket"]);
-        let unset = setup_template("polymarket").unwrap().unset_body.as_bytes();
+        let unset = UNSET;
         let install = |vfs, home| async move {
             settle_setup_settings(
                 vfs,
@@ -2029,7 +2105,7 @@ mod tests {
     #[tokio::test]
     async fn a_queued_write_never_replaces_an_owner_write_made_during_its_check() {
         let petals = chosen_setup(&["polymarket"]);
-        let unset = setup_template("polymarket").unwrap().unset_body.as_bytes();
+        let unset = UNSET;
         let route = SettingsRoute::holding(Some(unset));
         route
             .pause_reads

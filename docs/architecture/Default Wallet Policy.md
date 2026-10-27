@@ -234,7 +234,7 @@ records are the suggestions: the menu suggests a Petal only if it was chosen
 and each value as saved, and the non-interactive form keeps them unchanged,
 so a declined Petal stays declined. With no recorded choices every Petal is
 suggested. Setup never replaces settings the owner may already hold, and
-writes its own only over a settings route that still reads unset. An
+writes its own only while the Petal stores nothing for them. An
 uninstall keeps a Petal's private data under its package hash, so a
 reinstall of the same release finds the owner's settings and keeps them; a
 different release starts empty and receives setup's settings. For a
@@ -276,7 +276,10 @@ chosen Petals:
   cannot add any. Existing destinations are kept. Only a wallet's first
   policy is proposed, so a destination added to the catalog later reaches an
   existing wallet only through `bloom wallet update-policy`, or through a
-  flow that sets `owner_just_chose` (section 3).
+  flow that sets `owner_just_chose` (section 3). If a chosen Petal's install
+  record cannot be read, the first proposal stops with an error rather than
+  leave that Petal out: once a first policy commits, nothing would add it
+  back.
 - **Everything else** keeps the current defaults: approvals last at most 30
   days, and verifiers start empty.
 
@@ -317,12 +320,16 @@ follows; a rerun that updates the Petal instead keeps the settings it
 carries, clears the marker and prints the command (section 1). A queued
 write that fails stays queued, and a command that stops on an applied or
 changed policy names the command that retries it. It writes them only while
-the Petal's settings route still reads exactly as it does before anything is
-written there (for Polymarket, its built-in `enabled = false` and
-`allow_neg_risk = true` default). The route's handler makes the check and the
-write one step: the Petal router holds that Petal's write lock alone across
-the route's read, the comparison and the write, while ordinary writes to the
-Petal share it, so an owner's edit made meanwhile is never replaced. The VFS
+the Petal stores nothing for them: for Polymarket, no
+`settings/main/venue.toml` in account 0's partition of its private store,
+pinned with the release. What the route reads cannot decide this, because
+Polymarket reads its built-in `enabled = false` and `allow_neg_risk = true`
+default both when nothing is stored and when the owner saved exactly that.
+The route's handler makes the check and the write one step: the Petal router
+holds that Petal's write lock alone while it checks the store, as a run of
+the route would open it (after carrying a replaced release's data forward),
+and writes through the route, while ordinary writes to the Petal share the
+lock, so an owner's edit made meanwhile is never replaced. The VFS
 holds only the lock every ordinary write holds, so the route's callbacks can
 write elsewhere through it. If writes to the Petal keep running for two
 seconds, the check gives up and the marker stays for the next one. Anything
@@ -386,8 +393,8 @@ config; the owner can explicitly apply them later.
 Catalog Petals are installed and updated in two places: `bloom init`
 (`ensure_preinstalled_petals`) and every `bloom serve` start
 (`petal_provisioning::provision`). A fresh install receives the saved settings
-when its settings route still reads unset, which it does unless the same
-release was installed before and its settings kept. An update receives them
+when the Petal stores nothing for them, which holds unless the same release
+was installed before and its settings kept. An update receives them
 only when the default wallet is known not to exist, and on the same terms.
 `bloom init` prints the outcome, and `bloom serve` logs it.
 
@@ -520,7 +527,7 @@ changes come next.
   chosen Petal. An update keeps the settings its signed package lineage
   carries. A queued write that cannot be made yet is retried once `main`'s
   account exists, by wallet creation, `bloom wallet default-policy`, a rerun
-  of `bloom init` or `bloom serve`, only over the route's unset contents.
+  of `bloom init` or `bloom serve`, and only while nothing is stored.
 - **Wallet creation** (`crates/bloom`): `bloom wallet new main` and
   `bloom wallet import main` wait for the wallet, then walk the owner
   through the default policy with the `wallet_default_policy` Machine
@@ -553,13 +560,14 @@ Automated:
   other than "not found", keeps the owner's settings. The integrated path
   (`init` against a live projection, with Broker up and down) is checked on
   a developer triad, not in CI.
-- Every setup write goes in only over the route's unset contents: a
-  reinstalled Petal's surviving settings, and an owner's write made while
-  the route is being checked, both stay. A direct VFS write during a paused
+- Every setup write goes in only while the Petal stores nothing for it: a
+  reinstalled Petal's surviving settings, settings the owner saved as the
+  exact default, and an owner's write made during the check all stay. A direct VFS write during a paused
   check lands after it, a check's own callbacks and other writes can write
   through the VFS meanwhile, and a check gives up untouched while writes to
   its key keep running (`crates/bloom-vfs/src/router.rs`). The Petal router
-  holds a Petal alone for its check (`crates/bloom-petals/src/router.rs`).
+  checks the key in the route's account partition and holds the Petal alone
+  for it (`crates/bloom-petals/src/router.rs`).
 - A queued write that fails stays queued and is reported with the command
   that retries it; one whose retry cannot be recorded says so and gives the
   manual command. `bloom serve` makes a queued write once `main` exists.
@@ -577,7 +585,8 @@ Automated:
   never announces a ceremony that has already expired, and polls quietly
   while another command holds the wallet's policy lock.
 - One policy ceremony allows every chosen package, and packages are added
-  once, in order. An expired proposal, including one the Broker still reports
+  once, in order. A chosen Petal whose install record cannot be read stops
+  the first proposal instead of being left out of it. An expired proposal, including one the Broker still reports
   as awaiting the owner, is replaced by a new ceremony
   (`crates/bloom-vfs/tests/triad_policy_update.rs`).
 - Catalog provisioning reports an update separately from a fresh install.

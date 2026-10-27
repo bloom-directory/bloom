@@ -64,10 +64,11 @@ pub(crate) struct PetalSetupTemplate {
     /// File body; each `{name}` is replaced by the value of that name.
     pub body: &'static str,
     pub values: &'static [PetalSetupValue],
-    /// What the route reads before anything is written there, byte for byte.
-    /// A deferred setup write goes ahead only while the route still reads
-    /// this, so settings written since, by the owner or anyone else, stay.
-    pub unset_body: &'static str,
+    /// The key the Petal stores the route's settings under, in the account's
+    /// partition; `{wallet}` is the default-policy wallet. A setup write goes
+    /// ahead only while nothing is stored there, so settings saved by the
+    /// owner or anyone else stay, even ones that read like the default.
+    pub store_key: &'static str,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,8 +86,8 @@ const POLYMARKET_SETUP: PetalSetupTemplate = PetalSetupTemplate {
         prompt: "Polymarket daily buy limit in pUSD",
         default: "100",
     }],
-    // `read_venue_config` in the pinned release, when nothing is stored.
-    unset_body: "enabled = false\nallow_neg_risk = true\n",
+    // `venue_config_key` in the pinned release.
+    store_key: "settings/{wallet}/venue.toml",
 };
 
 const BASELINE_POLYMARKET_AUTHORITY_ROUTES: &[PetalAuthorityRoute] = &[

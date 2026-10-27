@@ -938,12 +938,12 @@ async fn default_wallet_first_proposal_allows_setup_packages_together() {
         let chosen = chosen.clone();
         Arc::new(move |wallet: &str| {
             if wallet == "alice" {
-                bloom_vfs::handlers::DefaultPolicySetup {
+                Ok(bloom_vfs::handlers::DefaultPolicySetup {
                     packages: vec![chosen.clone()],
                     destinations: vec![setup_destination()],
-                }
+                })
             } else {
-                bloom_vfs::handlers::DefaultPolicySetup::default()
+                Ok(bloom_vfs::handlers::DefaultPolicySetup::default())
             }
         })
     };
@@ -1050,12 +1050,12 @@ async fn setup_packages_join_only_a_wallets_first_policy_proposal() {
     let chosen = Digest32::from_bytes([8; 32]);
     let defaults: bloom_vfs::handlers::DefaultPolicyPackages = {
         let chosen = chosen.clone();
-        Arc::new(
-            move |_wallet: &str| bloom_vfs::handlers::DefaultPolicySetup {
+        Arc::new(move |_wallet: &str| {
+            Ok(bloom_vfs::handlers::DefaultPolicySetup {
                 packages: vec![chosen.clone()],
                 destinations: vec![setup_destination()],
-            },
-        )
+            })
+        })
     };
     let handler =
         eligibility_handler(temp.path(), fixture.clone()).with_default_policy_packages(defaults);
@@ -1096,11 +1096,12 @@ async fn revoking_every_petal_does_not_bring_the_setup_proposal_back() {
     let baseline = policy(60_000);
     let fixture = broker_fixture_with_policy(false, baseline.clone(), 2);
     let requested = Digest32::from_bytes([7; 32]);
-    let defaults: bloom_vfs::handlers::DefaultPolicyPackages =
-        Arc::new(|_wallet: &str| bloom_vfs::handlers::DefaultPolicySetup {
+    let defaults: bloom_vfs::handlers::DefaultPolicyPackages = Arc::new(|_wallet: &str| {
+        Ok(bloom_vfs::handlers::DefaultPolicySetup {
             packages: vec![Digest32::from_bytes([8; 32]), Digest32::from_bytes([9; 32])],
             destinations: vec![setup_destination()],
-        });
+        })
+    });
     let handler =
         eligibility_handler(temp.path(), fixture.clone()).with_default_policy_packages(defaults);
 
@@ -1126,6 +1127,58 @@ async fn revoking_every_petal_does_not_bring_the_setup_proposal_back() {
     assert_eq!(proposed.allowed_destinations, baseline.allowed_destinations);
 }
 
+/// A chosen Petal's owner record that cannot be read stops the wallet's first
+/// proposal instead of leaving that Petal out of it: once the first proposal
+/// commits, later ones add only the requested package, so nothing would put
+/// it back. After the first commit the setup is not used, so it cannot block.
+#[tokio::test]
+async fn an_unreadable_setup_stops_the_first_proposal() {
+    let failing: bloom_vfs::handlers::DefaultPolicyPackages = Arc::new(|_wallet: &str| {
+        Err(HandlerError::backend(
+            "read the installed polymarket Petal: owner record unreadable",
+        ))
+    });
+    let requested = Digest32::from_bytes([7; 32]);
+
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = broker_fixture_with_policy(false, policy(60_000), 1);
+    let handler = eligibility_handler(temp.path(), fixture.clone())
+        .with_default_policy_packages(failing.clone());
+    let error = handler
+        .ensure_petal_eligibility("alice", &requested)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("owner record unreadable"),
+        "{error}"
+    );
+    assert!(
+        fixture.state.lock().proposed_policy.is_none(),
+        "nothing is proposed without the full setup"
+    );
+
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = broker_fixture_with_policy(false, policy(60_000), 2);
+    let handler =
+        eligibility_handler(temp.path(), fixture.clone()).with_default_policy_packages(failing);
+    assert!(matches!(
+        handler
+            .ensure_petal_eligibility("alice", &requested)
+            .await
+            .unwrap(),
+        PetalEligibility::AwaitingPolicyApproval(_)
+    ));
+    let proposed: CanonicalWalletPolicy = serde_json::from_slice(
+        fixture
+            .state
+            .lock()
+            .proposed_policy
+            .as_ref()
+            .expect("the requested package is proposed"),
+    )
+    .unwrap();
+    assert_eq!(proposed.allowed_petal_packages, vec![requested]);
+}
 #[tokio::test]
 async fn the_default_policy_is_not_proposed_once_the_owner_has_changed_the_policy() {
     let temp = tempfile::tempdir().unwrap();

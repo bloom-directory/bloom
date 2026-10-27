@@ -436,6 +436,40 @@ fn map_host_err(error: crate::host::HostError) -> HandlerError {
 }
 
 impl PetalRouter {
+    /// The account a write to `path` runs as, observed live as `dispatch`
+    /// does; `None` for a route without a `[wallet]/[index]` capture.
+    async fn write_account(
+        &self,
+        mount: &str,
+        path: &str,
+    ) -> Result<Option<AccountPetalContext>, HandlerError> {
+        let matched = self
+            .runner
+            .petal_route(mount, DispatchOp::Write, path)
+            .map_err(map_petal_err)?;
+        let param = |name: &str| {
+            matched
+                .params
+                .iter()
+                .find(|(param, _)| param == name)
+                .map(|(_, value)| value.clone())
+        };
+        match (param("wallet"), param("index")) {
+            (Some(wallet), Some(index)) => {
+                let pattern = matched.route.pattern.split('/').collect::<Vec<_>>();
+                if !pattern
+                    .windows(2)
+                    .any(|pair| pair == ["[wallet]", "[index]"])
+                {
+                    return Err(HandlerError::PermissionDenied);
+                }
+                Ok(Some(self.account_context(&wallet, &index, true).await?))
+            }
+            (None, None) => Ok(None),
+            _ => Err(HandlerError::PermissionDenied),
+        }
+    }
+
     /// Run a route's write; the caller holds the Petal's write lock.
     async fn write_route(
         &self,
@@ -698,13 +732,15 @@ impl Handler for PetalRouter {
         self.write_route(mount, rest, data, path).await
     }
 
-    /// Read the route and write it only while it still reads `expected`,
-    /// holding the Petal's write lock alone so no other write to the Petal
-    /// lands in between.
-    async fn write_if_reads(
+    /// Write the route only while the Petal stores nothing under `key` for
+    /// it, holding the Petal's write lock alone so no other write to the
+    /// Petal lands in between. What is stored decides, not what the route
+    /// reads: a route may read the same default whether its value is missing
+    /// or was saved that way.
+    async fn write_if_absent(
         &self,
         path: &VfsPath,
-        expected: &[u8],
+        key: &str,
         data: &[u8],
     ) -> Result<bool, HandlerError> {
         let (mount, rest) = Self::mount_path(path)?;
@@ -712,17 +748,14 @@ impl Handler for PetalRouter {
             return Err(HandlerError::PermissionDenied);
         }
         let _held = self.write_locks.exclusive(mount).await?;
-        let current = match self
-            .dispatch(mount, DispatchOp::Read, rest.clone(), Vec::new())
-            .await?
-        {
-            DispatchResponse::Read(bytes) => bytes,
-            DispatchResponse::Error { code, message } => {
-                return Err(dispatch_error(code, message, path.to_string_path()));
-            }
-            other => return Err(unexpected_response("read", other)),
+        let stored = {
+            let _execution = self.runner.store().execution_guard().await;
+            let account = self.write_account(mount, &rest).await?;
+            self.runner
+                .petal_store_has(mount, &rest, account.as_ref(), key)
+                .map_err(map_petal_err)?
         };
-        if current != expected {
+        if stored {
             return Ok(false);
         }
         self.write_route(mount, rest, data, path).await?;
@@ -1245,29 +1278,50 @@ name = "example"
         );
     }
 
-    /// A conditional write checks what the route reads, never writes the
-    /// Petal root or its documents, and holds the Petal alone: it waits for
-    /// a write already running, then gives up, and an ordinary write waits
-    /// for it.
+    /// A conditional write checks whether the Petal stores the key in the
+    /// route's account partition, never writes the Petal root or its
+    /// documents, and holds the Petal alone: it gives up while a write to the
+    /// Petal runs, and an ordinary write waits for it.
     #[tokio::test]
-    async fn write_if_reads_checks_the_route_and_holds_the_petal_alone() {
+    async fn write_if_absent_checks_the_store_and_holds_the_petal_alone() {
         let (dir, runner) = runner();
-        let package = dir.path().join("demo-app");
-        write_demo_package(&package);
+        let package = dir.path().join("example-app");
+        write_async_failing_package(&package);
         runner.store().install_petal_package_dir(&package).unwrap();
-        let router = PetalRouter::new(runner, Arc::new(AccountHost));
-        let path = VfsPath::parse("/demo/hello.txt").unwrap();
-        let current = router.read(&path).await.unwrap();
+        let hash = runner
+            .store()
+            .resolve_petal_owner("example")
+            .unwrap()
+            .unwrap();
+        let router = PetalRouter::new(runner.clone(), Arc::new(AccountHost));
+        let path = VfsPath::parse("/example/operations/alice/0/submit").unwrap();
+        let key = "settings/alice/venue.toml";
 
+        // Nothing stored: it goes on to the route's write, which this fixture
+        // refuses.
+        let error = router
+            .write_if_absent(&path, key, b"new")
+            .await
+            .unwrap_err();
         assert!(
-            !router
-                .write_if_reads(&path, b"something else", b"new")
-                .await
-                .unwrap()
+            error.to_string().contains("component route write"),
+            "{error}"
         );
-        for refused in ["/demo", "/demo/README.md"] {
+
+        // Stored in the account's partition, whatever it reads: kept.
+        crate::private_store::PrivateStore::open_account(
+            runner.store().private_account_data_root(),
+            "alice",
+            0,
+        )
+        .unwrap()
+        .put(&hash, key, b"enabled = false\n", false)
+        .unwrap();
+        assert!(!router.write_if_absent(&path, key, b"new").await.unwrap());
+
+        for refused in ["/example", "/example/README.md"] {
             let error = router
-                .write_if_reads(&VfsPath::parse(refused).unwrap(), b"", b"new")
+                .write_if_absent(&VfsPath::parse(refused).unwrap(), key, b"new")
                 .await
                 .unwrap_err();
             assert!(
@@ -1276,19 +1330,22 @@ name = "example"
             );
         }
 
-        let running = router.write_locks.shared("demo").await;
+        let running = router.write_locks.shared("example").await;
         let error = router
-            .write_if_reads(&path, &current, b"new")
+            .write_if_absent(&path, "settings/other", b"new")
             .await
             .unwrap_err();
         assert!(matches!(error, HandlerError::Backend(_)), "{error}");
         drop(running);
 
-        let checking = router.write_locks.exclusive("demo").await.unwrap();
+        let checking = router.write_locks.exclusive("example").await.unwrap();
         let writer = router.clone();
         let mut write = tokio::spawn(async move {
             writer
-                .write(&VfsPath::parse("/demo/hello.txt").unwrap(), b"new")
+                .write(
+                    &VfsPath::parse("/example/operations/alice/0/submit").unwrap(),
+                    b"new",
+                )
                 .await
         });
         assert!(

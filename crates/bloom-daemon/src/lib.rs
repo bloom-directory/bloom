@@ -3771,6 +3771,37 @@ impl AccountPetalMount for AccountPetals {
     }
 }
 
+/// What `wallet`'s first Petal proposal also allows: each chosen Petal that is
+/// installed, and its destinations. A chosen Petal that is not installed is
+/// left out. One whose owner record cannot be read, or holds an invalid
+/// package hash, fails the whole setup, so the proposal stops rather than
+/// leaving that Petal out of the policy for good.
+fn default_policy_setup(
+    store: &PetalStore,
+    chosen: &[String],
+    wallet: &str,
+) -> Result<bloom_vfs::handlers::DefaultPolicySetup, bloom_vfs::HandlerError> {
+    let mut setup = bloom_vfs::handlers::DefaultPolicySetup::default();
+    if wallet != bloom_proto::config::DEFAULT_POLICY_WALLET {
+        return Ok(setup);
+    }
+    for name in chosen {
+        let installed = store.resolve_petal_owner(name).map_err(|error| {
+            warn!(petal = %name, %error, "petal.default_policy_owner_unreadable");
+            bloom_vfs::HandlerError::backend(format!("read the installed {name} Petal: {error}"))
+        })?;
+        let Some(hash) = installed else { continue };
+        let package = bloom_broker_api::Digest32::new(hash).map_err(|error| {
+            bloom_vfs::HandlerError::backend(format!(
+                "the installed {name} Petal has an invalid package hash: {error}"
+            ))
+        })?;
+        setup.packages.push(package);
+        setup.destinations.extend(default_policy_destinations(name));
+    }
+    Ok(setup)
+}
+
 /// The fixed contracts a chosen Petal transacts with, as Broker policy
 /// destinations. The table lives in Bloom's source, never in config.
 fn default_policy_destinations(name: &str) -> Vec<bloom_broker_api::PolicyDestination> {
@@ -4578,32 +4609,7 @@ impl Daemon {
             // call, so a Petal update is picked up without a restart.
             let chosen: Vec<String> = config.petals.setup.keys().cloned().collect();
             let store = petal_store.clone();
-            Arc::new(move |wallet: &str| {
-                if wallet != bloom_proto::config::DEFAULT_POLICY_WALLET {
-                    return bloom_vfs::handlers::DefaultPolicySetup::default();
-                }
-                let mut setup = bloom_vfs::handlers::DefaultPolicySetup::default();
-                for name in &chosen {
-                    let installed = match store.resolve_petal_owner(name) {
-                        Ok(installed) => installed,
-                        Err(error) => {
-                            warn!(
-                                petal = %name,
-                                error = %error,
-                                "petal.default_policy_owner_unreadable"
-                            );
-                            continue;
-                        }
-                    };
-                    let Some(hash) = installed else { continue };
-                    let Ok(package) = bloom_broker_api::Digest32::new(hash) else {
-                        continue;
-                    };
-                    setup.packages.push(package);
-                    setup.destinations.extend(default_policy_destinations(name));
-                }
-                setup
-            })
+            Arc::new(move |wallet: &str| default_policy_setup(&store, &chosen, wallet))
         };
         let wallets_handler = Arc::new(
             WalletsHandler::new(
@@ -5733,6 +5739,31 @@ mod tests {
 
         config.nfs_listen_addr = "not-a-socket".to_owned();
         assert!(configured_mount(&config, std::path::Path::new("/tmp/bloom-mount")).is_err());
+    }
+
+    /// One chosen Petal whose owner record cannot be read fails the whole
+    /// default-policy setup, rather than leaving that Petal out of the first
+    /// proposal. A chosen Petal that is not installed is simply left out.
+    #[test]
+    fn default_policy_setup_fails_when_an_owner_record_is_unreadable() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = PetalStore::open(temp.path()).unwrap();
+        let chosen = vec!["hyperliquid".to_owned(), "polymarket".to_owned()];
+
+        let setup = default_policy_setup(&store, &chosen, "main").unwrap();
+        assert!(setup.packages.is_empty(), "nothing is installed yet");
+
+        std::fs::create_dir_all(temp.path().join("owners")).unwrap();
+        std::fs::write(temp.path().join("owners/polymarket.json"), b"not json").unwrap();
+        let error = default_policy_setup(&store, &chosen, "main").unwrap_err();
+        assert!(error.to_string().contains("polymarket"), "{error}");
+        // Only the default-policy wallet reads the setup.
+        assert!(
+            default_policy_setup(&store, &chosen, "alt")
+                .unwrap()
+                .packages
+                .is_empty()
+        );
     }
 
     #[test]

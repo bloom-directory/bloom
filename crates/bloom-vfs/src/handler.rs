@@ -241,14 +241,17 @@ pub trait Handler: Send + Sync {
         Err(HandlerError::PermissionDenied)
     }
 
-    /// Write `data` only if `path` reads exactly `expected` now, and report
-    /// whether it wrote. The check and the write must be one step against
-    /// every other write this handler accepts for `path`, which
-    /// [`crate::WriteLocks`] provides. Default: unsupported, writing nothing.
-    async fn write_if_reads(
+    /// Write `data` to `path` only while the handler stores nothing under
+    /// `key` for it, and report whether it wrote. What is stored decides,
+    /// not what `path` reads: a file may read the same default whether its
+    /// value is missing or was saved that way. The check and the write must
+    /// be one step against every other write this handler accepts for
+    /// `path`, which [`crate::WriteLocks`] provides. Default: unsupported,
+    /// writing nothing.
+    async fn write_if_absent(
         &self,
         path: &VfsPath,
-        _expected: &[u8],
+        _key: &str,
         _data: &[u8],
     ) -> Result<bool, HandlerError> {
         Err(HandlerError::Unsupported(format!(

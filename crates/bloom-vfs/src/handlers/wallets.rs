@@ -318,7 +318,12 @@ pub struct DefaultPolicySetup {
     pub destinations: Vec<bloom_broker_api::PolicyDestination>,
 }
 
-pub type DefaultPolicyPackages = Arc<dyn Fn(&str) -> DefaultPolicySetup + Send + Sync>;
+/// Reads a wallet's [`DefaultPolicySetup`]. A failure, such as an unreadable
+/// Petal owner record, stops the first proposal rather than letting it leave
+/// a chosen Petal out: once that proposal commits, later ones add only the
+/// requested package, so nothing would put the missing Petal back.
+pub type DefaultPolicyPackages =
+    Arc<dyn Fn(&str) -> Result<DefaultPolicySetup, HandlerError> + Send + Sync>;
 
 #[derive(Clone)]
 pub struct WalletsHandler {
@@ -1938,17 +1943,16 @@ impl WalletsHandler {
         // has committed any change, later proposals add only the requested
         // package, so a Petal the owner removed is never proposed again behind
         // another.
-        let setup = self
-            .default_policy_packages
-            .as_ref()
-            .map(|defaults| defaults(wallet))
-            .unwrap_or_default();
+        let setup = match &self.default_policy_packages {
+            Some(defaults) => defaults(wallet),
+            None => Ok(DefaultPolicySetup::default()),
+        };
         self.ensure_policy_allows(
             wallet,
             std::slice::from_ref(package_hash),
             std::slice::from_ref(package_hash),
             &[],
-            &setup,
+            setup.as_ref(),
             true,
         )
         .await
@@ -1975,7 +1979,7 @@ impl WalletsHandler {
             packages,
             packages,
             destinations,
-            &DefaultPolicySetup::default(),
+            Ok(&DefaultPolicySetup::default()),
             propose_after_creation,
         )
         .await
@@ -1989,8 +1993,9 @@ impl WalletsHandler {
         destinations: &[bloom_broker_api::PolicyDestination],
         // Added only while the policy is still the one wallet creation
         // installed, so one ceremony makes every chosen Petal usable instead
-        // of gating each one.
-        first_proposal: &DefaultPolicySetup,
+        // of gating each one. If it could not be read, nothing is proposed
+        // while that is the case.
+        first_proposal: Result<&DefaultPolicySetup, &HandlerError>,
         // Whether to propose the request once the policy is no longer the one
         // wallet creation installed.
         propose_after_creation: bool,
@@ -2082,6 +2087,11 @@ impl WalletsHandler {
         // for so a pending change is judged against the request alone.
         let mut proposed_destinations = destinations.to_vec();
         if creation_policy {
+            let first_proposal = first_proposal.map_err(|error| {
+                HandlerError::backend(format!(
+                    "the Petals chosen during setup could not be read, so no policy was proposed for wallet {wallet}: {error}"
+                ))
+            })?;
             additions.extend_from_slice(&first_proposal.packages);
             proposed_destinations.extend_from_slice(&first_proposal.destinations);
         }
