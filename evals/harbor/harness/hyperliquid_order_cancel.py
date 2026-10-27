@@ -434,6 +434,20 @@ class HyperliquidOrderCancelEval(EvalDefinition):
     def _redact_ceremony_urls(self, output: str) -> str:
         return ANY_CEREMONY_URL.sub("[REDACTED_CEREMONY_URL]", output)
 
+    @property
+    def _core_session_dir(self) -> Path:
+        # The Petal has no stop route: core session stop revokes the session's
+        # approvals, and the Petal's status.json keeps `stopped: false` after it.
+        assert self.session_id is not None
+        return (
+            self.wallet_root / "0/sessions/hyperliquid" / session_key_slot(self.session_id)
+        )
+
+    def _core_session_stopped(self) -> bool:
+        session = self._read_json_if_exists(self._core_session_dir / "session.json")
+        stop = session.get("stop") if isinstance(session, dict) else None
+        return isinstance(stop, dict) and stop.get("complete") is True
+
     def _read_session_status(self, attempts: int = 3) -> Any | None:
         if self.session_base is None:
             return None
@@ -1156,7 +1170,7 @@ class HyperliquidOrderCancelEval(EvalDefinition):
             return
 
         self.session_created = True
-        stopped = isinstance(status_data, dict) and status_data.get("stopped") is True
+        stopped = self._core_session_stopped()
         if not stopped:
             cancel = self._write_route(
                 self.session_base / "cancel_all", b"host-cleanup", 30
@@ -1208,7 +1222,7 @@ class HyperliquidOrderCancelEval(EvalDefinition):
 
         if not failures and not stopped:
             stopped_result = self._write_route(
-                self.session_base / "stop", b"host-cleanup", 10
+                self._core_session_dir / "stop", b"host-cleanup", 10
             )
             if stopped_result.returncode != 0:
                 failures.append("session stop failed")
@@ -1217,17 +1231,9 @@ class HyperliquidOrderCancelEval(EvalDefinition):
 
             def session_stopped() -> bool:
                 self.cleanup_observations["session_stopped"] = None
-                final_status = self._read_json(self.session_base / "status.json")
-                self.cleanup_observations["session_stopped"] = (
-                    final_status.get("stopped")
-                    if isinstance(final_status, dict)
-                    and isinstance(final_status.get("stopped"), bool)
-                    else None
-                )
-                return (
-                    isinstance(final_status, dict)
-                    and final_status.get("stopped") is True
-                )
+                stopped = self._core_session_stopped()
+                self.cleanup_observations["session_stopped"] = stopped
+                return stopped
 
             if not self._poll_until(
                 session_stopped, STATUS_SETTLE_ATTEMPTS, STATUS_SETTLE_DELAY_SECONDS
