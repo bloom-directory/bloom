@@ -25,8 +25,8 @@ migration_floor = 1
 
 [protocols.machine_broker]
 major = 1
-minor_min = 7
-minor_max = 7
+minor_min = 8
+minor_max = 8
 
 [protocols.broker_signer]
 major = 1
