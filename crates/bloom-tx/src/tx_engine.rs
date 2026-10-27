@@ -3,7 +3,7 @@
 //! replacement / cancel txs and a legacy (non-1559) build path.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use alloy::consensus::{SignableTransaction, TxEip1559, TxEnvelope, TxLegacy};
@@ -420,7 +420,7 @@ type NonceLocks =
     Arc<parking_lot::Mutex<HashMap<(String, String, Address), Arc<tokio::sync::Mutex<()>>>>>;
 
 type EntryLocks =
-    Arc<parking_lot::Mutex<HashMap<(String, String, String), Arc<tokio::sync::Mutex<()>>>>>;
+    Arc<parking_lot::Mutex<HashMap<(String, String, String), Weak<tokio::sync::Mutex<()>>>>>;
 
 const TRIAD_SIGNING_STATE_FILE: &str = "ceremony.json";
 const TRIAD_BATCH_STATE_DIR: &str = ".batch-signing";
@@ -581,11 +581,15 @@ impl TxEngine {
     }
 
     fn entry_lock_for(&self, wallet: &str, chain: &str, id: &str) -> Arc<tokio::sync::Mutex<()>> {
-        self.entry_locks
-            .lock()
-            .entry((wallet.into(), chain.into(), id.into()))
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
+        let key = (wallet.into(), chain.into(), id.into());
+        let mut locks = self.entry_locks.lock();
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert(key, Arc::downgrade(&lock));
+        lock
     }
 
     fn assert_write_permit(&self, permit: &HomeWritePermit) -> Result<(), TxEngineError> {
@@ -4297,10 +4301,7 @@ impl TxEngine {
             .outbox
             .read_in_state(wallet, chain, id, OutboxState::Pending)?;
         if entry.staged.tx_hash.is_some()
-            || self
-                .outbox
-                .read_broadcast_attempt(&entry, BroadcastAttemptKind::Confirm)?
-                .is_some()
+            || self.outbox.has_broadcast_attempt(&entry)?
             || read_triad_signing_state(&entry.dir.join(TRIAD_SIGNING_STATE_FILE))
                 .map_err(|error| TxEngineError::ApprovalState(format!(
                     "cannot establish whether this transaction was signed: {error}; preserve ceremony.json, inspect the Broker operation and chain nonce, and restore the signing record from backup before retrying; do not delete the record")))?
@@ -9335,6 +9336,68 @@ mod tests {
                 .read_in_state("alice", "anvil", &staged.id, OutboxState::Pending)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn discard_refuses_every_broadcast_attempt_kind() {
+        for kind in [
+            BroadcastAttemptKind::Confirm,
+            BroadcastAttemptKind::Replacement,
+            BroadcastAttemptKind::CancelReplacement,
+        ] {
+            let (engine, _, dir) = fake_engine(60_000);
+            let permit = permit_for(&dir);
+            let staged = fake_staged_1559(kind.marker_name());
+            engine.outbox.write_pending(&staged, "p").unwrap();
+            let entry = engine
+                .outbox
+                .read_in_state("alice", "anvil", &staged.id, OutboxState::Pending)
+                .unwrap();
+            engine
+                .outbox
+                .write_broadcast_attempt(
+                    &entry,
+                    kind,
+                    &BroadcastAttempt {
+                        schema: "bloom.broadcast_attempted.v1".into(),
+                        tx_hash: format!("{:#x}", B256::ZERO),
+                        raw_tx_blake3: blake3::hash(&[]).to_hex().to_string(),
+                        raw_tx_path: kind.raw_name().into(),
+                        from: staged.from.clone(),
+                        to: staged.to.clone(),
+                        nonce: staged.nonce,
+                        chain_id: staged.chain_id,
+                        created_ms: now_ms(),
+                        transport: BroadcastTransport::PublicRpc,
+                        private_provider: None,
+                    },
+                )
+                .unwrap();
+
+            let error = engine
+                .discard_unsigned(&permit, "alice", "anvil", &staged.id)
+                .unwrap_err();
+            assert!(error.to_string().contains("cannot discard"), "{kind:?}");
+            assert!(
+                engine
+                    .outbox
+                    .read_in_state("alice", "anvil", &staged.id, OutboxState::Pending)
+                    .is_ok(),
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn entry_lock_registry_reclaims_completed_ids() {
+        let (engine, _, _dir) = fake_engine(60_000);
+        for index in 0..100 {
+            let lock = engine.entry_lock_for("alice", "anvil", &format!("{index:04}"));
+            let guard = lock.try_lock().unwrap();
+            drop(guard);
+            drop(lock);
+        }
+        assert_eq!(engine.entry_locks.lock().len(), 1);
     }
 
     /// A soft-Warn check must block confirm() when no override sentinel is
