@@ -121,7 +121,7 @@ jobs:
       BLOOM_INTEGRATION_BROKER_BIN: ${{ github.workspace }}/triad-bin/bloom-broker
       BLOOM_INTEGRATION_SIGNER_BIN: ${{ github.workspace }}/triad-bin/bloom-signer
       BLOOM_INTEGRATION_DEBUG_DRIVER_BIN: ${{ github.workspace }}/triad-bin/bloom-broker-debug-driver
-      BLOOM_EVAL_JOBS_DIR: ${{ runner.temp }}/harbor-jobs
+      BLOOM_EVAL_JOBS_DIR: ${{ github.workspace }}/harbor-jobs
     steps:
       - uses: actions/checkout@v6
       - uses: actions/download-artifact@v4
@@ -171,7 +171,7 @@ jobs:
         if: always()
         with:
           name: trials-${{ matrix.agent }}
-          path: ${{ runner.temp }}/harbor-jobs
+          path: ${{ github.workspace }}/harbor-jobs
           if-no-files-found: error
 
   report:
