@@ -682,7 +682,12 @@ impl Outbox {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(error.into()),
             };
-            let staged: StagedTx = serde_json::from_slice(&bytes)?;
+            let mut staged: StagedTx = serde_json::from_slice(&bytes)?;
+            // A crash between the move and the status rewrite leaves
+            // `failed/` reading `pending`; it can never be sent.
+            if state == OutboxState::Failed && staged.status == TxStatus::Pending {
+                staged.status = TxStatus::Failed;
+            }
             return Ok(OutboxEntry { state, staged, dir });
         }
         Err(OutboxError::NotFound(id.into()))
@@ -1550,10 +1555,16 @@ mod tests {
         ob.transition_with_status(&entry, OutboxState::Failed, TxStatus::Failed)
             .unwrap();
 
+        // A crash after the move, before the status rewrite.
+        ob.write_pending(&fake_staged("crashed"), "p").unwrap();
+        let entry = ob.read("alice", "anvil", "crashed").unwrap();
+        ob.transition(&entry, OutboxState::Failed).unwrap();
+
         for (id, expected) in [
             ("cancelled", TxStatus::Cancelled),
             ("expired", TxStatus::Failed),
             ("denied", TxStatus::Failed),
+            ("crashed", TxStatus::Failed),
         ] {
             let entry = ob.read("alice", "anvil", id).unwrap();
             assert_eq!(
