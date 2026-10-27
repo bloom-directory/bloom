@@ -176,7 +176,7 @@ jobs:
 
   report:
     name: Release eval report
-    needs: evals
+    needs: [build, evals]
     if: always() && needs.build.result == 'success'
     runs-on: ubuntu-latest
     permissions:
