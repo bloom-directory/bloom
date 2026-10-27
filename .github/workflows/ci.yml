@@ -222,6 +222,10 @@ jobs:
             -E 'package(bloom-vfs) and binary(triad_policy_update)' \
             --no-tests=fail \
             --no-fail-fast
+          cargo nextest run --archive-file target/nextest-archive.tar.zst \
+            -E 'package(bloom-daemon) and binary(m2_no_legacy_authority_store)' \
+            --no-tests=fail \
+            --no-fail-fast
       # The triad release binary asserts the content of the packaged
       # installers, launcher, and release gates. It was previously not run at
       # all, so a launcher change could silently invalidate its assertions.
