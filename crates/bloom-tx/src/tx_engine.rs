@@ -62,7 +62,7 @@ use fs2::FileExt as _;
 use parking_lot::RwLock;
 use sha2::Digest as _;
 use thiserror::Error;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::bump_scanner::MempoolIndexes;
 use crate::intent_parser::ParseError;
@@ -1974,7 +1974,7 @@ impl TxEngine {
         let entry = self
             .outbox
             .read_in_state(wallet, chain_name, id, OutboxState::Pending)?;
-        let mut staged = entry.staged.clone();
+        let staged = entry.staged.clone();
 
         if self
             .outbox
@@ -1999,12 +1999,10 @@ impl TxEngine {
 
         let hard = policy_engine::has_hard_violation(&staged.policy_checks);
         if hard {
-            staged.status = TxStatus::Failed;
-            self.outbox.transition_with_status(
-                &entry,
-                crate::outbox::OutboxState::Failed,
-                TxStatus::Failed,
-            )?;
+            // The denial stands even if recording it fails.
+            if let Err(e) = self.outbox.transition_with_status(&entry, TxStatus::Failed) {
+                warn!(id = %staged.id, error = %e, "tx.policy_denied_record_failed");
+            }
             debug!(
                 id = %staged.id,
                 wallet,
@@ -2401,12 +2399,10 @@ impl TxEngine {
         // Policy gate.
         let hard = policy_engine::has_hard_violation(&staged.policy_checks);
         if hard {
-            staged.status = TxStatus::Failed;
-            self.outbox.transition_with_status(
-                &entry,
-                crate::outbox::OutboxState::Failed,
-                TxStatus::Failed,
-            )?;
+            // The denial stands even if recording it fails.
+            if let Err(e) = self.outbox.transition_with_status(&entry, TxStatus::Failed) {
+                warn!(id = %staged.id, error = %e, "tx.policy_denied_record_failed");
+            }
             debug!(
                 id = %staged.id,
                 wallet,
@@ -4362,9 +4358,9 @@ impl TxEngine {
             .remove_broadcast_raw_tx(&entry, BroadcastAttemptKind::CancelReplacement);
         // The replacement took the nonce; the original can never be sent.
         if entry.state != OutboxState::Failed
-            && let Err(e) =
-                self.outbox
-                    .transition_with_status(&entry, OutboxState::Failed, TxStatus::Cancelled)
+            && let Err(e) = self
+                .outbox
+                .transition_with_status(&entry, TxStatus::Cancelled)
         {
             debug!(
                 id = %original.id,
@@ -9296,6 +9292,10 @@ mod tests {
             crate::outbox::OutboxState::Failed,
             "tx must be Failed after hard deny"
         );
+        // Persisted, not only normalised by `read`: the CLI serves these bytes.
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(entry.dir.join("intent.json")).unwrap()).unwrap();
+        assert_eq!(raw["status"], "failed");
     }
 
     /// A soft-Warn check must block confirm() when no override sentinel is
