@@ -16,8 +16,9 @@
 #    be absent before the wallet exists, present afterwards with the setup
 #    value rather than the catalog default, and the marker must be cleared.
 # 5. Leave the marker again, as a stopped `wallet new` would, after the owner
-#    has written their own Polymarket settings. Resuming keeps the owner's
-#    settings and clears the marker.
+#    has saved their own Polymarket settings, exactly the text the route reads
+#    when nothing is stored. Resuming keeps the owner's settings, since what is
+#    stored decides rather than what the route reads, and clears the marker.
 # 6. Remove Hyperliquid through an ordinary policy ceremony. Resuming then
 #    reports that the policy changed and proposes nothing.
 #
@@ -254,8 +255,9 @@ printf '%s\n' "$settings" | grep -q '^max_daily_usd = "73"$' || die "settings li
   die "the pending settings marker was not cleared after the write succeeded"
 say "Polymarket settings for $WALLET/0 applied from setup: enabled = true, max_daily_usd = \"73\""
 
-# 5. A deferred setup write never replaces settings written since.
-owner_settings="$(printf 'enabled = false\nmax_daily_usd = "5"\n')"
+# 5. A deferred setup write never replaces settings written since, even
+#    settings that read exactly like the route's default.
+owner_settings="$(printf 'enabled = false\nallow_neg_risk = true\n')"
 printf '%s\n' "$owner_settings" | cli vfs write "$settings_path" >/dev/null ||
   die "could not write the owner's Polymarket settings"
 : > "$machine_home/pending-petal-settings/polymarket"
@@ -267,7 +269,7 @@ settings="$(cli vfs cat "$settings_path")"
   die "resuming replaced the owner's Polymarket settings: $settings"
 [ ! -e "$machine_home/pending-petal-settings/polymarket" ] ||
   die "the pending settings marker survived settings the owner wrote"
-say "resuming kept the owner's Polymarket settings (enabled = false) and cleared the stale marker"
+say "resuming kept the owner's saved Polymarket settings, though they read like the default, and cleared the stale marker"
 
 # 6. Once the owner changes the policy, resuming proposes nothing.
 policy_path="/wallets/$WALLET/policy.json"

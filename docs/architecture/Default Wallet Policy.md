@@ -321,8 +321,9 @@ carries, clears the marker and prints the command (section 1). A queued
 write that fails stays queued, and a command that stops on an applied or
 changed policy names the command that retries it. It writes them only while
 the Petal stores nothing for them: for Polymarket, no
-`settings/main/venue.toml` in account 0's partition of its private store,
-pinned with the release. What the route reads cannot decide this, because
+`state/settings/main/venue.toml` in account 0's partition of its private
+store (its SDK's `state` namespace plus its own key), pinned with the
+release. What the route reads cannot decide this, because
 Polymarket reads its built-in `enabled = false` and `allow_neg_risk = true`
 default both when nothing is stored and when the owner saved exactly that.
 The route's handler makes the check and the write one step: the Petal router

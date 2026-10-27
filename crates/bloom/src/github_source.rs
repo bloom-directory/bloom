@@ -65,7 +65,8 @@ pub(crate) struct PetalSetupTemplate {
     pub body: &'static str,
     pub values: &'static [PetalSetupValue],
     /// The key the Petal stores the route's settings under, in the account's
-    /// partition; `{wallet}` is the default-policy wallet. A setup write goes
+    /// partition and as the host stores it, namespace included; `{wallet}` is
+    /// the default-policy wallet. A setup write goes
     /// ahead only while nothing is stored there, so settings saved by the
     /// owner or anyone else stay, even ones that read like the default.
     pub store_key: &'static str,
@@ -86,8 +87,9 @@ const POLYMARKET_SETUP: PetalSetupTemplate = PetalSetupTemplate {
         prompt: "Polymarket daily buy limit in pUSD",
         default: "100",
     }],
-    // `venue_config_key` in the pinned release.
-    store_key: "settings/{wallet}/venue.toml",
+    // `venue_config_key` in the pinned release, under the Petal SDK's `state`
+    // namespace, which its `store_get` and `store_put` add to every key.
+    store_key: "state/settings/{wallet}/venue.toml",
 };
 
 const BASELINE_POLYMARKET_AUTHORITY_ROUTES: &[PetalAuthorityRoute] = &[

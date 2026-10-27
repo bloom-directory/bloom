@@ -1501,9 +1501,11 @@ mod tests {
     }
 
     /// `store_key` is where the pinned Polymarket release stores a wallet's
-    /// venue settings. A setup write goes ahead only while nothing is stored
-    /// there, so a catalog bump must re-check it against the new release's
-    /// `venue_config_key`, or setup would write over settings it cannot see.
+    /// venue settings, as the host stores them: the Petal SDK's `state`
+    /// namespace (petal 2beed2ff, `STATE_NS`), then `venue_config_key`. A
+    /// setup write goes ahead only while nothing is stored there, so a catalog
+    /// bump must re-check both, or setup would write over settings it cannot
+    /// see.
     #[test]
     fn the_polymarket_settings_key_is_pinned_with_its_release() {
         let entry = github_source::preinstalled_petal("polymarket").unwrap();
@@ -1514,7 +1516,7 @@ mod tests {
         );
         assert_eq!(
             setup_template("polymarket").unwrap().store_key,
-            "settings/{wallet}/venue.toml"
+            "state/settings/{wallet}/venue.toml"
         );
     }
 
