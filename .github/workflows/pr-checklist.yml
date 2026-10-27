@@ -115,6 +115,8 @@ jobs:
         run: |
           cargo test --locked -p bloom-petals --test explicit_account_packages real_signing_producers_reach_the_host_with_selected_account_and_full_witness -- --ignored --exact 2>&1 | tee "$RUNNER_TEMP/pm80-producer-test.log"
           grep -q "test result: ok. 1 passed;" "$RUNNER_TEMP/pm80-producer-test.log"
+          cargo test --locked -p bloom --bin bloom github_source::tests::source_built_signing_packages_match_catalog_authority -- --ignored --exact 2>&1 | tee "$RUNNER_TEMP/pm80-catalog-test.log"
+          grep -q "test result: ok. 1 passed;" "$RUNNER_TEMP/pm80-catalog-test.log"
       - name: Read the release Signer revision
         id: release_signer
         run: |
