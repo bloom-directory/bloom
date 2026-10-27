@@ -1,0 +1,12 @@
+# RustSec gate for the Bloom Machine. CI runs `cargo deny check advisories`;
+# licence, ban and source policy are not configured here.
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = [
+  { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 (via alloy's k256 0.13) has no patch outside 0.7; the Machine holds no secp256k1 secret keys" },
+  { id = "RUSTSEC-2025-0141", reason = "bincode 1 is unmaintained, no known vulnerability; required by solana-instruction" },
+  { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained, no known vulnerability; compile-time macro only" },
+  { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2 is unmaintained, no known vulnerability; compile-time macro only" },
+]
