@@ -277,8 +277,11 @@ pub(crate) enum SetupWrite {
     NoTemplate,
     /// Setup's values went in; carries the chosen values, for messages.
     Written(String),
-    /// The route already held other settings, so they stay.
-    Kept(PetalSettingsWrite),
+    /// Setup left the route as it is, for the reason given.
+    Kept(PetalSettingsWrite, String),
+    /// Setup's values went in, but the Petal stored nothing under the key
+    /// setup checks, so that check protects nothing; carries the key.
+    Unprotected(PetalSettingsWrite, String),
 }
 
 /// Write a Petal's setup settings through its own settings route, but only
@@ -290,10 +293,18 @@ pub(crate) enum SetupWrite {
 /// stored as when the owner saved exactly that. The check and the write are
 /// one step ([`bloom_vfs::Vfs::write_if_absent`]), so an owner's edit made
 /// meanwhile is never replaced either.
+///
+/// The key is the one the catalog release stores these settings under, so
+/// setup writes only to that release (`installed` is the Petal's package
+/// hash): another release under the same name may store them elsewhere, where
+/// the check could not see them. After a write, the key must be stored; if it
+/// is not, the pinned key is wrong and setup says so, since it protects
+/// nothing.
 pub(crate) async fn write_petal_settings(
     vfs: &bloom_vfs::Vfs,
     petals: &PetalsConfig,
     name: &str,
+    installed: &str,
 ) -> Result<SetupWrite> {
     let Some(template) = setup_template(name) else {
         return Ok(SetupWrite::NoTemplate);
@@ -301,19 +312,55 @@ pub(crate) async fn write_petal_settings(
     let Some(settings) = render_petal_settings(petals, name, DEFAULT_POLICY_WALLET)? else {
         return Ok(SetupWrite::NoTemplate);
     };
+    let pinned = github_source::preinstalled_petal(name).and_then(|entry| entry.expected_hash);
+    if pinned != Some(installed) {
+        let reason = format!(
+            "the installed {} is not the release setup knows, so it did not risk replacing settings stored where it cannot check",
+            petal_label(name)
+        );
+        return Ok(SetupWrite::Kept(settings, reason));
+    }
     let path = bloom_vfs::VfsPath::parse(&settings.path)?;
     let key = template
         .store_key
         .replace("{wallet}", DEFAULT_POLICY_WALLET);
-    let written = vfs
-        .write_if_absent(&path, &key, &settings.body)
-        .await
-        .with_context(|| format!("write {} settings to {}", petal_label(name), settings.path))?;
-    Ok(if written {
-        SetupWrite::Written(settings.summary)
-    } else {
-        SetupWrite::Kept(settings)
+    let write = || async {
+        vfs.write_if_absent(&path, &key, &settings.body)
+            .await
+            .with_context(|| format!("write {} settings to {}", petal_label(name), settings.path))
+    };
+    if !write().await? {
+        return Ok(SetupWrite::Kept(
+            settings,
+            SETTINGS_ALREADY_THERE.to_owned(),
+        ));
+    }
+    // Setup's settings are stored under `key` now, so asking again must
+    // decline. Writing again, with the same settings, means `key` is not
+    // where this release stores them. The settings went in either way, so a
+    // check that cannot run is only logged.
+    Ok(match write().await {
+        Ok(true) => SetupWrite::Unprotected(settings, key),
+        Ok(false) => SetupWrite::Written(settings.summary),
+        Err(error) => {
+            tracing::warn!(
+                petal = %name,
+                error = %format!("{error:#}"),
+                "petal.setup_settings_key_unchecked"
+            );
+            SetupWrite::Written(settings.summary)
+        }
     })
+}
+
+/// Setup wrote a Petal's settings, but the key it checks before writing is
+/// not where the Petal stored them.
+fn settings_unprotected(name: &str, settings: &PetalSettingsWrite, key: &str) -> String {
+    format!(
+        "petal_settings_unprotected: {} set {}, but stored nothing under {key}, the key Bloom checks before setup writes, so later setup writes could replace settings saved since. Report this as a Bloom bug.",
+        petal_label(name),
+        settings.summary
+    )
 }
 
 /// Why setup left settings it found in place.
@@ -450,8 +497,9 @@ fn pending_settings(home: &std::path::Path, petals: &PetalsConfig) -> Vec<String
 /// wallet exists. The write goes ahead only while the Petal stores nothing
 /// for its settings, and that check and the write are one step no other write
 /// through Machine can land between. Anything stored may be the owner's, even
-/// if it reads like the default, so it stays and the marker is cleared. A write that cannot be
-/// made yet, as before the account exists, keeps its marker for next time.
+/// if it reads like the default, so it stays and the marker is cleared. A
+/// write that cannot be made yet, as before the account exists, keeps its
+/// marker for next time.
 pub(crate) async fn apply_pending_settings(daemon: &Daemon) -> PendingSettings {
     let owners = petal_owners(daemon).unwrap_or_default();
     apply_queued_writes(
@@ -481,10 +529,10 @@ async fn apply_queued_writes(
 ) -> PendingSettings {
     let mut outcome = PendingSettings::default();
     for name in pending_settings(home, petals) {
-        if !owners.contains_key(&name) {
+        let Some(installed) = owners.get(&name) else {
             continue;
-        }
-        match apply_queued_settings(vfs, home, petals, &name).await {
+        };
+        match apply_queued_settings(vfs, home, petals, &name, installed).await {
             QueuedWrite::Written(message) => outcome.written.push(message),
             QueuedWrite::Settled => {}
             QueuedWrite::Failed(error) => outcome
@@ -571,21 +619,28 @@ async fn apply_queued_settings(
     home: &std::path::Path,
     petals: &PetalsConfig,
     name: &str,
+    installed: &str,
 ) -> QueuedWrite {
-    match write_petal_settings(vfs, petals, name).await {
+    match write_petal_settings(vfs, petals, name, installed).await {
         Ok(SetupWrite::NoTemplate) => QueuedWrite::Settled,
         Ok(SetupWrite::Written(summary)) => {
             clear_settings_pending(home, name);
             QueuedWrite::Written(settings_message(name, &summary, false))
         }
-        Ok(SetupWrite::Kept(settings)) => {
+        Ok(SetupWrite::Kept(settings, reason)) => {
             clear_settings_pending(home, name);
             tracing::info!(
                 petal = %name,
-                message = %settings_not_written(name, &settings, SETTINGS_ALREADY_THERE),
+                message = %settings_not_written(name, &settings, &reason),
                 "petal.setup_settings_preserved"
             );
             QueuedWrite::Settled
+        }
+        Ok(SetupWrite::Unprotected(settings, key)) => {
+            clear_settings_pending(home, name);
+            let message = settings_unprotected(name, &settings, &key);
+            tracing::error!(petal = %name, %message, "petal.setup_settings_key_not_stored");
+            QueuedWrite::Written(message)
         }
         Err(error) => {
             let error = format!("{error:#}");
@@ -640,6 +695,7 @@ pub(crate) async fn apply_setup_settings(
                 daemon.home.root(),
                 &daemon.config.petals,
                 name,
+                installed,
                 step,
                 updated,
                 &account,
@@ -653,18 +709,20 @@ pub(crate) async fn apply_setup_settings(
 /// Carry out `step` for one installed, chosen Petal after `bloom init`
 /// provisioned it, and return what to tell the owner. `updated` says
 /// provisioning replaced an older release.
+#[allow(clippy::too_many_arguments)]
 async fn settle_setup_settings(
     vfs: &bloom_vfs::Vfs,
     home: &std::path::Path,
     petals: &PetalsConfig,
     name: &str,
+    installed: &str,
     step: SetupSettingsStep,
     updated: bool,
     account: &AccountPresence,
 ) -> Option<String> {
     let reason = match step {
         SetupSettingsStep::Leave => {
-            return finish_interrupted_setup(vfs, home, petals, name, account).await;
+            return finish_interrupted_setup(vfs, home, petals, name, installed, account).await;
         }
         SetupSettingsStep::Write => None,
         SetupSettingsStep::KeepOwners => Some(format!(
@@ -687,18 +745,18 @@ async fn settle_setup_settings(
             Err(error) => Some(format!("petal_settings_failed: {error:#}")),
         };
     }
-    match write_petal_settings(vfs, petals, name).await {
+    match write_petal_settings(vfs, petals, name, installed).await {
         Ok(SetupWrite::Written(summary)) => {
             clear_settings_pending(home, name);
             Some(settings_message(name, &summary, updated))
         }
-        Ok(SetupWrite::Kept(settings)) => {
+        Ok(SetupWrite::Kept(settings, reason)) => {
             clear_settings_pending(home, name);
-            Some(settings_not_written(
-                name,
-                &settings,
-                SETTINGS_ALREADY_THERE,
-            ))
+            Some(settings_not_written(name, &settings, &reason))
+        }
+        Ok(SetupWrite::Unprotected(settings, key)) => {
+            clear_settings_pending(home, name);
+            Some(settings_unprotected(name, &settings, &key))
         }
         Ok(SetupWrite::NoTemplate) => None,
         Err(error) => Some(match mark_settings_pending(home, name) {
@@ -730,6 +788,7 @@ async fn finish_interrupted_setup(
     home: &std::path::Path,
     petals: &PetalsConfig,
     name: &str,
+    installed: &str,
     account: &AccountPresence,
 ) -> Option<String> {
     let queued = |home| {
@@ -742,11 +801,13 @@ async fn finish_interrupted_setup(
     }
     let why = match account {
         AccountPresence::Absent => return None,
-        AccountPresence::Exists => match apply_queued_settings(vfs, home, petals, name).await {
-            QueuedWrite::Written(message) => return Some(message),
-            QueuedWrite::Settled => return None,
-            QueuedWrite::Failed(error) => format!("writing them did not complete ({error})"),
-        },
+        AccountPresence::Exists => {
+            match apply_queued_settings(vfs, home, petals, name, installed).await {
+                QueuedWrite::Written(message) => return Some(message),
+                QueuedWrite::Settled => return None,
+                QueuedWrite::Failed(error) => format!("writing them did not complete ({error})"),
+            }
+        }
         AccountPresence::Unknown(error) => {
             format!("Bloom could not check whether wallet {DEFAULT_POLICY_WALLET} exists ({error})")
         }
@@ -855,11 +916,22 @@ pub(crate) fn apply_provisioned_settings(
                 continue;
             }
         }
-        match runtime.block_on(write_petal_settings(
-            &daemon.vfs,
-            &daemon.config.petals,
-            &result.name,
-        )) {
+        let installed = petal_owners(daemon).and_then(|owners| {
+            owners
+                .get(&result.name)
+                .cloned()
+                .with_context(|| format!("{} has no install record", petal_label(&result.name)))
+        });
+        let write = match installed {
+            Ok(installed) => runtime.block_on(write_petal_settings(
+                &daemon.vfs,
+                &daemon.config.petals,
+                &result.name,
+                &installed,
+            )),
+            Err(error) => Err(error),
+        };
+        match write {
             Ok(SetupWrite::Written(summary)) => {
                 clear_settings_pending(daemon.home.root(), &result.name);
                 tracing::info!(
@@ -869,12 +941,20 @@ pub(crate) fn apply_provisioned_settings(
                     "petal.setup_settings_written"
                 );
             }
-            Ok(SetupWrite::Kept(settings)) => {
+            Ok(SetupWrite::Kept(settings, reason)) => {
                 clear_settings_pending(daemon.home.root(), &result.name);
                 tracing::info!(
                     petal = %result.name,
-                    message = %settings_not_written(&result.name, &settings, SETTINGS_ALREADY_THERE),
+                    message = %settings_not_written(&result.name, &settings, &reason),
                     "petal.setup_settings_preserved"
+                );
+            }
+            Ok(SetupWrite::Unprotected(settings, key)) => {
+                clear_settings_pending(daemon.home.root(), &result.name);
+                tracing::error!(
+                    petal = %result.name,
+                    message = %settings_unprotected(&result.name, &settings, &key),
+                    "petal.setup_settings_key_not_stored"
                 );
             }
             Ok(SetupWrite::NoTemplate) => {}
@@ -1571,6 +1651,8 @@ mod tests {
     struct SettingsRoute {
         /// Whether `main`'s account exists; the route fails without it.
         account: bool,
+        /// Whether the Petal stores its settings under the key setup checks.
+        under_key: bool,
         stored: tokio::sync::Mutex<Option<Vec<u8>>>,
         locks: bloom_vfs::WriteLocks,
         pause_reads: std::sync::atomic::AtomicBool,
@@ -1594,9 +1676,18 @@ mod tests {
             Self::with(true, Some(value.to_vec()))
         }
 
+        /// Nothing is stored, and what gets written is stored under a key
+        /// other than the one setup checks, as a stale pinned key would be.
+        fn misplacing() -> std::sync::Arc<Self> {
+            let mut route = Self::with(true, None);
+            std::sync::Arc::get_mut(&mut route).unwrap().under_key = false;
+            route
+        }
+
         fn with(account: bool, stored: Option<Vec<u8>>) -> std::sync::Arc<Self> {
             std::sync::Arc::new(Self {
                 account,
+                under_key: true,
                 stored: tokio::sync::Mutex::new(stored),
                 locks: bloom_vfs::WriteLocks::default(),
                 pause_reads: std::sync::atomic::AtomicBool::new(false),
@@ -1652,7 +1743,8 @@ mod tests {
         }
 
         /// A paused check returns what it saw before the pause, so a write
-        /// landing during the pause makes it stale.
+        /// landing during the pause makes it stale. Only the first check
+        /// pauses.
         async fn write_if_absent(
             &self,
             path: &bloom_vfs::VfsPath,
@@ -1663,8 +1755,11 @@ mod tests {
             if !self.account {
                 return Err(Self::no_account());
             }
-            let stored = self.stored.lock().await.is_some();
-            if self.pause_reads.load(std::sync::atomic::Ordering::SeqCst) {
+            let stored = self.under_key && self.stored.lock().await.is_some();
+            if self
+                .pause_reads
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
                 self.read_started.notify_one();
                 self.release_read.notified().await;
             }
@@ -1687,6 +1782,13 @@ mod tests {
         (home, vfs)
     }
 
+    /// The Polymarket release setup's settings key is pinned for.
+    fn release() -> &'static str {
+        github_source::preinstalled_petal("polymarket")
+            .and_then(|entry| entry.expected_hash)
+            .unwrap()
+    }
+
     fn polymarket_setup_body() -> Vec<u8> {
         render_petal_settings(&chosen_setup(&["polymarket"]), "polymarket", "main")
             .unwrap()
@@ -1701,7 +1803,8 @@ mod tests {
 
         let route = SettingsRoute::holding(Some(unset));
         let (home, vfs) = queued_polymarket(&route);
-        let outcome = apply_queued_settings(&vfs, home.path(), &petals, "polymarket").await;
+        let outcome =
+            apply_queued_settings(&vfs, home.path(), &petals, "polymarket", release()).await;
         assert!(
             matches!(&outcome, QueuedWrite::Written(message) if message.starts_with("petal_settings: ")),
             "{outcome:?}"
@@ -1713,7 +1816,7 @@ mod tests {
         let route = SettingsRoute::holding(Some(b"enabled = false\n"));
         let (home, vfs) = queued_polymarket(&route);
         assert_eq!(
-            apply_queued_settings(&vfs, home.path(), &petals, "polymarket").await,
+            apply_queued_settings(&vfs, home.path(), &petals, "polymarket", release()).await,
             QueuedWrite::Settled
         );
         assert_eq!(route.value().await.unwrap(), b"enabled = false\n");
@@ -1723,7 +1826,7 @@ mod tests {
         let route = SettingsRoute::holding(None);
         let (home, vfs) = queued_polymarket(&route);
         assert!(matches!(
-            apply_queued_settings(&vfs, home.path(), &petals, "polymarket").await,
+            apply_queued_settings(&vfs, home.path(), &petals, "polymarket", release()).await,
             QueuedWrite::Failed(_)
         ));
         assert_eq!(route.value().await, None);
@@ -1742,7 +1845,7 @@ mod tests {
         let (home, vfs) = queued_polymarket(&route);
         assert_eq!(route.value().await.unwrap(), UNSET);
         assert_eq!(
-            apply_queued_settings(&vfs, home.path(), &petals, "polymarket").await,
+            apply_queued_settings(&vfs, home.path(), &petals, "polymarket", release()).await,
             QueuedWrite::Settled
         );
         assert_eq!(*route.stored.lock().await, Some(UNSET.to_vec()));
@@ -1755,6 +1858,7 @@ mod tests {
             home.path(),
             &petals,
             "polymarket",
+            release(),
             SetupSettingsStep::Write,
             false,
             &AccountPresence::Exists,
@@ -1775,7 +1879,7 @@ mod tests {
         let petals = chosen_setup(&["polymarket"]);
         let route = SettingsRoute::holding(None);
         let (home, vfs) = queued_polymarket(&route);
-        let owners = BTreeMap::from([("polymarket".to_owned(), "a".repeat(64))]);
+        let owners = BTreeMap::from([("polymarket".to_owned(), release().to_owned())]);
         let outcome = apply_queued_writes(&vfs, home.path(), &petals, &owners).await;
         assert!(outcome.written.is_empty());
         assert_eq!(outcome.still_queued.len(), 1, "{outcome:?}");
@@ -1827,6 +1931,7 @@ mod tests {
                     &home,
                     &petals,
                     "polymarket",
+                    release(),
                     SetupSettingsStep::Write,
                     false,
                     &account,
@@ -1912,7 +2017,7 @@ mod tests {
     async fn serve_makes_a_queued_write_once_main_exists() {
         let petals = chosen_setup(&["polymarket"]);
         let unset = UNSET;
-        let installed = BTreeMap::from([("polymarket".to_owned(), "a".repeat(64))]);
+        let installed = BTreeMap::from([("polymarket".to_owned(), release().to_owned())]);
         let check = |exists: bool, owners: BTreeMap<String, String>| {
             let petals = petals.clone();
             async move {
@@ -1968,6 +2073,7 @@ mod tests {
                 home.path(),
                 &petals,
                 "polymarket",
+                release(),
                 SetupSettingsStep::Leave,
                 false,
                 &account,
@@ -1997,6 +2103,7 @@ mod tests {
             home.path(),
             &petals,
             "polymarket",
+            release(),
             SetupSettingsStep::Leave,
             false,
             &AccountPresence::Exists,
@@ -2017,6 +2124,7 @@ mod tests {
             home.path(),
             &petals,
             "polymarket",
+            release(),
             SetupSettingsStep::Leave,
             false,
             &exists,
@@ -2037,6 +2145,7 @@ mod tests {
             home.path(),
             &petals,
             "polymarket",
+            release(),
             SetupSettingsStep::Leave,
             false,
             &exists,
@@ -2044,6 +2153,89 @@ mod tests {
         .await;
         assert_eq!(finished, None);
         assert_eq!(route.value().await.unwrap(), unset);
+    }
+
+    /// A pinned key the release does not store its settings under protects
+    /// nothing, so setup says so once, loudly, and stops retrying.
+    #[tokio::test]
+    async fn a_pinned_key_the_release_does_not_store_under_is_reported() {
+        let petals = chosen_setup(&["polymarket"]);
+
+        let route = SettingsRoute::misplacing();
+        let (home, vfs) = queued_polymarket(&route);
+        let outcome =
+            apply_queued_settings(&vfs, home.path(), &petals, "polymarket", release()).await;
+        assert!(
+            matches!(&outcome, QueuedWrite::Written(message)
+                if message.starts_with("petal_settings_unprotected: ")
+                    && message.contains("state/settings/main/venue.toml")),
+            "{outcome:?}"
+        );
+        assert!(pending_settings(home.path(), &petals).is_empty());
+
+        let route = SettingsRoute::misplacing();
+        let (home, vfs) = queued_polymarket(&route);
+        let message = settle_setup_settings(
+            &vfs,
+            home.path(),
+            &petals,
+            "polymarket",
+            release(),
+            SetupSettingsStep::Write,
+            false,
+            &AccountPresence::Exists,
+        )
+        .await
+        .unwrap();
+        assert!(
+            message.starts_with("petal_settings_unprotected: "),
+            "{message}"
+        );
+        assert!(pending_settings(home.path(), &petals).is_empty());
+    }
+
+    /// Another release under the Petal's name may store its settings away
+    /// from the pinned key, where setup could not see them, so setup leaves
+    /// that release alone and gives the command instead.
+    #[tokio::test]
+    async fn setup_writes_only_to_the_release_its_key_is_pinned_for() {
+        let petals = chosen_setup(&["polymarket"]);
+        let other = "f".repeat(64);
+
+        let route = SettingsRoute::holding(Some(UNSET));
+        let (home, vfs) = queued_polymarket(&route);
+        assert_eq!(
+            apply_queued_settings(&vfs, home.path(), &petals, "polymarket", &other).await,
+            QueuedWrite::Settled
+        );
+        assert_eq!(*route.stored.lock().await, None);
+        assert!(pending_settings(home.path(), &petals).is_empty());
+
+        let route = SettingsRoute::holding(Some(UNSET));
+        let (home, vfs) = queued_polymarket(&route);
+        let message = settle_setup_settings(
+            &vfs,
+            home.path(),
+            &petals,
+            "polymarket",
+            &other,
+            SetupSettingsStep::Write,
+            false,
+            &AccountPresence::Exists,
+        )
+        .await
+        .unwrap();
+        assert!(
+            message.starts_with("petal_settings_not_written: "),
+            "{message}"
+        );
+        assert!(
+            message.contains("is not the release setup knows"),
+            "{message}"
+        );
+        assert!(message.contains("| bloom vfs write "), "{message}");
+        assert_eq!(*route.stored.lock().await, None);
+        assert!(pending_settings(home.path(), &petals).is_empty());
     }
 
     /// Setup writes a just-installed Petal's settings only over unset ones:
@@ -2059,6 +2251,7 @@ mod tests {
                 home,
                 &chosen_setup(&["polymarket"]),
                 "polymarket",
+                release(),
                 SetupSettingsStep::Write,
                 false,
                 &AccountPresence::Exists,
@@ -2120,9 +2313,9 @@ mod tests {
 
         let queued = {
             let (vfs, home, petals) = (vfs.clone(), home.path().to_owned(), petals.clone());
-            tokio::spawn(
-                async move { apply_queued_settings(&vfs, &home, &petals, "polymarket").await },
-            )
+            tokio::spawn(async move {
+                apply_queued_settings(&vfs, &home, &petals, "polymarket", release()).await
+            })
         };
         route.read_started.notified().await;
         let owner = {

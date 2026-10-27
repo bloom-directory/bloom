@@ -918,11 +918,10 @@ mod tests {
         assert_eq!(&*handler.latest.lock().await, "ordinary");
     }
 
-    /// A settings file whose read can be held open, to land a write between
-    /// a compare-and-write's check and its write.
     /// A settings route that reads `unset` while nothing is stored, and whose
     /// conditional write keeps its check and write together with
-    /// [`crate::WriteLocks`], as the Petal router does.
+    /// [`crate::WriteLocks`], as the Petal router does. Its check can be held
+    /// open, to try to land a write between the check and the write.
     struct SettingsHandler {
         stored: Mutex<Option<Vec<u8>>>,
         locks: crate::WriteLocks,

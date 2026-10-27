@@ -64,11 +64,13 @@ pub(crate) struct PetalSetupTemplate {
     /// File body; each `{name}` is replaced by the value of that name.
     pub body: &'static str,
     pub values: &'static [PetalSetupValue],
-    /// The key the Petal stores the route's settings under, in the account's
-    /// partition and as the host stores it, namespace included; `{wallet}` is
-    /// the default-policy wallet. A setup write goes
-    /// ahead only while nothing is stored there, so settings saved by the
-    /// owner or anyone else stay, even ones that read like the default.
+    /// The key the catalog release (`expected_hash`) stores the route's
+    /// settings under, in the account's partition and as the host stores it,
+    /// namespace included; `{wallet}` is the default-policy wallet. A setup
+    /// write goes ahead only to that release and only while nothing is stored
+    /// there, so settings saved by the owner or anyone else stay, even ones
+    /// that read like the default. Pin a new key with each release that moves
+    /// its settings.
     pub store_key: &'static str,
 }
 

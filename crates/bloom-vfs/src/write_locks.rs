@@ -14,7 +14,7 @@ pub const CONDITIONAL_WRITE_WAIT: Duration = Duration::from_secs(2);
 
 /// Lets a handler keep a conditional write's check and write together.
 /// Ordinary writes under a key share its lock, so they still run together; a
-/// conditional write holds it alone while it reads, compares and writes.
+/// conditional write holds it alone while it checks the store and writes.
 /// These locks belong to the handler, never to the VFS as a whole, so a
 /// handler callback that writes elsewhere through the VFS is never held up.
 /// A callback must not write under the key it is serving.

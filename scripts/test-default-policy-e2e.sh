@@ -15,6 +15,7 @@
 #    by `bloom init`, which cannot run against a live triad). The settings must
 #    be absent before the wallet exists, present afterwards with the setup
 #    value rather than the catalog default, and the marker must be cleared.
+#    Machine must not report that the pinned settings key went unstored.
 # 5. Leave the marker again, as a stopped `wallet new` would, after the owner
 #    has saved their own Polymarket settings, exactly the text the route reads
 #    when nothing is stored. Resuming keeps the owner's settings, since what is
@@ -253,6 +254,11 @@ printf '%s\n' "$settings" | grep -q '^enabled = true$' || die "settings not enab
 printf '%s\n' "$settings" | grep -q '^max_daily_usd = "73"$' || die "settings limit is not the setup value: $settings"
 [ ! -e "$machine_home/pending-petal-settings/polymarket" ] ||
   die "the pending settings marker was not cleared after the write succeeded"
+if grep -qE 'petal.setup_settings_key_(not_stored|unchecked)' "$log_dir/machine.log" ||
+  grep -q 'petal_settings_unprotected' "$new_out"; then
+  grep -E 'petal.setup_settings_key_(not_stored|unchecked)' "$log_dir/machine.log" >&2 || true
+  die "Polymarket did not store its settings under the pinned key; update store_key in github_source.rs"
+fi
 say "Polymarket settings for $WALLET/0 applied from setup: enabled = true, max_daily_usd = \"73\""
 
 # 5. A deferred setup write never replaces settings written since, even

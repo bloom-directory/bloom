@@ -337,6 +337,18 @@ seconds, the check gives up and the marker stays for the next one. Anything
 else there may be the owner's, so it stays: Machine clears the marker and
 logs the command that would apply setup's choice.
 
+The key is pinned for one release, so setup writes only when the installed
+package hash is the catalog's pinned hash. Another release under the same
+name, such as a fork or a newer release the catalog has not pinned, may store
+its settings elsewhere, where the check could not see them, so Machine keeps
+what it holds, clears the marker and prints the manual command. After a
+write, Machine asks once more and expects the key to be stored now. If the
+second write would also go ahead, the key is not where the release stores its
+settings and the check protects nothing: Machine reports
+`petal_settings_unprotected` (logged as
+`petal.setup_settings_key_not_stored`), clears the marker so it does not
+retry, and the end-to-end test fails on that log event.
+
 If the owner stops the command, or the policy ceremony expires, the wallet
 still exists:
 
