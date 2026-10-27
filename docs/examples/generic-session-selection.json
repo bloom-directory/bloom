@@ -1,0 +1,112 @@
+{
+  "assets": [
+    {
+      "chain": "evm-1",
+      "asset": "native"
+    },
+    {
+      "chain": "evm-1",
+      "asset": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+    },
+    {
+      "chain": "solana-mainnet",
+      "asset": "native"
+    },
+    {
+      "chain": "solana-mainnet",
+      "asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+    }
+  ],
+  "members": [
+    {
+      "account": 0,
+      "key_ref": {
+        "backend": "local",
+        "backend_instance": "local-default",
+        "locator": "replace-with-exact-public-child-locator",
+        "key_spec": "secp256k1",
+        "public_key_fingerprint": "1111111111111111111111111111111111111111111111111111111111111111",
+        "derivation": {
+          "scheme": "bip39-multicurve",
+          "wallet_seed_ref": "replace-with-public-wallet-seed-ref",
+          "profile": "bip44-evm-secp256k1-v1",
+          "path": "m/44'/60'/0'/0/0"
+        }
+      },
+      "subject": {
+        "kind": "system",
+        "component_id": "bloom-machine",
+        "operation_class": "transaction.confirm"
+      },
+      "selector": {
+        "kind": "system_session",
+        "scope": {
+          "component_id": "bloom-machine",
+          "actions": [
+            "native_transfer",
+            "erc20_transfer"
+          ],
+          "chains": [
+            {
+              "kind": "evm",
+              "chain": "evm-1",
+              "chain_id": "1"
+            }
+          ],
+          "destinations": [
+            {
+              "chain": "evm-1",
+              "destination": "0x1111111111111111111111111111111111111111"
+            }
+          ],
+          "tokens": [
+            {
+              "chain": "evm-1",
+              "asset": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+            }
+          ],
+          "per_action_value_limits": []
+        }
+      },
+      "provenance_digest": "2222222222222222222222222222222222222222222222222222222222222222",
+      "allowed_crypto_suites": [
+        "secp256k1-keccak256-recoverable"
+      ]
+    },
+    {
+      "account": 0,
+      "key_ref": {
+        "backend": "local",
+        "backend_instance": "local-default",
+        "locator": "replace-with-exact-public-child-locator",
+        "key_spec": "ed25519",
+        "public_key_fingerprint": "3333333333333333333333333333333333333333333333333333333333333333",
+        "derivation": {
+          "scheme": "bip39-multicurve",
+          "wallet_seed_ref": "replace-with-public-wallet-seed-ref",
+          "profile": "bip44-solana-slip10-ed25519-v1",
+          "path": "m/44'/501'/0'/0'"
+        }
+      },
+      "subject": {
+        "kind": "petal",
+        "package_hash": "4444444444444444444444444444444444444444444444444444444444444444",
+        "route": "swaps/main/0/submit",
+        "agent_id": null
+      },
+      "selector": {
+        "kind": "petal",
+        "package_hash": "4444444444444444444444444444444444444444444444444444444444444444",
+        "route": "swaps/main/0/submit",
+        "allowed_operation_classes": [
+          "example.swap.v1"
+        ],
+        "required_claim_assurance": "machine_asserted"
+      },
+      "provenance_digest": "5555555555555555555555555555555555555555555555555555555555555555",
+      "allowed_crypto_suites": [
+        "ed25519-message"
+      ]
+    }
+  ]
+}

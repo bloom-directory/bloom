@@ -3101,6 +3101,7 @@ mod tests {
     fn canonical_test_claim() -> Vec<u8> {
         let digest = bloom_broker_api::Digest32::from_bytes([3; 32]);
         serde_jcs::to_vec(&bloom_broker_api::PetalUseClaim {
+            economic_effects: None,
             package_hash: bloom_broker_api::Digest32::from_bytes([4; 32]),
             route: "r000001".into(),
             operation_class: bloom_broker_api::Token::new("orders.place").unwrap(),

@@ -51,6 +51,8 @@ pub(crate) struct PreinstalledPetal {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PetalAuthorityRoute {
+    /// Release-certified generic effects contract; old packages stay ineligible.
+    pub economic_effects_schema: Option<u16>,
     pub route_id: &'static str,
     pub operation_classes: &'static [&'static str],
 }
@@ -85,22 +87,27 @@ const POLYMARKET_SETUP: PetalSetupTemplate = PetalSetupTemplate {
 
 const BASELINE_POLYMARKET_AUTHORITY_ROUTES: &[PetalAuthorityRoute] = &[
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000036",
         operation_classes: &["polymarket.onboard"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000050",
         operation_classes: &["polymarket.relayer_batch"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000058",
         operation_classes: &["polymarket.relayer_batch"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000077",
         operation_classes: &["polymarket.order.poly1271"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000094",
         operation_classes: &["polymarket.relayer_batch"],
     },
@@ -108,66 +115,82 @@ const BASELINE_POLYMARKET_AUTHORITY_ROUTES: &[PetalAuthorityRoute] = &[
 
 const BASELINE_HYPERLIQUID_AUTHORITY_ROUTES: &[PetalAuthorityRoute] = &[
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000008",
         operation_classes: &["hyperliquid.agent_action"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000009",
         operation_classes: &["hyperliquid.agent_action"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000010",
         operation_classes: &["hyperliquid.agent_action"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000013",
         operation_classes: &["hyperliquid.agent_action"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000019",
         operation_classes: &["hyperliquid.agent_action"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000023",
         operation_classes: &["hyperliquid.agent_action"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000025",
         operation_classes: &["hyperliquid.approve_agent", "hyperliquid.agent_action"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000035",
         operation_classes: &["hyperliquid.cancel"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000036",
         operation_classes: &["hyperliquid.cancel_by_cloid"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000038",
         operation_classes: &["hyperliquid.order"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000040",
         operation_classes: &["hyperliquid.schedule_cancel"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000041",
         operation_classes: &["hyperliquid.usd_send"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000042",
         operation_classes: &["hyperliquid.update_leverage"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000043",
         operation_classes: &["hyperliquid.usd_class_transfer"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000044",
         operation_classes: &["hyperliquid.usd_send"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000045",
         operation_classes: &["hyperliquid.withdraw"],
     },
@@ -177,88 +200,109 @@ const BASELINE_HYPERLIQUID_AUTHORITY_ROUTES: &[PetalAuthorityRoute] = &[
 // daemon can still verify the outgoing release until activation completes.
 const POLYMARKET_AUTHORITY_ROUTES: &[PetalAuthorityRoute] = &[
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000042",
         operation_classes: &["polymarket.onboard"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000058",
         operation_classes: &["polymarket.relayer_batch"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000067",
         operation_classes: &["polymarket.relayer_batch"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000088",
         operation_classes: &["polymarket.order.poly1271"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000106",
         operation_classes: &["polymarket.relayer_batch"],
     },
 ];
 const HYPERLIQUID_AUTHORITY_ROUTES: &[PetalAuthorityRoute] = &[
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000008",
         operation_classes: &["hyperliquid.agent_action"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000009",
         operation_classes: &["hyperliquid.agent_action"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000010",
         operation_classes: &["hyperliquid.agent_action"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000013",
         operation_classes: &["hyperliquid.agent_action"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000019",
         operation_classes: &["hyperliquid.agent_action"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000023",
         operation_classes: &["hyperliquid.agent_action"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000025",
         operation_classes: &["hyperliquid.agent_action", "hyperliquid.approve_agent"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000036",
         operation_classes: &["hyperliquid.cancel"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000037",
         operation_classes: &["hyperliquid.cancel_by_cloid"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000039",
         operation_classes: &["hyperliquid.order"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000041",
         operation_classes: &["hyperliquid.schedule_cancel"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000042",
         operation_classes: &["hyperliquid.usd_send"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000043",
         operation_classes: &["hyperliquid.update_leverage"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000044",
         operation_classes: &["hyperliquid.usd_class_transfer"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000045",
         operation_classes: &["hyperliquid.usd_send"],
     },
     PetalAuthorityRoute {
+        economic_effects_schema: None,
         route_id: "r000046",
         operation_classes: &["hyperliquid.withdraw"],
     },
@@ -2257,6 +2301,7 @@ mod tests {
                 active: true,
             }),
             operation_classes: vec![ProvenanceOperationClass {
+                economic_effects_schema: None,
                 operation_class: Token::new("petal.run").unwrap(),
                 fee_asset: None,
             }],

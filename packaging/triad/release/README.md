@@ -326,16 +326,24 @@ prerequisites; fixture tests do not substitute for those observations. No public
 DNS changes or deployment occur as part of ordinary tests.
 
 The Linux Broker service permits IPv4/IPv6 networking for its outbound relay,
-ACME and DNS clients. It retains its isolated UID, protected files and Unix-only
+ACME, DNS, keyless USD-price providers and native SOL validation clients. The
+session profile uses HTTPS to `api.coingecko.com`, `coins.llama.fi` and
+`api.mainnet-beta.solana.com`. These requests originate only in Broker; no
+pricing key or Machine pricing proxy is installed. It retains its isolated UID, protected files and Unix-only
 authority RPC; Signer retains `PrivateNetwork=yes`, `IPAddressDeny=any` and
 `RestrictAddressFamilies=AF_UNIX`. Broker's ceremony TLS listener is loopback-only.
 Deployments requiring network enforcement of exact outbound destinations need a
-reviewed egress proxy or firewall policy covering relay, ACME and DNS lifecycle;
+reviewed egress proxy or firewall policy covering relay, ACME, DNS and the three
+session endpoints above;
 static ingress addresses alone do not cover CA renewal endpoints.
 
 The shipped v0.4.0 bundle used Machine–Broker API 1.7 and Broker state/floor 2.
-This clear-signing candidate adopts the landed Broker's API 1.8 and state/floor 3;
-Broker–Signer remains 1.6 and Machine/Signer state/floor remain 2. This is the
+This generic-session candidate negotiates Machine–Broker API 1.10 and
+Broker–Signer API 1.8; Broker state/floor is 3 and Machine/Signer state/floor
+remain 2. Session scope/valuation formats are versioned within those stores.
+Published immutable generic-effects Petals and installer catalog adoption are
+required before default production onboarding can activate them; the old
+Polymarket artifact remains ineligible and retains owner approval. This is the
 coordinated release bump, not an additional bump for each PR. Take a compatible
 backup before migration: the old v0.4.0 Broker cannot reopen state migrated to
 3. Rollback requires restoring compatible state, not lowering the floor or

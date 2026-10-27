@@ -22,6 +22,26 @@ pub struct PersonaSessionProposal {
     pub canonical_plan_facts_digest: Digest32,
 }
 
+/// Explicit capability selection. These are public suggestions, never authority.
+/// Broker validates provenance, mappings and each exact key during preparation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PersonaSessionSelection {
+    pub assets: Vec<bloom_broker_api::AssetId>,
+    pub members: Vec<PersonaSessionMember>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PersonaSessionMember {
+    pub account: u32,
+    pub key_ref: KeyRef,
+    pub subject: ApprovalSubject,
+    pub selector: ApprovalSelector,
+    pub provenance_digest: Digest32,
+    pub allowed_crypto_suites: Vec<CryptoSuite>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SessionRecord {
@@ -33,6 +53,8 @@ struct SessionRecord {
     revoke_request: Option<RevokeRequest>,
     #[serde(default)]
     revoke_confirmed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_fallback_code: Option<ProtocolErrorCode>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -48,6 +70,11 @@ pub struct PersonaSessionStatus {
     pub preparation_pending: bool,
     pub authority: ApprovalPublicStatus,
     pub usage: Option<ApprovalLimitState>,
+    /// Diagnostic only; live Broker status and usage remain authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_fallback_code: Option<ProtocolErrorCode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_error: Option<ProtocolErrorCode>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -56,6 +83,8 @@ struct SigningAttempt {
     approval_id: Digest32,
     source_digest: Digest32,
     operation_digest: Digest32,
+    #[serde(default)]
+    exact_fallback: bool,
 }
 
 fn io_error(error: impl std::fmt::Display) -> ProtocolError {
@@ -127,7 +156,7 @@ fn owner_account_number(key: &KeyRef) -> Option<u32> {
         Some(bloom_broker_api::DerivationRef::Bip39Multicurve { profile, path, .. }) => {
             match profile {
                 bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1 => {
-                    path.rsplit('/').next()?.parse().ok()
+                    path.split('/').nth(3)?.strip_suffix("'")?.parse().ok()
                 }
                 bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1 => {
                     path.split('/').nth(3)?.strip_suffix("'")?.parse().ok()
@@ -189,21 +218,35 @@ fn selector_matches(
                         && &grant.provenance_digest == provenance_digest
                 })
             };
+            let asset_allowed = |asset: &bloom_broker_api::AssetId| {
+                terms
+                    .session_budget
+                    .as_ref()
+                    .and_then(|budget| budget.usd_policy.as_ref())
+                    .map_or_else(
+                        || {
+                            terms
+                                .limits
+                                .value_limits
+                                .iter()
+                                .any(|limit| &limit.asset == asset)
+                        },
+                        |policy| policy.assets.iter().any(|entry| &entry.asset == asset),
+                    )
+            };
             scope_matches
-                && claim.declared_debits.iter().all(|debit| {
-                    terms
-                        .limits
-                        .value_limits
-                        .iter()
-                        .any(|limit| limit.asset == debit.asset)
-                })
+                && claim
+                    .declared_debits
+                    .iter()
+                    .all(|debit| asset_allowed(&debit.asset))
                 && match &claim.declared_fee {
                     bloom_broker_api::DeclaredFee::None => true,
-                    bloom_broker_api::DeclaredFee::Fee { chain, asset, .. } => terms
-                        .limits
-                        .value_limits
-                        .iter()
-                        .any(|limit| &limit.asset.chain == chain && &limit.asset.asset == asset),
+                    bloom_broker_api::DeclaredFee::Fee { chain, asset, .. } => {
+                        asset_allowed(&bloom_broker_api::AssetId {
+                            chain: chain.clone(),
+                            asset: asset.clone(),
+                        })
+                    }
                 }
         }
         (
@@ -223,6 +266,48 @@ fn selector_matches(
 }
 
 impl MachineBrokerClient {
+    pub async fn session_prices(
+        &self,
+        assets: Vec<bloom_broker_api::AssetId>,
+    ) -> Result<bloom_broker_api::SessionPricesResponse, ProtocolError> {
+        match self
+            .request(MachineBrokerRequest::SessionPrices(
+                bloom_broker_api::SessionPricesRequest {
+                    assets: assets.clone(),
+                },
+            ))
+            .await?
+        {
+            MachineBrokerResponse::SessionPrices(response) => {
+                if response.assets.len() != assets.len()
+                    || response.quotes.len() != assets.len()
+                    || assets.iter().any(|asset| {
+                        response
+                            .assets
+                            .iter()
+                            .filter(|entry| &entry.asset == asset)
+                            .count()
+                            != 1
+                            || response
+                                .quotes
+                                .iter()
+                                .filter(|quote| &quote.asset == asset)
+                                .count()
+                                != 1
+                    })
+                    || response.assets.iter().any(|entry| {
+                        bloom_broker_api::approved_session_asset(&entry.asset).as_ref()
+                            != Some(entry)
+                    })
+                {
+                    return Err(response_mismatch("session.prices asset identities"));
+                }
+                Ok(response)
+            }
+            _ => Err(response_mismatch("session.prices")),
+        }
+    }
+
     /// Read the source-pinned identity recorded before a session sign was sent.
     /// This lets native orchestrators reconcile instead of rotating their
     /// operation identity when a response or process was lost.
@@ -235,6 +320,7 @@ impl MachineBrokerClient {
         };
         Ok(
             read_json::<SigningAttempt>(&attempt_path(root, operation_id))?
+                .filter(|attempt| !attempt.exact_fallback)
                 .map(|attempt| attempt.operation_digest),
         )
     }
@@ -265,6 +351,65 @@ impl MachineBrokerClient {
     pub fn with_persona_session_store(mut self, root: impl Into<PathBuf>) -> Self {
         self.persona_session_root = Some(Arc::new(root.into()));
         self
+    }
+
+    /// Freeze the entire pool before the first ceremony. Interrupted activation
+    /// can then resume later members without a fresh nonce or shifted limits.
+    pub async fn stage_persona_sessions(
+        &self,
+        proposals: &[PersonaSessionProposal],
+    ) -> Result<(), ProtocolError> {
+        let root = self
+            .persona_session_root
+            .as_ref()
+            .ok_or_else(|| io_error("session store is not configured"))?;
+        let _gate = self.persona_session_gate.lock().await;
+        let _lock = store_lock(root)?;
+        for proposal in proposals {
+            proposal.terms.validate()?;
+            let id = proposal.terms.approval_id()?;
+            if let Some(record) = read_json::<SessionRecord>(&grant_path(root, &id))?
+                && record.proposal != *proposal
+            {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::OperationIdConflict,
+                    "staged session differs from frozen proposal",
+                ));
+            }
+        }
+        // A single manifest commits the full selection before per-member files.
+        // A crash during staging can reconstruct the remaining frozen members.
+        let manifest_id = jcs_digest(&proposals)?;
+        atomic_json(
+            &root
+                .join("pools")
+                .join(format!("{}.json", manifest_id.as_str())),
+            &proposals,
+        )?;
+        for proposal in proposals {
+            let id = proposal.terms.approval_id()?;
+            let path = grant_path(root, &id);
+            if let Some(record) = read_json::<SessionRecord>(&path)? {
+                if record.proposal != *proposal {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::OperationIdConflict,
+                        "staged session differs from frozen proposal",
+                    ));
+                }
+            } else {
+                atomic_json(
+                    &path,
+                    &SessionRecord {
+                        proposal: proposal.clone(),
+                        disabled: false,
+                        revoke_request: None,
+                        revoke_confirmed: false,
+                        last_fallback_code: None,
+                    },
+                )?;
+            }
+        }
+        Ok(())
     }
 
     pub async fn prepare_persona_session(
@@ -338,6 +483,7 @@ impl MachineBrokerClient {
                     disabled: false,
                     revoke_request: None,
                     revoke_confirmed: false,
+                    last_fallback_code: None,
                 };
                 atomic_json(&path, &record)?;
                 record
@@ -400,17 +546,36 @@ impl MachineBrokerClient {
                 "persona status identity mismatch",
             ));
         }
-        let usage = if authority.state == ApprovalLifecycleState::Active {
-            let usage = self.approval_limit_state(id.clone()).await?;
-            if usage.approval_id != id {
-                return Err(ProtocolError::new(
-                    ProtocolErrorCode::OperationIdConflict,
-                    "persona usage identity mismatch",
-                ));
+        let (usage, usage_error) = if matches!(
+            authority.state,
+            ApprovalLifecycleState::Active | ApprovalLifecycleState::Exhausted
+        ) {
+            match self.approval_limit_state(id.clone()).await {
+                Ok(usage) => {
+                    if usage.approval_id != id {
+                        return Err(ProtocolError::new(
+                            ProtocolErrorCode::OperationIdConflict,
+                            "persona usage identity mismatch",
+                        ));
+                    }
+                    (Some(usage), None)
+                }
+                Err(error)
+                    if matches!(
+                        error.code,
+                        ProtocolErrorCode::ServiceUnavailable
+                            | ProtocolErrorCode::ClockUntrusted
+                            | ProtocolErrorCode::ClockRollback
+                            | ProtocolErrorCode::QuotaExceeded
+                            | ProtocolErrorCode::AssuranceUnavailable
+                    ) =>
+                {
+                    (None, Some(error.code))
+                }
+                Err(error) => return Err(error),
             }
-            Some(usage)
         } else {
-            None
+            (None, None)
         };
         Ok(PersonaSessionStatus {
             approval_id: id,
@@ -421,6 +586,8 @@ impl MachineBrokerClient {
             preparation_pending,
             authority,
             usage,
+            last_fallback_code: record.last_fallback_code,
+            usage_error,
         })
     }
 
@@ -455,11 +622,51 @@ impl MachineBrokerClient {
         let _gate = self.persona_session_gate.lock().await;
         let _lock = store_lock(root)?;
         let mut stopped = Vec::new();
-        for mut record in records(root)? {
+        let mut pools = std::collections::BTreeMap::new();
+        let retained = records(root)?;
+        // One local marker disables the entire pool across a crash while its
+        // individual stop records are being rewritten. Broker is still truth.
+        for record in &retained {
+            if &record.proposal.terms.wallet_id == wallet
+                && let Some(budget) = &record.proposal.terms.session_budget
+                && budget.usd_policy.is_some()
+            {
+                let budget_id = budget.budget_id()?;
+                let path = root
+                    .join("stops")
+                    .join(format!("{}.json", budget_id.as_str()));
+                if read_json::<bloom_broker_api::SessionStopRequest>(&path)?.is_none() {
+                    atomic_json(
+                        &path,
+                        &bloom_broker_api::SessionStopRequest {
+                            operation_id: OperationId::from_bytes(
+                                Sha256::digest(
+                                    [
+                                        b"bloom.persona.pool-stop/v2".as_slice(),
+                                        budget_id.as_str().as_bytes(),
+                                    ]
+                                    .concat(),
+                                )
+                                .into(),
+                            ),
+                            budget_id,
+                            reason: reason.to_owned(),
+                        },
+                    )?;
+                }
+            }
+        }
+        for mut record in retained {
             if &record.proposal.terms.wallet_id != wallet {
                 continue;
             }
             record.disabled = true;
+            if let Some(budget) = &record.proposal.terms.session_budget
+                && budget.usd_policy.is_some()
+            {
+                let id = budget.budget_id()?;
+                pools.insert(id.as_str().to_owned(), id);
+            }
             let id = record.proposal.terms.approval_id()?;
             if record.revoke_request.is_none() {
                 let mut bytes = b"bloom.persona.revoke/v1\0".to_vec();
@@ -482,6 +689,30 @@ impl MachineBrokerClient {
                 });
             if !remotely_revoked {
                 stopped.push((id, record.revoke_request.expect("frozen above")));
+            }
+        }
+        // Fence every shared pool in Broker before any member revocation.
+        // Local records above are already disabled even if this RPC is lost.
+        for (_, budget_id) in pools {
+            let request: bloom_broker_api::SessionStopRequest = read_json(
+                &root
+                    .join("stops")
+                    .join(format!("{}.json", budget_id.as_str())),
+            )?
+            .ok_or_else(|| io_error("frozen pool stop disappeared"))?;
+            if request.budget_id != budget_id {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::OperationIdConflict,
+                    "frozen pool stop identity changed",
+                ));
+            }
+            match self
+                .request(MachineBrokerRequest::SessionStop(request))
+                .await?
+            {
+                MachineBrokerResponse::SessionStop(response) if response.budget_id == budget_id => {
+                }
+                _ => return Err(response_mismatch("session.stop")),
             }
         }
         let mut failures = Vec::new();
@@ -609,12 +840,14 @@ impl MachineBrokerClient {
         preimages: &[Vec<u8>],
         batch: bool,
     ) -> Result<Option<SigningResult>, ProtocolError> {
-        if system_use.is_some()
-            || system_claim.is_some()
-            || claim
-                .is_none_or(|claim| claim.operation_class.as_str() != "polymarket.order.poly1271")
-            || evidence.is_none()
-        {
+        // Selection is structural. Broker owns profile-specific verification,
+        // economic admission and all pricing; unrelated Petals need no global
+        // application-name gate or fabricated witness.
+        if !matches!(
+            (provenance, claim, system_use),
+            (ProvenanceSubject::Petal { .. }, Some(_), None)
+                | (ProvenanceSubject::System { .. }, None, Some(_))
+        ) {
             return Ok(None);
         }
         let Some(root) = &self.persona_session_root else {
@@ -644,6 +877,9 @@ impl MachineBrokerClient {
                     "persona retry changed its payload or trusted context",
                 ));
             }
+            if attempt.exact_fallback {
+                return Ok(None);
+            }
             let record = read_json::<SessionRecord>(&grant_path(root, &attempt.approval_id))?
                 .ok_or_else(|| io_error("original persona grant record is missing"))?;
             (record, Some(attempt))
@@ -669,6 +905,18 @@ impl MachineBrokerClient {
                 {
                     continue;
                 }
+                if terms
+                    .session_budget
+                    .as_ref()
+                    .is_some_and(|b| b.usd_policy.is_some())
+                    && claim.is_some_and(|c| {
+                        c.economic_effects.as_ref().is_none_or(|e| {
+                            e.permission_effect != bloom_broker_api::SessionPermissionEffect::None
+                        })
+                    })
+                {
+                    continue;
+                }
                 if terms.session_budget.is_some()
                     && claim.is_some_and(|claim| {
                         !claim
@@ -681,12 +929,8 @@ impl MachineBrokerClient {
                     // exact step-up without pinning a doomed session attempt.
                     continue;
                 }
-                let accounting = session_accounting(terms, claim, system_use)?;
-                if let Some(budget) = &terms.session_budget
-                    && budget.action_nominal_quantity(&accounting.values).is_err()
-                {
-                    continue;
-                }
+                // Do not convert quantities locally. A priced asset need not
+                // have a nominal conversion; only Broker can admit its value.
                 let id = terms.approval_id()?;
                 let status = self.approval_status(id.clone()).await?;
                 if status.approval_id != id || &status.wallet_id != wallet_id {
@@ -729,12 +973,18 @@ impl MachineBrokerClient {
             petal_use_claim_digest: match (claim, system_claim) {
                 (Some(claim), _) => Some(jcs_digest(claim)?),
                 (_, Some(claim)) => Some(jcs_digest(claim)?),
-                _ => None,
+                _ => system_use
+                    .map(bloom_broker_api::session_native_claim_digests)
+                    .transpose()?
+                    .map(|pair| pair.0),
             },
             claim_assurance_digest: match (claim, system_claim) {
                 (Some(claim), _) => Some(jcs_digest(&claim.claim_assurance)?),
                 (_, Some(claim)) => Some(jcs_digest(&claim.claim_assurance)?),
-                _ => None,
+                _ => system_use
+                    .map(bloom_broker_api::session_native_claim_digests)
+                    .transpose()?
+                    .map(|pair| pair.1),
             },
             policy_version: terms.policy_version.clone(),
             policy_digest: terms.policy_digest.clone(),
@@ -754,6 +1004,7 @@ impl MachineBrokerClient {
                     approval_id: approval_id.clone(),
                     source_digest,
                     operation_digest: operation_digest.clone(),
+                    exact_fallback: false,
                 },
             )?;
         }
@@ -811,12 +1062,44 @@ impl MachineBrokerClient {
         match result {
             Ok(result) => Ok(Some(result)),
             Err(mut error) => {
-                if let Ok(status) = self.operation_status(operation_id.clone()).await
+                let recovery_status = self.operation_status(operation_id.clone()).await;
+                if let Ok(status) = &recovery_status
                     && status.operation_id == expected.operation_id
                     && status.operation_digest == expected.operation_digest
-                    && let Some(result) = status.result
+                    && let Some(result) = &status.result
                 {
-                    return expected.validate(result).map(Some);
+                    return expected.validate(result.clone()).map(Some);
+                }
+                // Unsupported/degraded native verification may request exact
+                // review. A negative authenticated status is mandatory before
+                // changing authority; an existing or unreadable operation can
+                // already hold a signature/reservation and stays pinned.
+                let native_exact_stepup = system_use.is_some()
+                    && matches!(provenance, ProvenanceSubject::System { .. })
+                    && matches!(
+                        error.code,
+                        ProtocolErrorCode::SelectorMismatch | ProtocolErrorCode::EffectsUnsupported
+                    )
+                    && recovery_status
+                        .as_ref()
+                        .is_err_and(|status| status.code == ProtocolErrorCode::ApprovalNotFound);
+                if native_exact_stepup
+                    || matches!(
+                        error.code,
+                        ProtocolErrorCode::PriceUnavailable | ProtocolErrorCode::PriceStale
+                    )
+                {
+                    // Price denials precede reservation/signing; native denials
+                    // above additionally prove no retained operation exists.
+                    // Retain source identity while making the fallback durable.
+                    let mut attempt: SigningAttempt =
+                        read_json(&path)?.ok_or_else(|| io_error("missing frozen attempt"))?;
+                    attempt.exact_fallback = true;
+                    atomic_json(&path, &attempt)?;
+                    let mut record = record.clone();
+                    record.last_fallback_code = Some(error.code);
+                    atomic_json(&grant_path(root, &attempt.approval_id), &record)?;
+                    return Ok(None);
                 }
                 if matches!(
                     error.code,
@@ -834,25 +1117,42 @@ impl MachineBrokerClient {
     }
 }
 
-fn session_accounting(
-    terms: &SealedApprovalTerms,
-    claim: Option<&PetalUseClaim>,
-    system_use: Option<&bloom_broker_api::SystemSessionUse>,
-) -> Result<bloom_broker_api::SessionAccounting, ProtocolError> {
-    match (claim, system_use) {
-        (Some(claim), None) => bloom_broker_api::SessionAccounting::from_petal_claim(
-            claim,
-            terms.session_budget.as_ref(),
-        ),
-        (None, Some(action)) => action.accounting(terms.session_budget.as_ref()),
-        _ => Err(ProtocolError::new(
-            ProtocolErrorCode::ClaimInvalid,
-            "session action requires exactly one authenticated value projection",
-        )),
-    }
-}
-
 fn records(root: &Path) -> Result<Vec<SessionRecord>, ProtocolError> {
+    match fs::read_dir(root.join("pools")) {
+        Ok(entries) => {
+            for entry in entries {
+                let path = entry.map_err(io_error)?.path();
+                if path.extension().is_some_and(|e| e == "json") {
+                    let proposals: Vec<PersonaSessionProposal> =
+                        read_json(&path)?.ok_or_else(|| io_error("staged pool disappeared"))?;
+                    if proposals.is_empty()
+                        || proposals.len() > 128
+                        || path.file_stem().and_then(|s| s.to_str())
+                            != Some(jcs_digest(&proposals)?.as_str())
+                    {
+                        return Err(io_error("invalid frozen pool manifest"));
+                    }
+                    for proposal in proposals {
+                        let path = grant_path(root, &proposal.terms.approval_id()?);
+                        if read_json::<SessionRecord>(&path)?.is_none() {
+                            atomic_json(
+                                &path,
+                                &SessionRecord {
+                                    proposal,
+                                    disabled: false,
+                                    revoke_request: None,
+                                    revoke_confirmed: false,
+                                    last_fallback_code: None,
+                                },
+                            )?;
+                        }
+                    }
+                }
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(io_error(e)),
+    }
     let entries = match fs::read_dir(root.join("grants")) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -868,8 +1168,17 @@ fn records(root: &Path) -> Result<Vec<SessionRecord>, ProtocolError> {
             .extension()
             .is_some_and(|extension| extension == "json")
         {
-            let record = read_json::<SessionRecord>(&path)?
+            let mut record = read_json::<SessionRecord>(&path)?
                 .ok_or_else(|| io_error("grant disappeared during discovery"))?;
+            if let Some(budget) = &record.proposal.terms.session_budget
+                && budget.usd_policy.is_some()
+                && root
+                    .join("stops")
+                    .join(format!("{}.json", budget.budget_id()?.as_str()))
+                    .exists()
+            {
+                record.disabled = true;
+            }
             if path != grant_path(root, &record.proposal.terms.approval_id()?) {
                 return Err(io_error("grant filename does not match signed terms"));
             }
@@ -988,6 +1297,12 @@ mod tests {
         preparations: usize,
         lose_next_response: bool,
         fail_wallet_reads: bool,
+        reject_price: bool,
+        native_refusal: bool,
+        retain_native_refusal: bool,
+        status_unavailable: bool,
+        pending: BTreeMap<String, Digest32>,
+        pool_stop_requests: Vec<bloom_broker_api::SessionStopRequest>,
         outcomes: BTreeMap<String, SigningResult>,
     }
     struct Broker(Mutex<State>);
@@ -1008,17 +1323,76 @@ mod tests {
                         }
                         Ok(MachineBrokerResponse::WalletGetPublic(state.wallet.clone()))
                     }
-                    MachineBrokerRequest::KeyGetPublic(_) => {
+                    MachineBrokerRequest::WalletAccounts(request) => {
+                        let accounts = state
+                            .wallet
+                            .key_refs
+                            .iter()
+                            .filter_map(|key| {
+                                let Some(bloom_broker_api::DerivationRef::Bip39Multicurve {
+                                    profile,
+                                    path,
+                                    ..
+                                }) = &key.derivation
+                                else {
+                                    return None;
+                                };
+                                Some(bloom_broker_api::DerivedAccountPublic {
+                                    key_ref: key.clone(),
+                                    wallet_seed_profile:
+                                        bloom_broker_api::WalletSeedProfile::Bip39MulticurveV1,
+                                    derivation_profile: *profile,
+                                    path: path.clone(),
+                                    canonical_public_key: Base64UrlBytes::from_bytes(&[2; 33]),
+                                    public_key_encoding: if key.key_spec == KeySpec::Ed25519 {
+                                        bloom_broker_api::PublicKeyEncoding::Ed25519SpkiDer
+                                    } else {
+                                        bloom_broker_api::PublicKeyEncoding::Secp256k1SpkiDer
+                                    },
+                                    public_key_fingerprint: key.public_key_fingerprint.clone(),
+                                    supported_crypto_suites: vec![if key.key_spec
+                                        == KeySpec::Ed25519
+                                    {
+                                        CryptoSuite::Ed25519Message
+                                    } else {
+                                        CryptoSuite::Secp256k1Keccak256Recoverable
+                                    }],
+                                    chain_projections: vec![],
+                                    lifecycle: bloom_broker_api::AccountLifecycleState::Active,
+                                })
+                            })
+                            .collect();
+                        Ok(MachineBrokerResponse::WalletAccounts(
+                            bloom_broker_api::WalletAccountsPublic {
+                                wallet_id: request.wallet_id,
+                                seed_profile:
+                                    bloom_broker_api::WalletSeedProfile::Bip39MulticurveV1,
+                                accounts,
+                            },
+                        ))
+                    }
+                    MachineBrokerRequest::KeyGetPublic(request) => {
+                        let suite = if request.key_ref.key_spec == KeySpec::Ed25519 {
+                            CryptoSuite::Ed25519Message
+                        } else {
+                            CryptoSuite::Secp256k1Keccak256Recoverable
+                        };
                         Ok(MachineBrokerResponse::KeyGetPublic(KeyPublic {
-                            role: bloom_broker_api::KeyRole::WalletRoot,
-                            key_ref: key(),
+                            role: if state.wallet.root_key_ref.is_some() {
+                                bloom_broker_api::KeyRole::WalletRoot
+                            } else {
+                                bloom_broker_api::KeyRole::Derived
+                            },
+                            key_ref: request.key_ref,
                             canonical_public_key: Base64UrlBytes::from_bytes(&[2; 33]),
                             addresses: vec!["0x0000000000000000000000000000000000000001".into()],
-                            supported_crypto_suites: vec![
-                                CryptoSuite::Secp256k1Keccak256Recoverable,
-                            ],
+                            supported_crypto_suites: vec![suite],
                         }))
                     }
+                    MachineBrokerRequest::SealedApprovalLimitState(_) => Err(ProtocolError::new(
+                        ProtocolErrorCode::ClockUntrusted,
+                        "usage unavailable while clock is untrusted",
+                    )),
                     MachineBrokerRequest::SealedApprovalStatus(request) => Ok(
                         MachineBrokerResponse::SealedApprovalStatus(ApprovalPublicStatus {
                             approval_id: request.id,
@@ -1034,6 +1408,23 @@ mod tests {
                         }),
                     ),
                     MachineBrokerRequest::OperationStatus(request) => {
+                        if state.status_unavailable {
+                            return Err(ProtocolError::new(
+                                ProtocolErrorCode::ServiceUnavailable,
+                                "status unavailable",
+                            ));
+                        }
+                        if let Some(digest) = state.pending.get(request.operation_id.as_str()) {
+                            return Ok(MachineBrokerResponse::OperationStatus(
+                                OperationPublicStatus {
+                                    operation_id: request.operation_id,
+                                    operation_digest: digest.clone(),
+                                    state: OperationState::Reserved,
+                                    result: None,
+                                    error: None,
+                                },
+                            ));
+                        }
                         let result = state
                             .outcomes
                             .get(request.operation_id.as_str())
@@ -1055,6 +1446,24 @@ mod tests {
                         ))
                     }
                     MachineBrokerRequest::SigningSign(request) => {
+                        if state.native_refusal {
+                            if state.retain_native_refusal {
+                                state.pending.insert(
+                                    request.operation_id.as_str().to_owned(),
+                                    request.operation_digest,
+                                );
+                            }
+                            return Err(ProtocolError::new(
+                                ProtocolErrorCode::SelectorMismatch,
+                                "native RPC context unavailable; exact approval required",
+                            ));
+                        }
+                        if state.reject_price {
+                            return Err(ProtocolError::new(
+                                ProtocolErrorCode::PriceUnavailable,
+                                "no fresh quote; no reservation/signature",
+                            ));
+                        }
                         if !state.active {
                             return Err(ProtocolError::new(
                                 ProtocolErrorCode::ApprovalRevoked,
@@ -1067,7 +1476,14 @@ mod tests {
                             operation_digest: request.operation_digest,
                             signatures: vec![NormalizedSignature {
                                 crypto_suite: request.crypto_suite,
-                                bytes: Base64UrlBytes::from_bytes(&[7; 65]),
+                                bytes: Base64UrlBytes::from_bytes(&vec![
+                                    7;
+                                    if request.crypto_suite == CryptoSuite::Ed25519Message {
+                                        64
+                                    } else {
+                                        65
+                                    }
+                                ]),
                             }],
                             signer_receipt_digest: digest(90),
                             broker_receipt_digest: digest(91),
@@ -1090,6 +1506,16 @@ mod tests {
                         Err(ProtocolError::new(
                             ProtocolErrorCode::ClaimInvalid,
                             "unexpected per-action ceremony",
+                        ))
+                    }
+                    MachineBrokerRequest::SessionStop(request) => {
+                        state.pool_stop_requests.push(request.clone());
+                        Ok(MachineBrokerResponse::SessionStop(
+                            bloom_broker_api::SessionStopResponse {
+                                budget_id: request.budget_id,
+                                revoked: vec![],
+                                pending: vec![],
+                            },
                         ))
                     }
                     MachineBrokerRequest::SealedApprovalRevoke(request) => {
@@ -1122,6 +1548,12 @@ mod tests {
             preparations: 0,
             lose_next_response: false,
             fail_wallet_reads: false,
+            reject_price: false,
+            native_refusal: false,
+            retain_native_refusal: false,
+            status_unavailable: false,
+            pending: BTreeMap::new(),
+            pool_stop_requests: vec![],
             outcomes: BTreeMap::new(),
         })));
         let client =
@@ -1134,6 +1566,7 @@ mod tests {
                 disabled: false,
                 revoke_request: None,
                 revoke_confirmed: false,
+                last_fallback_code: None,
             },
         )
         .unwrap();
@@ -1141,6 +1574,7 @@ mod tests {
     }
     fn use_claim(payload: &[u8], chain: u64) -> PetalUseClaim {
         PetalUseClaim {
+            economic_effects: None,
             package_hash: digest(4), route: "trade/wallet/0/new".into(), operation_class: token("polymarket.order.poly1271"),
             crypto_suite: CryptoSuite::Secp256k1Keccak256Recoverable,
             payload_digest: petal_batch_payload_digest(&[payload.to_vec()]),
@@ -1181,6 +1615,554 @@ mod tests {
             )
             .await
     }
+    fn install_native_fixture(directory: &Path) {
+        use bloom_broker_api::*;
+        let mut record = records(directory).unwrap().remove(0);
+        let old = record.proposal.terms.approval_id().unwrap();
+        let use_ = action(1);
+        let asset = AssetId {
+            chain: token("evm-1"),
+            asset: "native".into(),
+        };
+        record.proposal.terms.subject = ApprovalSubject::System {
+            component_id: token("bloom-machine"),
+            operation_class: token("transaction.confirm"),
+        };
+        record.proposal.terms.selector = ApprovalSelector::SystemSession {
+            scope: SystemSessionScope {
+                component_id: token("bloom-machine"),
+                actions: vec![SystemSessionAction::NativeTransfer],
+                chains: vec![use_.chain],
+                destinations: vec![PolicyDestination {
+                    chain: token("evm-1"),
+                    destination: use_.recipient,
+                }],
+                tokens: vec![],
+                per_action_value_limits: vec![SessionValueCeiling {
+                    asset: asset.clone(),
+                    maximum: DecimalU256::parse("1000").unwrap(),
+                }],
+            },
+        };
+        record.proposal.terms.limits.value_limits = vec![ValueLimit {
+            asset,
+            lifetime: DecimalU256::parse("1000").unwrap(),
+            rolling_windows: vec![],
+        }];
+        let template = record.proposal.terms.clone();
+        let scope_digest = session_member_scope_digest(&template).unwrap();
+        let asset = AssetId {
+            chain: token("evm-1"),
+            asset: "native".into(),
+        };
+        record.proposal.terms.session_budget = Some(SessionBudget {
+            usd_policy: Some(SessionUsdPolicy {
+                schema_version: 2,
+                budget_nonce: RequestNonce::from_bytes([63; 16]),
+                member_scope_digests: vec![scope_digest.clone()],
+                member_backstop_allocations: vec![SessionMemberAllocation {
+                    scope_digest,
+                    limits: template.limits.clone(),
+                }],
+                member_templates: vec![template.clone()],
+                assets: vec![approved_session_asset(&asset).unwrap()],
+                pricing_policy_digest: session_pricing_policy_digest(),
+            }),
+            wallet_id: template.wallet_id.clone(),
+            policy_version: template.policy_version.clone(),
+            policy_digest: template.policy_digest.clone(),
+            wallet_revocation_epoch: template.wallet_revocation_epoch.clone(),
+            member_keys: vec![template.key_ref.clone()],
+            limits: template.limits.clone(),
+            nominal_asset_scales: vec![],
+            nominal_limits: SessionNominalLimits {
+                per_action: DecimalU256::parse("1000000").unwrap(),
+                lifetime: DecimalU256::parse("100000000").unwrap(),
+                rolling_windows: vec![],
+            },
+            per_action_value_limits: vec![SessionValueCeiling {
+                asset,
+                maximum: DecimalU256::parse("1000").unwrap(),
+            }],
+            not_before_ms: template.not_before_ms,
+            expires_at_ms: template.expires_at_ms,
+        });
+        fs::remove_file(grant_path(directory, &old)).unwrap();
+        atomic_json(
+            &grant_path(directory, &record.proposal.terms.approval_id().unwrap()),
+            &record,
+        )
+        .unwrap();
+    }
+    async fn native_sign(
+        client: &MachineBrokerClient,
+        operation: u8,
+    ) -> Result<Option<SigningResult>, ProtocolError> {
+        client
+            .try_persona_sign_payloads(
+                &token("wallet"),
+                &key(),
+                CryptoSuite::Secp256k1Keccak256Recoverable,
+                &ProvenanceSubject::System {
+                    component_id: token("bloom-machine"),
+                    operation_class: token("transaction.confirm"),
+                },
+                &digest(83),
+                None,
+                None,
+                Some(&action(1)),
+                None,
+                &OperationId::from_bytes([operation; 32]),
+                &[b"native transfer bytes".to_vec()],
+                false,
+            )
+            .await
+    }
+    #[tokio::test]
+    async fn pool_stop_retries_freeze_the_original_reason_and_fence_identity() {
+        let (directory, client, broker) = fixture();
+        install_native_fixture(directory.path());
+        client
+            .stop_persona_sessions(&token("wallet"), "original stop")
+            .await
+            .unwrap();
+        client
+            .stop_persona_sessions(&token("wallet"), "different retry reason")
+            .await
+            .unwrap();
+        let state = broker.0.lock().unwrap();
+        assert_eq!(state.pool_stop_requests.len(), 2);
+        assert_eq!(state.pool_stop_requests[0], state.pool_stop_requests[1]);
+        assert_eq!(state.pool_stop_requests[0].reason, "original stop");
+    }
+
+    #[tokio::test]
+    async fn native_degraded_context_steps_up_only_after_authoritative_absence() {
+        for (retain, unavailable, expect_fallback) in [
+            (false, false, true),
+            (true, false, false),
+            (false, true, false),
+        ] {
+            let (directory, client, broker) = fixture();
+            install_native_fixture(directory.path());
+            {
+                let mut state = broker.0.lock().unwrap();
+                state.native_refusal = true;
+                state.retain_native_refusal = retain;
+                state.status_unavailable = unavailable;
+            }
+            let result = native_sign(&client, 92).await;
+            if expect_fallback {
+                assert!(result.unwrap().is_none());
+                broker.0.lock().unwrap().native_refusal = false;
+                assert!(native_sign(&client, 92).await.unwrap().is_none());
+                assert_eq!(
+                    records(directory.path()).unwrap()[0].last_fallback_code,
+                    Some(ProtocolErrorCode::SelectorMismatch)
+                );
+            } else {
+                assert_eq!(
+                    result.unwrap_err().code,
+                    ProtocolErrorCode::SelectorMismatch
+                );
+            }
+            assert_eq!(broker.0.lock().unwrap().signatures, 0);
+            assert_eq!(
+                read_json::<SigningAttempt>(&attempt_path(
+                    directory.path(),
+                    &OperationId::from_bytes([92; 32])
+                ))
+                .unwrap()
+                .unwrap()
+                .exact_fallback,
+                expect_fallback
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn degraded_usage_does_not_hide_live_authority_status() {
+        let (_directory, client, _broker) = fixture();
+        let statuses = client.persona_sessions(&token("wallet")).await.unwrap();
+        assert_eq!(statuses[0].authority.state, ApprovalLifecycleState::Active);
+        assert!(statuses[0].usage.is_none());
+        assert_eq!(
+            statuses[0].usage_error,
+            Some(ProtocolErrorCode::ClockUntrusted)
+        );
+    }
+
+    #[tokio::test]
+    async fn unrelated_evm_and_svm_petals_use_one_pool_through_public_host_adapter() {
+        use bloom_broker_api::*;
+        let (directory, client, broker) = fixture();
+        let original = proposal();
+        fs::remove_file(grant_path(
+            directory.path(),
+            &original.terms.approval_id().unwrap(),
+        ))
+        .unwrap();
+        let assets = [
+            AssetId {
+                chain: token("evm-137"),
+                asset: "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb".into(),
+            },
+            AssetId {
+                chain: token("solana-mainnet"),
+                asset: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".into(),
+            },
+        ];
+        let mut proposals = Vec::new();
+        for (i, profile, suite, path) in [
+            (
+                0,
+                DerivationProfile::Bip44EvmSecp256k1V1,
+                CryptoSuite::Secp256k1Keccak256Recoverable,
+                "m/44'/60'/0'/0/0",
+            ),
+            (
+                1,
+                DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+                CryptoSuite::Ed25519Message,
+                "m/44'/501'/0'/0'",
+            ),
+        ] {
+            let mut p = original.clone();
+            p.terms.key_ref.key_spec = suite.key_spec();
+            p.terms.key_ref.locator = format!("child-{i}");
+            p.terms.key_ref.public_key_fingerprint = digest(30 + i as u8);
+            p.terms.key_ref.derivation = Some(DerivationRef::Bip39Multicurve {
+                wallet_seed_ref: token("seed"),
+                profile,
+                path: path.into(),
+            });
+            p.terms.allowed_crypto_suites = vec![suite];
+            p.terms.subject = ApprovalSubject::Petal {
+                package_hash: digest(40 + i as u8),
+                route: format!("application-{i}/wallet/0/action"),
+                agent_id: None,
+            };
+            p.terms.selector = ApprovalSelector::Petal {
+                package_hash: digest(40 + i as u8),
+                route: format!("application-{i}/wallet/0/action"),
+                allowed_operation_classes: vec![token(&format!("example-{i}.swap"))],
+                route_grants: vec![],
+                required_claim_assurance: ClaimAssuranceLevel::MachineAsserted,
+            };
+            p.terms.limits.value_limits.clear();
+            p.prepare_operation_id = OperationId::from_bytes([30 + i as u8; 32]);
+            proposals.push(p);
+        }
+        let mut members = proposals
+            .iter()
+            .map(|p| p.terms.clone())
+            .collect::<Vec<_>>();
+        members.sort_by_key(|t| session_member_scope_digest(t).unwrap().as_str().to_owned());
+        let mut limits = original.terms.limits.clone();
+        limits.value_limits.clear();
+        limits.max_operations = DecimalU64::new(limits.max_operations.get() * 2);
+        limits.max_signatures = DecimalU64::new(limits.max_signatures.get() * 2);
+        let budget = SessionBudget {
+            usd_policy: Some(SessionUsdPolicy {
+                schema_version: 2,
+                budget_nonce: RequestNonce::from_bytes([55; 16]),
+                member_scope_digests: members
+                    .iter()
+                    .map(|t| session_member_scope_digest(t).unwrap())
+                    .collect(),
+                member_backstop_allocations: members
+                    .iter()
+                    .map(|t| SessionMemberAllocation {
+                        scope_digest: session_member_scope_digest(t).unwrap(),
+                        limits: t.limits.clone(),
+                    })
+                    .collect(),
+                member_templates: members,
+                assets: assets
+                    .iter()
+                    .map(|a| approved_session_asset(a).unwrap())
+                    .collect(),
+                pricing_policy_digest: session_pricing_policy_digest(),
+            }),
+            wallet_id: token("wallet"),
+            policy_version: original.terms.policy_version.clone(),
+            policy_digest: original.terms.policy_digest.clone(),
+            wallet_revocation_epoch: original.terms.wallet_revocation_epoch.clone(),
+            member_keys: proposals.iter().map(|p| p.terms.key_ref.clone()).collect(),
+            limits,
+            nominal_asset_scales: vec![],
+            nominal_limits: SessionNominalLimits {
+                per_action: DecimalU256::parse("100000000").unwrap(),
+                lifetime: DecimalU256::parse("1000000000").unwrap(),
+                rolling_windows: vec![],
+            },
+            per_action_value_limits: assets
+                .iter()
+                .map(|a| SessionValueCeiling {
+                    asset: a.clone(),
+                    maximum: DecimalU256::parse("100000000").unwrap(),
+                })
+                .collect(),
+            not_before_ms: original.terms.not_before_ms,
+            expires_at_ms: original.terms.expires_at_ms,
+        };
+        budget.validate().unwrap();
+        for p in &mut proposals {
+            p.terms.session_budget = Some(budget.clone());
+            p.terms.validate().unwrap();
+        }
+        {
+            let mut state = broker.0.lock().unwrap();
+            state.wallet.root_key_ref = None;
+            state.wallet.key_refs = proposals.iter().map(|p| p.terms.key_ref.clone()).collect();
+        }
+        client.stage_persona_sessions(&proposals).await.unwrap();
+        for (i, p) in proposals.iter().enumerate() {
+            let suite = p.terms.allowed_crypto_suites[0];
+            let payload = format!("trusted generic transaction {i}").into_bytes();
+            let ApprovalSelector::Petal {
+                package_hash,
+                route,
+                allowed_operation_classes,
+                ..
+            } = &p.terms.selector
+            else {
+                panic!()
+            };
+            let mut claim = use_claim(&payload, 1);
+            claim.package_hash = package_hash.clone();
+            claim.route = route.clone();
+            claim.operation_class = allowed_operation_classes[0].clone();
+            claim.crypto_suite = suite;
+            claim.ordered_hashes = vec![suite_hash(suite, &payload)];
+            claim.declared_debits[0].asset = assets[i].clone();
+            claim.economic_effects = Some(EconomicEffectsV1 {
+                schema_version: 1,
+                payload_contexts: vec![SessionPayloadContext {
+                    payload_index: 0,
+                    network: assets[i].chain.clone(),
+                    spending_accounts: vec![],
+                }],
+                permission_effect: SessionPermissionEffect::None,
+            });
+            let request = ExactPayloadSignRequest {
+                session_use: None,
+                evm_reported_token: None,
+                wallet_id: token("wallet"),
+                preimage: payload.clone(),
+                claimed_hash: suite_hash(suite, &payload),
+                crypto_suite: suite,
+                provenance: ProvenanceSubject::Petal {
+                    package_hash: package_hash.clone(),
+                    route: route.clone(),
+                },
+                provenance_digest: p.terms.provenance_digest.clone(),
+                activation_mode: None,
+                approval_operation_id: OperationId::from_bytes([61 + i as u8; 32]),
+                signing_operation_id: OperationId::from_bytes([71 + i as u8; 32]),
+                request_nonce: RequestNonce::from_bytes([81 + i as u8; 16]),
+                issued_at_ms: DecimalU64::new(10),
+                expires_at_ms: DecimalU64::new(20),
+                canonical_plan_facts_digest: digest(91),
+                approval_id: None,
+                petal_use_claim: Some(claim),
+                system_use_claim: None,
+                claim_assurance_evidence: None,
+                approval_value_limits: vec![],
+                account_key_ref: Some(p.terms.key_ref.clone()),
+                safe_review_payload: None,
+                message_review_payload: None,
+            };
+            assert!(matches!(
+                client.sign_exact_payload(request).await.unwrap(),
+                ExactPayloadSignOutcome::Signed(_)
+            ));
+        }
+        assert_eq!(broker.0.lock().unwrap().signatures, 2);
+        assert_eq!(broker.0.lock().unwrap().preparations, 0);
+        assert_eq!(
+            records(directory.path())
+                .unwrap()
+                .iter()
+                .map(|r| r
+                    .proposal
+                    .terms
+                    .session_budget
+                    .as_ref()
+                    .unwrap()
+                    .budget_id()
+                    .unwrap())
+                .map(|d| d.as_str().to_owned())
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn arbitrary_certified_petal_class_needs_no_polymarket_witness() {
+        let (directory, client, broker) = fixture();
+        let mut record = records(directory.path()).unwrap().remove(0);
+        let old = record.proposal.terms.approval_id().unwrap();
+        let ApprovalSelector::Petal {
+            allowed_operation_classes,
+            ..
+        } = &mut record.proposal.terms.selector
+        else {
+            panic!()
+        };
+        *allowed_operation_classes = vec![token("example.swap.v1")];
+        fs::remove_file(grant_path(directory.path(), &old)).unwrap();
+        atomic_json(
+            &grant_path(
+                directory.path(),
+                &record.proposal.terms.approval_id().unwrap(),
+            ),
+            &record,
+        )
+        .unwrap();
+        let mut claim = use_claim(b"swap", 1);
+        claim.operation_class = token("example.swap.v1");
+        let result = client
+            .try_persona_sign_payloads(
+                &token("wallet"),
+                &key(),
+                claim.crypto_suite,
+                &ProvenanceSubject::Petal {
+                    package_hash: digest(4),
+                    route: claim.route.clone(),
+                },
+                &digest(83),
+                Some(&claim),
+                None,
+                None,
+                None,
+                &OperationId::from_bytes([22; 32]),
+                &[b"swap".to_vec()],
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(result.is_some());
+        assert_eq!(broker.0.lock().unwrap().signatures, 1);
+    }
+
+    #[tokio::test]
+    async fn missing_price_falls_back_durably_without_repricing_or_signing() {
+        let (directory, client, broker) = fixture();
+        broker.0.lock().unwrap().reject_price = true;
+        assert!(
+            sign(&client, 21, b"unpriced", &action(1))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            read_json::<SigningAttempt>(&attempt_path(
+                directory.path(),
+                &OperationId::from_bytes([21; 32])
+            ))
+            .unwrap()
+            .unwrap()
+            .exact_fallback
+        );
+        assert!(
+            client
+                .persona_operation_digest(&OperationId::from_bytes([21; 32]))
+                .unwrap()
+                .is_none()
+        );
+        broker.0.lock().unwrap().reject_price = false;
+        assert!(
+            sign(&client, 21, b"unpriced", &action(1))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(broker.0.lock().unwrap().signatures, 0);
+        assert_eq!(
+            sign(&client, 21, b"changed", &action(1))
+                .await
+                .unwrap_err()
+                .code,
+            ProtocolErrorCode::OperationIdConflict
+        );
+    }
+
+    #[test]
+    fn member_account_is_the_hardened_account_not_the_evm_address_index() {
+        let mut child = key();
+        child.derivation = Some(bloom_broker_api::DerivationRef::Bip39Multicurve {
+            wallet_seed_ref: token("seed"),
+            profile: bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1,
+            path: "m/44'/60'/7'/0/9".into(),
+        });
+        assert_eq!(owner_account_number(&child), Some(7));
+        child.derivation = Some(bloom_broker_api::DerivationRef::Bip39Multicurve {
+            wallet_seed_ref: token("seed"),
+            profile: bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+            path: "m/44'/501'/7'/0'".into(),
+        });
+        assert_eq!(owner_account_number(&child), Some(7));
+    }
+
+    #[test]
+    fn generic_contexts_bind_exact_host_account_and_order() {
+        let mut claim = use_claim(b"first", 1);
+        claim.economic_effects = Some(bloom_broker_api::EconomicEffectsV1 {
+            schema_version: 1,
+            payload_contexts: vec![bloom_broker_api::SessionPayloadContext {
+                payload_index: 0,
+                network: token("polygon"),
+                spending_accounts: vec![],
+            }],
+            permission_effect: bloom_broker_api::SessionPermissionEffect::None,
+        });
+        bind_economic_contexts(Some(&mut claim), &key(), 1).unwrap();
+        assert_eq!(
+            claim.economic_effects.as_ref().unwrap().payload_contexts[0].spending_accounts,
+            vec![key()]
+        );
+        let mut other = key();
+        other.locator = "different".into();
+        assert_eq!(
+            bind_economic_contexts(Some(&mut claim), &other, 1)
+                .unwrap_err()
+                .code,
+            ProtocolErrorCode::ClaimInvalid
+        );
+        claim.economic_effects.as_mut().unwrap().payload_contexts[0].payload_index = 1;
+        assert!(bind_economic_contexts(Some(&mut claim), &key(), 1).is_err());
+        claim.economic_effects.as_mut().unwrap().payload_contexts[0].payload_index = 0;
+        claim.economic_effects.as_mut().unwrap().payload_contexts[0].network =
+            token("wrong-network");
+        assert!(bind_economic_contexts(Some(&mut claim), &key(), 1).is_err());
+        assert!(bind_economic_contexts(Some(&mut claim), &key(), 2).is_err());
+    }
+
+    #[tokio::test]
+    async fn all_members_are_frozen_before_any_activation_rpc() {
+        let (directory, client, broker) = fixture();
+        let first = proposal();
+        let mut second = first.clone();
+        second.terms.request_nonce = RequestNonce::from_bytes([99; 16]);
+        second.prepare_operation_id = OperationId::from_bytes([99; 32]);
+        client
+            .stage_persona_sessions(&[first, second])
+            .await
+            .unwrap();
+        assert_eq!(records(directory.path()).unwrap().len(), 2);
+        // Simulate a crash after writing the pool manifest and only one grant.
+        let one = records(directory.path()).unwrap().remove(0);
+        fs::remove_file(grant_path(
+            directory.path(),
+            &one.proposal.terms.approval_id().unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(records(directory.path()).unwrap().len(), 2);
+        assert_eq!(broker.0.lock().unwrap().preparations, 0);
+    }
+
     #[tokio::test]
     async fn distinct_actions_reuse_one_grant_and_lost_responses_recover_without_another_sign() {
         let (_directory, client, broker) = fixture();

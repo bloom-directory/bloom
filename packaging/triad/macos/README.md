@@ -145,6 +145,12 @@ condition. A failed fresh install removes Directory Service records
 created by that invocation. An interrupted upgrade retains its forward intent
 so the next invocation can finish the same convergence safely.
 
+Generic session pricing/validation adds Broker HTTPS dependencies on
+`api.coingecko.com`, `coins.llama.fi` and `api.mainnet-beta.solana.com`.
+No price keys or pricing proxy are configured. Signer gains no HTTP client or
+pricing/network responsibility; the platform's existing enforcement limits
+below remain unchanged.
+
 Broker and Signer have `network_containment: null`. No PF rules are installed
 or enabled. Successful install, repair, upgrade and restore remove legacy Bloom
 anchors from disk and flush only their live filter rules. Uninstall scopes that

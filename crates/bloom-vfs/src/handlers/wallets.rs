@@ -6052,6 +6052,7 @@ mod tests {
                             publisher: bloom_broker_api::Token::new("bloom-installer").unwrap(),
                             petal_lineage: None,
                             operation_classes: vec![bloom_broker_api::ProvenanceOperationClass {
+                                economic_effects_schema: None,
                                 operation_class: bloom_broker_api::Token::new(
                                     "transaction.confirm",
                                 )
@@ -7438,6 +7439,7 @@ value = "0""#,
                 publisher: bloom_broker_api::Token::new("bloom-installer").unwrap(),
                 petal_lineage: None,
                 operation_classes: vec![bloom_broker_api::ProvenanceOperationClass {
+                    economic_effects_schema: None,
                     operation_class: bloom_broker_api::Token::new("solana.native-transfer")
                         .unwrap(),
                     fee_asset: Some(bloom_broker_api::ProvenanceFeeAsset {
@@ -7493,6 +7495,7 @@ value = "0""#,
                 publisher: bloom_broker_api::Token::new("bloom-installer").unwrap(),
                 petal_lineage: None,
                 operation_classes: vec![bloom_broker_api::ProvenanceOperationClass {
+                    economic_effects_schema: None,
                     operation_class: bloom_broker_api::Token::new("solana.native-transfer")
                         .unwrap(),
                     fee_asset: Some(bloom_broker_api::ProvenanceFeeAsset {

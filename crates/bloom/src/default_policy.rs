@@ -1296,6 +1296,7 @@ pub(crate) async fn create_wallet_then_default_policy(
         let session = crate::machine_command(
             endpoint,
             bloom_daemon::ipc::MachineCommand::PersonaSessionActivateConfigured {
+                selection: None,
                 wallet: name,
                 account: 0,
             },
@@ -1303,7 +1304,7 @@ pub(crate) async fn create_wallet_then_default_policy(
         .await?;
         if session.stdout.trim_start().starts_with('[') {
             println!(
-                "persona coverage: basic activation covers Polymarket buys using nominal pUSD collateral on main/account 0; other apps, native transfers and unsupported assets retain exact approval. Approve the returned scope URL, then run `bloom wallet persona activate main --account 0` to reconcile it."
+                "persona coverage: default activation proposes priced Polymarket BUY on the selected account; use --selection to review generic Petal/native members sharing one USD pool. Approve the returned scope URL, then run `bloom wallet persona activate main --account 0` to reconcile it."
             );
         }
         crate::print_machine_command_output(&session)?;

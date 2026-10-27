@@ -168,7 +168,7 @@ impl SolanaTransferSigner {
                     chain: Token::new("solana").map_err(|e| e.to_string())?,
                     asset: "native".into(),
                 },
-                amount: DecimalU256::parse(lamports.to_string()).map_err(|e| e.to_string())?,
+                amount: DecimalU256::parse(lamports.to_string()).expect("u64 quantity"),
             }],
             declared_destinations: vec![DeclaredDestination {
                 chain: Token::new("solana").map_err(|e| e.to_string())?,
@@ -194,7 +194,20 @@ impl SolanaTransferSigner {
             },
         };
         let request = ExactPayloadSignRequest {
-            session_use: None,
+            session_use: (genesis_hash == bloom_proto::SOLANA_MAINNET_BETA_GENESIS_HASH).then(
+                || bloom_broker_api::SystemSessionUse {
+                    action: bloom_broker_api::SystemSessionAction::NativeTransfer,
+                    chain: bloom_broker_api::SystemSessionChain::Solana {
+                        chain: Token::new("solana-mainnet").expect("constant network token"),
+                        genesis_hash: genesis_hash.to_owned(),
+                    },
+                    token: None,
+                    recipient: destination.to_owned(),
+                    amount: DecimalU256::parse(lamports.to_string()).expect("u64 quantity"),
+                    maximum_fee: DecimalU256::parse(fee_lamports.to_string())
+                        .expect("u64 quantity"),
+                },
+            ),
             evm_reported_token: None,
             wallet_id: Token::new(wallet_id).map_err(|e| e.to_string())?,
             preimage,

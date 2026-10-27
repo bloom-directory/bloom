@@ -2665,9 +2665,10 @@ ownership table in section 26.
 | D-062 | Ratified | Assurance verifiers are compile-time, feature-gated, digest-pinned crates with written verifier contracts, advertised through `broker.capabilities`. Fields outside a verifier's contract remain `machine_asserted` even under a verified proof. v1 may ship with none, in which case reusable approvals operate at `machine_asserted` with the section 1.1 disclosure. |
 | D-063 | Ratified | Payload size bounds are hierarchical and independently enforced (frame, single payload, batch child, batch aggregate, child count, HPKE envelope, locator); the frame bound alone does not constrain a batch. Errors are a closed, versioned set with declared retryability and durable-effect class. |
 | D-064 | Ratified | The v0.1 hash-only guest signing interface fails closed on triad builds with no compatibility shim, and its absence from production artifacts is a release scan. Machine supplies no policy reference on the signing call; Broker evaluates its own verified snapshot. Quotas and ceremony-creation bounds apply locally, because an authenticated Machine may still be compromised. |
+| D-065 | Ratified 2026-10-27 | New generic session profiles may use Broker-owned gross USD accounting across EVM/SVM member keys with release-approved metadata, keyless CoinGecko then DefiLlama and a 15-minute provider timestamp limit. This supersedes section 10.3's no-fiat restriction only for these reviewed profiles. Reuse Petal approvals; native transfers use a structural-only System selector. Signer receives no amounts/prices/shared budget ledger. Preserve mandatory existing semantic checks and fee/asset allowlists, trusted-claim disclosures, exact fallback, durable reservation and atomic pool-stop fences. |
 
 Earlier decisions remain applicable only where consistent with D-040 through
-D-064 and this consolidated normative text. In particular, any earlier decision
+D-065 and this consolidated normative text. In particular, any earlier decision
 requiring a registered semantic adapter before a Petal may hold a reusable or
 standing approval is superseded by D-051 as qualified by section 1.1 and D-062:
 adapters are an optional strengthening mechanism, not a precondition, and the
@@ -2718,9 +2719,25 @@ Its digest is bound through the ordinary request nonce, so its enforcement
 projection and Broker metadata share one immutable approval identity. Signer
 continues to bind the full Broker review digest opaquely during activation.
 
-Initial automatic authority is limited to an installer-pinned Polymarket BUY
-Petal selector. Broker verifies the complete order preimage and the charged
-collateral debit at use. Native transfers retain exact approval; the legacy
-draft `SystemSession` shape is explicitly refused. The new strict north edge
-negotiates 1.9; the south edge remains production 1.6. Existing no-budget
-approval identities and replay semantics are preserved.
+D-065 widens the candidate to generic trusted EVM/SVM Petals declaring
+versioned complete effects and exact-account payload contexts. Native single
+EVM currency/ERC-20 and mainnet SOL transfers use explicit System identity,
+recipient allowlists, immutable raw-unit caps and independent supported-byte
+verification. Polymarket BUY retains its mandatory order/debit verifier;
+automatic outcome-token SELL valuation and native SPL remain deferred.
+
+Broker owns all USD prices, conversion, gross-spend reservations, shared usage
+and recovery. CoinGecko keyless is primary; DefiLlama keyless is fallback;
+provider timestamps may be at most 15 minutes old and are rechecked at admission.
+Unpriced/stale/unsupported actions use existing owner approval. Fees consume
+reviewed priced asset scope; inflows do not replenish historical charges.
+The descriptor includes all member templates and fixed structural allocations,
+and every member review commits to that same descriptor. Generic claims are
+trusted quantities; the economic guarantee does not independently contain a
+dishonest Petal, Machine or Broker.
+
+The north edge negotiates 1.10 and the south edge 1.8. The south System selector
+contains component/class identity only; narrower economic/native scope stays
+in Broker. Existing no-budget approval identity/replay meanings remain intact.
+This is candidate behavior, not a deployment claim. See the detailed
+[generic session specification](2026-10-26-generic-evm-svm-sessions.md).

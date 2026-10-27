@@ -1240,6 +1240,7 @@ mod tests {
                     publisher: token("bloom-installer"),
                     petal_lineage: None,
                     operation_classes: vec![ProvenanceOperationClass {
+                        economic_effects_schema: None,
                         operation_class: token("transaction.confirm"),
                         fee_asset: None,
                     }],
@@ -1335,6 +1336,7 @@ mod tests {
                     publisher: token("bloom-installer"),
                     petal_lineage: None,
                     operation_classes: vec![ProvenanceOperationClass {
+                        economic_effects_schema: None,
                         operation_class: token("order.place"),
                         fee_asset: None,
                     }],
@@ -1356,6 +1358,7 @@ mod tests {
             Digest32::from_bytes(digest.finalize().into())
         };
         let claim = PetalUseClaim {
+            economic_effects: None,
             package_hash,
             route: "orders/place".into(),
             operation_class: token("order.place"),
@@ -1563,6 +1566,7 @@ mod tests {
                     publisher: token("bloom-installer"),
                     petal_lineage: None,
                     operation_classes: vec![ProvenanceOperationClass {
+                        economic_effects_schema: None,
                         operation_class: token(class),
                         fee_asset: None,
                     }],
@@ -1575,6 +1579,7 @@ mod tests {
         let payload = b"\x19\x01safe preimage";
         let ordered_hash = Digest32::from_bytes(alloy::primitives::keccak256(payload).into());
         let claim = PetalUseClaim {
+            economic_effects: None,
             package_hash,
             route: "transactions/confirm".into(),
             operation_class: token(class),
@@ -1809,6 +1814,7 @@ mod tests {
                     publisher: token("bloom-installer"),
                     petal_lineage: None,
                     operation_classes: vec![ProvenanceOperationClass {
+                        economic_effects_schema: None,
                         operation_class: token("fixture.withdraw"),
                         fee_asset: class_fee_asset,
                     }],
@@ -1821,6 +1827,7 @@ mod tests {
         let payload = b"exact withdraw payload";
         let ordered_hash = Digest32::from_bytes(Sha256::digest(payload).into());
         let claim = PetalUseClaim {
+            economic_effects: None,
             package_hash,
             route: "withdraw/request".into(),
             operation_class: token("fixture.withdraw"),

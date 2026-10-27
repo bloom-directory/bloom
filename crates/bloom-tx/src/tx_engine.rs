@@ -4608,6 +4608,88 @@ async fn evm_signing_key(
     }
 }
 
+/// A narrow projection only for native single transfers. Broker reconstructs
+/// these facts from the signing bytes; contracts/approvals retain exact review.
+fn native_session_projection(
+    staged: &StagedTx,
+) -> Result<Option<bloom_broker_api::SystemSessionUse>, TxEngineError> {
+    use bloom_broker_api::{
+        AssetId, DecimalU256, SystemSessionAction, SystemSessionChain, SystemSessionUse,
+    };
+    if !matches!(
+        staged.action_kind,
+        TxActionKind::NativeTransfer | TxActionKind::Erc20Transfer
+    ) || staged
+        .execution_origin
+        .as_ref()
+        .is_some_and(|origin| origin.petal_id != bloom_proto::petal_identity::PETAL_ID_EVM_WALLET)
+    {
+        return Ok(None);
+    }
+    let invalid = |message: String| TxEngineError::ApprovalConstruction(message);
+    let chain =
+        Token::new(format!("evm-{}", staged.chain_id)).map_err(|e| invalid(e.to_string()))?;
+    let price = staged
+        .max_fee_per_gas
+        .as_ref()
+        .or(staged.gas_price.as_ref())
+        .ok_or_else(|| invalid("transfer lacks maximum gas price".into()))?;
+    let fee = U256::from_str_radix(price, 10)
+        .map_err(|e| invalid(e.to_string()))?
+        .checked_mul(U256::from(staged.gas_limit))
+        .ok_or_else(|| invalid("maximum gas fee overflow".into()))?;
+    let to = staged
+        .to
+        .as_ref()
+        .ok_or_else(|| invalid("transfer lacks recipient".into()))?;
+    let (action, token, recipient, amount) = if staged.action_kind == TxActionKind::Erc20Transfer {
+        let data = hex::decode(
+            staged
+                .data_hex
+                .strip_prefix("0x")
+                .unwrap_or(&staged.data_hex),
+        )
+        .map_err(|e| invalid(e.to_string()))?;
+        if data.len() != 68
+            || data[..4] != [0xa9, 0x05, 0x9c, 0xbb]
+            || data[4..16].iter().any(|b| *b != 0)
+            || staged.value_wei != "0"
+        {
+            return Ok(None);
+        }
+        (
+            SystemSessionAction::Erc20Transfer,
+            Some(AssetId {
+                chain: chain.clone(),
+                asset: to.to_ascii_lowercase(),
+            }),
+            format!("0x{}", hex::encode(&data[16..36])),
+            U256::from_be_slice(&data[36..68]).to_string(),
+        )
+    } else {
+        if !matches!(staged.data_hex.as_str(), "" | "0x") {
+            return Ok(None);
+        }
+        (
+            SystemSessionAction::NativeTransfer,
+            None,
+            to.clone(),
+            staged.value_wei.clone(),
+        )
+    };
+    Ok(Some(SystemSessionUse {
+        action,
+        chain: SystemSessionChain::Evm {
+            chain,
+            chain_id: DecimalU64::new(staged.chain_id),
+        },
+        token,
+        recipient,
+        amount: DecimalU256::parse(amount).map_err(|e| invalid(e.to_string()))?,
+        maximum_fee: DecimalU256::parse(fee.to_string()).map_err(|e| invalid(e.to_string()))?,
+    }))
+}
+
 fn exact_evm_sign_request(
     staged: &StagedTx,
     signing_preimage: &[u8],
@@ -4618,7 +4700,7 @@ fn exact_evm_sign_request(
     evm_reported_token: Option<bloom_broker_api::EvmReportedToken>,
 ) -> Result<ExactPayloadSignRequest, TxEngineError> {
     Ok(ExactPayloadSignRequest {
-        session_use: None,
+        session_use: native_session_projection(staged)?,
         wallet_id: Token::new(staged.wallet.clone())
             .map_err(|error| TxEngineError::ApprovalConstruction(error.to_string()))?,
         preimage: signing_preimage.to_vec(),
@@ -5443,6 +5525,7 @@ mod tests {
                 publisher: Token::new("bloom-installer").unwrap(),
                 petal_lineage: None,
                 operation_classes: vec![ProvenanceOperationClass {
+                    economic_effects_schema: None,
                     operation_class: Token::new("transaction.confirm").unwrap(),
                     fee_asset: Some(ProvenanceFeeAsset {
                         chain: Token::new("ethereum").unwrap(),
@@ -5901,6 +5984,35 @@ mod tests {
             action_id: None,
             execution_origin: None,
         }
+    }
+
+    #[test]
+    fn reusable_native_projection_is_single_transfer_only_and_includes_maximum_gas() {
+        let mut staged = fake_staged_1559("session-projection");
+        staged.action_kind = TxActionKind::NativeTransfer;
+        staged.value_wei = "12".into();
+        let action = native_session_projection(&staged).unwrap().unwrap();
+        assert_eq!(action.maximum_fee.as_str(), "2100000");
+        assert_eq!(action.amount.as_str(), "12");
+        assert_eq!(action.chain.chain().as_str(), "evm-31337");
+        staged.action_kind = TxActionKind::Approval;
+        assert!(native_session_projection(&staged).unwrap().is_none());
+        staged.action_kind = TxActionKind::Erc20Transfer;
+        staged.value_wei = "0".into();
+        staged.data_hex = format!(
+            "0xa9059cbb{}{}{:064x}",
+            "00".repeat(12),
+            "11".repeat(20),
+            123
+        );
+        let action = native_session_projection(&staged).unwrap().unwrap();
+        assert_eq!(action.recipient, format!("0x{}", "11".repeat(20)));
+        assert_eq!(action.amount.as_str(), "123");
+        staged.value_wei = "1".into();
+        assert!(native_session_projection(&staged).unwrap().is_none());
+        staged.value_wei = "0".into();
+        staged.data_hex.push_str("00");
+        assert!(native_session_projection(&staged).unwrap().is_none());
     }
 
     /// The VFS outbox is the surface the deployment docs point an agent at,

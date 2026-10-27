@@ -758,6 +758,8 @@ pub enum MachineCommand {
     PersonaSessionActivateConfigured {
         wallet: String,
         account: u32,
+        #[serde(default)]
+        selection: Option<bloom_machine_client::PersonaSessionSelection>,
     },
     PersonaSessionPrepare {
         proposal: Box<bloom_machine_client::PersonaSessionProposal>,

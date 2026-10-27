@@ -7,12 +7,12 @@ on:
         description: Public bloom-broker ref
         required: false
         type: string
-        default: 556f6b3966f373a2eb2381355aabf3c619b485b7
+        default: ddd098b3f0208dce03648adcccc0ce25b66b0782
       signer_ref:
         description: Public bloom-signer ref
         required: false
         type: string
-        default: 8e40390b9cd350d178a90878b478eeb1189b5f62
+        default: 70a698fb0b122394070c6c2089422fc1461c159f
       login_uid_a:
         description: First active GUI login UID
         required: true
@@ -34,11 +34,11 @@ on:
       broker_ref:
         description: Public bloom-broker ref
         required: true
-        default: 556f6b3966f373a2eb2381355aabf3c619b485b7
+        default: ddd098b3f0208dce03648adcccc0ce25b66b0782
       signer_ref:
         description: Public bloom-signer ref
         required: true
-        default: 8e40390b9cd350d178a90878b478eeb1189b5f62
+        default: 70a698fb0b122394070c6c2089422fc1461c159f
       login_uid_a:
         description: First active GUI login UID
         required: true
@@ -75,8 +75,8 @@ jobs:
       - name: Reject mutable sibling refs
         shell: bash
         env:
-          BROKER_REF: ${{ inputs.broker_ref || '556f6b3966f373a2eb2381355aabf3c619b485b7' }}
-          SIGNER_REF: ${{ inputs.signer_ref || '8e40390b9cd350d178a90878b478eeb1189b5f62' }}
+          BROKER_REF: ${{ inputs.broker_ref || 'ddd098b3f0208dce03648adcccc0ce25b66b0782' }}
+          SIGNER_REF: ${{ inputs.signer_ref || '70a698fb0b122394070c6c2089422fc1461c159f' }}
         run: |
           [[ "$BROKER_REF" =~ ^[0-9a-f]{40}$ ]]
           [[ "$SIGNER_REF" =~ ^[0-9a-f]{40}$ ]]
@@ -84,13 +84,13 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           repository: bloom-directory/bloom-broker
-          ref: ${{ inputs.broker_ref || '556f6b3966f373a2eb2381355aabf3c619b485b7' }}
+          ref: ${{ inputs.broker_ref || 'ddd098b3f0208dce03648adcccc0ce25b66b0782' }}
           path: bloom-broker
       - name: Check out Signer
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           repository: bloom-directory/bloom-signer
-          ref: ${{ inputs.signer_ref || '8e40390b9cd350d178a90878b478eeb1189b5f62' }}
+          ref: ${{ inputs.signer_ref || '70a698fb0b122394070c6c2089422fc1461c159f' }}
           path: bloom-signer
       - name: Install Rust toolchain
         run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal

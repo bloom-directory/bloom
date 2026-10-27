@@ -331,6 +331,7 @@ async fn solana_full_stage_confirm_flow() -> Result<()> {
         publisher: tok("bloom-installer"),
         petal_lineage: None,
         operation_classes: vec![ProvenanceOperationClass {
+            economic_effects_schema: None,
             operation_class: tok(op),
             fee_asset: Some(ProvenanceFeeAsset {
                 chain: tok(chain),

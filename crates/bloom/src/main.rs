@@ -1398,12 +1398,17 @@ fn machine_error_from_protocol(
             MachineErrorKind::Conflict
         }
         Code::ServiceUnavailable
+        | Code::PriceUnavailable
+        | Code::PriceStale
         | Code::AssuranceUnavailable
         | Code::ClockUntrusted
         | Code::ClockRollback
         | Code::BackendUnsupported => MachineErrorKind::Unavailable,
         Code::AmbiguousProviderEffect => MachineErrorKind::Internal,
         Code::UnauthenticatedPeer
+        | Code::AssetUnsupported
+        | Code::EffectsUnsupported
+        | Code::PoolInactive
         | Code::ApprovalExpired
         | Code::ApprovalRevoked
         | Code::ApprovalRearmRequired
@@ -1877,12 +1882,13 @@ async fn execute_machine_command(
             let status = daemon.prepare_persona_session(*proposal).await?;
             format!("{}\n", serde_json::to_string(&status)?)
         }
-        MachineCommand::PersonaSessionActivateConfigured { wallet, account } => {
+        MachineCommand::PersonaSessionActivateConfigured {
+            wallet,
+            account,
+            selection,
+        } => {
             let _transition = default_policy::PERSONA_TRANSITION.lock().await;
             validate_wallet_name(&wallet)?;
-            if account != 0 {
-                anyhow::bail!("basic persona activation covers account 0 of the selected wallet");
-            }
             let configured = bloom_proto::Config::load(&daemon.home.config_path())?.persona;
             let Some(profile) = configured else {
                 return Ok(MachineCommandOutput {
@@ -1897,8 +1903,12 @@ async fn execute_machine_command(
                     .await?;
                 "persona_sessions: stopped; custodian retains transaction approvals\n".into()
             } else {
-                let proposals =
-                    persona_onboarding::compile_proposals(daemon, &wallet, account).await?;
+                let proposals = match selection {
+                    Some(selection) => {
+                        persona_onboarding::compile_selection(daemon, &wallet, selection).await?
+                    }
+                    None => persona_onboarding::compile_proposals(daemon, &wallet, account).await?,
+                };
                 let mut statuses = Vec::new();
                 for proposal in proposals {
                     let status = daemon.prepare_persona_session(proposal).await?;
@@ -2876,9 +2886,12 @@ enum PersonaCmd {
         wallet: String,
         #[arg(long, default_value_t = 0)]
         account: u32,
-        /// Explicit reviewed frozen terms for native/unit-cap scopes beyond basic pUSD buys.
-        #[arg(long)]
+        /// Explicit reviewed frozen terms. For scope compilation use --selection.
+        #[arg(long, conflicts_with = "selection")]
         proposal: Option<PathBuf>,
+        /// Public member scopes and priced asset identities for one shared pool.
+        #[arg(long)]
+        selection: Option<PathBuf>,
     },
     /// List scopes, expiry and remaining authority from Broker.
     Status { wallet: String },
@@ -4472,6 +4485,7 @@ async fn run(cli: Cli) -> Result<()> {
             wallet,
             account,
             proposal,
+            selection,
         })) => {
             if let Some(path) = proposal {
                 let mut file =
@@ -4498,12 +4512,32 @@ async fn run(cli: Cli) -> Result<()> {
                 )
                 .await;
             }
+            let selection = selection
+                .map(|path| -> anyhow::Result<_> {
+                    let mut file = std::fs::File::open(path).context("open session selection")?;
+                    if !file.metadata()?.is_file() {
+                        anyhow::bail!("session selection must be a regular file");
+                    }
+                    let mut bytes = Vec::new();
+                    (&mut file).take(262_145).read_to_end(&mut bytes)?;
+                    if bytes.len() > 262_144 {
+                        anyhow::bail!("session selection exceeds 256 KiB");
+                    }
+                    Ok(serde_json::from_slice::<
+                        bloom_machine_client::PersonaSessionSelection,
+                    >(&bytes)?)
+                })
+                .transpose()?;
             println!(
-                "persona coverage: basic activation covers Polymarket buys using nominal pUSD collateral on account 0 of the selected wallet; other apps, native transfers and unsupported assets retain exact approval. Approve the returned scope URL, then repeat activation to reconcile it."
+                "persona coverage: Broker prices approved assets against the shared USD pool. Approve each returned member ceremony, then repeat activation to reconcile. Unsupported actions retain owner approval."
             );
             call_machine_command(
                 &client_endpoint,
-                MachineCommand::PersonaSessionActivateConfigured { wallet, account },
+                MachineCommand::PersonaSessionActivateConfigured {
+                    wallet,
+                    account,
+                    selection,
+                },
             )
             .await
         }

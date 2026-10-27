@@ -322,6 +322,7 @@ pub fn exact_signing_catalog(operation_classes: &[&str]) -> ProvenanceCatalog {
                 publisher: Token::new("bloom-installer").unwrap(),
                 petal_lineage: None,
                 operation_classes: vec![ProvenanceOperationClass {
+                    economic_effects_schema: None,
                     operation_class: Token::new(*operation_class).unwrap(),
                     fee_asset: Some(ProvenanceFeeAsset {
                         chain: Token::new("ethereum").unwrap(),

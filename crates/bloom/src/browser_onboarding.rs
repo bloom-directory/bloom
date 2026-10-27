@@ -46,6 +46,10 @@ pub(super) struct SetupRequest {
 #[serde(deny_unknown_fields)]
 struct ActionRequest {
     action: Action,
+    #[serde(default)]
+    account: Option<u32>,
+    #[serde(default)]
+    selection: Option<bloom_machine_client::PersonaSessionSelection>,
     #[serde(default, deserialize_with = "deserialize_wallet_choice")]
     wallet: Option<String>,
 }
@@ -464,6 +468,14 @@ async fn setup(State(state): State<App>, Json(request): Json<SetupRequest>) -> R
 }
 
 async fn action(State(state): State<App>, Json(request): Json<ActionRequest>) -> Response {
+    if !matches!(request.action, Action::Activate)
+        && (request.account.is_some() || request.selection.is_some())
+    {
+        return api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "account/selection are only accepted by activate",
+        );
+    }
     if !matches!(request.action, Action::SelectWallet) && request.wallet.is_some() {
         return api_error(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -505,7 +517,11 @@ async fn action(State(state): State<App>, Json(request): Json<ActionRequest>) ->
     };
     let command = match request.action {
         Action::Policy => MachineCommand::WalletDefaultPolicy { name: wallet },
-        Action::Activate => MachineCommand::PersonaSessionActivateConfigured { wallet, account: 0 },
+        Action::Activate => MachineCommand::PersonaSessionActivateConfigured {
+            wallet,
+            account: request.account.unwrap_or(0),
+            selection: request.selection,
+        },
         Action::Stop => MachineCommand::PersonaSessionsStop {
             wallet,
             reason: "owner stopped sessions from onboarding".into(),

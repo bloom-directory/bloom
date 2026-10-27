@@ -6794,6 +6794,7 @@ mod tests {
                 active: true,
             }),
             operation_classes: vec![bloom_broker_api::ProvenanceOperationClass {
+                economic_effects_schema: None,
                 operation_class: bloom_broker_api::Token::new("exchange-agent").unwrap(),
                 fee_asset: None,
             }],
@@ -6975,6 +6976,7 @@ mod tests {
                 subject: subject.clone(),
                 publisher: bloom_broker_api::Token::new("fixture-publisher").unwrap(),
                 operation_classes: vec![bloom_broker_api::ProvenanceOperationClass {
+                    economic_effects_schema: None,
                     operation_class: bloom_broker_api::Token::new("order.place").unwrap(),
                     fee_asset: None,
                 }],
@@ -7007,6 +7009,7 @@ mod tests {
             bloom_broker_api::Digest32::from_bytes(digest.finalize().into())
         };
         let claim = bloom_broker_api::PetalUseClaim {
+            economic_effects: None,
             package_hash: bloom_broker_api::Digest32::from_bytes([0xbb; 32]),
             route: context.route_id.clone(),
             operation_class: bloom_broker_api::Token::new("order.place").unwrap(),
@@ -7153,6 +7156,7 @@ mod tests {
                 },
                 publisher: bloom_broker_api::Token::new("fixture-publisher").unwrap(),
                 operation_classes: vec![bloom_broker_api::ProvenanceOperationClass {
+                    economic_effects_schema: None,
                     operation_class: bloom_broker_api::Token::new(class).unwrap(),
                     fee_asset: None,
                 }],
@@ -7199,6 +7203,7 @@ mod tests {
             bloom_broker_api::Digest32::from_bytes(digest.finalize().into())
         };
         let claim = bloom_broker_api::PetalUseClaim {
+            economic_effects: None,
             package_hash: bloom_broker_api::Digest32::from_bytes([0xbb; 32]),
             route: context.route_id.clone(),
             operation_class: bloom_broker_api::Token::new(class).unwrap(),
@@ -7992,6 +7997,7 @@ mod tests {
                     publisher: bloom_broker_api::Token::new("bloom-installer").unwrap(),
                     petal_lineage: None,
                     operation_classes: vec![bloom_broker_api::ProvenanceOperationClass {
+                        economic_effects_schema: None,
                         operation_class: bloom_broker_api::Token::new("transaction.confirm")
                             .unwrap(),
                         fee_asset: Some(bloom_broker_api::ProvenanceFeeAsset {
@@ -8011,6 +8017,7 @@ mod tests {
                     publisher: bloom_broker_api::Token::new("bloom-installer").unwrap(),
                     petal_lineage: None,
                     operation_classes: vec![bloom_broker_api::ProvenanceOperationClass {
+                        economic_effects_schema: None,
                         operation_class: bloom_broker_api::Token::new("solana.native-transfer")
                             .unwrap(),
                         fee_asset: Some(bloom_broker_api::ProvenanceFeeAsset {
@@ -9372,6 +9379,7 @@ allowed = ["bloom:vfs.read"]
             })
             .collect::<Vec<_>>();
         let claim = bloom_broker_api::PetalUseClaim {
+            economic_effects: None,
             package_hash: bloom_broker_api::Digest32::new("ab".repeat(32)).unwrap(),
             route: "r000001".into(),
             operation_class: bloom_broker_api::Token::new("test.intent").unwrap(),

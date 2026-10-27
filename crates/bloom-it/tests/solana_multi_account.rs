@@ -463,6 +463,7 @@ async fn two_active_solana_children_select_sign_and_reconcile_independently() ->
         publisher: tok("bloom-installer"),
         petal_lineage: None,
         operation_classes: vec![ProvenanceOperationClass {
+            economic_effects_schema: None,
             operation_class: tok(op),
             fee_asset: Some(ProvenanceFeeAsset {
                 chain: tok(chain),
