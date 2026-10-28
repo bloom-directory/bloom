@@ -2,6 +2,9 @@
 
 ## What the testing establishes
 
+Remaining work and acceptance criteria are in the
+[finish plan](../plans/2026-10-28-finish-shopping-checkout.md).
+
 Eleven merchant payment preparations passed across Shopify and WooCommerce/
 Stripe. Separate real-service tests completed Stripe TEST payments, simulated
 bank challenges and declines, custody enrollment/deletion, and browser recovery.
