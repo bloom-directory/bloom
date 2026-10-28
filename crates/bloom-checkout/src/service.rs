@@ -559,12 +559,17 @@ impl CheckoutService {
                 .filter(|(field, _)| !matches!(field.as_str(), "gender" | "document_kind"))
                 .map(|(field, value)| (value.to_string(), format!("[saved {field}]")))
                 .chain(
-                    ["phone_national", "phone_local", "born_on_dmy"]
-                        .into_iter()
-                        .filter_map(|field| {
-                            derived_traveler_value(&values, field)
-                                .map(|value| (value.to_string(), format!("[saved {field}]")))
-                        }),
+                    [
+                        "phone_national",
+                        "phone_local",
+                        "born_on_dmy",
+                        "born_on_mdy",
+                    ]
+                    .into_iter()
+                    .filter_map(|field| {
+                        derived_traveler_value(&values, field)
+                            .map(|value| (value.to_string(), format!("[saved {field}]")))
+                    }),
                 ),
         );
         for field in ["born_on", "document_expiry"] {
@@ -725,6 +730,7 @@ impl CheckoutService {
             "born_on_month",
             "born_on_day",
             "born_on_dmy",
+            "born_on_mdy",
         ] {
             if values.contains_key(field) {
                 continue;
@@ -768,6 +774,10 @@ impl CheckoutService {
                     format!("{month}/{day}/{year}"),
                     format!("{day:02}/{month:02}/{year}"),
                     format!("{month:02}/{day:02}/{year}"),
+                    format!("{day}-{month}-{year}"),
+                    format!("{month}-{day}-{year}"),
+                    format!("{day:02}-{month:02}-{year}"),
+                    format!("{month:02}-{day:02}-{year}"),
                 ];
                 for name in [names[month - 1], &names[month - 1][..3]] {
                     forms.extend([
@@ -3647,7 +3657,7 @@ mod tests {
     #[tokio::test]
     async fn typed_traveler_values_reach_the_chosen_field_but_not_the_agent() {
         let (url, server) = crate::discovery::tests::fixture(
-            "<div><div>Teléfono *</div><input name='n1'></div><div><div>Nacimiento</div><input name='n2'></div>".into(),
+            "<div><div>Teléfono *</div><input name='n1'></div><div><div>Nacimiento</div><input name='n2'></div><label>Birthdate (MM-DD-YYYY)<input name='n3' oninput='document.getElementById(&quot;echo&quot;).textContent=this.value.replaceAll(&quot;/&quot;,&quot;-&quot;)'></label><p id='echo'></p>".into(),
         )
         .await;
         let root = tempfile::tempdir().unwrap().keep();
@@ -3682,12 +3692,7 @@ mod tests {
                 .as_str(),
             "91123456789"
         );
-        browser.redact(["phone_national", "born_on_dmy"].into_iter().map(|f| {
-            (
-                derived_traveler_value(&values, f).unwrap().to_string(),
-                format!("[saved {f}]"),
-            )
-        }));
+        CheckoutService::remember_fill(&browser, &values);
         service.travelers.lock().await.insert(
             "fixture".into(),
             UnlockedTraveler {
@@ -3702,9 +3707,19 @@ mod tests {
                 expires: tokio::time::Instant::now() + Duration::from_secs(60),
             },
         );
-        for (index, field) in [(0, "phone_national"), (1, "born_on_dmy")] {
+        for (index, field) in [
+            (0, "phone_national"),
+            (1, "born_on_dmy"),
+            (2, "born_on_mdy"),
+        ] {
             let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
-            let element_ref = snapshot["elements"][index]["ref"]
+            let element_ref = snapshot["elements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|e| e["role"] == "input")
+                .nth(index)
+                .unwrap()["ref"]
                 .as_str()
                 .unwrap()
                 .to_owned();
@@ -3727,9 +3742,24 @@ mod tests {
             .to_string();
         assert!(snapshot.contains("[saved phone_national]"), "{snapshot}");
         assert!(snapshot.contains("[saved born_on_dmy]"), "{snapshot}");
-        assert!(!snapshot.contains("91123456789") && !snapshot.contains("07/05/1990"));
+        assert!(snapshot.contains("[saved born_on_mdy]"), "{snapshot}");
+        assert!(
+            !snapshot.contains("91123456789")
+                && !snapshot.contains("07/05/1990")
+                && !snapshot.contains("05/07/1990")
+                && !snapshot.contains("05-07-")
+        );
         // Discarding the booking context (a finished checkout) ends the unlock.
-        browser.handoff().await.unwrap();
+        let tab = browser.handoff().await.unwrap();
+        let actual = tab
+            .cdp
+            .evaluate(
+                &tab.session,
+                "[...document.querySelectorAll('input')].map(e=>e.value)".into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(actual, json!(["91123456789", "07/05/1990", "05/07/1990"]));
         browser.return_control().await.unwrap();
         browser.browse(BrowseRequest::Open { url }).await.unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;

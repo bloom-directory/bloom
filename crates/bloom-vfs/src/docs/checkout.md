@@ -36,7 +36,9 @@ tool for this checkout.
   `phone_national` (no country code, when the page shows the prefix
   separately), `phone_area` and `phone_local` (area code and number, split by
   the country's numbering plan), `born_on_day`, `born_on_month`,
-  `born_on_year` or `born_on_dmy`.
+  `born_on_year`, `born_on_dmy` (day/month/year), or `born_on_mdy`
+  (month/day/year). Follow the field's stated date order; never guess from
+  the website's language or country.
   Snapshots show unlocked values as `[saved <field>]`; check each field holds
   the right placeholder, and never try to recover the values.
   Custom selector captions and saved radio choices are masked too. While
