@@ -105,6 +105,15 @@ pub(crate) fn derived_traveler_value(
                 born.get(0..4)?
             )))
         }
+        "born_on_mdy" => {
+            let born = values.get("born_on")?;
+            Some(Zeroizing::new(format!(
+                "{}/{}/{}",
+                born.get(5..7)?,
+                born.get(8..10)?,
+                born.get(0..4)?
+            )))
+        }
         _ => values.get(field).cloned(),
     }
 }
