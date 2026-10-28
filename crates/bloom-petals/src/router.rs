@@ -1001,6 +1001,7 @@ mod tests {
 
     use super::*;
     use crate::host::{DenyHost, HostError, HostVfsEntry, HostVfsEntryKind, PetalHost};
+    use crate::package::route_fixtures::FixtureWrite;
     use crate::registry::NameRegistry;
     use crate::store::PetalStore;
     use crate::vm::PetalVm;
@@ -1285,7 +1286,9 @@ namespaces = ["wallets"]
         );
     }
 
-    fn write_async_failing_package(root: &std::path::Path) {
+    /// A package whose single `submit` route declares `write-async` — Bloom
+    /// must wait for it anyway — and writes as `write` says.
+    fn write_route_package(root: &std::path::Path, write: FixtureWrite) {
         write_package_file(
             root,
             "petal.toml",
@@ -1298,7 +1301,7 @@ name = "example"
         write_package_file(
             root,
             "petal/example/operations/[wallet]/[index]/submit.wasm",
-            &crate::package::route_fixtures::async_failing_write_route_component(),
+            &crate::package::route_fixtures::write_route_component(write),
         );
     }
 
@@ -1882,12 +1885,11 @@ name = "example"
     async fn write_errors_are_returned_and_kept_in_last_error() {
         let (dir, runner) = runner();
         let package = dir.path().join("example-app");
-        // The failing route declares write_async; Bloom must still wait for it.
-        write_async_failing_package(&package);
+        write_route_package(&package, FixtureWrite::Denied);
         write_package_file(
             &package,
             "petal/example/operations/[wallet]/[index]/accept.wasm",
-            &crate::package::route_fixtures::accepting_write_route_component(),
+            &crate::package::route_fixtures::write_route_component(FixtureWrite::Accepting),
         );
         runner.store().install_petal_package_dir(&package).unwrap();
         let router = PetalRouter::new(runner, Arc::new(AccountHost));
@@ -1935,10 +1937,31 @@ name = "example"
     }
 
     #[tokio::test]
+    async fn a_trapping_route_records_the_host_error_it_has_no_reason_for() {
+        let (dir, runner) = runner();
+        let package = dir.path().join("example-app");
+        write_route_package(&package, FixtureWrite::Trapping);
+        runner.store().install_petal_package_dir(&package).unwrap();
+        let router = PetalRouter::new(runner, Arc::new(AccountHost));
+        let vfs = Vfs::builder().mount("petals", Arc::new(router)).build();
+        let failing = VfsPath::parse("/petals/example/operations/alice/0/submit").unwrap();
+        let last_error = VfsPath::parse("/petals/example/last_error.json").unwrap();
+
+        // A trap is not a route refusal, so there is no message to keep; the
+        // record falls back to the host error and must still name the path.
+        let error = vfs.write(&failing, b"payload").await.unwrap_err();
+        let record: serde_json::Value =
+            serde_json::from_slice(&vfs.read(&last_error).await.unwrap()).unwrap();
+        assert_eq!(record["path"], "operations/alice/0/submit");
+        assert_eq!(record["error"], error.to_string());
+        assert!(!record["error"].as_str().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn only_the_failing_path_clears_its_own_record() {
         let (dir, runner) = runner();
         let package = dir.path().join("example-app");
-        write_async_failing_package(&package);
+        write_route_package(&package, FixtureWrite::Denied);
         runner.store().install_petal_package_dir(&package).unwrap();
         let router = PetalRouter::new(runner, Arc::new(AccountHost));
 
@@ -1968,7 +1991,7 @@ name = "example"
     async fn an_uninstalled_mount_serves_no_record() {
         let (dir, runner) = runner();
         let package = dir.path().join("example-app");
-        write_async_failing_package(&package);
+        write_route_package(&package, FixtureWrite::Denied);
         runner.store().install_petal_package_dir(&package).unwrap();
         let router = PetalRouter::new(runner, Arc::new(AccountHost));
         router.record_write_error("example", "operations/a", "first");
