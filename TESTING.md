@@ -121,6 +121,11 @@ not submit a live purchase. It requires a fresh developer Triad launched with
 An installed custody origin, existing saved cards or shopping history are
 refused. Broker's four-ceremony/five-minute admission limit stays enabled.
 
+Build the disposable Checkout with `cargo build -p bloom-checkout --features
+triad-dev-harness --locked` before using `--checkout-fixture-tls`. Production
+Checkout deliberately rejects that fixture-only TLS flag. A strict-TLS merchant
+rehearsal does not need either the flag or this Checkout feature.
+
 With explicit paths for that disposable candidate:
 
 ```sh
