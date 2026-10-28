@@ -63,6 +63,9 @@ tool for this checkout.
   those controls, including on-page filters, remain usable.
 - Use fresh snapshot refs after every action. The browser rejects direct
   card entry and recognizable payment submission through shopping controls.
+  Use elements whose `role` is `input` or `textarea` for `type`, and `select`
+  for `select`. A label or button with the same name opens or focuses a field;
+  click it, then take a new snapshot to find the actual input.
 - Shops load controls in stages. If a control is missing or the document
   changed, request another snapshot before concluding it is unavailable.
   Check each product's required size, format and purchase frequency; radio

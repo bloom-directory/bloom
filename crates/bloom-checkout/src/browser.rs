@@ -587,6 +587,11 @@ impl Browser {
             } else {
                 description
             };
+            if reason.lines().next() == Some("Error: wrong field") {
+                bail!(
+                    "Choose an input for typing or a select for selection; request a new snapshot"
+                );
+            }
             if reason
                 .lines()
                 .next()
@@ -1323,7 +1328,9 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .find(|e| matches!(e["label"].as_str(), Some("Origen" | "Origin")))
+                .find(|e| {
+                    e["role"] == "input" && matches!(e["label"].as_str(), Some("Origen" | "Origin"))
+                })
                 .and_then(|e| e["ref"].as_str())
                 .map(str::to_owned);
             if reference.is_some() {
@@ -1349,7 +1356,9 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .find(|e| e["label"] == "Origen")
+                .find(|e| {
+                    e["role"] == "input" && matches!(e["label"].as_str(), Some("Origen" | "Origin"))
+                })
                 .unwrap()["ref"]
                 .as_str()
                 .unwrap()
@@ -1375,22 +1384,17 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(500)).await;
             if let Ok(snapshot) = browser.browse(BrowseRequest::Snapshot).await {
                 after = snapshot;
-                if after["text"].as_str().unwrap().contains("COR") {
+                if after["elements"].as_array().unwrap().iter().any(|e| {
+                    e["label"]
+                        .as_str()
+                        .is_some_and(|label| label.contains("COR"))
+                }) {
                     break;
                 }
             }
         }
-        let labels = after["elements"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|e| e["label"].as_str())
-            .collect::<Vec<_>>();
-        assert!(
-            after["text"].as_str().unwrap().contains("COR"),
-            "Expected Córdoba airport suggestion; got labels {labels:?}, text {}",
-            after["text"]
-        );
+        // The control projection carries suggestions even when AX hides the
+        // combobox subtree to avoid repeating private field values in text.
         let airport = after["elements"]
             .as_array()
             .unwrap()
@@ -1469,6 +1473,14 @@ mod tests {
                 .await
                 .is_err()
         );
+        let wrong_field = browser
+            .browse(BrowseRequest::Type {
+                element_ref: reference(&before, "Select itinerary"),
+                text: "Cordoba".into(),
+            })
+            .await
+            .unwrap_err();
+        assert!(wrong_field.to_string().contains("Choose an input"));
         browser
             .browse(BrowseRequest::Click {
                 element_ref: reference(&before, "Select itinerary"),

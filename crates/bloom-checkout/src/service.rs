@@ -2218,6 +2218,7 @@ const BROWSE_ERRORS: &[&str] = &[
     "Only ordinary HTTP(S) shopping URLs are supported",
     "Only ordinary shopping documents can be observed",
     "Shopping document changed; request a new snapshot",
+    "Choose an input for typing or a select for selection; request a new snapshot",
     "Invalid element reference",
     "Stale element reference; request a new snapshot",
     "payment requires approval",
