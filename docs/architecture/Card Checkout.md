@@ -50,7 +50,10 @@ total in a supported language and number format, or processor data for
 Stripe-hosted pages. If facts are unclear, the request falls back to a manual
 ceremony that releases no card, and the human finishes in the private view.
 Explicit contact-only marketing signup blocks are excluded from payment
-controls and recurring charge terms. Native submit controls repeated within
+controls and recurring charge terms. An offscreen newsletter text trap is
+ignored only when keyboard and assistive access are disabled and it is not
+card-like; other extra fields preserve ambiguity. Native submit controls repeated
+within
 one form represent the same action only when their labels, destinations,
 methods, name/value payloads and inline handlers agree. Distinct payment
 actions remain ambiguous. Repeated Stripe prices must all agree with the

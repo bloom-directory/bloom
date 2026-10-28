@@ -1,9 +1,9 @@
 # Shopping checkout acceptance, 2026-10-27
 
-Ten different merchants reached their final card checkout through Bloom's
+Eleven different merchants reached their final card checkout through Bloom's
 normal `checkout/browse` VFS. Each accepted synthetic contact and billing
 details, resolved shipping where applicable, exposed its payment control and
-reviewed Shopify card fields, and passed saved-card payment discovery.
+reviewed Shopify or Stripe card fields, and passed saved-card payment discovery.
 No live card was entered and no live order was submitted.
 
 | Merchant | Product | Displayed total (USD) |
@@ -18,11 +18,13 @@ No live card was entered and no live order was submitted.
 | [Hario](https://www.hario-usa.com/products/v60-plastic-coffee-dripper-02) | V60 plastic dripper, white, size 02 | 24.12 |
 | [Death Wish Coffee](https://www.deathwishcoffee.com/products/death-wish-coffee) | Dark roast, whole bean, 1 lb | 32.46 |
 | [theory11](https://store.theory11.com/products/monarchs) | Monarchs playing cards, one deck | 21.59 |
+| [Offerman Woodshop](https://offermanwoodshop.com/store/) | Good Clean Fun, autographed book | 51.23 |
 
 These are observed quotes for synthetic US delivery details, not advertised
 prices or promises about future tax, shipping, inventory or authorization.
-All ten real merchants use Shopify; this is merchant and checkout-layout
-coverage, not ten independent processors. Hario and theory11 exercise separate
+The first ten merchants use Shopify; Offerman uses WooCommerce with Stripe
+secure fields. This is merchant and checkout-layout coverage across two
+platforms, not eleven independent processors. Hario and theory11 exercise separate
 information, shipping and payment steps. Simply On Purpose needs no shipping.
 
 The test driver invoked the same CLI VFS actions available to a shopper:
@@ -238,3 +240,37 @@ and active GUI-login inputs remain unavailable; runner inventory returned403.
 Unlanded dependencies, independent review and specific merge approval remain
 separate gates. This evidence does not establish universal merchant support
 or live-bank authorization.
+
+## WooCommerce follow-up
+
+Runtime `553c5e4891143177bba5f040f227fa3c781ca7ae` also completed Offerman
+Woodshop preparation at USD51.23 through the normal VFS, with Chromium's
+sandbox and normal TLS validation. Media Mail was selected at $7.13; the $44.10
+subtotal included $4.10 tax. The three card fields were served by `js.stripe.com`.
+After the fix, history recorded 5123/USD with no preparation refusal before
+Broker rejected the deliberately nonexistent card. No card was entered or
+order submitted. This is the eleventh completed merchant preparation.
+
+The first attempt exposed another newsletter collision. A text field used as
+a bot trap made the newsletter block appear to contain a customer field. A
+normal Chromium diagnostic confirmed that it was entirely offscreen, removed
+from keyboard navigation and inside an `aria-hidden` block. The classifier now
+ignores only that combination for non-private text fields. Visible, focusable,
+assistively accessible, card-like and password fields preserve ambiguity.
+Making the trap visible after preparation also refuses submission without a
+second click. The payment-control regression now covers 25 scenarios. All 99
+checkout tests, real process recovery and strict Clippy passed.
+
+The earlier `7fd3ca5a` runtime additionally passed all four real public Stripe
+Elements TEST cases and a fresh strict-TLS bank challenge through the protected
+image/click view, including custody deletion. Its three-platform release dry
+run passed and its Mac candidate passed all checkout/browser/crash checks.
+That Mac run is still in installed isolation.
+
+The final runtime's seven real-service checks also passed, including an actual
+Stripe TEST payment, exactly-once site-saved submission and custody deletion.
+The
+[release40639701386](https://github.com/bloom-directory/bloom/actions/runs/40639701386)
+and [Mac40639706432](https://github.com/bloom-directory/bloom/actions/runs/40639706432)
+are running. The two-login runner, unlanded dependencies and independent review
+remain separate gates; nothing has been merged or production-published.
