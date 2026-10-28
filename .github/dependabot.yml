@@ -15,11 +15,15 @@ updates:
       # Exact `=1.8.0` pin in bloom-paid-mpp; moves by hand.
       - dependency-name: tempo-alloy
     groups:
-      # First matching group wins, so wasmtime and wasmtime-wasi move together.
+      # Keep the runtime security updates independent of other Cargo bumps.
       wasmtime:
         patterns:
-          - "wasmtime*"
+          - "wasmtime"
+          - "wasmtime-wasi"
       cargo-minor-and-patch:
+        exclude-patterns:
+          - "wasmtime"
+          - "wasmtime-wasi"
         update-types:
           - minor
           - patch
