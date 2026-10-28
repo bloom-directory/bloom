@@ -148,7 +148,7 @@ JSON instead of compiling an obsolete Broker/runtime dependency. The pin audit
 now fails only because the two dependencies have not landed; its inconsistent
 revision findings are resolved. No merge or approval requirement was waived.
 
-Final runtime verification at `679146b36791450761b4959406b4bf2ae1d92cc4`,
+Baseline runtime verification at `679146b36791450761b4959406b4bf2ae1d92cc4`,
 with those exact Broker/Signer revisions:
 
 - All seven real-service checks passed: custody card enrollment, isolation
@@ -176,8 +176,65 @@ results, logs and executable SHA-256 values are retained in the workspace's
 artifacts. These are developer-service tests with a software passkey; they
 do not replace installed OS-principal conformance.
 
-The exact-runtime [three-platform release dry run](https://github.com/bloom-directory/bloom/actions/runs/40619324801)
-and [single-Mac conformance run](https://github.com/bloom-directory/bloom/actions/runs/40619330497)
-were dispatched with explicit sibling revisions. Their results must be checked
-before claiming release readiness. The required two-login macOS runner and
-active GUI-login inputs remain unavailable; runner inventory returned403.
+That baseline's [three-platform release dry run](https://github.com/bloom-directory/bloom/actions/runs/40619324801)
+and [single-Mac conformance](https://github.com/bloom-directory/bloom/actions/runs/40619330497)
+passed with the explicit sibling revisions above, including installed W0.
+
+## Further shopping and flight use
+
+Runtime `7f67e430` passed all seven real-service checks again. Failed browser
+cleanup now enters the existing supervised restart path, preserving the known
+payment result instead of leaving shopping permanently paused. A real process
+test verifies restart on the same state and socket with the booking intact.
+
+A further real VFS journey selected Aerolíneas COR–AEP, one adult, one-way on
+31 October 2026, at the displayed final fare ARS120,484.95. Search, airport
+suggestions, calendar and fare selection worked. The early Comprar button
+required the existing private take-over; its approval bought nothing. The
+synthetic person advanced the fare and baggage warning through the protected
+image/click view, then returned control on the passenger form.
+
+Real Broker/Signer ceremonies saved and unlocked a synthetic traveler. The
+passenger form filled ten categories privately. This found and fixed two
+defects at `6da48d5f`:
+
+- US phone formatting uses hyphens as well as spaces. The former split treated
+  the full national number as its area code and produced an empty local number.
+  US, UK, Australian and Argentine regressions now verify both parts. The real
+  airline accepted the corrected split fields. Choosing its calling-code
+  selector first avoids the site's subsequent clearing of the number.
+- Custom date/country selectors displayed saved values beside emptied inputs;
+  radio checked-state also revealed the selected saved gender. The smallest
+  rendered choice wrappers and radio groups are now masked in labels, context
+  and selection state. Their page text uses the masked control projection.
+  A realistic regression preserves public fare controls with identical digits.
+  The repeated real airline snapshot contained none of the synthetic saved
+  names, document, email, month/country labels or years.
+
+After the passenger form passed its field checks, the airline redirected to
+`/checkout-error`: “No pudimos validar la verificación de seguridad.” This
+flight is **not** counted as a completed checkout. No security challenge was
+bypassed, ticket ordered or live payment attempted. Both runs deleted the
+synthetic card and traveler through custody. Checkout's browser used normal
+TLS validation and its sandbox. The earlier strict-TLS Stripe TEST3DS2 run also passed
+its enrollment, protected bank challenge and custody deletion checks.
+
+Mac run40633928931 exposed a catalog timeout while serializing its huge AX
+outline. Runtime `7fd3ca5aaf73af7b321b182a53eefb01a57e23cf` skips that work
+when the document already exceeds the 30,000-character public text budget.
+The bounded control projection stays usable; reply-size protection remains.
+Its real large-catalog test passed in1.65 seconds locally, all99 checkout
+library tests passed (8 opt-in exclusions), and subprocess recovery, strict
+Clippy and VFS source embedding passed.
+
+All seven real-service acceptance checks passed again at this final runtime,
+using a fresh developer triad and the exact sibling revisions above. The
+local synthetic merchant fixtures need the developer TLS exception; they do
+not replace strict-TLS or installed-principal verification. The
+[release dry run](https://github.com/bloom-directory/bloom/actions/runs/40636365930)
+and [Mac conformance](https://github.com/bloom-directory/bloom/actions/runs/40636370662)
+are running; queued checks are not passes. The required two-login macOS runner
+and active GUI-login inputs remain unavailable; runner inventory returned403.
+Unlanded dependencies, independent review and specific merge approval remain
+separate gates. This evidence does not establish universal merchant support
+or live-bank authorization.
