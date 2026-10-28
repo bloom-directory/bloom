@@ -1944,6 +1944,7 @@ fn route_records_from_files(
             has_app_file = true;
             if rel.ends_with(".wasm") {
                 let pattern = route_pattern_from_rel(rel)?;
+                reject_host_reserved_pattern(&pattern)?;
                 routes.push(RouteRecord {
                     route_id: String::new(),
                     params: route_params(&pattern)?,
@@ -1951,6 +1952,8 @@ fn route_records_from_files(
                     pattern,
                     source_path: PathBuf::from(&file.path),
                 });
+            } else {
+                reject_host_reserved_pattern(rel)?;
             }
         }
     }
@@ -1981,6 +1984,18 @@ fn validate_single_petal_root(
                 "Petal package has extra petal root {root:?}; expected only petal/{expected}/"
             )));
         }
+    }
+    Ok(())
+}
+
+/// Reject a package path the host serves itself at the Petal's mount root.
+/// The router shadows such a name on every operation, so accepting it at
+/// install would land a route that can never be reached.
+fn reject_host_reserved_pattern(pattern: &str) -> Result<(), PetalError> {
+    if pattern == crate::router::LAST_ERROR {
+        return Err(PetalError::InvalidWasm(format!(
+            "{pattern} at the Petal root is served by Bloom; rename it"
+        )));
     }
     Ok(())
 }
@@ -5014,6 +5029,25 @@ name = "foo.bar"
 
         let err = PreparedPetalPackage::from_dir(tmp.path()).unwrap_err();
         assert!(err.to_string().contains("too long for strict .petal.tar"));
+    }
+
+    /// `last_error.json` at a Petal's root is served by the host on every
+    /// operation, so a package route or file of that name could never be
+    /// reached. Refuse it at install rather than installing something dead.
+    #[test]
+    fn petal_scanner_rejects_a_host_served_root_name() {
+        for name in ["last_error.json.wasm", "last_error.json"] {
+            let tmp = tempfile::tempdir().unwrap();
+            write_petal_package(tmp.path());
+            write_package_file(
+                tmp.path(),
+                &format!("petal/echo/{name}"),
+                route_component_no_imports(),
+            );
+
+            let err = PreparedPetalPackage::from_dir(tmp.path()).unwrap_err();
+            assert!(err.to_string().contains("served by Bloom"), "{name}: {err}");
+        }
     }
 
     #[test]
