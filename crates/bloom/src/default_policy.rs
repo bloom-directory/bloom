@@ -79,15 +79,32 @@ pub(crate) fn select_persona(
 }
 
 /// Ask which persona `main` uses. An empty answer, or the end of input,
-/// keeps Institutional.
+/// keeps Institutional. `any_recipient_chains` names the configured chains
+/// Degen would open to any recipient ([`any_recipient_chain_names`]).
 pub(crate) fn run_persona_menu(
     saved: &mut Option<PersonaConfig>,
+    any_recipient_chains: &[String],
     input: &mut impl BufRead,
     output: &mut impl Write,
 ) -> Result<()> {
     writeln!(
         output,
-        "Persona for main: Institutional keeps each Petal's suggested limits and only recipients your policy lists; Trader suggests larger limits; Degen suggests the largest and lets the wallet send ERC-20 tokens to any recipient on Ethereum and Polygon. Every transaction still needs your approval."
+        "Persona for main. Every transaction still needs your approval."
+    )?;
+    writeln!(
+        output,
+        "  institutional: {}",
+        persona_behaviour(PersonaPreset::Custodian, any_recipient_chains)
+    )?;
+    writeln!(
+        output,
+        "  trader: {}",
+        persona_behaviour(PersonaPreset::Trader, any_recipient_chains)
+    )?;
+    writeln!(
+        output,
+        "  degen: {}",
+        persona_behaviour(PersonaPreset::Degen, any_recipient_chains)
     )?;
     loop {
         write!(
@@ -104,7 +121,11 @@ pub(crate) fn run_persona_menu(
         match answer.parse::<PersonaPreset>() {
             Ok(preset) => {
                 select_persona(saved, Some(preset))?;
-                writeln!(output, "{}", persona_message(saved.as_ref()))?;
+                writeln!(
+                    output,
+                    "{}",
+                    persona_message(saved.as_ref(), any_recipient_chains)
+                )?;
                 return Ok(());
             }
             Err(error) => writeln!(output, "{error}")?,
@@ -112,23 +133,89 @@ pub(crate) fn run_persona_menu(
     }
 }
 
-/// What the saved persona means for `main`, shown after it is chosen and by
-/// `bloom init`. A home without one behaves as Institutional.
-pub(crate) fn persona_message(persona: Option<&PersonaConfig>) -> String {
-    let default = PersonaConfig::default();
-    let persona = persona.unwrap_or(&default);
-    let behaviour = match persona.preset {
-        PersonaPreset::Custodian => "only recipients your policy lists",
-        PersonaPreset::Trader => "larger suggested Petal limits; only recipients your policy lists",
-        PersonaPreset::Degen => {
-            "the largest suggested Petal limits; ERC-20 sends from your wallet may go to any recipient on Ethereum and Polygon"
+/// What a persona does: what setup suggests, and what it asks `main`'s
+/// policy to allow. It describes the persona, not the wallet's current policy.
+fn persona_behaviour(preset: PersonaPreset, any_recipient_chains: &[String]) -> String {
+    match preset {
+        PersonaPreset::Custodian => "suggests each Petal's usual limits".to_owned(),
+        PersonaPreset::Trader => "suggests larger Petal limits".to_owned(),
+        PersonaPreset::Degen if any_recipient_chains.is_empty() => {
+            "suggests the largest Petal limits; it would allow curated ERC-20 transfers to any recipient on Ethereum or Polygon, but neither is configured".to_owned()
         }
-    };
-    let name = match persona.preset {
+        PersonaPreset::Degen => format!(
+            "suggests the largest Petal limits and asks main's policy to allow curated ERC-20 transfers to any recipient on {}",
+            any_recipient_chains.join(" and ")
+        ),
+    }
+}
+
+/// The name an owner chooses a persona by.
+fn persona_name(preset: PersonaPreset) -> &'static str {
+    match preset {
         PersonaPreset::Custodian => "institutional",
         other => other.as_str(),
+    }
+}
+
+/// What the saved persona means for `main`, shown after it is chosen and by
+/// `bloom init`. A home without one behaves as Institutional.
+pub(crate) fn persona_message(
+    persona: Option<&PersonaConfig>,
+    any_recipient_chains: &[String],
+) -> String {
+    let preset = persona.map_or(PersonaPreset::Custodian, |persona| persona.preset);
+    format!(
+        "persona: {}; {}; each transaction still needs your approval",
+        persona_name(preset),
+        persona_behaviour(preset, any_recipient_chains)
+    )
+}
+
+/// What `bloom init` adds when it saves a different persona on a home whose
+/// setup already ran: the persona does not reach back into choices already
+/// made. Empty when nothing changed or this is first setup.
+pub(crate) fn persona_change_notes(
+    wallet: &str,
+    previous: Option<&PersonaConfig>,
+    current: Option<&PersonaConfig>,
+) -> Vec<String> {
+    let preset = |persona: Option<&PersonaConfig>| {
+        persona.map_or(PersonaPreset::Custodian, |persona| persona.preset)
     };
-    format!("persona: {name}; {behaviour}; each transaction still needs your approval")
+    let (before, after) = (preset(previous), preset(current));
+    if before == after {
+        return Vec::new();
+    }
+    let mut notes = vec![format!(
+        "persona_note: {} is saved for {wallet}'s next default-policy proposal; Petal limits chosen during setup are unchanged, so change them through each Petal's settings",
+        persona_name(after)
+    )];
+    if after == PersonaPreset::Degen {
+        notes.push(format!(
+            "persona_note: run `bloom wallet default-policy {wallet}`; if {wallet}'s policy has changed since it was created, Bloom proposes nothing, and that command shows how to add {PERSONA_TRANSFERS} yourself"
+        ));
+    }
+    if before == PersonaPreset::Degen {
+        notes.push(format!(
+            "persona_note: Bloom does not remove {PERSONA_TRANSFERS} from {wallet}'s policy; `bloom wallet default-policy {wallet}` reports whether it still allows them, and how to remove them"
+        ));
+    }
+    notes
+}
+
+/// Display names of the configured chains Degen would open to any recipient.
+pub(crate) fn any_recipient_chain_names(
+    chains: &BTreeMap<String, bloom_proto::ChainSpec>,
+) -> Vec<String> {
+    bloom_daemon::any_recipient_chains(chains)
+        .into_iter()
+        .map(|chain| {
+            chain
+                .display_name
+                .clone()
+                .unwrap_or_else(|| chain.name.clone())
+        })
+        .collect()
 }
 
 /// Ask which Petals to use and the values each chosen Petal's settings need.
@@ -1089,6 +1176,24 @@ fn settings_not_written(name: &str, settings: &PetalSettingsWrite, reason: &str)
 
 /// Say which setup writes are still queued and how to retry them, since the
 /// command stops once the policy is settled.
+/// Say what the policy still allows beyond the saved persona, and how to
+/// remove it. Bloom never removes an entry itself.
+fn report_beyond_persona(
+    output: &mut dyn Write,
+    wallet: &str,
+    beyond_persona: &[String],
+) -> Result<()> {
+    if !beyond_persona.is_empty() {
+        writeln!(
+            output,
+            "default_policy: {wallet}'s policy still allows {}, which the saved persona does not propose; Bloom never removes an entry. To remove it, save `bloom vfs cat /wallets/{wallet}/policy.json` to a file, delete its \"{}\" entries from allowed_destinations, and run `bloom wallet update-policy {wallet} --file <that file>`",
+            beyond_persona.join(", "),
+            bloom_proto::policy::ERC20_ANY_RECIPIENT
+        )?;
+    }
+    Ok(())
+}
+
 fn report_settings_pending(
     output: &mut dyn Write,
     wallet: &str,
@@ -1151,6 +1256,11 @@ pub(crate) enum DefaultPolicyStatus {
         /// Setup writes that failed this time and stay queued.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         settings_pending: Vec<String>,
+        /// What the policy still allows that the saved persona does not
+        /// propose, such as Degen's transfers after the owner chose another
+        /// persona. Bloom never removes it; the owner can.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        beyond_persona: Vec<String>,
     },
     /// The policy has changed since the wallet was created and does not allow
     /// `missing`. Only a new wallet's policy is proposed, so nothing is.
@@ -1159,6 +1269,9 @@ pub(crate) enum DefaultPolicyStatus {
         /// Setup writes that failed this time and stay queued.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         settings_pending: Vec<String>,
+        /// As for `Applied`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        beyond_persona: Vec<String>,
     },
     /// Another command holds the wallet's policy lock; ask again shortly.
     Busy,
@@ -1173,9 +1286,10 @@ pub(crate) async fn advance_default_policy(
     wallet: &str,
     owner_just_chose: bool,
 ) -> Result<DefaultPolicyStatus> {
-    let mut petals = Vec::new();
-    let mut packages = Vec::new();
-    let mut destinations = Vec::new();
+    let mut request = DefaultPolicyRequest {
+        persona_applies: wallet == DEFAULT_POLICY_WALLET,
+        ..DefaultPolicyRequest::default()
+    };
     for name in daemon.config.petals.setup.keys() {
         let Some(hash) = daemon
             .petals
@@ -1185,28 +1299,31 @@ pub(crate) async fn advance_default_policy(
         else {
             continue;
         };
-        packages.push(
+        request.packages.push(
             bloom_broker_api::Digest32::new(hash)
                 .with_context(|| format!("installed Petal {name} has an invalid package hash"))?,
         );
-        destinations.extend(policy_destinations(name)?);
-        petals.push(name.clone());
+        request
+            .petal_destinations
+            .extend(policy_destinations(name)?);
+        request.petals.push(name.clone());
     }
-    // The persona's own entries are required like a chosen Petal's, and are
-    // named alongside the Petals in what the owner is told.
-    let persona_destinations = if wallet == DEFAULT_POLICY_WALLET {
-        bloom_daemon::persona_policy_destinations(&daemon.config)
-    } else {
-        Vec::new()
-    };
-    let mut allowed = petals.clone();
-    if !persona_destinations.is_empty() {
-        allowed.push(PERSONA_TRANSFERS.to_owned());
+    if request.persona_applies {
+        // Read from disk now, not from the copy Machine loaded at startup, so
+        // a persona saved since then is the one proposed.
+        request.persona_destinations =
+            bloom_daemon::saved_persona_policy_destinations(&daemon.home.config_path())
+                .context("read the saved persona")?;
     }
-    destinations.extend(persona_destinations.iter().cloned());
-    if packages.is_empty() && destinations.is_empty() {
+    if request.is_empty() {
         return Ok(DefaultPolicyStatus::NothingToAllow);
     }
+    let destinations = request.destinations();
+    let after_change = if owner_just_chose {
+        bloom_vfs::handlers::AfterPolicyChange::Propose
+    } else {
+        bloom_vfs::handlers::AfterPolicyChange::Report
+    };
     let wallet_id = bloom_broker_api::Token::new(wallet.to_owned())?;
     if let ControlFlow::Break(status) =
         wallet_read_step(daemon.wallet_projections.get_wallet(&wallet_id).await)?
@@ -1223,25 +1340,23 @@ pub(crate) async fn advance_default_policy(
     }
     let eligibility = match policy_step(
         daemon
-            .ensure_default_policy(wallet, &packages, &destinations, owner_just_chose)
+            .ensure_default_policy(wallet, &request.packages, &destinations, after_change)
             .await,
     )? {
         ControlFlow::Continue(eligibility) => eligibility,
         ControlFlow::Break(status) => return Ok(status),
     };
     Ok(match eligibility {
-        bloom_machine_client::PetalEligibility::Allowed(_) => DefaultPolicyStatus::Applied {
-            petals: allowed,
+        bloom_machine_client::PetalEligibility::Allowed(current) => DefaultPolicyStatus::Applied {
+            petals: request.allowed(),
             settings_pending,
+            beyond_persona: request.beyond_persona(&current)?,
         },
         bloom_machine_client::PetalEligibility::ChangedSinceCreation(current) => {
-            let mut missing = petals_not_allowed(&current, &petals, &packages)?;
-            if !policy_allows_destinations(&current, &persona_destinations)? {
-                missing.push(PERSONA_TRANSFERS.to_owned());
-            }
             DefaultPolicyStatus::ChangedSinceCreation {
-                missing,
+                missing: request.missing(&current)?,
                 settings_pending,
+                beyond_persona: request.beyond_persona(&current)?,
             }
         }
         bloom_machine_client::PetalEligibility::AwaitingPolicyApproval(pending) => {
@@ -1255,7 +1370,7 @@ pub(crate) async fn advance_default_policy(
                     .prepare
                     .as_ref()
                     .map(|prepare| prepare.ceremony_expires_at_ms.get()),
-                petals: allowed,
+                petals: request.allowed(),
                 proposes_chosen_petals: pending.includes_requested,
             }
         }
@@ -1370,17 +1485,95 @@ fn petals_not_allowed(
 /// the chosen Petals.
 pub(crate) const PERSONA_TRANSFERS: &str = "ERC-20 transfers to any recipient";
 
-/// Whether `current` allows every one of `destinations`.
-fn policy_allows_destinations(
+/// What the default policy asks of a wallet's policy: each chosen, installed
+/// Petal's package and destinations, and the saved persona's entries. All of
+/// them are required.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct DefaultPolicyRequest {
+    /// Chosen, installed Petals, in step with `packages`.
+    pub(crate) petals: Vec<String>,
+    pub(crate) packages: Vec<bloom_broker_api::Digest32>,
+    /// What the chosen Petals' transactions need.
+    pub(crate) petal_destinations: Vec<bloom_broker_api::PolicyDestination>,
+    /// Whether the saved persona applies to this wallet: only the default
+    /// wallet has one.
+    pub(crate) persona_applies: bool,
+    /// The saved persona's entries
+    /// ([`bloom_daemon::persona_policy_destinations`]).
+    pub(crate) persona_destinations: Vec<bloom_broker_api::PolicyDestination>,
+}
+
+impl DefaultPolicyRequest {
+    /// Every destination the request needs: the Petals', then the persona's.
+    pub(crate) fn destinations(&self) -> Vec<bloom_broker_api::PolicyDestination> {
+        let mut destinations = self.petal_destinations.clone();
+        destinations.extend(self.persona_destinations.iter().cloned());
+        destinations
+    }
+
+    /// Nothing to propose: no chosen Petal is installed, and the persona adds
+    /// nothing.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.packages.is_empty() && self.destinations().is_empty()
+    }
+
+    /// What the owner is told the policy allows: the Petals, and the
+    /// persona's entries by name.
+    pub(crate) fn allowed(&self) -> Vec<String> {
+        let mut allowed = self.petals.clone();
+        if !self.persona_destinations.is_empty() {
+            allowed.push(PERSONA_TRANSFERS.to_owned());
+        }
+        allowed
+    }
+
+    /// What `current` lacks: each Petal it does not allow, and the persona's
+    /// entries when any is missing.
+    pub(crate) fn missing(
+        &self,
+        current: &bloom_broker_api::SignedPolicySnapshot,
+    ) -> Result<Vec<String>> {
+        let mut missing = petals_not_allowed(current, &self.petals, &self.packages)?;
+        let policy = decode_policy(current)?;
+        if self
+            .persona_destinations
+            .iter()
+            .any(|destination| !policy.allowed_destinations.contains(destination))
+        {
+            missing.push(PERSONA_TRANSFERS.to_owned());
+        }
+        Ok(missing)
+    }
+
+    /// What `current` allows that the saved persona does not propose: an
+    /// `erc20:any-recipient` entry on any chain the persona does not ask for,
+    /// as after switching away from Degen. Empty for a wallet the persona
+    /// does not apply to.
+    pub(crate) fn beyond_persona(
+        &self,
+        current: &bloom_broker_api::SignedPolicySnapshot,
+    ) -> Result<Vec<String>> {
+        if !self.persona_applies {
+            return Ok(Vec::new());
+        }
+        let policy = decode_policy(current)?;
+        let leftover = policy.allowed_destinations.iter().any(|destination| {
+            destination.destination == bloom_proto::policy::ERC20_ANY_RECIPIENT
+                && !self.persona_destinations.contains(destination)
+        });
+        Ok(if leftover {
+            vec![PERSONA_TRANSFERS.to_owned()]
+        } else {
+            Vec::new()
+        })
+    }
+}
+
+fn decode_policy(
     current: &bloom_broker_api::SignedPolicySnapshot,
-    destinations: &[bloom_broker_api::PolicyDestination],
-) -> Result<bool> {
-    let policy: bloom_broker_api::CanonicalWalletPolicy =
-        serde_json::from_slice(&current.canonical_policy.decode())
-            .context("decode the wallet's current policy")?;
-    Ok(destinations
-        .iter()
-        .all(|destination| policy.allowed_destinations.contains(destination)))
+) -> Result<bloom_broker_api::CanonicalWalletPolicy> {
+    serde_json::from_slice(&current.canonical_policy.decode())
+        .context("decode the wallet's current policy")
 }
 
 /// The destinations a chosen Petal's transactions need, from Bloom's catalog.
@@ -1494,24 +1687,35 @@ impl DefaultPolicyWait {
             DefaultPolicyStatus::Applied {
                 petals,
                 settings_pending,
+                beyond_persona,
             } => {
                 writeln!(
                     output,
                     "default_policy: {wallet} allows {}; each transaction still needs your approval",
                     petal_labels(petals)
                 )?;
+                report_beyond_persona(output, wallet, beyond_persona)?;
                 report_settings_pending(output, wallet, settings_pending)?;
                 Ok(WaitStep::Stop)
             }
             DefaultPolicyStatus::ChangedSinceCreation {
                 missing,
                 settings_pending,
+                beyond_persona,
             } => {
                 writeln!(
                     output,
-                    "default_policy: {wallet}'s policy has changed since the wallet was created and does not allow {}; Bloom proposes the default policy only for a new wallet, so nothing was proposed. To allow one again, propose it with `bloom wallet update-policy {wallet} --file <policy.json>`",
+                    "default_policy: {wallet}'s policy has changed since the wallet was created and does not allow {}; Bloom proposes the default policy only for a new wallet, so nothing was proposed. To allow one, propose it with `bloom wallet update-policy {wallet} --file <policy.json>`",
                     petal_labels(missing)
                 )?;
+                if missing.iter().any(|label| label == PERSONA_TRANSFERS) {
+                    writeln!(
+                        output,
+                        "default_policy: to allow {PERSONA_TRANSFERS}, add {{\"chain\": \"evm-1\", \"destination\": \"{marker}\"}} for Ethereum and {{\"chain\": \"evm-137\", \"destination\": \"{marker}\"}} for Polygon to allowed_destinations in a copy of `bloom vfs cat /wallets/{wallet}/policy.json`, and propose that file",
+                        marker = bloom_proto::policy::ERC20_ANY_RECIPIENT
+                    )?;
+                }
+                report_beyond_persona(output, wallet, beyond_persona)?;
                 report_settings_pending(output, wallet, settings_pending)?;
                 Ok(WaitStep::Stop)
             }
@@ -2021,10 +2225,12 @@ mod tests {
             DefaultPolicyStatus::Applied {
                 petals: vec!["polymarket".into()],
                 settings_pending: outcome.still_queued.clone(),
+                beyond_persona: Vec::new(),
             },
             DefaultPolicyStatus::ChangedSinceCreation {
                 missing: vec!["polymarket".into()],
                 settings_pending: outcome.still_queued.clone(),
+                beyond_persona: Vec::new(),
             },
         ] {
             let mut wait = DefaultPolicyWait::new("main", 30_000);
@@ -2640,10 +2846,12 @@ mod tests {
     /// unknown answer is asked again.
     #[test]
     fn the_persona_menu_defaults_to_institutional() {
+        let chains = any_recipient_chain_names(&bloom_proto::Config::local_default().chains);
+        assert_eq!(chains, ["Ethereum Mainnet", "Polygon PoS"]);
         let ask = |answers: &str| {
             let mut saved = None;
             let mut output = Vec::new();
-            run_persona_menu(&mut saved, &mut answers.as_bytes(), &mut output).unwrap();
+            run_persona_menu(&mut saved, &chains, &mut answers.as_bytes(), &mut output).unwrap();
             (saved.unwrap().preset, String::from_utf8(output).unwrap())
         };
         assert_eq!(ask("").0, PersonaPreset::Custodian);
@@ -2651,11 +2859,238 @@ mod tests {
         let (preset, output) = ask("degen\n");
         assert_eq!(preset, PersonaPreset::Degen);
         assert!(output.contains("persona: degen;"), "{output}");
-        assert!(output.contains("any recipient"), "{output}");
+        assert!(
+            output.contains("any recipient on Ethereum Mainnet and Polygon PoS"),
+            "{output}"
+        );
         let (preset, output) = ask("yolo\ntrader\n");
         assert_eq!(preset, PersonaPreset::Trader);
         assert!(output.contains("persona must be"), "{output}");
-        assert!(persona_message(None).starts_with("persona: institutional;"));
+        assert!(persona_message(None, &chains).starts_with("persona: institutional;"));
+        // Without either network, Degen says so rather than naming them.
+        let degen = PersonaConfig::suggested(PersonaPreset::Degen);
+        let message = persona_message(Some(&degen), &[]);
+        assert!(message.contains("neither is configured"), "{message}");
+    }
+
+    /// A persona change on a home whose setup already ran says what it does
+    /// not change, and leaving Degen says its entry stays in the policy.
+    #[test]
+    fn a_later_persona_change_says_what_it_leaves_alone() {
+        let persona = |preset| Some(PersonaConfig::suggested(preset));
+        let degen = persona(PersonaPreset::Degen);
+        let trader = persona(PersonaPreset::Trader);
+        let institutional = persona(PersonaPreset::Custodian);
+        assert!(persona_change_notes("main", None, institutional.as_ref()).is_empty());
+        assert!(persona_change_notes("main", degen.as_ref(), degen.as_ref()).is_empty());
+
+        let notes = persona_change_notes("main", None, degen.as_ref()).join("\n");
+        assert!(
+            notes.contains("Petal limits chosen during setup are unchanged"),
+            "{notes}"
+        );
+        assert!(
+            notes.contains("bloom wallet default-policy main"),
+            "{notes}"
+        );
+        assert!(!notes.contains("does not remove"), "{notes}");
+
+        let notes = persona_change_notes("main", degen.as_ref(), trader.as_ref()).join("\n");
+        assert!(
+            notes.contains(&format!("Bloom does not remove {PERSONA_TRANSFERS}")),
+            "{notes}"
+        );
+    }
+
+    fn snapshot_of(
+        policy: &bloom_broker_api::CanonicalWalletPolicy,
+    ) -> bloom_broker_api::SignedPolicySnapshot {
+        let bytes = serde_jcs::to_vec(policy).unwrap();
+        bloom_broker_api::SignedPolicySnapshot {
+            wallet_id: policy.wallet_id.clone(),
+            version: bloom_broker_api::DecimalU64::new(3),
+            canonical_policy: bloom_broker_api::Base64UrlBytes::from_bytes(&bytes),
+            policy_digest: bloom_broker_api::Digest32::from_bytes([9; 32]),
+            policy_signing_key_id: bloom_broker_api::Token::new("policy-key").unwrap(),
+            policy_verifying_key: bloom_broker_api::Base64UrlBytes::from_bytes(&[2; 32]),
+            signer_signature: bloom_broker_api::Base64UrlBytes::from_bytes(&[3; 64]),
+        }
+    }
+
+    fn any_recipient(chain: &str) -> bloom_broker_api::PolicyDestination {
+        bloom_broker_api::PolicyDestination {
+            chain: bloom_broker_api::Token::new(chain).unwrap(),
+            destination: bloom_proto::policy::ERC20_ANY_RECIPIENT.into(),
+        }
+    }
+
+    /// What the default policy asks for, names and finds missing, with and
+    /// without a persona entry and with and without Petals.
+    #[test]
+    fn the_default_policy_request_counts_the_persona_entries() {
+        let package = bloom_broker_api::Digest32::from_bytes([1; 32]);
+        let degen = vec![any_recipient("evm-1"), any_recipient("evm-137")];
+        let none = DefaultPolicyRequest::default();
+        assert!(none.is_empty());
+        let degen_only = DefaultPolicyRequest {
+            persona_applies: true,
+            persona_destinations: degen.clone(),
+            ..DefaultPolicyRequest::default()
+        };
+        assert!(
+            !degen_only.is_empty(),
+            "a Degen wallet with no Petals has its entry proposed"
+        );
+        assert_eq!(degen_only.allowed(), [PERSONA_TRANSFERS]);
+        assert_eq!(degen_only.destinations(), degen);
+        let with_petal = DefaultPolicyRequest {
+            petals: vec!["polymarket".into()],
+            packages: vec![package.clone()],
+            petal_destinations: policy_destinations("polymarket").unwrap(),
+            ..degen_only.clone()
+        };
+        assert_eq!(with_petal.allowed(), ["polymarket", PERSONA_TRANSFERS]);
+        assert_eq!(with_petal.destinations().len(), 4 + degen.len());
+
+        let mut policy = bloom_broker_api::CanonicalWalletPolicy {
+            wallet_id: bloom_broker_api::Token::new("main").unwrap(),
+            allowed_petal_packages: vec![package],
+            allowed_destinations: policy_destinations("polymarket").unwrap(),
+            maximum_approval_lifetime_ms: 60_000,
+            required_verifiers: Vec::new(),
+            clear_signing: None,
+        };
+        assert_eq!(
+            with_petal.missing(&snapshot_of(&policy)).unwrap(),
+            [PERSONA_TRANSFERS]
+        );
+        policy.allowed_destinations.extend(degen.iter().cloned());
+        assert!(
+            with_petal
+                .missing(&snapshot_of(&policy))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            with_petal
+                .beyond_persona(&snapshot_of(&policy))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// After leaving Degen, the entry the policy still holds is reported for
+    /// the default wallet only; Bloom does not remove it.
+    #[test]
+    fn an_entry_the_saved_persona_does_not_propose_is_reported() {
+        let mut policy = bloom_broker_api::CanonicalWalletPolicy {
+            wallet_id: bloom_broker_api::Token::new("main").unwrap(),
+            allowed_petal_packages: Vec::new(),
+            allowed_destinations: vec![any_recipient("evm-1"), any_recipient("evm-137")],
+            maximum_approval_lifetime_ms: 60_000,
+            required_verifiers: Vec::new(),
+            clear_signing: None,
+        };
+        let institutional = DefaultPolicyRequest {
+            persona_applies: true,
+            ..DefaultPolicyRequest::default()
+        };
+        assert_eq!(
+            institutional.beyond_persona(&snapshot_of(&policy)).unwrap(),
+            [PERSONA_TRANSFERS]
+        );
+        // An entry spelt by chain name counts too.
+        policy.allowed_destinations = vec![any_recipient("ethereum")];
+        assert_eq!(
+            institutional.beyond_persona(&snapshot_of(&policy)).unwrap(),
+            [PERSONA_TRANSFERS]
+        );
+        // Degen still proposing it on that chain is not a leftover, but one
+        // on a chain Degen no longer covers is.
+        let degen_on_ethereum = DefaultPolicyRequest {
+            persona_applies: true,
+            persona_destinations: vec![any_recipient("evm-1")],
+            ..DefaultPolicyRequest::default()
+        };
+        policy.allowed_destinations = vec![any_recipient("evm-1")];
+        assert!(
+            degen_on_ethereum
+                .beyond_persona(&snapshot_of(&policy))
+                .unwrap()
+                .is_empty()
+        );
+        policy.allowed_destinations.push(any_recipient("evm-137"));
+        assert_eq!(
+            degen_on_ethereum
+                .beyond_persona(&snapshot_of(&policy))
+                .unwrap(),
+            [PERSONA_TRANSFERS]
+        );
+        // Another wallet has no persona to compare with.
+        assert!(
+            DefaultPolicyRequest::default()
+                .beyond_persona(&snapshot_of(&policy))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// The owner is told about a leftover entry with how to remove it, and
+    /// about a missing persona entry with exactly what to add.
+    #[test]
+    fn persona_entries_are_explained_when_present_or_missing() {
+        let observe = |status: DefaultPolicyStatus| {
+            let mut wait = DefaultPolicyWait::new("main", 30_000);
+            let mut output = Vec::new();
+            assert_eq!(
+                wait.observe(&status, 0, &mut output).unwrap(),
+                WaitStep::Stop
+            );
+            String::from_utf8(output).unwrap()
+        };
+        let output = observe(DefaultPolicyStatus::Applied {
+            petals: vec!["polymarket".into()],
+            settings_pending: Vec::new(),
+            beyond_persona: vec![PERSONA_TRANSFERS.into()],
+        });
+        assert!(output.contains("main allows Polymarket"), "{output}");
+        assert!(
+            output.contains(&format!(
+                "still allows {PERSONA_TRANSFERS}, which the saved persona does not propose"
+            )),
+            "{output}"
+        );
+        assert!(
+            output.contains("bloom vfs cat /wallets/main/policy.json"),
+            "{output}"
+        );
+        assert!(
+            output.contains("bloom wallet update-policy main"),
+            "{output}"
+        );
+
+        let output = observe(DefaultPolicyStatus::ChangedSinceCreation {
+            missing: vec![PERSONA_TRANSFERS.into()],
+            settings_pending: Vec::new(),
+            beyond_persona: Vec::new(),
+        });
+        assert!(output.contains("To allow one, propose it"), "{output}");
+        assert!(
+            output.contains(r#"{"chain": "evm-1", "destination": "erc20:any-recipient"}"#),
+            "{output}"
+        );
+        assert!(!output.contains("still allows"), "{output}");
+
+        // The new field is left out of the JSON when empty, as before.
+        assert_eq!(
+            serde_json::to_value(DefaultPolicyStatus::Applied {
+                petals: Vec::new(),
+                settings_pending: Vec::new(),
+                beyond_persona: Vec::new(),
+            })
+            .unwrap(),
+            serde_json::json!({"state": "applied", "petals": []})
+        );
     }
 
     fn menu(answers: &str) -> (PetalsConfig, String) {
@@ -3123,6 +3558,7 @@ mod tests {
             serde_json::to_value(DefaultPolicyStatus::ChangedSinceCreation {
                 missing: vec!["hyperliquid".into()],
                 settings_pending: Vec::new(),
+                beyond_persona: Vec::new(),
             })
             .unwrap(),
             serde_json::json!({"state": "changed_since_creation", "missing": ["hyperliquid"]})
@@ -3131,6 +3567,7 @@ mod tests {
         let applied = DefaultPolicyStatus::Applied {
             petals: vec!["polymarket".into()],
             settings_pending: vec!["Polymarket (busy)".into()],
+            beyond_persona: Vec::new(),
         };
         let value = serde_json::to_value(&applied).unwrap();
         assert_eq!(
@@ -3250,6 +3687,7 @@ mod tests {
         let applied = DefaultPolicyStatus::Applied {
             petals: vec!["polymarket".into(), "near-intents".into()],
             settings_pending: Vec::new(),
+            beyond_persona: Vec::new(),
         };
         assert_eq!(
             wait.observe(&applied, 30, &mut output).unwrap(),
@@ -3299,6 +3737,7 @@ mod tests {
         let changed = DefaultPolicyStatus::ChangedSinceCreation {
             missing: vec!["near-intents".into()],
             settings_pending: Vec::new(),
+            beyond_persona: Vec::new(),
         };
         assert_eq!(
             wait.observe(&changed, 10, &mut output).unwrap(),

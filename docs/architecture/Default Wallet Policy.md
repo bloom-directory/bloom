@@ -171,17 +171,35 @@ Agreed on 2026-09-14:
     owner (decision 6):
     - **Institutional** keeps everything above.
     - **Trader** and **Degen** suggest Polymarket daily buy limits of 1,000
-      and 10,000 pUSD rather than 100: their pUSD token quantities, not a
-      price. The owner can change the suggestion, and a saved value is kept.
+      and 10,000 pUSD rather than 100 during first setup: their pUSD token
+      quantities, not a price. The owner can change the suggestion, and a
+      saved value is kept.
     - **Degen** also adds
       `{"chain": "evm-1", "destination": "erc20:any-recipient"}`, and the same
       on `evm-137`, for configured Ethereum and Polygon. It is required like a
       chosen Petal's destinations, and is the only addition here that does not
       come from a Petal. Machine then stages the wallet's own canonical
-      ERC-20 transfer to any recipient on those chains: only through the
-      exact-transaction path, never for a Petal, and a recipient denylist
-      still applies. Broker checks no destination on that exact approval, so
-      the owner's approval of each transfer is the check.
+      ERC-20 transfer of a token in Bloom's curated table
+      (`bloom_proto::tokens`) to any recipient on those chains. Only the
+      exact-transaction path uses it, never a Petal, and a token outside the
+      table still needs its recipient listed, because any contract can answer
+      `decimals()` and run its own code under the `transfer` selector. Broker
+      checks no destination on that exact approval, so the owner's approval
+      of each transfer is the check. Until bloom-broker#112 is pinned, the
+      policy ceremony shows the entry as written.
+
+    A persona chosen later does not reach back. On a home whose setup already
+    ran, `bloom init --persona` saves it and says that the Petal limits from
+    setup are unchanged. Degen's entry is proposed only while `main`'s policy
+    is still the one wallet creation installed; otherwise
+    `bloom wallet default-policy main` reports it missing, with the entries
+    to add through `bloom wallet update-policy`. Leaving Degen does not
+    remove the entry, because Bloom never removes one: that command reports
+    what the policy still allows beyond the saved persona, and how to remove
+    it. Machine reads the persona from the config each time it proposes. A
+    saved persona that no longer parses or validates is set aside with a
+    warning, so Machine still starts and `bloom init --persona` can replace
+    it.
 
     Reusable Trader and Degen sessions come from section 6, which also lets
     an approved Degen session sign those transfers within its token limits.
@@ -483,13 +501,19 @@ entry, so those sessions build on it. The contract between the two:
   Once the wallet's policy has changed since creation, that command proposes
   only with `owner_just_chose` set, which bloom#377 must send when it has just
   saved the selection. Without it the owner sees which Petals are not allowed,
-  and nothing is proposed.
+  and nothing is proposed. Inside Machine this is `AfterPolicyChange::Propose`
+  rather than a `bool`, so another flag passed in its place does not compile.
+- **The persona is read when it is used.** Machine reads `[persona]` from the
+  config each time it proposes a default policy, not once at startup, so a
+  persona that browser onboarding saves on a running Machine is the one
+  proposed.
 - **Two limits; the lower applies.** Polymarket's `max_daily_usd`, written by
   setup, is enforced by the Petal before it asks for a signature. A persona
   session's token allowance is enforced by Broker and Signer. They are
-  independent, and a buy must pass both. Setup suggests the Polymarket limit
-  from the persona (decision 15), so it starts at Trader's or Degen's pUSD
-  quantity rather than 100.
+  independent, and a buy must pass both. First setup suggests the Polymarket
+  limit from the persona (decision 15), so it starts at Trader's or Degen's
+  pUSD quantity rather than 100. A persona chosen after setup leaves the
+  saved limit alone.
 - **Destination chain names differ.** This policy names a Petal's destinations
   by Bloom chain name, such as `polygon`. Typed persona sessions for native and
   ERC-20 transfers match destinations named `evm-<chain id>`, such as

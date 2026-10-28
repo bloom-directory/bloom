@@ -48,7 +48,13 @@ pub struct Config {
     )]
     pub wallet_projection_max_age: std::time::Duration,
     /// Optional onboarding suggestion. Absent on legacy homes; never grants authority.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// A saved persona that does not parse or validate is set aside on load
+    /// (see [`lenient_persona`]) rather than failing the whole config.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_persona"
+    )]
     pub persona: Option<crate::persona::PersonaConfig>,
     /// Map of chain name -> spec.
     #[serde(default)]
@@ -282,6 +288,37 @@ fn default_storage_reads_backend() -> Backend {
 }
 fn default_proxy_detection_backend() -> Backend {
     Backend::Rpc
+}
+
+/// Read `[persona]` without letting it fail the whole config. A persona that
+/// does not parse (a missing or unknown field, a newer schema) or does not
+/// validate is set aside with a warning and the home behaves as Institutional,
+/// which grants the least. Every other setting still loads, so Machine starts
+/// and `bloom init --persona` can choose one again. Writing a persona stays
+/// strict: [`Config::validate`] refuses an invalid one.
+fn lenient_persona<'de, D>(
+    deserializer: D,
+) -> Result<Option<crate::persona::PersonaConfig>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let Some(value) = Option::<toml::Value>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    let persona = value
+        .try_into::<crate::persona::PersonaConfig>()
+        .map_err(|error| error.to_string())
+        .and_then(|persona| persona.validate().map(|()| persona));
+    match persona {
+        Ok(persona) => Ok(Some(persona)),
+        Err(reason) => {
+            tracing::warn!(
+                %reason,
+                "config.persona_ignored: the saved [persona] is not usable and is treated as institutional; choose one again with `bloom init --persona <institutional|trader|degen>`"
+            );
+            Ok(None)
+        }
+    }
 }
 
 fn evm_chain(
@@ -1181,6 +1218,49 @@ rpc_urls = ["https://ethereum-rpc.publicnode.com"]
         let reloaded: Config = toml::from_str(&encoded).unwrap();
         assert_eq!(reloaded.persona, decoded.persona);
         assert!(reloaded.petals.setup_complete);
+    }
+
+    /// A saved persona that is not usable is set aside on load instead of
+    /// failing every command, and saving the config drops it. Writing one
+    /// stays strict.
+    #[test]
+    fn an_unusable_saved_persona_does_not_stop_the_config_loading() {
+        let td = tempdir().unwrap();
+        let path = td.path().join("config.toml");
+        let mut cfg = Config::local_default();
+        cfg.persona = Some(crate::persona::PersonaConfig::suggested(
+            crate::persona::PersonaPreset::Degen,
+        ));
+        let valid = toml::to_string(&cfg).unwrap();
+        assert!(valid.contains("window_secs = 604800"), "{valid}");
+        for edited in [
+            valid.replace("window_secs = 604800", "window_secs = 3600"),
+            valid.replace("schema_version = 2", "schema_version = 3"),
+            valid.replace("window_secs = 604800", "window_secs = 604800\nbudget = 5"),
+            valid.replace("preset = \"degen\"", "preset = \"whale\""),
+            valid.replace("window_secs = 604800\n", ""),
+        ] {
+            assert_ne!(edited, valid);
+            std::fs::write(&path, &edited).unwrap();
+            let loaded = Config::load(&path).unwrap_or_else(|error| panic!("{error}: {edited}"));
+            assert_eq!(loaded.persona, None, "{edited}");
+            assert_eq!(loaded.chains, cfg.chains, "every other setting still loads");
+            loaded.save(&path).unwrap();
+            assert!(
+                !std::fs::read_to_string(&path)
+                    .unwrap()
+                    .contains("[persona]")
+            );
+        }
+        std::fs::write(&path, &valid).unwrap();
+        assert_eq!(Config::load(&path).unwrap().persona, cfg.persona);
+
+        let mut invalid = cfg.clone();
+        invalid.persona.as_mut().unwrap().window_secs = 3600;
+        assert!(
+            invalid.validate().is_err(),
+            "writing an invalid persona is refused"
+        );
     }
 
     #[test]

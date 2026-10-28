@@ -1018,32 +1018,39 @@ fn init_records_the_chosen_persona_before_petal_setup() {
         if let Some(persona) = persona {
             command.args(["--persona", persona]);
         }
-        command
+        let output = command
             .assert()
             // Choices are saved before Petal provisioning, which is offline here.
             .failure()
             .stderr(predicate::str::contains(
                 "provision canonical pre-installed Petals",
-            ));
-        bloom_proto::Config::load(&bloom_proto::HomeDir::at(home).config_path()).unwrap()
+            ))
+            .get_output()
+            .stdout
+            .clone();
+        (
+            bloom_proto::Config::load(&bloom_proto::HomeDir::at(home).config_path()).unwrap(),
+            String::from_utf8(output).unwrap(),
+        )
     };
     let polymarket_limit = |config: &bloom_proto::Config| {
         config.petals.setup["polymarket"].values["max_daily_usd"].clone()
     };
 
     let degen_home = fresh_home();
-    let degen = init(degen_home.path(), Some("degen"));
+    let (degen, stdout) = init(degen_home.path(), Some("degen"));
     assert_eq!(degen.persona.as_ref().unwrap().preset, PersonaPreset::Degen);
     assert_eq!(polymarket_limit(&degen), "10000");
+    assert!(!stdout.contains("persona_note:"), "first setup: {stdout}");
 
     let home = fresh_home();
-    let first = init(home.path(), None);
+    let (first, _) = init(home.path(), None);
     assert_eq!(
         first.persona.as_ref().unwrap().preset,
         PersonaPreset::Custodian
     );
     assert_eq!(polymarket_limit(&first), "100");
-    let changed = init(home.path(), Some("trader"));
+    let (changed, stdout) = init(home.path(), Some("trader"));
     assert_eq!(
         changed.persona.as_ref().unwrap().preset,
         PersonaPreset::Trader
@@ -1052,6 +1059,59 @@ fn init_records_the_chosen_persona_before_petal_setup() {
         polymarket_limit(&changed),
         "100",
         "an existing home keeps its setup choices"
+    );
+    assert!(
+        stdout.contains("persona_note: trader is saved")
+            && stdout.contains("Petal limits chosen during setup are unchanged"),
+        "{stdout}"
+    );
+}
+
+/// A home set up before personas keeps having none until the owner chooses
+/// one, and a saved persona that is no longer usable can be replaced with
+/// `bloom init --persona` rather than stopping every command.
+#[test]
+fn init_leaves_a_legacy_home_alone_and_replaces_an_unusable_persona() {
+    use bloom_proto::persona::PersonaPreset;
+
+    let home = fresh_home();
+    let home_dir = bloom_proto::HomeDir::at(home.path());
+    home_dir.ensure().unwrap();
+    let mut legacy = bloom_proto::Config::local_default();
+    legacy.petals.setup_complete = true;
+    legacy.save(&home_dir.config_path()).unwrap();
+    let init = |persona: Option<&str>| {
+        let mut command = bloom_cmd(home.path());
+        command
+            .env("HTTPS_PROXY", "http://127.0.0.1:1")
+            .env("https_proxy", "http://127.0.0.1:1")
+            .env("NO_PROXY", "")
+            .env("no_proxy", "")
+            .arg("init");
+        if let Some(persona) = persona {
+            command.args(["--persona", persona]);
+        }
+        command.assert().failure().stderr(predicate::str::contains(
+            "provision canonical pre-installed Petals",
+        ));
+        bloom_proto::Config::load(&home_dir.config_path()).unwrap()
+    };
+
+    assert_eq!(init(None).persona, None, "a legacy home keeps no persona");
+
+    // A hand-edited persona that no longer validates.
+    let mut degen = legacy.clone();
+    degen.persona = Some(bloom_proto::persona::PersonaConfig::suggested(
+        PersonaPreset::Degen,
+    ));
+    let edited = toml::to_string(&degen)
+        .unwrap()
+        .replace("window_secs = 604800", "window_secs = 3600");
+    std::fs::write(home_dir.config_path(), edited).unwrap();
+    let replaced = init(Some("trader"));
+    assert_eq!(
+        replaced.persona.as_ref().unwrap().preset,
+        PersonaPreset::Trader
     );
 }
 

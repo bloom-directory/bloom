@@ -309,6 +309,17 @@ pub trait AccountPetalMount: Send + Sync {
         slot: &str,
     ) -> Result<(), HandlerError>;
 }
+/// What a default-policy request does once the wallet's policy has changed
+/// since wallet creation. A named type rather than a `bool`, so another flag
+/// passed in the same position does not compile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AfterPolicyChange {
+    /// Report what the policy lacks and propose nothing.
+    Report,
+    /// Propose it: the owner has just chosen it.
+    Propose,
+}
+
 /// What a wallet's first Petal policy proposal also allows: the Petals chosen
 /// during setup and the fixed contracts they transact with. Both are empty for
 /// wallets without a default policy.
@@ -1953,7 +1964,7 @@ impl WalletsHandler {
             std::slice::from_ref(package_hash),
             &[],
             setup.as_ref(),
-            true,
+            AfterPolicyChange::Propose,
         )
         .await
     }
@@ -1961,16 +1972,17 @@ impl WalletsHandler {
     /// Drive a wallet's default policy: propose every package and destination
     /// together through the existing policy operation. `Allowed` means the
     /// policy allows all of them. Once any change has been committed, nothing
-    /// is proposed unless `propose_after_creation` says the owner has just
-    /// chosen these again, so a Petal or destination the owner removed is
-    /// reported as `ChangedSinceCreation` instead of being proposed again.
-    /// A persona's destinations may be proposed without any package.
+    /// is proposed unless `after_change` is [`AfterPolicyChange::Propose`]
+    /// because the owner has just chosen these again, so a Petal or destination
+    /// the owner removed is reported as `ChangedSinceCreation` instead of being
+    /// proposed again. A persona's destinations may be proposed without any
+    /// package.
     pub async fn ensure_petal_packages_allowed(
         &self,
         wallet: &str,
         packages: &[bloom_broker_api::Digest32],
         destinations: &[bloom_broker_api::PolicyDestination],
-        propose_after_creation: bool,
+        after_change: AfterPolicyChange,
     ) -> Result<bloom_machine_client::PetalEligibility, HandlerError> {
         if packages.is_empty() && destinations.is_empty() {
             return Err(HandlerError::invalid(
@@ -1983,7 +1995,7 @@ impl WalletsHandler {
             packages,
             destinations,
             Ok(&DefaultPolicySetup::default()),
-            propose_after_creation,
+            after_change,
         )
         .await
     }
@@ -2001,7 +2013,7 @@ impl WalletsHandler {
         first_proposal: Result<&DefaultPolicySetup, &HandlerError>,
         // Whether to propose the request once the policy is no longer the one
         // wallet creation installed.
-        propose_after_creation: bool,
+        after_change: AfterPolicyChange,
     ) -> Result<bloom_machine_client::PetalEligibility, HandlerError> {
         use bloom_machine_client::{
             PetalEligibility, policy_with_destinations, policy_with_packages,
@@ -2082,7 +2094,7 @@ impl WalletsHandler {
         // the same fact: the owner may have removed every Petal on purpose.
         const CREATION_POLICY_VERSION: u64 = 1;
         let creation_policy = current.version.get() == CREATION_POLICY_VERSION;
-        if !creation_policy && !propose_after_creation {
+        if !creation_policy && after_change == AfterPolicyChange::Report {
             return Ok(PetalEligibility::ChangedSinceCreation(current));
         }
         let mut additions = additions.to_vec();

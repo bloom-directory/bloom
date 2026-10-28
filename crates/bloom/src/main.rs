@@ -3795,10 +3795,12 @@ async fn run(cli: Cli) -> Result<()> {
                 .transpose()
                 .map_err(anyhow::Error::msg)?;
             default_policy::select_persona(&mut d.config.persona, requested_persona)?;
+            let any_recipient_chains = default_policy::any_recipient_chain_names(&d.config.chains);
             if requested_persona.is_none() && first_setup && d.config.persona.is_none() {
                 if !structured_service_output() && default_policy::interactive_setup_available() {
                     default_policy::run_persona_menu(
                         &mut d.config.persona,
+                        &any_recipient_chains,
                         &mut std::io::stdin().lock(),
                         &mut std::io::stdout(),
                     )?;
@@ -3834,6 +3836,16 @@ async fn run(cli: Cli) -> Result<()> {
                 d.config
                     .save(&d.home.config_path())
                     .context("save persona choice")?;
+                // Setup already ran, so the new persona does not reach back
+                // into its choices or the wallet's current policy. Say so
+                // before anything else can fail.
+                for note in default_policy::persona_change_notes(
+                    bloom_proto::config::DEFAULT_POLICY_WALLET,
+                    previous_persona.as_ref(),
+                    d.config.persona.as_ref(),
+                ) {
+                    println!("{note}");
+                }
             }
             let preinstalled = github_source::ensure_preinstalled_petals(&home, &d)
                 .context("provision canonical pre-installed Petals")?;
@@ -3849,7 +3861,7 @@ async fn run(cli: Cli) -> Result<()> {
             println!("preinstalled_petals: {preinstalled:?}");
             println!(
                 "{}",
-                default_policy::persona_message(d.config.persona.as_ref())
+                default_policy::persona_message(d.config.persona.as_ref(), &any_recipient_chains)
             );
             println!("next: bloom wallet new main");
             println!("then: bloom wallet address main --qr");
