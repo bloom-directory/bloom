@@ -848,6 +848,34 @@ impl TxEngine {
                 data,
             } => {
                 let to_addr = self.resolve_recipient_async(to, address_book).await?;
+                let spec = chain.spec();
+                // The chain's own native symbol (POL, BNB, AVAX, ...) is a
+                // native send, not an ERC-20 lookup.
+                if token
+                    .as_deref()
+                    .is_some_and(|t| t.trim().eq_ignore_ascii_case(&spec.native_symbol))
+                {
+                    if !matches!(value.trim(), "" | "0") {
+                        return Err(TxEngineError::Amount(
+                            "native sends take one amount; value and amount were both set".into(),
+                        ));
+                    }
+                    let v = parse_units(amount.trim(), spec.native_decimals)
+                        .map_err(|e| TxEngineError::Amount(e.to_string()))?;
+                    let data = data.clone().unwrap_or_else(|| "0x".into());
+                    return Ok((Some(to_addr), v, data, None, None));
+                }
+                // "eth"/"ether" name an asset. On a chain whose native token is
+                // something else, sending it would move a different asset.
+                if token.is_none() && !spec.native_symbol.eq_ignore_ascii_case("ETH") {
+                    let unit = parse_amount(value).map(|p| p.unit).unwrap_or_default();
+                    if unit == "eth" || unit == "ether" {
+                        return Err(TxEngineError::Amount(format!(
+                            "{} pays in {}, not ETH; write the amount in {}",
+                            spec.name, spec.native_symbol, spec.native_symbol
+                        )));
+                    }
+                }
                 if let Some(v) = Self::resolve_native_value(value, token)? {
                     if !amount.trim().is_empty() {
                         return Err(TxEngineError::Amount(
@@ -5794,6 +5822,61 @@ mod tests {
             gas_limit_hint: None,
             usd_value_hint: usd_hint.map(str::to_string),
             review_mode: None,
+        }
+    }
+
+    async fn resolve_send_on(native_symbol: &str, intent: &str) -> Result<U256, TxEngineError> {
+        let mut spec = stage_chain("http://127.0.0.1:9").spec().clone();
+        spec.native_symbol = native_symbol.into();
+        let chain = ChainClient::new(spec).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let engine = TxEngine::new(Outbox::new(dir.path().join("outbox")).unwrap(), 60_000);
+        let body = crate::intent_parser::parse(intent).unwrap().body;
+        let (_, value, data, token, _) = engine
+            .resolve_intent_body(&body, &chain, 31337, None, Address::ZERO)
+            .await?;
+        assert_eq!((data.as_str(), token.is_none()), ("0x", true));
+        Ok(value)
+    }
+
+    #[tokio::test]
+    async fn the_chain_native_symbol_sends_the_native_asset() {
+        let to = "0x2222222222222222222222222222222222222222";
+        let pol = U256::from(10_000_000_000_000_000u64);
+        for intent in [
+            format!("send 0.01 POL to {to}"),
+            format!("send 0.01 pol to {to}"),
+            format!(r#"{{"kind":"send","to":"{to}","token":"POL","amount":"0.01"}}"#),
+        ] {
+            assert_eq!(
+                resolve_send_on("POL", &intent).await.unwrap(),
+                pol,
+                "{intent}"
+            );
+        }
+        assert_eq!(
+            resolve_send_on("POL", &format!("send 10000000000000000 wei to {to}"))
+                .await
+                .unwrap(),
+            pol
+        );
+        assert_eq!(
+            resolve_send_on("ETH", &format!("send 0.01 ETH to {to}"))
+                .await
+                .unwrap(),
+            pol
+        );
+    }
+
+    #[tokio::test]
+    async fn eth_is_refused_on_a_chain_with_another_native_asset() {
+        let to = "0x2222222222222222222222222222222222222222";
+        for intent in [
+            format!("send 0.01 ETH to {to}"),
+            format!("send 0.01 ether to {to}"),
+        ] {
+            let err = resolve_send_on("POL", &intent).await.unwrap_err();
+            assert!(err.to_string().contains("pays in POL, not ETH"), "{err}");
         }
     }
 
