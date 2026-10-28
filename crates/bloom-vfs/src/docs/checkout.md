@@ -188,11 +188,14 @@ For a `cancelled`, `failed_before_release` or pre-approval `expired` request
 with `paused`, write its `cancel` file again to retry browser cleanup. This
 cannot repeat payment; Bloom refuses if private approval or submission began.
 `reason` says why Bloom left the payment to the person: `facts_unreadable` for
-a total or currency it could not read, `fields_unsupported` for card fields in
+an unclear total, currency, charge terms or payment control, `fields_unsupported` for card fields in
 an unexpected shape, `receiving_origin_unreviewed` for a frame that would
 receive the card and is not a reviewed payment host. The first two can change
 with the page: reach the real payment step, let it finish loading and request
-payment again. The third needs the person, or another seller.
+payment again. If the same refusal remains on the completed page, use private
+take-over for human review; repeating requests on an unchanged page adds no
+evidence. Never click a competing Subscribe or Buy button to test which one
+charges. The third needs the person, or another seller.
 Older `not_submitted` records and interrupted `manual_required` or
 `human_control` views become `uncertain` on restart: the person may have paid
 privately. A fresh browser clears `paused`, not the uncertain result.

@@ -1,5 +1,52 @@
 # Shopping checkout acceptance, 2026-10-27
 
+## What the testing establishes
+
+Eleven merchant payment preparations passed across Shopify and WooCommerce/
+Stripe. Separate real-service tests completed Stripe TEST payments, simulated
+bank challenges and declines, custody enrollment/deletion, and browser recovery.
+No live merchant purchase, bank authorization or issued flight ticket was proved.
+The dated results below distinguish preparation, test payment and installed
+verification; older successful runs do not verify a newer runtime.
+
+The useful lessons are:
+
+- Payment controls need form and charge context. A newsletter Subscribe button
+  is not evidence of a second charge; genuinely different payment actions must
+  still stop automation. Equivalent native submits need equivalent payloads.
+- Checkout readiness includes selected variants, a confirmed cart, complete
+  billing and named shipping rates. Visible card boxes and an interim total
+  are insufficient. A history total is not a payment receipt.
+- Privacy must cover both reading and writing. Use the same live field
+  classification for snapshots and typing, including custom selectors and
+  fields that change on focus. Localhost cookies do not isolate ports.
+- Recovery must preserve uncertainty and never replay a purchase. Recover the
+  existing private view or inspect the existing operation before starting anew.
+- Real shopping finds defects that isolated fixtures miss. Ten Shopify shops
+  mostly exercise one platform; the WooCommerce and airline journeys exposed
+  different failures. Flight completion remains unverified after a merchant
+  security rejection.
+
+The next improvements, in priority order:
+
+1. Expose safe, specific preparation diagnostics. `facts_unreadable` currently
+   combines price, charge terms and payment-control ambiguity; the operator
+   cannot reliably tell which needs attention. Keep private values out of errors.
+2. Broaden real journeys to other checkout platforms and a completed airline
+   flow. Record dated final shipping/tax quotes, last completed steps and
+   blockers; retain a focused regression for each reproduced defect.
+3. Make verification cheaper to interpret: retain revision-bound results,
+   share compiled dependencies, and report changes or completion rather than
+   repeatedly polling and restating the same in-progress job. Installation
+   evidence remains separate from checkout usability evidence.
+
+These are follow-up priorities, not claims of implemented support. Do not add
+merchant-specific exceptions or relax ambiguity checks simply to raise the
+completed-shop count. The VFS guide should teach readiness and recovery rather
+than carry this test chronology or promise universal payment success.
+
+## Merchant evidence
+
 Eleven different merchants reached their final card checkout through Bloom's
 normal `checkout/browse` VFS. Each accepted synthetic contact and billing
 details, resolved shipping where applicable, exposed its payment control and
