@@ -492,6 +492,13 @@ async fn mounted_async_command_rejections_keep_the_mount_live() {
 #[derive(Default)]
 struct ValidatingCommandHandler {
     accepted: AtomicUsize,
+    rejected: AtomicUsize,
+}
+
+impl ValidatingCommandHandler {
+    fn invocations(&self) -> usize {
+        self.accepted.load(Ordering::SeqCst) + self.rejected.load(Ordering::SeqCst)
+    }
 }
 
 #[async_trait]
@@ -514,13 +521,16 @@ impl Handler for ValidatingCommandHandler {
             self.accepted.fetch_add(1, Ordering::SeqCst);
             Ok(())
         } else {
+            self.rejected.fetch_add(1, Ordering::SeqCst);
             Err(HandlerError::invalid("missing field action"))
         }
     }
 }
 
-/// Issue #371: a shell writer must see its command write rejected, and an
-/// accepted write must reach the handler exactly once.
+/// Issue #371: a shell writer must see its command write rejected, and every
+/// command — accepted or refused — must reach the handler exactly once. A
+/// refused write leaves the page dirty and `cat` flushes it again at close, so
+/// the rejected bodies are counted too, not just the accepted ones.
 #[tokio::test]
 async fn mounted_command_rejection_fails_the_shell_writer() {
     if !require_real_mount_test() {
@@ -537,6 +547,7 @@ async fn mounted_command_rejection_fails_the_shell_writer() {
     let target = mount_dir.join("stage/command");
 
     let mut outputs = Vec::new();
+    let mut counted = 0;
     for body in ["{\"order\":1}", "{\"action\":1}"] {
         for script in [
             "printf '%s' \"$2\" > \"$1\"",
@@ -554,7 +565,9 @@ async fn mounted_command_rejection_fails_the_shell_writer() {
                 let output = command_output_with_timeout(command, Duration::from_secs(10))
                     .await
                     .expect("run mounted command writer");
-                outputs.push((body, shell, script, output));
+                let invocations = handler.invocations() - counted;
+                counted += invocations;
+                outputs.push((body, shell, script, output, invocations));
             }
         }
     }
@@ -563,7 +576,7 @@ async fn mounted_command_rejection_fails_the_shell_writer() {
     }
     let _ = std::fs::remove_dir(&mount_dir);
 
-    for (body, shell, script, output) in outputs {
+    for (body, shell, script, output, invocations) in outputs {
         let output = output.unwrap_or_else(|| panic!("{shell} hung: {script}"));
         let stderr = String::from_utf8_lossy(&output.stderr);
         if body.contains("action") {
@@ -574,6 +587,10 @@ async fn mounted_command_rejection_fails_the_shell_writer() {
                 "{shell} {script} did not report the rejection: {stderr}"
             );
         }
+        assert_eq!(
+            invocations, 1,
+            "{shell} {script}: one command reached the handler {invocations} times"
+        );
     }
     assert_eq!(handler.accepted.load(Ordering::SeqCst), 6);
 }
