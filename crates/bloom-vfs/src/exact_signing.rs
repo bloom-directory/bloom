@@ -475,7 +475,11 @@ impl BrokerExactPayloadSigner {
             return Err("exact signing retry differs from its persisted operation identity".into());
         }
         let now = now_ms()?;
-        if state.expires_at_ms.get() <= now {
+        // A local TTL cannot retire an approval or a signing operation. Once
+        // prepared, replay the same identity so Broker can recover its result
+        // or report its authoritative expiry. In particular, do not replace
+        // a ceremony that the owner is still completing.
+        if state.expires_at_ms.get() <= now && state.approval_id.is_none() {
             state.approval_operation_id = random_operation_id();
             state.signing_operation_id = random_operation_id();
             state.request_nonce = random_request_nonce();
@@ -776,7 +780,7 @@ impl BrokerExactPayloadSigner {
             return Err("reusable signing attempt schema is unsupported".into());
         }
         let now = now_ms()?;
-        let expired = state.expires_at_ms.get() <= now;
+        let expired = state.expires_at_ms.get() <= now && state.approval_id.is_none();
         let different_request = previous_attempt.as_ref().filter(|attempt| {
             attempt.signing_operation_id == state.signing_operation_id
                 && attempt.request_digest != request_digest
@@ -1005,7 +1009,9 @@ impl BrokerExactPayloadSigner {
             );
         }
         let now = now_ms()?;
-        if state.expires_at_ms.get() <= now {
+        // Preserve the operation across local expiry, including lost replies
+        // and open ceremonies. Broker owns approval expiry and replay.
+        if state.expires_at_ms.get() <= now && state.approval_id.is_none() {
             state.approval_operation_id = random_operation_id();
             state.signing_operation_id = random_operation_id();
             state.request_nonce = random_request_nonce();
@@ -2727,7 +2733,8 @@ mod tests {
             .await
             .unwrap_err();
         let mut before = reusable_state(&home);
-        before.expires_at_ms = DecimalU64::new(0);
+        before.issued_at_ms = DecimalU64::new(0);
+        before.expires_at_ms = DecimalU64::new(1);
         write_state(&home.path().join("petal-reusable.json"), &before).unwrap();
 
         for bytes in [b"first".as_slice(), b"second".as_slice()] {
@@ -2735,7 +2742,7 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(
-                matches!(&error, ExactSigningError::OutcomeUnknown(m) if m.contains("has not settled")),
+                matches!(&error, ExactSigningError::OutcomeUnknown(_)),
                 "{error}"
             );
             let after = reusable_state(&home);
@@ -2744,6 +2751,77 @@ mod tests {
         }
         assert_eq!(prepares(&broker), 1);
         assert_eq!(broker.signings.lock().unwrap().len(), 1);
+    }
+
+    // Exercise both exact entrypoints with an expired local timestamp. The
+    // owner's ceremony and a committed-but-unacknowledged signature must each
+    // retain their identity; TTL expiry is not evidence of a final refusal.
+    #[tokio::test]
+    async fn exact_expiry_preserves_ceremony_and_recovers_the_original_signature() {
+        for batch in [false, true] {
+            let broker = Arc::new(MockBroker::default());
+            let (signer, home, claim, hash) = debiting_claim_fixture(&broker, None);
+            let path = home.path().join("petal-exact.json");
+            let attempt = || async {
+                if batch {
+                    signer
+                        .sign_or_prepare_petal_batch(
+                            &path,
+                            "withdraw-action",
+                            "wallet",
+                            "hyperliquid.withdraw",
+                            &[b"exact withdraw payload".to_vec()],
+                            std::slice::from_ref(&hash),
+                            CryptoSuite::Secp256k1Sha256Recoverable,
+                            &serde_json::json!({"asset": "USDC"}),
+                            &ProvenanceSubject::Petal {
+                                package_hash: claim.package_hash.clone(),
+                                route: "withdraw/request".into(),
+                            },
+                            &claim,
+                            Some(b"assurance"),
+                        )
+                        .await
+                        .map(|outcome| matches!(outcome, ExactPayloadBatchOutcome::Signed(_)))
+                } else {
+                    flow_once(&signer, &home, &claim, &hash)
+                        .await
+                        .map(|outcome| matches!(outcome, ExactPayloadOutcome::Signed(_)))
+                }
+            };
+            assert!(!attempt().await.unwrap());
+            let mut state: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            state["issued_at_ms"] = serde_json::json!("0");
+            state["expires_at_ms"] = serde_json::json!("1");
+            write_state(&path, &state).unwrap();
+            broker.ceremony_open.store(true, Ordering::SeqCst);
+            assert!(!attempt().await.unwrap());
+            assert_eq!(prepares(&broker), 1);
+            broker.ceremony_open.store(false, Ordering::SeqCst);
+            broker.lose_sign_response_once.store(true, Ordering::SeqCst);
+            broker
+                .operation_status_unavailable
+                .store(true, Ordering::SeqCst);
+            assert!(matches!(
+                attempt().await,
+                Err(ExactSigningError::OutcomeUnknown(_))
+            ));
+            assert!(matches!(
+                attempt().await,
+                Err(ExactSigningError::OutcomeUnknown(_))
+            ));
+            assert_eq!(prepares(&broker), 1);
+            assert_eq!(broker.signings.lock().unwrap().len(), 1);
+            let after: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(after, state);
+            broker
+                .operation_status_unavailable
+                .store(false, Ordering::SeqCst);
+            assert!(attempt().await.unwrap());
+            assert_eq!(broker.signings.lock().unwrap().len(), 1);
+        }
     }
 
     /// A refusal with no lasting effect settles the attempt where it
