@@ -129,6 +129,11 @@ controls, so result cards cannot crowd out the search filters.
 Public label activation also checks an associated submit/button control's
 payment labels before dispatching activation events. Image submit controls
 and their labels use the image's alternative text for the same payment guard.
+Typing uses the snapshot's live private-input classifier, including accessible
+and slotted labels and captions beside numeric placeholders. It rechecks after
+focus and selection before inserting text, so changing a field into a card or
+password input cannot redirect a public write. Approved private card filling
+uses its separate post-approval path.
 
 ## Booking sites that reject Bloom's browser
 

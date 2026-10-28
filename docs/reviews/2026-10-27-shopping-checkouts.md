@@ -282,3 +282,26 @@ checkout discards its cookies and storage, so another purchase may require a
 new login. The VFS guide now states that limit rather than promising one login
 per site indefinitely. The existing real-browser session-disposal regression
 passed in the99-test suite.
+
+## Private input follow-up, 2026-10-28
+
+A real Chromium regression found that a field labelled Card number without
+`autocomplete` was masked in snapshots but accepted ordinary shopping typing.
+Runtime `31c58316acbaec025e331534efb0a00b525248d3` makes typing use the same
+live private-input classifier as the snapshot. Eleven rejection cases cover
+names, accessible/slotted labels, numeric placeholders, passwords, autocomplete
+and fields changing on focus. No value is inserted in those cases. The existing
+payment-word guard and native selection behavior remain intact.
+
+All100 checkout library tests passed (8 opt-in exclusions), as did strict
+Clippy. All seven real Machine/Broker/Signer acceptance checks passed again:
+the stronger public typing guard permits normal contact entry and the approved
+sealed-card path still completes an actual Stripe TEST payment, then deletes
+the synthetic card through custody. The corrected session-lifetime guide was
+also read back byte-for-byte through the running VFS.
+
+Runtime553 completed its full installed Mac conformance successfully. The
+guarded runtime's [three-platform release run](https://github.com/bloom-directory/bloom/actions/runs/40678447250)
+and [Mac conformance](https://github.com/bloom-directory/bloom/actions/runs/40678454797)
+are the final verification records for this follow-up. The previously stated
+two-login infrastructure, unlanded-pin and independent-review gates remain.
