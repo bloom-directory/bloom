@@ -280,18 +280,16 @@ fn evm_chain(
     }
 }
 
-/// Polygon defaults shipped before 0.4.1, each paired with its replacement.
-/// `polygon-rpc.com` answers every call with 403 "tenant disabled" and
-/// `polygon-bor-rpc.publicnode.com` no longer resolves.
-const RETIRED_POLYGON_RPC_URLS: [(&str, &str); 2] = [
-    (
-        "https://polygon-rpc.com",
-        "https://polygon-bor.publicnode.com",
-    ),
-    (
-        "https://polygon-bor-rpc.publicnode.com",
-        "https://polygon.publicnode.com",
-    ),
+/// Keyless access was retired by the provider; authenticated/custom URLs stay.
+const RETIRED_POLYGON_RPC_URL: &str = "https://polygon-rpc.com";
+
+/// Independent providers, rather than several aliases of the same service.
+/// PublicNode's original hostname remains valid; local DNS failure is not
+/// evidence that a provider has retired an endpoint.
+const POLYGON_RPC_URLS: [&str; 3] = [
+    "https://polygon.drpc.org",
+    "https://polygon-bor-rpc.publicnode.com",
+    "https://tenderly.rpc.polygon.community",
 ];
 
 fn default_chains() -> BTreeMap<String, ChainSpec> {
@@ -355,16 +353,7 @@ fn default_chains() -> BTreeMap<String, ChainSpec> {
             "ETH",
         )
         .with_op_stack(),
-        evm_chain(
-            "polygon",
-            137,
-            &[
-                "https://polygon-bor.publicnode.com",
-                "https://polygon.publicnode.com",
-            ],
-            "Polygon PoS",
-            "POL",
-        ),
+        evm_chain("polygon", 137, &POLYGON_RPC_URLS, "Polygon PoS", "POL"),
         evm_chain(
             "bsc",
             56,
@@ -419,17 +408,20 @@ fn default_chains() -> BTreeMap<String, ChainSpec> {
     chains
 }
 
-/// Swap exact retired default URLs in place, keeping every other entry and the
-/// list order. Bloom only ever wrote these defaults to `rpc_urls`.
+/// Repair configs containing the exact retired default and add missing fallback
+/// providers. Preserve custom entries and their relative order; custom-only
+/// lists and explicit `rpc_endpoints` remain operator-controlled.
 fn replace_retired_polygon_urls(urls: &mut Vec<String>) {
-    for (retired, replacement) in RETIRED_POLYGON_RPC_URLS {
-        let Some(i) = urls.iter().position(|u| u == retired) else {
-            continue;
-        };
-        if urls.iter().any(|u| u == replacement) {
-            urls.remove(i);
-        } else {
-            urls[i] = replacement.to_string();
+    let Some(i) = urls.iter().position(|u| u == RETIRED_POLYGON_RPC_URL) else {
+        return;
+    };
+    if !urls.iter().any(|u| u == POLYGON_RPC_URLS[0]) {
+        urls[i] = POLYGON_RPC_URLS[0].to_string();
+    }
+    urls.retain(|u| u != RETIRED_POLYGON_RPC_URL);
+    for url in POLYGON_RPC_URLS {
+        if !urls.iter().any(|u| u == url) {
+            urls.push(url.to_string());
         }
     }
 }
@@ -1218,13 +1210,7 @@ allow_broadcast = false
     #[test]
     fn polygon_defaults_avoid_retired_endpoints() {
         let fresh = Config::local_default();
-        assert_eq!(
-            fresh.chains["polygon"].rpc_urls,
-            [
-                "https://polygon-bor.publicnode.com",
-                "https://polygon.publicnode.com"
-            ]
-        );
+        assert_eq!(fresh.chains["polygon"].rpc_urls, POLYGON_RPC_URLS);
         let mut migrated = fresh.clone();
         migrated.migrate();
         assert_configs_equivalent(&migrated, &fresh);
@@ -1251,20 +1237,34 @@ allow_broadcast = false
                 "https://user:secret@rpc.example/polygon",
                 "https://polygon-bor-rpc.publicnode.com",
                 "https://polygon-rpc.com",
+                "https://polygon.drpc.org",
+                "https://polygon-rpc.com",
             ]),
             [
                 "https://polygon.publicnode.com",
                 "https://user:secret@rpc.example/polygon",
-                "https://polygon-bor.publicnode.com",
+                "https://polygon-bor-rpc.publicnode.com",
+                "https://polygon.drpc.org",
+                "https://tenderly.rpc.polygon.community",
             ]
         );
         // Custom-only, including near-misses of the retired values.
         let custom = [
+            "https://polygon-bor-rpc.publicnode.com",
+            "https://polygon-bor.publicnode.com",
             "https://polygon-rpc.com/?key=abc",
             "https://polygon-rpc.com/",
             "https://polygon-mainnet.g.alchemy.com/v2/KEY",
         ];
         assert_eq!(migrated_polygon_urls(&custom), custom);
+    }
+
+    #[test]
+    fn migration_replaces_duplicate_retired_urls_once() {
+        assert_eq!(
+            migrated_polygon_urls(&[RETIRED_POLYGON_RPC_URL, RETIRED_POLYGON_RPC_URL]),
+            POLYGON_RPC_URLS
+        );
     }
 
     #[test]
