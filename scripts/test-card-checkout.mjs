@@ -40,11 +40,15 @@ async function vfs(command, path, value) {
   const child = spawn(binary, ['--quiet', '--home', home, '--connect', endpoint, 'vfs', command, path],
     {stdio:['pipe','pipe','pipe'], timeout:90000});
   let stdout = '';
+  let stderr = '';
   child.stdout.on('data', bytes => stdout += bytes);
-  child.stderr.resume();
+  child.stderr.on('data', bytes => { stderr = (stderr+bytes).slice(-4096); });
   child.stdin.end(value === undefined ? undefined : JSON.stringify(value));
   const status = await new Promise((resolve, reject) => { child.once('error', reject); child.once('close', resolve); });
-  assert.equal(status, 0, `VFS ${command} ${path} failed`);
+  const diagnostic = stderr.replaceAll('4242424242424242','[test card]')
+    .replaceAll('Bloom Synthetic Cardholder','[test holder]')
+    .replace(/private\?token=[^\s"']+/g,'private?[redacted]');
+  assert.equal(status, 0, `VFS ${command} ${path} failed: ${diagnostic}`);
   if (command !== 'cat') return;
   assert(!stdout.includes('4242424242424242') && !stdout.includes('Bloom Synthetic Cardholder')
     && !stdout.includes('private?token='), 'Private fixture values leaked through VFS');
@@ -53,6 +57,21 @@ async function vfs(command, path, value) {
 async function browse(request) {
   await vfs('write', `/checkout/browse/${slot}/in.json`, request);
   return vfs('cat', `/checkout/browse/${slot}/out.json`);
+}
+async function typeVisible(label, text, required = true) {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const snapshot = await browse({action:'snapshot'});
+    const field = snapshot.elements.find(e => e.role === 'input' && label.test(e.label));
+    if (!field) { if (!required) return; await delay(500); continue; }
+    try { await browse({action:'type',element_ref:field.ref,text}); return; }
+    catch (error) {
+      // Stripe replaces ordinary contact controls while its frames load.
+      // Reobserve a stale binding; never retry a payment action here.
+      if (!/snapshot|stale|page could not be read or changed/i.test(error.message)) throw error;
+      await delay(500);
+    }
+  }
+  throw Error(`Contact field did not stabilize: ${label}`);
 }
 async function poll(path, states) {
   for (let attempt = 0; attempt < 150; attempt++) {
@@ -143,12 +162,8 @@ try {
   await browse({action:'open',url:'https://buy.stripe.com/test_28o7u4eQMcaUgWk8ww'}); await delay(10000);
   let snapshot = await browse({action:'snapshot'});
   assert(snapshot.url.startsWith('https://buy.stripe.com/test_'), 'Refuse a live payment page');
-  const email = snapshot.elements.find(e => e.role === 'input' && /^email$/i.test(e.label));
-  assert(email, 'Stripe email field is not ready');
-  await browse({action:'type',element_ref:email.ref,text:'fixture-buyer@example.com'});
-  snapshot = await browse({action:'snapshot'});
-  const postal = snapshot.elements.find(e => e.role === 'input' && /postal|zip/i.test(e.label));
-  if (postal) await browse({action:'type',element_ref:postal.ref,text:'12345'});
+  await typeVisible(/^email$/i,'fixture-buyer@example.com');
+  await typeVisible(/postal|zip/i,'12345',false);
   const payment = id();
   await vfs('write',`/checkout/requests/${payment}/in.json`,{card_id:'stack-card',agent_description:'Stripe public TEST subscription; synthetic card; no real funds'});
   const awaiting = await checkoutStatus(payment);
