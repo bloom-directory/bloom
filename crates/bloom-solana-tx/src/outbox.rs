@@ -296,7 +296,7 @@ impl SolanaOutbox {
         fs::rename(&entry.dir, &target)?;
         if new_state == SolanaOutboxState::Failed {
             let _ = fs::remove_file(target.join(BROADCAST_RAW_TX));
-            let _ = fs::remove_file(target.join(PRIVATE_SIGNATURE_FILE));
+            // Retain the transaction identifier for later status queries.
         }
         if matches!(
             new_state,
@@ -729,21 +729,47 @@ impl SolanaOutbox {
         now_ms: u128,
         live_block_heights: &std::collections::HashMap<String, u64>,
     ) -> Result<usize, OutboxError> {
+        self.sweep_expired_with_statuses(now_ms, live_block_heights, &Default::default())
+    }
+
+    /// Status observations must include transaction history, taken after the
+    /// validity window closes. Missing/error observations leave signed entries
+    /// untouched; true means observed, false means all endpoints report absent.
+    pub fn sweep_expired_with_statuses(
+        &self,
+        now_ms: u128,
+        live_block_heights: &std::collections::HashMap<String, u64>,
+        signature_statuses: &std::collections::HashMap<(String, String), bool>,
+    ) -> Result<usize, OutboxError> {
         let expired = self.expired_pending(now_ms, live_block_heights)?;
         let mut count = 0;
         for entry in &expired {
             let mut expired = entry.clone();
-            expired.staged.status = SolanaTxStatus::Expired;
+            let state = match self.recorded_signature(entry)? {
+                Some(signature) => {
+                    match signature_statuses.get(&(entry.staged.chain.clone(), signature)) {
+                        Some(true) => SolanaOutboxState::Sent,
+                        Some(false) => SolanaOutboxState::Failed,
+                        None => continue,
+                    }
+                }
+                None => SolanaOutboxState::Failed,
+            };
+            expired.staged.status = if state == SolanaOutboxState::Sent {
+                SolanaTxStatus::Sent
+            } else {
+                SolanaTxStatus::Expired
+            };
             // A concurrent broadcast may have moved the entry to `sent`.
             // Only one rename can win; never recreate the pending directory.
-            let dir = match self.transition(&expired, SolanaOutboxState::Failed) {
+            let dir = match self.transition(&expired, state) {
                 Ok(dir) => dir,
                 Err(OutboxError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
                     continue;
                 }
                 Err(error) => return Err(error),
             };
-            expired.state = SolanaOutboxState::Failed;
+            expired.state = state;
             expired.dir = dir;
             self.rewrite_intent(&expired)?;
             count += 1;
@@ -785,10 +811,9 @@ impl SolanaOutbox {
                     }
                     let staged: StagedSolanaTransfer =
                         serde_json::from_slice(&fs::read(&intent_path)?)?;
-                    // Broadcast moves an entry to `sent` before it submits, so
-                    // a pending entry was never sent, signed or not. The one
-                    // exception is a crash between the broadcast marker and
-                    // that move; like cancel, leave a marked entry alone.
+                    // Signed bytes may already have reached the RPC through
+                    // simulation. The sweep must check their signature before
+                    // retiring them; a missing broadcast marker proves nothing.
                     let entry = SolanaOutboxEntry {
                         state: SolanaOutboxState::Pending,
                         staged,
