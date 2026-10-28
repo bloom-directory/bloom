@@ -70,9 +70,16 @@ pub(crate) fn derived_traveler_value(
         }
         "phone_area" | "phone_local" => {
             let formatted = formatted_phone(values.get("phone")?)?;
-            let mut groups: Vec<&str> = formatted.split(' ').skip(1).collect();
+            let mut groups: Vec<&str> = formatted
+                .split(|c: char| !c.is_ascii_digit())
+                .filter(|group| !group.is_empty())
+                .skip(1)
+                .collect();
             if groups.first() == Some(&"9") && groups.len() > 2 {
                 groups.remove(0);
+            }
+            if groups.len() < 2 {
+                return None;
             }
             let area = groups.first()?.to_string();
             let local: String = groups[1..]
@@ -526,6 +533,97 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(filled, json!(["SyntheticName", "Femenino", ""]));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn custom_traveler_displays_and_radio_choices_stay_private() {
+        let (browser, server, url) = browser_at(
+            r#"<html lang='es'><div id='expiry'>Fecha de Caducidad
+              <label>Día<div role='combobox'><span></span><input id='day' aria-label='Día de vencimiento' aria-autocomplete='list' readonly></div></label>
+              <label>Mes<div role='combobox'><span></span><input id='month' aria-label='Mes de vencimiento' aria-autocomplete='list' readonly></div></label>
+              <label>Año<div role='combobox'><span></span><input id='year' aria-label='Año de vencimiento' aria-autocomplete='list' readonly></div></label>
+            </div><fieldset><legend>Género</legend>
+              <label><input type='radio' name='gender' value='female'>Femenino</label>
+              <label><input type='radio' name='gender' value='male'>Masculino</label>
+            </fieldset><div id='options' hidden></div>
+            <label><input type='checkbox' checked>Terms accepted</label>
+            <button onclick="this.textContent='Fare selected'">Choose fare 31</button>
+            <script>
+              const values={day:['31','31'],month:['12','Diciembre'],year:['2035','2035']};
+              for(const input of expiry.querySelectorAll('input')) input.addEventListener('click',()=>{
+                const [value,label]=values[input.id];options.innerHTML='<div role="option">'+label+'</div>';
+                options.hidden=false;options.firstChild.addEventListener('click',()=>{
+                  input.value=value;input.parentElement.querySelector('span').textContent=label;
+                  options.hidden=true;
+                });
+              });
+            </script></html>"#,
+        ).await;
+        let values = [
+            (
+                "document_expiry".into(),
+                Zeroizing::new("2035-12-31".into()),
+            ),
+            ("gender".into(), Zeroizing::new("male".into())),
+        ]
+        .into_iter()
+        .collect();
+        let origin = url::Url::parse(&url)
+            .unwrap()
+            .origin()
+            .ascii_serialization();
+        let filled = browser
+            .fill_traveler(
+                &origin,
+                &browser.shopping_context().await,
+                &[TravelerField::DocumentExpiry, TravelerField::Gender],
+                &values,
+            )
+            .await
+            .unwrap();
+        assert!(filled.contains(&"document_expiry".into()) && filled.contains(&"gender".into()));
+        let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+        let serialized = snapshot.to_string();
+        assert!(
+            !serialized.contains("Diciembre") && !serialized.contains("2035"),
+            "{snapshot}"
+        );
+        assert!(
+            serialized.contains("[saved document_expiry_day]")
+                && serialized.contains("[saved gender]")
+        );
+        let elements = snapshot["elements"].as_array().unwrap();
+        assert!(
+            elements
+                .iter()
+                .filter(|e| e["type"] == "radio")
+                .all(|e| e.get("checked").is_none())
+        );
+        assert!(
+            elements
+                .iter()
+                .any(|e| e["label"] == "Terms accepted" && e["checked"] == true)
+        );
+        // The public fare has the same number as the saved day. It must stay
+        // readable and actionable; globally masking short date tokens is wrong.
+        let fare = elements
+            .iter()
+            .find(|e| e["label"] == "Choose fare 31")
+            .unwrap();
+        browser
+            .browse(BrowseRequest::Click {
+                element_ref: fare["ref"].as_str().unwrap().into(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            browser.browse(BrowseRequest::Snapshot).await.unwrap()["elements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["label"] == "Fare selected")
+        );
         server.abort();
     }
 

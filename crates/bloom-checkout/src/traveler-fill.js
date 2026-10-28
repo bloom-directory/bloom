@@ -99,6 +99,7 @@
       if (radios.length !== 1) throw new Skip(`radio ambiguous: ${radios.length} options`);
       radios[0].click();
       if (!radios[0].checked) throw new Skip('radio not checked');
+      (globalThis.__bloomPrivateDisplays ||= new Set()).add(e);
       filled.push(mapping.field);
       continue;
     }
@@ -179,6 +180,10 @@
       for (let a = e.parentElement, depth = 0; a && depth < 4 && !shownBeside; a = a.parentElement, depth++) {
         const shown = normalize(a.innerText);
         shownBeside = shown === chosen || aliases.some(x => normalize(x).length > 1 && normalize(x) === shown);
+        if (shownBeside) {
+          globalThis.__bloomPrivateFields.set(a, mapping.field + (mapping.part ? '_' + mapping.part : ''));
+          (globalThis.__bloomPrivateDisplays ||= new Set()).add(a);
+        }
       }
       const taken = normalize(e.value);
       // Typed text alone proves nothing: an editable list must also have closed.

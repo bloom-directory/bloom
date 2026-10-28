@@ -162,34 +162,49 @@ impl Browser {
                         .as_array()
                         .context("Missing shopping elements")?;
                     let limit = if position == 0 { 300 } else { 20 };
-                    let tree = self
-                        .cdp
-                        .call(
-                            Some(&frame.session),
-                            "Accessibility.getFullAXTree",
-                            json!({"frameId":frame.frame_id}),
-                        )
-                        .await;
-                    match tree {
-                        Ok(tree) => text.push_str(&accessibility_text(&tree)?),
-                        Err(error) if error.is::<OversizedReply>() => {
-                            // The structured controls already contain the safe
-                            // labels and context. Keep those usable without an
-                            // unbounded outline or another text-reading surface.
-                            eprintln!("checkout accessibility outline exceeded the reply limit");
-                            text.push_str("Large page: text is limited to the listed controls.\n");
-                            for element in projected.iter().take(limit) {
-                                if let Some(label) = element["label"].as_str() {
-                                    text.push_str(label);
-                                    text.push('\n');
-                                }
-                                if let Some(context) = element["context"].as_str() {
-                                    text.push_str(context);
-                                    text.push('\n');
-                                }
+                    // AX can repeat custom selected values outside their input
+                    // subtree. Use the masked projection while those are present.
+                    let private_displays = snapshot["private_displays"] == true;
+                    let outline = if private_displays {
+                        None
+                    } else {
+                        match self
+                            .cdp
+                            .call(
+                                Some(&frame.session),
+                                "Accessibility.getFullAXTree",
+                                json!({"frameId":frame.frame_id}),
+                            )
+                            .await
+                        {
+                            Ok(tree) => Some(accessibility_text(&tree)?),
+                            Err(error) if error.is::<OversizedReply>() => {
+                                eprintln!(
+                                    "checkout accessibility outline exceeded the reply limit"
+                                );
+                                None
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    };
+                    if let Some(outline) = outline {
+                        text.push_str(&outline);
+                    } else {
+                        text.push_str(if private_displays {
+                            "Saved traveler details: text is limited to the listed controls.\n"
+                        } else {
+                            "Large page: text is limited to the listed controls.\n"
+                        });
+                        for element in projected.iter().take(limit) {
+                            if let Some(label) = element["label"].as_str() {
+                                text.push_str(label);
+                                text.push('\n');
+                            }
+                            if let Some(context) = element["context"].as_str() {
+                                text.push_str(context);
+                                text.push('\n');
                             }
                         }
-                        Err(error) => return Err(error),
                     }
                     text.push('\n');
                     for (index, element) in projected.iter().enumerate() {

@@ -39,6 +39,10 @@ tool for this checkout.
   `born_on_year` or `born_on_dmy`.
   Snapshots show unlocked values as `[saved <field>]`; check each field holds
   the right placeholder, and never try to recover the values.
+  Custom selector captions and saved radio choices are masked too. While
+  those displays are present, page text is limited to the masked controls and
+  their surrounding context. Choose a phone's country/prefix before filling
+  area and local number; changing the country can clear those fields.
   One `fill_traveler` person per booking. The same person may be filled again
   on a later step. A different person is refused; use `type_traveler` with
   that person's id for each field. When a page contains multiple passenger
@@ -97,6 +101,9 @@ tool for this checkout.
   browser, so a take-over is needed once per site, not per purchase.
   Approvals use the passkey set up with the first saved card; if
   `cards/index.json` is empty, ask the human to add a card first.
+  An early Buy/Comprar button can also require approval before passenger
+  details. Use a take-over to let the person advance that step, then continue
+  after Done; never bypass the payment guard because a button seems early.
 - Cancellation is a write to the request's `cancel` file, only before release.
 - If the person loses an approved private-view tab, read `status.json` and
   forward `view_url`. It reopens the view in the browser that claimed it;

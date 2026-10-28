@@ -3981,8 +3981,12 @@ mod tests {
                 "{phone}"
             );
         }
-        // Argentine mobiles: 11 for Buenos Aires, three and four digit areas elsewhere.
+        // International formatting uses spaces, hyphens, or both. Never send
+        // the whole US number as its area code and an empty local number.
         for (phone, area, local) in [
+            ("+12025550123", "202", "5550123"),
+            ("+442079460958", "20", "79460958"),
+            ("+61293744000", "2", "93744000"),
             ("+5492944123456", "294", "4123456"),
             ("+5491123456789", "11", "23456789"),
             ("+5493514123456", "351", "4123456"),
