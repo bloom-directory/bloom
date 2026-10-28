@@ -71,6 +71,10 @@
   // Card and password values never leave the page; checkout redacts saved
   // traveler values before the agent reads anything else.
   const secret = BLOOM_CARD_SECRET;
+  // Actions use this same live classifier, including slotted labels and
+  // captions beside numeric placeholders, before inserting any public text.
+  const privateInput = e => secret(e, /^\d[\d\s]*$/.test(label(e)) ? caption(e) : label(e));
+  globalThis.__bloomPrivateInput = privateInput;
   // Labels toggle their (often restyled and hidden) radio or checkbox.
   const control = e => e.matches(native) || (e.tagName === 'LABEL' && e.control);
   // Open web components contain ordinary controls outside document selectors.
@@ -121,7 +125,7 @@
     context: context(e),
     type: e.type || null,
     // Numeric placeholders can hide the adjacent card-field caption.
-    value: field(e) && e.type !== 'checkbox' && e.type !== 'radio' && !secret(e, /^\d[\d\s]*$/.test(label(e)) ? caption(e) : label(e)) ?
+    value: field(e) && e.type !== 'checkbox' && e.type !== 'radio' && !privateInput(e) ?
       (e.value && globalThis.__bloomPrivateFields?.has(e) ? `[saved ${globalThis.__bloomPrivateFields.get(e)}]` : String(e.value).slice(0, 200)) : undefined,
     checked: checked(e),
     options: e.tagName === 'SELECT' ? [...e.options].map(o => ({value: o.value, label: o.text})) : undefined

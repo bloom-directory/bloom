@@ -1445,6 +1445,8 @@ mod tests {
             "<label>Cardholder name<input></label>",
             "<span id='caption'>Security code</span><input aria-labelledby='caption'>",
             "<div>Card number<input></div>",
+            "<div>Card number<input placeholder='1234 1234 1234 1234'></div>",
+            r#"<div id=host><span slot=caption>Card number</span></div><script>host.attachShadow({mode:'open'}).innerHTML='<label><slot name="caption"></slot><input></label>';</script>"#,
             "<input type=password>",
             "<input autocomplete='section-checkout billing cc-number'>",
             "<input aria-label='Travel reference' onfocus=\"this.setAttribute('aria-label','Card number')\">",
@@ -1497,7 +1499,7 @@ mod tests {
                     .cdp
                     .evaluate(
                         &tab.session,
-                        "document.querySelector('input,select').value".into()
+                        "(document.querySelector('input,select') || document.querySelector('#host').shadowRoot.querySelector('input')).value".into()
                     )
                     .await
                     .unwrap(),

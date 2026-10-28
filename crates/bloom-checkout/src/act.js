@@ -38,7 +38,8 @@
     }
     target.click();
   } else {
-    const privateInput = BLOOM_CARD_SECRET;
+    const privateInput = globalThis.__bloomPrivateInput;
+    if (typeof privateInput !== 'function') throw Error('stale');
     if ((e.autocomplete || '').split(' ').some(s => s.startsWith('cc-')) || (kind === 'type' && privateInput(e))) throw Error('payment requires approval');
     if (kind === 'select' && e.tagName !== 'SELECT') throw Error('wrong field');
     if (kind === 'type' && !['INPUT', 'TEXTAREA'].includes(e.tagName)) throw Error('wrong field');

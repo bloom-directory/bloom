@@ -4,7 +4,7 @@
       .map(id => e.getRootNode().getElementById(id)?.textContent || '').join(' ');
     label = namedBy || e.getAttribute('aria-label') || e.labels?.[0]?.innerText || e.placeholder || '';
     // The same small, single-field captions used in shopping snapshots.
-    if (!label) for (let parent = e.parentElement, depth = 0; parent && depth < 4; parent = parent.parentElement, depth++) {
+    if (!label || /^\d[\d\s]*$/.test(label)) for (let parent = e.parentElement, depth = 0; parent && depth < 4; parent = parent.parentElement, depth++) {
       if (parent.querySelectorAll('input,select,textarea').length > 1) break;
       const text = (parent.innerText || '').trim();
       if (text) { label = text.length <= 60 ? text : ''; break; }
