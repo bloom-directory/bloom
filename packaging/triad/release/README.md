@@ -77,7 +77,10 @@ source-quality gates. All targets emit the archive plus `.sha256`, `.sig`,
 and `.pub` sidecars.
 
 The release workflow builds Linux aarch64 natively on `ubuntu-24.04-arm` and
-macOS aarch64 on `macos-15` alongside Linux x86_64. A manual `dry_run=true`
+macOS aarch64 on `macos-15` alongside Linux x86_64 on `ubuntu-24.04`. Both
+Linux builds run in a pinned `ubuntu:22.04` container so the binaries need
+only glibc 2.35: a build on 24.04 requires glibc 2.38+ and fails to start on
+22.04. A manual `dry_run=true`
 dispatch uploads all three `test-unclaimed` candidates as Actions artifacts
 and cannot reach production
 signing or GitHub publication. Live candidate installation requires both a
