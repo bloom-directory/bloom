@@ -144,25 +144,16 @@ fn release_compatibility_declares_each_edge_without_a_global_protocol_range() {
                 query
             })
             .collect::<Vec<_>>();
-        let allowed_predecessor = match repository {
-            "bloom-broker" => Some("dd2add2b9d41540521d08c77d19fb467a2d8029e"),
-            "bloom-service-runtime" => Some("5db670e1b7507deabfdcf451be8b5d315c1c9d91"),
-            _ => None,
-        };
         assert!(
             locked.contains(&revision),
             "{repository} lockfile sources must include {key} {revision}"
         );
         assert!(
-            locked.iter().all(|locked_revision| {
-                *locked_revision == revision
-                    || allowed_predecessor.is_some_and(|allowed| *locked_revision == allowed)
-            }),
+            locked
+                .iter()
+                .all(|locked_revision| *locked_revision == revision),
             "{repository} lockfile contains an unreviewed source revision: {locked:?}"
         );
-        if let Some(predecessor) = allowed_predecessor {
-            assert!(locked.contains(&predecessor));
-        }
     }
     assert!(!compatibility.lines().any(is_legacy_global_protocol_key));
     assert!(is_legacy_global_protocol_key("  protocol_major = 1"));
@@ -301,7 +292,31 @@ fn tag_release_builds_the_locked_triad_and_isolates_production_signing() {
 #[test]
 fn linux_aarch64_release_candidate_uses_locked_sources() {
     let workflow = fs::read_to_string(workspace().join(".github/workflows/release.yml")).unwrap();
-    assert!(workflow.contains("runs-on: ubuntu-24.04-arm"));
+    // Both Linux build jobs compile in a 22.04 container (glibc 2.35).
+    for job in ["build", "build-linux-aarch64"] {
+        let header = format!("  {job}:");
+        let container = if job == "build" {
+            "    container: &linux-build-container"
+        } else {
+            "    container: *linux-build-container"
+        };
+        assert!(
+            workflow
+                .lines()
+                .skip_while(|line| *line != header)
+                .skip(1)
+                .take_while(|line| line.is_empty() || line.starts_with("   "))
+                .any(|line| line == container),
+            "{job} must build in the 22.04 container"
+        );
+    }
+    assert!(workflow.contains("      image: ubuntu:22.04@sha256:"));
+    assert!(workflow.contains("https://snapshot.ubuntu.com/ubuntu/20261027T000000Z/"));
+    assert!(workflow.contains("-o Dir::Etc::sourceparts=-"));
+    assert!(workflow.contains("apt_snapshot install"));
+    assert!(workflow.contains("rustup/archive/1.29.2/"));
+    assert!(workflow.contains("sha256sum --check --strict"));
+    assert!(!workflow.contains("https://sh.rustup.rs"));
     assert!(workflow.contains("uname -m | grep -Fx aarch64"));
     assert!(workflow.contains("ref: ${{ needs.prepare.outputs.release_sha }}"));
     assert!(workflow.contains("name: triad-linux-aarch64-candidate"));
@@ -1137,13 +1152,6 @@ fn production_release_rejects_machine_audit_test_features() {
     assert!(gate.contains("forbidden production Machine feature resolved"));
     assert!(gate.contains("cargo tree"));
     assert!(gate.contains("-e normal,build,features"));
-    for predecessor in [
-        "dd2add2b9d41540521d08c77d19fb467a2d8029e",
-        "5db670e1b7507deabfdcf451be8b5d315c1c9d91",
-    ] {
-        assert!(gate.contains(predecessor));
-    }
-    assert!(gate.contains("predecessor migration fixture resolved in production Machine graph"));
 }
 
 #[test]
