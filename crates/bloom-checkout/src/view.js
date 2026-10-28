@@ -2,6 +2,13 @@ const screen = document.getElementById('screen');
 const status = document.getElementById('status');
 const pages = document.getElementById('pages');
 let closed = false;
+const sessionKey = 'bloom.checkout.session';
+let session = '';
+let frameUrl;
+document.getElementById('controls').disabled = true;
+function privateFetch(path, options = {}) {
+  return fetch(path, {...options, credentials:'omit', headers:{...options.headers,Authorization:`Bearer ${session}`}});
+}
 function closeView(message) {
   closed = true;
   document.title = 'Private checkout closed · Bloom';
@@ -13,12 +20,14 @@ function closeView(message) {
   pages.replaceChildren();
   screen.hidden = true;
   screen.removeAttribute('src');
+  if (frameUrl) { URL.revokeObjectURL(frameUrl); frameUrl = undefined; }
 }
 screen.hidden = true;
-screen.addEventListener('load', () => { if (!closed) screen.hidden = false; });
+screen.addEventListener('load', () => { if (!closed) { screen.hidden = false; document.getElementById('controls').disabled = false; } });
 screen.addEventListener('error', () => {
   if (closed) return;
   screen.hidden = true;
+  document.getElementById('controls').disabled = true;
   status.textContent = 'Browser image unavailable. Wait for reconnection; do not repeat a payment.';
 });
 pages.addEventListener('change',()=>act({action:'select_page',target:pages.value}));
@@ -27,9 +36,9 @@ let queue = Promise.resolve();
 function act(action) {
   queue = queue.then(async () => {
     if (closed) return;
-    const response = await fetch('/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(action)});
+    const response = await privateFetch('/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(action)});
     if (!response.ok) status.textContent = 'Action was not confirmed. Inspect the page before trying again.';
-  }).catch(() => {});
+  }).catch(() => { if (!closed) status.textContent = 'Action was not confirmed. Inspect the page before trying again.'; });
 }
 // Typing straight onto the screen goes to the page's focused field.
 const keys = new Set(['Tab','Enter','Backspace','Escape','ArrowDown','ArrowUp']);
@@ -70,8 +79,9 @@ const describe = state => ({
 }[state.state] || state.state.replaceAll('_', ' '));
 async function refresh() {
   try {
-    const response=await fetch('/state');
+    const response=await privateFetch('/state');
     if (!response.ok) {
+      if (![401,403,410].includes(response.status)) throw Error('View temporarily unavailable');
       closeView('Return to Bloom for the recorded outcome. Closing this view does not prove whether a payment succeeded. Do not pay again until you have checked.');
       return;
     }
@@ -92,8 +102,35 @@ async function refresh() {
       return;
     }
     pages.replaceChildren(...state.pages.map(page=>{const option=document.createElement('option');option.value=page.target;option.textContent=page.origin;option.selected=page.target===state.selected_page;return option;}));
-    screen.src='/frame?refresh='+Date.now();
-    setTimeout(refresh,800);
-  } catch (_) {status.textContent='Connection lost. Check Bloom status; do not repeat a payment.';}
+    const frame = await privateFetch('/frame');
+    if (!frame.ok) throw Error('Browser image unavailable');
+    if (frame.ok && !closed) {
+      const previous = frameUrl;
+      frameUrl = URL.createObjectURL(await frame.blob());
+      screen.src = frameUrl;
+      if (previous) URL.revokeObjectURL(previous);
+    }
+  } catch (_) {
+    screen.hidden = true;
+    document.getElementById('controls').disabled = true;
+    status.textContent='Connection lost. Reconnecting; do not repeat a payment.';
+  } finally { if (!closed) setTimeout(refresh,800); }
 }
-refresh();
+async function openView() {
+  try {
+    session = localStorage.getItem(sessionKey) || '';
+    const bootstrap = new URLSearchParams(location.search).get('token');
+    if (bootstrap) {
+      const response = await privateFetch('/claim',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:bootstrap})});
+      if (!response.ok) throw Error('Approval access unavailable');
+      session = (await response.json()).session;
+      localStorage.setItem(sessionKey,session);
+      history.replaceState(null,'','/view');
+    }
+    if (!session) throw Error('Approval access unavailable');
+    await refresh();
+  } catch (_) {
+    closeView('Private access is unavailable. Reopen the approval link in the browser you used to approve. Do not request another payment.');
+  }
+}
+openView();

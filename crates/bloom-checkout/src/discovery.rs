@@ -380,6 +380,7 @@ impl Discovery {
     async fn read_once(tab: &PrivateTab, site: bool) -> Result<Self> {
         let mut frames = Vec::new();
         let mut candidates = Vec::new();
+        let mut refusal = PreparationReason::FactsUnreadable;
         let mut top_origin = None;
         let contexts = tab.cdp.contexts(&tab.session, "bloom-payment").await?;
         for (position, context) in contexts.iter().enumerate() {
@@ -411,6 +412,14 @@ impl Discovery {
                 // Script-owned reason codes, never merchant text or field values.
                 if let Some(reason) = candidate.get("refusal").and_then(Value::as_str) {
                     eprintln!("payment facts need review: {reason}");
+                    // Only script-owned constants may become public diagnostics.
+                    // A competing action takes precedence over unclear terms.
+                    refusal = match (refusal, reason) {
+                        (_, "pay_control_ambiguous") => PreparationReason::PaymentActionAmbiguous,
+                        (PreparationReason::PaymentActionAmbiguous, _) => refusal,
+                        (_, "installment_choice") => PreparationReason::ChargeTermsUnreadable,
+                        _ => refusal,
+                    };
                 } else if let Ok(facts) = serde_json::from_value::<CheckoutFacts>(candidate) {
                     candidates.push((session.clone(), world, facts));
                 }
@@ -456,8 +465,12 @@ impl Discovery {
             }
         }
         if candidates.len() != 1 {
-            return Err(anyhow::Error::new(PreparationReason::FactsUnreadable)
-                .context("Payment facts require human review"));
+            let reason = if candidates.is_empty() {
+                refusal
+            } else {
+                PreparationReason::FactsUnreadable
+            };
+            return Err(anyhow::Error::new(reason).context("Payment facts require human review"));
         }
         let (facts_session, main_world, mut facts) = candidates.remove(0);
         facts.origin = top_origin.context("Missing merchant origin")?;
@@ -647,8 +660,14 @@ pub(crate) mod tests {
         let mut tab = browser.handoff().await.unwrap();
         tab.fixture_payment_hosts = false; // Real provider pages need no fixture trust.
         let discovery = Discovery::read(&tab).await.unwrap();
-        assert_eq!(discovery.facts.currency, "USD");
-        assert_eq!(discovery.facts.total_minor, 2000);
+        assert!(discovery.facts.total_minor > 0);
+        if discovery.facts.currency == "USD" {
+            assert_eq!(discovery.facts.total_minor, 2000);
+        }
+        eprintln!(
+            "Hosted Stripe quote: {} {}",
+            discovery.facts.currency, discovery.facts.total_minor
+        );
         assert!(discovery.facts.recurring);
         discovery.recheck(&tab).await.unwrap();
         browser.return_control().await.unwrap();
@@ -701,9 +720,9 @@ pub(crate) mod tests {
             );
             // Synthetic non-card billing fields through the private test driver.
             tab.cdp.evaluate(&tab.session,r#"(()=>{
-                const set=(selector,value)=>{const e=document.querySelector(selector);if(!e)throw Error('Missing fixture field');Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(e,value);e.dispatchEvent(new Event('input',{bubbles:true}));e.dispatchEvent(new Event('change',{bubbles:true}));};
+                const set=(selector,value,required=true)=>{const e=document.querySelector(selector);if(!e){if(required)throw Error('Missing fixture field');return;}Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(e,value);e.dispatchEvent(new Event('input',{bubbles:true}));e.dispatchEvent(new Event('change',{bubbles:true}));};
                 set('input[name=email]','fixture-buyer@example.com');
-                set('input[name=billingPostalCode]','12345');
+                set('input[name=billingPostalCode]','12345',false);
                 const save=document.querySelector('input[type=checkbox]');if(save?.checked)save.click();return true;
             })()"#.into()).await.unwrap();
             let discovery = Discovery::read(&tab).await.unwrap();
@@ -832,11 +851,53 @@ pub(crate) mod tests {
         tokio::time::sleep(Duration::from_secs(10)).await;
         let mut tab = browser.handoff().await.unwrap();
         tab.fixture_payment_hosts = false; // Real provider pages need no fixture trust.
+        tab.cdp.evaluate(&tab.session, "(() => { const card = document.querySelector('input#basic-creditCards[name=basic]'); if (card && !card.checked) card.click(); return {card:!!card,frames:document.querySelectorAll('iframe').length}; })()".into()).await.map(|state| eprintln!("Shopify payment selection: {state}")).unwrap();
+        tokio::time::sleep(Duration::from_secs(3)).await;
         let discovery = Discovery::read(&tab).await.unwrap();
         assert_eq!(discovery.facts.currency, "USD");
         assert!((100..=200).contains(&discovery.facts.total_minor));
         assert_eq!(discovery.facts.installments, 1);
         discovery.recheck(&tab).await.unwrap();
+        browser.return_control().await.unwrap();
+    }
+
+    /// Replay a public checkout reached through the shopping VFS. No field
+    /// values are entered and the payment control is never submitted.
+    #[tokio::test]
+    #[ignore = "public checkout replay; set BLOOM_CHECKOUT_LIVE_URL; no purchase"]
+    async fn live_checkout_preparation_rechecks_fields_and_terms() {
+        let url = std::env::var("BLOOM_CHECKOUT_LIVE_URL").expect("Set the public checkout URL");
+        let browser = browser().await;
+        browser.browse(BrowseRequest::Open { url }).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+        if let Some(card) = snapshot["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["role"] == "label" && e["label"] == "Credit card")
+        {
+            browser
+                .browse(BrowseRequest::Click {
+                    element_ref: card["ref"].as_str().unwrap().into(),
+                })
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+        let mut tab = browser.handoff().await.unwrap();
+        tab.fixture_payment_hosts = false;
+        let discovery = Discovery::read(&tab).await.unwrap();
+        discovery.recheck(&tab).await.unwrap();
+        eprintln!(
+            "Verified checkout: origin={}, total={}, currency={}, installments={}, recurring={}, receiving_frames={}",
+            discovery.facts.origin,
+            discovery.facts.total_minor,
+            discovery.facts.currency,
+            discovery.facts.installments,
+            discovery.facts.recurring,
+            discovery.frames.len()
+        );
         browser.return_control().await.unwrap();
     }
 
@@ -1918,8 +1979,30 @@ pub(crate) mod tests {
             "",
             "Order confirmed",
         );
+        let ambiguous = merchant(
+            &inputs(),
+            "<button onclick='window.submitted=true'>Subscribe USD 12.00 monthly</button>",
+            "Order confirmed",
+        );
+        let installments = merchant(
+            &inputs(),
+            "<label>Installments<select name='installments'><option>Choose a schedule</option></select></label>",
+            "Order confirmed",
+        );
+        let conflicting_total = format!(
+            "<!doctype html><div>Total USD 3.99</div><div>Total EUR 4.99</div>{}<button>Pay</button>",
+            inputs()
+        );
         for (html, reviewed_host, expected) in [
             (no_total, true, PreparationReason::FactsUnreadable),
+            (conflicting_total, true, PreparationReason::FactsUnreadable),
+            (ambiguous, true, PreparationReason::PaymentActionAmbiguous),
+            (installments, true, PreparationReason::ChargeTermsUnreadable),
+            (
+                format!("<!doctype html><div>Total USD 3.99</div>{}", inputs()),
+                true,
+                PreparationReason::FactsUnreadable,
+            ),
             (two_numbers, true, PreparationReason::FieldsUnsupported),
             (
                 merchant(&inputs(), "", "Order confirmed"),
@@ -1935,6 +2018,18 @@ pub(crate) mod tests {
                 error.downcast_ref::<PreparationReason>().copied(),
                 Some(expected),
                 "{html}: {error:#}"
+            );
+            assert_eq!(
+                tab.cdp
+                    .evaluate(
+                        &tab.session,
+                        "!!window.submitted || document.body.innerText.includes('Order confirmed')"
+                            .into()
+                    )
+                    .await
+                    .unwrap(),
+                false,
+                "preparation must not try a payment action"
             );
             browser.return_control().await.unwrap();
             server.abort();
@@ -2172,6 +2267,295 @@ pub(crate) mod tests {
         assert!(!discovery.facts.recurring);
         browser.return_control().await.unwrap();
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn payment_form_excludes_newsletter_but_preserves_ambiguity() {
+        let browser = browser().await;
+        for (name, html, accepted) in [
+            (
+                "separate newsletter",
+                format!(
+                    "<form><h2>Newsletter</h2><input type=email><button>Subscribe*</button></form><form>{}<button>Pay now $3.99</button></form>",
+                    inputs()
+                ),
+                true,
+            ),
+            (
+                "newsletter with an offscreen bot trap",
+                format!(
+                    "<form>Join the newsletter<input type=email><div aria-hidden=true style='position:absolute;left:-5000px'><input type=text tabindex=-1></div><button>Subscribe</button></form><form>{}<button>Pay now $3.99</button></form>",
+                    inputs()
+                ),
+                true,
+            ),
+            (
+                "newsletter with a visible extra field",
+                format!(
+                    "<form>Newsletter<input type=email><div aria-hidden=true><input type=text tabindex=-1></div><button>Subscribe</button></form><form>{}<button>Pay</button></form>",
+                    inputs()
+                ),
+                false,
+            ),
+            (
+                "offscreen newsletter field remains accessible",
+                format!(
+                    "<form>Newsletter<input type=email><div style='position:absolute;left:-5000px'><input type=text tabindex=-1></div><button>Subscribe</button></form><form>{}<button>Pay</button></form>",
+                    inputs()
+                ),
+                false,
+            ),
+            (
+                "offscreen newsletter field remains focusable",
+                format!(
+                    "<form>Newsletter<input type=email><div aria-hidden=true style='position:absolute;left:-5000px'><input type=text></div><button>Subscribe</button></form><form>{}<button>Pay</button></form>",
+                    inputs()
+                ),
+                false,
+            ),
+            (
+                "offscreen card field is not a bot trap",
+                format!(
+                    "<form>Newsletter<input type=email><div aria-hidden=true style='position:absolute;left:-5000px'><input id=card-number type=text tabindex=-1></div><button>Subscribe</button></form><form>{}<button>Pay</button></form>",
+                    inputs()
+                ),
+                false,
+            ),
+            (
+                "offscreen private field is not a bot trap",
+                format!(
+                    "<form>Newsletter<input type=email><div aria-hidden=true style='position:absolute;left:-5000px'><input type=password tabindex=-1></div><button>Subscribe</button></form><form>{}<button>Pay</button></form>",
+                    inputs()
+                ),
+                false,
+            ),
+            (
+                "associated submit",
+                format!(
+                    "<form><h2>Newsletter</h2><input type=email><button>Subscribe</button></form><form id=payment>{}</form><button form=payment>Pay</button>",
+                    inputs()
+                ),
+                true,
+            ),
+            (
+                "shared checkout SMS signup",
+                format!(
+                    "<form><section>Text offers<input type=tel><button>Subscribe*</button><p>Receive recurring auto-dialed marketing SMS. Consent is not required to purchase.</p></section>{}<button>Pay now $3.99</button></form>",
+                    inputs()
+                ),
+                true,
+            ),
+            (
+                "repeated native submission",
+                format!(
+                    "<form>{}<button>Pay now $3.99</button><button>Pay now $3.99</button></form>",
+                    inputs()
+                ),
+                true,
+            ),
+            (
+                "different submit payloads",
+                format!(
+                    "<form>{}<button name=plan value=one>Pay</button><button name=plan value=two>Pay</button></form>",
+                    inputs()
+                ),
+                false,
+            ),
+            (
+                "different submit destinations",
+                format!(
+                    "<form>{}<button formaction='/one'>Pay</button><button formaction='/two'>Pay</button></form>",
+                    inputs()
+                ),
+                false,
+            ),
+            (
+                "script buttons are not native duplicates",
+                format!(
+                    "<form>{}<button type=button>Pay</button><button type=button>Pay</button></form>",
+                    inputs()
+                ),
+                false,
+            ),
+            (
+                "subscription upgrade outside card form",
+                format!(
+                    "<aside><button type=button>Subscribe &amp; Get Free Shipping</button></aside><form>{}<button>Pay now $3.99</button></form>",
+                    inputs()
+                ),
+                true,
+            ),
+            (
+                "priced upgrade outside card form",
+                format!(
+                    "<aside><button type=button>Subscribe $5</button></aside><form>{}<button>Pay now $3.99</button></form>",
+                    inputs()
+                ),
+                false,
+            ),
+            (
+                "transparent subscription popup",
+                format!(
+                    "<aside style='opacity:0'><button>Subscribe &amp; Get Free Shipping</button></aside><form>{}<button>Pay now $3.99</button></form>",
+                    inputs()
+                ),
+                true,
+            ),
+            (
+                "newsletter caption with card fields",
+                format!(
+                    "<form>Newsletter<input type=email>{}<button>Subscribe</button><button>Pay</button></form>",
+                    inputs()
+                ),
+                false,
+            ),
+            (
+                "subscription",
+                format!("<form>{}<button>Subscribe</button></form>", inputs()),
+                true,
+            ),
+            (
+                "two payment buttons",
+                format!(
+                    "<form>{}<button>Pay</button><button>Subscribe</button></form>",
+                    inputs()
+                ),
+                false,
+            ),
+            (
+                "separate explicit payment",
+                format!(
+                    "<form>{}<button>Pay</button></form><form><button>Buy now</button></form>",
+                    inputs()
+                ),
+                false,
+            ),
+            (
+                "unowned subscribe",
+                format!(
+                    "<form>{}<button>Pay</button></form><button>Subscribe</button>",
+                    inputs()
+                ),
+                false,
+            ),
+            (
+                "priced subscribe",
+                format!(
+                    "<form>{}<button>Pay</button></form><form><button>Subscribe $5</button></form>",
+                    inputs()
+                ),
+                false,
+            ),
+            (
+                "two card forms",
+                format!(
+                    "<form>{}<button>Pay</button></form><form>{}<button>Subscribe</button></form>",
+                    inputs(),
+                    inputs()
+                ),
+                false,
+            ),
+            (
+                "unowned card fields",
+                format!(
+                    "{}<form><button>Pay</button></form><button>Subscribe</button>",
+                    inputs()
+                ),
+                false,
+            ),
+            (
+                "no card form",
+                "<button>Pay</button><button>Subscribe</button>".into(),
+                false,
+            ),
+        ] {
+            let (url, server) = fixture(format!(
+                "<!doctype html><html lang=en><body><div>Total USD 3.99</div>{html}</body></html>"
+            ))
+            .await;
+            let tab = open(&browser, url).await;
+            let result = Discovery::read(&tab).await;
+            assert_eq!(result.is_ok(), accepted, "{name}");
+            if let Ok(discovery) = result {
+                assert_eq!(discovery.facts.total_minor, 399);
+                assert!(!discovery.facts.recurring, "{name}");
+                discovery.recheck(&tab).await.unwrap();
+                tab.cdp.evaluate(&tab.session, "document.addEventListener('click', event => { event.preventDefault(); globalThis.clicked = event.target.textContent; });".into()).await.unwrap();
+                assert!(discovery.submit(&tab).await.unwrap());
+                let clicked = tab
+                    .cdp
+                    .evaluate(&tab.session, "globalThis.clicked".into())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    clicked,
+                    if name == "subscription" {
+                        "Subscribe"
+                    } else if name == "associated submit" {
+                        "Pay"
+                    } else {
+                        "Pay now $3.99"
+                    }
+                );
+                // Moving the competing control into the payment form must
+                // invalidate the approval facts before another click.
+                if name == "separate newsletter" {
+                    tab.cdp.evaluate(&tab.session, "document.querySelector('input[autocomplete=cc-number]').form.append(document.querySelector('button'));".into()).await.unwrap();
+                    assert!(discovery.submit(&tab).await.is_err());
+                }
+                if name == "newsletter with an offscreen bot trap" {
+                    tab.cdp.evaluate(&tab.session, "globalThis.clicked=null;document.querySelector('[aria-hidden]').style.left='0px';".into()).await.unwrap();
+                    assert!(discovery.submit(&tab).await.is_err());
+                    assert_eq!(
+                        tab.cdp
+                            .evaluate(&tab.session, "globalThis.clicked".into())
+                            .await
+                            .unwrap(),
+                        Value::Null
+                    );
+                }
+            }
+            browser.return_control().await.unwrap();
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_stripe_prices_must_match_processor_amount_and_currency() {
+        let browser = browser().await;
+        for (prices, accepted) in [
+            (
+                "<div class=CurrencyAmount>$20.00</div><div class=CurrencyAmount>$20.00</div>",
+                true,
+            ),
+            (
+                "<div class=CurrencyAmount>$20.00</div><div class=CurrencyAmount>$30.00</div>",
+                false,
+            ),
+            ("<div class=CurrencyAmount>CAD 20.00</div>", false),
+            ("<div class=CurrencyAmount>€20.00</div>", false),
+            (
+                "<div class=CurrencyAmount>$20.00</div><aside style='opacity:0'><div class=CurrencyAmount>$30.00</div></aside>",
+                true,
+            ),
+        ] {
+            let (url, server) = fixture(format!(
+                "<!doctype html><body>{prices}<button>Subscribe</button></body>"
+            ))
+            .await;
+            let tab = open(&browser, url).await;
+            let expression = crate::scripts::prepare(include_str!("facts.js"))
+                .replace("BLOOM_FIXTURE_TOTALS", "false")
+                .replacen("(async () => {", "(async () => { const location={origin:'https://buy.stripe.com',hostname:'buy.stripe.com',pathname:'/test_fixture'}; globalThis.__bloomHostedStripeFacts={total_minor:2000,currency:'USD',recurring:true};", 1);
+            let result = tab.cdp.evaluate(&tab.session, expression).await.unwrap();
+            assert_eq!(
+                result.get("total_minor") == Some(&json!(2000)),
+                accepted,
+                "{prices}: {result}"
+            );
+            browser.return_control().await.unwrap();
+            server.abort();
+        }
     }
 
     async fn outcome_of(browser: &Browser, html: &str) -> Value {

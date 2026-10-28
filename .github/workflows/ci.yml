@@ -213,6 +213,9 @@ jobs:
           cargo nextest run --archive-file target/nextest-archive.tar.zst \
             -E 'package(bloom-it) and (binary(anvil_e2e) or binary(erc20_e2e))' \
             --no-fail-fast
+          cargo nextest run --archive-file target/nextest-archive.tar.zst \
+            -E 'package(bloom-checkout) and binary(browser_lifecycle)' \
+            --no-fail-fast
       # The triad release binary asserts the content of the packaged
       # installers, launcher, and release gates. It was previously not run at
       # all, so a launcher change could silently invalidate its assertions.
@@ -285,7 +288,7 @@ jobs:
       github.ref_name == 'triad-architecture'
     uses: ./.github/workflows/macos-unix-conformance.yml
     with:
-      broker_ref: 4dd1b58b7217cdcb0a1238c5ee70febbc1cf95a4
+      broker_ref: 88604d308412bea3876533adc80904223d334bf2
       signer_ref: 74e097a566f1bd08f5f43a7e847d3958b6386a3a
 
   linux_w0_isolation:

@@ -333,7 +333,7 @@ Deployments requiring network enforcement of exact outbound destinations need a
 reviewed egress proxy or firewall policy covering relay, ACME and DNS lifecycle;
 static ingress addresses alone do not cover CA renewal endpoints.
 
-The remote suite requires Machine–Broker API 1.7 and Broker–Signer API 1.6,
+The remote suite requires Machine–Broker API 1.8 and Broker–Signer API 1.6,
 with release state schema 2 and downgrade floor 2 for all three services.
 Legacy localhost credential wraps, RP IDs and user handles are preserved;
 legacy signed receipts retain their original canonical signed bytes. Old pending

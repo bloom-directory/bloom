@@ -39,6 +39,10 @@ tool for this checkout.
   `born_on_year` or `born_on_dmy`.
   Snapshots show unlocked values as `[saved <field>]`; check each field holds
   the right placeholder, and never try to recover the values.
+  Custom selector captions and saved radio choices are masked too. While
+  those displays are present, page text is limited to the masked controls and
+  their surrounding context. Choose a phone's country/prefix before filling
+  area and local number; changing the country can clear those fields.
   One `fill_traveler` person per booking. The same person may be filled again
   on a later step. A different person is refused; use `type_traveler` with
   that person's id for each field. When a page contains multiple passenger
@@ -61,8 +65,19 @@ tool for this checkout.
   different flight cards or the same day number in two calendar months.
   Large pages may report that text is limited to the listed controls;
   those controls, including on-page filters, remain usable.
-- Use fresh snapshot refs after every action. The browser rejects direct
-  card entry and recognizable payment submission through shopping controls.
+- Use fresh snapshot refs after every action. Shopping controls block recognized
+  card/password typing or selection and payment buttons; request private
+  checkout instead.
+  Use elements whose `role` is `input` or `textarea` for `type`, and `select`
+  for `select`. A label or button with the same name opens or focuses a field;
+  click it, then take a new snapshot to find the actual input.
+  Select an available option's `value` from that snapshot, not its label or
+  position. An unavailable value is refused without clearing the current choice.
+- Shops load controls in stages. If a control is missing or the document
+  changed, request another snapshot before concluding it is unavailable.
+  Check each product's required size, format and purchase frequency; radio
+  buttons and their labels report `checked`. After Add to cart, confirm the
+  cart updated before navigating away, so the shop can finish adding the item.
 - A payment request is refused while the page shows form errors; take a
   snapshot, fix what it marks, and request again.
 - For a saved-card payment, select the shop's debit/credit-card option so
@@ -71,6 +86,13 @@ tool for this checkout.
   with `card_id` and `agent_description`. That description is shown as agent
   text, not verified purchase facts. Read `status.json`, forward its ceremony
   URL, and wait. Shopping access stays paused through private checkout.
+  Complete contact, delivery and billing details and choose shipping first.
+  If billing matches delivery, select that option instead of leaving a
+  separate billing form empty. Blank shipping-choice labels are still loading;
+  wait for named rates and a selected method before requesting approval.
+  A total beside “Enter shipping address” can omit delivery and destination
+  taxes; it is not a final quote. Visible card boxes alone do not prove that
+  a checkout is ready to submit.
 - If the human is logged in to the shop with a saved payment method there,
   omit `card_id`: after approval Bloom clicks the shop's pay button once and
   the shop charges its saved method.
@@ -78,15 +100,25 @@ tool for this checkout.
   request with `"take_over": true` and an `agent_description` saying what the
   human must do. Forward the ceremony URL. The human approves, works in
   Bloom's browser, and clicks Done; `status.json` then says `returned` and
-  shopping continues on the page the human left. Logins persist in Bloom's
-  browser, so a take-over is needed once per site, not per purchase.
+  shopping continues on the page the human left, preserving the site session.
+  Closing a card or site-payment checkout clears website cookies and storage;
+  a later purchase can need another login.
   Approvals use the passkey set up with the first saved card; if
   `cards/index.json` is empty, ask the human to add a card first.
+  An early Buy/Comprar button can also require approval before passenger
+  details. Use a take-over to let the person advance that step, then continue
+  after Done; never bypass the payment guard because a button seems early.
 - Cancellation is a write to the request's `cancel` file, only before release.
+- If the person loses an approved private-view tab, read `status.json` and
+  forward `view_url`. It reopens the view in the browser that claimed it;
+  access still requires that browser's origin-scoped private session. It carries no access
+  token. The original approval-page link can also be reopened in that browser.
+  Do not request another payment just to recover a lost tab.
 - Read `checkout/history.json` for the 50 latest requests: time, kind, shop,
-  approved total and final status. Check it before buying again at the same
+  total read from the page and request status. A failed or cancelled request
+  can have a total without any approval or payment. Check it before buying again at the same
   shop so nothing is ordered twice. A subscription also carries the terms the
-  person approved, `renewal_minor`, `renewal_period` and `renewal_starts_on`,
+  page stated, `renewal_minor`, `renewal_period` and `renewal_starts_on`,
   so this is where to answer what they are still paying for and when it next
   charges. A renewal the person approved elsewhere is not here, and no entry
   proves the shop has not changed its price since.
@@ -98,8 +130,9 @@ once. Bloom fills a saved card into fields hosted by a known payment
 provider (Stripe, Shopify, Adyen, Braintree, Yuno and others) or into the own
 checkout page of a listed merchant. A bank challenge,
 card fields anywhere else, or
-an unclear total goes to the human's private view; its URL and screenshots
-never appear in VFS. A manual
+an unclear total goes to the human's private view; its access token and screenshots
+never appear in VFS. The session-protected `view_url` is only an entry point for
+the already authorized browser. A manual
 fallback releases no saved card.
 
 For a subscription, the approval states the ongoing price, how often it
@@ -151,15 +184,28 @@ verified the bank charge. For `booked`, `outcome.order_id` holds the booking
 code the site showed; a reference alone does not prove payment or ticket issue.
 `needs_input` means the page needs attention, not that no payment was submitted.
 Do not infer a charge outcome from a form error, timeout or closing the view.
-`paused` means checkout could not hand the browser back, so shopping stays paused.
+`paused` means checkout could not hand the browser back. The installed service
+restarts checkout with a fresh browser; check status before another payment.
+The restart clears the pause and preserves known or uncertain payment results.
+For a `cancelled`, `failed_before_release` or pre-approval `expired` request
+with `paused`, write its `cancel` file again to retry browser cleanup. This
+cannot repeat payment; Bloom refuses if private approval or submission began.
 `reason` says why Bloom left the payment to the person: `facts_unreadable` for
-a total or currency it could not read, `fields_unsupported` for card fields in
-an unexpected shape, `receiving_origin_unreviewed` for a frame that would
-receive the card and is not a reviewed payment host. The first two can change
-with the page: reach the real payment step, let it finish loading and request
-payment again. The third needs the person, or another seller.
-Older `not_submitted` records are also ambiguous and become `uncertain` on
-restart. `partially_filled`, `disclosure_unknown`, and `uncertain` require
+an unreadable total, currency or incomplete payment page;
+`payment_action_ambiguous` for competing payment actions (choose privately);
+`charge_terms_unreadable` for unclear installment choices (review the schedule
+privately); `fields_unsupported` for card fields in an unexpected shape;
+`receiving_origin_unreviewed` for a frame that would receive the card and is
+not a reviewed payment host. For incomplete facts or fields, reach the real
+payment step, let it finish loading and request payment again.
+If the same refusal remains on the completed page, use private
+take-over for human review; repeating requests on an unchanged page adds no
+evidence. Never click a competing Subscribe or Buy button to test which one
+charges. An unreviewed receiver needs the person, or another seller.
+Older `not_submitted` records and interrupted `manual_required` or
+`human_control` views become `uncertain` on restart: the person may have paid
+privately. A fresh browser clears `paused`, not the uncertain result.
+`partially_filled`, `disclosure_unknown`, and `uncertain` require
 human inspection; never repeat the purchase automatically. Ask the human to
 check the merchant account or confirmation email, then write
 `checkout/requests/<operation_id>/resolve`. The file ignores the body. Bloom

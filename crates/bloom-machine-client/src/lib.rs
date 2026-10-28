@@ -102,7 +102,7 @@ use bloom_broker_api::{
     MachineSignRequest, OperationId, OperationPublicStatus, OperationRequest, PetalUseClaim,
     PolicyCommitReceipt, PolicyCommitUpdateRequest, PolicyUpdatePrepareResponse,
     PolicyUpdateRequest, ProtocolError, ProtocolErrorCode, ProvenanceCatalog, ProvenanceSubject,
-    RequestNonce, ReviewMode, RevocationState, RevokeForKeyRequest, RevokeRequest,
+    RequestNonce, RevocationState, RevokeForKeyRequest, RevokeRequest,
     SealedApprovalPrepareResponse, SealedApprovalTerms, SignedPolicySnapshot, SigningPayloads,
     SigningResult, SystemUseClaim, Token, TypedRequestMethod, ValueLimit, WalletAccountsPublic,
     WalletOperationRequest, WalletPublic, WalletRequest, is_read_only_method,
@@ -1011,6 +1011,8 @@ impl MachineBrokerClient {
         self.prepare_approval(ApprovalPrepareRequest {
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             safe_review_payloads: Vec::new(),
+            message_review_payloads: Vec::new(),
+            evm_reported_token: None,
             evm_review_payloads: if native_evm_review(&request.provenance) {
                 vec![Base64UrlBytes::from_bytes(&request.preimage)]
             } else {
@@ -1021,7 +1023,6 @@ impl MachineBrokerClient {
             canonical_plan_facts_digest: request.canonical_plan_facts_digest,
             petal_use_claim: request.petal_use_claim,
             system_use_claim: request.system_use_claim,
-            requested_review_mode: request.requested_review_mode,
         })
         .await
         .map(ExactPayloadSignOutcome::ApprovalRequired)
@@ -1190,6 +1191,8 @@ impl MachineBrokerClient {
         self.prepare_approval(ApprovalPrepareRequest {
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             safe_review_payloads: Vec::new(),
+            message_review_payloads: Vec::new(),
+            evm_reported_token: None,
             evm_review_payloads: if native_evm_review(&request.provenance) {
                 request
                     .preimages
@@ -1204,7 +1207,6 @@ impl MachineBrokerClient {
             canonical_plan_facts_digest: request.canonical_plan_facts_digest,
             petal_use_claim: request.petal_use_claim,
             system_use_claim: None,
-            requested_review_mode: request.requested_review_mode,
         })
         .await
         .map(ExactPayloadSignOutcome::ApprovalRequired)
@@ -1356,6 +1358,8 @@ impl MachineBrokerClient {
         self.prepare_approval(ApprovalPrepareRequest {
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             safe_review_payloads: Vec::new(),
+            message_review_payloads: Vec::new(),
+            evm_reported_token: None,
             evm_review_payloads: Vec::new(),
             operation_id: request.approval_operation_id,
             terms,
@@ -1364,7 +1368,6 @@ impl MachineBrokerClient {
             system_use_claim: None,
             // A reusable Petal batch carries no EVM review payloads, so
             // there is no contract call to read either way.
-            requested_review_mode: None,
         })
         .await
         .map(ExactPayloadSignOutcome::ApprovalRequired)
@@ -2116,15 +2119,6 @@ pub struct ExactPayloadSignRequest {
     /// BIP-39 and holds more than one child for `crypto_suite`; `None` keeps
     /// the single-account and legacy-root behaviour.
     pub account_key_ref: Option<KeyRef>,
-    /// Which review the owner should be shown for a native EVM contract
-    /// call. `None` lets Broker choose under the wallet's policy: clear when
-    /// the wallet enables it and a signed description covers the call,
-    /// otherwise the existing envelope review. `OpaqueExact` is the caller
-    /// deliberately asking to approve bytes Bloom will not explain, and
-    /// Broker refuses it unless policy allows it. Nothing here can downgrade
-    /// a clear review silently: an unreadable call under a clear request
-    /// fails the preparation.
-    pub requested_review_mode: Option<ReviewMode>,
 }
 
 #[derive(Clone, Debug)]
@@ -2151,15 +2145,6 @@ pub struct ExactPayloadBatchSignRequest {
     /// BIP-39 and holds more than one child for `crypto_suite`; `None` keeps
     /// the single-account and legacy-root behaviour.
     pub account_key_ref: Option<KeyRef>,
-    /// Which review the owner should be shown for a native EVM contract
-    /// call. `None` lets Broker choose under the wallet's policy: clear when
-    /// the wallet enables it and a signed description covers the call,
-    /// otherwise the existing envelope review. `OpaqueExact` is the caller
-    /// deliberately asking to approve bytes Bloom will not explain, and
-    /// Broker refuses it unless policy allows it. Nothing here can downgrade
-    /// a clear review silently: an unreadable call under a clear request
-    /// fails the preparation.
-    pub requested_review_mode: Option<ReviewMode>,
 }
 
 impl ExactPayloadBatchSignRequest {
@@ -2799,9 +2784,9 @@ struct ClaimedPolicyAuthorityDiff {
 #[derive(Clone, Eq, PartialEq, Serialize)]
 struct ClaimedPolicyAuthorityClearSigning {
     #[serde(skip_serializing_if = "Option::is_none")]
-    before: Option<bloom_broker_api::ClearSigningPolicy>,
+    before: Option<bloom_broker_api::LegacyClearSigningPolicy>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    after: Option<bloom_broker_api::ClearSigningPolicy>,
+    after: Option<bloom_broker_api::LegacyClearSigningPolicy>,
 }
 
 #[derive(Clone, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -3399,6 +3384,17 @@ mod tests {
         r#""removed_destinations":[],"removed_petal_packages":[],"removed_required_verifiers":[]}"#,
     );
 
+    /// The verifier a wallet pinned before the catalog moved into Broker.
+    /// Broker no longer exports these, and no longer enforces the policy that
+    /// names them, but a wallet can still be carrying one, and the owner must
+    /// still see a change to it as a change of authority.
+    const LEGACY_VERIFIER_ID: &str = "evm-clear-signing-v1";
+    const LEGACY_VERIFIER_DIGEST_BYTES: [u8; 32] = [
+        0x30, 0x2d, 0x2b, 0xd0, 0xe2, 0xf0, 0xb1, 0x5d, 0xe8, 0xaa, 0x6e, 0x09, 0x07, 0x13, 0xff,
+        0xd7, 0x6a, 0xd1, 0x4e, 0x9b, 0xe9, 0xe4, 0x89, 0xfe, 0x27, 0x8d, 0xb2, 0xf8, 0xa3, 0x4b,
+        0xa7, 0x35,
+    ];
+
     fn clear_signing_wallet_policy(
         unlimited_allowance_allowed: bool,
     ) -> bloom_broker_api::CanonicalWalletPolicy {
@@ -3408,9 +3404,9 @@ mod tests {
             allowed_petal_packages: Vec::new(),
             allowed_destinations: Vec::new(),
             required_verifiers: Vec::new(),
-            clear_signing: Some(bloom_broker_api::ClearSigningPolicy {
+            clear_signing: Some(bloom_broker_api::LegacyClearSigningPolicy {
                 catalog_id: Token::new("bloom-tokens").unwrap(),
-                trusted_keys: vec![bloom_broker_api::CatalogTrustedKey {
+                trusted_keys: vec![bloom_broker_api::LegacyCatalogTrustedKey {
                     key_id: Token::new("publisher-1").unwrap(),
                     verifying_key: bloom_broker_api::Base64UrlBytes::from_bytes(
                         &ed25519_dalek::SigningKey::from_bytes(&[5; 32])
@@ -3423,11 +3419,8 @@ mod tests {
                 opaque_exact_allowed: false,
                 unlimited_allowance_allowed,
                 verifier: bloom_broker_api::RequiredVerifier {
-                    verifier_id: Token::new(bloom_broker_api::EVM_CLEAR_SIGNING_VERIFIER_ID)
-                        .unwrap(),
-                    verifier_digest: Digest32::from_bytes(
-                        bloom_broker_api::EVM_CLEAR_SIGNING_VERIFIER_DIGEST_BYTES,
-                    ),
+                    verifier_id: Token::new(LEGACY_VERIFIER_ID).unwrap(),
+                    verifier_digest: Digest32::from_bytes(LEGACY_VERIFIER_DIGEST_BYTES),
                 },
             }),
         }
@@ -3448,8 +3441,7 @@ mod tests {
             claimed_diff(&before, &after),
             UNLIMITED_ALLOWANCE_DIFF_JCS.replace(
                 "VERIFIER",
-                Digest32::from_bytes(bloom_broker_api::EVM_CLEAR_SIGNING_VERIFIER_DIGEST_BYTES)
-                    .as_str()
+                Digest32::from_bytes(LEGACY_VERIFIER_DIGEST_BYTES).as_str()
             ),
             "Broker asserts these same bytes; a change here must be made on both sides"
         );
@@ -4152,7 +4144,6 @@ mod tests {
             claim_assurance_evidence: None,
             approval_value_limits: Vec::new(),
             account_key_ref: None,
-            requested_review_mode: None,
         }
     }
 
@@ -4185,7 +4176,6 @@ mod tests {
             petal_use_claim: None,
             claim_assurance_evidence: None,
             account_key_ref: None,
-            requested_review_mode: None,
         }
     }
 
@@ -4311,7 +4301,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_confirm_replace_cancel_forward_payload_and_review_mode() {
+    async fn native_confirm_replace_cancel_forward_the_payload_to_review() {
         let broker = Arc::new(MockBroker {
             wallet: WalletPublic {
                 wallet_id: token("wallet"),
@@ -4332,30 +4322,28 @@ mod tests {
             "transaction.replace",
             "transaction.cancel",
         ] {
-            for mode in [ReviewMode::Clear, ReviewMode::OpaqueExact] {
-                broker.requests.lock().unwrap().clear();
-                let payload = format!("unsigned {class}").into_bytes();
-                let mut request = exact_request(payload.clone(), None);
-                request.provenance = ProvenanceSubject::Cli {
-                    client_id: token("bloom-cli"),
-                    command_class: token(class),
-                };
-                request.requested_review_mode = Some(mode);
-                client.sign_exact_payload(request).await.unwrap();
-                let requests = broker.requests.lock().unwrap();
-                let prepare = requests
-                    .iter()
-                    .find_map(|request| match request {
-                        MachineBrokerRequest::SealedApprovalPrepare(prepare) => Some(prepare),
-                        _ => None,
-                    })
-                    .unwrap();
-                assert_eq!(
-                    prepare.evm_review_payloads,
-                    vec![Base64UrlBytes::from_bytes(&payload)]
-                );
-                assert_eq!(prepare.requested_review_mode, Some(mode));
-            }
+            broker.requests.lock().unwrap().clear();
+            let payload = format!("unsigned {class}").into_bytes();
+            let mut request = exact_request(payload.clone(), None);
+            request.provenance = ProvenanceSubject::Cli {
+                client_id: token("bloom-cli"),
+                command_class: token(class),
+            };
+            client.sign_exact_payload(request).await.unwrap();
+            let requests = broker.requests.lock().unwrap();
+            let prepare = requests
+                .iter()
+                .find_map(|request| match request {
+                    MachineBrokerRequest::SealedApprovalPrepare(prepare) => Some(prepare),
+                    _ => None,
+                })
+                .unwrap();
+            // Broker reads these bytes and decides the review it can stand
+            // behind. Machine's job is to hand over the exact payload.
+            assert_eq!(
+                prepare.evm_review_payloads,
+                vec![Base64UrlBytes::from_bytes(&payload)]
+            );
         }
     }
 
@@ -4380,8 +4368,7 @@ mod tests {
             b"unsigned EVM child 1".to_vec(),
             b"unsigned EVM child 2".to_vec(),
         ];
-        let mut native_batch = exact_batch_request(payloads.clone(), None);
-        native_batch.requested_review_mode = Some(ReviewMode::OpaqueExact);
+        let native_batch = exact_batch_request(payloads.clone(), None);
         let prepared = client.sign_exact_payload_batch(native_batch).await.unwrap();
         let ExactPayloadSignOutcome::ApprovalRequired(prepared) = prepared else {
             panic!("first call must prepare one exact batch approval");
@@ -4394,7 +4381,6 @@ mod tests {
             };
             assert_eq!(request.terms.limits.max_operations.get(), 1);
             assert_eq!(request.terms.limits.max_signatures.get(), 2);
-            assert_eq!(request.requested_review_mode, Some(ReviewMode::OpaqueExact));
             assert_eq!(
                 request.evm_review_payloads,
                 payloads
@@ -4826,12 +4812,13 @@ mod tests {
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             safe_review_payloads: Vec::new(),
             evm_review_payloads: Vec::new(),
+            message_review_payloads: Vec::new(),
+            evm_reported_token: None,
             operation_id: OperationId::from_bytes([94; 32]),
             terms: approval_terms("wallet", None),
             canonical_plan_facts_digest: digest(95),
             petal_use_claim: None,
             system_use_claim: None,
-            requested_review_mode: None,
         };
         assert_eq!(
             client.prepare_approval(approval).await.unwrap_err().code,

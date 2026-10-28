@@ -105,18 +105,76 @@
     if (amounts.some(a => a.total !== amounts[0].total || a.currency !== amounts[0].currency)) { totalRefusal = 'conflicting_totals'; return null; }
     return amounts[0];
   };
-  const visible = e => e.getClientRects().length && getComputedStyle(e).visibility === 'visible';
+  const visible = e => e.getClientRects().length && e.checkVisibility({opacityProperty:true,visibilityProperty:true});
+  const cardSecret = BLOOM_CARD_SECRET;
   // YouTube prints "$8.99\u200b/month": a zero-width space between the amount
   // and its period. These characters are invisible to the reader, carry no
   // meaning, and are not whitespace to a regular expression, so they come
   // out before anything is matched against the page.
-  const text = document.body.innerText.replace(/[\u00ad\u200b-\u200d\u2060\ufeff]/g, '');
+  const clean = text => text.replace(/[\u00ad\u200b-\u200d\u2060\ufeff]/g, '');
+  let text = clean(document.body.innerText);
   const controls = [...document.querySelectorAll('button,input[type=submit],input[type=button],a,[role=button]')].filter(visible);
   // The one final payment button, in the main checkout languages (observed on
   // Shopify de/fr/es/pt/it/en checkouts, common shop systems, and Booking.com,
   // Ryanair and Airbnb final pages, 2026-10-11). Labels may use non-breaking spaces.
-  const pay = controls.filter(e => BLOOM_PAY_WORDS.test((e.innerText || e.value || '').replace(/\s+/g, ' ').trim()));
-  if (pay.length !== 1) return {refusal:'pay_control_count'};
+  // A newsletter/SMS signup can share the checkout form. Exclude it only
+  // when a small contact-only block explicitly identifies marketing consent.
+  // Another payment control or any card/other field keeps the block ambiguous.
+  const marketing = new Set();
+  const marketingButtons = new Set();
+  for (const button of controls) {
+    if (!/^subscribe\s*\*?$/i.test((button.innerText || button.value || '').trim())) continue;
+    for (let block = button.parentElement, depth = 0; block && block !== document.body && depth < 6; block = block.parentElement, depth++) {
+      const words = clean(block.innerText || '');
+      if (words.length > 2000) break;
+      if (!/\bnewsletter\b|\bmarketing\s+(?:sms|emails?|text)|\btext offers\b/i.test(words)) continue;
+      const fields = [...block.querySelectorAll('input,select,textarea,iframe')].filter(e => {
+        // Mail signup forms use an offscreen text trap for bots. It is not a
+        // customer field only when both keyboard and assistive access are off.
+        // Any card-like field, visible text field or focusable input still counts.
+        const trap = e.tagName === 'INPUT' && e.type === 'text' && e.tabIndex === -1
+          && e.closest('[aria-hidden="true"]') && e.getBoundingClientRect().right < 0
+          && !cardSecret(e, e.labels?.[0]?.innerText);
+        return !trap;
+      });
+      if (!fields.some(e => ['email','tel'].includes(e.type)) || fields.some(e =>
+        e.tagName !== 'INPUT' || !['email','tel','checkbox','hidden','submit','button'].includes(e.type))) continue;
+      if (controls.some(e => e !== button && block.contains(e) && BLOOM_PAY_WORDS.test((e.innerText || e.value || '').trim()))) continue;
+      marketing.add(block); marketingButtons.add(button); break;
+    }
+  }
+  // "Recurring marketing SMS" is not a recurring charge. Keep those consent
+  // terms out of the charge reader, while retaining payment terms elsewhere.
+  for (const block of marketing) text = text.replace(clean(block.innerText), '');
+  const cardForms = new Set([...document.querySelectorAll('input,iframe')].filter(e => {
+    const rect = e.getBoundingClientRect();
+    if (!visible(e) || !rect.width || !rect.height) return false;
+    if ((e.autocomplete || '').split(/\s+/).some(token => token.startsWith('cc-'))) return true;
+    try { return e.tagName === 'IFRAME' && new URL(e.src).origin === 'https://checkout.pci.shopifyinc.com'; }
+    catch { return false; }
+  }).map(e => e.form || e.closest('form')));
+  const cardForm = cardForms.size === 1 ? [...cardForms][0] : null;
+  const pay = controls.filter(e => {
+    const name = (e.innerText || e.value || '').replace(/\s+/g, ' ').trim();
+    // Checkout extensions can offer a subscription upgrade outside the card
+    // form. A non-submit button there is not that form's payment control.
+    // Keep priced offers, submit buttons and every explicit Pay/Buy ambiguous.
+    if (cardForm && e.type === 'button' && !e.form && !cardForm.contains(e)
+        && /^subscribe\b/i.test(name) && !/[\d€£$]/.test(name)) return false;
+    return !marketingButtons.has(e) && BLOOM_PAY_WORDS.test(name);
+  });
+  // Multi-step Shopify checkouts repeat the same native form submission at
+  // the top and bottom. They are one action only when the form, submit
+  // payload, destination, label and inline handler all agree.
+  const firstPay = pay[0];
+  const submitIdentity = e => JSON.stringify([
+    (e.innerText || e.value || '').replace(/\s+/g, ' ').trim(),
+    e.formAction, e.formMethod, e.name, e.value, e.getAttribute('onclick')
+  ]);
+  const repeatedSubmit = firstPay?.form && firstPay.type === 'submit'
+    && pay.every(e => e.form === firstPay.form && e.type === 'submit'
+      && submitIdentity(e) === submitIdentity(firstPay));
+  if (pay.length !== 1 && !repeatedSubmit) return {refusal:pay.length ? 'pay_control_ambiguous' : 'pay_control_missing'};
   // Test fixtures declare their total; a merchant page never chooses its own.
   const fixture = BLOOM_FIXTURE_TOTALS && ['localhost', '127.0.0.1'].includes(location.hostname);
   const explicit = fixture ? [...document.querySelectorAll('[data-bloom-total-minor][data-bloom-currency]')].filter(visible) : [];
@@ -125,7 +183,14 @@
   if (location.origin === 'https://buy.stripe.com') {
     const processor = globalThis.__bloomHostedStripeFacts;
     const displayed = [...document.querySelectorAll('.CurrencyAmount')].filter(visible);
-    if (!processor || displayed.length !== 1 || displayed[0].textContent.replace(/\D/g,'').replace(/^0+(?=\d)/,'') !== String(processor.total_minor)) return null;
+    // Stripe can repeat the same price in its summary and submit area. Every
+    // visible price must agree with the bound processor amount and currency.
+    // Appending the processor code resolves a bare "$", but conflicting
+    // currency marks (including adaptive local pricing) still fail closed.
+    if (!processor || !displayed.length || displayed.some(e => {
+      const amount = parseAmount(`${e.textContent} ${processor.currency}`);
+      return !amount || amount.total !== processor.total_minor || amount.currency !== processor.currency;
+    })) return null;
     total=processor.total_minor;currency=processor.currency;processorRecurring=processor.recurring;
   } else if (location.origin === 'https://js.stripe.com' && location.pathname === '/v3/embedded-checkout-inner.html') {
     // Observed bootstrap: read facts without submitting card data or a payment.

@@ -8814,7 +8814,8 @@ value = "0""#,
             canonical_plan_facts_digest: digest(31),
             petal_use_claim: None,
             system_use_claim: None,
-            requested_review_mode: None,
+            message_review_payloads: Vec::new(),
+            evm_reported_token: None,
         };
         let path = VfsPath::parse("/alice/sealed-approvals/new.json").unwrap();
         f.handler
@@ -8864,7 +8865,8 @@ value = "0""#,
                 canonical_plan_facts_digest: digest(31),
                 petal_use_claim: None,
                 system_use_claim: None,
-                requested_review_mode: None,
+                message_review_payloads: Vec::new(),
+                evm_reported_token: None,
             };
             let path = VfsPath::parse("/alice/sealed-approvals/new.json").unwrap();
             f.handler
@@ -8899,7 +8901,8 @@ value = "0""#,
             canonical_plan_facts_digest: digest(31),
             petal_use_claim: None,
             system_use_claim: None,
-            requested_review_mode: None,
+            message_review_payloads: Vec::new(),
+            evm_reported_token: None,
         };
         let path = VfsPath::parse("/alice/sealed-approvals/new.json").unwrap();
         f.handler
@@ -8933,7 +8936,8 @@ value = "0""#,
             canonical_plan_facts_digest: digest(31),
             petal_use_claim: None,
             system_use_claim: None,
-            requested_review_mode: None,
+            message_review_payloads: Vec::new(),
+            evm_reported_token: None,
         };
         let path = VfsPath::parse("/alice/sealed-approvals/new.json").unwrap();
 

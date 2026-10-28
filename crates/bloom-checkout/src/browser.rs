@@ -37,6 +37,7 @@ pub struct Browser {
     cdp: Arc<Cdp>,
     tab: Mutex<Tab>,
     revoked: AtomicBool,
+    unusable: AtomicBool,
     #[cfg(test)]
     fixture_payment_hosts: bool,
     /// Unlocked traveler values and their placeholders, removed from snapshots.
@@ -55,6 +56,10 @@ pub(crate) struct PrivateTab {
 }
 
 impl Browser {
+    pub fn needs_restart(&self) -> bool {
+        self.unusable.load(Ordering::SeqCst) || self.cdp.exited()
+    }
+
     /// Launch headless, as every caller but the service entry point wants.
     pub async fn launch(
         executable: &Path,
@@ -110,6 +115,7 @@ impl Browser {
             #[cfg(test)]
             fixture_payment_hosts,
             revoked: AtomicBool::new(false),
+            unusable: AtomicBool::new(false),
             redactions: std::sync::RwLock::new(Vec::new()),
         }))
     }
@@ -166,34 +172,50 @@ impl Browser {
                         .as_array()
                         .context("Missing shopping elements")?;
                     let limit = if position == 0 { 300 } else { 20 };
-                    let tree = self
-                        .cdp
-                        .call(
-                            Some(&frame.session),
-                            "Accessibility.getFullAXTree",
-                            json!({"frameId":frame.frame_id}),
-                        )
-                        .await;
-                    match tree {
-                        Ok(tree) => text.push_str(&accessibility_text(&tree)?),
-                        Err(error) if error.is::<OversizedReply>() => {
-                            // The structured controls already contain the safe
-                            // labels and context. Keep those usable without an
-                            // unbounded outline or another text-reading surface.
-                            eprintln!("checkout accessibility outline exceeded the reply limit");
-                            text.push_str("Large page: text is limited to the listed controls.\n");
-                            for element in projected.iter().take(limit) {
-                                if let Some(label) = element["label"].as_str() {
-                                    text.push_str(label);
-                                    text.push('\n');
-                                }
-                                if let Some(context) = element["context"].as_str() {
-                                    text.push_str(context);
-                                    text.push('\n');
-                                }
+                    // AX can repeat custom selected values outside their input
+                    // subtree. Large pages also need no AX serialization beyond
+                    // the public text budget. Both use the control projection.
+                    let private_displays = snapshot["private_displays"] == true;
+                    let outline = if private_displays || snapshot["large_page"] == true {
+                        None
+                    } else {
+                        match self
+                            .cdp
+                            .call(
+                                Some(&frame.session),
+                                "Accessibility.getFullAXTree",
+                                json!({"frameId":frame.frame_id}),
+                            )
+                            .await
+                        {
+                            Ok(tree) => Some(accessibility_text(&tree)?),
+                            Err(error) if error.is::<OversizedReply>() => {
+                                eprintln!(
+                                    "checkout accessibility outline exceeded the reply limit"
+                                );
+                                None
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    };
+                    if let Some(outline) = outline {
+                        text.push_str(&outline);
+                    } else {
+                        text.push_str(if private_displays {
+                            "Saved traveler details: text is limited to the listed controls.\n"
+                        } else {
+                            "Large page: text is limited to the listed controls.\n"
+                        });
+                        for element in projected.iter().take(limit) {
+                            if let Some(label) = element["label"].as_str() {
+                                text.push_str(label);
+                                text.push('\n');
+                            }
+                            if let Some(context) = element["context"].as_str() {
+                                text.push_str(context);
+                                text.push('\n');
                             }
                         }
-                        Err(error) => return Err(error),
                     }
                     text.push('\n');
                     for (index, element) in projected.iter().enumerate() {
@@ -591,6 +613,14 @@ impl Browser {
             } else {
                 description
             };
+            if reason.lines().next() == Some("Error: wrong field") {
+                bail!(
+                    "Choose an input for typing or a select for selection; request a new snapshot"
+                );
+            }
+            if reason.lines().next() == Some("Error: option unavailable") {
+                bail!("Choose an available option value from a new snapshot");
+            }
             if reason
                 .lines()
                 .next()
@@ -645,6 +675,9 @@ impl Browser {
     }
 
     fn available(&self) -> Result<()> {
+        if self.unusable.load(Ordering::SeqCst) {
+            bail!("Checkout browser is restarting; check request status before another payment");
+        }
         if self.revoked.load(Ordering::SeqCst) {
             bail!("Checkout has private control; shopping is paused");
         }
@@ -652,6 +685,7 @@ impl Browser {
     }
 
     pub(crate) async fn handoff(&self) -> Result<PrivateTab> {
+        self.available()?;
         if self.revoked.swap(true, Ordering::SeqCst) {
             bail!("Checkout is already private");
         }
@@ -676,14 +710,35 @@ impl Browser {
     /// the merchant kept, so shopping never reopens a private session and may
     /// return to the booking site.
     pub(crate) async fn return_control(&self) -> Result<()> {
+        self.reset_shopping().await.inspect_err(|_| {
+            self.unusable.store(true, Ordering::SeqCst);
+        })
+    }
+
+    async fn reset_shopping(&self) -> Result<()> {
         let mut tab = self.tab.lock().await;
-        self.cdp
+        if let Err(error) = self
+            .cdp
             .call(
                 None,
                 "Target.disposeBrowserContext",
                 json!({"browserContextId":tab.context}),
             )
-            .await?;
+            .await
+        {
+            // A previous attempt may have disposed the context before failing
+            // to create the replacement tab. Retry only with no contexts left.
+            let contexts = self
+                .cdp
+                .call(None, "Target.getBrowserContexts", json!({}))
+                .await?;
+            if contexts["browserContextIds"]
+                .as_array()
+                .is_none_or(|ids| !ids.is_empty())
+            {
+                return Err(error);
+            }
+        }
         // The entire browser belongs to checkout, including script-opened popups.
         // closeTarget acknowledges a request, not destruction. Keep shopping
         // revoked until every private page has disappeared, including popups
@@ -724,6 +779,12 @@ impl Browser {
 
     /// After a take-over, shopping continues on the page the human left.
     pub(crate) async fn return_control_at(&self, target: &str, url: Option<String>) -> Result<()> {
+        self.resume_shopping(target, url).await.inspect_err(|_| {
+            self.unusable.store(true, Ordering::SeqCst);
+        })
+    }
+
+    async fn resume_shopping(&self, target: &str, url: Option<String>) -> Result<()> {
         let Some(url) = url.filter(|u| u.starts_with("https://") || u.starts_with("http://"))
         else {
             return self.return_control().await;
@@ -1205,9 +1266,23 @@ mod tests {
             .browse(BrowseRequest::Open { url: url.clone() })
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        let snapshot = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Ok(snapshot) = browser.browse(BrowseRequest::Snapshot).await {
+                    if snapshot["elements"].as_array().is_some_and(|elements| {
+                        elements
+                            .iter()
+                            .any(|e| e["frame_origin"] != origin.as_str() && e["role"] == "input")
+                    }) {
+                        break snapshot;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("cross-origin chat fixture must finish loading");
         let context = browser.shopping_context().await;
-        let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
         let chat = snapshot["elements"]
             .as_array()
             .unwrap()
@@ -1296,7 +1371,9 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .find(|e| matches!(e["label"].as_str(), Some("Origen" | "Origin")))
+                .find(|e| {
+                    e["role"] == "input" && matches!(e["label"].as_str(), Some("Origen" | "Origin"))
+                })
                 .and_then(|e| e["ref"].as_str())
                 .map(str::to_owned);
             if reference.is_some() {
@@ -1322,7 +1399,9 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .find(|e| e["label"] == "Origen")
+                .find(|e| {
+                    e["role"] == "input" && matches!(e["label"].as_str(), Some("Origen" | "Origin"))
+                })
                 .unwrap()["ref"]
                 .as_str()
                 .unwrap()
@@ -1348,22 +1427,17 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(500)).await;
             if let Ok(snapshot) = browser.browse(BrowseRequest::Snapshot).await {
                 after = snapshot;
-                if after["text"].as_str().unwrap().contains("COR") {
+                if after["elements"].as_array().unwrap().iter().any(|e| {
+                    e["label"]
+                        .as_str()
+                        .is_some_and(|label| label.contains("COR"))
+                }) {
                     break;
                 }
             }
         }
-        let labels = after["elements"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|e| e["label"].as_str())
-            .collect::<Vec<_>>();
-        assert!(
-            after["text"].as_str().unwrap().contains("COR"),
-            "Expected Córdoba airport suggestion; got labels {labels:?}, text {}",
-            after["text"]
-        );
+        // The control projection carries suggestions even when AX hides the
+        // combobox subtree to avoid repeating private field values in text.
         let airport = after["elements"]
             .as_array()
             .unwrap()
@@ -1380,6 +1454,89 @@ mod tests {
             })
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn shopping_refuses_private_card_and_password_input() {
+        let root = tempfile::tempdir().unwrap();
+        let browser = Browser::launch(
+            &crate::test_chromium(),
+            &root.path().join("profile"),
+            &["--no-sandbox".into(), "--ignore-certificate-errors".into()],
+        )
+        .await
+        .unwrap();
+        for html in [
+            "<input aria-label='Card number'>",
+            "<input name='card_number'>",
+            "<label>Cardholder name<input></label>",
+            "<span id='caption'>Security code</span><input aria-labelledby='caption'>",
+            "<div>Card number<input></div>",
+            "<div>Card number<input placeholder='1234 1234 1234 1234'></div>",
+            r#"<div id=host><span slot=caption>Card number</span></div><script>host.attachShadow({mode:'open'}).innerHTML='<label><slot name="caption"></slot><input></label>';</script>"#,
+            "<input type=password>",
+            "<input autocomplete='section-checkout billing cc-number'>",
+            "<input aria-label='Travel reference' onfocus=\"this.setAttribute('aria-label','Card number')\">",
+            "<select autocomplete='cc-exp-month'><option value=''>Choose</option><option value='12'>12</option></select>",
+            "<label>Card expiry month<select><option value=''>Choose</option><option value='12'>12</option></select></label>",
+        ] {
+            let (url, server) =
+                crate::discovery::tests::fixture(format!("<!doctype html>{html}")).await;
+            browser.browse(BrowseRequest::Open { url }).await.unwrap();
+            let snapshot = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+                loop {
+                    if let Ok(snapshot) = browser.browse(BrowseRequest::Snapshot).await {
+                        if snapshot["elements"].as_array().is_some_and(|elements| {
+                            elements
+                                .iter()
+                                .any(|e| e["role"] == "input" || e["role"] == "select")
+                        }) {
+                            break snapshot;
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let field = snapshot["elements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["role"] == "input" || e["role"] == "select")
+                .unwrap();
+            let element_ref = field["ref"].as_str().unwrap().to_owned();
+            let request = if field["role"] == "select" {
+                BrowseRequest::Select {
+                    element_ref,
+                    value: "12".into(),
+                }
+            } else {
+                BrowseRequest::Type {
+                    element_ref,
+                    text: "4242424242424242".into(),
+                }
+            };
+            assert!(
+                browser.browse(request).await.is_err(),
+                "Private field accepted shopping input: {html}"
+            );
+            let tab = browser.tab.lock().await;
+            assert_eq!(
+                browser
+                    .cdp
+                    .evaluate(
+                        &tab.session,
+                        "(document.querySelector('input,select') || document.querySelector('#host').shadowRoot.querySelector('input')).value".into()
+                    )
+                    .await
+                    .unwrap(),
+                "",
+                "{html}"
+            );
+            drop(tab);
+            server.abort();
+        }
     }
 
     #[tokio::test]
@@ -1442,6 +1599,14 @@ mod tests {
                 .await
                 .is_err()
         );
+        let wrong_field = browser
+            .browse(BrowseRequest::Type {
+                element_ref: reference(&before, "Select itinerary"),
+                text: "Cordoba".into(),
+            })
+            .await
+            .unwrap_err();
+        assert!(wrong_field.to_string().contains("Choose an input"));
         browser
             .browse(BrowseRequest::Click {
                 element_ref: reference(&before, "Select itinerary"),
@@ -1532,7 +1697,8 @@ mod tests {
             "<!doctype html><style>p{{white-space:nowrap}}</style>
              <label><input type='checkbox' style='display:none'>Direct flights</label>
              <input aria-label='Card number' autocomplete='cc-number' value='4242424242424242'>
-             <div>{flights}</div><div>{rows}</div>"
+             <div>{flights}</div><div>{rows}</div>
+             <script>document.querySelector('button').textContent='Select fixture 0 ready';</script>"
         ))
         .await;
         let root = tempfile::tempdir().unwrap().keep();
@@ -1544,12 +1710,16 @@ mod tests {
         .await
         .unwrap();
         browser.browse(BrowseRequest::Open { url }).await.unwrap();
+        // The first button appears before the large response finishes parsing.
+        // Wait for the end-of-document marker before testing the AX size limit.
         let snapshot = tokio::time::timeout(Duration::from_secs(20), async {
             loop {
                 match browser.browse(BrowseRequest::Snapshot).await {
                     Ok(snapshot)
                         if snapshot["elements"].as_array().is_some_and(|elements| {
-                            elements.iter().any(|e| e["label"] == "Select fixture 0")
+                            elements
+                                .iter()
+                                .any(|e| e["label"] == "Select fixture 0 ready")
                         }) =>
                     {
                         break snapshot;
@@ -1577,7 +1747,7 @@ mod tests {
         );
         let select = elements
             .iter()
-            .find(|e| e["label"] == "Select fixture 0")
+            .find(|e| e["label"] == "Select fixture 0 ready")
             .unwrap();
         browser
             .browse(BrowseRequest::Click {
@@ -1679,7 +1849,7 @@ mod tests {
               <div id="component"></div>
               <div id="slotted"><span slot="label">Continue as guest</span></div>
               <div id="slotted-pay"><span slot="label">Pay now</span></div>
-              <label>Styled month<select aria-label="Styled month" style="opacity:0"><option value="">Month</option><option value="1">January</option></select></label>
+              <label>Styled month<select aria-label="Styled month" style="opacity:0"><option value="">Month</option><option value="1">January</option><option value="2" disabled>February</option><optgroup disabled label="Unavailable"><option value="3">March</option></optgroup></select></label>
               <select aria-label="Hidden styled month" aria-hidden="true" style="opacity:0"><option>Month</option></select>
               <div style="opacity:0"><select aria-label="Inactive month"><option>Month</option></select></div>
               <span id="birth-month-label">Birth month</span>
@@ -1945,6 +2115,34 @@ mod tests {
                 .unwrap()["value"],
             "1"
         );
+        for value in ["missing", "2", "3"] {
+            let current = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+            let month = current["elements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["role"] == "select" && e["label"] == "Styled month")
+                .unwrap();
+            let error = browser
+                .browse(BrowseRequest::Select {
+                    element_ref: month["ref"].as_str().unwrap().into(),
+                    value: value.into(),
+                })
+                .await
+                .err()
+                .unwrap();
+            assert!(error.to_string().contains("available option"), "{error}");
+            let after = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+            assert_eq!(
+                after["elements"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|e| e["role"] == "select" && e["label"] == "Styled month")
+                    .unwrap()["value"],
+                "1"
+            );
+        }
         fixture.abort();
     }
 
@@ -1990,6 +2188,20 @@ mod tests {
         let after = visit().await;
         assert!(after.contains("stored:|"), "{after}");
         assert!(!after.contains("Synthetic"));
+        // Retry after a partial return already destroyed the private context.
+        browser.handoff().await.unwrap();
+        let context = browser.tab.lock().await.context.clone();
+        browser
+            .cdp
+            .call(
+                None,
+                "Target.disposeBrowserContext",
+                json!({"browserContextId":context}),
+            )
+            .await
+            .unwrap();
+        browser.return_control().await.unwrap();
+        assert!(visit().await.contains("stored:|"));
         fixture.abort();
     }
 

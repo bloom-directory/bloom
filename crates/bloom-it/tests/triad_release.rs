@@ -239,25 +239,16 @@ fn release_compatibility_declares_each_edge_without_a_global_protocol_range() {
                 query
             })
             .collect::<Vec<_>>();
-        let allowed_predecessor = match repository {
-            "bloom-broker" => Some("dd2add2b9d41540521d08c77d19fb467a2d8029e"),
-            "bloom-service-runtime" => Some("5db670e1b7507deabfdcf451be8b5d315c1c9d91"),
-            _ => None,
-        };
         assert!(
             locked.contains(&revision),
             "{repository} lockfile sources must include {key} {revision}"
         );
         assert!(
-            locked.iter().all(|locked_revision| {
-                *locked_revision == revision
-                    || allowed_predecessor.is_some_and(|allowed| *locked_revision == allowed)
-            }),
+            locked
+                .iter()
+                .all(|locked_revision| *locked_revision == revision),
             "{repository} lockfile contains an unreviewed source revision: {locked:?}"
         );
-        if let Some(predecessor) = allowed_predecessor {
-            assert!(locked.contains(&predecessor));
-        }
     }
     assert!(!compatibility.lines().any(is_legacy_global_protocol_key));
     assert!(is_legacy_global_protocol_key("  protocol_major = 1"));
@@ -1234,13 +1225,6 @@ fn production_release_rejects_machine_audit_test_features() {
     assert!(gate.contains("forbidden production Machine feature resolved"));
     assert!(gate.contains("cargo tree"));
     assert!(gate.contains("-e normal,build,features"));
-    for predecessor in [
-        "dd2add2b9d41540521d08c77d19fb467a2d8029e",
-        "5db670e1b7507deabfdcf451be8b5d315c1c9d91",
-    ] {
-        assert!(gate.contains(predecessor));
-    }
-    assert!(gate.contains("predecessor migration fixture resolved in production Machine graph"));
 }
 
 #[test]
@@ -1983,14 +1967,15 @@ fn linux_installer_upgrade_rotation_and_confirmed_uninstall_are_staged_safely() 
     let machine_unit =
         fs::read_to_string(root.join("usr/lib/systemd/user/bloom-machine.service")).unwrap();
     assert!(machine_unit.contains("ExecStart=/usr/bin/bloom serve --mount %h/bloom"));
+    let nfs_port = installed_nfs_port(&root, "1000");
     let fstab = fs::read_to_string(root.join("etc/fstab")).unwrap();
-    assert!(fstab.contains(
-        "127.0.0.1:/ /home/alice/bloom nfs4 noauto,user,nosuid,nodev,noexec,actimeo=0,vers=4.1,proto=tcp,port=20000,rsize=65536,wsize=65536,timeo=10 0 0 # x-bloom.login-uid=1000"
-    ));
+    assert!(fstab.contains(&format!(
+        "127.0.0.1:/ /home/alice/bloom nfs4 noauto,user,nosuid,nodev,noexec,actimeo=0,vers=4.1,proto=tcp,port={nfs_port},rsize=65536,wsize=65536,timeo=10 0 0 # x-bloom.login-uid=1000"
+    )));
     assert_eq!(
         fs::read_to_string(root.join("etc/bloom/1000/machine.env")).unwrap(),
         format!(
-            "BLOOM_NFS_LISTEN=127.0.0.1:20000\nBLOOM_RELEASE_DIGEST={}\nBLOOM_CHECKOUT_SOCKET=/run/bloom/1000/checkout/rpc/checkout.sock\nBLOOM_CHECKOUT_UID=65533\n",
+            "BLOOM_NFS_LISTEN=127.0.0.1:{nfs_port}\nBLOOM_RELEASE_DIGEST={}\nBLOOM_CHECKOUT_SOCKET=/run/bloom/1000/checkout/rpc/checkout.sock\nBLOOM_CHECKOUT_UID=65533\n",
             release_digest
         )
     );
@@ -2463,10 +2448,13 @@ fn linux_installer_allocates_distinct_ports_and_rejects_mixed_release_sets() {
             String::from_utf8_lossy(&installed.stderr)
         );
     }
+    let alice_port = installed_nfs_port(&root, "1000");
+    let bob_port = installed_nfs_port(&root, "2000");
+    assert_ne!(alice_port, bob_port);
     assert_eq!(
         fs::read_to_string(root.join("etc/bloom/1000/machine.env")).unwrap(),
         format!(
-            "BLOOM_NFS_LISTEN=127.0.0.1:20000\nBLOOM_RELEASE_DIGEST={}\n\
+            "BLOOM_NFS_LISTEN=127.0.0.1:{alice_port}\nBLOOM_RELEASE_DIGEST={}\n\
              BLOOM_CHECKOUT_SOCKET=/run/bloom/1000/checkout/rpc/checkout.sock\n\
              BLOOM_CHECKOUT_UID=65533\n",
             release_digest
@@ -2475,14 +2463,17 @@ fn linux_installer_allocates_distinct_ports_and_rejects_mixed_release_sets() {
     assert_eq!(
         fs::read_to_string(root.join("etc/bloom/2000/machine.env")).unwrap(),
         format!(
-            "BLOOM_NFS_LISTEN=127.0.0.1:20001\nBLOOM_RELEASE_DIGEST={}\n\
+            "BLOOM_NFS_LISTEN=127.0.0.1:{bob_port}\nBLOOM_RELEASE_DIGEST={}\n\
              BLOOM_CHECKOUT_SOCKET=/run/bloom/2000/checkout/rpc/checkout.sock\n\
              BLOOM_CHECKOUT_UID=65533\n",
             release_digest
         )
     );
     let fstab = fs::read_to_string(root.join("etc/fstab")).unwrap();
-    assert!(fstab.contains("port=20000") && fstab.contains("port=20001"));
+    assert!(
+        fstab.contains(&format!("port={alice_port},"))
+            && fstab.contains(&format!("port={bob_port},"))
+    );
     // Each login's checkout view needs its own localhost port.
     for (uid, port) in [("1000", "11000"), ("2000", "12000")] {
         assert!(
@@ -2557,7 +2548,7 @@ fn linux_installer_allocates_distinct_ports_and_rejects_mixed_release_sets() {
     assert!(retained.status.success());
     let retained_record = fs::read_to_string(root.join("etc/bloom/retained/2000.json")).unwrap();
     assert!(retained_record.contains("\"release_digest\":"));
-    assert!(retained_record.contains("\"nfs_port\":20001"));
+    assert!(retained_record.contains(&format!("\"nfs_port\":{bob_port}")));
     let rejected_restore = Command::new(&installer)
         .args(["install"])
         .arg(&root)
@@ -3850,6 +3841,16 @@ fn assert_pre_ipv6_linux_contract(root: &Path, layout: &[LinuxTrackedUnit]) {
     );
 }
 
+fn installed_nfs_port(root: &Path, uid: &str) -> u64 {
+    let record: serde_json::Value = serde_json::from_slice(
+        &fs::read(root.join(format!("etc/bloom/enrollments/{uid}.json"))).unwrap(),
+    )
+    .unwrap();
+    let port = record["nfs_port"].as_u64().unwrap();
+    assert!((20000..=60999).contains(&port));
+    port
+}
+
 fn run_linux_installer(root: &Path, args: &[&str]) -> std::process::Output {
     let mut command = Command::new(release_script("install-linux.sh"));
     command.arg(args[0]).arg(root).args(&args[1..]);
@@ -4055,6 +4056,7 @@ fn linux_upgrade_failure_restores_the_previous_unit_contract_before_restart() {
         String::from_utf8_lossy(&installed.stderr)
     );
     let layout = apply_pre_ipv6_linux_layout(&root);
+    let nfs_port = installed_nfs_port(&root, "1000");
 
     // Force the upgrade to fail after the candidate unit writes: the
     // fstab-authorized mount path must be a real directory.
@@ -4090,7 +4092,7 @@ fn linux_upgrade_failure_restores_the_previous_unit_contract_before_restart() {
         format!(
             "BLOOM_CHECKOUT_SOCKET=/run/bloom/1000/checkout/rpc/checkout.sock\n\
              BLOOM_CHECKOUT_UID=65533\n\
-             BLOOM_NFS_LISTEN=127.0.0.1:20000\nBLOOM_RELEASE_DIGEST={old_digest}\n"
+             BLOOM_NFS_LISTEN=127.0.0.1:{nfs_port}\nBLOOM_RELEASE_DIGEST={old_digest}\n"
         )
     );
     assert!(
@@ -5096,6 +5098,7 @@ fn linux_legacy_interrupted_upgrade_recovers_without_operator_intervention() {
         .success()
     );
     let _layout = apply_pre_ipv6_linux_layout(&root);
+    let nfs_port = installed_nfs_port(&root, "1000");
     let (payload_b, new_digest) = make_linux_candidate_payload(
         directory.path(),
         "release-b",
@@ -5170,7 +5173,7 @@ fn linux_legacy_interrupted_upgrade_recovers_without_operator_intervention() {
         format!(
             "BLOOM_CHECKOUT_SOCKET=/run/bloom/1000/checkout/rpc/checkout.sock\n\
              BLOOM_CHECKOUT_UID=65533\n\
-             BLOOM_NFS_LISTEN=127.0.0.1:20000\nBLOOM_RELEASE_DIGEST={new_digest}\n"
+             BLOOM_NFS_LISTEN=127.0.0.1:{nfs_port}\nBLOOM_RELEASE_DIGEST={new_digest}\n"
         )
     );
 }

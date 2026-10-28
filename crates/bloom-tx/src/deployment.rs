@@ -155,12 +155,17 @@ impl DeploymentTransaction {
             return Err("gas must be positive".into());
         }
         Ok(Self {
+            // Broker decides the review from the payload it can verify, so
+            // "clear" is the only value that still describes what happens.
             review_mode: match o.get("reviewMode") {
                 None => None,
-                Some(Value::String(mode)) if mode == "clear" || mode == "opaque_exact" => {
-                    Some(mode.clone())
+                Some(Value::String(mode)) if mode == "clear" => Some(mode.clone()),
+                _ => {
+                    return Err(
+                        "reviewMode is no longer chosen by the caller; omit it, or send \"clear\""
+                            .into(),
+                    );
                 }
-                _ => return Err("reviewMode must be clear or opaque_exact".into()),
             },
             chain_id,
             from,
@@ -208,6 +213,8 @@ mod tests {
             ("chainId", json!("0x1")),
             ("data", json!("0x")),
             ("reviewMode", json!("unknown")),
+            // The caller no longer picks the opaque review.
+            ("reviewMode", json!("opaque_exact")),
             ("nonce", json!("0x00")),
             ("nonce", json!(-1)),
             ("gas", json!("0x0")),

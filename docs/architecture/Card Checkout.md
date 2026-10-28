@@ -45,10 +45,19 @@ and fields marked invalid, still block it.
 | no `card_id` | Site | the same facts with no payment frames | checkout rechecks the facts and clicks the merchant's pay button once; the merchant charges the method saved in the buyer's account |
 | `take_over: true` | Take-over | the agent's description only | the human works in the private view and hands back; nothing is bought |
 
-Facts come from `facts.js`: exactly one visible pay button and one labelled
+Facts come from `facts.js`: one distinguishable visible payment action and one labelled
 total in a supported language and number format, or processor data for
 Stripe-hosted pages. If facts are unclear, the request falls back to a manual
 ceremony that releases no card, and the human finishes in the private view.
+Explicit contact-only marketing signup blocks are excluded from payment
+controls and recurring charge terms. An offscreen newsletter text trap is
+ignored only when keyboard and assistive access are disabled and it is not
+card-like; other extra fields preserve ambiguity. Native submit controls repeated
+within
+one form represent the same action only when their labels, destinations,
+methods, name/value payloads and inline handlers agree. Distinct payment
+actions remain ambiguous. Repeated Stripe prices must all agree with the
+processor-bound amount and currency.
 An unpriced "Total amount"/"Gesamtsumme" heading before its subtotal breakdown
 supplies no charge. A priced total (including "Zu zahlender Betrag") is still
 required; conflicting priced totals stay manual.
@@ -88,8 +97,11 @@ Snapshot-redaction patterns use zeroizing storage and remain until the browser
 context is safely discarded, so expiry cannot expose values already in a DOM.
 Filled controls also carry private annotations in an isolated-world WeakMap;
 their public values become saved-field placeholders. This protects short date
-parts without replacing the same digits in prices or flight dates. Select
-values use this projection rather than duplicated accessibility-tree text.
+parts without replacing the same digits in prices or flight dates. Custom
+selected-value wrappers and saved radio groups are marked too: their labels,
+context and selection state cannot reveal the value. While those displays are
+present, text uses the masked control projection rather than a second
+accessibility outline that can repeat the selected values.
 Known numeric and English full-date renderings are redacted in review text.
 Names remain private at any length and after Unicode case changes. Short ASCII
 tokens match whole words. Filtering changes merchant text, labels and values;
@@ -97,7 +109,9 @@ protocol keys, control references, roles, types and frame origins remain exact.
 Before payment approval, verify the itinerary, party, extras and final total.
 
 Phone fill derives a country and calling code from the approved international
-number. A neighboring country selector is changed before entering national
+number. Area/local derivation accepts the library's hyphenated groups as well
+as spaces; it refuses a number without both parts. A neighboring country
+selector is changed before entering national
 digits; the selector alone never counts as a filled phone. An ambiguous or
 unchanged conflicting code leaves the number for private input. No additional
 saved traveler fields are required.
@@ -105,14 +119,21 @@ saved traveler fields are required.
 Public control projection removes styled layout containers with an ancestor
 walk, keeping large catalogs from triggering repeated scans of every control.
 Browser protocol replies remain bounded at 8 MiB. An oversized frame is drained
-and pending calls fail without replay, leaving later commands usable. When an
-accessibility outline exceeds that bound, public text reuses the existing
+and pending calls fail without replay, leaving later commands usable. When a
+page already exceeds the 30,000-character public text budget, skip generating
+its accessibility outline. If an outline still exceeds the reply bound,
+public text reuses the existing
 bounded control labels and context; private-field value filtering still applies.
 Labels operating hidden native inputs retain their place alongside native
 controls, so result cards cannot crowd out the search filters.
 Public label activation also checks an associated submit/button control's
 payment labels before dispatching activation events. Image submit controls
 and their labels use the image's alternative text for the same payment guard.
+Typing uses the snapshot's live private-input classifier, including accessible
+and slotted labels and captions beside numeric placeholders. It rechecks after
+focus and selection before inserting text, so changing a field into a card or
+password input cannot redirect a public write. Approved private card filling
+uses its separate post-approval path.
 
 ## Booking sites that reject Bloom's browser
 
@@ -133,10 +154,18 @@ inside the VFS.
 ## Private view
 
 The private view is an HTTP page on `localhost` served by `bloom-checkout`,
-opened from the approval page with a one-use capability. It streams
+opened from the approval page with a one-use capability, exchanged for a
+separate random session secret kept in the human browser's origin-scoped
+localStorage. Requests send that key explicitly in an Authorization header.
+Cookies cannot isolate localhost ports, so private access never uses them.
+The used URL capability cannot authenticate a session or claim another one.
+The authenticated browser can revisit the original link or `/view` after
+closing a tab. It streams
 screenshots and forwards clicks and keys to the held tab and its popups (bank
-challenges). While it is open, Machine's browse requests are refused. The URL
-and screenshots never appear in VFS. It is not reachable from another device.
+challenges). While it is open, Machine's browse requests are refused. The
+capability, session secret and screenshots never appear in VFS. Approved
+active status includes a public `view_url` pointing to `/view`; it grants no
+access without that browser's existing origin-scoped session key. It is not reachable from another device.
 
 Takeover is for login, verification or an unsupported field, not routine
 passenger entry. On handback, checkout navigates the human-selected tab through
@@ -162,18 +191,28 @@ The operation store is written before every irreversible step:
   before the site-mode click. A lost response never causes a second fill or
   click.
 - On restart, interrupted disclosure becomes `disclosure_unknown`; submission
-  and form-error states become `uncertain`. Earlier `not_submitted` records
+  and form-error states become `uncertain`, as do interrupted manual payment
+  and human-control views: the person may have paid privately. Earlier `not_submitted` records
   also become `uncertain`, since older code inferred them from form errors.
   Operations still awaiting release become `failed_before_release`. None is
   retried automatically.
+- A browser exit or failed private-browser cleanup terminates checkout with
+  failure so its service manager can restart it. New handoffs and shopping
+  actions are refused while that restart is pending. A fresh process clears
+  stale browser-pause flags without erasing
+  uncertain outcomes. Confirmed pre-release failures and cancellations can retry
+  browser cleanup through `cancel`; approved or submitted checkouts cannot.
 - Form errors, timeout and closing the private view do not establish that no
   charge occurred. The UI asks the person to check the merchant and bank before
   another attempt; it never promises that nothing was charged.
 - A reservation reference alone is not a successful purchase. `booked` needs
   the reference plus a merchant-reported purchase/payment confirmation or
   issued-ticket evidence. This remains page-derived evidence, not independent
-  bank settlement. Durable per-booking reconciliation and protection against
-  retrying an unresolved purchase under a new operation ID remain unfinished.
+  bank settlement. An unresolved card or site payment blocks another payment
+  at its recorded shop origin, including a new operation ID. After the private
+  view closes, the person must check the merchant and bank before `resolve`
+  clears that block. This is a shop-wide safeguard, not independent settlement
+  or reconciliation of individual bookings.
 
 `checkout/history.json` lists the 50 latest requests with mode, shop origin,
 the approved total and the current status, so an agent can avoid buying twice.
