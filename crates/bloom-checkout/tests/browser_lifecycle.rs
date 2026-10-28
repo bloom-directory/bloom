@@ -39,7 +39,9 @@ async fn checkout_exits_unsuccessfully_when_its_browser_exits() {
         .unwrap()
         .port()
         .to_string();
-    let mut checkout = Command::new(env!("CARGO_BIN_EXE_bloom-checkout"))
+    let binary = std::env::var("NEXTEST_BIN_EXE_bloom_checkout")
+        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_bloom-checkout").into());
+    let mut checkout = Command::new(binary)
         .arg("--chromium")
         .arg(&wrapper)
         .arg("--profile")
