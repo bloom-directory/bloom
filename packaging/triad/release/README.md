@@ -80,7 +80,14 @@ The release workflow builds Linux aarch64 natively on `ubuntu-24.04-arm` and
 macOS aarch64 on `macos-15` alongside Linux x86_64 on `ubuntu-24.04`. Both
 Linux builds run in a pinned `ubuntu:22.04` container so the binaries need
 only glibc 2.35: a build on 24.04 requires glibc 2.38+ and fails to start on
-22.04. A manual `dry_run=true`
+22.04. Both jobs share the same image digest, Ubuntu archive snapshot
+(`20261027T000000Z`) and checksum-verified rustup 1.29.2 installer. The snapshot
+pins transitive build packages as well as gcc/libc-dev; update it deliberately
+for security fixes. The hosted runner's read-only public CA bundle bootstraps
+HTTPS until the container installs its own certificates. Archive signatures
+remain required; historical snapshot metadata is exempt from expiry checks.
+These pins remove live package/bootstrap drift, not a guarantee of bit-identical
+binaries across different hosts. A manual `dry_run=true`
 dispatch uploads all three `test-unclaimed` candidates as Actions artifacts
 and cannot reach production
 signing or GitHub publication. Live candidate installation requires both a

@@ -161,16 +161,45 @@ jobs:
     runs-on: ubuntu-24.04
     # Build in Ubuntu 22.04 so the binaries need only glibc 2.35. A container,
     # not the ubuntu-22.04 runner, which GitHub retires on 2027-04-17.
-    container: ubuntu:22.04@sha256:e0f80c829509ef4df9e76bd8944eb7b8ec25cbb379b112a7f9448b2c77a77c9b
+    container: &linux-build-container
+      image: ubuntu:22.04@sha256:e0f80c829509ef4df9e76bd8944eb7b8ec25cbb379b112a7f9448b2c77a77c9b
+      # Bootstrap HTTPS before ca-certificates is installed in the container.
+      volumes:
+        - /etc/ssl/certs/ca-certificates.crt:/run/bloom-build-ca.crt:ro
     permissions:
       contents: read
     steps:
       - name: Install build tools
         run: &install-build-tools |
-          apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+          set -eu
+          cat > /tmp/bloom-build.sources <<'EOF'
+          Types: deb
+          URIs: https://snapshot.ubuntu.com/ubuntu/20261027T000000Z/
+          Suites: jammy jammy-updates jammy-security
+          Components: main universe
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+          Check-Valid-Until: no
+          EOF
+          # Never resolve packages from the image's moving archive mirrors.
+          apt_snapshot() {
+            apt-get -o Dir::Etc::sourcelist=/tmp/bloom-build.sources \
+              -o Dir::Etc::sourceparts=- \
+              -o Acquire::https::CaInfo=/run/bloom-build-ca.crt "$@"
+          }
+          apt_snapshot update
+          DEBIAN_FRONTEND=noninteractive apt_snapshot install -y --no-install-recommends \
             build-essential ca-certificates cmake curl file git openssh-client perl pkg-config
-          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+          case "$(uname -m)" in
+            x86_64) rustup_sha=5be191e8c70a5007074254cb74d78dbfdd25cd5a61c27de7b8e5410122ec24f4 ;;
+            aarch64) rustup_sha=a9c168dbea81a84671c6b7a5c1795cb0eb699020110d107ddfca427bd797e697 ;;
+            *) echo 'Unsupported release build architecture' >&2; exit 1 ;;
+          esac
+          curl --fail --show-error --silent --location \
+            "https://static.rust-lang.org/rustup/archive/1.29.2/$(uname -m)-unknown-linux-gnu/rustup-init" \
+            -o /tmp/rustup-init
+          printf '%s  /tmp/rustup-init\n' "$rustup_sha" | sha256sum --check --strict
+          chmod +x /tmp/rustup-init
+          /tmp/rustup-init -y --profile minimal --default-toolchain none --no-modify-path
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Check out Machine
@@ -297,7 +326,7 @@ jobs:
     needs: prepare
     runs-on: ubuntu-24.04-arm
     # Same 22.04 build container as the x86_64 job.
-    container: ubuntu:22.04@sha256:e0f80c829509ef4df9e76bd8944eb7b8ec25cbb379b112a7f9448b2c77a77c9b
+    container: *linux-build-container
     permissions:
       contents: read
     steps:

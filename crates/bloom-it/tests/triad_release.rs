@@ -295,16 +295,28 @@ fn linux_aarch64_release_candidate_uses_locked_sources() {
     // Both Linux build jobs compile in a 22.04 container (glibc 2.35).
     for job in ["build", "build-linux-aarch64"] {
         let header = format!("  {job}:");
+        let container = if job == "build" {
+            "    container: &linux-build-container"
+        } else {
+            "    container: *linux-build-container"
+        };
         assert!(
             workflow
                 .lines()
                 .skip_while(|line| *line != header)
                 .skip(1)
                 .take_while(|line| line.is_empty() || line.starts_with("   "))
-                .any(|line| line.starts_with("    container: ubuntu:22.04@sha256:")),
+                .any(|line| line == container),
             "{job} must build in the 22.04 container"
         );
     }
+    assert!(workflow.contains("      image: ubuntu:22.04@sha256:"));
+    assert!(workflow.contains("https://snapshot.ubuntu.com/ubuntu/20261027T000000Z/"));
+    assert!(workflow.contains("-o Dir::Etc::sourceparts=-"));
+    assert!(workflow.contains("apt_snapshot install"));
+    assert!(workflow.contains("rustup/archive/1.29.2/"));
+    assert!(workflow.contains("sha256sum --check --strict"));
+    assert!(!workflow.contains("https://sh.rustup.rs"));
     assert!(workflow.contains("uname -m | grep -Fx aarch64"));
     assert!(workflow.contains("ref: ${{ needs.prepare.outputs.release_sha }}"));
     assert!(workflow.contains("name: triad-linux-aarch64-candidate"));
