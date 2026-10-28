@@ -106,6 +106,8 @@ tool for this checkout.
   human must do. Forward the ceremony URL. The human approves, works in
   Bloom's browser, and clicks Done; `status.json` then says `returned` and
   shopping continues on the page the human left, preserving the site session.
+  Some sellers reset baggage, seats or optional extras after handback. Recheck
+  their selected values and final quote before continuing or requesting payment.
   Closing a card or site-payment checkout clears website cookies and storage;
   a later purchase can need another login.
   Approvals use the passkey set up with the first saved card; if
@@ -188,6 +190,9 @@ Do not click or type through the desktop.
 verified the bank charge. For `booked`, `outcome.order_id` holds the booking
 code the site showed; a reference alone does not prove payment or ticket issue.
 `needs_input` means the page needs attention, not that no payment was submitted.
+Optional wallet signup can introduce extra required contact fields. Complete
+or decline it in the existing private view; do not invent details or request a
+second payment to get past it.
 Do not infer a charge outcome from a form error, timeout or closing the view.
 `paused` means checkout could not hand the browser back. The installed service
 restarts checkout with a fresh browser; check status before another payment.
