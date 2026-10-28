@@ -6024,17 +6024,7 @@ mod tests {
                 &serde_json::to_vec(&staged).unwrap(),
             )
             .unwrap();
-        let (engine, _, broker) = triad_batch_fixture(outbox.clone(), true, false);
-        let mut catalog = triad_catalog();
-        let mut cancel_record = catalog.records[0].clone();
-        cancel_record.subject = ProvenanceSubject::System {
-            component_id: Token::new("bloom-machine").unwrap(),
-            operation_class: Token::new("transaction.cancel").unwrap(),
-        };
-        cancel_record.operation_classes[0].operation_class =
-            Token::new("transaction.cancel").unwrap();
-        catalog.records.push(cancel_record);
-        let engine = engine.with_triad_signing(broker, catalog).unwrap();
+        let (engine, _, _) = triad_batch_fixture(outbox.clone(), true, false);
         let chain = stage_chain(&spawn_batch_rpc(None).await);
         let permit = permit_for(&directory);
         let policy = Policy::default();
