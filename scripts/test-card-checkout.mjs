@@ -111,6 +111,8 @@ const server = https.createServer({key:readFileSync(join(root,'key.pem')),cert:r
   const url = new URL(request.url, 'https://localhost');
   response.setHeader('content-type','text/html');
   if (url.pathname === '/manual') response.end('<h1>Manual fixture</h1><p>Total unavailable</p>');
+  else if (url.pathname === '/ambiguous') response.end('<p>Total USD 3.99</p><form action="/done"><button>Pay</button></form><form action="/done"><button>Subscribe USD 12.00 monthly</button></form>');
+  else if (url.pathname === '/installments') response.end('<p>Total USD 3.99</p><form action="/done"><label>Installments<select name="installments"><option>Choose a schedule</option></select></label><button>Pay</button></form>');
   else if (url.pathname === '/site') response.end('<h1>Fixture shop</h1><p>Order total USD 3.99</p><form action="/done"><button>Place order</button></form>');
   else if (url.pathname === '/done') { fixtureSubmissions++; response.end('<h1>Order confirmed</h1><p>Order ID: FIXTURE-ONE</p><p>Total USD 3.99</p>'); }
   else if (url.pathname === '/login') response.end('<form action="/account"><input name="user" aria-label="User" style="width:90vw;height:80vh;font-size:40px"></form>');
@@ -151,6 +153,21 @@ async function checkoutStatus(operation) { return vfs('cat', `/checkout/requests
 try {
   assert.deepEqual(await vfs('cat','/cards/index.json'), [], 'Use a fresh disposable candidate');
   assert.deepEqual(await vfs('cat','/checkout/history.json'), [], 'Preserve existing shopping history');
+  for (const [path, reason] of [['manual','facts_unreadable'], ['ambiguous','payment_action_ambiguous'], ['installments','charge_terms_unreadable']]) {
+    await browse({action:'open',url:merchant+path});
+    await delay(500);
+    const operation = id();
+    await vfs('write',`/checkout/requests/${operation}/in.json`,{card_id:'missing-refusal-fixture',agent_description:'Synthetic refusal diagnostic; deliberately absent card; no approval or payment'});
+    const status = await checkoutStatus(operation);
+    assert.equal(status.state,'failed_before_release');
+    assert.equal(status.reason,reason);
+    assert.deepEqual(status.filled_fields,[]);
+    const history = await vfs('cat','/checkout/history.json');
+    assert.equal(history.find(entry => entry.status.operation_id === operation).status.reason,reason);
+    await returnedToShopping();
+    assert.equal(fixtureSubmissions,0,'Refusal must not try any payment action');
+  }
+  checkpoint('bounded refusal reasons survive real services, VFS status and history without submitting');
   const started = Date.now();
   const add = id();
   await vfs('write','/cards/add.json',{operation_id:add,card_id:'stack-card',label:'Synthetic acceptance card'});
