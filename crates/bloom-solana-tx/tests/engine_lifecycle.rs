@@ -1389,13 +1389,16 @@ async fn expiry_sweep_during_broadcast_leaves_one_state_and_no_send() {
             staged.last_valid_block_height + 1,
             std::sync::atomic::Ordering::SeqCst,
         );
+        let pending = outbox.read("wallet", "solana-devnet", &staged.id).unwrap();
+        let signature = outbox.recorded_signature(&pending).unwrap().unwrap();
         let swept = outbox
-            .sweep_expired(
+            .sweep_expired_with_statuses(
                 u128::MAX,
                 &std::collections::HashMap::from([(
                     "solana-devnet".to_string(),
                     staged.last_valid_block_height + 1,
                 )]),
+                &std::collections::HashMap::from([(("solana-devnet".into(), signature), false)]),
             )
             .unwrap();
         release.notify_one();
