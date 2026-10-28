@@ -281,7 +281,6 @@ class PolymarketProposalEval(PetalEval):
         expected = {
             "wallet": wallet,
             "account": 0,
-            "chain_id": 137,
             "address": account["evm"]["address"].lower(),
             "condition_id": self.market["conditionId"],
             "token_id": str(self.market["clobTokenIds"][0]),

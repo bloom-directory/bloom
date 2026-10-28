@@ -38,7 +38,8 @@ class ProjectionReader:
             ):
                 raise FileNotFoundError(args[-1])
             raise OSError(
-                f"public projection read failed for {args[-1]} (exit {result.returncode})"
+                f"public projection read failed for {args[-1]} "
+                f"(exit {result.returncode}): {result.stderr.strip()[-300:]}"
             )
         return result.stdout
 
@@ -59,14 +60,14 @@ class ProjectionReader:
                 }
             result = {}
             for line in self._cli("ls", "/" + path).splitlines():
-                name, kind = line.split("\t")
+                name, _, kind = line.partition("\t")
                 if (
                     not name
                     or "/" in name
                     or name in (".", "..")
-                    or kind not in ("Dir", "File")
+                    or kind not in ("Dir", "File", "Symlink")
                 ):
-                    raise OSError("malformed public directory projection")
+                    raise OSError(f"malformed public directory projection: {line!r}")
                 result[name] = kind
             return result
         except FileNotFoundError:

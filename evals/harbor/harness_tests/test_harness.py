@@ -20,6 +20,7 @@ from harness.core import (
     run_eval,
 )
 from harness.disposable import DisposableTriad
+from projection import ProjectionReader
 
 
 class FakeDefinition(EvalDefinition):
@@ -191,3 +192,14 @@ class TeardownTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProjectionListingTest(unittest.TestCase):
+    def test_entries_accept_symlinks_and_name_bad_lines(self):
+        with mock.patch.dict(os.environ, {"BLOOM_EVAL_PROJECTION_RPC_ENDPOINT": "ipc"}):
+            reader = ProjectionReader()
+        with mock.patch.object(reader, "_cli", return_value="0001\tDir\nlatest\tSymlink\n"):
+            self.assertEqual(reader.directories("outbox/pending"), ["0001"])
+        with mock.patch.object(reader, "_cli", return_value="x\tLink\n"):
+            with self.assertRaisesRegex(OSError, r"'x\\tLink'"):
+                reader.entries("outbox/pending")

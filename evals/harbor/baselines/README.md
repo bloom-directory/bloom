@@ -1,6 +1,6 @@
 # Default Petal agent baseline
 
-One trial per task and agent on Bloom master 83a94b82 with optimized services, reviewed by hand. Prompts give only the user's facts. The clarification task ran 2026-10-25; the rest ran 2026-10-26. Petals are the pinned releases: Hyperliquid v0.1.7, Polymarket v0.1.6 and NEAR Intents v0.1.4. Input tokens include cached input. The `claude` rows ran Claude Code on Sonnet 5; that agent is now `claude-opus` (Opus 5.5) and `claude-sonnet` (Sonnet 5.5), neither of which has a baseline row yet, so the release report does not gate them until one is recorded. `evm-transfer` and `evm-transfer-denied` were added after these trials and have no rows yet either.
+One trial per task and agent on Bloom master 83a94b82 with optimized services, reviewed by hand. Prompts give only the user's facts. The clarification task ran 2026-10-25; the rest ran 2026-10-26. Petals are the pinned releases: Hyperliquid v0.1.7, Polymarket v0.1.6 and NEAR Intents v0.1.4. Input tokens include cached input. The `claude` rows ran Claude Code on Sonnet 5; that agent is now `claude-opus` (Opus 5.5) and `claude-sonnet` (Sonnet 5.5), neither of which has a baseline row yet, so the release report does not gate them until one is recorded. `evm-transfer` ran on 2026-10-28 with the same services; `evm-transfer-denied` has no row yet.
 
 | Task | Agent | Reward | Tool calls | Input / cached tokens | Output tokens | Seconds |
 | --- | --- | ---: | ---: | --- | ---: | ---: |
@@ -16,6 +16,7 @@ One trial per task and agent on Bloom master 83a94b82 with optimized services, r
 | near-intents-swap-proposal | codex | 0 | 17 | 831,145 / 760,320 | 4,985 | 208 |
 | near-intents-swap-proposal | claude | 0 | 23 | 1,299,531 / 1,255,945 | 8,239 | 176 |
 | near-intents-swap-proposal | opencode | 1 | 103 | 5,730,659 / 5,622,528 | 12,072 | 592 |
+| evm-transfer | opencode | 1 | 26 | 790,739 / 748,288 | 3,821 | 164 |
 | polymarket-clarification | codex | 0 | 14 | 494,627 / 443,904 | 4,223 | 175 |
 | polymarket-clarification | claude | 1 | 13 | 533,128 / 497,702 | 4,265 | 113 |
 | polymarket-clarification | opencode | 1 | 35 | 703,127 / 641,536 | 3,800 | 173 |

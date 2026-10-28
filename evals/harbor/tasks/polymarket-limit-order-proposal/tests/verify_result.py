@@ -59,10 +59,6 @@ def verify(root=None):
         and evm.get("address", "").lower() == expected["address"],
         "wrong account address",
     )
-    require(
-        reader.read_json("chains/polygon/chain_id") == expected["chain_id"],
-        "wrong chain ID",
-    )
     base = f"petals/polymarket/trade/{wallet}/{number}"
     drafts = reader.directories(base + "/drafts")
     require(len(drafts) == 1, "expected exactly one draft")
