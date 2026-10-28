@@ -31,8 +31,16 @@ const ACCOUNT_CONTEXT_REUSE: Duration = Duration::from_secs(1);
 
 /// Why the last write to a Petal failed. A mount reports a failed write only
 /// as an errno, so the Petal's message is kept at `petals/<name>/last_error.json`
-/// until a later write to that Petal succeeds.
-const LAST_ERROR: &str = "last_error.json";
+/// until that same path's write succeeds. The record names the path it
+/// describes and when it was written: the mount can fail a write before the
+/// router ever runs, and a reader must be able to tell such a record from its
+/// own attempt. Shape matches `outbox/pending/<id>/last_error.json`.
+pub(crate) const LAST_ERROR: &str = "last_error.json";
+
+/// Ceiling on the guest message kept in a `last_error.json` record. A refusal
+/// is agent-facing prose; past this it is a payload, not a reason, and it is
+/// held in memory until the write that failed succeeds.
+const MAX_WRITE_ERROR_BYTES: usize = 4096;
 
 /// Recent account observations, ordered by when each began. A refusal is
 /// kept (as `None`) rather than removed, so an older observation that
@@ -49,6 +57,21 @@ struct CachedAccountContext {
     context: Option<AccountPetalContext>,
 }
 
+/// The most recent failed write to one Petal: the served record plus the path
+/// it describes, so a success on another route cannot clear it.
+struct LastWriteError {
+    path: String,
+    record: Vec<u8>,
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
 #[derive(Clone)]
 pub struct PetalRouter {
     runner: PetalRunner,
@@ -58,7 +81,7 @@ pub struct PetalRouter {
     audit_effect_lock: Arc<tokio::sync::Mutex<()>>,
     account_contexts: Arc<Mutex<AccountContextCache>>,
     account_context_reuse: Duration,
-    last_errors: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
+    last_errors: Arc<Mutex<BTreeMap<String, LastWriteError>>>,
 }
 
 impl PetalRouter {
@@ -133,8 +156,62 @@ impl PetalRouter {
         PETAL_DOCUMENT_NAMES.contains(&path)
     }
 
+    /// Files the host serves itself at a Petal's mount root. A guest route of
+    /// the same name is never reached, so every operation treats them alike.
+    fn is_host_file(rest: &str) -> bool {
+        rest == LAST_ERROR || Self::is_petal_document(rest)
+    }
+
     fn last_error(&self, mount: &str) -> Option<Vec<u8>> {
-        self.last_errors.lock().ok()?.get(mount).cloned()
+        Some(self.last_errors.lock().ok()?.get(mount)?.record.clone())
+    }
+
+    /// Keep `message` as the reason for `rest`'s failed write, replacing any
+    /// earlier record for this Petal. Only installed Petals get an entry, so
+    /// the map cannot be grown by writing to invented mount names.
+    fn record_write_error(&self, mount: &str, rest: &str, message: &str) {
+        if !self.is_petal(mount) {
+            return;
+        }
+        let mut message = message.to_owned();
+        if message.len() > MAX_WRITE_ERROR_BYTES {
+            let mut cut = MAX_WRITE_ERROR_BYTES;
+            while !message.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            message.truncate(cut);
+        }
+        let record = serde_json::json!({
+            "schema": "bloom.petal-write-error/1",
+            "path": rest,
+            "at_ms": now_ms(),
+            "error": message,
+            "next": "Check path and at_ms against the write you just made: an older record, or one for another path, is a different attempt. No record at all does not mean the write succeeded.",
+        });
+        let Ok(record) = serde_json::to_vec_pretty(&record) else {
+            return;
+        };
+        if let Ok(mut last_errors) = self.last_errors.lock() {
+            last_errors.insert(
+                mount.to_owned(),
+                LastWriteError {
+                    path: rest.to_owned(),
+                    record,
+                },
+            );
+        }
+    }
+
+    /// Drop the record only when this write is the one it blamed. A success on
+    /// another route says nothing about the failure a reader has yet to read.
+    fn clear_write_error(&self, mount: &str, rest: &str) {
+        if let Ok(mut last_errors) = self.last_errors.lock()
+            && last_errors
+                .get(mount)
+                .is_some_and(|entry| entry.path == rest)
+        {
+            last_errors.remove(mount);
+        }
     }
 
     fn add_petal_documents(mut entries: Vec<Entry>) -> Vec<Entry> {
@@ -261,8 +338,7 @@ impl PetalRouter {
 
     fn metadata_route_path(&self, path: &VfsPath, _op: DispatchOp) -> Option<(String, String)> {
         let (mount, rest) = Self::mount_path(path).ok()?;
-        (self.is_petal(mount) && rest != LAST_ERROR && !Self::is_petal_document(&rest))
-            .then(|| (mount.to_owned(), rest))
+        (self.is_petal(mount) && !Self::is_host_file(&rest)).then(|| (mount.to_owned(), rest))
     }
 
     async fn validate_ancestor(&self, mount: &str, path: &str) -> Result<(), HandlerError> {
@@ -658,6 +734,9 @@ impl Handler for PetalRouter {
 
     async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
         let (mount, rest) = Self::mount_path(path)?;
+        if !self.is_petal(mount) {
+            return Err(HandlerError::not_found(path.to_string_path()));
+        }
         if rest == LAST_ERROR {
             return self
                 .last_error(mount)
@@ -683,35 +762,29 @@ impl Handler for PetalRouter {
 
     async fn write(&self, path: &VfsPath, data: &[u8]) -> Result<(), HandlerError> {
         let (mount, rest) = Self::mount_path(path)?;
-        if rest.is_empty() || rest == LAST_ERROR || Self::is_petal_document(&rest) {
+        if rest.is_empty() || Self::is_host_file(&rest) {
             return Err(HandlerError::PermissionDenied);
         }
         // dispatch_error drops a -2 message, so keep the Petal's own reason.
-        let mut reason = String::new();
+        let mut reason = None;
         let result = match self
             .dispatch(mount, DispatchOp::Write, rest.clone(), data.to_vec())
             .await
         {
             Ok(DispatchResponse::Write) => Ok(()),
             Ok(DispatchResponse::Error { code, message }) => {
-                reason.clone_from(&message);
+                reason = Some(message.clone());
                 Err(dispatch_error(code, message, path.to_string_path()))
             }
             Ok(other) => Err(unexpected_response("write", other)),
             Err(error) => Err(error),
         };
-        if let Ok(mut last_errors) = self.last_errors.lock() {
-            match &result {
-                Ok(()) => last_errors.remove(mount),
-                Err(error) => last_errors.insert(
-                    mount.to_owned(),
-                    serde_json::to_vec_pretty(&serde_json::json!({
-                        "path": rest,
-                        "error": if reason.is_empty() { error.to_string() } else { reason },
-                    }))
-                    .unwrap_or_default(),
-                ),
-            };
+        match &result {
+            Ok(()) => self.clear_write_error(mount, &rest),
+            Err(error) => {
+                let message = reason.unwrap_or_else(|| error.to_string());
+                self.record_write_error(mount, &rest, &message);
+            }
         }
         result
     }
@@ -760,9 +833,14 @@ impl Handler for PetalRouter {
         }
         Ok(if rest.is_empty() {
             let mut entries = Self::add_petal_documents(entries);
-            if self.last_error(mount).is_some() {
-                entries.retain(|entry| entry.name != LAST_ERROR);
-                entries.push(Entry::read_only_file(LAST_ERROR));
+            // The host owns this name whether or not a record exists, so a
+            // guest entry of the same name is never advertised: lookup and
+            // read would refuse it.
+            entries.retain(|entry| entry.name != LAST_ERROR);
+            if let Some(record) = self.last_error(mount) {
+                let mut entry = Entry::read_only_file(LAST_ERROR);
+                entry.size = record.len() as u64;
+                entries.push(entry);
             }
             entries
         } else {
@@ -1834,6 +1912,9 @@ name = "example"
             serde_json::from_slice(&vfs.read(&last_error).await.unwrap()).unwrap();
         assert_eq!(record["path"], "operations/alice/0/submit");
         assert_eq!(record["error"], crate::package::route_fixtures::DENY_REASON);
+        assert_eq!(record["schema"], "bloom.petal-write-error/1");
+        // A reader compares at_ms with its own write, so it has to be real.
+        assert!(record["at_ms"].as_u64().unwrap() > 1_700_000_000_000);
         assert_eq!(vfs.lookup(&last_error).await.unwrap().mode, 0o444);
         assert!(listed(
             vfs.list(&VfsPath::parse("/petals/example").unwrap())
@@ -1845,7 +1926,60 @@ name = "example"
             Err(HandlerError::PermissionDenied)
         ));
 
+        // A success on another route says nothing about the refusal a reader
+        // has yet to read, so it must not clear it.
         vfs.write(&accepting, b"payload").await.unwrap();
-        assert!(vfs.lookup(&last_error).await.is_err());
+        let record: serde_json::Value =
+            serde_json::from_slice(&vfs.read(&last_error).await.unwrap()).unwrap();
+        assert_eq!(record["path"], "operations/alice/0/submit");
+    }
+
+    #[tokio::test]
+    async fn only_the_failing_path_clears_its_own_record() {
+        let (dir, runner) = runner();
+        let package = dir.path().join("example-app");
+        write_async_failing_package(&package);
+        runner.store().install_petal_package_dir(&package).unwrap();
+        let router = PetalRouter::new(runner, Arc::new(AccountHost));
+
+        router.record_write_error("example", "operations/a", "first");
+        router.clear_write_error("example", "operations/b");
+        assert!(router.last_error("example").is_some(), "unrelated success");
+        router.clear_write_error("example", "operations/a");
+        assert!(router.last_error("example").is_none());
+
+        // An uninstalled mount name never gets an entry: a write to an
+        // invented name would otherwise pin one for the process's life.
+        router.record_write_error("absent", "x", "nope");
+        assert!(router.last_error("absent").is_none());
+
+        // A route's refusal is prose; a payload-sized one is truncated.
+        let long = "x".repeat(MAX_WRITE_ERROR_BYTES * 2);
+        router.record_write_error("example", "operations/a", &long);
+        let record: serde_json::Value =
+            serde_json::from_slice(&router.last_error("example").unwrap()).unwrap();
+        assert_eq!(
+            record["error"].as_str().unwrap().len(),
+            MAX_WRITE_ERROR_BYTES
+        );
+    }
+
+    #[tokio::test]
+    async fn an_uninstalled_mount_serves_no_record() {
+        let (dir, runner) = runner();
+        let package = dir.path().join("example-app");
+        write_async_failing_package(&package);
+        runner.store().install_petal_package_dir(&package).unwrap();
+        let router = PetalRouter::new(runner, Arc::new(AccountHost));
+        router.record_write_error("example", "operations/a", "first");
+        let vfs = Vfs::builder().mount("petals", Arc::new(router)).build();
+
+        // read must agree with lookup: no Petal, no record, even if one was
+        // retained under that name before the Petal was removed.
+        let absent = VfsPath::parse("/petals/absent/last_error.json").unwrap();
+        assert!(matches!(
+            vfs.read(&absent).await,
+            Err(HandlerError::NotFound(_))
+        ));
     }
 }

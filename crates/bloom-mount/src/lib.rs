@@ -159,13 +159,17 @@ pub fn detect_mount_command() -> &'static str {
 ///
 /// The shared options are `vers=4.1,proto=tcp`, explicit `port` so we
 /// can target the auto-assigned ephemeral port, generous `rsize`/`wsize`
-/// so most JSON/TOML payloads fit in a single op (the adapter buffers
-/// multi-block writes anyway but a single op stays simpler for the
-/// common case), and `timeo=10` for snappy failure on a wedged server.
-/// Linux and macOS also mount `sync`: each `write(2)` waits for the
-/// server's reply, so a handler's refusal fails the writer's syscall and a
-/// shell redirect exits non-zero. Without it Linux sends the bytes at
-/// `close(2)`, whose error a shell ignores.
+/// so most JSON/TOML payloads fit in a single op, and `timeo=10` for
+/// snappy failure on a wedged server. Linux and macOS also mount `sync`:
+/// each `write(2)` waits for the server's reply, so a handler's refusal
+/// fails the writer's syscall and a shell redirect exits non-zero. Without
+/// it Linux sends the bytes at `close(2)`, whose error a shell ignores.
+///
+/// `sync` makes every `write(2)` its own FILE_SYNC WRITE, so a payload
+/// longer than `wsize` arrives in several of them with no EOF marker
+/// between. `MAX_WRITE_CHUNK_BYTES` in `adapter.rs` must track the `wsize`
+/// set here: that is how the adapter tells a chunk of a longer payload
+/// from a whole one, and dispatches the command exactly once.
 ///
 /// Caching options diverge per-platform because the kernels expose
 /// different knobs:

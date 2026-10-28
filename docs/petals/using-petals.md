@@ -97,7 +97,11 @@ Petal writes execute synchronously in this iteration. A filesystem write or
 returns an error, Bloom returns that error to the caller instead of reporting
 success while work continues in a detached task. A mount reports only an
 errno, so Bloom also keeps the route's message at
-`petals/<name>/last_error.json` until a later write to that Petal succeeds.
+`petals/<name>/last_error.json` until that same path's write succeeds. The
+record carries the failing `path` and an `at_ms` stamp, because a write the
+mount rejects before the route runs leaves no record at all; a reader compares
+both against its own attempt. `last_error.json` is served by Bloom, so a Petal
+cannot ship a route or file of that name at its root.
 
 Synchronous completion describes the route invocation, not every workflow the
 route may initiate. For example, a successful route may have staged a
