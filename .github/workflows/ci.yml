@@ -6,6 +6,7 @@ on:
       - ".github/workflows/ci.yml"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "deny.toml"
       - "rust-toolchain.toml"
       - "crates/**"
       - "examples/**"
@@ -39,6 +40,16 @@ jobs:
         run: rustup show
       - name: Check formatting
         run: cargo fmt --all -- --check
+
+  advisories:
+    name: cargo deny advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      # RustSec vulnerabilities and yanked crates, configured in deny.toml.
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check advisories
 
   harbor_eval_static:
     name: Harbor eval static checks
