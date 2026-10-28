@@ -39,6 +39,9 @@ tool for this checkout.
   `born_on_year`, `born_on_dmy` (day/month/year), or `born_on_mdy`
   (month/day/year). Follow the field's stated date order; never guess from
   the website's language or country.
+  `filled_fields` lists accepted fields. If a name is omitted or the page
+  rejects it, use `type_traveler` for that exact input, then verify the saved
+  placeholders on the seller's passenger review before continuing.
   Snapshots show unlocked values as `[saved <field>]`; check each field holds
   the right placeholder, and never try to recover the values.
   Custom selector captions and saved radio choices are masked too. While

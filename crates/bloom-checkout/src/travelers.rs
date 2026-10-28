@@ -508,6 +508,77 @@ mod tests {
         server.abort();
     }
     #[tokio::test]
+    async fn contact_first_forms_do_not_append_email_to_passenger_names() {
+        let (browser, server, _) = browser_at(
+            "<label>E-mail<input type='email'></label><label>Confirm e-mail<input type='email'></label>
+             <label>Mobile number<input type='tel'></label>
+             <fieldset><legend>Gender</legend><label>Male<input type='radio' name='gender' value='male'></label></fieldset>
+             <label>First name(s)<input name='firstName'></label><label>Last name<input name='lastName'></label>",
+        ).await;
+        let tab = browser.handoff().await.unwrap();
+        let fields = [
+            TravelerField::Email,
+            TravelerField::Phone,
+            TravelerField::Gender,
+            TravelerField::GivenName,
+            TravelerField::FamilyName,
+        ];
+        let values = [
+            ("email", "fixture@example.com"),
+            ("phone", "+12025550123"),
+            ("gender", "male"),
+            ("given_name", "Synthetic"),
+            ("family_name", "Fixture"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.into(), Zeroizing::new(v.into())))
+        .collect();
+        let discovery = TravelerDiscovery::read(&tab, &fields).await.unwrap();
+        discovery.fill(&tab, &values).await.unwrap();
+        let actual = tab.cdp.evaluate(&tab.session,
+            "[...document.querySelectorAll('input')].filter(e=>e.type!=='radio').map(e=>e.value)".into()).await.unwrap();
+        assert_eq!(
+            actual,
+            json!([
+                "fixture@example.com",
+                "fixture@example.com",
+                "+12025550123",
+                "Synthetic",
+                "Fixture"
+            ])
+        );
+        server.abort();
+    }
+    #[tokio::test]
+    async fn a_site_changed_passenger_name_is_not_reported_as_filled() {
+        let (browser, server, _) = browser_at(
+            "<label>First name<input name='firstName'></label><label>Last name<input id='family' name='lastName'></label>
+             <label>E-mail<input type='email' oninput=\"family.value += this.value\"></label>",
+        ).await;
+        let tab = browser.handoff().await.unwrap();
+        let discovery = TravelerDiscovery::read(
+            &tab,
+            &[
+                TravelerField::GivenName,
+                TravelerField::FamilyName,
+                TravelerField::Email,
+            ],
+        )
+        .await
+        .unwrap();
+        let values = [
+            ("given_name", "Synthetic"),
+            ("family_name", "Fixture"),
+            ("email", "fixture@example.com"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.into(), Zeroizing::new(v.into())))
+        .collect();
+        let filled = discovery.fill(&tab, &values).await.unwrap();
+        assert_eq!(filled, ["given_name", "email"]);
+        server.abort();
+    }
+    #[tokio::test]
     async fn site_drawn_dropdowns_are_chosen_by_clicking_their_option() {
         // Shaped like JetSMART: gender is a read-only input whose options appear on click.
         let (browser, server, _) = browser_at(
