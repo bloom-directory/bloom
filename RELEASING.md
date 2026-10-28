@@ -6,7 +6,10 @@ and the workflow and release driver checked into the commit being released.
 
 ## Procedure
 
-1. Prepare and review the version-bump PR. Update the workspace version in
+1. Prepare and review the version-bump PR. Choose a SemVer strictly greater
+   than the current workspace version, including when preparing the PR by hand.
+   The Propose Release workflow enforces this comparison; production publication
+   does not enforce monotonicity. Update the workspace version in
    `Cargo.toml`, workspace package records in `Cargo.lock`, and the Machine
    version in `packaging/triad/release/compatibility-v1.toml`. The optional
    **Propose Release** workflow creates this PR; it never tags or publishes.
@@ -39,7 +42,7 @@ and the workflow and release driver checked into the commit being released.
    each with `.sha256`, `.sig`, and `.pub` sidecars (12 assets). Verify both the
    outer archive checksum signature and the internal payload manifest. Include
    feature changes, upgrade caveats, and known issues in the public release
-   notes; the workflow supplies only generic artifact/verification notes.
+   notes; the workflow generates merged-change notes and artifact instructions.
 7. Coordinate website guide updates and verify the live setup script selects
    the new stable release and uses the reviewed key. It discovers the release
    tag dynamically; do not add a floating `latest` Git tag.
@@ -57,6 +60,7 @@ that tag's workflow and driver, recheck its SHA, reject changed/unexpected asset
 and upload only missing assets. Never replace an immutable tag to incorporate a
 fix; prepare a new version instead.
 
-The current retry path also marks the release latest and overwrites its body
-with generic notes. Avoid inadvertently promoting an older release, and restore
-curated release notes after a successful retry.
+The current retry path marks the release latest and refreshes the generated
+changes section while preserving maintainer notes outside it. Avoid inadvertently
+promoting an older release. Older tags run their own workflow, which may overwrite
+curated notes; inspect that workflow before retrying.
