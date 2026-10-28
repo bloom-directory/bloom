@@ -7,7 +7,7 @@ on:
         description: Public bloom-broker ref
         required: false
         type: string
-        default: 88604d308412bea3876533adc80904223d334bf2
+        default: b4f0c0bf04f3f34cc171f072a87ed982f4e7e196
       signer_ref:
         description: Public bloom-signer ref
         required: false
@@ -18,7 +18,7 @@ on:
       broker_ref:
         description: Public bloom-broker ref
         required: true
-        default: 88604d308412bea3876533adc80904223d334bf2
+        default: b4f0c0bf04f3f34cc171f072a87ed982f4e7e196
       signer_ref:
         description: Public bloom-signer ref
         required: true
@@ -42,7 +42,7 @@ jobs:
       - name: Reject mutable sibling refs
         shell: bash
         env:
-          BROKER_REF: ${{ inputs.broker_ref || '88604d308412bea3876533adc80904223d334bf2' }}
+          BROKER_REF: ${{ inputs.broker_ref || 'b4f0c0bf04f3f34cc171f072a87ed982f4e7e196' }}
           SIGNER_REF: ${{ inputs.signer_ref || '74e097a566f1bd08f5f43a7e847d3958b6386a3a' }}
         run: |
           [[ "$BROKER_REF" =~ ^[0-9a-f]{40}$ ]]
@@ -51,7 +51,7 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           repository: bloom-directory/bloom-broker
-          ref: ${{ inputs.broker_ref || '88604d308412bea3876533adc80904223d334bf2' }}
+          ref: ${{ inputs.broker_ref || 'b4f0c0bf04f3f34cc171f072a87ed982f4e7e196' }}
           path: bloom-broker
       - name: Check out Signer
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
@@ -160,7 +160,7 @@ jobs:
       - name: Reject mutable sibling refs
         shell: bash
         env:
-          BROKER_REF: ${{ inputs.broker_ref || '88604d308412bea3876533adc80904223d334bf2' }}
+          BROKER_REF: ${{ inputs.broker_ref || 'b4f0c0bf04f3f34cc171f072a87ed982f4e7e196' }}
           SIGNER_REF: ${{ inputs.signer_ref || '74e097a566f1bd08f5f43a7e847d3958b6386a3a' }}
         run: |
           [[ "$BROKER_REF" =~ ^[0-9a-f]{40}$ ]]
@@ -169,7 +169,7 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           repository: bloom-directory/bloom-broker
-          ref: ${{ inputs.broker_ref || '88604d308412bea3876533adc80904223d334bf2' }}
+          ref: ${{ inputs.broker_ref || 'b4f0c0bf04f3f34cc171f072a87ed982f4e7e196' }}
           path: bloom-broker
       - name: Check out Signer
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
