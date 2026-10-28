@@ -8,127 +8,191 @@ use bloom_proto::persona::PersonaPreset;
 use sha2::{Digest as _, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const ORDER_CLASS: &str = "polymarket.order.poly1271";
 const U256_MAX: &str =
     "115792089237316195423570985008687907853269984665640564039457584007913129639935";
 
-/// Convenience selection for the first reference Petal on an explicit account.
-/// Arbitrary certified Petal/native selections use compile_selection below.
-async fn compile_polymarket_proposals(
+/// Discover only profiles backed by a compiled Broker verifier and the exact
+/// installed package's signed route/effects declarations. Package names and
+/// UI preferences never stand in for provenance or authorize a signature.
+fn certified_petal_selection(
+    package_hash: &Digest32,
+    catalog: &ProvenanceCatalog,
+    account: u32,
+    key_ref: &KeyRef,
+    capability_schemas: &[Token],
+) -> Result<Option<PersonaSessionSelection>> {
+    let mut route_grants = Vec::new();
+    let mut classes = Vec::new();
+    let mut assets = Vec::new();
+    let mut suites = Vec::new();
+    for record in &catalog.records {
+        let ProvenanceSubject::Petal {
+            package_hash: hash,
+            route,
+        } = &record.subject
+        else {
+            continue;
+        };
+        if hash != package_hash {
+            continue;
+        }
+        let mut route_classes = Vec::new();
+        for profile in reusable_signing_profiles() {
+            if !profile.is_advertised(capability_schemas) {
+                continue;
+            }
+            if !record
+                .operation_classes
+                .iter()
+                .any(|class| profile.matches_certified_class(class))
+            {
+                continue;
+            }
+            if profile.crypto_suite.key_spec() != key_ref.key_spec {
+                continue;
+            }
+            route_classes.push(Token::new(profile.operation_class)?);
+            if !suites.contains(&profile.crypto_suite) {
+                suites.push(profile.crypto_suite);
+            }
+            for asset in profile.token_assets() {
+                if !assets.contains(&asset) {
+                    assets.push(asset);
+                }
+            }
+        }
+        route_classes.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        route_classes.dedup();
+        if route_classes.is_empty() {
+            continue;
+        }
+        for class in &route_classes {
+            if !classes.contains(class) {
+                classes.push(class.clone());
+            }
+        }
+        route_grants.push(PetalRouteGrant {
+            route: route.clone(),
+            allowed_operation_classes: route_classes,
+            provenance_digest: record.digest()?,
+        });
+    }
+    if route_grants.is_empty() {
+        return Ok(None);
+    }
+    route_grants.sort_by(|a, b| a.route.cmp(&b.route));
+    if route_grants.windows(2).any(|w| w[0].route == w[1].route) {
+        bail!("ambiguous certified Petal route");
+    }
+    classes.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    assets.sort_by(|a, b| (&a.chain, &a.asset).cmp(&(&b.chain, &b.asset)));
+    let primary = &route_grants[0];
+    Ok(Some(PersonaSessionSelection {
+        token_allowances: vec![],
+        assets,
+        members: vec![PersonaSessionMember {
+            account,
+            key_ref: key_ref.clone(),
+            subject: ApprovalSubject::Petal {
+                package_hash: package_hash.clone(),
+                route: primary.route.clone(),
+                agent_id: None,
+            },
+            selector: ApprovalSelector::Petal {
+                package_hash: package_hash.clone(),
+                route: primary.route.clone(),
+                allowed_operation_classes: classes,
+                route_grants: route_grants.clone(),
+                required_claim_assurance: ClaimAssuranceLevel::MachineAsserted,
+            },
+            provenance_digest: primary.provenance_digest.clone(),
+            allowed_crypto_suites: suites,
+        }],
+    }))
+}
+
+async fn compile_petal_proposals(
     daemon: &Daemon,
     wallet: &str,
     account: u32,
 ) -> Result<Vec<PersonaSessionProposal>> {
     let config = bloom_proto::Config::load(&daemon.home.config_path())?;
-    let profile = config.persona.unwrap_or_default();
-    if !config.petals.setup.contains_key("polymarket") {
-        bail!(
-            "Polymarket was not selected during setup; choose its policy scope before proposing a buy session"
-        );
-    }
-    profile.validate().map_err(anyhow::Error::msg)?;
-    if profile.preset == PersonaPreset::Custodian {
-        bail!("Institutional has no reusable session to activate");
-    }
     let broker = daemon.broker_client().context("Broker unavailable")?;
-    let wallet_id = Token::new(wallet.to_owned())?;
+    let wallet_id = Token::new(wallet)?;
     let descriptor = broker.wallet(wallet_id.clone()).await?;
     let snapshot = broker.policy(wallet_id.clone()).await?;
-    if descriptor.wallet_id != wallet_id || snapshot.wallet_id != wallet_id {
-        bail!("Broker wallet or policy projection differs from the selected wallet");
-    }
-    if snapshot.version != descriptor.policy_version
+    if snapshot.wallet_id != wallet_id
+        || descriptor.wallet_id != wallet_id
+        || snapshot.version != descriptor.policy_version
         || snapshot.policy_digest != descriptor.policy_digest
     {
-        bail!("wallet policy changed while compiling; retry activation");
+        bail!("wallet policy changed while discovering reusable profiles");
     }
     let policy: CanonicalWalletPolicy =
         serde_json::from_slice(&snapshot.canonical_policy.decode())?;
     if policy.wallet_id != wallet_id {
         bail!("policy wallet differs from selected wallet");
     }
-    let suite = CryptoSuite::Secp256k1Keccak256Recoverable;
-    let key_ref = selected_evm_key(daemon, wallet, account).await?;
-    let installed = daemon.petals.store().resolve_petal_owner("polymarket")?
-        .context("install Polymarket before activating its bounded buy session; other classes currently require exact review")?;
-    let package_hash = Digest32::new(installed)?;
-    if !policy.allowed_petal_packages.contains(&package_hash) {
-        bail!(
-            "installed Polymarket package is not allowed by the signed policy; complete policy setup before activation"
-        );
-    }
     let catalog = daemon
         .persona_provenance_catalog()
-        .context("installer provenance is unavailable")?;
-    let class = Token::new(ORDER_CLASS)?;
-    let mut routes = catalog
-        .records
-        .iter()
-        .filter_map(|record| {
-            let ProvenanceSubject::Petal {
-                package_hash: hash,
-                route,
-            } = &record.subject
-            else {
-                return None;
-            };
-            (hash == &package_hash
-                && record.operation_classes.iter().any(|entry| {
-                    entry.operation_class == class
-                        && entry.fee_asset.is_none()
-                        && entry.economic_effects_schema == Some(1)
-                }))
-            .then_some((route.clone(), record))
-        })
-        .collect::<Vec<_>>();
-    routes.sort_by(|a, b| a.0.cmp(&b.0));
-    if routes.is_empty() {
-        bail!(
-            "installed package lacks an installer-certified generic effects v1 BUY route; existing owner approval remains available"
-        );
-    }
-    let route_grants = routes
-        .iter()
-        .map(|(route, record)| {
-            Ok(PetalRouteGrant {
-                route: route.clone(),
-                allowed_operation_classes: vec![class.clone()],
-                provenance_digest: record.digest()?,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let primary = &route_grants[0];
-    let selector = ApprovalSelector::Petal {
-        package_hash: package_hash.clone(),
-        route: primary.route.clone(),
-        allowed_operation_classes: vec![class],
-        route_grants: route_grants.clone(),
-        required_claim_assurance: ClaimAssuranceLevel::MachineAsserted,
+        .context("installer provenance unavailable")?;
+    let MachineBrokerResponse::BrokerCapabilities(capabilities) = broker
+        .request(MachineBrokerRequest::BrokerCapabilities(Empty {}))
+        .await?
+    else {
+        bail!("Broker capability response mismatch");
     };
-    compile_selection(
-        daemon,
-        wallet,
-        PersonaSessionSelection {
-            token_allowances: vec![],
-            assets: vec![AssetId {
-                chain: Token::new("evm-137")?,
-                asset: "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb".into(),
-            }],
-            members: vec![PersonaSessionMember {
+    let mut proposals = Vec::new();
+    // One independent allowance per exact package/account. All certified routes
+    // within that package share it; discovering more routes cannot refill it.
+    for name in config.petals.setup.keys() {
+        let Some(installed) = daemon.petals.store().resolve_petal_owner(name)? else {
+            continue;
+        };
+        let package_hash = Digest32::new(installed)?;
+        let mut selected = None;
+        let mut selected_key_specs = Vec::new();
+        for suite in CryptoSuite::ALL {
+            if selected_key_specs.contains(&suite.key_spec()) {
+                continue;
+            }
+            let supported = reusable_signing_profiles().iter().any(|profile| {
+                profile.crypto_suite == suite
+                    && profile.is_advertised(&capabilities.schemas)
+                    && catalog.records.iter().any(|record| {
+                        matches!(&record.subject, ProvenanceSubject::Petal { package_hash: hash, .. } if hash == &package_hash)
+                            && record.operation_classes.iter().any(|class| profile.matches_certified_class(class))
+                    })
+            });
+            if !supported {
+                continue;
+            }
+            selected_key_specs.push(suite.key_spec());
+            let key = selected_account_key(daemon, wallet, account, suite).await?;
+            if let Some(selection) = certified_petal_selection(
+                &package_hash,
+                &catalog,
                 account,
-                key_ref,
-                subject: ApprovalSubject::Petal {
-                    package_hash,
-                    route: primary.route.clone(),
-                    agent_id: None,
-                },
-                selector,
-                provenance_digest: primary.provenance_digest.clone(),
-                allowed_crypto_suites: vec![suite],
-            }],
-        },
-    )
-    .await
+                &key,
+                &capabilities.schemas,
+            )? {
+                if selected.is_some() {
+                    bail!(
+                        "multiple key profiles for one Petal require an explicit account selection"
+                    );
+                }
+                selected = Some(selection);
+            }
+        }
+        let Some(selection) = selected else {
+            continue;
+        };
+        if !policy.allowed_petal_packages.contains(&package_hash) {
+            bail!("selected Petal {name} is not allowed by the signed wallet policy");
+        }
+        proposals.extend(compile_selection(daemon, wallet, selection).await?);
+    }
+    Ok(proposals)
 }
 
 /// Compile explicit native/Petal selections into independent token allowances.
@@ -456,10 +520,40 @@ fn proposal(
 
 /// Choose the same authoritative EVM account for native and Petal permissions.
 async fn selected_evm_key(daemon: &Daemon, wallet: &str, account: u32) -> Result<KeyRef> {
+    selected_account_key(
+        daemon,
+        wallet,
+        account,
+        CryptoSuite::Secp256k1Keccak256Recoverable,
+    )
+    .await
+}
+
+// Match the wallet VFS account numbering: EVM uses address indices under
+// hardened account zero; Solana uses hardened account indices.
+fn selected_account_path(key_spec: KeySpec, account: u32) -> (DerivationProfile, String) {
+    match key_spec {
+        KeySpec::Secp256k1 => (
+            DerivationProfile::Bip44EvmSecp256k1V1,
+            format!("m/44'/60'/0'/0/{account}"),
+        ),
+        KeySpec::Ed25519 => (
+            DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+            format!("m/44'/501'/{account}'/0'"),
+        ),
+    }
+}
+
+async fn selected_account_key(
+    daemon: &Daemon,
+    wallet: &str,
+    account: u32,
+    suite: CryptoSuite,
+) -> Result<KeyRef> {
     let broker = daemon.broker_client().context("Broker unavailable")?;
     let wallet_id = Token::new(wallet)?;
     let descriptor = broker.wallet(wallet_id.clone()).await?;
-    let suite = CryptoSuite::Secp256k1Keccak256Recoverable;
+    let (derivation_profile, path) = selected_account_path(suite.key_spec(), account);
     let key_ref = if let Some(root) = descriptor.root_key_ref.as_ref() {
         if account != 0 || !descriptor.key_refs.contains(root) || root.derivation.is_some() {
             bail!("selected wallet has no unambiguous account 0 owner root");
@@ -472,7 +566,7 @@ async fn selected_evm_key(daemon: &Daemon, wallet: &str, account: u32) -> Result
                     && key.role == KeyRole::WalletRoot
                     && key.supported_crypto_suites.contains(&suite)
             })
-            .context("wallet has no authoritative EVM root signing key")?;
+            .context("wallet has no authoritative signing key for the selected suite")?;
         key.key_ref.clone()
     } else {
         let accounts = broker.wallet_accounts(wallet_id.clone()).await?;
@@ -484,16 +578,16 @@ async fn selected_evm_key(daemon: &Daemon, wallet: &str, account: u32) -> Result
             .iter()
             .filter(|entry| {
                 entry.lifecycle == AccountLifecycleState::Active
-                    && entry.derivation_profile == DerivationProfile::Bip44EvmSecp256k1V1
-                    && entry.path == format!("m/44'/60'/{account}'/0/0")
-                    && matches!(&entry.key_ref.derivation, Some(DerivationRef::Bip39Multicurve { profile: DerivationProfile::Bip44EvmSecp256k1V1, path, .. }) if path == &entry.path)
+                    && entry.derivation_profile == derivation_profile
+                    && entry.path == path
+                    && matches!(&entry.key_ref.derivation, Some(DerivationRef::Bip39Multicurve { profile, path, .. }) if *profile == derivation_profile && path == &entry.path)
                     && entry.supported_crypto_suites.contains(&suite)
                     && descriptor.key_refs.contains(&entry.key_ref)
             })
             .collect::<Vec<_>>();
         let [entry] = candidates.as_slice() else {
             bail!(
-                "selected wallet/account has no unique active EVM owner key; choose an existing EVM account before activating"
+                "selected wallet/account has no unique active owner key for this signing profile"
             );
         };
         entry.validate()?;
@@ -519,9 +613,7 @@ pub(crate) async fn compile_proposals(
         let selection = degen_transfer_selection(daemon, wallet, account, &chain_ids).await?;
         proposals.extend(compile_selection(daemon, wallet, selection).await?);
     }
-    if config.petals.setup.contains_key("polymarket") {
-        proposals.extend(compile_polymarket_proposals(daemon, wallet, account).await?);
-    }
+    proposals.extend(compile_petal_proposals(daemon, wallet, account).await?);
     if proposals.is_empty() {
         bail!(
             "no supported reusable scope was selected; choose Degen transfers or a supported Petal"
@@ -661,6 +753,111 @@ fn same_allowance_owner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn signing_profiles_use_the_authoritative_account_numbering() {
+        assert_eq!(
+            selected_account_path(KeySpec::Secp256k1, 1),
+            (
+                DerivationProfile::Bip44EvmSecp256k1V1,
+                "m/44'/60'/0'/0/1".into()
+            )
+        );
+        assert_eq!(
+            selected_account_path(KeySpec::Ed25519, 1),
+            (
+                DerivationProfile::Bip44SolanaSlip10Ed25519V1,
+                "m/44'/501'/1'/0'".into()
+            )
+        );
+    }
+    #[test]
+    fn discovery_uses_certified_profiles_not_package_names_or_schema_alone() {
+        let explicit: PersonaSessionSelection = serde_json::from_str(include_str!(
+            "../../../docs/examples/generic-session-selection.json"
+        ))
+        .unwrap();
+        let key = explicit.members[0].key_ref.clone();
+        let hash = Digest32::from_bytes([7; 32]);
+        let profile = &reusable_signing_profiles()[0];
+        let advertised = vec![Token::new(profile.capability_schema()).unwrap()];
+        let record = |route: &str| ProvenanceRecord {
+            subject: ProvenanceSubject::Petal {
+                package_hash: hash.clone(),
+                route: route.into(),
+            },
+            publisher: Token::new("test-publisher").unwrap(),
+            petal_lineage: None,
+            operation_classes: vec![ProvenanceOperationClass {
+                economic_effects_schema: Some(1),
+                operation_class: Token::new(profile.operation_class).unwrap(),
+                fee_asset: None,
+            }],
+            installer_key_id: Token::new("test-installer").unwrap(),
+            installer_signature: Base64UrlBytes::from_bytes(&[0; 64]),
+        };
+        let mut catalog = ProvenanceCatalog {
+            schema: PROVENANCE_CATALOG_SCHEMA.into(),
+            records: vec![record("r000002"), record("r000001")],
+        };
+        let selection = certified_petal_selection(&hash, &catalog, 3, &key, &advertised)
+            .unwrap()
+            .unwrap();
+        assert!(
+            certified_petal_selection(&hash, &catalog, 3, &key, &[])
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(selection.members.len(), 1);
+        assert_eq!(selection.members[0].account, 3);
+        assert_eq!(selection.assets, profile.token_assets());
+        let ApprovalSelector::Petal { route_grants, .. } = &selection.members[0].selector else {
+            panic!("Petal scope expected")
+        };
+        assert_eq!(route_grants.len(), 2);
+        assert_eq!(route_grants[0].route, "r000001");
+        assert!(
+            certified_petal_selection(
+                &Digest32::from_bytes([8; 32]),
+                &catalog,
+                3,
+                &key,
+                &advertised
+            )
+            .unwrap()
+            .is_none()
+        );
+        for r in &mut catalog.records {
+            r.operation_classes[0].operation_class = Token::new("example.unknown").unwrap();
+        }
+        assert!(
+            certified_petal_selection(&hash, &catalog, 3, &key, &advertised)
+                .unwrap()
+                .is_none()
+        );
+        catalog.records = vec![record("r000001")];
+        catalog.records[0].operation_classes[0].economic_effects_schema = None;
+        assert!(
+            certified_petal_selection(&hash, &catalog, 3, &key, &advertised)
+                .unwrap()
+                .is_none()
+        );
+        catalog.records[0].operation_classes[0].economic_effects_schema = Some(2);
+        assert!(
+            certified_petal_selection(&hash, &catalog, 3, &key, &advertised)
+                .unwrap()
+                .is_none()
+        );
+        catalog.records = vec![record("r000001"), record("r000001")];
+        assert!(certified_petal_selection(&hash, &catalog, 3, &key, &advertised).is_err());
+        catalog.records = vec![record("r000001")];
+        let wrong_key = explicit.members[1].key_ref.clone();
+        assert!(
+            certified_petal_selection(&hash, &catalog, 3, &wrong_key, &advertised)
+                .unwrap()
+                .is_none()
+        );
+    }
+
     #[test]
     fn operator_selection_example_is_the_current_typed_contract() {
         let selection: PersonaSessionSelection = serde_json::from_str(include_str!(

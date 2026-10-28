@@ -379,11 +379,33 @@ async fn installed_account_one_auth_and_exact_continuation_use_real_authority() 
         daemon,
         wallet,
     } = account_one_fixture().await;
+    let capabilities = client
+        .request(bloom_broker_api::MachineBrokerRequest::BrokerCapabilities(
+            bloom_broker_api::Empty {},
+        ))
+        .await
+        .unwrap();
+    let bloom_broker_api::MachineBrokerResponse::BrokerCapabilities(capabilities) = capabilities
+    else {
+        panic!("Broker capability response mismatch");
+    };
+    assert!(
+        bloom_broker_api::reusable_signing_profiles()
+            .iter()
+            .all(|profile| profile.is_advertised(&capabilities.schemas))
+    );
     let accounts = client.wallet_accounts(wallet.clone()).await.unwrap();
     let account_one = accounts
         .accounts
         .iter()
         .find(|a| a.path == "m/44'/60'/0'/0/1")
+        .unwrap();
+    // Navigation reads use the authenticated cache; explicitly refresh after
+    // allocating the new account before reading its address in this fixture.
+    daemon
+        .wallet_projections
+        .get_wallet_authority(&wallet)
+        .await
         .unwrap();
     let owner: Address = String::from_utf8(
         daemon
@@ -580,7 +602,9 @@ async fn installed_account_one_auth_and_exact_continuation_use_real_authority() 
         let mut claim: bloom_broker_api::PetalUseClaim =
             serde_json::from_slice(&changed.petal_use_claim_jcs).unwrap();
         if mutation == "class" {
-            changed.operation_class = "polymarket.unauthorized.v1".into();
+            // A supported review format belonging to another route reaches
+            // provenance authorization; unknown signed-message formats fail earlier.
+            changed.operation_class = "polymarket.relayer_batch".into();
             claim.operation_class = Token::new(&changed.operation_class).unwrap();
         } else {
             changed.context.as_mut().unwrap().route_id = "unenrolled-route".into();
@@ -701,7 +725,7 @@ async fn installed_account_one_auth_and_exact_continuation_use_real_authority() 
     let result = serde_json::json!({"schema":"bloom.pm80.authorization-boundary.v1", "package_hash":hash,
         "auth_route":auth_route,"continuation_route":exact_route,"account":1,
         "owner_key_fingerprint":account_one.public_key_fingerprint,
-        "auth_timestamp_refreshed":true,"auth_headers_validated":true,"auth_posts":1,"separate_exact_approval":true,
+        "verified_profiles_advertised":true,"auth_timestamp_refreshed":true,"auth_headers_validated":true,"auth_posts":1,"separate_exact_approval":true,
         "signed_operations":2,"hint_substitutions":["account","class","route","batch"],
         "installer_denials_without_hint":["class","route"],"unknown_package_cannot_sign":true,
         "cancelled_approval_cannot_sign":true,

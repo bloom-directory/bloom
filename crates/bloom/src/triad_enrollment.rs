@@ -1388,6 +1388,7 @@ mod tests {
     #[test]
     fn developer_route_provenance_unions_only_immediate_and_explicit_classes() {
         let route = bloom_petals::package::RouteIndexRecord {
+            economic_effects_schema: None,
             route_id: "r000001".into(),
             pattern: "session.json".into(),
             source_path: "petal/fixture/session.json.wasm".into(),

@@ -384,7 +384,7 @@ async fn state_snapshot(state: &AppState) -> Result<Value> {
         .map(|id| json!({"label":crate::default_policy::petal_label(&id),"id":id}))
         .collect::<Vec<_>>();
     Ok(
-        json!({"config":config, "machine":{"available":available,"persona_supported":persona_supported,"error":wallets.get("error")}, "wallets":wallets, "wallet_choices":choices,"selected_wallet":selected,"wallet_required":available && selected.is_none(), "policy":policy, "sessions":sessions, "catalog":catalog, "ceremony_url":ceremony_url}),
+        json!({"config":config, "machine":{"available":available,"persona_supported":persona_supported,"error":wallets.get("error")}, "wallets":wallets, "wallet_choices":choices,"selected_wallet":selected,"wallet_required":available && selected.is_none(), "policy":policy, "sessions":sessions, "catalog":catalog, "reusable_profiles":bloom_broker_api::reusable_signing_profiles().iter().map(|p|json!({"id":p.id,"display_name":p.display_name,"operation_class":p.operation_class})).collect::<Vec<_>>(), "ceremony_url":ceremony_url}),
     )
 }
 

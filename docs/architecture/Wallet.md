@@ -244,3 +244,34 @@ the cached authenticated account inventory. The path still fixes the sender;
 Solana artifacts also pin the full account fingerprint. Confirming, replacing, cancelling, restaging,
 session changes and Petal account context still require fresh Broker authority;
 cached membership never authorizes a signature.
+
+## Discoverable reusable operation profiles
+
+Persona onboarding discovers supported signing profiles from the Broker API's
+compiled `reusable_signing_profiles()` catalog. Each profile specifies its
+operation class, effects schema, crypto suite, exact budget assets and Broker
+verifier. Machine first requires the running Broker to advertise the specific
+`bloom.reusable-profile/<id>` capability, then intersects that catalog with
+selected installed packages and their installer-certified route records. Unknown classes, absent/wrong schema
+versions and fee-bearing classes are not automatically selected. Preferences
+and capability metadata do not activate authority.
+
+All eligible routes for one exact package/account share one member and its
+independent allowance. Package names are display/configuration choices, not
+signing authority. Exact KeyRefs, immutable package/route provenance, wallet
+policy and existing approval/usage bindings remain mandatory. Changed routes,
+assets or policy require the existing explicit review/revocation flow; discovery
+never resets a consumed allowance. Native-wallet transfer scopes remain
+independent of Petal scopes.
+
+The Petal SDK's typed effects builder serializes raw token debits and binds the
+claim to exact ordered payloads. Machine supplies the authenticated spending
+account; Broker verifies supported protocol semantics. Polymarket BUY is the
+first migrated adapter. Its order-byte/owner/chain/debit reconstruction stays
+protocol-specific; SELL shares, builder fees, credentials and continuing
+permissions retain separate approval. Hyperliquid, Enso, NEAR Intents and
+Feedback have not been migrated or granted new automatic actions.
+
+No WIT, custody or signing wire shape changes are introduced by this discovery
+catalog. Claim assurance remains explicit; supported checks do not imply proof
+of arbitrary contract effects or successful venue settlement.
