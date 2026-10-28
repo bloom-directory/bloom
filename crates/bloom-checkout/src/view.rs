@@ -1,7 +1,7 @@
 use crate::service::{CheckoutService, ViewAction};
 use axum::{
     Json, Router,
-    extract::{Query, State},
+    extract::State,
     http::{HeaderMap, StatusCode, header},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
@@ -10,7 +10,7 @@ use serde::Deserialize;
 use std::sync::Arc;
 
 pub fn router(service: Arc<CheckoutService>) -> Router {
-    Router::new().route("/private",get(claim)).route("/view",get(page))
+    Router::new().route("/private",get(page)).route("/claim",post(claim)).route("/view",get(page))
         .route("/unlocked",get(||async {Html("<!doctype html><meta charset=utf-8><title>Bloom</title><p>Traveler details unlocked for this booking. You can close this page.</p>")}))
         .route("/view.js",get(||async {([(header::CONTENT_TYPE,"application/javascript")],include_str!("view.js"))}))
         .route("/state",get(state)).route("/frame",get(frame)).route("/action",post(action))
@@ -18,16 +18,16 @@ pub fn router(service: Arc<CheckoutService>) -> Router {
             let mut response=next.run(request).await;
             response.headers_mut().insert(header::CACHE_CONTROL,"no-store".parse().unwrap());
             response.headers_mut().insert("referrer-policy","no-referrer".parse().unwrap());
-            response.headers_mut().insert("content-security-policy","default-src 'none'; script-src 'self'; img-src 'self'; connect-src 'self'; style-src 'unsafe-inline'; frame-ancestors 'none'".parse().unwrap());
+            response.headers_mut().insert("content-security-policy","default-src 'none'; script-src 'self'; img-src 'self' blob:; connect-src 'self'; style-src 'unsafe-inline'; frame-ancestors 'none'".parse().unwrap());
             response
         })).with_state(service)
 }
 
-fn token(
+fn check_origin(
     headers: &HeaderMap,
     service: &CheckoutService,
     mutation: bool,
-) -> Result<String, StatusCode> {
+) -> Result<(), StatusCode> {
     let host = format!("localhost:{}", service.view_port);
     if headers.get(header::HOST).and_then(|v| v.to_str().ok()) != Some(host.as_str()) {
         return Err(StatusCode::FORBIDDEN);
@@ -38,16 +38,19 @@ fn token(
     {
         return Err(StatusCode::FORBIDDEN);
     }
-    let name = format!("bloom_checkout_{}=", service.view_port);
+    Ok(())
+}
+
+fn token(
+    headers: &HeaderMap,
+    service: &CheckoutService,
+    mutation: bool,
+) -> Result<String, StatusCode> {
+    check_origin(headers, service, mutation)?;
     headers
-        .get(header::COOKIE)
+        .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|cookies| {
-            cookies
-                .split(';')
-                .map(str::trim)
-                .find_map(|c| c.strip_prefix(&name))
-        })
+        .and_then(|value| value.strip_prefix("Bearer "))
         .map(str::to_owned)
         .ok_or(StatusCode::UNAUTHORIZED)
 }
@@ -59,36 +62,26 @@ struct Claim {
 async fn claim(
     State(service): State<Arc<CheckoutService>>,
     headers: HeaderMap,
-    Query(query): Query<Claim>,
+    Json(query): Json<Claim>,
 ) -> Response {
-    let host = format!("localhost:{}", service.view_port);
-    let cookie = token(&headers, &service, false).ok();
-    if headers.get(header::HOST).and_then(|v| v.to_str().ok()) != Some(host.as_str()) {
-        return StatusCode::FORBIDDEN.into_response();
+    if let Err(status) = check_origin(&headers, &service, true) {
+        return status.into_response();
     }
-    let Ok(session) = service.private_claim(&query.token, cookie.as_deref()).await else {
+    let previous = token(&headers, &service, false).ok();
+    let Ok(session) = service
+        .private_claim(&query.token, previous.as_deref())
+        .await
+    else {
         return StatusCode::FORBIDDEN.into_response();
     };
-    let cookie = format!(
-        "bloom_checkout_{}={}; HttpOnly; SameSite=Strict; Path=/; Max-Age=1800",
-        service.view_port, session
-    );
-    (
-        StatusCode::SEE_OTHER,
-        [
-            (header::SET_COOKIE, cookie),
-            (header::LOCATION, "/view".into()),
-        ],
-    )
-        .into_response()
+    Json(serde_json::json!({"session":session})).into_response()
 }
 async fn page(State(service): State<Arc<CheckoutService>>, headers: HeaderMap) -> Response {
-    let Ok(token) = token(&headers, &service, false) else {
-        return StatusCode::UNAUTHORIZED.into_response();
-    };
-    if service.private_state(&token).await.is_err() {
-        return StatusCode::UNAUTHORIZED.into_response();
+    if let Err(status) = check_origin(&headers, &service, false) {
+        return status.into_response();
     }
+    // Only a public shell. State, images and actions require the origin-bound
+    // key that view.js keeps in localStorage, never an ambient localhost cookie.
     Html(include_str!("view.html")).into_response()
 }
 async fn state(State(service): State<Arc<CheckoutService>>, headers: HeaderMap) -> Response {
@@ -131,7 +124,11 @@ mod tests {
 
     #[tokio::test]
     async fn closed_private_page_hides_controls_and_preserves_outcome() {
-        for state in [None, Some(json!({"state":"paid","closed":true}))] {
+        for (state, transient_failure) in [
+            (None, false),
+            (Some(json!({"state":"paid","closed":true})), false),
+            (Some(json!({"state":"paid","closed":true})), true),
+        ] {
             let expected_message = if state.is_some() {
                 "site confirmed the purchase"
             } else {
@@ -139,8 +136,10 @@ mod tests {
             };
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+            let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let server_reads = reads.clone();
             let app = Router::new()
-                .route("/", get(|| async { Html(include_str!("view.html")) }))
+                .route("/", get(|| async { Html(include_str!("view.html").replace("<script src=", "<script>localStorage.setItem('bloom.checkout.session','fixture-session')</script><script src=")) }))
                 .route(
                     "/view.js",
                     get(|| async {
@@ -154,7 +153,11 @@ mod tests {
                     "/state",
                     get(move || {
                         let state = state.clone();
+                        let reads = server_reads.clone();
                         async move {
+                            if reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 && transient_failure {
+                                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                            }
                             match state {
                                 Some(state) => Json(state).into_response(),
                                 None => StatusCode::GONE.into_response(),
@@ -187,6 +190,9 @@ mod tests {
             })
             .await
             .expect("closed checkout fixture did not finish loading");
+            if transient_failure {
+                assert!(reads.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+            }
             let tab = browser.handoff().await.unwrap();
             let result = tab.cdp.evaluate(&tab.session, r#"({
                     controlsHidden: document.getElementById('controls')?.hidden === true,

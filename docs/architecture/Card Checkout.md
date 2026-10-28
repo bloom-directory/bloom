@@ -140,15 +140,17 @@ inside the VFS.
 
 The private view is an HTTP page on `localhost` served by `bloom-checkout`,
 opened from the approval page with a one-use capability, exchanged for a
-separate random session secret in an HttpOnly, SameSite=Strict cookie. The
-used URL capability cannot authenticate a cookie or claim another session.
+separate random session secret kept in the human browser's origin-scoped
+localStorage. Requests send that key explicitly in an Authorization header.
+Cookies cannot isolate localhost ports, so private access never uses them.
+The used URL capability cannot authenticate a session or claim another one.
 The authenticated browser can revisit the original link or `/view` after
 closing a tab. It streams
 screenshots and forwards clicks and keys to the held tab and its popups (bank
 challenges). While it is open, Machine's browse requests are refused. The
 capability, session secret and screenshots never appear in VFS. Approved
 active status includes a public `view_url` pointing to `/view`; it grants no
-access without the existing session cookie. It is not reachable from another device.
+access without that browser's existing origin-scoped session key. It is not reachable from another device.
 
 Takeover is for login, verification or an unsupported field, not routine
 passenger entry. On handback, checkout navigates the human-selected tab through

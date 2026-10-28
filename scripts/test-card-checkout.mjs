@@ -9,6 +9,7 @@ import {tmpdir} from 'node:os';
 import {join, resolve} from 'node:path';
 import {createRequire} from 'node:module';
 import https from 'node:https';
+import http from 'node:http';
 
 const binary = process.env.BLOOM_BIN;
 const home = process.env.BLOOM_HOME;
@@ -55,8 +56,20 @@ async function vfs(command, path, value) {
   return JSON.parse(stdout);
 }
 async function browse(request) {
-  await vfs('write', `/checkout/browse/${slot}/in.json`, request);
-  return vfs('cat', `/checkout/browse/${slot}/out.json`);
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await vfs('write', `/checkout/browse/${slot}/in.json`, request);
+      return await vfs('cat', `/checkout/browse/${slot}/out.json`);
+    } catch (error) {
+      // Reading through changing payment/captcha frames can lose a document.
+      // Reobserve as the VFS guidance says; never replay an action or payment.
+      if (request.action !== 'snapshot' || attempt === 4 || !/snapshot|page could not be read or changed/i.test(error.message)) {
+        error.message = `${request.action}: ${error.message}`;
+        throw error;
+      }
+      await delay(500);
+    }
+  }
 }
 async function typeVisible(label, text, required = true) {
   for (let attempt = 0; attempt < 5; attempt++) {
@@ -105,6 +118,13 @@ const server = https.createServer({key:readFileSync(join(root,'key.pem')),cert:r
   else { response.statusCode = 404; response.end('Not found'); }
 });
 await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+const ambientCredentials = {cookie:false,authorization:false};
+const neighborServer = http.createServer((request,response) => {
+  ambientCredentials.cookie ||= /bloom_checkout_/.test(request.headers.cookie || '');
+  ambientCredentials.authorization ||= !!request.headers.authorization;
+  response.end('<title>Other local app fixture</title>');
+});
+await new Promise(resolve => neighborServer.listen(0,'127.0.0.1',resolve));
 const merchant = `https://localhost:${server.address().port}/`;
 const browser = await chromium.launch({executablePath:process.env.BLOOM_CHECKOUT_TEST_CHROMIUM || '/usr/lib/chromium/chromium',headless:true,args:['--no-sandbox']});
 const context = await browser.newContext();
@@ -149,6 +169,14 @@ try {
   const manualStatus = await poll(`/checkout/requests/${manual}/status.json`, ['manual_required']);
   assert.deepEqual(manualStatus.filled_fields, []);
   assert.equal(manualStatus.view_url, viewOrigin+'/view');
+  await privatePage.locator('#screen').waitFor({state:'visible'});
+  const neighbor = await context.newPage();
+  await neighbor.goto(`http://localhost:${neighborServer.address().port}/`);
+  assert.equal(await neighbor.evaluate(() => localStorage.getItem('bloom.checkout.session')),null);
+  assert.deepEqual(ambientCredentials,{cookie:false,authorization:false});
+  await neighbor.close();
+  assert(await privatePage.evaluate(() => /^[a-f0-9]{64}$/.test(localStorage.getItem('bloom.checkout.session') || '')));
+  checkpoint('private view session stays on its exact browser origin');
   await privatePage.close();
   privatePage = await context.newPage();
   assert.equal((await privatePage.goto(manualStatus.view_url)).status(),200);
@@ -216,4 +244,5 @@ try {
   console.error(`FAIL ${stage}: ${message}`); process.exitCode = 1;
 } finally {
   await browser.close(); server.closeAllConnections(); await new Promise(resolve => server.close(resolve));
+  neighborServer.closeAllConnections(); await new Promise(resolve => neighborServer.close(resolve));
 }

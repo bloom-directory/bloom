@@ -1445,19 +1445,19 @@ fn claim_view_session(
     capability: &str,
     session: &mut Option<String>,
     token: &str,
-    cookie: Option<&str>,
+    previous: Option<&str>,
 ) -> Result<String> {
     if !same_token(capability, token) {
         bail!("Private view capability rejected");
     }
     if let Some(session) = session {
-        if cookie.is_some_and(|cookie| same_token(session, cookie)) {
+        if previous.is_some_and(|previous| same_token(session, previous)) {
             return Ok(session.clone());
         }
         bail!("Private view capability rejected");
     }
     // Exchange the one-use URL capability for a separate session secret.
-    // A used URL must not also work as an HTTP cookie.
+    // A used URL must not also work as an authenticated session.
     let value = new_view_token();
     *session = Some(value.clone());
     Ok(value)
@@ -1737,7 +1737,7 @@ impl CheckoutService {
         }
     }
 
-    pub async fn private_claim(&self, token: &str, cookie: Option<&str>) -> Result<String> {
+    pub async fn private_claim(&self, token: &str, previous: Option<&str>) -> Result<String> {
         for _ in 0..20 {
             {
                 let mut private = self.private.lock().await;
@@ -1748,7 +1748,7 @@ impl CheckoutService {
                         &completed.capability,
                         &mut completed.session,
                         token,
-                        cookie,
+                        previous,
                     );
                 };
                 if !same_token(&checkout.capability, token) {
@@ -1759,7 +1759,7 @@ impl CheckoutService {
                         &checkout.capability,
                         &mut checkout.session,
                         token,
-                        cookie,
+                        previous,
                     );
                 }
             }
@@ -4298,47 +4298,66 @@ mod tests {
             .unwrap();
         assert_eq!(approved["view_url"], format!("{base}/view"));
         assert!(!approved.to_string().contains(&token));
-        let claim = client
-            .get(format!("{base}/private?token={token}"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(claim.status(), reqwest::StatusCode::SEE_OTHER);
-        let cookie = claim.headers()["set-cookie"]
-            .to_str()
-            .unwrap()
-            .split(';')
-            .next()
-            .unwrap()
-            .to_owned();
-        let session_token = cookie.split_once('=').unwrap().1;
-        assert_ne!(session_token, token);
-        assert!(service.private_claim(&token, None).await.is_err());
-        assert!(service.private_state(&token).await.is_err());
-        // Reusing the URL or forging a cookie from its used token cannot
-        // reopen the view. The authenticated browser can reopen either URL.
-        for request in [
-            client.get(format!("{base}/private?token={token}")),
-            client
-                .get(format!("{base}/frame"))
-                .header("cookie", format!("bloom_checkout_{port}={token}")),
-        ] {
-            assert!(request.send().await.unwrap().status().is_client_error());
-        }
+        let claim_url = format!("{base}/claim");
+        let bootstrap = json!({"token":token});
         assert_eq!(
             client
-                .get(format!("{base}/private?token={token}"))
-                .header("cookie", &cookie)
+                .post(&claim_url)
+                .header("origin", "http://localhost:1")
+                .json(&bootstrap)
                 .send()
                 .await
                 .unwrap()
                 .status(),
-            reqwest::StatusCode::SEE_OTHER
+            reqwest::StatusCode::FORBIDDEN
         );
+        let claim = client
+            .post(&claim_url)
+            .header("origin", &base)
+            .json(&bootstrap)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(claim.status(), reqwest::StatusCode::OK);
+        assert!(claim.headers().get("set-cookie").is_none());
+        let response: Value = claim.json().await.unwrap();
+        let session_token = response["session"].as_str().unwrap();
+        let authorization = format!("Bearer {session_token}");
+        assert_ne!(session_token, token);
+        assert!(service.private_claim(&token, None).await.is_err());
+        assert!(service.private_state(&token).await.is_err());
+        // A used bootstrap cannot authenticate; even a valid session in an
+        // ambient localhost cookie must not grant private access.
+        for request in [
+            client
+                .post(&claim_url)
+                .header("origin", &base)
+                .json(&bootstrap),
+            client.get(format!("{base}/frame")).bearer_auth(&token),
+            client
+                .get(format!("{base}/frame"))
+                .header("cookie", format!("bloom_checkout_{port}={session_token}")),
+        ] {
+            assert!(request.send().await.unwrap().status().is_client_error());
+        }
+        let reclaimed: Value = client
+            .post(&claim_url)
+            .header("origin", &base)
+            .header("authorization", &authorization)
+            .json(&bootstrap)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(reclaimed["session"], session_token);
+        // The shell is public; no private state or screenshot is embedded.
         assert_eq!(
             client
                 .get(format!("{base}/view"))
-                .header("cookie", &cookie)
                 .send()
                 .await
                 .unwrap()
@@ -4357,7 +4376,7 @@ mod tests {
         assert_eq!(
             client
                 .post(format!("{base}/action"))
-                .header("cookie", &cookie)
+                .header("authorization", &authorization)
                 .header("origin", "https://untrusted.invalid")
                 .json(&json!({"action":"finish"}))
                 .send()

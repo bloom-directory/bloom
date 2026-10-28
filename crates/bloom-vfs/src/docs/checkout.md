@@ -97,7 +97,7 @@ tool for this checkout.
 - Cancellation is a write to the request's `cancel` file, only before release.
 - If the person loses an approved private-view tab, read `status.json` and
   forward `view_url`. It reopens the view in the browser that claimed it;
-  access still requires that browser's private cookie. It carries no access
+  access still requires that browser's origin-scoped private session. It carries no access
   token. The original approval-page link can also be reopened in that browser.
   Do not request another payment just to recover a lost tab.
 - Read `checkout/history.json` for the 50 latest requests: time, kind, shop,
