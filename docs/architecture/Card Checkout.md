@@ -189,8 +189,11 @@ The operation store is written before every irreversible step:
 - A reservation reference alone is not a successful purchase. `booked` needs
   the reference plus a merchant-reported purchase/payment confirmation or
   issued-ticket evidence. This remains page-derived evidence, not independent
-  bank settlement. Durable per-booking reconciliation and protection against
-  retrying an unresolved purchase under a new operation ID remain unfinished.
+  bank settlement. An unresolved card or site payment blocks another payment
+  at its recorded shop origin, including a new operation ID. After the private
+  view closes, the person must check the merchant and bank before `resolve`
+  clears that block. This is a shop-wide safeguard, not independent settlement
+  or reconciliation of individual bookings.
 
 `checkout/history.json` lists the 50 latest requests with mode, shop origin,
 the approved total and the current status, so an agent can avoid buying twice.

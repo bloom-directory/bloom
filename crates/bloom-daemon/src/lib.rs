@@ -978,7 +978,6 @@ impl DaemonPetalHost {
                 // belongs to the native Solana transfer path.
                 petal_use_claim: None,
                 system_use_claim: None,
-                safe_review_payloads: Vec::new(),
                 message_review_payloads: Vec::new(),
                 evm_reported_token: None,
             })

@@ -4812,7 +4812,6 @@ mod tests {
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
             safe_review_payloads: Vec::new(),
             evm_review_payloads: Vec::new(),
-            safe_review_payloads: Vec::new(),
             message_review_payloads: Vec::new(),
             evm_reported_token: None,
             operation_id: OperationId::from_bytes([94; 32]),
