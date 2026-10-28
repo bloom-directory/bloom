@@ -10,6 +10,7 @@ mod persona_sessions;
 mod petal_eligibility;
 pub use persona_sessions::{
     PersonaSessionMember, PersonaSessionProposal, PersonaSessionSelection, PersonaSessionStatus,
+    PersonaTokenAllowance,
 };
 mod projection;
 

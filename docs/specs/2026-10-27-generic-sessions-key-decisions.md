@@ -10,5 +10,5 @@ The owner replaced the earlier USD proposal with recurring token allowances. The
 - Local wallet locking remains enforced. An explicit passkey rearm resumes unchanged standing authority without resetting counters or accounting.
 - Generic Petal/Machine economic declarations remain trusted. Preserve native transfer verification, mandatory Polymarket BUY witnesses and stronger existing approval profiles.
 - Signer keeps custody and structural backstops; add no token economics there.
-- The first automatic convenience scope remains Polymarket BUY. Other certified Petal/native scopes use explicit selections; unsupported actions retain owner review.
+- Automatic convenience scopes include Polymarket BUY and, for Degen only, independently verified native-wallet ERC20 transfers to any recipient on configured Ethereum/Polygon. Other certified scopes use explicit selections; unsupported actions retain owner review.
 - Defer simulation, a verifier framework, on-chain token approvals and compatibility with old unshipped USD grants. Retain historical audit/recovery data and use fresh isolated dev state.

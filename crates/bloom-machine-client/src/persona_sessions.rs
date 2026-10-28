@@ -1677,6 +1677,7 @@ mod tests {
         };
         record.proposal.terms.selector = ApprovalSelector::SystemSession {
             scope: SystemSessionScope {
+                any_erc20_recipient: false,
                 component_id: token("bloom-machine"),
                 actions: vec![SystemSessionAction::NativeTransfer],
                 chains: vec![use_.chain],

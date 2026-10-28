@@ -1692,6 +1692,13 @@ impl TxEngine {
         match &intent.body {
             RawIntentBody::Send { .. } => {
                 if let Some(t) = &token_for_plan {
+                    policy_ctx.standard_erc20_transfer = data_bytes.len() == 68
+                        && data_bytes[..4] == [0xa9, 0x05, 0x9c, 0xbb]
+                        && data_bytes[4..16].iter().all(|b| *b == 0)
+                        && value_wei == U256::ZERO
+                        && execution_origin.as_ref().is_none_or(|o| {
+                            o.petal_id == bloom_proto::petal_identity::PETAL_ID_EVM_WALLET
+                        });
                     policy_ctx.token = to;
                     policy_ctx.contract = to;
                     policy_ctx.destination_is_contract = true;

@@ -1976,8 +1976,10 @@ impl WalletsHandler {
         destinations: &[bloom_broker_api::PolicyDestination],
         standing: bool,
     ) -> Result<bloom_machine_client::PetalEligibility, HandlerError> {
-        if packages.is_empty() {
-            return Err(HandlerError::invalid("no Petal packages to allow"));
+        if packages.is_empty() && destinations.is_empty() {
+            return Err(HandlerError::invalid(
+                "no packages or destinations to allow",
+            ));
         }
         self.ensure_policy_allows(
             wallet,

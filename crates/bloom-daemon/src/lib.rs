@@ -4741,6 +4741,25 @@ impl Daemon {
                     setup.packages.push(package);
                     setup.destinations.extend(default_policy_destinations(name));
                 }
+                if let Some(profile) = current.persona.as_ref() {
+                    setup.standing_allowances =
+                        profile.preset != bloom_proto::persona::PersonaPreset::Custodian;
+                    if profile.preset == bloom_proto::persona::PersonaPreset::Degen {
+                        for id in [1, 137] {
+                            if current.chains.values().any(|c| c.chain_id == id) {
+                                setup
+                                    .destinations
+                                    .push(bloom_broker_api::PolicyDestination {
+                                        chain: bloom_broker_api::Token::new(format!("evm-{id}"))
+                                            .map_err(|e| {
+                                                bloom_vfs::HandlerError::backend(e.to_string())
+                                            })?,
+                                        destination: bloom_broker_api::ERC20_ANY_RECIPIENT.into(),
+                                    });
+                            }
+                        }
+                    }
+                }
                 Ok(setup)
             })
         };

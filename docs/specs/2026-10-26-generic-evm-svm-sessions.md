@@ -66,3 +66,24 @@ Verify independent token/Petal/account scopes, shared-route usage, duplicate sel
 Do not add simulation, a verifier framework, new on-chain approvals or a parallel legacy pricing engine in this change.
 
 An owner can unlock retained local authority with `bloom wallet persona rearm WALLET` (`--approval ID` selects a specific grant). This reuses the sealed-approval passkey ceremony with the unchanged standing terms and a signed rearm purpose. It preserves both Broker usage and Signer counters, refuses stopped/revoked or changed terms, and retains an operation identity across retries. It does not add a wallet-unlock ceremony kind or silently create replacement authority.
+
+## Degen ERC20 transfers to any recipient
+
+Degen onboarding additionally proposes a native-wallet, ERC20-only standing
+transfer scope on configured Ethereum (1) and Polygon (137). Its exact token
+contracts come from the reviewed catalog and use Degen's per-action and rolling
+seven-day quantities. Each chain's gas allowance is separate: Ethereum 0.005
+ETH/action and 0.05 ETH/7d; Polygon 1 POL/action and 10 POL/7d. These quantities
+are displayed for owner approval and do not derive from prices. Native-token
+transfers are not included. Trader and Institutional defaults are unchanged.
+
+The wallet policy separately signs `erc20:any-recipient` for each chain, and
+the immutable system scope signs `any_erc20_recipient: true`. Neither alone
+permits signing. Broker reconstructs the recipient, exact token, amount and
+maximum gas from the canonical transaction bytes and enforces both opt-ins,
+asset caps and rolling windows. Machine's native send staging recognizes this
+narrow permission without clearing general allowlists. Petal calls, approve,
+transferFrom, opaque calldata and batches gain no exception. Already-created
+wallets require an owner-reviewed policy/session change; no existing authority
+is widened silently. Other supported native scopes can still select recipients
+explicitly. Locking, rearm, retries and revocation retain their existing rules.

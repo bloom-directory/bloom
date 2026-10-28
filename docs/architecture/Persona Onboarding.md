@@ -6,7 +6,7 @@ Wallet creation offers Continue to setup. `bloom onboard` opens or resumes the l
 
 Institutional retains individual approval. Trader uses independent token allowances per rolling 24 hours; Degen uses larger allowances per rolling seven days. Standing permissions last until revoked. Picking a radio button grants nothing; policy and exact app/account/token amounts require passkey consent. The legacy `custodian` spelling remains accepted for Institutional.
 
-The first convenience automatic integration is Polymarket BUY on the selected EVM account, using the exact Polygon pUSD identity. Other integrations need installer-certified effects and explicitly reviewed supported scopes. Existing stronger profiles remain enforced. Account 0 is a convenience, never an alias for a different key or wallet.
+The convenience automatic integration is Polymarket BUY on the selected EVM account, using the exact Polygon pUSD identity. Degen additionally proposes native-wallet ERC20 transfers to any recipient on configured Ethereum and Polygon, with independent seven-day token and gas allowances. Other integrations need installer-certified effects and explicitly reviewed supported scopes. Existing stronger profiles remain enforced. Account 0 is a convenience, never an alias for a different key or wallet.
 
 ```sh
 bloom init --persona trader

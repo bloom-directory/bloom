@@ -977,7 +977,21 @@ pub(crate) async fn advance_default_policy(
         destinations.extend(policy_destinations(name)?);
         petals.push(name.clone());
     }
-    if packages.is_empty() {
+    if config
+        .persona
+        .as_ref()
+        .is_some_and(|p| p.preset == PersonaPreset::Degen)
+    {
+        for id in [1, 137] {
+            if config.chains.values().any(|c| c.chain_id == id) {
+                destinations.push(bloom_broker_api::PolicyDestination {
+                    chain: bloom_broker_api::Token::new(format!("evm-{id}"))?,
+                    destination: bloom_broker_api::ERC20_ANY_RECIPIENT.into(),
+                });
+            }
+        }
+    }
+    if packages.is_empty() && destinations.is_empty() {
         return Ok(DefaultPolicyStatus::NothingToAllow);
     }
     let wallet_id = bloom_broker_api::Token::new(wallet.to_owned())?;
@@ -1200,7 +1214,11 @@ impl DefaultPolicyWait {
                     writeln!(
                         output,
                         "default_policy: approve the policy for {wallet} to allow {}",
-                        petal_labels(petals)
+                        if petals.is_empty() {
+                            "reviewed native transfer permissions".into()
+                        } else {
+                            petal_labels(petals)
+                        }
                     )?;
                     writeln!(output, "default_policy_url: {url}")?;
                     self.announced = Some(operation_id.clone());
@@ -1258,7 +1276,7 @@ pub(crate) async fn create_wallet_then_default_policy(
         .await?;
         if session.stdout.trim_start().starts_with('[') {
             println!(
-                "persona coverage: automatic Polymarket BUY uses recurring pUSD amounts on the selected account. Other certified Petal/native scopes have independent token allowances. Approve the returned scope URL, then repeat activation to reconcile it."
+                "persona coverage: selected scopes use independent token allowances. Degen includes ERC20 transfers to any recipient on supported networks; selected Polymarket BUY uses pUSD. Approve each returned scope once, then repeat activation to reconcile it."
             );
         }
         crate::print_machine_command_output(&session)?;

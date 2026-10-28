@@ -14,7 +14,7 @@ const U256_MAX: &str =
 
 /// Convenience selection for the first reference Petal on an explicit account.
 /// Arbitrary certified Petal/native selections use compile_selection below.
-pub(crate) async fn compile_proposals(
+async fn compile_polymarket_proposals(
     daemon: &Daemon,
     wallet: &str,
     account: u32,
@@ -48,45 +48,7 @@ pub(crate) async fn compile_proposals(
         bail!("policy wallet differs from selected wallet");
     }
     let suite = CryptoSuite::Secp256k1Keccak256Recoverable;
-    let key_ref = if let Some(root) = descriptor.root_key_ref.as_ref() {
-        if account != 0 || !descriptor.key_refs.contains(root) || root.derivation.is_some() {
-            bail!("selected wallet has no unambiguous account 0 owner root");
-        }
-        let keys = broker.keys(wallet_id.clone()).await?;
-        let key = keys
-            .iter()
-            .find(|key| {
-                &key.key_ref == root
-                    && key.role == KeyRole::WalletRoot
-                    && key.supported_crypto_suites.contains(&suite)
-            })
-            .context("wallet has no authoritative EVM root signing key")?;
-        key.key_ref.clone()
-    } else {
-        let accounts = broker.wallet_accounts(wallet_id.clone()).await?;
-        if accounts.wallet_id != wallet_id {
-            bail!("Broker account projection differs from the selected wallet");
-        }
-        let candidates = accounts
-            .accounts
-            .iter()
-            .filter(|entry| {
-                entry.lifecycle == AccountLifecycleState::Active
-                    && entry.derivation_profile == DerivationProfile::Bip44EvmSecp256k1V1
-                    && entry.path == format!("m/44'/60'/{account}'/0/0")
-                    && matches!(&entry.key_ref.derivation, Some(DerivationRef::Bip39Multicurve { profile: DerivationProfile::Bip44EvmSecp256k1V1, path, .. }) if path == &entry.path)
-                    && entry.supported_crypto_suites.contains(&suite)
-                    && descriptor.key_refs.contains(&entry.key_ref)
-            })
-            .collect::<Vec<_>>();
-        let [entry] = candidates.as_slice() else {
-            bail!(
-                "selected wallet/account has no unique active EVM owner key; choose an existing EVM account before activating"
-            );
-        };
-        entry.validate()?;
-        entry.key_ref.clone()
-    };
+    let key_ref = selected_evm_key(daemon, wallet, account).await?;
     let installed = daemon.petals.store().resolve_petal_owner("polymarket")?
         .context("install Polymarket before activating its bounded buy session; other classes currently require exact review")?;
     let package_hash = Digest32::new(installed)?;
@@ -243,7 +205,13 @@ pub(crate) async fn compile_selection(
     let existing = daemon.persona_sessions(wallet).await?;
     let active = existing
         .iter()
-        .filter(|s| !s.locally_disabled && s.terms.expires_at_ms.get() > now)
+        .filter(|s| {
+            !s.locally_disabled
+                && s.terms.expires_at_ms.get() > now
+                && selection.members.iter().any(|m| {
+                    same_allowance_owner(&s.terms.subject, &s.terms.key_ref, &m.subject, &m.key_ref)
+                })
+        })
         .collect::<Vec<_>>();
     if active
         .iter()
@@ -486,6 +454,210 @@ fn proposal(
     })
 }
 
+/// Choose the same authoritative EVM account for native and Petal permissions.
+async fn selected_evm_key(daemon: &Daemon, wallet: &str, account: u32) -> Result<KeyRef> {
+    let broker = daemon.broker_client().context("Broker unavailable")?;
+    let wallet_id = Token::new(wallet)?;
+    let descriptor = broker.wallet(wallet_id.clone()).await?;
+    let suite = CryptoSuite::Secp256k1Keccak256Recoverable;
+    let key_ref = if let Some(root) = descriptor.root_key_ref.as_ref() {
+        if account != 0 || !descriptor.key_refs.contains(root) || root.derivation.is_some() {
+            bail!("selected wallet has no unambiguous account 0 owner root");
+        }
+        let keys = broker.keys(wallet_id.clone()).await?;
+        let key = keys
+            .iter()
+            .find(|key| {
+                &key.key_ref == root
+                    && key.role == KeyRole::WalletRoot
+                    && key.supported_crypto_suites.contains(&suite)
+            })
+            .context("wallet has no authoritative EVM root signing key")?;
+        key.key_ref.clone()
+    } else {
+        let accounts = broker.wallet_accounts(wallet_id.clone()).await?;
+        if accounts.wallet_id != wallet_id {
+            bail!("Broker account projection differs from the selected wallet");
+        }
+        let candidates = accounts
+            .accounts
+            .iter()
+            .filter(|entry| {
+                entry.lifecycle == AccountLifecycleState::Active
+                    && entry.derivation_profile == DerivationProfile::Bip44EvmSecp256k1V1
+                    && entry.path == format!("m/44'/60'/{account}'/0/0")
+                    && matches!(&entry.key_ref.derivation, Some(DerivationRef::Bip39Multicurve { profile: DerivationProfile::Bip44EvmSecp256k1V1, path, .. }) if path == &entry.path)
+                    && entry.supported_crypto_suites.contains(&suite)
+                    && descriptor.key_refs.contains(&entry.key_ref)
+            })
+            .collect::<Vec<_>>();
+        let [entry] = candidates.as_slice() else {
+            bail!(
+                "selected wallet/account has no unique active EVM owner key; choose an existing EVM account before activating"
+            );
+        };
+        entry.validate()?;
+        entry.key_ref.clone()
+    };
+    Ok(key_ref)
+}
+
+/// Degen combines independent native-wallet transfer and selected Petal grants.
+pub(crate) async fn compile_proposals(
+    daemon: &Daemon,
+    wallet: &str,
+    account: u32,
+) -> Result<Vec<PersonaSessionProposal>> {
+    let config = bloom_proto::Config::load(&daemon.home.config_path())?;
+    let profile = config.persona.clone().unwrap_or_default();
+    let mut proposals = Vec::new();
+    if profile.preset == PersonaPreset::Degen {
+        let chain_ids: Vec<u64> = [1, 137]
+            .into_iter()
+            .filter(|id| config.chains.values().any(|c| c.chain_id == *id))
+            .collect();
+        let selection = degen_transfer_selection(daemon, wallet, account, &chain_ids).await?;
+        proposals.extend(compile_selection(daemon, wallet, selection).await?);
+    }
+    if config.petals.setup.contains_key("polymarket") {
+        proposals.extend(compile_polymarket_proposals(daemon, wallet, account).await?);
+    }
+    if proposals.is_empty() {
+        bail!(
+            "no supported reusable scope was selected; choose Degen transfers or a supported Petal"
+        );
+    }
+    Ok(proposals)
+}
+
+/// Curated exact contracts only. These gas quantities are displayed for owner review.
+fn degen_transfer_assets(
+    chain_ids: &[u64],
+) -> Result<(
+    Vec<AssetId>,
+    Vec<bloom_machine_client::PersonaTokenAllowance>,
+)> {
+    let profile = bloom_proto::persona::PersonaConfig::suggested(PersonaPreset::Degen);
+    let mut assets: Vec<AssetId> = known_tokens()
+        .iter()
+        .filter(|t| {
+            chain_ids.contains(&t.chain_id)
+                && matches!(t.chain_id, 1 | 137)
+                && profile.token_amounts(&t.symbol).is_some()
+        })
+        .map(|t| AssetId {
+            chain: Token::new(format!("evm-{}", t.chain_id)).expect("fixed chain"),
+            asset: t.address.clone(),
+        })
+        .collect();
+    assets.sort_by(|a, b| (&a.chain, &a.asset).cmp(&(&b.chain, &b.asset)));
+    assets.dedup();
+    let mut gas = Vec::new();
+    for id in chain_ids.iter().filter(|id| matches!(id, 1 | 137)) {
+        let asset = AssetId {
+            chain: Token::new(format!("evm-{id}"))?,
+            asset: "native".into(),
+        };
+        let (action, window) = if *id == 1 {
+            ("0.005", "0.05")
+        } else {
+            ("1", "10")
+        };
+        gas.push(bloom_machine_client::PersonaTokenAllowance {
+            asset: asset.clone(),
+            per_action: token_units(action, 18)?,
+            per_window: token_units(window, 18)?,
+        });
+        assets.push(asset);
+    }
+    Ok((assets, gas))
+}
+async fn degen_transfer_selection(
+    daemon: &Daemon,
+    wallet: &str,
+    account: u32,
+    chain_ids: &[u64],
+) -> Result<PersonaSessionSelection> {
+    let (assets, token_allowances) = degen_transfer_assets(chain_ids)?;
+    let tokens: Vec<_> = assets
+        .iter()
+        .filter(|a| a.asset != "native")
+        .cloned()
+        .collect();
+    if tokens.is_empty() {
+        bail!(
+            "Degen transfers currently support configured Ethereum and Polygon chains; none are configured"
+        );
+    }
+    let catalog = daemon
+        .persona_provenance_catalog()
+        .context("installer provenance unavailable")?;
+    let record = catalog.records.iter().find(|r| matches!(&r.subject,ProvenanceSubject::System {component_id,operation_class} if component_id.as_str()=="bloom-machine" && operation_class.as_str()=="transaction.confirm")).context("native transfer provenance unavailable")?;
+    Ok(PersonaSessionSelection {
+        assets,
+        token_allowances,
+        members: vec![PersonaSessionMember {
+            account,
+            key_ref: selected_evm_key(daemon, wallet, account).await?,
+            subject: ApprovalSubject::System {
+                component_id: Token::new("bloom-machine")?,
+                operation_class: Token::new("transaction.confirm")?,
+            },
+            selector: ApprovalSelector::SystemSession {
+                scope: SystemSessionScope {
+                    component_id: Token::new("bloom-machine")?,
+                    actions: vec![SystemSessionAction::Erc20Transfer],
+                    chains: chain_ids
+                        .iter()
+                        .filter(|id| matches!(id, 1 | 137))
+                        .map(|id| {
+                            Ok(SystemSessionChain::Evm {
+                                chain: Token::new(format!("evm-{id}"))?,
+                                chain_id: DecimalU64::new(*id),
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                    destinations: vec![],
+                    any_erc20_recipient: true,
+                    tokens,
+                    per_action_value_limits: vec![],
+                },
+            },
+            provenance_digest: record.digest()?,
+            allowed_crypto_suites: vec![CryptoSuite::Secp256k1Keccak256Recoverable],
+        }],
+    })
+}
+
+fn same_allowance_owner(
+    a: &ApprovalSubject,
+    ak: &KeyRef,
+    b: &ApprovalSubject,
+    bk: &KeyRef,
+) -> bool {
+    ak == bk
+        && match (a, b) {
+            (
+                ApprovalSubject::Petal {
+                    package_hash: a, ..
+                },
+                ApprovalSubject::Petal {
+                    package_hash: b, ..
+                },
+            ) => a == b,
+            (
+                ApprovalSubject::System {
+                    component_id: a,
+                    operation_class: ac,
+                },
+                ApprovalSubject::System {
+                    component_id: b,
+                    operation_class: bc,
+                },
+            ) => a == b && ac == bc,
+            _ => a == b,
+        }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -517,5 +689,55 @@ mod tests {
         for value in ["0", "NaN", "1e3", "-1", "0.0000001"] {
             assert!(token_units(value, 6).is_err());
         }
+    }
+    #[test]
+    fn degen_native_defaults_are_exact_supported_assets_with_separate_gas_caps() {
+        let (assets, gas) = degen_transfer_assets(&[1, 137, 8453]).unwrap();
+        assert!(
+            assets
+                .iter()
+                .all(|a| matches!(a.chain.as_str(), "evm-1" | "evm-137"))
+        );
+        assert!(
+            assets
+                .iter()
+                .any(|a| a.asset == "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48")
+        );
+        assert_eq!(gas.len(), 2);
+        assert_eq!(gas[0].per_action.as_str(), "5000000000000000");
+        assert_eq!(gas[0].per_window.as_str(), "50000000000000000");
+        assert!(assets.iter().all(|a| approved_session_asset(a).is_some()));
+        assert!(degen_transfer_assets(&[8453]).unwrap().0.is_empty());
+    }
+    #[test]
+    fn allowance_resume_isolated_by_owner_without_multiplying_changed_routes() {
+        let selection: PersonaSessionSelection = serde_json::from_str(include_str!(
+            "../../../docs/examples/generic-session-selection.json"
+        ))
+        .unwrap();
+        let native = &selection.members[0];
+        let petal = &selection.members[1];
+        assert!(!same_allowance_owner(
+            &native.subject,
+            &native.key_ref,
+            &petal.subject,
+            &native.key_ref
+        ));
+        assert!(same_allowance_owner(
+            &native.subject,
+            &native.key_ref,
+            &native.subject,
+            &native.key_ref
+        ));
+        let mut next_route = petal.subject.clone();
+        if let ApprovalSubject::Petal { route, .. } = &mut next_route {
+            *route = "different-route".into();
+        }
+        assert!(same_allowance_owner(
+            &petal.subject,
+            &petal.key_ref,
+            &next_route,
+            &petal.key_ref
+        ));
     }
 }

@@ -47,8 +47,13 @@ policy allowance does not activate signing authority. A covered confirm may
 consume a live owner-approved session without a new ceremony; use the same
 staging, review and outcome-reconciliation surfaces as usual.
 
-The first automatic profile scope is fee-free Polymarket BUY orders on
+Automatic profiles support fee-free Polymarket BUY orders on
 the selected wallet/account, with positive pUSD debit claims from the updated package.
+Degen also supports owner-approved native-wallet ERC20 transfer sessions to any
+recipient on Ethereum and Polygon. Selected tokens and maximum native gas have
+independent per-action and rolling seven-day limits; matching sends need no new
+passkey prompt. Native currency sends, arbitrary calls and token approvals are
+not included in that permission.
 Other apps, SELL shares, builder fees and unsupported assets require separate
 review. Explicit native transfer sessions currently support Ethereum, Polygon
 and local chain 31337 with reviewed asset and fee unit limits. Supported mainnet SOL transfers use live cluster/blockhash/fee checks; other native formats retain exact approval. Venue settings may impose tighter limits.
