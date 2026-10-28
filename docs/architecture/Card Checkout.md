@@ -45,10 +45,16 @@ and fields marked invalid, still block it.
 | no `card_id` | Site | the same facts with no payment frames | checkout rechecks the facts and clicks the merchant's pay button once; the merchant charges the method saved in the buyer's account |
 | `take_over: true` | Take-over | the agent's description only | the human works in the private view and hands back; nothing is bought |
 
-Facts come from `facts.js`: exactly one visible pay button and one labelled
+Facts come from `facts.js`: one distinguishable visible payment action and one labelled
 total in a supported language and number format, or processor data for
 Stripe-hosted pages. If facts are unclear, the request falls back to a manual
 ceremony that releases no card, and the human finishes in the private view.
+Explicit contact-only marketing signup blocks are excluded from payment
+controls and recurring charge terms. Native submit controls repeated within
+one form represent the same action only when their labels, destinations,
+methods, name/value payloads and inline handlers agree. Distinct payment
+actions remain ambiguous. Repeated Stripe prices must all agree with the
+processor-bound amount and currency.
 An unpriced "Total amount"/"Gesamtsumme" heading before its subtotal breakdown
 supplies no charge. A priced total (including "Zu zahlender Betrag") is still
 required; conflicting priced totals stay manual.
@@ -133,10 +139,16 @@ inside the VFS.
 ## Private view
 
 The private view is an HTTP page on `localhost` served by `bloom-checkout`,
-opened from the approval page with a one-use capability. It streams
+opened from the approval page with a one-use capability, exchanged for a
+separate random session secret in an HttpOnly, SameSite=Strict cookie. The
+used URL capability cannot authenticate a cookie or claim another session.
+The authenticated browser can revisit the original link or `/view` after
+closing a tab. It streams
 screenshots and forwards clicks and keys to the held tab and its popups (bank
-challenges). While it is open, Machine's browse requests are refused. The URL
-and screenshots never appear in VFS. It is not reachable from another device.
+challenges). While it is open, Machine's browse requests are refused. The
+capability, session secret and screenshots never appear in VFS. Approved
+active status includes a public `view_url` pointing to `/view`; it grants no
+access without the existing session cookie. It is not reachable from another device.
 
 Takeover is for login, verification or an unsupported field, not routine
 passenger entry. On handback, checkout navigates the human-selected tab through

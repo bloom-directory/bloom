@@ -62,14 +62,16 @@ async fn claim(
     Query(query): Query<Claim>,
 ) -> Response {
     let host = format!("localhost:{}", service.view_port);
-    if headers.get(header::HOST).and_then(|v| v.to_str().ok()) != Some(host.as_str())
-        || service.private_claim(&query.token).await.is_err()
-    {
+    let cookie = token(&headers, &service, false).ok();
+    if headers.get(header::HOST).and_then(|v| v.to_str().ok()) != Some(host.as_str()) {
         return StatusCode::FORBIDDEN.into_response();
     }
+    let Ok(session) = service.private_claim(&query.token, cookie.as_deref()).await else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
     let cookie = format!(
         "bloom_checkout_{}={}; HttpOnly; SameSite=Strict; Path=/; Max-Age=1800",
-        service.view_port, query.token
+        service.view_port, session
     );
     (
         StatusCode::SEE_OTHER,

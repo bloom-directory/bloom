@@ -255,7 +255,7 @@ struct PrivateCheckout {
     discovery: Option<Discovery>,
     recipient: Option<Recipient>,
     capability: String,
-    claimed: bool,
+    session: Option<String>,
     approved: bool,
     view_target: String,
     view_session: String,
@@ -329,7 +329,7 @@ fn selected_traveler<'a>(
 
 struct CompletedView {
     capability: String,
-    claimed: bool,
+    session: Option<String>,
     status: Status,
 }
 
@@ -419,6 +419,7 @@ impl CheckoutService {
             outcome: None,
             paused: false,
             reason: None,
+            view_url: None,
         };
         self.store.insert(
             &status,
@@ -909,7 +910,13 @@ impl CheckoutService {
                 self.browser.browse(request).await
             }
             Request::Status { operation_id } => {
-                Ok(serde_json::to_value(self.store.get(&operation_id)?)?)
+                let mut status = self.store.get(&operation_id)?;
+                if self.private.lock().await.as_ref().is_some_and(|checkout| {
+                    checkout.operation_id == operation_id && checkout.approved
+                }) {
+                    status.view_url = Some(format!("http://localhost:{}/view", self.view_port));
+                }
+                Ok(serde_json::to_value(status)?)
             }
             Request::History => Ok(serde_json::to_value(self.store.history()?)?),
             Request::Checkout {
@@ -951,6 +958,7 @@ impl CheckoutService {
                     outcome: None,
                     paused: false,
                     reason: None,
+                    view_url: None,
                 };
                 if matches!(mode, Mode::Card | Mode::Site) {
                     // Ask for payment only once the page accepts what was entered.
@@ -1034,10 +1042,7 @@ impl CheckoutService {
                 )?;
                 let recipient =
                     (mode == Mode::Card && discovery.is_some()).then(Recipient::generate);
-                use rand::RngCore;
-                let mut token = [0; 32];
-                rand::thread_rng().fill_bytes(&mut token);
-                let capability = hex_token(&token);
+                let capability = new_view_token();
                 let challenge_url = challenge_url(self.view_port, &capability);
                 let request = match (&discovery, &recipient) {
                     (Some(discovery), Some(recipient)) => {
@@ -1072,7 +1077,7 @@ impl CheckoutService {
                             discovery,
                             recipient,
                             capability,
-                            claimed: false,
+                            session: None,
                             approved: false,
                             manual_submission: false,
                             submitted: false,
@@ -1380,7 +1385,12 @@ fn closing_state(current: &str) -> &str {
 }
 
 fn authorize_view(checkout: &PrivateCheckout, token: &str) -> Result<()> {
-    if !checkout.approved || !checkout.claimed || !same_token(&checkout.capability, token) {
+    if !checkout.approved
+        || !checkout
+            .session
+            .as_ref()
+            .is_some_and(|session| same_token(session, token))
+    {
         bail!("Private user view rejected");
     }
     Ok(())
@@ -1396,6 +1406,35 @@ fn same_token(expected: &str, received: &str) -> bool {
         == 0
 }
 
+fn new_view_token() -> String {
+    use rand::RngCore;
+    let mut token = [0; 32];
+    rand::thread_rng().fill_bytes(&mut token);
+    hex_token(&token)
+}
+
+fn claim_view_session(
+    capability: &str,
+    session: &mut Option<String>,
+    token: &str,
+    cookie: Option<&str>,
+) -> Result<String> {
+    if !same_token(capability, token) {
+        bail!("Private view capability rejected");
+    }
+    if let Some(session) = session {
+        if cookie.is_some_and(|cookie| same_token(session, cookie)) {
+            return Ok(session.clone());
+        }
+        bail!("Private view capability rejected");
+    }
+    // Exchange the one-use URL capability for a separate session secret.
+    // A used URL must not also work as an HTTP cookie.
+    let value = new_view_token();
+    *session = Some(value.clone());
+    Ok(value)
+}
+
 fn challenge_url(view_port: u16, capability: &str) -> String {
     format!("http://localhost:{view_port}/private?token={capability}")
 }
@@ -1404,7 +1443,7 @@ impl CheckoutService {
     fn retain_completed(&self, checkout: &PrivateCheckout, status: Status) {
         *self.completed.lock() = Some(CompletedView {
             capability: checkout.capability.clone(),
-            claimed: checkout.claimed,
+            session: checkout.session.clone(),
             status,
         });
     }
@@ -1670,25 +1709,30 @@ impl CheckoutService {
         }
     }
 
-    pub async fn private_claim(&self, token: &str) -> Result<()> {
+    pub async fn private_claim(&self, token: &str, cookie: Option<&str>) -> Result<String> {
         for _ in 0..20 {
             {
                 let mut private = self.private.lock().await;
                 let Some(checkout) = private.as_mut() else {
                     let mut completed = self.completed.lock();
                     let completed = completed.as_mut().context("No private checkout")?;
-                    if !same_token(&completed.capability, token) || completed.claimed {
-                        bail!("Private view capability rejected");
-                    }
-                    completed.claimed = true;
-                    return Ok(());
+                    return claim_view_session(
+                        &completed.capability,
+                        &mut completed.session,
+                        token,
+                        cookie,
+                    );
                 };
-                if !same_token(&checkout.capability, token) || checkout.claimed {
+                if !same_token(&checkout.capability, token) {
                     bail!("Private view capability rejected");
                 }
                 if checkout.approved {
-                    checkout.claimed = true;
-                    return Ok(());
+                    return claim_view_session(
+                        &checkout.capability,
+                        &mut checkout.session,
+                        token,
+                        cookie,
+                    );
                 }
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1700,7 +1744,11 @@ impl CheckoutService {
         let completed = self.completed.lock();
         let completed = completed
             .as_ref()
-            .filter(|c| c.claimed && same_token(&c.capability, token))
+            .filter(|c| {
+                c.session
+                    .as_ref()
+                    .is_some_and(|session| same_token(session, token))
+            })
             .context("Private view rejected")?;
         Ok(
             json!({"state":completed.status.state,"outcome":completed.status.outcome,"closed":true,"pages":[]}),
@@ -2269,6 +2317,7 @@ mod tests {
                     outcome: None,
                     paused: false,
                     reason: None,
+                    view_url: None,
                 },
                 "traveler",
                 "Synthetic pending unlock",
@@ -2412,6 +2461,7 @@ mod tests {
                     outcome: None,
                     paused: false,
                     reason: None,
+                    view_url: None,
                 },
                 "traveler",
                 "Synthetic approved person",
@@ -2695,6 +2745,7 @@ mod tests {
             outcome: None,
             paused: false,
             reason: None,
+            view_url: None,
         };
         service
             .store
@@ -2711,7 +2762,7 @@ mod tests {
             discovery: None,
             recipient: None,
             capability: token.clone(),
-            claimed: true,
+            session: Some(token.clone()),
             approved: true,
             manual_submission: false,
             submitted,
@@ -2821,6 +2872,7 @@ mod tests {
                     outcome: None,
                     paused: false,
                     reason: None,
+                    view_url: None,
                 },
                 "traveler",
                 "Synthetic unlock",
@@ -2981,6 +3033,7 @@ mod tests {
             outcome: None,
             paused: false,
             reason: None,
+            view_url: None,
         };
         service
             .store
@@ -2997,7 +3050,7 @@ mod tests {
             discovery: None,
             recipient: None,
             capability: token.clone(),
-            claimed: true,
+            session: Some(token.clone()),
             approved: true,
             manual_submission: false,
             submitted: false,
@@ -3057,6 +3110,7 @@ mod tests {
             outcome: None,
             paused: false,
             reason: None,
+            view_url: None,
         };
         service
             .store
@@ -3072,7 +3126,7 @@ mod tests {
             discovery: None,
             recipient: None,
             capability: hex_token(&[29; 32]),
-            claimed: true,
+            session: Some(hex_token(&[29; 32])),
             approved: true,
             manual_submission: false,
             submitted: false,
@@ -3130,6 +3184,7 @@ mod tests {
             outcome: None,
             paused: false,
             reason: None,
+            view_url: None,
         };
         service
             .store
@@ -3145,7 +3200,7 @@ mod tests {
             discovery: None,
             recipient: None,
             capability: hex_token(&[31; 32]),
-            claimed: true,
+            session: Some(hex_token(&[31; 32])),
             approved: true,
             manual_submission: false,
             submitted: false,
@@ -3207,6 +3262,7 @@ mod tests {
             outcome: None,
             paused: false,
             reason: None,
+            view_url: None,
         };
         service
             .store
@@ -3222,7 +3278,7 @@ mod tests {
             discovery: None,
             recipient: None,
             capability: hex_token(&[33; 32]),
-            claimed: true,
+            session: Some(hex_token(&[33; 32])),
             approved: true,
             manual_submission: false,
             submitted: false,
@@ -3261,6 +3317,7 @@ mod tests {
             outcome: None,
             paused: false,
             reason: None,
+            view_url: None,
         };
         service
             .store
@@ -3277,7 +3334,7 @@ mod tests {
             discovery: Some(discovery),
             recipient: None,
             capability: token.clone(),
-            claimed: true,
+            session: Some(token.clone()),
             approved: true,
             manual_submission: false,
             submitted: false,
@@ -3408,7 +3465,7 @@ mod tests {
             discovery: None,
             recipient: None,
             capability: "fixture".into(),
-            claimed: true,
+            session: Some("fixture".into()),
             approved: true,
             manual_submission: false,
             submitted: false,
@@ -3943,6 +4000,7 @@ mod tests {
                     outcome: None,
                     paused: false,
                     reason: None,
+                    view_url: None,
                 },
                 "card",
                 "Fixture prior",
@@ -3998,6 +4056,7 @@ mod tests {
                     outcome: None,
                     paused: false,
                     reason: None,
+                    view_url: None,
                 },
                 "card",
                 "Fixture open approval",
@@ -4031,6 +4090,7 @@ mod tests {
                 outcome: None,
                 paused: false,
                 reason: None,
+                view_url: None,
             };
             store
                 .insert(&status, "traveler", "Fixture passenger")
@@ -4054,6 +4114,7 @@ mod tests {
                 outcome: None,
                 paused: false,
                 reason: None,
+                view_url: None,
             };
             store
                 .insert(&status, "traveler", "Fixture passenger")
@@ -4120,6 +4181,7 @@ mod tests {
             outcome: None,
             paused: false,
             reason: None,
+            view_url: None,
         };
         service.store.insert(&status, "card", "test").unwrap();
         let token = hex_token(&[42; 32]);
@@ -4133,7 +4195,7 @@ mod tests {
             discovery: None,
             recipient: None,
             capability: token.clone(),
-            claimed: false,
+            session: None,
             approved: false,
             manual_submission: false,
             submitted: false,
@@ -4147,9 +4209,31 @@ mod tests {
             .build()
             .unwrap();
         let base = format!("http://localhost:{port}");
-        assert!(service.private_claim(&hex_token(&[43; 32])).await.is_err());
+        assert!(
+            service
+                .private_claim(&hex_token(&[43; 32]), None)
+                .await
+                .is_err()
+        );
         assert!(service.private_state(&token).await.is_err());
+        let pending = service
+            .clone()
+            .request(Request::Status {
+                operation_id: "private-fixture".into(),
+            })
+            .await
+            .unwrap();
+        assert!(pending.get("view_url").is_none());
         service.private.lock().await.as_mut().unwrap().approved = true;
+        let approved = service
+            .clone()
+            .request(Request::Status {
+                operation_id: "private-fixture".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(approved["view_url"], format!("{base}/view"));
+        assert!(!approved.to_string().contains(&token));
         let claim = client
             .get(format!("{base}/private?token={token}"))
             .send()
@@ -4163,7 +4247,40 @@ mod tests {
             .next()
             .unwrap()
             .to_owned();
-        assert!(service.private_claim(&token).await.is_err());
+        let session_token = cookie.split_once('=').unwrap().1;
+        assert_ne!(session_token, token);
+        assert!(service.private_claim(&token, None).await.is_err());
+        assert!(service.private_state(&token).await.is_err());
+        // Reusing the URL or forging a cookie from its used token cannot
+        // reopen the view. The authenticated browser can reopen either URL.
+        for request in [
+            client.get(format!("{base}/private?token={token}")),
+            client
+                .get(format!("{base}/frame"))
+                .header("cookie", format!("bloom_checkout_{port}={token}")),
+        ] {
+            assert!(request.send().await.unwrap().status().is_client_error());
+        }
+        assert_eq!(
+            client
+                .get(format!("{base}/private?token={token}"))
+                .header("cookie", &cookie)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::SEE_OTHER
+        );
+        assert_eq!(
+            client
+                .get(format!("{base}/view"))
+                .header("cookie", &cookie)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::OK
+        );
         assert_eq!(
             client
                 .get(format!("{base}/frame"))
@@ -4192,7 +4309,7 @@ mod tests {
                 .is_err()
         );
         service
-            .private_action(&token, ViewAction::Click { x: 28., y: 20. })
+            .private_action(session_token, ViewAction::Click { x: 28., y: 20. })
             .await
             .unwrap();
         let root_target = service
@@ -4206,7 +4323,7 @@ mod tests {
             .clone();
         let state = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                let state = service.private_state(&token).await.unwrap();
+                let state = service.private_state(session_token).await.unwrap();
                 if state["selected_page"] != root_target {
                     break state;
                 }
@@ -4218,12 +4335,12 @@ mod tests {
         assert_eq!(state["pages"].as_array().unwrap().len(), 2);
         assert_ne!(state["selected_page"], root_target);
         service
-            .private_action(&token, ViewAction::Key { key: "Tab".into() })
+            .private_action(session_token, ViewAction::Key { key: "Tab".into() })
             .await
             .unwrap();
         service
             .private_action(
-                &token,
+                session_token,
                 ViewAction::Type {
                     text: "12345".into(),
                 },
@@ -4246,7 +4363,7 @@ mod tests {
                 json!(true)
             );
         }
-        let screenshot = service.private_screenshot(&token).await.unwrap();
+        let screenshot = service.private_screenshot(session_token).await.unwrap();
         assert_eq!(&screenshot[..8], b"\x89PNG\r\n\x1a\n");
         // A valid PNG header also passes for a completely black frame.
         // Prove that this view captures changes in the selected document.
@@ -4263,7 +4380,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let painted = service.private_screenshot(&token).await.unwrap();
+        let painted = service.private_screenshot(session_token).await.unwrap();
         assert_ne!(
             screenshot, painted,
             "Private view must render the selected page"
@@ -4271,7 +4388,7 @@ mod tests {
         assert!(
             service
                 .private_action(
-                    &token,
+                    session_token,
                     ViewAction::SelectPage {
                         target: "unrelated".into()
                     }
@@ -4281,7 +4398,7 @@ mod tests {
         );
         service
             .private_action(
-                &token,
+                session_token,
                 ViewAction::Scroll {
                     x: 200.,
                     y: 200.,
@@ -4291,11 +4408,11 @@ mod tests {
             .await
             .unwrap();
         service
-            .private_action(&token, ViewAction::Finish)
+            .private_action(session_token, ViewAction::Finish)
             .await
             .unwrap();
         assert_eq!(
-            service.private_state(&token).await.unwrap()["state"],
+            service.private_state(session_token).await.unwrap()["state"],
             "uncertain"
         );
         assert_eq!(
@@ -4355,6 +4472,7 @@ mod tests {
             outcome: None,
             paused: false,
             reason: None,
+            view_url: None,
         };
         service.store.insert(&status, "card", "test").unwrap();
         let token = hex_token(&[44; 32]);
@@ -4368,7 +4486,7 @@ mod tests {
             discovery: None,
             recipient: None,
             capability: token.clone(),
-            claimed: true,
+            session: Some(token.clone()),
             approved: true,
             manual_submission: false,
             submitted: false,
@@ -4436,6 +4554,7 @@ mod tests {
             outcome: None,
             paused: false,
             reason: None,
+            view_url: None,
         };
         store.insert(&status, "card", "Two socks").unwrap();
         store
@@ -4503,6 +4622,7 @@ mod tests {
             outcome: None,
             paused: false,
             reason: None,
+            view_url: None,
         };
         reopened.insert(&submitted, "card", "Flight").unwrap();
         let mut needs_input = submitted.clone();

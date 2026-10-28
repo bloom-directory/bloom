@@ -107,6 +107,34 @@ alone is not evidence that a custody or transaction workflow succeeds.
 
 ## Categories and entrypoints
 
+### Shopping through the real Triad
+
+`scripts/test-card-checkout.mjs` exercises card enrollment/deletion, manual
+fallback, lost-tab recovery, take-over/handback and a shop-saved payment through
+VFS and the real Broker ceremony UI, Signer and checkout services. Its saved-card
+payment uses Stripe's public **test** checkout with a synthetic card. It does
+not submit a live purchase. It requires a fresh developer Triad launched with
+`--checkout-fixture-tls` for its local manual/site fixtures, Chromium and
+`playwright-core` (set `BLOOM_CHECKOUT_PLAYWRIGHT_ROOT` to its package directory).
+An installed custody origin, existing saved cards or shopping history are
+refused. Broker's four-ceremony/five-minute admission limit stays enabled.
+
+With explicit paths for that disposable candidate:
+
+```sh
+BLOOM_BIN=/path/to/candidate/bloom \
+BLOOM_HOME=/tmp/shopping-test/root/home \
+BLOOM_RPC_ENDPOINT=unix:/tmp/shopping-test/m.sock \
+BLOOM_CHECKOUT_CEREMONY_ORIGIN=http://localhost:28820 \
+BLOOM_CHECKOUT_VIEW_ORIGIN=http://localhost:28821 \
+BLOOM_CHECKOUT_PLAYWRIGHT_ROOT=/path/to/playwright-package \
+node scripts/test-card-checkout.mjs /tmp/shopping-test/result.json
+```
+
+The result omits approval capabilities and card plaintext. This verifies real
+service boundaries with a software passkey, not OS principal isolation or
+live bank settlement; those retain their separate release gates.
+
 Category comments describe a test's purpose; inspect its setup for actual
 dependencies. An in-crate test can use a temporary filesystem or local server,
 and an integration test can launch subprocesses.

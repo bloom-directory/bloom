@@ -95,6 +95,11 @@ tool for this checkout.
   Approvals use the passkey set up with the first saved card; if
   `cards/index.json` is empty, ask the human to add a card first.
 - Cancellation is a write to the request's `cancel` file, only before release.
+- If the person loses an approved private-view tab, read `status.json` and
+  forward `view_url`. It reopens the view in the browser that claimed it;
+  access still requires that browser's private cookie. It carries no access
+  token. The original approval-page link can also be reopened in that browser.
+  Do not request another payment just to recover a lost tab.
 - Read `checkout/history.json` for the 50 latest requests: time, kind, shop,
   total read from the page and request status. A failed or cancelled request
   can have a total without any approval or payment. Check it before buying again at the same
@@ -111,8 +116,9 @@ once. Bloom fills a saved card into fields hosted by a known payment
 provider (Stripe, Shopify, Adyen, Braintree, Yuno and others) or into the own
 checkout page of a listed merchant. A bank challenge,
 card fields anywhere else, or
-an unclear total goes to the human's private view; its URL and screenshots
-never appear in VFS. A manual
+an unclear total goes to the human's private view; its access token and screenshots
+never appear in VFS. The cookie-protected `view_url` is only an entry point for
+the already authorized browser. A manual
 fallback releases no saved card.
 
 For a subscription, the approval states the ongoing price, how often it
