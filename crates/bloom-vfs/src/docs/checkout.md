@@ -97,8 +97,9 @@ tool for this checkout.
   request with `"take_over": true` and an `agent_description` saying what the
   human must do. Forward the ceremony URL. The human approves, works in
   Bloom's browser, and clicks Done; `status.json` then says `returned` and
-  shopping continues on the page the human left. Logins persist in Bloom's
-  browser, so a take-over is needed once per site, not per purchase.
+  shopping continues on the page the human left, preserving the site session.
+  Closing a card or site-payment checkout clears website cookies and storage;
+  a later purchase can need another login.
   Approvals use the passkey set up with the first saved card; if
   `cards/index.json` is empty, ask the human to add a card first.
   An early Buy/Comprar button can also require approval before passenger

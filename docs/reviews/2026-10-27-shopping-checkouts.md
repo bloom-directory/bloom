@@ -235,7 +235,7 @@ local synthetic merchant fixtures need the developer TLS exception; they do
 not replace strict-TLS or installed-principal verification. The
 [release dry run](https://github.com/bloom-directory/bloom/actions/runs/40636365930)
 and [Mac conformance](https://github.com/bloom-directory/bloom/actions/runs/40636370662)
-are running; queued checks are not passes. The required two-login macOS runner
+passed, including installed W0 isolation. The required two-login macOS runner
 and active GUI-login inputs remain unavailable; runner inventory returned403.
 Unlanded dependencies, independent review and specific merge approval remain
 separate gates. This evidence does not establish universal merchant support
@@ -265,12 +265,20 @@ The earlier `7fd3ca5a` runtime additionally passed all four real public Stripe
 Elements TEST cases and a fresh strict-TLS bank challenge through the protected
 image/click view, including custody deletion. Its three-platform release dry
 run passed and its Mac candidate passed all checkout/browser/crash checks.
-That Mac run is still in installed isolation.
+Its installed isolation checks also passed.
 
 The final runtime's seven real-service checks also passed, including an actual
 Stripe TEST payment, exactly-once site-saved submission and custody deletion.
-The
-[release40639701386](https://github.com/bloom-directory/bloom/actions/runs/40639701386)
-and [Mac40639706432](https://github.com/bloom-directory/bloom/actions/runs/40639706432)
-are running. The two-login runner, unlanded dependencies and independent review
-remain separate gates; nothing has been merged or production-published.
+The final [release dry run](https://github.com/bloom-directory/bloom/actions/runs/40639701386)
+passed on all three platforms, and its Mac candidate passed the full
+checkout/browser/crash suite. See the
+[Mac conformance record](https://github.com/bloom-directory/bloom/actions/runs/40639706432)
+for its installed-isolation result. The two-login runner, unlanded dependencies
+and independent review remain separate gates; nothing has been merged or
+production-published.
+
+Take-over preserves the current site session. Closing a card or site-payment
+checkout discards its cookies and storage, so another purchase may require a
+new login. The VFS guide now states that limit rather than promising one login
+per site indefinitely. The existing real-browser session-disposal regression
+passed in the99-test suite.
