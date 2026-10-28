@@ -9395,6 +9395,9 @@ mod tests {
             Code::CeremonyRateLimited,
             Code::QuotaExceeded,
             Code::PolicyBaselineStale,
+            Code::ApprovalRearmRequired,
+            Code::RevocationEpochUnreconciled,
+            Code::ClockRollback,
             Code::ServiceUnavailable,
         ] {
             assert!(

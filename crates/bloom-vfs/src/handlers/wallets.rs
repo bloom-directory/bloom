@@ -2421,12 +2421,7 @@ impl WalletsHandler {
         self.policy_update_state_dir(wallet, state).join(action_id)
     }
 
-    /// Atomically move an action between lifecycle states (e.g. `pending` →
-    /// `confirmed` once the approved policy is installed). Best-effort: a
-    /// failure is logged but never overrides an already-decided install/error
-    /// outcome. In production the Broker/Signer receipt is authoritative and
-    /// this move changes only Machine's workflow projection.
-    /// A rate limit or quota refusal means the Broker opened no ceremony, so
+    /// A definitive prepare refusal means the Broker opened no ceremony, so
     /// the pending proposal has nothing to approve or cancel. Left in
     /// `pending/` it would block every later policy write; move it to
     /// `failed/` and return the Broker's reason.
@@ -2436,17 +2431,17 @@ impl WalletsHandler {
         operation_id: &str,
         error: bloom_broker_api::ProtocolError,
     ) -> HandlerError {
-        if matches!(
-            error.code,
-            ProtocolErrorCode::CeremonyRateLimited | ProtocolErrorCode::QuotaExceeded
-        ) && let Err(io) =
-            self.policy_update_transition(wallet, operation_id, "pending", "failed")
+        if error.code != ProtocolErrorCode::ServiceUnavailable
+            && let Err(io) =
+                self.policy_update_transition(wallet, operation_id, "pending", "failed")
         {
             return HandlerError::from(io);
         }
         HandlerError::backend(error.to_string())
     }
 
+    /// Atomically move Machine's workflow projection between lifecycle states.
+    /// The Broker/Signer receipt remains authoritative.
     fn policy_update_transition(
         &self,
         wallet: &str,
