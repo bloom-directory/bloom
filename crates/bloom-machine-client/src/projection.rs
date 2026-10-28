@@ -1438,6 +1438,15 @@ mod tests {
         policy: SignedPolicySnapshot,
     }
 
+    #[derive(Debug, serde::Deserialize, serde::Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct Schema1CredentialPublic {
+        credential_id: String,
+        wallet_id: String,
+        created_at_ms: String,
+        state: String,
+    }
+
     struct FakeBroker {
         available: Mutex<bool>,
         wallet_list_reads: AtomicU64,
@@ -2480,17 +2489,11 @@ mod tests {
 
     #[test]
     fn schema1_credentials_load_but_surface_projections_require_schema2_reader() {
-        // Serialize with the actual released API, not a current object with
-        // its version marker changed. The surrounding cache format is stable.
-        let old: schema1_broker_api::CredentialPublic = serde_json::from_value(serde_json::json!({
-            "credential_id": "CwsLCwsLCwsLCwsLCwsLCw",
-            "wallet_id": "alice",
-            "created_at_ms": "1",
-            "state": "ACTIVE"
-        }))
-        .unwrap();
-        let legacy_bytes = serde_json::to_vec(&old).unwrap();
-        let credential: CredentialPublic = serde_json::from_slice(&legacy_bytes).unwrap();
+        // Frozen output from Broker dd2add2b's released schema-1 API. Keep the
+        // reader local so a compatibility fixture cannot enter release pins.
+        let legacy_bytes = br#"{"credential_id":"CwsLCwsLCwsLCwsLCwsLCw","wallet_id":"alice","created_at_ms":"1","state":"ACTIVE"}"#;
+        serde_json::from_slice::<Schema1CredentialPublic>(legacy_bytes).unwrap();
+        let credential: CredentialPublic = serde_json::from_slice(legacy_bytes).unwrap();
         assert!(credential.surface.is_none());
         let mut fixture = migrated_fixture();
         fixture.credentials = vec![credential];
@@ -2524,8 +2527,7 @@ mod tests {
         )
         .unwrap();
         let updated = serde_json::to_vec(&projection.credentials[0]).unwrap();
-        let error =
-            serde_json::from_slice::<schema1_broker_api::CredentialPublic>(&updated).unwrap_err();
+        let error = serde_json::from_slice::<Schema1CredentialPublic>(&updated).unwrap_err();
         assert!(error.to_string().contains("unknown field `surface`"));
         cache
             .wallets
