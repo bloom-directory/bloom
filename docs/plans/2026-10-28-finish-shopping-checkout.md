@@ -20,9 +20,12 @@ holds revision-bound results; it needs refreshing before final acceptance.
 ## Established baseline
 
 Execution update: diagnostics and dropdown recovery are implemented and pushed
-on existing #346 (`50b38c92`, `88155b68`, `734e430b`). The final runtime passed
+on existing #346 (`50b38c92`, `88155b68`, `734e430b`, `e115804e`). The final runtime passed
 100 library tests, strict checkout/API Clippy, 12 docs tests, browser-death
-recovery and eight real-service checks. Mounted guide bytes match the source.
+recovery and eight real-service checks. Mounted guide bytes match the source. Card selectors without autocomplete now
+use the same private-field guard as typing; a failing browser regression proves
+the gap and twelve rejection cases verify the fix. A separate strict-TLS
+real-service bank challenge passed; no live funds moved.
 Additional recurring and non-Shopify journeys, including their limits, are
 recorded in the [acceptance report](../reviews/2026-10-27-shopping-checkouts.md#finish-plan-implementation-2026-10-28).
 Flight and live-trial readiness remain unverified. Do not mark this plan complete:

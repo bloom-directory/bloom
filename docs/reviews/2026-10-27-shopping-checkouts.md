@@ -32,7 +32,7 @@ The useful lessons are:
 
 ## Finish-plan implementation, 2026-10-28
 
-Runtime `734e430b6c02714408202f2a20e01714f28352ed` adds two bounded public
+Runtime `e115804e647dc0ac0eb276431311bb8094f97207` includes two bounded public
 refusals: `payment_action_ambiguous` for competing payment actions and
 `charge_terms_unreadable` for unclear installment choices. Missing actions and
 unreadable/conflicting prices retain `facts_unreadable`. These codes survive
@@ -44,7 +44,11 @@ The SparkFun journey also exposed that selecting a nonexistent option reported
 success while clearing the current choice. Bloom now rejects missing, disabled
 and disabled-group options before changing the selection, with an instruction
 to use an available value from a fresh snapshot. Real Chromium regressions
-verify the old selection survives each refusal. The mounted operator guide
+verify the old selection survives each refusal. A further failing Chromium
+regression showed a card-expiry selector without autocomplete could still be
+changed by ordinary shopping. Selection now uses the same live private-field
+classifier as typing and snapshots; twelve card/password rejection cases keep
+the fields empty. The mounted operator guide
 includes that recovery instruction and the new payment reasons; byte-for-byte
 readback through the running VFS passed.
 
@@ -54,7 +58,15 @@ subprocess recovery, and all eight real-service acceptance checks. The eighth
 check covers refusal diagnostics; the original seven still include custody,
 private-view recovery, Stripe TEST payment and exactly-once shop-saved submission.
 Local acceptance uses software passkeys and a certificate exception for local
-fixtures; it does not establish installed principal isolation.
+fixtures; it does not establish installed principal isolation. A separate run
+with normal TLS and Chromium sandboxing completed Stripe TEST3DS2 through the
+protected image/click view and deleted its synthetic card. The final four public
+Stripe Elements TEST cases cover success, decline and both challenge outcomes.
+
+Two parallel-browser fixtures exposed navigation races during this iteration.
+The private handback test now waits for its password fixture to finish parsing;
+the cross-origin traveler test waits for its child-frame input. Both retain their
+original privacy/recovery assertions and do not retry an action or payment.
 
 Additional normal-TLS shopping used the diagnostic runtime `50b38c9244e81038339b94379a3c8e1d6e1a5754`
 before the dropdown correction. No live card or order was submitted:
@@ -67,6 +79,7 @@ before the dropdown correction. No live card or order was submitted:
 | Patagonia | Maintenance page; no checkout reached. |
 | Wikimedia recurring donation | HTTP 429 before a donation form; no Adyen support claim. |
 | Verve Roaster's Choice Blend subscription | Product offered no usable frequency selection and labeled variants unavailable; no cart or subscription claimed. |
+| JetSMART alternative flight search | COR–Buenos Aires BUE, 31 October 2026, one adult, one way. Calendar context verified; search reset to empty inputs, including after a canonical-host retry and required-cookie consent. No fare, exact AEP flight or payment reached; cause undetermined. |
 
 These add recurring-purchase evidence, not a twelfth distinct completed merchant.
 Trial/renewal disclosure is also covered by browser fixtures; an ordinary live
@@ -83,7 +96,11 @@ Signer `74e097a5`. This verifies the previous runtime and cache fix, not the
 new diagnostics/dropdown changes. New-runtime
 [release dry run](https://github.com/bloom-directory/bloom/actions/runs/40703500154)
 and [installed Mac run](https://github.com/bloom-directory/bloom/actions/runs/40704154927)
-were dispatched at runtime `734e430b`; their results remain pending here.
+at `734e430b` were superseded and cancellation requested after the card-selector
+guard regression was found. Final-runtime
+[release dry run](https://github.com/bloom-directory/bloom/actions/runs/40707367094)
+and [installed Mac run](https://github.com/bloom-directory/bloom/actions/runs/40707367630)
+were dispatched at `e115804e`; their results remain pending here.
 
 Remaining improvements and release gates, in priority order:
 
