@@ -302,6 +302,11 @@ also read back byte-for-byte through the running VFS.
 
 Runtime553 completed its full installed Mac conformance successfully. The
 guarded runtime's [three-platform release run](https://github.com/bloom-directory/bloom/actions/runs/40678447250)
-and [Mac conformance](https://github.com/bloom-directory/bloom/actions/runs/40678454797)
-are the final verification records for this follow-up. The previously stated
-two-login infrastructure, unlanded-pin and independent-review gates remain.
+passed. Its [Mac conformance](https://github.com/bloom-directory/bloom/actions/runs/40678454797)
+passed the candidate tests, then reached the sixty-minute job limit while
+compiling installed-test dependencies. This is incomplete installed verification.
+The workflow configured a cached build directory but did not pass the existing
+`BLOOM_MACOS_ACCEPTANCE_CARGO_TARGET_DIR` option across `sudo` to the driver.
+It now does, so the test suites share compiled dependencies and the cache can
+be saved. Checks and the sixty-minute limit are unchanged. The previously
+stated two-login infrastructure, unlanded-pin and independent-review gates remain.

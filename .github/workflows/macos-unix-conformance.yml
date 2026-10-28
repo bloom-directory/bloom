@@ -253,6 +253,7 @@ jobs:
             BLOOM_MACOS_ACCEPTANCE_CARGO="$(command -v cargo)" \
             BLOOM_MACOS_ACCEPTANCE_CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" \
             BLOOM_MACOS_ACCEPTANCE_RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" \
+            BLOOM_MACOS_ACCEPTANCE_CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
             bloom/tests/conformance/macos-unix-principals/run-disposable.sh \
             "$RUNNER_TEMP/verified-w0/bloom-triad" \
             "$login_uid" \
