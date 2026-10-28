@@ -2122,6 +2122,14 @@ mod tests {
             .insert("alice".into(), fixture(2));
         let cached = reader.get_wallet(&wallet).await.unwrap();
         assert_eq!(cached.policy.version.get(), 1);
+        // Force the refresh-sharing condition without relying on the test
+        // completing within one wall-clock millisecond. Authority must bypass
+        // it even if the clock moved backwards after the cached observation.
+        reader
+            .wallet_refreshed_ms
+            .lock()
+            .unwrap()
+            .insert("alice".into(), u64::MAX);
         let authoritative = reader.get_wallet_authority(&wallet).await.unwrap();
         assert_eq!(authoritative.policy.version.get(), 2);
         let refreshed = reader.get_wallet(&wallet).await.unwrap();
