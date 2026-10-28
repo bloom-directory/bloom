@@ -105,7 +105,7 @@
     if (amounts.some(a => a.total !== amounts[0].total || a.currency !== amounts[0].currency)) { totalRefusal = 'conflicting_totals'; return null; }
     return amounts[0];
   };
-  const visible = e => e.getClientRects().length && getComputedStyle(e).visibility === 'visible';
+  const visible = e => e.getClientRects().length && e.checkVisibility({opacityProperty:true,visibilityProperty:true});
   // YouTube prints "$8.99\u200b/month": a zero-width space between the amount
   // and its period. These characters are invisible to the reader, carry no
   // meaning, and are not whitespace to a regular expression, so they come
@@ -137,11 +137,35 @@
   // "Recurring marketing SMS" is not a recurring charge. Keep those consent
   // terms out of the charge reader, while retaining payment terms elsewhere.
   for (const block of marketing) text = text.replace(clean(block.innerText), '');
+  const cardForms = new Set([...document.querySelectorAll('input,iframe')].filter(e => {
+    const rect = e.getBoundingClientRect();
+    if (!visible(e) || !rect.width || !rect.height) return false;
+    if ((e.autocomplete || '').split(/\s+/).some(token => token.startsWith('cc-'))) return true;
+    try { return e.tagName === 'IFRAME' && new URL(e.src).origin === 'https://checkout.pci.shopifyinc.com'; }
+    catch { return false; }
+  }).map(e => e.form || e.closest('form')));
+  const cardForm = cardForms.size === 1 ? [...cardForms][0] : null;
   const pay = controls.filter(e => {
     const name = (e.innerText || e.value || '').replace(/\s+/g, ' ').trim();
+    // Checkout extensions can offer a subscription upgrade outside the card
+    // form. A non-submit button there is not that form's payment control.
+    // Keep priced offers, submit buttons and every explicit Pay/Buy ambiguous.
+    if (cardForm && e.type === 'button' && !e.form && !cardForm.contains(e)
+        && /^subscribe\b/i.test(name) && !/[\d€£$]/.test(name)) return false;
     return !marketingButtons.has(e) && BLOOM_PAY_WORDS.test(name);
   });
-  if (pay.length !== 1) return {refusal:'pay_control_count'};
+  // Multi-step Shopify checkouts repeat the same native form submission at
+  // the top and bottom. They are one action only when the form, submit
+  // payload, destination, label and inline handler all agree.
+  const firstPay = pay[0];
+  const submitIdentity = e => JSON.stringify([
+    (e.innerText || e.value || '').replace(/\s+/g, ' ').trim(),
+    e.formAction, e.formMethod, e.name, e.value, e.getAttribute('onclick')
+  ]);
+  const repeatedSubmit = firstPay?.form && firstPay.type === 'submit'
+    && pay.every(e => e.form === firstPay.form && e.type === 'submit'
+      && submitIdentity(e) === submitIdentity(firstPay));
+  if (pay.length !== 1 && !repeatedSubmit) return {refusal:'pay_control_count'};
   // Test fixtures declare their total; a merchant page never chooses its own.
   const fixture = BLOOM_FIXTURE_TOTALS && ['localhost', '127.0.0.1'].includes(location.hostname);
   const explicit = fixture ? [...document.querySelectorAll('[data-bloom-total-minor][data-bloom-currency]')].filter(visible) : [];
@@ -150,7 +174,14 @@
   if (location.origin === 'https://buy.stripe.com') {
     const processor = globalThis.__bloomHostedStripeFacts;
     const displayed = [...document.querySelectorAll('.CurrencyAmount')].filter(visible);
-    if (!processor || displayed.length !== 1 || displayed[0].textContent.replace(/\D/g,'').replace(/^0+(?=\d)/,'') !== String(processor.total_minor)) return null;
+    // Stripe can repeat the same price in its summary and submit area. Every
+    // visible price must agree with the bound processor amount and currency.
+    // Appending the processor code resolves a bare "$", but conflicting
+    // currency marks (including adaptive local pricing) still fail closed.
+    if (!processor || !displayed.length || displayed.some(e => {
+      const amount = parseAmount(`${e.textContent} ${processor.currency}`);
+      return !amount || amount.total !== processor.total_minor || amount.currency !== processor.currency;
+    })) return null;
     total=processor.total_minor;currency=processor.currency;processorRecurring=processor.recurring;
   } else if (location.origin === 'https://js.stripe.com' && location.pathname === '/v3/embedded-checkout-inner.html') {
     // Observed bootstrap: read facts without submitting card data or a payment.

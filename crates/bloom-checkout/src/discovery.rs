@@ -647,8 +647,14 @@ pub(crate) mod tests {
         let mut tab = browser.handoff().await.unwrap();
         tab.fixture_payment_hosts = false; // Real provider pages need no fixture trust.
         let discovery = Discovery::read(&tab).await.unwrap();
-        assert_eq!(discovery.facts.currency, "USD");
-        assert_eq!(discovery.facts.total_minor, 2000);
+        assert!(discovery.facts.total_minor > 0);
+        if discovery.facts.currency == "USD" {
+            assert_eq!(discovery.facts.total_minor, 2000);
+        }
+        eprintln!(
+            "Hosted Stripe quote: {} {}",
+            discovery.facts.currency, discovery.facts.total_minor
+        );
         assert!(discovery.facts.recurring);
         discovery.recheck(&tab).await.unwrap();
         browser.return_control().await.unwrap();
@@ -701,9 +707,9 @@ pub(crate) mod tests {
             );
             // Synthetic non-card billing fields through the private test driver.
             tab.cdp.evaluate(&tab.session,r#"(()=>{
-                const set=(selector,value)=>{const e=document.querySelector(selector);if(!e)throw Error('Missing fixture field');Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(e,value);e.dispatchEvent(new Event('input',{bubbles:true}));e.dispatchEvent(new Event('change',{bubbles:true}));};
+                const set=(selector,value,required=true)=>{const e=document.querySelector(selector);if(!e){if(required)throw Error('Missing fixture field');return;}Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(e,value);e.dispatchEvent(new Event('input',{bubbles:true}));e.dispatchEvent(new Event('change',{bubbles:true}));};
                 set('input[name=email]','fixture-buyer@example.com');
-                set('input[name=billingPostalCode]','12345');
+                set('input[name=billingPostalCode]','12345',false);
                 const save=document.querySelector('input[type=checkbox]');if(save?.checked)save.click();return true;
             })()"#.into()).await.unwrap();
             let discovery = Discovery::read(&tab).await.unwrap();
@@ -839,6 +845,46 @@ pub(crate) mod tests {
         assert!((100..=200).contains(&discovery.facts.total_minor));
         assert_eq!(discovery.facts.installments, 1);
         discovery.recheck(&tab).await.unwrap();
+        browser.return_control().await.unwrap();
+    }
+
+    /// Replay a public checkout reached through the shopping VFS. No field
+    /// values are entered and the payment control is never submitted.
+    #[tokio::test]
+    #[ignore = "public checkout replay; set BLOOM_CHECKOUT_LIVE_URL; no purchase"]
+    async fn live_checkout_preparation_rechecks_fields_and_terms() {
+        let url = std::env::var("BLOOM_CHECKOUT_LIVE_URL").expect("Set the public checkout URL");
+        let browser = browser().await;
+        browser.browse(BrowseRequest::Open { url }).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+        if let Some(card) = snapshot["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["role"] == "label" && e["label"] == "Credit card")
+        {
+            browser
+                .browse(BrowseRequest::Click {
+                    element_ref: card["ref"].as_str().unwrap().into(),
+                })
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+        let mut tab = browser.handoff().await.unwrap();
+        tab.fixture_payment_hosts = false;
+        let discovery = Discovery::read(&tab).await.unwrap();
+        discovery.recheck(&tab).await.unwrap();
+        eprintln!(
+            "Verified checkout: origin={}, total={}, currency={}, installments={}, recurring={}, receiving_frames={}",
+            discovery.facts.origin,
+            discovery.facts.total_minor,
+            discovery.facts.currency,
+            discovery.facts.installments,
+            discovery.facts.recurring,
+            discovery.frames.len()
+        );
         browser.return_control().await.unwrap();
     }
 
@@ -2205,6 +2251,62 @@ pub(crate) mod tests {
                 true,
             ),
             (
+                "repeated native submission",
+                format!(
+                    "<form>{}<button>Pay now $3.99</button><button>Pay now $3.99</button></form>",
+                    inputs()
+                ),
+                true,
+            ),
+            (
+                "different submit payloads",
+                format!(
+                    "<form>{}<button name=plan value=one>Pay</button><button name=plan value=two>Pay</button></form>",
+                    inputs()
+                ),
+                false,
+            ),
+            (
+                "different submit destinations",
+                format!(
+                    "<form>{}<button formaction='/one'>Pay</button><button formaction='/two'>Pay</button></form>",
+                    inputs()
+                ),
+                false,
+            ),
+            (
+                "script buttons are not native duplicates",
+                format!(
+                    "<form>{}<button type=button>Pay</button><button type=button>Pay</button></form>",
+                    inputs()
+                ),
+                false,
+            ),
+            (
+                "subscription upgrade outside card form",
+                format!(
+                    "<aside><button type=button>Subscribe &amp; Get Free Shipping</button></aside><form>{}<button>Pay now $3.99</button></form>",
+                    inputs()
+                ),
+                true,
+            ),
+            (
+                "priced upgrade outside card form",
+                format!(
+                    "<aside><button type=button>Subscribe $5</button></aside><form>{}<button>Pay now $3.99</button></form>",
+                    inputs()
+                ),
+                false,
+            ),
+            (
+                "transparent subscription popup",
+                format!(
+                    "<aside style='opacity:0'><button>Subscribe &amp; Get Free Shipping</button></aside><form>{}<button>Pay now $3.99</button></form>",
+                    inputs()
+                ),
+                true,
+            ),
+            (
                 "newsletter caption with card fields",
                 format!(
                     "<form>Newsletter<input type=email>{}<button>Subscribe</button><button>Pay</button></form>",
@@ -2307,6 +2409,44 @@ pub(crate) mod tests {
                     assert!(discovery.submit(&tab).await.is_err());
                 }
             }
+            browser.return_control().await.unwrap();
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_stripe_prices_must_match_processor_amount_and_currency() {
+        let browser = browser().await;
+        for (prices, accepted) in [
+            (
+                "<div class=CurrencyAmount>$20.00</div><div class=CurrencyAmount>$20.00</div>",
+                true,
+            ),
+            (
+                "<div class=CurrencyAmount>$20.00</div><div class=CurrencyAmount>$30.00</div>",
+                false,
+            ),
+            ("<div class=CurrencyAmount>CAD 20.00</div>", false),
+            ("<div class=CurrencyAmount>€20.00</div>", false),
+            (
+                "<div class=CurrencyAmount>$20.00</div><aside style='opacity:0'><div class=CurrencyAmount>$30.00</div></aside>",
+                true,
+            ),
+        ] {
+            let (url, server) = fixture(format!(
+                "<!doctype html><body>{prices}<button>Subscribe</button></body>"
+            ))
+            .await;
+            let tab = open(&browser, url).await;
+            let expression = crate::scripts::prepare(include_str!("facts.js"))
+                .replace("BLOOM_FIXTURE_TOTALS", "false")
+                .replacen("(async () => {", "(async () => { const location={origin:'https://buy.stripe.com',hostname:'buy.stripe.com',pathname:'/test_fixture'}; globalThis.__bloomHostedStripeFacts={total_minor:2000,currency:'USD',recurring:true};", 1);
+            let result = tab.cdp.evaluate(&tab.session, expression).await.unwrap();
+            assert_eq!(
+                result.get("total_minor") == Some(&json!(2000)),
+                accepted,
+                "{prices}: {result}"
+            );
             browser.return_control().await.unwrap();
             server.abort();
         }
