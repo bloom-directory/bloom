@@ -3408,7 +3408,9 @@ mod tests {
             let operation_id = status.operation_id.clone();
             async move { service.watch_outcome(operation_id).await }
         });
-        tokio::time::timeout(Duration::from_secs(3), async {
+        // This polls a real Chromium observation, not an in-memory event.
+        // Use the private image's readiness budget on shared Mac runners.
+        tokio::time::timeout(Duration::from_secs(20), async {
             while service.store.get(&status.operation_id).unwrap().state != "needs_input" {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
