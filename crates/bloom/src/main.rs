@@ -2684,12 +2684,24 @@ enum Cmd {
     Update(UpdateCmd),
     /// Initialise ~/.bloom with default config + dirs.
     Init {
+        /// Persona for the main wallet's default policy; saving it grants nothing.
+        #[arg(long, value_parser = persona_cli_values())]
+        persona: Option<String>,
         #[command(subcommand)]
         internal: Option<InitInternal>,
     },
 
     /// Print a shell completion script.
     Completions { shell: Shell },
+}
+
+fn persona_cli_values() -> clap::builder::PossibleValuesParser {
+    use clap::builder::PossibleValue;
+    clap::builder::PossibleValuesParser::new([
+        PossibleValue::new("institutional").alias("custodian"),
+        PossibleValue::new("trader"),
+        PossibleValue::new("degen"),
+    ])
 }
 
 #[derive(Subcommand, Debug)]
@@ -3668,7 +3680,7 @@ async fn run(cli: Cli) -> Result<()> {
     }
 
     match cli.cmd.context("a command is required")? {
-        Cmd::Init { internal } => {
+        Cmd::Init { persona, internal } => {
             if let Some(internal) = internal {
                 return match internal {
                     #[cfg(feature = "triad-dev-harness")]
@@ -3774,16 +3786,40 @@ async fn run(cli: Cli) -> Result<()> {
             // `bloom serve` does the same, so the file's presence says nothing
             // about setup. The marker is saved only together with the choices.
             let first_setup = !d.config.petals.setup_complete;
+            // `--persona` replaces any saved persona. Otherwise only first
+            // setup asks, and an existing home keeps what it has.
+            let previous_persona = d.config.persona.clone();
+            let requested_persona = persona
+                .as_deref()
+                .map(str::parse::<bloom_proto::persona::PersonaPreset>)
+                .transpose()
+                .map_err(anyhow::Error::msg)?;
+            default_policy::select_persona(&mut d.config.persona, requested_persona)?;
+            if requested_persona.is_none() && first_setup && d.config.persona.is_none() {
+                if !structured_service_output() && default_policy::interactive_setup_available() {
+                    default_policy::run_persona_menu(
+                        &mut d.config.persona,
+                        &mut std::io::stdin().lock(),
+                        &mut std::io::stdout(),
+                    )?;
+                } else {
+                    d.config.persona = Some(bloom_proto::persona::PersonaConfig::default());
+                }
+            }
             let owners_before = default_policy::petal_owners(&d)?;
             if first_setup {
                 if !structured_service_output() && default_policy::interactive_setup_available() {
                     default_policy::run_setup_menu(
                         &mut d.config.petals,
+                        d.config.persona.as_ref(),
                         &mut std::io::stdin().lock(),
                         &mut std::io::stdout(),
                     )?;
                 } else {
-                    default_policy::accept_setup_suggestions(&mut d.config.petals);
+                    default_policy::accept_setup_suggestions(
+                        &mut d.config.petals,
+                        d.config.persona.as_ref(),
+                    );
                 }
                 // Queue the settings this run will write before anything is
                 // installed, so a run that stops part-way still writes them later.
@@ -3794,6 +3830,10 @@ async fn run(cli: Cli) -> Result<()> {
                 d.config
                     .save(&d.home.config_path())
                     .context("save setup choices")?;
+            } else if d.config.persona != previous_persona {
+                d.config
+                    .save(&d.home.config_path())
+                    .context("save persona choice")?;
             }
             let preinstalled = github_source::ensure_preinstalled_petals(&home, &d)
                 .context("provision canonical pre-installed Petals")?;
@@ -3807,6 +3847,10 @@ async fn run(cli: Cli) -> Result<()> {
             println!("config: {}", d.home.config_path().display());
             println!("chains: {:?}", d.chains.list_names());
             println!("preinstalled_petals: {preinstalled:?}");
+            println!(
+                "{}",
+                default_policy::persona_message(d.config.persona.as_ref())
+            );
             println!("next: bloom wallet new main");
             println!("then: bloom wallet address main --qr");
             println!("packaged Linux mount: systemctl --user status bloom-machine.service");

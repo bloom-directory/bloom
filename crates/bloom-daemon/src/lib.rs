@@ -3772,19 +3772,22 @@ impl AccountPetalMount for AccountPetals {
 }
 
 /// What `wallet`'s first Petal proposal also allows: each chosen Petal that is
-/// installed, and its destinations. A chosen Petal that is not installed is
+/// installed, its destinations, and the chosen persona's destinations
+/// ([`persona_policy_destinations`]). A chosen Petal that is not installed is
 /// left out. One whose owner record cannot be read, or holds an invalid
 /// package hash, fails the whole setup, so the proposal stops rather than
 /// leaving that Petal out of the policy for good.
 fn default_policy_setup(
     store: &PetalStore,
     chosen: &[String],
+    persona_destinations: &[bloom_broker_api::PolicyDestination],
     wallet: &str,
 ) -> Result<bloom_vfs::handlers::DefaultPolicySetup, bloom_vfs::HandlerError> {
     let mut setup = bloom_vfs::handlers::DefaultPolicySetup::default();
     if wallet != bloom_proto::config::DEFAULT_POLICY_WALLET {
         return Ok(setup);
     }
+    setup.destinations.extend_from_slice(persona_destinations);
     for name in chosen {
         let installed = store.resolve_petal_owner(name).map_err(|error| {
             warn!(petal = %name, %error, "petal.default_policy_owner_unreadable");
@@ -3800,6 +3803,32 @@ fn default_policy_setup(
         setup.destinations.extend(default_policy_destinations(name));
     }
     Ok(setup)
+}
+
+/// What the persona chosen during setup adds to the default wallet's policy.
+/// Degen opts Ethereum and Polygon, where configured, into native-wallet
+/// ERC-20 transfers to any recipient
+/// ([`bloom_proto::policy::ERC20_ANY_RECIPIENT`]). Each such transfer is still
+/// an exact owner approval until reviewed sessions can sign them
+/// (bloom-broker#112). Institutional and Trader add nothing here.
+pub fn persona_policy_destinations(config: &Config) -> Vec<bloom_broker_api::PolicyDestination> {
+    if !config
+        .persona
+        .as_ref()
+        .is_some_and(|persona| persona.preset == bloom_proto::persona::PersonaPreset::Degen)
+    {
+        return Vec::new();
+    }
+    [1u64, 137]
+        .into_iter()
+        .filter(|id| config.chains.values().any(|chain| chain.chain_id == *id))
+        .filter_map(|id| {
+            Some(bloom_broker_api::PolicyDestination {
+                chain: bloom_broker_api::Token::new(format!("evm-{id}")).ok()?,
+                destination: bloom_proto::policy::ERC20_ANY_RECIPIENT.into(),
+            })
+        })
+        .collect()
 }
 
 /// The fixed contracts a chosen Petal transacts with, as Broker policy
@@ -4601,15 +4630,19 @@ impl Daemon {
             .map_err(|e| DaemonError::Audit(format!("petals store: {e}")))?;
 
         // The default-policy wallet's first Petal proposal also allows every
-        // installed Petal chosen during setup.
+        // installed Petal chosen during setup, and the persona's destinations.
         let default_policy_packages: bloom_vfs::handlers::DefaultPolicyPackages = {
-            // Read once: only `bloom init` writes `[petals.setup]`, and it needs
-            // the home write lock this daemon holds, so the choice cannot change
-            // while this closure is alive. Installed hashes are resolved on each
-            // call, so a Petal update is picked up without a restart.
+            // Read once: only `bloom init` writes `[petals.setup]` and
+            // `[persona]`, and it needs the home write lock this daemon holds,
+            // so the choices cannot change while this closure is alive.
+            // Installed hashes are resolved on each call, so a Petal update is
+            // picked up without a restart.
             let chosen: Vec<String> = config.petals.setup.keys().cloned().collect();
+            let persona_destinations = persona_policy_destinations(&config);
             let store = petal_store.clone();
-            Arc::new(move |wallet: &str| default_policy_setup(&store, &chosen, wallet))
+            Arc::new(move |wallet: &str| {
+                default_policy_setup(&store, &chosen, &persona_destinations, wallet)
+            })
         };
         let wallets_handler = Arc::new(
             WalletsHandler::new(
@@ -5750,19 +5783,66 @@ mod tests {
         let store = PetalStore::open(temp.path()).unwrap();
         let chosen = vec!["hyperliquid".to_owned(), "polymarket".to_owned()];
 
-        let setup = default_policy_setup(&store, &chosen, "main").unwrap();
+        let setup = default_policy_setup(&store, &chosen, &[], "main").unwrap();
         assert!(setup.packages.is_empty(), "nothing is installed yet");
 
         std::fs::create_dir_all(temp.path().join("owners")).unwrap();
         std::fs::write(temp.path().join("owners/polymarket.json"), b"not json").unwrap();
-        let error = default_policy_setup(&store, &chosen, "main").unwrap_err();
+        let error = default_policy_setup(&store, &chosen, &[], "main").unwrap_err();
         assert!(error.to_string().contains("polymarket"), "{error}");
         // Only the default-policy wallet reads the setup.
         assert!(
-            default_policy_setup(&store, &chosen, "alt")
+            default_policy_setup(&store, &chosen, &[], "alt")
                 .unwrap()
                 .packages
                 .is_empty()
+        );
+    }
+
+    /// Degen opts the default wallet into ERC-20 transfers to any recipient
+    /// on each configured network Broker sessions support. No other persona,
+    /// and no other wallet, gets the entry.
+    #[test]
+    fn degen_adds_any_recipient_erc20_transfers_to_the_default_wallet_only() {
+        use bloom_proto::persona::{PersonaConfig, PersonaPreset};
+
+        let mut config = Config::local_default();
+        assert!(
+            persona_policy_destinations(&config).is_empty(),
+            "no persona"
+        );
+        for preset in [PersonaPreset::Custodian, PersonaPreset::Trader] {
+            config.persona = Some(PersonaConfig::suggested(preset));
+            assert!(
+                persona_policy_destinations(&config).is_empty(),
+                "{preset:?}"
+            );
+        }
+        config.persona = Some(PersonaConfig::suggested(PersonaPreset::Degen));
+        let degen = persona_policy_destinations(&config);
+        let entries: Vec<(&str, &str)> = degen
+            .iter()
+            .map(|d| (d.chain.as_str(), d.destination.as_str()))
+            .collect();
+        assert_eq!(
+            entries,
+            [
+                ("evm-1", bloom_proto::policy::ERC20_ANY_RECIPIENT),
+                ("evm-137", bloom_proto::policy::ERC20_ANY_RECIPIENT),
+            ]
+        );
+        // A network that is not configured gets no entry.
+        config.chains.retain(|_, chain| chain.chain_id != 137);
+        assert_eq!(persona_policy_destinations(&config), degen[..1]);
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = PetalStore::open(temp.path()).unwrap();
+        let chosen = vec!["polymarket".to_owned()];
+        let main = default_policy_setup(&store, &chosen, &degen, "main").unwrap();
+        assert_eq!(main.destinations, degen);
+        assert_eq!(
+            default_policy_setup(&store, &chosen, &degen, "alt").unwrap(),
+            bloom_vfs::handlers::DefaultPolicySetup::default()
         );
     }
 

@@ -24,6 +24,8 @@ const ETHER: u128 = 1_000_000_000_000_000_000;
 /// Addresses + tags involved in a tx, used by allow/deny list checks.
 #[derive(Debug, Clone, Default)]
 pub struct AddressContext {
+    /// Native wallet's canonical ERC20 send, classified by the transaction engine.
+    pub standard_erc20_transfer: bool,
     /// The contract being called (if any).
     pub contract: Option<Address>,
     /// The token being moved (for ERC-20 transfers).
@@ -239,7 +241,17 @@ pub fn evaluate(
     // recipient allow-list for the transaction it staged. Everything else on
     // this wallet, including transactions the owner stages by hand, is still
     // matched against the listed addresses.
+    let any_erc20 = ctx.standard_erc20_transfer
+        && policy
+            .allowlists
+            .recipients
+            .contains(bloom_proto::policy::ERC20_ANY_RECIPIENT);
     match petal_destination_entry(policy, &ctx) {
+        _ if any_erc20 => out.push(PolicyCheck::hard(
+            "allowlists.recipients",
+            PolicyOutcome::Pass,
+            "wallet policy allows ERC20 transfers to any recipient",
+        )),
         Some(entry) => out.push(PolicyCheck::hard(
             "allowlists.recipients",
             PolicyOutcome::Pass,
@@ -897,5 +909,50 @@ mod tests {
                 .any(|c| c.rule == "caps.per_day_usd" && matches!(c.outcome, PolicyOutcome::Warn)),
             "{checks:?}"
         );
+    }
+
+    #[test]
+    fn any_recipient_marker_exempts_only_classified_native_wallet_erc20_sends() {
+        let mut policy = bloom_proto::Policy::default();
+        policy
+            .allowlists
+            .recipients
+            .insert(bloom_proto::policy::ERC20_ANY_RECIPIENT.into());
+        let mut ctx = AddressContext {
+            recipient: Some(
+                "0x1111111111111111111111111111111111111111"
+                    .parse()
+                    .unwrap(),
+            ),
+            standard_erc20_transfer: true,
+            ..Default::default()
+        };
+        assert!(!has_hard_violation(&evaluate(
+            &policy,
+            "ethereum",
+            U256::ZERO,
+            18,
+            ctx.clone()
+        )));
+        ctx.standard_erc20_transfer = false;
+        assert!(has_hard_violation(&evaluate(
+            &policy,
+            "ethereum",
+            U256::ZERO,
+            18,
+            ctx.clone()
+        )));
+        ctx.standard_erc20_transfer = true;
+        policy
+            .denylists
+            .recipients
+            .insert("0x1111111111111111111111111111111111111111".into());
+        assert!(has_hard_violation(&evaluate(
+            &policy,
+            "ethereum",
+            U256::ZERO,
+            18,
+            ctx
+        )));
     }
 }

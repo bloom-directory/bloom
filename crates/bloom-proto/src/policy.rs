@@ -7,6 +7,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::AssuranceLevel;
 use serde::{Deserialize, Serialize};
 
+/// Wallet policy opt-in, listed as `{"chain": "evm-<chain id>", "destination":
+/// ERC20_ANY_RECIPIENT}`, that lets Machine stage the native wallet's canonical
+/// ERC-20 transfer to any recipient on that chain. The Degen persona proposes
+/// it. It is the same string as `bloom_broker_api::ERC20_ANY_RECIPIENT` in
+/// bloom-broker#112, whose reviewed sessions also honour it; a Broker without
+/// that change stores it verbatim and matches no address with it. It is never
+/// a literal destination or a general wildcard.
+pub const ERC20_ANY_RECIPIENT: &str = "erc20:any-recipient";
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Policy {
     /// Authenticated numeric-chain deployment opt-in. This advisory flag is

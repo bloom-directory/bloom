@@ -999,6 +999,62 @@ fn init_runs_setup_once_even_when_the_config_already_exists() {
     assert!(config.petals.setup.is_empty(), "{:?}", config.petals.setup);
 }
 
+/// `bloom init` records a persona before the Petal setup it suggests values
+/// for. Without a terminal, first setup records Institutional; `--persona`
+/// chooses one, and on an existing home replaces the saved one without
+/// rerunning setup.
+#[test]
+fn init_records_the_chosen_persona_before_petal_setup() {
+    use bloom_proto::persona::PersonaPreset;
+
+    let init = |home: &Path, persona: Option<&str>| {
+        let mut command = bloom_cmd(home);
+        command
+            .env("HTTPS_PROXY", "http://127.0.0.1:1")
+            .env("https_proxy", "http://127.0.0.1:1")
+            .env("NO_PROXY", "")
+            .env("no_proxy", "")
+            .arg("init");
+        if let Some(persona) = persona {
+            command.args(["--persona", persona]);
+        }
+        command
+            .assert()
+            // Choices are saved before Petal provisioning, which is offline here.
+            .failure()
+            .stderr(predicate::str::contains(
+                "provision canonical pre-installed Petals",
+            ));
+        bloom_proto::Config::load(&bloom_proto::HomeDir::at(home).config_path()).unwrap()
+    };
+    let polymarket_limit = |config: &bloom_proto::Config| {
+        config.petals.setup["polymarket"].values["max_daily_usd"].clone()
+    };
+
+    let degen_home = fresh_home();
+    let degen = init(degen_home.path(), Some("degen"));
+    assert_eq!(degen.persona.as_ref().unwrap().preset, PersonaPreset::Degen);
+    assert_eq!(polymarket_limit(&degen), "10000");
+
+    let home = fresh_home();
+    let first = init(home.path(), None);
+    assert_eq!(
+        first.persona.as_ref().unwrap().preset,
+        PersonaPreset::Custodian
+    );
+    assert_eq!(polymarket_limit(&first), "100");
+    let changed = init(home.path(), Some("trader"));
+    assert_eq!(
+        changed.persona.as_ref().unwrap().preset,
+        PersonaPreset::Trader
+    );
+    assert_eq!(
+        polymarket_limit(&changed),
+        "100",
+        "an existing home keeps its setup choices"
+    );
+}
+
 /// Setup queues the chosen settings before provisioning. Here provisioning
 /// fails, as a run that stops part-way would, so nothing is installed or
 /// written, and Polymarket's settings must stay queued for when `main`'s

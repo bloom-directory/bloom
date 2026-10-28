@@ -12,6 +12,7 @@ use std::ops::ControlFlow;
 use anyhow::{Context, Result, bail};
 use bloom_daemon::Daemon;
 use bloom_proto::config::{DEFAULT_POLICY_WALLET, PetalSetupConfig, PetalsConfig};
+use bloom_proto::persona::{PersonaConfig, PersonaPreset};
 use serde::{Deserialize, Serialize};
 
 use crate::github_source::{self, PetalSetupTemplate};
@@ -62,6 +63,74 @@ pub(crate) fn interactive_setup_available() -> bool {
     std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
 }
 
+/// Save a proposal only. Existing homes keep their choice unless an explicit
+/// selection is supplied, independently of the Petal setup-complete marker.
+pub(crate) fn select_persona(
+    saved: &mut Option<PersonaConfig>,
+    preset: Option<PersonaPreset>,
+) -> Result<()> {
+    let Some(preset) = preset else {
+        return Ok(());
+    };
+    let proposal = PersonaConfig::suggested(preset);
+    proposal.validate().map_err(anyhow::Error::msg)?;
+    *saved = Some(proposal);
+    Ok(())
+}
+
+/// Ask which persona `main` uses. An empty answer, or the end of input,
+/// keeps Institutional.
+pub(crate) fn run_persona_menu(
+    saved: &mut Option<PersonaConfig>,
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+) -> Result<()> {
+    writeln!(
+        output,
+        "Persona for main: Institutional keeps each Petal's suggested limits and only recipients your policy lists; Trader suggests larger limits; Degen suggests the largest and lets the wallet send ERC-20 tokens to any recipient on Ethereum and Polygon. Every transaction still needs your approval."
+    )?;
+    loop {
+        write!(
+            output,
+            "Choose institutional, trader or degen [institutional]: "
+        )?;
+        output.flush()?;
+        let answer = read_answer(input)?.unwrap_or_default();
+        let answer = if answer.is_empty() {
+            "custodian"
+        } else {
+            &answer
+        };
+        match answer.parse::<PersonaPreset>() {
+            Ok(preset) => {
+                select_persona(saved, Some(preset))?;
+                writeln!(output, "{}", persona_message(saved.as_ref()))?;
+                return Ok(());
+            }
+            Err(error) => writeln!(output, "{error}")?,
+        }
+    }
+}
+
+/// What the saved persona means for `main`, shown after it is chosen and by
+/// `bloom init`. A home without one behaves as Institutional.
+pub(crate) fn persona_message(persona: Option<&PersonaConfig>) -> String {
+    let default = PersonaConfig::default();
+    let persona = persona.unwrap_or(&default);
+    let behaviour = match persona.preset {
+        PersonaPreset::Custodian => "only recipients your policy lists",
+        PersonaPreset::Trader => "larger suggested Petal limits; only recipients your policy lists",
+        PersonaPreset::Degen => {
+            "the largest suggested Petal limits; ERC-20 sends from your wallet may go to any recipient on Ethereum and Polygon"
+        }
+    };
+    let name = match persona.preset {
+        PersonaPreset::Custodian => "institutional",
+        other => other.as_str(),
+    };
+    format!("persona: {name}; {behaviour}; each transaction still needs your approval")
+}
+
 /// Ask which Petals to use and the values each chosen Petal's settings need.
 /// An empty answer, or the end of input, accepts the suggestion.
 ///
@@ -71,9 +140,11 @@ pub(crate) fn interactive_setup_available() -> bool {
 /// the catalog's values.
 ///
 /// Bloom installs every canonical Petal regardless. Each chosen Petal is
-/// recorded in `setup`, which the default policy proposes.
+/// recorded in `setup`, which the default policy proposes. A value with no
+/// saved answer is suggested from `persona` where it has one.
 pub(crate) fn run_setup_menu(
     petals: &mut PetalsConfig,
+    persona: Option<&PersonaConfig>,
     input: &mut impl BufRead,
     output: &mut impl Write,
 ) -> Result<()> {
@@ -99,12 +170,13 @@ pub(crate) fn run_setup_menu(
         let mut values = BTreeMap::new();
         if let Some(template) = setup_template(name) {
             for value in template.values {
+                let persona_suggestion = suggested_venue_limit(persona, name, value.name);
                 let suggestion = earlier
                     .get(name)
                     .and_then(|setup| setup.values.get(value.name))
                     .map(String::as_str)
                     .filter(|saved| is_setup_amount(saved))
-                    .unwrap_or(value.default);
+                    .unwrap_or(persona_suggestion.as_deref().unwrap_or(value.default));
                 let answer = ask_amount(input, output, value.prompt, suggestion)?;
                 values.insert(value.name.to_owned(), answer);
             }
@@ -119,7 +191,7 @@ pub(crate) fn run_setup_menu(
 /// no earlier choices that records every canonical Petal with the catalog's
 /// values; earlier choices are kept as they are, so a declined Petal stays
 /// declined and a saved value stays saved.
-pub(crate) fn accept_setup_suggestions(petals: &mut PetalsConfig) {
+pub(crate) fn accept_setup_suggestions(petals: &mut PetalsConfig, persona: Option<&PersonaConfig>) {
     if !petals.setup.is_empty() {
         return;
     }
@@ -129,7 +201,13 @@ pub(crate) fn accept_setup_suggestions(petals: &mut PetalsConfig) {
                 template
                     .values
                     .iter()
-                    .map(|value| (value.name.to_owned(), value.default.to_owned()))
+                    .map(|value| {
+                        (
+                            value.name.to_owned(),
+                            suggested_venue_limit(persona, &name, value.name)
+                                .unwrap_or_else(|| value.default.to_owned()),
+                        )
+                    })
                     .collect()
             })
             .unwrap_or_default();
@@ -138,6 +216,26 @@ pub(crate) fn accept_setup_suggestions(petals: &mut PetalsConfig) {
             .entry(name.clone())
             .or_insert(PetalSetupConfig { values });
     }
+}
+
+/// The persona's suggestion for a Petal setting, where it has one. Only
+/// Polymarket's daily buy limit is suggested: Trader's and Degen's pUSD
+/// token quantities, never a price.
+fn suggested_venue_limit(
+    persona: Option<&PersonaConfig>,
+    petal: &str,
+    value: &str,
+) -> Option<String> {
+    if petal != "polymarket" || value != "max_daily_usd" {
+        return None;
+    }
+    // This existing venue setting is a pUSD order-cost ceiling despite its
+    // historic name. Seed fresh settings from the token quantity, never a
+    // price. Saved owner settings are still preserved by the setup merge.
+    let profile = persona?;
+    profile
+        .token_amounts("pUSD")
+        .map(|(_, total)| total.to_owned())
 }
 
 fn ask_yes_no(
@@ -1094,7 +1192,19 @@ pub(crate) async fn advance_default_policy(
         destinations.extend(policy_destinations(name)?);
         petals.push(name.clone());
     }
-    if packages.is_empty() {
+    // The persona's own entries are required like a chosen Petal's, and are
+    // named alongside the Petals in what the owner is told.
+    let persona_destinations = if wallet == DEFAULT_POLICY_WALLET {
+        bloom_daemon::persona_policy_destinations(&daemon.config)
+    } else {
+        Vec::new()
+    };
+    let mut allowed = petals.clone();
+    if !persona_destinations.is_empty() {
+        allowed.push(PERSONA_TRANSFERS.to_owned());
+    }
+    destinations.extend(persona_destinations.iter().cloned());
+    if packages.is_empty() && destinations.is_empty() {
         return Ok(DefaultPolicyStatus::NothingToAllow);
     }
     let wallet_id = bloom_broker_api::Token::new(wallet.to_owned())?;
@@ -1121,12 +1231,16 @@ pub(crate) async fn advance_default_policy(
     };
     Ok(match eligibility {
         bloom_machine_client::PetalEligibility::Allowed(_) => DefaultPolicyStatus::Applied {
-            petals,
+            petals: allowed,
             settings_pending,
         },
         bloom_machine_client::PetalEligibility::ChangedSinceCreation(current) => {
+            let mut missing = petals_not_allowed(&current, &petals, &packages)?;
+            if !policy_allows_destinations(&current, &persona_destinations)? {
+                missing.push(PERSONA_TRANSFERS.to_owned());
+            }
             DefaultPolicyStatus::ChangedSinceCreation {
-                missing: petals_not_allowed(&current, &petals, &packages)?,
+                missing,
                 settings_pending,
             }
         }
@@ -1141,7 +1255,7 @@ pub(crate) async fn advance_default_policy(
                     .prepare
                     .as_ref()
                     .map(|prepare| prepare.ceremony_expires_at_ms.get()),
-                petals,
+                petals: allowed,
                 proposes_chosen_petals: pending.includes_requested,
             }
         }
@@ -1250,6 +1364,23 @@ fn petals_not_allowed(
         }
     }
     Ok(missing)
+}
+
+/// How the default policy names the persona's entries to the owner, beside
+/// the chosen Petals.
+pub(crate) const PERSONA_TRANSFERS: &str = "ERC-20 transfers to any recipient";
+
+/// Whether `current` allows every one of `destinations`.
+fn policy_allows_destinations(
+    current: &bloom_broker_api::SignedPolicySnapshot,
+    destinations: &[bloom_broker_api::PolicyDestination],
+) -> Result<bool> {
+    let policy: bloom_broker_api::CanonicalWalletPolicy =
+        serde_json::from_slice(&current.canonical_policy.decode())
+            .context("decode the wallet's current policy")?;
+    Ok(destinations
+        .iter()
+        .all(|destination| policy.allowed_destinations.contains(destination)))
 }
 
 /// The destinations a chosen Petal's transactions need, from Bloom's catalog.
@@ -2457,10 +2588,80 @@ mod tests {
         }
     }
 
+    #[test]
+    fn persona_selection_preserves_unspecified_choices_and_uses_token_windows() {
+        let mut saved = None;
+        select_persona(&mut saved, None).unwrap();
+        assert_eq!(saved, None);
+        select_persona(&mut saved, Some(PersonaPreset::Trader)).unwrap();
+        let choice = saved.clone();
+        select_persona(&mut saved, None).unwrap();
+        assert_eq!(saved, choice);
+        assert_eq!(saved.as_ref().unwrap().window_secs, 86400);
+        select_persona(&mut saved, Some(PersonaPreset::Degen)).unwrap();
+        assert_eq!(saved.unwrap().window_secs, 604800);
+    }
+
+    #[test]
+    fn persona_token_limits_do_not_rewrite_venue_settings_or_saved_owner_choice() {
+        let trader = PersonaConfig::suggested(PersonaPreset::Trader);
+        let mut fresh = PetalsConfig::default();
+        accept_setup_suggestions(&mut fresh, Some(&trader));
+        assert_eq!(polymarket_limit(&fresh), Some("1000"));
+        fresh
+            .setup
+            .get_mut("polymarket")
+            .unwrap()
+            .values
+            .insert("max_daily_usd".into(), "42.5".into());
+        let mut output = Vec::new();
+        run_setup_menu(&mut fresh, Some(&trader), &mut "".as_bytes(), &mut output).unwrap();
+        assert_eq!(polymarket_limit(&fresh), Some("42.5"));
+        assert!(String::from_utf8(output).unwrap().contains("[42.5]"));
+    }
+
+    /// Institutional keeps the catalog's suggestion; Degen suggests its pUSD
+    /// quantity.
+    #[test]
+    fn each_persona_suggests_its_own_polymarket_limit() {
+        let mut none = PetalsConfig::default();
+        accept_setup_suggestions(&mut none, None);
+        let mut institutional = PetalsConfig::default();
+        let custodian = PersonaConfig::suggested(PersonaPreset::Custodian);
+        accept_setup_suggestions(&mut institutional, Some(&custodian));
+        assert_eq!(polymarket_limit(&institutional), polymarket_limit(&none));
+        let mut degen = PetalsConfig::default();
+        let profile = PersonaConfig::suggested(PersonaPreset::Degen);
+        accept_setup_suggestions(&mut degen, Some(&profile));
+        assert_eq!(polymarket_limit(&degen), Some("10000"));
+    }
+
+    /// An empty answer, or the end of input, keeps Institutional; an
+    /// unknown answer is asked again.
+    #[test]
+    fn the_persona_menu_defaults_to_institutional() {
+        let ask = |answers: &str| {
+            let mut saved = None;
+            let mut output = Vec::new();
+            run_persona_menu(&mut saved, &mut answers.as_bytes(), &mut output).unwrap();
+            (saved.unwrap().preset, String::from_utf8(output).unwrap())
+        };
+        assert_eq!(ask("").0, PersonaPreset::Custodian);
+        assert_eq!(ask("\n").0, PersonaPreset::Custodian);
+        let (preset, output) = ask("degen\n");
+        assert_eq!(preset, PersonaPreset::Degen);
+        assert!(output.contains("persona: degen;"), "{output}");
+        assert!(output.contains("any recipient"), "{output}");
+        let (preset, output) = ask("yolo\ntrader\n");
+        assert_eq!(preset, PersonaPreset::Trader);
+        assert!(output.contains("persona must be"), "{output}");
+        assert!(persona_message(None).starts_with("persona: institutional;"));
+    }
+
     fn menu(answers: &str) -> (PetalsConfig, String) {
         let mut petals = PetalsConfig::default();
         let mut output = Vec::new();
-        run_setup_menu(&mut petals, &mut answers.as_bytes(), &mut output).unwrap();
+        run_setup_menu(&mut petals, None, &mut answers.as_bytes(), &mut output).unwrap();
         (petals, String::from_utf8(output).unwrap())
     }
 
@@ -2538,7 +2739,13 @@ mod tests {
             },
         );
         let mut output = Vec::new();
-        run_setup_menu(&mut petals, &mut "\n\n\n\n\n\n".as_bytes(), &mut output).unwrap();
+        run_setup_menu(
+            &mut petals,
+            None,
+            &mut "\n\n\n\n\n\n".as_bytes(),
+            &mut output,
+        )
+        .unwrap();
         let output = String::from_utf8(output).unwrap();
         assert_eq!(chosen(&petals), ["hyperliquid", "polymarket"]);
         assert_eq!(polymarket_limit(&petals), Some("42.5"));
@@ -2551,12 +2758,13 @@ mod tests {
 
         // The same at the end of input, and an explicit answer still wins.
         let mut eof = petals.clone();
-        run_setup_menu(&mut eof, &mut "".as_bytes(), &mut Vec::new()).unwrap();
+        run_setup_menu(&mut eof, None, &mut "".as_bytes(), &mut Vec::new()).unwrap();
         assert_eq!(chosen(&eof), ["hyperliquid", "polymarket"]);
         assert_eq!(polymarket_limit(&eof), Some("42.5"));
         let mut changed = petals.clone();
         run_setup_menu(
             &mut changed,
+            None,
             &mut "\n\ny\n\n\n60\n".as_bytes(),
             &mut Vec::new(),
         )
@@ -2574,7 +2782,7 @@ mod tests {
                 values: BTreeMap::from([("max_daily_usd".into(), "42.5".into())]),
             },
         );
-        accept_setup_suggestions(&mut petals);
+        accept_setup_suggestions(&mut petals, None);
         assert_eq!(chosen(&petals), ["polymarket"]);
         assert_eq!(polymarket_limit(&petals), Some("42.5"));
     }
@@ -2649,7 +2857,7 @@ mod tests {
     #[test]
     fn scripted_setup_chooses_every_canonical_petal_and_keeps_existing_values() {
         let mut petals = PetalsConfig::default();
-        accept_setup_suggestions(&mut petals);
+        accept_setup_suggestions(&mut petals, None);
         assert_eq!(
             chosen(&petals),
             [
@@ -2670,7 +2878,7 @@ mod tests {
                 values: BTreeMap::from([("max_daily_usd".into(), "5".into())]),
             },
         );
-        accept_setup_suggestions(&mut edited);
+        accept_setup_suggestions(&mut edited, None);
         assert_eq!(polymarket_limit(&edited), Some("5"));
         assert_eq!(chosen(&edited), ["polymarket"]);
 
@@ -2681,14 +2889,14 @@ mod tests {
             .or_default()
             .values
             .insert("tolly_writes".into(), "disabled".into());
-        accept_setup_suggestions(&mut disabled);
+        accept_setup_suggestions(&mut disabled, None);
         assert_eq!(tolly_writes(&disabled), Some("disabled"));
     }
 
     #[test]
     fn chosen_petals_round_trip_as_config_tables() {
         let mut config = bloom_proto::Config::local_default();
-        accept_setup_suggestions(&mut config.petals);
+        accept_setup_suggestions(&mut config.petals, None);
         let encoded = toml::to_string(&config).unwrap();
         assert!(encoded.contains("[petals.setup.hyperliquid]"), "{encoded}");
         assert!(
