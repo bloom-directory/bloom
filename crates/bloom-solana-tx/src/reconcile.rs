@@ -118,7 +118,7 @@ impl SolanaReconciler {
                 return Ok(None);
             }
             let quorum = chain
-                .probe_signature_status_all_endpoints(&entry.signature)
+                .probe_signature_status_all_endpoints(&entry.signature, entry.last_valid_block_height)
                 .await;
             let mut finalized: Option<bloom_solana::SignatureStatus> = None;
             let mut seen_unfinalized = false;
@@ -147,7 +147,7 @@ impl SolanaReconciler {
                 // a durable receipt stays terminal-only.
                 return Ok(None);
             }
-            if unavailable > 0 {
+            if unavailable > 0 || absent == 0 {
                 // Absence cannot be proven while endpoints are missing.
                 // Keep the entry unreconciled rather than risk recording an
                 // executed transfer as failed.

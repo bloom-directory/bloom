@@ -5098,7 +5098,7 @@ impl Daemon {
                                     };
                                     // Each probe searches transaction history. A single
                                     // lagging endpoint cannot establish absence.
-                                    let probes = client.probe_signature_status_all_endpoints(&signature).await;
+                                    let probes = client.probe_signature_status_all_endpoints(&signature, entry.staged.last_valid_block_height).await;
                                     let found = probes.iter().any(|probe| matches!(&probe.status, Ok(Some(_))));
                                     let absent = !probes.is_empty() && probes.iter().all(|probe| matches!(&probe.status, Ok(None)));
                                     if found || absent {

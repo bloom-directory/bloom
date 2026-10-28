@@ -339,7 +339,14 @@ impl SolanaClient {
     pub async fn probe_signature_status_all_endpoints(
         &self,
         signature: &str,
+        last_valid_block_height: u64,
     ) -> Vec<SignatureStatusProbe> {
+        // Establish each endpoint's finalized height BEFORE asking its
+        // history. A fast endpoint cannot qualify a lagging peer's absence.
+        // Both probe batches retain configured endpoint order (no failover).
+        let heights = self.inner.rpc.probe_all_endpoints(
+            "getBlockHeight", &json!([{ "commitment": "finalized" }]),
+        ).await;
         self.inner
             .rpc
             .probe_all_endpoints(
@@ -354,7 +361,8 @@ impl SolanaClient {
             )
             .await
             .into_iter()
-            .map(|probe| SignatureStatusProbe {
+            .zip(heights)
+            .map(|(probe, height)| SignatureStatusProbe {
                 endpoint_label: probe.endpoint_label,
                 status: probe.outcome.and_then(|result| {
                     let entry = result
@@ -367,7 +375,13 @@ impl SolanaClient {
                             )
                         })?;
                     if entry.is_null() {
-                        Ok(None)
+                        let finalized = height.outcome?.as_u64().ok_or_else(||
+                            SolanaRpcError::Decode("getBlockHeight: expected integer".into()))?;
+                        if finalized > last_valid_block_height {
+                            Ok(None)
+                        } else {
+                            Err(SolanaRpcError::Decode("signature absence is unproven before this endpoint's finalized blockhash expiry".into()))
+                        }
                     } else {
                         serde_json::from_value::<SignatureStatus>(entry)
                             .map(Some)

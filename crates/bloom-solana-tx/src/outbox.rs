@@ -293,6 +293,16 @@ impl SolanaOutbox {
         if target.exists() {
             return Err(OutboxError::TargetExists(target.display().to_string()));
         }
+        if new_state == SolanaOutboxState::Failed {
+            // Persist the reason before the atomic move. Readers use it if a
+            // crash prevents the subsequent intent rewrite, preserving the
+            // expired/restage route rather than inventing a generic failure.
+            let status = match entry.staged.status {
+                SolanaTxStatus::Expired | SolanaTxStatus::Cancelled => entry.staged.status,
+                _ => SolanaTxStatus::Cancelled,
+            };
+            write_atomic(entry.dir.join("transition-status.json"), &serde_json::to_vec(&status)?)?;
+        }
         fs::rename(&entry.dir, &target)?;
         if new_state == SolanaOutboxState::Failed {
             let _ = fs::remove_file(target.join(BROADCAST_RAW_TX));
@@ -337,7 +347,7 @@ impl SolanaOutbox {
         ] {
             let dir = self.state_dir(wallet, chain, state)?.join(id);
             if dir.join("intent.json").exists() {
-                let staged = serde_json::from_slice(&fs::read(dir.join("intent.json"))?)?;
+                let staged = read_projected_intent(&dir, state)?;
                 return Ok(SolanaOutboxEntry { state, staged, dir });
             }
         }
@@ -410,7 +420,7 @@ impl SolanaOutbox {
     ) -> Result<SolanaOutboxEntry, OutboxError> {
         let dir = self.state_dir(wallet, chain, expected)?.join(id);
         if dir.join("intent.json").exists() {
-            let staged = serde_json::from_slice(&fs::read(dir.join("intent.json"))?)?;
+            let staged = read_projected_intent(&dir, expected)?;
             return Ok(SolanaOutboxEntry {
                 state: expected,
                 staged,
@@ -838,6 +848,27 @@ impl SolanaOutbox {
 
 fn blake3_hash(bytes: &[u8]) -> String {
     blake3::hash(bytes).to_hex().to_string()
+}
+
+fn read_projected_intent(dir: &Path, state: SolanaOutboxState) -> Result<StagedSolanaTransfer, OutboxError> {
+    let mut staged: StagedSolanaTransfer = serde_json::from_slice(&fs::read(dir.join("intent.json"))?)?;
+    match state {
+        SolanaOutboxState::Sent => staged.status = SolanaTxStatus::Sent,
+        SolanaOutboxState::Failed if !matches!(staged.status, SolanaTxStatus::Expired | SolanaTxStatus::Cancelled) => {
+            staged.status = match fs::read(dir.join("transition-status.json")) {
+                Ok(bytes) => match serde_json::from_slice::<SolanaTxStatus>(&bytes)? {
+                    SolanaTxStatus::Expired => SolanaTxStatus::Expired,
+                    _ => SolanaTxStatus::Cancelled,
+                },
+                // Legacy interrupted moves cannot prove expiry; never offer
+                // automatic restaging based on a guessed terminal reason.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => SolanaTxStatus::Cancelled,
+                Err(error) => return Err(error.into()),
+            };
+        }
+        _ => {}
+    }
+    Ok(staged)
 }
 
 fn write_atomic(path: impl AsRef<Path>, body: &[u8]) -> Result<(), OutboxError> {
