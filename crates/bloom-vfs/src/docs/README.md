@@ -78,7 +78,8 @@ initial account.
 Address, QR, and public-key files exist only beneath a numbered account.
 Delegated sessions live beneath the numbered account at
 `sessions/<petal>/<key-slot>/`; installed Petals are mounted only at
-`petals/<petal>/`. See the mount `AGENTS.md` for account creation, session
+`petals/<petal>/`, with wallet/index pairs in each account-dependent route
+(for example `petals/enso/intents/<wallet>/<n>/new`). Public routes stay unscoped. See the mount `AGENTS.md` for account creation, session
 status, and revocation rules.
 
 ## Writes and authority
@@ -91,21 +92,25 @@ transaction was not submitted.
 | Operation | Route / procedure |
 |---|---|
 | Register wallet | `wallets/new`; [wallet creation](./examples.md#creating-a-wallet) |
+| Recover wallet | `wallets/recover`; [recovery](./examples.md#recovering-a-wallet) |
 | EVM transaction | `wallets/<wallet>/0/chains/<chain>/outbox/new.tx`; [Anvil workflow](./examples.md#local-anvil-transaction) |
 | Solana transaction | Same outbox shape with strict JSON; [Solana workflow](./examples.md#solana-account-aware-reads-and-transfer) |
 | Update policy | `wallets/<wallet>/policy.json`; [policy workflow](./examples.md#updating-wallet-policy) |
 | Reusable authority | `wallets/<wallet>/sealed-approvals/` |
-| Petal operation | `petals/<name>/`; [installed package workflow](./examples.md#installed-petal-workflow) |
+| Petal operation | Package-defined `<wallet>/<index>` routes; [installed package workflow](./examples.md#installed-petal-workflow) |
 | Paid HTTP | `requests/`; inspect plan, wallet, payment protocol, cap, approval, and receipt |
 
 Wallet registration is asynchronous and does not create a local wallet.
 Read `wallets/registrations/<petname>/status.json`, verify `requested_name`,
 complete the human ceremony, then check `COMPLETED` and `result.json`.
 Mnemonic and raw-key input stays in the Broker-hosted browser ceremony.
+Recovery ID and secret input likewise stays in the Browser ceremony; start it
+with only the wallet name at `wallets/recover`, then inspect
+`wallets/recoveries/<petname>/status.json`.
 
 For a transaction requiring fresh approval, inspect the same action's
 `approval_challenge.json`, verify its identity and expiry, and retry its exact
-`retry_path` only after the human approves. Read the resulting state and
+`retry_path` once its live `state` is `active`. Read the resulting state and
 receipt before reporting success; never restage merely because a pending path
 disappeared.
 

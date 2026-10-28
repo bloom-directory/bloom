@@ -38,6 +38,15 @@ pub struct Config {
     /// Outbox stage TTL.
     #[serde(default = "default_stage_ttl", with = "humantime_serde")]
     pub stage_ttl: std::time::Duration,
+    /// How long mounted wallet reads reuse one Broker projection refresh.
+    /// Each refresh costs several Broker requests per wallet, so a shorter
+    /// window spends Broker's request quota faster. Mounted wallet files may
+    /// be this stale; authority always comes from Broker.
+    #[serde(
+        default = "default_wallet_projection_max_age",
+        with = "humantime_serde"
+    )]
+    pub wallet_projection_max_age: std::time::Duration,
     /// Map of chain name -> spec.
     #[serde(default)]
     pub chains: BTreeMap<String, ChainSpec>,
@@ -62,6 +71,25 @@ pub struct Config {
     /// reads.
     #[serde(default)]
     pub backends: BackendsConfig,
+    /// Local Model Context Protocol proxy over the VFS command surface.
+    /// Disabled by default; nothing starts an MCP server without an
+    /// explicit `[mcp] enabled = true`.
+    #[serde(default)]
+    pub mcp: McpConfig,
+}
+
+/// Gate for the `bloom mcp serve` stdio proxy.
+///
+/// The proxy exposes the same `lookup`/`read`/`write`/`write_with_lookup`/
+/// `list` command surface the CLI uses, so it is off unless an operator turns
+/// it on. Absent `[mcp]` block, absent `enabled` key, and a fresh
+/// [`Config::local_default`] all mean disabled.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpConfig {
+    /// Whether an MCP server may start at all. Disabled by default.
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -206,6 +234,9 @@ fn default_chain_name() -> String {
 fn default_stage_ttl() -> std::time::Duration {
     std::time::Duration::from_secs(3600)
 }
+fn default_wallet_projection_max_age() -> std::time::Duration {
+    std::time::Duration::from_secs(1)
+}
 fn default_etherscan_url() -> String {
     "https://api.etherscan.io/v2/api".to_string()
 }
@@ -257,7 +288,7 @@ fn default_chains() -> BTreeMap<String, ChainSpec> {
             1,
             &[
                 "https://ethereum-rpc.publicnode.com",
-                "https://eth.llamarpc.com",
+                "https://ethereum.drpc.org",
             ],
             "Ethereum Mainnet",
             "ETH",
@@ -265,7 +296,12 @@ fn default_chains() -> BTreeMap<String, ChainSpec> {
         evm_chain(
             "base",
             8453,
-            &["https://mainnet.base.org", "https://base.llamarpc.com"],
+            &[
+                "https://base-rpc.publicnode.com",
+                "https://base.drpc.org",
+                "https://base.gateway.tenderly.co",
+                "https://mainnet.base.org",
+            ],
             "Base Mainnet",
             "ETH",
         )
@@ -363,7 +399,6 @@ fn default_chains() -> BTreeMap<String, ChainSpec> {
             "HYPE",
         ),
         evm_chain("arc", 5_042, &["https://rpc.arc-scan.org"], "Arc", "USDC"),
-        ChainSpec::anvil_default(),
     ] {
         chains.insert(spec.name.clone(), spec);
     }
@@ -371,7 +406,9 @@ fn default_chains() -> BTreeMap<String, ChainSpec> {
 }
 
 impl Config {
-    /// An agentic-wallet default: public EVM networks, Anvil, and Solana mainnet.
+    /// An agentic-wallet default: public EVM networks and Solana mainnet. A local
+    /// Anvil node is opt-in; an unreachable default endpoint stalls every read of
+    /// its chain files.
     ///
     /// Broadcast is enabled by default on every chain. Signing, policy,
     /// confirmation, and Sealed Approval gates still apply to value-moving
@@ -384,6 +421,7 @@ impl Config {
             default_wallet: None,
             default_chain: default_chain_name(),
             stage_ttl: default_stage_ttl(),
+            wallet_projection_max_age: default_wallet_projection_max_age(),
             chains,
             solana_chains: BTreeMap::from([(
                 "solana-mainnet".into(),
@@ -406,6 +444,7 @@ impl Config {
             mempool: BTreeMap::new(),
             private_rpc: BTreeMap::new(),
             backends: BackendsConfig::default(),
+            mcp: McpConfig::default(),
         }
     }
 
@@ -665,7 +704,7 @@ mod tests {
         assert!(cfg.etherscan.is_none());
         assert!(cfg.petals.preinstalled.is_empty());
         assert!(!toml::to_string(&cfg).unwrap().contains("allow_broadcast"));
-        assert_eq!(cfg.chains.len(), 14);
+        assert_eq!(cfg.chains.len(), 13);
         assert_eq!(cfg.solana_chains.len(), 1);
         let solana = cfg
             .solana_chains
@@ -682,6 +721,26 @@ mod tests {
         assert!(!ethereum.rpc_urls.is_empty());
         let base = cfg.chains.get("base").expect("base entry");
         assert_eq!(base.chain_id, 8453);
+        // Base carried one reachable endpoint and it rate-limits: 11 of 25
+        // sequential `eth_call`s to `mainnet.base.org` return -32016, which
+        // reads as a broken Petal rather than a thin endpoint list. Keep it
+        // last, behind spares that survive the same burst, and pin the list so
+        // a revert is caught here.
+        assert_eq!(
+            base.rpc_urls,
+            vec![
+                "https://base-rpc.publicnode.com",
+                "https://base.drpc.org",
+                "https://base.gateway.tenderly.co",
+                "https://mainnet.base.org",
+            ]
+        );
+        assert!(
+            !cfg.chains
+                .values()
+                .any(|spec| spec.rpc_urls.iter().any(|url| url.contains("llamarpc"))),
+            "llamarpc endpoints stopped resolving; no default chain should depend on one"
+        );
         let tempo = cfg.chains.get("tempo").expect("tempo entry");
         assert_eq!(tempo.chain_id, 4217);
         assert_eq!(tempo.rpc_urls, vec!["https://rpc.tempo.xyz"]);
@@ -701,9 +760,10 @@ mod tests {
         assert_eq!(arc.display_name.as_deref(), Some("Arc"));
         assert_eq!(arc.native_symbol, "USDC");
         assert_eq!(arc.native_decimals, 18);
-        let anvil = cfg.chains.get("anvil").expect("anvil entry");
-        assert_eq!(anvil.chain_id, 31337);
-        assert!(!anvil.rpc_urls.is_empty());
+        assert!(
+            !cfg.chains.contains_key("anvil"),
+            "a local Anvil node is opt-in, not a default chain"
+        );
         // Default backends: metadata + history -> Etherscan, rest -> RPC.
         assert_eq!(cfg.backends.contract_metadata, Backend::Etherscan);
         assert_eq!(cfg.backends.address_history, Backend::Etherscan);
@@ -937,6 +997,69 @@ mod tests {
     }
 
     #[test]
+    fn mcp_is_disabled_by_default_and_on_configs_predating_the_block() {
+        assert!(!McpConfig::default().enabled);
+        assert!(!Config::local_default().mcp.enabled);
+
+        let td = tempdir().unwrap();
+        let path = td.path().join("config.toml");
+        // A config written before `[mcp]` existed must keep loading, disabled.
+        std::fs::write(
+            &path,
+            r#"
+default_chain = "ethereum"
+
+[chains.ethereum]
+name = "ethereum"
+chain_id = 1
+rpc_urls = ["https://ethereum-rpc.publicnode.com"]
+"#,
+        )
+        .unwrap();
+        assert!(!Config::load(&path).unwrap().mcp.enabled);
+
+        // An empty `[mcp]` block is still "off"; enabling has to be explicit.
+        std::fs::write(
+            &path,
+            r#"
+default_chain = "ethereum"
+
+[mcp]
+
+[chains.ethereum]
+name = "ethereum"
+chain_id = 1
+rpc_urls = ["https://ethereum-rpc.publicnode.com"]
+"#,
+        )
+        .unwrap();
+        assert!(!Config::load(&path).unwrap().mcp.enabled);
+    }
+
+    #[test]
+    fn mcp_enablement_is_explicit_and_survives_save_load() {
+        let td = tempdir().unwrap();
+        let path = td.path().join("config.toml");
+        let mut cfg = Config::local_default();
+        cfg.mcp.enabled = true;
+        cfg.save(&path).unwrap();
+        assert!(
+            std::fs::read_to_string(&path).unwrap().contains("enabled"),
+            "saved config must spell out the mcp flag"
+        );
+        assert!(Config::load(&path).unwrap().mcp.enabled);
+    }
+
+    #[test]
+    fn unknown_mcp_key_is_rejected() {
+        let err = toml::from_str::<McpConfig>("enabled = true\ntransport = \"tcp\"\n").unwrap_err();
+        assert!(
+            err.to_string().contains("unknown field `transport`"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn toml_round_trip_default() {
         let cfg = Config::local_default();
         let s = toml::to_string_pretty(&cfg).unwrap();
@@ -1131,19 +1254,35 @@ allow_broadcast = true
         )
         .unwrap();
         assert!(cfg.default_wallet.is_none());
+        assert_eq!(
+            cfg.wallet_projection_max_age,
+            std::time::Duration::from_secs(1)
+        );
         cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn wallet_projection_max_age_accepts_durations_including_zero() {
+        for (value, expected) in [("250ms", 250), ("0s", 0)] {
+            let cfg: Config =
+                toml::from_str(&format!("wallet_projection_max_age = \"{value}\"")).unwrap();
+            assert_eq!(
+                cfg.wallet_projection_max_age,
+                std::time::Duration::from_millis(expected)
+            );
+        }
     }
 
     #[test]
     fn validate_rejects_key_name_mismatch() {
         let mut cfg = Config::local_default();
-        let mut spec = cfg.chains.remove("anvil").unwrap();
+        let mut spec = cfg.chains.remove("ethereum").unwrap();
         spec.name = "renamed".to_string();
-        cfg.chains.insert("anvil".to_string(), spec);
+        cfg.chains.insert("ethereum".to_string(), spec);
         let err = cfg.validate().unwrap_err();
         match err {
             ConfigError::Invalid(m) => {
-                assert!(m.contains("anvil") && m.contains("renamed"), "msg: {m}")
+                assert!(m.contains("ethereum") && m.contains("renamed"), "msg: {m}")
             }
             other => panic!("expected Invalid, got {other:?}"),
         }
@@ -1152,7 +1291,7 @@ allow_broadcast = true
     #[test]
     fn config_rejects_when_both_empty() {
         let mut cfg = Config::local_default();
-        let entry = cfg.chains.get_mut("anvil").unwrap();
+        let entry = cfg.chains.get_mut("ethereum").unwrap();
         entry.rpc_urls.clear();
         entry.rpc_endpoints.clear();
         let err = cfg.validate().unwrap_err();
@@ -1171,7 +1310,7 @@ allow_broadcast = true
         // stand on its own.
         use crate::chain::EndpointSpec;
         let mut cfg = Config::local_default();
-        let entry = cfg.chains.get_mut("anvil").unwrap();
+        let entry = cfg.chains.get_mut("ethereum").unwrap();
         entry.rpc_urls.clear();
         entry.rpc_endpoints.push(EndpointSpec {
             url: "http://127.0.0.1:8545".into(),
@@ -1187,7 +1326,7 @@ allow_broadcast = true
     #[test]
     fn chain_lookup_by_name() {
         let cfg = Config::local_default();
-        assert!(cfg.chain("anvil").is_some());
+        assert!(cfg.chain("anvil").is_none(), "a local Anvil node is opt-in");
         assert!(cfg.chain("ethereum").is_some());
         assert!(cfg.chain("hyperliquid").is_some());
         assert!(cfg.chain("ghost").is_none());

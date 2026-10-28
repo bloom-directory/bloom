@@ -11,6 +11,8 @@
 //! - `wallets/registrations/<petname>/status.json`                 — public registration projection
 //! - `wallets/registrations/<petname>/result.json`                 — completed registration result
 //! - `wallets/registrations/<petname>/cancel`                       — write `y`, `yes`, or `cancel` before acceptance
+//! - `wallets/recover`                                              — write a wallet name to prepare browser-only recovery
+//! - `wallets/recoveries/<petname>/{status.json,result.json,cancel}` — recovery lifecycle
 //! - `wallets/<wallet>/kind`                                        — wallet kind token
 //! - `wallets/<wallet>/projection.json`                             — authenticated wallet projection
 //! - `wallets/<wallet>/accounts.json`                               — derived accounts, each with its number
@@ -45,6 +47,8 @@ use std::sync::Arc;
 
 /// `wallets/<wallet>/<n>/...`: the numbered account view.
 mod accounts;
+/// `wallets/<wallet>/passkeys/...`: passkeys, nicknames and enrollment.
+mod passkeys;
 use accounts::accounts_json_with_numbers as render_accounts_json;
 
 pub use accounts::{
@@ -112,12 +116,38 @@ struct ApprovalCeremonyProjection {
 struct WalletRegistrationProjection {
     schema: String,
     requested_name: String,
+    #[serde(default)]
+    surface_selection: bloom_broker_api::CeremonySurfaceSelection,
     operation_id: bloom_broker_api::OperationId,
     ceremony_kind: bloom_broker_api::CeremonyKind,
     ceremony_state: bloom_broker_api::CeremonyState,
     ceremony_url: Option<String>,
     ceremony_expires_at_ms: Option<bloom_broker_api::DecimalU64>,
     signer_contribution_digest: bloom_broker_api::Digest32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct WalletRecoveryProjection {
+    schema: String,
+    requested_name: String,
+    #[serde(default)]
+    surface_selection: bloom_broker_api::CeremonySurfaceSelection,
+    operation_id: bloom_broker_api::OperationId,
+    ceremony_kind: bloom_broker_api::CeremonyKind,
+    ceremony_state: bloom_broker_api::CeremonyState,
+    ceremony_url: Option<String>,
+    ceremony_expires_at_ms: Option<bloom_broker_api::DecimalU64>,
+    signer_contribution_digest: bloom_broker_api::Digest32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct WalletRecoveryIntent {
+    schema: String,
+    requested_name: String,
+    surface_selection: bloom_broker_api::CeremonySurfaceSelection,
+    operation_id: bloom_broker_api::OperationId,
 }
 
 impl TriadPolicyUpdateProjection {
@@ -287,6 +317,16 @@ pub struct WalletsHandler {
     pub wallet_projections: Option<Arc<dyn WalletProjectionReader>>,
     /// Machine-owned workflow projections; never a Broker or Signer state root.
     policy_projection_root: std::path::PathBuf,
+    /// Serializes name-keyed recovery intents across handler clones.
+    recovery_prepare_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Durable Machine-only passkey nicknames, keyed by full credential ID.
+    /// Defaults beside the workflow projections when not configured.
+    passkey_names_path: Option<std::path::PathBuf>,
+    /// Serializes nickname read-modify-write across handler clones.
+    passkey_names_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes passkey enrollment prepare and cancel across handler
+    /// clones, so concurrent writes to `passkeys/new` start one enrollment.
+    passkey_enrollment_lock: Arc<tokio::sync::Mutex<()>>,
     /// Solana transfer engines keyed by chain name, dispatching the same
     /// `chains/<chain>/outbox/...` route family as EVM for Solana chains.
     solana: Option<
@@ -320,6 +360,10 @@ impl WalletsHandler {
             broker: None,
             wallet_projections: Some(wallet_projections),
             policy_projection_root: policy_projection_root.into(),
+            recovery_prepare_lock: Arc::new(tokio::sync::Mutex::new(())),
+            passkey_names_path: None,
+            passkey_names_lock: Arc::new(tokio::sync::Mutex::new(())),
+            passkey_enrollment_lock: Arc::new(tokio::sync::Mutex::new(())),
             solana: None,
             solana_reads: None,
             account_petals: Arc::new(parking_lot::RwLock::new(None)),
@@ -391,6 +435,12 @@ impl WalletsHandler {
         self
     }
 
+    /// Keep passkey nicknames in a durable file outside the projection cache.
+    pub fn with_passkey_names_path(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.passkey_names_path = Some(path.into());
+        self
+    }
+
     pub fn with_broker(mut self, broker: Option<MachineBrokerClient>) -> Self {
         self.broker = broker;
         self
@@ -415,38 +465,75 @@ impl WalletsHandler {
     }
 
     async fn wallet_projection(&self, wallet: &str) -> Result<WalletProjection, HandlerError> {
+        self.wallet_projection_with_refresh(wallet, true).await
+    }
+
+    async fn wallet_projection_navigation(
+        &self,
+        wallet: &str,
+    ) -> Result<WalletProjection, HandlerError> {
+        self.wallet_projection_with_refresh(wallet, false).await
+    }
+
+    async fn wallet_projection_with_refresh(
+        &self,
+        wallet: &str,
+        live: bool,
+    ) -> Result<WalletProjection, HandlerError> {
         let wallet_id = bloom_broker_api::Token::new(wallet.to_owned())
             .map_err(|error| HandlerError::invalid(error.to_string()))?;
-        self.wallet_projections
-            .as_ref()
-            .ok_or_else(|| {
-                HandlerError::backend(
-                    "SERVICE_UNAVAILABLE: Machine wallet projection reader is not configured",
-                )
-            })?
-            .get_wallet(&wallet_id)
-            .await
-            .map_err(|error| {
-                // A wallet that is not registered is absent, not broken. The
-                // projection reader reports it as an invalid request; to a
-                // filesystem client that must be ENOENT, or `ls` of a mistyped
-                // wallet name looks like the machine is failing.
-                let absent = error.code == ProtocolErrorCode::BackendInvalidRequest
-                    && (error.message == format!("wallet {wallet} not found")
-                        || error.message == format!("wallet {wallet} was deleted"));
-                if absent {
-                    HandlerError::not_found(wallet.to_owned())
-                } else {
-                    HandlerError::backend(error.to_string())
-                }
-            })
+        let projections = self.wallet_projections.as_ref().ok_or_else(|| {
+            HandlerError::backend(
+                "SERVICE_UNAVAILABLE: Machine wallet projection reader is not configured",
+            )
+        })?;
+        let result = if live {
+            projections.get_wallet(&wallet_id).await
+        } else {
+            projections.get_wallet_navigation(&wallet_id).await
+        };
+        Self::map_wallet_projection(wallet, result)
+    }
+
+    async fn wallet_projection_authority(
+        &self,
+        wallet: &str,
+    ) -> Result<WalletProjection, HandlerError> {
+        let wallet_id = bloom_broker_api::Token::new(wallet.to_owned())
+            .map_err(|error| HandlerError::invalid(error.to_string()))?;
+        let projections = self.wallet_projections.as_ref().ok_or_else(|| {
+            HandlerError::backend(
+                "SERVICE_UNAVAILABLE: Machine wallet projection reader is not configured",
+            )
+        })?;
+        Self::map_wallet_projection(wallet, projections.get_wallet_authority(&wallet_id).await)
+    }
+
+    fn map_wallet_projection(
+        wallet: &str,
+        result: Result<WalletProjection, bloom_broker_api::ProtocolError>,
+    ) -> Result<WalletProjection, HandlerError> {
+        result.map_err(|error| {
+            // A wallet that is not registered is absent, not broken. The
+            // projection reader reports it as an invalid request; to a
+            // filesystem client that must be ENOENT, or `ls` of a mistyped
+            // wallet name looks like the machine is failing.
+            let absent = error.code == ProtocolErrorCode::BackendInvalidRequest
+                && (error.message == format!("wallet {wallet} not found")
+                    || error.message == format!("wallet {wallet} was deleted"));
+            if absent {
+                HandlerError::not_found(wallet.to_owned())
+            } else {
+                HandlerError::backend(error.to_string())
+            }
+        })
     }
 
     async fn wallet_projection_list(&self) -> Result<Vec<WalletProjection>, HandlerError> {
         let Some(projections) = &self.wallet_projections else {
             return Ok(Vec::new());
         };
-        match projections.list_wallets().await {
+        match projections.list_wallets_navigation().await {
             Ok(wallets) => Ok(wallets),
             // Root directory enumeration is navigation, not an authority
             // decision. Prefer a previously authenticated cache when the live
@@ -478,7 +565,12 @@ impl WalletsHandler {
             .map_err(err_be)?
             .parse()
             .map_err(|error| HandlerError::invalid(format!("wallet address: {error}")))?;
-        let policy = crate::advisory_evm_policy(&projection, chain).map_err(err_be)?;
+        let client = self
+            .chains
+            .get(chain)
+            .ok_or_else(|| HandlerError::invalid(format!("chain '{chain}' is not configured")))?;
+        let policy = crate::advisory_exact_evm_policy(&projection, chain, client.spec().chain_id)
+            .map_err(err_be)?;
         Ok((address, policy))
     }
 
@@ -638,12 +730,30 @@ impl WalletsHandler {
         if data.len() > MAX_REQUEST_BYTES {
             return Err(HandlerError::invalid("wallet name is too large"));
         }
-        let requested_name = std::str::from_utf8(data)
-            .map_err(|error| {
-                HandlerError::invalid(format!("wallet name must be valid UTF-8: {error}"))
-            })?
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct RegistrationRequest {
+            name: String,
+            #[serde(default)]
+            surface_selection: bloom_broker_api::CeremonySurfaceSelection,
+        }
+        let text = std::str::from_utf8(data)
+            .map_err(|_| HandlerError::invalid("wallet request must be valid UTF-8"))?
             .trim();
-        if requested_name.is_empty()
+        let request = if text.starts_with('{') {
+            serde_json::from_str::<RegistrationRequest>(text)
+                .map_err(|_| HandlerError::invalid("invalid wallet registration request"))?
+        } else {
+            RegistrationRequest {
+                name: text.to_owned(),
+                surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
+            }
+        };
+        let requested_name = request.name.as_str();
+        if matches!(
+            requested_name,
+            "new" | "registrations" | "recover" | "recoveries"
+        ) || requested_name.is_empty()
             || requested_name.len() > 64
             || !requested_name.chars().all(|character| {
                 character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
@@ -668,6 +778,11 @@ impl WalletsHandler {
         if let Some((_, projection)) = &existing
             && projection.ceremony_state == bloom_broker_api::CeremonyState::AwaitingUser
         {
+            if projection.surface_selection != request.surface_selection {
+                return Err(HandlerError::invalid(
+                    "a live registration already uses a different surface; cancel it before changing surface",
+                ));
+            }
             // A shell retry (or an NFS client replaying a committed write) must
             // not allocate a second Broker operation for the same live
             // registration. Refreshing also proves that the retained launch is
@@ -695,6 +810,7 @@ impl WalletsHandler {
             .prepare_custody(
                 bloom_machine_client::CustodyPrepareMethod::WalletRegistration,
                 bloom_broker_api::CustodyPrepareRequest {
+                    surface_selection: request.surface_selection,
                     ceremony_kind: bloom_broker_api::CeremonyKind::WalletRegistration,
                     custody_operation_id: operation_id.clone(),
                     wallet_id: Some(wallet_id),
@@ -726,6 +842,7 @@ impl WalletsHandler {
         let projection = WalletRegistrationProjection {
             schema: PROJECTION_SCHEMA.into(),
             requested_name: requested_name.to_owned(),
+            surface_selection: request.surface_selection,
             operation_id,
             ceremony_kind: prepared.ceremony_kind,
             ceremony_state: bloom_broker_api::CeremonyState::AwaitingUser,
@@ -788,20 +905,25 @@ impl WalletsHandler {
         }
         projection.ceremony_state = status.state;
         if status.state == bloom_broker_api::CeremonyState::AwaitingUser {
-            let ceremony_url = status
-                .ceremony_url
-                .filter(|url| !url.trim().is_empty())
-                .ok_or_else(|| {
-                    HandlerError::backend(
-                        "Broker omitted the actionable wallet registration ceremony URL",
-                    )
-                })?;
             if status.expires_at_ms.get() <= now_ms_u64() {
                 return Err(HandlerError::backend(
                     "Broker returned an expired wallet registration ceremony",
                 ));
             }
-            projection.ceremony_url = Some(ceremony_url);
+            if status
+                .ceremony_url
+                .as_ref()
+                .is_some_and(|url| url.trim().is_empty())
+            {
+                return Err(HandlerError::backend(
+                    "Broker returned an empty wallet registration ceremony URL",
+                ));
+            }
+            // A remote fragment capability is single-use. After the Browser
+            // exchanges it, Broker still owns an AWAITING_USER ceremony but
+            // correctly omits the now-spent URL. Clear our cached copy rather
+            // than resurrecting a bearer capability or inventing failure.
+            projection.ceremony_url = status.ceremony_url;
             projection.ceremony_expires_at_ms = Some(status.expires_at_ms);
         } else {
             projection.ceremony_url = None;
@@ -863,6 +985,484 @@ impl WalletsHandler {
             "wallet_id": result.wallet_id,
             "public_key_refs": result.public_key_refs,
             "credential_summaries": result.credential_summaries,
+                "surface": result.surface,
+                "credential_authority_generation": result.credential_authority_generation,
+            "initial_policy": result.initial_policy,
+            "receipt_digest": result.receipt_digest,
+            "signer_key_id": result.signer_key_id,
+            "signer_signature": result.signer_signature,
+        }))
+        .map_err(|error| HandlerError::backend(error.to_string()))?;
+        bytes.push(b'\n');
+        Ok(bytes)
+    }
+
+    fn recovery_root(&self) -> std::path::PathBuf {
+        self.policy_projection_root.join("recoveries")
+    }
+
+    fn recovery_path(&self, requested_name: &str) -> std::path::PathBuf {
+        self.recovery_root().join(format!("{requested_name}.json"))
+    }
+
+    fn recovery_intent_path(&self, requested_name: &str) -> std::path::PathBuf {
+        self.recovery_root()
+            .join("intents")
+            .join(format!("{requested_name}.json"))
+    }
+
+    fn recovery_records(
+        &self,
+    ) -> Result<Vec<(std::path::PathBuf, WalletRecoveryProjection)>, HandlerError> {
+        let root = self.recovery_root();
+        let mut records = Vec::new();
+        let entries = match std::fs::read_dir(root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(records),
+            Err(error) => return Err(error.into()),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let projection: WalletRecoveryProjection = read_json(&path)?;
+            let stem = path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .ok_or_else(|| HandlerError::backend("recovery projection filename is invalid"))?;
+            if projection.schema != "bloom.machine-wallet-recovery-projection.1"
+                || projection.ceremony_kind != bloom_broker_api::CeremonyKind::WalletRecovery
+                || Self::wallet_id(&projection.requested_name).is_err()
+                || stem != projection.requested_name
+            {
+                return Err(HandlerError::backend(
+                    "Machine wallet recovery projection identity is invalid",
+                ));
+            }
+            if records.iter().any(
+                |(_, existing): &(std::path::PathBuf, WalletRecoveryProjection)| {
+                    existing.requested_name == projection.requested_name
+                },
+            ) {
+                return Err(HandlerError::backend(
+                    "multiple wallet recovery projections claim the same petname",
+                ));
+            }
+            records.push((path, projection));
+        }
+        Ok(records)
+    }
+
+    fn recovery_names(&self) -> Result<Vec<String>, HandlerError> {
+        let mut names = self
+            .recovery_records()?
+            .into_iter()
+            .map(|(_, projection)| projection.requested_name)
+            .collect::<Vec<_>>();
+        names.sort();
+        if names.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(HandlerError::backend(
+                "multiple wallet recovery projections claim the same petname",
+            ));
+        }
+        Ok(names)
+    }
+
+    fn recovery_record(
+        &self,
+        requested_name: &str,
+    ) -> Result<(std::path::PathBuf, WalletRecoveryProjection), HandlerError> {
+        Self::wallet_id(requested_name)?;
+        let mut matches = self
+            .recovery_records()?
+            .into_iter()
+            .filter(|(_, projection)| projection.requested_name == requested_name);
+        let record = matches.next().ok_or_else(|| {
+            HandlerError::not_found(format!("wallet recovery {requested_name:?}"))
+        })?;
+        if matches.next().is_some() {
+            return Err(HandlerError::backend(
+                "multiple wallet recovery projections claim the same petname",
+            ));
+        }
+        Ok(record)
+    }
+
+    fn recovery_result_ready(projection: &WalletRecoveryProjection) -> bool {
+        Some(projection.ceremony_state)
+            == bloom_broker_api::CeremonyKind::WalletRecovery.successful_terminal_state()
+    }
+
+    fn recovery_terminal(state: bloom_broker_api::CeremonyState) -> bool {
+        matches!(
+            state,
+            bloom_broker_api::CeremonyState::Completed
+                | bloom_broker_api::CeremonyState::Succeeded
+                | bloom_broker_api::CeremonyState::Cancelled
+                | bloom_broker_api::CeremonyState::Expired
+                | bloom_broker_api::CeremonyState::Failed
+        )
+    }
+
+    fn recovery_status_entry(projection: &WalletRecoveryProjection) -> Result<Entry, HandlerError> {
+        let size = serde_json::to_vec_pretty(projection)
+            .map_err(|error| HandlerError::backend(error.to_string()))?
+            .len()
+            .saturating_add(1);
+        Ok(Entry::file("status.json").with_size(size as u64))
+    }
+
+    async fn prepare_wallet_recovery(&self, data: &[u8]) -> Result<(), HandlerError> {
+        use sha2::Digest as _;
+
+        let _prepare_guard = self.recovery_prepare_lock.lock().await;
+
+        const PROJECTION_SCHEMA: &str = "bloom.machine-wallet-recovery-projection.1";
+        const MAX_REQUEST_BYTES: usize = 4096;
+        if data.len() > MAX_REQUEST_BYTES {
+            return Err(HandlerError::invalid("wallet name is too large"));
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct RecoveryRequest {
+            name: String,
+            #[serde(default)]
+            surface_selection: bloom_broker_api::CeremonySurfaceSelection,
+        }
+        let text = std::str::from_utf8(data)
+            .map_err(|_| HandlerError::invalid("wallet request must be valid UTF-8"))?
+            .trim();
+        let request = if text.starts_with('{') {
+            serde_json::from_str::<RecoveryRequest>(text)
+                .map_err(|_| HandlerError::invalid("invalid wallet recovery request"))?
+        } else {
+            RecoveryRequest {
+                name: text.to_owned(),
+                surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
+            }
+        };
+        let requested_name = request.name.as_str();
+        if matches!(
+            requested_name,
+            "new" | "registrations" | "recover" | "recoveries"
+        ) || requested_name.is_empty()
+            || requested_name.len() > 64
+            || !requested_name.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+            })
+        {
+            return Err(HandlerError::invalid(
+                "wallet name must be 1-64 ASCII alphanumeric, '-' or '_' characters",
+            ));
+        }
+        let wallet_id = bloom_broker_api::Token::new(requested_name.to_owned())
+            .map_err(|error| HandlerError::invalid(error.to_string()))?;
+        let mut existing_records = self
+            .recovery_records()?
+            .into_iter()
+            .filter(|(_, existing)| existing.requested_name == requested_name);
+        let existing = existing_records.next();
+        if existing_records.next().is_some() {
+            return Err(HandlerError::backend(
+                "multiple wallet recovery projections claim the same petname",
+            ));
+        }
+        if let Some((_, projection)) = &existing
+            && !Self::recovery_terminal(projection.ceremony_state)
+        {
+            if projection.surface_selection != request.surface_selection {
+                return Err(HandlerError::invalid(
+                    "a live recovery already uses a different surface; cancel it before changing surface",
+                ));
+            }
+            // A shell retry (or an NFS client replaying a committed write) must
+            // not allocate a second Broker operation for the same live
+            // recovery. Refreshing also proves that the retained launch is
+            // still actionable before reporting the retry as successful.
+            let refreshed = self.recovery_projection_unlocked(requested_name).await?;
+            if !Self::recovery_terminal(refreshed.ceremony_state) {
+                return Ok(());
+            }
+        }
+        let recovery_path = self.recovery_path(requested_name);
+        let intent_path = self.recovery_intent_path(requested_name);
+        let retained_intent = match std::fs::read(&intent_path) {
+            Ok(bytes) => {
+                let intent: WalletRecoveryIntent = serde_json::from_slice(&bytes)
+                    .map_err(|error| HandlerError::backend(format!("recovery intent: {error}")))?;
+                if intent.schema != "bloom.machine-wallet-recovery-intent.1"
+                    || intent.requested_name != requested_name
+                {
+                    return Err(HandlerError::backend("recovery intent identity is invalid"));
+                }
+                Some(intent)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        // A previous response may have been persisted before intent cleanup.
+        // In that case the projection is authoritative about the old attempt.
+        let retained_intent = match (retained_intent, &existing) {
+            (Some(intent), Some((_, projection)))
+                if intent.operation_id == projection.operation_id =>
+            {
+                std::fs::remove_file(&intent_path)?;
+                None
+            }
+            (intent, _) => intent,
+        };
+        let reused_intent = retained_intent.is_some();
+        let intent = if let Some(mut intent) = retained_intent {
+            if intent.surface_selection != request.surface_selection {
+                // No projection exists for this intent, so Broker never
+                // confirmed it. Retrying on the requested surface keeps the
+                // same operation ID: a surface Broker refused outright (for
+                // example remote while the hosted relay is pending) can be
+                // replaced, while an operation Signer did accept on the old
+                // surface rejects the retry instead of gaining a second one.
+                intent.surface_selection = request.surface_selection;
+                write_atomic_json(&intent_path, &intent)?;
+            }
+            intent
+        } else {
+            let mut operation_bytes = [0_u8; 32];
+            rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut operation_bytes);
+            let intent = WalletRecoveryIntent {
+                schema: "bloom.machine-wallet-recovery-intent.1".into(),
+                requested_name: requested_name.to_owned(),
+                surface_selection: request.surface_selection,
+                operation_id: bloom_broker_api::OperationId::from_bytes(operation_bytes),
+            };
+            write_atomic_json(&intent_path, &intent)?;
+            intent
+        };
+        let operation_id = intent.operation_id.clone();
+        let reviewed_terms = serde_jcs::to_vec(&serde_json::json!({
+            "ceremony_kind": bloom_broker_api::CeremonyKind::WalletRecovery,
+            "wallet_id": wallet_id,
+            "operation_id": operation_id,
+        }))
+        .map_err(|error| HandlerError::invalid(format!("canonicalize recovery: {error}")))?;
+        let prepared = self
+            .custody_broker()?
+            .prepare_custody(
+                bloom_machine_client::CustodyPrepareMethod::Recovery,
+                bloom_broker_api::CustodyPrepareRequest {
+                    surface_selection: request.surface_selection,
+                    ceremony_kind: bloom_broker_api::CeremonyKind::WalletRecovery,
+                    custody_operation_id: operation_id.clone(),
+                    wallet_id: Some(wallet_id),
+                    key_ref: None,
+                    exact_terms_digest: bloom_broker_api::Digest32::from_bytes(
+                        sha2::Sha256::digest(reviewed_terms).into(),
+                    ),
+                    expected_input_class: bloom_broker_api::Token::new("recovery-factor-v1")
+                        .map_err(|error| HandlerError::invalid(error.to_string()))?,
+                    browser_output_recipient_key: None,
+                    petal_key_scope: None,
+                    legacy_passkey_migration: None,
+                    wallet_seed_profile: None,
+                    derivation_requests: Vec::new(),
+                    account_terms: None,
+                },
+            )
+            .await;
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                if reused_intent
+                    && let Ok(status) = self
+                        .custody_broker()?
+                        .ceremony_status(operation_id.clone())
+                        .await
+                    && status.operation_id == operation_id
+                    && status.ceremony_kind == bloom_broker_api::CeremonyKind::WalletRecovery
+                    && matches!(
+                        status.state,
+                        bloom_broker_api::CeremonyState::Expired
+                            | bloom_broker_api::CeremonyState::Cancelled
+                    )
+                {
+                    std::fs::remove_file(&intent_path)?;
+                    return Err(HandlerError::invalid(
+                        "the pending recovery expired or was cancelled; write the wallet name again for a fresh ceremony",
+                    ));
+                }
+                return Err(HandlerError::backend(error.to_string()));
+            }
+        };
+        if prepared.custody_operation_id != operation_id
+            || prepared.ceremony_kind != bloom_broker_api::CeremonyKind::WalletRecovery
+            || prepared.ceremony_url.trim().is_empty()
+            || prepared.ceremony_expires_at_ms.get() <= now_ms_u64()
+        {
+            return Err(HandlerError::backend(
+                "Broker returned an invalid wallet recovery prepare response",
+            ));
+        }
+        let projection = WalletRecoveryProjection {
+            schema: PROJECTION_SCHEMA.into(),
+            requested_name: requested_name.to_owned(),
+            surface_selection: request.surface_selection,
+            operation_id,
+            ceremony_kind: prepared.ceremony_kind,
+            ceremony_state: bloom_broker_api::CeremonyState::AwaitingUser,
+            ceremony_url: Some(prepared.ceremony_url),
+            ceremony_expires_at_ms: Some(prepared.ceremony_expires_at_ms),
+            signer_contribution_digest: prepared.signer_contribution_digest,
+        };
+        write_atomic_json(&recovery_path, &projection)?;
+        std::fs::remove_file(&intent_path)?;
+        Ok(())
+    }
+
+    async fn recovery_projection(
+        &self,
+        requested_name: &str,
+    ) -> Result<WalletRecoveryProjection, HandlerError> {
+        let _prepare_guard = self.recovery_prepare_lock.lock().await;
+        self.recovery_projection_unlocked(requested_name).await
+    }
+
+    async fn recovery_projection_unlocked(
+        &self,
+        requested_name: &str,
+    ) -> Result<WalletRecoveryProjection, HandlerError> {
+        let (path, mut projection) = self.recovery_record(requested_name)?;
+        if Self::recovery_terminal(projection.ceremony_state) {
+            return Ok(projection);
+        }
+        let local_launch_expired = projection
+            .ceremony_expires_at_ms
+            .as_ref()
+            .is_some_and(|expires_at| expires_at.get() <= now_ms_u64());
+        let status = match self
+            .custody_broker()?
+            .ceremony_status(projection.operation_id.clone())
+            .await
+        {
+            Ok(status) => status,
+            Err(error)
+                if local_launch_expired && error.code == ProtocolErrorCode::ServiceUnavailable =>
+            {
+                // Never infer a terminal result from the launch deadline. The
+                // owner may have completed at the boundary while Broker was
+                // becoming unavailable. Remove only the stale bearer URL and
+                // retain the operation for a later authoritative retry.
+                projection.ceremony_url = None;
+                projection.ceremony_expires_at_ms = None;
+                write_atomic_json(&path, &projection)?;
+                return Err(HandlerError::backend(error.to_string()));
+            }
+            Err(error) => return Err(HandlerError::backend(error.to_string())),
+        };
+        if status.operation_id != projection.operation_id
+            || status.ceremony_kind != bloom_broker_api::CeremonyKind::WalletRecovery
+        {
+            return Err(HandlerError::backend(
+                "Broker returned a mismatched wallet recovery status",
+            ));
+        }
+        projection.ceremony_state = status.state;
+        if status.state == bloom_broker_api::CeremonyState::AwaitingUser {
+            if status.expires_at_ms.get() <= now_ms_u64() {
+                return Err(HandlerError::backend(
+                    "Broker returned an expired wallet recovery ceremony",
+                ));
+            }
+            if status
+                .ceremony_url
+                .as_ref()
+                .is_some_and(|url| url.trim().is_empty())
+            {
+                return Err(HandlerError::backend(
+                    "Broker returned an empty wallet recovery ceremony URL",
+                ));
+            }
+            // A remote fragment capability is single-use. After the Browser
+            // exchanges it, Broker still owns an AWAITING_USER ceremony but
+            // correctly omits the now-spent URL. Clear our cached copy rather
+            // than resurrecting a bearer capability or inventing failure.
+            projection.ceremony_url = status.ceremony_url;
+            projection.ceremony_expires_at_ms = Some(status.expires_at_ms);
+        } else {
+            projection.ceremony_url = None;
+            projection.ceremony_expires_at_ms = None;
+        }
+        write_atomic_json(&path, &projection)?;
+        Ok(projection)
+    }
+
+    async fn cancel_wallet_recovery(&self, requested_name: &str) -> Result<(), HandlerError> {
+        let _prepare_guard = self.recovery_prepare_lock.lock().await;
+        let projection = self.recovery_projection_unlocked(requested_name).await?;
+        let operation_id = projection.operation_id.clone();
+        if projection.ceremony_state != bloom_broker_api::CeremonyState::AwaitingUser {
+            return Err(HandlerError::invalid(
+                "wallet recovery is no longer cancellable",
+            ));
+        }
+        let status = self
+            .custody_broker()?
+            .cancel_ceremony(operation_id.clone())
+            .await
+            .map_err(|error| HandlerError::backend(error.to_string()))?;
+        if status.operation_id != operation_id
+            || status.ceremony_kind != bloom_broker_api::CeremonyKind::WalletRecovery
+            || status.state != bloom_broker_api::CeremonyState::Cancelled
+        {
+            return Err(HandlerError::backend(
+                "Broker did not confirm wallet recovery cancellation",
+            ));
+        }
+        let _ = self.recovery_projection_unlocked(requested_name).await?;
+        Ok(())
+    }
+
+    async fn wallet_recovery_result_json(
+        &self,
+        requested_name: &str,
+    ) -> Result<Vec<u8>, HandlerError> {
+        let _prepare_guard = self.recovery_prepare_lock.lock().await;
+        let projection = self.recovery_projection_unlocked(requested_name).await?;
+        if !Self::recovery_result_ready(&projection) {
+            return Err(HandlerError::not_found(format!(
+                "wallet recovery result for {requested_name}"
+            )));
+        }
+        let operation_id = projection.operation_id;
+        let result = self
+            .custody_broker()?
+            .custody_result(bloom_broker_api::OperationRequest {
+                operation_id: operation_id.clone(),
+            })
+            .await
+            .map_err(|error| HandlerError::backend(error.to_string()))?;
+        if result.custody_operation_id != operation_id
+            || result.ceremony_kind != bloom_broker_api::CeremonyKind::WalletRecovery
+            || result
+                .wallet_id
+                .as_ref()
+                .map(|wallet_id| wallet_id.as_str())
+                != Some(requested_name)
+            || Some(result.public_status)
+                != bloom_broker_api::CeremonyKind::WalletRecovery.successful_terminal_state()
+        {
+            return Err(HandlerError::backend(
+                "Broker returned a mismatched wallet recovery result",
+            ));
+        }
+        let mut bytes = serde_json::to_vec_pretty(&serde_json::json!({
+            "ceremony_kind": result.ceremony_kind,
+            "operation_id": result.custody_operation_id,
+            "status": result.public_status,
+            "wallet_id": result.wallet_id,
+            "public_key_refs": result.public_key_refs,
+            "credential_summaries": result.credential_summaries,
+                "surface": result.surface,
+                "credential_authority_generation": result.credential_authority_generation,
             "initial_policy": result.initial_policy,
             "receipt_digest": result.receipt_digest,
             "signer_key_id": result.signer_key_id,
@@ -1709,6 +2309,13 @@ impl WalletsHandler {
                 "Broker policy baseline is noncanonical or names another wallet",
             ));
         }
+        // Rewriting the current policy changes nothing, so there is nothing
+        // to approve. Staging it anyway would open a passkey ceremony that
+        // holds the wallet's only live ceremony slot until it expires,
+        // refusing every other approval for the wallet in the meantime.
+        if proposed_policy_digest == baseline.policy_digest {
+            return Ok(());
+        }
         let authority_diff_digest =
             bloom_machine_client::claimed_policy_authority_diff_digest(&baseline_policy, &proposed)
                 .map_err(|error| HandlerError::invalid(error.to_string()))?;
@@ -2040,6 +2647,7 @@ impl WalletsHandler {
             Entry::writable_file("policy.json"),
             Entry::dir("sealed-approvals"),
             Entry::dir("policy-updates"),
+            Entry::dir("passkeys"),
         ]
     }
 }
@@ -2106,8 +2714,7 @@ fn tx_open_err(e: TxEngineError) -> HandlerError {
     match e {
         TxEngineError::ApprovalRequired(_) => HandlerError::PermissionDenied,
         TxEngineError::PolicyDenied => HandlerError::OperationNotPermitted,
-        TxEngineError::EnsoQuoteStale { .. }
-        | TxEngineError::DependencyNotSatisfied { .. }
+        TxEngineError::DependencyNotSatisfied { .. }
         | TxEngineError::SimulationReverted { .. }
         | TxEngineError::NonceGap { .. } => HandlerError::invalid(e.to_string()),
         other => err_be(other),
@@ -2259,6 +2866,65 @@ fn write_atomic_file(path: &Path, bytes: &[u8]) -> Result<(), HandlerError> {
         std::fs::File::open(parent)?.sync_all()?;
     }
     Ok(())
+}
+
+/// Why the last `confirm` of an outbox entry was refused. A mount reports a
+/// refusal only as an errno, so the reason is kept beside the entry, at
+/// `outbox/pending/<id>/last_error.json`.
+const CONFIRM_ERROR_FILE: &str = "last_error.json";
+
+fn clear_confirm_error(entry_dir: &Path) {
+    let _ = std::fs::remove_file(entry_dir.join(CONFIRM_ERROR_FILE));
+}
+
+/// Best effort, and never recreates an entry directory that has moved on:
+/// the temporary file is created inside the existing directory only.
+fn record_confirm_error(entry_dir: &Path, wallet: &str, id: &str, error: &HandlerError) {
+    use std::io::Write as _;
+
+    let message = error.to_string();
+    let (kind, next) = if message.contains("POLICY_APPROVAL_REQUIRED") {
+        (
+            "policy_approval_required",
+            format!(
+                "The wallet policy does not yet allow the Petal that staged this transaction. Give the owner the ceremony link in error (pending updates are under wallets/{wallet}/policy-updates/pending/); once they approve, write confirm again."
+            ),
+        )
+    } else {
+        (
+            "refused",
+            "Read this entry before retrying: if it is still pending, resolve the cause in error and write confirm again.".to_owned(),
+        )
+    };
+    let record = serde_json::json!({
+        "schema": "bloom.outbox-confirm-error/1",
+        "tx_id": id,
+        "at_ms": now_ms_u128() as u64,
+        "kind": kind,
+        "error": message,
+        "next": next,
+    });
+    let Ok(bytes) = serde_json::to_vec_pretty(&record) else {
+        return;
+    };
+    let mut nonce = [0_u8; 16];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
+    let tmp = entry_dir.join(format!(".{CONFIRM_ERROR_FILE}.tmp-{}", hex::encode(nonce)));
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let written = options.open(&tmp).and_then(|mut file| {
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, entry_dir.join(CONFIRM_ERROR_FILE))
+    });
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
 
 fn write_atomic_json(path: &Path, value: &impl serde::Serialize) -> Result<(), HandlerError> {
@@ -2738,6 +3404,35 @@ impl WalletsHandler {
         if segs.len() == 1 && segs[0] == "new" {
             return Ok(Entry::writable_file("new"));
         }
+        if segs.len() == 1 && segs[0] == "recover" {
+            return Ok(Entry::writable_file("recover"));
+        }
+        if segs[0] == "recoveries" {
+            return match segs {
+                [_] => Ok(Entry::dir("recoveries")),
+                [_, requested_name] => {
+                    let _ = self.recovery_record(requested_name)?;
+                    Ok(Entry::dir(requested_name))
+                }
+                [_, requested_name, leaf] if leaf == "status.json" => {
+                    let (_, projection) = self.recovery_record(requested_name)?;
+                    Self::recovery_status_entry(&projection)
+                }
+                [_, requested_name, leaf] if leaf == "result.json" => {
+                    let projection = self.recovery_projection(requested_name).await?;
+                    if Self::recovery_result_ready(&projection) {
+                        Ok(Entry::file(leaf))
+                    } else {
+                        Err(HandlerError::not_found(path.to_string_path()))
+                    }
+                }
+                [_, requested_name, leaf] if leaf == "cancel" => {
+                    let _ = self.recovery_record(requested_name)?;
+                    Ok(Entry::writable_file("cancel"))
+                }
+                _ => Err(HandlerError::not_found(path.to_string_path())),
+            };
+        }
         if segs[0] == "registrations" {
             return match segs {
                 [_] => Ok(Entry::dir("registrations")),
@@ -2765,9 +3460,13 @@ impl WalletsHandler {
             };
         }
         let wallet = &segs[0];
-        let _projection = self.wallet_projection(wallet).await?;
+        // Lookup and listing are navigation: reuse a recent observation.
+        let projection = self.wallet_projection_navigation(wallet).await?;
         if segs.len() == 1 {
             return Ok(Entry::dir(wallet));
+        }
+        if segs[1] == "passkeys" {
+            return self.lookup_passkeys(wallet, &projection, &segs[2..]).await;
         }
         if let Some(number) = parse_account_segment(&segs[1]) {
             return self.lookup_account(wallet, number, &segs[2..]).await;
@@ -2884,7 +3583,10 @@ impl WalletsHandler {
         if segs.len() == 1 && segs[0] == "new" {
             return Ok(b"Write a wallet name matching [A-Za-z0-9_-]{1,64}.\n".to_vec());
         }
-        if segs.len() == 1 && segs[0] != "registrations" {
+        if segs.len() == 1 && segs[0] == "recover" {
+            return Ok(b"Write the wallet name to start browser-only recovery.\n".to_vec());
+        }
+        if segs.len() == 1 && segs[0] != "registrations" && segs[0] != "recoveries" {
             // Reading a wallet directory is EISDIR, but only if the wallet is
             // there. Answering "is a directory" for a name that does not exist
             // tells the caller the opposite of the truth.
@@ -2910,12 +3612,34 @@ impl WalletsHandler {
                 _ => Err(HandlerError::NotAFile(path.to_string_path())),
             };
         }
+        if segs[0] == "recoveries" {
+            return match segs {
+                [_, requested_name, leaf] if leaf == "status.json" => {
+                    let projection = self.recovery_projection(requested_name).await?;
+                    let mut bytes = serde_json::to_vec_pretty(&projection)
+                        .map_err(|error| HandlerError::backend(error.to_string()))?;
+                    bytes.push(b'\n');
+                    Ok(bytes)
+                }
+                [_, requested_name, leaf] if leaf == "result.json" => {
+                    let projection = self.recovery_projection(requested_name).await?;
+                    if !Self::recovery_result_ready(&projection) {
+                        return Err(HandlerError::not_found(path.to_string_path()));
+                    }
+                    self.wallet_recovery_result_json(requested_name).await
+                }
+                _ => Err(HandlerError::NotAFile(path.to_string_path())),
+            };
+        }
         let wallet = &segs[0];
         if let Some(number) = segs
             .get(1)
             .and_then(|segment| parse_account_segment(segment))
         {
             return self.read_account(wallet, number, &segs[2..]).await;
+        }
+        if segs.get(1).map(String::as_str) == Some("passkeys") {
+            return self.read_passkeys(wallet, &segs[2..]).await;
         }
         match segs.get(1).map(|s| s.as_str()).unwrap_or("") {
             "accounts.json" => {
@@ -3017,6 +3741,32 @@ impl WalletsHandler {
             self.write_permit()?;
             return self.prepare_wallet_registration(data).await;
         }
+        if segs.len() == 1 && segs[0] == "recover" {
+            self.write_permit()?;
+            return self.prepare_wallet_recovery(data).await;
+        }
+        if segs[0] == "recoveries" {
+            if let [_, requested_name, leaf] = segs
+                && leaf == "cancel"
+            {
+                self.write_permit()?;
+                let confirmation = std::str::from_utf8(data)
+                    .map_err(|_| {
+                        HandlerError::invalid("recovery cancellation requires UTF-8 confirmation")
+                    })?
+                    .trim();
+                if !confirmation.eq_ignore_ascii_case("y")
+                    && !confirmation.eq_ignore_ascii_case("yes")
+                    && !confirmation.eq_ignore_ascii_case("cancel")
+                {
+                    return Err(HandlerError::invalid(
+                        "recovery cancellation accepts only `y`, `yes`, or `cancel`",
+                    ));
+                }
+                return self.cancel_wallet_recovery(requested_name).await;
+            }
+            return Err(HandlerError::PermissionDenied);
+        }
         if segs[0] == "registrations" {
             if let [_, requested_name, leaf] = segs
                 && leaf == "cancel"
@@ -3047,6 +3797,9 @@ impl WalletsHandler {
             .and_then(|segment| parse_account_segment(segment))
         {
             return self.write_account(wallet, number, &segs[2..], data).await;
+        }
+        if segs.get(1).map(String::as_str) == Some("passkeys") {
+            return self.write_passkeys(wallet, &segs[2..], data).await;
         }
         if segs.len() == 2 && segs[1] == "policy.json" {
             self.write_permit()?;
@@ -3106,7 +3859,30 @@ impl WalletsHandler {
                 .collect();
             out.push(Entry::writable_file("new"));
             out.push(Entry::dir("registrations"));
+            out.push(Entry::writable_file("recover"));
+            out.push(Entry::dir("recoveries"));
             return Ok(out);
+        }
+        if segs[0] == "recoveries" {
+            return match segs {
+                [_] => Ok(self
+                    .recovery_names()?
+                    .into_iter()
+                    .map(|name| Entry::dir(&name))
+                    .collect()),
+                [_, requested_name] => {
+                    let (_, projection) = self.recovery_record(requested_name)?;
+                    let mut entries = vec![
+                        Self::recovery_status_entry(&projection)?,
+                        Entry::writable_file("cancel"),
+                    ];
+                    if Self::recovery_result_ready(&projection) {
+                        entries.push(Entry::file("result.json"));
+                    }
+                    Ok(entries)
+                }
+                _ => Err(HandlerError::NotADir(path.to_string_path())),
+            };
         }
         if segs[0] == "registrations" {
             return match segs {
@@ -3133,12 +3909,16 @@ impl WalletsHandler {
             };
         }
         let wallet = &segs[0];
-        let _projection = self.wallet_projection(wallet).await?;
+        // Lookup and listing are navigation: reuse a recent observation.
+        let projection = self.wallet_projection_navigation(wallet).await?;
         if let Some(number) = segs
             .get(1)
             .and_then(|segment| parse_account_segment(segment))
         {
             return self.list_account(wallet, number, &segs[2..]).await;
+        }
+        if segs.get(1).map(String::as_str) == Some("passkeys") {
+            return self.list_passkeys(wallet, &projection, &segs[2..]).await;
         }
         match segs.len() {
             1 => {
@@ -3261,19 +4041,26 @@ impl WalletsHandler {
         &self,
         wallet: &str,
         selector: Option<&str>,
+        unsigned_stage: bool,
     ) -> Result<SolanaAccount, HandlerError> {
         // Resolve through the cached authenticated inventory like the
         // numbered tree does, so reads and staging carry no live Broker
         // side effect. A stale-marked projection is re-observed live
         // before anything spends from it, because the cache may predate a
         // retirement or a new sibling.
-        let projection = self.wallet_projection(wallet).await?;
+        let projection = if unsigned_stage {
+            self.wallet_projection_navigation(wallet).await?
+        } else {
+            self.wallet_projection(wallet).await?
+        };
         let mut accounts = projection
             .account_inventory()
             .map_err(err_be)?
             .accounts
             .clone();
-        if projection.freshness == bloom_machine_client::ProjectionFreshness::Stale {
+        if !unsigned_stage
+            && projection.freshness == bloom_machine_client::ProjectionFreshness::Stale
+        {
             let broker = self.broker.as_ref().ok_or_else(|| {
                 HandlerError::backend(
                     "the cached Solana account inventory is stale and the Broker edge is \
@@ -3367,7 +4154,7 @@ impl WalletsHandler {
                 intent.account_fingerprint = Some(pinned.fingerprint.to_owned());
                 let destination = intent.destination_bytes().map_err(HandlerError::invalid)?;
                 let child = self
-                    .resolve_solana_child(wallet, intent.account_fingerprint.as_deref())
+                    .resolve_solana_child(wallet, intent.account_fingerprint.as_deref(), true)
                     .await?;
                 let staged = engine
                     .stage(
@@ -3416,7 +4203,11 @@ impl WalletsHandler {
                 // against. Resolving the wallet's children again would let a
                 // second active child sign a message staged for the first.
                 let child = self
-                    .resolve_solana_child(wallet, entry.staged.account_fingerprint.as_deref())
+                    .resolve_solana_child(
+                        wallet,
+                        entry.staged.account_fingerprint.as_deref(),
+                        false,
+                    )
                     .await?;
                 let approval_id = std::fs::read(
                     entry
@@ -3553,7 +4344,11 @@ impl WalletsHandler {
                     .map_err(solana_outbox_err)?;
                 require_pinned(&expired.staged, id)?;
                 let child = self
-                    .resolve_solana_child(wallet, expired.staged.account_fingerprint.as_deref())
+                    .resolve_solana_child(
+                        wallet,
+                        expired.staged.account_fingerprint.as_deref(),
+                        false,
+                    )
                     .await?;
                 let replacement = engine
                     .restage_expired(wallet, id, &child.pubkey, now_ms_u128())
@@ -3662,28 +4457,43 @@ impl WalletsHandler {
                 } else {
                     first_confirm_line(confirm_text)
                 };
-                self.require_outbox_petal_eligibility(wallet, chain, id)
-                    .await?;
-                let _staged = self
+                let entry_dir = self
                     .tx_engine
-                    .confirm(
-                        self.write_permit()?,
-                        wallet,
-                        chain,
-                        id,
-                        &client,
-                        policy,
-                        confirm_text,
-                    )
-                    .await
-                    .map_err(|e| match e {
-                        TxEngineError::EnsoQuoteStale { .. } => {
-                            HandlerError::invalid(e.to_string())
-                        }
-                        TxEngineError::ApprovalRequired(_) => HandlerError::PermissionDenied,
-                        other => err_be(other),
-                    })?;
-                Ok(())
+                    .outbox
+                    .read(wallet, chain, id)
+                    .map_err(err_be)?
+                    .dir;
+                clear_confirm_error(&entry_dir);
+                let result = async {
+                    self.require_outbox_petal_eligibility(wallet, chain, id)
+                        .await?;
+                    self.tx_engine
+                        .confirm(
+                            self.write_permit()?,
+                            wallet,
+                            chain,
+                            id,
+                            &client,
+                            policy,
+                            confirm_text,
+                        )
+                        .await
+                        .map_err(|e| match e {
+                            TxEngineError::ApprovalRequired(_) => HandlerError::PermissionDenied,
+                            other => err_be(other),
+                        })
+                }
+                .await;
+                match result {
+                    Ok(_staged) => Ok(()),
+                    // A pending owner approval has its own projection,
+                    // approval_challenge.json; anything else is recorded.
+                    Err(HandlerError::PermissionDenied) => Err(HandlerError::PermissionDenied),
+                    Err(error) => {
+                        record_confirm_error(&entry_dir, wallet, id, &error);
+                        Err(error)
+                    }
+                }
             }
             // outbox/pending/<id>/cancel — fire a self-send replacement.
             // Same content rules as confirm (fix #9 / #10).
@@ -3799,6 +4609,10 @@ mod tests {
         state: Mutex<CeremonyState>,
         omit_ceremony_url: Mutex<bool>,
         status_error: Mutex<Option<ProtocolErrorCode>>,
+        lose_recovery_prepare_response_once: Mutex<bool>,
+        pause_status_once: Mutex<bool>,
+        status_entered: tokio::sync::Notify,
+        status_release: tokio::sync::Notify,
     }
 
     struct WalletAccountsBroker;
@@ -3833,6 +4647,22 @@ mod tests {
         ) -> ServiceFuture<'a, MachineBrokerResponse> {
             Box::pin(async move {
                 self.requests.lock().unwrap().push(request.clone());
+                let is_recovery = self
+                    .requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|request| matches!(request, MachineBrokerRequest::RecoveryPrepare(_)));
+                let kind = if is_recovery {
+                    CeremonyKind::WalletRecovery
+                } else {
+                    CeremonyKind::WalletRegistration
+                };
+                let url = if is_recovery {
+                    "https://recovery.example/ceremony/#cap=test"
+                } else {
+                    "http://localhost:18734/ceremony/registration-secret"
+                };
                 match request {
                     MachineBrokerRequest::WalletRegistrationPrepare(request) => Ok(
                         MachineBrokerResponse::WalletRegistrationPrepare(CustodyPrepareResponse {
@@ -3845,6 +4675,26 @@ mod tests {
                             signer_contribution_digest: digest(61),
                         }),
                     ),
+                    MachineBrokerRequest::RecoveryPrepare(request) => {
+                        if std::mem::take(
+                            &mut *self.lose_recovery_prepare_response_once.lock().unwrap(),
+                        ) {
+                            return Err(ProtocolError::new(
+                                ProtocolErrorCode::ServiceUnavailable,
+                                "recovery response lost after dispatch",
+                            ));
+                        }
+                        Ok(MachineBrokerResponse::RecoveryPrepare(
+                            CustodyPrepareResponse {
+                                ceremony_kind: CeremonyKind::WalletRecovery,
+                                custody_operation_id: request.custody_operation_id,
+                                state: CustodyPrepareState::AwaitingUser,
+                                ceremony_url: url.into(),
+                                ceremony_expires_at_ms: DecimalU64::new(u64::MAX),
+                                signer_contribution_digest: digest(61),
+                            },
+                        ))
+                    }
                     MachineBrokerRequest::CeremonyStatus(request) => {
                         if let Some(code) = *self.status_error.lock().unwrap() {
                             return Err(ProtocolError::new(
@@ -3854,18 +4704,20 @@ mod tests {
                         }
                         let state = *self.state.lock().unwrap();
                         let omit_ceremony_url = *self.omit_ceremony_url.lock().unwrap();
+                        if std::mem::take(&mut *self.pause_status_once.lock().unwrap()) {
+                            self.status_entered.notify_one();
+                            self.status_release.notified().await;
+                        }
                         Ok(MachineBrokerResponse::CeremonyStatus(
                             CeremonyPublicStatus {
                                 ceremony_id: digest(62),
-                                ceremony_kind: CeremonyKind::WalletRegistration,
+                                ceremony_kind: kind,
                                 operation_id: OperationId::new(request.id.as_str().to_owned())?,
                                 state,
                                 expires_at_ms: DecimalU64::new(u64::MAX),
                                 ceremony_url: (state == CeremonyState::AwaitingUser
                                     && !omit_ceremony_url)
-                                    .then(|| {
-                                        "http://localhost:18734/ceremony/registration-secret".into()
-                                    }),
+                                    .then(|| url.into()),
                                 receipt_digest: None,
                             },
                         ))
@@ -3875,7 +4727,7 @@ mod tests {
                         Ok(MachineBrokerResponse::CeremonyCancel(
                             CeremonyPublicStatus {
                                 ceremony_id: digest(62),
-                                ceremony_kind: CeremonyKind::WalletRegistration,
+                                ceremony_kind: kind,
                                 operation_id: OperationId::new(request.id.as_str().to_owned())?,
                                 state: CeremonyState::Cancelled,
                                 expires_at_ms: DecimalU64::new(u64::MAX),
@@ -3886,10 +4738,17 @@ mod tests {
                     }
                     MachineBrokerRequest::CustodyResult(request) => {
                         Ok(MachineBrokerResponse::CustodyResult(CustodyResult {
-                            ceremony_kind: CeremonyKind::WalletRegistration,
+                            surface: Some(bloom_broker_api::CeremonySurfaceRef {
+                                surface_id: bloom_broker_api::Token::new("local").unwrap(),
+                                identity_digest: bloom_broker_api::Digest32::from_bytes([0; 32]),
+                            }),
+                            credential_authority_generation: Some(
+                                bloom_broker_api::DecimalU64::new(0),
+                            ),
+                            ceremony_kind: kind,
                             custody_operation_id: request.operation_id,
                             public_status: *self.state.lock().unwrap(),
-                            wallet_id: Some(token("main")),
+                            wallet_id: Some(token(if is_recovery { "lost" } else { "main" })),
                             public_key_refs: Vec::new(),
                             credential_summaries: Vec::new(),
                             initial_policy: None,
@@ -3912,6 +4771,52 @@ mod tests {
     struct StaticProjection(WalletProjection);
 
     struct UnavailableProjection;
+
+    struct NavigationOnlyProjection(WalletProjection);
+
+    #[async_trait]
+    impl WalletProjectionReader for NavigationOnlyProjection {
+        async fn list_wallets(
+            &self,
+        ) -> Result<Vec<WalletProjection>, bloom_broker_api::ProtocolError> {
+            Ok(vec![self.0.clone()])
+        }
+
+        async fn get_wallet_authority(
+            &self,
+            _wallet_id: &Token,
+        ) -> Result<WalletProjection, bloom_broker_api::ProtocolError> {
+            Err(ProtocolError::new(
+                ProtocolErrorCode::ServiceUnavailable,
+                "live account authority unavailable",
+            ))
+        }
+
+        async fn get_wallet(
+            &self,
+            _wallet_id: &Token,
+        ) -> Result<WalletProjection, bloom_broker_api::ProtocolError> {
+            Ok(self.0.clone())
+        }
+
+        async fn get_wallet_navigation(
+            &self,
+            wallet_id: &Token,
+        ) -> Result<WalletProjection, bloom_broker_api::ProtocolError> {
+            if self.0.wallet.wallet_id == *wallet_id {
+                Ok(self.0.clone())
+            } else {
+                Err(ProtocolError::new(
+                    ProtocolErrorCode::BackendInvalidRequest,
+                    format!("wallet {} not found", wallet_id.as_str()),
+                ))
+            }
+        }
+
+        fn cached_wallets(&self) -> Result<Vec<WalletProjection>, bloom_broker_api::ProtocolError> {
+            Ok(vec![self.0.clone()])
+        }
+    }
 
     struct FailedProjection {
         code: ProtocolErrorCode,
@@ -4035,6 +4940,7 @@ mod tests {
             allowed_petal_packages: Vec::new(),
             allowed_destinations: Vec::new(),
             required_verifiers: Vec::new(),
+            clear_signing: None,
         })
         .unwrap();
         let policy_digest = Digest32::from_bytes(sha2::Sha256::digest(&canonical).into());
@@ -4115,6 +5021,7 @@ mod tests {
             allowed_petal_packages: Vec::new(),
             allowed_destinations: Vec::new(),
             required_verifiers: Vec::new(),
+            clear_signing: None,
         })
         .unwrap();
         let policy_digest = Digest32::from_bytes(sha2::Sha256::digest(&canonical).into());
@@ -4317,6 +5224,15 @@ mod tests {
                         }
                         Ok(MachineBrokerResponse::CustodyResult(
                             bloom_broker_api::CustodyResult {
+                                surface: Some(bloom_broker_api::CeremonySurfaceRef {
+                                    surface_id: bloom_broker_api::Token::new("local").unwrap(),
+                                    identity_digest: bloom_broker_api::Digest32::from_bytes(
+                                        [0; 32],
+                                    ),
+                                }),
+                                credential_authority_generation: Some(
+                                    bloom_broker_api::DecimalU64::new(0),
+                                ),
                                 ceremony_kind: bloom_broker_api::CeremonyKind::AccountAllocate,
                                 custody_operation_id: bloom_broker_api::OperationId::from_bytes(
                                     [9; 32],
@@ -4817,7 +5733,7 @@ mod tests {
             chain: "anvil".into(),
             chain_id: 31337,
             from: from.into(),
-            to: "0x0000000000000000000000000000000000000002".into(),
+            to: Some("0x0000000000000000000000000000000000000002".into()),
             value_wei: "0".into(),
             data_hex: "0x".into(),
             gas_limit: 21000,
@@ -4831,6 +5747,7 @@ mod tests {
             expires_ms: u128::MAX,
             status: bloom_proto::TxStatus::Pending,
             action_kind: bloom_proto::TxActionKind::Unknown,
+            review_mode: None,
             tx_hash: None,
             token: None,
             nft: None,
@@ -6316,7 +7233,7 @@ value = "0""#,
     }
 
     #[tokio::test]
-    async fn solana_new_tx_stages_through_the_resolved_child() {
+    async fn solana_new_tx_stages_cached_child_but_confirm_requires_authority() {
         let f = make_handler_with_chain(true);
         let node = spawn_solana_node().await;
         let child_pubkey = [0xccu8; 32];
@@ -6375,9 +7292,14 @@ value = "0""#,
         // through account 0.
         let (projection, _sol0_address, _sol0_fingerprint) =
             bip39_projection_with_solana_account0(f.wallet_addr, &child_pubkey);
+        let mut cached = projection
+            .get_wallet_navigation(&token("alice"))
+            .await
+            .unwrap();
+        cached.freshness = bloom_machine_client::ProjectionFreshness::Stale;
         let handler = f
             .handler
-            .with_projection_reader(projection)
+            .with_projection_reader(Arc::new(NavigationOnlyProjection(cached)))
             .with_broker(Some(bloom_machine_client::MachineBrokerClient::new(broker)))
             .with_solana(std::collections::BTreeMap::from([(
                 "solana-devnet".to_string(),
@@ -6388,6 +7310,17 @@ value = "0""#,
         // the derived Solana child as fee payer and stages the message.
         let destination = bs58::encode([0xbbu8; 32]).into_string();
         let intent = serde_json::json!({ "destination": destination, "lamports": 1_000_000 });
+        let mismatched = serde_json::json!({
+            "destination": destination, "lamports": 1_000_000, "account_fingerprint": "ffff"
+        });
+        let error = handler
+            .write(
+                &VfsPath::parse("/alice/0/chains/solana-devnet/outbox/new.tx").unwrap(),
+                &serde_json::to_vec(&mismatched).unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, HandlerError::Invalid(_)));
         handler
             .write(
                 &VfsPath::parse("/alice/0/chains/solana-devnet/outbox/new.tx").unwrap(),
@@ -6401,6 +7334,21 @@ value = "0""#,
             .await
             .unwrap();
         assert_eq!(listed.len(), 1);
+        let error = handler
+            .write(
+                &VfsPath::parse(&format!(
+                    "/alice/0/chains/solana-devnet/outbox/pending/{}/confirm",
+                    listed[0].name
+                ))
+                .unwrap(),
+                b"y",
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, HandlerError::Backend(message) if message.contains("authority unavailable")),
+            "{error:?}"
+        );
         let intent_bytes = handler
             .read(
                 &VfsPath::parse(&format!(
@@ -6696,7 +7644,7 @@ value = "0""#,
             chain: "anvil".into(),
             chain_id: 31337,
             from: bloom_proto::checksum_address(&f.wallet_addr),
-            to: "0x0000000000000000000000000000000000000002".into(),
+            to: Some("0x0000000000000000000000000000000000000002".into()),
             value_wei: "0".into(),
             data_hex: "0x".into(),
             gas_limit: 21000,
@@ -6710,6 +7658,7 @@ value = "0""#,
             expires_ms: u128::MAX,
             status: bloom_proto::TxStatus::Pending,
             action_kind: bloom_proto::TxActionKind::Unknown,
+            review_mode: None,
             tx_hash: None,
             token: None,
             nft: None,
@@ -6777,6 +7726,8 @@ value = "0""#,
         assert!(names.contains(&"alice"));
         assert!(names.contains(&"new"));
         assert!(names.contains(&"registrations"));
+        assert!(names.contains(&"recover"));
+        assert!(names.contains(&"recoveries"));
     }
 
     #[tokio::test]
@@ -6785,7 +7736,7 @@ value = "0""#,
         f.handler.wallet_projections = Some(Arc::new(UnavailableProjection));
         let entries = f.handler.list(&VfsPath::parse("/").unwrap()).await.unwrap();
         let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
-        assert_eq!(names, ["new", "registrations"]);
+        assert_eq!(names, ["new", "registrations", "recover", "recoveries"]);
     }
 
     #[tokio::test]
@@ -6807,6 +7758,376 @@ value = "0""#,
     }
 
     #[tokio::test]
+    async fn recovery_starts_without_wallet_inventory_and_retains_the_operation() {
+        let mut fixture = make_handler();
+        fixture.handler.wallet_projections = Some(Arc::new(UnavailableProjection));
+        let broker = Arc::new(RegistrationBroker {
+            requests: Mutex::new(Vec::new()),
+            state: Mutex::new(CeremonyState::AwaitingUser),
+            omit_ceremony_url: Mutex::new(false),
+            status_error: Mutex::new(None),
+            lose_recovery_prepare_response_once: Mutex::new(false),
+            pause_status_once: Mutex::new(false),
+            status_entered: tokio::sync::Notify::new(),
+            status_release: tokio::sync::Notify::new(),
+        });
+        fixture.handler = fixture
+            .handler
+            .with_broker(Some(MachineBrokerClient::new(broker.clone())));
+        let root = fixture
+            .handler
+            .list(&VfsPath::parse("/").unwrap())
+            .await
+            .unwrap();
+        assert!(root.iter().any(|entry| entry.name == "recover"));
+        assert!(root.iter().any(|entry| entry.name == "recoveries"));
+        let recover = VfsPath::parse("/recover").unwrap();
+        for body in [
+            br#"{"name":"lost","recovery_secret":"forbidden"}"#.as_slice(),
+            b"lost other",
+            b"",
+        ] {
+            assert!(matches!(
+                fixture.handler.write(&recover, body).await,
+                Err(HandlerError::Invalid(_))
+            ));
+        }
+        *broker.lose_recovery_prepare_response_once.lock().unwrap() = true;
+        assert!(fixture.handler.write(&recover, b"lost\n").await.is_err());
+        let intent_path = fixture.handler.recovery_intent_path("lost");
+        let pending: WalletRecoveryIntent = read_json(&intent_path).unwrap();
+        assert!(!fixture.handler.recovery_path("lost").exists());
+        fixture.handler = fixture.handler.clone();
+        fixture.handler.write(&recover, b"lost\n").await.unwrap();
+        assert!(!intent_path.exists());
+        let attempted_ids: Vec<_> = broker
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|request| match request {
+                MachineBrokerRequest::RecoveryPrepare(request) => {
+                    Some(request.custody_operation_id.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            attempted_ids,
+            [pending.operation_id.clone(), pending.operation_id]
+        );
+        let status_path = VfsPath::parse("/recoveries/lost/status.json").unwrap();
+        let initial: serde_json::Value =
+            serde_json::from_slice(&fixture.handler.read(&status_path).await.unwrap()).unwrap();
+        assert_eq!(initial["requested_name"], "lost");
+        assert_eq!(initial["ceremony_kind"], "wallet_recovery");
+        assert_eq!(initial["ceremony_state"], "AWAITING_USER");
+        assert_eq!(
+            initial["ceremony_url"],
+            "https://recovery.example/ceremony/#cap=test"
+        );
+        let first_operation = initial["operation_id"].clone();
+        let preparations = || {
+            broker
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| matches!(request, MachineBrokerRequest::RecoveryPrepare(_)))
+                .count()
+        };
+        assert_eq!(preparations(), 2);
+        let (first_retry, second_retry) = tokio::join!(
+            fixture.handler.write(&recover, b"lost"),
+            fixture.handler.write(&recover, b"lost")
+        );
+        first_retry.unwrap();
+        second_retry.unwrap();
+        assert_eq!(preparations(), 2);
+        *broker.omit_ceremony_url.lock().unwrap() = true;
+        let consumed: serde_json::Value =
+            serde_json::from_slice(&fixture.handler.read(&status_path).await.unwrap()).unwrap();
+        assert!(consumed["ceremony_url"].is_null());
+        assert_eq!(consumed["operation_id"], first_operation);
+        for pending_state in [
+            CeremonyState::WalletCommitted,
+            CeremonyState::AwaitingRecoveryAck,
+        ] {
+            *broker.state.lock().unwrap() = pending_state;
+            let pending_status: serde_json::Value =
+                serde_json::from_slice(&fixture.handler.read(&status_path).await.unwrap()).unwrap();
+            assert_eq!(pending_status["operation_id"], first_operation);
+            assert_eq!(
+                pending_status["ceremony_state"],
+                serde_json::to_value(pending_state).unwrap()
+            );
+            fixture.handler.write(&recover, b"lost").await.unwrap();
+            assert_eq!(
+                preparations(),
+                2,
+                "pending recovery must reuse its operation"
+            );
+            assert!(matches!(
+                fixture
+                    .handler
+                    .read(&VfsPath::parse("/recoveries/lost/result.json").unwrap())
+                    .await,
+                Err(HandlerError::NotFound(_))
+            ));
+        }
+        *broker.state.lock().unwrap() = CeremonyState::AwaitingUser;
+        assert!(
+            fixture
+                .handler
+                .lookup(&VfsPath::parse("/recoveries/lost/cancel").unwrap())
+                .await
+                .is_ok()
+        );
+        fixture
+            .handler
+            .write(
+                &VfsPath::parse("/recoveries/lost/cancel").unwrap(),
+                b"cancel\n",
+            )
+            .await
+            .unwrap();
+        let cancelled: serde_json::Value =
+            serde_json::from_slice(&fixture.handler.read(&status_path).await.unwrap()).unwrap();
+        assert_eq!(cancelled["ceremony_state"], "CANCELLED");
+        *broker.state.lock().unwrap() = CeremonyState::AwaitingUser;
+        fixture.handler.write(&recover, b"lost").await.unwrap();
+        assert_eq!(preparations(), 3);
+        let refreshed: serde_json::Value =
+            serde_json::from_slice(&fixture.handler.read(&status_path).await.unwrap()).unwrap();
+        assert_ne!(refreshed["operation_id"], first_operation);
+        *broker.state.lock().unwrap() = CeremonyState::Expired;
+        let expired: serde_json::Value =
+            serde_json::from_slice(&fixture.handler.read(&status_path).await.unwrap()).unwrap();
+        assert_eq!(expired["ceremony_state"], "EXPIRED");
+        *broker.state.lock().unwrap() = CeremonyState::AwaitingUser;
+        fixture.handler.write(&recover, b"lost").await.unwrap();
+        assert_eq!(preparations(), 4);
+        let after_expiry: serde_json::Value =
+            serde_json::from_slice(&fixture.handler.read(&status_path).await.unwrap()).unwrap();
+        assert_ne!(after_expiry["operation_id"], refreshed["operation_id"]);
+        *broker.state.lock().unwrap() = CeremonyState::Succeeded;
+        let completed: serde_json::Value =
+            serde_json::from_slice(&fixture.handler.read(&status_path).await.unwrap()).unwrap();
+        assert_eq!(completed["ceremony_state"], "SUCCEEDED");
+        let result: serde_json::Value = serde_json::from_slice(
+            &fixture
+                .handler
+                .read(&VfsPath::parse("/recoveries/lost/result.json").unwrap())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(result["ceremony_kind"], "wallet_recovery");
+        assert_eq!(result["operation_id"], completed["operation_id"]);
+        assert!(result.get("encrypted_browser_result").is_none());
+    }
+
+    #[tokio::test]
+    async fn expired_ambiguous_recovery_intent_can_be_replaced() {
+        let mut fixture = make_handler();
+        let broker = Arc::new(RegistrationBroker {
+            requests: Mutex::new(Vec::new()),
+            state: Mutex::new(CeremonyState::AwaitingUser),
+            omit_ceremony_url: Mutex::new(false),
+            status_error: Mutex::new(None),
+            lose_recovery_prepare_response_once: Mutex::new(true),
+            pause_status_once: Mutex::new(false),
+            status_entered: tokio::sync::Notify::new(),
+            status_release: tokio::sync::Notify::new(),
+        });
+        fixture.handler = fixture
+            .handler
+            .with_broker(Some(MachineBrokerClient::new(broker.clone())));
+        let recover = VfsPath::parse("/recover").unwrap();
+        assert!(fixture.handler.write(&recover, b"lost").await.is_err());
+        let old_intent: WalletRecoveryIntent =
+            read_json(fixture.handler.recovery_intent_path("lost")).unwrap();
+        *broker.state.lock().unwrap() = CeremonyState::Expired;
+        *broker.lose_recovery_prepare_response_once.lock().unwrap() = true;
+        assert!(matches!(
+            fixture.handler.write(&recover, b"lost").await,
+            Err(HandlerError::Invalid(_))
+        ));
+        assert!(!fixture.handler.recovery_intent_path("lost").exists());
+        *broker.state.lock().unwrap() = CeremonyState::AwaitingUser;
+        fixture.handler.write(&recover, b"lost").await.unwrap();
+        let new_projection = fixture.handler.recovery_record("lost").unwrap().1;
+        assert_ne!(new_projection.operation_id, old_intent.operation_id);
+    }
+
+    #[tokio::test]
+    async fn refused_recovery_surface_can_be_retried_on_another_with_the_same_operation() {
+        let mut fixture = make_handler();
+        let broker = Arc::new(RegistrationBroker {
+            requests: Mutex::new(Vec::new()),
+            state: Mutex::new(CeremonyState::AwaitingUser),
+            omit_ceremony_url: Mutex::new(false),
+            status_error: Mutex::new(Some(ProtocolErrorCode::ApprovalNotFound)),
+            lose_recovery_prepare_response_once: Mutex::new(true),
+            pause_status_once: Mutex::new(false),
+            status_entered: tokio::sync::Notify::new(),
+            status_release: tokio::sync::Notify::new(),
+        });
+        fixture.handler = fixture
+            .handler
+            .with_broker(Some(MachineBrokerClient::new(broker.clone())));
+        let recover = VfsPath::parse("/recover").unwrap();
+        // Broker refuses the remote surface; the intent stays, because a
+        // failed prepare cannot prove Signer holds no operation.
+        assert!(
+            fixture
+                .handler
+                .write(
+                    &recover,
+                    br#"{"name":"ghost","surface_selection":"remote"}"#
+                )
+                .await
+                .is_err()
+        );
+        let intent: WalletRecoveryIntent =
+            read_json(fixture.handler.recovery_intent_path("ghost")).unwrap();
+        // The advised local retry is accepted and reuses that operation ID.
+        fixture
+            .handler
+            .write(&recover, br#"{"name":"ghost","surface_selection":"local"}"#)
+            .await
+            .unwrap();
+        let projection = fixture.handler.recovery_record("ghost").unwrap().1;
+        assert_eq!(projection.operation_id, intent.operation_id);
+        assert_eq!(
+            projection.surface_selection,
+            bloom_broker_api::CeremonySurfaceSelection::Local
+        );
+        let prepares = broker
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|request| match request {
+                MachineBrokerRequest::RecoveryPrepare(request) => Some((
+                    request.custody_operation_id.clone(),
+                    request.surface_selection,
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            prepares,
+            vec![
+                (
+                    intent.operation_id.clone(),
+                    bloom_broker_api::CeremonySurfaceSelection::Remote
+                ),
+                (
+                    intent.operation_id,
+                    bloom_broker_api::CeremonySurfaceSelection::Local
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn delayed_recovery_status_cannot_overwrite_a_new_operation() {
+        let mut fixture = make_handler();
+        let broker = Arc::new(RegistrationBroker {
+            requests: Mutex::new(Vec::new()),
+            state: Mutex::new(CeremonyState::AwaitingUser),
+            omit_ceremony_url: Mutex::new(false),
+            status_error: Mutex::new(None),
+            lose_recovery_prepare_response_once: Mutex::new(false),
+            pause_status_once: Mutex::new(false),
+            status_entered: tokio::sync::Notify::new(),
+            status_release: tokio::sync::Notify::new(),
+        });
+        fixture.handler = fixture
+            .handler
+            .with_broker(Some(MachineBrokerClient::new(broker.clone())));
+        let recover = VfsPath::parse("/recover").unwrap();
+        fixture.handler.write(&recover, b"lost").await.unwrap();
+        let old_id = fixture
+            .handler
+            .recovery_record("lost")
+            .unwrap()
+            .1
+            .operation_id;
+        *broker.pause_status_once.lock().unwrap() = true;
+        let entered = broker.status_entered.notified();
+        let status_handler = fixture.handler.clone();
+        let status_task = tokio::spawn(async move {
+            status_handler
+                .read(&VfsPath::parse("/recoveries/lost/status.json").unwrap())
+                .await
+        });
+        entered.await;
+        *broker.state.lock().unwrap() = CeremonyState::Expired;
+        let prepare_handler = fixture.handler.clone();
+        let mut prepare_task = tokio::spawn(async move {
+            prepare_handler
+                .write(&VfsPath::parse("/recover").unwrap(), b"lost")
+                .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut prepare_task)
+                .await
+                .is_err(),
+            "a prepare must wait for the older status reconciliation"
+        );
+        broker.status_release.notify_one();
+        status_task.await.unwrap().unwrap();
+        prepare_task.await.unwrap().unwrap();
+        let latest = fixture.handler.recovery_record("lost").unwrap().1;
+        assert_ne!(latest.operation_id, old_id);
+        assert_eq!(latest.ceremony_state, CeremonyState::AwaitingUser);
+    }
+
+    #[tokio::test]
+    async fn mounted_registration_local_selection_is_forwarded_and_retry_bound() {
+        let mut fixture = make_handler();
+        let broker = Arc::new(RegistrationBroker {
+            requests: Mutex::new(Vec::new()),
+            state: Mutex::new(CeremonyState::AwaitingUser),
+            omit_ceremony_url: Mutex::new(false),
+            status_error: Mutex::new(None),
+            lose_recovery_prepare_response_once: Mutex::new(false),
+            pause_status_once: Mutex::new(false),
+            status_entered: tokio::sync::Notify::new(),
+            status_release: tokio::sync::Notify::new(),
+        });
+        fixture.handler = fixture
+            .handler
+            .with_broker(Some(MachineBrokerClient::new(broker.clone())));
+        let new = VfsPath::parse("/new").unwrap();
+        let request = br#"{"name":"main","surface_selection":"local"}"#;
+        fixture.handler.write(&new, request).await.unwrap();
+        fixture.handler.write(&new, request).await.unwrap();
+        assert!(fixture.handler.write(&new, b"main").await.is_err());
+        for invalid in [
+            br#"{"name":"other","surface_selection":"https://foreign.test"}"#.as_slice(),
+            br#"{"name":"other","surface_selection":"local","origin":"https://foreign.test"}"#,
+        ] {
+            assert!(fixture.handler.write(&new, invalid).await.is_err());
+        }
+        let requests = broker.requests.lock().unwrap();
+        let preparations: Vec<_> = requests
+            .iter()
+            .filter_map(|request| match request {
+                MachineBrokerRequest::WalletRegistrationPrepare(request) => Some(request),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(preparations.len(), 1);
+        assert_eq!(
+            preparations[0].surface_selection,
+            bloom_broker_api::CeremonySurfaceSelection::Local
+        );
+    }
+
+    #[tokio::test]
     async fn mounted_registration_accepts_a_trimmed_plain_name() {
         let mut fixture = make_handler();
         let broker = Arc::new(RegistrationBroker {
@@ -6814,6 +8135,10 @@ value = "0""#,
             state: Mutex::new(CeremonyState::AwaitingUser),
             omit_ceremony_url: Mutex::new(false),
             status_error: Mutex::new(None),
+            lose_recovery_prepare_response_once: Mutex::new(false),
+            pause_status_once: Mutex::new(false),
+            status_entered: tokio::sync::Notify::new(),
+            status_release: tokio::sync::Notify::new(),
         });
         fixture.handler = fixture
             .handler
@@ -6948,11 +8273,22 @@ value = "0""#,
         );
 
         *broker.omit_ceremony_url.lock().unwrap() = true;
-        assert!(matches!(
-            fixture.handler.read(&status_path).await,
-            Err(HandlerError::Backend(_))
-        ));
-        *broker.omit_ceremony_url.lock().unwrap() = false;
+        let consumed: serde_json::Value =
+            serde_json::from_slice(&fixture.handler.read(&status_path).await.unwrap()).unwrap();
+        assert_eq!(consumed["ceremony_state"], "AWAITING_USER");
+        assert!(consumed["ceremony_url"].is_null());
+        assert_eq!(consumed["operation_id"], persisted.operation_id.as_str());
+        assert_eq!(consumed["ceremony_expires_at_ms"], u64::MAX.to_string());
+        let (_, retained) = fixture.handler.registration_record("main").unwrap();
+        assert!(
+            retained.ceremony_url.is_none(),
+            "spent capability must be cleared durably"
+        );
+        assert_eq!(retained.operation_id, persisted.operation_id);
+        assert_eq!(
+            retained.ceremony_expires_at_ms,
+            persisted.ceremony_expires_at_ms
+        );
 
         assert!(matches!(
             fixture
@@ -7070,6 +8406,10 @@ value = "0""#,
             state: Mutex::new(CeremonyState::AwaitingUser),
             omit_ceremony_url: Mutex::new(false),
             status_error: Mutex::new(None),
+            lose_recovery_prepare_response_once: Mutex::new(false),
+            pause_status_once: Mutex::new(false),
+            status_entered: tokio::sync::Notify::new(),
+            status_release: tokio::sync::Notify::new(),
         });
         fixture.handler = fixture
             .handler
@@ -7105,6 +8445,10 @@ value = "0""#,
             state: Mutex::new(CeremonyState::AwaitingUser),
             omit_ceremony_url: Mutex::new(false),
             status_error: Mutex::new(None),
+            lose_recovery_prepare_response_once: Mutex::new(false),
+            pause_status_once: Mutex::new(false),
+            status_entered: tokio::sync::Notify::new(),
+            status_release: tokio::sync::Notify::new(),
         });
         fixture.handler = fixture
             .handler
@@ -7155,6 +8499,10 @@ value = "0""#,
             state: Mutex::new(CeremonyState::AwaitingUser),
             omit_ceremony_url: Mutex::new(false),
             status_error: Mutex::new(None),
+            lose_recovery_prepare_response_once: Mutex::new(false),
+            pause_status_once: Mutex::new(false),
+            status_entered: tokio::sync::Notify::new(),
+            status_release: tokio::sync::Notify::new(),
         });
         fixture.handler = fixture
             .handler
@@ -7189,6 +8537,10 @@ value = "0""#,
             state: Mutex::new(CeremonyState::AwaitingUser),
             omit_ceremony_url: Mutex::new(false),
             status_error: Mutex::new(None),
+            lose_recovery_prepare_response_once: Mutex::new(false),
+            pause_status_once: Mutex::new(false),
+            status_entered: tokio::sync::Notify::new(),
+            status_release: tokio::sync::Notify::new(),
         });
         fixture.handler = fixture
             .handler
@@ -7207,6 +8559,141 @@ value = "0""#,
             panic!("expected wallet registration prepare request")
         };
         assert_eq!(request.wallet_id.as_ref(), Some(&token(&name)));
+    }
+
+    #[tokio::test]
+    async fn evm_approval_challenge_is_public_and_tracks_the_live_approval() {
+        let mut f = make_handler_with_chain(true);
+        let w = f.wallet_name.clone();
+        let approval = digest(21);
+        // Broker reports the unopened ceremony link while the approval waits.
+        let mut waiting = approval_status(
+            approval.clone(),
+            &w,
+            ApprovalLifecycleState::AwaitingCeremony,
+        );
+        waiting.ceremony_url = Some("https://relay.test/ceremony/#cap=abc".into());
+        waiting.ceremony_expires_at_ms = Some(DecimalU64::new(60_000));
+        let broker = approval_broker(vec![waiting]);
+        f.handler = f
+            .handler
+            .with_broker(Some(MachineBrokerClient::new(broker.clone())));
+        seed_pending(&f, "needs-approval");
+        let entry = f
+            .handler
+            .tx_engine
+            .outbox
+            .read_in_state(&w, "anvil", "needs-approval", OutboxState::Pending)
+            .unwrap();
+        // The transaction engine's private signing state, as a confirm
+        // write leaves it after requesting an owner approval.
+        std::fs::write(
+            entry.dir.join("ceremony.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema": "bloom.machine-evm-signing.1",
+                "action_id": "evm-abc",
+                "approval_id": approval.as_str(),
+                "ceremony_url": "https://relay.test/ceremony/#cap=abc",
+                "ceremony_expires_at_ms": "60000",
+                "signing_operation_id": "private-operation",
+                "request_nonce": "private-nonce",
+                "sign_dispatched": false,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let dir = format!("/{w}/0/chains/anvil/outbox/pending/needs-approval");
+
+        let names: Vec<String> = f
+            .handler
+            .list(&vfs(dir.clone()))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        assert!(
+            names.contains(&"approval_challenge.json".to_string()),
+            "{names:?}"
+        );
+        assert!(!names.contains(&"ceremony.json".to_string()), "{names:?}");
+        for private in ["ceremony.json", ".ceremony.json.1.tmp"] {
+            assert!(matches!(
+                f.handler.lookup(&vfs(format!("{dir}/{private}"))).await,
+                Err(HandlerError::NotFound(_))
+            ));
+            assert!(matches!(
+                f.handler.read(&vfs(format!("{dir}/{private}"))).await,
+                Err(HandlerError::NotFound(_))
+            ));
+        }
+
+        let read_challenge = || async {
+            serde_json::from_slice::<serde_json::Value>(
+                &f.handler
+                    .read(&vfs(format!("{dir}/approval_challenge.json")))
+                    .await
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        let waiting = read_challenge().await;
+        assert_eq!(waiting["schema"], "bloom.evm-approval-challenge/1");
+        assert_eq!(waiting["state"], "awaiting_ceremony");
+        assert_eq!(waiting["tx_id"], "needs-approval");
+        assert_eq!(waiting["approval_id"], approval.as_str());
+        assert_eq!(
+            waiting["ceremony_url"],
+            "https://relay.test/ceremony/#cap=abc"
+        );
+        assert_eq!(waiting["expiry_ms"], 60_000);
+        assert_eq!(
+            waiting["retry_path"],
+            format!("wallets/{w}/0/chains/anvil/outbox/pending/needs-approval/confirm")
+        );
+        assert!(waiting.get("signing_operation_id").is_none());
+        assert!(waiting.get("request_nonce").is_none());
+
+        // The owner approves on their phone. Nothing is written to the
+        // outbox, yet the next read reports it and withdraws the link.
+        broker.statuses.lock().unwrap()[0].state = ApprovalLifecycleState::Active;
+        let approved = read_challenge().await;
+        assert_eq!(approved["state"], "active");
+        assert!(approved["ceremony_url"].is_null());
+        assert!(
+            approved["next"]
+                .as_str()
+                .unwrap()
+                .contains("retry_path now"),
+            "{approved}"
+        );
+
+        // A Solana-shaped challenge gains the same live state.
+        let solana = f
+            .handler
+            .live_approval_challenge(
+                &w,
+                serde_json::json!({
+                    "schema": "bloom.solana-approval-challenge/1",
+                    "approval_id": approval.as_str(),
+                    "ceremony_url": "https://relay.test/ceremony/#cap=abc",
+                }),
+            )
+            .await
+            .unwrap();
+        let solana: serde_json::Value = serde_json::from_slice(&solana).unwrap();
+        assert_eq!(solana["state"], "active");
+        assert!(solana["ceremony_url"].is_null());
+
+        // An entry that never needed owner approval projects no challenge.
+        seed_pending(&f, "no-approval");
+        let plain = format!("/{w}/0/chains/anvil/outbox/pending/no-approval");
+        assert!(matches!(
+            f.handler
+                .lookup(&vfs(format!("{plain}/approval_challenge.json")))
+                .await,
+            Err(HandlerError::NotFound(_))
+        ));
     }
 
     #[tokio::test]
@@ -7319,11 +8806,14 @@ value = "0""#,
             .handler
             .with_broker(Some(MachineBrokerClient::new(broker.clone())));
         let request = ApprovalPrepareRequest {
+            surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
+            evm_review_payloads: Vec::new(),
             operation_id: OperationId::from_bytes([30; 32]),
             terms: approval_terms("alice", None),
             canonical_plan_facts_digest: digest(31),
             petal_use_claim: None,
             system_use_claim: None,
+            requested_review_mode: None,
         };
         let path = VfsPath::parse("/alice/sealed-approvals/new.json").unwrap();
         f.handler
@@ -7365,11 +8855,14 @@ value = "0""#,
                 .handler
                 .with_broker(Some(MachineBrokerClient::new(broker.clone())));
             let request = ApprovalPrepareRequest {
+                surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
+                evm_review_payloads: Vec::new(),
                 operation_id: OperationId::from_bytes([30; 32]),
                 terms: approval_terms("alice", None),
                 canonical_plan_facts_digest: digest(31),
                 petal_use_claim: None,
                 system_use_claim: None,
+                requested_review_mode: None,
             };
             let path = VfsPath::parse("/alice/sealed-approvals/new.json").unwrap();
             f.handler
@@ -7396,11 +8889,14 @@ value = "0""#,
             .handler
             .with_broker(Some(MachineBrokerClient::new(broker.clone())));
         let request = ApprovalPrepareRequest {
+            surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
+            evm_review_payloads: Vec::new(),
             operation_id: OperationId::from_bytes([30; 32]),
             terms: approval_terms("alice", None),
             canonical_plan_facts_digest: digest(31),
             petal_use_claim: None,
             system_use_claim: None,
+            requested_review_mode: None,
         };
         let path = VfsPath::parse("/alice/sealed-approvals/new.json").unwrap();
         f.handler
@@ -7426,11 +8922,14 @@ value = "0""#,
             .handler
             .with_broker(Some(MachineBrokerClient::new(broker)));
         let request = ApprovalPrepareRequest {
+            surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
+            evm_review_payloads: Vec::new(),
             operation_id: OperationId::from_bytes([30; 32]),
             terms: approval_terms("alice", None),
             canonical_plan_facts_digest: digest(31),
             petal_use_claim: None,
             system_use_claim: None,
+            requested_review_mode: None,
         };
         let path = VfsPath::parse("/alice/sealed-approvals/new.json").unwrap();
 
@@ -8364,6 +9863,95 @@ value = "0""#,
         assert!(matches!(r, Err(HandlerError::Invalid(_))), "got: {r:?}");
     }
 
+    /// A refused confirm reaches a mount only as an errno, so its reason is
+    /// kept beside the entry; the next attempt starts from a clean slate.
+    #[tokio::test]
+    async fn refused_confirm_is_recorded_beside_the_entry() {
+        let f = make_handler_with_chain(true);
+        seed_pending(&f, "0001-test");
+        let dir = format!("/{}/0/chains/anvil/outbox/pending/0001-test", f.wallet_name);
+        let confirm = VfsPath::parse(&format!("{dir}/confirm")).unwrap();
+        let error = f.handler.write(&confirm, b"y").await.unwrap_err();
+        assert!(
+            !matches!(error, HandlerError::PermissionDenied),
+            "{error:?}"
+        );
+
+        let names: Vec<String> = f
+            .handler
+            .list(&VfsPath::parse(&dir).unwrap())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        assert!(
+            names.iter().any(|name| name == CONFIRM_ERROR_FILE),
+            "{names:?}"
+        );
+        let record: serde_json::Value = serde_json::from_slice(
+            &f.handler
+                .read(&VfsPath::parse(&format!("{dir}/{CONFIRM_ERROR_FILE}")).unwrap())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record["schema"], "bloom.outbox-confirm-error/1");
+        assert_eq!(record["tx_id"], "0001-test");
+        assert_eq!(record["kind"], "refused");
+        assert_eq!(record["error"], error.to_string());
+
+        let entry_dir = f
+            .handler
+            .tx_engine
+            .outbox
+            .read(&f.wallet_name, "anvil", "0001-test")
+            .unwrap()
+            .dir;
+        clear_confirm_error(&entry_dir);
+        assert!(!entry_dir.join(CONFIRM_ERROR_FILE).exists());
+    }
+
+    #[test]
+    fn confirm_error_record_names_policy_approval_and_never_recreates_an_entry() {
+        let directory = tempfile::tempdir().unwrap();
+        record_confirm_error(
+            directory.path(),
+            "alice",
+            "0001-test",
+            &HandlerError::backend(
+                "POLICY_APPROVAL_REQUIRED: complete the owner ceremony at https://example.invalid/c then retry this operation; status: /wallets/alice/policy-updates/pending/x/status.json",
+            ),
+        );
+        let record: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(directory.path().join(CONFIRM_ERROR_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record["kind"], "policy_approval_required");
+        assert!(
+            record["next"]
+                .as_str()
+                .unwrap()
+                .contains("wallets/alice/policy-updates/pending/")
+        );
+        assert!(
+            record["error"]
+                .as_str()
+                .unwrap()
+                .contains("https://example.invalid/c")
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(directory.path())
+            .unwrap()
+            .flatten()
+            .map(|item| item.file_name())
+            .collect();
+        assert_eq!(leftovers.len(), 1, "{leftovers:?}");
+
+        let moved = directory.path().join("moved-to-sent");
+        record_confirm_error(&moved, "alice", "0001-test", &HandlerError::backend("late"));
+        assert!(!moved.exists());
+    }
+
     #[tokio::test]
     async fn confirm_cancel_discards_pending_locally() {
         let f = make_handler_with_chain(true);
@@ -8697,6 +10285,285 @@ value = "0""#,
         let parsed: WalletAccountsPublic = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed.wallet_id.as_str(), f.wallet_name);
         assert!(parsed.accounts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unsigned_account_stage_uses_cache_but_authority_paths_stay_live() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let rpc = tokio::spawn(async move {
+            let mut requests = tokio::task::JoinSet::new();
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                requests.spawn(async move {
+                    let request: serde_json::Value = tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        async {
+                            let mut bytes = Vec::new();
+                            let mut chunk = [0; 1024];
+                            loop {
+                                let len = socket.read(&mut chunk).await.unwrap();
+                                assert!(len > 0, "staging RPC ended before its JSON body");
+                                bytes.extend_from_slice(&chunk[..len]);
+                                assert!(bytes.len() <= 8192, "oversized staging RPC");
+                                if let Some((_, body)) = std::str::from_utf8(&bytes).unwrap().split_once("\r\n\r\n")
+                                    && let Ok(request) = serde_json::from_str(body)
+                                {
+                                    break request;
+                                }
+                            }
+                        },
+                    ).await.expect("staging RPC body deadline");
+                    let zero = format!("0x{}", "00".repeat(32));
+                    let result = match request["method"].as_str().unwrap() {
+                        "eth_chainId" => serde_json::json!("0x7a69"),
+                        "eth_getBlockByNumber" => serde_json::json!({
+                            "number":"0x1", "hash":zero, "parentHash":zero,
+                            "sha3Uncles":zero, "logsBloom":format!("0x{}", "00".repeat(256)),
+                            "transactionsRoot":zero,"stateRoot":zero,"receiptsRoot":zero,
+                            "miner":format!("0x{}", "00".repeat(20)),"difficulty":"0x0",
+                            "totalDifficulty":"0x0","extraData":"0x","size":"0x0",
+                            "gasLimit":"0x100000","gasUsed":"0x0","timestamp":"0x1",
+                            "uncles":[],"transactions":[],"mixHash":zero,
+                            "nonce":"0x0000000000000000","baseFeePerGas":"0x1"
+                        }),
+                        "eth_getTransactionCount" => serde_json::json!("0x0"),
+                        "eth_getCode" => serde_json::json!("0x"),
+                        "eth_getBalance" => serde_json::json!("0xde0b6b3a7640000"),
+                        "eth_estimateGas" => serde_json::json!("0x5208"),
+                        "eth_gasPrice" => serde_json::json!("0x1"),
+                        method => panic!("unexpected staging RPC {method}"),
+                    };
+                    let body =
+                        serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":result})
+                            .to_string();
+                    socket.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+                });
+            }
+        });
+        for derived in [false, true] {
+            let mut f = make_handler_with_chain(false);
+            let home = bloom_proto::HomeDir::at(f._tmp.path());
+            f.handler = f
+                .handler
+                .with_home_write_permit(Arc::new(HomeWritePermit::acquire(&home).unwrap()));
+            let spec = bloom_proto::ChainSpec {
+                name: "anvil".into(),
+                chain_id: 31337,
+                rpc_urls: vec![endpoint.clone()],
+                rpc_endpoints: Vec::new(),
+                etherscan_api_url: None,
+                display_name: None,
+                native_symbol: "ETH".into(),
+                native_decimals: 18,
+                legacy_tx: false,
+                op_stack: false,
+            };
+            f.handler
+                .chains
+                .add(bloom_evm::ChainClient::new(spec).unwrap());
+            let mut projection = if derived {
+                bip39_projection_value(
+                    f.wallet_addr,
+                    vec![derived_account(
+                        bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1,
+                        "m/44'/60'/0'/0/1",
+                        72,
+                        &format!("{:#x}", f.wallet_addr),
+                    )],
+                )
+            } else {
+                static_projection_value(f.wallet_addr)
+            };
+            let number = if derived { 1 } else { 0 };
+            let mut policy: CanonicalWalletPolicy =
+                serde_json::from_slice(&projection.policy.canonical_policy.decode()).unwrap();
+            policy
+                .allowed_destinations
+                .push(bloom_broker_api::PolicyDestination {
+                    chain: token("anvil"),
+                    destination: format!("{:#x}", f.wallet_addr),
+                });
+            let canonical = serde_jcs::to_vec(&policy).unwrap();
+            let policy_digest = Digest32::from_bytes(sha2::Sha256::digest(&canonical).into());
+            projection.policy.canonical_policy = Base64UrlBytes::from_bytes(&canonical);
+            projection.policy.policy_digest = policy_digest.clone();
+            projection.wallet.policy_digest = policy_digest;
+            projection.freshness = bloom_machine_client::ProjectionFreshness::Stale;
+            let mut restored = projection.clone();
+            f.handler = f
+                .handler
+                .with_projection_reader(Arc::new(NavigationOnlyProjection(projection)));
+            let root = format!("/alice/{number}");
+            let stage_path = VfsPath::parse(&format!("{root}/chains/anvil/outbox/new.tx")).unwrap();
+            let error = f
+                .handler
+                .write(&stage_path, br#"{"account_fingerprint":"ffff"}"#)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, HandlerError::Invalid(_)));
+            assert!(
+                f.handler
+                    .tx_engine
+                    .outbox
+                    .list("alice", "anvil", OutboxState::Pending)
+                    .unwrap()
+                    .is_empty()
+            );
+            f.handler
+                .write(
+                    &VfsPath::parse(&format!("{root}/chains/anvil/outbox/new.tx")).unwrap(),
+                    format!(
+                        "send 0.000000000000000001 eth to {:#x} on anvil",
+                        f.wallet_addr
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let entries = f
+                .handler
+                .tx_engine
+                .outbox
+                .list("alice", "anvil", OutboxState::Pending)
+                .unwrap();
+            assert_eq!(entries.len(), 1);
+            let staged = f
+                .handler
+                .tx_engine
+                .outbox
+                .read("alice", "anvil", &entries[0])
+                .unwrap();
+            assert_eq!(
+                staged.staged.from,
+                bloom_proto::checksum_address(&f.wallet_addr)
+            );
+            for suffix in [
+                format!("chains/anvil/outbox/pending/{}/confirm", entries[0]),
+                "chains/anvil/outbox/new.tx/extra".into(),
+                "sessions/enso/router/stop".into(),
+            ] {
+                let error = f
+                    .handler
+                    .write(&VfsPath::parse(&format!("{root}/{suffix}")).unwrap(), b"y")
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(&error, HandlerError::Backend(message) if message.contains("authority unavailable")),
+                    "{error:?}"
+                );
+            }
+            let error = f
+                .handler
+                .read(&VfsPath::parse(&format!("{root}/account.json")).unwrap())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&error, HandlerError::Backend(message) if message.contains("authority unavailable")),
+                "{error:?}"
+            );
+            // Restoring authority must not let a cached sender spend as its
+            // replacement.
+            restored.freshness = bloom_machine_client::ProjectionFreshness::Fresh;
+            if derived {
+                restored.accounts.accounts[0].chain_projections[0].address =
+                    format!("{:#x}", Address::repeat_byte(0x22));
+            } else {
+                restored.keys[0].addresses[0] = format!("{:#x}", Address::repeat_byte(0x22));
+            }
+            f.handler = f
+                .handler
+                .with_projection_reader(Arc::new(StaticProjection(restored)));
+            let error = f
+                .handler
+                .write(
+                    &VfsPath::parse(&format!(
+                        "{root}/chains/anvil/outbox/pending/{}/confirm",
+                        entries[0]
+                    ))
+                    .unwrap(),
+                    b"y",
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(error, HandlerError::NotFound(_)), "{error:?}");
+        }
+        rpc.abort();
+    }
+
+    #[tokio::test]
+    async fn account_context_read_requires_live_authority_after_navigation() {
+        let f = make_handler();
+        let handler = f
+            .handler
+            .with_projection_reader(Arc::new(NavigationOnlyProjection(static_projection_value(
+                f.wallet_addr,
+            ))));
+        let path = VfsPath::parse(&format!("/{}/0/account.json", f.wallet_name)).unwrap();
+        handler.lookup(&path).await.unwrap();
+        let error = handler.read(&path).await.unwrap_err();
+        assert!(
+            matches!(error, HandlerError::Backend(_)),
+            "Petal account context must not use the navigation snapshot: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_account_projection_cannot_become_trusted_petal_context() {
+        let f = make_handler();
+        for derived in [false, true] {
+            let mut projection = if derived {
+                let profile = bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1;
+                bip39_projection_value(
+                    f.wallet_addr,
+                    vec![derived_account(
+                        profile,
+                        "m/44'/60'/0'/0/0",
+                        72,
+                        &format!("{:#x}", f.wallet_addr),
+                    )],
+                )
+            } else {
+                static_projection_value(f.wallet_addr)
+            };
+            projection.freshness = bloom_machine_client::ProjectionFreshness::Stale;
+            let handler = make_handler()
+                .handler
+                .with_projection_reader(Arc::new(StaticProjection(projection)));
+            let account = VfsPath::parse("/alice/0/account.json").unwrap();
+            handler.lookup(&account).await.unwrap();
+            assert!(
+                handler
+                    .list(&VfsPath::parse("/alice/0").unwrap())
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|entry| entry.name == "account.json")
+            );
+            handler
+                .read(&VfsPath::parse("/alice/0/address.evm").unwrap())
+                .await
+                .unwrap();
+            let error = handler.read(&account).await.unwrap_err();
+            assert!(
+                matches!(&error, HandlerError::Backend(message) if message.contains("fresh Broker wallet projection")),
+                "{error:?}"
+            );
+            // The same boundary guards account writes, including session stop.
+            let error = handler
+                .write(
+                    &VfsPath::parse("/alice/0/sessions/enso/router/stop").unwrap(),
+                    b"y",
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&error, HandlerError::Backend(message) if message.contains("fresh Broker wallet projection")),
+                "{error:?}"
+            );
+        }
     }
 
     /// A wallet the Broker refused to characterise (the retired-out legacy
@@ -9291,5 +11158,770 @@ value = "0""#,
             f.handler.list(&path).await,
             Err(HandlerError::NotADir(_))
         ));
+    }
+
+    mod passkeys_tests {
+        use super::*;
+        use bloom_broker_api::{
+            CeremonyCrossSurfacePrepareResponse, CeremonyPublicStatus, CeremonySurfaceRef,
+            CeremonySurfaceSelection, CredentialPublic, CredentialState, OperationId,
+        };
+
+        const LAPTOP_MS: u64 = 1_789_466_400_000; // 2026-09-15T10:00:00Z
+        const PHONE_MS: u64 = 1_790_242_200_000; // 2026-09-24T09:30:00Z
+        const TABLET_MS: u64 = 1_790_275_500_000; // 2026-09-24T18:45:00Z
+
+        fn credential(id: u8, surface: Option<&str>, created_at_ms: u64) -> CredentialPublic {
+            CredentialPublic {
+                credential_id: Base64UrlBytes::from_bytes(&[id; 32]),
+                wallet_id: token("alice"),
+                surface: surface.map(|surface| CeremonySurfaceRef {
+                    surface_id: token(surface),
+                    identity_digest: digest(90),
+                }),
+                created_at_ms: DecimalU64::new(created_at_ms),
+                state: CredentialState::Active,
+            }
+        }
+
+        fn passkey_handler(
+            credentials: Vec<CredentialPublic>,
+        ) -> (tempfile::TempDir, WalletsHandler) {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut projection = static_projection_value(Address::repeat_byte(0x11));
+            projection.credentials = credentials;
+            let home = bloom_proto::HomeDir::at(tmp.path().join("home"));
+            let permit = Arc::new(HomeWritePermit::acquire(&home).unwrap());
+            let handler = WalletsHandler::new(
+                ChainRegistry::new(),
+                TxEngine::new(Outbox::new(tmp.path().join("outbox")).unwrap(), 60_000),
+                AddressBook::default(),
+                Arc::new(StaticProjection(projection)),
+                tmp.path().join("machine-policy-projections"),
+            )
+            .with_home_write_permit(permit);
+            (tmp, handler)
+        }
+
+        fn path(value: &str) -> VfsPath {
+            VfsPath::parse(value).unwrap()
+        }
+
+        async fn text(handler: &WalletsHandler, value: &str) -> String {
+            String::from_utf8(handler.read(&path(value)).await.unwrap()).unwrap()
+        }
+
+        async fn names(handler: &WalletsHandler, value: &str) -> Vec<String> {
+            let mut names: Vec<String> = handler
+                .list(&path(value))
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect();
+            names.sort();
+            names
+        }
+
+        #[tokio::test]
+        async fn passkeys_are_listed_by_date_and_surface_with_machine_nicknames() {
+            let laptop = credential(1, None, LAPTOP_MS);
+            let phone = credential(2, Some("remote"), PHONE_MS);
+            let tablet = credential(3, Some("remote"), TABLET_MS);
+            let (tmp, handler) = passkey_handler(vec![laptop.clone(), phone.clone(), tablet]);
+
+            assert!(
+                names(&handler, "/alice")
+                    .await
+                    .contains(&"passkeys".to_owned())
+            );
+            let listed = names(&handler, "/alice/passkeys").await;
+            let dirs: Vec<&String> = listed
+                .iter()
+                .filter(|name| name.starts_with("2026-"))
+                .collect();
+            assert_eq!(dirs.len(), 3);
+            assert!(dirs[0].starts_with("2026-09-15-local-"));
+            assert!(dirs[1].starts_with("2026-09-24-remote-"));
+            assert!(dirs[2].starts_with("2026-09-24-remote-"));
+            assert!(
+                dirs.iter()
+                    .all(|dir| dir.rsplit('-').next().unwrap().len() == 12)
+            );
+            for fixed in ["by-name", "enrollments", "new"] {
+                assert!(
+                    listed.contains(&fixed.to_owned()),
+                    "{fixed} missing: {listed:?}"
+                );
+            }
+            assert!(!listed.contains(&"latest".to_owned()));
+
+            let laptop_dir = format!("/alice/passkeys/{}", dirs[0]);
+            let mut phone_dir = None;
+            for dir in &dirs[1..] {
+                let dir = format!("/alice/passkeys/{dir}");
+                if text(&handler, &format!("{dir}/credential_id")).await
+                    == format!("{}\n", phone.credential_id.encoded())
+                {
+                    phone_dir = Some(dir);
+                }
+            }
+            let phone_dir = phone_dir.expect("phone passkey is listed");
+            assert_eq!(
+                text(&handler, &format!("{laptop_dir}/surface")).await,
+                "local\n"
+            );
+            assert_eq!(
+                text(&handler, &format!("{laptop_dir}/created")).await,
+                "2026-09-15T10:00:00Z\n"
+            );
+            assert_eq!(
+                text(&handler, &format!("{laptop_dir}/state")).await,
+                "active\n"
+            );
+            assert_eq!(
+                text(&handler, &format!("{laptop_dir}/credential_id")).await,
+                format!("{}\n", laptop.credential_id.encoded())
+            );
+            assert_eq!(text(&handler, &format!("{laptop_dir}/name")).await, "");
+
+            handler
+                .write(&path(&format!("{phone_dir}/name")), b"iPhone\n")
+                .await
+                .unwrap();
+            assert_eq!(
+                text(&handler, &format!("{phone_dir}/name")).await,
+                "iPhone\n"
+            );
+            let link = handler
+                .lookup(&path("/alice/passkeys/by-name/iPhone"))
+                .await
+                .unwrap();
+            assert_eq!(
+                link.link_target.as_deref(),
+                Some(format!("../{}", phone_dir.rsplit('/').next().unwrap()).as_str())
+            );
+            // Nicknames are keyed by the full credential ID, never the display name.
+            let stored: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(
+                    tmp.path()
+                        .join("machine-policy-projections/passkey-names.json"),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(stored["names"][phone.credential_id.encoded()], "iPhone");
+
+            let duplicate = handler
+                .write(&path(&format!("{laptop_dir}/name")), b"iPhone")
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(duplicate, HandlerError::Invalid(_)),
+                "{duplicate:?}"
+            );
+            for invalid in [".hidden", "a/b", "tab\there"] {
+                assert!(
+                    handler
+                        .write(&path(&format!("{laptop_dir}/name")), invalid.as_bytes())
+                        .await
+                        .is_err(),
+                    "{invalid:?} accepted"
+                );
+            }
+            handler
+                .write(&path(&format!("{phone_dir}/name")), b"")
+                .await
+                .unwrap();
+            assert!(names(&handler, "/alice/passkeys/by-name").await.is_empty());
+            assert!(matches!(
+                handler
+                    .lookup(&path("/alice/passkeys/2026-01-01-local-0000"))
+                    .await,
+                Err(HandlerError::NotFound(_))
+            ));
+        }
+
+        #[test]
+        fn passkey_names_are_fixed_length_and_never_change_when_another_is_added() {
+            use sha2::Digest as _;
+            let with_id = |bytes: Vec<u8>| CredentialPublic {
+                credential_id: Base64UrlBytes::from_bytes(&bytes),
+                ..credential(0, Some("remote"), PHONE_MS)
+            };
+            let dir_names = |credentials: &[CredentialPublic]| {
+                super::super::passkeys::tests_support::dir_names(credentials)
+            };
+            // Two credentials that collided under the old 4-hex suffix.
+            let mut seen = std::collections::BTreeMap::new();
+            let (first, second) = (0_u16..=u16::MAX)
+                .find_map(|n| {
+                    let bytes = n.to_be_bytes().to_vec();
+                    let prefix = hex::encode(sha2::Sha256::digest(&bytes))[..4].to_owned();
+                    seen.insert(prefix, bytes.clone())
+                        .map(|other| (other, bytes))
+                })
+                .expect("a 4-hex prefix collision exists");
+            let alone = dir_names(&[with_id(first.clone())]);
+            let together = dir_names(&[with_id(first), with_id(second)]);
+            let suffix = |name: &String| name.rsplit('-').next().unwrap().len();
+            assert_eq!(
+                alone[0], together[0],
+                "adding a passkey renamed an existing one"
+            );
+            assert_ne!(together[0], together[1]);
+            assert!(
+                together
+                    .iter()
+                    .all(|name| name.starts_with("2026-09-24-remote-"))
+            );
+            assert!(
+                together.iter().all(|name| suffix(name) == 12),
+                "{together:?}"
+            );
+        }
+
+        struct PasskeyBroker {
+            requests: Mutex<Vec<MachineBrokerRequest>>,
+            state: Mutex<CeremonyState>,
+            url_spent: Mutex<bool>,
+            /// Refuse prepare as Broker does when no passkey could approve.
+            refuse: Mutex<bool>,
+            /// Operations Broker accepted; status and cancel know only these.
+            accepted: Mutex<std::collections::HashSet<String>>,
+            /// Fail the next prepare: `true` after accepting it (the response
+            /// is lost), `false` before it reaches Broker.
+            prepare_fault: Mutex<Option<bool>>,
+            /// Refuse the next prepare with this code before accepting it.
+            prepare_refusal: Mutex<Option<ProtocolErrorCode>>,
+        }
+
+        impl bloom_broker_api::MachineBrokerService for PasskeyBroker {
+            fn dispatch<'a>(
+                &'a self,
+                request: MachineBrokerRequest,
+            ) -> bloom_broker_api::ServiceFuture<'a, bloom_broker_api::MachineBrokerResponse>
+            {
+                Box::pin(async move {
+                    self.requests.lock().unwrap().push(request.clone());
+                    let status =
+                        |operation_id: OperationId, state: CeremonyState| CeremonyPublicStatus {
+                            ceremony_id: digest(91),
+                            ceremony_kind: bloom_broker_api::CeremonyKind::CredentialAdd,
+                            operation_id,
+                            state,
+                            expires_at_ms: DecimalU64::new(u64::MAX),
+                            ceremony_url: (state == CeremonyState::AwaitingUser
+                                && !*self.url_spent.lock().unwrap())
+                            .then(|| "https://relay.test/ceremony/#cap=abc".to_owned()),
+                            receipt_digest: None,
+                        };
+                    match request {
+                        MachineBrokerRequest::CredentialCrossSurfacePrepare(_)
+                            if *self.refuse.lock().unwrap() =>
+                        {
+                            Err(ProtocolError::new(
+                                ProtocolErrorCode::ApprovalNotFound,
+                                "wallet alice has no active passkey that can approve adding another",
+                            ))
+                        }
+                        MachineBrokerRequest::CredentialCrossSurfacePrepare(request) => {
+                            // A real Broker call suspends, letting concurrent
+                            // writers interleave as they would in production.
+                            tokio::task::yield_now().await;
+                            if let Some(code) = self.prepare_refusal.lock().unwrap().take() {
+                                return Err(ProtocolError::new(code, "Broker refused the prepare"));
+                            }
+                            let fault = self.prepare_fault.lock().unwrap().take();
+                            if fault == Some(false) {
+                                return Err(ProtocolError::new(
+                                    ProtocolErrorCode::ServiceUnavailable,
+                                    "Broker unreachable",
+                                ));
+                            }
+                            self.accepted
+                                .lock()
+                                .unwrap()
+                                .insert(request.operation_id.as_str().to_owned());
+                            if fault == Some(true) {
+                                *self.state.lock().unwrap() = CeremonyState::AwaitingUser;
+                                *self.url_spent.lock().unwrap() = false;
+                                return Err(ProtocolError::new(
+                                    ProtocolErrorCode::ServiceUnavailable,
+                                    "prepare response lost after Broker accepted it",
+                                ));
+                            }
+                            *self.state.lock().unwrap() = CeremonyState::AwaitingUser;
+                            *self.url_spent.lock().unwrap() = false;
+                            Ok(bloom_broker_api::MachineBrokerResponse::CredentialCrossSurfacePrepare(
+                                CeremonyCrossSurfacePrepareResponse {
+                                    operation_id: request.operation_id,
+                                    ceremony_id: digest(91),
+                                    state: CeremonyState::AwaitingUser,
+                                    destination_url: "https://relay.test/ceremony/#cap=abc".into(),
+                                    expires_at_ms: DecimalU64::new(u64::MAX),
+                                },
+                            ))
+                        }
+                        MachineBrokerRequest::CeremonyStatus(request)
+                        | MachineBrokerRequest::CeremonyCancel(request)
+                            if !self.accepted.lock().unwrap().contains(request.id.as_str()) =>
+                        {
+                            Err(ProtocolError::new(
+                                ProtocolErrorCode::ApprovalNotFound,
+                                "ceremony not found",
+                            ))
+                        }
+                        MachineBrokerRequest::CeremonyStatus(request) => {
+                            let operation_id = OperationId::new(request.id.as_str().to_owned())?;
+                            let state = *self.state.lock().unwrap();
+                            Ok(bloom_broker_api::MachineBrokerResponse::CeremonyStatus(
+                                status(operation_id, state),
+                            ))
+                        }
+                        MachineBrokerRequest::CeremonyCancel(request) => {
+                            let operation_id = OperationId::new(request.id.as_str().to_owned())?;
+                            *self.state.lock().unwrap() = CeremonyState::Cancelled;
+                            Ok(bloom_broker_api::MachineBrokerResponse::CeremonyCancel(
+                                status(operation_id, CeremonyState::Cancelled),
+                            ))
+                        }
+                        other => Err(ProtocolError::new(
+                            ProtocolErrorCode::UnknownMethod,
+                            format!("unexpected {other:?}"),
+                        )),
+                    }
+                })
+            }
+        }
+
+        fn prepared_operations(broker: &PasskeyBroker) -> Vec<String> {
+            broker
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|request| match request {
+                    MachineBrokerRequest::CredentialCrossSurfacePrepare(request) => {
+                        Some(request.operation_id.as_str().to_owned())
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn faulty_passkey_broker(fault: bool) -> Arc<PasskeyBroker> {
+            Arc::new(PasskeyBroker {
+                requests: Mutex::new(Vec::new()),
+                state: Mutex::new(CeremonyState::AwaitingUser),
+                url_spent: Mutex::new(false),
+                refuse: Mutex::new(false),
+                accepted: Mutex::new(Default::default()),
+                prepare_fault: Mutex::new(Some(fault)),
+                prepare_refusal: Mutex::new(None),
+            })
+        }
+
+        async fn read_text(handler: &WalletsHandler, at: &str) -> String {
+            String::from_utf8(handler.read(&path(at)).await.unwrap()).unwrap()
+        }
+
+        #[tokio::test]
+        async fn a_lost_enrollment_prepare_response_is_resumed_with_the_same_operation() {
+            let (_tmp, handler) = passkey_handler(vec![credential(1, None, LAPTOP_MS)]);
+            let broker = faulty_passkey_broker(true);
+            let handler = handler.with_broker(Some(MachineBrokerClient::new(broker.clone())));
+
+            // Broker accepts, but its response never arrives.
+            assert!(
+                handler
+                    .write(&path("/alice/passkeys/new"), b"remote")
+                    .await
+                    .is_err()
+            );
+            // The enrollment is listed and its status comes from Broker, which
+            // holds it, rather than staying an unknown orphan.
+            let operation = prepared_operations(&broker)[0].clone();
+            let at = |leaf: &str| format!("/alice/passkeys/enrollments/{operation}/{leaf}");
+            assert_eq!(read_text(&handler, &at("status")).await, "awaiting_user\n");
+            // A retry resumes the same operation: Broker sees no second one.
+            handler
+                .write(&path("/alice/passkeys/new"), b"remote")
+                .await
+                .unwrap();
+            let operations = prepared_operations(&broker);
+            assert_eq!(operations.len(), 1, "{operations:?}");
+            let entries = handler
+                .list(&path("/alice/passkeys/enrollments"))
+                .await
+                .unwrap();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].name, operations[0]);
+            assert_eq!(
+                read_text(&handler, &at("url")).await,
+                "https://relay.test/ceremony/#cap=abc\n"
+            );
+        }
+
+        #[tokio::test]
+        async fn an_enrollment_broker_never_saw_is_shown_preparing_and_cancels_locally() {
+            let (_tmp, handler) = passkey_handler(vec![credential(1, None, LAPTOP_MS)]);
+            let broker = faulty_passkey_broker(false);
+            let handler = handler.with_broker(Some(MachineBrokerClient::new(broker.clone())));
+
+            assert!(
+                handler
+                    .write(&path("/alice/passkeys/new"), b"remote")
+                    .await
+                    .is_err()
+            );
+            let operation = handler
+                .list(&path("/alice/passkeys/enrollments"))
+                .await
+                .unwrap()[0]
+                .name
+                .clone();
+            let at = |leaf: &str| format!("/alice/passkeys/enrollments/{operation}/{leaf}");
+            assert_eq!(read_text(&handler, &at("status")).await, "preparing\n");
+            assert!(matches!(
+                handler.read(&path(&at("url"))).await,
+                Err(HandlerError::NotFound(_))
+            ));
+            handler
+                .write(
+                    &path(&format!("/alice/passkeys/enrollments/{operation}/cancel")),
+                    b"cancel",
+                )
+                .await
+                .unwrap();
+            assert_eq!(read_text(&handler, &at("status")).await, "cancelled\n");
+            // A fresh write then starts a new enrollment.
+            handler
+                .write(&path("/alice/passkeys/new"), b"remote")
+                .await
+                .unwrap();
+            let operations = prepared_operations(&broker);
+            assert_eq!(operations.len(), 2);
+            assert_ne!(operations[0], operations[1]);
+        }
+
+        fn healthy_passkey_broker() -> Arc<PasskeyBroker> {
+            Arc::new(PasskeyBroker {
+                requests: Mutex::new(Vec::new()),
+                state: Mutex::new(CeremonyState::AwaitingUser),
+                url_spent: Mutex::new(false),
+                refuse: Mutex::new(false),
+                accepted: Mutex::new(Default::default()),
+                prepare_fault: Mutex::new(None),
+                prepare_refusal: Mutex::new(None),
+            })
+        }
+
+        #[tokio::test]
+        async fn a_refused_enrollment_prepare_leaves_no_record_and_keeps_latest() {
+            let (_tmp, handler) = passkey_handler(vec![credential(1, None, LAPTOP_MS)]);
+            let broker = healthy_passkey_broker();
+            let handler = handler.with_broker(Some(MachineBrokerClient::new(broker.clone())));
+
+            handler
+                .write(&path("/alice/passkeys/new"), b"remote")
+                .await
+                .unwrap();
+            let waiting = latest_operation(&handler).await;
+            // Broker refuses the next one outright, creating nothing: there is
+            // nothing to resume or cancel, so no `preparing` record remains.
+            *broker.prepare_refusal.lock().unwrap() = Some(ProtocolErrorCode::CeremonyRateLimited);
+            assert!(matches!(
+                handler.write(&path("/alice/passkeys/new"), b"local").await,
+                Err(HandlerError::Backend(_))
+            ));
+            let entries = handler
+                .list(&path("/alice/passkeys/enrollments"))
+                .await
+                .unwrap();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].name, waiting);
+            assert_eq!(latest_operation(&handler).await, waiting);
+            // Once Broker allows it, the same write starts the enrollment.
+            handler
+                .write(&path("/alice/passkeys/new"), b"local")
+                .await
+                .unwrap();
+            assert_ne!(latest_operation(&handler).await, waiting);
+            assert_eq!(prepared_operations(&broker).len(), 3);
+        }
+
+        async fn latest_operation(handler: &WalletsHandler) -> String {
+            handler
+                .lookup(&path("/alice/passkeys/latest"))
+                .await
+                .unwrap()
+                .link_target
+                .unwrap()
+                .strip_prefix("enrollments/")
+                .unwrap()
+                .to_owned()
+        }
+
+        #[tokio::test]
+        async fn latest_follows_the_enrollment_a_write_reused() {
+            let (_tmp, handler) = passkey_handler(vec![credential(1, None, LAPTOP_MS)]);
+            let broker = healthy_passkey_broker();
+            let handler = handler.with_broker(Some(MachineBrokerClient::new(broker.clone())));
+            handler
+                .write(&path("/alice/passkeys/new"), b"local")
+                .await
+                .unwrap();
+            let local = latest_operation(&handler).await;
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            handler
+                .write(&path("/alice/passkeys/new"), b"remote")
+                .await
+                .unwrap();
+            let remote = latest_operation(&handler).await;
+            assert_ne!(local, remote);
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            // Asking for local again reuses the older local enrollment, and
+            // `latest` now names it rather than the newer remote one.
+            handler
+                .write(&path("/alice/passkeys/new"), b"local")
+                .await
+                .unwrap();
+            assert_eq!(prepared_operations(&broker).len(), 2);
+            assert_eq!(latest_operation(&handler).await, local);
+        }
+
+        #[tokio::test]
+        async fn concurrent_writes_to_new_start_one_enrollment() {
+            let (_tmp, handler) = passkey_handler(vec![credential(1, None, LAPTOP_MS)]);
+            let broker = healthy_passkey_broker();
+            let handler = handler.with_broker(Some(MachineBrokerClient::new(broker.clone())));
+            let new = path("/alice/passkeys/new");
+            let (first, second) = tokio::join!(
+                handler.write(&new, b"remote"),
+                handler.write(&new, b"remote"),
+            );
+            first.unwrap();
+            second.unwrap();
+            assert_eq!(prepared_operations(&broker).len(), 1);
+        }
+
+        #[tokio::test]
+        async fn a_lost_enrollment_is_cancelled_on_broker() {
+            let (_tmp, handler) = passkey_handler(vec![credential(1, None, LAPTOP_MS)]);
+            let broker = faulty_passkey_broker(true);
+            let handler = handler.with_broker(Some(MachineBrokerClient::new(broker.clone())));
+            assert!(
+                handler
+                    .write(&path("/alice/passkeys/new"), b"remote")
+                    .await
+                    .is_err()
+            );
+            let operation = prepared_operations(&broker)[0].clone();
+            handler
+                .write(
+                    &path(&format!("/alice/passkeys/enrollments/{operation}/cancel")),
+                    b"cancel",
+                )
+                .await
+                .unwrap();
+            assert_eq!(*broker.state.lock().unwrap(), CeremonyState::Cancelled);
+            assert!(
+                broker
+                    .requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|request| matches!(request, MachineBrokerRequest::CeremonyCancel(_)))
+            );
+        }
+
+        fn prepares(broker: &PasskeyBroker) -> Vec<CeremonySurfaceSelection> {
+            broker
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|request| match request {
+                    MachineBrokerRequest::CredentialCrossSurfacePrepare(request) => {
+                        assert_eq!(request.wallet_id, token("alice"));
+                        Some(request.destination)
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn enrollment_starts_from_new_and_is_followed_through_latest() {
+            let (_tmp, handler) = passkey_handler(vec![credential(1, None, LAPTOP_MS)]);
+            let broker = Arc::new(PasskeyBroker {
+                requests: Mutex::new(Vec::new()),
+                state: Mutex::new(CeremonyState::AwaitingUser),
+                url_spent: Mutex::new(false),
+                refuse: Mutex::new(false),
+                accepted: Mutex::new(Default::default()),
+                prepare_fault: Mutex::new(None),
+                prepare_refusal: Mutex::new(None),
+            });
+            let handler = handler.with_broker(Some(MachineBrokerClient::new(broker.clone())));
+
+            let refused = handler
+                .write(&path("/alice/passkeys/new"), b"phone")
+                .await
+                .unwrap_err();
+            assert!(matches!(refused, HandlerError::Invalid(_)));
+            assert!(prepares(&broker).is_empty());
+
+            handler
+                .write(&path("/alice/passkeys/new"), b"remote\n")
+                .await
+                .unwrap();
+            // A retried write reuses the live enrollment instead of starting another.
+            handler
+                .write(&path("/alice/passkeys/new"), b"remote")
+                .await
+                .unwrap();
+            assert_eq!(prepares(&broker), vec![CeremonySurfaceSelection::Remote]);
+
+            let latest = handler
+                .lookup(&path("/alice/passkeys/latest"))
+                .await
+                .unwrap();
+            let target = latest.link_target.unwrap();
+            let operation = target.strip_prefix("enrollments/").unwrap().to_owned();
+            assert_eq!(
+                names(&handler, "/alice/passkeys/enrollments").await,
+                vec![operation.clone()]
+            );
+            let dir = format!("/alice/passkeys/enrollments/{operation}");
+            assert_eq!(
+                text(&handler, &format!("{dir}/url")).await,
+                "https://relay.test/ceremony/#cap=abc\n"
+            );
+            assert_eq!(
+                text(&handler, &format!("{dir}/status")).await,
+                "awaiting_user\n"
+            );
+
+            // Once the browser uses the one-time link, the URL disappears.
+            *broker.url_spent.lock().unwrap() = true;
+            assert!(matches!(
+                handler.read(&path(&format!("{dir}/url"))).await,
+                Err(HandlerError::NotFound(_))
+            ));
+            assert_eq!(
+                text(&handler, &format!("{dir}/status")).await,
+                "awaiting_user\n"
+            );
+
+            handler
+                .write(&path(&format!("{dir}/cancel")), b"\n")
+                .await
+                .unwrap();
+            assert_eq!(
+                text(&handler, &format!("{dir}/status")).await,
+                "cancelled\n"
+            );
+            let status: serde_json::Value = serde_json::from_slice(
+                &handler
+                    .read(&path(&format!("{dir}/status.json")))
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(status["ceremony_state"], "CANCELLED");
+            assert!(
+                handler
+                    .write(&path(&format!("{dir}/cancel")), b"")
+                    .await
+                    .is_err()
+            );
+
+            // A finished enrollment no longer blocks a new one.
+            handler
+                .write(&path("/alice/passkeys/new"), b"local")
+                .await
+                .unwrap();
+            assert_eq!(
+                prepares(&broker),
+                vec![
+                    CeremonySurfaceSelection::Remote,
+                    CeremonySurfaceSelection::Local
+                ]
+            );
+            assert_eq!(
+                names(&handler, "/alice/passkeys/enrollments").await.len(),
+                2
+            );
+        }
+
+        #[tokio::test]
+        async fn default_enrollment_reports_an_already_registered_device_and_refusals() {
+            let (_tmp, handler) = passkey_handler(vec![credential(1, None, LAPTOP_MS)]);
+            let broker = Arc::new(PasskeyBroker {
+                requests: Mutex::new(Vec::new()),
+                state: Mutex::new(CeremonyState::AwaitingUser),
+                url_spent: Mutex::new(false),
+                refuse: Mutex::new(false),
+                accepted: Mutex::new(Default::default()),
+                prepare_fault: Mutex::new(None),
+                prepare_refusal: Mutex::new(None),
+            });
+            let handler = handler.with_broker(Some(MachineBrokerClient::new(broker.clone())));
+
+            // An empty write asks Broker for its default surface and records
+            // the one it chose.
+            handler
+                .write(&path("/alice/passkeys/new"), b"\n")
+                .await
+                .unwrap();
+            assert_eq!(prepares(&broker), vec![CeremonySurfaceSelection::Default]);
+            let target = handler
+                .lookup(&path("/alice/passkeys/latest"))
+                .await
+                .unwrap()
+                .link_target
+                .unwrap();
+            let dir = format!("/alice/passkeys/{target}");
+            let status: serde_json::Value = serde_json::from_slice(
+                &handler
+                    .read(&path(&format!("{dir}/status.json")))
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(status["destination"], "remote");
+
+            // The new device already held a wallet passkey: a final state
+            // that neither blocks nor is cancellable.
+            *broker.state.lock().unwrap() = CeremonyState::AlreadyRegistered;
+            assert_eq!(
+                text(&handler, &format!("{dir}/status")).await,
+                "already_registered\n"
+            );
+            assert!(
+                handler
+                    .write(&path(&format!("{dir}/cancel")), b"")
+                    .await
+                    .is_err()
+            );
+
+            // With no passkey able to approve, Broker refuses before any link
+            // exists, and the write says so as a gate rather than a fault.
+            *broker.refuse.lock().unwrap() = true;
+            let refused = handler
+                .write(&path("/alice/passkeys/new"), b"remote")
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(refused, HandlerError::OperationNotPermitted),
+                "{refused:?}"
+            );
+            assert_eq!(
+                names(&handler, "/alice/passkeys/enrollments").await.len(),
+                1
+            );
+        }
     }
 }

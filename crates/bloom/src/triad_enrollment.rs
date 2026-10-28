@@ -197,7 +197,6 @@ struct DeveloperPetalLineageInput<'a> {
     active: bool,
 }
 
-#[cfg(feature = "triad-dev-harness")]
 fn base32_lower_no_pad(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
     let mut output = String::with_capacity(bytes.len().div_ceil(5) * 8);
@@ -257,22 +256,7 @@ fn sign_developer_petal_lineage(
 }
 
 #[cfg(feature = "triad-dev-harness")]
-fn enroll_developer_petal_provenance(
-    config_dir: &Path,
-    petal_dir: &Path,
-    expected_owner: u32,
-) -> Result<()> {
-    require_private_developer_file(
-        &config_dir.join("installer-identity.json"),
-        expected_owner,
-        "installer identity",
-    )?;
-    require_private_developer_file(
-        &config_dir.join("provenance-catalog.json"),
-        expected_owner,
-        "provenance catalog",
-    )?;
-
+fn load_developer_installer(config_dir: &Path) -> Result<(SigningKey, Token)> {
     let mut identity_bytes = fs::read(config_dir.join("installer-identity.json"))?;
     let mut identity: OwnedInstallerIdentity =
         serde_json::from_slice(&identity_bytes).context("parse developer installer identity")?;
@@ -293,7 +277,100 @@ fn enroll_developer_petal_provenance(
     if hex::encode(signing_key.verifying_key().to_bytes()) != identity.public_key_hex {
         bail!("developer installer identity public key does not match its signing seed");
     }
-    let installer_key_id = Token::new(identity.key_id)?;
+    Ok((signing_key, Token::new(identity.key_id)?))
+}
+
+/// Re-sign a developer provenance catalog for the current binary, as packaged
+/// upgrades do with `triad-refresh-provenance-catalog`: records come from the
+/// current public template plus this binary's bundled Petal release pins.
+/// Developer-owned records (fixtures, locally enrolled Petals) are kept.
+/// Without this, a long-lived developer root keeps the release pins of the
+/// binary that first created it, and newer bundled Petal releases can never
+/// activate. Rewrites the catalog only when it changes.
+#[cfg(feature = "triad-dev-harness")]
+pub fn run_developer_provenance_refresh(template: &Path, config_dir: &Path) -> Result<()> {
+    let uid = rustix::process::geteuid().as_raw();
+    validate_developer_caller(uid, std::env::consts::OS)?;
+    let config_dir =
+        fs::canonicalize(config_dir).context("canonicalize developer triad config directory")?;
+    refresh_developer_provenance_catalog(template, &config_dir, uid)
+}
+
+#[cfg(feature = "triad-dev-harness")]
+fn refresh_developer_provenance_catalog(
+    template: &Path,
+    config_dir: &Path,
+    expected_owner: u32,
+) -> Result<()> {
+    let catalog_path = config_dir.join("provenance-catalog.json");
+    require_private_developer_file(
+        &config_dir.join("installer-identity.json"),
+        expected_owner,
+        "installer identity",
+    )?;
+    require_private_developer_file(&catalog_path, expected_owner, "provenance catalog")?;
+    let (signing_key, installer_key_id) = load_developer_installer(config_dir)?;
+    let existing: ProvenanceCatalog =
+        serde_json::from_slice(&fs::read(&catalog_path)?).context("parse provenance catalog")?;
+    existing.validate_shape()?;
+    let mut catalog: ProvenanceCatalog = serde_json::from_slice(&read_public_template(template)?)
+        .context("parse unsigned provenance catalog")?;
+    catalog.validate_shape()?;
+    let release_publisher = Token::new("bloom-release-pins")?;
+    let developer_records: Vec<ProvenanceRecord> = existing
+        .records
+        .iter()
+        .filter(|record| {
+            record.publisher != release_publisher
+                && !catalog
+                    .records
+                    .iter()
+                    .any(|template| template.subject == record.subject)
+        })
+        .cloned()
+        .collect();
+    catalog.records.extend(developer_records);
+    append_release_petal_provenance(&mut catalog, &installer_key_id, &signing_key)?;
+    for record in &mut catalog.records {
+        record.installer_key_id = installer_key_id.clone();
+        let mut message = PROVENANCE_RECORD_SIGNATURE_DOMAIN.to_vec();
+        message.extend_from_slice(&record.unsigned_canonical_bytes()?);
+        record.installer_signature =
+            Base64UrlBytes::from_bytes(&signing_key.sign(&message).to_bytes());
+        message.zeroize();
+    }
+    catalog.records.sort_by_key(|record| {
+        serde_jcs::to_vec(&record.subject).expect("provenance subject is serializable")
+    });
+    catalog.validate_shape()?;
+    let mut current = existing;
+    current.records.sort_by_key(|record| {
+        serde_jcs::to_vec(&record.subject).expect("provenance subject is serializable")
+    });
+    if current == catalog {
+        return Ok(());
+    }
+    rewrite_private_json(&catalog_path, &serde_json::to_value(catalog)?)
+}
+
+#[cfg(feature = "triad-dev-harness")]
+fn enroll_developer_petal_provenance(
+    config_dir: &Path,
+    petal_dir: &Path,
+    expected_owner: u32,
+) -> Result<()> {
+    require_private_developer_file(
+        &config_dir.join("installer-identity.json"),
+        expected_owner,
+        "installer identity",
+    )?;
+    require_private_developer_file(
+        &config_dir.join("provenance-catalog.json"),
+        expected_owner,
+        "provenance catalog",
+    )?;
+
+    let (signing_key, installer_key_id) = load_developer_installer(config_dir)?;
 
     // The Petal's source build may have changed its generated route components
     // since a previous developer run left ignored package artifacts behind.
@@ -973,6 +1050,112 @@ fn append_release_petal_provenance(
     installer_key_id: &Token,
     signing_key: &SigningKey,
 ) -> Result<()> {
+    append_release_petal_provenance_for_entries(
+        catalog,
+        installer_key_id,
+        signing_key,
+        &crate::github_source::release_lineage_petals(),
+    )
+}
+
+fn append_release_petal_provenance_for_entries(
+    catalog: &mut ProvenanceCatalog,
+    installer_key_id: &Token,
+    signing_key: &SigningKey,
+    entries: &[&crate::github_source::PreinstalledPetal],
+) -> Result<()> {
+    let publisher = Token::new("bloom-release-pins")?;
+    let mut package_hashes = std::collections::BTreeSet::new();
+    let mut lineage_ids = std::collections::BTreeSet::new();
+    for entry in entries {
+        let package_hash = Digest32::new(
+            entry
+                .expected_hash
+                .context("release Petal has no package hash")?,
+        )?;
+        let lineage_id = entry
+            .lineage_id
+            .map(str::to_owned)
+            .unwrap_or_else(|| release_petal_lineage_id(&publisher, entry.name));
+        bloom_broker_api::validate_lineage_id(&lineage_id)?;
+        if entry.release_sequence == 0
+            || !package_hashes.insert(package_hash.as_str().to_owned())
+            || !lineage_ids.insert(lineage_id.clone())
+        {
+            bail!("release Petal contains an invalid or duplicate lineage");
+        }
+        let predecessors = entry
+            .predecessor_package_hashes
+            .iter()
+            .map(|hash| Digest32::new(*hash))
+            .collect::<Result<Vec<_>, _>>()?;
+        let baseline = crate::github_source::release_lineage_predecessor(entry.name)
+            .context("bundled Petal has no baseline release hash")?;
+        if package_hash.as_str() != baseline.hash {
+            if entry.release_sequence <= 1
+                || !predecessors
+                    .iter()
+                    .any(|hash| hash.as_str() == baseline.hash)
+            {
+                bail!(
+                    "successor {} must advance its release sequence and list its baseline hash",
+                    entry.name
+                );
+            }
+            let old_hash = Digest32::new(baseline.hash)?;
+            append_release_lineage_record(
+                catalog,
+                signing_key,
+                installer_key_id,
+                &publisher,
+                &lineage_id,
+                &old_hash,
+                1,
+                &[],
+                false,
+                baseline.authority_routes,
+            )?;
+        }
+        append_release_lineage_record(
+            catalog,
+            signing_key,
+            installer_key_id,
+            &publisher,
+            &lineage_id,
+            &package_hash,
+            entry.release_sequence,
+            &predecessors,
+            true,
+            entry.authority_routes,
+        )?;
+    }
+    catalog.validate_shape()?;
+    Ok(())
+}
+
+fn release_petal_lineage_id(publisher: &Token, package_name: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"bloom-release-petal-lineage-id/v1");
+    hasher.update(&[0]);
+    hasher.update(publisher.as_str().as_bytes());
+    hasher.update(&[0]);
+    hasher.update(package_name.as_bytes());
+    format!("pln1_{}", base32_lower_no_pad(hasher.finalize().as_bytes()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_release_lineage_record(
+    catalog: &mut ProvenanceCatalog,
+    signing_key: &SigningKey,
+    installer_key_id: &Token,
+    publisher: &Token,
+    lineage_id: &str,
+    package_hash: &Digest32,
+    release_sequence: u64,
+    predecessors: &[Digest32],
+    active: bool,
+    authority_routes: &[crate::github_source::PetalAuthorityRoute],
+) -> Result<()> {
     #[derive(Serialize)]
     struct LineageStatement<'a> {
         schema: &'static str,
@@ -984,54 +1167,42 @@ fn append_release_petal_provenance(
         publisher: &'a Token,
         active: bool,
     }
-
-    let publisher = Token::new("bloom-release-pins")?;
-    let mut package_hashes = std::collections::BTreeSet::new();
-    let mut lineage_ids = std::collections::BTreeSet::new();
-    for entry in crate::github_source::release_authority_petals() {
-        let package_hash = Digest32::new(
-            entry
-                .expected_hash
-                .context("release Petal has no package hash")?,
-        )?;
-        let lineage_id = entry
-            .lineage_id
-            .context("release Petal has no lineage ID")?;
-        bloom_broker_api::validate_lineage_id(lineage_id)?;
-        if entry.release_sequence == 0
-            || !package_hashes.insert(package_hash.as_str().to_owned())
-            || !lineage_ids.insert(lineage_id.to_owned())
-        {
-            bail!("release Petal authority contains an invalid or duplicate lineage");
-        }
-        let predecessors = entry
-            .predecessor_package_hashes
-            .iter()
-            .map(|hash| Digest32::new(*hash))
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut lineage_message = b"bloom-release-petal-lineage/v1".to_vec();
-        lineage_message.extend_from_slice(&serde_jcs::to_vec(&LineageStatement {
-            schema: "bloom.release-petal-lineage.1",
-            lineage_id,
-            package_hash: &package_hash,
-            release_sequence: DecimalU64::new(entry.release_sequence),
-            predecessor_package_hashes: &predecessors,
-            controller_key_id: installer_key_id,
-            publisher: &publisher,
-            active: true,
-        })?);
-        let lineage = PetalLineageMembership {
-            lineage_id: lineage_id.to_owned(),
-            release_sequence: DecimalU64::new(entry.release_sequence),
-            predecessor_package_hashes: predecessors,
-            controller_key_id: installer_key_id.clone(),
-            controller_signature: Base64UrlBytes::from_bytes(
-                &signing_key.sign(&lineage_message).to_bytes(),
-            ),
-            active: true,
-        };
-        lineage_message.zeroize();
-        for route in entry.authority_routes {
+    let mut message = b"bloom-release-petal-lineage/v1".to_vec();
+    message.extend_from_slice(&serde_jcs::to_vec(&LineageStatement {
+        schema: "bloom.release-petal-lineage.1",
+        lineage_id,
+        package_hash,
+        release_sequence: DecimalU64::new(release_sequence),
+        predecessor_package_hashes: predecessors,
+        controller_key_id: installer_key_id,
+        publisher,
+        active,
+    })?);
+    let lineage = PetalLineageMembership {
+        lineage_id: lineage_id.to_owned(),
+        release_sequence: DecimalU64::new(release_sequence),
+        predecessor_package_hashes: predecessors.to_vec(),
+        controller_key_id: installer_key_id.clone(),
+        controller_signature: Base64UrlBytes::from_bytes(&signing_key.sign(&message).to_bytes()),
+        active,
+    };
+    message.zeroize();
+    // No authority class is assigned to these metadata-only records. The
+    // Broker accepts their shape for lineage but rejects them for approvals.
+    if authority_routes.is_empty() {
+        catalog.records.push(ProvenanceRecord {
+            subject: ProvenanceSubject::Petal {
+                package_hash: package_hash.clone(),
+                route: "__lineage__".into(),
+            },
+            publisher: publisher.clone(),
+            petal_lineage: Some(lineage),
+            operation_classes: vec![],
+            installer_key_id: installer_key_id.clone(),
+            installer_signature: Base64UrlBytes::from_bytes(&[]),
+        });
+    } else {
+        for route in authority_routes {
             let operation_classes = route
                 .operation_classes
                 .iter()
@@ -1055,7 +1226,6 @@ fn append_release_petal_provenance(
             });
         }
     }
-    catalog.validate_shape()?;
     Ok(())
 }
 
@@ -1180,6 +1350,11 @@ mod tests {
     use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
     use std::os::unix::fs::PermissionsExt as _;
 
+    /// Building the fixture Petal rewrites its package artifacts in place, so
+    /// tests that build it must not run concurrently.
+    #[cfg(feature = "triad-dev-harness")]
+    static FIXTURE_PETAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn template_dir() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -1251,7 +1426,118 @@ mod tests {
 
     #[cfg(feature = "triad-dev-harness")]
     #[test]
+    fn developer_catalog_refresh_replaces_stale_release_pins_and_keeps_developer_records() {
+        let _fixture = FIXTURE_PETAL
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("config");
+        fs::create_dir(&output).unwrap();
+        fs::set_permissions(&output, fs::Permissions::from_mode(0o700)).unwrap();
+        let owner = rustix::process::geteuid().as_raw();
+        let plan = EnrollmentPlan {
+            template_dir: template_dir(),
+            output_dir: output.clone(),
+            login_uid: 1_001,
+            broker_uid: 1_002,
+            signer_uid: 1_003,
+            session_socket_gid: 1_004,
+            release_digest: "44".repeat(32),
+        };
+        generate_for_owner(&plan, owner).unwrap();
+        let petal_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .unwrap()
+            .join("tests/fixtures/triad-authority-petal");
+        let developer_hash = PreparedPetalPackage::from_dir(&petal_dir).unwrap().hash;
+        enroll_developer_petal_provenance(&output, &petal_dir, owner).unwrap();
+        let catalog_path = output.join("provenance-catalog.json");
+        let read = || -> ProvenanceCatalog {
+            serde_json::from_slice(&fs::read(&catalog_path).unwrap()).unwrap()
+        };
+        let developer_records = |catalog: &ProvenanceCatalog| -> Vec<ProvenanceRecord> {
+            catalog
+                .records
+                .iter()
+                .filter(|record| matches!(&record.subject,
+                    ProvenanceSubject::Petal { package_hash, .. } if package_hash.as_str() == developer_hash))
+                .cloned()
+                .collect()
+        };
+        let enrolled = developer_records(&read());
+        assert!(!enrolled.is_empty());
+
+        // Simulate a developer root created by an older binary: its release
+        // pins name a package this binary no longer ships.
+        let (signing_key, installer_key_id) = load_developer_installer(&output).unwrap();
+        let mut stale = read();
+        let release_publisher = Token::new("bloom-release-pins").unwrap();
+        stale
+            .records
+            .retain(|record| record.publisher != release_publisher);
+        let stale_hash = Digest32::new("ab".repeat(32)).unwrap();
+        append_release_lineage_record(
+            &mut stale,
+            &signing_key,
+            &installer_key_id,
+            &release_publisher,
+            &release_petal_lineage_id(&release_publisher, "polymarket"),
+            &stale_hash,
+            1,
+            &[],
+            true,
+            &[],
+        )
+        .unwrap();
+        rewrite_private_json(&catalog_path, &serde_json::to_value(&stale).unwrap()).unwrap();
+
+        let template = template_dir().join("provenance-catalog.unsigned.json");
+        refresh_developer_provenance_catalog(&template, &output, owner).unwrap();
+        let refreshed = read();
+        refreshed.validate_shape().unwrap();
+        assert_eq!(developer_records(&refreshed), enrolled);
+        let active_hashes: Vec<&str> = refreshed
+            .records
+            .iter()
+            .filter(|record| record.petal_lineage.as_ref().is_some_and(|l| l.active))
+            .filter_map(|record| match &record.subject {
+                ProvenanceSubject::Petal { package_hash, .. } => Some(package_hash.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(!active_hashes.contains(&stale_hash.as_str()));
+        for pinned in crate::github_source::release_lineage_petals() {
+            assert!(
+                active_hashes.contains(&pinned.expected_hash.unwrap()),
+                "{}",
+                pinned.name
+            );
+        }
+        let verifier = signing_key.verifying_key();
+        for record in &refreshed.records {
+            let mut message = PROVENANCE_RECORD_SIGNATURE_DOMAIN.to_vec();
+            message.extend_from_slice(&record.unsigned_canonical_bytes().unwrap());
+            let signature: [u8; 64] = record.installer_signature.decode().try_into().unwrap();
+            verifier
+                .verify(&message, &Signature::from_bytes(&signature))
+                .unwrap();
+        }
+
+        // An up-to-date catalog is left untouched.
+        let before = fs::read(&catalog_path).unwrap();
+        let inode = fs::metadata(&catalog_path).unwrap().ino();
+        refresh_developer_provenance_catalog(&template, &output, owner).unwrap();
+        assert_eq!(fs::read(&catalog_path).unwrap(), before);
+        assert_eq!(fs::metadata(&catalog_path).unwrap().ino(), inode);
+    }
+
+    #[cfg(feature = "triad-dev-harness")]
+    #[test]
     fn enrolled_linux_petal_satisfies_the_machine_active_lineage_gate() {
+        let _fixture = FIXTURE_PETAL
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         validate_developer_caller(1000, "linux").unwrap();
         let directory = tempfile::tempdir().unwrap();
         let output = directory.path().join("config");
@@ -1375,6 +1661,93 @@ mod tests {
     }
 
     #[test]
+    fn bundled_successor_retains_inactive_baseline_for_state_carry_forward() {
+        let signing = SigningKey::from_bytes(&[17; 32]);
+        let key_id = Token::new("installer-key").unwrap();
+        for (name, baseline_hash) in [
+            (
+                "enso",
+                "97650f327691f01bc4591cde25253d1e20010643e700674cc9759cd1366876b9",
+            ),
+            (
+                "near-intents",
+                "ac2ccab59f36ee863843f92aaf0c975c00dbf32b246df5ccbb79757093785921",
+            ),
+            (
+                "polymarket",
+                "5df5a1377dc4d70c71e47ffe6827e691e1f5868543b752dc8d19a500284e5fa6",
+            ),
+            (
+                "hyperliquid",
+                "b29c7afb88ec9d2df774b18dad2699ec169100eeeedbcefca02ea0cc3712a188",
+            ),
+            (
+                "tolly",
+                "f50f9f6f55eca103c11ed40d424311c6e5863ff5046231f57f58822d1aac6709",
+            ),
+        ] {
+            let current = crate::github_source::preinstalled_petal(name).unwrap();
+            let successor = crate::github_source::PreinstalledPetal {
+                expected_hash: Some(
+                    "1111111111111111111111111111111111111111111111111111111111111111",
+                ),
+                release_sequence: 2,
+                predecessor_package_hashes: match name {
+                    "enso" => &["97650f327691f01bc4591cde25253d1e20010643e700674cc9759cd1366876b9"],
+                    "near-intents" => {
+                        &["ac2ccab59f36ee863843f92aaf0c975c00dbf32b246df5ccbb79757093785921"]
+                    }
+                    "polymarket" => {
+                        &["5df5a1377dc4d70c71e47ffe6827e691e1f5868543b752dc8d19a500284e5fa6"]
+                    }
+                    "hyperliquid" => {
+                        &["b29c7afb88ec9d2df774b18dad2699ec169100eeeedbcefca02ea0cc3712a188"]
+                    }
+                    _ => &["f50f9f6f55eca103c11ed40d424311c6e5863ff5046231f57f58822d1aac6709"],
+                },
+                ..*current
+            };
+            let mut catalog = ProvenanceCatalog {
+                schema: bloom_broker_api::PROVENANCE_CATALOG_SCHEMA.into(),
+                records: vec![],
+            };
+            append_release_petal_provenance_for_entries(
+                &mut catalog,
+                &key_id,
+                &signing,
+                &[&successor],
+            )
+            .unwrap();
+            let old = catalog.records.iter().find(|record| matches!(
+                &record.subject,
+                ProvenanceSubject::Petal { package_hash, .. } if package_hash.as_str() == baseline_hash
+            )).unwrap();
+            let new = catalog.records.iter().find(|record| matches!(
+                &record.subject,
+                ProvenanceSubject::Petal { package_hash, .. } if package_hash.as_str() == successor.expected_hash.unwrap()
+            )).unwrap();
+            let old_lineage = old.petal_lineage.as_ref().unwrap();
+            let new_lineage = new.petal_lineage.as_ref().unwrap();
+            assert!(!old_lineage.active);
+            assert_eq!(old_lineage.release_sequence.get(), 1);
+            assert!(new_lineage.active);
+            assert_eq!(new_lineage.release_sequence.get(), 2);
+            assert_eq!(old_lineage.lineage_id, new_lineage.lineage_id);
+            assert_eq!(old.publisher, new.publisher);
+            assert!(
+                new_lineage
+                    .predecessor_package_hashes
+                    .iter()
+                    .any(|hash| hash.as_str() == baseline_hash)
+            );
+            if !matches!(name, "polymarket" | "hyperliquid") {
+                assert!(old.operation_classes.is_empty());
+                assert!(new.operation_classes.is_empty());
+            }
+        }
+    }
+
+    #[test]
     fn generated_material_is_fresh_cross_pinned_and_provenance_signed() {
         let directory = tempfile::tempdir().unwrap();
         let output = directory.path().join("output");
@@ -1450,8 +1823,8 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(petal_hashes.len(), 21);
-        for name in ["polymarket", "hyperliquid"] {
+        assert_eq!(petal_hashes.len(), 47);
+        for name in crate::github_source::DEFAULT_PETALS {
             let expected = crate::github_source::preinstalled_petal(name)
                 .unwrap()
                 .expected_hash

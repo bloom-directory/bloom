@@ -221,7 +221,7 @@ wait_for_fixture_stage() {
   attempts=0
   while [ "$attempts" -lt 200 ]; do
     fixture_body="$(bounded_mounted_read \
-      "$(mounted /petals/triad-authority-fixture/session.json)" \
+      "$(mounted /petals/triad-authority-fixture/wallets/${registered_wallet}/0/session.json)" \
       "fixture Petal session read")"
     fixture_stage="$(printf '%s' "$fixture_body" | jq -r '
       if .stage == "key" then "key:" + (.outcome.state // "")
@@ -359,16 +359,17 @@ if [ -z "${BLOOM_INTEGRATION_DEBUG_DRIVER_BIN:-}" ]; then
 fi
 start_stack
 
-# Machine exposes credential replacement and the explicit legacy-passkey
-# receipt migration workflow. Prove the exact user-visible CLI inventory and
-# that neither operation is exposed as an unaudited mounted mutation surface.
+# Machine exposes paired credential addition, replacement, and explicit legacy
+# receipt migration. Prove the exact CLI inventory and that credential mutation
+# is not exposed as an unaudited mounted control.
 wallet_help="$(cli wallet --help)"
 credential_commands="$(printf '%s\n' "$wallet_help" |
   sed -n 's/^  \([a-z][a-z-]*\)  *.*/\1/p' |
   grep -E '(credential|passkey|authenticator)' || true)"
-[ "$credential_commands" = "migrate-passkey
+[ "$credential_commands" = "add-passkey
+migrate-passkey
 rebind-passkey" ] ||
-  die "credential-change CLI inventory is not exactly migrate-passkey and rebind-passkey: ${credential_commands:-<none>}"
+  die "credential-change CLI inventory differs from add-passkey, migrate-passkey, rebind-passkey: ${credential_commands:-<none>}"
 
 printf 'MA-03: registering wallet through Broker/Signer...\n'
 registration_launch="$(cli wallet new ma03-registration)"
@@ -477,7 +478,7 @@ fixture_request="$(jq -nc \
   '{request_id:$request_id,wallet_id:$wallet_id,purpose:"fixture.payload",
     maximum_lifetime_ms:900000,preimage_hex:"6d613033",
     nonce_hex:"11111111111111111111111111111111",approval_hint:null}')"
-printf '%s\n' "$fixture_request" > "$(mounted /petals/triad-authority-fixture/session.json)" 2>/dev/null || true
+printf '%s\n' "$fixture_request" > "$(mounted /petals/triad-authority-fixture/wallets/${registered_wallet}/0/session.json)" 2>/dev/null || true
 key_record="$(wait_for_fixture_record "$request_id")"
 key_ceremony_url="$(printf '%s' "$key_record" | jq -er '.ceremony_url')"
 before_key_count="$(printf '%s' "$policy_projection" | jq -er '.keys | length')"
@@ -498,7 +499,7 @@ printf 'MA-08: signing with the scoped child through the mounted fixture Petal..
 # Re-run the exact mounted request after custody completion.  The Petal must
 # now reach the canonical missing-approval boundary rather than receiving any
 # child secret or a Machine-minted capability.
-printf '%s\n' "$fixture_request" > "$(mounted /petals/triad-authority-fixture/session.json)" 2>/dev/null || true
+printf '%s\n' "$fixture_request" > "$(mounted /petals/triad-authority-fixture/wallets/${registered_wallet}/0/session.json)" 2>/dev/null || true
 fixture_missing_approval="$(wait_for_fixture_stage signing_failed)"
 printf '%s' "$fixture_missing_approval" | jq -e '
   .stage == "signing_failed" and (.error | contains("APPROVAL_NOT_FOUND"))
@@ -576,7 +577,7 @@ approval_ceremony_url="$(printf '%s' "$approval_projection" | jq -er '.ceremony_
 wait_for_approval_active "$registered_wallet" "$fixture_approval_id"
 fixture_request="$(printf '%s' "$fixture_request" | jq -cS --arg approval_id "$fixture_approval_id" \
   '.approval_hint = $approval_id')"
-printf '%s\n' "$fixture_request" > "$(mounted /petals/triad-authority-fixture/session.json)"
+printf '%s\n' "$fixture_request" > "$(mounted /petals/triad-authority-fixture/wallets/${registered_wallet}/0/session.json)"
 fixture_signed="$(wait_for_fixture_stage complete)"
 printf '%s' "$fixture_signed" | jq -e '
   .stage == "complete" and
@@ -623,4 +624,4 @@ fi
   die "deleted wallet resurrected in the mounted VFS across restart"
 assert_no_legacy_record "$registered_wallet" "$imported_wallet"
 
-printf 'MA-03 projection fidelity passed: the sole retained credential-change surface (replacement), registration, import, policy update, Petal key derivation, deletion, and restart matched through CLI and mounted VFS; no credential add/remove Machine surface exists.\n'
+printf 'MA-03 projection fidelity passed: registration, import, replacement, policy update, Petal key derivation, deletion, and restart matched through CLI and mounted VFS; paired addition is covered by remote ceremony acceptance.\n'

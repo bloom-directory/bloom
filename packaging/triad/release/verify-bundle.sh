@@ -34,6 +34,10 @@ for required in \
   PLATFORM_CLAIM \
   compatibility-v1.toml \
   installer/release/install-linux.sh \
+  installer/release/compatibility-v1.toml \
+  installer/relay/control-ca.pem \
+  installer/relay/receipt-public-keys.hex \
+  installer/relay/superseded-pins \
   installer/linux/bin/bloom-uninstall \
   installer/linux/systemd-user/bloom-machine.service \
   installer/macos/launchagents/com.bloom.machine.plist.in \
@@ -69,25 +73,6 @@ compat_value() {
     active && $1 == key && $2 == "=" { print $3 }
   ' "$compatibility"
 }
-require_compat_value() {
-  local section="$1" key="$2" expected="$3" actual
-  actual="$(compat_value "$section" "$key")"
-  [[ "$actual" == "$expected" ]] || {
-    echo "bundle compatibility has invalid $section.$key" >&2
-    exit 65
-  }
-}
-require_compat_value protocols.machine_broker major 1
-require_compat_value protocols.machine_broker minor_min 6
-require_compat_value protocols.machine_broker minor_max 6
-require_compat_value protocols.broker_signer major 1
-require_compat_value protocols.broker_signer minor_min 5
-require_compat_value protocols.broker_signer minor_max 5
-for support_edge in signer_control session; do
-  require_compat_value "protocols.$support_edge" major 1
-  require_compat_value "protocols.$support_edge" minor_min 0
-  require_compat_value "protocols.$support_edge" minor_max 1
-done
 source_revision() {
   local key="$1" value
   value="$(sed -n -E "s/^$key=([0-9a-f]{40})$/\\1/p" "$payload/SOURCE_REVISIONS")"
@@ -112,12 +97,19 @@ signer_revision="$(source_revision BLOOM_SIGNER_SHA)"
   echo "bundle compatibility revision does not match SOURCE_REVISIONS" >&2
   exit 65
 }
-require_compat_value revisions service_runtime_commit '"5db670e1b7507deabfdcf451be8b5d315c1c9d91"'
-require_compat_value revisions petal_contract_commit '"73c5b06a77599368fbc79fb7947a629b5b4c630e"'
-for state_owner in machine broker signer; do
-  require_compat_value "state.$state_owner" current 1
-  require_compat_value "state.$state_owner" downgrade_floor 1
-done
+# Everything but the built Broker and Signer commits must be exactly the
+# reviewed record in this checkout (its values are checked against the API
+# crates and lockfile in bloom-it's triad_release tests); those two commits
+# describe the build, so they must match SOURCE_REVISIONS above.
+reviewed_compatibility="$script_dir/compatibility-v1.toml"
+without_built_revisions() {
+  grep -Ev '^(broker|signer)_commit = ' "$1"
+}
+diff -u <(without_built_revisions "$reviewed_compatibility") \
+  <(without_built_revisions "$compatibility") >&2 || {
+  echo "bundle compatibility differs from the reviewed compatibility-v1.toml" >&2
+  exit 65
+}
 if grep -Eq '^[[:space:]]*(protocol_major|protocol_minor_min|protocol_minor_max)[[:space:]]*=' "$compatibility"; then
   echo "bundle compatibility must not declare a global protocol range" >&2
   exit 65
