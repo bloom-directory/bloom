@@ -267,7 +267,11 @@ class DisposableTriad:
             f'chain_id = 1\nrpc_urls = ["{ethereum_rpc}"]\n'
             'display_name = "Ethereum"\nnative_symbol = "ETH"\nnative_decimals = 18\n'
             '[chains.polygon]\nname = "polygon"\nchain_id = 137\n'
-            'rpc_urls = ["https://polygon-bor-rpc.publicnode.com"]\n'
+            # Bloom's own Polygon defaults (#387): one public node alone timed
+            # out for a whole trial on 2026-10-28 and failed the verifier.
+            'rpc_urls = ["https://polygon.drpc.org", '
+            '"https://polygon-bor-rpc.publicnode.com", '
+            '"https://tenderly.rpc.polygon.community"]\n'
             'display_name = "Polygon"\nnative_symbol = "POL"\nnative_decimals = 18\n'
         )
         if solana:
