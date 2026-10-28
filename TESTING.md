@@ -110,7 +110,8 @@ alone is not evidence that a custody or transaction workflow succeeds.
 ### Shopping through the real Triad
 
 `scripts/test-card-checkout.mjs` exercises card enrollment/deletion, manual
-fallback, lost-tab recovery, take-over/handback and a shop-saved payment through
+fallback, lost-tab recovery, isolation from another localhost app,
+take-over/handback and a shop-saved payment through
 VFS and the real Broker ceremony UI, Signer and checkout services. Its saved-card
 payment uses Stripe's public **test** checkout with a synthetic card. It does
 not submit a live purchase. It requires a fresh developer Triad launched with

@@ -117,7 +117,7 @@ provider (Stripe, Shopify, Adyen, Braintree, Yuno and others) or into the own
 checkout page of a listed merchant. A bank challenge,
 card fields anywhere else, or
 an unclear total goes to the human's private view; its access token and screenshots
-never appear in VFS. The cookie-protected `view_url` is only an entry point for
+never appear in VFS. The session-protected `view_url` is only an entry point for
 the already authorized browser. A manual
 fallback releases no saved card.
 

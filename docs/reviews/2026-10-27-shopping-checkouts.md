@@ -115,9 +115,16 @@ development revisions recorded above; this was not a release installation or
 an OS-principal isolation test.
 
 Private bootstrap URLs are one-use; their values no longer double as session
-cookies. A separate random HttpOnly cookie lets the same browser reopen the
-approved view through the safe `view_url` in request status. Replaying a used
-bootstrap or forging a cookie from it is rejected.
+credentials. A second follow-up at `679146b3` replaces the session cookie:
+a real two-server Chromium test demonstrated that a localhost cookie is also
+sent to other localhost ports. The independent session key now stays in the
+human browser's localStorage for the checkout's exact origin and is sent only
+in explicit Authorization headers. Screenshots use authenticated fetches.
+Another local app receives neither the key nor an authentication cookie.
+The safe `view_url` reopens the view in the browser that claimed it. Used
+bootstrap replay, cookie-only access and cross-origin mutations are refused.
+The private UI retries failed reads after temporary outages and hides its
+controls while its image is unavailable; it never retries payment actions.
 
 Recovery regressions also cover interrupted human payment remaining uncertain
 after restart, stale pause flags clearing on a fresh browser, retrying cleanup
@@ -129,3 +136,45 @@ Live bank authorization and live merchant settlement remain untested. A test
 payment cannot prove that a bank will approve a live purchase. Release builds,
 macOS conformance and inherited dependency-pin failures are separate gates.
 Nothing was merged.
+
+The existing protocol migration from Bloom #378 is incorporated in this
+candidate. Machine speaks Broker API1.8, and every build/release/workflow pin
+now names Broker `88604d308412bea3876533adc80904223d334bf2` and Signer
+`74e097a566f1bd08f5f43a7e847d3958b6386a3a`. Migration tests use frozen schema-1
+JSON instead of compiling an obsolete Broker/runtime dependency. The pin audit
+now fails only because the two dependencies have not landed; its inconsistent
+revision findings are resolved. No merge or approval requirement was waived.
+
+Final runtime verification at `679146b36791450761b4959406b4bf2ae1d92cc4`,
+with those exact Broker/Signer revisions:
+
+- All seven real-service checks passed: custody card enrollment, isolation
+  from another HTTP localhost app, manual fallback and lost-tab recovery,
+  sealed card release and a real Stripe TEST payment, authenticated takeover
+  handback, exactly one shop-saved payment submission, and custody deletion.
+  The local app received neither private authentication cookies nor an
+  Authorization header and could not read the checkout's origin storage.
+- Checkout library98 passed (8 opt-in tests ignored); Machine client70,
+  protocol182, Solana transactions20, transactions183 (1 ignored), VFS439.
+- Linux packaging55 passed (16 macOS tests excluded, as in Linux CI).
+  The real browser-death subprocess test also passed under nextest.
+- All four public Stripe Elements TEST cases passed: success, card decline,
+  successful simulated bank challenge and failed simulated bank challenge.
+  The real public test backend explicitly returned `livemode=false`.
+- Strict Clippy across affected packages, final VFS source embedding and
+  JavaScript syntax checks passed. A real UI regression also verifies read
+  reconnection after a temporary server failure and closed-view controls.
+
+The final developer triad used ports28820/28821 and root
+`/tmp/checkout-1027-public/origin-triad`; its recorded launcher was stopped
+after card deletion. Installed custody on18734 was untouched. Sanitized
+results, logs and executable SHA-256 values are retained in the workspace's
+`shared/checkout-1027-evidence/full-service-verification.json` and adjacent
+artifacts. These are developer-service tests with a software passkey; they
+do not replace installed OS-principal conformance.
+
+The exact-runtime [three-platform release dry run](https://github.com/bloom-directory/bloom/actions/runs/40619324801)
+and [single-Mac conformance run](https://github.com/bloom-directory/bloom/actions/runs/40619330497)
+were dispatched with explicit sibling revisions. Their results must be checked
+before claiming release readiness. The required two-login macOS runner and
+active GUI-login inputs remain unavailable; runner inventory returned403.
