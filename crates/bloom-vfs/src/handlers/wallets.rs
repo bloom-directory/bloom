@@ -8837,6 +8837,7 @@ value = "0""#,
             .with_broker(Some(MachineBrokerClient::new(broker.clone())));
         let request = ApprovalPrepareRequest {
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
+            safe_review_payloads: Vec::new(),
             evm_review_payloads: Vec::new(),
             operation_id: OperationId::from_bytes([30; 32]),
             terms: approval_terms("alice", None),
@@ -8886,6 +8887,7 @@ value = "0""#,
                 .with_broker(Some(MachineBrokerClient::new(broker.clone())));
             let request = ApprovalPrepareRequest {
                 surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
+                safe_review_payloads: Vec::new(),
                 evm_review_payloads: Vec::new(),
                 operation_id: OperationId::from_bytes([30; 32]),
                 terms: approval_terms("alice", None),
@@ -8920,6 +8922,7 @@ value = "0""#,
             .with_broker(Some(MachineBrokerClient::new(broker.clone())));
         let request = ApprovalPrepareRequest {
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
+            safe_review_payloads: Vec::new(),
             evm_review_payloads: Vec::new(),
             operation_id: OperationId::from_bytes([30; 32]),
             terms: approval_terms("alice", None),
@@ -8953,6 +8956,7 @@ value = "0""#,
             .with_broker(Some(MachineBrokerClient::new(broker)));
         let request = ApprovalPrepareRequest {
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
+            safe_review_payloads: Vec::new(),
             evm_review_payloads: Vec::new(),
             operation_id: OperationId::from_bytes([30; 32]),
             terms: approval_terms("alice", None),
