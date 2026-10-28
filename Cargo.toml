@@ -85,8 +85,8 @@ futures = "0.3"
 lru = "0.18.2"
 fs2 = "0.4"
 bloom-audit-checkpoint = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "ad0072512bb97fb4eb68d249ce785ea3ea4a49ab" }
-wasmtime = { version = "=36.0.13", default-features = false, features = ["async", "cranelift", "runtime", "cache", "parallel-compilation"] }
-wasmtime-wasi = "=36.0.13"
+wasmtime = { version = "=36.0.19", default-features = false, features = ["async", "cranelift", "runtime", "parallel-compilation"] }
+wasmtime-wasi = "=36.0.19"
 wat = "1"
 # danger-allow-state-serialisation: webauthn-rs requires this feature to allow
 # the PasskeyRegistration / PasskeyAuthentication state structs to be serialised
@@ -137,7 +137,7 @@ bloom-petals   = { path = "crates/bloom-petals" }
 bloom-petal-contract = { git = "https://github.com/bloom-directory/petal", rev = "73c5b06a77599368fbc79fb7947a629b5b4c630e" }
 bloom-daemon   = { path = "crates/bloom-daemon" }
 bloom-update   = { path = "crates/bloom-update" }
-bloom-broker-api = { git = "https://github.com/bloom-directory/bloom-broker.git", rev = "88604d308412bea3876533adc80904223d334bf2" }
+bloom-broker-api = { git = "https://github.com/bloom-directory/bloom-broker.git", rev = "b4f0c0bf04f3f34cc171f072a87ed982f4e7e196" }
 bloom-rpc-wire = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "ad0072512bb97fb4eb68d249ce785ea3ea4a49ab" }
 bloom-triad-local-transport = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "ad0072512bb97fb4eb68d249ce785ea3ea4a49ab" }
 bloom-service-activation = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "ad0072512bb97fb4eb68d249ce785ea3ea4a49ab" }
