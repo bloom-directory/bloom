@@ -1783,7 +1783,7 @@ impl PetalHost for DaemonPetalHost {
                 builder = builder.header(name.as_str(), value.as_str());
             }
             let resp = builder.body(body.clone()).send().await.map_err(|e| {
-                let err = HostError::Backend(format!("http_fetch send: {e}"));
+                let err = petal_http_transport_error("send", &method, &url, e);
                 self.audited_http_error(&correlation_id, &method, &url, "error", None, None, err)
             })?;
             let status = resp.status().as_u16();
@@ -1899,7 +1899,7 @@ impl PetalHost for DaemonPetalHost {
             let mut stream = resp.bytes_stream();
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.map_err(|e| {
-                    let err = HostError::Backend(format!("http_fetch body: {e}"));
+                    let err = petal_http_transport_error("body", &method, &url, e);
                     self.audited_http_error(
                         &correlation_id,
                         &method,
@@ -3076,6 +3076,31 @@ fn petal_outbox_outcome(
         plan_md,
         approval_required,
     })
+}
+
+fn petal_http_transport_error(
+    phase: &str,
+    method: &str,
+    url: &str,
+    error: reqwest::Error,
+) -> HostError {
+    // URL userinfo, paths and queries can hold credentials, so the message
+    // names only method and host. reqwest prints the URL from its own field,
+    // which without_url() clears; the source chain (DNS, connect, TLS,
+    // timeout) is appended as is and, in the pinned reqwest, carries no URL.
+    let host = url::Url::parse(url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .unwrap_or_else(|| "<invalid url>".into());
+    let error = error.without_url();
+    let mut message = format!("http_fetch {phase}: {method} {host}: {error}");
+    let mut source = std::error::Error::source(&error);
+    while let Some(cause) = source {
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    HostError::Backend(message)
 }
 
 fn resolve_redirect_target(current_url: &str, location: &str) -> Result<String, HostError> {
@@ -9914,6 +9939,35 @@ allowed = ["bloom:vfs.read"]
         assert!(
             names.contains(&"unknown-eeeeeeeeeeee"),
             "an unmounted session renders under unknown-<hash prefix>: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn petal_http_transport_errors_name_method_host_and_cause_but_no_url_data() {
+        // Bound but not listening: the port stays ours and connects are refused.
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let url = format!(
+            "http://fixture-user:fixture-password@127.0.0.1:{port}/fixture-path-token?key=fixture-query-token"
+        );
+        let original = reqwest::Client::new().get(&url).send().await.unwrap_err();
+        let message = petal_http_transport_error("send", "GET", &url, original).to_string();
+        for value in [
+            "fixture-user",
+            "fixture-password",
+            "fixture-path-token",
+            "fixture-query-token",
+        ] {
+            assert!(!message.contains(value), "URL data leaked: {message}");
+        }
+        assert!(
+            message.contains("http_fetch send: GET 127.0.0.1: "),
+            "method and host were dropped: {message}"
+        );
+        assert!(
+            message.contains("Connection refused"),
+            "transport cause was dropped: {message}"
         );
     }
 }
