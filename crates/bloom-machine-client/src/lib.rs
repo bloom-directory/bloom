@@ -598,10 +598,17 @@ impl MachineBrokerClient {
         let expected = ExpectedSigningResult::from_request(&request);
         match self
             .request(MachineBrokerRequest::SigningSign(request))
-            .await?
+            .await
+            .map_err(uncertain_signing_response)?
         {
-            MachineBrokerResponse::SigningSign(result) => expected.validate(result),
-            _ => Err(response_mismatch("signing.sign")),
+            MachineBrokerResponse::SigningSign(result) => expected.validate(result).map_err(|_| {
+                service_unavailable(
+                    "Broker signing response could not be verified; retain the operation identity",
+                )
+            }),
+            _ => Err(service_unavailable(
+                "Broker returned a mismatched signing response; retain the operation identity",
+            )),
         }
     }
 
@@ -612,10 +619,11 @@ impl MachineBrokerClient {
         let expected = ExpectedSigningResult::from_request(&request);
         match self
             .request(MachineBrokerRequest::SigningSignBatch(request))
-            .await?
+            .await.map_err(uncertain_signing_response)?
         {
-            MachineBrokerResponse::SigningSignBatch(result) => expected.validate(result),
-            _ => Err(response_mismatch("signing.sign_batch")),
+            MachineBrokerResponse::SigningSignBatch(result) => expected.validate(result)
+                .map_err(|_| service_unavailable("Broker batch signing response could not be verified; retain the operation identity")),
+            _ => Err(service_unavailable("Broker returned a mismatched batch signing response; retain the operation identity")),
         }
     }
 
@@ -2970,6 +2978,22 @@ fn response_mismatch(method: &str) -> ProtocolError {
     )
 }
 
+// The service API flattens local frame errors and Broker refusals. A frame
+// failure after dispatch cannot prove the Broker did not sign. Conservatively
+// retain the operation even when the same code could be a remote refusal.
+fn uncertain_signing_response(error: ProtocolError) -> ProtocolError {
+    if matches!(
+        error.code,
+        ProtocolErrorCode::MalformedFrame | ProtocolErrorCode::LimitExceededFrame
+    ) {
+        service_unavailable(
+            "Broker signing response frame unavailable; retain the operation identity",
+        )
+    } else {
+        error
+    }
+}
+
 fn response_identity_mismatch(method: &str) -> ProtocolError {
     ProtocolError::new(
         ProtocolErrorCode::OperationIdConflict,
@@ -3019,6 +3043,23 @@ pub fn ceremony_repair(status: &bloom_broker_api::CeremonyExposureStatus) -> ser
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn post_dispatch_frame_failures_remain_uncertain() {
+        for code in [
+            ProtocolErrorCode::MalformedFrame,
+            ProtocolErrorCode::LimitExceededFrame,
+        ] {
+            assert_eq!(
+                super::uncertain_signing_response(ProtocolError::new(code, "reply lost")).code,
+                ProtocolErrorCode::ServiceUnavailable,
+            );
+        }
+        let refusal = super::uncertain_signing_response(ProtocolError::new(
+            ProtocolErrorCode::LimitExceededValue,
+            "definitive refusal",
+        ));
+        assert_eq!(refusal.code, ProtocolErrorCode::LimitExceededValue);
+    }
     use super::*;
 
     #[test]
@@ -4797,7 +4838,7 @@ mod tests {
             })
             .await
             .unwrap_err();
-        assert_eq!(error.code, ProtocolErrorCode::OperationIdConflict);
+        assert_eq!(error.code, ProtocolErrorCode::ServiceUnavailable);
     }
 
     #[tokio::test]
