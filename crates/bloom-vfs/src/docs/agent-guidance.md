@@ -43,7 +43,10 @@ directory and inspect the resulting projection before retrying or continuing.
 ## What an error means
 
 Use the error class to decide what to inspect. An error alone does not establish
-whether an earlier operation completed or whether retrying a write is safe.
+whether an earlier operation completed or whether retrying a write is safe. A
+failed write under `petals/<name>/`, whatever the error, leaves the Petal's
+reason in `petals/<name>/last_error.json`; read it and fix the request rather
+than repeating it.
 
 - **No such file or directory** — the path is absent in the requested state.
   A discarded transfer or one that advanced out of `pending/` no longer has its
@@ -62,6 +65,7 @@ whether an earlier operation completed or whether retrying a write is safe.
   request (same bytes, same operation id) to reconcile it; never rebuild the
   operation under a new identifier, and never rebroadcast, until the earlier
   attempt is confirmed not to have landed.
+- **Invalid argument** — the target rejected what you wrote.
 - **Input/output error** — a backend or I/O operation failed. Inspect action
   state and diagnostics before considering a retry. On an EVM outbox confirm,
   read `last_error.json` beside the pending entry: it gives the refusal and the

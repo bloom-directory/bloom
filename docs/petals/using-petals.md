@@ -95,7 +95,9 @@ and host interfaces are not restored by selecting account 0.
 Petal writes execute synchronously in this iteration. A filesystem write or
 `bloom vfs write` call waits for the route component to finish. If the route
 returns an error, Bloom returns that error to the caller instead of reporting
-success while work continues in a detached task.
+success while work continues in a detached task. A mount reports only an
+errno, so Bloom also keeps the route's message at
+`petals/<name>/last_error.json` until a later write to that Petal succeeds.
 
 Synchronous completion describes the route invocation, not every workflow the
 route may initiate. For example, a successful route may have staged a

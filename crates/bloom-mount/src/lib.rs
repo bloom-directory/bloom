@@ -162,6 +162,10 @@ pub fn detect_mount_command() -> &'static str {
 /// so most JSON/TOML payloads fit in a single op (the adapter buffers
 /// multi-block writes anyway but a single op stays simpler for the
 /// common case), and `timeo=10` for snappy failure on a wedged server.
+/// Linux and macOS also mount `sync`: each `write(2)` waits for the
+/// server's reply, so a handler's refusal fails the writer's syscall and a
+/// shell redirect exits non-zero. Without it Linux sends the bytes at
+/// `close(2)`, whose error a shell ignores.
 ///
 /// Caching options diverge per-platform because the kernels expose
 /// different knobs:
@@ -170,8 +174,7 @@ pub fn detect_mount_command() -> &'static str {
 ///   without relying on `lookupcache=none`, which is rejected by some
 ///   minimal CI images.
 /// * **macOS** (`mount_nfs`): `actimeo=0` zeros the attribute-cache
-///   timeouts. `sync` keeps short-lived command writers attached until the
-///   server has replied to their NFS writes. The Linux-only
+///   timeouts. The Linux-only
 ///   `lookupcache=none`, `nocallback`, and
 ///   `nonegnamecache` knobs are *not* recognised by macOS and would
 ///   cause the mount to be rejected. `nolocks` is NFSv2/v3-only per
@@ -195,12 +198,7 @@ pub fn build_mount_args(cfg: &MountConfig, server: SocketAddr) -> Vec<String> {
     ]
 }
 
-#[cfg(target_os = "linux")]
-fn build_mount_opts(port: u16) -> String {
-    format!("actimeo=0,vers=4.1,proto=tcp,port={port},rsize=65536,wsize=65536,timeo=10")
-}
-
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn build_mount_opts(port: u16) -> String {
     format!("actimeo=0,sync,vers=4.1,proto=tcp,port={port},rsize=65536,wsize=65536,timeo=10")
 }
@@ -271,6 +269,10 @@ mod tests {
         assert!(
             joined.contains("actimeo=0"),
             "linux opts must include actimeo=0: {joined}"
+        );
+        assert!(
+            joined.contains("sync"),
+            "linux opts must make NFS writes synchronous: {joined}"
         );
         assert!(
             !joined.contains("lookupcache="),
