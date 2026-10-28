@@ -87,12 +87,14 @@ async function typeVisible(label, text, required = true) {
   throw Error(`Contact field did not stabilize: ${label}`);
 }
 async function poll(path, states) {
+  let lastState = 'unavailable';
   for (let attempt = 0; attempt < 150; attempt++) {
     const status = await vfs('cat', path);
     if (states.includes(status.state)) return status;
+    lastState = status.state;
     await delay(250);
   }
-  throw Error(`State timeout during ${stage}`);
+  throw Error(`State timeout during ${stage}; last state: ${lastState}`);
 }
 async function returnedToShopping() {
   for (let attempt = 0; attempt < 50; attempt++) {

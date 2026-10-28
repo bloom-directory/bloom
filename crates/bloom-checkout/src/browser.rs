@@ -1704,6 +1704,15 @@ mod tests {
         // Wait for the end-of-document marker before testing the AX size limit.
         let snapshot = tokio::time::timeout(Duration::from_secs(20), async {
             loop {
+                // Observing the entire page while its multi-megabyte response
+                // is still parsing repeatedly forces layout on an unfinished
+                // document. Wait on the fixture marker with a small DOM read.
+                let ready = browser.cdp.evaluate(&browser.tab.lock().await.session,
+                    "document.readyState === 'complete' && document.querySelector('button')?.textContent === 'Select fixture 0 ready'".into()).await;
+                if !ready.is_ok_and(|ready| ready == true) {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    continue;
+                }
                 match browser.browse(BrowseRequest::Snapshot).await {
                     Ok(snapshot)
                         if snapshot["elements"].as_array().is_some_and(|elements| {
