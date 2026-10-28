@@ -380,6 +380,7 @@ impl Discovery {
     async fn read_once(tab: &PrivateTab, site: bool) -> Result<Self> {
         let mut frames = Vec::new();
         let mut candidates = Vec::new();
+        let mut refusal = PreparationReason::FactsUnreadable;
         let mut top_origin = None;
         let contexts = tab.cdp.contexts(&tab.session, "bloom-payment").await?;
         for (position, context) in contexts.iter().enumerate() {
@@ -411,6 +412,14 @@ impl Discovery {
                 // Script-owned reason codes, never merchant text or field values.
                 if let Some(reason) = candidate.get("refusal").and_then(Value::as_str) {
                     eprintln!("payment facts need review: {reason}");
+                    // Only script-owned constants may become public diagnostics.
+                    // A competing action takes precedence over unclear terms.
+                    refusal = match (refusal, reason) {
+                        (_, "pay_control_ambiguous") => PreparationReason::PaymentActionAmbiguous,
+                        (PreparationReason::PaymentActionAmbiguous, _) => refusal,
+                        (_, "installment_choice") => PreparationReason::ChargeTermsUnreadable,
+                        _ => refusal,
+                    };
                 } else if let Ok(facts) = serde_json::from_value::<CheckoutFacts>(candidate) {
                     candidates.push((session.clone(), world, facts));
                 }
@@ -456,8 +465,12 @@ impl Discovery {
             }
         }
         if candidates.len() != 1 {
-            return Err(anyhow::Error::new(PreparationReason::FactsUnreadable)
-                .context("Payment facts require human review"));
+            let reason = if candidates.is_empty() {
+                refusal
+            } else {
+                PreparationReason::FactsUnreadable
+            };
+            return Err(anyhow::Error::new(reason).context("Payment facts require human review"));
         }
         let (facts_session, main_world, mut facts) = candidates.remove(0);
         facts.origin = top_origin.context("Missing merchant origin")?;
@@ -1966,8 +1979,30 @@ pub(crate) mod tests {
             "",
             "Order confirmed",
         );
+        let ambiguous = merchant(
+            &inputs(),
+            "<button onclick='window.submitted=true'>Subscribe USD 12.00 monthly</button>",
+            "Order confirmed",
+        );
+        let installments = merchant(
+            &inputs(),
+            "<label>Installments<select name='installments'><option>Choose a schedule</option></select></label>",
+            "Order confirmed",
+        );
+        let conflicting_total = format!(
+            "<!doctype html><div>Total USD 3.99</div><div>Total EUR 4.99</div>{}<button>Pay</button>",
+            inputs()
+        );
         for (html, reviewed_host, expected) in [
             (no_total, true, PreparationReason::FactsUnreadable),
+            (conflicting_total, true, PreparationReason::FactsUnreadable),
+            (ambiguous, true, PreparationReason::PaymentActionAmbiguous),
+            (installments, true, PreparationReason::ChargeTermsUnreadable),
+            (
+                format!("<!doctype html><div>Total USD 3.99</div>{}", inputs()),
+                true,
+                PreparationReason::FactsUnreadable,
+            ),
             (two_numbers, true, PreparationReason::FieldsUnsupported),
             (
                 merchant(&inputs(), "", "Order confirmed"),
@@ -1983,6 +2018,18 @@ pub(crate) mod tests {
                 error.downcast_ref::<PreparationReason>().copied(),
                 Some(expected),
                 "{html}: {error:#}"
+            );
+            assert_eq!(
+                tab.cdp
+                    .evaluate(
+                        &tab.session,
+                        "!!window.submitted || document.body.innerText.includes('Order confirmed')"
+                            .into()
+                    )
+                    .await
+                    .unwrap(),
+                false,
+                "preparation must not try a payment action"
             );
             browser.return_control().await.unwrap();
             server.abort();

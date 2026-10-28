@@ -131,8 +131,14 @@ pub struct Status {
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PreparationReason {
-    /// The page's total or currency could not be read without ambiguity.
+    /// The total, currency or charge terms could not be read, or the page
+    /// has no recognizable payment action. Complete the page before retrying.
     FactsUnreadable,
+    /// More than one distinct payment action remains. Choose privately;
+    /// trying buttons is not a safe discovery method.
+    PaymentActionAmbiguous,
+    /// Installment choices do not identify one clear charge schedule.
+    ChargeTermsUnreadable,
     /// The card fields are missing, duplicated or in an unexpected shape.
     FieldsUnsupported,
     /// A frame that would receive the card is not a reviewed payment host.
@@ -143,6 +149,8 @@ impl std::fmt::Display for PreparationReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::FactsUnreadable => "facts_unreadable",
+            Self::PaymentActionAmbiguous => "payment_action_ambiguous",
+            Self::ChargeTermsUnreadable => "charge_terms_unreadable",
             Self::FieldsUnsupported => "fields_unsupported",
             Self::ReceivingOriginUnreviewed => "receiving_origin_unreviewed",
         })
@@ -225,6 +233,29 @@ pub struct SelectOption {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn preparation_reasons_survive_status_and_history_roundtrips() {
+        // Machine clients and VFS deserialize this same packaged contract.
+        // Existing persisted broad reasons remain readable; unknown codes
+        // are rejected rather than displayed as merchant-controlled text.
+        for code in [
+            "facts_unreadable",
+            "payment_action_ambiguous",
+            "charge_terms_unreadable",
+            "fields_unsupported",
+            "receiving_origin_unreviewed",
+        ] {
+            let status = json!({"operation_id":"fixture", "state":"manual_required", "ceremony_url":null, "filled_fields":[], "outcome":null, "reason":code});
+            let parsed: Status = serde_json::from_value(status.clone()).unwrap();
+            assert_eq!(parsed.reason.unwrap().to_string(), code);
+            assert_eq!(serde_json::to_value(parsed).unwrap(), status);
+            let entry = json!({"created":0, "kind":"card", "description":"Fixture", "shop":null, "total_minor":null, "currency":null, "renewal_minor":null, "renewal_period":null, "renewal_starts_on":null, "status":status});
+            let parsed: HistoryEntry = serde_json::from_value(entry.clone()).unwrap();
+            assert_eq!(serde_json::to_value(parsed).unwrap(), entry);
+        }
+        assert!(serde_json::from_value::<PreparationReason>(json!("merchant text")).is_err());
+    }
 
     #[test]
     fn traveler_selection_keeps_single_person_json_compatible() {

@@ -174,7 +174,7 @@
   const repeatedSubmit = firstPay?.form && firstPay.type === 'submit'
     && pay.every(e => e.form === firstPay.form && e.type === 'submit'
       && submitIdentity(e) === submitIdentity(firstPay));
-  if (pay.length !== 1 && !repeatedSubmit) return {refusal:'pay_control_count'};
+  if (pay.length !== 1 && !repeatedSubmit) return {refusal:pay.length ? 'pay_control_ambiguous' : 'pay_control_missing'};
   // Test fixtures declare their total; a merchant page never chooses its own.
   const fixture = BLOOM_FIXTURE_TOTALS && ['localhost', '127.0.0.1'].includes(location.hostname);
   const explicit = fixture ? [...document.querySelectorAll('[data-bloom-total-minor][data-bloom-currency]')].filter(visible) : [];
