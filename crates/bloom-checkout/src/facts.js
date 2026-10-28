@@ -115,7 +115,25 @@
   // The one final payment button, in the main checkout languages (observed on
   // Shopify de/fr/es/pt/it/en checkouts, common shop systems, and Booking.com,
   // Ryanair and Airbnb final pages, 2026-10-11). Labels may use non-breaking spaces.
-  const pay = controls.filter(e => BLOOM_PAY_WORDS.test((e.innerText || e.value || '').replace(/\s+/g, ' ').trim()));
+  // A separate newsletter form is not part of the payment form. Scope only
+  // when card fields identify exactly one form; never guess from proximity
+  // or footer placement. Shopify hosts its card inputs inside these frames.
+  const cardForms = new Set([...document.querySelectorAll('input,iframe')].filter(visible).filter(e =>
+    (e.autocomplete || '').split(/\s+/).some(token => token.startsWith('cc-')) ||
+    (e.tagName === 'IFRAME' && (() => {
+      try { return new URL(e.src).origin === 'https://checkout.pci.shopifyinc.com'; }
+      catch { return false; }
+    })())
+  ).map(e => e.form || e.closest('form')));
+  const paymentForm = cardForms.size === 1 ? [...cardForms][0] : null;
+  const pay = controls.filter(e => {
+    const name = (e.innerText || e.value || '').replace(/\s+/g, ' ').trim();
+    const form = e.form || e.closest('form');
+    // Only the ambiguous subscription word gets this exception. Another
+    // explicit Pay/Buy control anywhere still makes the page ambiguous.
+    if (paymentForm && form && form !== paymentForm && /^subscribe\s*\*?$/i.test(name)) return false;
+    return BLOOM_PAY_WORDS.test(name);
+  });
   if (pay.length !== 1) return {refusal:'pay_control_count'};
   // Test fixtures declare their total; a merchant page never chooses its own.
   const fixture = BLOOM_FIXTURE_TOTALS && ['localhost', '127.0.0.1'].includes(location.hostname);

@@ -832,6 +832,8 @@ pub(crate) mod tests {
         tokio::time::sleep(Duration::from_secs(10)).await;
         let mut tab = browser.handoff().await.unwrap();
         tab.fixture_payment_hosts = false; // Real provider pages need no fixture trust.
+        tab.cdp.evaluate(&tab.session, "(() => { const card = document.querySelector('input#basic-creditCards[name=basic]'); if (card && !card.checked) card.click(); return {card:!!card,frames:document.querySelectorAll('iframe').length}; })()".into()).await.map(|state| eprintln!("Shopify payment selection: {state}")).unwrap();
+        tokio::time::sleep(Duration::from_secs(3)).await;
         let discovery = Discovery::read(&tab).await.unwrap();
         assert_eq!(discovery.facts.currency, "USD");
         assert!((100..=200).contains(&discovery.facts.total_minor));
@@ -2172,6 +2174,125 @@ pub(crate) mod tests {
         assert!(!discovery.facts.recurring);
         browser.return_control().await.unwrap();
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn payment_form_excludes_newsletter_but_preserves_ambiguity() {
+        let browser = browser().await;
+        for (name, html, accepted) in [
+            (
+                "separate newsletter",
+                format!(
+                    "<form><input type=email><button>Subscribe*</button></form><form>{}<button>Pay now $3.99</button></form>",
+                    inputs()
+                ),
+                true,
+            ),
+            (
+                "associated submit",
+                format!(
+                    "<form><button>Subscribe</button></form><form id=payment>{}</form><button form=payment>Pay</button>",
+                    inputs()
+                ),
+                true,
+            ),
+            (
+                "subscription",
+                format!("<form>{}<button>Subscribe</button></form>", inputs()),
+                true,
+            ),
+            (
+                "two payment buttons",
+                format!(
+                    "<form>{}<button>Pay</button><button>Subscribe</button></form>",
+                    inputs()
+                ),
+                false,
+            ),
+            (
+                "separate explicit payment",
+                format!(
+                    "<form>{}<button>Pay</button></form><form><button>Buy now</button></form>",
+                    inputs()
+                ),
+                false,
+            ),
+            (
+                "unowned subscribe",
+                format!(
+                    "<form>{}<button>Pay</button></form><button>Subscribe</button>",
+                    inputs()
+                ),
+                false,
+            ),
+            (
+                "priced subscribe",
+                format!(
+                    "<form>{}<button>Pay</button></form><form><button>Subscribe $5</button></form>",
+                    inputs()
+                ),
+                false,
+            ),
+            (
+                "two card forms",
+                format!(
+                    "<form>{}<button>Pay</button></form><form>{}<button>Subscribe</button></form>",
+                    inputs(),
+                    inputs()
+                ),
+                false,
+            ),
+            (
+                "unowned card fields",
+                format!(
+                    "{}<form><button>Pay</button></form><button>Subscribe</button>",
+                    inputs()
+                ),
+                false,
+            ),
+            (
+                "no card form",
+                "<button>Pay</button><button>Subscribe</button>".into(),
+                false,
+            ),
+        ] {
+            let (url, server) = fixture(format!(
+                "<!doctype html><html lang=en><body><div>Total USD 3.99</div>{html}</body></html>"
+            ))
+            .await;
+            let tab = open(&browser, url).await;
+            let result = Discovery::read(&tab).await;
+            assert_eq!(result.is_ok(), accepted, "{name}");
+            if let Ok(discovery) = result {
+                assert_eq!(discovery.facts.total_minor, 399);
+                discovery.recheck(&tab).await.unwrap();
+                tab.cdp.evaluate(&tab.session, "document.addEventListener('click', event => { event.preventDefault(); globalThis.clicked = event.target.textContent; });".into()).await.unwrap();
+                assert!(discovery.submit(&tab).await.unwrap());
+                let clicked = tab
+                    .cdp
+                    .evaluate(&tab.session, "globalThis.clicked".into())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    clicked,
+                    if name == "subscription" {
+                        "Subscribe"
+                    } else if name == "associated submit" {
+                        "Pay"
+                    } else {
+                        "Pay now $3.99"
+                    }
+                );
+                // Moving the competing control into the payment form must
+                // invalidate the approval facts before another click.
+                if name == "separate newsletter" {
+                    tab.cdp.evaluate(&tab.session, "document.querySelector('input[autocomplete=cc-number]').form.append(document.querySelector('button'));".into()).await.unwrap();
+                    assert!(discovery.submit(&tab).await.is_err());
+                }
+            }
+            browser.return_control().await.unwrap();
+            server.abort();
+        }
     }
 
     async fn outcome_of(browser: &Browser, html: &str) -> Value {
