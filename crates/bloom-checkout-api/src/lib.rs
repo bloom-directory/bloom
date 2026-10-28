@@ -88,11 +88,12 @@ pub struct HistoryEntry {
     pub description: String,
     /// The shop's origin, when Bloom could read the page.
     pub shop: Option<String>,
-    /// The total the human approved, when Bloom read one.
+    /// The total read during preparation; status must be checked separately
+    /// for approval and payment. Failed requests can also carry a total.
     pub total_minor: Option<u64>,
     pub currency: Option<String>,
     /// What the shop charges once any trial or intro price ends, and how
-    /// often, when the page stated it and the human approved those terms.
+    /// often, when the page stated it during preparation.
     /// Bloom cannot cap what the shop takes later; cancelling is done with
     /// the shop.
     pub renewal_minor: Option<u64>,

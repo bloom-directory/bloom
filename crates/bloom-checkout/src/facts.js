@@ -110,29 +110,36 @@
   // and its period. These characters are invisible to the reader, carry no
   // meaning, and are not whitespace to a regular expression, so they come
   // out before anything is matched against the page.
-  const text = document.body.innerText.replace(/[\u00ad\u200b-\u200d\u2060\ufeff]/g, '');
+  const clean = text => text.replace(/[\u00ad\u200b-\u200d\u2060\ufeff]/g, '');
+  let text = clean(document.body.innerText);
   const controls = [...document.querySelectorAll('button,input[type=submit],input[type=button],a,[role=button]')].filter(visible);
   // The one final payment button, in the main checkout languages (observed on
   // Shopify de/fr/es/pt/it/en checkouts, common shop systems, and Booking.com,
   // Ryanair and Airbnb final pages, 2026-10-11). Labels may use non-breaking spaces.
-  // A separate newsletter form is not part of the payment form. Scope only
-  // when card fields identify exactly one form; never guess from proximity
-  // or footer placement. Shopify hosts its card inputs inside these frames.
-  const cardForms = new Set([...document.querySelectorAll('input,iframe')].filter(visible).filter(e =>
-    (e.autocomplete || '').split(/\s+/).some(token => token.startsWith('cc-')) ||
-    (e.tagName === 'IFRAME' && (() => {
-      try { return new URL(e.src).origin === 'https://checkout.pci.shopifyinc.com'; }
-      catch { return false; }
-    })())
-  ).map(e => e.form || e.closest('form')));
-  const paymentForm = cardForms.size === 1 ? [...cardForms][0] : null;
+  // A newsletter/SMS signup can share the checkout form. Exclude it only
+  // when a small contact-only block explicitly identifies marketing consent.
+  // Another payment control or any card/other field keeps the block ambiguous.
+  const marketing = new Set();
+  const marketingButtons = new Set();
+  for (const button of controls) {
+    if (!/^subscribe\s*\*?$/i.test((button.innerText || button.value || '').trim())) continue;
+    for (let block = button.parentElement, depth = 0; block && block !== document.body && depth < 6; block = block.parentElement, depth++) {
+      const words = clean(block.innerText || '');
+      if (words.length > 2000) break;
+      if (!/\bnewsletter\b|\bmarketing\s+(?:sms|emails?|text)|\btext offers\b/i.test(words)) continue;
+      const fields = [...block.querySelectorAll('input,select,textarea,iframe')];
+      if (!fields.some(e => ['email','tel'].includes(e.type)) || fields.some(e =>
+        e.tagName !== 'INPUT' || !['email','tel','checkbox','hidden','submit','button'].includes(e.type))) continue;
+      if (controls.some(e => e !== button && block.contains(e) && BLOOM_PAY_WORDS.test((e.innerText || e.value || '').trim()))) continue;
+      marketing.add(block); marketingButtons.add(button); break;
+    }
+  }
+  // "Recurring marketing SMS" is not a recurring charge. Keep those consent
+  // terms out of the charge reader, while retaining payment terms elsewhere.
+  for (const block of marketing) text = text.replace(clean(block.innerText), '');
   const pay = controls.filter(e => {
     const name = (e.innerText || e.value || '').replace(/\s+/g, ' ').trim();
-    const form = e.form || e.closest('form');
-    // Only the ambiguous subscription word gets this exception. Another
-    // explicit Pay/Buy control anywhere still makes the page ambiguous.
-    if (paymentForm && form && form !== paymentForm && /^subscribe\s*\*?$/i.test(name)) return false;
-    return BLOOM_PAY_WORDS.test(name);
+    return !marketingButtons.has(e) && BLOOM_PAY_WORDS.test(name);
   });
   if (pay.length !== 1) return {refusal:'pay_control_count'};
   // Test fixtures declare their total; a merchant page never chooses its own.

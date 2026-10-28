@@ -2183,7 +2183,7 @@ pub(crate) mod tests {
             (
                 "separate newsletter",
                 format!(
-                    "<form><input type=email><button>Subscribe*</button></form><form>{}<button>Pay now $3.99</button></form>",
+                    "<form><h2>Newsletter</h2><input type=email><button>Subscribe*</button></form><form>{}<button>Pay now $3.99</button></form>",
                     inputs()
                 ),
                 true,
@@ -2191,10 +2191,26 @@ pub(crate) mod tests {
             (
                 "associated submit",
                 format!(
-                    "<form><button>Subscribe</button></form><form id=payment>{}</form><button form=payment>Pay</button>",
+                    "<form><h2>Newsletter</h2><input type=email><button>Subscribe</button></form><form id=payment>{}</form><button form=payment>Pay</button>",
                     inputs()
                 ),
                 true,
+            ),
+            (
+                "shared checkout SMS signup",
+                format!(
+                    "<form><section>Text offers<input type=tel><button>Subscribe*</button><p>Receive recurring auto-dialed marketing SMS. Consent is not required to purchase.</p></section>{}<button>Pay now $3.99</button></form>",
+                    inputs()
+                ),
+                true,
+            ),
+            (
+                "newsletter caption with card fields",
+                format!(
+                    "<form>Newsletter<input type=email>{}<button>Subscribe</button><button>Pay</button></form>",
+                    inputs()
+                ),
+                false,
             ),
             (
                 "subscription",
@@ -2265,6 +2281,7 @@ pub(crate) mod tests {
             assert_eq!(result.is_ok(), accepted, "{name}");
             if let Ok(discovery) = result {
                 assert_eq!(discovery.facts.total_minor, 399);
+                assert!(!discovery.facts.recurring, "{name}");
                 discovery.recheck(&tab).await.unwrap();
                 tab.cdp.evaluate(&tab.session, "document.addEventListener('click', event => { event.preventDefault(); globalThis.clicked = event.target.textContent; });".into()).await.unwrap();
                 assert!(discovery.submit(&tab).await.unwrap());

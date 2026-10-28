@@ -63,6 +63,11 @@ tool for this checkout.
   those controls, including on-page filters, remain usable.
 - Use fresh snapshot refs after every action. The browser rejects direct
   card entry and recognizable payment submission through shopping controls.
+- Shops load controls in stages. If a control is missing or the document
+  changed, request another snapshot before concluding it is unavailable.
+  Check each product's required size, format and purchase frequency; radio
+  buttons and their labels report `checked`. After Add to cart, confirm the
+  cart updated before navigating away, so the shop can finish adding the item.
 - A payment request is refused while the page shows form errors; take a
   snapshot, fix what it marks, and request again.
 - For a saved-card payment, select the shop's debit/credit-card option so
@@ -71,6 +76,10 @@ tool for this checkout.
   with `card_id` and `agent_description`. That description is shown as agent
   text, not verified purchase facts. Read `status.json`, forward its ceremony
   URL, and wait. Shopping access stays paused through private checkout.
+  Complete contact, delivery and billing details and choose shipping first.
+  A total beside “Enter shipping address” can omit delivery and destination
+  taxes; it is not a final quote. Visible card boxes alone do not prove that
+  a checkout is ready to submit.
 - If the human is logged in to the shop with a saved payment method there,
   omit `card_id`: after approval Bloom clicks the shop's pay button once and
   the shop charges its saved method.
@@ -84,9 +93,10 @@ tool for this checkout.
   `cards/index.json` is empty, ask the human to add a card first.
 - Cancellation is a write to the request's `cancel` file, only before release.
 - Read `checkout/history.json` for the 50 latest requests: time, kind, shop,
-  approved total and final status. Check it before buying again at the same
+  total read from the page and request status. A failed or cancelled request
+  can have a total without any approval or payment. Check it before buying again at the same
   shop so nothing is ordered twice. A subscription also carries the terms the
-  person approved, `renewal_minor`, `renewal_period` and `renewal_starts_on`,
+  page stated, `renewal_minor`, `renewal_period` and `renewal_starts_on`,
   so this is where to answer what they are still paying for and when it next
   charges. A renewal the person approved elsewhere is not here, and no entry
   proves the shop has not changed its price since.
