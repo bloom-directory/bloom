@@ -4511,6 +4511,20 @@ pub(crate) mod route_fixtures {
     pub(crate) const DENY_REASON: &str = "approval required";
     pub(crate) const LOOKUP_ENTRY_SIZE: u64 = 7;
 
+    /// What a fixture route's `write` export does. Everything but
+    /// [`FixtureWrite::Accepting`] also advertises `write-async`, so a test
+    /// that picks one of them is asserting Bloom waits for the route anyway.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum FixtureWrite {
+        /// Accepts every write.
+        Accepting,
+        /// Refuses every write with `denied(DENY_REASON)`.
+        Denied,
+        /// Traps inside the write handler: a host failure, not a refusal, so
+        /// the route never names a reason.
+        Trapping,
+    }
+
     /// Builds a directory (`$index`) route component whose `metadata`
     /// export reports `kind = dir`, `mode = 0o755`,
     /// `cache-ttl-ms = some(30000)` and `required-caps = metadata_caps`,
@@ -4529,8 +4543,7 @@ pub(crate) mod route_fixtures {
             package_import,
             false,
             true,
-            false,
-            false,
+            FixtureWrite::Accepting,
             false,
         )
     }
@@ -4548,8 +4561,7 @@ pub(crate) mod route_fixtures {
             package_import,
             true,
             true,
-            false,
-            false,
+            FixtureWrite::Accepting,
             false,
         )
     }
@@ -4562,8 +4574,7 @@ pub(crate) mod route_fixtures {
             None,
             false,
             false,
-            false,
-            false,
+            FixtureWrite::Accepting,
             false,
         )
     }
@@ -4576,15 +4587,14 @@ pub(crate) mod route_fixtures {
             None,
             false,
             false,
-            false,
-            false,
+            FixtureWrite::Accepting,
             true,
         )
     }
 
-    /// Builds a writable route which advertises asynchronous writes but
-    /// refuses every write with `denied(DENY_REASON)`.
-    pub(crate) fn async_failing_write_route_component() -> Vec<u8> {
+    /// Builds a writable file route whose `write` export behaves as `write`
+    /// says.
+    pub(crate) fn write_route_component(write: FixtureWrite) -> Vec<u8> {
         build_dynamic_dir_route_component(
             false,
             FixtureVfsImport::None,
@@ -4592,22 +4602,7 @@ pub(crate) mod route_fixtures {
             None,
             false,
             true,
-            true,
-            true,
-            true,
-        )
-    }
-
-    pub(crate) fn accepting_write_route_component() -> Vec<u8> {
-        build_dynamic_dir_route_component(
-            false,
-            FixtureVfsImport::None,
-            &[],
-            None,
-            false,
-            true,
-            false,
-            false,
+            write,
             true,
         )
     }
@@ -4620,8 +4615,7 @@ pub(crate) mod route_fixtures {
         package_import: Option<&str>,
         side_effecting_read: bool,
         include_list: bool,
-        write_async: bool,
-        deny_write: bool,
+        write: FixtureWrite,
         file_route: bool,
     ) -> Vec<u8> {
         // String table for the metadata cap names and the lookup entry name.
@@ -4650,7 +4644,7 @@ pub(crate) mod route_fixtures {
         meta[16] = 1; // cache-ttl-ms: some
         meta[24..32].copy_from_slice(&30_000u64.to_le_bytes());
         meta[32] = u8::from(side_effecting_read);
-        meta[33] = u8::from(write_async);
+        meta[33] = u8::from(write != FixtureWrite::Accepting);
         meta[60..64].copy_from_slice(&caps_array.to_le_bytes());
         meta[64..68].copy_from_slice(&(metadata_caps.len() as u32).to_le_bytes());
 
@@ -4667,12 +4661,12 @@ pub(crate) mod route_fixtures {
         // with empty ok lists, and result<_, route-error> ok.
         let mut empty_list = vec![0u8; 16];
         empty_list[4..8].copy_from_slice(&EMPTY_LIST_PTR.to_le_bytes());
-        let mut write = vec![0u8; 16];
-        if deny_write {
-            write[0] = 1; // err
-            write[4] = 2; // route-error case "denied"
-            write[8..12].copy_from_slice(&reason_ptr.to_le_bytes());
-            write[12..16].copy_from_slice(&(DENY_REASON.len() as u32).to_le_bytes());
+        let mut write_result = vec![0u8; 16];
+        if write == FixtureWrite::Denied {
+            write_result[0] = 1; // err
+            write_result[4] = 2; // route-error case "denied"
+            write_result[8..12].copy_from_slice(&reason_ptr.to_le_bytes());
+            write_result[12..16].copy_from_slice(&(DENY_REASON.len() as u32).to_le_bytes());
         }
 
         let store_import = if import_store {
@@ -4720,6 +4714,13 @@ pub(crate) mod route_fixtures {
         let package_import = package_import
             .map(|name| format!("  (import {name:?} (instance))\n"))
             .unwrap_or_default();
+        let core_write_func = if write == FixtureWrite::Trapping {
+            r#"(func $write (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)
+      unreachable)"#
+        } else {
+            r#"(func $write (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)
+      i32.const 1408)"#
+        };
         let core_list_func = if include_list {
             r#"(func $list (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)
       i32.const 1280)"#
@@ -4805,8 +4806,7 @@ pub(crate) mod route_fixtures {
     {core_list_func}
     (func $read (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)
       i32.const {READ_RESULT})
-    (func $write (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)
-      i32.const 1408)
+    {core_write_func}
     (export "memory" (memory 0))
     (export "cabi_realloc" (func $realloc))
     (export "metadata" (func $metadata))
@@ -4856,7 +4856,7 @@ pub(crate) mod route_fixtures {
             lookup_data = data_segment(LOOKUP_RESULT, &lookup),
             list_data = data_segment(LIST_RESULT, &empty_list),
             read_data = data_segment(READ_RESULT, &empty_list),
-            write_data = data_segment(WRITE_RESULT, &write),
+            write_data = data_segment(WRITE_RESULT, &write_result),
         );
         wat::parse_str(&wat).unwrap()
     }

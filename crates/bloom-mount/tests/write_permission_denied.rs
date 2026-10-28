@@ -546,15 +546,17 @@ async fn mounted_command_rejection_fails_the_shell_writer() {
         .expect("mount command VFS");
     let target = mount_dir.join("stage/command");
 
+    let scripts = [
+        "printf '%s' \"$2\" > \"$1\"",
+        "echo \"$2\" > \"$1\"",
+        "printf '%s\\n' \"$2\" | cat > \"$1\"",
+    ];
+    let shells = ["sh", "bash"];
     let mut outputs = Vec::new();
     let mut counted = 0;
     for body in ["{\"order\":1}", "{\"action\":1}"] {
-        for script in [
-            "printf '%s' \"$2\" > \"$1\"",
-            "echo \"$2\" > \"$1\"",
-            "printf '%s\\n' \"$2\" | cat > \"$1\"",
-        ] {
-            for shell in ["sh", "bash"] {
+        for script in scripts {
+            for shell in shells {
                 let mut command = Command::new(shell);
                 command
                     .arg("-c")
@@ -592,5 +594,7 @@ async fn mounted_command_rejection_fails_the_shell_writer() {
             "{shell} {script}: one command reached the handler {invocations} times"
         );
     }
-    assert_eq!(handler.accepted.load(Ordering::SeqCst), 6);
+    let per_body = scripts.len() * shells.len();
+    assert_eq!(handler.accepted.load(Ordering::SeqCst), per_body);
+    assert_eq!(handler.rejected.load(Ordering::SeqCst), per_body);
 }
