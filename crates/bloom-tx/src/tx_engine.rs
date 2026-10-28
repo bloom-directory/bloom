@@ -4175,6 +4175,21 @@ impl TxEngine {
         self.assert_write_permit(permit)?;
         let bump = bump_pct.max(10);
         let entry = self.read_replaceable_entry(wallet, chain_name, original_id)?;
+        if entry
+            .dir
+            .join("cancel_tx_hash")
+            .try_exists()
+            .map_err(OutboxError::Io)?
+            || self
+                .outbox
+                .read_broadcast_attempt(&entry, BroadcastAttemptKind::CancelReplacement)?
+                .is_some()
+        {
+            return Err(TxEngineError::ApprovalDenied(
+                "cancellation already submitted; reconcile it before replacing the transaction"
+                    .into(),
+            ));
+        }
         let original = &entry.staged;
         self.assert_nonce_still_replaceable(
             chain,
@@ -4296,6 +4311,10 @@ impl TxEngine {
                 .outbox
                 .read_broadcast_attempt(&entry, BroadcastAttemptKind::Confirm)?
                 .is_none()
+            && self
+                .outbox
+                .read_broadcast_attempt(&entry, BroadcastAttemptKind::Replacement)?
+                .is_none()
             && read_triad_signing_state(&entry.dir.join(TRIAD_SIGNING_STATE_FILE))?
                 .is_none_or(|state| !state.sign_dispatched)
         {
@@ -4359,6 +4378,14 @@ impl TxEngine {
         // Broadcast does not settle the nonce race. Keep a sent original
         // visible to the reconciler so it can record a receipt if it wins.
         if original.tx_hash.is_none()
+            && self
+                .outbox
+                .read_broadcast_attempt(&entry, BroadcastAttemptKind::Confirm)?
+                .is_none()
+            && self
+                .outbox
+                .read_broadcast_attempt(&entry, BroadcastAttemptKind::Replacement)?
+                .is_none()
             && entry.state != OutboxState::Failed
             && let Err(e) = self
                 .outbox
@@ -5936,6 +5963,20 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_replacement_keeps_sent_original_available_for_reconciliation() {
+        check_cancel_keeps_original(None).await;
+    }
+
+    #[tokio::test]
+    async fn cancel_replacement_keeps_lost_broadcast_available_for_reconciliation() {
+        for kind in [
+            BroadcastAttemptKind::Confirm,
+            BroadcastAttemptKind::Replacement,
+        ] {
+            check_cancel_keeps_original(Some(kind)).await;
+        }
+    }
+
+    async fn check_cancel_keeps_original(marker: Option<BroadcastAttemptKind>) {
         let directory = tempfile::tempdir().unwrap();
         let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
         let mut staged = fake_staged_1559("cancel-race");
@@ -5948,6 +5989,28 @@ mod tests {
         let sent = outbox.read("alice", "anvil", &staged.id).unwrap();
         staged.status = TxStatus::Sent;
         staged.tx_hash = Some(format!("{:#x}", B256::repeat_byte(1)));
+        if let Some(kind) = marker {
+            outbox
+                .write_broadcast_attempt(
+                    &sent,
+                    kind,
+                    &crate::outbox::BroadcastAttempt {
+                        schema: "bloom.broadcast_attempted.v1".into(),
+                        tx_hash: staged.tx_hash.clone().unwrap(),
+                        raw_tx_blake3: blake3::hash(b"original").to_hex().to_string(),
+                        raw_tx_path: kind.raw_name().into(),
+                        from: staged.from.clone(),
+                        to: staged.to.clone(),
+                        nonce: staged.nonce,
+                        chain_id: staged.chain_id,
+                        created_ms: now_ms(),
+                        transport: crate::outbox::BroadcastTransport::PublicRpc,
+                        private_provider: None,
+                    },
+                )
+                .unwrap();
+            staged.tx_hash = None;
+        }
         outbox
             .write_artefact(
                 &sent.dir,
@@ -5986,6 +6049,11 @@ mod tests {
         assert_eq!(original.staged.tx_hash, staged.tx_hash);
         assert!(original.dir.join("cancel_tx_hash").exists());
         assert!(original.dir.join("cancel_intent.json").exists());
+        let err = engine
+            .replace(&permit, "alice", "anvil", &staged.id, &chain, 15, &policy)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TxEngineError::ApprovalDenied(_)));
     }
 
     #[tokio::test]
