@@ -2,7 +2,7 @@ schema = "bloom.triad-compatibility/1"
 
 [revisions]
 broker_commit = "1a6a8a5873488d5d8d4fac006f02e1c4874d31ee"
-signer_commit = "bc88ad690757165ebf1978410ea5c7ec652215d3"
+signer_commit = "ed5794c3cefda41cd1e3751e73b1f2547f609e71"
 service_runtime_commit = "ad0072512bb97fb4eb68d249ce785ea3ea4a49ab"
 petal_contract_commit = "73c5b06a77599368fbc79fb7947a629b5b4c630e"
 
@@ -44,7 +44,7 @@ minor_min = 0
 minor_max = 1
 
 [[bundles]]
-machine = "0.4.0"
+machine = "0.4.1"
 broker = "0.1.0"
 signer = "0.1.0"
 backends = ["local"]
