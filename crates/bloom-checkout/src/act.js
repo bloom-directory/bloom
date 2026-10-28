@@ -38,7 +38,8 @@
     }
     target.click();
   } else {
-    if ((e.autocomplete || '').split(' ').some(s => s.startsWith('cc-'))) throw Error('private payment input');
+    const privateInput = BLOOM_CARD_SECRET;
+    if ((e.autocomplete || '').split(' ').some(s => s.startsWith('cc-')) || (kind === 'type' && privateInput(e))) throw Error('payment requires approval');
     if (kind === 'select' && e.tagName !== 'SELECT') throw Error('wrong field');
     if (kind === 'type' && !['INPUT', 'TEXTAREA'].includes(e.tagName)) throw Error('wrong field');
     if (savedField) (globalThis.__bloomPrivateFields ||= new WeakMap()).set(e, savedField);
@@ -47,9 +48,9 @@
       // handlers. Focus and insertion run in one call so navigation cannot
       // redirect a later insertion.
       e.focus();
-      if (!e.isConnected || e.getRootNode().activeElement !== e || (e.autocomplete || '').split(' ').some(s => s.startsWith('cc-'))) throw Error('stale');
+      if (!e.isConnected || e.getRootNode().activeElement !== e || privateInput(e)) throw Error('stale');
       e.select();
-      if (!e.isConnected || e.getRootNode().activeElement !== e || (e.autocomplete || '').split(' ').some(s => s.startsWith('cc-'))) throw Error('stale');
+      if (!e.isConnected || e.getRootNode().activeElement !== e || privateInput(e)) throw Error('stale');
       if (!document.execCommand('insertText', false, value)) throw Error('input unsupported');
       e.dispatchEvent(new KeyboardEvent('keyup', {key: value.slice(-1), bubbles: true}));
     } else {

@@ -1430,6 +1430,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shopping_refuses_private_card_and_password_input() {
+        let root = tempfile::tempdir().unwrap();
+        let browser = Browser::launch(
+            &crate::test_chromium(),
+            &root.path().join("profile"),
+            &["--no-sandbox".into(), "--ignore-certificate-errors".into()],
+        )
+        .await
+        .unwrap();
+        for html in [
+            "<input aria-label='Card number'>",
+            "<input name='card_number'>",
+            "<label>Cardholder name<input></label>",
+            "<span id='caption'>Security code</span><input aria-labelledby='caption'>",
+            "<div>Card number<input></div>",
+            "<input type=password>",
+            "<input autocomplete='section-checkout billing cc-number'>",
+            "<input aria-label='Travel reference' onfocus=\"this.setAttribute('aria-label','Card number')\">",
+            "<select autocomplete='cc-exp-month'><option value=''>Choose</option><option value='12'>12</option></select>",
+        ] {
+            let (url, server) =
+                crate::discovery::tests::fixture(format!("<!doctype html>{html}")).await;
+            browser.browse(BrowseRequest::Open { url }).await.unwrap();
+            let snapshot = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+                loop {
+                    if let Ok(snapshot) = browser.browse(BrowseRequest::Snapshot).await {
+                        if snapshot["elements"].as_array().is_some_and(|elements| {
+                            elements
+                                .iter()
+                                .any(|e| e["role"] == "input" || e["role"] == "select")
+                        }) {
+                            break snapshot;
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let field = snapshot["elements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["role"] == "input" || e["role"] == "select")
+                .unwrap();
+            let element_ref = field["ref"].as_str().unwrap().to_owned();
+            let request = if field["role"] == "select" {
+                BrowseRequest::Select {
+                    element_ref,
+                    value: "12".into(),
+                }
+            } else {
+                BrowseRequest::Type {
+                    element_ref,
+                    text: "4242424242424242".into(),
+                }
+            };
+            assert!(
+                browser.browse(request).await.is_err(),
+                "Private field accepted shopping input: {html}"
+            );
+            let tab = browser.tab.lock().await;
+            assert_eq!(
+                browser
+                    .cdp
+                    .evaluate(
+                        &tab.session,
+                        "document.querySelector('input,select').value".into()
+                    )
+                    .await
+                    .unwrap(),
+                "",
+                "{html}"
+            );
+            drop(tab);
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
     async fn shopping_type_triggers_autocomplete_and_click_follows_popup() {
         let root = tempfile::tempdir().unwrap().keep();
         let browser = Browser::launch(
