@@ -222,5 +222,16 @@
     skipped.push(`${mapping.field}${mapping.part ? ' ' + mapping.part : ''}: ${error.message}`);
   }
   }
-  return {filled:[...new Set(filled)],skipped};
+  // Later input handlers can rewrite an earlier passenger name. Check the
+  // completed form before reporting acceptance; never return its actual value.
+  const accepted = [...new Set(filled)].filter(field => {
+    if (!['given_name','family_name'].includes(field)) return true;
+    const matches = mapped.filter(m => m.field === field).every(m => {
+      const e = binding.refs[m.index];
+      return e?.isConnected && normalize(e.value) === normalize(values[field]);
+    });
+    if (!matches) skipped.push(`${field}: field changed after filling`);
+    return matches;
+  });
+  return {filled:accepted,skipped};
 })()
