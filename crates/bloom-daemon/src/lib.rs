@@ -5,6 +5,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod deployment;
 pub mod ipc;
 
 mod ens_resolver;
@@ -539,6 +540,8 @@ impl DaemonPetalHost {
             == Some("wallets")
             && ((segments.len() == 2 && segments[1] == "new")
                 || (segments.len() >= 2 && segments[1] == "registrations")
+                || (segments.len() == 2 && segments[1] == "recover")
+                || (segments.len() >= 2 && segments[1] == "recoveries")
                 || (segments.len() == 4
                     && segments[2] == "sealed-approvals"
                     && segments[3] == "new.json")
@@ -964,6 +967,8 @@ impl DaemonPetalHost {
             .map_err(|error| HostError::Invalid(error.to_string()))?;
         let prepared = broker
             .prepare_approval(bloom_broker_api::ApprovalPrepareRequest {
+                surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
+                evm_review_payloads: Vec::new(),
                 operation_id,
                 terms,
                 canonical_plan_facts_digest: plan_digest,
@@ -972,6 +977,7 @@ impl DaemonPetalHost {
                 // belongs to the native Solana transfer path.
                 petal_use_claim: None,
                 system_use_claim: None,
+                requested_review_mode: None,
             })
             .await
             .map_err(|error| {
@@ -1687,6 +1693,7 @@ impl PetalHost for DaemonPetalHost {
             .prepare_custody(
                 bloom_machine_client::CustodyPrepareMethod::KeyDerive,
                 bloom_broker_api::CustodyPrepareRequest {
+                    surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
                     ceremony_kind: bloom_broker_api::CeremonyKind::KeyDerive,
                     custody_operation_id: custody_operation_id.clone(),
                     wallet_id: Some(wallet_id),
@@ -2639,6 +2646,7 @@ impl PetalHost for DaemonPetalHost {
                     nonce: req.nonce,
                     gas_limit_hint: None,
                     usd_value_hint: None,
+                    review_mode: None,
                 },
                 &chain,
                 &wallet_policy,
@@ -3018,7 +3026,11 @@ fn petal_pending_request_matches(
     staged.expires_ms > now_ms
         && staged.resolved_execution_origin() == *origin
         && staged.from.parse::<Address>().ok() == Some(requested_from)
-        && staged.to.parse::<Address>().ok() == Some(requested_to)
+        && staged
+            .to
+            .as_deref()
+            .and_then(|to| to.parse::<Address>().ok())
+            == Some(requested_to)
         && staged.value_wei.parse::<U256>().ok() == Some(requested_value)
         && staged.data_hex == request.data_hex
         && request.nonce.is_none_or(|nonce| staged.nonce == nonce)
@@ -3759,6 +3771,7 @@ impl AccountPetalMount for AccountPetals {
 /// behind Arc/clone-safe inner types).
 #[derive(Clone)]
 pub struct Daemon {
+    deployment_locks: Arc<deployment::DeploymentLocks>,
     pub home: HomeDir,
     pub config: Config,
     pub chains: ChainRegistry,
@@ -4070,7 +4083,8 @@ impl Daemon {
             )
             .map_err(|error| {
                 DaemonError::Audit(format!("Machine wallet projection cache: {error}"))
-            })?,
+            })?
+            .with_max_age(config.wallet_projection_max_age),
         );
         // Build per-chain mempool indexes + handlers from [mempool.<chain>]
         // config. Each entry creates an LRU index, a VFS handler, and
@@ -4489,6 +4503,7 @@ impl Daemon {
                 env!("CARGO_PKG_VERSION"),
                 wallet_projections.clone(),
             )
+            .with_ceremony_broker(broker.clone())
             .with_solana_chains(solana_chain_registry.clone())
             .with_mempool_statuses(initial_mempool_statuses)
             .with_update_snapshot_fn(Arc::new(move || {
@@ -4535,6 +4550,7 @@ impl Daemon {
                 wallet_projections.clone(),
                 home.root().join("machine-policy-projections"),
             )
+            .with_passkey_names_path(home.root().join("passkey-names.json"))
             .with_broker(broker.clone())
             .with_home_write_permit_opt(home_write_permit.clone())
             .with_mempool_indexes(mempool_indexes.clone())
@@ -4899,6 +4915,7 @@ impl Daemon {
         );
 
         Ok(Self {
+            deployment_locks: Arc::new(deployment::DeploymentLocks::default()),
             home,
             config,
             chains,
@@ -5206,6 +5223,15 @@ fn run_expiry_sweep_once(
     audit: &AuditLog,
     now_ms: u128,
 ) -> Result<usize, String> {
+    // A sweep with nothing to expire changes nothing, so an idle tick is not
+    // journaled; otherwise every tick would grow the audit journal forever.
+    if outbox
+        .expired_pending(now_ms)
+        .map_err(|error| error.to_string())?
+        .is_empty()
+    {
+        return Ok(0);
+    }
     let intent = serde_json::json!({
         "operation": "tx.outbox.sweep_expired",
         "cutoff_ms": now_ms.to_string(),
@@ -5261,6 +5287,14 @@ fn run_solana_expiry_sweep_once(
     now_ms: u128,
     live_block_heights: &std::collections::HashMap<String, u64>,
 ) -> Result<usize, String> {
+    // As for EVM: an idle tick changes nothing and is not journaled.
+    if outbox
+        .expired_pending(now_ms, live_block_heights)
+        .map_err(|error| error.to_string())?
+        .is_empty()
+    {
+        return Ok(0);
+    }
     let intent = serde_json::json!({
         "operation": "solana_tx.outbox.sweep_expired",
         "cutoff_ms": now_ms.to_string(),
@@ -6069,6 +6103,15 @@ mod tests {
                         }
                         Ok(MachineBrokerResponse::CustodyResult(
                             bloom_broker_api::CustodyResult {
+                                surface: Some(bloom_broker_api::CeremonySurfaceRef {
+                                    surface_id: bloom_broker_api::Token::new("local").unwrap(),
+                                    identity_digest: bloom_broker_api::Digest32::from_bytes(
+                                        [0; 32],
+                                    ),
+                                }),
+                                credential_authority_generation: Some(
+                                    bloom_broker_api::DecimalU64::new(0),
+                                ),
                                 ceremony_kind: bloom_broker_api::CeremonyKind::KeyDerive,
                                 custody_operation_id: request.operation_id,
                                 public_status: bloom_broker_api::CeremonyState::Succeeded,
@@ -6926,6 +6969,11 @@ mod tests {
         let protected = vec![
             "wallets/new".to_string(),
             "wallets/registrations".to_string(),
+            "wallets/recover".to_string(),
+            "wallets/recoveries".to_string(),
+            "wallets/recoveries/alice/status.json".to_string(),
+            "wallets/recoveries/alice/result.json".to_string(),
+            "wallets/recoveries/alice/cancel".to_string(),
             format!("wallets/registrations/{}/status.json", "22".repeat(32)),
             format!("wallets/registrations/{}/result.json", "22".repeat(32)),
             format!("wallets/registrations/{}/cancel", "22".repeat(32)),
@@ -7114,7 +7162,7 @@ mod tests {
             chain: "anvil".into(),
             chain_id: 31337,
             from: broker.child(true, 0).address.clone(),
-            to: "0x0000000000000000000000000000000000000002".into(),
+            to: Some("0x0000000000000000000000000000000000000002".into()),
             value_wei: "0".into(),
             data_hex: "0x".into(),
             gas_limit: 21_000,
@@ -7127,6 +7175,7 @@ mod tests {
             expires_ms: u128::MAX,
             status: bloom_proto::TxStatus::Pending,
             action_kind: bloom_proto::TxActionKind::Unknown,
+            review_mode: None,
             tx_hash: Some(tx_hash.clone()),
             token: None,
             nft: None,
@@ -7139,7 +7188,7 @@ mod tests {
         let request = EvmTransactionRequest {
             wallet: "w".into(),
             chain: "anvil".into(),
-            to: staged.to.clone(),
+            to: staged.to.clone().unwrap(),
             value_wei: staged.value_wei.clone(),
             data_hex: staged.data_hex.clone(),
             nonce: None,
@@ -7153,7 +7202,7 @@ mod tests {
             &request,
             &origin,
             staged.from.parse().unwrap(),
-            staged.to.parse().unwrap(),
+            staged.to.as_deref().unwrap().parse().unwrap(),
             staged.value_wei.parse().unwrap(),
         ));
         assert!(
@@ -7164,7 +7213,7 @@ mod tests {
                 "0x0000000000000000000000000000000000000003"
                     .parse()
                     .unwrap(),
-                staged.to.parse().unwrap(),
+                staged.to.as_deref().unwrap().parse().unwrap(),
                 staged.value_wei.parse().unwrap(),
             ),
             "the same request from another account must not reuse this outbox"
@@ -7177,7 +7226,7 @@ mod tests {
             &equivalent_fee_request,
             &origin,
             staged.from.parse().unwrap(),
-            staged.to.parse().unwrap(),
+            staged.to.as_deref().unwrap().parse().unwrap(),
             staged.value_wei.parse().unwrap(),
         ));
         let mut changed_request = request;
@@ -7187,7 +7236,7 @@ mod tests {
             &changed_request,
             &origin,
             staged.from.parse().unwrap(),
-            staged.to.parse().unwrap(),
+            staged.to.as_deref().unwrap().parse().unwrap(),
             staged.value_wei.parse().unwrap(),
         ));
         let entry_dir = daemon
@@ -7199,6 +7248,7 @@ mod tests {
             outcome: "success".into(),
             tx_hash: tx_hash.clone(),
             block_number: Some(42),
+            contract_address: None,
             revert_reason: None,
         };
         daemon
@@ -7586,6 +7636,238 @@ ws_url = "wss://example.invalid"
         assert!(daemon.mempool_shutdown.lock().is_empty());
     }
 
+    /// Register an unreachable EVM chain: every validation branch below
+    /// answers before any upstream use, so a regression that starts
+    /// dialling fails loudly (connection refused) instead of hanging.
+    fn deployment_validation_chain(daemon: &Daemon) {
+        let spec = ChainSpec {
+            name: "anvil".into(),
+            chain_id: 31337,
+            rpc_urls: vec!["http://127.0.0.1:1".into()],
+            rpc_endpoints: Vec::new(),
+            etherscan_api_url: None,
+            display_name: None,
+            native_symbol: "ETH".into(),
+            native_decimals: 18,
+            legacy_tx: false,
+            op_stack: false,
+        };
+        daemon.chains.add(ChainClient::new(spec).unwrap());
+    }
+
+    fn deployment_daemon() -> (tempfile::TempDir, Daemon) {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = Daemon::from_home(HomeDir::at(dir.path())).unwrap();
+        deployment_validation_chain(&daemon);
+        (dir, daemon)
+    }
+
+    #[tokio::test]
+    async fn deployment_rpc_rejects_bad_names_and_unknown_chains() {
+        let (_dir, daemon) = deployment_daemon();
+        for (wallet, chain) in [
+            ("", "anvil"),
+            ("alice", ""),
+            ("alice/with-slash", "anvil"),
+            ("alice", "anvil!"),
+        ] {
+            let reply = daemon
+                .deployment_rpc(wallet, chain, "bloom_deploymentList", serde_json::json!([]))
+                .await;
+            assert_eq!(
+                reply["error"]["code"],
+                serde_json::json!(-32602),
+                "{wallet}/{chain}: {reply}"
+            );
+        }
+        let reply = daemon
+            .deployment_rpc(
+                "alice",
+                "nope",
+                "bloom_deploymentList",
+                serde_json::json!([]),
+            )
+            .await;
+        assert_eq!(reply["error"]["message"], "unknown chain");
+    }
+
+    #[tokio::test]
+    async fn deployment_rpc_validates_params_and_ids_without_a_node() {
+        let (_dir, daemon) = deployment_daemon();
+        let reply = daemon
+            .deployment_rpc(
+                "alice",
+                "anvil",
+                "bloom_deploymentList",
+                serde_json::json!({}),
+            )
+            .await;
+        assert_eq!(reply["error"]["message"], "params must be an array");
+        let reply = daemon
+            .deployment_rpc(
+                "alice",
+                "anvil",
+                "bloom_deploymentList",
+                serde_json::json!([]),
+            )
+            .await;
+        assert_eq!(reply["result"], serde_json::json!([]));
+        for params in [
+            serde_json::json!(["nope"]),
+            serde_json::json!(["deploy-abc"]),
+        ] {
+            let reply = daemon
+                .deployment_rpc("alice", "anvil", "bloom_deploymentStatus", params)
+                .await;
+            assert_eq!(
+                reply["error"]["message"], "invalid deployment ID",
+                "{reply}"
+            );
+        }
+        let reply = daemon
+            .deployment_rpc(
+                "alice",
+                "anvil",
+                "bloom_deploymentStatus",
+                serde_json::json!([42]),
+            )
+            .await;
+        assert_eq!(reply["error"]["message"], "expected deployment ID");
+        let missing = format!("deploy-{}", "ab".repeat(32));
+        let reply = daemon
+            .deployment_rpc(
+                "alice",
+                "anvil",
+                "bloom_deploymentStatus",
+                serde_json::json!([missing]),
+            )
+            .await;
+        assert_eq!(reply["error"]["message"], "deployment not found");
+    }
+
+    #[tokio::test]
+    async fn deployment_status_rejects_a_foreign_chain_id() {
+        let (_dir, daemon) = deployment_daemon();
+        let id = format!("deploy-{}", "cd".repeat(32));
+        let staged = bloom_proto::StagedTx {
+            id: id.clone(),
+            wallet: "alice".into(),
+            chain: "anvil".into(),
+            chain_id: 1,
+            from: "0x0000000000000000000000000000000000000001".into(),
+            to: None,
+            value_wei: "0".into(),
+            data_hex: "0x60006000f3".into(),
+            gas_limit: 21_000,
+            max_fee_per_gas: None,
+            max_priority_fee_per_gas: None,
+            gas_price: None,
+            nonce: 0,
+            policy_checks: vec![],
+            created_ms: 1,
+            expires_ms: 0,
+            status: bloom_proto::TxStatus::Pending,
+            action_kind: bloom_proto::TxActionKind::ContractCreation,
+            review_mode: None,
+            tx_hash: None,
+            token: None,
+            nft: None,
+            usd_value: None,
+            valuation: None,
+            depends_on: None,
+            action_id: None,
+            execution_origin: None,
+        };
+        daemon
+            .tx_engine
+            .outbox
+            .write_pending(&staged, "plan")
+            .unwrap();
+        let reply = daemon
+            .deployment_rpc(
+                "alice",
+                "anvil",
+                "bloom_deploymentStatus",
+                serde_json::json!([id]),
+            )
+            .await;
+        assert_eq!(
+            reply["error"]["message"],
+            "deployment belongs to a different chain ID than the current profile"
+        );
+    }
+
+    #[tokio::test]
+    async fn deployment_list_reports_a_restaged_id_once() {
+        let (_dir, daemon) = deployment_daemon();
+        let id = format!("deploy-{}", "ef".repeat(32));
+        let staged = bloom_proto::StagedTx {
+            id: id.clone(),
+            wallet: "alice".into(),
+            chain: "anvil".into(),
+            chain_id: 31337,
+            from: "0x0000000000000000000000000000000000000001".into(),
+            to: None,
+            value_wei: "0".into(),
+            data_hex: "0x60006000f3".into(),
+            gas_limit: 21_000,
+            max_fee_per_gas: None,
+            max_priority_fee_per_gas: None,
+            gas_price: None,
+            nonce: 0,
+            policy_checks: vec![],
+            created_ms: 1,
+            expires_ms: 0,
+            status: bloom_proto::TxStatus::Pending,
+            action_kind: bloom_proto::TxActionKind::ContractCreation,
+            review_mode: None,
+            tx_hash: None,
+            token: None,
+            nft: None,
+            usd_value: None,
+            valuation: None,
+            depends_on: None,
+            action_id: None,
+            execution_origin: None,
+        };
+        daemon
+            .tx_engine
+            .outbox
+            .write_pending(&staged, "plan")
+            .unwrap();
+        // The same id restaged after failure: a fresh pending row plus the
+        // quarantined failed row. List must still show it once.
+        let entry = daemon
+            .tx_engine
+            .outbox
+            .read_in_state(
+                "alice",
+                "anvil",
+                &id,
+                bloom_tx::outbox::OutboxState::Pending,
+            )
+            .unwrap();
+        daemon
+            .tx_engine
+            .outbox
+            .transition(&entry, bloom_tx::outbox::OutboxState::Failed)
+            .unwrap();
+        daemon
+            .tx_engine
+            .outbox
+            .write_pending(&staged, "plan")
+            .unwrap();
+        let reply = daemon
+            .deployment_rpc(
+                "alice",
+                "anvil",
+                "bloom_deploymentList",
+                serde_json::json!([]),
+            )
+            .await;
+        assert_eq!(reply["result"], serde_json::json!([id]));
+    }
+
     /// Boots a daemon with one valid mempool chain and verifies that the
     /// bump scanner and backends probe tasks were both spawned (their
     /// shutdown senders are non-empty), and that the StatusHandler's
@@ -7776,7 +8058,7 @@ ws_url = "wss://example.invalid"
             chain: "anvil".into(),
             chain_id: 31337,
             from: "0x0000000000000000000000000000000000000001".into(),
-            to: "0x0000000000000000000000000000000000000002".into(),
+            to: Some("0x0000000000000000000000000000000000000002".into()),
             value_wei: "0".into(),
             data_hex: "0x".into(),
             gas_limit: 21000,
@@ -7789,6 +8071,7 @@ ws_url = "wss://example.invalid"
             expires_ms: 1,
             status: bloom_proto::TxStatus::Pending,
             action_kind: bloom_proto::TxActionKind::Unknown,
+            review_mode: None,
             tx_hash: None,
             token: None,
             nft: None,
@@ -7814,6 +8097,38 @@ ws_url = "wss://example.invalid"
         tokio::time::timeout(std::time::Duration::from_secs(2), tasks.shutdown())
             .await
             .expect("background task did not honour shutdown signal");
+    }
+
+    #[tokio::test]
+    async fn idle_expiry_sweeps_leave_the_audit_journal_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = HomeDir::at(dir.path());
+        let d = Daemon::from_home(home.clone()).unwrap();
+        let solana_outbox =
+            bloom_solana_tx::outbox::SolanaOutbox::new(home.solana_outbox_dir()).unwrap();
+        let before = d.audit.count().unwrap();
+        for now_ms in [1_u128, 2, 3] {
+            assert_eq!(
+                run_expiry_sweep_once(&d.tx_engine.outbox, &d.audit, now_ms).unwrap(),
+                0
+            );
+            assert_eq!(
+                run_solana_expiry_sweep_once(
+                    &solana_outbox,
+                    &d.audit,
+                    now_ms,
+                    &std::collections::HashMap::new(),
+                )
+                .unwrap(),
+                0
+            );
+        }
+        assert_eq!(
+            d.audit.count().unwrap(),
+            before,
+            "idle sweeps must not append records"
+        );
+        assert!(d.audit.pending_effect_correlations().unwrap().is_empty());
     }
 
     // Fix D (PLAN-SOLANA-PR-FIXES.md): the periodic sweep task only ever
@@ -7890,7 +8205,7 @@ ws_url = "wss://example.invalid"
             chain: "anvil".into(),
             chain_id: 31337,
             from: "0x0000000000000000000000000000000000000001".into(),
-            to: "0x0000000000000000000000000000000000000002".into(),
+            to: Some("0x0000000000000000000000000000000000000002".into()),
             value_wei: "0".into(),
             data_hex: "0x".into(),
             gas_limit: 21_000,
@@ -7903,6 +8218,7 @@ ws_url = "wss://example.invalid"
             expires_ms: 1,
             status: bloom_proto::TxStatus::Pending,
             action_kind: bloom_proto::TxActionKind::Unknown,
+            review_mode: None,
             tx_hash: None,
             token: None,
             nft: None,
@@ -8201,6 +8517,7 @@ ws_url = "wss://example.invalid"
                 allowed_petal_packages: Vec::new(),
                 allowed_destinations: Vec::new(),
                 required_verifiers: Vec::new(),
+                clear_signing: None,
             })
             .unwrap();
             bloom_broker_api::SignedPolicySnapshot {
@@ -8693,6 +9010,8 @@ allowed = ["bloom:vfs.read"]
 
     #[tokio::test]
     async fn identical_petal_evm_stage_requests_reuse_only_the_selected_account_pending_entry() {
+        // A default chain: a local Anvil node is opt-in. Reusing the staged
+        // entry never reaches the chain's RPC endpoint.
         let (_dir, daemon, broker) = isolation_daemon().await;
         let host =
             test_petal_host(&daemon).with_broker(Some(MachineBrokerClient::new(broker.clone())));
@@ -8702,7 +9021,7 @@ allowed = ["bloom:vfs.read"]
             let context = account_route_context("w", Some(number), None);
             let staged: bloom_proto::StagedTx = serde_json::from_value(serde_json::json!({
                 "id": format!("account-{number}-pending"),
-                "wallet": "w", "chain": "anvil", "chain_id": 31337,
+                "wallet": "w", "chain": "ethereum", "chain_id": 1,
                 "from": broker.child(true, number).address, "to": to,
                 "value_wei": "0", "data_hex": "0x", "gas_limit": 21000,
                 "nonce": 0, "policy_checks": [], "created_ms": 1,
@@ -8721,7 +9040,7 @@ allowed = ["bloom:vfs.read"]
             let outcome = host
                 .evm_tx_stage(EvmTransactionRequest {
                     wallet: "w".into(),
-                    chain: "anvil".into(),
+                    chain: "ethereum".into(),
                     to: to.clone(),
                     value_wei: "0".into(),
                     data_hex: "0x".into(),
@@ -8738,7 +9057,7 @@ allowed = ["bloom:vfs.read"]
             daemon
                 .tx_engine
                 .outbox
-                .list("w", "anvil", OutboxState::Pending)
+                .list("w", "ethereum", OutboxState::Pending)
                 .unwrap()
                 .len(),
             2

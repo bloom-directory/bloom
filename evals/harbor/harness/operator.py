@@ -16,13 +16,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from .core import EvalError, run_eval
+from .core import EvalError, EvalEvidence, reasoning_effort, run_eval
 from .hyperliquid_order_cancel import (
     MAINNET_ACK,
     PACKAGE_HASH,
-    WALLET,
     WALLET_ID,
     HyperliquidOrderCancelEval,
+    ceremony_origin,
+    wallet_account_projection,
 )
 
 STATE_SCHEMA = "bloom.eval.operator-state.v1"
@@ -242,6 +243,23 @@ def safe_json(path: Path) -> Any:
         raise EvalError("required discovery input is unavailable or invalid") from error
 
 
+def mount_ceremony_origin(mount: Path) -> str:
+    """Return the ceremony origin the Machine publishes for this Triad."""
+    surfaces = safe_json(mount / "status/ceremonies.json")
+    origin = surfaces.get("local_origin") if isinstance(surfaces, dict) else None
+    if not isinstance(origin, str):
+        raise EvalError("Machine published no local ceremony origin")
+    return ceremony_origin(origin)
+
+
+def validate_ceremony_origin(state: dict[str, Any]) -> None:
+    recorded = state.get("ceremony_origin")
+    if not isinstance(recorded, str):
+        raise EvalError("operator state has no ceremony origin; re-run init")
+    if mount_ceremony_origin(Path(state["paths"]["bloom_mount"])) != recorded:
+        raise EvalError("ceremony origin changed; re-run init before creating authority")
+
+
 def expected_deny_policy(wallet_id: str) -> dict[str, Any]:
     return {
         "allowed_destinations": [],
@@ -261,6 +279,7 @@ def require_deny_policy(definition: HyperliquidOrderCancelEval, wallet_id: str) 
 def require_no_pending_owner_requests(
     definition: HyperliquidOrderCancelEval, wallet_id: str, package_hash: str
 ) -> None:
+    now_ms = int(time.time() * 1000)
     for root_name, statuses in (
         ("petal-key-requests", {"awaiting_user"}),
         ("petal-signing-requests", {"awaiting_owner_approval"}),
@@ -280,6 +299,16 @@ def require_no_pending_owner_requests(
             except EvalError:
                 continue
             if not isinstance(record, dict) or record.get("status") not in statuses:
+                continue
+            # Machine keeps an abandoned key request at `awaiting_user` after
+            # its ceremony expires; an expired ceremony can never complete.
+            # Anything without a parseable expiry still counts as pending.
+            expires_at_ms = record.get("ceremony_expires_at_ms")
+            if (
+                isinstance(expires_at_ms, str)
+                and expires_at_ms.isdigit()
+                and int(expires_at_ms) <= now_ms
+            ):
                 continue
             scope = record.get("scope")
             scoped_wallet = scope.get("wallet_id") if isinstance(scope, dict) else None
@@ -313,6 +342,11 @@ def definition_env(state: dict[str, Any]) -> dict[str, str]:
         BLOOM_EVAL_JOBS_DIR=paths["jobs_dir"],
         BLOOM_EVAL_MAINNET_ACK=MAINNET_ACK,
         **(
+            {"BLOOM_EVAL_CEREMONY_ORIGIN": state["ceremony_origin"]}
+            if state.get("ceremony_origin")
+            else {}
+        ),
+        **(
             {"BLOOM_EVAL_AGENT_NAME": state["agent_name"]}
             if state.get("agent_name")
             else {}
@@ -330,7 +364,9 @@ def redact(error: BaseException, state: dict[str, Any] | None) -> str:
         (v for v in sensitive if isinstance(v, str)), key=len, reverse=True
     ):
         text = text.replace(value, "[REDACTED]")
-    text = re.sub(r"http://localhost:18734/ceremony/[A-Za-z0-9_-]+", "[REDACTED]", text)
+    text = re.sub(
+        r"http://localhost:[0-9]+/ceremony/[A-Za-z0-9_-]+", "[REDACTED]", text
+    )
     return text
 
 
@@ -827,17 +863,9 @@ def initialize(args: argparse.Namespace, repo_root: Path) -> None:
     catalog = triad_root / "config/provenance-catalog.json"
     if not os.path.ismount(mount):
         raise EvalError("configured Bloom path is not an active mount")
-    addresses = safe_json(mount / "wallets" / args.wallet_id / "addresses.json")
-    owner = addresses.get("owner") if isinstance(addresses, dict) else None
-    if not isinstance(owner, str) or WALLET.fullmatch(owner.lower()) is None:
-        raise EvalError("wallet owner projection is invalid")
-    if (
-        addresses.get("wallet") != args.wallet_id
-        or addresses.get("policy_status") != "broker_verified"
-    ):
-        raise EvalError(
-            "wallet projection is not Broker-verified for the selected wallet"
-        )
+    owner, _ = wallet_account_projection(
+        safe_json, mount / "wallets" / args.wallet_id, args.wallet_id
+    )
     owner_data = safe_json(owner_record)
     package_hash = owner_data.get("hash") if isinstance(owner_data, dict) else None
     if (
@@ -884,6 +912,9 @@ def initialize(args: argparse.Namespace, repo_root: Path) -> None:
             "agent_name": (
                 "Optional stable venue agent name override; null uses deterministic derivation."
             ),
+            "ceremony_origin": (
+                "The Triad's local ceremony origin; the harness completes no other."
+            ),
             "recovery": (
                 "Protected state, policy-backup, summary, and marker locations."
             ),
@@ -895,6 +926,7 @@ def initialize(args: argparse.Namespace, repo_root: Path) -> None:
         "package_hash": package_hash,
         "model": args.model,
         "agent_name": args.agent_name,
+        "ceremony_origin": mount_ceremony_origin(mount),
         "next_sign_count": args.sign_count,
         "pending_policy_recovery": None,
         "paths": {
@@ -957,6 +989,11 @@ def status(store: StateStore, repo_root: Path) -> None:
     )
     checks["mount_active"] = os.path.ismount(state["paths"]["bloom_mount"])
     try:
+        validate_ceremony_origin(state)
+        checks["ceremony_origin_current"] = True
+    except EvalError:
+        checks["ceremony_origin_current"] = False
+    try:
         validate_lineage(state, repo_root)
         checks["lineage_current"] = True
     except EvalError:
@@ -989,7 +1026,8 @@ def result_summary(result: Any) -> dict[str, Any]:
     stats = result.stats
     rewards: dict[str, Any] = {}
     if result.trial_results and result.trial_results[0].verifier_result is not None:
-        rewards = dict(result.trial_results[0].verifier_result.rewards)
+        # Harbor leaves rewards null when verification never produced any.
+        rewards = dict(result.trial_results[0].verifier_result.rewards or {})
     return {
         "rewards": rewards,
         "errored_trials": stats.n_errored_trials,
@@ -1005,12 +1043,15 @@ def run_or_recover(
     state = store.read()
     if args.ack != MAINNET_ACK:
         raise EvalError(f"explicit acknowledgement must equal {MAINNET_ACK}")
+    # Only a new run uses the reasoning effort; recovery must never depend on
+    # it, so a stale or invalid value cannot leave an allow policy in place.
+    effort: str | None = None
     lock_path = Path(state["paths"]["lock_file"])
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     started_total = time.monotonic()
     timings: dict[str, float] = {}
     outcome = "failed"
-    result: Any | None = None
+    evidence = EvalEvidence()
     error_text: str | None = None
     definition = HyperliquidOrderCancelEval(
         repo_root,
@@ -1042,6 +1083,9 @@ def run_or_recover(
                 # prerequisites for restoring the exact digest-bound policy
                 # backup after a branch switch or rebuild.
                 validate_lineage(state, repo_root)
+                validate_ceremony_origin(state)
+                # Validate before any policy change so a bad value costs nothing.
+                effort = reasoning_effort(state["model"])
                 try:
                     phase = time.monotonic()
                     try:
@@ -1052,11 +1096,12 @@ def run_or_recover(
                         )
                     refreshed = store.read()
                     definition.sign_count_value = str(refreshed["next_sign_count"])
-                    result = run_eval(
+                    run_eval(
                         definition,
                         state["model"],
                         acquire_lock=False,
                         phase_timings=timings,
+                        evidence=evidence,
                     )
                 finally:
                     if store.backup_path.exists():
@@ -1080,16 +1125,25 @@ def run_or_recover(
                 "finished_at": datetime.now(UTC).isoformat(),
                 "outcome": outcome,
                 "model": state["model"],
+                "reasoning_effort": "n/a"
+                if recover_only
+                else effort or "harbor-default",
                 "harbor_version": os.environ.get("HARBOR_VERSION", "0.21.0"),
                 "package_hash": state["package_hash"],
                 "lineage": state["lineage"],
                 "timings": {key: round(value, 6) for key, value in timings.items()},
-                "result": result_summary(result) if result is not None else None,
+                "result": result_summary(evidence.result)
+                if evidence.result is not None else None,
                 "error": error_text,
+                "cleanup": {
+                    "succeeded": evidence.cleanup_succeeded,
+                    "error": redact(evidence.cleanup_error, state)
+                    if evidence.cleanup_error is not None else None,
+                },
                 "final_state": {
-                    "open_orders": 0 if outcome == "passed" else None,
-                    "positions": 0 if outcome == "passed" else None,
-                    "session_stopped": True if outcome == "passed" else None,
+                    "open_orders": definition.cleanup_observations.get("open_orders"),
+                    "positions": definition.cleanup_observations.get("positions"),
+                    "session_stopped": definition.cleanup_observations.get("session_stopped"),
                     "policy_restored": not store.backup_path.exists(),
                     "counter_reconciled": store.read().get("pending_policy_recovery")
                     is None,

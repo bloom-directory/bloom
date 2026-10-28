@@ -676,6 +676,12 @@ pub enum MachineCommand {
         outcome: String,
         confirm: String,
     },
+    DeploymentRpc {
+        wallet: String,
+        chain: String,
+        method: String,
+        params: Value,
+    },
     WalletList,
     WalletProjection {
         name: String,
@@ -706,6 +712,16 @@ pub enum MachineCommand {
     WalletCustody {
         name: String,
         kind: MachineCustodyKind,
+        #[serde(default)]
+        local: bool,
+    },
+    WalletAddPasskey {
+        name: String,
+        local: bool,
+        /// With neither `local` nor `remote`, Broker's default applies: the
+        /// hosted surface when effective, otherwise this host's browser.
+        #[serde(default)]
+        remote: bool,
     },
     WalletMigrate {
         receipt: MachineLegacyMigrationReceipt,

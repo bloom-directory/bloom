@@ -272,6 +272,20 @@ fn build_tx_request(
             let d = data.clone().unwrap_or_else(|| "0x".into());
             (to_addr, v, d)
         }
+        RawIntentBody::Deploy { data, value } => {
+            let data = decode_hex(data)?;
+            if data.is_empty() {
+                return Err(HandlerError::invalid("deploy requires nonempty initcode"));
+            }
+            let mut req = TransactionRequest::default()
+                .with_kind(alloy::primitives::TxKind::Create)
+                .with_value(resolve_value(value, &None)?)
+                .with_input(data);
+            if let Some(nonce) = intent.nonce {
+                req = req.with_nonce(nonce);
+            }
+            return Ok(req);
+        }
         RawIntentBody::Raw { to, value, data } => {
             let to_addr = resolve_addr(to, addr_book)?;
             let v = if value.is_empty() {
@@ -328,11 +342,6 @@ fn build_tx_request(
             // unsupported here rather than mis-encoding.
             return Err(HandlerError::Unsupported(
                 "NFT intents are simulated via the selected account's outbox stage path (see wallets/<w>/<n>/chains/<c>/outbox/new.tx)".into(),
-            ));
-        }
-        RawIntentBody::Enso { .. } => {
-            return Err(HandlerError::Unsupported(
-                "Enso intents are not simulated through /simulate (use defi/intents/)".into(),
             ));
         }
     };
@@ -413,6 +422,17 @@ fn render_sim_plan(session: &SimSession) -> String {
                     ));
                 }
             }
+            RawIntentBody::Deploy { data, value } => {
+                s.push_str("Kind:  deploy (CREATE)\nTo:    (none; contract creation)\n");
+                s.push_str(&format!(
+                    "Value: {}\n",
+                    if value.is_empty() { "0" } else { value }
+                ));
+                s.push_str(&format!(
+                    "Initcode: {} bytes\n",
+                    data.trim_start_matches("0x").len() / 2
+                ));
+            }
             RawIntentBody::Raw { to, value, data } => {
                 s.push_str("Kind:  raw\n");
                 s.push_str(&format!("To:    {}\n", to));
@@ -480,10 +500,6 @@ fn render_sim_plan(session: &SimSession) -> String {
                 s.push_str(&format!("Contract:{}\n", contract));
                 s.push_str(&format!("Operator:{}\n", operator));
                 s.push_str(&format!("Approved:{}\n", approved));
-            }
-            RawIntentBody::Enso { intent } => {
-                s.push_str("Kind:   enso\n");
-                s.push_str(&format!("Intent: {}\n", intent));
             }
         }
     }
@@ -873,6 +889,19 @@ const _CSA: fn(&Address) -> String = checksum_address;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn deployment_simulation_has_no_recipient() {
+        let intent = bloom_tx::intent_parser::parse(
+            r#"{"kind":"deploy","data":"0x60006000f3","value":"123 wei","nonce":7}"#,
+        )
+        .unwrap();
+        let request =
+            super::build_tx_request(&intent, &bloom_proto::AddressBook::default()).unwrap();
+        assert_eq!(request.to, Some(alloy::primitives::TxKind::Create));
+        assert_eq!(request.value, Some(alloy::primitives::U256::from(123)));
+        assert_eq!(request.nonce, Some(7));
+    }
+
     use super::*;
     use std::net::TcpListener;
     use std::process::Stdio;
