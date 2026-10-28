@@ -66,13 +66,14 @@ whether an earlier operation completed or whether retrying a write is safe.
   possibly submitted transaction, reconcile by its recorded hash or signature;
   never blindly restage or rebroadcast.
 
-Petal HTTP errors never include URL userinfo, paths or queries, because they
-can contain credentials. A policy denial is one of:
+Machine's Petal HTTP transport errors omit URL userinfo, paths and queries,
+which can contain credentials. Petals may still return upstream response bodies.
+A policy denial is one of:
 
 - `net.fetch requires https`;
 - `net.fetch disallows non-default https port <port>`;
-- `<METHOD> <host>: <host|method|path> not allowed by package network policy`,
-  naming the part of the request no `[[net.allow]]` rule permits.
+- `<METHOD> <host>: not allowed by effective network policy (check manifest and invocation grant)`.
+  Both `[[net.allow]]` and the invocation's runtime grant must permit the request.
 
 Transport errors read `http_fetch <send|body>: <METHOD> <host>: <cause>`, where
 the cause is the underlying DNS, connect, TLS or timeout error.

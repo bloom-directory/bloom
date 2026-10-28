@@ -3156,7 +3156,6 @@ fn audit_http_target(raw: &str) -> serde_json::Value {
             "scheme": url.scheme(),
             "host": url.host_str(),
             "port": url.port(),
-            "path": url.path(),
         }),
         Err(_) => serde_json::json!({ "invalid": true }),
     }
@@ -5669,6 +5668,21 @@ fn render_petal_discovery_markdown(installed: &[bloom_petals::package::PetalDisc
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn http_audit_target_omits_credentials_and_path() {
+        let target = super::audit_http_target(
+            "https://user:password@example.com/path-secret?key=query-secret",
+        );
+        assert_eq!(
+            target,
+            serde_json::json!({"scheme":"https", "host":"example.com", "port":null})
+        );
+        assert_eq!(
+            super::audit_http_target("invalid-secret"),
+            serde_json::json!({"invalid":true})
+        );
+    }
+
     use super::*;
     use bloom_broker_api::{MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService};
     use bloom_vfs::VfsPath;

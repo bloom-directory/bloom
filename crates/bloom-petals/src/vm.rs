@@ -1007,7 +1007,6 @@ async fn component_http_fetch(
             petal = %store.data().petal_hash,
             method = %req.method,
             host = audit.host.as_deref().unwrap_or("<invalid>"),
-            path = audit.path.as_deref().unwrap_or("<invalid>"),
             "component http.fetch denied by net policy"
         );
         return set_component_result(results, component_host_err(e));
@@ -1024,7 +1023,6 @@ async fn component_http_fetch(
                 petal = %petal_hash,
                 method = %method,
                 host = audit.host.as_deref().unwrap_or("<invalid>"),
-                path = audit.path.as_deref().unwrap_or("<invalid>"),
                 status = resp.status,
                 request_bytes = req_body_len,
                 response_bytes = resp.body.len(),
@@ -2887,19 +2885,14 @@ fn log_denied(d: &StoreData, op: &str) {
 
 struct HttpAuditTarget {
     host: Option<String>,
-    path: Option<String>,
 }
 
 fn http_audit_target(url: &str) -> HttpAuditTarget {
     match url::Url::parse(url) {
         Ok(parsed) => HttpAuditTarget {
             host: parsed.host_str().map(|h| h.to_ascii_lowercase()),
-            path: Some(parsed.path().to_string()),
         },
-        Err(_) => HttpAuditTarget {
-            host: None,
-            path: None,
-        },
+        Err(_) => HttpAuditTarget { host: None },
     }
 }
 
@@ -3026,6 +3019,17 @@ mod tests {
     use wasmtime::AsContextMut;
 
     const VALID_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn http_audit_target_retains_only_the_host() {
+        assert_eq!(
+            http_audit_target("https://user:password@example.com/path-secret?key=query-secret")
+                .host
+                .as_deref(),
+            Some("example.com")
+        );
+        assert!(http_audit_target("invalid-secret").host.is_none());
+    }
 
     fn component_payload_request(wallet: &str, byte: u8, operation_class: &str) -> ComponentVal {
         ComponentVal::Record(vec![
