@@ -28,14 +28,15 @@ Solana chains it shows SOL only, not SPL tokens.
 
 ## When the request leaves something out
 
-Infer the wallet, account, chain and network from state, and ask only when
-the request is still ambiguous:
+Use live state to identify the wallet and account. Ask which chain to use
+when the user has not named one:
 
 - If there is only one wallet or account, use it.
-- If `holdings.json` shows the asset on only one chain, use that chain.
-- Use the chain a Petal documents as its default, and mainnet unless the
-  request names a testnet.
-- If two or more choices remain plausible, ask one question that names them.
+- Use `holdings.json` and the Petal's documentation to explain the available
+  choices, not to select a chain or default to mainnet. Holdings can be
+  incomplete when a read fails or a token is outside the curated list.
+- If the wallet, account or network is ambiguous, ask one question that names
+  the remaining choices before staging work.
 
 Report a failed or partially completed action as a failure, never as done.
 
