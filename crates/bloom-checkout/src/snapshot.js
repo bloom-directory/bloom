@@ -128,5 +128,6 @@
   }));
   // Child frames are observed separately; their contents are never merged here.
   return {url: location.href === 'about:blank' ? 'about:blank' : location.origin + location.pathname,
-    elements, private_displays: privateDisplays.length > 0};
+    elements, private_displays: privateDisplays.length > 0,
+    large_page: document.body.innerText.length > 30000};
 })()

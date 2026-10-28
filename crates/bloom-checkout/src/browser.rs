@@ -163,9 +163,10 @@ impl Browser {
                         .context("Missing shopping elements")?;
                     let limit = if position == 0 { 300 } else { 20 };
                     // AX can repeat custom selected values outside their input
-                    // subtree. Use the masked projection while those are present.
+                    // subtree. Large pages also need no AX serialization beyond
+                    // the public text budget. Both use the control projection.
                     let private_displays = snapshot["private_displays"] == true;
-                    let outline = if private_displays {
+                    let outline = if private_displays || snapshot["large_page"] == true {
                         None
                     } else {
                         match self
