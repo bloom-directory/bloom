@@ -77,6 +77,9 @@ tool for this checkout.
   text, not verified purchase facts. Read `status.json`, forward its ceremony
   URL, and wait. Shopping access stays paused through private checkout.
   Complete contact, delivery and billing details and choose shipping first.
+  If billing matches delivery, select that option instead of leaving a
+  separate billing form empty. Blank shipping-choice labels are still loading;
+  wait for named rates and a selected method before requesting approval.
   A total beside “Enter shipping address” can omit delivery and destination
   taxes; it is not a final quote. Visible card boxes alone do not prove that
   a checkout is ready to submit.
