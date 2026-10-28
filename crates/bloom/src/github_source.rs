@@ -994,8 +994,14 @@ fn curl_download(
             "--location",
             "--connect-timeout",
             "10",
+            // Abort a stalled transfer, not a slow one: a 46 MB release archive
+            // took longer than a fixed 120 s on a slow GitHub day (bloom#393).
+            "--speed-limit",
+            "1024",
+            "--speed-time",
+            "60",
             "--max-time",
-            "120",
+            "900",
         ])
         .arg(url)
         .arg("--output")
@@ -1003,7 +1009,7 @@ fn curl_download(
     let result = run_bounded_command(
         &mut command,
         Some(context),
-        std::time::Duration::from_secs(125),
+        std::time::Duration::from_secs(905),
     )
     .context("download pre-installed Petal release with curl")?;
     if !result.status.success() {
