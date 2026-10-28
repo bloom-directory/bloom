@@ -2235,6 +2235,54 @@ pub(crate) mod tests {
                 true,
             ),
             (
+                "newsletter with an offscreen bot trap",
+                format!(
+                    "<form>Join the newsletter<input type=email><div aria-hidden=true style='position:absolute;left:-5000px'><input type=text tabindex=-1></div><button>Subscribe</button></form><form>{}<button>Pay now $3.99</button></form>",
+                    inputs()
+                ),
+                true,
+            ),
+            (
+                "newsletter with a visible extra field",
+                format!(
+                    "<form>Newsletter<input type=email><div aria-hidden=true><input type=text tabindex=-1></div><button>Subscribe</button></form><form>{}<button>Pay</button></form>",
+                    inputs()
+                ),
+                false,
+            ),
+            (
+                "offscreen newsletter field remains accessible",
+                format!(
+                    "<form>Newsletter<input type=email><div style='position:absolute;left:-5000px'><input type=text tabindex=-1></div><button>Subscribe</button></form><form>{}<button>Pay</button></form>",
+                    inputs()
+                ),
+                false,
+            ),
+            (
+                "offscreen newsletter field remains focusable",
+                format!(
+                    "<form>Newsletter<input type=email><div aria-hidden=true style='position:absolute;left:-5000px'><input type=text></div><button>Subscribe</button></form><form>{}<button>Pay</button></form>",
+                    inputs()
+                ),
+                false,
+            ),
+            (
+                "offscreen card field is not a bot trap",
+                format!(
+                    "<form>Newsletter<input type=email><div aria-hidden=true style='position:absolute;left:-5000px'><input id=card-number type=text tabindex=-1></div><button>Subscribe</button></form><form>{}<button>Pay</button></form>",
+                    inputs()
+                ),
+                false,
+            ),
+            (
+                "offscreen private field is not a bot trap",
+                format!(
+                    "<form>Newsletter<input type=email><div aria-hidden=true style='position:absolute;left:-5000px'><input type=password tabindex=-1></div><button>Subscribe</button></form><form>{}<button>Pay</button></form>",
+                    inputs()
+                ),
+                false,
+            ),
+            (
                 "associated submit",
                 format!(
                     "<form><h2>Newsletter</h2><input type=email><button>Subscribe</button></form><form id=payment>{}</form><button form=payment>Pay</button>",
@@ -2407,6 +2455,17 @@ pub(crate) mod tests {
                 if name == "separate newsletter" {
                     tab.cdp.evaluate(&tab.session, "document.querySelector('input[autocomplete=cc-number]').form.append(document.querySelector('button'));".into()).await.unwrap();
                     assert!(discovery.submit(&tab).await.is_err());
+                }
+                if name == "newsletter with an offscreen bot trap" {
+                    tab.cdp.evaluate(&tab.session, "globalThis.clicked=null;document.querySelector('[aria-hidden]').style.left='0px';".into()).await.unwrap();
+                    assert!(discovery.submit(&tab).await.is_err());
+                    assert_eq!(
+                        tab.cdp
+                            .evaluate(&tab.session, "globalThis.clicked".into())
+                            .await
+                            .unwrap(),
+                        Value::Null
+                    );
                 }
             }
             browser.return_control().await.unwrap();

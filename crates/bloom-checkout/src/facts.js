@@ -106,6 +106,7 @@
     return amounts[0];
   };
   const visible = e => e.getClientRects().length && e.checkVisibility({opacityProperty:true,visibilityProperty:true});
+  const cardSecret = BLOOM_CARD_SECRET;
   // YouTube prints "$8.99\u200b/month": a zero-width space between the amount
   // and its period. These characters are invisible to the reader, carry no
   // meaning, and are not whitespace to a regular expression, so they come
@@ -127,7 +128,15 @@
       const words = clean(block.innerText || '');
       if (words.length > 2000) break;
       if (!/\bnewsletter\b|\bmarketing\s+(?:sms|emails?|text)|\btext offers\b/i.test(words)) continue;
-      const fields = [...block.querySelectorAll('input,select,textarea,iframe')];
+      const fields = [...block.querySelectorAll('input,select,textarea,iframe')].filter(e => {
+        // Mail signup forms use an offscreen text trap for bots. It is not a
+        // customer field only when both keyboard and assistive access are off.
+        // Any card-like field, visible text field or focusable input still counts.
+        const trap = e.tagName === 'INPUT' && e.type === 'text' && e.tabIndex === -1
+          && e.closest('[aria-hidden="true"]') && e.getBoundingClientRect().right < 0
+          && !cardSecret(e, e.labels?.[0]?.innerText);
+        return !trap;
+      });
       if (!fields.some(e => ['email','tel'].includes(e.type)) || fields.some(e =>
         e.tagName !== 'INPUT' || !['email','tel','checkbox','hidden','submit','button'].includes(e.type))) continue;
       if (controls.some(e => e !== button && block.contains(e) && BLOOM_PAY_WORDS.test((e.innerText || e.value || '').trim()))) continue;
