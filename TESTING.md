@@ -109,7 +109,8 @@ alone is not evidence that a custody or transaction workflow succeeds.
 
 ### Shopping through the real Triad
 
-`scripts/test-card-checkout.mjs` exercises card enrollment/deletion, manual
+`scripts/test-card-checkout.mjs` exercises bounded refusal reasons through VFS
+status and history without a card or submission, card enrollment/deletion, manual
 fallback, lost-tab recovery, isolation from another localhost app,
 take-over/handback and a shop-saved payment through
 VFS and the real Broker ceremony UI, Signer and checkout services. Its saved-card

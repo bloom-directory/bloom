@@ -4601,10 +4601,19 @@ mod tests {
             .private_action(&token, ViewAction::Click { x: 20., y: 15. })
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(300)).await;
         {
             let private = service.private.lock().await;
             let checkout = private.as_ref().unwrap();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if checkout.tab.cdp.evaluate(&checkout.view_session,
+                        "document.readyState!=='loading' && !!document.getElementById('private-password')".into())
+                        .await.is_ok_and(|ready| ready == true) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            }).await.expect("private account fixture must finish navigating");
             checkout.tab.cdp.evaluate(&checkout.view_session,
                 "globalThis.privateFixture='do-not-retain';document.getElementById('private-password').focus()".into()).await.unwrap();
         }

@@ -1256,9 +1256,23 @@ mod tests {
             .browse(BrowseRequest::Open { url: url.clone() })
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        let snapshot = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Ok(snapshot) = browser.browse(BrowseRequest::Snapshot).await {
+                    if snapshot["elements"].as_array().is_some_and(|elements| {
+                        elements
+                            .iter()
+                            .any(|e| e["frame_origin"] != origin.as_str() && e["role"] == "input")
+                    }) {
+                        break snapshot;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("cross-origin chat fixture must finish loading");
         let context = browser.shopping_context().await;
-        let snapshot = browser.browse(BrowseRequest::Snapshot).await.unwrap();
         let chat = snapshot["elements"]
             .as_array()
             .unwrap()
@@ -1454,6 +1468,7 @@ mod tests {
             "<input autocomplete='section-checkout billing cc-number'>",
             "<input aria-label='Travel reference' onfocus=\"this.setAttribute('aria-label','Card number')\">",
             "<select autocomplete='cc-exp-month'><option value=''>Choose</option><option value='12'>12</option></select>",
+            "<label>Card expiry month<select><option value=''>Choose</option><option value='12'>12</option></select></label>",
         ] {
             let (url, server) =
                 crate::discovery::tests::fixture(format!("<!doctype html>{html}")).await;

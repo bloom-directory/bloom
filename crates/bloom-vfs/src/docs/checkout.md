@@ -66,7 +66,8 @@ tool for this checkout.
   Large pages may report that text is limited to the listed controls;
   those controls, including on-page filters, remain usable.
 - Use fresh snapshot refs after every action. Shopping controls block recognized
-  card/password typing and payment buttons; request private checkout instead.
+  card/password typing or selection and payment buttons; request private
+  checkout instead.
   Use elements whose `role` is `input` or `textarea` for `type`, and `select`
   for `select`. A label or button with the same name opens or focuses a field;
   click it, then take a new snapshot to find the actual input.
