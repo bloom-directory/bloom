@@ -31,6 +31,7 @@ const slot = id();
 const checks = [];
 let stage = 'fresh candidate';
 let ceremonyWindowStarted;
+let ownsFixtureCard = false;
 let fixtureSubmissions = 0;
 function checkpoint(name, details = {}) {
   checks.push({name, ...details});
@@ -174,6 +175,7 @@ try {
   const started = ceremonyWindowStarted = Date.now();
   const add = id();
   await vfs('write','/cards/add.json',{operation_id:add,card_id:'stack-card',label:'Synthetic acceptance card'});
+  ownsFixtureCard = true;
   await approve((await vfs('cat',`/cards/operations/${add}/ceremony.json`)).ceremony_url,'add');
   await poll(`/cards/operations/${add}/status.json`, ['succeeded']);
   const cards = await vfs('cat','/cards/index.json');
@@ -270,7 +272,7 @@ try {
   // A diagnostic failure must not strand the synthetic card after closing the
   // only browser that holds this test's virtual passkey.
   try {
-    if ((await vfs('cat','/cards/index.json')).some(card => card.card_id === 'stack-card')) {
+    if (ownsFixtureCard && (await vfs('cat','/cards/index.json')).some(card => card.card_id === 'stack-card')) {
       for (const privatePage of context.pages().filter(p => p.url().startsWith(viewOrigin+'/view'))) {
         if (await privatePage.locator('#finish').isVisible()) await privatePage.locator('#finish').click();
       }
