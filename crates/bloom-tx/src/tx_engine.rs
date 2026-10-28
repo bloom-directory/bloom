@@ -5502,7 +5502,8 @@ mod tests {
     }
 
     /// Serve one queued result per method, in order. Tests that stage several
-    /// transactions against one server repeat the queues they consume.
+    /// transactions against one server repeat the queues they consume. An
+    /// entry prefixed `error:` is served as that JSON-RPC error object.
     async fn spawn_queued_rpc(responses: HashMap<String, Vec<String>>) -> String {
         use std::net::SocketAddr;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -5574,6 +5575,11 @@ mod tests {
                         }
                     });
                     let response_body = match result {
+                        Some(result) if result.starts_with("error:") => format!(
+                            "{{\"jsonrpc\":\"2.0\",\"id\":{},\"error\":{}}}",
+                            serde_json::to_string(&id).unwrap(),
+                            &result["error:".len()..]
+                        ),
                         Some(result) => format!(
                             "{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{}}}",
                             serde_json::to_string(&id).unwrap(),
@@ -8926,6 +8932,128 @@ mod tests {
             }
             other => panic!("expected StateMismatch, got {other:?}"),
         }
+    }
+
+    /// A confirm interrupted after its broadcast marker recovers through
+    /// `reconcile_confirm_attempt`. Lookup errors (Polygon's public endpoint
+    /// answers some with an archive-token error) must surface and leave the
+    /// entry pending with its marker; a later receipt finalizes the attempted
+    /// hash without signing or broadcasting again.
+    #[tokio::test]
+    async fn interrupted_confirm_surfaces_lookup_errors_until_the_receipt_arrives() {
+        let archive_error =
+            r#"error:{"code":-32602,"message":"Archive requests require a personal token"}"#;
+        let tx_hash = alloy::primitives::B256::repeat_byte(7);
+        let receipt = serde_json::json!({
+            "transactionHash": format!("{tx_hash:#x}"),
+            "transactionIndex": "0x0",
+            "blockHash": format!("{:#x}", alloy::primitives::B256::repeat_byte(9)),
+            "blockNumber": "0x5",
+            "from": TEST_SIGNER_ADDRESS,
+            "to": "0x0000000000000000000000000000000000000002",
+            "cumulativeGasUsed": "0x5208",
+            "gasUsed": "0x5208",
+            "contractAddress": null,
+            "logs": [],
+            "logsBloom": format!("0x{}", "00".repeat(256)),
+            "status": "0x1",
+            "effectiveGasPrice": "0x1",
+            "type": "0x2"
+        });
+        // No eth_sendRawTransaction is queued: a resubmit would fail the test.
+        let url = spawn_queued_rpc(HashMap::from([
+            (
+                "eth_getTransactionByHash".into(),
+                vec![archive_error.into(), "null".into(), "null".into()],
+            ),
+            (
+                "eth_getTransactionReceipt".into(),
+                vec![archive_error.into(), receipt.to_string()],
+            ),
+        ]))
+        .await;
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        let (engine, fixture, _) = triad_batch_fixture(outbox.clone(), true, false);
+        let permit = permit_for(&directory);
+        let chain = stage_chain(&url);
+        let policy = Policy::default();
+        let staged = fake_staged_1559("interrupted");
+        outbox.write_pending(&staged, "p").unwrap();
+        let entry = outbox.read("alice", "anvil", "interrupted").unwrap();
+        outbox
+            .write_broadcast_raw_tx(&entry, BroadcastAttemptKind::Confirm, b"raw")
+            .unwrap();
+        let attempt = BroadcastAttempt {
+            schema: "bloom.broadcast_attempted.v1".into(),
+            tx_hash: format!("{tx_hash:#x}"),
+            raw_tx_blake3: blake3::hash(b"raw").to_hex().to_string(),
+            raw_tx_path: BroadcastAttemptKind::Confirm.raw_name().into(),
+            from: staged.from.clone(),
+            to: staged.to.clone(),
+            nonce: staged.nonce,
+            chain_id: staged.chain_id,
+            created_ms: now_ms(),
+            transport: BroadcastTransport::PublicRpc,
+            private_provider: None,
+        };
+        outbox
+            .write_broadcast_attempt(&entry, BroadcastAttemptKind::Confirm, &attempt)
+            .unwrap();
+
+        // Transaction lookup fails, then receipt lookup fails.
+        for _ in 0..2 {
+            let error = engine
+                .confirm_with_warning_override(
+                    &permit,
+                    "alice",
+                    "anvil",
+                    "interrupted",
+                    &chain,
+                    &policy,
+                    false,
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&error, TxEngineError::Chain(_))
+                    && error
+                        .to_string()
+                        .contains("Archive requests require a personal token"),
+                "lookup error must stay visible: {error:?}"
+            );
+            let entry = outbox.read("alice", "anvil", "interrupted").unwrap();
+            assert_eq!(entry.state, OutboxState::Pending);
+            assert!(
+                outbox
+                    .read_broadcast_attempt(&entry, BroadcastAttemptKind::Confirm)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+
+        let sent = engine
+            .confirm_with_warning_override(
+                &permit,
+                "alice",
+                "anvil",
+                "interrupted",
+                &chain,
+                &policy,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(sent.status, TxStatus::Sent);
+        assert_eq!(sent.tx_hash, Some(format!("{tx_hash:#x}")));
+        assert_eq!(
+            outbox.read("alice", "anvil", "interrupted").unwrap().state,
+            OutboxState::Sent
+        );
+        assert!(
+            fixture.requests.lock().is_empty(),
+            "recovery must not reach the Broker to sign"
+        );
     }
 
     /// Fix #3: confirm must reject a pending entry whose stage TTL has
