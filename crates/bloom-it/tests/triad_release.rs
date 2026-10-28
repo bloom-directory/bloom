@@ -2336,6 +2336,12 @@ fn linux_installer_refuses_aws_kms_signer_configuration_before_changing_state() 
 
 #[test]
 fn linux_installer_allocates_distinct_ports_and_rejects_mixed_release_sets() {
+    // A staged install must not depend on sockets in the real host namespace.
+    let _host_listener = match std::net::TcpListener::bind("127.0.0.1:20000") {
+        Ok(listener) => Some(listener),
+        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => None,
+        Err(error) => panic!("occupy the unrelated host NFS port: {error}"),
+    };
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("root");
     fs::create_dir(&root).unwrap();

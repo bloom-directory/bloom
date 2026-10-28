@@ -120,10 +120,19 @@ prepare_verified_payload_for_execution() {
 }
 
 field() {
-  if command -v plutil >/dev/null 2>&1; then
+  if $live; then
+    command -v plutil >/dev/null 2>&1 || die "plutil is required for live macOS installation"
     plutil -extract "$2" raw -o - "$1"
   else
-    die "plutil is required for live macOS installation"
+    # Staged-root lifecycle tests also run on Linux, without Apple's plutil.
+    python3 - "$1" "$2" <<'PY'
+import json, sys
+with open(sys.argv[1]) as record:
+    value = json.load(record)[sys.argv[2]]
+if value is None or isinstance(value, (dict, list)):
+    raise SystemExit(1)
+print(str(value).lower() if isinstance(value, bool) else value)
+PY
   fi
 }
 record_exists() { dscl . -read "/$1/$2" >/dev/null 2>&1; }

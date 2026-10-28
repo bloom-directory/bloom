@@ -1130,10 +1130,13 @@ allocate_linux_nfs_port() {
         break
       fi
     done
-    if [[ "$used" == false ]] && ! linux_nfs_port_is_listening "$candidate"; then
-      printf '%s\n' "$candidate"
-      return 0
+    [[ "$used" == false ]] || continue
+    # Staged roots have their own enrollment namespace and never bind a port.
+    if [[ "$install_root" == / ]] && linux_nfs_port_is_listening "$candidate"; then
+      continue
     fi
+    printf '%s\n' "$candidate"
+    return 0
   done
   echo "no per-login Bloom NFS port is available" >&2
   return 69
