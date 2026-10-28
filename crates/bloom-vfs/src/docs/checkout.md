@@ -171,8 +171,9 @@ code the site showed; a reference alone does not prove payment or ticket issue.
 `needs_input` means the page needs attention, not that no payment was submitted.
 Do not infer a charge outcome from a form error, timeout or closing the view.
 `paused` means checkout could not hand the browser back, so shopping stays paused.
-For a `cancelled` or `failed_before_release` request with `paused`, write its
-`cancel` file again to retry browser cleanup. This cannot repeat payment.
+For a `cancelled`, `failed_before_release` or pre-approval `expired` request
+with `paused`, write its `cancel` file again to retry browser cleanup. This
+cannot repeat payment; Bloom refuses if private approval or submission began.
 `reason` says why Bloom left the payment to the person: `facts_unreadable` for
 a total or currency it could not read, `fields_unsupported` for card fields in
 an unexpected shape, `receiving_origin_unreviewed` for a frame that would

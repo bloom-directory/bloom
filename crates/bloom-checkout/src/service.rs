@@ -1112,10 +1112,12 @@ impl CheckoutService {
                     bail!("Checkout not active");
                 }
                 let status = self.store.get(&operation_id)?;
-                if matches!(status.state.as_str(), "cancelled" | "failed_before_release")
-                    && private
-                        .as_ref()
-                        .is_some_and(|p| !p.approved && !p.submitted)
+                if matches!(
+                    status.state.as_str(),
+                    "cancelled" | "failed_before_release" | "expired"
+                ) && private
+                    .as_ref()
+                    .is_some_and(|p| !p.approved && !p.submitted)
                 {
                     if let Err(error) = self.return_control().await {
                         self.mark_paused(&operation_id);
@@ -2805,7 +2807,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_checkout_can_retry_cleanup_without_releasing_a_card() {
-        for state in ["cancelled", "failed_before_release"] {
+        for state in ["cancelled", "failed_before_release", "expired"] {
             let (service, id, _, server) =
                 watched_checkout("<h1>Checkout</h1>", state, false, false).await;
             // A final state alone is insufficient: approved private access
