@@ -541,15 +541,11 @@ sudo -u "$login_user" \
   "$release_digest"
 
 launchctl bootout "$session_label"
-deadline=$((SECONDS + 15))
-while [[ $SECONDS -lt $deadline ]]; do
-  if ! pgrep -u "$broker_uid" -x bloom-broker >/dev/null 2>&1 &&
-    ! pgrep -u "$signer_uid" -x bloom-signer >/dev/null 2>&1
-  then
-    break
-  fi
-  sleep 0.1
-done
+# A queued launchd start can run between the old process exiting and its
+# replacement rejecting the absent session. An empty process snapshot is not
+# a settled state. Check after the full existing drain allowance, rather than
+# breaking on that gap and immediately racing a new process.
+sleep 15
 if pgrep -u "$broker_uid" -x bloom-broker >/dev/null 2>&1 ||
   pgrep -u "$signer_uid" -x bloom-signer >/dev/null 2>&1
 then
