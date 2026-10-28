@@ -48,7 +48,7 @@ pub const RECEIPT_FILE: &str = "receipt.json";
 /// Persistent record of a sent tx's mined outcome.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MinedReceipt {
-    /// `"success"` or `"reverted"`.
+    /// `"success"`, `"reverted"`, or `"cancelled"` when the same-nonce cancel mined.
     pub outcome: String,
     pub tx_hash: String,
     #[serde(default)]
@@ -689,6 +689,12 @@ impl Outbox {
                 && OutboxState::from_status(&staged.status) != OutboxState::Failed
             {
                 staged.status = TxStatus::Failed;
+            }
+            if let Ok(bytes) = fs::read(dir.join(RECEIPT_FILE))
+                && let Ok(receipt) = serde_json::from_slice::<MinedReceipt>(&bytes)
+                && receipt.outcome == "cancelled"
+            {
+                staged.status = TxStatus::Cancelled;
             }
             return Ok(OutboxEntry { state, staged, dir });
         }
