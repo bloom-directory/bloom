@@ -3460,13 +3460,7 @@ impl TxEngine {
             Err(error) => {
                 // Replace a permanently refused lineage only when nothing durable
                 // remains. Retryable and ambiguous failures retain it.
-                if state.approval_id.is_some()
-                    && error.code.contract().retry == RetryClass::Never
-                    && matches!(
-                        error.code.contract().durable_effect,
-                        DurableEffect::None | DurableEffect::ReservationReleased
-                    )
-                {
+                if state.approval_id.is_some() && signing_refusal_releases_reservation(error.code) {
                     // Approval and operation IDs are immutable: clearing only
                     // the dispatch marker would reuse the same dead request.
                     state = new_state()?;
@@ -3829,13 +3823,7 @@ impl TxEngine {
             Err(error) => {
                 // Match single-payload recovery: preserve retryable or
                 // ambiguous outcomes, replace definite permanent refusals.
-                if state.approval_id.is_some()
-                    && error.code.contract().retry == RetryClass::Never
-                    && matches!(
-                        error.code.contract().durable_effect,
-                        DurableEffect::None | DurableEffect::ReservationReleased
-                    )
-                {
+                if state.approval_id.is_some() && signing_refusal_releases_reservation(error.code) {
                     state = new_state()?;
                     write_triad_batch_signing_state(&state_path, &state)?;
                 }
@@ -4955,6 +4943,24 @@ fn write_triad_signing_state(
         let _ = std::fs::remove_file(&temporary);
     }
     result.map_err(|error| TxEngineError::Outbox(error.into()))
+}
+
+fn signing_refusal_releases_reservation(code: ProtocolErrorCode) -> bool {
+    // Pre-dispatch peer/version errors say nothing about the approval, and a
+    // pinned Signer without signer#62 reports a quarantined operation as
+    // BackendInvalidRequest. None of these prove the request is dead.
+    let contract = code.contract();
+    contract.retry == RetryClass::Never
+        && matches!(
+            contract.durable_effect,
+            DurableEffect::None | DurableEffect::ReservationReleased
+        )
+        && !matches!(
+            code,
+            ProtocolErrorCode::UnauthenticatedPeer
+                | ProtocolErrorCode::UnsupportedVersion
+                | ProtocolErrorCode::BackendInvalidRequest
+        )
 }
 
 fn protocol_signing_error(error: bloom_broker_api::ProtocolError) -> TxEngineError {
@@ -7931,13 +7937,14 @@ mod tests {
 
         fixture.active.store(true, Ordering::SeqCst);
         // Recoverable and ambiguous errors must not mint another approval.
-        for code in ProtocolErrorCode::ALL.into_iter().filter(|code| {
-            code.contract().retry != RetryClass::Never
-                || !matches!(
-                    code.contract().durable_effect,
-                    DurableEffect::None | DurableEffect::ReservationReleased
-                )
-        }) {
+        for code in [
+            ProtocolErrorCode::BackendInvalidRequest,
+            ProtocolErrorCode::UnauthenticatedPeer,
+            ProtocolErrorCode::UnsupportedVersion,
+            ProtocolErrorCode::AmbiguousProviderEffect,
+            ProtocolErrorCode::ServiceUnavailable,
+            ProtocolErrorCode::OperationIdConflict,
+        ] {
             *fixture.deny_sign.lock() = Some(code);
             assert!(
                 engine
@@ -8334,13 +8341,14 @@ mod tests {
             .unwrap();
 
         fixture.active.store(true, Ordering::SeqCst);
-        for code in ProtocolErrorCode::ALL.into_iter().filter(|code| {
-            code.contract().retry != RetryClass::Never
-                || !matches!(
-                    code.contract().durable_effect,
-                    DurableEffect::None | DurableEffect::ReservationReleased
-                )
-        }) {
+        for code in [
+            ProtocolErrorCode::BackendInvalidRequest,
+            ProtocolErrorCode::UnauthenticatedPeer,
+            ProtocolErrorCode::UnsupportedVersion,
+            ProtocolErrorCode::AmbiguousProviderEffect,
+            ProtocolErrorCode::ServiceUnavailable,
+            ProtocolErrorCode::OperationIdConflict,
+        ] {
             *fixture.deny_sign.lock() = Some(code);
             assert!(
                 engine
