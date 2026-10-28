@@ -170,7 +170,9 @@ verified the bank charge. For `booked`, `outcome.order_id` holds the booking
 code the site showed; a reference alone does not prove payment or ticket issue.
 `needs_input` means the page needs attention, not that no payment was submitted.
 Do not infer a charge outcome from a form error, timeout or closing the view.
-`paused` means checkout could not hand the browser back, so shopping stays paused.
+`paused` means checkout could not hand the browser back. The installed service
+restarts checkout with a fresh browser; check status before another payment.
+The restart clears the pause and preserves known or uncertain payment results.
 For a `cancelled`, `failed_before_release` or pre-approval `expired` request
 with `paused`, write its `cancel` file again to retry browser cleanup. This
 cannot repeat payment; Bloom refuses if private approval or submission began.

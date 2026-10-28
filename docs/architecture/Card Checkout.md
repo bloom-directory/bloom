@@ -181,8 +181,10 @@ The operation store is written before every irreversible step:
   also become `uncertain`, since older code inferred them from form errors.
   Operations still awaiting release become `failed_before_release`. None is
   retried automatically.
-- A browser exit terminates checkout with failure so its service manager can
-  restart it. A fresh process clears stale browser-pause flags without erasing
+- A browser exit or failed private-browser cleanup terminates checkout with
+  failure so its service manager can restart it. New handoffs and shopping
+  actions are refused while that restart is pending. A fresh process clears
+  stale browser-pause flags without erasing
   uncertain outcomes. Confirmed pre-release failures and cancellations can retry
   browser cleanup through `cancel`; approved or submitted checkouts cannot.
 - Form errors, timeout and closing the private view do not establish that no

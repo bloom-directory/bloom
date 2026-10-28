@@ -129,8 +129,11 @@ controls while its image is unavailable; it never retries payment actions.
 Recovery regressions also cover interrupted human payment remaining uncertain
 after restart, stale pause flags clearing on a fresh browser, retrying cleanup
 after confirmed pre-release cancellation, and partial browser-context disposal.
-A real subprocess test kills checkout's own Chromium and requires checkout to
-exit unsuccessfully, allowing the installed service manager to restart it.
+A real subprocess test kills checkout's own Chromium, requires checkout to
+exit unsuccessfully, then starts it against the same state and socket. Shopping
+works in a fresh browser; the recorded booking survives and its pause clears.
+Failed private-browser cleanup also requests supervised restart instead of
+leaving shopping permanently paused. This never retries a payment.
 
 Live bank authorization and live merchant settlement remain untested. A test
 payment cannot prove that a bank will approve a live purchase. Release builds,

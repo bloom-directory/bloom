@@ -2223,6 +2223,7 @@ const BROWSE_ERRORS: &[&str] = &[
     "payment requires approval",
     "Input exceeds limit",
     "Checkout has private control; shopping is paused",
+    "Checkout browser is restarting; check request status before another payment",
     "Saved traveler details are unlocked for another booking or website",
     "Choose traveler_id explicitly when multiple people are unlocked",
     "Unlock that saved traveler for this booking first",
@@ -3051,6 +3052,7 @@ mod tests {
         let (service, id, token, server) = watched_checkout(booked, "submitted", true, true).await;
         assert_eq!(watch_briefly(&service, &id).await, "booked");
         assert!(service.store.get(&id).unwrap().paused);
+        assert!(service.browser.needs_restart());
         let _ = service.private_action(&token, ViewAction::Finish).await;
         assert_eq!(service.store.get(&id).unwrap().state, "booked");
         server.abort();
@@ -3204,6 +3206,20 @@ mod tests {
         let public = service.store.get(&status.operation_id).unwrap();
         assert_eq!(public.state, "booked");
         assert!(public.paused, "status.json must say shopping is paused");
+        assert!(
+            service.browser.needs_restart(),
+            "failed cleanup needs supervised recovery"
+        );
+        assert!(service.browser.handoff().await.is_err());
+        assert!(
+            service
+                .browser
+                .browse(BrowseRequest::Snapshot)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("restarting")
+        );
         assert!(service.private.lock().await.is_some());
         server.abort();
     }

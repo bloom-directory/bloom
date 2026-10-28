@@ -110,7 +110,8 @@ pub struct Status {
     pub operation_id: String,
     pub state: String,
     pub ceremony_url: Option<String>,
-    /// Cookie-protected entry point for reopening an approved private view.
+    /// Entry point for reopening a private view with the claiming browser's
+    /// origin-bound session key.
     /// Contains no capability; only the browser that claimed it has access.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub view_url: Option<String>,

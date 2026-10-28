@@ -88,8 +88,8 @@ async fn main() -> Result<()> {
     let browser_lifecycle = async {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            if browser.exited() {
-                anyhow::bail!("Checkout browser exited; restarting checkout is required");
+            if browser.needs_restart() {
+                anyhow::bail!("Checkout browser cannot continue; restarting checkout is required");
             }
         }
     };

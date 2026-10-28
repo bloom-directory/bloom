@@ -37,6 +37,7 @@ pub struct Browser {
     cdp: Arc<Cdp>,
     tab: Mutex<Tab>,
     revoked: AtomicBool,
+    unusable: AtomicBool,
     #[cfg(test)]
     fixture_payment_hosts: bool,
     /// Unlocked traveler values and their placeholders, removed from snapshots.
@@ -55,8 +56,8 @@ pub(crate) struct PrivateTab {
 }
 
 impl Browser {
-    pub fn exited(&self) -> bool {
-        self.cdp.exited()
+    pub fn needs_restart(&self) -> bool {
+        self.unusable.load(Ordering::SeqCst) || self.cdp.exited()
     }
 
     pub async fn launch(
@@ -104,6 +105,7 @@ impl Browser {
             #[cfg(test)]
             fixture_payment_hosts,
             revoked: AtomicBool::new(false),
+            unusable: AtomicBool::new(false),
             redactions: std::sync::RwLock::new(Vec::new()),
         }))
     }
@@ -639,6 +641,9 @@ impl Browser {
     }
 
     fn available(&self) -> Result<()> {
+        if self.unusable.load(Ordering::SeqCst) {
+            bail!("Checkout browser is restarting; check request status before another payment");
+        }
         if self.revoked.load(Ordering::SeqCst) {
             bail!("Checkout has private control; shopping is paused");
         }
@@ -646,6 +651,7 @@ impl Browser {
     }
 
     pub(crate) async fn handoff(&self) -> Result<PrivateTab> {
+        self.available()?;
         if self.revoked.swap(true, Ordering::SeqCst) {
             bail!("Checkout is already private");
         }
@@ -670,6 +676,12 @@ impl Browser {
     /// the merchant kept, so shopping never reopens a private session and may
     /// return to the booking site.
     pub(crate) async fn return_control(&self) -> Result<()> {
+        self.reset_shopping().await.inspect_err(|_| {
+            self.unusable.store(true, Ordering::SeqCst);
+        })
+    }
+
+    async fn reset_shopping(&self) -> Result<()> {
         let mut tab = self.tab.lock().await;
         if let Err(error) = self
             .cdp
@@ -733,6 +745,12 @@ impl Browser {
 
     /// After a take-over, shopping continues on the page the human left.
     pub(crate) async fn return_control_at(&self, target: &str, url: Option<String>) -> Result<()> {
+        self.resume_shopping(target, url).await.inspect_err(|_| {
+            self.unusable.store(true, Ordering::SeqCst);
+        })
+    }
+
+    async fn resume_shopping(&self, target: &str, url: Option<String>) -> Result<()> {
         let Some(url) = url.filter(|u| u.starts_with("https://") || u.starts_with("http://"))
         else {
             return self.return_control().await;
@@ -1541,7 +1559,8 @@ mod tests {
             "<!doctype html><style>p{{white-space:nowrap}}</style>
              <label><input type='checkbox' style='display:none'>Direct flights</label>
              <input aria-label='Card number' autocomplete='cc-number' value='4242424242424242'>
-             <div>{flights}</div><div>{rows}</div>"
+             <div>{flights}</div><div>{rows}</div>
+             <script>document.querySelector('button').textContent='Select fixture 0 ready';</script>"
         ))
         .await;
         let root = tempfile::tempdir().unwrap().keep();
@@ -1553,12 +1572,16 @@ mod tests {
         .await
         .unwrap();
         browser.browse(BrowseRequest::Open { url }).await.unwrap();
+        // The first button appears before the large response finishes parsing.
+        // Wait for the end-of-document marker before testing the AX size limit.
         let snapshot = tokio::time::timeout(Duration::from_secs(20), async {
             loop {
                 match browser.browse(BrowseRequest::Snapshot).await {
                     Ok(snapshot)
                         if snapshot["elements"].as_array().is_some_and(|elements| {
-                            elements.iter().any(|e| e["label"] == "Select fixture 0")
+                            elements
+                                .iter()
+                                .any(|e| e["label"] == "Select fixture 0 ready")
                         }) =>
                     {
                         break snapshot;
@@ -1586,7 +1609,7 @@ mod tests {
         );
         let select = elements
             .iter()
-            .find(|e| e["label"] == "Select fixture 0")
+            .find(|e| e["label"] == "Select fixture 0 ready")
             .unwrap();
         browser
             .browse(BrowseRequest::Click {

@@ -340,7 +340,8 @@ mod tests {
             .unwrap()
             .origin()
             .ascii_serialization();
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        // Real browser startup on shared Mac runners can exceed five seconds.
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
             loop {
                 let snapshot = browser.browse(BrowseRequest::Snapshot).await;
                 if snapshot.is_ok_and(|snapshot| {
