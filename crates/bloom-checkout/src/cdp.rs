@@ -232,13 +232,26 @@ impl Cdp {
         }
         Ok(contexts)
     }
-    pub fn launch(executable: &Path, profile: &Path, test_flags: &[String]) -> Result<Arc<Self>> {
+    pub fn launch(
+        executable: &Path,
+        profile: &Path,
+        test_flags: &[String],
+        window: bool,
+    ) -> Result<Arc<Self>> {
         let (command_read, command_write) = pipe()?;
         let (event_read, event_write) = pipe()?;
         let child_read = child_fd(&command_read)?;
         let child_write = child_fd(&event_write)?;
         let mut command = Command::new(executable);
-        command.args(["--headless=new","--remote-debugging-pipe","--no-first-run",
+        // Headless Chromium names itself in every request it sends, as
+        // "HeadlessChrome/<version>", and shops that screen for automated
+        // browsers read that string and refuse the page. `window` runs the
+        // ordinary browser instead, on whatever display it is given, which
+        // may be a real screen or a virtual one.
+        if !window {
+            command.arg("--headless=new");
+        }
+        command.args(["--remote-debugging-pipe","--no-first-run",
             "--no-default-browser-check","--disable-sync","--disable-breakpad",
             "--disable-crash-reporter","--disable-extensions","--disable-component-extensions-with-background-pages",
             "--force-device-scale-factor=1","--window-size=1280,900",
@@ -436,7 +449,13 @@ mod tests {
     #[tokio::test]
     async fn oversized_reply_does_not_disable_later_browser_commands() {
         let root = tempfile::tempdir().unwrap().keep();
-        let cdp = Cdp::launch(&crate::test_chromium(), &root, &["--no-sandbox".into()]).unwrap();
+        let cdp = Cdp::launch(
+            &crate::test_chromium(),
+            &root,
+            &["--no-sandbox".into()],
+            false,
+        )
+        .unwrap();
         let target = cdp
             .call(None, "Target.createTarget", json!({"url":"about:blank"}))
             .await

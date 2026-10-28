@@ -60,10 +60,20 @@ impl Browser {
         self.unusable.load(Ordering::SeqCst) || self.cdp.exited()
     }
 
+    /// Launch headless, as every caller but the service entry point wants.
     pub async fn launch(
         executable: &Path,
         profile: &Path,
         test_flags: &[String],
+    ) -> Result<Arc<Self>> {
+        Self::launch_with(executable, profile, test_flags, false).await
+    }
+
+    pub async fn launch_with(
+        executable: &Path,
+        profile: &Path,
+        test_flags: &[String],
+        window: bool,
     ) -> Result<Arc<Self>> {
         if profile.exists() {
             let metadata = std::fs::symlink_metadata(profile)?;
@@ -97,7 +107,7 @@ impl Browser {
         let fixture_payment_hosts = test_flags
             .iter()
             .any(|f| f == "--ignore-certificate-errors");
-        let cdp = Cdp::launch(executable, profile, test_flags)?;
+        let cdp = Cdp::launch(executable, profile, test_flags, window)?;
         let tab = new_tab(&cdp, None, 1).await?;
         Ok(Arc::new(Self {
             cdp,
