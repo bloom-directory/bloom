@@ -608,6 +608,9 @@ impl Browser {
                     "Choose an input for typing or a select for selection; request a new snapshot"
                 );
             }
+            if reason.lines().next() == Some("Error: option unavailable") {
+                bail!("Choose an available option value from a new snapshot");
+            }
             if reason
                 .lines()
                 .next()
@@ -1821,7 +1824,7 @@ mod tests {
               <div id="component"></div>
               <div id="slotted"><span slot="label">Continue as guest</span></div>
               <div id="slotted-pay"><span slot="label">Pay now</span></div>
-              <label>Styled month<select aria-label="Styled month" style="opacity:0"><option value="">Month</option><option value="1">January</option></select></label>
+              <label>Styled month<select aria-label="Styled month" style="opacity:0"><option value="">Month</option><option value="1">January</option><option value="2" disabled>February</option><optgroup disabled label="Unavailable"><option value="3">March</option></optgroup></select></label>
               <select aria-label="Hidden styled month" aria-hidden="true" style="opacity:0"><option>Month</option></select>
               <div style="opacity:0"><select aria-label="Inactive month"><option>Month</option></select></div>
               <span id="birth-month-label">Birth month</span>
@@ -2087,6 +2090,34 @@ mod tests {
                 .unwrap()["value"],
             "1"
         );
+        for value in ["missing", "2", "3"] {
+            let current = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+            let month = current["elements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["role"] == "select" && e["label"] == "Styled month")
+                .unwrap();
+            let error = browser
+                .browse(BrowseRequest::Select {
+                    element_ref: month["ref"].as_str().unwrap().into(),
+                    value: value.into(),
+                })
+                .await
+                .err()
+                .unwrap();
+            assert!(error.to_string().contains("available option"), "{error}");
+            let after = browser.browse(BrowseRequest::Snapshot).await.unwrap();
+            assert_eq!(
+                after["elements"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|e| e["role"] == "select" && e["label"] == "Styled month")
+                    .unwrap()["value"],
+                "1"
+            );
+        }
         fixture.abort();
     }
 

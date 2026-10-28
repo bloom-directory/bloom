@@ -70,6 +70,8 @@ tool for this checkout.
   Use elements whose `role` is `input` or `textarea` for `type`, and `select`
   for `select`. A label or button with the same name opens or focuses a field;
   click it, then take a new snapshot to find the actual input.
+  Select an available option's `value` from that snapshot, not its label or
+  position. An unavailable value is refused without clearing the current choice.
 - Shops load controls in stages. If a control is missing or the document
   changed, request another snapshot before concluding it is unavailable.
   Check each product's required size, format and purchase frequency; radio
