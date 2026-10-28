@@ -2,6 +2,9 @@
 
 ## What the testing establishes
 
+Flights are the user's primary use case. The food-delivery service they named
+was **PedidosYa**; it has not been tested in this work.
+
 Remaining work and acceptance criteria are in the
 [finish plan](../plans/2026-10-28-finish-shopping-checkout.md).
 
@@ -27,8 +30,58 @@ The useful lessons are:
   existing private view or inspect the existing operation before starting anew.
 - Real shopping finds defects that isolated fixtures miss. Ten Shopify shops
   mostly exercise one platform; the WooCommerce and airline journeys exposed
-  different failures. Flight completion remains unverified after a merchant
-  security rejection.
+  different failures. Flight payment preparation and ticket issuance are
+  separate claims; see the newer flight rehearsal below.
+
+## Flight priority follow-up, 2026-10-28
+
+The normal Bloom browser search found Air Europa UX1672 and UX41 for one
+synthetic adult in economy: ZRH 18:30 → MAD 20:55 on 5 December 2026,
+then MAD 23:55 → EZE 08:50 on 6 December. Air Europa's actual booking link
+returned Page Unavailable. Gotogate offered the matching flights for USD
+863.64, with one personal item and one 10 kg cabin bag, no checked bag.
+Its passenger review and final payment page were reached through the ordinary
+VFS, with normal TLS and the Checkout Chromium sandbox. No challenge was bypassed.
+
+The journey exposed a missing private date representation: the US form states
+MM-DD-YYYY, while `type_traveler` previously offered only ISO or day-first
+combined dates. Commit `b67249ea` adds `born_on_mdy` and masks slash/hyphen
+echoes. A real-browser regression failed before the change, then verified the
+actual inserted month-first date and masked snapshot. The mounted VFS guide
+now explains date order and using the national phone when the prefix is separate.
+
+Automatic filling left transient name-validation text, and the price overview
+rendered the saved email immediately after the surname. These projections do
+not establish that the surname input was corrupted; a static contact-first
+fixture does not reproduce corruption. The booking did not advance during a
+bounded wait after Continue; private surname re-entry followed by Continue
+recovered it in both real rehearsals. The cause remains unresolved.
+Commit `b01e5d4d` checks that the completed form retains the saved names before
+reporting them filled. A separate fixture reproduces later-input mutation of
+an earlier surname and failed before this check. This is a safeguard and a
+recovery path, not proof that every merchant's controlled inputs are supported.
+
+At `b67249ea`, final discovery read USD 86364 minor units and the reviewed
+Etraveli card frame, after synthetic US billing was completed and extras were
+declined. An intentionally absent card stopped the request before release,
+without a preparation-refusal reason. That establishes preparation, not a
+payment. The final `b01e5d4d` rehearsal and custody cleanup are recorded in the
+workspace's `shared/checkout-1027-evidence/flight-priority-verification.json`.
+That final runtime reached `awaiting_approval` using its synthetic saved card,
+without a fallback reason or filled card fields. The quoted USD 863.64 and
+Etraveli receiving origin matched the final page. Cancellation returned
+`cancelled` before approval or release. This verifies a real flight preparation
+and cancellation, not a live payment or universal flight support. The rehearsal
+helper initially stopped on a changing document, then overcounted a parent-page
+card label as a receiver. Those harness mistakes were corrected by reobserving
+snapshots and counting only actual input fields; no merchant action was replayed.
+No live card, charge, order confirmation, booking reference or ticket is claimed.
+
+The source passes 102 Checkout tests (eight opt-in exclusions), strict Clippy,
+and the VFS documentation checks. Integration belongs in the existing #346:
+its writer is now `followups-1028`, so these commits are preserved on
+`checkout-pay-control` for that owner to integrate. No replacement PR was
+opened and no merge was performed.
 
 ## Finish-plan implementation, 2026-10-28
 
