@@ -535,6 +535,23 @@ mod tests {
         .collect();
         let discovery = TravelerDiscovery::read(&tab, &fields).await.unwrap();
         discovery.fill(&tab, &values).await.unwrap();
+        // A controlled form can clear its confirmation field after the first
+        // pass. The second pass must still edit that email input, not the
+        // passenger name that held the most recent text selection.
+        tab.cdp
+            .evaluate(
+                &tab.session,
+                "document.querySelectorAll('input[type=email]')[1].value = ''; true".into(),
+            )
+            .await
+            .unwrap();
+        let second = TravelerDiscovery::read(&tab, &fields).await.unwrap();
+        let wanted = second
+            .field_names()
+            .into_iter()
+            .filter_map(|field| values.get(&field).map(|v| (field, v.clone())))
+            .collect();
+        second.fill(&tab, &wanted).await.unwrap();
         let actual = tab.cdp.evaluate(&tab.session,
             "[...document.querySelectorAll('input')].filter(e=>e.type!=='radio').map(e=>e.value)".into()).await.unwrap();
         assert_eq!(
@@ -547,6 +564,31 @@ mod tests {
                 "Fixture"
             ])
         );
+        server.abort();
+    }
+    #[tokio::test]
+    async fn ordinary_private_fields_do_not_depend_on_the_pages_text_selection() {
+        let (browser, server, _) = browser_at(
+            "<label>E-mail<input id='email' type='email' onfocus=\"surname.focus()\"></label>
+             <label>Last name<input id='surname' name='lastName'></label>",
+        )
+        .await;
+        let tab = browser.handoff().await.unwrap();
+        let discovery =
+            TravelerDiscovery::read(&tab, &[TravelerField::Email, TravelerField::FamilyName])
+                .await
+                .unwrap();
+        let values = [("email", "fixture@example.com"), ("family_name", "Fixture")]
+            .into_iter()
+            .map(|(k, v)| (k.into(), Zeroizing::new(v.into())))
+            .collect();
+        discovery.fill(&tab, &values).await.unwrap();
+        let actual = tab
+            .cdp
+            .evaluate(&tab.session, "[email.value,surname.value]".into())
+            .await
+            .unwrap();
+        assert_eq!(actual, json!(["fixture@example.com", "Fixture"]));
         server.abort();
     }
     #[tokio::test]
