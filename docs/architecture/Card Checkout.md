@@ -174,10 +174,15 @@ The operation store is written before every irreversible step:
   before the site-mode click. A lost response never causes a second fill or
   click.
 - On restart, interrupted disclosure becomes `disclosure_unknown`; submission
-  and form-error states become `uncertain`. Earlier `not_submitted` records
+  and form-error states become `uncertain`, as do interrupted manual payment
+  and human-control views: the person may have paid privately. Earlier `not_submitted` records
   also become `uncertain`, since older code inferred them from form errors.
   Operations still awaiting release become `failed_before_release`. None is
   retried automatically.
+- A browser exit terminates checkout with failure so its service manager can
+  restart it. A fresh process clears stale browser-pause flags without erasing
+  uncertain outcomes. Confirmed pre-release failures and cancellations can retry
+  browser cleanup through `cancel`; approved or submitted checkouts cannot.
 - Form errors, timeout and closing the private view do not establish that no
   charge occurred. The UI asks the person to check the merchant and bank before
   another attempt; it never promises that nothing was charged.

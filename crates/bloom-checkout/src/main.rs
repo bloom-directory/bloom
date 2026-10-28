@@ -58,7 +58,7 @@ async fn main() -> Result<()> {
     let flags = Vec::new();
     let browser = Browser::launch(&args.chromium, &args.profile, &flags).await?;
     let service = CheckoutService::new(
-        browser,
+        browser.clone(),
         &args.state,
         args.broker_socket,
         args.broker_uid,
@@ -85,6 +85,16 @@ async fn main() -> Result<()> {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
     };
-    tokio::select! {result=api=>result?,result=viewer=>result?,_=tokio::signal::ctrl_c()=>{},_=lifecycle=>{}}
+    let browser_lifecycle = async {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            if browser.exited() {
+                anyhow::bail!("Checkout browser exited; restarting checkout is required");
+            }
+        }
+    };
+    // The service manager restarts failures. Keeping a dead browser behind a
+    // healthy checkout socket would leave every shopper permanently blocked.
+    tokio::select! {result=api=>result?,result=viewer=>result?,_=tokio::signal::ctrl_c()=>{},_=lifecycle=>{},result=browser_lifecycle=>result?}
     Ok(())
 }

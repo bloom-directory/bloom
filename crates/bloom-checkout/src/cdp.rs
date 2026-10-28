@@ -397,9 +397,11 @@ impl Cdp {
         Ok(value["result"].clone())
     }
 
-    #[cfg(test)]
     pub fn exited(&self) -> bool {
-        self.child.lock().try_wait().unwrap().is_some()
+        self.child
+            .lock()
+            .try_wait()
+            .is_ok_and(|status| status.is_some())
     }
 
     #[cfg(test)]

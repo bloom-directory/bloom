@@ -55,6 +55,10 @@ pub(crate) struct PrivateTab {
 }
 
 impl Browser {
+    pub fn exited(&self) -> bool {
+        self.cdp.exited()
+    }
+
     pub async fn launch(
         executable: &Path,
         profile: &Path,
@@ -667,13 +671,28 @@ impl Browser {
     /// return to the booking site.
     pub(crate) async fn return_control(&self) -> Result<()> {
         let mut tab = self.tab.lock().await;
-        self.cdp
+        if let Err(error) = self
+            .cdp
             .call(
                 None,
                 "Target.disposeBrowserContext",
                 json!({"browserContextId":tab.context}),
             )
-            .await?;
+            .await
+        {
+            // A previous attempt may have disposed the context before failing
+            // to create the replacement tab. Retry only with no contexts left.
+            let contexts = self
+                .cdp
+                .call(None, "Target.getBrowserContexts", json!({}))
+                .await?;
+            if contexts["browserContextIds"]
+                .as_array()
+                .is_none_or(|ids| !ids.is_empty())
+            {
+                return Err(error);
+            }
+        }
         // The entire browser belongs to checkout, including script-opened popups.
         // closeTarget acknowledges a request, not destruction. Keep shopping
         // revoked until every private page has disappeared, including popups
@@ -1980,6 +1999,20 @@ mod tests {
         let after = visit().await;
         assert!(after.contains("stored:|"), "{after}");
         assert!(!after.contains("Synthetic"));
+        // Retry after a partial return already destroyed the private context.
+        browser.handoff().await.unwrap();
+        let context = browser.tab.lock().await.context.clone();
+        browser
+            .cdp
+            .call(
+                None,
+                "Target.disposeBrowserContext",
+                json!({"browserContextId":context}),
+            )
+            .await
+            .unwrap();
+        browser.return_control().await.unwrap();
+        assert!(visit().await.contains("stored:|"));
         fixture.abort();
     }
 

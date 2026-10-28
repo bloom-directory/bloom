@@ -79,9 +79,13 @@ impl Store {
         // A lost recipient cannot be reconstructed. Interrupted disclosure is never retried.
         // Form errors can arrive after a pay click. Older versions incorrectly
         // converted them to not_submitted; neither state proves no charge.
-        conn.execute("UPDATE operations SET state='uncertain',status=json_set(status,'$.state','uncertain','$.ceremony_url',NULL) WHERE state IN ('submitted','needs_input','not_submitted')",[])?;
+        // The person may have paid in the private view even when no saved
+        // card was released. Restarting cannot turn that into proof of no charge.
+        conn.execute("UPDATE operations SET state='uncertain',status=json_set(status,'$.state','uncertain','$.ceremony_url',NULL) WHERE state IN ('submitted','needs_input','not_submitted','manual_required','human_control')",[])?;
         conn.execute("UPDATE operations SET state='disclosure_unknown',status=json_set(status,'$.state','disclosure_unknown','$.ceremony_url',NULL) WHERE state IN ('release_started','filled','partially_filled')",[])?;
-        conn.execute("UPDATE operations SET state='failed_before_release',status=json_set(status,'$.state','failed_before_release','$.ceremony_url',NULL) WHERE state IN ('requested','preparing','awaiting_approval','manual_required','human_control')",[])?;
+        conn.execute("UPDATE operations SET state='failed_before_release',status=json_set(status,'$.state','failed_before_release','$.ceremony_url',NULL) WHERE state IN ('requested','preparing','awaiting_approval')",[])?;
+        // This process owns a fresh browser; no earlier private view can pause it.
+        conn.execute("UPDATE operations SET status=json_set(status,'$.paused',json('false')) WHERE json_extract(status,'$.paused')=1",[])?;
         // The unlocked values lived in memory. After a restart they are gone.
         conn.execute("UPDATE operations SET state='expired',status=json_set(status,'$.state','expired','$.ceremony_url',NULL) WHERE state='unlocked'",[])?;
         Ok(Self(Mutex::new(conn)))
@@ -1108,6 +1112,21 @@ impl CheckoutService {
                     bail!("Checkout not active");
                 }
                 let status = self.store.get(&operation_id)?;
+                if matches!(status.state.as_str(), "cancelled" | "failed_before_release")
+                    && private
+                        .as_ref()
+                        .is_some_and(|p| !p.approved && !p.submitted)
+                {
+                    if let Err(error) = self.return_control().await {
+                        self.mark_paused(&operation_id);
+                        return Err(error);
+                    }
+                    let mut status = status;
+                    status.paused = false;
+                    self.store.update(&status)?;
+                    *private = None;
+                    return Ok(serde_json::to_value(status)?);
+                }
                 if status.state != "awaiting_approval" {
                     bail!("Release may have started; inspect the private view instead");
                 }
@@ -1130,7 +1149,10 @@ impl CheckoutService {
                 status.state = "cancelled".into();
                 status.ceremony_url = None;
                 self.store.update(&status)?;
-                self.return_control().await?;
+                if let Err(error) = self.return_control().await {
+                    self.mark_paused(&operation_id);
+                    return Err(error);
+                }
                 *private = None;
                 Ok(serde_json::to_value(status)?)
             }
@@ -1225,6 +1247,8 @@ impl CheckoutService {
                         self.set_state(&operation_id, "failed_before_release");
                         if self.return_control().await.is_ok() {
                             *private = None;
+                        } else {
+                            self.mark_paused(&operation_id);
                         }
                         return;
                     }
@@ -1235,6 +1259,8 @@ impl CheckoutService {
                 self.set_state(&operation_id, "expired");
                 if self.return_control().await.is_ok() {
                     *private = None;
+                } else {
+                    self.mark_paused(&operation_id);
                 }
                 return;
             }
@@ -2775,6 +2801,42 @@ mod tests {
         let _ =
             tokio::time::timeout(Duration::from_secs(3), service.watch_outcome(id.into())).await;
         service.store.get(id).unwrap().state
+    }
+
+    #[tokio::test]
+    async fn cancelled_checkout_can_retry_cleanup_without_releasing_a_card() {
+        for state in ["cancelled", "failed_before_release"] {
+            let (service, id, _, server) =
+                watched_checkout("<h1>Checkout</h1>", state, false, false).await;
+            // A final state alone is insufficient: approved private access
+            // must never be discarded through the pre-release cancel path.
+            assert!(
+                service
+                    .request(Request::Cancel {
+                        operation_id: id.clone()
+                    })
+                    .await
+                    .is_err()
+            );
+            service.private.lock().await.as_mut().unwrap().approved = false;
+            service.mark_paused(&id);
+            let result = service
+                .request(Request::Cancel {
+                    operation_id: id.clone(),
+                })
+                .await
+                .unwrap();
+            assert_eq!(result["state"], state);
+            assert!(!serde_json::from_value::<Status>(result).unwrap().paused);
+            assert!(service.private.lock().await.is_none());
+            service
+                .request(Request::Browse {
+                    request: BrowseRequest::Snapshot,
+                })
+                .await
+                .unwrap();
+            server.abort();
+        }
     }
 
     #[tokio::test]
@@ -4539,6 +4601,44 @@ mod tests {
     #[test]
     fn result_wait_outlives_the_approval_link() {
         assert!(APPROVAL_RESULT_WAIT > Duration::from_secs(15 * 60));
+    }
+
+    #[test]
+    fn restart_preserves_uncertainty_after_private_human_control() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("operations.sqlite3");
+        let store = Store::open(&path).unwrap();
+        for state in ["manual_required", "human_control"] {
+            let status = Status {
+                operation_id: state.into(),
+                state: state.into(),
+                ceremony_url: None,
+                filled_fields: vec![],
+                outcome: None,
+                paused: true,
+                reason: None,
+                view_url: None,
+            };
+            store
+                .insert(&status, "card", "Human may have paid privately")
+                .unwrap();
+            store
+                .record_order(state, Some(&format!("https://{state}.example")), None, None)
+                .unwrap();
+        }
+        drop(store);
+        let reopened = Store::open(&path).unwrap();
+        for state in ["manual_required", "human_control"] {
+            let status = reopened.get(state).unwrap();
+            assert_eq!(status.state, "uncertain", "{state}");
+            assert!(!status.paused, "a new browser is no longer privately held");
+            assert!(
+                reopened
+                    .unresolved(&format!("https://{state}.example"))
+                    .unwrap()
+                    .is_some()
+            );
+        }
     }
 
     #[test]

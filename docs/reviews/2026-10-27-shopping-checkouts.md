@@ -102,9 +102,30 @@ Public snapshots, the VFS driver and operation traces are retained under
 `shared/checkout-takeover-2026-10-27.md` in the development workspace.
 No checkout-session URLs or private-view capabilities are published here.
 
-Live bank authorization, a real card release through Broker/Signer and live
-merchant settlement were not exercised. A sandbox payment cannot prove that
-a bank will approve a live purchase. The Linux release build, macOS
-conformance workflows, inherited dependency-pin failures and the previously
-reported private-view recovery issues remain outside this acceptance result.
+## Full service test and recovery follow-up
+
+At `4af81c33`, `scripts/test-card-checkout.mjs` passed against real Machine,
+Broker and Signer services with a software passkey. It enrolled a synthetic
+card through custody, approved sealed card release and completed a real Stripe
+**test** payment. It also verified manual fallback without card release,
+reopening a closed approved private tab, returning an authenticated page after
+takeover, one submission using a shop-saved payment method, and custody-backed
+card deletion. Ports were 28820/28821. Broker and Signer revisions were the
+development revisions recorded above; this was not a release installation or
+an OS-principal isolation test.
+
+Private bootstrap URLs are one-use; their values no longer double as session
+cookies. A separate random HttpOnly cookie lets the same browser reopen the
+approved view through the safe `view_url` in request status. Replaying a used
+bootstrap or forging a cookie from it is rejected.
+
+Recovery regressions also cover interrupted human payment remaining uncertain
+after restart, stale pause flags clearing on a fresh browser, retrying cleanup
+after confirmed pre-release cancellation, and partial browser-context disposal.
+A real subprocess test kills checkout's own Chromium and requires checkout to
+exit unsuccessfully, allowing the installed service manager to restart it.
+
+Live bank authorization and live merchant settlement remain untested. A test
+payment cannot prove that a bank will approve a live purchase. Release builds,
+macOS conformance and inherited dependency-pin failures are separate gates.
 Nothing was merged.
