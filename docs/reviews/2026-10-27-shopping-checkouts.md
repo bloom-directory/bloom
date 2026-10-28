@@ -30,20 +30,77 @@ The useful lessons are:
   different failures. Flight completion remains unverified after a merchant
   security rejection.
 
-The next improvements, in priority order:
+## Finish-plan implementation, 2026-10-28
 
-1. Expose safe, specific preparation diagnostics. `facts_unreadable` currently
-   combines price, charge terms and payment-control ambiguity; the operator
-   cannot reliably tell which needs attention. Keep private values out of errors.
-2. Broaden real journeys to other checkout platforms and a completed airline
+Runtime `734e430b6c02714408202f2a20e01714f28352ed` adds two bounded public
+refusals: `payment_action_ambiguous` for competing payment actions and
+`charge_terms_unreadable` for unclear installment choices. Missing actions and
+unreadable/conflicting prices retain `facts_unreadable`. These codes survive
+real Checkout/Machine/VFS status and history without a submit or private value.
+Checkout, Machine clients and VFS ship the same API crate; existing persisted
+reasons still deserialize. No Broker/Signer approval protocol changed.
+
+The SparkFun journey also exposed that selecting a nonexistent option reported
+success while clearing the current choice. Bloom now rejects missing, disabled
+and disabled-group options before changing the selection, with an instruction
+to use an available value from a fresh snapshot. Real Chromium regressions
+verify the old selection survives each refusal. The mounted operator guide
+includes that recovery instruction and the new payment reasons; byte-for-byte
+readback through the running VFS passed.
+
+The resulting runtime passed 100 checkout library tests (8 opt-in tests remain
+excluded), strict checkout/API Clippy, 12 VFS documentation tests, browser-death
+subprocess recovery, and all eight real-service acceptance checks. The eighth
+check covers refusal diagnostics; the original seven still include custody,
+private-view recovery, Stripe TEST payment and exactly-once shop-saved submission.
+Local acceptance uses software passkeys and a certificate exception for local
+fixtures; it does not establish installed principal isolation.
+
+Additional normal-TLS shopping used the diagnostic runtime `50b38c9244e81038339b94379a3c8e1d6e1a5754`
+before the dropdown correction. No live card or order was submitted:
+
+| Journey | Last verified step and result |
+|---|---|
+| Stumptown Holler Mountain, 12oz whole bean, quantity 1, weekly subscription | Complete US shipping/billing; selected free Subscription Shipping; preparation read USD 20.00 today and USD 20.00/week. No trial or renewal date was stated. Expected absent-card refusal followed successful discovery. |
+| SparkFun Resistor Lead Bending Tool, TOL-13114, quantity 1 | Final card form, same billing as US shipping, USPS Ground Advantage. Displayed $21.34; Bloom could not establish the currency and refused. Not a successful preparation or a verified additional processor. |
+| Adafruit SPDT Slide Switch, PID 805, quantity 1 | Contact, US shipping/billing and USPS Ground Advantage completed; $8.53 displayed at step 4/5 with Stripe card fields. Card entry is required before final review; final preparation remains unverified. |
+| Patagonia | Maintenance page; no checkout reached. |
+| Wikimedia recurring donation | HTTP 429 before a donation form; no Adyen support claim. |
+| Verve Roaster's Choice Blend subscription | Product offered no usable frequency selection and labeled variants unavailable; no cart or subscription claimed. |
+
+These add recurring-purchase evidence, not a twelfth distinct completed merchant.
+Trial/renewal disclosure is also covered by browser fixtures; an ordinary live
+trial checkout remains unverified. Flight payment remains unverified after the
+previous Aerolíneas passenger-validation/security-rejection journey.
+
+The corrected installed Mac run
+[40689432767](https://github.com/bloom-directory/bloom/actions/runs/40689432767)
+passed both jobs and saved its W0 build cache. All eleven downloaded criterion
+files match subject digest
+`bbf5dc823dd468ab7352d99808978da37f4143d667ec45eb545b67a68c00c065`, bound to
+Machine `8d9b13853395962fc39c847929c3673b51c85f37`, Broker `88604d30` and
+Signer `74e097a5`. This verifies the previous runtime and cache fix, not the
+new diagnostics/dropdown changes. New-runtime
+[release dry run](https://github.com/bloom-directory/bloom/actions/runs/40703500154)
+and [installed Mac run](https://github.com/bloom-directory/bloom/actions/runs/40704154927)
+were dispatched at runtime `734e430b`; their results remain pending here.
+
+Remaining improvements and release gates, in priority order:
+
+1. Broaden real journeys to other checkout platforms and a completed airline
    flow. Record dated final shipping/tax quotes, last completed steps and
    blockers; retain a focused regression for each reproduced defect.
-3. Make verification cheaper to interpret: retain revision-bound results,
+2. Make verification cheaper to interpret: retain revision-bound results,
    share compiled dependencies, and report changes or completion rather than
    repeatedly polling and restating the same in-progress job. Installation
    evidence remains separate from checkout usability evidence.
+3. Resolve master conflicts only after the specifically required branch-merge
+   approval; obtain independent review and approval for each dependency merge,
+   then advance every pin to landed commits and verify that resulting combination.
+   Two-login Mac proof still needs a disposable runner with two actual active
+   GUI identities; no such environment is available in this session.
 
-These are follow-up priorities, not claims of implemented support. Do not add
+These remaining priorities are not claims of implemented support. Do not add
 merchant-specific exceptions or relax ambiguity checks simply to raise the
 completed-shop count. The VFS guide should teach readiness and recovery rather
 than carry this test chronology or promise universal payment success.

@@ -19,6 +19,18 @@ holds revision-bound results; it needs refreshing before final acceptance.
 
 ## Established baseline
 
+Execution update: diagnostics and dropdown recovery are implemented and pushed
+on existing #346 (`50b38c92`, `88155b68`, `734e430b`). The final runtime passed
+100 library tests, strict checkout/API Clippy, 12 docs tests, browser-death
+recovery and eight real-service checks. Mounted guide bytes match the source.
+Additional recurring and non-Shopify journeys, including their limits, are
+recorded in the [acceptance report](../reviews/2026-10-27-shopping-checkouts.md#finish-plan-implementation-2026-10-28).
+Flight and live-trial readiness remain unverified. Do not mark this plan complete:
+the new release/installed runs, two-login infrastructure, independent reviews,
+landed dependencies and explicit merge approvals remain outstanding. The old
+corrected Mac run has now passed, including cache persistence and all eleven
+digest-bound installed criteria. It does not verify the new runtime.
+
 - Eleven merchants reached final preparation: ten Shopify, one WooCommerce/
   Stripe. Shipping, billing and final quotes were checked; no live order was
   submitted. A nonexistent-card refusal after discovery is preparation evidence,
