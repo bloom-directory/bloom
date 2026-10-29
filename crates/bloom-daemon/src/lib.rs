@@ -9958,10 +9958,14 @@ allowed = ["bloom:vfs.read"]
 
     #[tokio::test]
     async fn petal_http_transport_errors_name_method_host_and_cause_but_no_url_data() {
-        // Bound but not listening: the port stays ours and connects are refused.
-        let socket = tokio::net::TcpSocket::new_v4().unwrap();
-        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        let port = socket.local_addr().unwrap().port();
+        // A closed port: Linux and macOS both refuse the connect at once.
+        // (A bound socket that never listens times out on macOS instead.)
+        let port = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
         let url = format!(
             "http://fixture-user:fixture-password@127.0.0.1:{port}/fixture-path-token?key=fixture-query-token"
         );
@@ -9980,7 +9984,7 @@ allowed = ["bloom:vfs.read"]
             "method and host were dropped: {message}"
         );
         assert!(
-            message.contains("Connection refused"),
+            message.contains("tcp connect error"),
             "transport cause was dropped: {message}"
         );
     }
