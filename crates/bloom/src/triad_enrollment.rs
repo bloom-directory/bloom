@@ -1089,31 +1089,46 @@ fn append_release_petal_provenance_for_entries(
             .iter()
             .map(|hash| Digest32::new(*hash))
             .collect::<Result<Vec<_>, _>>()?;
-        let baseline = crate::github_source::release_lineage_predecessor(entry.name)
+        let history = crate::github_source::release_lineage_predecessors(entry.name);
+        let baseline = history
+            .first()
             .context("bundled Petal has no baseline release hash")?;
-        if package_hash.as_str() != baseline.hash {
-            if entry.release_sequence <= 1
+        if package_hash.as_str() != baseline.hash
+            && (entry.release_sequence <= 1
                 || !predecessors
                     .iter()
-                    .any(|hash| hash.as_str() == baseline.hash)
-            {
-                bail!(
-                    "successor {} must advance its release sequence and list its baseline hash",
-                    entry.name
-                );
-            }
-            let old_hash = Digest32::new(baseline.hash)?;
+                    .any(|hash| hash.as_str() == baseline.hash))
+        {
+            bail!(
+                "successor {} must advance its release sequence and list its baseline hash",
+                entry.name
+            );
+        }
+        // The Machine refuses to replace an installed release that the
+        // successor lists but the catalog lacks, so record every one.
+        for hash in &predecessors {
+            let old = history
+                .iter()
+                .find(|old| old.hash == hash.as_str())
+                .with_context(|| {
+                    format!("{} predecessor {hash} has no recorded release", entry.name)
+                })?;
+            let old_predecessors = old
+                .predecessor_package_hashes
+                .iter()
+                .map(|hash| Digest32::new(*hash))
+                .collect::<Result<Vec<_>, _>>()?;
             append_release_lineage_record(
                 catalog,
                 signing_key,
                 installer_key_id,
                 &publisher,
                 &lineage_id,
-                &old_hash,
-                1,
-                &[],
+                hash,
+                old.release_sequence,
+                &old_predecessors,
                 false,
-                baseline.authority_routes,
+                old.authority_routes,
             )?;
         }
         append_release_lineage_record(
@@ -1745,6 +1760,72 @@ mod tests {
                 assert!(new.operation_classes.is_empty());
             }
         }
+    }
+
+    // Upgrading from Bloom v0.4.0 (Polymarket v0.1.6) failed with "predecessor
+    // release information is missing" because only the baseline was recorded.
+    #[test]
+    fn release_catalog_records_every_listed_predecessor() {
+        let mut catalog = ProvenanceCatalog {
+            schema: bloom_broker_api::PROVENANCE_CATALOG_SCHEMA.into(),
+            records: vec![],
+        };
+        append_release_petal_provenance(
+            &mut catalog,
+            &Token::new("installer-key").unwrap(),
+            &SigningKey::from_bytes(&[17; 32]),
+        )
+        .unwrap();
+        let lineage = |hash: &str| {
+            catalog
+                .records
+                .iter()
+                .find(|record| matches!(
+                    &record.subject,
+                    ProvenanceSubject::Petal { package_hash, .. } if package_hash.as_str() == hash
+                ))
+                .and_then(|record| record.petal_lineage.clone())
+        };
+        for entry in crate::github_source::release_lineage_petals() {
+            for hash in entry.predecessor_package_hashes {
+                let old = lineage(hash)
+                    .unwrap_or_else(|| panic!("{} predecessor {hash} missing", entry.name));
+                assert!(!old.active);
+                assert!(old.release_sequence.get() < entry.release_sequence);
+            }
+        }
+        let v016 = lineage("0f365cd7f613129f73ce66fb07256c8a42c4e70abbb77721804dbd6df85b96b5")
+            .expect("Polymarket v0.1.6 is in the catalog");
+        assert_eq!(v016.release_sequence.get(), 2);
+    }
+
+    #[test]
+    fn release_catalog_refuses_an_unrecorded_predecessor() {
+        let current = crate::github_source::preinstalled_petal("polymarket").unwrap();
+        let successor = crate::github_source::PreinstalledPetal {
+            expected_hash: Some("1111111111111111111111111111111111111111111111111111111111111111"),
+            release_sequence: 4,
+            predecessor_package_hashes: &[
+                "5df5a1377dc4d70c71e47ffe6827e691e1f5868543b752dc8d19a500284e5fa6",
+                "2222222222222222222222222222222222222222222222222222222222222222",
+            ],
+            ..*current
+        };
+        let mut catalog = ProvenanceCatalog {
+            schema: bloom_broker_api::PROVENANCE_CATALOG_SCHEMA.into(),
+            records: vec![],
+        };
+        let error = append_release_petal_provenance_for_entries(
+            &mut catalog,
+            &Token::new("installer-key").unwrap(),
+            &SigningKey::from_bytes(&[17; 32]),
+            &[&successor],
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("has no recorded release"),
+            "{error:#}"
+        );
     }
 
     #[test]
