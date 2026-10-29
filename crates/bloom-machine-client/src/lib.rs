@@ -1009,6 +1009,7 @@ impl MachineBrokerClient {
         terms.validate()?;
         self.prepare_approval(ApprovalPrepareRequest {
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
+            safe_review_payloads: Vec::new(),
             evm_review_payloads: if native_evm_review(&request.provenance) {
                 vec![Base64UrlBytes::from_bytes(&request.preimage)]
             } else {
@@ -1187,6 +1188,7 @@ impl MachineBrokerClient {
         terms.validate()?;
         self.prepare_approval(ApprovalPrepareRequest {
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
+            safe_review_payloads: Vec::new(),
             evm_review_payloads: if native_evm_review(&request.provenance) {
                 request
                     .preimages
@@ -1352,6 +1354,7 @@ impl MachineBrokerClient {
         terms.validate()?;
         self.prepare_approval(ApprovalPrepareRequest {
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
+            safe_review_payloads: Vec::new(),
             evm_review_payloads: Vec::new(),
             operation_id: request.approval_operation_id,
             terms,
@@ -4820,6 +4823,7 @@ mod tests {
 
         let approval = ApprovalPrepareRequest {
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
+            safe_review_payloads: Vec::new(),
             evm_review_payloads: Vec::new(),
             operation_id: OperationId::from_bytes([94; 32]),
             terms: approval_terms("wallet", None),
