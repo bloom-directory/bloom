@@ -46,13 +46,34 @@ fn heights_past_window(chain: &str, height: u64) -> std::collections::HashMap<St
 fn interrupted_terminal_move_preserves_the_reason_and_restage_lookup() {
     for status in [SolanaTxStatus::Expired, SolanaTxStatus::Cancelled] {
         let (_dir, outbox) = outbox();
-        outbox.write_pending(&staged("interrupted"), "plan").unwrap();
-        let mut entry = outbox.read("alice", "solana-devnet", "interrupted").unwrap();
+        outbox
+            .write_pending(&staged("interrupted"), "plan")
+            .unwrap();
+        let mut entry = outbox
+            .read("alice", "solana-devnet", "interrupted")
+            .unwrap();
         entry.staged.status = status;
-        outbox.transition(&entry, SolanaOutboxState::Failed).unwrap();
+        outbox
+            .transition(&entry, SolanaOutboxState::Failed)
+            .unwrap();
         // Simulate death before rewrite_intent: the on-disk intent is pending.
-        assert_eq!(outbox.read("alice", "solana-devnet", "interrupted").unwrap().staged.status, status);
-        assert_eq!(outbox.read_restageable("alice", "solana-devnet", "interrupted").unwrap().0.staged.status, status);
+        assert_eq!(
+            outbox
+                .read("alice", "solana-devnet", "interrupted")
+                .unwrap()
+                .staged
+                .status,
+            status
+        );
+        assert_eq!(
+            outbox
+                .read_restageable("alice", "solana-devnet", "interrupted")
+                .unwrap()
+                .0
+                .staged
+                .status,
+            status
+        );
     }
 }
 

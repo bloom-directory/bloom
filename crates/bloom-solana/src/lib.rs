@@ -344,9 +344,11 @@ impl SolanaClient {
         // Establish each endpoint's finalized height BEFORE asking its
         // history. A fast endpoint cannot qualify a lagging peer's absence.
         // Both probe batches retain configured endpoint order (no failover).
-        let heights = self.inner.rpc.probe_all_endpoints(
-            "getBlockHeight", &json!([{ "commitment": "finalized" }]),
-        ).await;
+        let heights = self
+            .inner
+            .rpc
+            .probe_all_endpoints("getBlockHeight", &json!([{ "commitment": "finalized" }]))
+            .await;
         self.inner
             .rpc
             .probe_all_endpoints(

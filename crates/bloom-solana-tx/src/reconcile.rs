@@ -118,7 +118,10 @@ impl SolanaReconciler {
                 return Ok(None);
             }
             let quorum = chain
-                .probe_signature_status_all_endpoints(&entry.signature, entry.last_valid_block_height)
+                .probe_signature_status_all_endpoints(
+                    &entry.signature,
+                    entry.last_valid_block_height,
+                )
                 .await;
             let mut finalized: Option<bloom_solana::SignatureStatus> = None;
             let mut seen_unfinalized = false;

@@ -412,14 +412,21 @@ async fn a_lagging_peers_absence_cannot_expire_a_transfer() {
     let dir = TempDir::new().unwrap();
     let outbox = seed_sent(&dir);
     let client = two_endpoint_client(&current, &lagging);
-    let probes = client.probe_signature_status_all_endpoints("signature", 1).await;
+    let probes = client
+        .probe_signature_status_all_endpoints("signature", 1)
+        .await;
     assert!(matches!(probes[0].status, Ok(None)));
     assert!(probes[1].status.is_err());
     let registry = SolanaChainRegistry::new();
     registry.add(client);
     let reconciler = SolanaReconciler::new(outbox.clone(), registry, audit(&dir));
     assert_eq!(reconciler.tick().await, 0);
-    assert!(outbox.read_receipt("alice", "solana-devnet", "0001-00001").unwrap().is_none());
+    assert!(
+        outbox
+            .read_receipt("alice", "solana-devnet", "0001-00001")
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
