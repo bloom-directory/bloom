@@ -2,7 +2,8 @@
 
 This is the route reference for the mounted operator interface. Read the
 mount's `AGENTS.md` for action-selection and recovery rules, and
-[examples.md](./examples.md) for complete procedures. Contributor setup lives
+[examples.md](./examples.md) for transaction procedures and
+[wallets.md](./wallets.md) for wallet, passkey and policy procedures. Contributor setup lives
 in the repository's `DEVELOPMENT.md`.
 
 Work from a scratch directory outside the mount and set its actual location:
@@ -34,7 +35,7 @@ Petals before choosing paths; their names and availability vary by installation.
 | `ens/`, `prices/` | ENS resolution and price-provider reads |
 | `addressbook/` | Named public addresses |
 | `tools/` | Pure encoding, hashing, address, ABI, and unit helpers |
-| `docs/` | Route reference, examples, installed-Petal index |
+| `docs/` | Route reference, examples, wallet and passkey procedures, installed-Petal index |
 | `petal-key-requests/`, `petal-signing-requests/` | Broker-backed Petal request projections |
 
 `chains/` is EVM-only. Solana status lives under
@@ -91,11 +92,11 @@ transaction was not submitted.
 
 | Operation | Route / procedure |
 |---|---|
-| Register wallet | `wallets/new`; [wallet creation](./examples.md#creating-a-wallet) |
-| Recover wallet | `wallets/recover`; [recovery](./examples.md#recovering-a-wallet) |
+| Register wallet | `wallets/new`; [wallet creation](./wallets.md#creating-a-wallet) |
+| Recover wallet | `wallets/recover`; [recovery](./wallets.md#recovering-a-wallet) |
 | EVM transaction | `wallets/<wallet>/0/chains/<chain>/outbox/new.tx`; [Anvil workflow](./examples.md#local-anvil-transaction) |
 | Solana transaction | Same outbox shape with strict JSON; [Solana workflow](./examples.md#solana-account-aware-reads-and-transfer) |
-| Update policy | `wallets/<wallet>/policy.json`; [policy workflow](./examples.md#updating-wallet-policy) |
+| Update policy | `wallets/<wallet>/policy.json`; [policy workflow](./wallets.md#updating-wallet-policy) |
 | Reusable authority | `wallets/<wallet>/sealed-approvals/` |
 | Petal operation | Package-defined `<wallet>/<index>` routes; [installed package workflow](./examples.md#installed-petal-workflow) |
 | Paid HTTP | `requests/`; inspect plan, wallet, payment protocol, cap, approval, and receipt |

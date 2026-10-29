@@ -111,50 +111,6 @@ itself. Runnable examples and recovery instructions are in
 https://github.com/bloom-directory/bloom/tree/master/examples/evm-deploy.
 
 
-## Creating a wallet
-
-Wallet creation is asynchronous passkey registration:
-
-```sh
-# 1. Request the petname. This does not block and does not create a local
-#    wallet.
-printf 'main\n' > "$BLOOM/wallets/new"
-
-# 2. Read the projection keyed by the requested petname. Confirm that
-#    requested_name is "main" and forward ceremony_url to the human.
-cat "$BLOOM/wallets/registrations/main/status.json"
-
-# 3. Poll the same projection until ceremony_state is COMPLETED.
-cat "$BLOOM/wallets/registrations/main/status.json"
-cat "$BLOOM/wallets/registrations/main/result.json"
-cat "$BLOOM/wallets/main/projection.json"
-```
-
-Before acceptance, cancellation is explicit:
-
-```sh
-printf 'cancel\n' > "$BLOOM/wallets/registrations/main/cancel"
-```
-
-Do not put a mnemonic, private key, passkey response, or PRF output in the
-mount. Those inputs stay inside the Broker-hosted browser ceremony.
-
-## Recovering a wallet
-
-```sh
-printf 'main\n' > "$BLOOM/wallets/recover"
-cat "$BLOOM/wallets/recoveries/main/status.json"
-# Open the complete ceremony_url in a browser and enter recovery material there.
-# Poll until ceremony_state is SUCCEEDED, then inspect:
-cat "$BLOOM/wallets/recoveries/main/result.json"
-```
-
-The write needs only the wallet name, even when Machine has no cached wallet
-inventory. A consumed one-use URL is removed from status. To cancel a pending
-ceremony, write `cancel` to `wallets/recoveries/main/cancel`; after cancellation
-or expiry, write the name to `wallets/recover` again for a new operation.
-Never write the recovery ID or secret into the mount or pass them as arguments.
-
 ## Solana account-aware reads and transfer
 
 ```sh
@@ -227,30 +183,6 @@ printf 'nft transfer <contract> <token-id> to <recipient>\n' \
 Inspect `plan.md` before confirmation. Operator-wide approval is broader than
 a single-token approval and should be clearly visible in the policy projection.
 
-## Updating wallet policy
-
-```sh
-# The proposal is a scratch file in the working directory, outside the mount.
-cat "$BLOOM/wallets/alice/policy.json" > proposed-policy.json
-# Edit the complete proposal, then stage those exact bytes.
-cp proposed-policy.json "$BLOOM/wallets/alice/policy.json"
-cat "$BLOOM/wallets/alice/policy-updates/latest/status.json"
-cat "$BLOOM/wallets/alice/policy-updates/latest/approval_challenge.json"
-```
-
-Verify that the update challenge matches the proposal before forwarding its
-ceremony URL. After the human approves, retry the exact same proposal bytes:
-
-```sh
-cp proposed-policy.json "$BLOOM/wallets/alice/policy.json"
-cat "$BLOOM/wallets/alice/policy.json"
-cat "$BLOOM/wallets/alice/policy-updates/latest/status.json"
-```
-
-Verify the committed policy and terminal status. Broker performs
-`policy.validate_update` before approval and `policy.commit_update` on the
-authorized retry. Editing or reformatting the proposal requires fresh review.
-
 ## Installed Petal workflow
 
 ```sh
@@ -259,16 +191,17 @@ cat "$BLOOM/docs/petals.md"
 cat "$BLOOM/petals/<name>/README.md"
 cat "$BLOOM/petals/<name>/AGENTS.md"
 
-# 2. Follow that package's staging grammar. Correlate any resulting Petal
-#    action with its exact central outbox action before confirmation.
+# 2. Read the write file itself: it returns the request body it accepts.
 ls "$BLOOM/petals/<name>/"
-# Example: Enso selects wallet and index under intents.
-ls "$BLOOM/petals/enso/intents/<wallet>/0/"
-ls "$BLOOM/wallets/<wallet>/0/chains/<chain>/outbox/"
+cat "$BLOOM/petals/<name>/<route>/<wallet>/0/new"
+
+# 3. Write that body once, then follow the package's own next step: a draft
+#    directory, a session's status.json, or an entry in this account's outbox.
+ls "$BLOOM/wallets/<wallet>/0/chains/<chain>/outbox/pending/"
 ```
 
-Enso, Hyperliquid, Polymarket, and other applications are Petals when installed.
-Use the selected package's own instructions and examples.
+Wallet creation, recovery, passkeys and policy updates are in
+[wallets.md](./wallets.md).
 
 ## Pure tools
 
