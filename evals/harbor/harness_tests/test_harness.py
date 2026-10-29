@@ -184,14 +184,70 @@ class TeardownTests(unittest.TestCase):
             self.assertIsNone(triad.mount_lock)
             self.assertTrue(triad.root.is_dir())
         for _ in range(50):
-            if not Path(f"/proc/{child}").exists():
+            try:
+                os.kill(child, 0)
+            except ProcessLookupError:
                 break
             time.sleep(0.1)
-        self.assertFalse(Path(f"/proc/{child}").exists(), "child survived teardown")
+        else:
+            self.fail("child survived teardown")
+
+    def test_close_removes_a_real_root_with_the_hosts_rm(self):
+        with tempfile.TemporaryDirectory() as directory:
+            triad = DisposableTriad(Path(directory))
+            triad.root = Path(directory) / "root"
+            triad.mount = triad.root / "mount"
+            (triad.root / "dev/runtime.x").mkdir(parents=True)
+            (triad.root / "dev/runtime.x/log").write_text("x")
+            triad.close()
+            self.assertFalse(triad.root.exists())
+
+    def test_close_keeps_the_root_and_says_why_rm_failed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            triad = DisposableTriad(Path(directory))
+            triad.root = Path(directory) / "root"
+            triad.mount = triad.root / "mount"
+            locked = triad.root / "locked"
+            (locked / "file").parent.mkdir(parents=True)
+            (locked / "file").write_text("x")
+            locked.chmod(0o500)
+            try:
+                if os.geteuid() == 0:
+                    self.skipTest("root ignores directory permissions")
+                with self.assertRaisesRegex(EvalError, "could not remove.*: .+"):
+                    triad.close()
+                self.assertTrue((locked / "file").exists())
+            finally:
+                locked.chmod(0o700)
 
 
-if __name__ == "__main__":
-    unittest.main()
+class RootsDirTests(unittest.TestCase):
+    def triad(self, **env):
+        return DisposableTriad(Path("/repo"), env)
+
+    def test_default_roots_leave_room_for_trial_sockets(self):
+        # The home that overflowed macOS's sun_path in review, and a typical Linux one.
+        for platform, home in (
+            ("darwin", "/Users/jeremiahosullivan"),
+            ("linux", "/home/jeremiahosullivan"),
+        ):
+            with mock.patch("harness.disposable.sys.platform", platform), mock.patch.object(
+                Path, "home", return_value=Path(home)
+            ):
+                with self.assertRaisesRegex(EvalError, "_BIN must name"):
+                    self.triad().preflight()  # The roots check passed first.
+        with mock.patch("harness.disposable.sys.platform", "darwin"):
+            self.assertTrue(str(self.triad().roots()).endswith(f"bloom-harbor-{os.getuid()}"))
+
+    def test_a_long_roots_dir_fails_before_anything_starts(self):
+        triad = self.triad(BLOOM_EVAL_ROOTS_DIR="/Users/jeremiahosullivan/.cache/bloom-harbor")
+        with mock.patch("harness.disposable.sys.platform", "darwin"):
+            with self.assertRaisesRegex(EvalError, "BLOOM_EVAL_ROOTS_DIR .* too long: .* 105 of 103"):
+                triad.preflight()
+        triad = self.triad(BLOOM_EVAL_ROOTS_DIR="/" + "r" * 44)
+        with mock.patch("harness.disposable.sys.platform", "linux"):
+            with self.assertRaisesRegex(EvalError, "too long: .* 108 of 107"):
+                triad.preflight()
 
 
 class ProjectionListingTest(unittest.TestCase):
@@ -203,3 +259,7 @@ class ProjectionListingTest(unittest.TestCase):
         with mock.patch.object(reader, "_cli", return_value="x\tLink\n"):
             with self.assertRaisesRegex(OSError, r"'x\\tLink'"):
                 reader.entries("outbox/pending")
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -8,14 +8,14 @@ import re
 
 from .default_petals import PetalEval
 
-# "Which market", "what Polymarket event", "which of the markets", or a request
+# "Which market", "what Polymarket question", "which of the markets", or a request
 # to name the market. Words between may not be prepositions or verbs, so
 # "which wallet should I use for this market" does not count.
-MARKET = r"(?:markets?|events?)\b"
+MARKET = r"(?:markets?|events?|questions?)\b"
 FILLER = r"(?:(?!(?:for|in|on|of|to|with|should|do|does|is|are|would|will|can)\b)\w+\s+){0,2}"
 ASKS_FOR_MARKET = re.compile(
     rf"\b(?:which|what)\s+(?:of\s+(?:the|these|those)\s+)?{FILLER}{MARKET}"
-    rf"|\b(?:tell me|let me know|specify|name|share|provide|confirm)\b[^.?!]{{0,30}}?"
+    rf"|\b(?:tell me|let me know|specify|name|share|send|provide|confirm)\b[^.?!]{{0,30}}?"
     rf"\b(?:the|which|what)\s+{FILLER}{MARKET}",
     re.IGNORECASE,
 )

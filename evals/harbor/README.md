@@ -19,10 +19,10 @@ services such as the local validator or the Machine's NFS export. Teardown remov
 the root. Failed trials keep it for diagnosis; it can hold ceremony
 capabilities, so never publish its raw logs.
 
-Roots live under `~/.cache/bloom-harbor` by default, or the short directory in
-`BLOOM_EVAL_ROOTS_DIR`. On this host they use `/data/codex-scratch/user/hb-1022`,
-so retained failures consume disk rather than RAM-backed `/tmp`. Keep the root
-short enough for Unix socket paths.
+Roots live in `BLOOM_EVAL_ROOTS_DIR`, by default `~/.cache/bloom-harbor` on
+Linux, so retained failures consume disk rather than RAM-backed `/tmp`, and
+`/tmp/bloom-harbor-<uid>` on macOS. The Triad's Unix socket paths must fit in
+`sun_path` (104 bytes on macOS, 108 on Linux); preflight refuses a longer root.
 
 | Task | Coverage | Passes when |
 | --- | --- | --- |

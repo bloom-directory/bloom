@@ -10,6 +10,7 @@ import secrets
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.request
@@ -19,6 +20,10 @@ from typing import Any
 from .core import EvalError
 
 CEREMONY = re.compile(r"http://localhost:[0-9]+/ceremony/[A-Za-z0-9_-]{43}")
+# The longest Unix socket path bound below the roots directory: Broker's and
+# Signer's control sockets under bloom-service-activation's temporary
+# ".<name>.new.<pid>" name.
+SOCKET_SUFFIX = "/h-XXXXXXXX/dev/runtime.XXXXXX/signer/.control.sock.new."
 
 
 def free_port() -> int:
@@ -89,7 +94,27 @@ class DisposableTriad:
         self.wallet = ""
         self.mount_lock = None
 
+    def roots(self) -> Path:
+        # macOS home paths leave too little room for sockets; Linux /tmp may
+        # be RAM-backed, and failed trials keep their roots.
+        default = (
+            f"/tmp/bloom-harbor-{os.getuid()}"
+            if sys.platform == "darwin"
+            else str(Path.home() / ".cache/bloom-harbor")
+        )
+        return Path(self.env.get("BLOOM_EVAL_ROOTS_DIR", default)).resolve()
+
     def preflight(self) -> None:
+        # sun_path holds 104 bytes on macOS and 108 on Linux, with its NUL;
+        # PIDs have at most 5 and 7 digits.
+        darwin = sys.platform == "darwin"
+        longest = len(str(self.roots()) + SOCKET_SUFFIX) + (5 if darwin else 7)
+        limit = 103 if darwin else 107
+        if longest > limit:
+            raise EvalError(
+                f"BLOOM_EVAL_ROOTS_DIR {self.roots()} is too long: trial sockets "
+                f"would need {longest} of {limit} bytes; choose a shorter one"
+            )
         for role in ("MACHINE", "BROKER", "SIGNER", "DEBUG_DRIVER"):
             name = f"BLOOM_INTEGRATION_{role}_BIN"
             binary = Path(self.env.get(name, ""))
@@ -188,11 +213,7 @@ class DisposableTriad:
 
     def start(self, *, solana: bool = False, ethereum_fork: bool = False) -> None:
         self.preflight()
-        roots = Path(
-            self.env.get(
-                "BLOOM_EVAL_ROOTS_DIR", str(Path.home() / ".cache/bloom-harbor")
-            )
-        )
+        roots = self.roots()
         roots.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.root = Path(tempfile.mkdtemp(prefix="h-", dir=roots))
         self.root.chmod(0o700)
@@ -448,11 +469,16 @@ class DisposableTriad:
                 )
             # Ordinary recursive removal, never forced; an unexpected mount or
             # permissions problem is a cleanup failure and preserves evidence.
+            # BSD rm spells GNU's --one-file-system as -x.
+            same_device = "-x" if sys.platform == "darwin" else "--one-file-system"
             result = subprocess.run(
-                ["rm", "-r", "--one-file-system", "--", str(self.root)],
+                ["rm", "-r", same_device, "--", str(self.root)],
                 capture_output=True,
                 timeout=45,
                 check=False,
             )
             if result.returncode:
-                raise EvalError(f"could not remove disposable root {self.root}")
+                reason = result.stderr.decode(errors="replace").strip()
+                raise EvalError(
+                    f"could not remove disposable root {self.root}: {reason}"
+                )

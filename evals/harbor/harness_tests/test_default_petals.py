@@ -203,6 +203,8 @@ class ClarificationTests(unittest.TestCase):
             "Which Polymarket market do you mean?",
             "Which of the markets should I use?",
             "Could you specify which market you want?",
+            "Which Polymarket question should I buy **Yes** on? Please send its URL or exact market slug.",
+            "Please send the market's URL.",
         ):
             with self.subTest(message=message):
                 self.assertTrue(asks_for_market(self.trajectory(message)))
