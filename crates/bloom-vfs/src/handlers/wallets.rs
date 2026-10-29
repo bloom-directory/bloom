@@ -5259,12 +5259,25 @@ mod tests {
             prepared: std::sync::Mutex::new(None),
             state: std::sync::Mutex::new(bloom_broker_api::CeremonyState::AwaitingUser),
         });
-        let mut handler = f.handler.with_broker(Some(MachineBrokerClient::new(service.clone())));
+        let mut handler = f
+            .handler
+            .with_broker(Some(MachineBrokerClient::new(service.clone())));
         handler.wallet_projections = Some(Arc::new(NavigationOnlyProjection(
             bip39_projection_value(f.wallet_addr, vec![]),
         )));
-        let error = handler.write(&vfs(format!("/{}/new", f.wallet_name)), br#"{"request_id":"fresh-policy"}"#).await.unwrap_err();
-        assert!(error.to_string().contains("live account authority unavailable"), "{error}");
+        let error = handler
+            .write(
+                &vfs(format!("/{}/new", f.wallet_name)),
+                br#"{"request_id":"fresh-policy"}"#,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("live account authority unavailable"),
+            "{error}"
+        );
         assert!(service.prepared.lock().unwrap().is_none());
     }
 
