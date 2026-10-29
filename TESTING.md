@@ -101,6 +101,13 @@ release gates still apply.
 | Machine authority boundary or production features | Both authority-boundary scripts | Release/package checks above |
 | macOS packaging or isolation | Disposable Tart VM acceptance | Required release conformance above |
 
+The prepared-signing SDK host fixture requires the canonical SDK checkout at
+Machine's `bloom-petal-contract` revision. In that checkout, run
+`cargo run --locked -p bloom-petal-cli -- build --config fixtures/petal-build.toml`
+with `wasm32-wasip2` and `wasm-tools` installed. Then run from Machine:
+`BLOOM_PREPARED_FIXTURES=<sdk-checkout>/fixtures/components cargo test --locked -p bloom-petals --test prepared_actions -- --ignored`.
+The CI prepared-signing fixture job performs these steps against the pinned revision.
+
 Use `cargo test -p <package> --locked` for package entries. A fixture-backed
 test is evidence only for the boundary it exercises; starting the launcher
 alone is not evidence that a custody or transaction workflow succeeds.

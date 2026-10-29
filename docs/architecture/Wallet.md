@@ -264,14 +264,37 @@ assets or policy require the existing explicit review/revocation flow; discovery
 never resets a consumed allowance. Native-wallet transfer scopes remain
 independent of Petal scopes.
 
-The Petal SDK's typed effects builder serializes raw token debits and binds the
-claim to exact ordered payloads. Machine supplies the authenticated spending
-account; Broker verifies supported protocol semantics. Polymarket BUY is the
-first migrated adapter. Its order-byte/owner/chain/debit reconstruction stays
-protocol-specific; SELL shares, builder fees, credentials and continuing
+The typed effects builder remains available to existing callers. Migrated
+Polymarket uses prepared actions: Machine constructs the accounting claim and
+supplies the authenticated spending account; Broker retains its protocol-specific
+signed-byte checks. SELL shares, builder fees, credentials and continuing
 permissions retain separate approval. Hyperliquid, Enso, NEAR Intents and
 Feedback have not been migrated or granted new automatic actions.
 
 No WIT, custody or signing wire shape changes are introduced by this discovery
 catalog. Claim assurance remains explicit; supported checks do not imply proof
 of arbitrary contract effects or successful venue settlement.
+
+
+## Prepared Petal signing
+
+The canonical SDK prepared-action API supplies one signing payload, a versioned
+review artifact and optional raw-unit spending declarations. Polymarket derives
+these from its persisted typed order; it does not rebuild an order from review
+JSON to calculate debits. The SDK computes hashes and serializes the request.
+Machine independently validates it and supplies trusted package, route and
+exact account identity. Declarations alone do not activate a reusable permission.
+
+Machine retains a frozen operation keyed by exact package, signing route,
+wallet/account KeyRef and Petal domain operation key. Pending approvals,
+validated signature results and ambiguous recovery are core state. A changed
+exact action conflicts rather than creating replacement authority. Status is
+read-only and uses a distinct capability; it may resolve a unique operation
+across routes of the same exact package and account without authorizing signing.
+
+Supported generic message review uses the existing single-payload exact path.
+Polymarket keeps its existing signed-byte BUY verifier and narrowly scoped
+one-use login timestamp refresh. Unknown review artifact formats are rejected;
+the API does not infer arbitrary signature economics or upgrade claim assurance.
+See [Prepared Petal actions](../specs/2026-10-29-prepared-petal-actions.md) for the
+migration requirements and acceptance criteria.

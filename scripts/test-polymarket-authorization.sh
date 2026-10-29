@@ -5,7 +5,11 @@ set -euo pipefail
 umask 077
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 run_root="${1:?usage: test-polymarket-authorization.sh FRESH_EMPTY_RUN_ROOT}"
-test_name=installed_account_one_auth_and_exact_continuation_use_real_authority
+case "${2:-login}" in
+  login) test_name=installed_account_one_auth_and_exact_continuation_use_real_authority ;;
+  prepared-buy) test_name=prepared_buy_uses_real_bounded_permission ;;
+  *) echo "Expected login or prepared-buy" >&2; exit 1 ;;
+esac
 [[ "$run_root" == /tmp/pm80-auth.* ]] || { echo 'Expected a fresh /tmp/pm80-auth.* root' >&2; exit 1; }
 [ -d "$run_root" ] && [ ! -L "$run_root" ] || exit 1
 [ -z "$(find "$run_root" -mindepth 1 -maxdepth 1 -print -quit)" ] || { echo 'Run root must be empty' >&2; exit 1; }
@@ -42,22 +46,38 @@ cleanup() {
   exit "$status"
 }
 trap cleanup EXIT INT TERM
-bash "$repo_root/scripts/triad-dev-launch.sh" --services-only --retain-temporary-files \
-  --developer-root "$run_root" --machine-socket "$run_root/m.sock" \
-  --log-dir "$run_root/logs" --ready-file "$run_root/ready" \
-  --ceremony-port "$(free_port)" --remote-upstream-port "$(free_port)" \
-  > "$run_root/launcher.log" 2>&1 &
-launcher_pid=$!
-for attempt in $(seq 1 900); do
-  [ ! -f "$run_root/ready" ] || break
-  kill -0 "$launcher_pid" 2>/dev/null || { echo "Launcher failed; inspect $run_root/launcher.log" >&2; exit 1; }
-  sleep 0.1
-done
-[ -f "$run_root/ready" ] || { echo 'Launcher readiness timed out' >&2; exit 1; }
-# Generated public connection settings; authenticated clients use their own
-# protected identity files without copying credential values into evidence.
-source "$run_root/logs/triad.env"
+ceremony_port="$(free_port)"
+remote_upstream_port="$(free_port)"
+start_services() {
+  bash "$repo_root/scripts/triad-dev-launch.sh" --services-only --retain-temporary-files \
+    --developer-root "$run_root" --machine-socket "$run_root/m.sock" \
+    --log-dir "$run_root/logs" --ready-file "$run_root/ready" \
+    --ceremony-port "$ceremony_port" --remote-upstream-port "$remote_upstream_port" \
+    >> "$run_root/launcher.log" 2>&1 &
+  launcher_pid=$!
+  for attempt in $(seq 1 900); do
+    [ ! -f "$run_root/ready" ] || break
+    kill -0 "$launcher_pid" 2>/dev/null || { echo "Launcher failed; inspect $run_root/launcher.log" >&2; exit 1; }
+    sleep 0.1
+  done
+  [ -f "$run_root/ready" ] || { echo 'Launcher readiness timed out' >&2; exit 1; }
+  source "$run_root/logs/triad.env"
+}
+run_test() {
+  cargo test --locked -p bloom-daemon --features triad-dev-harness --lib \
+    "polymarket_authorization::$test_name" -- --ignored --exact
+}
 cd "$repo_root"
-cargo test --locked -p bloom-daemon --features triad-dev-harness --lib \
-  "polymarket_authorization::$test_name" \
-  -- --ignored --exact
+start_services
+if [ "$test_name" = prepared_buy_uses_real_bounded_permission ]; then
+  export BLOOM_PM80_BUY_PHASE=first
+  run_test
+  kill "$launcher_pid"
+  wait "$launcher_pid" || true
+  launcher_pid=""
+  start_services
+  export BLOOM_PM80_BUY_PHASE=restart
+  run_test
+else
+  run_test
+fi

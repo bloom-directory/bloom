@@ -7,18 +7,31 @@ use std::sync::{Mutex, atomic::AtomicU64};
 
 struct VenueFixture {
     machine: Arc<DaemonPetalHost>,
+    trading_ready: bool,
     timestamp: AtomicU64,
     requests: Mutex<Vec<PayloadBatchSignRequest>>,
     signed: Mutex<Vec<(PayloadBatchSignRequest, Vec<Vec<u8>>)>>,
     auth_posts: AtomicU64,
+    prepared_requests: Mutex<Vec<(bloom_petal_contract::prepared::Request, PetalRouteContext)>>,
+    prepared_signed: Mutex<Vec<(bloom_petal_contract::prepared::Request, Vec<u8>)>>,
+    prepared_outcomes: Mutex<
+        Vec<(
+            String,
+            Result<
+                bloom_petal_contract::prepared::SigningOutcome,
+                bloom_petal_contract::prepared::SigningError,
+            >,
+        )>,
+    >,
     single_requests: Mutex<Vec<PayloadSignRequest>>,
     single_signed: Mutex<Vec<(PayloadSignRequest, Vec<u8>)>>,
 }
 
 impl VenueFixture {
-    fn new(machine: Arc<DaemonPetalHost>) -> Self {
+    fn new(machine: Arc<DaemonPetalHost>, trading_ready: bool) -> Self {
         Self {
             machine,
+            trading_ready,
             timestamp: AtomicU64::new(
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -28,6 +41,9 @@ impl VenueFixture {
             requests: Mutex::new(vec![]),
             signed: Mutex::new(vec![]),
             auth_posts: AtomicU64::new(0),
+            prepared_requests: Mutex::new(vec![]),
+            prepared_signed: Mutex::new(vec![]),
+            prepared_outcomes: Mutex::new(vec![]),
             single_requests: Mutex::new(vec![]),
             single_signed: Mutex::new(vec![]),
         }
@@ -66,45 +82,38 @@ impl PetalHost for VenueFixture {
         } else if request.url == "https://clob.polymarket.com/auth/api-key"
             && request.method == "POST"
         {
-            let signed = self.signed.lock().unwrap();
+            let signed = self.prepared_signed.lock().unwrap();
             assert_eq!(
                 signed.len(),
                 1,
-                "credentials require a real completed signature"
+                "credentials require one completed signature"
             );
-            let (authorization, signatures) = &signed[0];
-            assert_eq!(authorization.payloads.len(), 1);
-            assert_eq!(signatures.len(), 1);
-            let signature = alloy::primitives::Signature::from_raw(&signatures[0]).unwrap();
+            let (authorization, signature_bytes) = &signed[0];
+            let signature = alloy::primitives::Signature::from_raw(signature_bytes).unwrap();
             let owner = signature
                 .recover_address_from_prehash(&alloy::primitives::B256::from(
-                    authorization.payloads[0].claimed_hash,
+                    authorization.action.payload.hash,
                 ))
                 .unwrap();
-            let prepared: serde_json::Value = serde_json::from_slice(
-                authorization
-                    .action
-                    .as_ref()
-                    .expect("auth keeps its prepared record"),
-            )
-            .unwrap();
+            let prepared: serde_json::Value =
+                serde_json::from_slice(&authorization.action.review.bytes).unwrap();
             let prepared = &prepared[0];
             assert_eq!(
                 prepared["preimage"]["timestamp"].as_u64(),
                 Some(self.timestamp.load(Ordering::SeqCst))
             );
             assert_eq!(prepared["preimage"]["nonce"].as_u64(), Some(0));
-            assert!(
+            assert_eq!(
                 prepared["owner"]
                     .as_str()
                     .unwrap()
                     .parse::<alloy::primitives::Address>()
-                    .unwrap()
-                    == owner
+                    .unwrap(),
+                owner
             );
-            assert!(
-                prepared["signing_preimage_hex"].as_str().unwrap()
-                    == hex::encode(&authorization.payloads[0].preimage)
+            assert_eq!(
+                prepared["signing_preimage_hex"].as_str().unwrap(),
+                hex::encode(&authorization.action.payload.preimage)
             );
             let header = |name: &str| {
                 let values = request
@@ -120,9 +129,23 @@ impl PetalHost for VenueFixture {
             assert!(header("POLY_ADDRESS") == format!("{owner:#x}"));
             assert!(header("POLY_NONCE") == "0");
             assert!(header("POLY_TIMESTAMP") == self.timestamp.load(Ordering::SeqCst).to_string());
-            assert!(header("POLY_SIGNATURE") == format!("0x{}", hex::encode(&signatures[0])));
+            assert!(header("POLY_SIGNATURE") == format!("0x{}", hex::encode(signature_bytes)));
             self.auth_posts.fetch_add(1, Ordering::SeqCst);
             include_bytes!("../../tests/fixtures/polymarket-credentials.json").to_vec()
+        } else if request.url == "https://gamma-api.polymarket.com/markets/slug/test"
+            && request.method == "GET"
+        {
+            br#"{"slug":"test","question":"test","conditionId":"condition","clobTokenIds":["42","43"],"outcomes":["Yes","No"],"active":true,"closed":false,"enableOrderBook":true,"negRisk":false}"#.to_vec()
+        } else if request.url.starts_with("https://clob.polymarket.com/book?")
+            && request.method == "GET"
+        {
+            br#"{"market":"condition","asset_id":"42","tick_size":"0.01","min_order_size":"1","neg_risk":false,"asks":[{"price":"0.50","size":"100"}],"bids":[{"price":"0.49","size":"100"}]}"#.to_vec()
+        } else if request
+            .url
+            .starts_with("https://clob.polymarket.com/balance-allowance?")
+            && request.method == "GET"
+        {
+            br#"{"balance":"100000000","allowance":"100000000"}"#.to_vec()
         } else if request
             .url
             .starts_with("https://relayer-v2.polymarket.com/nonce?")
@@ -148,23 +171,66 @@ impl PetalHost for VenueFixture {
             "eth_getCode" => "0x6000".into(),
             "eth_call" => {
                 let data = params[0]["data"].as_str().unwrap();
-                let word = match &data[..10] {
-                    "0x5c60da1b" | "0x1f264778" => 3u64,
-                    "0x70a08231" => 100,
-                    "0xdd62ed3e" | "0xe985e9c5" => 0,
-                    _ => {
-                        return Err(HostError::Denied(
-                            "unexpected fixture chain selector".into(),
-                        ));
+                match &data[..10] {
+                    // The live readiness gate requires at least 2^160, not
+                    // merely a positive ERC20 allowance.
+                    "0xdd62ed3e" if self.trading_ready => format!("0x{}", "f".repeat(64)),
+                    "0xdd62ed3e" => format!("0x{:064x}", 0),
+                    selector => {
+                        let word = match selector {
+                            "0x5c60da1b" | "0x1f264778" => 3u64,
+                            "0x70a08231" | "0x00fdd58e" => 100_000_000,
+                            "0xe985e9c5" => u64::from(self.trading_ready),
+                            _ => {
+                                return Err(HostError::Denied(
+                                    "unexpected fixture chain selector".into(),
+                                ));
+                            }
+                        };
+                        format!("0x{word:064x}")
                     }
-                };
-                format!("0x{word:064x}")
+                }
             }
             _ => return Err(HostError::Denied("unexpected fixture chain method".into())),
         };
         Ok(ChainResponse {
             result_json: serde_json::to_string(&value).unwrap(),
         })
+    }
+    async fn prepared_sign(
+        &self,
+        request: bloom_petal_contract::prepared::Request,
+        context: PetalRouteContext,
+    ) -> Result<
+        bloom_petal_contract::prepared::SigningOutcome,
+        bloom_petal_contract::prepared::SigningError,
+    > {
+        self.prepared_requests
+            .lock()
+            .unwrap()
+            .push((request.clone(), context.clone()));
+        let result = self.machine.prepared_sign(request.clone(), context).await;
+        self.prepared_outcomes
+            .lock()
+            .unwrap()
+            .push((request.operation_key.clone(), result.clone()));
+        if let Ok(bloom_petal_contract::prepared::SigningOutcome::Signed { signature }) = &result {
+            self.prepared_signed
+                .lock()
+                .unwrap()
+                .push((request, signature.clone()));
+        }
+        result
+    }
+    async fn prepared_sign_status(
+        &self,
+        request: bloom_petal_contract::prepared::StatusRequest,
+        context: PetalRouteContext,
+    ) -> Result<
+        bloom_petal_contract::prepared::SigningOutcome,
+        bloom_petal_contract::prepared::SigningError,
+    > {
+        self.machine.prepared_sign_status(request, context).await
     }
     async fn sign_payload_batch_outcome(
         &self,
@@ -344,16 +410,51 @@ async fn account_one_fixture() -> AuthorizationFixture {
     }
 }
 
+async fn existing_authorization_fixture() -> AuthorizationFixture {
+    let root = setting("BLOOM_TRIAD_DEVELOPER_ROOT");
+    let home = HomeDir::at(setting("BLOOM_HOME"));
+    let client = MachineBrokerClient::connect_unix_from_developer_files(
+        &root,
+        setting("BLOOM_BROKER_SOCKET"),
+        setting("BLOOM_MACHINE_IDENTITY"),
+        setting("BLOOM_EDGE_MANIFEST"),
+    )
+    .unwrap();
+    let catalog: bloom_broker_api::ProvenanceCatalog =
+        serde_json::from_slice(&std::fs::read(setting("BLOOM_PROVENANCE_CATALOG")).unwrap())
+            .unwrap();
+    let permit = Arc::new(HomeWritePermit::acquire(&home).unwrap());
+    let daemon = Daemon::from_home_with_permit_and_broker(
+        home.clone(),
+        permit,
+        client.clone(),
+        catalog.clone(),
+    )
+    .unwrap();
+    AuthorizationFixture {
+        home,
+        client,
+        catalog,
+        daemon,
+        wallet: Token::new("pm80-authorization").unwrap(),
+    }
+}
+
 async fn approve_package(
     daemon: &Daemon,
     client: &MachineBrokerClient,
     wallet: &Token,
     hash: &str,
     counter: u64,
+    standing: bool,
 ) {
     let baseline = client.policy(wallet.clone()).await.unwrap();
     let mut policy: bloom_broker_api::CanonicalWalletPolicy =
         serde_json::from_slice(&baseline.canonical_policy.decode()).unwrap();
+    if standing {
+        policy.maximum_approval_lifetime_ms =
+            bloom_broker_api::STANDING_APPROVAL_POLICY_LIFETIME_MS;
+    }
     policy
         .allowed_petal_packages
         .push(Digest32::new(hash.to_owned()).unwrap());
@@ -463,20 +564,20 @@ async fn installed_account_one_auth_and_exact_continuation_use_real_authority() 
         .petals
         .install_staged_petal_package(staged, None, || Ok(()))
         .unwrap();
-    approve_package(&daemon, &client, &wallet, &hash, 3).await;
+    approve_package(&daemon, &client, &wallet, &hash, 3, false).await;
 
     let late = Arc::new(LateVfsHost::new());
     late.set(Arc::new(daemon.vfs.clone()));
     let state = home.cache_dir().join("pm80-signing-requests");
     let machine = Arc::new(
         DaemonPetalHost::new(late, daemon.audit.clone())
-            .with_broker(Some(client.clone()))
+            .with_broker(daemon.broker_client())
             .with_wallets(daemon.wallets.clone())
             .with_petal_runner(daemon.petals.clone())
             .with_provenance_catalog(Some(catalog))
             .with_petal_signing_state_root(state.clone()),
     );
-    let host = Arc::new(VenueFixture::new(machine.clone()));
+    let host = Arc::new(VenueFixture::new(machine.clone(), false));
     let vfs = Vfs::builder()
         .mount(
             "petals",
@@ -486,50 +587,69 @@ async fn installed_account_one_auth_and_exact_continuation_use_real_authority() 
     let begin = VfsPath::parse("petals/polymarket/onboard/pm80-authorization/1/begin").unwrap();
     let begin_error = vfs.write(&begin, b"begin").await.unwrap_err();
     assert!(
-        !host.requests.lock().unwrap().is_empty(),
-        "begin failed before calling the signing host: {begin_error}"
+        !host.prepared_requests.lock().unwrap().is_empty(),
+        "begin failed before prepared signing: {begin_error}"
     );
     assert_eq!(host.auth_posts.load(Ordering::SeqCst), 0);
-    let auth = pending(&state, "polymarket.clob_auth.v1");
-    let first = host.requests.lock().unwrap()[0].clone();
-    assert_eq!(first.context.as_ref().unwrap().route_id, auth_route);
-    assert_eq!(
-        first
-            .context
-            .as_ref()
-            .unwrap()
-            .trusted_account()
-            .unwrap()
-            .number,
-        1
+    let first_outcome = host.prepared_outcomes.lock().unwrap()[0].1.clone();
+    assert!(
+        matches!(
+            first_outcome,
+            Ok(bloom_petal_contract::prepared::SigningOutcome::ApprovalPending { .. })
+        ),
+        "login should request review, outcome: {first_outcome:?}; route error: {begin_error}"
     );
+    let auth = pending(&state, "polymarket.clob_auth.v1");
+    let (first, first_context) = host.prepared_requests.lock().unwrap()[0].clone();
+    assert_eq!(first_context.route_id, auth_route);
+    assert_eq!(first_context.trusted_account().unwrap().number, 1);
     complete(auth["ceremony_url"].as_str().unwrap(), 4, None);
     host.timestamp.fetch_add(2, Ordering::SeqCst);
     vfs.write(&begin, b"begin").await.unwrap();
     assert_eq!(host.auth_posts.load(Ordering::SeqCst), 1);
     {
-        let signed = host.signed.lock().unwrap();
+        let signed = host.prepared_signed.lock().unwrap();
         assert_eq!(signed.len(), 1);
         assert_ne!(
-            signed[0].0.payloads[0].preimage, first.payloads[0].preimage,
+            signed[0].0.action.payload.preimage, first.action.payload.preimage,
             "server timestamp refreshed under one-use auth profile"
         );
-        assert_eq!(signed[0].1[0].len(), 65);
+        assert_eq!(signed[0].1.len(), 65);
     }
     let continuation =
         VfsPath::parse("petals/polymarket/onboard/pm80-authorization/1/continue").unwrap();
-    assert!(vfs.write(&continuation, b"continue").await.is_err());
+    let continuation_error = vfs
+        .write(&continuation, b"continue")
+        .await
+        .expect_err("continuation must await exact review");
+    let continuation_outcome = host.prepared_outcomes.lock().unwrap().last().cloned();
+    let continuation_state = match &continuation_outcome {
+        Some((_, Ok(bloom_petal_contract::prepared::SigningOutcome::ApprovalPending { .. }))) => {
+            "approval_pending".to_owned()
+        }
+        Some((_, Ok(bloom_petal_contract::prepared::SigningOutcome::Signed { .. }))) => {
+            "signed".to_owned()
+        }
+        Some((_, Ok(bloom_petal_contract::prepared::SigningOutcome::RecoveryRequired { .. }))) => {
+            "recovery_required".to_owned()
+        }
+        Some((_, Err(error))) => format!("error: {error}"),
+        None => "not called".to_owned(),
+    };
+    assert_eq!(
+        continuation_state, "approval_pending",
+        "continuation should reach exact review; route error: {continuation_error}"
+    );
     let exact = pending(&state, "polymarket.onboard");
     assert_ne!(auth["approval_id"], exact["approval_id"]);
-    let exact_request = host.requests.lock().unwrap().last().unwrap().clone();
-    assert_eq!(
-        exact_request.context.as_ref().unwrap().route_id,
-        exact_route
-    );
-    assert_eq!(
-        exact_request.selector,
-        bloom_broker_api::PetalSignSelector::Exact
-    );
+    let (exact_request, exact_context) = host
+        .prepared_requests
+        .lock()
+        .unwrap()
+        .last()
+        .unwrap()
+        .clone();
+    assert_eq!(exact_context.route_id, exact_route);
     let approval_count = client.list_approvals(wallet.clone()).await.unwrap().len();
     for _ in 0..2 {
         vfs.write(&begin, b"begin").await.unwrap();
@@ -542,15 +662,22 @@ async fn installed_account_one_auth_and_exact_continuation_use_real_authority() 
         pending(&state, "polymarket.onboard")["approval_id"],
         exact["approval_id"]
     );
-
-    // These hinted substitutions test pending-request identity, not installer
-    // authorization or an upgrade from a real predecessor package.
-    for mutation in ["account", "class", "route", "batch"] {
-        let mut changed = exact_request.clone();
-        changed.approval_hint = Some(exact["request_id"].as_str().unwrap().to_owned());
-        let mut claim: bloom_broker_api::PetalUseClaim =
-            serde_json::from_slice(&changed.petal_use_claim_jcs).unwrap();
-        let context = changed.context.as_mut().unwrap();
+    let mut changed = exact_request.clone();
+    changed.action.payload.preimage.push(0);
+    changed.action.payload.hash = bloom_petal_contract::prepared::SigningPayload::hash_for(
+        changed.action.payload.suite,
+        &changed.action.payload.preimage,
+    );
+    let conflict = machine
+        .prepared_sign(changed, exact_context.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(
+        conflict.code,
+        bloom_petal_contract::prepared::ErrorCode::Conflict
+    );
+    for mutation in ["account", "route"] {
+        let mut context = exact_context.clone();
         match mutation {
             "account" => {
                 for (key, value) in &mut context.params {
@@ -559,94 +686,66 @@ async fn installed_account_one_auth_and_exact_continuation_use_real_authority() 
                     }
                 }
             }
-            "class" => {
-                changed.operation_class = "polymarket.clob_auth.v1".into();
-                claim.operation_class = Token::new(&changed.operation_class).unwrap();
-            }
-            "route" => {
-                context.route_id = "old-route".into();
-                claim.route = context.route_id.clone();
-            }
-            "batch" => {
-                changed.payloads[0].preimage[0] ^= 1;
-                changed.payloads[0].claimed_hash =
-                    alloy::primitives::keccak256(&changed.payloads[0].preimage).into();
-                claim.ordered_hashes = changed
-                    .payloads
-                    .iter()
-                    .map(|p| Digest32::from_bytes(p.claimed_hash))
-                    .collect();
-                let mut digest = sha2::Sha256::new();
-                digest.update(b"bloom.petal.payload-batch.v1\0");
-                digest.update((changed.payloads.len() as u64).to_be_bytes());
-                for payload in &changed.payloads {
-                    digest.update((payload.preimage.len() as u64).to_be_bytes());
-                    digest.update(&payload.preimage);
-                }
-                claim.payload_digest = Digest32::from_bytes(digest.finalize().into());
-            }
+            "route" => context.route_id = "unenrolled-route".into(),
             _ => unreachable!(),
         }
-        changed.petal_use_claim_jcs = serde_jcs::to_vec(&claim).unwrap();
         assert!(
-            machine.sign_payload_batch_outcome(changed).await.is_err(),
-            "{mutation} substitution must fail"
+            !matches!(
+                machine.prepared_sign(exact_request.clone(), context).await,
+                Ok(bloom_petal_contract::prepared::SigningOutcome::Signed { .. })
+            ),
+            "{mutation} substitution must not sign"
         );
     }
     complete(exact["ceremony_url"].as_str().unwrap(), 5, None);
-    // With the exact grant approved and unconsumed, bypass the hint guard and
-    // require the installer-specific denial. A generic error is insufficient.
-    for mutation in ["class", "route"] {
-        let mut changed = exact_request.clone();
-        changed.approval_hint = None;
-        let mut claim: bloom_broker_api::PetalUseClaim =
-            serde_json::from_slice(&changed.petal_use_claim_jcs).unwrap();
-        if mutation == "class" {
-            // A supported review format belonging to another route reaches
-            // provenance authorization; unknown signed-message formats fail earlier.
-            changed.operation_class = "polymarket.relayer_batch".into();
-            claim.operation_class = Token::new(&changed.operation_class).unwrap();
-        } else {
-            changed.context.as_mut().unwrap().route_id = "unenrolled-route".into();
-            claim.route = "unenrolled-route".into();
+    // The fixture refuses venue submission after the real signature.
+    let continuation_retry = vfs.write(&continuation, b"continue").await;
+    {
+        let signed = host.prepared_signed.lock().unwrap();
+        assert_eq!(
+            signed.len(),
+            2,
+            "approved continuation did not sign; route result: {continuation_retry:?}"
+        );
+        assert_eq!(signed[1].0.action.operation_class, "polymarket.onboard");
+        assert_eq!(
+            signed[1].0.action.payload.preimage,
+            exact_request.action.payload.preimage
+        );
+        for (request, signature) in signed.iter() {
+            let signature = alloy::primitives::Signature::from_raw(signature).unwrap();
+            assert_eq!(
+                signature
+                    .recover_address_from_prehash(&alloy::primitives::B256::from(
+                        request.action.payload.hash
+                    ))
+                    .unwrap(),
+                owner
+            );
         }
-        changed.petal_use_claim_jcs = serde_jcs::to_vec(&claim).unwrap();
-        let expected = format!(
-            "installer provenance does not authorize {}",
-            changed.operation_class
-        );
-        let error = machine
-            .sign_payload_batch_outcome(changed)
-            .await
-            .unwrap_err();
-        assert!(
-            error.to_string().contains(&expected),
-            "{mutation} must reach installer authorization: {error}"
-        );
     }
-    // The fixture refuses the subsequent venue submission, after the actual
-    // exact batch signature has traversed Broker and Signer successfully.
-    let _ = vfs.write(&continuation, b"continue").await;
-    let cancelled_root = home.cache_dir().join("pm80-cancelled-signing");
+    let cancelled_root = home.cache_dir().join("pm80-cancelled-prepared");
     let cancelled_host = DaemonPetalHost::new(machine.vfs.clone(), daemon.audit.clone())
-        .with_broker(Some(client.clone()))
+        .with_broker(daemon.broker_client())
         .with_wallets(daemon.wallets.clone())
         .with_petal_runner(daemon.petals.clone())
         .with_provenance_catalog(machine.provenance_catalog.clone())
         .with_petal_signing_state_root(cancelled_root.clone());
-    let cancelled_request = exact_request.clone();
-    let PayloadBatchSignOutcome::ApprovalPending(cancelled) = cancelled_host
-        .sign_payload_batch_outcome(cancelled_request.clone())
-        .await
-        .unwrap()
+    let mut cancelled_request = exact_request.clone();
+    cancelled_request.operation_key.push_str(":cancel-test");
+    let bloom_petal_contract::prepared::SigningOutcome::ApprovalPending { action_id, .. } =
+        cancelled_host
+            .prepared_sign(cancelled_request.clone(), exact_context.clone())
+            .await
+            .unwrap()
     else {
-        panic!("fresh exact request must require its own owner approval");
+        panic!("fresh exact request must require owner approval");
     };
     let cancelled_state: serde_json::Value = serde_json::from_slice(
         &std::fs::read(
             cancelled_root
                 .join(".state")
-                .join(format!("{}.json", cancelled.action_id)),
+                .join(format!("{action_id}.json")),
         )
         .unwrap(),
     )
@@ -665,75 +764,868 @@ async fn installed_account_one_auth_and_exact_continuation_use_real_authority() 
             .state,
         bloom_broker_api::CeremonyState::Cancelled
     );
-    assert!(
-        !matches!(
-            cancelled_host
-                .sign_payload_batch_outcome(cancelled_request)
-                .await,
-            Ok(PayloadBatchSignOutcome::Signatures(_))
-        ),
-        "cancelled owner approval cannot sign"
-    );
-    // Unknown packages can initiate separate policy consent before installer
-    // authorization. Do this last: a retained policy proposal intentionally
-    // takes precedence over unrelated signing attempts on the same wallet.
-    let mut unknown_package = exact_request.clone();
-    unknown_package.approval_hint = None;
-    unknown_package.context.as_mut().unwrap().package_hash = "99".repeat(32);
-    let mut claim: bloom_broker_api::PetalUseClaim =
-        serde_json::from_slice(&unknown_package.petal_use_claim_jcs).unwrap();
-    claim.package_hash = Digest32::new("99".repeat(32)).unwrap();
-    unknown_package.petal_use_claim_jcs = serde_jcs::to_vec(&claim).unwrap();
-    assert!(
-        !matches!(
-            machine.sign_payload_batch_outcome(unknown_package).await,
-            Ok(PayloadBatchSignOutcome::Signatures(_))
-        ),
-        "an unknown package cannot use the approved grant"
-    );
-    let signed = host.signed.lock().unwrap();
-    assert_eq!(signed.len(), 2);
-    assert_eq!(signed[1].0.operation_class, "polymarket.onboard");
-    assert_eq!(
-        signed[1].0.payloads[0].preimage,
-        exact_request.payloads[0].preimage
-    );
-    assert_eq!(signed[1].1[0].len(), 65);
-    for (request, signatures) in signed.iter() {
-        assert_eq!(
-            request.payloads.len(),
-            signatures.len(),
-            "every requested payload must have exactly one signature"
-        );
-        assert_eq!(
-            request.signature_algorithm,
-            "secp256k1-keccak256-recoverable"
-        );
-        for (payload, signature) in request.payloads.iter().zip(signatures) {
-            let signature = alloy::primitives::Signature::from_raw(signature).unwrap();
-            assert_eq!(
-                signature
-                    .recover_address_from_prehash(&alloy::primitives::B256::from(
-                        payload.claimed_hash
-                    ))
-                    .unwrap(),
-                owner,
-                "real signatures must recover the selected account-1 owner"
-            );
-        }
-    }
+    assert!(!matches!(
+        cancelled_host
+            .prepared_sign(cancelled_request, exact_context.clone())
+            .await,
+        Ok(bloom_petal_contract::prepared::SigningOutcome::Signed { .. })
+    ));
+    // Unknown package can initiate a separate retained policy review; do this
+    // last so it cannot interfere with exact continuation or cancellation.
+    let mut wrong_context = exact_context.clone();
+    wrong_context.package_hash = "99".repeat(32);
+    assert!(!matches!(
+        machine
+            .prepared_sign(exact_request.clone(), wrong_context)
+            .await,
+        Ok(bloom_petal_contract::prepared::SigningOutcome::Signed { .. })
+    ));
     let result = serde_json::json!({"schema":"bloom.pm80.authorization-boundary.v1", "package_hash":hash,
         "auth_route":auth_route,"continuation_route":exact_route,"account":1,
         "owner_key_fingerprint":account_one.public_key_fingerprint,
         "verified_profiles_advertised":true,"auth_timestamp_refreshed":true,"auth_headers_validated":true,"auth_posts":1,"separate_exact_approval":true,
-        "signed_operations":2,"hint_substitutions":["account","class","route","batch"],
-        "installer_denials_without_hint":["class","route"],"unknown_package_cannot_sign":true,
-        "cancelled_approval_cannot_sign":true,
-        "reviewed_reusable_preference_uses_exact_approval":true,
+        "signed_operations":2,"changed_exact_payload_conflict":true,"cancelled_approval_cannot_sign":true,
         "limits":"disposable software owner; controlled venue/chain observations; no venue submission, funds or settlement"});
     std::fs::write(
         setting("BLOOM_PM80_AUTHORIZATION_RESULT"),
         serde_json::to_vec_pretty(&result).unwrap(),
     )
     .unwrap();
+}
+
+/// Compile the same single-member token budget used by persona onboarding.
+/// This fixture deliberately scopes it to the installed route and account.
+async fn activate_buy_permission(
+    daemon: &Daemon,
+    wallet: &Token,
+    key_ref: bloom_broker_api::KeyRef,
+    package_hash: &str,
+    route: &str,
+    provenance_digest: Digest32,
+    counter: u64,
+) -> bloom_machine_client::PersonaSessionStatus {
+    use bloom_broker_api::*;
+    use sha2::Digest as _;
+    let client = daemon.broker_client().unwrap();
+    let descriptor = client.wallet(wallet.clone()).await.unwrap();
+    let now = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+    let package = Digest32::new(package_hash.to_owned()).unwrap();
+    let class = Token::new("polymarket.order.poly1271").unwrap();
+    let asset = AssetId {
+        chain: Token::new("evm-137").unwrap(),
+        asset: "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb".into(),
+    };
+    let limits = ApprovalLimits {
+        max_operations: DecimalU64::new(20),
+        max_signatures: DecimalU64::new(20),
+        operation_rate_limits: vec![SlidingWindow {
+            duration_ms: DecimalU64::new(60_000),
+            maximum: DecimalU64::new(20),
+        }],
+        signature_rate_limits: vec![SlidingWindow {
+            duration_ms: DecimalU64::new(60_000),
+            maximum: DecimalU64::new(20),
+        }],
+        value_limits: vec![],
+    };
+    let mut terms = SealedApprovalTerms {
+        session_budget: None,
+        subject: ApprovalSubject::Petal {
+            package_hash: package.clone(),
+            route: route.into(),
+            agent_id: None,
+        },
+        wallet_id: wallet.clone(),
+        key_ref: key_ref.clone(),
+        allowed_crypto_suites: vec![CryptoSuite::Secp256k1Keccak256Recoverable],
+        selector: ApprovalSelector::Petal {
+            package_hash: package,
+            route: route.into(),
+            allowed_operation_classes: vec![class],
+            route_grants: vec![],
+            required_claim_assurance: ClaimAssuranceLevel::MachineAsserted,
+        },
+        limits: limits.clone(),
+        activation_mode: ActivationMode::DurableLocal {
+            provider_tier: Token::new("local-passkey").unwrap(),
+            maximum_rearm_until_ms: DecimalU64::new(u64::MAX),
+        },
+        wallet_revocation_epoch: descriptor.wallet_revocation_epoch.clone(),
+        policy_version: descriptor.policy_version.clone(),
+        policy_digest: descriptor.policy_digest.clone(),
+        provenance_digest,
+        request_nonce: RequestNonce::from_bytes([0x91; 16]),
+        issued_at_ms: DecimalU64::new(now),
+        not_before_ms: DecimalU64::new(now),
+        expires_at_ms: DecimalU64::new(u64::MAX),
+        renewal_of: None,
+    };
+    let scope = session_member_scope_digest(&terms).unwrap();
+    let mut pool_limits = limits.clone();
+    pool_limits.value_limits = vec![ValueLimit {
+        asset: asset.clone(),
+        lifetime: DecimalU256::parse("10000000").unwrap(),
+        rolling_windows: vec![ValueWindow {
+            maximum: DecimalU256::parse("10000000").unwrap(),
+            duration_ms: DecimalU64::new(86_400_000),
+        }],
+    }];
+    terms.session_budget = Some(SessionBudget {
+        token_policy: Some(SessionTokenPolicy {
+            schema_version: 3,
+            budget_nonce: RequestNonce::from_bytes([0x92; 16]),
+            member_scope_digests: vec![scope.clone()],
+            member_templates: vec![terms.clone()],
+            member_backstop_allocations: vec![SessionMemberAllocation {
+                scope_digest: scope,
+                limits,
+            }],
+            assets: vec![approved_session_asset(&asset).unwrap()],
+        }),
+        wallet_id: wallet.clone(),
+        policy_version: descriptor.policy_version,
+        policy_digest: descriptor.policy_digest,
+        wallet_revocation_epoch: descriptor.wallet_revocation_epoch,
+        member_keys: vec![key_ref],
+        limits: pool_limits,
+        per_action_value_limits: vec![SessionValueCeiling {
+            asset,
+            maximum: DecimalU256::parse("3000000").unwrap(),
+        }],
+        not_before_ms: DecimalU64::new(now),
+        expires_at_ms: DecimalU64::new(u64::MAX),
+    });
+    terms.validate().unwrap();
+    let id = terms.approval_id().unwrap();
+    let op: [u8; 32] = sha2::Sha256::digest(
+        [
+            b"bloom.persona.prepare.v1\0".as_slice(),
+            id.as_str().as_bytes(),
+        ]
+        .concat(),
+    )
+    .into();
+    let facts = serde_json::json!({ "schema":"bloom.machine.persona-session-facts.v1", "persona":"trader", "account":1, "terms":&terms });
+    let proposal = bloom_machine_client::PersonaSessionProposal {
+        schema_version: 1,
+        persona: "trader".into(),
+        account: 1,
+        prepare_operation_id: OperationId::from_bytes(op),
+        terms,
+        canonical_plan_facts_digest: Digest32::from_bytes(
+            sha2::Sha256::digest(serde_jcs::to_vec(&facts).unwrap()).into(),
+        ),
+    };
+    client
+        .stage_persona_sessions(std::slice::from_ref(&proposal))
+        .await
+        .unwrap();
+    let pending = client
+        .prepare_persona_session(proposal.clone())
+        .await
+        .unwrap();
+    complete(
+        pending
+            .authority
+            .ceremony_url
+            .as_deref()
+            .expect("activation ceremony"),
+        counter,
+        None,
+    );
+    let active = client.prepare_persona_session(proposal).await.unwrap();
+    assert_eq!(active.authority.state, ApprovalLifecycleState::Active);
+    active
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires disposable real services; run scripts/test-polymarket-authorization.sh with prepared-buy"]
+async fn prepared_buy_uses_real_bounded_permission() {
+    let phase = std::env::var("BLOOM_PM80_BUY_PHASE").unwrap_or_else(|_| "first".into());
+    assert!(phase == "first" || phase == "restart");
+    let AuthorizationFixture {
+        home,
+        client,
+        catalog,
+        daemon,
+        wallet,
+    } = if phase == "first" {
+        account_one_fixture().await
+    } else {
+        existing_authorization_fixture().await
+    };
+    let account = client
+        .wallet_accounts(wallet.clone())
+        .await
+        .unwrap()
+        .accounts
+        .into_iter()
+        .find(|a| a.path == "m/44'/60'/0'/0/1")
+        .unwrap();
+    daemon
+        .wallet_projections
+        .get_wallet_authority(&wallet)
+        .await
+        .unwrap();
+    let owner: Address = String::from_utf8(
+        daemon
+            .vfs
+            .read(&VfsPath::parse("wallets/pm80-authorization/1/address.evm").unwrap())
+            .await
+            .unwrap(),
+    )
+    .unwrap()
+    .trim()
+    .parse()
+    .unwrap();
+    let package =
+        bloom_petals::package::build_petal_package_dir(setting("BLOOM_PM80_POLYMARKET_ROOT"))
+            .unwrap();
+    let hash = package.hash.clone();
+    let route = package
+        .route_index
+        .routes
+        .iter()
+        .find(|r| r.pattern == "trade/[wallet]/[index]/drafts/[id]/post")
+        .unwrap()
+        .route_id
+        .clone();
+    let provenance = catalog
+        .record(&bloom_broker_api::ProvenanceSubject::Petal {
+            package_hash: Digest32::new(hash.clone()).unwrap(),
+            route: route.clone(),
+        })
+        .unwrap()
+        .digest()
+        .unwrap();
+    let grant_id = if phase == "first" {
+        let staged = daemon.petals.store().stage_petal_package(package).unwrap();
+        daemon
+            .petals
+            .install_staged_petal_package(staged, None, || Ok(()))
+            .unwrap();
+        approve_package(&daemon, &client, &wallet, &hash, 3, true).await;
+        let grant = activate_buy_permission(
+            &daemon,
+            &wallet,
+            account.key_ref,
+            &hash,
+            &route,
+            provenance,
+            4,
+        )
+        .await;
+        let grant_id = grant.approval_id.clone();
+        let store = bloom_petals::PrivateStore::open_account(
+            daemon.petals.store().private_account_data_root(),
+            wallet.as_str(),
+            1,
+        )
+        .unwrap();
+        store
+            .put(
+                &hash,
+                "state/settings/pm80-authorization/venue.toml",
+                b"enabled = true\n",
+                false,
+            )
+            .unwrap();
+        store
+            .put(
+                &hash,
+                "secrets/creds/pm80-authorization/clob.json",
+                include_bytes!("../../tests/fixtures/polymarket-credentials.json"),
+                true,
+            )
+            .unwrap();
+        let status = serde_json::json!({"wallet":wallet.as_str(), "owner":format!("{owner:#x}"), "stage":"complete", "tradeable":true, "creds_present":true, "deposit_wallet":{"address":"0x1111111111111111111111111111111111111111","source":"live_factory_resolved","fundable":true}});
+        store
+            .put(
+                &hash,
+                "state/onboard/pm80-authorization/status.json",
+                &serde_json::to_vec(&status).unwrap(),
+                false,
+            )
+            .unwrap();
+        grant_id
+    } else {
+        let statuses = daemon.persona_sessions(wallet.as_str()).await.unwrap();
+        assert_eq!(
+            statuses.len(),
+            1,
+            "restart retains exactly the existing grant"
+        );
+        statuses[0].approval_id.clone()
+    };
+    let late = Arc::new(LateVfsHost::new());
+    late.set(Arc::new(daemon.vfs.clone()));
+    let state = home.cache_dir().join("pm80-prepared-buy-signing");
+    let machine = Arc::new(
+        DaemonPetalHost::new(late, daemon.audit.clone())
+            .with_broker(daemon.broker_client())
+            .with_wallets(daemon.wallets.clone())
+            .with_petal_runner(daemon.petals.clone())
+            .with_provenance_catalog(Some(catalog))
+            .with_petal_signing_state_root(state),
+    );
+    let host = Arc::new(VenueFixture::new(machine, true));
+    let vfs = Vfs::builder()
+        .mount(
+            "petals",
+            Arc::new(PetalRouter::new(daemon.petals.clone(), host.clone())),
+        )
+        .build();
+    if phase == "first" {
+        let readiness = read_json(
+            &vfs,
+            "petals/polymarket/onboard/pm80-authorization/1/status.json",
+        )
+        .await;
+        assert_eq!(
+            readiness["stage"], "complete",
+            "controlled observations must satisfy the normal onboarding gate"
+        );
+        assert_eq!(readiness["tradeable"], true);
+        assert_eq!(readiness["probes"]["approvals_in_place"], true);
+        assert_eq!(readiness["probes"]["clob_collateral_synced"], true);
+        let approvals = client.list_approvals(wallet.clone()).await.unwrap().len();
+        for id in ["0001", "0002"] {
+            let new = VfsPath::parse("petals/polymarket/trade/pm80-authorization/1/new").unwrap();
+            vfs.write(
+            &new,
+            br#"{"slug":"test","outcome":"YES","amount":"1","side":"buy","limit_price":"0.50"}"#,
+        )
+        .await
+        .unwrap();
+            let base = format!("petals/polymarket/trade/pm80-authorization/1/drafts/{id}");
+            vfs.write(
+                &VfsPath::parse(&format!("{base}/revalidate")).unwrap(),
+                br#"{"revalidate":true}"#,
+            )
+            .await
+            .unwrap();
+            let post = VfsPath::parse(&format!("{base}/post")).unwrap();
+            let _ = vfs
+                .write(&post, br#"{"post":true,"acknowledge_warnings":true}"#)
+                .await;
+            let _ = vfs
+                .write(&post, br#"{"post":true,"acknowledge_warnings":true}"#)
+                .await;
+        }
+        let signatures = {
+            let signed = host.prepared_signed.lock().unwrap();
+            assert_eq!(
+                signed.len(),
+                2,
+                "two distinct orders signed once each before blocked venue submission"
+            );
+            for (request, sig) in signed.iter() {
+                assert_eq!(request.action.operation_class, "polymarket.order.poly1271");
+                let recovered = alloy::primitives::Signature::from_raw(sig)
+                    .unwrap()
+                    .recover_address_from_prehash(&alloy::primitives::B256::from(
+                        request.action.payload.hash,
+                    ))
+                    .unwrap();
+                assert_eq!(recovered, owner);
+            }
+            assert_ne!(signed[0].0.operation_key, signed[1].0.operation_key);
+            signed
+                .iter()
+                .map(|(_, signature)| signature.clone())
+                .collect::<Vec<_>>()
+        };
+        let requests = host.prepared_requests.lock().unwrap().clone();
+        let mut unique = Vec::new();
+        for (request, context) in requests {
+            if !unique.iter().any(
+                |(existing, _): &(bloom_petal_contract::prepared::Request, PetalRouteContext)| {
+                    existing.operation_key == request.operation_key
+                },
+            ) {
+                unique.push((request, context));
+            }
+        }
+        assert_eq!(unique.len(), 2);
+        for ((request, context), signature) in
+            unique.iter().cloned().zip(signatures.iter().cloned())
+        {
+            let result = host.machine.prepared_sign(request, context).await.unwrap();
+            assert_eq!(
+                result,
+                bloom_petal_contract::prepared::SigningOutcome::Signed { signature }
+            );
+        }
+        // Simulate a crash after Broker persisted the signature but before
+        // Machine persisted its outer result. Preserve the frozen action and
+        // all lower-level records and retry the identical operation.
+        let (crash_request, crash_context) = &unique[0];
+        let prepared_root = home
+            .cache_dir()
+            .join("pm80-prepared-buy-signing")
+            .join(".prepared");
+        let mut matching = Vec::new();
+        for entry in std::fs::read_dir(prepared_root).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let record: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            if record["operation_key"] == crash_request.operation_key {
+                matching.push((path, record));
+            }
+        }
+        assert_eq!(matching.len(), 1, "one frozen prepared operation");
+        let (path, mut record) = matching.pop().unwrap();
+        assert_eq!(record["outcome"]["state"], "signed");
+        record["outcome"] = serde_json::Value::Null;
+        std::fs::write(path, serde_json::to_vec(&record).unwrap()).unwrap();
+        let recovered = host
+            .machine
+            .prepared_sign(crash_request.clone(), crash_context.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            recovered,
+            bloom_petal_contract::prepared::SigningOutcome::Signed {
+                signature: signatures[0].clone()
+            },
+            "crash recovery must return the original signature"
+        );
+        assert_eq!(
+            client.list_approvals(wallet.clone()).await.unwrap().len(),
+            approvals,
+            "covered orders must not create ceremonies"
+        );
+    }
+    let statuses = daemon.persona_sessions(wallet.as_str()).await.unwrap();
+    let status = statuses.iter().find(|s| s.approval_id == grant_id).unwrap();
+    let usage = status
+        .usage
+        .as_ref()
+        .unwrap()
+        .session_budget_state
+        .as_ref()
+        .unwrap();
+    assert_eq!(usage.operations.get(), 2);
+    assert_eq!(usage.signatures.get(), 2);
+    assert_eq!(usage.asset_usage.len(), 1);
+    assert_eq!(usage.asset_usage[0].amount.as_str(), "2000000");
+    if phase == "first" {
+        use bloom_petal_contract::prepared::{SigningOutcome, Spend};
+        let (original, context) = host.prepared_requests.lock().unwrap()[0].clone();
+        for kind in [
+            "sell_declaration",
+            "wrong_asset",
+            "amount_mismatch",
+            "witness_mismatch",
+            "wrong_account",
+            "wrong_route",
+            "credential_class",
+            "onboarding_class",
+        ] {
+            let mut request = original.clone();
+            request.operation_key = format!("acceptance-negative-{kind}");
+            let mut trusted = context.clone();
+            match kind {
+                "sell_declaration" => {
+                    request.action.spend = Spend::erc1155(
+                        "evm-137",
+                        "0x4d97dcd97ec945f40cf65f87097ace5ea0476045",
+                        "42",
+                        "1000000",
+                    )
+                    .unwrap()
+                }
+                "wrong_asset" => {
+                    request.action.spend = Spend::erc20(
+                        "evm-137",
+                        "0x1111111111111111111111111111111111111111",
+                        "1000000",
+                    )
+                    .unwrap()
+                }
+                "amount_mismatch" => {
+                    request.action.spend =
+                        Spend::erc20("evm-137", "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb", "1")
+                            .unwrap()
+                }
+                "witness_mismatch" => request.action.review.bytes = b"[]".to_vec(),
+                "wrong_account" => {
+                    for (key, value) in &mut trusted.params {
+                        if key == "bloom.account" {
+                            *value = "0".into();
+                        }
+                    }
+                }
+                "wrong_route" => trusted.route_id = "unenrolled-route".into(),
+                "credential_class" => {
+                    request.action.operation_class = "polymarket.clob_auth.v1".into()
+                }
+                "onboarding_class" => request.action.operation_class = "polymarket.onboard".into(),
+                _ => unreachable!(),
+            }
+            let negative_host =
+                DaemonPetalHost::new(host.machine.vfs.clone(), daemon.audit.clone())
+                    .with_broker(daemon.broker_client())
+                    .with_wallets(daemon.wallets.clone())
+                    .with_petal_runner(daemon.petals.clone())
+                    .with_provenance_catalog(host.machine.provenance_catalog.clone())
+                    .with_petal_signing_state_root(
+                        home.cache_dir().join(format!("pm80-negative-{kind}")),
+                    );
+            let outcome = negative_host.prepared_sign(request, trusted).await;
+            assert!(
+                !matches!(&outcome, Ok(SigningOutcome::Signed { .. })),
+                "negative case {kind} cannot sign using BUY permission"
+            );
+            if matches!(kind, "amount_mismatch" | "witness_mismatch") {
+                assert!(
+                    outcome.is_err(),
+                    "{kind} must be refused, not offered as a valid operation"
+                );
+            }
+        }
+        let statuses = daemon.persona_sessions(wallet.as_str()).await.unwrap();
+        let after_negatives = statuses
+            .iter()
+            .find(|s| s.approval_id == grant_id)
+            .unwrap()
+            .usage
+            .as_ref()
+            .unwrap()
+            .session_budget_state
+            .as_ref()
+            .unwrap();
+        assert_eq!(after_negatives.operations.get(), 2);
+        assert_eq!(after_negatives.asset_usage[0].amount.as_str(), "2000000");
+        std::fs::write(setting("BLOOM_PM80_AUTHORIZATION_RESULT").with_extension("first.json"), serde_json::to_vec_pretty(&serde_json::json!({"schema":"bloom.prepared-buy.acceptance.v1", "phase":"before_restart", "package_hash":hash, "approval_id":grant_id, "account":1, "recovered_owner":format!("{owner:#x}"), "covered_operations":2, "usage_raw_pusd":"2000000", "stable_retries":true, "crash_recovered_same_signature_and_no_charge":true, "negative_cases_no_sign":true})).unwrap()).unwrap();
+        return;
+    }
+
+    let rearmed = daemon
+        .broker_client()
+        .unwrap()
+        .rearm_persona_session(
+            &wallet,
+            Some(&grant_id),
+            OperationId::from_bytes([0x93; 32]),
+        )
+        .await
+        .unwrap();
+    complete(
+        rearmed
+            .authority
+            .ceremony_url
+            .as_deref()
+            .expect("rearm ceremony"),
+        5,
+        None,
+    );
+    let before = daemon.persona_sessions(wallet.as_str()).await.unwrap();
+    let before = before
+        .iter()
+        .find(|s| s.approval_id == grant_id)
+        .unwrap()
+        .usage
+        .as_ref()
+        .unwrap()
+        .session_budget_state
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        before.operations.get(),
+        2,
+        "rearm must preserve prior usage"
+    );
+    let restarted = Arc::new(
+        DaemonPetalHost::new(host.machine.vfs.clone(), daemon.audit.clone())
+            .with_broker(daemon.broker_client())
+            .with_wallets(daemon.wallets.clone())
+            .with_petal_runner(daemon.petals.clone())
+            .with_provenance_catalog(host.machine.provenance_catalog.clone())
+            .with_petal_signing_state_root(home.cache_dir().join("pm80-prepared-buy-signing")),
+    );
+    let host2 = Arc::new(VenueFixture::new(restarted, true));
+    let vfs2 = Vfs::builder()
+        .mount(
+            "petals",
+            Arc::new(PetalRouter::new(daemon.petals.clone(), host2.clone())),
+        )
+        .build();
+    let new = VfsPath::parse("petals/polymarket/trade/pm80-authorization/1/new").unwrap();
+    vfs2.write(
+        &new,
+        br#"{"slug":"test","outcome":"YES","amount":"1","side":"buy","limit_price":"0.50"}"#,
+    )
+    .await
+    .unwrap();
+    let base = "petals/polymarket/trade/pm80-authorization/1/drafts/0003";
+    vfs2.write(
+        &VfsPath::parse(&format!("{base}/revalidate")).unwrap(),
+        br#"{"revalidate":true}"#,
+    )
+    .await
+    .unwrap();
+    let _ = vfs2
+        .write(
+            &VfsPath::parse(&format!("{base}/post")).unwrap(),
+            br#"{"post":true,"acknowledge_warnings":true}"#,
+        )
+        .await;
+    {
+        let signed = host2.prepared_signed.lock().unwrap();
+        assert_eq!(signed.len(), 1, "rearmed host must sign covered order");
+        let (request, signature) = &signed[0];
+        let recovered = alloy::primitives::Signature::from_raw(signature)
+            .unwrap()
+            .recover_address_from_prehash(&alloy::primitives::B256::from(
+                request.action.payload.hash,
+            ))
+            .unwrap();
+        assert_eq!(recovered, owner);
+    }
+    let after = daemon.persona_sessions(wallet.as_str()).await.unwrap();
+    let after = after
+        .iter()
+        .find(|s| s.approval_id == grant_id)
+        .unwrap()
+        .usage
+        .as_ref()
+        .unwrap()
+        .session_budget_state
+        .as_ref()
+        .unwrap();
+    assert_eq!(after.operations.get(), 3);
+    assert_eq!(after.asset_usage[0].amount.as_str(), "3000000");
+
+    // This is a real SELL produced by the built Polymarket component. CTF
+    // balance and approvals are controlled observations, not live funds.
+    vfs2.write(
+        &new,
+        br#"{"slug":"test","outcome":"YES","amount":"1","side":"sell","limit_price":"0.50"}"#,
+    )
+    .await
+    .unwrap();
+    let sell = "petals/polymarket/trade/pm80-authorization/1/drafts/0004";
+    vfs2.write(
+        &VfsPath::parse(&format!("{sell}/revalidate")).unwrap(),
+        br#"{"revalidate":true}"#,
+    )
+    .await
+    .unwrap();
+    let sell_post_error = vfs2
+        .write(
+            &VfsPath::parse(&format!("{sell}/post")).unwrap(),
+            br#"{"post":true,"acknowledge_warnings":true}"#,
+        )
+        .await
+        .expect_err("SELL must await review, not submit");
+    let sell_request = host2
+        .prepared_requests
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(request, _)| request.operation_key.contains("drafts/0004/"))
+        .map(|(request, _)| request.clone())
+        .unwrap_or_else(|| {
+            panic!("SELL must reach prepared signing; post error: {sell_post_error}")
+        });
+    match &sell_request.action.spend {
+        bloom_petal_contract::prepared::Spend::Bounded { debits } => {
+            assert_eq!(debits.len(), 1);
+            assert_eq!(debits[0].network, "evm-137");
+            assert_eq!(debits[0].amount, "1000000");
+            assert!(
+                matches!(&debits[0].asset, bloom_petal_contract::prepared::Asset::Erc1155 { token_id, .. } if token_id == "42")
+            );
+        }
+        _ => panic!("SELL must declare its share debit"),
+    }
+    let sell_outcome = host2
+        .prepared_outcomes
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(key, _)| *key == sell_request.operation_key)
+        .map(|(_, outcome)| outcome.clone())
+        .expect("SELL host outcome");
+    let sell_action_id = match sell_outcome {
+        Ok(bloom_petal_contract::prepared::SigningOutcome::ApprovalPending {
+            action_id, ..
+        }) => action_id,
+        Err(error) => panic!("SELL requires separate exact review: {error}"),
+        Ok(_) => panic!("SELL requires separate exact review"),
+    };
+    assert_eq!(
+        host2.prepared_signed.lock().unwrap().len(),
+        1,
+        "SELL must not sign using BUY permission"
+    );
+    let statuses = daemon.persona_sessions(wallet.as_str()).await.unwrap();
+    let after_sell = statuses
+        .iter()
+        .find(|s| s.approval_id == grant_id)
+        .unwrap()
+        .usage
+        .as_ref()
+        .unwrap()
+        .session_budget_state
+        .as_ref()
+        .unwrap();
+    assert_eq!(after_sell.operations.get(), 3);
+    assert_eq!(after_sell.asset_usage[0].amount.as_str(), "3000000");
+    // The Broker permits one live ceremony per wallet. Cancel this separate
+    // SELL review before exercising the over-limit BUY review below.
+    let sell_state: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(
+            home.cache_dir()
+                .join("pm80-prepared-buy-signing")
+                .join(".state")
+                .join(format!("{sell_action_id}.json")),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let sell_operation: OperationId =
+        serde_json::from_value(sell_state["approval_operation_id"].clone()).unwrap();
+    client
+        .cancel_ceremony(sell_operation.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        client.ceremony_status(sell_operation).await.unwrap().state,
+        bloom_broker_api::CeremonyState::Cancelled
+    );
+    // Broker applies a short cancellation backoff before another ceremony.
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+    vfs2.write(
+        &new,
+        br#"{"slug":"test","outcome":"YES","amount":"4","side":"buy","limit_price":"0.50"}"#,
+    )
+    .await
+    .unwrap();
+    let over = "petals/polymarket/trade/pm80-authorization/1/drafts/0005";
+    vfs2.write(
+        &VfsPath::parse(&format!("{over}/revalidate")).unwrap(),
+        br#"{"revalidate":true}"#,
+    )
+    .await
+    .unwrap();
+    assert!(
+        vfs2.write(
+            &VfsPath::parse(&format!("{over}/post")).unwrap(),
+            br#"{"post":true,"acknowledge_warnings":true}"#
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(
+        host2.prepared_signed.lock().unwrap().len(),
+        1,
+        "over-limit order must not sign"
+    );
+    let over_outcome = host2
+        .prepared_outcomes
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(key, _)| key.contains("drafts/0005/"))
+        .map(|(_, outcome)| outcome.clone())
+        .expect("over-limit BUY must reach signing");
+    let action_id = match over_outcome {
+        Ok(bloom_petal_contract::prepared::SigningOutcome::ApprovalPending {
+            action_id, ..
+        }) => action_id,
+        other => panic!("over-limit BUY requires separate exact review; got {other:?}"),
+    };
+    let (over_request, over_context) = host2
+        .prepared_requests
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(request, _)| request.operation_key.contains("drafts/0005/"))
+        .cloned()
+        .expect("over-limit prepared request");
+    let exact_state: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(
+            home.cache_dir()
+                .join("pm80-prepared-buy-signing")
+                .join(".state")
+                .join(format!("{action_id}.json")),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let cancel_operation: OperationId =
+        serde_json::from_value(exact_state["approval_operation_id"].clone()).unwrap();
+    client
+        .cancel_ceremony(cancel_operation.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        client
+            .ceremony_status(cancel_operation)
+            .await
+            .unwrap()
+            .state,
+        bloom_broker_api::CeremonyState::Cancelled
+    );
+    let status_request = bloom_petal_contract::prepared::StatusRequest {
+        version: bloom_petal_contract::prepared::VERSION,
+        wallet: over_request.wallet.clone(),
+        operation_key: over_request.operation_key.clone(),
+    };
+    let status_error = host2
+        .machine
+        .prepared_sign_status(status_request, over_context.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(
+        status_error.code,
+        bloom_petal_contract::prepared::ErrorCode::Cancelled,
+        "status must expose terminal cancellation"
+    );
+    let retry_error = host2
+        .machine
+        .prepared_sign(over_request, over_context)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        retry_error.code,
+        bloom_petal_contract::prepared::ErrorCode::Cancelled,
+        "retry cannot renew or replace cancelled approval"
+    );
+    assert_eq!(host2.prepared_signed.lock().unwrap().len(), 1);
+    let statuses = daemon.persona_sessions(wallet.as_str()).await.unwrap();
+    let after_cancel = statuses
+        .iter()
+        .find(|s| s.approval_id == grant_id)
+        .unwrap()
+        .usage
+        .as_ref()
+        .unwrap()
+        .session_budget_state
+        .as_ref()
+        .unwrap();
+    assert_eq!(after_cancel.operations.get(), 3);
+    assert_eq!(after_cancel.asset_usage[0].amount.as_str(), "3000000");
+    // Unknown package can create a separate policy proposal, so perform this
+    // last to avoid influencing subsequent signing attempts in the fixture.
+    let (mut wrong_package, mut context) = host2.prepared_requests.lock().unwrap()[0].clone();
+    wrong_package.operation_key = "acceptance-negative-wrong-package".into();
+    context.package_hash = "99".repeat(32);
+    assert!(!matches!(
+        host2.machine.prepared_sign(wrong_package, context).await,
+        Ok(bloom_petal_contract::prepared::SigningOutcome::Signed { .. })
+    ));
+    std::fs::write(setting("BLOOM_PM80_AUTHORIZATION_RESULT"), serde_json::to_vec_pretty(&serde_json::json!({"schema":"bloom.prepared-buy.acceptance.v1", "phase":"after_restart", "package_hash":hash, "approval_id":grant_id, "account":1, "recovered_owner":format!("{owner:#x}"), "covered_operations":3, "usage_raw_pusd":"3000000", "prior_usage_retained_after_restart_and_rearm":true, "sell_separate_review":true, "over_limit_separate_review":true, "cancelled_over_limit_retry_and_status_refused":true, "scope":"disposable owner; controlled venue and chain observations; no venue submission or funds"})).unwrap()).unwrap();
 }
