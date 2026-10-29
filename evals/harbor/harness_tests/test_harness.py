@@ -998,15 +998,13 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         self.definition._read_session_status = mock.Mock(
             return_value={"stopped": False}
         )
-        # open_orders: stale, stale, then settled. status.json: stale then stopped.
+        # open_orders: stale, stale, then settled. Core stop: unstopped at
+        # entry, stale after the write, then complete.
         self.definition._read_json = mock.Mock(
-            side_effect=[
-                [{"oid": 1}],
-                [{"oid": 1}],
-                [],
-                {"stopped": False},
-                {"stopped": True},
-            ]
+            side_effect=[[{"oid": 1}], [{"oid": 1}], []]
+        )
+        self.definition._core_session_stopped = mock.Mock(
+            side_effect=[False, False, True]
         )
         self.definition._nonzero_positions = mock.Mock(return_value=[])
         self.definition._require_no_orders_or_positions = mock.Mock()
@@ -1021,9 +1019,36 @@ class HyperliquidDefinitionTests(unittest.TestCase):
             call.args[0].name for call in self.definition._write_route.call_args_list
         ]
         self.assertEqual(routes, ["cancel_all", "stop"])
+        self.assertEqual(
+            self.definition._write_route.call_args_list[-1].args[0],
+            self.mount
+            / "wallets/eval-wallet/0/sessions/hyperliquid"
+            / session_key_slot("created")
+            / "stop",
+        )
         self.assertEqual(self.definition.cleanup_observations, {
             "open_orders": 0, "positions": 0, "session_stopped": True,
         })
+
+    def test_core_session_stop_record_is_the_stop_signal(self) -> None:
+        # A core stop leaves the Petal's status.json at `stopped: false`; only
+        # the core session.json `stop` record shows the stop completed.
+        self.definition.session_id = "created"
+        session_dir = (
+            self.mount / "wallets/eval-wallet/0/sessions/hyperliquid"
+            / session_key_slot("created")
+        )
+        self.assertFalse(self.definition._core_session_stopped())
+        session_dir.mkdir(parents=True)
+        for stop, expected in (
+            (None, False),
+            ({"at_ms": 1, "complete": False}, False),
+            ({"at_ms": 1, "complete": True}, True),
+        ):
+            (session_dir / "session.json").write_text(
+                json.dumps({"signing_authority": "active", "stop": stop})
+            )
+            self.assertEqual(self.definition._core_session_stopped(), expected)
 
     def test_final_cleanup_read_failure_does_not_report_stale_zero_counts(self) -> None:
         self.definition.cleanup_observations = {"open_orders": 0, "positions": 0}
@@ -1061,7 +1086,8 @@ class HyperliquidDefinitionTests(unittest.TestCase):
         self.definition._read_session_status = mock.Mock(
             return_value={"stopped": False}
         )
-        self.definition._read_json = mock.Mock(side_effect=[[], {"stopped": True}])
+        self.definition._read_json = mock.Mock(return_value=[])
+        self.definition._core_session_stopped = mock.Mock(side_effect=[False, True])
         self.definition._nonzero_positions = mock.Mock(
             side_effect=[[{"position": {"szi": "0.0001"}}], []]
         )
