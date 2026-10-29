@@ -4530,6 +4530,47 @@ impl WalletsHandler {
                         "replace requires a non-empty intent body",
                     ));
                 }
+                let json = serde_json::from_str::<serde_json::Value>(body).ok();
+                if json.as_ref().is_some_and(|value| {
+                    value.get("max_fee_per_gas").is_some()
+                        || value.get("max_priority_fee_per_gas").is_some()
+                }) {
+                    #[derive(serde::Deserialize)]
+                    #[serde(deny_unknown_fields)]
+                    struct FeeRepair {
+                        max_fee_per_gas: String,
+                        max_priority_fee_per_gas: String,
+                    }
+                    let request: FeeRepair = serde_json::from_str(body).map_err(|error| {
+                        HandlerError::invalid(format!("fee repair JSON: {error}"))
+                    })?;
+                    let fees = bloom_tx::Eip1559FeeOverrides::from_decimal_pair(
+                        Some(&request.max_fee_per_gas),
+                        Some(&request.max_priority_fee_per_gas),
+                        client.spec().legacy_tx,
+                    )
+                    .map_err(err_be)?
+                    .expect("complete fee pair");
+                    self.require_outbox_petal_eligibility_for_action(wallet, chain, id, true)
+                        .await?;
+                    return self
+                        .tx_engine
+                        .replace_fees(
+                            self.write_permit()?,
+                            wallet,
+                            chain,
+                            id,
+                            &client,
+                            fees,
+                            policy,
+                        )
+                        .await
+                        .map(|_| ())
+                        .map_err(|error| match error {
+                            TxEngineError::ApprovalRequired(_) => HandlerError::PermissionDenied,
+                            other => err_be(other),
+                        });
+                }
                 let intent: RawIntent = intent_parser::parse(body).map_err(err_be)?;
                 // Bump at >= 10% (mempool floor) and substitute the
                 // calldata derived from the new intent — same nonce,

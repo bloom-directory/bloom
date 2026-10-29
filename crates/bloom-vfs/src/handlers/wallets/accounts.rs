@@ -907,7 +907,7 @@ impl WalletsHandler {
                     let signing = evm_signing_state(&entry)
                         .ok_or_else(|| HandlerError::not_found(rest.join("/")))?;
                     let outbox = format!("wallets/{wallet}/{number}/chains/{chain}/outbox");
-                    let challenge = evm_approval_challenge(&entry, &signing, &outbox);
+                    let challenge = evm_approval_challenge(&entry, &signing, &outbox)?;
                     return self.live_approval_challenge(wallet, challenge).await;
                 }
                 if is_private_evm_outbox_artifact(fname) {
@@ -1945,14 +1945,59 @@ fn evm_approval_challenge(
     entry: &bloom_tx::outbox::OutboxEntry,
     signing: &serde_json::Value,
     outbox: &str,
-) -> serde_json::Value {
-    let staged = &entry.staged;
+) -> Result<serde_json::Value, HandlerError> {
+    use sha2::Digest as _;
+    let mut staged = entry.staged.clone();
+    let mut retry_body = serde_json::Value::String("confirm".into());
+    let mut control = "confirm";
+    let mut plan = "plan.md";
+    let replacement_action = format!("{}:{}:replace", staged.chain_id, staged.id);
+    if signing.get("action_id").and_then(|value| value.as_str()) == Some(&replacement_action)
+        && entry.dir.join("replacement_request.json").exists()
+    {
+        let replacement: bloom_proto::StagedTx =
+            read_json(entry.dir.join("replacement_intent.json"))?;
+        let mut expected = staged.clone();
+        expected.max_fee_per_gas = replacement.max_fee_per_gas.clone();
+        expected.max_priority_fee_per_gas = replacement.max_priority_fee_per_gas.clone();
+        let canonical = serde_jcs::to_vec(&replacement).map_err(err_be)?;
+        let digest = hex::encode(sha2::Sha256::digest(&canonical));
+        if serde_jcs::to_vec(&expected).map_err(err_be)? != canonical
+            || signing
+                .get("canonical_plan_facts_digest")
+                .and_then(|value| value.as_str())
+                != Some(&digest)
+        {
+            return Err(HandlerError::backend(
+                "fee replacement differs from the exact signing plan",
+            ));
+        }
+        let request: serde_json::Value = read_json(entry.dir.join("replacement_request.json"))?;
+        if request.as_object().is_none_or(|fields| fields.len() != 2)
+            || request
+                .get("max_fee_per_gas")
+                .and_then(|value| value.as_str())
+                != replacement.max_fee_per_gas.as_deref()
+            || request
+                .get("max_priority_fee_per_gas")
+                .and_then(|value| value.as_str())
+                != replacement.max_priority_fee_per_gas.as_deref()
+        {
+            return Err(HandlerError::backend(
+                "fee replacement retry body differs from its signing plan",
+            ));
+        }
+        staged = replacement;
+        retry_body = request;
+        control = "replace";
+        plan = "replacement_plan.md";
+    }
     let expiry_ms = signing.get("ceremony_expires_at_ms").and_then(|value| {
         value
             .as_u64()
             .or_else(|| value.as_str().and_then(|text| text.parse::<u64>().ok()))
     });
-    serde_json::json!({
+    Ok(serde_json::json!({
         "schema": "bloom.evm-approval-challenge/1",
         "action_id": signing.get("action_id"),
         "tx_id": staged.id,
@@ -1966,9 +2011,10 @@ fn evm_approval_challenge(
         "approval_id": signing.get("approval_id"),
         "ceremony_url": signing.get("ceremony_url"),
         "expiry_ms": expiry_ms,
-        "plan_path": format!("{outbox}/pending/{}/plan.md", staged.id),
-        "retry_path": format!("{outbox}/pending/{}/confirm", staged.id),
-    })
+        "plan_path": format!("{outbox}/pending/{}/{plan}", staged.id),
+        "retry_path": format!("{outbox}/pending/{}/{control}", staged.id),
+        "retry_body": retry_body,
+    }))
 }
 
 /// Applies Broker's live approval status to a projected challenge. While the
@@ -1985,7 +2031,7 @@ fn reconcile_approval_challenge(
         Some(status) => approval_next_step(status.state),
         None => (
             "unknown",
-            "Bloom could not read this approval's state. Writing confirm to retry_path is safe and reports it.",
+            "Bloom could not read this approval's state. Writing retry_body to retry_path is safe and reports it.",
         ),
     };
     let Some(object) = challenge.as_object_mut() else {
@@ -2020,11 +2066,11 @@ fn approval_next_step(
     match state {
         S::Prepared | S::AwaitingCeremony => (
             "awaiting_ceremony",
-            "Give ceremony_url to the owner. As soon as they approve, write confirm to retry_path. Retrying earlier is safe: it starts no new ceremony and returns permission denied again.",
+            "Give ceremony_url to the owner. As soon as they approve, write retry_body to retry_path. Retrying earlier is safe: it starts no new ceremony and returns permission denied again.",
         ),
         S::Active => (
             "active",
-            "The owner approved. Write confirm to retry_path now to sign and broadcast.",
+            "The owner approved. Write retry_body to retry_path now to sign and broadcast.",
         ),
         S::Exhausted => (
             "exhausted",
@@ -2032,11 +2078,11 @@ fn approval_next_step(
         ),
         S::Expired => (
             "expired",
-            "This approval expired unused. Ask the owner before writing confirm to retry_path again, which starts over or says why it cannot.",
+            "This approval expired unused. Ask the owner before writing retry_body to retry_path again, which starts over or says why it cannot.",
         ),
         S::Cancelled => (
             "cancelled",
-            "This approval was cancelled unused. Ask the owner before writing confirm to retry_path again, which starts over or says why it cannot.",
+            "This approval was cancelled unused. Ask the owner before writing retry_body to retry_path again, which starts over or says why it cannot.",
         ),
         S::Orphaned | S::Revoked | S::Failed => (
             "refused",
@@ -2079,6 +2125,93 @@ impl WalletsHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fee_repair_challenge_binds_the_retry_body_and_unchanged_call() {
+        use sha2::Digest as _;
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = bloom_tx::Outbox::new(directory.path().join("outbox")).unwrap();
+        let original: bloom_proto::StagedTx = serde_json::from_value(serde_json::json!({
+            "id": "fee-repair", "wallet": "main", "chain": "polygon", "chain_id": 137,
+            "from": "0x1111111111111111111111111111111111111111",
+            "to": "0x2222222222222222222222222222222222222222",
+            "value_wei": "0", "data_hex": "0x12345678", "nonce": 1,
+            "gas_limit": 84000, "max_fee_per_gas": "50000000000",
+            "max_priority_fee_per_gas": "2500000000", "policy_checks": [],
+            "created_ms": 1, "expires_ms": 10000, "status": "pending",
+            "action_kind": "contract_call"
+        }))
+        .unwrap();
+        outbox.write_pending(&original, "original plan").unwrap();
+        let entry = outbox.read("main", "polygon", "fee-repair").unwrap();
+        let mut replacement = original.clone();
+        replacement.max_fee_per_gas = Some("60000000000".into());
+        replacement.max_priority_fee_per_gas = Some("30000000000".into());
+        let request = serde_json::json!({
+            "max_fee_per_gas": "60000000000", "max_priority_fee_per_gas": "30000000000"
+        });
+        outbox
+            .write_artefact(
+                &entry.dir,
+                "replacement_intent.json",
+                &serde_json::to_vec(&replacement).unwrap(),
+            )
+            .unwrap();
+        outbox
+            .write_artefact(
+                &entry.dir,
+                "replacement_request.json",
+                &serde_json::to_vec(&request).unwrap(),
+            )
+            .unwrap();
+        let signing = serde_json::json!({
+            "action_id": "137:fee-repair:replace",
+            "canonical_plan_facts_digest": hex::encode(sha2::Sha256::digest(serde_jcs::to_vec(&replacement).unwrap())),
+        });
+        let root = "wallets/main/0/chains/polygon/outbox";
+        let challenge = evm_approval_challenge(&entry, &signing, root).unwrap();
+        assert_eq!(
+            challenge["retry_path"],
+            format!("{root}/pending/fee-repair/replace")
+        );
+        assert_eq!(challenge["retry_body"], request);
+        assert_eq!(
+            challenge["plan_path"],
+            format!("{root}/pending/fee-repair/replacement_plan.md")
+        );
+        assert_eq!(challenge["to"], original.to.as_ref().unwrap().as_str());
+
+        let mut altered = request.clone();
+        altered["max_priority_fee_per_gas"] = "25000000000".into();
+        outbox
+            .write_artefact(
+                &entry.dir,
+                "replacement_request.json",
+                &serde_json::to_vec(&altered).unwrap(),
+            )
+            .unwrap();
+        assert!(evm_approval_challenge(&entry, &signing, root).is_err());
+        outbox
+            .write_artefact(
+                &entry.dir,
+                "replacement_request.json",
+                &serde_json::to_vec(&request).unwrap(),
+            )
+            .unwrap();
+        replacement.value_wei = "1".into();
+        outbox
+            .write_artefact(
+                &entry.dir,
+                "replacement_intent.json",
+                &serde_json::to_vec(&replacement).unwrap(),
+            )
+            .unwrap();
+        let changed_signing = serde_json::json!({
+            "action_id": "137:fee-repair:replace",
+            "canonical_plan_facts_digest": hex::encode(sha2::Sha256::digest(serde_jcs::to_vec(&replacement).unwrap())),
+        });
+        assert!(evm_approval_challenge(&entry, &changed_signing, root).is_err());
+    }
 
     #[test]
     fn challenge_follows_brokers_live_ceremony_link() {

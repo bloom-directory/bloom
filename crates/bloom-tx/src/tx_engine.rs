@@ -1554,17 +1554,7 @@ impl TxEngine {
         } else if spec.legacy_tx {
             (gas_price, 0)
         } else {
-            let priority = match chain.max_priority_fee_per_gas().await {
-                Ok(priority) => priority.max(1),
-                Err(error) => {
-                    // A fraction of gasPrice can fall below a chain's minimum
-                    // tip (Polygon requires 25 gwei). Use its full quote when
-                    // the node cannot supply the dedicated priority quote.
-                    tracing::warn!(%error, chain = %spec.name, "tx.priority_fee_fallback");
-                    gas_price.max(1)
-                }
-            };
-            (gas_price.max(priority).saturating_mul(2), priority)
+            chain.eip1559_fees(gas_price).await
         };
 
         let mut req = TransactionRequest::default()
@@ -4183,9 +4173,73 @@ impl TxEngine {
         address_book: Option<&AddressBook>,
         policy: &Policy,
     ) -> Result<StagedTx, TxEngineError> {
+        self.replace_inner(
+            permit,
+            wallet,
+            chain_name,
+            original_id,
+            chain,
+            bump_pct,
+            substitute,
+            address_book,
+            policy,
+            None,
+        )
+        .await
+    }
+
+    /// Replace a rejected pending transaction's fees without changing its
+    /// nonce, destination, value, calldata, account, or Petal provenance.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn replace_fees(
+        &self,
+        permit: &HomeWritePermit,
+        wallet: &str,
+        chain_name: &str,
+        original_id: &str,
+        chain: &ChainClient,
+        fees: Eip1559FeeOverrides,
+        policy: &Policy,
+    ) -> Result<StagedTx, TxEngineError> {
+        self.replace_inner(
+            permit,
+            wallet,
+            chain_name,
+            original_id,
+            chain,
+            10,
+            None,
+            None,
+            policy,
+            Some(fees),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn replace_inner(
+        &self,
+        permit: &HomeWritePermit,
+        wallet: &str,
+        chain_name: &str,
+        original_id: &str,
+        chain: &ChainClient,
+        bump_pct: u32,
+        substitute: Option<RawIntent>,
+        address_book: Option<&AddressBook>,
+        policy: &Policy,
+        fees: Option<Eip1559FeeOverrides>,
+    ) -> Result<StagedTx, TxEngineError> {
         self.assert_write_permit(permit)?;
         let bump = bump_pct.max(10);
         let entry = self.read_replaceable_entry(wallet, chain_name, original_id)?;
+        if fees.is_some()
+            && (entry.state != OutboxState::Pending || entry.staged.gas_price.is_some())
+        {
+            return Err(TxEngineError::InvalidFeeOverride(
+                "fee repair requires a pending EIP-1559 transaction".into(),
+            ));
+        }
         let original = &entry.staged;
         self.assert_nonce_still_replaceable(
             chain,
@@ -4234,6 +4288,59 @@ impl TxEngine {
             ));
         }
         bump_fees_in_place(&mut bumped, bump);
+        if let Some(fees) = fees {
+            if fees.max_fee_per_gas
+                < bumped
+                    .max_fee_per_gas
+                    .as_deref()
+                    .unwrap_or("0")
+                    .parse::<u128>()
+                    .unwrap_or(u128::MAX)
+                || fees.max_priority_fee_per_gas
+                    < bumped
+                        .max_priority_fee_per_gas
+                        .as_deref()
+                        .unwrap_or("0")
+                        .parse::<u128>()
+                        .unwrap_or(u128::MAX)
+            {
+                return Err(TxEngineError::InvalidFeeOverride(
+                    "replacement max fee and priority fee must each increase by at least 10%"
+                        .into(),
+                ));
+            }
+            bumped.max_fee_per_gas = Some(fees.max_fee_per_gas.to_string());
+            bumped.max_priority_fee_per_gas = Some(fees.max_priority_fee_per_gas.to_string());
+            self.outbox.write_artefact(
+                &entry.dir,
+                "replacement_original.json",
+                &serde_json::to_vec_pretty(original).unwrap(),
+            )?;
+            self.outbox.write_artefact(
+                &entry.dir,
+                "replacement_intent.json",
+                &serde_json::to_vec_pretty(&bumped).unwrap(),
+            )?;
+            self.outbox.write_artefact(
+                &entry.dir,
+                "replacement_plan.md",
+                bloom_proto::PlanRender::render(
+                    &bumped,
+                    &chain.spec().native_symbol,
+                    chain.spec().native_decimals,
+                )
+                .as_bytes(),
+            )?;
+            self.outbox.write_artefact(
+                &entry.dir,
+                "replacement_request.json",
+                &serde_json::to_vec(&serde_json::json!({
+                    "max_fee_per_gas": fees.max_fee_per_gas.to_string(),
+                    "max_priority_fee_per_gas": fees.max_priority_fee_per_gas.to_string(),
+                }))
+                .unwrap(),
+            )?;
+        }
         let unsigned = self.build_unsigned_evm_tx(&bumped, chain)?;
         let prepared = PreparedEvmTx {
             signing_hash: Self::unsigned_signing_hash(&unsigned),
@@ -4262,19 +4369,67 @@ impl TxEngine {
         bumped.tx_hash = Some(format!("{:#x}", tx_hash));
         bumped.status = TxStatus::Sent;
 
+        let artifact_dir = if fees.is_some() {
+            // Keep the original signed attempt as evidence, and follow the
+            // accepted replacement through the same account-owned outbox ID.
+            let updated = crate::outbox::OutboxEntry {
+                state: entry.state,
+                staged: bumped.clone(),
+                dir: entry.dir.clone(),
+            };
+            let dir = self.outbox.transition(&updated, OutboxState::Sent)?;
+            self.outbox.write_artefact(
+                &dir,
+                "intent.json",
+                &serde_json::to_vec_pretty(&bumped).unwrap(),
+            )?;
+            self.outbox.write_artefact(
+                &dir,
+                "tx_hash",
+                bumped.tx_hash.as_ref().unwrap().as_bytes(),
+            )?;
+            self.outbox.write_artefact(
+                &dir,
+                "plan.md",
+                bloom_proto::PlanRender::render(
+                    &bumped,
+                    &chain.spec().native_symbol,
+                    chain.spec().native_decimals,
+                )
+                .as_bytes(),
+            )?;
+            if let Some(action_id) = bumped.action_id.as_deref() {
+                self.write_central_evm_result(EvmCentralResult {
+                    action_id,
+                    state: OutboxState::Sent,
+                    outcome: "sent",
+                    tx_hash,
+                    nonce: bumped.nonce,
+                    signing_hash: &Self::unsigned_signing_hash(
+                        &self.build_unsigned_evm_tx(&bumped, chain)?,
+                    ),
+                    action_kind: EvmOutboxActionKind::Replace.action_kind(),
+                })?;
+            }
+            dir
+        } else {
+            entry.dir.clone()
+        };
+
         self.outbox.write_artefact(
-            &entry.dir,
+            &artifact_dir,
             "replacement_tx_hash",
             bumped.tx_hash.as_ref().unwrap().as_bytes(),
         )?;
         self.outbox.write_artefact(
-            &entry.dir,
+            &artifact_dir,
             "replacement_intent.json",
             &serde_json::to_vec_pretty(&bumped).unwrap(),
         )?;
+        let updated_entry = self.outbox.read(wallet, chain_name, original_id)?;
         let _ = self
             .outbox
-            .remove_broadcast_raw_tx(&entry, BroadcastAttemptKind::Replacement);
+            .remove_broadcast_raw_tx(&updated_entry, BroadcastAttemptKind::Replacement);
         info!(
             id = %original.id,
             replacement = %bumped.tx_hash.as_deref().unwrap_or(""),
@@ -6912,6 +7067,187 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("does not match"));
+    }
+
+    #[tokio::test]
+    async fn fee_repair_requires_fresh_approval_and_keeps_the_rejected_call() {
+        let directory = tempfile::tempdir().unwrap();
+        let permit = permit_for(&directory);
+        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        let mut staged = fake_staged_1559("fee-repair");
+        staged.created_ms = now_ms();
+        staged.data_hex = "0x12345678".into();
+        staged.execution_origin = Some(ExecutionOrigin {
+            petal_id: "petal:test".into(),
+            petal_digest: "aa".repeat(32),
+            petal_version: "v1".into(),
+            route_id: Some("r000001".into()),
+        });
+        outbox.write_pending(&staged, "original plan").unwrap();
+        let fixture = Arc::new(TriadBrokerFixture {
+            active: AtomicBool::new(false),
+            approval_terminal: parking_lot::Mutex::new(None),
+            signing_terminal: parking_lot::Mutex::new(None),
+            lose_sign_response_once: AtomicBool::new(false),
+            corrupt_status_result: AtomicBool::new(false),
+            completed_result: parking_lot::Mutex::new(None),
+            requests: parking_lot::Mutex::new(Vec::new()),
+            key_ref: triad_key_ref(),
+            derived: Vec::new(),
+        });
+        let mut catalog = triad_catalog();
+        let mut replacement = catalog.records[0].clone();
+        replacement.subject = ProvenanceSubject::System {
+            component_id: Token::new("bloom-machine").unwrap(),
+            operation_class: Token::new("transaction.replace").unwrap(),
+        };
+        replacement.operation_classes[0].operation_class =
+            Token::new("transaction.replace").unwrap();
+        catalog.records.push(replacement);
+        let service: Arc<dyn MachineBrokerService> = fixture.clone();
+        let engine = TxEngine::new(outbox.clone(), 60_000)
+            .with_triad_signing(MachineBrokerClient::new(service), catalog)
+            .unwrap();
+        let url = spawn_batch_rpc(Some(1)).await;
+        let chain = stage_chain(&url);
+        let policy = Policy::default();
+        assert!(matches!(
+            engine
+                .confirm(
+                    &permit,
+                    "alice",
+                    "anvil",
+                    "fee-repair",
+                    &chain,
+                    &policy,
+                    "confirm"
+                )
+                .await,
+            Err(TxEngineError::ApprovalRequired(_))
+        ));
+        fixture.active.store(true, Ordering::SeqCst);
+        assert!(
+            engine
+                .confirm(
+                    &permit,
+                    "alice",
+                    "anvil",
+                    "fee-repair",
+                    &chain,
+                    &policy,
+                    "confirm"
+                )
+                .await
+                .is_err()
+        );
+        let original = outbox.read("alice", "anvil", "fee-repair").unwrap();
+        let original_attempt = outbox
+            .read_broadcast_attempt(&original, BroadcastAttemptKind::Confirm)
+            .unwrap()
+            .unwrap();
+        let original_signing =
+            read_triad_signing_state(&original.dir.join(TRIAD_SIGNING_STATE_FILE))
+                .unwrap()
+                .unwrap();
+
+        // This fixture keeps one operation result; the replacement has its
+        // own approval and signing identities, not the original's result.
+        *fixture.completed_result.lock() = None;
+
+        let requests_before = fixture.requests.lock().len();
+        for (max_fee, priority) in [("109", "20"), ("120", "10")] {
+            let fees = Eip1559FeeOverrides::from_decimal_pair(Some(max_fee), Some(priority), false)
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                engine
+                    .replace_fees(
+                        &permit,
+                        "alice",
+                        "anvil",
+                        "fee-repair",
+                        &chain,
+                        fees,
+                        &policy
+                    )
+                    .await,
+                Err(TxEngineError::InvalidFeeOverride(_))
+            ));
+        }
+        assert_eq!(fixture.requests.lock().len(), requests_before);
+
+        fixture.active.store(false, Ordering::SeqCst);
+        let fees = Eip1559FeeOverrides::from_decimal_pair(Some("500"), Some("250"), false)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            engine
+                .replace_fees(
+                    &permit,
+                    "alice",
+                    "anvil",
+                    "fee-repair",
+                    &chain,
+                    fees,
+                    &policy
+                )
+                .await,
+            Err(TxEngineError::ApprovalRequired(_))
+        ));
+        let waiting = outbox.read("alice", "anvil", "fee-repair").unwrap();
+        assert_eq!(waiting.state, OutboxState::Pending);
+        assert_eq!(
+            waiting.staged.max_priority_fee_per_gas,
+            staged.max_priority_fee_per_gas
+        );
+        let signing = read_triad_signing_state(&waiting.dir.join(TRIAD_SIGNING_STATE_FILE))
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            signing.approval_operation_id,
+            original_signing.approval_operation_id
+        );
+        assert_ne!(signing.payload_digest, original_signing.payload_digest);
+        assert!(!signing.sign_dispatched);
+        let candidate: StagedTx = serde_json::from_slice(
+            &std::fs::read(waiting.dir.join("replacement_intent.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(candidate.nonce, staged.nonce);
+        assert_eq!(candidate.from, staged.from);
+        assert_eq!(candidate.to, staged.to);
+        assert_eq!(candidate.data_hex, staged.data_hex);
+        assert_eq!(candidate.value_wei, staged.value_wei);
+        assert_eq!(candidate.execution_origin, staged.execution_origin);
+
+        fixture.active.store(true, Ordering::SeqCst);
+        let repaired = engine
+            .replace_fees(
+                &permit,
+                "alice",
+                "anvil",
+                "fee-repair",
+                &chain,
+                fees,
+                &policy,
+            )
+            .await
+            .unwrap();
+        let sent = outbox.read("alice", "anvil", "fee-repair").unwrap();
+        assert_eq!(sent.state, OutboxState::Sent);
+        assert_eq!(sent.staged.tx_hash, repaired.tx_hash);
+        assert_eq!(sent.staged.max_priority_fee_per_gas.as_deref(), Some("250"));
+        assert_eq!(sent.staged.data_hex, staged.data_hex);
+        assert_eq!(sent.staged.execution_origin, staged.execution_origin);
+        assert_eq!(
+            outbox
+                .read_broadcast_attempt(&sent, BroadcastAttemptKind::Confirm)
+                .unwrap()
+                .unwrap()
+                .tx_hash,
+            original_attempt.tx_hash
+        );
+        assert!(sent.dir.join("replacement_original.json").exists());
     }
 
     #[tokio::test]
