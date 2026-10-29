@@ -20,6 +20,9 @@ pub enum Capability {
     /// May call `sign_hash`.
     #[serde(rename = "sign")]
     Sign,
+    /// May read prepared signing status.
+    #[serde(rename = "sign.status")]
+    SignStatus,
     /// May call `store_*`.
     #[serde(rename = "store")]
     Store,
@@ -41,6 +44,7 @@ impl Capability {
             Capability::VfsWrite => "vfs.write",
             Capability::NetFetch => "net.fetch",
             Capability::Sign => "sign",
+            Capability::SignStatus => "sign.status",
             Capability::Store => "store",
             Capability::Chain => "chain",
             Capability::TxOutbox => "tx.outbox",
@@ -54,6 +58,7 @@ impl Capability {
             "vfs.write" => Some(Capability::VfsWrite),
             "net.fetch" => Some(Capability::NetFetch),
             "sign" => Some(Capability::Sign),
+            "sign.status" => Some(Capability::SignStatus),
             "store" => Some(Capability::Store),
             "chain" => Some(Capability::Chain),
             "tx.outbox" => Some(Capability::TxOutbox),
@@ -155,6 +160,7 @@ pub fn validate_mode_caps(
                     | Capability::VfsWrite
                     | Capability::NetFetch
                     | Capability::Sign
+                    | Capability::SignStatus
                     | Capability::Store
                     | Capability::Chain
                     | Capability::TxOutbox

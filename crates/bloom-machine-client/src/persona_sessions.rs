@@ -164,20 +164,31 @@ fn attempt_path(root: &Path, id: &OperationId) -> PathBuf {
 }
 
 fn owner_account_number(key: &KeyRef) -> Option<u32> {
-    match &key.derivation {
-        None => Some(0),
+    let digits = match &key.derivation {
+        None => return Some(0),
         Some(bloom_broker_api::DerivationRef::Bip39Multicurve { profile, path, .. }) => {
             match profile {
                 bloom_broker_api::DerivationProfile::Bip44EvmSecp256k1V1 => {
-                    path.split('/').nth(3)?.strip_suffix("'")?.parse().ok()
+                    path.strip_prefix("m/44'/60'/0'/0/")?
                 }
                 bloom_broker_api::DerivationProfile::Bip44SolanaSlip10Ed25519V1 => {
-                    path.split('/').nth(3)?.strip_suffix("'")?.parse().ok()
+                    path.strip_prefix("m/44'/501'/")?.strip_suffix("'/0'")?
                 }
             }
         }
-        _ => None,
+        _ => return None,
+    };
+    if digits.is_empty()
+        || digits.len() > 10
+        || !digits.bytes().all(|b| b.is_ascii_digit())
+        || (digits.len() > 1 && digits.starts_with('0'))
+    {
+        return None;
     }
+    digits
+        .parse::<u32>()
+        .ok()
+        .filter(|number| *number < (1_u32 << 31))
 }
 
 fn assurance_rank(level: bloom_broker_api::ClaimAssuranceLevel) -> u8 {
@@ -293,6 +304,19 @@ impl MachineBrokerClient {
             read_json::<SigningAttempt>(&attempt_path(root, operation_id))?
                 .filter(|attempt| !attempt.exact_fallback)
                 .map(|attempt| attempt.operation_digest),
+        )
+    }
+
+    pub fn persona_exact_fallback(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<bool, ProtocolError> {
+        let Some(root) = &self.persona_session_root else {
+            return Ok(false);
+        };
+        Ok(
+            read_json::<SigningAttempt>(&attempt_path(root, operation_id))?
+                .is_some_and(|attempt| attempt.exact_fallback),
         )
     }
 
@@ -814,6 +838,16 @@ impl MachineBrokerClient {
         key_ref: &KeyRef,
     ) -> Result<Option<SigningResult>, ProtocolError> {
         if request
+            .expected_key_ref
+            .as_ref()
+            .is_some_and(|expected| expected != key_ref)
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::KeyrefMismatch,
+                "persona retry changed its expected key",
+            ));
+        }
+        if request
             .account_key_ref
             .as_ref()
             .is_some_and(|selected| selected != key_ref)
@@ -836,6 +870,7 @@ impl MachineBrokerClient {
             &request.signing_operation_id,
             std::slice::from_ref(&request.preimage),
             false,
+            false,
         )
         .await
     }
@@ -845,6 +880,16 @@ impl MachineBrokerClient {
         request: &ExactPayloadBatchSignRequest,
         key_ref: &KeyRef,
     ) -> Result<Option<SigningResult>, ProtocolError> {
+        if request
+            .expected_key_ref
+            .as_ref()
+            .is_some_and(|expected| expected != key_ref)
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::KeyrefMismatch,
+                "persona retry changed its expected key",
+            ));
+        }
         if request
             .account_key_ref
             .as_ref()
@@ -871,6 +916,7 @@ impl MachineBrokerClient {
             &request.signing_operation_id,
             &request.preimages,
             true,
+            request.allow_limit_stepup,
         )
         .await
     }
@@ -890,6 +936,7 @@ impl MachineBrokerClient {
         operation_id: &OperationId,
         preimages: &[Vec<u8>],
         batch: bool,
+        allow_limit_stepup: bool,
     ) -> Result<Option<SigningResult>, ProtocolError> {
         // Selection is structural. Broker owns profile-specific verification,
         // economic admission; unrelated Petals need no global
@@ -1134,7 +1181,27 @@ impl MachineBrokerClient {
                     && recovery_status
                         .as_ref()
                         .is_err_and(|status| status.code == ProtocolErrorCode::ApprovalNotFound);
-                if native_exact_stepup {
+                let limit_stepup = allow_limit_stepup
+                    && matches!(provenance, ProvenanceSubject::Petal { .. })
+                    && error.code == ProtocolErrorCode::LimitExceededValue
+                    && error.durable_effect == bloom_broker_api::DurableEffect::ReservationReleased
+                    && error.has_valid_contract()
+                    && match &recovery_status {
+                        Err(status) => status.code == ProtocolErrorCode::ApprovalNotFound,
+                        Ok(status) => {
+                            status.operation_id == expected.operation_id
+                                && status.operation_digest == expected.operation_digest
+                                && status.state == bloom_broker_api::OperationState::Denied
+                                && status.result.is_none()
+                                && status.error.as_ref().is_some_and(|e| {
+                                    e.code == error.code
+                                        && e.has_valid_contract()
+                                        && e.durable_effect
+                                            == bloom_broker_api::DurableEffect::ReservationReleased
+                                })
+                        }
+                    };
+                if native_exact_stepup || limit_stepup {
                     // Native step-up additionally proves no retained operation exists.
                     // Retain source identity while making the fallback durable.
                     let mut attempt: SigningAttempt =
@@ -1259,6 +1326,29 @@ mod tests {
             derivation: None,
         }
     }
+    #[test]
+    fn owner_account_number_requires_canonical_profile_path() {
+        use bloom_broker_api::{DerivationProfile as P, DerivationRef};
+        let mut owner = key();
+        assert_eq!(owner_account_number(&owner), Some(0));
+        for (profile, path, expected) in [
+            (P::Bip44EvmSecp256k1V1, "m/44'/60'/0'/0/1", Some(1)),
+            (P::Bip44EvmSecp256k1V1, "m/44'/60'/0'/0/01", None),
+            (P::Bip44EvmSecp256k1V1, "m/44'/60'/1'/0/1", None),
+            (P::Bip44EvmSecp256k1V1, "m/44'/60'/0'/0/2147483648", None),
+            (P::Bip44SolanaSlip10Ed25519V1, "m/44'/501'/1'/0'", Some(1)),
+            (P::Bip44SolanaSlip10Ed25519V1, "m/44'/501'/01'/0'", None),
+            (P::Bip44SolanaSlip10Ed25519V1, "m/44'/501'/1'/1'", None),
+        ] {
+            owner.derivation = Some(DerivationRef::Bip39Multicurve {
+                wallet_seed_ref: token("seed"),
+                profile,
+                path: path.into(),
+            });
+            assert_eq!(owner_account_number(&owner), expected, "{path}");
+        }
+    }
+
     fn wallet() -> WalletPublic {
         WalletPublic {
             wallet_id: token("wallet"),
@@ -1659,6 +1749,7 @@ mod tests {
                 &OperationId::from_bytes([operation; 32]),
                 &[payload.to_vec()],
                 false,
+                false,
             )
             .await
     }
@@ -1755,6 +1846,7 @@ mod tests {
                 None,
                 &OperationId::from_bytes([operation; 32]),
                 &[b"native transfer bytes".to_vec()],
+                false,
                 false,
             )
             .await
@@ -2012,6 +2104,8 @@ mod tests {
                 claim_assurance_evidence: None,
                 approval_value_limits: vec![],
                 account_key_ref: Some(p.terms.key_ref.clone()),
+                expected_key_ref: None,
+                allow_persona: true,
                 safe_review_payload: None,
                 message_review_payload: None,
             };
@@ -2082,11 +2176,61 @@ mod tests {
                 &OperationId::from_bytes([22; 32]),
                 &[b"swap".to_vec()],
                 false,
+                false,
             )
             .await
             .unwrap();
         assert!(result.is_some());
         assert_eq!(broker.0.lock().unwrap().signatures, 1);
+    }
+
+    #[tokio::test]
+    async fn prepared_limit_stepup_requires_definitive_no_result_status() {
+        for unavailable in [false, true] {
+            let (directory, client, broker) = fixture();
+            {
+                let mut state = broker.0.lock().unwrap();
+                state.reject_limit = true;
+                state.status_unavailable = unavailable;
+            }
+            let payload = b"limited";
+            let claim = use_claim(payload, 1);
+            let operation = OperationId::from_bytes([51; 32]);
+            let outcome = client
+                .try_persona_sign_payloads(
+                    &token("wallet"),
+                    &key(),
+                    claim.crypto_suite,
+                    &ProvenanceSubject::Petal {
+                        package_hash: digest(4),
+                        route: claim.route.clone(),
+                    },
+                    &digest(83),
+                    Some(&claim),
+                    None,
+                    None,
+                    Some(b"retained prepared order witness"),
+                    &operation,
+                    &[payload.to_vec()],
+                    false,
+                    true,
+                )
+                .await;
+            let attempt = read_json::<SigningAttempt>(&attempt_path(directory.path(), &operation))
+                .unwrap()
+                .unwrap();
+            if unavailable {
+                assert_eq!(
+                    outcome.unwrap_err().code,
+                    ProtocolErrorCode::LimitExceededValue
+                );
+                assert!(!attempt.exact_fallback);
+            } else {
+                assert!(outcome.unwrap().is_none());
+                assert!(attempt.exact_fallback);
+            }
+            assert_eq!(broker.0.lock().unwrap().signatures, 0);
+        }
     }
 
     #[tokio::test]
@@ -2252,6 +2396,8 @@ mod tests {
             claim_assurance_evidence: Some(b"retained prepared order witness".to_vec()),
             approval_value_limits: vec![],
             account_key_ref: None,
+            expected_key_ref: None,
+            allow_persona: true,
             safe_review_payload: None,
             message_review_payload: Some(b"retained prepared order witness".to_vec()),
         };
@@ -2322,6 +2468,7 @@ mod tests {
                 None,
                 &OperationId::from_bytes([7; 32]),
                 &[b"native".to_vec()],
+                false,
                 false,
             )
             .await

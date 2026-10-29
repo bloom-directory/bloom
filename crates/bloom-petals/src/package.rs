@@ -2465,6 +2465,8 @@ enum ComponentHostInterface {
     StoreKv,
     SignSigningV1,
     SignSigningV2,
+    PreparedSigning,
+    PreparedStatus,
     KeyDerive,
     TxOutbox,
     ChainRead,
@@ -2486,6 +2488,8 @@ fn component_host_interface(name: &str) -> Option<ComponentHostInterface> {
         ContractHostInterface::HttpFetch => Some(ComponentHostInterface::HttpFetch),
         ContractHostInterface::StoreKv => Some(ComponentHostInterface::StoreKv),
         ContractHostInterface::SignSigning => Some(ComponentHostInterface::SignSigningV2),
+        ContractHostInterface::PreparedSigning => Some(ComponentHostInterface::PreparedSigning),
+        ContractHostInterface::PreparedStatus => Some(ComponentHostInterface::PreparedStatus),
         ContractHostInterface::KeyDerive => Some(ComponentHostInterface::KeyDerive),
         ContractHostInterface::TxOutbox => Some(ComponentHostInterface::TxOutbox),
         ContractHostInterface::ChainRead => Some(ComponentHostInterface::ChainRead),
@@ -2744,6 +2748,7 @@ enum HostFuncExport {
     SignHashesStructured,
     SafeSignPayloadStructured,
     PayloadBatchSignStructured,
+    PreparedSigning,
     PetalKeyRequest,
     EvmTxStage,
     EvmTxConfirm,
@@ -2930,6 +2935,10 @@ fn host_func_export(interface: ComponentHostInterface, name: &str) -> Option<Hos
         (ComponentHostInterface::SignSigningV2, "sign-payload-batch") => {
             Some(HostFuncExport::PayloadBatchSignStructured)
         }
+        (ComponentHostInterface::PreparedSigning, "sign")
+        | (ComponentHostInterface::PreparedStatus, "status") => {
+            Some(HostFuncExport::PreparedSigning)
+        }
         (ComponentHostInterface::KeyDerive, "request") => Some(HostFuncExport::PetalKeyRequest),
         (ComponentHostInterface::TxOutbox, "stage") => Some(HostFuncExport::EvmTxStage),
         (ComponentHostInterface::TxOutbox, "confirm") => Some(HostFuncExport::EvmTxConfirm),
@@ -3094,6 +3103,10 @@ fn host_func_export_matches(
                 HostOkType::PayloadBatchSignResultStructured,
             )
         }
+        HostFuncExport::PreparedSigning => {
+            params_match(params, types, &[("request", is_byte_list)])
+                && result_bytes_or_bytes(&ty.result, types)
+        }
         HostFuncExport::PetalKeyRequest => {
             params_match(params, types, &[("request", is_byte_list)])
                 && result_matches(&ty.result, types, HostOkType::Bytes)
@@ -3196,6 +3209,25 @@ enum HostOkType {
     PayloadBatchSignResultStructured,
     StagedTransaction,
     OutboxInspection,
+}
+
+fn result_bytes_or_bytes(
+    result: &Option<ComponentValType>,
+    types: &[ComponentTypeEntry<'_>],
+) -> bool {
+    let Some(result_ty) = single_component_result(result) else {
+        return false;
+    };
+    with_defined_type(result_ty, types, 0, |defined, types, depth| {
+        let ComponentDefinedType::Result {
+            ok: Some(ok),
+            err: Some(err),
+        } = defined
+        else {
+            return false;
+        };
+        is_byte_list(ok, types, depth) && is_byte_list(err, types, depth)
+    })
 }
 
 fn result_matches(
@@ -6664,6 +6696,45 @@ paths = ["/*"]
         assert!(component_host_interface("bloom:sign/signing@0.4.0").is_none());
         assert!(component_import_caps("bloom:sign/signing@9.9.9").is_none());
         assert!(component_host_interface("bloom:sign/signing@9.9.9").is_none());
+    }
+
+    #[test]
+    fn prepared_sign_and_status_imports_have_separate_capabilities_and_byte_results() {
+        assert_eq!(
+            component_import_caps("bloom:prepared-sign/signing@0.1.0"),
+            Some(&["bloom:sign"][..])
+        );
+        assert_eq!(
+            component_import_caps("bloom:prepared-sign/status@0.1.0"),
+            Some(&["bloom:sign.status"][..])
+        );
+        assert!(component_import_caps("bloom:prepared-sign/signing@0.2.0").is_none());
+        for (interface, import, function) in [
+            (
+                ComponentHostInterface::PreparedSigning,
+                "bloom:prepared-sign/signing@0.1.0",
+                "sign",
+            ),
+            (
+                ComponentHostInterface::PreparedStatus,
+                "bloom:prepared-sign/status@0.1.0",
+                "status",
+            ),
+        ] {
+            let wit = format!(
+                r#"(component (type $interface (instance
+                (type $bytes (list u8))
+                (type $outcome (result $bytes (error $bytes)))
+                (type $request (func (param "request" $bytes) (result $outcome)))
+                (export "{function}" (func (type $request)))))
+                (import "{import}" (instance (type $interface))))"#
+            );
+            assert!(host_import_instance_matches(interface, &wit));
+            assert!(!host_import_instance_matches(
+                interface,
+                &wit.replace("(error $bytes)", "(error string)")
+            ));
+        }
     }
 
     #[test]

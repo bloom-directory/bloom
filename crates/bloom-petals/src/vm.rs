@@ -934,6 +934,18 @@ fn link_component_host_imports(linker: &mut ComponentLinker<StoreData>) -> anyho
         })?;
     }
     {
+        let mut signing = linker.instance("bloom:prepared-sign/signing@0.1.0")?;
+        signing.func_new_async("sign", |store, params, results| {
+            Box::new(async move { component_prepared_sign(store, params, results, false).await })
+        })?;
+    }
+    {
+        let mut signing = linker.instance("bloom:prepared-sign/status@0.1.0")?;
+        signing.func_new_async("status", |store, params, results| {
+            Box::new(async move { component_prepared_sign(store, params, results, true).await })
+        })?;
+    }
+    {
         let mut key = linker.instance("bloom:key/derive@0.1.0")?;
         key.func_new_async("request", |store, params, results| {
             Box::new(async move { component_petal_key_request(store, params, results).await })
@@ -1550,6 +1562,84 @@ fn apply_manifest_key_scope(
     }
     request.allowed_routes = data.key_derive_allowed_routes.clone();
     Ok(())
+}
+
+async fn component_prepared_sign(
+    store: StoreContextMut<'_, StoreData>,
+    params: &[ComponentVal],
+    results: &mut [ComponentVal],
+    status: bool,
+) -> anyhow::Result<()> {
+    use bloom_petal_contract::prepared::{
+        ErrorCode, MAX_REQUEST, Request, SigningError, StatusRequest,
+    };
+    let fail = |code, message: String| SigningError { code, message };
+    let parsed = (|| {
+        if !store.data().caps.contains(&if status {
+            Capability::SignStatus
+        } else {
+            Capability::Sign
+        }) {
+            return Err(fail(ErrorCode::Denied, "sign capability required".into()));
+        }
+        let [ComponentVal::List(values)] = params else {
+            return Err(fail(ErrorCode::Invalid, "request must be bytes".into()));
+        };
+        if values.len() > MAX_REQUEST {
+            return Err(fail(ErrorCode::Invalid, "request exceeds limit".into()));
+        }
+        let bytes = values
+            .iter()
+            .map(|v| match v {
+                ComponentVal::U8(b) => Ok(*b),
+                _ => Err(fail(ErrorCode::Invalid, "request must be bytes".into())),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let context = store
+            .data()
+            .sign_context
+            .clone()
+            .ok_or_else(|| fail(ErrorCode::Denied, "trusted route context required".into()))?;
+        if status {
+            let request: StatusRequest = serde_json::from_slice(&bytes)
+                .map_err(|e| fail(ErrorCode::Invalid, e.to_string()))?;
+            request.validate()?;
+            require_trusted_wallet(store.data(), &request.wallet)
+                .map_err(|e| fail(ErrorCode::Denied, e.to_string()))?;
+            Ok((None, Some(request), context))
+        } else {
+            let request: Request = serde_json::from_slice(&bytes)
+                .map_err(|e| fail(ErrorCode::Invalid, e.to_string()))?;
+            request.validate()?;
+            require_trusted_wallet(store.data(), &request.wallet)
+                .map_err(|e| fail(ErrorCode::Denied, e.to_string()))?;
+            if !sign_intent_allowed(store.data(), &request.action.operation_class) {
+                return Err(fail(ErrorCode::Denied, "sign intent not allowed".into()));
+            }
+            Ok((Some(request), None, context))
+        }
+    })();
+    let outcome = match parsed {
+        Ok((Some(request), _, context)) => store.data().host.prepared_sign(request, context).await,
+        Ok((_, Some(request), context)) => {
+            store
+                .data()
+                .host
+                .prepared_sign_status(request, context)
+                .await
+        }
+        Ok(_) => unreachable!(),
+        Err(error) => Err(error),
+    };
+    let value = match outcome {
+        Ok(outcome) => ComponentVal::Result(Ok(Some(Box::new(component_bytes(
+            serde_json::to_vec(&outcome)?,
+        ))))),
+        Err(error) => ComponentVal::Result(Err(Some(Box::new(component_bytes(
+            serde_json::to_vec(&error)?,
+        ))))),
+    };
+    set_component_result(results, value)
 }
 
 async fn component_petal_key_request(

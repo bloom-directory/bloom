@@ -235,6 +235,8 @@ impl SolanaTransferSigner {
             safe_review_payload: None,
             message_review_payload: None,
             account_key_ref,
+            expected_key_ref: None,
+            allow_persona: true,
             // Solana, not EVM: there is no contract call for the EVM review
             // to read, in either mode.
             approval_value_limits: vec![ValueLimit {

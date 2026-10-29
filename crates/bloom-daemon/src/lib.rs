@@ -9,6 +9,7 @@ pub mod deployment;
 pub mod ipc;
 
 mod ens_resolver;
+mod prepared_signing;
 mod price_oracle;
 
 #[cfg(all(test, feature = "triad-dev-harness"))]
@@ -1109,6 +1110,15 @@ impl DaemonPetalHost {
             identity.update(&(part.len() as u64).to_be_bytes());
             identity.update(part);
         }
+        if let Some((_, operation)) = context
+            .params
+            .iter()
+            .find(|(name, _)| name == "bloom.internal.prepared-operation")
+        {
+            identity.update(b"prepared-operation/v1\0");
+            identity.update(&(operation.len() as u64).to_be_bytes());
+            identity.update(operation.as_bytes());
+        }
         let request_id = identity.finalize().to_hex().to_string();
         Ok((
             request_id.clone(),
@@ -1149,6 +1159,15 @@ impl DaemonPetalHost {
         if let Some(binding) = review_binding {
             identity.update(b"solana-message-review/v1\0");
             identity.update(binding.as_str().as_bytes());
+        }
+        if let Some((_, operation)) = context
+            .params
+            .iter()
+            .find(|(name, _)| name == "bloom.internal.prepared-operation")
+        {
+            identity.update(b"prepared-operation/v1\0");
+            identity.update(&(operation.len() as u64).to_be_bytes());
+            identity.update(operation.as_bytes());
         }
         let request_id = identity.finalize().to_hex().to_string();
         Ok((
@@ -2125,8 +2144,27 @@ impl PetalHost for DaemonPetalHost {
             let catalog = self.provenance_catalog.clone().ok_or_else(|| {
                 HostError::Backend("installer provenance catalog is not configured".into())
             })?;
+            let strict = context
+                .params
+                .iter()
+                .any(|(name, _)| name == "bloom.internal.prepared-operation");
+            let expected_key = context
+                .params
+                .iter()
+                .find(|(name, _)| name == "bloom.internal.prepared-key")
+                .map(|(_, value)| {
+                    serde_json::from_str(value)
+                        .map_err(|e| HostError::Invalid(format!("invalid internal key: {e}")))
+                })
+                .transpose()?;
+            if strict && expected_key.is_none() {
+                return Err(HostError::Denied("prepared key binding is missing".into()));
+            }
             let signer = BrokerExactPayloadSigner::new(broker.clone(), catalog)
-                .with_account_key(account_key.clone());
+                .with_account_key(account_key.clone())
+                .with_expected_key(expected_key)
+                .with_persona_discovery(!strict)
+                .with_strict_recovery(strict);
             let _guard = self.petal_signing_lock.lock().await;
             let outcome = signer
                 .sign_or_prepare_petal(
@@ -2275,6 +2313,28 @@ impl PetalHost for DaemonPetalHost {
         Ok(SignOutcome::Signature(bytes))
     }
 
+    async fn prepared_sign(
+        &self,
+        request: bloom_petal_contract::prepared::Request,
+        context: PetalRouteContext,
+    ) -> Result<
+        bloom_petal_contract::prepared::SigningOutcome,
+        bloom_petal_contract::prepared::SigningError,
+    > {
+        self.run_prepared(request, context).await
+    }
+
+    async fn prepared_sign_status(
+        &self,
+        request: bloom_petal_contract::prepared::StatusRequest,
+        context: PetalRouteContext,
+    ) -> Result<
+        bloom_petal_contract::prepared::SigningOutcome,
+        bloom_petal_contract::prepared::SigningError,
+    > {
+        self.status_prepared(request, context).await
+    }
+
     async fn sign_payload_batch_outcome(
         &self,
         mut req: PayloadBatchSignRequest,
@@ -2307,6 +2367,36 @@ impl PetalHost for DaemonPetalHost {
                 return Err(HostError::Invalid("Polymarket exact signing requires one bounded prepared record and one recoverable Keccak payload".into()));
             }
             Some(bytes)
+        } else if req.operation_class != bloom_broker_api::POLYMARKET_CLOB_AUTH_CLASS
+            && req.context.as_ref().is_some_and(|context| {
+                context
+                    .params
+                    .iter()
+                    .any(|(name, _)| name == "bloom.internal.prepared-operation")
+            })
+        {
+            if req.payloads.len() != 1 {
+                return Err(HostError::Invalid(
+                    "prepared signing requires one payload".into(),
+                ));
+            }
+            let crypto = match req.signature_algorithm.as_str() {
+                "secp256k1-keccak256-recoverable" => {
+                    bloom_broker_api::CryptoSuite::Secp256k1Keccak256Recoverable
+                }
+                "secp256k1-sha256-recoverable" => {
+                    bloom_broker_api::CryptoSuite::Secp256k1Sha256Recoverable
+                }
+                "ed25519-message" => bloom_broker_api::CryptoSuite::Ed25519Message,
+                _ => return Err(HostError::Invalid("unsupported signature algorithm".into())),
+            };
+            petal_review_payload(
+                &req.operation_class,
+                &req.operation_class,
+                req.action.as_deref(),
+                crypto,
+                &req.payloads[0].preimage,
+            )?
         } else {
             None
         };
@@ -2512,8 +2602,32 @@ impl PetalHost for DaemonPetalHost {
         let catalog = self.provenance_catalog.clone().ok_or_else(|| {
             HostError::Backend("installer provenance catalog is not configured".into())
         })?;
-        let signer =
-            BrokerExactPayloadSigner::new(broker.clone(), catalog).with_account_key(account_key);
+        let strict = context
+            .params
+            .iter()
+            .any(|(name, _)| name == "bloom.internal.prepared-operation");
+        let expected_key = context
+            .params
+            .iter()
+            .find(|(name, _)| name == "bloom.internal.prepared-key")
+            .map(|(_, value)| {
+                serde_json::from_str(value)
+                    .map_err(|e| HostError::Invalid(format!("invalid internal key: {e}")))
+            })
+            .transpose()?;
+        if strict && expected_key.is_none() {
+            return Err(HostError::Denied("prepared key binding is missing".into()));
+        }
+        let signer = BrokerExactPayloadSigner::new(broker.clone(), catalog)
+            .with_account_key(account_key)
+            .with_expected_key(expected_key)
+            .with_persona_discovery(
+                !strict
+                    || context.params.iter().any(|(name, value)| {
+                        name == "bloom.internal.prepared-persona" && value == "true"
+                    }),
+            )
+            .with_strict_recovery(strict);
         let _guard = self.petal_signing_lock.lock().await;
         let outcome = if req.selector == bloom_broker_api::PetalSignSelector::Reusable {
             signer

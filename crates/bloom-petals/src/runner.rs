@@ -1043,6 +1043,7 @@ fn petal_capability(cap: &str) -> Option<Capability> {
         "bloom:http" => Some(Capability::NetFetch),
         "bloom:store" => Some(Capability::Store),
         "bloom:sign" => Some(Capability::Sign),
+        "bloom:sign.status" => Some(Capability::SignStatus),
         "bloom:chain" => Some(Capability::Chain),
         "bloom:tx.outbox" => Some(Capability::TxOutbox),
         "bloom:key.derive" => Some(Capability::KeyDerive),

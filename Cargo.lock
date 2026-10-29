@@ -2302,6 +2302,7 @@ dependencies = [
  "bloom-mempool",
  "bloom-mount",
  "bloom-paid-http",
+ "bloom-petal-contract",
  "bloom-petals",
  "bloom-prices",
  "bloom-proto",
@@ -2314,9 +2315,11 @@ dependencies = [
  "bloom-vfs",
  "bloom-watch",
  "bs58",
+ "ed25519-dalek",
  "fs2",
  "futures",
  "hex",
+ "k256 0.13.4",
  "parking_lot",
  "reqwest 0.12.28",
  "rustix 1.1.4",
@@ -2571,10 +2574,13 @@ dependencies = [
 [[package]]
 name = "bloom-petal-contract"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/petal?rev=73c5b06a77599368fbc79fb7947a629b5b4c630e#73c5b06a77599368fbc79fb7947a629b5b4c630e"
+source = "git+https://github.com/bloom-directory/petal?rev=a285dcd03187e0670722ce37285f6598fd20831d#a285dcd03187e0670722ce37285f6598fd20831d"
 dependencies = [
  "hex",
+ "serde",
+ "serde_json",
  "sha2 0.11.0",
+ "sha3 0.11.0",
 ]
 
 [[package]]
@@ -4197,6 +4203,7 @@ version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29fcf32e6c73d1079f83ab4d782de2d81620346a5f38c6237a86a22f8368980a"
 dependencies = [
+ "pkcs8 0.11.0",
  "signature 3.0.0",
 ]
 
@@ -5693,6 +5700,7 @@ dependencies = [
  "once_cell",
  "serdect 0.2.0",
  "sha2 0.10.9",
+ "signature 2.2.0",
 ]
 
 [[package]]

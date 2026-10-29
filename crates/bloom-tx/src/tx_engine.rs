@@ -3840,6 +3840,9 @@ impl TxEngine {
             canonical_plan_facts_digest: state.canonical_plan_facts_digest.clone(),
             approval_id: state.approval_id.clone(),
             account_key_ref: key.selector.clone(),
+            expected_key_ref: None,
+            allow_persona: true,
+            allow_limit_stepup: false,
             petal_use_claim: None,
             claim_assurance_evidence: None,
         };
@@ -4723,6 +4726,8 @@ fn exact_evm_sign_request(
         canonical_plan_facts_digest: state.canonical_plan_facts_digest.clone(),
         approval_id: state.approval_id.clone(),
         account_key_ref,
+        expected_key_ref: None,
+        allow_persona: true,
         petal_use_claim: None,
         system_use_claim: None,
         claim_assurance_evidence: None,

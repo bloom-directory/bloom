@@ -977,7 +977,8 @@ impl MachineBrokerClient {
                 }
                 (Some(_), Some(_)) => unreachable!("mutual exclusion checked above"),
             };
-        if request.approval_id.is_none()
+        if request.allow_persona
+            && request.approval_id.is_none()
             && let Some(key) = self.persona_recovery_key(&request.signing_operation_id)?
             && let Some(result) = self.try_persona_sign(&request, &key).await?
         {
@@ -991,10 +992,21 @@ impl MachineBrokerClient {
                 request.account_key_ref.as_ref(),
             )
             .await?;
+        if request
+            .expected_key_ref
+            .as_ref()
+            .is_some_and(|expected| expected != &key_ref)
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::KeyrefMismatch,
+                "selected signing key changed",
+            ));
+        }
         // Recheck after the fresh wallet/key read: a changing projection may
         // not move an already account-bound economic declaration to another key.
         bind_economic_contexts(request.petal_use_claim.as_mut(), &key_ref, 1)?;
-        if request.approval_id.is_none()
+        if request.allow_persona
+            && request.approval_id.is_none()
             && let Some(result) = self.try_persona_sign(&request, &key_ref).await?
         {
             return Ok(ExactPayloadSignOutcome::Signed(result));
@@ -1191,7 +1203,8 @@ impl MachineBrokerClient {
                 (None, None)
             }
         };
-        if request.approval_id.is_none()
+        if request.allow_persona
+            && request.approval_id.is_none()
             && let Some(key) = self.persona_recovery_key(&request.signing_operation_id)?
             && let Some(result) = self.try_persona_sign_batch(&request, &key).await?
         {
@@ -1205,12 +1218,23 @@ impl MachineBrokerClient {
                 request.account_key_ref.as_ref(),
             )
             .await?;
+        if request
+            .expected_key_ref
+            .as_ref()
+            .is_some_and(|expected| expected != &key_ref)
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::KeyrefMismatch,
+                "selected signing key changed",
+            ));
+        }
         bind_economic_contexts(
             request.petal_use_claim.as_mut(),
             &key_ref,
             request.preimages.len(),
         )?;
-        if request.approval_id.is_none()
+        if request.allow_persona
+            && request.approval_id.is_none()
             && let Some(result) = self.try_persona_sign_batch(&request, &key_ref).await?
         {
             return Ok(ExactPayloadSignOutcome::Signed(result));
@@ -1385,7 +1409,8 @@ impl MachineBrokerClient {
                 "reusable Petal batch claim does not match provenance or payloads",
             ));
         }
-        if request.approval_id.is_none()
+        if request.allow_persona
+            && request.approval_id.is_none()
             && let Some(key) = self.persona_recovery_key(&request.signing_operation_id)?
             && let Some(result) = self.try_persona_sign_batch(&request, &key).await?
         {
@@ -1399,7 +1424,18 @@ impl MachineBrokerClient {
                 request.account_key_ref.as_ref(),
             )
             .await?;
-        if request.approval_id.is_none()
+        if request
+            .expected_key_ref
+            .as_ref()
+            .is_some_and(|expected| expected != &key_ref)
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::KeyrefMismatch,
+                "selected signing key changed",
+            ));
+        }
+        if request.allow_persona
+            && request.approval_id.is_none()
             && let Some(result) = self.try_persona_sign_batch(&request, &key_ref).await?
         {
             return Ok(ExactPayloadSignOutcome::Signed(result));
@@ -2312,6 +2348,8 @@ pub struct ExactPayloadSignRequest {
     /// BIP-39 and holds more than one child for `crypto_suite`; `None` keeps
     /// the single-account and legacy-root behaviour.
     pub account_key_ref: Option<KeyRef>,
+    pub expected_key_ref: Option<KeyRef>,
+    pub allow_persona: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -2340,6 +2378,12 @@ pub struct ExactPayloadBatchSignRequest {
     /// BIP-39 and holds more than one child for `crypto_suite`; `None` keeps
     /// the single-account and legacy-root behaviour.
     pub account_key_ref: Option<KeyRef>,
+    /// Optional Machine-owned expected key, including an explicit root binding.
+    pub expected_key_ref: Option<KeyRef>,
+    /// Whether this action may discover a previously activated persona session.
+    pub allow_persona: bool,
+    /// Permit a separately reviewed exact step-up after a definitive limit denial.
+    pub allow_limit_stepup: bool,
 }
 
 /// EIP-191/712 messages need semantic review independently of their Petal label.
@@ -4411,6 +4455,8 @@ mod tests {
             message_review_payload: None,
             approval_value_limits: Vec::new(),
             account_key_ref: None,
+            expected_key_ref: None,
+            allow_persona: true,
         }
     }
 
@@ -4687,6 +4733,9 @@ mod tests {
             petal_use_claim: None,
             claim_assurance_evidence: None,
             account_key_ref: None,
+            expected_key_ref: None,
+            allow_persona: true,
+            allow_limit_stepup: false,
         }
     }
 
@@ -4997,6 +5046,84 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn exact_single_refuses_changed_expected_root_before_prepare_or_sign() {
+        let broker = Arc::new(MockBroker {
+            wallet: WalletPublic {
+                wallet_id: token("wallet"),
+                wallet_kind: token("local"),
+                root_key_ref: Some(key_ref()),
+                key_refs: vec![key_ref()],
+                policy_version: DecimalU64::new(7),
+                policy_digest: digest(7),
+                wallet_revocation_epoch: DecimalU64::new(2),
+            },
+            accounts: empty_accounts(),
+            requests: Mutex::new(Vec::new()),
+            corrupt_response: false,
+        });
+        let mut request = exact_request(b"payload".to_vec(), None);
+        let mut expected = key_ref();
+        expected.public_key_fingerprint = digest(99);
+        request.expected_key_ref = Some(expected);
+        let error = MachineBrokerClient::new(broker.clone())
+            .sign_exact_payload(request)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::KeyrefMismatch);
+        assert!(
+            broker
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|request| !matches!(
+                    request,
+                    MachineBrokerRequest::SealedApprovalPrepare(_)
+                        | MachineBrokerRequest::SigningSign(_)
+                ))
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_batch_refuses_changed_expected_root_before_prepare_or_sign() {
+        let broker = Arc::new(MockBroker {
+            wallet: WalletPublic {
+                wallet_id: token("wallet"),
+                wallet_kind: token("local"),
+                root_key_ref: Some(key_ref()),
+                key_refs: vec![key_ref()],
+                policy_version: DecimalU64::new(7),
+                policy_digest: digest(7),
+                wallet_revocation_epoch: DecimalU64::new(2),
+            },
+            accounts: empty_accounts(),
+            requests: Mutex::new(Vec::new()),
+            corrupt_response: false,
+        });
+        let mut request = exact_batch_request(vec![b"payload".to_vec()], None);
+        let mut expected = key_ref();
+        expected.public_key_fingerprint = digest(99);
+        request.expected_key_ref = Some(expected);
+        let error = MachineBrokerClient::new(broker.clone())
+            .sign_exact_payload_batch(request)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::KeyrefMismatch);
+        assert!(
+            broker
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|request| !matches!(
+                    request,
+                    MachineBrokerRequest::SealedApprovalPrepare(_)
+                        | MachineBrokerRequest::SigningSignBatch(_)
+                ))
+        );
     }
 
     #[tokio::test]
