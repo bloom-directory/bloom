@@ -65,6 +65,7 @@ for pair in "$login_uid_a:$login_user_a" "$login_uid_b:$login_user_b"; do
 done
 
 conformance_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+source "$conformance_dir/logout-drain.sh"
 main_root="$(cd "$conformance_dir/../../.." && pwd -P)"
 release_dir="$main_root/packaging/triad/release"
 installer="$release_dir/install-macos.sh"
@@ -149,17 +150,8 @@ wait_for_services_to_stop() {
   login_uid="$1"
   broker_uid="$(field "$login_uid" broker_uid)"
   signer_uid="$(field "$login_uid" signer_uid)"
-  deadline=$((SECONDS + 20))
-  while [[ $SECONDS -lt $deadline ]]; do
-    if ! pgrep -u "$broker_uid" -x bloom-broker >/dev/null 2>&1 &&
-      ! pgrep -u "$signer_uid" -x bloom-signer >/dev/null 2>&1
-    then
-      return
-    fi
-    sleep 0.1
-  done
-  echo "two-login W0 services did not stop for login UID $login_uid" >&2
-  exit 1
+  wait_for_logout_services "$broker_uid" "$signer_uid" \
+    "system/com.bloom.broker.$login_uid" "system/com.bloom.signer.$login_uid"
 }
 
 assert_unused_enrollment "$login_uid_a"
