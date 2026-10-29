@@ -390,7 +390,6 @@ impl BrokerExactPayloadSigner {
             // This path signs Petal and system exact payloads, not staged
             // EVM transactions, so it never asks for a review mode: Broker
             // decides under the wallet's policy.
-            requested_review_mode: None,
             account_key_ref: self.account_key_ref.clone(),
             petal_use_claim: petal_claim.map(|(claim, _)| claim.clone()),
             system_use_claim: None,
@@ -657,7 +656,6 @@ impl BrokerExactPayloadSigner {
             // This path signs Petal and system exact payloads, not staged
             // EVM transactions, so it never asks for a review mode: Broker
             // decides under the wallet's policy.
-            requested_review_mode: None,
             account_key_ref: self.account_key_ref.clone(),
             petal_use_claim: Some(claim.clone()),
             claim_assurance_evidence: claim_assurance_evidence.map(<[u8]>::to_vec),
@@ -800,7 +798,6 @@ impl BrokerExactPayloadSigner {
             // This path signs Petal and system exact payloads, not staged
             // EVM transactions, so it never asks for a review mode: Broker
             // decides under the wallet's policy.
-            requested_review_mode: None,
             account_key_ref: self.account_key_ref.clone(),
             petal_use_claim: Some(claim.clone()),
             claim_assurance_evidence: claim_assurance_evidence.map(<[u8]>::to_vec),
