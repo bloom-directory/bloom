@@ -803,6 +803,7 @@ PY
 # isolated negative harness launches the same packaged `bloom serve` binary
 # against its private home, endpoint, and mount.
 sudo -H -u "$login_user" env \
+  RUST_LOG=info,bloom_mount::adapter=trace,embednfs::server::compound=trace \
   BLOOM_HOME="$clean_home" \
   BLOOM_MACHINE_AUDIT_CHECKPOINT_DIR="$clean_home/audit-checkpoints" \
   BLOOM_BROKER_SOCKET="$broker_socket" \
@@ -1031,7 +1032,20 @@ assert_mounted_effect_denied \
   "$approval_audit_start"
 run_login_with_deadline \
   "$work/approval-after.log" \
-  /bin/cat "$mount_dir/wallets/$wallet_id/sealed-approvals/new.json"
+  /bin/cat "$mount_dir/wallets/$wallet_id/sealed-approvals/new.json" || {
+  cat "$work/approval-after.log" >&2
+  # Distinguish a kernel-mount failure from the packaged VFS response without
+  # retrying or relaxing the failed mounted read.
+  run_machine_with_deadline \
+    "$work/approval-after-stat.log" \
+    --home "$clean_home" vfs stat "/wallets/$wallet_id/sealed-approvals/new.json" || true
+  run_machine_with_deadline \
+    "$work/approval-after-ipc.log" \
+    --home "$clean_home" vfs cat "/wallets/$wallet_id/sealed-approvals/new.json" || true
+  cat "$work/approval-after-stat.log" "$work/approval-after-ipc.log" "$work/machine-service.log" >&2
+  echo "packaged Machine could not read the approval request after its denied mutation" >&2
+  exit 1
+}
 /usr/bin/python3 - "$work/approval-after.log" <<'PY'
 import json
 import pathlib

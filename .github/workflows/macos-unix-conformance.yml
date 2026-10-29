@@ -7,22 +7,22 @@ on:
         description: Public bloom-broker ref
         required: false
         type: string
-        default: 9f394aebbc9c04a6031de31a12385e5485f8ca9b
+        default: b4f0c0bf04f3f34cc171f072a87ed982f4e7e196
       signer_ref:
         description: Public bloom-signer ref
         required: false
         type: string
-        default: bc88ad690757165ebf1978410ea5c7ec652215d3
+        default: 74e097a566f1bd08f5f43a7e847d3958b6386a3a
   workflow_dispatch:
     inputs:
       broker_ref:
         description: Public bloom-broker ref
         required: true
-        default: 9f394aebbc9c04a6031de31a12385e5485f8ca9b
+        default: b4f0c0bf04f3f34cc171f072a87ed982f4e7e196
       signer_ref:
         description: Public bloom-signer ref
         required: true
-        default: bc88ad690757165ebf1978410ea5c7ec652215d3
+        default: 74e097a566f1bd08f5f43a7e847d3958b6386a3a
 
 permissions:
   contents: read
@@ -42,8 +42,8 @@ jobs:
       - name: Reject mutable sibling refs
         shell: bash
         env:
-          BROKER_REF: ${{ inputs.broker_ref || '9f394aebbc9c04a6031de31a12385e5485f8ca9b' }}
-          SIGNER_REF: ${{ inputs.signer_ref || 'bc88ad690757165ebf1978410ea5c7ec652215d3' }}
+          BROKER_REF: ${{ inputs.broker_ref || 'b4f0c0bf04f3f34cc171f072a87ed982f4e7e196' }}
+          SIGNER_REF: ${{ inputs.signer_ref || '74e097a566f1bd08f5f43a7e847d3958b6386a3a' }}
         run: |
           [[ "$BROKER_REF" =~ ^[0-9a-f]{40}$ ]]
           [[ "$SIGNER_REF" =~ ^[0-9a-f]{40}$ ]]
@@ -51,14 +51,21 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           repository: bloom-directory/bloom-broker
-          ref: ${{ inputs.broker_ref || '9f394aebbc9c04a6031de31a12385e5485f8ca9b' }}
+          ref: ${{ inputs.broker_ref || 'b4f0c0bf04f3f34cc171f072a87ed982f4e7e196' }}
           path: bloom-broker
       - name: Check out Signer
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           repository: bloom-directory/bloom-signer
-          ref: ${{ inputs.signer_ref || 'bc88ad690757165ebf1978410ea5c7ec652215d3' }}
+          ref: ${{ inputs.signer_ref || '74e097a566f1bd08f5f43a7e847d3958b6386a3a' }}
           path: bloom-signer
+      - name: Install checkout browser
+        shell: bash
+        run: |
+          if [[ ! -x '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' ]]; then
+            brew install --cask google-chrome
+          fi
+
       - name: Install Rust toolchain
         run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
       - name: Configure shared release build directory
@@ -99,6 +106,7 @@ jobs:
             "$RUNNER_TEMP/verified/bloom-triad/bin/bloom-broker" \
             "$RUNNER_TEMP/verified/bloom-triad/bin/bloom-signer" \
             "$RUNNER_TEMP/verified/bloom-triad/bin/bloom-signer-migrate" \
+            "$RUNNER_TEMP/verified/bloom-triad/bin/bloom-checkout" \
             "$RUNNER_TEMP/w0-staging/bin/"
           cp -p \
             "$RUNNER_TEMP/verified/bloom-triad/compatibility-v1.toml" \
@@ -124,6 +132,10 @@ jobs:
       - name: Run complete Broker suite before installation
         run: cargo test --manifest-path bloom-broker/Cargo.toml --workspace --locked
 
+      - name: Verify checkout browser and crash protection on macOS
+        # Each browser test launches Chrome; bound concurrency on the shared runner.
+        run: cargo test --manifest-path bloom/Cargo.toml -p bloom-checkout --lib --locked -- --test-threads=4
+
       - name: Upload verified macOS candidate
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -148,8 +160,8 @@ jobs:
       - name: Reject mutable sibling refs
         shell: bash
         env:
-          BROKER_REF: ${{ inputs.broker_ref || '9f394aebbc9c04a6031de31a12385e5485f8ca9b' }}
-          SIGNER_REF: ${{ inputs.signer_ref || 'bc88ad690757165ebf1978410ea5c7ec652215d3' }}
+          BROKER_REF: ${{ inputs.broker_ref || 'b4f0c0bf04f3f34cc171f072a87ed982f4e7e196' }}
+          SIGNER_REF: ${{ inputs.signer_ref || '74e097a566f1bd08f5f43a7e847d3958b6386a3a' }}
         run: |
           [[ "$BROKER_REF" =~ ^[0-9a-f]{40}$ ]]
           [[ "$SIGNER_REF" =~ ^[0-9a-f]{40}$ ]]
@@ -157,14 +169,21 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           repository: bloom-directory/bloom-broker
-          ref: ${{ inputs.broker_ref || '9f394aebbc9c04a6031de31a12385e5485f8ca9b' }}
+          ref: ${{ inputs.broker_ref || 'b4f0c0bf04f3f34cc171f072a87ed982f4e7e196' }}
           path: bloom-broker
       - name: Check out Signer
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           repository: bloom-directory/bloom-signer
-          ref: ${{ inputs.signer_ref || 'bc88ad690757165ebf1978410ea5c7ec652215d3' }}
+          ref: ${{ inputs.signer_ref || '74e097a566f1bd08f5f43a7e847d3958b6386a3a' }}
           path: bloom-signer
+      - name: Install checkout browser
+        shell: bash
+        run: |
+          if [[ ! -x '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' ]]; then
+            brew install --cask google-chrome
+          fi
+
       - name: Install Rust toolchain
         run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
       - name: Configure shared W0 acceptance directory
@@ -191,8 +210,8 @@ jobs:
         shell: bash
         run: |
           chmod 0755 \
-            "$RUNNER_TEMP/verified/bloom-triad/bin/"{bloom,bloom-broker,bloom-signer,bloom-signer-migrate} \
-            "$RUNNER_TEMP/verified-w0/bloom-triad/bin/"{bloom,bloom-broker,bloom-signer,bloom-signer-migrate}
+            "$RUNNER_TEMP/verified/bloom-triad/bin/"{bloom,bloom-broker,bloom-signer,bloom-signer-migrate,bloom-checkout} \
+            "$RUNNER_TEMP/verified-w0/bloom-triad/bin/"{bloom,bloom-broker,bloom-signer,bloom-signer-migrate,bloom-checkout}
 
       - name: Prove disposable host prerequisites
         shell: bash
@@ -223,6 +242,7 @@ jobs:
           login_user="$(id -un)"
           mkdir "$RUNNER_TEMP/macos-w0-evidence"
           sudo env \
+            RUNNER_TEMP="$RUNNER_TEMP" \
             BLOOM_RUN_MACOS_UNIX_W0=true \
             BLOOM_RELEASE_PUBLIC_KEY=/private/var/db/bloom-w0-release-key.pem \
             BLOOM_MACOS_INSTALLED_ACCEPTANCE_MAIN_ROOT="$GITHUB_WORKSPACE/bloom" \
@@ -233,6 +253,7 @@ jobs:
             BLOOM_MACOS_ACCEPTANCE_CARGO="$(command -v cargo)" \
             BLOOM_MACOS_ACCEPTANCE_CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" \
             BLOOM_MACOS_ACCEPTANCE_RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" \
+            BLOOM_MACOS_ACCEPTANCE_CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
             bloom/tests/conformance/macos-unix-principals/run-disposable.sh \
             "$RUNNER_TEMP/verified-w0/bloom-triad" \
             "$login_uid" \

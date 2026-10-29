@@ -1765,7 +1765,13 @@ async fn execute_machine_command(
             prepare_policy_update(home, machine_broker()?, &name, &policy, &assurance_level).await?
         }
         MachineCommand::WalletPolicyCommit { operation_id } => {
-            commit_policy_update(home, machine_broker()?, operation_id).await?
+            commit_policy_update(
+                home,
+                machine_broker()?,
+                daemon.wallet_projections.as_ref(),
+                operation_id,
+            )
+            .await?
         }
         MachineCommand::WalletOutboxCancel {
             wallet,
@@ -2063,6 +2069,7 @@ async fn prepare_policy_update(
 async fn commit_policy_update(
     home: &HomeDir,
     client: &bloom_machine_client::MachineBrokerClient,
+    projections: &dyn bloom_machine_client::WalletProjectionReader,
     operation_id: String,
 ) -> Result<String> {
     let operation_id = bloom_broker_api::OperationId::new(operation_id)
@@ -2107,6 +2114,10 @@ async fn commit_policy_update(
             receipt.operation_id == operation_id,
             "Broker policy commit receipt operation identity mismatch"
         );
+        projections
+            .invalidate_wallet(&receipt.wallet_id)
+            .await
+            .context("invalidate committed wallet policy projection")?;
 
         if let Ok(status) = client.ceremony_status(operation_id.clone()).await {
             let now_ms = current_unix_ms();
@@ -6244,7 +6255,13 @@ mod tests {
 
         let invalid_operation_id = "not-an-operation-id";
         emit_machine_mutation("policy_update", Some(invalid_operation_id), "started");
-        let pre_remote = commit_policy_update(&home, &broker, invalid_operation_id.into()).await;
+        let projections = bloom_machine_client::CachedWalletProjectionReader::new(
+            None,
+            bloom_machine_client::FileProjectionStore::new(temp.path().join("wallets.json")),
+        )
+        .unwrap();
+        let pre_remote =
+            commit_policy_update(&home, &broker, &projections, invalid_operation_id.into()).await;
         assert!(pre_remote.is_err());
         emit_machine_mutation_rejection_if_needed(
             "policy_update",

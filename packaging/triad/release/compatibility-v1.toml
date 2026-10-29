@@ -1,8 +1,8 @@
 schema = "bloom.triad-compatibility/1"
 
 [revisions]
-broker_commit = "9f394aebbc9c04a6031de31a12385e5485f8ca9b"
-signer_commit = "bc88ad690757165ebf1978410ea5c7ec652215d3"
+broker_commit = "b4f0c0bf04f3f34cc171f072a87ed982f4e7e196"
+signer_commit = "74e097a566f1bd08f5f43a7e847d3958b6386a3a"
 service_runtime_commit = "ad0072512bb97fb4eb68d249ce785ea3ea4a49ab"
 petal_contract_commit = "73c5b06a77599368fbc79fb7947a629b5b4c630e"
 
@@ -25,8 +25,8 @@ migration_floor = 1
 
 [protocols.machine_broker]
 major = 1
-minor_min = 7
-minor_max = 7
+minor_min = 8
+minor_max = 8
 
 [protocols.broker_signer]
 major = 1

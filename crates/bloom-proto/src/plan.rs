@@ -200,14 +200,11 @@ pub struct StagedTx {
     /// on historical entries, which therefore remain unsupported/review-only.
     #[serde(default)]
     pub action_kind: TxActionKind,
-    /// The owner's explicit review choice, recorded when the transaction was
-    /// staged. `None` lets Broker decide under the wallet's policy: a clear
-    /// reading when a signed description covers the call, the existing
-    /// envelope review otherwise. `"opaque_exact"` is the owner asking to
-    /// approve bytes Bloom will not explain, which Broker still refuses
-    /// unless policy permits it. Absent on every row staged before clear
-    /// signing existed, and skipped when absent, so those rows keep their
-    /// exact bytes.
+    /// The review choice recorded when the transaction was staged, kept so
+    /// rows written before Broker took the decision still load. Broker now
+    /// reads the exact payload and decides which review it can stand behind,
+    /// so `"clear"` and an absent value both confirm normally; any other
+    /// value is refused at confirmation rather than reinterpreted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_mode: Option<String>,
     /// Tx hash once broadcast.

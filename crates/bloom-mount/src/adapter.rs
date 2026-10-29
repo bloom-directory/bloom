@@ -913,7 +913,17 @@ impl BloomFs {
             return Ok(metadata.0);
         }
 
-        Ok(self.load_directory_snapshot(dir_path, true).await?.change)
+        match self.load_directory_snapshot(dir_path, true).await {
+            Ok(snapshot) => Ok(snapshot.change),
+            Err(FsError::Io) => {
+                // A known directory's attributes must remain readable when its
+                // dynamic listing is offline, including access to static
+                // command templates. READDIR still reports the listing error.
+                debug!(path = %dir_path, "mount.directory_cache.metadata_refresh_unavailable");
+                Ok(metadata.0)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn parent_path(path: &VfsPath) -> Option<VfsPath> {
@@ -3081,14 +3091,61 @@ mod tests {
         async fn lookup(&self, p: &VfsPath) -> Result<Entry, HandlerError> {
             if p.is_root() {
                 Ok(Entry::dir(""))
+            } else if matches!(p.segments(), [name] if name == "new.json") {
+                Ok(Entry::writable_file("new.json"))
             } else {
                 Err(HandlerError::NotFound(p.to_string_path()))
             }
         }
 
+        async fn read(&self, _p: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+            Ok(b"command template\n".to_vec())
+        }
+
+        async fn write(&self, _p: &VfsPath, _data: &[u8]) -> Result<(), HandlerError> {
+            Err(HandlerError::Backend("authority backend offline".into()))
+        }
+
         async fn list(&self, _p: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
             Err(HandlerError::Backend("directory backend offline".into()))
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn denied_command_write_keeps_parent_metadata_and_template_readable() {
+        let vfs = Vfs::builder()
+            .mount("box", Arc::new(FailingDirectoryHandler))
+            .build();
+        let fs = BloomFs::new(vfs);
+        let ctx = fake_ctx();
+        let directory = fs.lookup(&ctx, &BloomHandle::Root, "box").await.unwrap();
+        let before = fs.getattr(&ctx, &directory).await.unwrap();
+        let command = fs.lookup(&ctx, &directory, "new.json").await.unwrap();
+        let denied = fs
+            .write(
+                &ctx,
+                &command,
+                0,
+                Bytes::from_static(b"{}\n"),
+                WriteStability::FileSync,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(denied, FsError::Io);
+        tokio::time::advance(DIRECTORY_CACHE_REVALIDATE_INTERVAL + Duration::from_millis(1)).await;
+        let after = fs.getattr(&ctx, &directory).await.unwrap();
+        assert_eq!(after.change, before.change);
+        assert_eq!(after.mode, before.mode);
+        let rendered = fs.getattr(&ctx, &command).await.unwrap();
+        assert_eq!(rendered.size, b"command template\n".len() as u64);
+        let read = fs.read(&ctx, &command, 0, u32::MAX).await.unwrap();
+        assert_eq!(read.data.as_ref(), b"command template\n");
+        // Directory enumeration still reports its backend failure.
+        let error = fs
+            .readdir(&ctx, &directory, 0, u32::MAX, false)
+            .await
+            .unwrap_err();
+        assert_eq!(error, FsError::Io);
     }
 
     #[tokio::test]

@@ -224,6 +224,9 @@ jobs:
           cargo nextest run --archive-file target/nextest-archive.tar.zst \
             -E 'package(bloom-it) and (binary(anvil_e2e) or binary(erc20_e2e))' \
             --no-fail-fast
+          cargo nextest run --archive-file target/nextest-archive.tar.zst \
+            -E 'package(bloom-checkout) and binary(browser_lifecycle)' \
+            --no-fail-fast
       # The triad release binary asserts the content of the packaged
       # installers, launcher, and release gates. It was previously not run at
       # all, so a launcher change could silently invalidate its assertions.
@@ -296,8 +299,8 @@ jobs:
       github.ref_name == 'triad-architecture'
     uses: ./.github/workflows/macos-unix-conformance.yml
     with:
-      broker_ref: 9f394aebbc9c04a6031de31a12385e5485f8ca9b
-      signer_ref: bc88ad690757165ebf1978410ea5c7ec652215d3
+      broker_ref: b4f0c0bf04f3f34cc171f072a87ed982f4e7e196
+      signer_ref: 74e097a566f1bd08f5f43a7e847d3958b6386a3a
 
   linux_w0_isolation:
     name: Linux W0 principal and socket isolation
@@ -312,7 +315,7 @@ jobs:
           cp packaging/triad/linux/systemd/*.socket "$unit_dir/"
           for source in packaging/triad/linux/systemd/*.service.in; do
             destination="$unit_dir/$(basename "${source%.in}")"
-            sed 's|@BLOOM_BROKER_BINARY@|/usr/bin/true|; s|@BLOOM_SIGNER_BINARY@|/usr/bin/true|' \
+            sed 's|@BLOOM_[A-Z]*_BINARY@|/usr/bin/true|' \
               "$source" > "$destination"
           done
           cp "$unit_dir/bloom-signer@.service" "$unit_dir/bloom-signer@1000.service"

@@ -1368,7 +1368,7 @@ impl TxEngine {
         // Reject an unknown review mode before reserving a nonce or writing
         // a pending entry; signing-time validation would otherwise fail the
         // row only after staging side effects.
-        parse_review_mode(intent.review_mode.as_deref())?;
+        check_review_mode(intent.review_mode.as_deref())?;
         // Only creation lacks a recipient. A deployment grant must leave
         // sends, calls, spenders and operators under the ordinary allowlist.
         let mut creation_policy;
@@ -3757,18 +3757,8 @@ impl TxEngine {
             .await
             .map_err(protocol_signing_error)?;
         let key = evm_signing_key(&service.broker, &wallet_public, sender).await?;
-        // Broker reviews a batch under one mode. Members that were staged
-        // asking for different reviews are refused here rather than sent for
-        // Broker to reject, because the disagreement is in this outbox.
-        let batch_review_mode = requested_review_mode(&staged_plans[0])?;
-        for staged in &staged_plans[1..] {
-            if requested_review_mode(staged)? != batch_review_mode {
-                return Err(TxEngineError::ApprovalDenied(
-                    "a transaction batch must be reviewed one way; its members ask for different \
-                     reviews. Confirm them separately."
-                        .into(),
-                ));
-            }
+        for staged in staged_plans {
+            check_review_mode(staged.review_mode.as_deref())?;
         }
         let request = ExactPayloadBatchSignRequest {
             wallet_id: Token::new(wallet.to_string())
@@ -3785,7 +3775,6 @@ impl TxEngine {
             issued_at_ms: state.issued_at_ms.clone(),
             expires_at_ms: state.expires_at_ms.clone(),
             canonical_plan_facts_digest: state.canonical_plan_facts_digest.clone(),
-            requested_review_mode: batch_review_mode,
             approval_id: state.approval_id.clone(),
             account_key_ref: key.selector.clone(),
             petal_use_claim: None,
@@ -4536,24 +4525,19 @@ async fn evm_signing_key(
 /// An unrecognised value is an error rather than a default: a row asking for
 /// a mode this build does not know must not be prepared under some other
 /// one, because the difference is exactly what the owner will be shown.
-fn parse_review_mode(
-    mode: Option<&str>,
-) -> Result<Option<bloom_broker_api::ReviewMode>, TxEngineError> {
+/// `reviewMode` used to choose between the readable review and approving
+/// bytes Bloom would not explain. Broker now decides that itself from the
+/// payload it can verify, and discloses which review it gave, so a row asking
+/// for `clear` already gets what it asked for. A row asking for the opposite
+/// cannot be honoured quietly, and says so here.
+fn check_review_mode(mode: Option<&str>) -> Result<(), TxEngineError> {
     match mode {
-        None => Ok(None),
-        Some("clear") => Ok(Some(bloom_broker_api::ReviewMode::Clear)),
-        Some("opaque_exact") => Ok(Some(bloom_broker_api::ReviewMode::OpaqueExact)),
+        None | Some("clear") => Ok(()),
         Some(other) => Err(TxEngineError::ApprovalConstruction(format!(
-            "unknown review mode `{other}`; use `clear`, `opaque_exact`, or omit it"
+            "reviewMode `{other}` is no longer accepted; Broker chooses the review it can \
+             verify from the exact payload"
         ))),
     }
-}
-
-/// The review the staged row asked for.
-fn requested_review_mode(
-    staged: &StagedTx,
-) -> Result<Option<bloom_broker_api::ReviewMode>, TxEngineError> {
-    parse_review_mode(staged.review_mode.as_deref())
 }
 
 fn exact_evm_sign_request(
@@ -4579,7 +4563,6 @@ fn exact_evm_sign_request(
         issued_at_ms: state.issued_at_ms.clone(),
         expires_at_ms: state.expires_at_ms.clone(),
         canonical_plan_facts_digest: state.canonical_plan_facts_digest.clone(),
-        requested_review_mode: requested_review_mode(staged)?,
         approval_id: state.approval_id.clone(),
         account_key_ref,
         petal_use_claim: None,
@@ -6495,7 +6478,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stage_rejects_unknown_review_mode_before_any_write() {
+    async fn stage_rejects_a_review_mode_broker_no_longer_takes() {
         let url = spawn_stage_rpc(true).await;
         let oracle = RecordingOracle {
             calls: Arc::new(parking_lot::Mutex::new(Vec::new())),
@@ -6507,7 +6490,7 @@ mod tests {
         let from: Address = TEST_SIGNER_ADDRESS.parse().unwrap();
         let body = r#"{"kind":"deploy","data":"0x60006000f3","value":"123 wei"}"#;
         let mut intent = crate::intent_parser::parse(body).unwrap();
-        intent.review_mode = Some("Clear".into());
+        intent.review_mode = Some("opaque_exact".into());
         let error = engine
             .stage(
                 &permit,
@@ -6521,7 +6504,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(&error, TxEngineError::ApprovalConstruction(reason) if reason.contains("unknown review mode")),
+            matches!(&error, TxEngineError::ApprovalConstruction(reason) if reason.contains("no longer accepted")),
             "{error:?}"
         );
         // The rejection happens before any nonce reservation or outbox write.
@@ -6532,9 +6515,9 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        // A known mode still stages.
+        // The one value that still describes what Broker does stages.
         let mut intent = crate::intent_parser::parse(body).unwrap();
-        intent.review_mode = Some("opaque_exact".into());
+        intent.review_mode = Some("clear".into());
         let staged = engine
             .stage(
                 &permit,
@@ -6547,7 +6530,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(staged.review_mode.as_deref(), Some("opaque_exact"));
+        assert_eq!(staged.review_mode.as_deref(), Some("clear"));
     }
 
     #[tokio::test]

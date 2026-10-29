@@ -1,5 +1,7 @@
 [workspace]
 members = [
+  "crates/bloom-checkout",
+  "crates/bloom-checkout-api",
   "crates/bloom",
   "crates/bloom-machine",
   "crates/bloom-daemon",
@@ -38,6 +40,7 @@ license = "MIT"
 repository = "https://github.com/bloom-directory/bloom"
 
 [workspace.dependencies]
+bloom-checkout-api = { path = "crates/bloom-checkout-api" }
 anyhow = "~1.0.104"
 thiserror = "2"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "signal", "sync", "time", "fs", "net", "io-util"] }
@@ -65,7 +68,7 @@ base64 = "0.22"
 bs58 = "0.5"
 argon2 = "0.5"
 chacha20poly1305 = "0.10"
-zeroize = { version = "1", features = ["zeroize_derive"] }
+zeroize = { version = "1", features = ["zeroize_derive", "serde"] }
 rand = "0.8"
 ml-dsa = { version = "0.1.0", features = ["getrandom", "zeroize"] }
 ed25519-dalek = { version = "3", features = ["rand_core"] }
@@ -134,7 +137,7 @@ bloom-petals   = { path = "crates/bloom-petals" }
 bloom-petal-contract = { git = "https://github.com/bloom-directory/petal", rev = "73c5b06a77599368fbc79fb7947a629b5b4c630e" }
 bloom-daemon   = { path = "crates/bloom-daemon" }
 bloom-update   = { path = "crates/bloom-update" }
-bloom-broker-api = { git = "https://github.com/bloom-directory/bloom-broker.git", rev = "9f394aebbc9c04a6031de31a12385e5485f8ca9b" }
+bloom-broker-api = { git = "https://github.com/bloom-directory/bloom-broker.git", rev = "b4f0c0bf04f3f34cc171f072a87ed982f4e7e196" }
 bloom-rpc-wire = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "ad0072512bb97fb4eb68d249ce785ea3ea4a49ab" }
 bloom-triad-local-transport = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "ad0072512bb97fb4eb68d249ce785ea3ea4a49ab" }
 bloom-service-activation = { git = "https://github.com/bloom-directory/bloom-service-runtime.git", rev = "ad0072512bb97fb4eb68d249ce785ea3ea4a49ab" }

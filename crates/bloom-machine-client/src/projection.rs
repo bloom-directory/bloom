@@ -178,6 +178,10 @@ pub trait WalletProjectionReader: Send + Sync {
         self.list_wallets().await
     }
     async fn get_wallet(&self, wallet_id: &Token) -> Result<WalletProjection, ProtocolError>;
+    /// Forget freshness after a committed mutation; retain the offline snapshot.
+    async fn invalidate_wallet(&self, _wallet_id: &Token) -> Result<(), ProtocolError> {
+        Ok(())
+    }
     /// Read account authority from Broker without a cached success or fallback.
     async fn get_wallet_authority(
         &self,
@@ -737,6 +741,22 @@ impl CachedWalletProjectionReader {
 
 #[async_trait]
 impl WalletProjectionReader for CachedWalletProjectionReader {
+    async fn invalidate_wallet(&self, wallet_id: &Token) -> Result<(), ProtocolError> {
+        // Wait for an older in-flight observation before clearing freshness.
+        let store = self.store.clone();
+        let _refresh_lock = tokio::task::spawn_blocking(move || store.acquire_refresh_lock())
+            .await
+            .map_err(|error| {
+                unavailable(format!("join Machine projection lock task: {error}"))
+            })??;
+        self.last_live_refresh_ms.store(0, Ordering::SeqCst);
+        self.wallet_refreshed_ms
+            .lock()
+            .map_err(|_| unavailable("Machine projection freshness mutex poisoned"))?
+            .remove(wallet_id.as_str());
+        Ok(())
+    }
+
     async fn list_wallets(&self) -> Result<Vec<WalletProjection>, ProtocolError> {
         match self.refresh_coalesced().await {
             Ok(projections) => Ok(projections),

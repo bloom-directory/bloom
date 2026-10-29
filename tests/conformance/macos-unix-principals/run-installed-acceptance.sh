@@ -65,7 +65,7 @@ payload_release_digest="$(
 [[ "$release_digest" == "$payload_release_digest" ]]
 release_root="/usr/local/libexec/bloom/releases/$release_digest"
 [[ "$(readlink /usr/local/libexec/bloom/current)" == "releases/$release_digest" ]]
-for binary in bloom bloom-broker bloom-signer bloom-signer-migrate; do
+for binary in bloom bloom-broker bloom-signer bloom-signer-migrate bloom-checkout; do
   installed="$release_root/$binary"
   [[ "$(stat -f '%u:%g:%Lp:%l' "$installed")" == "0:0:755:1" ]]
   cmp "$payload/bin/$binary" "$installed" >/dev/null || {
@@ -88,7 +88,7 @@ then
   echo "tested payload contains an Apple Developer Program artifact" >&2
   exit 1
 fi
-for binary in bloom bloom-broker bloom-signer bloom-signer-migrate; do
+for binary in bloom bloom-broker bloom-signer bloom-signer-migrate bloom-checkout; do
   codesign_report="$static_work/$binary.codesign"
   codesign -d --verbose=4 "$payload/bin/$binary" \
     >"$codesign_report" 2>&1 || true
@@ -328,6 +328,7 @@ if [[ "${BLOOM_MACOS_ACCEPTANCE_EXCLUSIVE_LISTENER_TESTED:-}" == 1 ]]; then
   broker_test_args+=(-- --skip paired_loopback_servers_validate_serve_both_families_and_shutdown)
 fi
 run_as_login test "${broker_test_args[@]}"
+run_as_login test --manifest-path "$main_root/Cargo.toml" -p bloom-checkout --lib --locked -- --test-threads=4
 run_as_login test \
   --manifest-path "$signer_root/Cargo.toml" \
   --workspace \

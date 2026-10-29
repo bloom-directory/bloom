@@ -2181,6 +2181,12 @@ impl WalletsHandler {
                 }
                 projection.ceremony_url = None;
                 projection.ceremony_expires_at_ms = None;
+                if let Some(projections) = &self.wallet_projections {
+                    projections
+                        .invalidate_wallet(&wallet_id)
+                        .await
+                        .map_err(|error| HandlerError::backend(error.to_string()))?;
+                }
                 write_atomic_json(&projection_path, &projection)?;
                 self.policy_update_transition(
                     wallet,
@@ -8807,13 +8813,15 @@ value = "0""#,
             .with_broker(Some(MachineBrokerClient::new(broker.clone())));
         let request = ApprovalPrepareRequest {
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
+            safe_review_payloads: Vec::new(),
             evm_review_payloads: Vec::new(),
             operation_id: OperationId::from_bytes([30; 32]),
             terms: approval_terms("alice", None),
             canonical_plan_facts_digest: digest(31),
             petal_use_claim: None,
             system_use_claim: None,
-            requested_review_mode: None,
+            message_review_payloads: Vec::new(),
+            evm_reported_token: None,
         };
         let path = VfsPath::parse("/alice/sealed-approvals/new.json").unwrap();
         f.handler
@@ -8856,13 +8864,15 @@ value = "0""#,
                 .with_broker(Some(MachineBrokerClient::new(broker.clone())));
             let request = ApprovalPrepareRequest {
                 surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
+                safe_review_payloads: Vec::new(),
                 evm_review_payloads: Vec::new(),
                 operation_id: OperationId::from_bytes([30; 32]),
                 terms: approval_terms("alice", None),
                 canonical_plan_facts_digest: digest(31),
                 petal_use_claim: None,
                 system_use_claim: None,
-                requested_review_mode: None,
+                message_review_payloads: Vec::new(),
+                evm_reported_token: None,
             };
             let path = VfsPath::parse("/alice/sealed-approvals/new.json").unwrap();
             f.handler
@@ -8890,13 +8900,15 @@ value = "0""#,
             .with_broker(Some(MachineBrokerClient::new(broker.clone())));
         let request = ApprovalPrepareRequest {
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
+            safe_review_payloads: Vec::new(),
             evm_review_payloads: Vec::new(),
             operation_id: OperationId::from_bytes([30; 32]),
             terms: approval_terms("alice", None),
             canonical_plan_facts_digest: digest(31),
             petal_use_claim: None,
             system_use_claim: None,
-            requested_review_mode: None,
+            message_review_payloads: Vec::new(),
+            evm_reported_token: None,
         };
         let path = VfsPath::parse("/alice/sealed-approvals/new.json").unwrap();
         f.handler
@@ -8923,13 +8935,15 @@ value = "0""#,
             .with_broker(Some(MachineBrokerClient::new(broker)));
         let request = ApprovalPrepareRequest {
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
+            safe_review_payloads: Vec::new(),
             evm_review_payloads: Vec::new(),
             operation_id: OperationId::from_bytes([30; 32]),
             terms: approval_terms("alice", None),
             canonical_plan_facts_digest: digest(31),
             petal_use_claim: None,
             system_use_claim: None,
-            requested_review_mode: None,
+            message_review_payloads: Vec::new(),
+            evm_reported_token: None,
         };
         let path = VfsPath::parse("/alice/sealed-approvals/new.json").unwrap();
 
