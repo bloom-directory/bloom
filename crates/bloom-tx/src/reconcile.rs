@@ -624,6 +624,10 @@ mod tests {
         nonce: Arc<Mutex<Option<u64>>>,
         receipt: Arc<Mutex<serde_json::Value>>,
         receipt_fails: Arc<Mutex<bool>>,
+        /// The JSON-RPC error a failing receipt lookup answers with.
+        receipt_error: serde_json::Value,
+        /// Every method requested, in order.
+        methods: Arc<Mutex<Vec<String>>>,
         calls: Arc<AtomicUsize>,
         nonce_calls: Arc<AtomicUsize>,
         /// Set the test clock to this many seconds when the next nonce read
@@ -639,6 +643,8 @@ mod tests {
                 nonce: Arc::new(Mutex::new(nonce)),
                 receipt: Arc::new(Mutex::new(receipt)),
                 receipt_fails: Arc::new(Mutex::new(false)),
+                receipt_error: serde_json::json!({"code": -32000, "message": "unavailable"}),
+                methods: Arc::new(Mutex::new(Vec::new())),
                 calls: Arc::new(AtomicUsize::new(0)),
                 nonce_calls: Arc::new(AtomicUsize::new(0)),
                 clock_on_nonce: Arc::new(Mutex::new(None)),
@@ -673,6 +679,9 @@ mod tests {
                         .cloned()
                         .unwrap_or(serde_json::Value::Null);
                     let reply = |field: &str, value: serde_json::Value| serde_json::json!({"jsonrpc": "2.0", "id": id, field: value});
+                    if let Some(method) = request_json["method"].as_str() {
+                        rpc.methods.lock().unwrap().push(method.to_owned());
+                    }
                     let body = match request_json["method"].as_str() {
                         Some("eth_getTransactionCount") => {
                             rpc.nonce_calls.fetch_add(1, Ordering::SeqCst);
@@ -696,10 +705,7 @@ mod tests {
                                 audit.fail_next_write_for_test();
                             }
                             if *rpc.receipt_fails.lock().unwrap() {
-                                reply(
-                                    "error",
-                                    serde_json::json!({"code": -32000, "message": "unavailable"}),
-                                )
+                                reply("error", rpc.receipt_error.clone())
                             } else if rpc.receipt_hash.as_ref().is_some_and(|hash| request_json["params"][0].as_str() != Some(hash.as_str())) {
                                 reply("result", serde_json::Value::Null)
                             } else {
@@ -990,6 +996,67 @@ mod tests {
         *rpc.receipt_fails.lock().unwrap() = false;
         at(332);
         assert_eq!(reconciler.tick().await, 1);
+    }
+
+    /// Polygon's public endpoint answers a receipt lookup it cannot serve with
+    /// an authorization error rather than `null`. That error must stay visible
+    /// and leave the entry sent and unprojected until the receipt arrives; the
+    /// reconciler never signs or broadcasts.
+    #[tokio::test]
+    async fn receipt_lookup_errors_keep_the_entry_sent_until_the_receipt_arrives() {
+        let (_directory, outbox) = sent_outbox();
+        let audit_directory = tempfile::tempdir().unwrap();
+        let audit = Arc::new(AuditLog::open(audit_directory.path().join("audit.jsonl")).unwrap());
+        let mut rpc = MockRpc::new(Some(1), mined_receipt());
+        rpc.receipt_error = serde_json::json!({
+            "code": -32602,
+            "message": "Archive requests require a personal token",
+        });
+        *rpc.receipt_fails.lock().unwrap() = true;
+        let chains = ChainRegistry::default();
+        chains.add(mock_chain(rpc.clone()).await);
+        let (reconciler, at) = clocked(outbox.clone(), chains, audit.clone());
+        for secs in [0, 15, 60, 240, 301, 320] {
+            at(secs);
+            assert_eq!(reconciler.tick().await, 0);
+            let entry = outbox.read("alice", "anvil", "tx-1").unwrap();
+            assert_eq!(entry.state, crate::outbox::OutboxState::Sent);
+            assert!(
+                outbox
+                    .read_receipt("alice", "anvil", "tx-1")
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert_eq!(rpc.lookups(), 5, "the grace window, then deferred");
+        let last = audit.tail(1).unwrap();
+        assert_eq!(last[0].data["result"]["outcome"], "error");
+        assert!(
+            last[0].data["result"]["error"]
+                .as_str()
+                .unwrap()
+                .contains("Archive requests require a personal token")
+        );
+
+        *rpc.receipt_fails.lock().unwrap() = false;
+        at(332);
+        assert_eq!(reconciler.tick().await, 1);
+        assert_eq!(
+            outbox
+                .read_receipt("alice", "anvil", "tx-1")
+                .unwrap()
+                .unwrap()
+                .outcome,
+            "success"
+        );
+        assert!(audit.pending_effect_correlations().unwrap().is_empty());
+        let methods = rpc.methods.lock().unwrap();
+        assert!(
+            methods
+                .iter()
+                .all(|m| m == "eth_getTransactionCount" || m == "eth_getTransactionReceipt"),
+            "reconciliation only reads: {methods:?}"
+        );
     }
 
     #[tokio::test]
