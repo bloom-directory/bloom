@@ -593,6 +593,10 @@ impl ChainClient {
         Ok(self.primary.get_gas_price().await?)
     }
 
+    pub async fn max_priority_fee_per_gas(&self) -> Result<u128, ChainError> {
+        Ok(self.primary.get_max_priority_fee_per_gas().await?)
+    }
+
     pub async fn estimate_gas(
         &self,
         tx: &alloy::rpc::types::eth::TransactionRequest,

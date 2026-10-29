@@ -1549,10 +1549,23 @@ impl TxEngine {
         let gas_price = deployment
             .and_then(|(_, tx)| tx.gas_price)
             .unwrap_or(gas_price);
-        let (max_fee, prio) = fee_overrides.map_or_else(
-            || (gas_price.saturating_mul(2), (gas_price / 10).max(1)),
-            |fees| (fees.max_fee_per_gas, fees.max_priority_fee_per_gas),
-        );
+        let (max_fee, prio) = if let Some(fees) = fee_overrides {
+            (fees.max_fee_per_gas, fees.max_priority_fee_per_gas)
+        } else if spec.legacy_tx {
+            (gas_price, 0)
+        } else {
+            let priority = match chain.max_priority_fee_per_gas().await {
+                Ok(priority) => priority.max(1),
+                Err(error) => {
+                    // A fraction of gasPrice can fall below a chain's minimum
+                    // tip (Polygon requires 25 gwei). Use its full quote when
+                    // the node cannot supply the dedicated priority quote.
+                    tracing::warn!(%error, chain = %spec.name, "tx.priority_fee_fallback");
+                    gas_price.max(1)
+                }
+            };
+            (gas_price.max(priority).saturating_mul(2), priority)
+        };
 
         let mut req = TransactionRequest::default()
             .with_from(from)
@@ -6221,6 +6234,52 @@ mod tests {
                 ))
         );
         assert_eq!(outbox.walk_all_sent().unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn stage_respects_node_priority_fee_instead_of_dividing_gas_price() {
+        for (gas_price, priority_response) in [
+            (25_000_000_000u128, "\"0x5d21dba00\""),
+            (1_000_000_000, "\"0x5d21dba00\""),
+            (
+                25_000_000_000,
+                "error:{\"code\":-32601,\"message\":\"unsupported\"}",
+            ),
+        ] {
+            let mut responses = stage_rpc_responses(true);
+            responses.insert("eth_gasPrice".into(), vec![format!("\"0x{gas_price:x}\"")]);
+            responses.insert(
+                "eth_maxPriorityFeePerGas".into(),
+                vec![priority_response.into()],
+            );
+            let url = spawn_queued_rpc(responses).await;
+            let oracle = RecordingOracle {
+                calls: Arc::new(parking_lot::Mutex::new(Vec::new())),
+                usd_micro: 1_000_000,
+                age_ms: 0,
+                max_age_ms: 60_000,
+            };
+            let (engine, _dir, permit, chain) = stage_fixture(&url, oracle);
+            let staged = engine
+                .stage(
+                    &permit,
+                    "alice",
+                    "0x1111111111111111111111111111111111111111"
+                        .parse()
+                        .unwrap(),
+                    native_intent("0.001 eth", None),
+                    &chain,
+                    &policy_with_usd_cap(),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                staged.max_priority_fee_per_gas.as_deref(),
+                Some("25000000000")
+            );
+            assert_eq!(staged.max_fee_per_gas.as_deref(), Some("50000000000"));
+        }
     }
 
     #[tokio::test]
