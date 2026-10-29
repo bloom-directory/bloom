@@ -528,6 +528,8 @@ fn is_known_six_decimal_usd_asset(asset: &str) -> bool {
         asset.to_ascii_lowercase().as_str(),
         // USDC on Base.
         "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
+            // USDC ERC-20 interface on Arc (native gas amounts use 18 decimals).
+            | "0x3600000000000000000000000000000000000000"
             // USDC on Tempo, as advertised by Nansen's MPP challenges.
             | "0x20c000000000000000000000b9537d11c60e8b50"
             // USD0 on Tempo.
@@ -998,6 +1000,62 @@ mod tests {
             ),
             Some(0.05)
         );
+    }
+
+    #[test]
+    fn parses_arc_usdc_base_units_as_usd() {
+        let asset = Some("0x3600000000000000000000000000000000000000");
+        assert_eq!(parse_payment_amount_usd(asset, Some("10000")), Some(0.01));
+        assert_eq!(parse_payment_amount_usd(asset, Some("1000000")), Some(1.0));
+        assert_eq!(parse_payment_amount_usd(asset, Some("0.01")), Some(0.01));
+        assert_eq!(parse_payment_amount_usd(asset, Some("$0.01")), Some(0.01));
+    }
+
+    #[test]
+    fn converts_arc_usdc_caps_to_atomic_units() {
+        let asset = Some("0x3600000000000000000000000000000000000000");
+        assert_eq!(usd_to_atomic_units(asset, 0.01), Some(10_000));
+        assert_eq!(usd_to_atomic_units(asset, 1.0), Some(1_000_000));
+    }
+
+    #[test]
+    fn arc_x402_cost_passes_request_cap() {
+        for (version, amount_key) in [(1, "maxAmountRequired"), (2, "amount")] {
+            let body = serde_json::json!({
+                "x402Version": version,
+                "accepts": [{
+                    "scheme": "exact",
+                    "network": "eip155:5042002",
+                    "asset": "0x3600000000000000000000000000000000000000",
+                    (amount_key): "10000"
+                }]
+            });
+            let challenge = normalize_challenge(
+                &HeaderMap::new(),
+                &serde_json::to_vec(&body).unwrap(),
+                &Url::parse("https://merchant.test/pay").unwrap(),
+            );
+            assert_eq!(challenge.protocol, "x402");
+            assert_eq!(challenge.amount_usd, Some(0.01));
+            let requirement = &challenge.accepts[0];
+            let checks = super::evaluate_payment_policy(
+                &bloom_proto::Policy::default(),
+                super::PolicyEvalInput {
+                    host: "merchant.test",
+                    asset: requirement.asset.as_deref(),
+                    network: requirement.network.as_deref(),
+                    intent: &challenge.intent,
+                    amount_usd: selected_requirement_amount_usd(&challenge, requirement),
+                    request_max_amount_usd: Some(0.01),
+                    spent_24h_usd: 0.0,
+                },
+            );
+            assert!(
+                checks.iter().any(|check| {
+                    check.rule == "request.max_amount_usd" && check.result == "pass"
+                })
+            );
+        }
     }
 
     #[test]
