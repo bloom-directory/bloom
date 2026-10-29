@@ -46,6 +46,7 @@ launchctl print "gui/$login_uid" >/dev/null 2>&1 || {
 }
 
 conformance_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+source "$conformance_dir/logout-drain.sh"
 main_root="$(cd "$conformance_dir/../../.." && pwd -P)"
 release_dir="$main_root/packaging/triad/release"
 installer="$release_dir/install-macos.sh"
@@ -541,21 +542,7 @@ sudo -u "$login_user" \
   "$release_digest"
 
 launchctl bootout "$session_label"
-deadline=$((SECONDS + 15))
-while [[ $SECONDS -lt $deadline ]]; do
-  if ! pgrep -u "$broker_uid" -x bloom-broker >/dev/null 2>&1 &&
-    ! pgrep -u "$signer_uid" -x bloom-signer >/dev/null 2>&1
-  then
-    break
-  fi
-  sleep 0.1
-done
-if pgrep -u "$broker_uid" -x bloom-broker >/dev/null 2>&1 ||
-  pgrep -u "$signer_uid" -x bloom-signer >/dev/null 2>&1
-then
-  echo "services did not drain after the login-session sentinel disappeared" >&2
-  exit 1
-fi
+wait_for_logout_services "$broker_uid" "$signer_uid" "$broker_label" "$signer_label"
 for ceremony_host in 127.0.0.1 '[::1]'; do
   if curl --silent --globoff --max-time 1 "http://$ceremony_host:18734/" >/dev/null 2>&1; then
     echo "Broker retained the ceremony listener on $ceremony_host after session logout" >&2
