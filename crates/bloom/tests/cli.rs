@@ -2933,7 +2933,7 @@ fn github_source_install_polymarket_dispatches_route_contract() {
         return;
     }
     // Exercise source installation of the current pinned Polymarket release.
-    let petal_ref = "a0177ae4e68f4a043df4db727fb3212e23ab7395";
+    let petal_ref = "74f1f928313916b332d9059f2e4363eac8f147af";
     let home = fresh_home();
     let home_dir = bloom_proto::HomeDir::at(home.path());
     let config = bloom_proto::Config::local_default();

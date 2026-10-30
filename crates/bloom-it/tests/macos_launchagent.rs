@@ -504,7 +504,15 @@ fn privileged_w0_harness_requires_an_external_disposable_host_marker() {
     assert!(source.contains("task-access-probe"));
     assert!(source.contains("Machine login sampled"));
     assert!(source.contains("session sentinel did not reject an unauthorized login-UID peer"));
-    assert!(source.contains("services did not drain after the login-session sentinel disappeared"));
+    assert!(source.contains("source \"$conformance_dir/logout-drain.sh\""));
+    assert!(source.contains(
+        "wait_for_logout_services \"$broker_uid\" \"$signer_uid\" \"$broker_label\" \"$signer_label\""
+    ));
+    let logout_drain = fs::read_to_string(
+        workspace().join("tests/conformance/macos-unix-principals/logout-drain.sh"),
+    )
+    .unwrap();
+    assert!(logout_drain.contains("services did not exit successfully after login-session logout"));
     assert!(
         source.contains(
             "Broker retained the ceremony listener on $ceremony_host after session logout"
