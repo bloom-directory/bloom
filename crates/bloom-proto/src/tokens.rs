@@ -38,6 +38,13 @@ pub fn resolve_symbol(chain_id: u64, symbol: &str) -> Option<&'static KnownToken
         .find(|t| t.symbol.eq_ignore_ascii_case(symbol))
 }
 
+/// The curated token at `address` on `chain_id`, compared case-insensitively.
+pub fn resolve_address(chain_id: u64, address: &str) -> Option<&'static KnownToken> {
+    for_chain(chain_id)
+        .iter()
+        .find(|t| t.address.eq_ignore_ascii_case(address))
+}
+
 const ETHEREUM: &[KnownToken] = &[
     KnownToken {
         address: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",

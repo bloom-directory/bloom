@@ -28,6 +28,7 @@ pub mod planning;
 pub mod router;
 #[cfg(test)]
 pub(crate) mod test_support;
+pub mod write_locks;
 
 pub use cache::PathCache;
 pub use exact_signing::{BrokerExactPayloadSigner, ExactPayloadBatchOutcome, ExactPayloadOutcome};
@@ -41,3 +42,4 @@ pub use paginate::{PAGE_SIZE, Projection, page_indices, page_name, page_slice, p
 pub use path::{PercentDecodeError, VfsPath, percent_decode_segment};
 pub use planning::{advisory_evm_policy, advisory_exact_evm_policy, advisory_paid_http_policy};
 pub use router::Vfs;
+pub use write_locks::{CONDITIONAL_WRITE_WAIT, WriteLocks};

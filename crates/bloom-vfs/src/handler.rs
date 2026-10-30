@@ -241,6 +241,25 @@ pub trait Handler: Send + Sync {
         Err(HandlerError::PermissionDenied)
     }
 
+    /// Write `data` to `path` only while the handler stores nothing under
+    /// `key` for it, and report whether it wrote. What is stored decides,
+    /// not what `path` reads: a file may read the same default whether its
+    /// value is missing or was saved that way. The check and the write must
+    /// be one step against every other write this handler accepts for
+    /// `path`, which [`crate::WriteLocks`] provides. Default: unsupported,
+    /// writing nothing.
+    async fn write_if_absent(
+        &self,
+        path: &VfsPath,
+        _key: &str,
+        _data: &[u8],
+    ) -> Result<bool, HandlerError> {
+        Err(HandlerError::Unsupported(format!(
+            "conditional write to {}",
+            path.to_string_path()
+        )))
+    }
+
     /// Prepare for a write-open before any bytes are accepted by the mount.
     ///
     /// Handlers that need user-visible failures for shell redirects should

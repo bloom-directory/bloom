@@ -933,6 +933,39 @@ impl PetalRunner {
         sign_intents_from_manifest_toml(&manifest)
     }
 
+    /// Whether the Petal at `mount` stores a value under `key` for the write
+    /// route at `path`, in the partition a run of that route uses for
+    /// `account`. Data a replaced release carries forward is moved first, as
+    /// before a run, so carried values count as stored.
+    pub fn petal_store_has(
+        &self,
+        mount: &str,
+        path: &str,
+        account: Option<&AccountPetalContext>,
+        key: &str,
+    ) -> Result<bool, PetalError> {
+        let matched = self.petal_route(mount, DispatchOp::Write, path)?;
+        self.prepare_private_store(&matched.hash, account)?;
+        let root = match account {
+            Some(_) => self.store.private_account_data_root(),
+            None => self.store.private_data_root(),
+        };
+        let account = account.map(|account| (account.wallet.clone(), account.number));
+        let policy = self.petal_store_policy(&matched.hash)?;
+        let store = crate::vm::open_selected_private_store(
+            root,
+            account.as_ref(),
+            Some(&policy),
+            Some(&self.store.private_data_root()),
+        )
+        .map_err(|e| PetalError::vm(format!("private store open: {e}")))?;
+        match store.get(&matched.hash, key) {
+            Ok(_) => Ok(true),
+            Err(crate::host::HostError::NotFound(_)) => Ok(false),
+            Err(e) => Err(PetalError::vm(format!("private store read: {e}"))),
+        }
+    }
+
     fn petal_store_policy(
         &self,
         hash: &str,

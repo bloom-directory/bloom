@@ -47,6 +47,15 @@ pub struct Config {
         with = "humantime_serde"
     )]
     pub wallet_projection_max_age: std::time::Duration,
+    /// Optional onboarding suggestion. Absent on legacy homes; never grants authority.
+    /// A saved persona that does not parse or validate is set aside on load
+    /// (see [`lenient_persona`]) rather than failing the whole config.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_persona"
+    )]
+    pub persona: Option<crate::persona::PersonaConfig>,
     /// Map of chain name -> spec.
     #[serde(default)]
     pub chains: BTreeMap<String, ChainSpec>,
@@ -100,6 +109,28 @@ pub struct PetalsConfig {
     pub preinstalled: Vec<String>,
     #[serde(default)]
     pub runtime: BTreeMap<String, PetalRuntimeConfig>,
+    /// Petals chosen during `bloom init` setup, with the values each one's
+    /// settings need. Bloom provisions its canonical Petals regardless; the
+    /// default wallet policy proposes exactly these. They grant no authority.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub setup: BTreeMap<String, PetalSetupConfig>,
+    /// Written together with `setup` when `bloom init` finished. This, not an
+    /// empty `setup`, is what tells a later run that setup already happened:
+    /// declining every Petal is a valid choice, and `bloom serve` or an
+    /// interrupted menu can leave a config with no choices in it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub setup_complete: bool,
+}
+
+/// Wallet whose default policy allows the Petals chosen during setup.
+pub const DEFAULT_POLICY_WALLET: &str = "main";
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PetalSetupConfig {
+    /// Named values substituted into the catalog's settings template.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub values: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -257,6 +288,37 @@ fn default_storage_reads_backend() -> Backend {
 }
 fn default_proxy_detection_backend() -> Backend {
     Backend::Rpc
+}
+
+/// Read `[persona]` without letting it fail the whole config. A persona that
+/// does not parse (a missing or unknown field, a newer schema) or does not
+/// validate is set aside with a warning and the home behaves as Institutional,
+/// which grants the least. Every other setting still loads, so Machine starts
+/// and `bloom init --persona` can choose one again. Writing a persona stays
+/// strict: [`Config::validate`] refuses an invalid one.
+fn lenient_persona<'de, D>(
+    deserializer: D,
+) -> Result<Option<crate::persona::PersonaConfig>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let Some(value) = Option::<toml::Value>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    let persona = value
+        .try_into::<crate::persona::PersonaConfig>()
+        .map_err(|error| error.to_string())
+        .and_then(|persona| persona.validate().map(|()| persona));
+    match persona {
+        Ok(persona) => Ok(Some(persona)),
+        Err(reason) => {
+            tracing::warn!(
+                %reason,
+                "config.persona_ignored: the saved [persona] is not usable and is treated as institutional; choose one again with `bloom init --persona <institutional|trader|degen>`"
+            );
+            Ok(None)
+        }
+    }
 }
 
 fn evm_chain(
@@ -443,6 +505,7 @@ impl Config {
             default_chain: default_chain_name(),
             stage_ttl: default_stage_ttl(),
             wallet_projection_max_age: default_wallet_projection_max_age(),
+            persona: None,
             chains,
             solana_chains: BTreeMap::from([(
                 "solana-mainnet".into(),
@@ -525,6 +588,9 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if let Some(persona) = &self.persona {
+            persona.validate().map_err(ConfigError::Invalid)?;
+        }
         if self.chains.is_empty() {
             return Err(ConfigError::Invalid(
                 "config.chains must contain at least one entry".into(),
@@ -1138,6 +1204,88 @@ rpc_urls = ["https://ethereum-rpc.publicnode.com"]
         assert!(cfg.solana_chains.contains_key("solana-mainnet"));
         let cfg2 = Config::load_or_init(&path).unwrap();
         assert_configs_equivalent(&cfg, &cfg2);
+    }
+
+    #[test]
+    fn setup_completion_is_written_only_once_recorded() {
+        let mut cfg = Config::local_default();
+        assert!(!cfg.petals.setup_complete);
+        let encoded = toml::to_string_pretty(&cfg).unwrap();
+        assert!(!encoded.contains("setup_complete"), "{encoded}");
+
+        // Petal tables alone do not mean setup finished.
+        let mut with_tables = toml::Value::try_from(&cfg).unwrap();
+        with_tables["petals"]
+            .as_table_mut()
+            .unwrap()
+            .insert("setup".into(), toml::toml! { hyperliquid = {} }.into());
+        let decoded: Config = with_tables.try_into().unwrap();
+        assert!(decoded.petals.setup.contains_key("hyperliquid"));
+        assert!(!decoded.petals.setup_complete);
+
+        cfg.petals.setup_complete = true;
+        let decoded: Config = toml::from_str(&toml::to_string_pretty(&cfg).unwrap()).unwrap();
+        assert!(decoded.petals.setup_complete);
+    }
+
+    #[test]
+    fn persona_migration_keeps_legacy_absent_and_independent_of_petal_setup() {
+        let mut cfg = Config::local_default();
+        cfg.petals.setup_complete = true;
+        let legacy = toml::to_string(&cfg).unwrap();
+        assert!(!legacy.contains("[persona]"));
+        let mut decoded: Config = toml::from_str(&legacy).unwrap();
+        assert!(decoded.persona.is_none());
+        decoded.persona = Some(crate::persona::PersonaConfig::suggested(
+            crate::persona::PersonaPreset::Trader,
+        ));
+        let encoded = toml::to_string(&decoded).unwrap();
+        let reloaded: Config = toml::from_str(&encoded).unwrap();
+        assert_eq!(reloaded.persona, decoded.persona);
+        assert!(reloaded.petals.setup_complete);
+    }
+
+    /// A saved persona that is not usable is set aside on load instead of
+    /// failing every command, and saving the config drops it. Writing one
+    /// stays strict.
+    #[test]
+    fn an_unusable_saved_persona_does_not_stop_the_config_loading() {
+        let td = tempdir().unwrap();
+        let path = td.path().join("config.toml");
+        let mut cfg = Config::local_default();
+        cfg.persona = Some(crate::persona::PersonaConfig::suggested(
+            crate::persona::PersonaPreset::Degen,
+        ));
+        let valid = toml::to_string(&cfg).unwrap();
+        assert!(valid.contains("window_secs = 604800"), "{valid}");
+        for edited in [
+            valid.replace("window_secs = 604800", "window_secs = 3600"),
+            valid.replace("schema_version = 2", "schema_version = 3"),
+            valid.replace("window_secs = 604800", "window_secs = 604800\nbudget = 5"),
+            valid.replace("preset = \"degen\"", "preset = \"whale\""),
+            valid.replace("window_secs = 604800\n", ""),
+        ] {
+            assert_ne!(edited, valid);
+            std::fs::write(&path, &edited).unwrap();
+            let loaded = Config::load(&path).unwrap_or_else(|error| panic!("{error}: {edited}"));
+            assert_eq!(loaded.persona, None, "{edited}");
+            assert_eq!(loaded.chains, cfg.chains, "every other setting still loads");
+            loaded.save(&path).unwrap();
+            assert!(
+                !std::fs::read_to_string(&path)
+                    .unwrap()
+                    .contains("[persona]")
+            );
+        }
+        std::fs::write(&path, &valid).unwrap();
+        assert_eq!(Config::load(&path).unwrap().persona, cfg.persona);
+
+        let mut invalid = cfg.clone();
+        invalid.persona.as_mut().unwrap().window_secs = 3600;
+        assert!(
+            invalid.validate().is_err(),
+            "writing an invalid persona is refused"
+        );
     }
 
     #[test]

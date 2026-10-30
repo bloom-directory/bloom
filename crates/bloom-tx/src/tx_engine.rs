@@ -1642,7 +1642,15 @@ impl TxEngine {
         // the destination has bytecode we still flag it as a contract
         // call; the heuristic mirrors the spec's "code length > 0 OR data
         // is non-empty" rule.
-        let mut policy_ctx = policy_engine::AddressContext::default();
+        let mut policy_ctx = policy_engine::AddressContext {
+            // A Petal's own destinations are only trusted when the policy names
+            // it; the engine merely reports which Petal staged this.
+            staged_by_petal: execution_origin
+                .as_ref()
+                .map(|origin| origin.petal_id.clone())
+                .filter(|petal| !petal.is_empty()),
+            ..Default::default()
+        };
         // Synthetic policy checks contributed by NFT-aware code paths
         // (e.g. operator-wide approvals) — appended after the rules engine
         // has produced its own checks so they all show up in plan.md.
@@ -1674,6 +1682,17 @@ impl TxEngine {
         match &intent.body {
             RawIntentBody::Send { .. } => {
                 if let Some(t) = &token_for_plan {
+                    // Any contract can answer `decimals()` and run arbitrary
+                    // code under the `transfer` selector, so only a token in
+                    // Bloom's reviewed table counts as an ERC-20 transfer here.
+                    policy_ctx.standard_erc20_transfer = data_bytes.len() == 68
+                        && data_bytes[..4] == [0xa9, 0x05, 0x9c, 0xbb]
+                        && data_bytes[4..16].iter().all(|b| *b == 0)
+                        && value_wei == U256::ZERO
+                        && to.is_some_and(|token| is_curated_token(chain_id, token))
+                        && execution_origin.as_ref().is_none_or(|o| {
+                            o.petal_id == bloom_proto::petal_identity::PETAL_ID_EVM_WALLET
+                        });
                     policy_ctx.token = to;
                     policy_ctx.contract = to;
                     policy_ctx.destination_is_contract = true;
@@ -5149,6 +5168,13 @@ fn lookup_known_token(chain_id: u64, symbol_upper: &str) -> Option<&'static str>
     hit
 }
 
+/// Whether `token` is in the same curated table `lookup_known_token` reads,
+/// whether the send named it by symbol or by address.
+fn is_curated_token(chain_id: u64, token: Address) -> bool {
+    let lookup_chain = if chain_id == 31337 { 1 } else { chain_id };
+    bloom_proto::tokens::resolve_address(lookup_chain, &format!("{token:#x}")).is_some()
+}
+
 const _PARSE_UNITS: fn(&str, u8) -> Result<U256, bloom_proto::units::UnitError> = parse_units;
 
 #[cfg(test)]
@@ -6398,6 +6424,128 @@ mod tests {
         assert_eq!(subject.total_value_usd_micro, Some(1_250_000));
         assert_eq!(calls.lock().len(), 1);
         assert_eq!(calls.lock()[0].1, "1250000");
+    }
+
+    /// Stage a send of 1.25 `token` (or 0.001 of the native asset) to an
+    /// unlisted recipient under `policy`, as `origin` would.
+    async fn stage_send_to_unlisted_recipient(
+        token: Option<Address>,
+        policy: &Policy,
+        origin: Option<ExecutionOrigin>,
+    ) -> Result<StagedTx, TxEngineError> {
+        let url = spawn_stage_rpc(false).await;
+        let oracle = RecordingOracle {
+            calls: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            usd_micro: 1_250_000,
+            age_ms: 0,
+            max_age_ms: 60_000,
+        };
+        let (engine, _dir, permit, chain) = stage_fixture(&url, oracle);
+        if let Some(token) = token {
+            engine.token_cache.write().insert(
+                (31337, token),
+                TokenMeta {
+                    address: token,
+                    symbol: "USDC".into(),
+                    decimals: 6,
+                },
+            );
+        }
+        let intent = RawIntent {
+            body: RawIntentBody::Send {
+                to: "0x2222222222222222222222222222222222222222".into(),
+                value: if token.is_some() {
+                    String::new()
+                } else {
+                    "0.001 eth".into()
+                },
+                token: token.map(|token| token.to_string()),
+                amount: if token.is_some() {
+                    "1.25 usdc".into()
+                } else {
+                    String::new()
+                },
+                data: None,
+            },
+            chain: Some("anvil".into()),
+            gas: bloom_proto::intent::GasStrategy::Auto,
+            nonce: None,
+            gas_limit_hint: None,
+            usd_value_hint: None,
+            review_mode: None,
+        };
+        engine
+            .stage_with_execution_origin(
+                &permit,
+                "alice",
+                "0x3333333333333333333333333333333333333333"
+                    .parse()
+                    .unwrap(),
+                intent,
+                &chain,
+                policy,
+                None,
+                origin,
+            )
+            .await
+    }
+
+    /// The `erc20:any-recipient` opt-in covers only the wallet's own canonical
+    /// transfer of a curated token. A Petal's transfer, an uncurated token, a
+    /// native send, or a policy without the opt-in keep matching listed
+    /// recipients.
+    #[tokio::test]
+    async fn only_a_curated_native_wallet_erc20_send_uses_the_any_recipient_opt_in() {
+        let denied = |staged: &Result<StagedTx, TxEngineError>| match staged {
+            Ok(staged) => crate::policy_engine::has_hard_violation(&staged.policy_checks),
+            Err(_) => true,
+        };
+        // Anvil reuses Ethereum's curated table.
+        let curated: Address = lookup_known_token(1, "USDC").unwrap().parse().unwrap();
+        let uncurated: Address = "0x1111111111111111111111111111111111111111"
+            .parse()
+            .unwrap();
+        let mut opted_in = Policy::default();
+        opted_in
+            .allowlists
+            .recipients
+            .insert(bloom_proto::policy::ERC20_ANY_RECIPIENT.into());
+        let mut listed_only = Policy::default();
+        listed_only
+            .allowlists
+            .recipients
+            .insert("0x4444444444444444444444444444444444444444".into());
+        let petal = ExecutionOrigin {
+            petal_id: "petal:polymarket".into(),
+            ..ExecutionOrigin::default()
+        };
+
+        for origin in [None, Some(ExecutionOrigin::default())] {
+            let staged = stage_send_to_unlisted_recipient(Some(curated), &opted_in, origin).await;
+            let staged = staged.unwrap();
+            assert!(
+                !crate::policy_engine::has_hard_violation(&staged.policy_checks),
+                "{:?}",
+                staged.policy_checks
+            );
+            assert!(
+                staged
+                    .policy_checks
+                    .iter()
+                    .any(|check| check.message.contains("ERC20 transfers to any recipient")),
+                "{:?}",
+                staged.policy_checks
+            );
+        }
+        for (token, policy, origin) in [
+            (Some(curated), &opted_in, Some(petal)),
+            (Some(uncurated), &opted_in, None),
+            (None, &opted_in, None),
+            (Some(curated), &listed_only, None),
+        ] {
+            let staged = stage_send_to_unlisted_recipient(token, policy, origin.clone()).await;
+            assert!(denied(&staged), "{token:?} {origin:?}: {staged:?}");
+        }
     }
 
     #[tokio::test]
@@ -8628,6 +8776,19 @@ mod tests {
     fn lookup_usdc_mainnet() {
         let addr = lookup_known_token(1, "USDC").unwrap();
         assert!(addr.to_ascii_lowercase().starts_with("0xa0b86991"));
+    }
+
+    /// A token is curated by its address on that chain, however the send
+    /// named it. Anvil reuses Ethereum's table, as symbol lookup does.
+    #[test]
+    fn curated_tokens_are_matched_by_address_on_their_own_chain() {
+        let usdc: Address = lookup_known_token(1, "USDC").unwrap().parse().unwrap();
+        assert!(is_curated_token(1, usdc));
+        assert!(is_curated_token(31337, usdc));
+        assert!(!is_curated_token(137, usdc), "Ethereum's USDC on Polygon");
+        let polygon_usdc: Address = lookup_known_token(137, "USDC").unwrap().parse().unwrap();
+        assert!(is_curated_token(137, polygon_usdc));
+        assert!(!is_curated_token(1, Address::repeat_byte(0x42)));
     }
 
     #[test]
