@@ -211,6 +211,49 @@ bloom petals install path/to/my-petal
 bloom petals install my-petal.petal.tar
 ```
 
+### Release installs versus the development Triad
+
+A Petal can be installed on any Bloom, but signing authority depends on
+provenance. Broker authorizes a Petal's signing and approval routes only for
+package hashes in its installer-signed provenance catalog, and refuses
+anything else with `PROVENANCE_REQUIRED` ("subject is absent from Broker's
+installer-owned current catalog"). On a release install that catalog is signed
+at installation and lists only the Petal releases that Bloom ships, so a
+locally built package under a new name can be installed and read but cannot
+sign. A local build cannot replace a shipped Petal of the same name either:
+activation fails with "successor release information is missing from the
+loaded installer catalog". This is deliberate; there is no release-mode switch
+to trust a local package.
+
+To develop a Petal that signs, use the development Triad
+(`scripts/triad-dev-launch.sh`, see [DEVELOPMENT.md](../../DEVELOPMENT.md)).
+Its developer installer key can add a record for your package:
+
+```sh
+# In the terminal that sourced the Triad's triad.env (debug Machine on PATH).
+bloom init triad-enroll-developer-petal-provenance \
+  "$BLOOM_TRIAD_DEVELOPER_ROOT/config" path/to/my-petal
+# Restart the launcher with the same developer root: Broker loads the
+# catalog at startup, and the launcher keeps developer records.
+bloom petals install path/to/my-petal
+```
+
+Enrollment rebuilds the package first, so the recorded hash matches what you
+install; enroll and restart again after every rebuild. The command exists only
+in `triad-dev-harness` builds.
+
+The launcher can do this for the bundled integration Petals. Its package
+variables do not behave the same way:
+
+| Variable | Builds the package | Enrolls provenance | Installs |
+|---|---|---|---|
+| `BLOOM_TRIAD_DEV_HYPERLIQUID_PACKAGE` | yes, with its `scripts/build.sh`, unless `BLOOM_TRIAD_DEV_BUILD_PETALS=0` | yes | yes |
+| `BLOOM_TRIAD_DEV_POLYMARKET_PACKAGE` | no | no | yes |
+
+So a Polymarket checkout passed this way installs but its signing routes are
+refused unless its exact hash is already in the catalog. For any other Petal,
+use the steps above.
+
 Before publishing, test both direct VFS fallback and a mounted daemon. Cover
 lookup, list, read, invalid input, backend failure, and every writable route.
 For a staged transaction workflow, verify that documentation and route output
