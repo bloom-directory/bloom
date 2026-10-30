@@ -4483,6 +4483,7 @@ impl WalletsHandler {
                     return self
                         .tx_engine
                         .discard_unsigned(permit, wallet, chain, id)
+                        .await
                         .map_err(|error| {
                             let error = err_be(error);
                             record_confirm_error(&entry_dir, wallet, id, &error);

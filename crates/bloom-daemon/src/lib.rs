@@ -5108,7 +5108,15 @@ impl Daemon {
                             .duration_since(UNIX_EPOCH)
                             .map(|d| d.as_millis())
                             .unwrap_or(0);
-                        match run_expiry_sweep_once(&outbox, &audit, now_ms) {
+                        // The sweep waits for the outbox lifecycle file lock;
+                        // keep that wait off the async worker.
+                        let (sweep_outbox, sweep_audit) = (outbox.clone(), audit.clone());
+                        let swept = tokio::task::spawn_blocking(move || {
+                            run_expiry_sweep_once(&sweep_outbox, &sweep_audit, now_ms)
+                        })
+                        .await
+                        .unwrap_or_else(|error| Err(error.to_string()));
+                        match swept {
                             Ok(0) => tracing::trace!("outbox.sweep_expired.empty"),
                             Ok(n) => info!(swept = n, "outbox.sweep_expired"),
                             Err(error) => {
