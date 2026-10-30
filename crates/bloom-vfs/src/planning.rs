@@ -16,10 +16,15 @@ pub fn advisory_evm_policy(projection: &WalletProjection, chain: &str) -> Result
     }
 
     let mut policy = Policy::default();
+    // The any-recipient opt-in is not an address. Only
+    // `advisory_exact_evm_policy` reads it, keyed `evm-<chain id>`; copied
+    // here under a Bloom chain name it would opt in under a spelling Broker's
+    // sessions do not honour.
     for destination in canonical
         .allowed_destinations
         .iter()
         .filter(|destination| destination.chain.as_str() == chain)
+        .filter(|destination| destination.destination != bloom_proto::policy::ERC20_ANY_RECIPIENT)
     {
         policy
             .allowlists
@@ -322,5 +327,30 @@ mod tests {
                 .recipients
                 .contains(marker)
         );
+    }
+
+    /// The opt-in is keyed `evm-<chain id>`, the spelling Broker's reviewed
+    /// sessions honour. The same string under a Bloom chain name is not an
+    /// address and opts in to nothing: a policy whose only entry on the chain
+    /// is that string still denies every recipient.
+    #[test]
+    fn a_marker_under_a_bloom_chain_name_opts_in_to_nothing() {
+        let marker = bloom_proto::policy::ERC20_ANY_RECIPIENT;
+        let p = projection(vec![PolicyDestination {
+            chain: Token::new("ethereum").unwrap(),
+            destination: marker.into(),
+        }]);
+        for policy in [
+            advisory_exact_evm_policy(&p, "ethereum", 1).unwrap(),
+            advisory_evm_policy(&p, "ethereum").unwrap(),
+        ] {
+            assert!(!policy.allowlists.recipients.contains(marker));
+            assert!(
+                policy
+                    .allowlists
+                    .recipients
+                    .contains("__broker_policy_denies_all_destinations__")
+            );
+        }
     }
 }

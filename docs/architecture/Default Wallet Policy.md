@@ -1,6 +1,6 @@
 # Default Wallet Policy
 
-**Status:** design proposal, updated for the implementation on 2026-10-16
+**Status:** design proposal, updated for the implementation on 2026-10-30
 **Audience:** Bloom engineers, Petal authors, and implementation agents
 
 A new Bloom user should go from installing Bloom to using their Petals by
@@ -63,7 +63,8 @@ Agreed on 2026-09-14:
    policy makes the Petals usable. It does not approve swaps, trades, token
    approvals, or spending allowances.
 7. **Each Petal defines and enforces its own limits.** Broker does not track
-   spending, and the wallet policy only allows the chosen Petals.
+   spending, and the wallet policy only allows the chosen Petals and, for
+   Degen, its `erc20:any-recipient` entry (decision 15).
 8. **Polymarket uses its existing settings:** trading turned on, with a daily
    limit of 100 pUSD.
 9. **Petal settings survive an update.** Signed package lineage carries a
@@ -173,11 +174,14 @@ Agreed on 2026-09-14:
     - **Trader** and **Degen** suggest Polymarket daily buy limits of 1,000
       and 10,000 pUSD rather than 100 during first setup: their pUSD token
       quantities, not a price. That daily limit is all a persona sets here:
-      no per-action cap and no session length. The owner can change the
-      suggestion, and a saved value is kept.
+      no per-action cap and no session length. The saved `[persona]` still
+      records `window_secs`, which only bloom#377 reads. The owner can
+      change the suggestion, and a saved value is kept.
     - **Degen** also adds
       `{"chain": "evm-1", "destination": "erc20:any-recipient"}`, and the same
-      on `evm-137`, for configured Ethereum and Polygon. It is required like a
+      on `evm-137`, for configured Ethereum and Polygon. Only that
+      `evm-<chain id>` spelling counts: the same string under a Bloom chain
+      name, such as `ethereum`, opts in to nothing. It is required like a
       chosen Petal's destinations, and is the only addition here that does not
       come from a Petal. Machine then stages the wallet's own canonical
       ERC-20 transfer of a token in Bloom's curated table
@@ -484,20 +488,22 @@ depend on them: section 4 holds until they land.
   Trader suggests 100 pUSD per action and 1,000 per rolling day for 24
   hours; Degen suggests 1,000 per action and 10,000 per rolling day for
   seven days. These are nominal amounts, not a USD valuation or a maximum
-  loss. Automatic coverage is limited to eligible Polymarket BUYs, and
-  explicit native-transfer sessions cover Ethereum, Polygon and local chain
-  31337. Every other action keeps exact approval, and several scopes can
-  need separate activation ceremonies.
+  loss. Automatic coverage is limited to eligible Polymarket BUYs. Explicit
+  transfer sessions, native and canonical ERC-20, cover Ethereum, Polygon and
+  local chain 31337, to recipients the policy lists as `evm-<chain id>`
+  destinations, which this design does not propose. Every other action keeps
+  exact approval, and several scopes can need separate activation ceremonies.
 - [bloom#377](https://github.com/bloom-directory/bloom/pull/377), built on
   bloom#352's Machine commits, replaces those limits with recurring
   per-token allowances: Trader per rolling 24 hours, Degen per rolling seven
   days. It pins
   [bloom-broker#112](https://github.com/bloom-directory/bloom-broker/pull/112),
-  which builds on bloom-broker#100, and
+  which builds on bloom-broker#100,
   [bloom-signer#81](https://github.com/bloom-directory/bloom-signer/pull/81),
-  which does not build on bloom-signer#68. It uses
-  [bloom-petal-polymarket#26](https://github.com/bloom-directory/bloom-petal-polymarket/pull/26)
-  and [petal#52](https://github.com/bloom-directory/petal/pull/52). With
+  which does not build on bloom-signer#68, and
+  [petal#52](https://github.com/bloom-directory/petal/pull/52). It uses
+  [bloom-petal-polymarket#26](https://github.com/bloom-directory/bloom-petal-polymarket/pull/26);
+  neither stack pins a Polymarket PR, and both still install v0.1.6. With
   bloom-broker#112, a Degen session also covers the any-recipient ERC-20
   transfers in decision 15.
 
@@ -520,9 +526,12 @@ this design and those stacks:
   policy, so the default policy is applied first. Choosing a persona grants
   nothing on its own. bloom#377's recurring allowances also need the
   policy's maximum approval lifetime at its standing value
-  (`STANDING_APPROVAL_POLICY_LIFETIME_MS`). This design never proposes that,
-  so after this default policy commits, bloom#377 needs a second policy
-  ceremony, which its onboarding must propose with `owner_just_chose`.
+  (`STANDING_APPROVAL_POLICY_LIFETIME_MS`). This design never proposes that.
+  bloom#377 adds it to the same default-policy proposal for Trader and Degen
+  (`standing`). Rebased, the lifetime also belongs in the check that finds
+  the policy already allowed, so it stays one ceremony. Only a wallet whose
+  default policy committed without it needs another, which onboarding
+  proposes with `owner_just_chose`.
 - **A policy change ends persona sessions.** A session and its budget are
   bound to the policy version and digest they were approved under. Any later
   policy commit stops them signing:
@@ -539,8 +548,10 @@ this design and those stacks:
   only with `owner_just_chose` set. Without it the owner sees which Petals
   are not allowed, and nothing is proposed. bloom#352 and bloom#377 predate
   this rule and propose at any policy version. Rebased, their
-  `WalletDefaultPolicy { name }` no longer compiles: onboarding sets
-  `owner_just_chose` only right after it saves the selection. Inside Machine
+  `WalletDefaultPolicy { name }` no longer compiles: onboarding must set
+  `owner_just_chose` only right after it saves the selection. It should
+  preselect from `[petals.setup]` while the policy is still the one creation
+  installed, and from what the current policy allows after that. Inside Machine
   this is `AfterPolicyChange::Propose` rather than a `bool`, so another flag
   passed in its place, such as bloom#377's `standing`, does not compile;
   `standing` stays a separate argument.
@@ -563,7 +574,9 @@ this design and those stacks:
   with no per-action cap. Under bloom#377, Degen's 10,000 pUSD is a seven-day
   allowance, so the session's limit is the stricter one. A persona chosen
   after setup leaves the saved limit alone, so a Trader session activated
-  later is still capped by the limit setup wrote, 100 pUSD for Institutional.
+  later is still capped by the limit setup wrote: 100 pUSD under
+  Institutional, if Polymarket was chosen. If it was not, setup wrote nothing
+  and Polymarket refuses buys until its settings exist.
 - **Destination chain names differ.** This policy names a Petal's destinations
   by Bloom chain name, such as `polygon`. Typed persona sessions for native and
   ERC-20 transfers match destinations named `evm-<chain id>`, such as
@@ -573,24 +586,32 @@ this design and those stacks:
 - **Pending settings.** This design records a pending setup setting as an empty
   marker file, `pending-petal-settings/<name>`. bloom#352, and bloom#377 on
   top of it, write a versioned journal entry at the same path that binds the
-  package hash, the settings and the config revision. Today they refuse an
-  empty marker ("legacy setup obligation has no frozen package/config
-  revision"), and this design overwrites their entry with an empty marker
-  when it queues the same Petal. They must migrate or reconcile markers
-  written by this design.
+  package hash, the settings and the config revision. On a home upgraded
+  from this design they keep the empty marker and then refuse it ("legacy
+  setup obligation has no frozen package/config revision"), so they must
+  migrate or reconcile these markers. A build of this design on a home
+  bloom#352 used treats their entry as its own marker: it writes
+  `[petals.setup]`'s values for that Petal and deletes the entry, or leaves
+  an empty marker if the write fails.
 - **Versions.** The sessions need Broker and Signer changes that are not
   merged, and each accepts exactly one protocol minor: bloom-signer#68 only
   Broker–Signer 1.7, and bloom-broker#100 only Machine–Broker 1.8. The pinned
-  Broker and Signer speak Machine–Broker 1.7 and Broker–Signer 1.6. So
-  bloom#352's stack merges bloom-signer#68, then bloom-broker#100, which pins
-  it, then Machine, and ships all three as one Triad release. bloom#377's
-  pins speak Broker–Signer 1.8 and Machine–Broker 1.10. Polymarket coverage
-  also needs a published Polymarket package that declares each order's pUSD
-  debit. None does yet: v0.1.6 (pinned here), v0.1.8 (pinned on master) and
-  v0.2.0 all declare no debit for an order signature.
-  bloom-petal-polymarket#19 adds them for bloom#352 but conflicts with main;
-  bloom-petal-polymarket#26, which contains it, is bloom#377's. This design
-  keeps the current Broker, Signer and Polymarket pins until then. Bloom
+  Broker and Signer speak Machine–Broker 1.7 and Broker–Signer 1.6, so
+  bloom#352's stack ships bloom-signer#68, bloom-broker#100 (which pins it)
+  and Machine as one Triad release. Broker master has since moved on: it
+  already uses Machine–Broker 1.8 for bloom-broker#103, which
+  bloom-broker#100 does not contain, and it refuses declared debits on
+  Polymarket order approvals. Rebased, bloom-broker#100 needs a new minor and
+  a check of those debits against Broker's own rebuild, as bloom-broker#112
+  has; otherwise Broker refuses every bloom-petal-polymarket#19 order.
+  bloom#377's pins speak Broker–Signer 1.8 and Machine–Broker 1.10.
+  Polymarket coverage also needs a published Polymarket package that
+  declares its debits to Broker. None does yet: v0.1.6 (pinned here), v0.1.8
+  (pinned on master) and v0.2.0 declare none for any signature.
+  bloom-petal-polymarket#19 adds them for bloom#352, and
+  bloom-petal-polymarket#26, which contains it, for bloom#377; both conflict
+  with main. This design keeps the current Broker, Signer and Polymarket pins
+  until then. Bloom
   defines the `erc20:any-recipient` string
   (`bloom_proto::policy::ERC20_ANY_RECIPIENT`) until it can use
   bloom-broker#112's `bloom_broker_api::ERC20_ANY_RECIPIENT`; the two must
@@ -600,9 +621,10 @@ this design and those stacks:
 
 - **Setup:** the creation ceremony and the default policy ceremony.
 - **Every transaction:** each swap, trade, token approval, Polymarket
-  onboarding step, and Hyperliquid owner action, unless a persona session
-  (section 6) covers it, such as an eligible Polymarket BUY, or with
-  bloom#377 and bloom-broker#112 a Degen ERC-20 transfer.
+  onboarding step, and Hyperliquid owner action. This design has no persona
+  sessions. With bloom#352 or bloom#377, one can cover some of these
+  (section 6), such as an eligible Polymarket BUY, or with bloom#377 and
+  bloom-broker#112 a Degen ERC-20 transfer.
 - **Hyperliquid sessions:** a key-derivation ceremony and an approval
   ([bloom#171](https://github.com/bloom-directory/bloom/issues/171)).
 - **Petal changes:** one policy update ceremony each.
@@ -612,7 +634,8 @@ this design and those stacks:
 The Petals chosen during setup are an installation profile: a safe default
 that makes a new wallet usable in one ceremony. It is deliberately the
 narrowest thing that works — the chosen packages and the fixed contracts they
-transact with, nothing else.
+transact with, plus Degen's `erc20:any-recipient` entry (decision 15), and
+nothing else.
 
 It is a starting point, not a fixed set. Owners can narrow or widen it later
 through the ordinary policy ceremony (`bloom wallet update-policy`), add or
@@ -629,9 +652,13 @@ destination the owner removed is not proposed again behind a later request
 - The policy allows exactly the package hashes it lists. A different or
   tampered build does not match.
 - Allowed destinations are addresses pinned in Bloom's source and shown in
-  the policy ceremony, never taken from a quote or a Petal at runtime. The one
-  exception is a `petal:<name>` entry (decision 14), which is also pinned in
-  Bloom's source and names the Petal, not an address.
+  the policy ceremony, never taken from a quote or a Petal at runtime. There
+  are two exceptions, both pinned in Bloom's source and neither an address:
+  a `petal:<name>` entry (decision 14), which names the Petal, and Degen's
+  `erc20:any-recipient` (decision 15). The second lifts Machine's recipient
+  check for the wallet's own curated ERC-20 transfers. Broker checks no
+  destination on an exact approval, so the owner's approval of each transfer
+  is the recipient check.
 - Signing the policy grants no signing authority. Every signature still
   needs an approval the owner gave for that transaction.
 - Petal limits live in each Petal's settings, not the signed policy. Any
@@ -680,6 +707,11 @@ changes come next.
   `crates/bloom-daemon`): `ensure_petal_packages_allowed` proposes several
   packages through the wallet's existing policy operation, and
   `ensure_petal_eligibility` adds the chosen Petals for `main`.
+- **Personas** (`crates/bloom-proto/src/persona.rs`, `crates/bloom`,
+  `crates/bloom-tx`, `crates/bloom-vfs/src/planning.rs`): the persona
+  question and `--persona`, Polymarket's suggested limit, Degen's
+  `erc20:any-recipient` entry and staging exemption, and the report of a
+  missing or leftover entry.
 
 **Next**
 
@@ -734,6 +766,11 @@ Automated:
   as awaiting the owner, is replaced by a new ceremony
   (`crates/bloom-vfs/tests/triad_policy_update.rs`).
 - Catalog provisioning reports an update separately from a fresh install.
+- Each persona's menu choice, `--persona` and Polymarket suggestion; Degen's
+  entry on configured chains and for `main` only; an unusable saved persona
+  set aside; staging that passes only the wallet's own curated ERC-20
+  transfer with the entry; and the planner honouring the entry only under
+  `evm-<chain id>`.
 
 Manual, on the developer triad:
 
