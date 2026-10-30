@@ -76,7 +76,9 @@ must be at least 10% above the original caps and satisfy the node's quoted
 minimum. This preserves the account, nonce, destination, value, calldata, and
 Petal origin. Like `confirm`, it is refused until a `depends_on` predecessor
 has mined successfully, or while the call fails simulation. It requires a new
-exact owner approval. For example, when the
+exact owner approval. Any other body written to `replace` returns permission
+denied and records nothing: through the mount, `replace` accepts only this fee
+pair. For example, when the
 node requires a 25 gwei tip and the original max fee is 50 gwei:
 
 ```sh
