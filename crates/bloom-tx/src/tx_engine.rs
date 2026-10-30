@@ -419,9 +419,9 @@ fn classify_action_kind(
 type NonceLocks =
     Arc<parking_lot::Mutex<HashMap<(String, String, Address), Arc<tokio::sync::Mutex<()>>>>>;
 
-const TRIAD_SIGNING_STATE_FILE: &str = "ceremony.json";
-const TRIAD_BATCH_STATE_DIR: &str = ".batch-signing";
-const TRIAD_BATCH_STATE_FILE: &str = "ceremony.json";
+const TRIAD_SIGNING_STATE_FILE: &str = crate::outbox::SIGNING_STATE_FILE;
+const TRIAD_BATCH_STATE_DIR: &str = crate::outbox::BATCH_SIGNING_STATE_DIR;
+const TRIAD_BATCH_STATE_FILE: &str = crate::outbox::SIGNING_STATE_FILE;
 const TRIAD_EXACT_APPROVAL_TTL_MS: u64 = 10 * 60 * 1_000;
 
 #[derive(Clone)]

@@ -2811,10 +2811,21 @@ impl PetalHost for DaemonPetalHost {
             .map(|receipt| serde_json::to_string(&receipt))
             .transpose()
             .map_err(|e| HostError::Backend(format!("encode EVM outbox receipt: {e}")))?;
+        // A broadcast whose RPC reply was lost records its hash only in the
+        // attempt marker; report it so the caller can still track the tx.
+        let tx_hash = match entry.staged.tx_hash.clone() {
+            Some(hash) => Some(hash),
+            None => service
+                .tx_engine
+                .outbox
+                .read_broadcast_attempt(&entry, bloom_tx::outbox::BroadcastAttemptKind::Confirm)
+                .map_err(|e| HostError::Backend(format!("read EVM broadcast attempt: {e}")))?
+                .map(|attempt| attempt.tx_hash),
+        };
         Ok(EvmOutboxInspection {
             outbox_id,
             state,
-            tx_hash: entry.staged.tx_hash,
+            tx_hash,
             receipt_json,
         })
     }
@@ -7314,6 +7325,54 @@ mod tests {
         )
         .await
         .unwrap();
+
+        // A broadcast whose RPC reply was lost has no hash in intent.json;
+        // inspection reports the hash recorded in its attempt marker.
+        let mut unacknowledged = staged.clone();
+        unacknowledged.id = "petal-inspect-lost-reply".into();
+        unacknowledged.tx_hash = None;
+        daemon
+            .tx_engine
+            .outbox
+            .write_pending(&unacknowledged, "# plan")
+            .unwrap();
+        let entry = daemon
+            .tx_engine
+            .outbox
+            .read("w", "anvil", &unacknowledged.id)
+            .unwrap();
+        daemon
+            .tx_engine
+            .outbox
+            .write_broadcast_attempt(
+                &entry,
+                bloom_tx::outbox::BroadcastAttemptKind::Confirm,
+                &bloom_tx::outbox::BroadcastAttempt {
+                    schema: "bloom.broadcast_attempted.v1".into(),
+                    tx_hash: tx_hash.clone(),
+                    raw_tx_blake3: String::new(),
+                    raw_tx_path: "raw_tx".into(),
+                    from: unacknowledged.from.clone(),
+                    to: unacknowledged.to.clone(),
+                    nonce: unacknowledged.nonce,
+                    chain_id: unacknowledged.chain_id,
+                    created_ms: 1,
+                    transport: bloom_tx::outbox::BroadcastTransport::PublicRpc,
+                    private_provider: None,
+                },
+            )
+            .unwrap();
+        let inspection = host
+            .evm_tx_inspect(
+                "w".into(),
+                "anvil".into(),
+                unacknowledged.id.clone(),
+                Some(context.clone()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(inspection.state, "pending");
+        assert_eq!(inspection.tx_hash.as_deref(), Some(tx_hash.as_str()));
 
         let mut other_app = context.clone();
         other_app.petal_root = "other".into();
