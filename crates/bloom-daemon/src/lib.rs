@@ -968,6 +968,7 @@ impl DaemonPetalHost {
         let prepared = broker
             .prepare_approval(bloom_broker_api::ApprovalPrepareRequest {
                 surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
+                safe_review_payloads: Vec::new(),
                 evm_review_payloads: Vec::new(),
                 operation_id,
                 terms,
@@ -1783,7 +1784,7 @@ impl PetalHost for DaemonPetalHost {
                 builder = builder.header(name.as_str(), value.as_str());
             }
             let resp = builder.body(body.clone()).send().await.map_err(|e| {
-                let err = HostError::Backend(format!("http_fetch send: {e}"));
+                let err = petal_http_transport_error("send", &method, &url, e);
                 self.audited_http_error(&correlation_id, &method, &url, "error", None, None, err)
             })?;
             let status = resp.status().as_u16();
@@ -1899,7 +1900,7 @@ impl PetalHost for DaemonPetalHost {
             let mut stream = resp.bytes_stream();
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.map_err(|e| {
-                    let err = HostError::Backend(format!("http_fetch body: {e}"));
+                    let err = petal_http_transport_error("body", &method, &url, e);
                     self.audited_http_error(
                         &correlation_id,
                         &method,
@@ -2105,7 +2106,7 @@ impl PetalHost for DaemonPetalHost {
                         reason = %reason,
                         "petal.sign_payload_denied"
                     );
-                    HostError::Denied(reason)
+                    exact_signing_host_error(reason)
                 })?;
             return match outcome {
                 bloom_vfs::ExactPayloadOutcome::ApprovalRequired {
@@ -2200,7 +2201,7 @@ impl PetalHost for DaemonPetalHost {
                 protocol_error_code = error.code.as_str(),
                 "petal.sign_payload_denied"
             );
-            HostError::Denied(format!("{}: {}", error.code.as_str(), error.message))
+            exact_signing_host_error(bloom_vfs::ExactSigningError::from_broker(error, true))
         })?;
         let [signature] = result.signatures.as_slice() else {
             return Err(HostError::Backend(
@@ -2437,7 +2438,7 @@ impl PetalHost for DaemonPetalHost {
                 )
                 .await
         }
-        .map_err(HostError::Denied)?;
+        .map_err(exact_signing_host_error)?;
         match outcome {
             bloom_vfs::ExactPayloadBatchOutcome::ApprovalRequired {
                 approval_id,
@@ -3078,6 +3079,31 @@ fn petal_outbox_outcome(
     })
 }
 
+fn petal_http_transport_error(
+    phase: &str,
+    method: &str,
+    url: &str,
+    error: reqwest::Error,
+) -> HostError {
+    // URL userinfo, paths and queries can hold credentials, so the message
+    // names only method and host. reqwest prints the URL from its own field,
+    // which without_url() clears; the source chain (DNS, connect, TLS,
+    // timeout) is appended as is and, in the pinned reqwest, carries no URL.
+    let host = url::Url::parse(url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .unwrap_or_else(|| "<invalid url>".into());
+    let error = error.without_url();
+    let mut message = format!("http_fetch {phase}: {method} {host}: {error}");
+    let mut source = std::error::Error::source(&error);
+    while let Some(cause) = source {
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    HostError::Backend(message)
+}
+
 fn resolve_redirect_target(current_url: &str, location: &str) -> Result<String, HostError> {
     let base = url::Url::parse(current_url).map_err(|e| HostError::Invalid(format!("url: {e}")))?;
     base.join(location)
@@ -3131,7 +3157,6 @@ fn audit_http_target(raw: &str) -> serde_json::Value {
             "scheme": url.scheme(),
             "host": url.host_str(),
             "port": url.port(),
-            "path": url.path(),
         }),
         Err(_) => serde_json::json!({ "invalid": true }),
     }
@@ -3856,6 +3881,19 @@ fn ceremony_projection_records(root: &Path) -> Result<Vec<PathBuf>, DaemonError>
     }
     records.sort();
     Ok(records)
+}
+
+/// Only a refusal proves no signature exists; a Petal may rebuild after
+/// `Denied` but must keep its payload after `Backend`. The unknown outcome
+/// carries no Broker text: Petal SDKs classify host errors by words such as
+/// "denied" or "invalid", and it must never read as a refusal.
+fn exact_signing_host_error(error: bloom_vfs::ExactSigningError) -> HostError {
+    match error {
+        bloom_vfs::ExactSigningError::Refused(reason) => HostError::Denied(reason),
+        bloom_vfs::ExactSigningError::OutcomeUnknown(_) => {
+            HostError::Backend("signing outcome unknown; it may already be signed".into())
+        }
+    }
 }
 
 /// Stop every durable Petal ceremony projection from advertising an owner
@@ -5087,7 +5125,27 @@ impl Daemon {
                                     }
                                 }
                             }
-                            match run_solana_expiry_sweep_once(solana_outbox, &audit, now_ms, &live_heights) {
+                            let mut signature_statuses = std::collections::HashMap::new();
+                            match solana_outbox.expired_pending(now_ms, &live_heights) {
+                                Ok(entries) => for entry in entries {
+                                    let Ok(Some(signature)) = solana_outbox.recorded_signature(&entry) else {
+                                        continue;
+                                    };
+                                    let Some(client) = solana_chains.get(&entry.staged.chain) else {
+                                        continue;
+                                    };
+                                    // Each probe searches transaction history. A single
+                                    // lagging endpoint cannot establish absence.
+                                    let probes = client.probe_signature_status_all_endpoints(&signature).await;
+                                    let found = probes.iter().any(|probe| matches!(&probe.status, Ok(Some(_))));
+                                    let absent = !probes.is_empty() && probes.iter().all(|probe| matches!(&probe.status, Ok(None)));
+                                    if found || absent {
+                                        signature_statuses.insert((entry.staged.chain, signature), found);
+                                    }
+                                },
+                                Err(error) => warn!(error = %error, "solana_outbox.sweep_signature_scan_failed"),
+                            }
+                            match run_solana_expiry_sweep_once(solana_outbox, &audit, now_ms, &live_heights, &signature_statuses) {
                                 Ok(0) => tracing::trace!("solana_outbox.sweep_expired.empty"),
                                 Ok(n) => info!(swept = n, "solana_outbox.sweep_expired"),
                                 Err(e) => warn!(error = %e, "solana_outbox.sweep_expired_failed"),
@@ -5286,6 +5344,7 @@ fn run_solana_expiry_sweep_once(
     audit: &AuditLog,
     now_ms: u128,
     live_block_heights: &std::collections::HashMap<String, u64>,
+    signature_statuses: &std::collections::HashMap<(String, String), bool>,
 ) -> Result<usize, String> {
     // As for EVM: an idle tick changes nothing and is not journaled.
     if outbox
@@ -5321,7 +5380,7 @@ fn run_solana_expiry_sweep_once(
         .map_err(|error| {
             format!("Machine audit unavailable before Solana expiry sweep: {error}")
         })?;
-    let swept = outbox.sweep_expired(now_ms, live_block_heights);
+    let swept = outbox.sweep_expired_with_statuses(now_ms, live_block_heights, signature_statuses);
     let result = match &swept {
         Ok(count) => serde_json::json!({"outcome": "completed", "swept": count}),
         Err(error) => serde_json::json!({"outcome": "error", "error": error.to_string()}),
@@ -5644,6 +5703,21 @@ fn render_petal_discovery_markdown(installed: &[bloom_petals::package::PetalDisc
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn http_audit_target_omits_credentials_and_path() {
+        let target = super::audit_http_target(
+            "https://user:password@example.com/path-secret?key=query-secret",
+        );
+        assert_eq!(
+            target,
+            serde_json::json!({"scheme":"https", "host":"example.com", "port":null})
+        );
+        assert_eq!(
+            super::audit_http_target("invalid-secret"),
+            serde_json::json!({"invalid":true})
+        );
+    }
+
     use super::*;
     use bloom_broker_api::{MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService};
     use bloom_vfs::VfsPath;
@@ -8118,6 +8192,7 @@ ws_url = "wss://example.invalid"
                     &d.audit,
                     now_ms,
                     &std::collections::HashMap::new(),
+                    &std::collections::HashMap::new(),
                 )
                 .unwrap(),
                 0
@@ -8173,6 +8248,7 @@ ws_url = "wss://example.invalid"
             &d.audit,
             2,
             &std::collections::HashMap::from([("solana-devnet".to_string(), 101_u64)]),
+            &std::collections::HashMap::new(),
         )
         .unwrap();
         assert_eq!(n, 1, "an abandoned, expired Solana stage must be reaped");
@@ -9914,6 +9990,39 @@ allowed = ["bloom:vfs.read"]
         assert!(
             names.contains(&"unknown-eeeeeeeeeeee"),
             "an unmounted session renders under unknown-<hash prefix>: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn petal_http_transport_errors_name_method_host_and_cause_but_no_url_data() {
+        // A closed port: Linux and macOS both refuse the connect at once.
+        // (A bound socket that never listens times out on macOS instead.)
+        let port = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let url = format!(
+            "http://fixture-user:fixture-password@127.0.0.1:{port}/fixture-path-token?key=fixture-query-token"
+        );
+        let original = reqwest::Client::new().get(&url).send().await.unwrap_err();
+        let message = petal_http_transport_error("send", "GET", &url, original).to_string();
+        for value in [
+            "fixture-user",
+            "fixture-password",
+            "fixture-path-token",
+            "fixture-query-token",
+        ] {
+            assert!(!message.contains(value), "URL data leaked: {message}");
+        }
+        assert!(
+            message.contains("http_fetch send: GET 127.0.0.1: "),
+            "method and host were dropped: {message}"
+        );
+        assert!(
+            message.contains("tcp connect error"),
+            "transport cause was dropped: {message}"
         );
     }
 }

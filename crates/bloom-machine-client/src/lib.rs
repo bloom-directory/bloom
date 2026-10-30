@@ -627,6 +627,41 @@ impl MachineBrokerClient {
         }
     }
 
+    /// A completed signing operation is replay-protected by Broker, so a
+    /// retry may receive `OPERATION_ID_CONFLICT` even when the original result
+    /// was durably committed. Recover that authenticated retained result by
+    /// operation id, but only when its complete operation digest still matches
+    /// this exact request. Without `recover`, the sign error is returned as is.
+    async fn sign_recovering_result(
+        &self,
+        recover: bool,
+        request: MachineSignRequest,
+    ) -> Result<SigningResult, ProtocolError> {
+        let expected = ExpectedSigningResult::from_request(&request);
+        let signed = match request.payloads {
+            SigningPayloads::Single { .. } => self.sign(request).await,
+            SigningPayloads::Batch { .. } => self.sign_batch(request).await,
+        };
+        match signed {
+            Ok(result) => Ok(result),
+            Err(sign_error) if !recover => Err(sign_error),
+            Err(sign_error) => {
+                let Ok(status) = self.operation_status(expected.operation_id.clone()).await else {
+                    return Err(sign_error);
+                };
+                if status.operation_id != expected.operation_id
+                    || status.operation_digest != expected.operation_digest
+                {
+                    return Err(sign_error);
+                }
+                match status.result {
+                    Some(result) => expected.validate(result),
+                    None => Err(status.error.unwrap_or(sign_error)),
+                }
+            }
+        }
+    }
+
     /// Validate and translate a payload-bearing Petal request. Provenance is
     /// supplied independently by the trusted runner, never copied from guest
     /// fields without comparison.
@@ -842,6 +877,24 @@ impl MachineBrokerClient {
         &self,
         request: ExactPayloadSignRequest,
     ) -> Result<ExactPayloadSignOutcome, ProtocolError> {
+        self.exact_payload(request, false).await
+    }
+
+    /// `sign_exact_payload` for a caller without its own reconciliation: a
+    /// lost signing response, or a retry Broker refuses as a replay, recovers
+    /// the retained result by operation status.
+    pub async fn sign_exact_payload_recovering(
+        &self,
+        request: ExactPayloadSignRequest,
+    ) -> Result<ExactPayloadSignOutcome, ProtocolError> {
+        self.exact_payload(request, true).await
+    }
+
+    async fn exact_payload(
+        &self,
+        request: ExactPayloadSignRequest,
+        recover: bool,
+    ) -> Result<ExactPayloadSignOutcome, ProtocolError> {
         request.validate()?;
         let wallet = self.wallet(request.wallet_id.clone()).await?;
         let payload_digest = Digest32::from_bytes(Sha256::digest(&request.preimage).into());
@@ -963,23 +1016,26 @@ impl MachineBrokerClient {
             }
             .digest()?;
             return self
-                .sign(MachineSignRequest {
-                    operation_id: request.signing_operation_id,
-                    operation_digest,
-                    approval_id,
-                    key_ref,
-                    crypto_suite: request.crypto_suite,
-                    payloads: SigningPayloads::Single {
-                        payload: Base64UrlBytes::from_bytes(&request.preimage),
+                .sign_recovering_result(
+                    recover,
+                    MachineSignRequest {
+                        operation_id: request.signing_operation_id,
+                        operation_digest,
+                        approval_id,
+                        key_ref,
+                        crypto_suite: request.crypto_suite,
+                        payloads: SigningPayloads::Single {
+                            payload: Base64UrlBytes::from_bytes(&request.preimage),
+                        },
+                        petal_use_claim: request.petal_use_claim,
+                        system_use_claim: request.system_use_claim,
+                        claim_assurance_evidence: request
+                            .claim_assurance_evidence
+                            .as_deref()
+                            .map(Base64UrlBytes::from_bytes),
+                        provenance: request.provenance,
                     },
-                    petal_use_claim: request.petal_use_claim,
-                    system_use_claim: request.system_use_claim,
-                    claim_assurance_evidence: request
-                        .claim_assurance_evidence
-                        .as_deref()
-                        .map(Base64UrlBytes::from_bytes),
-                    provenance: request.provenance,
-                })
+                )
                 .await
                 .map(ExactPayloadSignOutcome::Signed);
         }
@@ -1017,6 +1073,7 @@ impl MachineBrokerClient {
         terms.validate()?;
         self.prepare_approval(ApprovalPrepareRequest {
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
+            safe_review_payloads: Vec::new(),
             evm_review_payloads: if native_evm_review(&request.provenance) {
                 vec![Base64UrlBytes::from_bytes(&request.preimage)]
             } else {
@@ -1044,6 +1101,23 @@ impl MachineBrokerClient {
     pub async fn sign_exact_payload_batch(
         &self,
         request: ExactPayloadBatchSignRequest,
+    ) -> Result<ExactPayloadSignOutcome, ProtocolError> {
+        self.exact_payload_batch(request, false).await
+    }
+
+    /// `sign_exact_payload_batch` with `sign_exact_payload_recovering`'s
+    /// result recovery.
+    pub async fn sign_exact_payload_batch_recovering(
+        &self,
+        request: ExactPayloadBatchSignRequest,
+    ) -> Result<ExactPayloadSignOutcome, ProtocolError> {
+        self.exact_payload_batch(request, true).await
+    }
+
+    async fn exact_payload_batch(
+        &self,
+        request: ExactPayloadBatchSignRequest,
+        recover: bool,
     ) -> Result<ExactPayloadSignOutcome, ProtocolError> {
         request.validate()?;
         let wallet = self.wallet(request.wallet_id.clone()).await?;
@@ -1134,27 +1208,30 @@ impl MachineBrokerClient {
             }
             .digest()?;
             return self
-                .sign_batch(MachineSignRequest {
-                    operation_id: request.signing_operation_id,
-                    operation_digest,
-                    approval_id,
-                    key_ref,
-                    crypto_suite: request.crypto_suite,
-                    payloads: SigningPayloads::Batch {
-                        children: request
-                            .preimages
-                            .iter()
-                            .map(|payload| Base64UrlBytes::from_bytes(payload))
-                            .collect(),
+                .sign_recovering_result(
+                    recover,
+                    MachineSignRequest {
+                        operation_id: request.signing_operation_id,
+                        operation_digest,
+                        approval_id,
+                        key_ref,
+                        crypto_suite: request.crypto_suite,
+                        payloads: SigningPayloads::Batch {
+                            children: request
+                                .preimages
+                                .iter()
+                                .map(|payload| Base64UrlBytes::from_bytes(payload))
+                                .collect(),
+                        },
+                        petal_use_claim: request.petal_use_claim,
+                        system_use_claim: None,
+                        claim_assurance_evidence: request
+                            .claim_assurance_evidence
+                            .as_deref()
+                            .map(Base64UrlBytes::from_bytes),
+                        provenance: request.provenance,
                     },
-                    petal_use_claim: request.petal_use_claim,
-                    system_use_claim: None,
-                    claim_assurance_evidence: request
-                        .claim_assurance_evidence
-                        .as_deref()
-                        .map(Base64UrlBytes::from_bytes),
-                    provenance: request.provenance,
-                })
+                )
                 .await
                 .map(ExactPayloadSignOutcome::Signed);
         }
@@ -1195,6 +1272,7 @@ impl MachineBrokerClient {
         terms.validate()?;
         self.prepare_approval(ApprovalPrepareRequest {
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
+            safe_review_payloads: Vec::new(),
             evm_review_payloads: if native_evm_review(&request.provenance) {
                 request
                     .preimages
@@ -1295,27 +1373,30 @@ impl MachineBrokerClient {
             }
             .digest()?;
             return self
-                .sign_batch(MachineSignRequest {
-                    operation_id: request.signing_operation_id,
-                    operation_digest,
-                    approval_id,
-                    key_ref,
-                    crypto_suite: request.crypto_suite,
-                    payloads: SigningPayloads::Batch {
-                        children: request
-                            .preimages
-                            .iter()
-                            .map(|payload| Base64UrlBytes::from_bytes(payload))
-                            .collect(),
+                .sign_recovering_result(
+                    true,
+                    MachineSignRequest {
+                        operation_id: request.signing_operation_id,
+                        operation_digest,
+                        approval_id,
+                        key_ref,
+                        crypto_suite: request.crypto_suite,
+                        payloads: SigningPayloads::Batch {
+                            children: request
+                                .preimages
+                                .iter()
+                                .map(|payload| Base64UrlBytes::from_bytes(payload))
+                                .collect(),
+                        },
+                        petal_use_claim: Some(claim.clone()),
+                        system_use_claim: None,
+                        claim_assurance_evidence: request
+                            .claim_assurance_evidence
+                            .as_deref()
+                            .map(Base64UrlBytes::from_bytes),
+                        provenance: request.provenance,
                     },
-                    petal_use_claim: Some(claim.clone()),
-                    system_use_claim: None,
-                    claim_assurance_evidence: request
-                        .claim_assurance_evidence
-                        .as_deref()
-                        .map(Base64UrlBytes::from_bytes),
-                    provenance: request.provenance,
-                })
+                )
                 .await
                 .map(ExactPayloadSignOutcome::Signed);
         }
@@ -1360,6 +1441,7 @@ impl MachineBrokerClient {
         terms.validate()?;
         self.prepare_approval(ApprovalPrepareRequest {
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
+            safe_review_payloads: Vec::new(),
             evm_review_payloads: Vec::new(),
             operation_id: request.approval_operation_id,
             terms,
@@ -4861,6 +4943,7 @@ mod tests {
 
         let approval = ApprovalPrepareRequest {
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
+            safe_review_payloads: Vec::new(),
             evm_review_payloads: Vec::new(),
             operation_id: OperationId::from_bytes([94; 32]),
             terms: approval_terms("wallet", None),

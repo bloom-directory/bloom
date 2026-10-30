@@ -296,7 +296,7 @@ impl SolanaOutbox {
         fs::rename(&entry.dir, &target)?;
         if new_state == SolanaOutboxState::Failed {
             let _ = fs::remove_file(target.join(BROADCAST_RAW_TX));
-            let _ = fs::remove_file(target.join(PRIVATE_SIGNATURE_FILE));
+            // Retain the transaction identifier for later status queries.
         }
         if matches!(
             new_state,
@@ -729,16 +729,52 @@ impl SolanaOutbox {
         now_ms: u128,
         live_block_heights: &std::collections::HashMap<String, u64>,
     ) -> Result<usize, OutboxError> {
+        self.sweep_expired_with_statuses(now_ms, live_block_heights, &Default::default())
+    }
+
+    /// Status observations must include transaction history, taken after the
+    /// validity window closes. Missing/error observations leave signed entries
+    /// untouched; true means observed, false means all endpoints report absent.
+    pub fn sweep_expired_with_statuses(
+        &self,
+        now_ms: u128,
+        live_block_heights: &std::collections::HashMap<String, u64>,
+        signature_statuses: &std::collections::HashMap<(String, String), bool>,
+    ) -> Result<usize, OutboxError> {
         let expired = self.expired_pending(now_ms, live_block_heights)?;
+        let mut count = 0;
         for entry in &expired {
             let mut expired = entry.clone();
-            expired.staged.status = SolanaTxStatus::Expired;
-            let dir = self.transition(&expired, SolanaOutboxState::Failed)?;
-            expired.state = SolanaOutboxState::Failed;
+            let state = match self.recorded_signature(entry)? {
+                Some(signature) => {
+                    match signature_statuses.get(&(entry.staged.chain.clone(), signature)) {
+                        Some(true) => SolanaOutboxState::Sent,
+                        Some(false) => SolanaOutboxState::Failed,
+                        None => continue,
+                    }
+                }
+                None => SolanaOutboxState::Failed,
+            };
+            expired.staged.status = if state == SolanaOutboxState::Sent {
+                SolanaTxStatus::Sent
+            } else {
+                SolanaTxStatus::Expired
+            };
+            // A concurrent broadcast may have moved the entry to `sent`.
+            // Only one rename can win; never recreate the pending directory.
+            let dir = match self.transition(&expired, state) {
+                Ok(dir) => dir,
+                Err(OutboxError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            expired.state = state;
             expired.dir = dir;
             self.rewrite_intent(&expired)?;
+            count += 1;
         }
-        Ok(expired.len())
+        Ok(count)
     }
 
     /// Pending entries [`Self::sweep_expired`] would expire, read without
@@ -775,9 +811,9 @@ impl SolanaOutbox {
                     }
                     let staged: StagedSolanaTransfer =
                         serde_json::from_slice(&fs::read(&intent_path)?)?;
-                    // A signed pending entry may represent a broadcast whose
-                    // RPC response was lost. Keep it retryable and visible;
-                    // expiry alone must not turn it into a false failure.
+                    // Signed bytes may already have reached the RPC through
+                    // simulation. The sweep must check their signature before
+                    // retiring them; a missing broadcast marker proves nothing.
                     let entry = SolanaOutboxEntry {
                         state: SolanaOutboxState::Pending,
                         staged,
@@ -786,7 +822,7 @@ impl SolanaOutbox {
                     let cluster_past_window = live_block_heights
                         .get(&entry.staged.chain)
                         .is_some_and(|height| *height > entry.staged.last_valid_block_height);
-                    if self.recorded_signature(&entry)?.is_none()
+                    if !entry.dir.join(BROADCAST_ATTEMPT_FILE).exists()
                         && entry.staged.expires_ms != 0
                         && now_ms >= entry.staged.expires_ms
                         && cluster_past_window
@@ -813,10 +849,11 @@ fn write_private_atomic(path: &Path, body: &[u8]) -> Result<(), OutboxError> {
 }
 
 fn write_atomic_with_mode(path: &Path, body: &[u8], mode: u32) -> Result<(), OutboxError> {
+    // Never create the parent: an entry directory that vanished was moved to
+    // another state, and recreating it would split one transfer in two.
     let parent = path
         .parent()
         .ok_or_else(|| OutboxError::Other("outbox artifact has no parent".into()))?;
-    fs::create_dir_all(parent)?;
     let mut random = [0_u8; 8];
     rand::rngs::OsRng.fill_bytes(&mut random);
     let name = path

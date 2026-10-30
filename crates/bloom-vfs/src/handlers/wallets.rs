@@ -3359,12 +3359,15 @@ impl Handler for WalletsHandler {
     /// that bypasses the mode check still cannot trigger a sign or
     /// broadcast just by stat'ing.
     fn is_read_side_effecting(&self, path: &VfsPath) -> bool {
-        pending_outbox_control(path.segments()).is_some_and(|target| {
-            matches!(
-                target.control,
-                "confirm" | "confirm.override" | "replace" | "cancel" | "restage"
-            )
-        })
+        // An expired entry's `failed/<id>/restage` is a write-only sink too;
+        // rendering it fails NotFound and GETATTR reports the route missing.
+        is_failed_outbox_restage(path.segments())
+            || pending_outbox_control(path.segments()).is_some_and(|target| {
+                matches!(
+                    target.control,
+                    "confirm" | "confirm.override" | "replace" | "cancel" | "restage"
+                )
+            })
     }
 }
 
@@ -3375,6 +3378,18 @@ struct PendingOutboxControl<'a> {
     chain: &'a str,
     id: &'a str,
     control: &'a str,
+}
+
+/// Match `<w>/<n>/chains/<c>/outbox/failed/<id>/restage`.
+fn is_failed_outbox_restage(segs: &[String]) -> bool {
+    matches!(
+        segs,
+        [_wallet, _number, chains, _chain, outbox, failed, _id, restage]
+            if chains == "chains"
+                && outbox == "outbox"
+                && failed == "failed"
+                && restage == "restage"
+    )
 }
 
 /// Match `<w>/<n>/chains/<c>/outbox/pending/<id>/<control>`.
@@ -3681,10 +3696,16 @@ impl WalletsHandler {
             "sealed-approvals" if segs.len() == 4 && segs[3] == "limits.json" => {
                 self.sealed_approval_limits_json(wallet, &segs[2]).await
             }
-            "sealed-approvals" if segs.len() == 4 && segs[3] == "renew" => self
-                .approval_ceremony_projection_json(wallet, Some(&segs[2]))
-                .await?
-                .ok_or_else(|| HandlerError::not_found(path.to_string_path())),
+            "sealed-approvals" if segs.len() == 4 && segs[3] == "renew" => {
+                self.approval_status_for_wallet(wallet, &segs[2]).await?;
+                match self
+                    .approval_ceremony_projection_json(wallet, Some(&segs[2]))
+                    .await?
+                {
+                    Some(projection) => Ok(projection),
+                    None => Ok(b"{\"schema\":\"bloom.approval_renew_request.v1\",\"write\":\"complete ApprovalRenewRequest JSON\"}\n".to_vec()),
+                }
+            }
             "policy-updates" if segs.len() == 4 && segs[2] == "latest" => {
                 let action_id = self
                     .policy_update_latest_pending_id(wallet)
@@ -5253,6 +5274,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn account_creation_never_uses_a_display_only_policy() {
+        let f = make_handler();
+        let service = Arc::new(CreationBroker {
+            prepared: std::sync::Mutex::new(None),
+            state: std::sync::Mutex::new(bloom_broker_api::CeremonyState::AwaitingUser),
+        });
+        let mut handler = f
+            .handler
+            .with_broker(Some(MachineBrokerClient::new(service.clone())));
+        handler.wallet_projections = Some(Arc::new(NavigationOnlyProjection(
+            bip39_projection_value(f.wallet_addr, vec![]),
+        )));
+        let error = handler
+            .write(
+                &vfs(format!("/{}/new", f.wallet_name)),
+                br#"{"request_id":"fresh-policy"}"#,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("live account authority unavailable"),
+            "{error}"
+        );
+        assert!(service.prepared.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn account_creation_terminal_results_require_a_new_request_id() {
         use bloom_broker_api::CeremonyState;
         for (terminal, name) in [
@@ -6183,6 +6233,21 @@ value = "0""#
                 .unwrap();
             assert_eq!(sink.mode, 0o644, "{path}/restage must be writable");
         }
+    }
+
+    /// GETATTR must never render an expired entry's write-only `restage`
+    /// sink: the read fails NotFound and mounted agents see it as missing.
+    #[test]
+    fn failed_restage_sink_is_never_rendered() {
+        let f = make_handler_with_chain(true);
+        let w = &f.wallet_name;
+        for chain in ["anvil", "solana-local"] {
+            let p = vfs(format!("/{w}/0/chains/{chain}/outbox/failed/e1/restage"));
+            assert!(f.handler.is_read_side_effecting(&p), "{chain}");
+            assert!(!f.handler.is_async_write_command(&p), "{chain}");
+        }
+        let doc = vfs(format!("/{w}/0/chains/anvil/outbox/failed/e1/restage.md"));
+        assert!(!f.handler.is_read_side_effecting(&doc));
     }
 
     /// Account 0's Solana `new.tx` is pinned to account 0: a body
@@ -8801,6 +8866,7 @@ value = "0""#,
             .with_broker(Some(MachineBrokerClient::new(broker.clone())));
         let request = ApprovalPrepareRequest {
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
+            safe_review_payloads: Vec::new(),
             evm_review_payloads: Vec::new(),
             operation_id: OperationId::from_bytes([30; 32]),
             terms: approval_terms("alice", None),
@@ -8850,6 +8916,7 @@ value = "0""#,
                 .with_broker(Some(MachineBrokerClient::new(broker.clone())));
             let request = ApprovalPrepareRequest {
                 surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
+                safe_review_payloads: Vec::new(),
                 evm_review_payloads: Vec::new(),
                 operation_id: OperationId::from_bytes([30; 32]),
                 terms: approval_terms("alice", None),
@@ -8884,6 +8951,7 @@ value = "0""#,
             .with_broker(Some(MachineBrokerClient::new(broker.clone())));
         let request = ApprovalPrepareRequest {
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
+            safe_review_payloads: Vec::new(),
             evm_review_payloads: Vec::new(),
             operation_id: OperationId::from_bytes([30; 32]),
             terms: approval_terms("alice", None),
@@ -8917,6 +8985,7 @@ value = "0""#,
             .with_broker(Some(MachineBrokerClient::new(broker)));
         let request = ApprovalPrepareRequest {
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
+            safe_review_payloads: Vec::new(),
             evm_review_payloads: Vec::new(),
             operation_id: OperationId::from_bytes([30; 32]),
             terms: approval_terms("alice", None),
@@ -8965,6 +9034,14 @@ value = "0""#,
             old_id.as_str()
         ))
         .unwrap();
+        let initial: serde_json::Value =
+            serde_json::from_slice(&f.handler.read(&renew_path).await.unwrap()).unwrap();
+        assert_eq!(initial["schema"], "bloom.approval_renew_request.v1");
+        assert!(
+            !f.handler
+                .approval_projection_path("alice", Some(old_id.as_str()))
+                .exists()
+        );
         f.handler
             .write(&renew_path, &serde_json::to_vec(&renewal).unwrap())
             .await

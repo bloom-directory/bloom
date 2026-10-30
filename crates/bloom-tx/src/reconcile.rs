@@ -298,6 +298,41 @@ impl Reconciler {
             if !self.audit_result(&se, &receipt_correlation, receipt_result) {
                 break;
             }
+            // A cancel is a competing same-nonce transaction, not proof that
+            // the original lost. Prefer its original receipt; only record a
+            // cancellation after observing the replacement on chain.
+            if matches!(&receipt_call, Ok(None)) {
+                let cancel_hash = self
+                    .outbox
+                    .sent_dir(&se.wallet, &se.chain, &se.id)
+                    .ok()
+                    .and_then(|dir| std::fs::read_to_string(dir.join("cancel_tx_hash")).ok())
+                    .and_then(|hash| hash.trim().parse::<alloy::primitives::B256>().ok());
+                if let Some(hash) = cancel_hash {
+                    let Some(correlation) = self.audit_intent(&se, serde_json::json!({
+                        "operation": "tx.reconcile.cancel_receipt_lookup", "tx_hash": format!("{hash:#x}")
+                    })) else { break; };
+                    let cancel = chain.receipt(hash).await;
+                    if !self.audit_result(&se, &correlation, serde_json::json!({
+                        "outcome": match &cancel { Ok(Some(_)) => "found", Ok(None) => "not_found", Err(_) => "error" }
+                    })) { break; }
+                    if let Ok(Some(receipt)) = cancel {
+                        let record = MinedReceipt {
+                            outcome: "cancelled".into(),
+                            tx_hash: format!("{hash:#x}"),
+                            block_number: receipt.block_number,
+                            contract_address: None,
+                            revert_reason: None,
+                        };
+                        if let Ok(bytes) = serde_json::to_vec_pretty(&record)
+                            && self.project_receipt(&se, &bytes).is_ok()
+                        {
+                            updated += 1;
+                        }
+                        continue;
+                    }
+                }
+            }
             let receipt = match receipt_call {
                 Ok(Some(r)) => {
                     self.backoff
@@ -596,12 +631,17 @@ mod tests {
         nonce: Arc<Mutex<Option<u64>>>,
         receipt: Arc<Mutex<serde_json::Value>>,
         receipt_fails: Arc<Mutex<bool>>,
+        /// The JSON-RPC error a failing receipt lookup answers with.
+        receipt_error: serde_json::Value,
+        /// Every method requested, in order.
+        methods: Arc<Mutex<Vec<String>>>,
         calls: Arc<AtomicUsize>,
         nonce_calls: Arc<AtomicUsize>,
         /// Set the test clock to this many seconds when the next nonce read
         /// is answered, simulating a slow read inside one tick.
         clock_on_nonce: ClockOnNonce,
         fail_result_audit: Option<Arc<AuditLog>>,
+        receipt_hash: Option<String>,
     }
 
     impl MockRpc {
@@ -610,10 +650,13 @@ mod tests {
                 nonce: Arc::new(Mutex::new(nonce)),
                 receipt: Arc::new(Mutex::new(receipt)),
                 receipt_fails: Arc::new(Mutex::new(false)),
+                receipt_error: serde_json::json!({"code": -32000, "message": "unavailable"}),
+                methods: Arc::new(Mutex::new(Vec::new())),
                 calls: Arc::new(AtomicUsize::new(0)),
                 nonce_calls: Arc::new(AtomicUsize::new(0)),
                 clock_on_nonce: Arc::new(Mutex::new(None)),
                 fail_result_audit: None,
+                receipt_hash: None,
             }
         }
 
@@ -643,6 +686,9 @@ mod tests {
                         .cloned()
                         .unwrap_or(serde_json::Value::Null);
                     let reply = |field: &str, value: serde_json::Value| serde_json::json!({"jsonrpc": "2.0", "id": id, field: value});
+                    if let Some(method) = request_json["method"].as_str() {
+                        rpc.methods.lock().unwrap().push(method.to_owned());
+                    }
                     let body = match request_json["method"].as_str() {
                         Some("eth_getTransactionCount") => {
                             rpc.nonce_calls.fetch_add(1, Ordering::SeqCst);
@@ -666,10 +712,11 @@ mod tests {
                                 audit.fail_next_write_for_test();
                             }
                             if *rpc.receipt_fails.lock().unwrap() {
-                                reply(
-                                    "error",
-                                    serde_json::json!({"code": -32000, "message": "unavailable"}),
-                                )
+                                reply("error", rpc.receipt_error.clone())
+                            } else if rpc.receipt_hash.as_ref().is_some_and(|hash| {
+                                request_json["params"][0].as_str() != Some(hash.as_str())
+                            }) {
+                                reply("result", serde_json::Value::Null)
                             } else {
                                 reply("result", rpc.receipt.lock().unwrap().clone())
                             }
@@ -853,6 +900,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_mined_cancel_terminates_the_original_without_reporting_its_success() {
+        let (_directory, outbox) = sent_outbox();
+        let entry = outbox.read("alice", "anvil", "tx-1").unwrap();
+        let hash = format!("{:#x}", alloy::primitives::B256::repeat_byte(8));
+        outbox
+            .write_artefact(&entry.dir, "cancel_tx_hash", hash.as_bytes())
+            .unwrap();
+        let audit_directory = tempfile::tempdir().unwrap();
+        let audit = Arc::new(AuditLog::open(audit_directory.path().join("audit.jsonl")).unwrap());
+        let mut rpc = MockRpc::new(Some(1), mined_receipt());
+        rpc.receipt_hash = Some(hash.clone());
+        let chains = ChainRegistry::default();
+        chains.add(mock_chain(rpc).await);
+        let reconciler = Reconciler::new(outbox.clone(), chains, audit);
+        assert_eq!(reconciler.tick().await, 1);
+        let receipt = outbox
+            .read_receipt("alice", "anvil", "tx-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.outcome, "cancelled");
+        assert_eq!(receipt.tx_hash, hash);
+        assert!(!receipt.is_success());
+        assert_eq!(
+            outbox.read("alice", "anvil", "tx-1").unwrap().staged.status,
+            TxStatus::Cancelled
+        );
+        assert_eq!(reconciler.tick().await, 0);
+    }
+
+    #[tokio::test]
+    async fn original_receipt_is_recorded_when_it_beats_a_cancel_replacement() {
+        let (_directory, outbox) = sent_outbox();
+        let entry = outbox.read("alice", "anvil", "tx-1").unwrap();
+        outbox
+            .write_artefact(
+                &entry.dir,
+                "cancel_tx_hash",
+                format!("{:#x}", alloy::primitives::B256::repeat_byte(8)).as_bytes(),
+            )
+            .unwrap();
+        let audit_directory = tempfile::tempdir().unwrap();
+        let audit = Arc::new(AuditLog::open(audit_directory.path().join("audit.jsonl")).unwrap());
+        let rpc = MockRpc::new(Some(1), mined_receipt());
+        let chains = ChainRegistry::default();
+        chains.add(mock_chain(rpc).await);
+        let reconciler = Reconciler::new(outbox.clone(), chains, audit);
+        assert_eq!(reconciler.tick().await, 1);
+        assert!(
+            outbox
+                .read_receipt("alice", "anvil", "tx-1")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
     async fn a_provider_without_nonces_still_reconciles() {
         let (_directory, outbox) = sent_outbox();
         let audit_directory = tempfile::tempdir().unwrap();
@@ -910,6 +1013,67 @@ mod tests {
         *rpc.receipt_fails.lock().unwrap() = false;
         at(332);
         assert_eq!(reconciler.tick().await, 1);
+    }
+
+    /// Polygon's public endpoint answers a receipt lookup it cannot serve with
+    /// an authorization error rather than `null`. That error must stay visible
+    /// and leave the entry sent and unprojected until the receipt arrives; the
+    /// reconciler never signs or broadcasts.
+    #[tokio::test]
+    async fn receipt_lookup_errors_keep_the_entry_sent_until_the_receipt_arrives() {
+        let (_directory, outbox) = sent_outbox();
+        let audit_directory = tempfile::tempdir().unwrap();
+        let audit = Arc::new(AuditLog::open(audit_directory.path().join("audit.jsonl")).unwrap());
+        let mut rpc = MockRpc::new(Some(1), mined_receipt());
+        rpc.receipt_error = serde_json::json!({
+            "code": -32602,
+            "message": "Archive requests require a personal token",
+        });
+        *rpc.receipt_fails.lock().unwrap() = true;
+        let chains = ChainRegistry::default();
+        chains.add(mock_chain(rpc.clone()).await);
+        let (reconciler, at) = clocked(outbox.clone(), chains, audit.clone());
+        for secs in [0, 15, 60, 240, 301, 320] {
+            at(secs);
+            assert_eq!(reconciler.tick().await, 0);
+            let entry = outbox.read("alice", "anvil", "tx-1").unwrap();
+            assert_eq!(entry.state, crate::outbox::OutboxState::Sent);
+            assert!(
+                outbox
+                    .read_receipt("alice", "anvil", "tx-1")
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert_eq!(rpc.lookups(), 5, "the grace window, then deferred");
+        let last = audit.tail(1).unwrap();
+        assert_eq!(last[0].data["result"]["outcome"], "error");
+        assert!(
+            last[0].data["result"]["error"]
+                .as_str()
+                .unwrap()
+                .contains("Archive requests require a personal token")
+        );
+
+        *rpc.receipt_fails.lock().unwrap() = false;
+        at(332);
+        assert_eq!(reconciler.tick().await, 1);
+        assert_eq!(
+            outbox
+                .read_receipt("alice", "anvil", "tx-1")
+                .unwrap()
+                .unwrap()
+                .outcome,
+            "success"
+        );
+        assert!(audit.pending_effect_correlations().unwrap().is_empty());
+        let methods = rpc.methods.lock().unwrap();
+        assert!(
+            methods
+                .iter()
+                .all(|m| m == "eth_getTransactionCount" || m == "eth_getTransactionReceipt"),
+            "reconciliation only reads: {methods:?}"
+        );
     }
 
     #[tokio::test]
