@@ -838,7 +838,9 @@ snapshot_linux_upgrade_state() {
   done
   mkdir -m 0700 "$snapshot" || return 65
   if ((${#relatives[@]})); then
-    needed="$(cd "$state_root" && du -sk -- "${relatives[@]}" | awk '{ total += $1 } END { print total + 0 }')" || return 65
+    # Each root is copied by its own `cp -a`, which keeps hard links only
+    # within one invocation. Count every link so the total is an upper bound.
+    needed="$(cd "$state_root" && du -skl -- "${relatives[@]}" | awk '{ total += $1 } END { print total + 0 }')" || return 65
     available="$(df -Pk -- "$snapshot" | awk 'NR == 2 { print $4 }')" || return 65
     [[ "$needed" =~ ^[0-9]+$ && "$available" =~ ^[0-9]+$ ]] || return 65
     ((available > needed)) || {
