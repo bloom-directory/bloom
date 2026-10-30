@@ -120,7 +120,11 @@ impl NetPolicy {
                 return Ok(());
             }
         }
-        Err(HostError::Denied(format!("{method} {host}{path}")))
+        // This policy intersects the manifest and invocation grant. It cannot
+        // attribute a denial to either source; paths may also contain secrets.
+        Err(HostError::Denied(format!(
+            "{method} {host}: not allowed by effective network policy (check manifest and invocation grant)"
+        )))
     }
 }
 
@@ -358,6 +362,52 @@ host = "api.example.com"
 methods = ["GET", "POST"]
 paths = ["/markets*", "/auth/*", "/wallets/*/orders"]
 "#
+    }
+
+    #[test]
+    fn network_denials_do_not_blame_the_manifest_or_echo_url_data() {
+        let policy = NetPolicy::from_manifest_toml(manifest_toml()).unwrap();
+        let secret = "fixture-user:fixture-password@";
+        let tail = "/fixture-path-token?key=fixture-query-token";
+        for (method, url, expected) in [
+            (
+                "GET",
+                format!("https://{secret}other.example.com{tail}"),
+                "GET other.example.com: not allowed by effective network policy",
+            ),
+            (
+                "DELETE",
+                format!("https://{secret}api.example.com/markets{tail}"),
+                "DELETE api.example.com: not allowed by effective network policy",
+            ),
+            (
+                "GET",
+                format!("https://{secret}api.example.com/private{tail}"),
+                "GET api.example.com: not allowed by effective network policy",
+            ),
+        ] {
+            let failure = policy.check(method, &url).unwrap_err();
+            assert!(matches!(failure, HostError::Denied(_)));
+            let message = failure.to_string();
+            assert!(message.contains(expected), "{message}");
+            for value in [
+                "fixture-user",
+                "fixture-password",
+                "fixture-path-token",
+                "fixture-query-token",
+            ] {
+                assert!(!message.contains(value), "URL data leaked: {message}");
+            }
+        }
+        let url = "https://api.example.com/markets";
+        assert!(policy.check("GET", url).is_ok());
+        let message = policy
+            .intersect(&NetPolicy::deny_all())
+            .check("GET", url)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("invocation grant"));
+        assert!(!message.contains("package network policy"));
     }
 
     #[test]
