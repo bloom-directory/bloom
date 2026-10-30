@@ -83,10 +83,12 @@ reports only the blockhash/dwell trigger.
 
 ### Implemented freshness and restaging behavior
 
-`SolanaOutbox::sweep_expired` moves unsigned pending entries past `expires_ms`
-to `failed` with status `expired`. Signed pending entries remain visible so a
-lost RPC response cannot be misreported as failure. Signing and broadcast
-also query the current blockheight and refuse an expired message.
+`SolanaOutbox::sweep_expired` moves pending entries past `expires_ms` to
+`failed` with status `expired`, signed or not, once the cluster's block height
+has passed the blockhash window. Broadcast moves an entry to `sent` before it
+submits, so a pending entry was never sent; only one with a broadcast marker
+is left in place. Signing and broadcast also query the current blockheight
+and refuse an expired message.
 
 For an expired pending entry, writing non-empty content to `restage` creates a
 new immutable stage with the same destination and lamports but a fresh
