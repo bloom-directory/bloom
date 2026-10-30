@@ -2890,6 +2890,11 @@ fn record_confirm_error(entry_dir: &Path, wallet: &str, id: &str, error: &Handle
                 "The wallet policy does not yet allow the Petal that staged this transaction. Give the owner the ceremony link in error (pending updates are under wallets/{wallet}/policy-updates/pending/); once they approve, write confirm again."
             ),
         )
+    } else if message.contains("cannot discard a possibly signed transaction") {
+        (
+            "possibly_signed",
+            "This entry may already be signed or broadcast, so `cancel` kept it. Do not reuse its nonce. Reconcile it by its recorded hash first; if it is still unmined, replace it with `bloom wallet cancel`, which needs its own owner approval.".to_owned(),
+        )
     } else {
         (
             "refused",
@@ -4445,12 +4450,21 @@ impl WalletsHandler {
                     ));
                 }
                 if confirm_text.eq_ignore_ascii_case("cancel") {
-                    self.write_permit()?;
-                    self.tx_engine
+                    let entry_dir = self
+                        .tx_engine
                         .outbox
-                        .cancel(wallet, chain, id)
-                        .map_err(err_be)?;
-                    return Ok(());
+                        .read(wallet, chain, id)
+                        .map_err(err_be)?
+                        .dir;
+                    clear_confirm_error(&entry_dir);
+                    return self
+                        .tx_engine
+                        .discard_unsigned(self.write_permit()?, wallet, chain, id)
+                        .map_err(|error| {
+                            let error = err_be(error);
+                            record_confirm_error(&entry_dir, wallet, id, &error);
+                            error
+                        });
                 }
                 let confirm_text = if fname == "confirm.override" {
                     policy.override_sentinel()
@@ -9958,7 +9972,10 @@ value = "0""#,
 
     #[tokio::test]
     async fn confirm_cancel_discards_pending_locally() {
-        let f = make_handler_with_chain(true);
+        let mut f = make_handler_with_chain(true);
+        f.handler.home_write_permit = Some(Arc::new(
+            HomeWritePermit::acquire(&bloom_proto::HomeDir::at(f._tmp.path())).unwrap(),
+        ));
         seed_pending(&f, "0001-test");
         let p = VfsPath::parse(&format!(
             "/{}/0/chains/anvil/outbox/pending/0001-test/confirm",
@@ -9976,6 +9993,117 @@ value = "0""#,
         assert_eq!(entry.state, OutboxState::Failed);
         assert!(!entry.dir.join("broadcast_attempted.json").exists());
         assert!(!entry.dir.join("raw_tx").exists());
+    }
+
+    /// `cancel` written to `confirm` only discards an entry that cannot have
+    /// been signed: a lost broadcast reply or a dispatched signature may
+    /// still land, and discarding it would free its nonce for reuse.
+    #[tokio::test]
+    async fn confirm_cancel_preserves_possible_signatures() {
+        let ceremony = |sign_dispatched: bool| {
+            let digest = "11".repeat(32);
+            serde_json::to_vec(&serde_json::json!({
+                "schema": "bloom.machine-evm-signing.1", "action_id": "test",
+                "payload_digest": digest, "claimed_hash": digest,
+                "provenance_digest": digest, "canonical_plan_facts_digest": digest,
+                "approval_operation_id": "22".repeat(32), "signing_operation_id": "33".repeat(32),
+                "request_nonce": "11".repeat(16), "issued_at_ms": "1", "expires_at_ms": "2",
+                "approval_id": digest, "sign_dispatched": sign_dispatched
+            }))
+            .unwrap()
+        };
+        for marker in [
+            "none",
+            "approved",
+            "hash",
+            "broadcast",
+            "dispatched",
+            "malformed",
+        ] {
+            for control in ["confirm", "confirm.override"] {
+                let mut f = make_handler_with_chain(true);
+                f.handler.home_write_permit = Some(Arc::new(
+                    HomeWritePermit::acquire(&bloom_proto::HomeDir::at(f._tmp.path())).unwrap(),
+                ));
+                seed_pending(&f, "0001-test");
+                let entry = f
+                    .handler
+                    .tx_engine
+                    .outbox
+                    .read(&f.wallet_name, "anvil", "0001-test")
+                    .unwrap();
+                match marker {
+                    "none" => {}
+                    "approved" => {
+                        std::fs::write(entry.dir.join("ceremony.json"), ceremony(false)).unwrap()
+                    }
+                    "hash" => {
+                        let mut staged = entry.staged.clone();
+                        staged.tx_hash = Some(format!("0x{}", "11".repeat(32)));
+                        std::fs::write(
+                            entry.dir.join("intent.json"),
+                            serde_json::to_vec(&staged).unwrap(),
+                        )
+                        .unwrap();
+                    }
+                    "broadcast" => {
+                        std::fs::write(
+                            entry.dir.join("broadcast_attempted.json"),
+                            serde_json::to_vec(&serde_json::json!({
+                                "schema": "bloom.broadcast_attempted.v1", "tx_hash": "signed",
+                                "raw_tx_blake3": "digest", "raw_tx_path": "raw_tx",
+                                "from": entry.staged.from, "to": null, "nonce": 0,
+                                "chain_id": 31337, "created_ms": 0, "transport": "public_rpc"
+                            }))
+                            .unwrap(),
+                        )
+                        .unwrap();
+                    }
+                    "dispatched" => {
+                        std::fs::write(entry.dir.join("ceremony.json"), ceremony(true)).unwrap()
+                    }
+                    _ => std::fs::write(entry.dir.join("ceremony.json"), b"invalid").unwrap(),
+                }
+                let path = VfsPath::parse(&format!(
+                    "/{}/0/chains/anvil/outbox/pending/0001-test/{control}",
+                    f.wallet_name
+                ))
+                .unwrap();
+                let result = f.handler.write(&path, b"cancel").await;
+                let retained = f
+                    .handler
+                    .tx_engine
+                    .outbox
+                    .read(&f.wallet_name, "anvil", "0001-test")
+                    .unwrap();
+                if matches!(marker, "none" | "approved") {
+                    result.unwrap();
+                    assert_eq!(retained.state, OutboxState::Failed, "{marker}/{control}");
+                    assert!(retained.dir.join("cancel.txt").exists());
+                    continue;
+                }
+                let error = result.unwrap_err();
+                assert_eq!(retained.state, OutboxState::Pending, "{marker}/{control}");
+                assert!(!retained.dir.join("cancel.txt").exists());
+                if marker != "malformed" {
+                    assert!(
+                        error.to_string().contains("cannot discard"),
+                        "{marker}: {error}"
+                    );
+                    let record: serde_json::Value = serde_json::from_slice(
+                        &std::fs::read(retained.dir.join(CONFIRM_ERROR_FILE)).unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(record["kind"], "possibly_signed", "{marker}");
+                    assert!(
+                        record["next"]
+                            .as_str()
+                            .unwrap()
+                            .contains("bloom wallet cancel")
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]
