@@ -196,9 +196,10 @@ Agreed on 2026-09-14:
       checks no destination on the wallet's own exact EVM approval, which
       carries no claim, so the owner's approval of each transfer is the only
       recipient check. On the pinned Broker that check is hard to make: a
-      wallet without clear signing, which includes every default-policy
-      wallet, sees such a transfer as "Approve a call Bloom cannot read",
-      naming the token contract rather than the recipient. Broker master
+      wallet whose owner has not turned clear signing on, as on every new
+      wallet, sees such a transfer as "Approve a call Bloom cannot read". The
+      page names the token contract, and the recipient appears only inside
+      the raw calldata. Broker master
       (bloom-broker#103) decodes the transfer and shows its recipient. Until
       bloom-broker#112 is pinned, the policy ceremony shows the entry as
       written.
@@ -255,7 +256,10 @@ Bloom installs its canonical Petals (`DEFAULT_PETALS` in
 `[petals] preinstalled` setting. Setup records each chosen Petal under
 `[petals.setup]`, with the values the menu asked about, and the default
 policy proposes exactly these Petals. Canonical setup does not add runtime
-write switches. The persona is recorded under `[persona]`; Institutional is
+write switches. Saving the choices rewrites `config.toml` in full: comments
+and keys this build does not know are dropped, and anything it migrates on
+load, such as the Polygon RPC defaults, is written out. The
+persona is recorded under `[persona]`; Institutional is
 stored by its legacy name, `custodian`:
 
 ```toml
@@ -406,11 +410,16 @@ seconds, the check gives up and the marker stays for the next one. Anything
 else there may be the owner's, so it stays: Machine clears the marker and
 logs the command that would apply setup's choice.
 
-The key is pinned for one release, so setup writes only when the installed
-package hash is the catalog's pinned hash. Another release under the same
-name, such as a fork or a newer release the catalog has not pinned, may store
-its settings elsewhere, where the check could not see them, so Machine keeps
-what it holds, clears the marker and prints the manual command. After a
+The key is pinned with the releases checked to store settings there
+(`releases` in the catalog's settings template): Polymarket v0.1.8, the
+catalog's release, and v0.1.6, which Bloom v0.4.0 installed and a home may
+still run while it updates. Setup writes only when the installed package hash
+is one of them, and the signed lineage carries a write made to v0.1.6 forward
+to v0.1.8. Another release under the same name, such as a fork or a newer
+release whose key nobody has checked, may store its settings elsewhere, where
+the check could not see them, so Machine keeps what it holds and clears the
+marker. `bloom init` prints the manual command; a queued retry only logs it
+(`petal.setup_settings_preserved`). After a
 write, Machine asks once more and expects the key to be stored now. If the
 second write would also go ahead, the key is not where the release stores its
 settings and the check protects nothing: Machine reports
@@ -455,7 +464,8 @@ approvals work exactly as they do today:
   that would pass the daily limit is refused before the owner is asked.
 
 Polymarket's existing daily limit counts buys from its trade receipts over
-the last 24 hours. It does not count sells, and it has no total limit.
+the last 24 hours; v0.1.8 counts each buy's amount plus the most its fee can
+be. It does not count sells, and it has no total limit.
 
 ### 5. Adding, updating, and removing Petals
 
@@ -564,9 +574,7 @@ this design and those stacks:
   `WalletDefaultPolicy { name }` no longer compiles: onboarding must set
   `owner_just_chose` only right after it saves the selection. It should
   preselect from `[petals.setup]` while the policy is still the one creation
-  installed, and from what the current policy allows after that, and keep
-  the saved values of Petals left unticked, so re-ticking one restores the
-  owner's amount rather than the persona's suggestion. Inside Machine
+  installed, and from what the current policy allows after that. Inside Machine
   this is `AfterPolicyChange::Propose` rather than a `bool`, so another flag
   passed in its place, such as bloom#377's `standing`, does not compile;
   `standing` stays a separate argument.
@@ -606,10 +614,12 @@ this design and those stacks:
   setup obligation has no frozen package/config revision"), so they must
   migrate or reconcile these markers. A build of this design on a home
   bloom#352 used treats their entry as its own marker. A queued retry writes
-  `[petals.setup]`'s values while that Petal's settings read as unset and
-  deletes the entry, or deletes it without writing when settings already
-  exist; a failed retry leaves it as it is. A `bloom init` that queues the
-  same Petal overwrites it with an empty marker.
+  `[petals.setup]`'s values while nothing is stored under the settings key,
+  and deletes the entry. It deletes it without writing when settings are
+  already stored or the installed release is not one setup checked, and
+  leaves it when the retry fails. A first-setup `bloom init` overwrites it
+  with an empty marker when it queues that Petal, and deletes it when it
+  does not.
 - **Versions.** The sessions need Broker and Signer changes that are not
   merged, and each accepts exactly one protocol minor: bloom-signer#68 only
   Broker–Signer 1.7, and bloom-broker#100 only Machine–Broker 1.8. The pinned
@@ -678,8 +688,9 @@ destination the owner removed is not proposed again behind a later request
   `erc20:any-recipient` (decision 15). The second lifts Machine's recipient
   check for the wallet's own curated ERC-20 transfers. Broker checks no
   destination on that exact EVM approval, which carries no claim, so the
-  owner's approval of each transfer is the only recipient check, and on the
-  pinned Broker the approval page does not show the recipient (decision 15).
+  owner's approval of each transfer is the only recipient check. On the
+  pinned Broker the approval page does not name the recipient; it appears
+  only inside the raw calldata (decision 15).
 - Signing the policy grants no signing authority. Every signature still
   needs an approval the owner gave for that transaction.
 - Petal limits live in each Petal's settings, not the signed policy. Any
@@ -788,6 +799,9 @@ Automated:
   as awaiting the owner, is replaced by a new ceremony
   (`crates/bloom-vfs/tests/triad_policy_update.rs`).
 - Catalog provisioning reports an update separately from a fresh install.
+- A queued write goes into Polymarket v0.1.6 as well as the catalog's
+  v0.1.8, which store settings under the same key, and into no other
+  release; the catalog bump test lists both.
 - Each persona's menu choice, `--persona` and Polymarket suggestion; Degen's
   entry on configured chains and for `main` only; an unusable saved persona
   set aside; staging that passes only the wallet's own curated ERC-20

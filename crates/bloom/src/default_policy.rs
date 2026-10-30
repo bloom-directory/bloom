@@ -479,12 +479,14 @@ pub(crate) enum SetupWrite {
 /// one step ([`bloom_vfs::Vfs::write_if_absent`]), so an owner's edit made
 /// meanwhile is never replaced either.
 ///
-/// The key is the one the catalog release stores these settings under, so
-/// setup writes only to that release (`installed` is the Petal's package
+/// The key is the one the template's releases store these settings under, so
+/// setup writes only to one of them (`installed` is the Petal's package
 /// hash): another release under the same name may store them elsewhere, where
-/// the check could not see them. After a write, the key must be stored; if it
-/// is not, the pinned key is wrong and setup says so, since it protects
-/// nothing.
+/// the check could not see them. An earlier release on the list is written to
+/// as well, so a home still updating to the catalog release keeps setup's
+/// choice; the signed package lineage carries it forward. After a write, the
+/// key must be stored; if it is not, the pinned key is wrong and setup says
+/// so, since it protects nothing.
 pub(crate) async fn write_petal_settings(
     vfs: &bloom_vfs::Vfs,
     petals: &PetalsConfig,
@@ -497,8 +499,7 @@ pub(crate) async fn write_petal_settings(
     let Some(settings) = render_petal_settings(petals, name, DEFAULT_POLICY_WALLET)? else {
         return Ok(SetupWrite::NoTemplate);
     };
-    let pinned = github_source::preinstalled_petal(name).and_then(|entry| entry.expected_hash);
-    if pinned != Some(installed) {
+    if !template.releases.contains(&installed) {
         let reason = format!(
             "the installed {} is not the release setup knows, so it did not risk replacing settings stored where it cannot check",
             petal_label(name)
@@ -1174,8 +1175,6 @@ fn settings_not_written(name: &str, settings: &PetalSettingsWrite, reason: &str)
     )
 }
 
-/// Say which setup writes are still queued and how to retry them, since the
-/// command stops once the policy is settled.
 /// Say what the policy still allows beyond the saved persona, and how to
 /// remove it. Bloom never removes an entry itself.
 fn report_beyond_persona(
@@ -1194,6 +1193,8 @@ fn report_beyond_persona(
     Ok(())
 }
 
+/// Say which setup writes are still queued and how to retry them, since the
+/// command stops once the policy is settled.
 fn report_settings_pending(
     output: &mut dyn Write,
     wallet: &str,
@@ -1928,12 +1929,12 @@ mod tests {
         clear_settings_pending(home.path(), "polymarket");
     }
 
-    /// `store_key` is where the pinned Polymarket release stores a wallet's
+    /// `store_key` is where the listed Polymarket releases store a wallet's
     /// venue settings, as the host stores them: the Petal SDK's `state`
     /// namespace (petal 2beed2ff, `STATE_NS`), then `venue_config_key`. A
     /// setup write goes ahead only while nothing is stored there, so a catalog
-    /// bump must re-check both, or setup would write over settings it cannot
-    /// see.
+    /// bump must re-check the key against the new release and list it, or
+    /// setup would write over settings it cannot see.
     #[test]
     fn the_polymarket_settings_key_is_pinned_with_its_release() {
         let entry = github_source::preinstalled_petal("polymarket").unwrap();
@@ -1943,6 +1944,18 @@ mod tests {
             Some("6eb2065e8558f3761399fcb0516731a600fdb0b49974c8ed0808abd38fde7db4"),
             "re-check store_key against the new release, then update both"
         );
+        let template = setup_template("polymarket").unwrap();
+        assert_eq!(
+            template.releases,
+            [
+                // v0.1.6, pinned by Bloom v0.4.0, which a home may still run
+                // while it updates.
+                "0f365cd7f613129f73ce66fb07256c8a42c4e70abbb77721804dbd6df85b96b5",
+                "6eb2065e8558f3761399fcb0516731a600fdb0b49974c8ed0808abd38fde7db4",
+            ],
+            "list a release only once its key is checked"
+        );
+        assert!(template.releases.contains(&entry.expected_hash.unwrap()));
         assert_eq!(
             setup_template("polymarket").unwrap().store_key,
             "state/settings/{wallet}/venue.toml"
@@ -2586,6 +2599,28 @@ mod tests {
         );
         assert!(message.contains("| bloom vfs write "), "{message}");
         assert_eq!(*route.stored.lock().await, None);
+        assert!(pending_settings(home.path(), &petals).is_empty());
+    }
+
+    /// A home that still runs the release Bloom v0.4.0 installed, because its
+    /// update to the catalog release has not landed, keeps setup's choice: the
+    /// queued write goes into that release, whose key is the same, and the
+    /// signed lineage carries it forward.
+    #[tokio::test]
+    async fn a_queued_write_goes_into_the_earlier_release_that_shares_the_key() {
+        let petals = chosen_setup(&["polymarket"]);
+        let earlier = "0f365cd7f613129f73ce66fb07256c8a42c4e70abbb77721804dbd6df85b96b5";
+        assert_ne!(earlier, release());
+
+        let route = SettingsRoute::holding(Some(UNSET));
+        let (home, vfs) = queued_polymarket(&route);
+        let outcome =
+            apply_queued_settings(&vfs, home.path(), &petals, "polymarket", earlier).await;
+        assert!(
+            matches!(&outcome, QueuedWrite::Written(message) if message.starts_with("petal_settings: ")),
+            "{outcome:?}"
+        );
+        assert_eq!(route.value().await.unwrap(), polymarket_setup_body());
         assert!(pending_settings(home.path(), &petals).is_empty());
     }
 

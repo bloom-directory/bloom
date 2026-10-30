@@ -64,14 +64,20 @@ pub(crate) struct PetalSetupTemplate {
     /// File body; each `{name}` is replaced by the value of that name.
     pub body: &'static str,
     pub values: &'static [PetalSetupValue],
-    /// The key the catalog release (`expected_hash`) stores the route's
-    /// settings under, in the account's partition and as the host stores it,
-    /// namespace included; `{wallet}` is the default-policy wallet. A setup
-    /// write goes ahead only to that release and only while nothing is stored
+    /// The key the releases in `releases` store the route's settings under,
+    /// in the account's partition and as the host stores it, namespace
+    /// included; `{wallet}` is the default-policy wallet. A setup write goes
+    /// ahead only to one of those releases and only while nothing is stored
     /// there, so settings saved by the owner or anyone else stay, even ones
     /// that read like the default. Pin a new key with each release that moves
     /// its settings.
     pub store_key: &'static str,
+    /// Package hashes of the releases checked to store these settings under
+    /// `store_key`: the catalog release (`expected_hash`) and earlier ones a
+    /// home may still have installed while it updates. A setup write made to
+    /// an earlier one is carried to the catalog release by the signed package
+    /// lineage.
+    pub releases: &'static [&'static str],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,9 +95,15 @@ const POLYMARKET_SETUP: PetalSetupTemplate = PetalSetupTemplate {
         prompt: "Polymarket daily buy limit in pUSD",
         default: "100",
     }],
-    // `venue_config_key` in the pinned release, under the Petal SDK's `state`
+    // `venue_config_key` in these releases, under the Petal SDK's `state`
     // namespace, which its `store_get` and `store_put` add to every key.
     store_key: "state/settings/{wallet}/venue.toml",
+    // v0.1.6 (pinned by Bloom v0.4.0) and v0.1.8, both built on petal
+    // 2beed2ff with the same `venue_config_key`.
+    releases: &[
+        "0f365cd7f613129f73ce66fb07256c8a42c4e70abbb77721804dbd6df85b96b5",
+        "6eb2065e8558f3761399fcb0516731a600fdb0b49974c8ed0808abd38fde7db4",
+    ],
 };
 
 const BASELINE_POLYMARKET_AUTHORITY_ROUTES: &[PetalAuthorityRoute] = &[
