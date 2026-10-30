@@ -62,7 +62,7 @@ use fs2::FileExt as _;
 use parking_lot::RwLock;
 use sha2::Digest as _;
 use thiserror::Error;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::bump_scanner::MempoolIndexes;
 use crate::intent_parser::ParseError;
@@ -848,6 +848,34 @@ impl TxEngine {
                 data,
             } => {
                 let to_addr = self.resolve_recipient_async(to, address_book).await?;
+                let spec = chain.spec();
+                // The chain's own native symbol (POL, BNB, AVAX, ...) is a
+                // native send, not an ERC-20 lookup.
+                if token
+                    .as_deref()
+                    .is_some_and(|t| t.trim().eq_ignore_ascii_case(&spec.native_symbol))
+                {
+                    if !matches!(value.trim(), "" | "0") {
+                        return Err(TxEngineError::Amount(
+                            "native sends take one amount; value and amount were both set".into(),
+                        ));
+                    }
+                    let v = parse_units(amount.trim(), spec.native_decimals)
+                        .map_err(|e| TxEngineError::Amount(e.to_string()))?;
+                    let data = data.clone().unwrap_or_else(|| "0x".into());
+                    return Ok((Some(to_addr), v, data, None, None));
+                }
+                // "eth"/"ether" name an asset. On a chain whose native token is
+                // something else, sending it would move a different asset.
+                if token.is_none() && !spec.native_symbol.eq_ignore_ascii_case("ETH") {
+                    let unit = parse_amount(value).map(|p| p.unit).unwrap_or_default();
+                    if unit == "eth" || unit == "ether" {
+                        return Err(TxEngineError::Amount(format!(
+                            "{} pays in {}, not ETH; write the amount in {}",
+                            spec.name, spec.native_symbol, spec.native_symbol
+                        )));
+                    }
+                }
                 if let Some(v) = Self::resolve_native_value(value, token)? {
                     if !amount.trim().is_empty() {
                         return Err(TxEngineError::Amount(
@@ -1974,7 +2002,8 @@ impl TxEngine {
         let entry = self
             .outbox
             .read_in_state(wallet, chain_name, id, OutboxState::Pending)?;
-        let mut staged = entry.staged.clone();
+        self.require_no_cancellation(&entry)?;
+        let staged = entry.staged.clone();
 
         if self
             .outbox
@@ -1999,9 +2028,10 @@ impl TxEngine {
 
         let hard = policy_engine::has_hard_violation(&staged.policy_checks);
         if hard {
-            staged.status = TxStatus::Failed;
-            self.outbox
-                .transition(&entry, crate::outbox::OutboxState::Failed)?;
+            // The denial stands even if recording it fails.
+            if let Err(e) = self.outbox.transition_with_status(&entry, TxStatus::Failed) {
+                warn!(id = %staged.id, error = %e, "tx.policy_denied_record_failed");
+            }
             debug!(
                 id = %staged.id,
                 wallet,
@@ -2120,6 +2150,7 @@ impl TxEngine {
         for target in &targets {
             let policy = &target.policy;
             let entry = self.outbox.read(wallet, &target.chain_name, &target.id)?;
+            self.require_no_cancellation(&entry)?;
             if entry.staged.wallet != wallet
                 || entry.staged.chain != target.chain_name
                 || entry.staged.id != target.id
@@ -2364,6 +2395,7 @@ impl TxEngine {
         let entry = self
             .outbox
             .read_in_state(wallet, chain_name, id, OutboxState::Pending)?;
+        self.require_no_cancellation(&entry)?;
         let mut staged = entry.staged.clone();
 
         if let Some(attempt) = self
@@ -2398,9 +2430,10 @@ impl TxEngine {
         // Policy gate.
         let hard = policy_engine::has_hard_violation(&staged.policy_checks);
         if hard {
-            staged.status = TxStatus::Failed;
-            self.outbox
-                .transition(&entry, crate::outbox::OutboxState::Failed)?;
+            // The denial stands even if recording it fails.
+            if let Err(e) = self.outbox.transition_with_status(&entry, TxStatus::Failed) {
+                warn!(id = %staged.id, error = %e, "tx.policy_denied_record_failed");
+            }
             debug!(
                 id = %staged.id,
                 wallet,
@@ -4092,6 +4125,25 @@ impl TxEngine {
         Ok(signed.hash)
     }
 
+    fn require_no_cancellation(&self, entry: &crate::OutboxEntry) -> Result<(), TxEngineError> {
+        if entry
+            .dir
+            .join("cancel_tx_hash")
+            .try_exists()
+            .map_err(OutboxError::Io)?
+            || self
+                .outbox
+                .read_broadcast_attempt(entry, BroadcastAttemptKind::CancelReplacement)?
+                .is_some()
+        {
+            return Err(TxEngineError::ApprovalDenied(
+                "cancellation already submitted; reconcile it before confirming the transaction"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn read_replaceable_entry(
         &self,
         wallet: &str,
@@ -4173,6 +4225,21 @@ impl TxEngine {
         self.assert_write_permit(permit)?;
         let bump = bump_pct.max(10);
         let entry = self.read_replaceable_entry(wallet, chain_name, original_id)?;
+        if entry
+            .dir
+            .join("cancel_tx_hash")
+            .try_exists()
+            .map_err(OutboxError::Io)?
+            || self
+                .outbox
+                .read_broadcast_attempt(&entry, BroadcastAttemptKind::CancelReplacement)?
+                .is_some()
+        {
+            return Err(TxEngineError::ApprovalDenied(
+                "cancellation already submitted; reconcile it before replacing the transaction"
+                    .into(),
+            ));
+        }
         let original = &entry.staged;
         self.assert_nonce_still_replaceable(
             chain,
@@ -4323,11 +4390,38 @@ impl TxEngine {
                 .outbox
                 .read_broadcast_attempt(&entry, BroadcastAttemptKind::Confirm)?
                 .is_none()
+            && self
+                .outbox
+                .read_broadcast_attempt(&entry, BroadcastAttemptKind::Replacement)?
+                .is_none()
             && read_triad_signing_state(&entry.dir.join(TRIAD_SIGNING_STATE_FILE))?
                 .is_none_or(|state| !state.sign_dispatched)
         {
             self.outbox.cancel(wallet, chain_name, original_id)?;
             return Ok(self.outbox.read(wallet, chain_name, original_id)?.staged);
+        }
+        // Recover the original hash before submitting a cancel, so a lost
+        // send response cannot leave it outside the reconciler's sent queue.
+        let mut entry = entry;
+        if entry.staged.tx_hash.is_none() {
+            for kind in [
+                BroadcastAttemptKind::Confirm,
+                BroadcastAttemptKind::Replacement,
+            ] {
+                if let Some(attempt) = self.outbox.read_broadcast_attempt(&entry, kind)? {
+                    entry.staged.tx_hash = Some(attempt.tx_hash);
+                    break;
+                }
+            }
+        }
+        if entry.staged.tx_hash.is_some() {
+            self.outbox.write_artefact(
+                &entry.dir,
+                "intent.json",
+                &serde_json::to_vec_pretty(&entry.staged).map_err(OutboxError::Json)?,
+            )?;
+            self.outbox.transition_with_status(&entry, TxStatus::Sent)?;
+            entry = self.outbox.read(wallet, chain_name, original_id)?;
         }
         let original = &entry.staged;
         self.assert_nonce_still_replaceable(
@@ -4383,8 +4477,21 @@ impl TxEngine {
         let _ = self
             .outbox
             .remove_broadcast_raw_tx(&entry, BroadcastAttemptKind::CancelReplacement);
-        if entry.state != OutboxState::Failed
-            && let Err(e) = self.outbox.transition(&entry, OutboxState::Failed)
+        // Broadcast does not settle the nonce race. Keep a sent original
+        // visible to the reconciler so it can record a receipt if it wins.
+        if original.tx_hash.is_none()
+            && self
+                .outbox
+                .read_broadcast_attempt(&entry, BroadcastAttemptKind::Confirm)?
+                .is_none()
+            && self
+                .outbox
+                .read_broadcast_attempt(&entry, BroadcastAttemptKind::Replacement)?
+                .is_none()
+            && entry.state != OutboxState::Failed
+            && let Err(e) = self
+                .outbox
+                .transition_with_status(&entry, TxStatus::Cancelled)
         {
             debug!(
                 id = %original.id,
@@ -5832,6 +5939,81 @@ mod tests {
         }
     }
 
+    async fn resolve_send_on(native_symbol: &str, intent: &str) -> Result<U256, TxEngineError> {
+        let mut spec = stage_chain("http://127.0.0.1:9").spec().clone();
+        spec.native_symbol = native_symbol.into();
+        let chain = ChainClient::new(spec).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let engine = TxEngine::new(Outbox::new(dir.path().join("outbox")).unwrap(), 60_000);
+        let body = crate::intent_parser::parse(intent).unwrap().body;
+        let (_, value, data, token, _) = engine
+            .resolve_intent_body(&body, &chain, 31337, None, Address::ZERO)
+            .await?;
+        assert_eq!((data.as_str(), token.is_none()), ("0x", true));
+        Ok(value)
+    }
+
+    #[tokio::test]
+    async fn the_chain_native_symbol_sends_the_native_asset() {
+        let to = "0x2222222222222222222222222222222222222222";
+        let pol = U256::from(10_000_000_000_000_000u64);
+        for intent in [
+            format!("send 0.01 POL to {to}"),
+            format!("send 0.01 pol to {to}"),
+            format!(r#"{{"kind":"send","to":"{to}","token":"POL","amount":"0.01"}}"#),
+        ] {
+            assert_eq!(
+                resolve_send_on("POL", &intent).await.unwrap(),
+                pol,
+                "{intent}"
+            );
+        }
+        assert_eq!(
+            resolve_send_on("POL", &format!("send 10000000000000000 wei to {to}"))
+                .await
+                .unwrap(),
+            pol
+        );
+        assert_eq!(
+            resolve_send_on("ETH", &format!("send 0.01 ETH to {to}"))
+                .await
+                .unwrap(),
+            pol
+        );
+    }
+
+    /// The 0.4.1 ceremony case: `send 0.1 POL` on the shipped polygon chain
+    /// (id 137) failed with "unknown token 'POL' on chain id 137".
+    #[tokio::test]
+    async fn the_default_polygon_chain_sends_pol_natively() {
+        let spec = bloom_proto::config::Config::local_default().chains["polygon"].clone();
+        let chain = ChainClient::new(spec).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let engine = TxEngine::new(Outbox::new(dir.path().join("outbox")).unwrap(), 60_000);
+        let to = "0x2222222222222222222222222222222222222222";
+        let body = crate::intent_parser::parse(&format!("send 0.1 POL to {to}"))
+            .unwrap()
+            .body;
+        let (_, value, data, token, _) = engine
+            .resolve_intent_body(&body, &chain, 137, None, Address::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(value, U256::from(100_000_000_000_000_000u64));
+        assert_eq!((data.as_str(), token.is_none()), ("0x", true));
+    }
+
+    #[tokio::test]
+    async fn eth_is_refused_on_a_chain_with_another_native_asset() {
+        let to = "0x2222222222222222222222222222222222222222";
+        for intent in [
+            format!("send 0.01 ETH to {to}"),
+            format!("send 0.01 ether to {to}"),
+        ] {
+            let err = resolve_send_on("POL", &intent).await.unwrap_err();
+            assert!(err.to_string().contains("pays in POL, not ETH"), "{err}");
+        }
+    }
+
     #[test]
     fn native_send_to_contract_is_not_typed_as_transfer() {
         let body = RawIntentBody::Send {
@@ -5960,6 +6142,123 @@ mod tests {
             "{:?}",
             staged.policy_checks
         );
+    }
+
+    #[tokio::test]
+    async fn cancel_replacement_keeps_sent_original_available_for_reconciliation() {
+        check_cancel_keeps_original(None, false).await;
+    }
+
+    #[tokio::test]
+    async fn cancel_replacement_keeps_lost_broadcast_available_for_reconciliation() {
+        for kind in [
+            BroadcastAttemptKind::Confirm,
+            BroadcastAttemptKind::Replacement,
+        ] {
+            check_cancel_keeps_original(Some(kind), false).await;
+            check_cancel_keeps_original(Some(kind), true).await;
+        }
+    }
+
+    async fn check_cancel_keeps_original(
+        marker: Option<BroadcastAttemptKind>,
+        pending_marker: bool,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        let mut staged = fake_staged_1559("cancel-race");
+        staged.created_ms = now_ms();
+        outbox.write_pending(&staged, "original").unwrap();
+        let pending = outbox.read("alice", "anvil", &staged.id).unwrap();
+        if !pending_marker {
+            outbox
+                .transition_with_status(&pending, TxStatus::Sent)
+                .unwrap();
+        }
+        let sent = outbox.read("alice", "anvil", &staged.id).unwrap();
+        staged.status = TxStatus::Sent;
+        staged.tx_hash = Some(format!("{:#x}", B256::repeat_byte(1)));
+        if let Some(kind) = marker {
+            outbox
+                .write_broadcast_attempt(
+                    &sent,
+                    kind,
+                    &crate::outbox::BroadcastAttempt {
+                        schema: "bloom.broadcast_attempted.v1".into(),
+                        tx_hash: staged.tx_hash.clone().unwrap(),
+                        raw_tx_blake3: blake3::hash(b"original").to_hex().to_string(),
+                        raw_tx_path: kind.raw_name().into(),
+                        from: staged.from.clone(),
+                        to: staged.to.clone(),
+                        nonce: staged.nonce,
+                        chain_id: staged.chain_id,
+                        created_ms: now_ms(),
+                        transport: crate::outbox::BroadcastTransport::PublicRpc,
+                        private_provider: None,
+                    },
+                )
+                .unwrap();
+            staged.tx_hash = None;
+        }
+        outbox
+            .write_artefact(
+                &sent.dir,
+                "intent.json",
+                &serde_json::to_vec(&staged).unwrap(),
+            )
+            .unwrap();
+        let (engine, _, broker) = triad_batch_fixture(outbox.clone(), true, false);
+        let mut catalog = triad_catalog();
+        let mut cancel_record = catalog.records[0].clone();
+        cancel_record.subject = ProvenanceSubject::System {
+            component_id: Token::new("bloom-machine").unwrap(),
+            operation_class: Token::new("transaction.cancel").unwrap(),
+        };
+        cancel_record.operation_classes[0].operation_class =
+            Token::new("transaction.cancel").unwrap();
+        if !catalog
+            .records
+            .iter()
+            .any(|record| record.subject == cancel_record.subject)
+        {
+            catalog.records.push(cancel_record);
+        }
+        let engine = engine.with_triad_signing(broker, catalog).unwrap();
+        let chain = stage_chain(&spawn_batch_rpc(None).await);
+        let permit = permit_for(&directory);
+        let policy = Policy::default();
+        let result = engine
+            .cancel(&permit, "alice", "anvil", &staged.id, &chain, 15, &policy)
+            .await;
+        if matches!(result, Err(TxEngineError::ApprovalRequired(_))) {
+            engine
+                .cancel(&permit, "alice", "anvil", &staged.id, &chain, 15, &policy)
+                .await
+                .unwrap();
+        } else {
+            result.unwrap();
+        }
+        let original = outbox.read("alice", "anvil", &staged.id).unwrap();
+        assert_eq!(original.state, OutboxState::Sent);
+        assert_eq!(original.staged.status, TxStatus::Sent);
+        assert_eq!(
+            original.staged.tx_hash,
+            Some(format!("{:#x}", B256::repeat_byte(1)))
+        );
+        assert!(original.dir.join("cancel_tx_hash").exists());
+        assert!(original.dir.join("cancel_intent.json").exists());
+        assert_eq!(outbox.walk_all_sent().unwrap().len(), 1);
+        assert!(
+            outbox
+                .highest_pending_nonce("alice", "anvil", TEST_SIGNER_ADDRESS.parse().unwrap())
+                .unwrap()
+                .is_none()
+        );
+        let err = engine
+            .replace(&permit, "alice", "anvil", &staged.id, &chain, 15, &policy)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TxEngineError::ApprovalDenied(_)));
     }
 
     #[tokio::test]
@@ -6427,6 +6726,63 @@ mod tests {
         assert_eq!(subject.total_value_usd_micro, Some(1_250_000));
         assert_eq!(calls.lock().len(), 1);
         assert_eq!(calls.lock()[0].1, "1250000");
+    }
+
+    #[tokio::test]
+    async fn stage_erc20_transfer_accepts_bare_fractional_amount() {
+        // `send 0.5 USDC to ...` and `{"token":"USDC","amount":"0.5"}` both
+        // carry a bare "0.5"; it must scale by the token's decimals, not wei.
+        let url = spawn_stage_rpc(false).await;
+        let oracle = RecordingOracle {
+            calls: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            usd_micro: 500_000,
+            age_ms: 0,
+            max_age_ms: 60_000,
+        };
+        let (engine, _dir, permit, chain) = stage_fixture(&url, oracle);
+        let token_addr: Address = "0x1111111111111111111111111111111111111111"
+            .parse()
+            .unwrap();
+        engine.token_cache.write().insert(
+            (31337, token_addr),
+            TokenMeta {
+                address: token_addr,
+                symbol: "USDC".into(),
+                decimals: 6,
+            },
+        );
+        let intent = RawIntent {
+            body: RawIntentBody::Send {
+                to: "0x2222222222222222222222222222222222222222".into(),
+                value: String::new(),
+                token: Some(token_addr.to_string()),
+                amount: "0.5".into(),
+                data: None,
+            },
+            chain: Some("anvil".into()),
+            gas: bloom_proto::intent::GasStrategy::Auto,
+            nonce: None,
+            gas_limit_hint: None,
+            usd_value_hint: None,
+            review_mode: None,
+        };
+        let staged = engine
+            .stage(
+                &permit,
+                "alice",
+                "0x3333333333333333333333333333333333333333"
+                    .parse()
+                    .unwrap(),
+                intent,
+                &chain,
+                &policy_with_usd_cap(),
+                None,
+            )
+            .await
+            .unwrap();
+        let token = staged.token.as_ref().unwrap();
+        assert_eq!(token.amount, "0.5");
+        assert_eq!(token.amount_base_units.as_deref(), Some("500000"));
     }
 
     #[tokio::test]
@@ -9444,6 +9800,10 @@ mod tests {
             crate::outbox::OutboxState::Failed,
             "tx must be Failed after hard deny"
         );
+        // Persisted, not only normalised by `read`: the CLI serves these bytes.
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(entry.dir.join("intent.json")).unwrap()).unwrap();
+        assert_eq!(raw["status"], "failed");
     }
 
     /// A soft-Warn check must block confirm() when no override sentinel is
