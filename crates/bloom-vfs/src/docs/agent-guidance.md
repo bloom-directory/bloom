@@ -71,6 +71,18 @@ whether an earlier operation completed or whether retrying a write is safe.
   possibly submitted transaction, reconcile by its recorded hash or signature;
   never blindly restage or rebroadcast.
 
+Machine's Petal HTTP transport errors omit URL userinfo, paths and queries,
+which can contain credentials. Petals may still return upstream response bodies.
+A policy denial is one of:
+
+- `net.fetch requires https`;
+- `net.fetch disallows non-default https port <port>`;
+- `<METHOD> <host>: not allowed by effective network policy (check manifest and invocation grant)`.
+  Both `[[net.allow]]` and the invocation's runtime grant must permit the request.
+
+Transport errors read `http_fetch <send|body>: <METHOD> <host>: <cause>`, where
+the cause is the underlying DNS, connect, TLS or timeout error.
+
 If you write to a control file and then cannot find what you wrote, check
 whether the transfer moved to `sent/` or `failed/` before assuming the write
 was lost. Listing the wallet's outbox states is cheaper than re-issuing the
