@@ -46,7 +46,7 @@ jobs:
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: "true"
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: bloom
       - name: Select agents
@@ -70,13 +70,13 @@ jobs:
           echo "broker=$broker" >> "$GITHUB_OUTPUT"
           echo "signer=$signer" >> "$GITHUB_OUTPUT"
       - name: Check out the pinned Broker
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: bloom-directory/bloom-broker
           ref: ${{ steps.pins.outputs.broker }}
           path: bloom-broker
       - name: Check out the pinned Signer
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: bloom-directory/bloom-signer
           ref: ${{ steps.pins.outputs.signer }}
@@ -129,7 +129,7 @@ jobs:
       BLOOM_INTEGRATION_DEBUG_DRIVER_BIN: ${{ github.workspace }}/triad-bin/bloom-broker-debug-driver
       BLOOM_EVAL_JOBS_DIR: ${{ github.workspace }}/harbor-jobs
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: triad-dev-binaries
@@ -204,7 +204,7 @@ jobs:
       contents: read
       pull-requests: write
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: trials-*
