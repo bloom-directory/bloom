@@ -3409,7 +3409,7 @@ fn installer_upgrade_transactions_preserve_recovery_state_atomically() {
         linux.find("preflight_linux_release_set \"$root\"").unwrap()
             < linux.find("install_linux_release \"$root\"").unwrap()
     );
-    assert!(linux.contains("bloom.linux-upgrade-transaction.2"));
+    assert!(linux.contains("bloom.linux-upgrade-transaction.3"));
     assert!(linux.contains(
         "snapshot_linux_upgrade_units \"$install_root\" \"$upgrade_transaction_scratch\""
     ));
@@ -3815,14 +3815,29 @@ write_candidate_units() {
       "$unit_root/bloom-broker-control@.socket"
   fi
 }
+# Stands in for a candidate Broker, Signer, and Machine that migrate their
+# durable state on first start, as the 2026-10-29 Broker did.
+migrate_candidate_state() {
+  local state="$root/var/lib/bloom/1000"
+  [[ -d "$state/broker" ]] || return 0
+  printf 'candidate journal format 3\n' > "$state/broker/journal.db"
+  printf 'candidate wal\n' >> "$state/broker/journal.db-wal"
+  rm -f -- "$state/broker/journal.db-shm"
+  printf 'candidate head\n' > "$state/broker/audit-checkpoints/candidate"
+  chmod 0750 "$state/broker/audit-checkpoints"
+  printf 'candidate signer\n' > "$state/signer/signer.db"
+  printf 'candidate broker head\n' >> "$state/machine/audit-checkpoints/heads"
+}
 case "$mode" in
   interrupt)
     begin_linux_upgrade "$root" "$old_digest" "$new_digest"
     write_candidate_units
+    migrate_candidate_state
     ;;
   rollback)
     begin_linux_upgrade "$root" "$old_digest" "$new_digest"
     write_candidate_units
+    migrate_candidate_state
     rollback_linux_upgrade
     ;;
   recover)
@@ -4022,6 +4037,169 @@ fn linux_upgrade_failure_restores_the_previous_unit_contract_before_restart() {
         }
         assert!(!root.join("var/lib/bloom/upgrade-transaction").exists());
     }
+}
+
+/// Writes durable service state for login 1000 with distinct modes.
+fn write_linux_service_state(root: &Path) {
+    let state = root.join("var/lib/bloom/1000");
+    for (directory, mode) in [
+        ("", 0o711),
+        ("broker", 0o700),
+        ("broker/audit-checkpoints", 0o700),
+        ("signer", 0o700),
+        ("signer/audit-checkpoints", 0o700),
+        ("machine", 0o700),
+        ("machine/audit-checkpoints", 0o700),
+    ] {
+        fs::create_dir_all(state.join(directory)).unwrap();
+        set_linux_mode(&state.join(directory), mode);
+    }
+    for (file, contents, mode) in [
+        ("broker/journal.db", "previous journal format 2\n", 0o600),
+        ("broker/journal.db-wal", "previous wal\n", 0o600),
+        ("broker/journal.db-shm", "previous shm\n", 0o600),
+        (
+            "broker/audit-checkpoints/heads",
+            "previous signer head\n",
+            0o600,
+        ),
+        ("signer/signer.db", "previous signer\n", 0o600),
+        (
+            "signer/audit-checkpoints/heads",
+            "previous broker head\n",
+            0o400,
+        ),
+        (
+            "machine/audit-checkpoints/heads",
+            "previous broker head\n",
+            0o600,
+        ),
+    ] {
+        fs::write(state.join(file), contents).unwrap();
+        set_linux_mode(&state.join(file), mode);
+    }
+}
+
+/// Every path under login 1000's service state with its mode and bytes.
+fn linux_service_state(root: &Path) -> Vec<(PathBuf, u32, Vec<u8>)> {
+    fn walk(base: &Path, path: &Path, entries: &mut Vec<(PathBuf, u32, Vec<u8>)>) {
+        let metadata = fs::symlink_metadata(path).unwrap();
+        let contents = if metadata.is_file() {
+            fs::read(path).unwrap()
+        } else {
+            Vec::new()
+        };
+        entries.push((
+            path.strip_prefix(base).unwrap().to_owned(),
+            metadata.permissions().mode(),
+            contents,
+        ));
+        if metadata.is_dir() {
+            let mut children: Vec<_> = fs::read_dir(path)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect();
+            children.sort();
+            for child in children {
+                walk(base, &child, entries);
+            }
+        }
+    }
+    let base = root.join("var/lib/bloom/1000");
+    let mut entries = Vec::new();
+    for principal in ["broker", "signer", "machine"] {
+        walk(&base, &base.join(principal), &mut entries);
+    }
+    entries
+}
+
+/// A candidate that migrates durable state and then fails must leave the
+/// previous release's Broker, Signer, and Machine state byte-identical, both
+/// through the in-process rollback and through recovery of an interrupted
+/// upgrade. Without this, the 2026-10-29 rollback left the previous Broker
+/// unable to open its migrated journal.
+#[test]
+fn linux_upgrade_rollback_restores_service_state() {
+    let harness_directory = tempfile::tempdir().unwrap();
+    let harness = write_linux_upgrade_harness(harness_directory.path());
+    let installer = release_script("install-linux.sh");
+
+    let rollback_root = tempfile::tempdir().unwrap();
+    let mut before = Vec::new();
+    let (root, _layout, old_digest, _new_digest, rolled_back) =
+        stage_linux_upgrade_root(rollback_root.path(), &harness, "rollback", "all", |root| {
+            write_linux_service_state(root);
+            before = linux_service_state(root);
+        });
+    assert!(
+        rolled_back.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rolled_back.stderr)
+    );
+    assert_eq!(linux_service_state(&root), before);
+    let log = fs::read_to_string(rollback_root.path().join("rollback-all.log")).unwrap();
+    assert!(log.contains(&format!("start current=releases/{old_digest} ")));
+    assert!(!root.join("var/lib/bloom/upgrade-transaction").exists());
+
+    let interrupted_root = tempfile::tempdir().unwrap();
+    let mut before = Vec::new();
+    let (root, _layout, old_digest, new_digest, _) = stage_linux_upgrade_root(
+        interrupted_root.path(),
+        &harness,
+        "interrupt",
+        "all",
+        |root| {
+            write_linux_service_state(root);
+            before = linux_service_state(root);
+        },
+    );
+    assert_ne!(linux_service_state(&root), before);
+    let transaction = root.join("var/lib/bloom/upgrade-transaction");
+    assert_eq!(
+        fs::metadata(&transaction).unwrap().permissions().mode() & 0o777,
+        0o700,
+        "the state snapshot must stay inside the root-only transaction"
+    );
+    assert!(transaction.join("state/complete").is_file());
+    let recovered = run_linux_upgrade_harness(
+        &harness,
+        &installer,
+        &root,
+        "recover",
+        &interrupted_root.path().join("recover.log"),
+        &[&old_digest, &new_digest],
+    );
+    assert!(
+        recovered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    assert_eq!(linux_service_state(&root), before);
+    assert!(!transaction.exists());
+
+    // A snapshot interrupted before its completion marker was taken before
+    // any candidate binary was selected, so recovery leaves live state alone.
+    let partial_root = tempfile::tempdir().unwrap();
+    let (root, _layout, old_digest, new_digest, _) =
+        stage_linux_upgrade_root(partial_root.path(), &harness, "interrupt", "all", |root| {
+            write_linux_service_state(root);
+        });
+    let migrated = linux_service_state(&root);
+    fs::remove_file(root.join("var/lib/bloom/upgrade-transaction/state/complete")).unwrap();
+    let recovered = run_linux_upgrade_harness(
+        &harness,
+        &installer,
+        &root,
+        "recover",
+        &partial_root.path().join("recover.log"),
+        &[&old_digest, &new_digest],
+    );
+    assert!(
+        recovered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    assert_eq!(linux_service_state(&root), migrated);
 }
 
 #[test]
@@ -4791,7 +4969,7 @@ fn linux_upgrade_recovery_shares_templates_and_rejects_foreign_transactions() {
         stage_interrupted_linux_root(future_root.path(), &harness, "all");
     fs::write(
         root.join("var/lib/bloom/upgrade-transaction/schema"),
-        "bloom.linux-upgrade-transaction.3\n",
+        "bloom.linux-upgrade-transaction.4\n",
     )
     .unwrap();
     let future = run_linux_installer(

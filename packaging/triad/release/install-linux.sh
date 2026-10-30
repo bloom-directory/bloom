@@ -796,6 +796,84 @@ restore_linux_upgrade_units() {
   done
 }
 
+# Copies each enrolled login's durable service state into the upgrade
+# transaction while the release set is stopped and before the candidate is
+# selected. A candidate may migrate this state in place on its first start;
+# restoring binaries and units without it leaves the previous release unable
+# to open its own databases. Broker, Signer, and Machine checkpoint state are
+# copied as one set because each retains its peers' signed audit heads and
+# fails closed when a peer's head moves backwards. The copies stay on the
+# same filesystem, inside the root-only transaction, with their original
+# owners and modes. The completion marker is written last: without it no
+# candidate binary has run against the live state.
+snapshot_linux_upgrade_state() {
+  local install_root="$1" transaction="$2"
+  local state_root="$install_root/var/lib/bloom" snapshot="$2/state"
+  local record uid principal relative needed available
+  local -a relatives=()
+
+  for record in "$install_root/etc/bloom/enrollments"/*.json; do
+    [[ -f "$record" && ! -L "$record" ]] || continue
+    uid="$(linux_record_number "$record" login_uid)"
+    [[ "$uid" =~ ^[1-9][0-9]*$ && -d "$state_root/$uid" && ! -L "$state_root/$uid" ]] ||
+      continue
+    for principal in broker signer machine; do
+      relative="$uid/$principal"
+      [[ -e "$state_root/$relative" || -L "$state_root/$relative" ]] || continue
+      [[ -d "$state_root/$relative" && ! -L "$state_root/$relative" ]] || {
+        echo "Bloom service state is not a directory: /var/lib/bloom/$relative" >&2
+        return 65
+      }
+      relatives+=("$relative")
+    done
+  done
+  mkdir -m 0700 "$snapshot" || return 65
+  if ((${#relatives[@]})); then
+    needed="$(cd "$state_root" && du -sk -- "${relatives[@]}" | awk '{ total += $1 } END { print total + 0 }')" || return 65
+    available="$(df -Pk -- "$snapshot" | awk 'NR == 2 { print $4 }')" || return 65
+    [[ "$needed" =~ ^[0-9]+$ && "$available" =~ ^[0-9]+$ ]] || return 65
+    ((available > needed)) || {
+      echo "Bloom Linux upgrade needs ${needed} KiB free under /var/lib/bloom to snapshot service state for rollback; ${available} KiB is available" >&2
+      return 75
+    }
+  fi
+  for relative in "${relatives[@]}"; do
+    [[ -d "$snapshot/${relative%/*}" ]] || mkdir -m 0700 "$snapshot/${relative%/*}" || return 65
+    cp -a --reflink=auto -- "$state_root/$relative" "$snapshot/$relative" || return 65
+  done
+  sync || return 65
+  : > "$snapshot/complete" || return 65
+  sync
+}
+
+# Replaces each snapshotted state directory with its snapshot. Only numeric
+# login and known principal names are interpreted. Idempotent: an interrupted
+# restoration is repeated in full by the next recovery.
+restore_linux_upgrade_state() {
+  local install_root="$1" snapshot="$2/state"
+  local entry uid principal live
+  [[ -f "$snapshot/complete" && ! -L "$snapshot/complete" ]] || return 0
+  for entry in "$snapshot"/*/*; do
+    [[ -e "$entry" || -L "$entry" ]] || continue
+    principal="${entry##*/}"
+    uid="${entry%/*}"
+    uid="${uid##*/}"
+    [[ "$uid" =~ ^[1-9][0-9]*$ && "$principal" =~ ^(broker|signer|machine)$ && \
+      -d "$snapshot/$uid" && ! -L "$snapshot/$uid" && -d "$entry" && ! -L "$entry" && \
+      -d "$install_root/var/lib/bloom/$uid" && ! -L "$install_root/var/lib/bloom/$uid" ]] || {
+      echo "Linux upgrade state snapshot entry is unsafe" >&2
+      return 65
+    }
+    live="$install_root/var/lib/bloom/$uid/$principal"
+    rm -rf -- "$live" &&
+      cp -a --reflink=auto -- "$entry" "$live" || {
+      echo "Linux upgrade state restoration failed: /var/lib/bloom/$uid/$principal" >&2
+      return 65
+    }
+  done
+  sync
+}
+
 # Checked explicitly and aggregated across logins: rollback runs with
 # errexit suspended, where only the last command's status would otherwise
 # be reported, and restoring units under a still-running service is unsafe.
@@ -972,7 +1050,7 @@ begin_linux_upgrade() {
   }
   upgrade_transaction_scratch="${upgrade_transaction}.new.$$"
   mkdir -m 0700 "$upgrade_transaction_scratch"
-  printf '%s\n' bloom.linux-upgrade-transaction.2 > "$upgrade_transaction_scratch/schema"
+  printf '%s\n' bloom.linux-upgrade-transaction.3 > "$upgrade_transaction_scratch/schema"
   printf '%s\n' "$old_digest" > "$upgrade_transaction_scratch/old-digest"
   printf '%s\n' "$new_digest" > "$upgrade_transaction_scratch/new-digest"
   if ! snapshot_linux_upgrade_units "$install_root" "$upgrade_transaction_scratch"; then
@@ -989,6 +1067,9 @@ begin_linux_upgrade() {
   upgrade_root="$install_root"
   upgrade_old_digest="$old_digest"
   upgrade_rollback_required=true
+  # From here a failure rolls back. State is copied only once nothing runs.
+  stop_linux_release_set "$install_root" || return
+  snapshot_linux_upgrade_state "$install_root" "$upgrade_transaction"
 }
 
 # Runs one rollback step without letting set -e abort the rollback, and
@@ -1011,6 +1092,7 @@ rollback_step() {
 restore_linux_previous_release() {
   rollback_step "stop the release set" stop_linux_release_set "$upgrade_root" &&
     rollback_step "restore installed units" restore_linux_upgrade_units "$upgrade_root" "$upgrade_transaction" &&
+    rollback_step "restore service state" restore_linux_upgrade_state "$upgrade_root" "$upgrade_transaction" &&
     rollback_step "select the previous release" switch_linux_release "$upgrade_root" "$upgrade_old_digest" &&
     rollback_step "restore release metadata" rewrite_linux_release_set "$upgrade_root" "$upgrade_old_digest" active
 }
@@ -1076,11 +1158,13 @@ recover_interrupted_linux_upgrade() {
   schema="$(<"$transaction/schema")"
   old_digest="$(<"$transaction/old-digest")"
   new_digest="$(<"$transaction/new-digest")"
-  # Schema 1 predates unit snapshots and is recovered without one. It is the
-  # only format an already-deployed installer can leave behind, and there is
-  # no supported path that reaches a running release without rolling it back.
+  # Schema 1 predates unit snapshots and is recovered without one; schema 2
+  # predates state snapshots. Both are formats an already-deployed installer
+  # can leave behind, and there is no supported path that reaches a running
+  # release without rolling it back.
   [[ ("$schema" == bloom.linux-upgrade-transaction.1 || \
-    "$schema" == bloom.linux-upgrade-transaction.2) && \
+    "$schema" == bloom.linux-upgrade-transaction.2 || \
+    "$schema" == bloom.linux-upgrade-transaction.3) && \
     "$old_digest" =~ ^[0-9a-f]{64}$ && \
     "$new_digest" =~ ^[0-9a-f]{64}$ ]] || {
     echo "invalid interrupted Linux upgrade" >&2
@@ -1393,7 +1477,6 @@ case "$action" in
     install_linux_release "$root" "$payload" "$release_digest"
     if [[ "$release_upgrade" == true ]]; then
       begin_linux_upgrade "$root" "$shared_release_digest" "$release_digest"
-      stop_linux_release_set "$root"
       rewrite_linux_release_set "$root" "$release_digest" activating
       switch_linux_release "$root" "$release_digest"
     else
