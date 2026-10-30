@@ -74,7 +74,9 @@ chain minimum. Keep the exact pending entry and inspect its `last_error.json`,
 For a pending EIP-1559 entry, write a JSON fee pair to `replace`. Both caps
 must be at least 10% above the original caps and satisfy the node's quoted
 minimum. This preserves the account, nonce, destination, value, calldata, and
-Petal origin. It requires a new exact owner approval. For example, when the
+Petal origin. Like `confirm`, it is refused until a `depends_on` predecessor
+has mined successfully, or while the call fails simulation. It requires a new
+exact owner approval. For example, when the
 node requires a 25 gwei tip and the original max fee is 50 gwei:
 
 ```sh
@@ -89,8 +91,10 @@ Open that challenge's ceremony URL once. Poll its state; when active, write
 its exact `retry_body` to `retry_path`. For fee repair this is the same fee
 JSON, not a new transaction intent. Read the resulting sent entry's receipt
 before continuing the Petal operation. Original attempt metadata remains for
-reconciliation. A transport error does not prove a transaction was absent;
-inspect the recorded hashes and outcome before any further action.
+reconciliation, and the receipt records whichever attempt mined. A transport
+error does not prove a transaction was absent. Write the same `retry_body`
+again: once a replacement was signed, the retry settles that recorded
+replacement and never signs another.
 
 ## Deploying an EVM contract
 
