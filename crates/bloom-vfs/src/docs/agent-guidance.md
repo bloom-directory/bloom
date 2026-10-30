@@ -57,6 +57,11 @@ whether an earlier operation completed or whether retrying a write is safe.
 - **Operation not permitted** — policy or a transaction safety check refused the
   operation. Inspect `policy_check.json` where exposed and the chain's status.
   Repeating the write does not remove the gate.
+- **"signing outcome unknown; it may already be signed"** — a signing request
+  failed in a way that does not prove no signature exists. Retry the identical
+  request (same bytes, same operation id) to reconcile it; never rebuild the
+  operation under a new identifier, and never rebroadcast, until the earlier
+  attempt is confirmed not to have landed.
 - **Input/output error** — a backend or I/O operation failed. Inspect action
   state and diagnostics before considering a retry. On an EVM outbox confirm,
   read `last_error.json` beside the pending entry: it gives the refusal and the
@@ -65,6 +70,18 @@ whether an earlier operation completed or whether retrying a write is safe.
   ceremony link in `error`, then confirm again once they approve. For a
   possibly submitted transaction, reconcile by its recorded hash or signature;
   never blindly restage or rebroadcast.
+
+Machine's Petal HTTP transport errors omit URL userinfo, paths and queries,
+which can contain credentials. Petals may still return upstream response bodies.
+A policy denial is one of:
+
+- `net.fetch requires https`;
+- `net.fetch disallows non-default https port <port>`;
+- `<METHOD> <host>: not allowed by effective network policy (check manifest and invocation grant)`.
+  Both `[[net.allow]]` and the invocation's runtime grant must permit the request.
+
+Transport errors read `http_fetch <send|body>: <METHOD> <host>: <cause>`, where
+the cause is the underlying DNS, connect, TLS or timeout error.
 
 If you write to a control file and then cannot find what you wrote, check
 whether the transfer moved to `sent/` or `failed/` before assuming the write
@@ -440,8 +457,11 @@ files or environment variables. See `docs/examples.md` for commands.
 Replacing `wallets/<wallet>/policy.json` starts a Broker ceremony. Prepare
 the complete proposal outside the mount and keep the exact same proposed bytes
 through `policy.validate_update`, human approval, and the
-`policy.commit_update` retry. Inspect the update's status and challenge, then
-verify the committed policy and terminal status. Editing or reformatting the
+`policy.commit_update` retry. Inspect the update's status and challenge under
+`policy-updates/latest/` and note its `action_id`. `latest` names only a
+pending update; after the commit, verify the committed policy and read the
+terminal status at `policy-updates/confirmed/<action_id>/status.json` (or
+`failed/<action_id>/`). Editing or reformatting the
 proposal creates a different request. Commands are in the policy-update
 walkthrough in `docs/examples.md`.
 
