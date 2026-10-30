@@ -52,7 +52,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 async-trait = "0.1"
 parking_lot = "0.12"
-dirs = "5"
+dirs = "7"
 hex = "0.4"
 num-bigint = "0.4"
 libc = "0.2"
