@@ -365,9 +365,16 @@ human rather than retrying on your own.
 
 `bloom wallet confirm` exits 3 when owner approval is pending and 4 when
 confirmation has no recorded result yet. Exit 0 reports a recorded broadcast
-or a completed local discard. Use `--text cancel` to discard an unsigned
-pending entry; an already broadcast transaction needs `bloom wallet cancel`
-and its own approval. Dropping a reservation does not renumber later rows:
+or a completed local discard.
+
+To discard an EVM entry that was never broadcast, including one whose
+approval is already `active`, write `cancel` to its `confirm` file (CLI:
+`bloom wallet confirm --text cancel`). The entry moves to `failed/` and
+nothing is signed. Writing the entry's `cancel` or `replace` file through the
+mount always returns permission denied and records nothing, because those
+controls can sign a new same-nonce transaction. A transaction already
+broadcast needs `bloom wallet cancel` or `bloom wallet replace` and its own
+owner approval. Dropping a reservation does not renumber later rows:
 restage with an explicit nonce to fill a gap.
 
 `confirm.override` is not a general escape hatch. Use it only when the

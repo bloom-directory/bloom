@@ -9978,6 +9978,50 @@ value = "0""#,
         assert!(!entry.dir.join("raw_tx").exists());
     }
 
+    /// The documented discard for an owner-approved entry that was never
+    /// broadcast: the mount refuses its `cancel` control, `confirm` takes it.
+    #[tokio::test]
+    async fn confirm_cancel_discards_an_owner_approved_unbroadcast_entry() {
+        let f = make_handler_with_chain(true);
+        seed_pending(&f, "approved");
+        let entry = f
+            .handler
+            .tx_engine
+            .outbox
+            .read_in_state(&f.wallet_name, "anvil", "approved", OutboxState::Pending)
+            .unwrap();
+        std::fs::write(
+            entry.dir.join("ceremony.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema": "bloom.machine-evm-signing.1",
+                "action_id": "evm-abc",
+                "approval_id": digest(21).as_str(),
+                "ceremony_url": null,
+                "ceremony_expires_at_ms": "60000",
+                "signing_operation_id": "private-operation",
+                "request_nonce": "private-nonce",
+                "sign_dispatched": false,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let p = vfs(format!(
+            "/{}/0/chains/anvil/outbox/pending/approved/confirm",
+            f.wallet_name
+        ));
+        f.handler.write(&p, b"cancel\n").await.unwrap();
+
+        let entry = f
+            .handler
+            .tx_engine
+            .outbox
+            .read(&f.wallet_name, "anvil", "approved")
+            .unwrap();
+        assert_eq!(entry.state, OutboxState::Failed);
+        assert!(!entry.dir.join("raw_tx").exists());
+        assert!(!entry.dir.join("broadcast_attempted.json").exists());
+    }
+
     #[tokio::test]
     async fn normal_confirm_open_preserves_body_control_semantics() {
         let f = make_handler_with_chain(true);

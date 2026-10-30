@@ -897,6 +897,25 @@ mod tests {
         }
     }
 
+    /// The mount refuses EVM `pending/<id>/cancel` and `replace` with a bare
+    /// permission denied, so the guide must say why and name the discard
+    /// route that works (the 0.4.1 ceremony found neither).
+    #[test]
+    fn agent_guidance_explains_the_refused_evm_cancel_control() {
+        let guidance = std::str::from_utf8(AGENT_GUIDANCE)
+            .expect("guidance is utf-8")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for expected in [
+            "write `cancel` to its `confirm` file",
+            "Writing the entry's `cancel` or `replace` file through the mount always returns permission denied",
+            "`bloom wallet cancel`",
+        ] {
+            assert!(guidance.contains(expected), "guide must say: {expected}");
+        }
+    }
+
     #[test]
     fn agent_guidance_anvil_example_is_a_valid_chain_config() {
         let guidance = std::str::from_utf8(AGENT_GUIDANCE).expect("guidance is utf-8");
