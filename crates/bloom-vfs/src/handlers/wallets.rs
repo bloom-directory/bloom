@@ -4938,6 +4938,37 @@ mod tests {
         }
     }
 
+    /// Counts live authority reads so a test can tell a refresh happened.
+    struct CountingProjection(WalletProjection, std::sync::atomic::AtomicUsize);
+
+    #[async_trait]
+    impl WalletProjectionReader for CountingProjection {
+        async fn list_wallets(
+            &self,
+        ) -> Result<Vec<WalletProjection>, bloom_broker_api::ProtocolError> {
+            Ok(vec![self.0.clone()])
+        }
+
+        async fn get_wallet(
+            &self,
+            _wallet_id: &Token,
+        ) -> Result<WalletProjection, bloom_broker_api::ProtocolError> {
+            Ok(self.0.clone())
+        }
+
+        async fn get_wallet_authority(
+            &self,
+            _wallet_id: &Token,
+        ) -> Result<WalletProjection, bloom_broker_api::ProtocolError> {
+            self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self.0.clone())
+        }
+
+        fn cached_wallets(&self) -> Result<Vec<WalletProjection>, bloom_broker_api::ProtocolError> {
+            Ok(vec![self.0.clone()])
+        }
+    }
+
     fn static_projection_value(address: Address) -> WalletProjection {
         let wallet_id = token("alice");
         let key_ref = KeyRef {
@@ -5364,7 +5395,12 @@ mod tests {
         });
         let broker = MachineBrokerClient::new(shared_service.clone());
         let mut handler = f.handler.with_broker(Some(broker));
-        handler.wallet_projections = Some(bip39_projection(f.wallet_addr, accounts));
+        let projection = Arc::new(CountingProjection(
+            bip39_projection_value(f.wallet_addr, accounts),
+            Default::default(),
+        ));
+        handler.wallet_projections = Some(projection.clone());
+        let authority_reads = || projection.1.load(std::sync::atomic::Ordering::SeqCst);
         let w = &f.wallet_name;
 
         // The write starts one ceremony and stores a pending request.
@@ -5401,12 +5437,16 @@ mod tests {
         // returned paths.
         *shared_service.state.lock().unwrap() = bloom_broker_api::CeremonyState::Succeeded;
 
+        let reads_before = authority_reads();
         let status: serde_json::Value =
             serde_json::from_slice(&handler.read(&vfs(format!("/{w}/new"))).await.unwrap())
                 .unwrap();
         assert_eq!(status["requests"][0]["state"], "created");
         assert_eq!(status["requests"][0]["number"], 2);
         assert_eq!(status["requests"][0]["already_created"], true);
+        // Reporting the account refreshes the wallet projection, so a
+        // navigation read straight after it cannot reuse a pre-ceremony view.
+        assert_eq!(authority_reads(), reads_before + 1);
 
         // The prepared request carried the multi-family list and terms.
         let prepared = shared_service.prepared.lock().unwrap().clone().unwrap();
