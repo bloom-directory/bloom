@@ -3840,6 +3840,28 @@ case "$mode" in
     migrate_candidate_state
     rollback_linux_upgrade
     ;;
+  published-interrupt|published-rollback)
+    begin_linux_upgrade "$root" "$old_digest" "$new_digest"
+    write_candidate_units
+    fence_linux_upgrade_state
+    migrate_candidate_state
+    [[ "$mode" == published-interrupt ]] || rollback_linux_upgrade
+    ;;
+  rollback-cleanup-killed)
+    # The rollback succeeds, then the process dies while deleting the
+    # transaction, after removing one snapshot file.
+    rm() {
+      if [[ "${*: -1}" == *upgrade-transaction* ]]; then
+        command rm -f -- "${*: -1}/state/1000/broker/journal.db"
+        kill -9 $$
+      fi
+      command rm "$@"
+    }
+    begin_linux_upgrade "$root" "$old_digest" "$new_digest"
+    write_candidate_units
+    migrate_candidate_state
+    rollback_linux_upgrade
+    ;;
   recover)
     recover_interrupted_linux_upgrade "$root"
     ;;
@@ -4200,6 +4222,118 @@ fn linux_upgrade_rollback_restores_service_state() {
         String::from_utf8_lossy(&recovered.stderr)
     );
     assert_eq!(linux_service_state(&root), migrated);
+}
+
+/// Once enrollments may become active, a candidate can accept signatures,
+/// counters, or revocations. Neither rollback nor recovery may then restore
+/// the older snapshot over that state.
+#[test]
+fn linux_upgrade_rollback_keeps_state_the_candidate_could_serve() {
+    let linux = fs::read_to_string(release_script("install-linux.sh")).unwrap();
+    assert!(
+        linux.find("fence_linux_upgrade_state\n").unwrap()
+            < linux
+                .find("rewrite_linux_release_set \"$root\" \"$release_digest\" active")
+                .unwrap(),
+        "the state fence must be durable before any enrollment becomes active"
+    );
+    let harness_directory = tempfile::tempdir().unwrap();
+    let harness = write_linux_upgrade_harness(harness_directory.path());
+    let installer = release_script("install-linux.sh");
+
+    let rollback_root = tempfile::tempdir().unwrap();
+    let (root, _layout, old_digest, _new_digest, rolled_back) = stage_linux_upgrade_root(
+        rollback_root.path(),
+        &harness,
+        "published-rollback",
+        "all",
+        write_linux_service_state,
+    );
+    assert!(
+        rolled_back.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rolled_back.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&rolled_back.stderr).contains(
+            "rollback keeps Broker, Signer, and Machine state as the new release left it"
+        )
+    );
+    let state = linux_service_state(&root);
+    assert!(state.iter().any(|(path, _, contents)| {
+        path.ends_with("broker/journal.db") && contents == b"candidate journal format 3\n"
+    }));
+    let log = fs::read_to_string(rollback_root.path().join("published-rollback-all.log")).unwrap();
+    assert!(log.contains(&format!("start current=releases/{old_digest} ")));
+    assert!(!root.join("var/lib/bloom/upgrade-transaction").exists());
+
+    let interrupted_root = tempfile::tempdir().unwrap();
+    let (root, _layout, old_digest, new_digest, interrupted) = stage_linux_upgrade_root(
+        interrupted_root.path(),
+        &harness,
+        "published-interrupt",
+        "all",
+        write_linux_service_state,
+    );
+    assert!(interrupted.status.success());
+    let published = linux_service_state(&root);
+    let recovered = run_linux_upgrade_harness(
+        &harness,
+        &installer,
+        &root,
+        "recover",
+        &interrupted_root.path().join("recover.log"),
+        &[&old_digest, &new_digest],
+    );
+    assert!(
+        recovered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    assert_eq!(linux_service_state(&root), published);
+    assert!(!root.join("var/lib/bloom/upgrade-transaction").exists());
+}
+
+/// A process killed while deleting a finished transaction must not leave a
+/// partial snapshot that recovery would restore over intact state.
+#[test]
+fn linux_upgrade_interrupted_cleanup_never_restores_a_partial_snapshot() {
+    let harness_directory = tempfile::tempdir().unwrap();
+    let harness = write_linux_upgrade_harness(harness_directory.path());
+    let directory = tempfile::tempdir().unwrap();
+    let mut before = Vec::new();
+    let (root, _layout, old_digest, new_digest, killed) = stage_linux_upgrade_root(
+        directory.path(),
+        &harness,
+        "rollback-cleanup-killed",
+        "all",
+        |root| {
+            write_linux_service_state(root);
+            before = linux_service_state(root);
+        },
+    );
+    assert!(!killed.status.success());
+    assert_eq!(linux_service_state(&root), before);
+    let recovered = run_linux_upgrade_harness(
+        &harness,
+        &release_script("install-linux.sh"),
+        &root,
+        "recover",
+        &directory.path().join("recover.log"),
+        &[&old_digest, &new_digest],
+    );
+    assert!(
+        recovered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    assert_eq!(linux_service_state(&root), before);
+    let leftovers: Vec<_> = fs::read_dir(root.join("var/lib/bloom"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| name.to_string_lossy().starts_with("upgrade-transaction"))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
 }
 
 #[test]

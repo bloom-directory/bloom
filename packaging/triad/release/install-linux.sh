@@ -857,12 +857,25 @@ snapshot_linux_upgrade_state() {
   sync
 }
 
+# Written durably before enrollments become active. On Linux the session
+# sentinel starts the Broker and Signer only for an active enrollment, so
+# this is the first point at which a candidate can accept a signature,
+# counter, or revocation. From here the snapshot is never restored: it would
+# erase changes the candidate accepted and may already have published.
+fence_linux_upgrade_state() {
+  : > "$upgrade_transaction/state-published" && sync
+}
+
 # Replaces each snapshotted state directory with its snapshot. Only numeric
 # login and known principal names are interpreted. Idempotent: an interrupted
 # restoration is repeated in full by the next recovery.
 restore_linux_upgrade_state() {
   local install_root="$1" snapshot="$2/state"
   local entry uid principal live
+  if [[ -e "$2/state-published" || -L "$2/state-published" ]]; then
+    echo "Bloom Linux upgrade rollback keeps Broker, Signer, and Machine state as the new release left it, because that release may have accepted custody changes. If the previous release cannot open this state, install a release that can." >&2
+    return 0
+  fi
   [[ -f "$snapshot/complete" && ! -L "$snapshot/complete" ]] || return 0
   for entry in "$snapshot"/*/*; do
     [[ -e "$entry" || -L "$entry" ]] || continue
@@ -1119,7 +1132,7 @@ rollback_linux_upgrade() {
     rollback_status=$?
   fi
   if ((rollback_status == 0)); then
-    rm -rf -- "$upgrade_transaction"
+    retire_linux_upgrade_transaction
     upgrade_rollback_required=false
   else
     echo "Bloom Linux upgrade rollback failed; transaction preserved for retry" >&2
@@ -1127,8 +1140,16 @@ rollback_linux_upgrade() {
   return "$rollback_status"
 }
 
+# Renames the transaction out of recovery's reach before deleting it, so an
+# interrupted deletion never leaves a partial snapshot marked complete.
+# Recovery removes what an interrupted deletion leaves behind.
+retire_linux_upgrade_transaction() {
+  local retired="${upgrade_transaction}.retired.$$"
+  mv -T -- "$upgrade_transaction" "$retired" && sync && rm -rf -- "$retired"
+}
+
 finish_linux_upgrade() {
-  rm -rf -- "$upgrade_transaction"
+  retire_linux_upgrade_transaction
   upgrade_rollback_required=false
   upgrade_transaction=""
   upgrade_root=""
@@ -1155,6 +1176,7 @@ recover_interrupted_linux_upgrade() {
   local transaction="$install_root/var/lib/bloom/upgrade-transaction"
   local schema old_digest new_digest
 
+  rm -rf -- "$transaction".retired.*
   [[ -e "$transaction" || -L "$transaction" ]] || return 0
   [[ -d "$transaction" && ! -L "$transaction" ]] || {
     echo "invalid interrupted Linux upgrade" >&2
@@ -1765,6 +1787,7 @@ case "$action" in
         "$config_root/session/identity.json"
     fi
     if [[ "$release_upgrade" == true ]]; then
+      fence_linux_upgrade_state
       rewrite_linux_release_set "$root" "$release_digest" active
     fi
 
