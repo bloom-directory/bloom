@@ -365,10 +365,16 @@ human rather than retrying on your own.
 
 `bloom wallet confirm` exits 3 when owner approval is pending and 4 when
 confirmation has no recorded result yet. Exit 0 reports a recorded broadcast
-or a completed local discard. Use `--text cancel` to discard an unsigned
-pending entry; an already broadcast transaction needs `bloom wallet cancel`
-and its own approval. Dropping a reservation does not renumber later rows:
+or a completed local discard. To discard an unsigned pending entry, write
+`cancel` to its `confirm` file (`bloom wallet confirm --text cancel`); this
+works for Petal-staged entries too. The separate `cancel` file replaces an
+already broadcast transaction (`bloom wallet cancel`) and needs its own
+approval. Dropping a reservation does not renumber later rows:
 restage with an explicit nonce to fill a gap.
+Discard is refused while another operation is active or signing/broadcast may
+have occurred. An unreadable signing record is not proof that nothing signed:
+preserve it, inspect Broker operation status and the chain nonce, and restore
+the record from backup before retrying. Never delete it to force a fresh attempt.
 
 `confirm.override` is not a general escape hatch. Use it only when the
 inspected policy projection explicitly permits that control and the human has
@@ -445,7 +451,54 @@ verify the committed policy and terminal status. Editing or reformatting the
 proposal creates a different request. Commands are in the policy-update
 walkthrough in `docs/examples.md`.
 
+## What the owner sees when approving
+
+The approval page shows Broker's own reading of the exact bytes to be signed:
+the action, account, assets and amounts, recipient and any limits it sets.
+Bloom does not take a Petal's description for this. Before forwarding the
+link, tell the human in one or two sentences what you asked for, so they can
+compare, and to cancel if the page shows anything else. Point out these if
+they appear:
+
+- **No output protection**: a swap with no enforced minimum output.
+- **Spending limit: Unlimited**: the spender can take any amount of that
+  token.
+- **Contract call Bloom cannot read**: the page shows exact bytes instead of
+  a reading. Approve only if the human expected exactly that call.
+
+An unknown token is shown by its address and raw units; never name it from a
+ticker you guessed. An approval proves what was signed, not that a quote was
+met, an order filled or funds arrived. Report outcomes from receipts and the
+Petal's status files.
+
 ## Petals and paid requests
+
+Petals send Broker the complete transaction or message to sign, bound to the
+account in the route path. If a Petal write fails with a bare "permission
+denied" and no ceremony link, stop and report the route and the error; do not
+reinstall the Petal or retry. Do not work around the refusal by changing
+accounts, removing fields, or switching to a reusable or batch path. When a
+write returns a ceremony link, retry the same request after the owner
+approves.
+
+- **Enso:** same-chain swaps carry an on-chain minimum output, stated in the
+  intent's `plan.md`. Cross-chain swaps report `destination_unverified` after
+  the source transaction succeeds; Bloom does not track the destination.
+- **Polymarket:** `begin` asks for a login approval that can only create
+  exchange credentials; it cannot sign payments, orders or wallet batches.
+  `continue` sets up the deposit wallet with its own exact approval. Read
+  `status.json` and follow `next_action`. Each order currently needs exact
+  approval; selecting Trader or Degen does not itself authorize automatic orders.
+- **Hyperliquid:** delegated trading sessions sign later actions without a
+  new prompt. The Petal's own session limits are local; the exchange does not
+  enforce them.
+- **Pump:** a refreshed recent blockhash keeps the existing approval; any
+  other change to the transaction needs a new one. Retry through the same Pump
+  operation. The approval permits one signature only. After signing, recover
+  that result and reconcile submission; do not request another signature with
+  a refreshed blockhash while the first transaction may still land.
+- **Venice:** a login approval grants no payment authority, and each later
+  request uses a fresh login proof.
 
 Installed application documents and public routes live under `petals/<name>/`.
 Account-dependent routes explicitly select a wallet and index, for example

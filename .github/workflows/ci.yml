@@ -1,5 +1,8 @@
 name: CI
 
+permissions:
+  contents: read
+
 on:
   pull_request:
     paths: &code_paths
@@ -226,6 +229,16 @@ jobs:
           cargo nextest run --archive-file target/nextest-archive.tar.zst \
             -E 'package(bloom-it) and (binary(anvil_e2e) or binary(erc20_e2e))' \
             --no-fail-fast
+          # Machine-to-Broker exact signing (x402, MPP, policy update). Only the
+          # dispatch-only macOS W0 job ran it before, so Linux PRs missed breaks.
+          cargo nextest run --archive-file target/nextest-archive.tar.zst \
+            -E 'package(bloom-vfs) and binary(triad_policy_update)' \
+            --no-tests=fail \
+            --no-fail-fast
+          cargo nextest run --archive-file target/nextest-archive.tar.zst \
+            -E 'package(bloom-daemon) and binary(m2_no_legacy_authority_store)' \
+            --no-tests=fail \
+            --no-fail-fast
       # The triad release binary asserts the content of the packaged
       # installers, launcher, and release gates. It was previously not run at
       # all, so a launcher change could silently invalidate its assertions.
@@ -298,7 +311,7 @@ jobs:
       github.ref_name == 'triad-architecture'
     uses: ./.github/workflows/macos-unix-conformance.yml
     with:
-      broker_ref: 5a09d5ede4af1affd09c7e8e197ca015f4f32b4f
+      broker_ref: 529c3a4d00b286eea77603b7922e111b268e95ab
       signer_ref: c157444af1b118a2d03f1ac5ce7a04933669c084
 
   linux_w0_isolation:

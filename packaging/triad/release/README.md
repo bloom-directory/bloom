@@ -343,8 +343,13 @@ Deployments requiring network enforcement of exact outbound destinations need a
 reviewed egress proxy or firewall policy covering relay, ACME and DNS lifecycle;
 static ingress addresses alone do not cover CA renewal endpoints.
 
-The remote suite requires Machine–Broker API 1.7 and Broker–Signer API 1.6,
-with release state schema 2 and downgrade floor 2 for all three services.
+The shipped v0.4.0 bundle used Machine–Broker API 1.7 and Broker state/floor 2.
+This clear-signing candidate adopts the landed Broker's API 1.8 and state/floor 3;
+Broker–Signer remains 1.6 and Machine/Signer state/floor remain 2. This is the
+coordinated release bump, not an additional bump for each PR. Take a compatible
+backup before migration: the old v0.4.0 Broker cannot reopen state migrated to
+3. Rollback requires restoring compatible state, not lowering the floor or
+installing the old binary over migrated data.
 Legacy localhost credential wraps, RP IDs and user handles are preserved;
 legacy signed receipts retain their original canonical signed bytes. Old pending
 ceremonies fail on restart. After activating this state version, supported

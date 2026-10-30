@@ -7,11 +7,35 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: pr-checklist-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
 jobs:
   checklist:
+    needs: [release_impact, signing_producers]
+    if: always()
     name: checklist-complete
     runs-on: ubuntu-latest
     steps:
+      - name: Require compatible shipped signing packages
+        env:
+          IMPACT_RESULT: ${{ needs.release_impact.result }}
+          REQUIRED: ${{ needs.release_impact.outputs.required }}
+          RESULT: ${{ needs.signing_producers.result }}
+        run: |
+          if [ "$IMPACT_RESULT" != success ]; then
+            echo "::error::Could not determine whether release-boundary tests are required (result: $IMPACT_RESULT)."
+            exit 1
+          fi
+          if [ "$REQUIRED" = true ] && [ "$RESULT" != success ]; then
+            echo "::error::Shipped signing package and authority tests must pass before merge (result: $RESULT)."
+            exit 1
+          fi
       - name: Verify all checklist items are checked
         env:
           PR_BODY: ${{ github.event.pull_request.body }}
@@ -32,3 +56,147 @@ jobs:
           fi
 
           echo "All $total checklist items checked."
+
+  release_impact:
+    name: signing producer impact
+    runs-on: ubuntu-latest
+    outputs:
+      required: ${{ steps.changed.outputs.required }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+      - name: Detect release-impacting changes
+        id: changed
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if git diff --quiet "$BASE_SHA" "$HEAD_SHA" -- \
+            .github/workflows/pr-checklist.yml \
+            Cargo.toml Cargo.lock \
+            crates \
+            packaging/triad/release \
+            scripts/test-polymarket-authorization.sh \
+            scripts/triad-dev-launch.sh; then
+            echo "required=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "required=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  signing_producers:
+    needs: release_impact
+    if: needs.release_impact.outputs.required == 'true'
+    name: compiled signing producers and real authorization boundary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - name: Read shipped signing package revisions
+        id: catalog
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import re
+          from pathlib import Path
+          source = Path("crates/bloom/src/github_source.rs").read_text()
+          for name in ("polymarket", "hyperliquid"):
+              record = re.search(r"const PREINSTALLED_" + name.upper() + r": PreinstalledPetal = PreinstalledPetal \{(.*?)\n\};", source, re.S)
+              assert record, f"missing default {name} catalog entry"
+              commit = re.search(r'^\s*commit: "([0-9a-f]{40})"', record[1], re.M)
+              assert commit, f"{name} must use an immutable source commit"
+              print(f"{name}_ref={commit[1]}")
+              tooling = re.search(r'^\s*tooling_commit: "([0-9a-f]{40})"', record[1], re.M)
+              assert tooling, f"{name} must pin its Petal CLI commit"
+              print(f"{name}_tooling={tooling[1]}")
+          PY
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          repository: bloom-directory/bloom-petal-polymarket
+          ref: ${{ steps.catalog.outputs.polymarket_ref }}
+          path: .pm80-packages/polymarket
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          repository: bloom-directory/bloom-petal-hyperliquid
+          ref: ${{ steps.catalog.outputs.hyperliquid_ref }}
+          path: .pm80-packages/hyperliquid
+      - name: Fetch the exact Broker fixture input
+        run: |
+          broker_ref="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["workspace"]["dependencies"]["bloom-broker-api"]["rev"])')"
+          git init "$RUNNER_TEMP/pm80-broker"
+          git -C "$RUNNER_TEMP/pm80-broker" fetch --depth=1 https://github.com/bloom-directory/bloom-broker.git "$broker_ref"
+          git -C "$RUNNER_TEMP/pm80-broker" checkout --detach FETCH_HEAD
+          python3 - "$RUNNER_TEMP/pm80-broker" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+          broker = Path(sys.argv[1]) / "crates/bloom-broker/tests/fixtures"
+          for source, target in [
+              ("hyperliquid-producer-cancel.json", "crates/bloom-petals/tests/fixtures/hyperliquid-producer-cancel.json"),
+              ("legacy-policy-removal.json", "crates/bloom-machine-client/tests/fixtures/legacy-policy-removal.json"),
+          ]:
+              assert json.loads((broker / source).read_text()) == json.loads(Path(target).read_text()), source
+          PY
+      - name: Install Rust and component tooling
+        run: |
+          rustup show
+          rustup target add wasm32-unknown-unknown
+      - uses: bytecodealliance/actions/wasm-tools/setup@9152e710e9f7182e4c29ad218e4f335a7b203613 # v1
+      - name: Build the pinned real signing components
+        run: |
+          for pair in polymarket=${{ steps.catalog.outputs.polymarket_tooling }} hyperliquid=${{ steps.catalog.outputs.hyperliquid_tooling }}; do
+            name="${pair%%=*}" rev="${pair#*=}"
+            cargo install --git https://github.com/bloom-directory/petal --rev "$rev" --locked --root "$RUNNER_TEMP/petal-$rev" bloom-petal-cli
+            PETAL_BIN="$RUNNER_TEMP/petal-$rev/bin/petal" bash ".pm80-packages/$name/scripts/build.sh"
+          done
+      - name: Verify actual component emissions, pending batch preservation and Broker witness agreement
+        env:
+          BLOOM_PM80_POLYMARKET_ROOT: ${{ github.workspace }}/.pm80-packages/polymarket
+          BLOOM_PM80_HYPERLIQUID_ROOT: ${{ github.workspace }}/.pm80-packages/hyperliquid
+          BLOOM_PM80_PACKAGE_RECORDS: ${{ runner.temp }}/pm80-package-records.json
+        run: |
+          cargo test --locked -p bloom-petals --test explicit_account_packages real_signing_producers_reach_the_host_with_selected_account_and_full_witness -- --ignored --exact 2>&1 | tee "$RUNNER_TEMP/pm80-producer-test.log"
+          grep -q "test result: ok. 1 passed;" "$RUNNER_TEMP/pm80-producer-test.log"
+          cargo test --locked -p bloom --bin bloom github_source::tests::source_built_signing_packages_match_catalog_authority -- --ignored --exact 2>&1 | tee "$RUNNER_TEMP/pm80-catalog-test.log"
+          grep -q "test result: ok. 1 passed;" "$RUNNER_TEMP/pm80-catalog-test.log"
+      - name: Read the release Signer revision
+        id: release_signer
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import tomllib
+          with open("packaging/triad/release/compatibility-v1.toml", "rb") as source:
+              print("ref=" + tomllib.load(source)["revisions"]["signer_commit"])
+          PY
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          repository: bloom-directory/bloom-signer
+          ref: ${{ steps.release_signer.outputs.ref }}
+          path: .pm80-packages/signer
+      - name: Prepare disposable Linux service manager
+        run: |
+          sudo loginctl enable-linger "$(id -un)"
+          sudo systemctl start "user@$(id -u).service"
+          echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus" >> "$GITHUB_ENV"
+      - name: Build exact developer-mode authority services
+        run: |
+          cargo test --locked --manifest-path "$RUNNER_TEMP/pm80-broker/Cargo.toml" -p bloom-broker --test w4_authority
+          cargo build --locked --manifest-path "$RUNNER_TEMP/pm80-broker/Cargo.toml" -p bloom-broker -p bloom-broker-debug-driver --features bloom-broker/triad-dev-harness
+          cargo build --locked --manifest-path .pm80-packages/signer/Cargo.toml -p bloom-signer --features triad-dev-harness
+          cargo build --locked -p bloom --no-default-features --features mount,triad-dev-harness
+      - name: Authorize installed account-1 authentication and exact continuation
+        env:
+          BLOOM_INTEGRATION_MACHINE_BIN: ${{ github.workspace }}/target/debug/bloom
+          BLOOM_INTEGRATION_BROKER_BIN: ${{ runner.temp }}/pm80-broker/target/debug/bloom-broker
+          BLOOM_INTEGRATION_DEBUG_DRIVER_BIN: ${{ runner.temp }}/pm80-broker/target/debug/bloom-broker-debug-driver
+          BLOOM_INTEGRATION_SIGNER_BIN: ${{ github.workspace }}/.pm80-packages/signer/target/debug/bloom-signer
+          BLOOM_PM80_POLYMARKET_ROOT: ${{ github.workspace }}/.pm80-packages/polymarket
+        run: |
+          run_root="$(mktemp -d /tmp/pm80-auth.XXXXXX)"
+          bash scripts/test-polymarket-authorization.sh "$run_root"
+          cp "$run_root/authorization-result.json" "$RUNNER_TEMP/pm80-authorization-result.json"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: signing-producer-package-records
+          path: |
+            ${{ runner.temp }}/pm80-package-records.json
+            ${{ runner.temp }}/pm80-authorization-result.json
+          if-no-files-found: error

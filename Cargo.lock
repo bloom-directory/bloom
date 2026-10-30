@@ -2131,6 +2131,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
+name = "bech32"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32637268377fc7b10a8c6d51de3e7fba1ce5dd371a96e342b34e6078db558e7f"
+
+[[package]]
 name = "bimap"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2337,12 +2343,17 @@ dependencies = [
 [[package]]
 name = "bloom-broker-api"
 version = "0.1.0"
-source = "git+https://github.com/bloom-directory/bloom-broker.git?rev=5a09d5ede4af1affd09c7e8e197ca015f4f32b4f#5a09d5ede4af1affd09c7e8e197ca015f4f32b4f"
+source = "git+https://github.com/bloom-directory/bloom-broker.git?rev=529c3a4d00b286eea77603b7922e111b268e95ab#529c3a4d00b286eea77603b7922e111b268e95ab"
 dependencies = [
+ "bech32",
  "bloom-rpc-wire",
+ "bs58",
+ "hex",
  "serde",
  "serde_jcs",
+ "serde_json",
  "sha2 0.11.0",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -3068,6 +3079,7 @@ version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf88ba1141d185c399bee5288d850d63b8369520c1eafc32a0430b5b6c287bf4"
 dependencies = [
+ "sha2 0.10.9",
  "tinyvec",
 ]
 
