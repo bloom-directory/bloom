@@ -145,7 +145,8 @@ const BASELINE_HYPERLIQUID_AUTHORITY_ROUTES: &[PetalAuthorityRoute] = &[
 
 // Keep baseline declarations when successor pins change so the executing
 // daemon can still verify the outgoing release until activation completes.
-const POLYMARKET_AUTHORITY_ROUTES: &[PetalAuthorityRoute] = &[
+// Polymarket v0.1.6 and its v0.1.8 patch release share one route layout.
+const POLYMARKET_V0_1_6_AUTHORITY_ROUTES: &[PetalAuthorityRoute] = &[
     PetalAuthorityRoute {
         route_id: "r000042",
         operation_classes: &["polymarket.onboard"],
@@ -164,6 +165,32 @@ const POLYMARKET_AUTHORITY_ROUTES: &[PetalAuthorityRoute] = &[
     },
     PetalAuthorityRoute {
         route_id: "r000106",
+        operation_classes: &["polymarket.relayer_batch"],
+    },
+];
+const POLYMARKET_AUTHORITY_ROUTES: &[PetalAuthorityRoute] = &[
+    PetalAuthorityRoute {
+        route_id: "r000042",
+        operation_classes: &["polymarket.clob_auth.v1"],
+    },
+    PetalAuthorityRoute {
+        route_id: "r000043",
+        operation_classes: &["polymarket.onboard"],
+    },
+    PetalAuthorityRoute {
+        route_id: "r000059",
+        operation_classes: &["polymarket.relayer_batch"],
+    },
+    PetalAuthorityRoute {
+        route_id: "r000068",
+        operation_classes: &["polymarket.relayer_batch"],
+    },
+    PetalAuthorityRoute {
+        route_id: "r000089",
+        operation_classes: &["polymarket.order.poly1271"],
+    },
+    PetalAuthorityRoute {
+        route_id: "r000107",
         operation_classes: &["polymarket.relayer_batch"],
     },
 ];
@@ -336,7 +363,17 @@ pub(crate) fn release_lineage_predecessors(name: &str) -> &'static [ReleaseLinea
             predecessor_package_hashes: &[
                 "5df5a1377dc4d70c71e47ffe6827e691e1f5868543b752dc8d19a500284e5fa6",
             ],
-            authority_routes: POLYMARKET_AUTHORITY_ROUTES,
+            authority_routes: POLYMARKET_V0_1_6_AUTHORITY_ROUTES,
+        },
+        // v0.1.8, the protocol-1.7 patch release pinned by Bloom v0.4.1.
+        ReleaseLineagePredecessor {
+            hash: "6eb2065e8558f3761399fcb0516731a600fdb0b49974c8ed0808abd38fde7db4",
+            release_sequence: 3,
+            predecessor_package_hashes: &[
+                "5df5a1377dc4d70c71e47ffe6827e691e1f5868543b752dc8d19a500284e5fa6",
+                "0f365cd7f613129f73ce66fb07256c8a42c4e70abbb77721804dbd6df85b96b5",
+            ],
+            authority_routes: POLYMARKET_V0_1_6_AUTHORITY_ROUTES,
         },
     ];
     const HYPERLIQUID: &[ReleaseLineagePredecessor] = &[
@@ -384,19 +421,20 @@ pub(crate) fn release_lineage_predecessors(name: &str) -> &'static [ReleaseLinea
 const PREINSTALLED_POLYMARKET: PreinstalledPetal = PreinstalledPetal {
     name: "polymarket",
     repository: "https://github.com/bloom-directory/bloom-petal-polymarket",
-    commit: "74f1f928313916b332d9059f2e4363eac8f147af",
-    release_tag: "v0.1.8",
-    archive: "polymarket-v0.1.8.petal.tar.gz",
-    expected_hash: Some("6eb2065e8558f3761399fcb0516731a600fdb0b49974c8ed0808abd38fde7db4"),
-    archive_sha256: "312f945ecf0b6a29d574a0497e369234c5a584cb539b61f09056844e7e3586ae",
-    tooling_commit: "2beed2ff344ce2b0c112e07096027e1ae0404007",
+    commit: "7c83978b99a10b5f5617863a461291781bda6f54",
+    release_tag: "v0.2.0",
+    archive: "polymarket-v0.2.0.petal.tar.gz",
+    expected_hash: Some("17a50dda0894b7b7e5757033806f8ec31523575438419ea1330b731a2c6c5d14"),
+    archive_sha256: "63cc15af11c121751d4fc53fd2b25ed41c97b071fbf00d4521d336bfd18ff378",
+    tooling_commit: "4fefa736df67fa1ee51aeaa0c749d2f11414257d",
     petal_abi: "bloom.petal-host/payload-signing-v1",
     default_eligible: true,
     lineage_id: Some("pln1_6etojfshqyk6bzm257kzv7noj3perfz4siioiuhj74xosznyzhka"),
-    release_sequence: 3,
+    release_sequence: 4,
     predecessor_package_hashes: &[
         "5df5a1377dc4d70c71e47ffe6827e691e1f5868543b752dc8d19a500284e5fa6",
         "0f365cd7f613129f73ce66fb07256c8a42c4e70abbb77721804dbd6df85b96b5",
+        "6eb2065e8558f3761399fcb0516731a600fdb0b49974c8ed0808abd38fde7db4",
     ],
     authority_routes: POLYMARKET_AUTHORITY_ROUTES,
 };
