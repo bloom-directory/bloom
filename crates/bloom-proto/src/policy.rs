@@ -12,9 +12,9 @@ use serde::{Deserialize, Serialize};
 /// ERC-20 transfer of a token in the curated table ([`crate::tokens`]) to any
 /// recipient on that chain. The Degen persona proposes it. It is the same
 /// string as `bloom_broker_api::ERC20_ANY_RECIPIENT` in
-/// bloom-broker#112, whose reviewed sessions also honour it; a Broker without
-/// that change stores it verbatim and matches no address with it. It is never
-/// a literal destination or a general wildcard.
+/// bloom-broker#112, whose reviewed sessions also honour it. A Broker without
+/// that change keeps it as a literal string, which matches no address.
+/// Machine never treats it as an address or a general wildcard.
 pub const ERC20_ANY_RECIPIENT: &str = "erc20:any-recipient";
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]

@@ -42,8 +42,10 @@ pub fn advisory_evm_policy(projection: &WalletProjection, chain: &str) -> Result
 /// Reusable Petal planning must continue using `advisory_evm_policy`.
 ///
 /// The opt-in permits contract creation, which has no recipient address.
-/// The engine applies that exemption only to creation. All addressed
-/// transactions keep the canonical recipient allowlist.
+/// The engine applies that exemption only to creation. Addressed
+/// transactions keep the canonical recipient allowlist, except that an
+/// `erc20:any-recipient` entry for this chain lets the engine pass the
+/// wallet's own transfer of a curated ERC-20 token to any recipient.
 pub fn advisory_exact_evm_policy(
     projection: &WalletProjection,
     chain: &str,
