@@ -431,7 +431,10 @@ sudo -H -u "$login_user" env \
   BLOOM_EDGE_MANIFEST="$edge_manifest" \
   "$machine_binary" --home "$clean_home" --connect "unix:$machine_socket" \
     wallet commit-policy "$policy_operation_id" \
-  >"$work/policy-commit-live.log" 2>&1
+  >"$work/policy-commit-live.log" 2>"$work/policy-commit-live.stderr" || {
+  cat "$work/policy-commit-live.stderr" >&2
+  exit 1
+}
 
 broker_log="/private/var/log/bloom/$login_uid/broker.jsonl"
 signer_log="/private/var/log/bloom/$login_uid/signer.jsonl"
@@ -503,13 +506,35 @@ for service_log in "$broker_log" "$signer_log"; do
   sudo -u "$login_user" test -r "$service_log"
   if sudo -u "$login_user" test -w "$service_log"; then exit 1; fi
 done
-sudo -H -u "$login_user" env \
-  BLOOM_HOME="$clean_home" \
-  BLOOM_MACHINE_IDENTITY="$machine_identity" \
-  BLOOM_EDGE_MANIFEST="$edge_manifest" \
-  "$machine_binary" --home "$clean_home" --connect "unix:$machine_socket" \
-    wallet projection "$wallet_id" \
-  >"$work/live-projection.log" 2>"$work/live-projection.stderr"
+# Display projections may reuse the pre-commit observation within their
+# configured freshness window. Wait for the exact signed commit, not a delay
+# or merely a successful read, before testing its destination and caching it.
+deadline=$((SECONDS + 15))
+while [[ $SECONDS -lt $deadline ]]; do
+  if sudo -H -u "$login_user" env \
+    BLOOM_HOME="$clean_home" \
+    BLOOM_MACHINE_IDENTITY="$machine_identity" \
+    BLOOM_EDGE_MANIFEST="$edge_manifest" \
+    "$machine_binary" --home "$clean_home" --connect "unix:$machine_socket" \
+      wallet projection "$wallet_id" \
+    >"$work/live-projection.log" 2>"$work/live-projection.stderr" &&
+    jq -e --slurpfile receipt "$work/policy-commit-live.log" \
+      '.policy.version == $receipt[0].committed.version and
+       .policy.policy_digest == $receipt[0].committed.policy_digest' \
+      "$work/live-projection.log" >/dev/null
+  then
+    break
+  fi
+  sleep 0.1
+done
+jq -e --slurpfile receipt "$work/policy-commit-live.log" \
+  '.policy.version == $receipt[0].committed.version and
+   .policy.policy_digest == $receipt[0].committed.policy_digest' \
+  "$work/live-projection.log" >/dev/null || {
+  cat "$work/live-projection.stderr" >&2
+  echo "authenticated projection did not observe the committed policy within 15s" >&2
+  exit 1
+}
 jq -e \
   --arg address "$wallet_address" \
   --arg wallet "$wallet_id" \
@@ -528,7 +553,10 @@ encoded += "=" * (-len(encoded) % 4)
 policy = json.loads(base64.urlsafe_b64decode(encoded))
 expected = {"chain": "anvil", "destination": sys.argv[2]}
 if expected not in policy["allowed_destinations"]:
-    raise SystemExit("authenticated policy projection omitted the MA-05 destination")
+    raise SystemExit(
+        f"authenticated policy v{projection['policy']['version']} omitted the MA-05 destination: "
+        f"expected {expected}, observed {policy['allowed_destinations']}"
+    )
 PY
 [[ -s "$clean_home/cache/wallet-projections.json" ]]
 kill "$machine_service_pid"

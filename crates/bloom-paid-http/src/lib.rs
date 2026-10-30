@@ -532,6 +532,9 @@ fn is_known_six_decimal_usd_asset(asset: &str) -> bool {
             | "0x20c000000000000000000000b9537d11c60e8b50"
             // USD0 on Tempo.
             | "0x779ded0c9e1022225f8e0630b35a9b54be713736"
+            // USDC on Arc (mainnet 5042 and testnet 5042002): the ERC-20 interface of Arc's
+            // native USDC, 6 decimals, the asset x402 sellers on Arc quote in.
+            | "0x3600000000000000000000000000000000000000"
     )
 }
 
@@ -1047,5 +1050,17 @@ mod tests {
             usd_to_atomic_units(Some("0x20C000000000000000000000b9537d11c60E8b50"), 5.0),
             Some(5_000_000)
         );
+    }
+
+    #[test]
+    fn arc_usdc_amounts_are_six_decimals() {
+        let arc_usdc = Some("0x3600000000000000000000000000000000000000");
+        assert!(networks_equivalent("5042", "eip155:5042"));
+        // An x402 seller on Arc quoting 0.01 USDC sends the atomic amount "10000".
+        assert_eq!(
+            parse_payment_amount_usd(arc_usdc, Some("10000")),
+            Some(0.01)
+        );
+        assert_eq!(usd_to_atomic_units(arc_usdc, 0.25), Some(250_000));
     }
 }
