@@ -2649,7 +2649,7 @@ dependencies = [
  "bloom-vfs",
  "flate2",
  "futures",
- "getrandom 0.2.17",
+ "getrandom 0.4.2",
  "hex",
  "lru 0.18.2",
  "parking_lot",
