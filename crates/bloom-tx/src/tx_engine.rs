@@ -6401,6 +6401,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stage_erc20_transfer_accepts_bare_fractional_amount() {
+        // `send 0.5 USDC to ...` and `{"token":"USDC","amount":"0.5"}` both
+        // carry a bare "0.5"; it must scale by the token's decimals, not wei.
+        let url = spawn_stage_rpc(false).await;
+        let oracle = RecordingOracle {
+            calls: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            usd_micro: 500_000,
+            age_ms: 0,
+            max_age_ms: 60_000,
+        };
+        let (engine, _dir, permit, chain) = stage_fixture(&url, oracle);
+        let token_addr: Address = "0x1111111111111111111111111111111111111111"
+            .parse()
+            .unwrap();
+        engine.token_cache.write().insert(
+            (31337, token_addr),
+            TokenMeta {
+                address: token_addr,
+                symbol: "USDC".into(),
+                decimals: 6,
+            },
+        );
+        let intent = RawIntent {
+            body: RawIntentBody::Send {
+                to: "0x2222222222222222222222222222222222222222".into(),
+                value: String::new(),
+                token: Some(token_addr.to_string()),
+                amount: "0.5".into(),
+                data: None,
+            },
+            chain: Some("anvil".into()),
+            gas: bloom_proto::intent::GasStrategy::Auto,
+            nonce: None,
+            gas_limit_hint: None,
+            usd_value_hint: None,
+            review_mode: None,
+        };
+        let staged = engine
+            .stage(
+                &permit,
+                "alice",
+                "0x3333333333333333333333333333333333333333"
+                    .parse()
+                    .unwrap(),
+                intent,
+                &chain,
+                &policy_with_usd_cap(),
+                None,
+            )
+            .await
+            .unwrap();
+        let token = staged.token.as_ref().unwrap();
+        assert_eq!(token.amount, "0.5");
+        assert_eq!(token.amount_base_units.as_deref(), Some("500000"));
+    }
+
+    #[tokio::test]
     async fn fresh_native_valuation_can_satisfy_under_policy_authorization() {
         let url = spawn_stage_rpc(true).await;
         let oracle = RecordingOracle {
