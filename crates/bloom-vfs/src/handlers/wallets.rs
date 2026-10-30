@@ -3681,10 +3681,16 @@ impl WalletsHandler {
             "sealed-approvals" if segs.len() == 4 && segs[3] == "limits.json" => {
                 self.sealed_approval_limits_json(wallet, &segs[2]).await
             }
-            "sealed-approvals" if segs.len() == 4 && segs[3] == "renew" => self
-                .approval_ceremony_projection_json(wallet, Some(&segs[2]))
-                .await?
-                .ok_or_else(|| HandlerError::not_found(path.to_string_path())),
+            "sealed-approvals" if segs.len() == 4 && segs[3] == "renew" => {
+                self.approval_status_for_wallet(wallet, &segs[2]).await?;
+                match self
+                    .approval_ceremony_projection_json(wallet, Some(&segs[2]))
+                    .await?
+                {
+                    Some(projection) => Ok(projection),
+                    None => Ok(b"{\"schema\":\"bloom.approval_renew_request.v1\",\"write\":\"complete ApprovalRenewRequest JSON\"}\n".to_vec()),
+                }
+            }
             "policy-updates" if segs.len() == 4 && segs[2] == "latest" => {
                 let action_id = self
                     .policy_update_latest_pending_id(wallet)
@@ -8801,6 +8807,7 @@ value = "0""#,
             .with_broker(Some(MachineBrokerClient::new(broker.clone())));
         let request = ApprovalPrepareRequest {
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
+            safe_review_payloads: Vec::new(),
             evm_review_payloads: Vec::new(),
             operation_id: OperationId::from_bytes([30; 32]),
             terms: approval_terms("alice", None),
@@ -8850,6 +8857,7 @@ value = "0""#,
                 .with_broker(Some(MachineBrokerClient::new(broker.clone())));
             let request = ApprovalPrepareRequest {
                 surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
+                safe_review_payloads: Vec::new(),
                 evm_review_payloads: Vec::new(),
                 operation_id: OperationId::from_bytes([30; 32]),
                 terms: approval_terms("alice", None),
@@ -8884,6 +8892,7 @@ value = "0""#,
             .with_broker(Some(MachineBrokerClient::new(broker.clone())));
         let request = ApprovalPrepareRequest {
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
+            safe_review_payloads: Vec::new(),
             evm_review_payloads: Vec::new(),
             operation_id: OperationId::from_bytes([30; 32]),
             terms: approval_terms("alice", None),
@@ -8917,6 +8926,7 @@ value = "0""#,
             .with_broker(Some(MachineBrokerClient::new(broker)));
         let request = ApprovalPrepareRequest {
             surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
+            safe_review_payloads: Vec::new(),
             evm_review_payloads: Vec::new(),
             operation_id: OperationId::from_bytes([30; 32]),
             terms: approval_terms("alice", None),
@@ -8965,6 +8975,14 @@ value = "0""#,
             old_id.as_str()
         ))
         .unwrap();
+        let initial: serde_json::Value =
+            serde_json::from_slice(&f.handler.read(&renew_path).await.unwrap()).unwrap();
+        assert_eq!(initial["schema"], "bloom.approval_renew_request.v1");
+        assert!(
+            !f.handler
+                .approval_projection_path("alice", Some(old_id.as_str()))
+                .exists()
+        );
         f.handler
             .write(&renew_path, &serde_json::to_vec(&renewal).unwrap())
             .await
