@@ -1974,7 +1974,7 @@ impl TxEngine {
         let entry = self
             .outbox
             .read_in_state(wallet, chain_name, id, OutboxState::Pending)?;
-        let mut staged = entry.staged.clone();
+        let staged = entry.staged.clone();
 
         if self
             .outbox
@@ -1999,9 +1999,7 @@ impl TxEngine {
 
         let hard = policy_engine::has_hard_violation(&staged.policy_checks);
         if hard {
-            staged.status = TxStatus::Failed;
-            self.outbox
-                .transition(&entry, crate::outbox::OutboxState::Failed)?;
+            self.outbox.fail(&entry, TxStatus::Failed)?;
             debug!(
                 id = %staged.id,
                 wallet,
@@ -2398,9 +2396,7 @@ impl TxEngine {
         // Policy gate.
         let hard = policy_engine::has_hard_violation(&staged.policy_checks);
         if hard {
-            staged.status = TxStatus::Failed;
-            self.outbox
-                .transition(&entry, crate::outbox::OutboxState::Failed)?;
+            self.outbox.fail(&entry, TxStatus::Failed)?;
             debug!(
                 id = %staged.id,
                 wallet,
@@ -9408,13 +9404,48 @@ mod tests {
             "expected PolicyDenied, got {r:?}"
         );
 
-        // The outbox entry must have been moved to the `failed` state.
+        // The outbox entry must have been moved to the `failed` state, and
+        // its intent.json must say so too.
         let entry = engine.outbox.read("alice", "anvil", "0001-test").unwrap();
         assert_eq!(
             entry.state,
             crate::outbox::OutboxState::Failed,
             "tx must be Failed after hard deny"
         );
+        assert_eq!(entry.staged.status, TxStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn policy_hard_deny_at_confirm_open_records_failed_status() {
+        use bloom_proto::policy::{PolicyCheck, PolicyOutcome};
+
+        let (engine, spec, dir) = fake_engine(60_000);
+        let permit = permit_for(&dir);
+        let chain = bloom_evm::ChainClient::new(spec.clone()).unwrap();
+        let mut staged = fake_staged_1559("0001-open");
+        staged.expires_ms = now_ms() + 60_000;
+        staged.policy_checks = vec![PolicyCheck::hard(
+            "caps.max_value_eth",
+            PolicyOutcome::Deny,
+            "value exceeds max",
+        )];
+        engine.outbox.write_pending(&staged, "p").unwrap();
+
+        let r = engine
+            .prepare_confirm_write_open(
+                &permit,
+                "alice",
+                "anvil",
+                "0001-open",
+                &chain,
+                &bloom_proto::Policy::default(),
+                false,
+            )
+            .await;
+        assert!(matches!(r, Err(TxEngineError::PolicyDenied)), "got {r:?}");
+        let entry = engine.outbox.read("alice", "anvil", "0001-open").unwrap();
+        assert_eq!(entry.state, crate::outbox::OutboxState::Failed);
+        assert_eq!(entry.staged.status, TxStatus::Failed);
     }
 
     /// A soft-Warn check must block confirm() when no override sentinel is

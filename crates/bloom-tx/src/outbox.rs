@@ -970,20 +970,23 @@ impl Outbox {
 
     pub fn cancel(&self, wallet: &str, chain: &str, id: &str) -> Result<(), OutboxError> {
         let entry = self.read_in_state(wallet, chain, id, OutboxState::Pending)?;
-        let mut staged = entry.staged.clone();
-        staged.status = TxStatus::Cancelled;
-        let entry = OutboxEntry {
-            state: entry.state,
-            staged: staged.clone(),
-            dir: entry.dir.clone(),
-        };
-        let new_dir = self.transition(&entry, OutboxState::Failed)?;
-        fs::write(
-            new_dir.join("intent.json"),
-            serde_json::to_vec_pretty(&staged)?,
-        )?;
+        let new_dir = self.fail(&entry, TxStatus::Cancelled)?;
         fs::write(new_dir.join("cancel.txt"), b"cancelled by user")?;
         Ok(())
+    }
+
+    /// Move an entry to failed/ and record `status` in its `intent.json`,
+    /// so readers of the entry see the same outcome as its directory.
+    pub fn fail(&self, entry: &OutboxEntry, status: TxStatus) -> Result<PathBuf, OutboxError> {
+        let mut staged = entry.staged.clone();
+        staged.status = status;
+        let new_dir = self.transition(entry, OutboxState::Failed)?;
+        self.write_artefact(
+            &new_dir,
+            "intent.json",
+            &serde_json::to_vec_pretty(&staged)?,
+        )?;
+        Ok(new_dir)
     }
 
     /// Pending entries whose expiry has passed, read without changing
