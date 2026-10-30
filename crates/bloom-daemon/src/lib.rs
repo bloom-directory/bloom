@@ -968,6 +968,7 @@ impl DaemonPetalHost {
         let prepared = broker
             .prepare_approval(bloom_broker_api::ApprovalPrepareRequest {
                 surface_selection: bloom_broker_api::CeremonySurfaceSelection::Default,
+                safe_review_payloads: Vec::new(),
                 evm_review_payloads: Vec::new(),
                 operation_id,
                 terms,
@@ -5087,7 +5088,27 @@ impl Daemon {
                                     }
                                 }
                             }
-                            match run_solana_expiry_sweep_once(solana_outbox, &audit, now_ms, &live_heights) {
+                            let mut signature_statuses = std::collections::HashMap::new();
+                            match solana_outbox.expired_pending(now_ms, &live_heights) {
+                                Ok(entries) => for entry in entries {
+                                    let Ok(Some(signature)) = solana_outbox.recorded_signature(&entry) else {
+                                        continue;
+                                    };
+                                    let Some(client) = solana_chains.get(&entry.staged.chain) else {
+                                        continue;
+                                    };
+                                    // Each probe searches transaction history. A single
+                                    // lagging endpoint cannot establish absence.
+                                    let probes = client.probe_signature_status_all_endpoints(&signature).await;
+                                    let found = probes.iter().any(|probe| matches!(&probe.status, Ok(Some(_))));
+                                    let absent = !probes.is_empty() && probes.iter().all(|probe| matches!(&probe.status, Ok(None)));
+                                    if found || absent {
+                                        signature_statuses.insert((entry.staged.chain, signature), found);
+                                    }
+                                },
+                                Err(error) => warn!(error = %error, "solana_outbox.sweep_signature_scan_failed"),
+                            }
+                            match run_solana_expiry_sweep_once(solana_outbox, &audit, now_ms, &live_heights, &signature_statuses) {
                                 Ok(0) => tracing::trace!("solana_outbox.sweep_expired.empty"),
                                 Ok(n) => info!(swept = n, "solana_outbox.sweep_expired"),
                                 Err(e) => warn!(error = %e, "solana_outbox.sweep_expired_failed"),
@@ -5286,6 +5307,7 @@ fn run_solana_expiry_sweep_once(
     audit: &AuditLog,
     now_ms: u128,
     live_block_heights: &std::collections::HashMap<String, u64>,
+    signature_statuses: &std::collections::HashMap<(String, String), bool>,
 ) -> Result<usize, String> {
     // As for EVM: an idle tick changes nothing and is not journaled.
     if outbox
@@ -5321,7 +5343,7 @@ fn run_solana_expiry_sweep_once(
         .map_err(|error| {
             format!("Machine audit unavailable before Solana expiry sweep: {error}")
         })?;
-    let swept = outbox.sweep_expired(now_ms, live_block_heights);
+    let swept = outbox.sweep_expired_with_statuses(now_ms, live_block_heights, signature_statuses);
     let result = match &swept {
         Ok(count) => serde_json::json!({"outcome": "completed", "swept": count}),
         Err(error) => serde_json::json!({"outcome": "error", "error": error.to_string()}),
@@ -8118,6 +8140,7 @@ ws_url = "wss://example.invalid"
                     &d.audit,
                     now_ms,
                     &std::collections::HashMap::new(),
+                    &std::collections::HashMap::new(),
                 )
                 .unwrap(),
                 0
@@ -8173,6 +8196,7 @@ ws_url = "wss://example.invalid"
             &d.audit,
             2,
             &std::collections::HashMap::from([("solana-devnet".to_string(), 101_u64)]),
+            &std::collections::HashMap::new(),
         )
         .unwrap();
         assert_eq!(n, 1, "an abandoned, expired Solana stage must be reaped");
