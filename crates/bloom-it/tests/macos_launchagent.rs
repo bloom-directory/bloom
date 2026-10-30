@@ -194,7 +194,7 @@ fn legacy_monitor_preserves_session_lifecycle_without_claiming_network_containme
     assert!(monitor.contains("status.json"));
     assert!(monitor.contains("restart_services_for_live_session"));
     assert!(monitor.contains("if enrollment_state == \"active\""));
-    assert!(monitor.contains("gui/{login_uid}/com.bloom.session"));
+    assert!(monitor.contains("user/{login_uid}/com.bloom.session"));
     assert!(monitor.contains("session.sock"));
     assert!(monitor.contains("metadata.file_type().is_socket()"));
     assert!(monitor.contains("system/com.bloom.{service}.{login_uid}"));
@@ -204,10 +204,13 @@ fn legacy_monitor_preserves_session_lifecycle_without_claiming_network_containme
     assert_ordered(
         &monitor,
         &[
-            "gui/{login_uid}/com.bloom.session",
-            "state = running",
+            "fn restart_services_for_live_session",
+            "prepare_login_sentinel(",
             "session.sock",
             "[\"signer\", \"broker\"]",
+            "fn prepare_login_sentinel",
+            "user/{login_uid}/com.bloom.session",
+            "state = running",
         ],
     );
 
