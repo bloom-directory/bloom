@@ -1546,9 +1546,9 @@ impl DefaultPolicyRequest {
     }
 
     /// What `current` allows that the saved persona does not propose: an
-    /// `erc20:any-recipient` entry on any chain the persona does not ask for,
-    /// as after switching away from Degen. Empty for a wallet the persona
-    /// does not apply to.
+    /// `erc20:any-recipient` entry keyed `evm-<chain id>` on any chain the
+    /// persona does not ask for, as after switching away from Degen. Empty for
+    /// a wallet the persona does not apply to.
     pub(crate) fn beyond_persona(
         &self,
         current: &bloom_broker_api::SignedPolicySnapshot,
@@ -1558,8 +1558,7 @@ impl DefaultPolicyRequest {
         }
         let policy = decode_policy(current)?;
         let leftover = policy.allowed_destinations.iter().any(|destination| {
-            destination.destination == bloom_proto::policy::ERC20_ANY_RECIPIENT
-                && !self.persona_destinations.contains(destination)
+            is_any_recipient_opt_in(destination) && !self.persona_destinations.contains(destination)
         });
         Ok(if leftover {
             vec![PERSONA_TRANSFERS.to_owned()]
@@ -1567,6 +1566,20 @@ impl DefaultPolicyRequest {
             Vec::new()
         })
     }
+}
+
+/// Whether `destination` is an `erc20:any-recipient` entry Machine honours:
+/// keyed `evm-<chain id>`, as `bloom_vfs::advisory_exact_evm_policy` reads it.
+/// The same string under a Bloom chain name, such as `ethereum`, allows
+/// nothing.
+fn is_any_recipient_opt_in(destination: &bloom_broker_api::PolicyDestination) -> bool {
+    destination.destination == bloom_proto::policy::ERC20_ANY_RECIPIENT
+        && destination
+            .chain
+            .as_str()
+            .strip_prefix("evm-")
+            .and_then(|id| id.parse::<u64>().ok().filter(|n| n.to_string() == id))
+            .is_some()
 }
 
 fn decode_policy(
@@ -3000,8 +3013,20 @@ mod tests {
             institutional.beyond_persona(&snapshot_of(&policy)).unwrap(),
             [PERSONA_TRANSFERS]
         );
-        // An entry spelt by chain name counts too.
-        policy.allowed_destinations = vec![any_recipient("ethereum")];
+        // The same string under a Bloom chain name, or a non-canonical id,
+        // allows nothing (the planner reads only `evm-<chain id>`), so it is
+        // not reported.
+        for chain in ["ethereum", "evm-01", "evm-"] {
+            policy.allowed_destinations = vec![any_recipient(chain)];
+            assert!(
+                institutional
+                    .beyond_persona(&snapshot_of(&policy))
+                    .unwrap()
+                    .is_empty(),
+                "{chain}"
+            );
+        }
+        policy.allowed_destinations = vec![any_recipient("evm-8453")];
         assert_eq!(
             institutional.beyond_persona(&snapshot_of(&policy)).unwrap(),
             [PERSONA_TRANSFERS]

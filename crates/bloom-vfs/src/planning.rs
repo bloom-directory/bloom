@@ -353,4 +353,29 @@ mod tests {
             );
         }
     }
+
+    /// A Bloom chain may be named like another chain's key. The opt-in
+    /// follows the numeric chain id being planned, never a matching name.
+    #[test]
+    fn the_opt_in_follows_the_chain_id_not_a_matching_chain_name() {
+        let marker = bloom_proto::policy::ERC20_ANY_RECIPIENT;
+        let p = projection(vec![PolicyDestination {
+            chain: Token::new("evm-137").unwrap(),
+            destination: marker.into(),
+        }]);
+        assert!(
+            !advisory_exact_evm_policy(&p, "evm-137", 1)
+                .unwrap()
+                .allowlists
+                .recipients
+                .contains(marker)
+        );
+        assert!(
+            advisory_exact_evm_policy(&p, "evm-137", 137)
+                .unwrap()
+                .allowlists
+                .recipients
+                .contains(marker)
+        );
+    }
 }

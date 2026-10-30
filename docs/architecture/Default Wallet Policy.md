@@ -175,8 +175,9 @@ Agreed on 2026-09-14:
       and 10,000 pUSD rather than 100 during first setup: their pUSD token
       quantities, not a price. That daily limit is all a persona sets here:
       no per-action cap and no session length. The saved `[persona]` still
-      records `window_secs`, which only bloom#377 reads. The owner can
-      change the suggestion, and a saved value is kept.
+      records `window_secs`, which only bloom#377 uses; this design checks
+      only that it matches the preset. The owner can change the suggestion,
+      and a saved value is kept.
     - **Degen** also adds
       `{"chain": "evm-1", "destination": "erc20:any-recipient"}`, and the same
       on `evm-137`, for configured Ethereum and Polygon. Only that
@@ -185,13 +186,22 @@ Agreed on 2026-09-14:
       chosen Petal's destinations, and is the only addition here that does not
       come from a Petal. Machine then stages the wallet's own canonical
       ERC-20 transfer of a token in Bloom's curated table
-      (`bloom_proto::tokens`) to any recipient on those chains. Only the
+      (`bloom_proto::tokens`) to any recipient on those chains. An
+      owner-written entry works the same way on any other chain with a
+      curated table, such as `evm-8453` for Base, although bloom-broker#112's
+      sessions cover only chains 1, 137 and 31337. Only the
       exact-transaction path uses it, never a Petal, and a token outside the
       table still needs its recipient listed, because any contract can answer
       `decimals()` and run its own code under the `transfer` selector. Broker
-      checks no destination on that exact approval, so the owner's approval
-      of each transfer is the check. Until bloom-broker#112 is pinned, the
-      policy ceremony shows the entry as written.
+      checks no destination on the wallet's own exact EVM approval, which
+      carries no claim, so the owner's approval of each transfer is the only
+      recipient check. On the pinned Broker that check is hard to make: a
+      wallet without clear signing, which includes every default-policy
+      wallet, sees such a transfer as "Approve a call Bloom cannot read",
+      naming the token contract rather than the recipient. Broker master
+      (bloom-broker#103) decodes the transfer and shows its recipient. Until
+      bloom-broker#112 is pinned, the policy ceremony shows the entry as
+      written.
 
     A persona chosen later does not reach back. On a home whose setup already
     ran, `bloom init --persona` saves it and says that the Petal limits from
@@ -526,12 +536,15 @@ this design and those stacks:
   policy, so the default policy is applied first. Choosing a persona grants
   nothing on its own. bloom#377's recurring allowances also need the
   policy's maximum approval lifetime at its standing value
-  (`STANDING_APPROVAL_POLICY_LIFETIME_MS`). This design never proposes that.
-  bloom#377 adds it to the same default-policy proposal for Trader and Degen
-  (`standing`). Rebased, the lifetime also belongs in the check that finds
-  the policy already allowed, so it stays one ceremony. Only a wallet whose
-  default policy committed without it needs another, which onboarding
-  proposes with `owner_just_chose`.
+  (`STANDING_APPROVAL_POLICY_LIFETIME_MS`), which this design never
+  proposes. bloom#377 adds it to the same default-policy proposal for Trader
+  and Degen (`standing`), so it stays one ceremony. Rebased, that check and
+  proposal belong to the default-policy path only, never the Petal gate's
+  setup, or every Petal use on such a wallet opens a ceremony for the
+  lifetime. The default-policy report must also name a missing lifetime: its
+  list of what the policy does not allow covers only Petals and the persona's
+  entry. Only a wallet whose default policy committed without the lifetime
+  needs another ceremony, which onboarding proposes with `owner_just_chose`.
 - **A policy change ends persona sessions.** A session and its budget are
   bound to the policy version and digest they were approved under. Any later
   policy commit stops them signing:
@@ -551,7 +564,9 @@ this design and those stacks:
   `WalletDefaultPolicy { name }` no longer compiles: onboarding must set
   `owner_just_chose` only right after it saves the selection. It should
   preselect from `[petals.setup]` while the policy is still the one creation
-  installed, and from what the current policy allows after that. Inside Machine
+  installed, and from what the current policy allows after that, and keep
+  the saved values of Petals left unticked, so re-ticking one restores the
+  owner's amount rather than the persona's suggestion. Inside Machine
   this is `AfterPolicyChange::Propose` rather than a `bool`, so another flag
   passed in its place, such as bloom#377's `standing`, does not compile;
   `standing` stays a separate argument.
@@ -590,9 +605,11 @@ this design and those stacks:
   from this design they keep the empty marker and then refuse it ("legacy
   setup obligation has no frozen package/config revision"), so they must
   migrate or reconcile these markers. A build of this design on a home
-  bloom#352 used treats their entry as its own marker: it writes
-  `[petals.setup]`'s values for that Petal and deletes the entry, or leaves
-  an empty marker if the write fails.
+  bloom#352 used treats their entry as its own marker. A queued retry writes
+  `[petals.setup]`'s values while that Petal's settings read as unset and
+  deletes the entry, or deletes it without writing when settings already
+  exist; a failed retry leaves it as it is. A `bloom init` that queues the
+  same Petal overwrites it with an empty marker.
 - **Versions.** The sessions need Broker and Signer changes that are not
   merged, and each accepts exactly one protocol minor: bloom-signer#68 only
   Broker–Signer 1.7, and bloom-broker#100 only Machine–Broker 1.8. The pinned
@@ -600,10 +617,13 @@ this design and those stacks:
   bloom#352's stack ships bloom-signer#68, bloom-broker#100 (which pins it)
   and Machine as one Triad release. Broker master has since moved on: it
   already uses Machine–Broker 1.8 for bloom-broker#103, which
-  bloom-broker#100 does not contain, and it refuses declared debits on
-  Polymarket order approvals. Rebased, bloom-broker#100 needs a new minor and
-  a check of those debits against Broker's own rebuild, as bloom-broker#112
-  has; otherwise Broker refuses every bloom-petal-polymarket#19 order.
+  bloom-broker#100 does not contain. It also requires exact approval for
+  every Polymarket class it rebuilds (orders, relayer batches, onboarding)
+  and refuses any declared debit, destination or fee on them. Rebased,
+  bloom-broker#100 needs a new minor, bloom-broker#112's exemption for
+  budgeted order sessions, and its check of order debits against Broker's
+  own rebuild; otherwise Broker refuses every bloom#352 BUY session and every
+  bloom-petal-polymarket#19 order.
   bloom#377's pins speak Broker–Signer 1.8 and Machine–Broker 1.10.
   Polymarket coverage also needs a published Polymarket package that
   declares its debits to Broker. None does yet: v0.1.6, v0.1.8 (pinned here)
@@ -657,8 +677,9 @@ destination the owner removed is not proposed again behind a later request
   a `petal:<name>` entry (decision 14), which names the Petal, and Degen's
   `erc20:any-recipient` (decision 15). The second lifts Machine's recipient
   check for the wallet's own curated ERC-20 transfers. Broker checks no
-  destination on an exact approval, so the owner's approval of each transfer
-  is the recipient check.
+  destination on that exact EVM approval, which carries no claim, so the
+  owner's approval of each transfer is the only recipient check, and on the
+  pinned Broker the approval page does not show the recipient (decision 15).
 - Signing the policy grants no signing authority. Every signature still
   needs an approval the owner gave for that transaction.
 - Petal limits live in each Petal's settings, not the signed policy. Any
@@ -707,8 +728,9 @@ changes come next.
   `crates/bloom-daemon`): `ensure_petal_packages_allowed` proposes several
   packages through the wallet's existing policy operation, and
   `ensure_petal_eligibility` adds the chosen Petals for `main`.
-- **Personas** (`crates/bloom-proto/src/persona.rs`, `crates/bloom`,
-  `crates/bloom-tx`, `crates/bloom-vfs/src/planning.rs`): the persona
+- **Personas** (`crates/bloom-proto`: `persona.rs`, `config.rs`,
+  `policy.rs`, `tokens.rs`; `crates/bloom`, `crates/bloom-daemon`,
+  `crates/bloom-tx`, `crates/bloom-vfs`): the persona
   question and `--persona`, Polymarket's suggested limit, Degen's
   `erc20:any-recipient` entry and staging exemption, and the report of a
   missing or leftover entry.
@@ -769,8 +791,8 @@ Automated:
 - Each persona's menu choice, `--persona` and Polymarket suggestion; Degen's
   entry on configured chains and for `main` only; an unusable saved persona
   set aside; staging that passes only the wallet's own curated ERC-20
-  transfer with the entry; and the planner honouring the entry only under
-  `evm-<chain id>`.
+  transfer with the entry; and the planner honouring, and the leftover
+  report counting, the entry only under `evm-<chain id>`.
 
 Manual, on the developer triad:
 
