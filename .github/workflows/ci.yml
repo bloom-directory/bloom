@@ -175,7 +175,7 @@ jobs:
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
       - name: Download nextest archive
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: nextest-archive
           path: target
@@ -207,12 +207,12 @@ jobs:
         with:
           node-version: "22.14.0"
       - name: Download nextest archive
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: nextest-archive
           path: target
       - name: Download the bloom CLI
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: bloom-cli
           path: target/debug
@@ -348,7 +348,7 @@ jobs:
       - name: Install wasm-tools
         uses: bytecodealliance/actions/wasm-tools/setup@v1
       - name: Download nextest archive
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: nextest-archive
           path: target
