@@ -238,16 +238,19 @@ cat "$BLOOM/wallets/alice/policy-updates/latest/status.json"
 cat "$BLOOM/wallets/alice/policy-updates/latest/approval_challenge.json"
 ```
 
-Verify that the update challenge matches the proposal before forwarding its
-ceremony URL. After the human approves, retry the exact same proposal bytes:
+Note the `action_id` in `status.json`. Verify that the update challenge
+matches the proposal before forwarding its ceremony URL. After the human
+approves, retry the exact same proposal bytes:
 
 ```sh
 cp proposed-policy.json "$BLOOM/wallets/alice/policy.json"
 cat "$BLOOM/wallets/alice/policy.json"
-cat "$BLOOM/wallets/alice/policy-updates/latest/status.json"
+cat "$BLOOM/wallets/alice/policy-updates/confirmed/<action_id>/status.json"
 ```
 
-Verify the committed policy and terminal status. Broker performs
+`latest` names only a pending update, so it is gone once the update commits.
+A refused or failed update is under `failed/<action_id>/` instead. Verify the
+committed policy and terminal status. Broker performs
 `policy.validate_update` before approval and `policy.commit_update` on the
 authorized retry. Editing or reformatting the proposal requires fresh review.
 
