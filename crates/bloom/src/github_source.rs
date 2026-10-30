@@ -275,60 +275,92 @@ const HYPERLIQUID_AUTHORITY_ROUTES: &[PetalAuthorityRoute] = &[
     },
 ];
 
+/// A release a pinned Petal may replace. Each install writes the catalog
+/// afresh, so every predecessor a pin lists needs a row here: otherwise an
+/// upgrade from that release fails before activation.
 pub(crate) struct ReleaseLineagePredecessor {
     pub hash: &'static str,
+    pub release_sequence: u64,
+    pub predecessor_package_hashes: &'static [&'static str],
     pub authority_routes: &'static [PetalAuthorityRoute],
 }
 
-pub(crate) fn release_lineage_predecessor(name: &str) -> Option<ReleaseLineagePredecessor> {
-    let (hash, authority_routes) = match name {
-        "polymarket" => (
+const fn baseline(
+    hash: &'static str,
+    authority_routes: &'static [PetalAuthorityRoute],
+) -> ReleaseLineagePredecessor {
+    ReleaseLineagePredecessor {
+        hash,
+        release_sequence: 1,
+        predecessor_package_hashes: &[],
+        authority_routes,
+    }
+}
+
+/// Past releases of a bundled Petal, baseline (sequence 1) first.
+pub(crate) fn release_lineage_predecessors(name: &str) -> &'static [ReleaseLineagePredecessor] {
+    const POLYMARKET: &[ReleaseLineagePredecessor] = &[
+        baseline(
             "5df5a1377dc4d70c71e47ffe6827e691e1f5868543b752dc8d19a500284e5fa6",
             BASELINE_POLYMARKET_AUTHORITY_ROUTES,
         ),
-        "hyperliquid" => (
-            "b29c7afb88ec9d2df774b18dad2699ec169100eeeedbcefca02ea0cc3712a188",
-            BASELINE_HYPERLIQUID_AUTHORITY_ROUTES,
-        ),
-        "enso" => (
-            "97650f327691f01bc4591cde25253d1e20010643e700674cc9759cd1366876b9",
-            &[][..],
-        ),
-        "near-intents" => (
-            "ac2ccab59f36ee863843f92aaf0c975c00dbf32b246df5ccbb79757093785921",
-            &[][..],
-        ),
-        "feedback" => (
-            "5f26e7bbf7f507cfcf4c13645cf9f4f0c903d769c201e3e9d1f5c914b14fa2a3",
-            &[][..],
-        ),
-        "tolly" => (
-            "f50f9f6f55eca103c11ed40d424311c6e5863ff5046231f57f58822d1aac6709",
-            &[][..],
-        ),
-        _ => return None,
-    };
-    Some(ReleaseLineagePredecessor {
-        hash,
-        authority_routes,
-    })
+        // v0.1.6, pinned by Bloom v0.4.0.
+        ReleaseLineagePredecessor {
+            hash: "0f365cd7f613129f73ce66fb07256c8a42c4e70abbb77721804dbd6df85b96b5",
+            release_sequence: 2,
+            predecessor_package_hashes: &[
+                "5df5a1377dc4d70c71e47ffe6827e691e1f5868543b752dc8d19a500284e5fa6",
+            ],
+            authority_routes: POLYMARKET_AUTHORITY_ROUTES,
+        },
+    ];
+    const HYPERLIQUID: &[ReleaseLineagePredecessor] = &[baseline(
+        "b29c7afb88ec9d2df774b18dad2699ec169100eeeedbcefca02ea0cc3712a188",
+        BASELINE_HYPERLIQUID_AUTHORITY_ROUTES,
+    )];
+    const ENSO: &[ReleaseLineagePredecessor] = &[baseline(
+        "97650f327691f01bc4591cde25253d1e20010643e700674cc9759cd1366876b9",
+        &[],
+    )];
+    const NEAR_INTENTS: &[ReleaseLineagePredecessor] = &[baseline(
+        "ac2ccab59f36ee863843f92aaf0c975c00dbf32b246df5ccbb79757093785921",
+        &[],
+    )];
+    const FEEDBACK: &[ReleaseLineagePredecessor] = &[baseline(
+        "5f26e7bbf7f507cfcf4c13645cf9f4f0c903d769c201e3e9d1f5c914b14fa2a3",
+        &[],
+    )];
+    const TOLLY: &[ReleaseLineagePredecessor] = &[baseline(
+        "f50f9f6f55eca103c11ed40d424311c6e5863ff5046231f57f58822d1aac6709",
+        &[],
+    )];
+    match name {
+        "polymarket" => POLYMARKET,
+        "hyperliquid" => HYPERLIQUID,
+        "enso" => ENSO,
+        "near-intents" => NEAR_INTENTS,
+        "feedback" => FEEDBACK,
+        "tolly" => TOLLY,
+        _ => &[],
+    }
 }
 
 const PREINSTALLED_POLYMARKET: PreinstalledPetal = PreinstalledPetal {
     name: "polymarket",
     repository: "https://github.com/bloom-directory/bloom-petal-polymarket",
-    commit: "a0177ae4e68f4a043df4db727fb3212e23ab7395",
-    release_tag: "v0.1.6",
-    archive: "polymarket-v0.1.6.petal.tar.gz",
-    expected_hash: Some("0f365cd7f613129f73ce66fb07256c8a42c4e70abbb77721804dbd6df85b96b5"),
-    archive_sha256: "e02d300af67875a625eb633299f7782ce30a02be79dde3c813cda1db5a116d9f",
+    commit: "74f1f928313916b332d9059f2e4363eac8f147af",
+    release_tag: "v0.1.8",
+    archive: "polymarket-v0.1.8.petal.tar.gz",
+    expected_hash: Some("6eb2065e8558f3761399fcb0516731a600fdb0b49974c8ed0808abd38fde7db4"),
+    archive_sha256: "312f945ecf0b6a29d574a0497e369234c5a584cb539b61f09056844e7e3586ae",
     tooling_commit: "2beed2ff344ce2b0c112e07096027e1ae0404007",
     petal_abi: "bloom.petal-host/payload-signing-v1",
     default_eligible: true,
     lineage_id: Some("pln1_6etojfshqyk6bzm257kzv7noj3perfz4siioiuhj74xosznyzhka"),
-    release_sequence: 2,
+    release_sequence: 3,
     predecessor_package_hashes: &[
         "5df5a1377dc4d70c71e47ffe6827e691e1f5868543b752dc8d19a500284e5fa6",
+        "0f365cd7f613129f73ce66fb07256c8a42c4e70abbb77721804dbd6df85b96b5",
     ],
     authority_routes: POLYMARKET_AUTHORITY_ROUTES,
     setup: Some(&POLYMARKET_SETUP),
@@ -1044,8 +1076,14 @@ fn curl_download(
             "--location",
             "--connect-timeout",
             "10",
+            // Abort a stalled transfer, not a slow one: a 46 MB release archive
+            // took longer than a fixed 120 s on a slow GitHub day (bloom#393).
+            "--speed-limit",
+            "1024",
+            "--speed-time",
+            "60",
             "--max-time",
-            "120",
+            "900",
         ])
         .arg(url)
         .arg("--output")
@@ -1053,7 +1091,7 @@ fn curl_download(
     let result = run_bounded_command(
         &mut command,
         Some(context),
-        std::time::Duration::from_secs(125),
+        std::time::Duration::from_secs(905),
     )
     .context("download pre-installed Petal release with curl")?;
     if !result.status.success() {

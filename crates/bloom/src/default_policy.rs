@@ -1926,7 +1926,8 @@ mod tests {
         let entry = github_source::preinstalled_petal("polymarket").unwrap();
         assert_eq!(
             entry.expected_hash,
-            Some("0f365cd7f613129f73ce66fb07256c8a42c4e70abbb77721804dbd6df85b96b5"),
+            // v0.1.8: same petal 2beed2ff and `venue_config_key` as v0.1.6.
+            Some("6eb2065e8558f3761399fcb0516731a600fdb0b49974c8ed0808abd38fde7db4"),
             "re-check store_key against the new release, then update both"
         );
         assert_eq!(

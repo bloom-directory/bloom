@@ -316,7 +316,7 @@ chosen Petals:
   "maximum_approval_lifetime_ms": 2592000000,
   "allowed_petal_packages": [
     "07fdcc9841c88de8fe1d0b4526bc01deac004c1c7dec202e2c8d7443300f22af",
-    "0f365cd7f613129f73ce66fb07256c8a42c4e70abbb77721804dbd6df85b96b5"
+    "6eb2065e8558f3761399fcb0516731a600fdb0b49974c8ed0808abd38fde7db4"
   ],
   "allowed_destinations": [
     { "chain": "polygon", "destination": "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb" },
@@ -329,7 +329,7 @@ chosen Petals:
 ```
 
 - **`allowed_petal_packages`** lists each chosen Petal by the exact hash
-  Bloom's catalog pins: Hyperliquid v0.1.7 and Polymarket v0.1.6.
+  Bloom's catalog pins: Hyperliquid v0.1.7 and Polymarket v0.1.8.
 - **`allowed_destinations`** lists the fixed contracts each chosen Petal
   transacts with (decision 13), from Bloom's catalog only; an edited config
   cannot add any. Existing destinations are kept. Only a wallet's first
@@ -606,8 +606,8 @@ this design and those stacks:
   has; otherwise Broker refuses every bloom-petal-polymarket#19 order.
   bloom#377's pins speak Broker–Signer 1.8 and Machine–Broker 1.10.
   Polymarket coverage also needs a published Polymarket package that
-  declares its debits to Broker. None does yet: v0.1.6 (pinned here), v0.1.8
-  (pinned on master) and v0.2.0 declare none for any signature.
+  declares its debits to Broker. None does yet: v0.1.6, v0.1.8 (pinned here)
+  and v0.2.0 declare none for any signature.
   bloom-petal-polymarket#19 adds them for bloom#352, and
   bloom-petal-polymarket#26, which contains it, for bloom#377; both conflict
   with main. This design keeps the current Broker, Signer and Polymarket pins

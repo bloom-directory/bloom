@@ -342,6 +342,18 @@ fn evm_chain(
     }
 }
 
+/// Keyless access was retired by the provider; authenticated/custom URLs stay.
+const RETIRED_POLYGON_RPC_URL: &str = "https://polygon-rpc.com";
+
+/// Independent providers, rather than several aliases of the same service.
+/// PublicNode's original hostname remains valid; local DNS failure is not
+/// evidence that a provider has retired an endpoint.
+const POLYGON_RPC_URLS: [&str; 3] = [
+    "https://polygon.drpc.org",
+    "https://polygon-bor-rpc.publicnode.com",
+    "https://tenderly.rpc.polygon.community",
+];
+
 fn default_chains() -> BTreeMap<String, ChainSpec> {
     let mut chains = BTreeMap::new();
     for spec in [
@@ -403,16 +415,7 @@ fn default_chains() -> BTreeMap<String, ChainSpec> {
             "ETH",
         )
         .with_op_stack(),
-        evm_chain(
-            "polygon",
-            137,
-            &[
-                "https://polygon-rpc.com",
-                "https://polygon-bor-rpc.publicnode.com",
-            ],
-            "Polygon PoS",
-            "POL",
-        ),
+        evm_chain("polygon", 137, &POLYGON_RPC_URLS, "Polygon PoS", "POL"),
         evm_chain(
             "bsc",
             56,
@@ -465,6 +468,24 @@ fn default_chains() -> BTreeMap<String, ChainSpec> {
         chains.insert(spec.name.clone(), spec);
     }
     chains
+}
+
+/// Repair configs containing the exact retired default and add missing fallback
+/// providers. Preserve custom entries and their relative order; custom-only
+/// lists and explicit `rpc_endpoints` remain operator-controlled.
+fn replace_retired_polygon_urls(urls: &mut Vec<String>) {
+    let Some(i) = urls.iter().position(|u| u == RETIRED_POLYGON_RPC_URL) else {
+        return;
+    };
+    if !urls.iter().any(|u| u == POLYGON_RPC_URLS[0]) {
+        urls[i] = POLYGON_RPC_URLS[0].to_string();
+    }
+    urls.retain(|u| u != RETIRED_POLYGON_RPC_URL);
+    for url in POLYGON_RPC_URLS {
+        if !urls.iter().any(|u| u == url) {
+            urls.push(url.to_string());
+        }
+    }
 }
 
 impl Config {
@@ -540,7 +561,8 @@ impl Config {
 
     /// Apply post-load migrations for backwards compatibility.
     ///
-    /// Add the release's new networks without replacing operator configuration.
+    /// Add the release's new networks without replacing operator configuration,
+    /// and swap retired default endpoints that a saved config still holds verbatim.
     /// Like other load migrations, this updates the effective config; save persists it.
     fn migrate(&mut self) {
         let mut defaults = Self::local_default();
@@ -559,6 +581,9 @@ impl Config {
         }
         for spec in self.chains.values_mut() {
             spec.infer_op_stack();
+            if spec.chain_id == 137 {
+                replace_retired_polygon_urls(&mut spec.rpc_urls);
+            }
         }
     }
 
@@ -1311,6 +1336,106 @@ allow_broadcast = false
         assert_configs_equivalent(&loaded, &expected);
         loaded.save(&path).unwrap();
         assert_configs_equivalent(&Config::load(&path).unwrap(), &expected);
+    }
+
+    fn migrated_polygon_urls(urls: &[&str]) -> Vec<String> {
+        let mut cfg = Config::local_default();
+        let polygon = cfg.chains.get_mut("polygon").unwrap();
+        polygon.rpc_urls = urls.iter().map(|u| (*u).to_string()).collect();
+        polygon.rpc_endpoints = vec![EndpointSpec {
+            url: "https://polygon-rpc.com".into(),
+            ..http_endpoint()
+        }];
+        cfg.migrate();
+        let once = cfg.chains["polygon"].clone();
+        cfg.migrate();
+        assert_eq!(cfg.chains["polygon"], once, "migration must be idempotent");
+        // Bloom never wrote defaults to the richer form; leave it to the operator.
+        assert_eq!(once.rpc_endpoints[0].url, "https://polygon-rpc.com");
+        once.rpc_urls
+    }
+
+    #[test]
+    fn polygon_defaults_avoid_retired_endpoints() {
+        let fresh = Config::local_default();
+        assert_eq!(fresh.chains["polygon"].rpc_urls, POLYGON_RPC_URLS);
+        let mut migrated = fresh.clone();
+        migrated.migrate();
+        assert_configs_equivalent(&migrated, &fresh);
+    }
+
+    #[test]
+    fn migration_replaces_exact_retired_polygon_defaults() {
+        assert_eq!(
+            migrated_polygon_urls(&[
+                "https://polygon-rpc.com",
+                "https://polygon-bor-rpc.publicnode.com",
+            ]),
+            Config::local_default().chains["polygon"].rpc_urls
+        );
+    }
+
+    #[test]
+    fn migration_keeps_custom_polygon_urls_and_order() {
+        // Mixed: custom entries keep their place; a replacement already present
+        // is not duplicated.
+        assert_eq!(
+            migrated_polygon_urls(&[
+                "https://polygon.publicnode.com",
+                "https://user:secret@rpc.example/polygon",
+                "https://polygon-bor-rpc.publicnode.com",
+                "https://polygon-rpc.com",
+                "https://polygon.drpc.org",
+                "https://polygon-rpc.com",
+            ]),
+            [
+                "https://polygon.publicnode.com",
+                "https://user:secret@rpc.example/polygon",
+                "https://polygon-bor-rpc.publicnode.com",
+                "https://polygon.drpc.org",
+                "https://tenderly.rpc.polygon.community",
+            ]
+        );
+        // Custom-only, including near-misses of the retired values.
+        let custom = [
+            "https://polygon-bor-rpc.publicnode.com",
+            "https://polygon-bor.publicnode.com",
+            "https://polygon-rpc.com/?key=abc",
+            "https://polygon-rpc.com/",
+            "https://polygon-mainnet.g.alchemy.com/v2/KEY",
+        ];
+        assert_eq!(migrated_polygon_urls(&custom), custom);
+    }
+
+    #[test]
+    fn migration_replaces_duplicate_retired_urls_once() {
+        assert_eq!(
+            migrated_polygon_urls(&[RETIRED_POLYGON_RPC_URL, RETIRED_POLYGON_RPC_URL]),
+            POLYGON_RPC_URLS
+        );
+    }
+
+    #[test]
+    fn migration_replaces_polygon_defaults_in_a_saved_config() {
+        let td = tempdir().unwrap();
+        let path = td.path().join("config.toml");
+        let existing = r#"
+default_chain = "polygon"
+
+[chains.polygon]
+name = "polygon"
+chain_id = 137
+rpc_urls = ["https://polygon-rpc.com", "https://polygon-bor-rpc.publicnode.com"]
+native_symbol = "POL"
+"#;
+        std::fs::write(&path, existing).unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(
+            loaded.chains["polygon"].rpc_urls,
+            Config::local_default().chains["polygon"].rpc_urls
+        );
+        loaded.save(&path).unwrap();
+        assert_configs_equivalent(&Config::load(&path).unwrap(), &loaded);
     }
 
     #[test]
