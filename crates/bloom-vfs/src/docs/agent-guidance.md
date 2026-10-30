@@ -390,9 +390,11 @@ human rather than retrying on your own.
 
 `bloom wallet confirm` exits 3 when owner approval is pending and 4 when
 confirmation has no recorded result yet. Exit 0 reports a recorded broadcast
-or a completed local discard. Use `--text cancel` to discard an unsigned
-pending entry; an already broadcast transaction needs `bloom wallet cancel`
-and its own approval. Dropping a reservation does not renumber later rows:
+or a completed local discard. Use `--text cancel` to discard a pending entry
+that was never sent for signing. If a signature may exist, even with no hash
+recorded yet, Bloom keeps the entry and its `last_error.json` says how to
+reconcile it; an expired entry stays pending for the same reason. An already
+broadcast transaction needs `bloom wallet cancel` and its own approval. Dropping a reservation does not renumber later rows:
 restage with an explicit nonce to fill a gap.
 
 `confirm.override` is not a general escape hatch. Use it only when the
