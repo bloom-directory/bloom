@@ -62,7 +62,7 @@ use fs2::FileExt as _;
 use parking_lot::RwLock;
 use sha2::Digest as _;
 use thiserror::Error;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::bump_scanner::MempoolIndexes;
 use crate::intent_parser::ParseError;
@@ -1974,7 +1974,8 @@ impl TxEngine {
         let entry = self
             .outbox
             .read_in_state(wallet, chain_name, id, OutboxState::Pending)?;
-        let mut staged = entry.staged.clone();
+        self.require_no_cancellation(&entry)?;
+        let staged = entry.staged.clone();
 
         if self
             .outbox
@@ -1999,9 +2000,10 @@ impl TxEngine {
 
         let hard = policy_engine::has_hard_violation(&staged.policy_checks);
         if hard {
-            staged.status = TxStatus::Failed;
-            self.outbox
-                .transition(&entry, crate::outbox::OutboxState::Failed)?;
+            // The denial stands even if recording it fails.
+            if let Err(e) = self.outbox.transition_with_status(&entry, TxStatus::Failed) {
+                warn!(id = %staged.id, error = %e, "tx.policy_denied_record_failed");
+            }
             debug!(
                 id = %staged.id,
                 wallet,
@@ -2120,6 +2122,7 @@ impl TxEngine {
         for target in &targets {
             let policy = &target.policy;
             let entry = self.outbox.read(wallet, &target.chain_name, &target.id)?;
+            self.require_no_cancellation(&entry)?;
             if entry.staged.wallet != wallet
                 || entry.staged.chain != target.chain_name
                 || entry.staged.id != target.id
@@ -2364,6 +2367,7 @@ impl TxEngine {
         let entry = self
             .outbox
             .read_in_state(wallet, chain_name, id, OutboxState::Pending)?;
+        self.require_no_cancellation(&entry)?;
         let mut staged = entry.staged.clone();
 
         if let Some(attempt) = self
@@ -2398,9 +2402,10 @@ impl TxEngine {
         // Policy gate.
         let hard = policy_engine::has_hard_violation(&staged.policy_checks);
         if hard {
-            staged.status = TxStatus::Failed;
-            self.outbox
-                .transition(&entry, crate::outbox::OutboxState::Failed)?;
+            // The denial stands even if recording it fails.
+            if let Err(e) = self.outbox.transition_with_status(&entry, TxStatus::Failed) {
+                warn!(id = %staged.id, error = %e, "tx.policy_denied_record_failed");
+            }
             debug!(
                 id = %staged.id,
                 wallet,
@@ -4092,6 +4097,25 @@ impl TxEngine {
         Ok(signed.hash)
     }
 
+    fn require_no_cancellation(&self, entry: &crate::OutboxEntry) -> Result<(), TxEngineError> {
+        if entry
+            .dir
+            .join("cancel_tx_hash")
+            .try_exists()
+            .map_err(OutboxError::Io)?
+            || self
+                .outbox
+                .read_broadcast_attempt(entry, BroadcastAttemptKind::CancelReplacement)?
+                .is_some()
+        {
+            return Err(TxEngineError::ApprovalDenied(
+                "cancellation already submitted; reconcile it before confirming the transaction"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn read_replaceable_entry(
         &self,
         wallet: &str,
@@ -4173,6 +4197,21 @@ impl TxEngine {
         self.assert_write_permit(permit)?;
         let bump = bump_pct.max(10);
         let entry = self.read_replaceable_entry(wallet, chain_name, original_id)?;
+        if entry
+            .dir
+            .join("cancel_tx_hash")
+            .try_exists()
+            .map_err(OutboxError::Io)?
+            || self
+                .outbox
+                .read_broadcast_attempt(&entry, BroadcastAttemptKind::CancelReplacement)?
+                .is_some()
+        {
+            return Err(TxEngineError::ApprovalDenied(
+                "cancellation already submitted; reconcile it before replacing the transaction"
+                    .into(),
+            ));
+        }
         let original = &entry.staged;
         self.assert_nonce_still_replaceable(
             chain,
@@ -4294,11 +4333,38 @@ impl TxEngine {
                 .outbox
                 .read_broadcast_attempt(&entry, BroadcastAttemptKind::Confirm)?
                 .is_none()
+            && self
+                .outbox
+                .read_broadcast_attempt(&entry, BroadcastAttemptKind::Replacement)?
+                .is_none()
             && read_triad_signing_state(&entry.dir.join(TRIAD_SIGNING_STATE_FILE))?
                 .is_none_or(|state| !state.sign_dispatched)
         {
             self.outbox.cancel(wallet, chain_name, original_id)?;
             return Ok(self.outbox.read(wallet, chain_name, original_id)?.staged);
+        }
+        // Recover the original hash before submitting a cancel, so a lost
+        // send response cannot leave it outside the reconciler's sent queue.
+        let mut entry = entry;
+        if entry.staged.tx_hash.is_none() {
+            for kind in [
+                BroadcastAttemptKind::Confirm,
+                BroadcastAttemptKind::Replacement,
+            ] {
+                if let Some(attempt) = self.outbox.read_broadcast_attempt(&entry, kind)? {
+                    entry.staged.tx_hash = Some(attempt.tx_hash);
+                    break;
+                }
+            }
+        }
+        if entry.staged.tx_hash.is_some() {
+            self.outbox.write_artefact(
+                &entry.dir,
+                "intent.json",
+                &serde_json::to_vec_pretty(&entry.staged).map_err(OutboxError::Json)?,
+            )?;
+            self.outbox.transition_with_status(&entry, TxStatus::Sent)?;
+            entry = self.outbox.read(wallet, chain_name, original_id)?;
         }
         let original = &entry.staged;
         self.assert_nonce_still_replaceable(
@@ -4354,8 +4420,21 @@ impl TxEngine {
         let _ = self
             .outbox
             .remove_broadcast_raw_tx(&entry, BroadcastAttemptKind::CancelReplacement);
-        if entry.state != OutboxState::Failed
-            && let Err(e) = self.outbox.transition(&entry, OutboxState::Failed)
+        // Broadcast does not settle the nonce race. Keep a sent original
+        // visible to the reconciler so it can record a receipt if it wins.
+        if original.tx_hash.is_none()
+            && self
+                .outbox
+                .read_broadcast_attempt(&entry, BroadcastAttemptKind::Confirm)?
+                .is_none()
+            && self
+                .outbox
+                .read_broadcast_attempt(&entry, BroadcastAttemptKind::Replacement)?
+                .is_none()
+            && entry.state != OutboxState::Failed
+            && let Err(e) = self
+                .outbox
+                .transition_with_status(&entry, TxStatus::Cancelled)
         {
             debug!(
                 id = %original.id,
@@ -5931,6 +6010,123 @@ mod tests {
             "{:?}",
             staged.policy_checks
         );
+    }
+
+    #[tokio::test]
+    async fn cancel_replacement_keeps_sent_original_available_for_reconciliation() {
+        check_cancel_keeps_original(None, false).await;
+    }
+
+    #[tokio::test]
+    async fn cancel_replacement_keeps_lost_broadcast_available_for_reconciliation() {
+        for kind in [
+            BroadcastAttemptKind::Confirm,
+            BroadcastAttemptKind::Replacement,
+        ] {
+            check_cancel_keeps_original(Some(kind), false).await;
+            check_cancel_keeps_original(Some(kind), true).await;
+        }
+    }
+
+    async fn check_cancel_keeps_original(
+        marker: Option<BroadcastAttemptKind>,
+        pending_marker: bool,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        let mut staged = fake_staged_1559("cancel-race");
+        staged.created_ms = now_ms();
+        outbox.write_pending(&staged, "original").unwrap();
+        let pending = outbox.read("alice", "anvil", &staged.id).unwrap();
+        if !pending_marker {
+            outbox
+                .transition_with_status(&pending, TxStatus::Sent)
+                .unwrap();
+        }
+        let sent = outbox.read("alice", "anvil", &staged.id).unwrap();
+        staged.status = TxStatus::Sent;
+        staged.tx_hash = Some(format!("{:#x}", B256::repeat_byte(1)));
+        if let Some(kind) = marker {
+            outbox
+                .write_broadcast_attempt(
+                    &sent,
+                    kind,
+                    &crate::outbox::BroadcastAttempt {
+                        schema: "bloom.broadcast_attempted.v1".into(),
+                        tx_hash: staged.tx_hash.clone().unwrap(),
+                        raw_tx_blake3: blake3::hash(b"original").to_hex().to_string(),
+                        raw_tx_path: kind.raw_name().into(),
+                        from: staged.from.clone(),
+                        to: staged.to.clone(),
+                        nonce: staged.nonce,
+                        chain_id: staged.chain_id,
+                        created_ms: now_ms(),
+                        transport: crate::outbox::BroadcastTransport::PublicRpc,
+                        private_provider: None,
+                    },
+                )
+                .unwrap();
+            staged.tx_hash = None;
+        }
+        outbox
+            .write_artefact(
+                &sent.dir,
+                "intent.json",
+                &serde_json::to_vec(&staged).unwrap(),
+            )
+            .unwrap();
+        let (engine, _, broker) = triad_batch_fixture(outbox.clone(), true, false);
+        let mut catalog = triad_catalog();
+        let mut cancel_record = catalog.records[0].clone();
+        cancel_record.subject = ProvenanceSubject::System {
+            component_id: Token::new("bloom-machine").unwrap(),
+            operation_class: Token::new("transaction.cancel").unwrap(),
+        };
+        cancel_record.operation_classes[0].operation_class =
+            Token::new("transaction.cancel").unwrap();
+        if !catalog
+            .records
+            .iter()
+            .any(|record| record.subject == cancel_record.subject)
+        {
+            catalog.records.push(cancel_record);
+        }
+        let engine = engine.with_triad_signing(broker, catalog).unwrap();
+        let chain = stage_chain(&spawn_batch_rpc(None).await);
+        let permit = permit_for(&directory);
+        let policy = Policy::default();
+        let result = engine
+            .cancel(&permit, "alice", "anvil", &staged.id, &chain, 15, &policy)
+            .await;
+        if matches!(result, Err(TxEngineError::ApprovalRequired(_))) {
+            engine
+                .cancel(&permit, "alice", "anvil", &staged.id, &chain, 15, &policy)
+                .await
+                .unwrap();
+        } else {
+            result.unwrap();
+        }
+        let original = outbox.read("alice", "anvil", &staged.id).unwrap();
+        assert_eq!(original.state, OutboxState::Sent);
+        assert_eq!(original.staged.status, TxStatus::Sent);
+        assert_eq!(
+            original.staged.tx_hash,
+            Some(format!("{:#x}", B256::repeat_byte(1)))
+        );
+        assert!(original.dir.join("cancel_tx_hash").exists());
+        assert!(original.dir.join("cancel_intent.json").exists());
+        assert_eq!(outbox.walk_all_sent().unwrap().len(), 1);
+        assert!(
+            outbox
+                .highest_pending_nonce("alice", "anvil", TEST_SIGNER_ADDRESS.parse().unwrap())
+                .unwrap()
+                .is_none()
+        );
+        let err = engine
+            .replace(&permit, "alice", "anvil", &staged.id, &chain, 15, &policy)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TxEngineError::ApprovalDenied(_)));
     }
 
     #[tokio::test]
@@ -9415,6 +9611,10 @@ mod tests {
             crate::outbox::OutboxState::Failed,
             "tx must be Failed after hard deny"
         );
+        // Persisted, not only normalised by `read`: the CLI serves these bytes.
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(entry.dir.join("intent.json")).unwrap()).unwrap();
+        assert_eq!(raw["status"], "failed");
     }
 
     /// A soft-Warn check must block confirm() when no override sentinel is
