@@ -457,8 +457,11 @@ files or environment variables. See `docs/examples.md` for commands.
 Replacing `wallets/<wallet>/policy.json` starts a Broker ceremony. Prepare
 the complete proposal outside the mount and keep the exact same proposed bytes
 through `policy.validate_update`, human approval, and the
-`policy.commit_update` retry. Inspect the update's status and challenge, then
-verify the committed policy and terminal status. Editing or reformatting the
+`policy.commit_update` retry. Inspect the update's status and challenge under
+`policy-updates/latest/` and note its `action_id`. `latest` names only a
+pending update; after the commit, verify the committed policy and read the
+terminal status at `policy-updates/confirmed/<action_id>/status.json` (or
+`failed/<action_id>/`). Editing or reformatting the
 proposal creates a different request. Commands are in the policy-update
 walkthrough in `docs/examples.md`.
 
