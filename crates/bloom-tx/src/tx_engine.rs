@@ -5874,6 +5874,26 @@ mod tests {
         );
     }
 
+    /// The 0.4.1 ceremony case: `send 0.1 POL` on the shipped polygon chain
+    /// (id 137) failed with "unknown token 'POL' on chain id 137".
+    #[tokio::test]
+    async fn the_default_polygon_chain_sends_pol_natively() {
+        let spec = bloom_proto::config::Config::local_default().chains["polygon"].clone();
+        let chain = ChainClient::new(spec).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let engine = TxEngine::new(Outbox::new(dir.path().join("outbox")).unwrap(), 60_000);
+        let to = "0x2222222222222222222222222222222222222222";
+        let body = crate::intent_parser::parse(&format!("send 0.1 POL to {to}"))
+            .unwrap()
+            .body;
+        let (_, value, data, token, _) = engine
+            .resolve_intent_body(&body, &chain, 137, None, Address::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(value, U256::from(100_000_000_000_000_000u64));
+        assert_eq!((data.as_str(), token.is_none()), ("0x", true));
+    }
+
     #[tokio::test]
     async fn eth_is_refused_on_a_chain_with_another_native_asset() {
         let to = "0x2222222222222222222222222222222222222222";
