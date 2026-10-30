@@ -1,0 +1,34 @@
+schema_version = "1.4"
+
+[task]
+name = "bloom/evm-transfer"
+version = "0.1.0"
+authors = [{ name = "Bloom", email = "engineering@bloom.directory" }]
+keywords = ["bloom", "ethereum", "transfer", "outbox"]
+
+[metadata]
+difficulty = "medium"
+category = "agent-actions"
+tags = ["transfer", "cleanup-required", "sealed-approval"]
+
+[agent]
+# Stage, hit the approval boundary, wait for the owner, confirm, read the
+# receipt. The fork mines at once, so there is no finalization wait.
+timeout_sec = 600.0
+
+[verifier]
+# Three RPC round trips on the local fork.
+timeout_sec = 120.0
+
+[environment]
+docker_image = "ghcr.io/bloom-directory/bloom-eval-agent-base@sha256:c1fa42378d25f356d791bc32b20e6e3898f1942368a765830d5419e446b81a7e"
+build_timeout_sec = 600.0
+cpus = 2
+memory_mb = 4096
+storage_mb = 10240
+network_mode = "public"
+mcp_servers = []
+
+[verifier.env]
+
+[solution.env]
