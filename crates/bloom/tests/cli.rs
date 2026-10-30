@@ -2962,8 +2962,8 @@ fn github_source_install_polymarket_dispatches_route_contract() {
         )))
         .stdout(predicate::str::contains("Building source package..."))
         .stdout(predicate::str::contains("Validating Petal package..."))
-        .stdout(predicate::str::contains("\"routes\": 109"))
-        .stdout(predicate::str::contains("routes: 109"));
+        .stdout(predicate::str::contains("\"routes\": 110"))
+        .stdout(predicate::str::contains("routes: 110"));
 
     bloom_cmd(home.path())
         .args(["petals", "ls"])
