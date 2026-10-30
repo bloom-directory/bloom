@@ -3815,52 +3815,50 @@ write_candidate_units() {
       "$unit_root/bloom-broker-control@.socket"
   fi
 }
-# Stands in for a candidate Broker, Signer, and Machine that migrate their
-# durable state on first start, as the 2026-10-29 Broker did.
-migrate_candidate_state() {
-  local state="$root/var/lib/bloom/1000"
-  [[ -d "$state/broker" ]] || return 0
-  printf 'candidate journal format 3\n' > "$state/broker/journal.db"
-  printf 'candidate wal\n' >> "$state/broker/journal.db-wal"
-  rm -f -- "$state/broker/journal.db-shm"
-  printf 'candidate head\n' > "$state/broker/audit-checkpoints/candidate"
-  chmod 0750 "$state/broker/audit-checkpoints"
-  printf 'candidate signer\n' > "$state/signer/signer.db"
-  printf 'candidate broker head\n' >> "$state/machine/audit-checkpoints/heads"
+# Installs the candidate's state declaration as install_linux_release would.
+# The Broker state version can be raised through var/lib/bloom/candidate-broker-state.
+stage_candidate_release() {
+  local release="$root/usr/libexec/bloom/releases/$new_digest"
+  local raised="$root/var/lib/bloom/candidate-broker-state" state=""
+  [[ ! -f "$raised" ]] || state="$(<"$raised")"
+  mkdir -p "$release"
+  awk -v state="$state" '
+    /^\[/ { broker = ($0 == "[state.broker]") }
+    broker && state != "" && $1 == "current" { $0 = "current = " state }
+    { print }
+  ' "$(dirname "$installer")/compatibility-v1.toml" > "$release/compatibility-v1.toml"
+}
+# Only forward-only recovery selects the candidate; other tests install the
+# candidate digest from their own payloads afterwards.
+begin_upgrade() {
+  stage_candidate_release
+  begin_linux_upgrade "$root" "$old_digest" "$new_digest"
+  [[ -e "$upgrade_transaction/forward-only" ]] ||
+    command rm -rf -- "$root/usr/libexec/bloom/releases/$new_digest"
 }
 case "$mode" in
   interrupt)
-    begin_linux_upgrade "$root" "$old_digest" "$new_digest"
+    begin_upgrade
     write_candidate_units
-    migrate_candidate_state
     ;;
   rollback)
-    begin_linux_upgrade "$root" "$old_digest" "$new_digest"
+    begin_upgrade
     write_candidate_units
-    migrate_candidate_state
     rollback_linux_upgrade
     ;;
-  published-interrupt|published-rollback)
-    begin_linux_upgrade "$root" "$old_digest" "$new_digest"
-    write_candidate_units
-    fence_linux_upgrade_state
-    migrate_candidate_state
-    [[ "$mode" == published-interrupt ]] || rollback_linux_upgrade
-    ;;
-  rollback-cleanup-killed)
-    # The rollback succeeds, then the process dies while deleting the
-    # transaction, after removing one snapshot file.
+  finish-killed)
+    # The upgrade succeeds, then the process dies while deleting the
+    # transaction, after removing its forward-only marker.
     rm() {
       if [[ "${*: -1}" == *upgrade-transaction* ]]; then
-        command rm -f -- "${*: -1}/state/1000/broker/journal.db"
+        command rm -f -- "${*: -1}/forward-only"
         kill -9 $$
       fi
       command rm "$@"
     }
-    begin_linux_upgrade "$root" "$old_digest" "$new_digest"
+    begin_upgrade
     write_candidate_units
-    migrate_candidate_state
-    rollback_linux_upgrade
+    finish_linux_upgrade
     ;;
   recover)
     recover_interrupted_linux_upgrade "$root"
@@ -4061,259 +4059,101 @@ fn linux_upgrade_failure_restores_the_previous_unit_contract_before_restart() {
     }
 }
 
-/// Writes durable service state for login 1000 with distinct modes.
-fn write_linux_service_state(root: &Path) {
-    let state = root.join("var/lib/bloom/1000");
-    for (directory, mode) in [
-        ("", 0o711),
-        ("broker", 0o700),
-        ("broker/audit-checkpoints", 0o700),
-        ("signer", 0o700),
-        ("signer/audit-checkpoints", 0o700),
-        ("machine", 0o700),
-        ("machine/audit-checkpoints", 0o700),
-    ] {
-        fs::create_dir_all(state.join(directory)).unwrap();
-        set_linux_mode(&state.join(directory), mode);
-    }
-    for (file, contents, mode) in [
-        ("broker/journal.db", "previous journal format 2\n", 0o600),
-        ("broker/journal.db-wal", "previous wal\n", 0o600),
-        ("broker/journal.db-shm", "previous shm\n", 0o600),
-        (
-            "broker/audit-checkpoints/heads",
-            "previous signer head\n",
-            0o600,
-        ),
-        ("signer/signer.db", "previous signer\n", 0o600),
-        (
-            "signer/audit-checkpoints/heads",
-            "previous broker head\n",
-            0o400,
-        ),
-        (
-            "machine/audit-checkpoints/heads",
-            "previous broker head\n",
-            0o600,
-        ),
-    ] {
-        fs::write(state.join(file), contents).unwrap();
-        set_linux_mode(&state.join(file), mode);
-    }
+/// Makes the harness candidate declare Broker state 3.
+fn raise_linux_candidate_broker_state(root: &Path) {
+    fs::create_dir_all(root.join("var/lib/bloom")).unwrap();
+    fs::write(root.join("var/lib/bloom/candidate-broker-state"), "3\n").unwrap();
 }
 
-/// Every path under login 1000's service state with its mode and bytes.
-fn linux_service_state(root: &Path) -> Vec<(PathBuf, u32, Vec<u8>)> {
-    fn walk(base: &Path, path: &Path, entries: &mut Vec<(PathBuf, u32, Vec<u8>)>) {
-        let metadata = fs::symlink_metadata(path).unwrap();
-        let contents = if metadata.is_file() {
-            fs::read(path).unwrap()
-        } else {
-            Vec::new()
-        };
-        entries.push((
-            path.strip_prefix(base).unwrap().to_owned(),
-            metadata.permissions().mode(),
-            contents,
-        ));
-        if metadata.is_dir() {
-            let mut children: Vec<_> = fs::read_dir(path)
-                .unwrap()
-                .map(|entry| entry.unwrap().path())
-                .collect();
-            children.sort();
-            for child in children {
-                walk(base, &child, entries);
-            }
-        }
-    }
-    let base = root.join("var/lib/bloom/1000");
-    let mut entries = Vec::new();
-    for principal in ["broker", "signer", "machine"] {
-        walk(&base, &base.join(principal), &mut entries);
-    }
-    entries
+/// Upgrades that the candidate's declared state versions make forward-only.
+fn stage_forward_only_linux_upgrade(
+    directory: &Path,
+    harness: &Path,
+    mode: &str,
+    prepare: impl FnOnce(&Path),
+) -> (PathBuf, String, String, std::process::Output) {
+    let (root, _layout, old_digest, new_digest, staged) =
+        stage_linux_upgrade_root(directory, harness, mode, "all", prepare);
+    (root, old_digest, new_digest, staged)
 }
 
-/// A candidate that migrates durable state and then fails must leave the
-/// previous release's Broker, Signer, and Machine state byte-identical, both
-/// through the in-process rollback and through recovery of an interrupted
-/// upgrade. Without this, the 2026-10-29 rollback left the previous Broker
-/// unable to open its migrated journal.
+/// A candidate that declares a newer Broker state, or that upgrades a
+/// release with no state record, migrates state on its first start. When it
+/// then fails, neither the in-process rollback nor recovery may put the
+/// previous release back over that state.
 #[test]
-fn linux_upgrade_rollback_restores_service_state() {
+fn linux_forward_only_upgrade_failure_keeps_the_candidate() {
     let harness_directory = tempfile::tempdir().unwrap();
     let harness = write_linux_upgrade_harness(harness_directory.path());
     let installer = release_script("install-linux.sh");
+    fn drop_installed_record(root: &Path) {
+        let old_digest = hex::encode(Sha256::digest(b"test payload\n"));
+        fs::remove_file(root.join(format!(
+            "usr/libexec/bloom/releases/{old_digest}/compatibility-v1.toml"
+        )))
+        .unwrap();
+    }
+    let cases = [
+        (
+            "newer broker state",
+            raise_linux_candidate_broker_state as fn(&Path),
+        ),
+        ("no installed state record", drop_installed_record),
+    ];
+    for (case, prepare) in cases {
+        let directory = tempfile::tempdir().unwrap();
+        let (root, old_digest, new_digest, failed) =
+            stage_forward_only_linux_upgrade(directory.path(), &harness, "rollback", prepare);
+        let stderr = String::from_utf8_lossy(&failed.stderr);
+        assert!(!failed.status.success(), "{case}: {stderr}");
+        assert!(
+            stderr.contains("state migration is forward-only"),
+            "{case}: {stderr}"
+        );
+        let log = fs::read_to_string(directory.path().join("rollback-all.log")).unwrap();
+        assert!(!log.contains("start"), "{case}: {log}");
+        let transaction = root.join("var/lib/bloom/upgrade-transaction");
+        assert!(transaction.join("forward-only").is_file(), "{case}");
 
-    let rollback_root = tempfile::tempdir().unwrap();
-    let mut before = Vec::new();
-    let (root, _layout, old_digest, _new_digest, rolled_back) =
-        stage_linux_upgrade_root(rollback_root.path(), &harness, "rollback", "all", |root| {
-            write_linux_service_state(root);
-            before = linux_service_state(root);
-        });
-    assert!(
-        rolled_back.status.success(),
-        "{}",
-        String::from_utf8_lossy(&rolled_back.stderr)
-    );
-    assert_eq!(linux_service_state(&root), before);
-    let log = fs::read_to_string(rollback_root.path().join("rollback-all.log")).unwrap();
-    assert!(log.contains(&format!("start current=releases/{old_digest} ")));
-    assert!(!root.join("var/lib/bloom/upgrade-transaction").exists());
-
-    let interrupted_root = tempfile::tempdir().unwrap();
-    let mut before = Vec::new();
-    let (root, _layout, old_digest, new_digest, _) = stage_linux_upgrade_root(
-        interrupted_root.path(),
-        &harness,
-        "interrupt",
-        "all",
-        |root| {
-            write_linux_service_state(root);
-            before = linux_service_state(root);
-        },
-    );
-    assert_ne!(linux_service_state(&root), before);
-    let transaction = root.join("var/lib/bloom/upgrade-transaction");
-    assert_eq!(
-        fs::metadata(&transaction).unwrap().permissions().mode() & 0o777,
-        0o700,
-        "the state snapshot must stay inside the root-only transaction"
-    );
-    assert!(transaction.join("state/complete").is_file());
-    let recovered = run_linux_upgrade_harness(
-        &harness,
-        &installer,
-        &root,
-        "recover",
-        &interrupted_root.path().join("recover.log"),
-        &[&old_digest, &new_digest],
-    );
-    assert!(
-        recovered.status.success(),
-        "{}",
-        String::from_utf8_lossy(&recovered.stderr)
-    );
-    assert_eq!(linux_service_state(&root), before);
-    assert!(!transaction.exists());
-
-    // A snapshot interrupted before its completion marker was taken before
-    // any candidate binary was selected, so recovery leaves live state alone.
-    let partial_root = tempfile::tempdir().unwrap();
-    let (root, _layout, old_digest, new_digest, _) =
-        stage_linux_upgrade_root(partial_root.path(), &harness, "interrupt", "all", |root| {
-            write_linux_service_state(root);
-        });
-    let migrated = linux_service_state(&root);
-    fs::remove_file(root.join("var/lib/bloom/upgrade-transaction/state/complete")).unwrap();
-    let recovered = run_linux_upgrade_harness(
-        &harness,
-        &installer,
-        &root,
-        "recover",
-        &partial_root.path().join("recover.log"),
-        &[&old_digest, &new_digest],
-    );
-    assert!(
-        recovered.status.success(),
-        "{}",
-        String::from_utf8_lossy(&recovered.stderr)
-    );
-    assert_eq!(linux_service_state(&root), migrated);
+        let recover_log = directory.path().join("recover.log");
+        let recovered = run_linux_upgrade_harness(
+            &harness,
+            &installer,
+            &root,
+            "recover",
+            &recover_log,
+            &[&old_digest, &new_digest],
+        );
+        let stderr = String::from_utf8_lossy(&recovered.stderr);
+        assert!(recovered.status.success(), "{case}: {stderr}");
+        assert!(stderr.contains("forward-only"), "{case}: {stderr}");
+        assert_eq!(
+            fs::read_link(root.join("usr/libexec/bloom/current")).unwrap(),
+            PathBuf::from(format!("releases/{new_digest}")),
+            "{case}"
+        );
+        let log = fs::read_to_string(&recover_log).unwrap();
+        assert!(
+            log.contains(&format!("rewrite {new_digest} active")),
+            "{case}: {log}"
+        );
+        assert!(!log.contains("start"), "{case}: {log}");
+        assert!(!transaction.exists(), "{case}");
+    }
 }
 
-/// Once enrollments may become active, a candidate can accept signatures,
-/// counters, or revocations. Neither rollback nor recovery may then restore
-/// the older snapshot over that state.
+/// A process killed while deleting a forward-only transaction must not leave
+/// one that recovery would roll back over migrated state.
 #[test]
-fn linux_upgrade_rollback_keeps_state_the_candidate_could_serve() {
-    let linux = fs::read_to_string(release_script("install-linux.sh")).unwrap();
-    assert!(
-        linux.find("fence_linux_upgrade_state\n").unwrap()
-            < linux
-                .find("rewrite_linux_release_set \"$root\" \"$release_digest\" active")
-                .unwrap(),
-        "the state fence must be durable before any enrollment becomes active"
-    );
-    let harness_directory = tempfile::tempdir().unwrap();
-    let harness = write_linux_upgrade_harness(harness_directory.path());
-    let installer = release_script("install-linux.sh");
-
-    let rollback_root = tempfile::tempdir().unwrap();
-    let (root, _layout, old_digest, _new_digest, rolled_back) = stage_linux_upgrade_root(
-        rollback_root.path(),
-        &harness,
-        "published-rollback",
-        "all",
-        write_linux_service_state,
-    );
-    assert!(
-        rolled_back.status.success(),
-        "{}",
-        String::from_utf8_lossy(&rolled_back.stderr)
-    );
-    assert!(
-        String::from_utf8_lossy(&rolled_back.stderr).contains(
-            "rollback keeps Broker, Signer, and Machine state as the new release left it"
-        )
-    );
-    let state = linux_service_state(&root);
-    assert!(state.iter().any(|(path, _, contents)| {
-        path.ends_with("broker/journal.db") && contents == b"candidate journal format 3\n"
-    }));
-    let log = fs::read_to_string(rollback_root.path().join("published-rollback-all.log")).unwrap();
-    assert!(log.contains(&format!("start current=releases/{old_digest} ")));
-    assert!(!root.join("var/lib/bloom/upgrade-transaction").exists());
-
-    let interrupted_root = tempfile::tempdir().unwrap();
-    let (root, _layout, old_digest, new_digest, interrupted) = stage_linux_upgrade_root(
-        interrupted_root.path(),
-        &harness,
-        "published-interrupt",
-        "all",
-        write_linux_service_state,
-    );
-    assert!(interrupted.status.success());
-    let published = linux_service_state(&root);
-    let recovered = run_linux_upgrade_harness(
-        &harness,
-        &installer,
-        &root,
-        "recover",
-        &interrupted_root.path().join("recover.log"),
-        &[&old_digest, &new_digest],
-    );
-    assert!(
-        recovered.status.success(),
-        "{}",
-        String::from_utf8_lossy(&recovered.stderr)
-    );
-    assert_eq!(linux_service_state(&root), published);
-    assert!(!root.join("var/lib/bloom/upgrade-transaction").exists());
-}
-
-/// A process killed while deleting a finished transaction must not leave a
-/// partial snapshot that recovery would restore over intact state.
-#[test]
-fn linux_upgrade_interrupted_cleanup_never_restores_a_partial_snapshot() {
+fn linux_upgrade_interrupted_cleanup_never_rolls_back_a_forward_only_upgrade() {
     let harness_directory = tempfile::tempdir().unwrap();
     let harness = write_linux_upgrade_harness(harness_directory.path());
     let directory = tempfile::tempdir().unwrap();
-    let mut before = Vec::new();
-    let (root, _layout, old_digest, new_digest, killed) = stage_linux_upgrade_root(
-        directory.path(),
-        &harness,
-        "rollback-cleanup-killed",
-        "all",
-        |root| {
-            write_linux_service_state(root);
-            before = linux_service_state(root);
-        },
-    );
+    let (root, old_digest, new_digest, killed) =
+        stage_forward_only_linux_upgrade(directory.path(), &harness, "finish-killed", |root| {
+            raise_linux_candidate_broker_state(root)
+        });
     assert!(!killed.status.success());
-    assert_eq!(linux_service_state(&root), before);
     let recovered = run_linux_upgrade_harness(
         &harness,
         &release_script("install-linux.sh"),
@@ -4322,12 +4162,9 @@ fn linux_upgrade_interrupted_cleanup_never_restores_a_partial_snapshot() {
         &directory.path().join("recover.log"),
         &[&old_digest, &new_digest],
     );
-    assert!(
-        recovered.status.success(),
-        "{}",
-        String::from_utf8_lossy(&recovered.stderr)
-    );
-    assert_eq!(linux_service_state(&root), before);
+    let stderr = String::from_utf8_lossy(&recovered.stderr);
+    assert!(recovered.status.success(), "{stderr}");
+    assert!(!stderr.contains("restoring"), "{stderr}");
     let leftovers: Vec<_> = fs::read_dir(root.join("var/lib/bloom"))
         .unwrap()
         .map(|entry| entry.unwrap().file_name())
