@@ -18,7 +18,7 @@ const TRUSTED_GITHUB_OWNER: &str = "bloom-directory";
 // Retain a bounded diagnostic tail for reconciliation after streamed output.
 const SOURCE_BUILD_STREAM_LIMIT: usize = 256 * 1024;
 const NEAR_INTENTS_RELEASE_COMMIT: &str = "4dc28dbe7a6d48435ff16dab7e24b33bd3d0b413";
-const ENSO_RELEASE_COMMIT: &str = "7bbe03770721c7cfdbe6c7c34a9b1665ae2eec9f";
+const ENSO_RELEASE_COMMIT: &str = "7b4039f7943011d6af7adfc5c8ac151ddcf88392";
 
 /// Canonical defaults for every Bloom home, independent of persisted config.
 pub(crate) const DEFAULT_PETALS: &[&str] = &[
@@ -391,10 +391,21 @@ pub(crate) fn release_lineage_predecessors(name: &str) -> &'static [ReleaseLinea
             authority_routes: HYPERLIQUID_V0_1_7_AUTHORITY_ROUTES,
         },
     ];
-    const ENSO: &[ReleaseLineagePredecessor] = &[baseline(
-        "97650f327691f01bc4591cde25253d1e20010643e700674cc9759cd1366876b9",
-        &[],
-    )];
+    const ENSO: &[ReleaseLineagePredecessor] = &[
+        baseline(
+            "97650f327691f01bc4591cde25253d1e20010643e700674cc9759cd1366876b9",
+            &[],
+        ),
+        // v0.1.6, pinned by Bloom v0.4.0 and v0.4.1.
+        ReleaseLineagePredecessor {
+            hash: "e6ffbfdc96c5fa9b5fe5b62dc0c373b2522fb31d216a5a33ea2e1dab21c082a0",
+            release_sequence: 2,
+            predecessor_package_hashes: &[
+                "97650f327691f01bc4591cde25253d1e20010643e700674cc9759cd1366876b9",
+            ],
+            authority_routes: &[],
+        },
+    ];
     const NEAR_INTENTS: &[ReleaseLineagePredecessor] = &[baseline(
         "ac2ccab59f36ee863843f92aaf0c975c00dbf32b246df5ccbb79757093785921",
         &[],
@@ -442,11 +453,11 @@ const PREINSTALLED_POLYMARKET: PreinstalledPetal = PreinstalledPetal {
 const PREINSTALLED_HYPERLIQUID: PreinstalledPetal = PreinstalledPetal {
     name: "hyperliquid",
     repository: "https://github.com/bloom-directory/bloom-petal-hyperliquid",
-    commit: "d815a5dc812479ef83362d753ccb31a477ef5a65",
-    release_tag: "v0.1.8",
-    archive: "hyperliquid-v0.1.8.petal.tar.gz",
-    expected_hash: Some("ff5424e09d5a6548798e5cc8df7c0241d6e69976341cabe83813323979a57660"),
-    archive_sha256: "9ca9dbd7945ee421ea5dc065714ed0553b36f2c5144f55a13e43ef8b151de85f",
+    commit: "01a74c76557a97c4499ca129336b7155b3d9cb16",
+    release_tag: "v0.1.9",
+    archive: "hyperliquid-v0.1.9.petal.tar.gz",
+    expected_hash: Some("d811c181c7ec469026335c9265d7019a520d8d9d882b302064278cf1138d2db2"),
+    archive_sha256: "5f28e44c56df84cd86c4caf1fcf64963f93f943d9bf29477998b399b0488a038",
     tooling_commit: "2beed2ff344ce2b0c112e07096027e1ae0404007",
     petal_abi: "bloom.petal-host/payload-signing-v1",
     default_eligible: true,
@@ -499,17 +510,18 @@ const PREINSTALLED_ENSO: PreinstalledPetal = PreinstalledPetal {
     name: "enso",
     repository: "https://github.com/bloom-directory/bloom-petal-enso",
     commit: ENSO_RELEASE_COMMIT,
-    release_tag: "v0.1.6",
-    archive: "enso-v0.1.6.petal.tar.gz",
-    expected_hash: Some("e6ffbfdc96c5fa9b5fe5b62dc0c373b2522fb31d216a5a33ea2e1dab21c082a0"),
-    archive_sha256: "1dfe18aeb3646b3edbed56e80a33da205aed36b9651b95f4fc0fb12da1a10f4e",
+    release_tag: "v0.1.7",
+    archive: "enso-v0.1.7.petal.tar.gz",
+    expected_hash: Some("14d25e95d7fdede23320e0a17e786bb16d530547ecb67e73d0f4bbc974964b20"),
+    archive_sha256: "eee216baf4b5215dfe42d28b7b09e70bccac824f17d901260fe9a4335b89cfef",
     tooling_commit: "2beed2ff344ce2b0c112e07096027e1ae0404007",
     petal_abi: "bloom.petal-host/triad-compatible-nonauthority-v1",
     default_eligible: true,
     lineage_id: None,
-    release_sequence: 2,
+    release_sequence: 3,
     predecessor_package_hashes: &[
         "97650f327691f01bc4591cde25253d1e20010643e700674cc9759cd1366876b9",
+        "e6ffbfdc96c5fa9b5fe5b62dc0c373b2522fb31d216a5a33ea2e1dab21c082a0",
     ],
     authority_routes: &[],
 };
@@ -2137,9 +2149,9 @@ mod tests {
         assert_eq!(near.archive, "near-intents-v0.1.4.petal.tar.gz");
         assert!(near.repository.ends_with("/bloom-petal-near"));
         let enso = preinstalled_petal("enso").unwrap();
-        assert_eq!(enso.release_tag, "v0.1.6");
+        assert_eq!(enso.release_tag, "v0.1.7");
         assert_eq!(enso.commit, ENSO_RELEASE_COMMIT);
-        assert_eq!(enso.archive, "enso-v0.1.6.petal.tar.gz");
+        assert_eq!(enso.archive, "enso-v0.1.7.petal.tar.gz");
         assert!(enso.repository.ends_with("/bloom-petal-enso"));
         for name in [
             "polymarket",
