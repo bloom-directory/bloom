@@ -44,6 +44,13 @@ directory and inspect the resulting projection before retrying or continuing.
 
 Use the error class to decide what to inspect. An error alone does not establish
 whether an earlier operation completed or whether retrying a write is safe.
+When a Petal route refuses a write under `petals/<name>/`, its reason is kept
+in `petals/<name>/last_error.json`; read it and fix the request rather than
+repeating it. The record names the `path` it describes and the `at_ms` it was
+written: a write the mount rejects before the route runs records nothing, so an
+older record left by a different attempt can still be there. Check both fields
+against the write you just made, and treat no record as no information — never
+as a write that succeeded.
 
 - **No such file or directory** — the path is absent in the requested state.
   A discarded transfer or one that advanced out of `pending/` no longer has its
@@ -62,6 +69,7 @@ whether an earlier operation completed or whether retrying a write is safe.
   request (same bytes, same operation id) to reconcile it; never rebuild the
   operation under a new identifier, and never rebroadcast, until the earlier
   attempt is confirmed not to have landed.
+- **Invalid argument** — the target rejected what you wrote.
 - **Input/output error** — a backend or I/O operation failed. Inspect action
   state and diagnostics before considering a retry. On an EVM outbox confirm,
   read `last_error.json` beside the pending entry: it gives the refusal and the
