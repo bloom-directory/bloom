@@ -3063,10 +3063,14 @@ fn response_mismatch(method: &str) -> ProtocolError {
 // The service API flattens local frame errors and Broker refusals. A frame
 // failure after dispatch cannot prove the Broker did not sign. Conservatively
 // retain the operation even when the same code could be a remote refusal.
+// `UnknownField` is raised by strict decoding of the response frame, which
+// happens only after the request was written.
 fn uncertain_signing_response(error: ProtocolError) -> ProtocolError {
     if matches!(
         error.code,
-        ProtocolErrorCode::MalformedFrame | ProtocolErrorCode::LimitExceededFrame
+        ProtocolErrorCode::MalformedFrame
+            | ProtocolErrorCode::LimitExceededFrame
+            | ProtocolErrorCode::UnknownField
     ) {
         service_unavailable(
             "Broker signing response frame unavailable; retain the operation identity",
@@ -3130,6 +3134,7 @@ mod tests {
         for code in [
             ProtocolErrorCode::MalformedFrame,
             ProtocolErrorCode::LimitExceededFrame,
+            ProtocolErrorCode::UnknownField,
         ] {
             assert_eq!(
                 super::uncertain_signing_response(ProtocolError::new(code, "reply lost")).code,
@@ -5886,5 +5891,62 @@ mod tests {
             .await
             .expect_err("a root-signing wallet has no derived account to select");
         assert_eq!(error.code, ProtocolErrorCode::KeyrefMismatch);
+    }
+
+    /// A response that fails strict decoding after `signing.sign` or
+    /// `signing.sign_batch` was written cannot prove the Broker did not sign,
+    /// so both must surface as retryable `ServiceUnavailable`, which keeps the
+    /// operation identity and dispatch marker for reconciliation.
+    struct UndecodableSigningResponseBroker;
+
+    impl MachineBrokerService for UndecodableSigningResponseBroker {
+        fn dispatch<'a>(
+            &'a self,
+            _request: MachineBrokerRequest,
+        ) -> ServiceFuture<'a, MachineBrokerResponse> {
+            Box::pin(async {
+                Err(ProtocolError::new(
+                    ProtocolErrorCode::UnknownField,
+                    "response frame carried an unknown field",
+                ))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn undecodable_signing_response_keeps_single_and_batch_identity() {
+        let client = MachineBrokerClient::new(Arc::new(UndecodableSigningResponseBroker));
+        let request = |payloads| MachineSignRequest {
+            operation_id: OperationId::from_bytes([94; 32]),
+            operation_digest: digest(95),
+            approval_id: digest(96),
+            key_ref: key_ref(),
+            crypto_suite: CryptoSuite::Secp256k1Keccak256Recoverable,
+            payloads,
+            petal_use_claim: None,
+            system_use_claim: None,
+            claim_assurance_evidence: None,
+            provenance: ProvenanceSubject::System {
+                component_id: token("bloom-machine"),
+                operation_class: token("evm.transaction"),
+            },
+        };
+        let single = client
+            .sign(request(SigningPayloads::Single {
+                payload: Base64UrlBytes::from_bytes(b"payload"),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(single.code, ProtocolErrorCode::ServiceUnavailable);
+        let batch = client
+            .sign_batch(request(SigningPayloads::Batch {
+                children: vec![
+                    Base64UrlBytes::from_bytes(b"first"),
+                    Base64UrlBytes::from_bytes(b"second"),
+                ],
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(batch.code, ProtocolErrorCode::ServiceUnavailable);
     }
 }
