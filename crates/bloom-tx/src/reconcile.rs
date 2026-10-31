@@ -438,6 +438,16 @@ impl Reconciler {
                 .map(|attempt| attempt.tx_hash)
         };
         let file = |name: &str| std::fs::read_to_string(dir.join(name)).ok();
+        // A node-refused fee repair is retired but its bytes may still mine.
+        let retired_prefix = format!(
+            "{}.rejected-",
+            BroadcastAttemptKind::Replacement.marker_name()
+        );
+        let retired = std::fs::read_dir(&dir).into_iter().flatten().flatten();
+        let retired = retired.filter_map(|item| {
+            let name = item.file_name().into_string().ok()?;
+            Some((Some(name.strip_prefix(&retired_prefix)?.to_owned()), false))
+        });
         let mut out: Vec<(alloy::primitives::B256, bool)> = Vec::new();
         for (hash, cancel) in [
             (file("cancel_tx_hash"), true),
@@ -445,7 +455,10 @@ impl Reconciler {
             (marker(BroadcastAttemptKind::Confirm), false),
             (marker(BroadcastAttemptKind::Replacement), false),
             (file("replacement_tx_hash"), false),
-        ] {
+        ]
+        .into_iter()
+        .chain(retired)
+        {
             if let Some(hash) = hash.and_then(|hash| hash.trim().parse().ok())
                 && hash != entry.hash
                 && !out.iter().any(|(seen, _)| *seen == hash)
@@ -1038,6 +1051,47 @@ mod tests {
         assert_eq!(receipt.outcome, "success");
         assert_eq!(receipt.tx_hash, original);
         assert_eq!(reconciler.tick().await, 0);
+    }
+
+    /// A refused fee repair is retired, but its signed bytes may still be
+    /// mined. Its retained hash settles the row.
+    #[tokio::test]
+    async fn a_retired_rejected_attempt_still_settles_the_row() {
+        let (_directory, outbox) = sent_outbox();
+        let entry = outbox.read("alice", "anvil", "tx-1").unwrap();
+        let rejected = format!("{:#x}", alloy::primitives::B256::repeat_byte(9));
+        let attempt = BroadcastAttempt {
+            schema: "bloom.broadcast_attempted.v1".into(),
+            tx_hash: rejected.clone(),
+            raw_tx_blake3: String::new(),
+            raw_tx_path: BroadcastAttemptKind::Replacement.raw_name().into(),
+            from: entry.staged.from.clone(),
+            to: entry.staged.to.clone(),
+            nonce: 0,
+            chain_id: 31337,
+            created_ms: 0,
+            transport: crate::outbox::BroadcastTransport::PublicRpc,
+            private_provider: None,
+        };
+        outbox
+            .write_broadcast_attempt(&entry, BroadcastAttemptKind::Replacement, &attempt)
+            .unwrap();
+        outbox
+            .set_aside_rejected_attempt(&entry, BroadcastAttemptKind::Replacement, "ceremony.json")
+            .unwrap();
+        let audit_directory = tempfile::tempdir().unwrap();
+        let audit = Arc::new(AuditLog::open(audit_directory.path().join("audit.jsonl")).unwrap());
+        let mut rpc = MockRpc::new(Some(1), mined_receipt());
+        rpc.receipt_hash = Some(rejected.clone());
+        let chains = ChainRegistry::default();
+        chains.add(mock_chain(rpc).await);
+        let reconciler = Reconciler::new(outbox.clone(), chains, audit);
+        assert_eq!(reconciler.tick().await, 1);
+        let receipt = outbox
+            .read_receipt("alice", "anvil", "tx-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.tx_hash, rejected);
     }
 
     #[tokio::test]

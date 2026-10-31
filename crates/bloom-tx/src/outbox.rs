@@ -583,9 +583,10 @@ impl Outbox {
         }
     }
 
-    /// Rename a node-rejected attempt's signing record, marker and raw bytes
-    /// to `<name>.rejected-<tx hash>`. They stay as evidence, but no longer
-    /// count as an attempt a later write must replay.
+    /// Retire a node-rejected attempt so a later write signs a new one
+    /// instead of replaying it. Its marker stays as non-executable evidence
+    /// at `<marker>.rejected-<tx hash>`, which the receipt reconciler still
+    /// follows; the signing record is hidden and the raw bytes are deleted.
     pub fn set_aside_rejected_attempt(
         &self,
         entry: &OutboxEntry,
@@ -597,19 +598,22 @@ impl Outbox {
         };
         let suffix = format!("rejected-{}", attempt.tx_hash);
         // The marker moves after the signing record: until it does, a retry
-        // replays the refused bytes and, refused again, finishes this. Orphan
-        // raw bytes are read by nothing without a marker.
-        for name in [signing_record, kind.marker_name(), kind.raw_name()] {
-            match fs::rename(
-                entry.dir.join(name),
-                entry.dir.join(format!("{name}.{suffix}")),
-            ) {
+        // replays the refused bytes and, refused again, finishes this. The
+        // raw bytes go last; without a marker nothing reads them.
+        for (name, retired) in [
+            (signing_record, format!(".{signing_record}.{suffix}")),
+            (
+                kind.marker_name(),
+                format!("{}.{suffix}", kind.marker_name()),
+            ),
+        ] {
+            match fs::rename(entry.dir.join(name), entry.dir.join(retired)) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e.into()),
             }
         }
-        Ok(())
+        self.remove_broadcast_raw_tx(entry, kind)
     }
 
     pub fn broadcast_attempts_for_nonce(

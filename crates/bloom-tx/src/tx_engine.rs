@@ -3403,8 +3403,10 @@ impl TxEngine {
                             };
                         if !recorded && !unsigned {
                             return Err(TxEngineError::ApprovalState(format!(
-                                "signing operation {} for action {} was dispatched but its signature is not recorded; retry that action to reconcile it before starting another",
-                                state.signing_operation_id, state.action_id
+                                "signing operation {} for action {} was dispatched but its signature is not recorded; {} to reconcile it before starting another",
+                                state.signing_operation_id,
+                                state.action_id,
+                                retry_instruction(&state.action_id)
                             )));
                         }
                         new_state()?
@@ -4352,15 +4354,12 @@ impl TxEngine {
             self.ensure_dependency_satisfied(wallet, chain_name, dep_id)?;
         }
         let original = &entry.staged;
-        self.assert_nonce_still_replaceable(
-            chain,
-            original
-                .from
-                .parse()
-                .map_err(|e: alloy::hex::FromHexError| TxEngineError::Address(e.to_string()))?,
-            original.nonce,
-        )
-        .await?;
+        let from: Address = original
+            .from
+            .parse()
+            .map_err(|e: alloy::hex::FromHexError| TxEngineError::Address(e.to_string()))?;
+        self.assert_nonce_still_replaceable(chain, from, original.nonce)
+            .await?;
 
         let mut bumped = original.clone();
         bumped.status = TxStatus::Pending;
@@ -4388,6 +4387,25 @@ impl TxEngine {
         }
         bumped.max_fee_per_gas = Some(fees.max_fee_per_gas.to_string());
         bumped.max_priority_fee_per_gas = Some(fees.max_priority_fee_per_gas.to_string());
+        // The higher cap raises the worst-case gas cost: recheck funding at
+        // the new cap, so policy denies an unaffordable repair before any
+        // ceremony. An unreadable balance leaves the check to the node.
+        bumped
+            .policy_checks
+            .retain(|check| check.rule != "balance.native_funds");
+        if let Ok(available) = chain.balance(from).await {
+            let spec = chain.spec();
+            bumped.policy_checks.extend(insufficient_native_funds_check(
+                &bumped.from,
+                spec.display_name.as_deref().unwrap_or(&spec.name),
+                &spec.native_symbol,
+                spec.native_decimals,
+                available,
+                U256::from_str_radix(&bumped.value_wei, 10).unwrap_or(U256::ZERO),
+                bumped.gas_limit,
+                fees.max_fee_per_gas,
+            ));
+        }
         // Same pre-broadcast simulation as confirm, before any ceremony.
         self.simulate_or_reject(&bumped, chain).await?;
         self.outbox.write_artefact(
@@ -4451,10 +4469,6 @@ impl TxEngine {
         // move to sent may fail the call.
         let bumped =
             self.finalize_sent(&entry, bumped, tx_hash, EvmOutboxActionKind::Replace, chain)?;
-        let updated_entry = self.outbox.read(wallet, chain_name, original_id)?;
-        let _ = self
-            .outbox
-            .remove_broadcast_raw_tx(&updated_entry, BroadcastAttemptKind::Replacement);
         info!(
             id = %original.id,
             replacement = %bumped.tx_hash.as_deref().unwrap_or(""),
@@ -4651,7 +4665,11 @@ fn bump_fees_in_place(staged: &mut StagedTx, pct: u32) {
     fn bump_one(s: &Option<String>, pct: u32) -> Option<String> {
         s.as_deref().and_then(|x| {
             let v = x.parse::<u128>().ok()?;
-            let bump = v.saturating_mul(pct as u128) / 100;
+            // Ceiling of v * pct / 100, split so the product cannot overflow.
+            let pct = u128::from(pct);
+            let bump = (v / 100)
+                .saturating_mul(pct)
+                .saturating_add((v % 100 * pct).div_ceil(100));
             let bumped = v.saturating_add(bump.max(1));
             Some(bumped.to_string())
         })
@@ -5227,6 +5245,7 @@ fn node_rejected_before_acceptance(error: &ChainError) -> bool {
             "underpriced",
             "fee cap less than block base fee",
             "max fee per gas less than block base fee",
+            "insufficient funds",
         ]
         .iter()
         .any(|reason| message.contains(reason))
@@ -5250,6 +5269,19 @@ fn signing_action_broadcast_kind(action_id: &str) -> BroadcastAttemptKind {
         BroadcastAttemptKind::CancelReplacement
     } else {
         BroadcastAttemptKind::Confirm
+    }
+}
+
+/// The write that resumes a signing lineage's action on its pending entry.
+fn retry_instruction(action_id: &str) -> &'static str {
+    match signing_action_broadcast_kind(action_id) {
+        BroadcastAttemptKind::Replacement => {
+            "write the same fee pair (replacement_request.json) to this entry's replace control again"
+        }
+        BroadcastAttemptKind::CancelReplacement => {
+            "write cancel to this entry's cancel control again"
+        }
+        BroadcastAttemptKind::Confirm => "write confirm to this entry's confirm control again",
     }
 }
 
@@ -7716,6 +7748,16 @@ mod tests {
             })
             .collect();
         assert_eq!(rejected.len(), 1, "the refused attempt stays as evidence");
+        // Only non-executable metadata stays public: the raw signed bytes
+        // are deleted and the signing record is hidden.
+        for item in std::fs::read_dir(&pending.dir).unwrap().flatten() {
+            let name = item.file_name().to_string_lossy().into_owned();
+            assert!(
+                !name.contains(BroadcastAttemptKind::Replacement.raw_name())
+                    && !name.starts_with(TRIAD_SIGNING_STATE_FILE),
+                "{name}"
+            );
+        }
 
         // The higher fees need their own approval, then sign a new attempt.
         f.fixture.active.store(false, Ordering::SeqCst);
@@ -7743,15 +7785,17 @@ mod tests {
         assert_eq!(sent.state, OutboxState::Sent);
     }
 
-    /// Retiring a refused repair renames its signing record, marker and raw
-    /// bytes. If the process stops before the marker moves, the next
-    /// higher-fee repair is refused once more, finishes the retirement, and
-    /// the one after that starts a fresh approval.
+    /// Retiring a refused repair hides its signing record, renames its
+    /// marker and deletes its raw bytes. If the process stops before the
+    /// marker moves, the next higher-fee repair is refused once more,
+    /// finishes the retirement, and the one after that starts a fresh
+    /// approval.
     #[tokio::test]
     async fn interrupted_rejection_retirement_finishes_on_the_next_repair() {
         for signing_record_moved in [false, true] {
             let underpriced =
                 r#"error:{"code":-32000,"message":"replacement transaction underpriced"}"#;
+            let timeout = r#"error:{"code":-32000,"message":"request timed out"}"#;
             let url = spawn_queued_rpc(HashMap::from([
                 (
                     "eth_chainId".to_string(),
@@ -7761,33 +7805,39 @@ mod tests {
                 ("eth_getTransactionCount".into(), vec!["\"0x0\"".into(); 40]),
                 ("eth_getTransactionByHash".into(), vec!["null".into(); 40]),
                 ("eth_getTransactionReceipt".into(), vec!["null".into(); 40]),
-                ("eth_sendRawTransaction".into(), vec![underpriced.into(); 2]),
+                (
+                    "eth_sendRawTransaction".into(),
+                    vec![timeout.into(), underpriced.into(), underpriced.into()],
+                ),
             ]))
             .await;
             let f = fee_repair_fixture(&url, |_| {});
             let _ = f.repair(repair_fees("500", "250")).await;
             f.fixture.active.store(true, Ordering::SeqCst);
+            // An ambiguous send keeps the bytes; the replay is refused.
+            assert!(f.repair(repair_fees("500", "250")).await.is_err());
+            let dir = f.outbox.read("alice", "anvil", "fee-repair").unwrap().dir;
+            let raw_path = dir.join(BroadcastAttemptKind::Replacement.raw_name());
+            let raw = std::fs::read(&raw_path).unwrap();
             assert!(matches!(
                 f.repair(repair_fees("500", "250")).await,
                 Err(TxEngineError::Chain(_))
             ));
+            assert!(!raw_path.exists());
             // Undo the retirement, as if the process stopped part way.
-            let dir = f.outbox.read("alice", "anvil", "fee-repair").unwrap().dir;
-            let mut names = vec![
-                BroadcastAttemptKind::Replacement.marker_name(),
-                BroadcastAttemptKind::Replacement.raw_name(),
-            ];
+            std::fs::write(&raw_path, raw).unwrap();
+            let mut names = vec![("", BroadcastAttemptKind::Replacement.marker_name())];
             if !signing_record_moved {
-                names.push(TRIAD_SIGNING_STATE_FILE);
+                names.push((".", TRIAD_SIGNING_STATE_FILE));
             }
-            for name in names {
+            for (hidden, name) in names {
                 let retired = std::fs::read_dir(&dir)
                     .unwrap()
                     .flatten()
                     .find(|e| {
                         e.file_name()
                             .to_string_lossy()
-                            .starts_with(&format!("{name}.rejected-"))
+                            .starts_with(&format!("{hidden}{name}.rejected-"))
                     })
                     .unwrap();
                 std::fs::rename(retired.path(), dir.join(name)).unwrap();
@@ -7806,6 +7856,61 @@ mod tests {
                 "{fresh:?}"
             );
         }
+    }
+
+    /// Higher fee caps raise the worst-case gas cost. A repair the account
+    /// cannot afford is denied before any ceremony; a node's
+    /// insufficient-funds refusal retires the attempt instead of wedging
+    /// the row on the same unaffordable bytes.
+    #[tokio::test]
+    async fn fee_repair_rechecks_native_funds_and_retires_an_unaffordable_attempt() {
+        let base = || {
+            HashMap::from([
+                (
+                    "eth_chainId".to_string(),
+                    vec!["\"0x7a69\"".to_string(); 40],
+                ),
+                ("eth_call".into(), vec!["\"0x\"".into(); 40]),
+                ("eth_getTransactionCount".into(), vec!["\"0x0\"".into(); 40]),
+                ("eth_getTransactionByHash".into(), vec!["null".into(); 40]),
+                ("eth_getTransactionReceipt".into(), vec!["null".into(); 40]),
+            ])
+        };
+        let mut poor = base();
+        poor.insert("eth_getBalance".into(), vec!["\"0x1\"".into(); 4]);
+        let f = fee_repair_fixture(&spawn_queued_rpc(poor).await, |_| {});
+        f.fixture.active.store(true, Ordering::SeqCst);
+        let denied = f.repair(repair_fees("500", "250")).await;
+        assert!(
+            matches!(&denied, Err(TxEngineError::ApprovalDenied(reason))
+                if reason.contains("balance.native_funds")),
+            "{denied:?}"
+        );
+        assert!(f.fixture.requests.lock().is_empty());
+
+        let mut refused = base();
+        refused.insert(
+            "eth_sendRawTransaction".into(),
+            vec![
+                r#"error:{"code":-32000,"message":"insufficient funds for gas * price + value"}"#
+                    .into(),
+            ],
+        );
+        let f = fee_repair_fixture(&spawn_queued_rpc(refused).await, |_| {});
+        let _ = f.repair(repair_fees("500", "250")).await;
+        f.fixture.active.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            f.repair(repair_fees("500", "250")).await,
+            Err(TxEngineError::Chain(_))
+        ));
+        let pending = f.outbox.read("alice", "anvil", "fee-repair").unwrap();
+        assert!(
+            f.outbox
+                .read_broadcast_attempt(&pending, BroadcastAttemptKind::Replacement)
+                .unwrap()
+                .is_none(),
+            "a refused unaffordable attempt must not be replayed"
+        );
     }
 
     /// Stages central actions but cannot write their result or status.
@@ -7877,7 +7982,7 @@ mod tests {
 
         let error = f.repair(repair_fees("500", "250")).await.unwrap_err();
         assert!(
-            matches!(&error, TxEngineError::ApprovalState(message) if message.contains("not recorded")),
+            matches!(&error, TxEngineError::ApprovalState(message) if message.contains("not recorded") && message.contains("write confirm to this entry's confirm control")),
             "{error}"
         );
         let kept = read_triad_signing_state(&entry.dir.join(TRIAD_SIGNING_STATE_FILE))
@@ -7888,6 +7993,26 @@ mod tests {
         // Retrying the dispatched action collects its signature and sends it.
         let sent = f.confirm().await.unwrap();
         assert_eq!(sent.status, TxStatus::Sent);
+    }
+
+    /// The refusal names the write that resumes the uncollected action: a
+    /// fee repair is resumed through `replace`, not `confirm`.
+    #[tokio::test]
+    async fn an_uncollected_fee_repair_names_the_replace_write() {
+        let url = spawn_batch_rpc(None).await;
+        let f = fee_repair_fixture(&url, |_| {});
+        let _ = f.repair(repair_fees("500", "250")).await;
+        f.fixture.active.store(true, Ordering::SeqCst);
+        f.fixture
+            .lose_sign_response_once
+            .store(true, Ordering::SeqCst);
+        assert!(f.repair(repair_fees("500", "250")).await.is_err());
+        let error = f.confirm().await.unwrap_err();
+        assert!(
+            matches!(&error, TxEngineError::ApprovalState(message)
+                if message.contains("replacement_request.json) to this entry's replace control")),
+            "{error}"
+        );
     }
 
     #[tokio::test]
@@ -9689,9 +9814,15 @@ mod tests {
         bump_fees_in_place(&mut s, 15);
         // 100 * 1.15 = 115; integer math: 100 + (100*15/100) = 115.
         assert_eq!(s.max_fee_per_gas.as_deref(), Some("115"));
-        // 10 * 1.15 = 11.5 — integer math: 10 + (10*15/100=1) = 11.
-        // But our bump-one floors the bump at 1 wei.
-        assert_eq!(s.max_priority_fee_per_gas.as_deref(), Some("11"));
+        // 10 * 1.15 = 11.5; the bump rounds up so it is never below pct.
+        assert_eq!(s.max_priority_fee_per_gas.as_deref(), Some("12"));
+        let mut s = fake_staged_1559("b");
+        s.max_fee_per_gas = Some("109".into());
+        bump_fees_in_place(&mut s, 10);
+        assert_eq!(s.max_fee_per_gas.as_deref(), Some("120"));
+        s.max_fee_per_gas = Some(u128::MAX.to_string());
+        bump_fees_in_place(&mut s, 10);
+        assert_eq!(s.max_fee_per_gas, Some(u128::MAX.to_string()));
     }
 
     #[test]
