@@ -3496,6 +3496,11 @@ impl TxEngine {
                 if state.approval_id.is_some() && signing_refusal_releases_reservation(error.code) {
                     // Approval and operation IDs are immutable: clearing only
                     // the dispatch marker would reuse the same dead request.
+                    // Record the refusal first: after expiry no fresh lineage
+                    // can be prepared, and the entry is then provably unsigned.
+                    state.sign_dispatched = false;
+                    state.expected_operation_digest = None;
+                    write_triad_signing_state(&state_path, &state)?;
                     state = new_state()?;
                     write_triad_signing_state(&state_path, &state)?;
                 }
@@ -3857,6 +3862,9 @@ impl TxEngine {
                 // Match single-payload recovery: preserve retryable or
                 // ambiguous outcomes, replace definite permanent refusals.
                 if state.approval_id.is_some() && signing_refusal_releases_reservation(error.code) {
+                    state.sign_dispatched = false;
+                    state.expected_operation_digest = None;
+                    write_triad_batch_signing_state(&state_path, &state)?;
                     state = new_state()?;
                     write_triad_batch_signing_state(&state_path, &state)?;
                 }
@@ -8386,6 +8394,43 @@ mod tests {
         assert_eq!(reissued.signing_operation_id, state.signing_operation_id);
         assert!(reissued.approval_id.is_some());
         assert_ne!(reissued.approval_id, first.approval_id);
+    }
+
+    #[tokio::test]
+    async fn a_refusal_after_expiry_still_records_the_entry_unsigned() {
+        let (engine, fixture, entry, mut staged, preimage, signing_hash, _outbox_dir) =
+            single_material("triad-refused-expired", false);
+        let sign = |staged: StagedTx| {
+            let (engine, entry, preimage) = (&engine, &entry, &preimage);
+            async move {
+                engine
+                    .triad_sign_evm_payload(
+                        entry,
+                        &staged,
+                        EvmOutboxActionKind::Confirm,
+                        preimage,
+                        signing_hash,
+                    )
+                    .await
+            }
+        };
+        assert!(matches!(
+            sign(staged.clone()).await,
+            Err(TxEngineError::ApprovalRequired(_))
+        ));
+        fixture.active.store(true, Ordering::SeqCst);
+        *fixture.deny_sign.lock() = Some(ProtocolErrorCode::LimitExceededValue);
+        // The staged deadline passes while the request is in flight, so no
+        // fresh lineage can be prepared after the refusal.
+        staged.expires_ms = now_ms() - 1;
+        assert!(sign(staged).await.is_err());
+        let state = read_triad_signing_state(&entry.dir.join(TRIAD_SIGNING_STATE_FILE))
+            .unwrap()
+            .unwrap();
+        // A refusal proves no signature exists; a stale marker would make the
+        // expired entry look possibly signed and block its discard.
+        assert!(!state.sign_dispatched);
+        assert!(state.expected_operation_digest.is_none());
     }
 
     #[tokio::test]
