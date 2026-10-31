@@ -7791,7 +7791,8 @@ mod tests {
         let fixture = Arc::new(TriadBrokerFixture {
             active: AtomicBool::new(false),
             approval_terminal: parking_lot::Mutex::new(None),
-            signing_terminal: parking_lot::Mutex::new(None),
+            deny_sign: parking_lot::Mutex::new(None),
+            operation_terminal: parking_lot::Mutex::new(None),
             lose_sign_response_once: AtomicBool::new(false),
             corrupt_status_result: AtomicBool::new(false),
             completed_result: parking_lot::Mutex::new(None),
@@ -10041,6 +10042,9 @@ mod tests {
         let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
         let (engine, fixture, _) = triad_batch_fixture(outbox.clone(), false, false);
         let (refs, staged, preimages, hashes) = batch_material(&["refused-a", "refused-b"]);
+        for plan in &staged {
+            outbox.write_pending(plan, "p").unwrap();
+        }
 
         assert!(matches!(
             engine
@@ -10153,6 +10157,9 @@ mod tests {
             let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
             let (engine, fixture, _) = triad_batch_fixture(outbox.clone(), false, true);
             let (refs, staged, preimages, hashes) = batch_material(&["terminal-a", "terminal-b"]);
+            for plan in &staged {
+                outbox.write_pending(plan, "p").unwrap();
+            }
 
             assert!(matches!(
                 engine
