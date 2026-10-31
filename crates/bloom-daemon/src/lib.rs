@@ -2915,6 +2915,28 @@ async fn daemon_petal_chain_read(
                 .map_err(|e| HostError::Backend(format!("eth_call: {e}")))?;
             format!("0x{}", hex::encode(bytes))
         }
+        "eth_getTransactionReceipt" => {
+            let [hash_param] = params.as_slice() else {
+                return Err(HostError::Invalid(
+                    "eth_getTransactionReceipt takes a single transaction hash".into(),
+                ));
+            };
+            let hash: alloy::primitives::B256 = hash_param
+                .as_str()
+                .ok_or_else(|| {
+                    HostError::Invalid("eth_getTransactionReceipt hash must be a string".into())
+                })?
+                .parse()
+                .map_err(|e| HostError::Invalid(format!("eth_getTransactionReceipt hash: {e}")))?;
+            // The guest parses this response as raw JSON, so return the
+            // receipt object (or null) without the string-quoting tail below.
+            let receipt = chain
+                .receipt_json(hash)
+                .await
+                .map_err(|e| HostError::Backend(format!("transaction receipt: {e}")))?;
+            return serde_json::to_string(&receipt)
+                .map_err(|e| HostError::Backend(format!("encode receipt: {e}")));
+        }
         "eth_chainId" | "eth_getBalance" | "eth_getCode" | "eth_call" => {
             return Err(HostError::Invalid(format!(
                 "invalid {method} parameters; only latest-block reads are allowed"
@@ -7210,6 +7232,75 @@ mod tests {
         assert!(parse_petal_hex_bytes("70a08231", "data").is_err());
         assert!(parse_petal_hex_quantity("0x0", "value").is_ok());
         assert!(parse_petal_hex_quantity("0", "value").is_err());
+    }
+
+    #[tokio::test]
+    async fn daemon_petal_chain_read_returns_receipt_object_and_null() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let hash = format!("0x{}", "ab".repeat(32));
+        let block = format!("0x{}", "cd".repeat(32));
+        let to = format!("0x{}", "22".repeat(20));
+        let log = serde_json::json!({
+            "address": to, "topics": [format!("0x{}", "33".repeat(32))], "data": "0x1234",
+            "logIndex": "0x0", "transactionIndex": "0x0", "transactionHash": hash,
+            "blockHash": block, "blockNumber": "0x1", "removed": false
+        });
+        let receipt = serde_json::json!({
+            "transactionHash": hash, "transactionIndex": "0x0", "blockHash": block,
+            "blockNumber": "0x1", "from": format!("0x{}", "11".repeat(20)), "to": to,
+            "cumulativeGasUsed": "0x5208", "gasUsed": "0x5208", "effectiveGasPrice": "0x1",
+            "contractAddress": null, "status": "0x1", "type": "0x2",
+            "logsBloom": format!("0x{}", "00".repeat(256)), "logs": [log]
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let rpc = tokio::spawn(async move {
+            for result in [receipt, serde_json::Value::Null] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let request: serde_json::Value = loop {
+                    let mut chunk = [0; 4096];
+                    let count = socket.read(&mut chunk).await.unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&chunk[..count]);
+                    if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n")
+                        && let Ok(request) = serde_json::from_slice(&bytes[end + 4..])
+                    {
+                        break request;
+                    }
+                };
+                assert_eq!(request["method"], "eth_getTransactionReceipt");
+                let body =
+                    serde_json::json!({"jsonrpc": "2.0", "id": request["id"], "result": result})
+                        .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let mut spec = bloom_proto::ChainSpec::anvil_default();
+        spec.rpc_urls = vec![format!("http://{address}")];
+        let chain = ChainClient::new(spec).unwrap();
+        let method = "eth_getTransactionReceipt";
+
+        let bad = daemon_petal_chain_read(&chain, method, r#"["not-a-hash"]"#).await;
+        assert!(matches!(bad, Err(HostError::Invalid(_))), "{bad:?}");
+
+        let params = serde_json::json!([hash]).to_string();
+        let found: serde_json::Value = serde_json::from_str(
+            &daemon_petal_chain_read(&chain, method, &params)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(found["logs"], serde_json::json!([log]));
+        let missing = daemon_petal_chain_read(&chain, method, &params)
+            .await
+            .unwrap();
+        assert_eq!(missing, "null");
+        rpc.await.unwrap();
     }
 
     #[tokio::test]
