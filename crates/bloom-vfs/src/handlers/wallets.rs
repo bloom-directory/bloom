@@ -63,7 +63,7 @@ use bloom_machine_client::{MachineBrokerClient, WalletProjectionReader};
 use bloom_proto::{AddressBook, HomeWritePermit, Policy, RawIntent};
 use bloom_tx::{
     intent_parser,
-    outbox::OutboxState,
+    outbox::{OutboxError, OutboxState, SigningEvidence},
     tx_engine::{TxEngine, TxEngineError},
 };
 use qrcode::QrCode;
@@ -2682,8 +2682,7 @@ fn newest_pending_target(mut pending: Vec<(u128, String)>) -> Option<String> {
 /// `StateMismatch` maps to `NotFound` deliberately: the caller named an id in a
 /// state it is not in, so the path it asked for does not exist. It lives
 /// somewhere else, which is what a lookup should report.
-fn outbox_err(e: bloom_tx::outbox::OutboxError) -> HandlerError {
-    use bloom_tx::outbox::OutboxError;
+fn outbox_err(e: OutboxError) -> HandlerError {
     match e {
         OutboxError::NotFound(what) => HandlerError::not_found(what),
         OutboxError::StateMismatch { id, .. } => HandlerError::not_found(id),
@@ -2879,11 +2878,42 @@ fn clear_confirm_error(entry_dir: &Path) {
 
 /// Best effort, and never recreates an entry directory that has moved on:
 /// the temporary file is created inside the existing directory only.
-fn record_confirm_error(entry_dir: &Path, wallet: &str, id: &str, error: &HandlerError) {
+/// How to reconcile an entry that `cancel` kept because it may be signed.
+fn possibly_signed_next(error: &TxEngineError) -> Option<String> {
+    let TxEngineError::Outbox(OutboxError::PossiblySigned {
+        wallet,
+        tx_hash,
+        evidence,
+        ..
+    }) = error
+    else {
+        return None;
+    };
+    Some(match (tx_hash, evidence) {
+        (Some(_), _) => "This entry may already be signed or broadcast, so `cancel` kept it. Do not reuse its nonce. Reconcile it by its recorded hash first; if it is still unmined, replace it with `bloom wallet cancel`, which needs its own owner approval.".to_owned(),
+        (None, SigningEvidence::Entry) => "A signing request for this entry may have reached the Broker without its reply being recorded, so `cancel` kept the entry; no transaction hash is recorded yet. Do not reuse its nonce. Write the same confirm again: Bloom asks the Broker for the recorded signing operation's result and broadcasts or reconciles it. If it is still unmined afterwards, replace it with `bloom wallet cancel`, which needs its own owner approval.".to_owned(),
+        (None, SigningEvidence::Batch { ordered_refs }) => format!(
+            "A batch signing request covering this entry may have reached the Broker without its reply being recorded, so `cancel` kept the entry. Do not reuse its nonce. Writing confirm here cannot reconcile a batch. Run `bloom wallet confirm-batch {wallet} {}` with the refs in exactly this order: Bloom asks the Broker for that batch's result and broadcasts or reconciles each entry.",
+            ordered_refs.join(" ")
+        ),
+        (None, SigningEvidence::UnreadableBatch) => "Bloom could not read a batch signing record, and that record could cover any entry, so `cancel` kept this one. Confirm still works. An operator must repair the record named by `outbox.batch_state_unreadable` in the Machine log, or remove it only after the Broker shows that batch never signed; then write cancel again.".to_owned(),
+    })
+}
+
+/// `possibly_signed` is the guidance from [`possibly_signed_next`], if any.
+fn record_confirm_error(
+    entry_dir: &Path,
+    wallet: &str,
+    id: &str,
+    error: &HandlerError,
+    possibly_signed: Option<String>,
+) {
     use std::io::Write as _;
 
     let message = error.to_string();
-    let (kind, next) = if message.contains("POLICY_APPROVAL_REQUIRED") {
+    let (kind, next) = if let Some(next) = possibly_signed {
+        ("possibly_signed", next)
+    } else if message.contains("POLICY_APPROVAL_REQUIRED") {
         (
             "policy_approval_required",
             format!(
@@ -4460,12 +4490,26 @@ impl WalletsHandler {
                     ));
                 }
                 if confirm_text.eq_ignore_ascii_case("cancel") {
-                    self.write_permit()?;
-                    self.tx_engine
+                    // Check the permit before clearing the last refusal, so a
+                    // refused write leaves its recovery guidance in place.
+                    let permit = self.write_permit()?;
+                    let entry_dir = self
+                        .tx_engine
                         .outbox
-                        .cancel(wallet, chain, id)
-                        .map_err(err_be)?;
-                    return Ok(());
+                        .read(wallet, chain, id)
+                        .map_err(err_be)?
+                        .dir;
+                    clear_confirm_error(&entry_dir);
+                    return self
+                        .tx_engine
+                        .discard_unsigned(permit, wallet, chain, id)
+                        .await
+                        .map_err(|error| {
+                            let next = possibly_signed_next(&error);
+                            let error = err_be(error);
+                            record_confirm_error(&entry_dir, wallet, id, &error, next);
+                            error
+                        });
                 }
                 let confirm_text = if fname == "confirm.override" {
                     policy.override_sentinel()
@@ -4505,7 +4549,7 @@ impl WalletsHandler {
                     // approval_challenge.json; anything else is recorded.
                     Err(HandlerError::PermissionDenied) => Err(HandlerError::PermissionDenied),
                     Err(error) => {
-                        record_confirm_error(&entry_dir, wallet, id, &error);
+                        record_confirm_error(&entry_dir, wallet, id, &error, None);
                         Err(error)
                     }
                 }
@@ -9984,6 +10028,7 @@ value = "0""#,
             &HandlerError::backend(
                 "POLICY_APPROVAL_REQUIRED: complete the owner ceremony at https://example.invalid/c then retry this operation; status: /wallets/alice/policy-updates/pending/x/status.json",
             ),
+            None,
         );
         let record: serde_json::Value = serde_json::from_slice(
             &std::fs::read(directory.path().join(CONFIRM_ERROR_FILE)).unwrap(),
@@ -10010,20 +10055,42 @@ value = "0""#,
         assert_eq!(leftovers.len(), 1, "{leftovers:?}");
 
         let moved = directory.path().join("moved-to-sent");
-        record_confirm_error(&moved, "alice", "0001-test", &HandlerError::backend("late"));
+        record_confirm_error(
+            &moved,
+            "alice",
+            "0001-test",
+            &HandlerError::backend("late"),
+            None,
+        );
         assert!(!moved.exists());
+    }
+
+    /// A handler whose write permit matches its outbox home, with one
+    /// pending entry `0001-test`.
+    fn cancel_fixture() -> Fixture {
+        let mut f = make_handler_with_chain(true);
+        f.handler.home_write_permit = Some(Arc::new(
+            HomeWritePermit::acquire(&bloom_proto::HomeDir::at(f._tmp.path())).unwrap(),
+        ));
+        seed_pending(&f, "0001-test");
+        f
+    }
+
+    fn write_cancel_path(f: &Fixture, control: &str) -> VfsPath {
+        VfsPath::parse(&format!(
+            "/{}/0/chains/anvil/outbox/pending/0001-test/{control}",
+            f.wallet_name
+        ))
+        .unwrap()
     }
 
     #[tokio::test]
     async fn confirm_cancel_discards_pending_locally() {
-        let f = make_handler_with_chain(true);
-        seed_pending(&f, "0001-test");
-        let p = VfsPath::parse(&format!(
-            "/{}/0/chains/anvil/outbox/pending/0001-test/confirm",
-            f.wallet_name
-        ))
-        .unwrap();
-        f.handler.write(&p, b"cancel").await.unwrap();
+        let f = cancel_fixture();
+        f.handler
+            .write(&write_cancel_path(&f, "confirm"), b"cancel")
+            .await
+            .unwrap();
 
         let entry = f
             .handler
@@ -10034,6 +10101,187 @@ value = "0""#,
         assert_eq!(entry.state, OutboxState::Failed);
         assert!(!entry.dir.join("broadcast_attempted.json").exists());
         assert!(!entry.dir.join("raw_tx").exists());
+    }
+
+    /// `cancel` written to `confirm` only discards an entry that is provably
+    /// unsigned: any hash, broadcast attempt, signed raw bytes, or signing
+    /// request (single or batch, or unreadable state) keeps it, because the
+    /// transaction may still land and its nonce must not be reused.
+    #[tokio::test]
+    async fn confirm_cancel_preserves_possible_signatures() {
+        let ceremony = |sign_dispatched: bool| {
+            let digest = "11".repeat(32);
+            serde_json::to_vec(&serde_json::json!({
+                "schema": "bloom.machine-evm-signing.1", "action_id": "test",
+                "payload_digest": digest, "claimed_hash": digest,
+                "provenance_digest": digest, "canonical_plan_facts_digest": digest,
+                "approval_operation_id": "22".repeat(32), "signing_operation_id": "33".repeat(32),
+                "request_nonce": "11".repeat(16), "issued_at_ms": "1", "expires_at_ms": "2",
+                "approval_id": digest, "sign_dispatched": sign_dispatched
+            }))
+            .unwrap()
+        };
+        let attempt = |entry: &bloom_tx::outbox::OutboxEntry| {
+            serde_json::to_vec(&serde_json::json!({
+                "schema": "bloom.broadcast_attempted.v1", "tx_hash": "0xsigned",
+                "raw_tx_blake3": "digest", "raw_tx_path": "raw_tx",
+                "from": entry.staged.from, "to": null, "nonce": 0,
+                "chain_id": 31337, "created_ms": 0, "transport": "public_rpc"
+            }))
+            .unwrap()
+        };
+        let markers = [
+            "none",
+            "approved",
+            "hash",
+            "broadcast_attempted.json",
+            "replacement_broadcast_attempted.json",
+            "cancel_broadcast_attempted.json",
+            "raw_tx",
+            "replacement_raw_tx",
+            "cancel_raw_tx",
+            "dispatched",
+            "malformed",
+            "batch",
+            "unreadable_batch",
+        ];
+        for marker in markers {
+            for control in ["confirm", "confirm.override"] {
+                let f = cancel_fixture();
+                let outbox = &f.handler.tx_engine.outbox;
+                let entry = outbox.read(&f.wallet_name, "anvil", "0001-test").unwrap();
+                match marker {
+                    "none" => {}
+                    "approved" => {
+                        std::fs::write(entry.dir.join("ceremony.json"), ceremony(false)).unwrap()
+                    }
+                    "hash" => {
+                        let mut staged = entry.staged.clone();
+                        staged.tx_hash = Some(format!("0x{}", "11".repeat(32)));
+                        std::fs::write(
+                            entry.dir.join("intent.json"),
+                            serde_json::to_vec(&staged).unwrap(),
+                        )
+                        .unwrap();
+                    }
+                    "dispatched" => {
+                        std::fs::write(entry.dir.join("ceremony.json"), ceremony(true)).unwrap()
+                    }
+                    "malformed" => {
+                        std::fs::write(entry.dir.join("ceremony.json"), b"invalid").unwrap()
+                    }
+                    "batch" => {
+                        let batch = outbox.root().join(".batch-signing/digest");
+                        std::fs::create_dir_all(&batch).unwrap();
+                        std::fs::write(
+                            batch.join("ceremony.json"),
+                            serde_json::to_vec(&serde_json::json!({
+                                "wallet": f.wallet_name, "sign_dispatched": true,
+                                "ordered_refs": [{"chain": "anvil", "id": "0001-test"}]
+                            }))
+                            .unwrap(),
+                        )
+                        .unwrap();
+                    }
+                    "unreadable_batch" => {
+                        let batch = outbox.root().join(".batch-signing/unreadable");
+                        std::fs::create_dir_all(&batch).unwrap();
+                        std::fs::write(batch.join("ceremony.json"), b"invalid").unwrap();
+                    }
+                    name if name.ends_with(".json") => {
+                        std::fs::write(entry.dir.join(name), attempt(&entry)).unwrap()
+                    }
+                    raw => std::fs::write(entry.dir.join(raw), b"signed").unwrap(),
+                }
+                let result = f
+                    .handler
+                    .write(&write_cancel_path(&f, control), b"cancel")
+                    .await;
+                let retained = outbox.read(&f.wallet_name, "anvil", "0001-test").unwrap();
+                if matches!(marker, "none" | "approved") {
+                    result.unwrap();
+                    assert_eq!(retained.state, OutboxState::Failed, "{marker}/{control}");
+                    assert!(retained.dir.join("cancel.txt").exists());
+                    continue;
+                }
+                let error = result.unwrap_err();
+                assert_eq!(retained.state, OutboxState::Pending, "{marker}/{control}");
+                assert!(!retained.dir.join("cancel.txt").exists());
+                assert!(
+                    error.to_string().contains("cannot discard"),
+                    "{marker}: {error}"
+                );
+                let record: serde_json::Value = serde_json::from_slice(
+                    &std::fs::read(retained.dir.join(CONFIRM_ERROR_FILE)).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(record["kind"], "possibly_signed", "{marker}");
+                let next = record["next"].as_str().unwrap();
+                if marker == "unreadable_batch" {
+                    // No signing operation of this entry's own is recorded, so
+                    // retrying confirm cannot reconcile it; an operator must.
+                    assert!(
+                        next.contains("could not read a batch signing record"),
+                        "{next}"
+                    );
+                    assert!(!next.contains("Write the same confirm again"), "{next}");
+                    continue;
+                }
+                if marker == "batch" {
+                    // Single confirm reads only the entry's own state; only
+                    // the exact ordered batch reconciles a batch signature.
+                    let command = format!(
+                        "bloom wallet confirm-batch {} anvil:0001-test",
+                        f.wallet_name
+                    );
+                    assert!(next.contains(&command), "{next}");
+                    assert!(!next.contains("Write the same confirm again"), "{next}");
+                    continue;
+                }
+                assert!(next.contains("bloom wallet cancel"), "{marker}: {next}");
+                // Without a recorded hash, the next step is to reconcile the
+                // recorded signing operation, not to use a hash.
+                let hashless = !matches!(marker, "hash") && !marker.ends_with(".json");
+                assert_eq!(
+                    next.contains("Write the same confirm again"),
+                    hashless,
+                    "{marker}: {next}"
+                );
+                assert_eq!(
+                    next.contains("recorded hash"),
+                    !hashless,
+                    "{marker}: {next}"
+                );
+            }
+        }
+    }
+
+    /// A `cancel` the write permit refuses changes nothing, including the
+    /// recovery guidance from the last refusal.
+    #[tokio::test]
+    async fn refused_confirm_cancel_preserves_last_error() {
+        let mut f = cancel_fixture();
+        let entry = f
+            .handler
+            .tx_engine
+            .outbox
+            .read(&f.wallet_name, "anvil", "0001-test")
+            .unwrap();
+        std::fs::write(
+            entry.dir.join(CONFIRM_ERROR_FILE),
+            b"{\"kind\":\"possibly_signed\"}",
+        )
+        .unwrap();
+        f.handler.home_write_permit = None;
+        f.handler
+            .write(&write_cancel_path(&f, "confirm"), b"cancel")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            std::fs::read(entry.dir.join(CONFIRM_ERROR_FILE)).unwrap(),
+            b"{\"kind\":\"possibly_signed\"}"
+        );
+        assert!(entry.dir.join("intent.json").exists());
     }
 
     #[tokio::test]
