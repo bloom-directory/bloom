@@ -583,6 +583,33 @@ impl Outbox {
         }
     }
 
+    /// Rename a node-rejected attempt's marker and raw bytes to
+    /// `<name>.rejected-<tx hash>` and return that hash. They stay as
+    /// evidence, but no longer count as an attempt a later write must replay.
+    pub fn set_aside_rejected_attempt(
+        &self,
+        entry: &OutboxEntry,
+        kind: BroadcastAttemptKind,
+    ) -> Result<Option<String>, OutboxError> {
+        let Some(attempt) = self.read_broadcast_attempt(entry, kind)? else {
+            return Ok(None);
+        };
+        let suffix = format!("rejected-{}", attempt.tx_hash);
+        // Marker first: an interrupted rename leaves only orphan raw bytes,
+        // which nothing reads without a marker.
+        for name in [kind.marker_name(), kind.raw_name()] {
+            match fs::rename(
+                entry.dir.join(name),
+                entry.dir.join(format!("{name}.{suffix}")),
+            ) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(Some(attempt.tx_hash))
+    }
+
     pub fn broadcast_attempts_for_nonce(
         &self,
         query: SameNonceAttemptQuery<'_>,
