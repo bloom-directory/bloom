@@ -253,6 +253,18 @@ impl NormalizedChallenge {
 
 pub fn normalize_challenge(headers: &HeaderMap, body: &[u8], url: &Url) -> NormalizedChallenge {
     let header_map = headers_to_string_map(headers);
+    let body_json: serde_json::Value = header_map
+        .get("payment-required")
+        .and_then(|value| B64.decode(value).ok())
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .or_else(|| serde_json::from_slice(body).ok())
+        .unwrap_or_else(|| json!({}));
+    // Mixed-protocol merchants offer x402 alongside Tempo. Keep their x402
+    // choices available to the wallet's network and asset policy selector.
+    let offers_x402 = body_json
+        .get("accepts")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|accepts| !accepts.is_empty());
     let www_values = headers
         .get_all(reqwest::header::WWW_AUTHENTICATE)
         .iter()
@@ -261,7 +273,7 @@ pub fn normalize_challenge(headers: &HeaderMap, body: &[u8], url: &Url) -> Norma
     if let Some((challenge, value)) = mpp::parse_www_authenticate_all(www_values)
         .into_iter()
         .filter_map(Result::ok)
-        .find(|c| c.method.as_str() == "tempo")
+        .find(|c| c.method.as_str() == "tempo" && !offers_x402)
         .and_then(|challenge| {
             challenge
                 .request
@@ -305,12 +317,6 @@ pub fn normalize_challenge(headers: &HeaderMap, body: &[u8], url: &Url) -> Norma
         .cloned()
         .unwrap_or_default();
     let lower_www = www.to_ascii_lowercase();
-    let body_json: serde_json::Value = header_map
-        .get("payment-required")
-        .and_then(|value| B64.decode(value).ok())
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .or_else(|| serde_json::from_slice(body).ok())
-        .unwrap_or_else(|| json!({}));
     let lower_body_protocol = json_string(&body_json, &["protocol", "paymentProtocol", "scheme"])
         .unwrap_or_default()
         .to_ascii_lowercase();
@@ -982,8 +988,74 @@ mod tests {
         usd_to_atomic_units,
     };
     use super::{normalize_challenge, parse_payment_amount_usd};
+    use base64::Engine as _;
     use reqwest::header::{HeaderMap, HeaderValue};
     use url::Url;
+
+    #[test]
+    fn mixed_protocol_challenge_preserves_x402_network_choices() {
+        let tempo = mpp::PaymentChallenge::new(
+            "flight-search",
+            "merchant.test",
+            "tempo",
+            "charge",
+            mpp::Base64UrlJson::from_value(&serde_json::json!({
+                "amount": "20000",
+                "currency": "0x20c000000000000000000000b9537d11c60e8b50",
+                "methodDetails": { "chainId": 4217 }
+            }))
+            .unwrap(),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "www-authenticate",
+            HeaderValue::from_str(&tempo.to_header().unwrap()).unwrap(),
+        );
+        let url = Url::parse("https://merchant.test/flights").unwrap();
+        let mpp_only = normalize_challenge(&headers, b"{}", &url);
+        assert_eq!(mpp_only.protocol, "mpp");
+        assert_eq!(mpp_only.network.as_deref(), Some("tempo"));
+
+        let x402 = serde_json::json!({
+            "x402Version": 2,
+            "accepts": [{
+                "scheme": "exact",
+                "network": "eip155:8453",
+                "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+                "amount": "20000",
+                "payTo": "0xDd257723b86B4947483905cdAcBbBC70fACF2ec0"
+            }, {
+                "scheme": "exact",
+                "network": "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                "asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                "amount": "20000",
+                "payTo": "6u5LMGQC2qk9peNibahmRWxGVXrBypk8nhTCcqtiuqMY"
+            }]
+        });
+        let body = serde_json::to_vec(&x402).unwrap();
+        headers.insert(
+            "payment-required",
+            HeaderValue::from_str(&super::B64.encode(&body)).unwrap(),
+        );
+        let mixed = normalize_challenge(&headers, b"{}", &url);
+        assert_eq!(mixed.protocol, "x402");
+        assert_eq!(mixed.accepts.len(), 2);
+        assert_eq!(mixed.amount_usd, Some(0.02));
+        assert_eq!(mixed.accepts[0].network.as_deref(), Some("eip155:8453"));
+
+        // Merchants can carry the alternatives in the body instead.
+        headers.remove("payment-required");
+        assert_eq!(normalize_challenge(&headers, &body, &url).protocol, "x402");
+
+        // An empty or malformed alternative must not hide usable MPP terms.
+        for alternative in [br#"{"x402Version":2,"accepts":[]}"#.as_slice(), b"invalid"] {
+            headers.insert(
+                "payment-required",
+                HeaderValue::from_str(&super::B64.encode(alternative)).unwrap(),
+            );
+            assert_eq!(normalize_challenge(&headers, b"{}", &url).protocol, "mpp");
+        }
+    }
 
     #[test]
     fn parses_known_payment_stablecoin_base_units_as_usd() {

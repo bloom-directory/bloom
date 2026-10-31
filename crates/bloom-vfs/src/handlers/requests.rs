@@ -434,24 +434,22 @@ impl RequestsHandler {
         crate::advisory_paid_http_policy(&projection).map_err(HandlerError::backend)
     }
 
-    async fn wallet_address(
+    async fn wallet_signing_account(
         &self,
         wallet: &str,
-    ) -> Result<alloy::primitives::Address, HandlerError> {
+    ) -> Result<(alloy::primitives::Address, Option<bloom_broker_api::KeyRef>), HandlerError> {
         let wallet_id = bloom_broker_api::Token::new(wallet.to_owned())
             .map_err(|error| HandlerError::invalid(error.to_string()))?;
-        self.wallet_projections
+        let projection = self
+            .wallet_projections
             .as_ref()
             .ok_or_else(|| {
                 HandlerError::backend("SERVICE_UNAVAILABLE: wallet projections are not configured")
             })?
             .get_wallet(&wallet_id)
             .await
-            .map_err(|error| HandlerError::backend(error.to_string()))?
-            .primary_address()
-            .map_err(|error| HandlerError::backend(error.to_string()))?
-            .parse()
-            .map_err(|error| HandlerError::invalid(format!("wallet address: {error}")))
+            .map_err(|error| HandlerError::backend(error.to_string()))?;
+        primary_payment_account(&projection)
     }
 
     fn sum_paid_usd_last_24h(&self, wallet: &str) -> Result<f64, HandlerError> {
@@ -655,10 +653,15 @@ impl RequestsHandler {
     }
 
     /// Build the payload-bearing paid-HTTP Broker signing seam.
-    fn paid_http_host_signer(&self, wallet: &str, action_id: &str) -> Arc<dyn PaidHttpHostSigner> {
+    fn paid_http_host_signer(
+        &self,
+        wallet: &str,
+        action_id: &str,
+        account_key: Option<bloom_broker_api::KeyRef>,
+    ) -> Arc<dyn PaidHttpHostSigner> {
         match &self.exact_signer {
             Some(signer) => Arc::new(BrokerPaidHttpHostSigner {
-                signer: signer.clone(),
+                signer: signer.clone().with_account_key(account_key),
                 wallet: wallet.to_owned(),
                 action_id: action_id.to_owned(),
                 requests_root: self.requests_root(),
@@ -745,13 +748,13 @@ impl RequestsHandler {
             checks.extend(live_checks.into_iter().filter(|c| c.result == "deny"));
             self.ensure_sealed_confirm_approval(&pending, id).await?;
             let action_id = self.request_action_id(id).await?;
-            let wallet_address = self.wallet_address(&wallet).await?;
+            let (wallet_address, account_key) = self.wallet_signing_account(&wallet).await?;
             let policy_snapshot_digest = Some(sealed_inputs.policy_snapshot_digest.clone());
             let mut requirement = sealed_inputs.requirement.clone();
             if requirement.resource.is_none() {
                 requirement.resource = Some(request.url.to_string());
             }
-            let host_signer = self.paid_http_host_signer(&wallet, &action_id);
+            let host_signer = self.paid_http_host_signer(&wallet, &action_id, account_key);
             let facts = paid_http_mpp_facts(
                 id,
                 &request,
@@ -834,9 +837,9 @@ impl RequestsHandler {
         // one signature allowance is consumed atomically inside host signing;
         // there is no separate bookkeeping consume around a direct signature.
         let action_id = self.request_action_id(id).await?;
-        let wallet_address = self.wallet_address(&wallet).await?;
+        let (wallet_address, account_key) = self.wallet_signing_account(&wallet).await?;
         let policy_snapshot_digest = Some(sealed_inputs.policy_snapshot_digest);
-        let host_signer = self.paid_http_host_signer(&wallet, &action_id);
+        let host_signer = self.paid_http_host_signer(&wallet, &action_id, account_key);
         let facts = paid_http_x402_facts(
             id,
             &request,
@@ -912,6 +915,28 @@ impl RequestsHandler {
         self.write_latest(final_state, id)?;
         Ok(())
     }
+}
+
+// Paid requests already use the wallet's primary address. Bind its exact key
+// into Broker approval and signing as well, rather than asking Broker to infer
+// a child when a BIP-39 wallet has several active accounts.
+fn primary_payment_account(
+    projection: &bloom_machine_client::WalletProjection,
+) -> Result<(alloy::primitives::Address, Option<bloom_broker_api::KeyRef>), HandlerError> {
+    let key = projection
+        .primary_key()
+        .map_err(|error| HandlerError::backend(error.to_string()))?;
+    let address = projection
+        .primary_address()
+        .map_err(|error| HandlerError::backend(error.to_string()))?
+        .parse()
+        .map_err(|error| HandlerError::invalid(format!("wallet address: {error}")))?;
+    let selected = projection
+        .wallet
+        .root_key_ref
+        .is_none()
+        .then(|| key.key_ref.clone());
+    Ok((address, selected))
 }
 
 /// Stub used when no Broker signer is wired. It never signs.
@@ -2381,6 +2406,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn payment_address_and_signing_key_select_the_same_primary_account() {
+        use bloom_broker_api::{DerivationProfile, DerivationRef, Digest32, KeyRole, Token};
+        let (_, handler) = handler();
+        let mut projection = handler
+            .wallet_projections
+            .as_ref()
+            .unwrap()
+            .get_wallet(&Token::new("alice").unwrap())
+            .await
+            .unwrap();
+        let (address, selected) = primary_payment_account(&projection).unwrap();
+        assert_eq!(address, alloy::primitives::Address::with_last_byte(1));
+        assert!(
+            selected.is_none(),
+            "root-signing wallets must not select a derived child"
+        );
+
+        projection.wallet.root_key_ref = None;
+        let mut primary = projection.keys[0].clone();
+        primary.role = KeyRole::Derived;
+        primary.key_ref.derivation = Some(DerivationRef::Bip39Multicurve {
+            wallet_seed_ref: Token::new("seed").unwrap(),
+            profile: DerivationProfile::Bip44EvmSecp256k1V1,
+            path: "m/44'/60'/0'/0/0".into(),
+        });
+        let mut other = primary.clone();
+        other.key_ref.public_key_fingerprint = Digest32::from_bytes([2; 32]);
+        other.key_ref.locator = "alice/other".into();
+        other.key_ref.derivation = Some(DerivationRef::Bip39Multicurve {
+            wallet_seed_ref: Token::new("seed").unwrap(),
+            profile: DerivationProfile::Bip44EvmSecp256k1V1,
+            path: "m/44'/60'/0'/0/1".into(),
+        });
+        other.addresses = vec!["0x0000000000000000000000000000000000000002".into()];
+        projection.wallet.key_refs = vec![other.key_ref.clone(), primary.key_ref.clone()];
+        projection.keys = vec![other, primary.clone()];
+        let (address, selected) = primary_payment_account(&projection).unwrap();
+        assert_eq!(address, alloy::primitives::Address::with_last_byte(1));
+        assert_eq!(selected, Some(primary.key_ref));
+        projection.keys.pop();
+        assert!(
+            primary_payment_account(&projection).is_err(),
+            "a missing primary must not fall back to another account"
+        );
+    }
+
+    #[tokio::test]
     async fn wallet_payment_serialization_rechecks_daily_spending() {
         use std::future::Future;
         let (_tmp, handler) = handler();
@@ -2664,7 +2736,7 @@ mod tests {
     #[tokio::test]
     async fn unwired_paid_http_signer_rejects_payload_and_hash_signing() {
         let (_tmp, handler) = handler();
-        let signer = handler.paid_http_host_signer("alice", "req");
+        let signer = handler.paid_http_host_signer("alice", "req", None);
         let facts = PaidHttpSigningFacts::default();
         for intent in [PAID_HTTP_X402_SIGN_INTENT, PAID_HTTP_MPP_SIGN_INTENT] {
             assert!(
