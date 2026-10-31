@@ -48,9 +48,9 @@ sol! {
     }
 }
 use bloom_broker_api::{
-    ApprovalLifecycleState, CryptoSuite, DecimalU64, Digest32, OperationId, OperationState,
-    ProtocolErrorCode, ProvenanceCatalog, ProvenanceRecord, ProvenanceSubject, RequestNonce,
-    SigningResult, Token,
+    ApprovalLifecycleState, CryptoSuite, DecimalU64, Digest32, DurableEffect, OperationId,
+    OperationState, ProtocolErrorCode, ProvenanceCatalog, ProvenanceRecord, ProvenanceSubject,
+    RequestNonce, RetryClass, SigningResult, Token,
 };
 use bloom_proto::plan::ExecutionOrigin;
 use bloom_proto::{
@@ -3291,9 +3291,9 @@ impl TxEngine {
                     {
                         // Confirm, replace, and cancel are distinct exact
                         // operations over one outbox entry. A completed prior
-                        // operation must not authorize the next one, but its
-                        // terminal owner projection may be atomically
-                        // superseded by the next ceremony.
+                        // operation and a reset lineage that never reached the
+                        // Broker may both be atomically superseded, but neither
+                        // may authorize the next operation.
                         new_state()?
                     } else {
                         return Err(TxEngineError::ApprovalState(
@@ -3376,8 +3376,8 @@ impl TxEngine {
                             state.ceremony_url = None;
                             state.ceremony_expires_at_ms = None;
                             write_triad_signing_state(&state_path, &state)?;
-                            return Err(TxEngineError::ApprovalDenied(format!(
-                                "Broker signing operation is quarantined; reconcile operation {} before confirming again",
+                            return Err(TxEngineError::ApprovalState(format!(
+                                "Broker signing operation is quarantined; a signature may exist — reconcile operation {} before confirming again",
                                 state.signing_operation_id
                             )));
                         }
@@ -3391,7 +3391,9 @@ impl TxEngine {
                     state.expected_operation_digest = None;
                     write_triad_signing_state(&state_path, &state)?;
                 }
-                Err(error) => return Err(protocol_signing_error(error)),
+                Err(error) => {
+                    return Err(unresolved_signing_error(&state.signing_operation_id, error));
+                }
             }
         }
 
@@ -3464,36 +3466,61 @@ impl TxEngine {
             .await
             .map_err(protocol_signing_error)?;
         let key = evm_signing_key(&service.broker, &wallet, &staged.from).await?;
-        let request = exact_evm_sign_request(
-            staged,
-            signing_preimage,
-            signing_hash,
-            provenance,
-            &state,
-            key.selector.clone(),
-        )?;
-        if state.approval_id.is_some() {
-            let expected_operation_digest = expected_evm_sign_operation_digest(
-                &wallet,
-                key.key_ref.clone(),
+        // At most two passes: a definite refusal replaces the lineage with one
+        // that has no approval, and that pass prepares its ceremony.
+        let mut refused = None;
+        let outcome = loop {
+            let request = exact_evm_sign_request(
+                staged,
+                signing_preimage,
+                signing_hash,
+                provenance,
                 &state,
-                state.payload_digest.clone(),
-                state.claimed_hash.clone(),
+                key.selector.clone(),
             )?;
-            // Exact signing only ever dispatches with an activated approval,
-            // and the durable dispatch marker is written first: a lost
-            // response reconciles through operation status instead of signing
-            // twice, and an absent marker proves no signature exists.
-            state.sign_dispatched = true;
-            state.expected_operation_digest = Some(expected_operation_digest);
-            write_triad_signing_state(&state_path, &state)?;
-        }
-        match service
-            .broker
-            .sign_exact_payload(request)
-            .await
-            .map_err(protocol_signing_error)?
-        {
+            if state.approval_id.is_some() {
+                let expected_operation_digest = expected_evm_sign_operation_digest(
+                    &wallet,
+                    key.key_ref.clone(),
+                    &state,
+                    state.payload_digest.clone(),
+                    state.claimed_hash.clone(),
+                )?;
+                // Exact signing only ever dispatches with an activated approval,
+                // and the durable dispatch marker is written first: a lost
+                // response reconciles through operation status instead of signing
+                // twice, and an absent marker proves no signature exists.
+                state.sign_dispatched = true;
+                state.expected_operation_digest = Some(expected_operation_digest);
+                write_triad_signing_state(&state_path, &state)?;
+            }
+            match service.broker.sign_exact_payload(request).await {
+                Ok(outcome) => break outcome,
+                // Replace a permanently refused lineage only when nothing durable
+                // remains, and hand back its fresh ceremony so every caller keeps
+                // the row. Retryable and ambiguous failures retain the lineage.
+                Err(error)
+                    if state.approval_id.is_some()
+                        && signing_refusal_releases_reservation(error.code) =>
+                {
+                    // Approval and operation IDs are immutable: clearing only
+                    // the dispatch marker would reuse the same dead request.
+                    // Record the refusal first: after expiry no fresh lineage
+                    // can be prepared, and the entry is then provably unsigned.
+                    state.sign_dispatched = false;
+                    state.expected_operation_digest = None;
+                    write_triad_signing_state(&state_path, &state)?;
+                    state = new_state()?;
+                    write_triad_signing_state(&state_path, &state)?;
+                    refused = Some(refusal_reason(&error));
+                }
+                Err(error) if state.sign_dispatched => {
+                    return Err(unresolved_signing_error(&state.signing_operation_id, error));
+                }
+                Err(error) => return Err(protocol_signing_error(error)),
+            }
+        };
+        match outcome {
             ExactPayloadSignOutcome::ApprovalRequired(prepared) => {
                 if state
                     .approval_id
@@ -3513,7 +3540,9 @@ impl TxEngine {
                 write_triad_signing_state(&state_path, &state)?;
                 Err(TxEngineError::ApprovalRequired(approval_requirement(
                     &state,
-                    "exact Broker approval ceremony required",
+                    refused
+                        .as_deref()
+                        .unwrap_or("exact Broker approval ceremony required"),
                 )?))
             }
             ExactPayloadSignOutcome::Signed(result) => {
@@ -3692,14 +3721,19 @@ impl TxEngine {
                         OperationState::Denied
                         | OperationState::Cancelled
                         | OperationState::Failed => {
-                            // No signature was produced, so a fresh lineage
-                            // cannot double-sign; prepare a new ceremony now.
+                            // Definite terminal failure: replace the dead
+                            // approval and operation IDs, keeping exact bytes.
                             state = new_state()?;
                             write_triad_batch_signing_state(&state_path, &state)?;
                         }
                         OperationState::Quarantined => {
-                            return Err(TxEngineError::ApprovalDenied(format!(
-                                "Broker batch operation is quarantined; reconcile operation {} before confirming again",
+                            // A signature may exist. Keep its identity for
+                            // reconciliation, but stop offering the dead URL.
+                            state.ceremony_url = None;
+                            state.ceremony_expires_at_ms = None;
+                            write_triad_batch_signing_state(&state_path, &state)?;
+                            return Err(TxEngineError::ApprovalState(format!(
+                                "Broker batch operation is quarantined (terminal: Quarantined); a signature may exist — reconcile operation {} before confirming again",
                                 state.signing_operation_id
                             )));
                         }
@@ -3710,7 +3744,9 @@ impl TxEngine {
                     state.expected_operation_digest = None;
                     write_triad_batch_signing_state(&state_path, &state)?;
                 }
-                Err(error) => return Err(protocol_signing_error(error)),
+                Err(error) => {
+                    return Err(unresolved_signing_error(&state.signing_operation_id, error));
+                }
             }
         }
 
@@ -3803,46 +3839,65 @@ impl TxEngine {
                 ));
             }
         }
-        let request = ExactPayloadBatchSignRequest {
-            wallet_id: Token::new(wallet.to_string())
-                .map_err(|error| TxEngineError::ApprovalConstruction(error.to_string()))?,
-            preimages: preimages.to_vec(),
-            claimed_hashes: ordered_hashes.clone(),
-            crypto_suite: CryptoSuite::Secp256k1Keccak256Recoverable,
-            provenance: provenance.subject.clone(),
-            provenance_digest: state.provenance_digest.clone(),
-            activation_mode: None,
-            approval_operation_id: state.approval_operation_id.clone(),
-            signing_operation_id: state.signing_operation_id.clone(),
-            request_nonce: state.request_nonce.clone(),
-            issued_at_ms: state.issued_at_ms.clone(),
-            expires_at_ms: state.expires_at_ms.clone(),
-            canonical_plan_facts_digest: state.canonical_plan_facts_digest.clone(),
-            requested_review_mode: batch_review_mode,
-            approval_id: state.approval_id.clone(),
-            account_key_ref: key.selector.clone(),
-            petal_use_claim: None,
-            claim_assurance_evidence: None,
+        let mut refused = None;
+        // Two passes at most, as for single payloads.
+        let outcome = loop {
+            let request = ExactPayloadBatchSignRequest {
+                wallet_id: Token::new(wallet.to_string())
+                    .map_err(|error| TxEngineError::ApprovalConstruction(error.to_string()))?,
+                preimages: preimages.to_vec(),
+                claimed_hashes: ordered_hashes.clone(),
+                crypto_suite: CryptoSuite::Secp256k1Keccak256Recoverable,
+                provenance: provenance.subject.clone(),
+                provenance_digest: state.provenance_digest.clone(),
+                activation_mode: None,
+                approval_operation_id: state.approval_operation_id.clone(),
+                signing_operation_id: state.signing_operation_id.clone(),
+                request_nonce: state.request_nonce.clone(),
+                issued_at_ms: state.issued_at_ms.clone(),
+                expires_at_ms: state.expires_at_ms.clone(),
+                canonical_plan_facts_digest: state.canonical_plan_facts_digest.clone(),
+                requested_review_mode: batch_review_mode,
+                approval_id: state.approval_id.clone(),
+                account_key_ref: key.selector.clone(),
+                petal_use_claim: None,
+                claim_assurance_evidence: None,
+            };
+            if state.approval_id.is_some() {
+                state.expected_operation_digest = Some(expected_evm_batch_sign_operation_digest(
+                    &wallet_public,
+                    key.key_ref.clone(),
+                    &state,
+                )?);
+                // Same pre-dispatch durability rule as single payloads: batch
+                // signing only ever dispatches with an activated approval, so a
+                // lost response reconciles and an absent marker proves no batch
+                // signature exists.
+                state.sign_dispatched = true;
+                write_triad_batch_signing_state(&state_path, &state)?;
+            }
+            match service.broker.sign_exact_payload_batch(request).await {
+                Ok(outcome) => break outcome,
+                // Match single-payload recovery: preserve retryable or
+                // ambiguous outcomes, replace definite permanent refusals.
+                Err(error)
+                    if state.approval_id.is_some()
+                        && signing_refusal_releases_reservation(error.code) =>
+                {
+                    state.sign_dispatched = false;
+                    state.expected_operation_digest = None;
+                    write_triad_batch_signing_state(&state_path, &state)?;
+                    state = new_state()?;
+                    write_triad_batch_signing_state(&state_path, &state)?;
+                    refused = Some(refusal_reason(&error));
+                }
+                Err(error) if state.sign_dispatched => {
+                    return Err(unresolved_signing_error(&state.signing_operation_id, error));
+                }
+                Err(error) => return Err(protocol_signing_error(error)),
+            }
         };
-        if state.approval_id.is_some() {
-            state.expected_operation_digest = Some(expected_evm_batch_sign_operation_digest(
-                &wallet_public,
-                key.key_ref.clone(),
-                &state,
-            )?);
-            // Same pre-dispatch durability rule as single payloads: batch
-            // signing only ever dispatches with an activated approval, so a
-            // lost response reconciles and an absent marker proves no batch
-            // signature exists.
-            state.sign_dispatched = true;
-            write_triad_batch_signing_state(&state_path, &state)?;
-        }
-        match service
-            .broker
-            .sign_exact_payload_batch(request)
-            .await
-            .map_err(protocol_signing_error)?
-        {
+        match outcome {
             ExactPayloadSignOutcome::ApprovalRequired(prepared) => {
                 if state
                     .approval_id
@@ -3862,7 +3917,9 @@ impl TxEngine {
                 write_triad_batch_signing_state(&state_path, &state)?;
                 Err(TxEngineError::ApprovalRequired(batch_approval_requirement(
                     &state,
-                    "exact Broker batch approval ceremony required",
+                    refused
+                        .as_deref()
+                        .unwrap_or("exact Broker batch approval ceremony required"),
                 )?))
             }
             ExactPayloadSignOutcome::Signed(result) => {
@@ -5031,6 +5088,47 @@ fn write_triad_signing_state(
     result.map_err(|error| TxEngineError::Outbox(error.into()))
 }
 
+fn signing_refusal_releases_reservation(code: ProtocolErrorCode) -> bool {
+    // Pre-dispatch peer/version errors say nothing about the approval, and a
+    // pinned Signer without signer#62 reports a quarantined operation as
+    // BackendInvalidRequest. None of these prove the request is dead.
+    let contract = code.contract();
+    contract.retry == RetryClass::Never
+        && matches!(
+            contract.durable_effect,
+            DurableEffect::None | DurableEffect::ReservationReleased
+        )
+        && !matches!(
+            code,
+            ProtocolErrorCode::UnauthenticatedPeer
+                | ProtocolErrorCode::UnsupportedVersion
+                | ProtocolErrorCode::BackendInvalidRequest
+        )
+}
+
+/// Why a definite refusal led to a fresh ceremony, for the owner and agent.
+fn refusal_reason(error: &bloom_broker_api::ProtocolError) -> String {
+    format!(
+        "Broker refused the previous approval ({}: {}); nothing was signed, and a fresh ceremony is required",
+        error.code.as_str(),
+        error.message
+    )
+}
+
+/// A dispatched request, or a quarantined operation, may have produced a
+/// signature. Report it as unresolved rather than as a clean denial.
+fn unresolved_signing_error(
+    operation_id: &impl std::fmt::Display,
+    error: bloom_broker_api::ProtocolError,
+) -> TxEngineError {
+    match protocol_signing_error(error) {
+        TxEngineError::ApprovalDenied(detail) => TxEngineError::ApprovalState(format!(
+            "signing outcome unknown; a signature may exist — reconcile operation {operation_id} before confirming again ({detail})"
+        )),
+        other => other,
+    }
+}
+
 fn protocol_signing_error(error: bloom_broker_api::ProtocolError) -> TxEngineError {
     match error.code {
         bloom_broker_api::ProtocolErrorCode::ServiceUnavailable => {
@@ -5280,7 +5378,11 @@ mod tests {
     struct TriadBrokerFixture {
         active: AtomicBool,
         approval_terminal: parking_lot::Mutex<Option<ApprovalLifecycleState>>,
-        signing_terminal: parking_lot::Mutex<Option<OperationState>>,
+        deny_sign: parking_lot::Mutex<Option<ProtocolErrorCode>>,
+        /// Forces `operation.status` to report a terminal state instead of
+        /// `Succeeded`, which is how a dispatched row learns its signing
+        /// operation died.
+        operation_terminal: parking_lot::Mutex<Option<OperationState>>,
         lose_sign_response_once: AtomicBool,
         corrupt_status_result: AtomicBool,
         completed_result: parking_lot::Mutex<Option<SigningResult>>,
@@ -5392,11 +5494,18 @@ mod tests {
                         ))
                     }
                     MachineBrokerRequest::OperationStatus(request) => {
-                        if let Some(state) = *self.signing_terminal.lock() {
+                        if let Some(state) = *self.operation_terminal.lock() {
+                            let operation_digest = self
+                                .completed_result
+                                .lock()
+                                .as_ref()
+                                .filter(|result| result.operation_id == request.operation_id)
+                                .map(|result| result.operation_digest.clone())
+                                .unwrap_or_else(|| Digest32::from_bytes([11; 32]));
                             return Ok(MachineBrokerResponse::OperationStatus(
                                 OperationPublicStatus {
                                     operation_id: request.operation_id,
-                                    operation_digest: Digest32::from_bytes([11; 32]),
+                                    operation_digest,
                                     state,
                                     result: None,
                                     error: None,
@@ -5423,6 +5532,12 @@ mod tests {
                         ))
                     }
                     MachineBrokerRequest::SigningSign(request) => {
+                        if let Some(code) = *self.deny_sign.lock() {
+                            return Err(bloom_broker_api::ProtocolError::new(
+                                code,
+                                "simulated Broker refusal before any signing",
+                            ));
+                        }
                         let SigningPayloads::Single { payload } = &request.payloads else {
                             panic!("fixture expects one exact payload");
                         };
@@ -5448,6 +5563,12 @@ mod tests {
                         Ok(MachineBrokerResponse::SigningSign(result))
                     }
                     MachineBrokerRequest::SigningSignBatch(request) => {
+                        if let Some(code) = *self.deny_sign.lock() {
+                            return Err(bloom_broker_api::ProtocolError::new(
+                                code,
+                                "simulated Broker refusal before any batch signing",
+                            ));
+                        }
                         let SigningPayloads::Batch { children } = &request.payloads else {
                             panic!("fixture expects an exact payload batch");
                         };
@@ -5482,26 +5603,33 @@ mod tests {
         }
     }
 
+    fn system_record(operation_class: &str, signature_byte: u8) -> ProvenanceRecord {
+        ProvenanceRecord {
+            subject: ProvenanceSubject::System {
+                component_id: Token::new("bloom-machine").unwrap(),
+                operation_class: Token::new(operation_class).unwrap(),
+            },
+            publisher: Token::new("bloom-installer").unwrap(),
+            petal_lineage: None,
+            operation_classes: vec![ProvenanceOperationClass {
+                operation_class: Token::new(operation_class).unwrap(),
+                fee_asset: Some(ProvenanceFeeAsset {
+                    chain: Token::new("ethereum").unwrap(),
+                    asset: "native".into(),
+                }),
+            }],
+            installer_key_id: Token::new("installer-key").unwrap(),
+            installer_signature: Base64UrlBytes::from_bytes(&[signature_byte; 64]),
+        }
+    }
+
     fn triad_catalog() -> ProvenanceCatalog {
         ProvenanceCatalog {
             schema: bloom_broker_api::PROVENANCE_CATALOG_SCHEMA.into(),
-            records: vec![ProvenanceRecord {
-                subject: ProvenanceSubject::System {
-                    component_id: Token::new("bloom-machine").unwrap(),
-                    operation_class: Token::new("transaction.confirm").unwrap(),
-                },
-                publisher: Token::new("bloom-installer").unwrap(),
-                petal_lineage: None,
-                operation_classes: vec![ProvenanceOperationClass {
-                    operation_class: Token::new("transaction.confirm").unwrap(),
-                    fee_asset: Some(ProvenanceFeeAsset {
-                        chain: Token::new("ethereum").unwrap(),
-                        asset: "native".into(),
-                    }),
-                }],
-                installer_key_id: Token::new("installer-key").unwrap(),
-                installer_signature: Base64UrlBytes::from_bytes(&[11; 64]),
-            }],
+            records: vec![
+                system_record("transaction.confirm", 11),
+                system_record("transaction.cancel", 12),
+            ],
         }
     }
 
@@ -6364,7 +6492,8 @@ mod tests {
         let fixture = Arc::new(TriadBrokerFixture {
             active: AtomicBool::new(false),
             approval_terminal: parking_lot::Mutex::new(None),
-            signing_terminal: parking_lot::Mutex::new(None),
+            deny_sign: parking_lot::Mutex::new(None),
+            operation_terminal: parking_lot::Mutex::new(None),
             lose_sign_response_once: AtomicBool::new(false),
             corrupt_status_result: AtomicBool::new(false),
             completed_result: parking_lot::Mutex::new(None),
@@ -7225,7 +7354,8 @@ mod tests {
         let fixture = Arc::new(TriadBrokerFixture {
             active: AtomicBool::new(false),
             approval_terminal: parking_lot::Mutex::new(None),
-            signing_terminal: parking_lot::Mutex::new(None),
+            deny_sign: parking_lot::Mutex::new(None),
+            operation_terminal: parking_lot::Mutex::new(None),
             lose_sign_response_once: AtomicBool::new(false),
             corrupt_status_result: AtomicBool::new(false),
             completed_result: parking_lot::Mutex::new(None),
@@ -7343,7 +7473,8 @@ mod tests {
         let fixture = Arc::new(TriadBrokerFixture {
             active: AtomicBool::new(true),
             approval_terminal: parking_lot::Mutex::new(None),
-            signing_terminal: parking_lot::Mutex::new(None),
+            deny_sign: parking_lot::Mutex::new(None),
+            operation_terminal: parking_lot::Mutex::new(None),
             lose_sign_response_once: AtomicBool::new(false),
             corrupt_status_result: AtomicBool::new(false),
             completed_result: parking_lot::Mutex::new(None),
@@ -7452,7 +7583,8 @@ mod tests {
         let fixture = Arc::new(TriadBrokerFixture {
             active: AtomicBool::new(true),
             approval_terminal: parking_lot::Mutex::new(None),
-            signing_terminal: parking_lot::Mutex::new(None),
+            deny_sign: parking_lot::Mutex::new(None),
+            operation_terminal: parking_lot::Mutex::new(None),
             lose_sign_response_once: AtomicBool::new(false),
             corrupt_status_result: AtomicBool::new(false),
             completed_result: parking_lot::Mutex::new(None),
@@ -7832,7 +7964,7 @@ mod tests {
         dead.sign_dispatched = true;
         dead.expected_operation_digest = Some(Digest32::from_bytes([11; 32]));
         write_triad_signing_state(&state_path, &dead).unwrap();
-        *fixture.signing_terminal.lock() = Some(OperationState::Quarantined);
+        *fixture.operation_terminal.lock() = Some(OperationState::Quarantined);
 
         let error = engine
             .triad_sign_evm_payload(
@@ -7845,8 +7977,8 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(&error, TxEngineError::ApprovalDenied(reason) if reason.contains("quarantined")),
-            "ambiguous outcomes must stay blocked: {error:?}"
+            matches!(&error, TxEngineError::ApprovalState(reason) if reason.contains("quarantined")),
+            "ambiguous outcomes must stay blocked, never reported as denied: {error:?}"
         );
         let after = read_triad_signing_state(&state_path).unwrap().unwrap();
         assert_eq!(after.signing_operation_id, dead.signing_operation_id);
@@ -8048,7 +8180,7 @@ mod tests {
         dead.sign_dispatched = true;
         dead.expected_operation_digest = Some(Digest32::from_bytes([11; 32]));
         write_triad_signing_state(&state_path, &dead).unwrap();
-        *fixture.signing_terminal.lock() = Some(OperationState::Failed);
+        *fixture.operation_terminal.lock() = Some(OperationState::Failed);
 
         assert!(
             matches!(
@@ -8204,6 +8336,322 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_refused_signature_replaces_the_stale_single_lineage() {
+        let (engine, fixture, entry, staged, preimage, signing_hash, _outbox_dir) =
+            single_material("triad-refused", false);
+        // First call mints the approval and hands back the ceremony.
+        assert!(matches!(
+            engine
+                .triad_sign_evm_payload(
+                    &entry,
+                    &staged,
+                    EvmOutboxActionKind::Confirm,
+                    &preimage,
+                    signing_hash,
+                )
+                .await,
+            Err(TxEngineError::ApprovalRequired(_))
+        ));
+        let state_path = entry.dir.join(TRIAD_SIGNING_STATE_FILE);
+        let first = read_triad_signing_state(&state_path).unwrap().unwrap();
+
+        fixture.active.store(true, Ordering::SeqCst);
+        // Recoverable and ambiguous errors must not mint another approval.
+        for code in [
+            ProtocolErrorCode::BackendInvalidRequest,
+            ProtocolErrorCode::UnauthenticatedPeer,
+            ProtocolErrorCode::UnsupportedVersion,
+            ProtocolErrorCode::AmbiguousProviderEffect,
+            ProtocolErrorCode::ServiceUnavailable,
+            ProtocolErrorCode::OperationIdConflict,
+        ] {
+            *fixture.deny_sign.lock() = Some(code);
+            let outcome = engine
+                .triad_sign_evm_payload(
+                    &entry,
+                    &staged,
+                    EvmOutboxActionKind::Confirm,
+                    &preimage,
+                    signing_hash,
+                )
+                .await;
+            // A retained, possibly signed request is unresolved, not denied.
+            assert!(
+                matches!(
+                    outcome,
+                    Err(TxEngineError::ApprovalState(_)
+                        | TxEngineError::ApprovalServiceUnavailable(_))
+                ),
+                "{code:?}: {outcome:?}"
+            );
+            let held = read_triad_signing_state(&state_path).unwrap().unwrap();
+            assert!(held.sign_dispatched, "{code:?}");
+            assert_eq!(held.approval_id, first.approval_id, "{code:?}");
+            assert_eq!(
+                held.signing_operation_id, first.signing_operation_id,
+                "{code:?}"
+            );
+            assert_eq!(held.request_nonce, first.request_nonce, "{code:?}");
+        }
+        // The simulated QUOTA_EXCEEDED above makes the Machine client refuse
+        // requests locally for its initial 250 ms backoff.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        *fixture.deny_sign.lock() = Some(ProtocolErrorCode::LimitExceededValue);
+        assert!(matches!(
+            engine
+                .triad_sign_evm_payload(
+                    &entry,
+                    &staged,
+                    EvmOutboxActionKind::Confirm,
+                    &preimage,
+                    signing_hash,
+                )
+                .await,
+            Err(TxEngineError::ApprovalRequired(required))
+                if required.reason.contains("LIMIT_EXCEEDED_VALUE")
+        ));
+
+        let state = read_triad_signing_state(&state_path).unwrap().unwrap();
+        assert_eq!(
+            ProtocolErrorCode::LimitExceededValue
+                .contract()
+                .durable_effect,
+            DurableEffect::ReservationReleased,
+            "the premise of this test is the Broker releasing the reservation, so nothing durable remains"
+        );
+        // Regression: only this marker was cleared. The stale approval and
+        // operation IDs still wedged both retry and cancellation.
+        assert!(
+            !state.sign_dispatched,
+            "a refusal that changed nothing must not leave a dispatch recorded"
+        );
+        assert!(state.expected_operation_digest.is_none());
+        // The fresh lineage is already prepared, awaiting its own ceremony.
+        assert!(state.approval_id.is_some() && state.approval_id != first.approval_id);
+        assert_ne!(state.approval_operation_id, first.approval_operation_id);
+        assert_ne!(state.signing_operation_id, first.signing_operation_id);
+        assert_ne!(state.request_nonce, first.request_nonce);
+
+        *fixture.deny_sign.lock() = None;
+        fixture.active.store(false, Ordering::SeqCst);
+        assert!(matches!(
+            engine
+                .triad_sign_evm_payload(
+                    &entry,
+                    &staged,
+                    EvmOutboxActionKind::Confirm,
+                    &preimage,
+                    signing_hash,
+                )
+                .await,
+            Err(TxEngineError::ApprovalRequired(_))
+        ));
+        let reissued = read_triad_signing_state(&state_path).unwrap().unwrap();
+        assert_eq!(reissued.approval_operation_id, state.approval_operation_id);
+        assert_eq!(reissued.signing_operation_id, state.signing_operation_id);
+        assert!(reissued.approval_id.is_some());
+        assert_ne!(reissued.approval_id, first.approval_id);
+    }
+
+    #[tokio::test]
+    async fn confirm_keeps_a_refused_row_pending_behind_a_fresh_ceremony() {
+        let url = spawn_batch_rpc(None).await;
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        let mut staged = fake_staged_1559("refused-confirm");
+        staged.created_ms = now_ms();
+        outbox.write_pending(&staged, "exact EVM review").unwrap();
+        let (engine, fixture, _) = triad_batch_fixture(outbox.clone(), false, false);
+        let (permit, chain, policy) =
+            (permit_for(&directory), stage_chain(&url), Policy::default());
+        let confirm = || {
+            engine.confirm(
+                &permit,
+                "alice",
+                "anvil",
+                "refused-confirm",
+                &chain,
+                &policy,
+                "y",
+            )
+        };
+        assert!(matches!(
+            confirm().await,
+            Err(TxEngineError::ApprovalRequired(_))
+        ));
+        let first = read_triad_signing_state(
+            &outbox
+                .read("alice", "anvil", "refused-confirm")
+                .unwrap()
+                .dir
+                .join(TRIAD_SIGNING_STATE_FILE),
+        )
+        .unwrap()
+        .unwrap();
+
+        fixture.active.store(true, Ordering::SeqCst);
+        *fixture.deny_sign.lock() = Some(ProtocolErrorCode::LimitExceededValue);
+        let refused = confirm().await;
+        assert!(
+            matches!(refused, Err(TxEngineError::ApprovalRequired(_))),
+            "{refused:?}"
+        );
+        let entry = outbox.read("alice", "anvil", "refused-confirm").unwrap();
+        assert_eq!(
+            entry.state,
+            OutboxState::Pending,
+            "the retry lineage must stay usable"
+        );
+        let fresh = read_triad_signing_state(&entry.dir.join(TRIAD_SIGNING_STATE_FILE))
+            .unwrap()
+            .unwrap();
+        assert!(fresh.approval_id.is_some() && fresh.approval_id != first.approval_id);
+        assert!(!fresh.sign_dispatched);
+
+        *fixture.deny_sign.lock() = None;
+        let sent = confirm().await.unwrap();
+        assert_eq!(sent.status, TxStatus::Sent);
+    }
+
+    #[tokio::test]
+    async fn a_refusal_after_expiry_still_records_the_entry_unsigned() {
+        let (engine, fixture, entry, mut staged, preimage, signing_hash, _outbox_dir) =
+            single_material("triad-refused-expired", false);
+        let sign = |staged: StagedTx| {
+            let (engine, entry, preimage) = (&engine, &entry, &preimage);
+            async move {
+                engine
+                    .triad_sign_evm_payload(
+                        entry,
+                        &staged,
+                        EvmOutboxActionKind::Confirm,
+                        preimage,
+                        signing_hash,
+                    )
+                    .await
+            }
+        };
+        assert!(matches!(
+            sign(staged.clone()).await,
+            Err(TxEngineError::ApprovalRequired(_))
+        ));
+        fixture.active.store(true, Ordering::SeqCst);
+        *fixture.deny_sign.lock() = Some(ProtocolErrorCode::LimitExceededValue);
+        // The staged deadline passes while the request is in flight, so no
+        // fresh lineage can be prepared after the refusal.
+        staged.expires_ms = now_ms() - 1;
+        assert!(sign(staged).await.is_err());
+        let state = read_triad_signing_state(&entry.dir.join(TRIAD_SIGNING_STATE_FILE))
+            .unwrap()
+            .unwrap();
+        // A refusal proves no signature exists; a stale marker would make the
+        // expired entry look possibly signed and block its discard.
+        assert!(!state.sign_dispatched);
+        assert!(state.expected_operation_digest.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_refused_confirmation_can_be_superseded_by_cancellation() {
+        let (engine, fixture, entry, staged, preimage, signing_hash, _outbox_dir) =
+            single_material("triad-refused-cancel", false);
+        assert!(matches!(
+            engine
+                .triad_sign_evm_payload(
+                    &entry,
+                    &staged,
+                    EvmOutboxActionKind::Confirm,
+                    &preimage,
+                    signing_hash,
+                )
+                .await,
+            Err(TxEngineError::ApprovalRequired(_))
+        ));
+        fixture.active.store(true, Ordering::SeqCst);
+        *fixture.deny_sign.lock() = Some(ProtocolErrorCode::ClaimInvalid);
+        assert!(matches!(
+            engine
+                .triad_sign_evm_payload(
+                    &entry,
+                    &staged,
+                    EvmOutboxActionKind::Confirm,
+                    &preimage,
+                    signing_hash,
+                )
+                .await,
+            Err(TxEngineError::ApprovalRequired(_))
+        ));
+        let state_path = entry.dir.join(TRIAD_SIGNING_STATE_FILE);
+        let refused = read_triad_signing_state(&state_path).unwrap().unwrap();
+        assert!(!refused.sign_dispatched);
+
+        *fixture.deny_sign.lock() = None;
+        fixture.active.store(false, Ordering::SeqCst);
+        assert!(matches!(
+            engine
+                .triad_sign_evm_payload(
+                    &entry,
+                    &staged,
+                    EvmOutboxActionKind::Cancel,
+                    &preimage,
+                    signing_hash,
+                )
+                .await,
+            Err(TxEngineError::ApprovalRequired(_))
+        ));
+        let cancellation = read_triad_signing_state(&state_path).unwrap().unwrap();
+        assert_eq!(
+            cancellation.action_id,
+            outbox_action_id(&staged, EvmOutboxActionKind::Cancel)
+        );
+        assert_ne!(
+            cancellation.approval_operation_id,
+            refused.approval_operation_id
+        );
+        assert!(cancellation.approval_id.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_lost_response_keeps_the_dispatch_marker_because_a_signature_may_exist() {
+        let (engine, fixture, entry, staged, preimage, signing_hash, _outbox_dir) =
+            single_material("triad-lost", true);
+        assert!(matches!(
+            engine
+                .triad_sign_evm_payload(
+                    &entry,
+                    &staged,
+                    EvmOutboxActionKind::Confirm,
+                    &preimage,
+                    signing_hash,
+                )
+                .await,
+            Err(TxEngineError::ApprovalRequired(_))
+        ));
+
+        // ServiceUnavailable after the Broker already committed: the signature
+        // exists, only the answer was lost. Clearing the marker here would let
+        // a retry sign the same nonce twice.
+        fixture.active.store(true, Ordering::SeqCst);
+        assert!(
+            engine
+                .triad_sign_evm_payload(
+                    &entry,
+                    &staged,
+                    EvmOutboxActionKind::Confirm,
+                    &preimage,
+                    signing_hash,
+                )
+                .await
+                .is_err()
+        );
+        let state_path = entry.dir.join(TRIAD_SIGNING_STATE_FILE);
+        let state = read_triad_signing_state(&state_path).unwrap().unwrap();
+        assert!(
+            state.sign_dispatched,
+            "an unresolved dispatch must stay recorded so recovery reconciles it"
+        );
+    }
+
     fn triad_batch_fixture(
         outbox: Outbox,
         active: bool,
@@ -8212,7 +8660,8 @@ mod tests {
         let fixture = Arc::new(TriadBrokerFixture {
             active: AtomicBool::new(active),
             approval_terminal: parking_lot::Mutex::new(None),
-            signing_terminal: parking_lot::Mutex::new(None),
+            deny_sign: parking_lot::Mutex::new(None),
+            operation_terminal: parking_lot::Mutex::new(None),
             lose_sign_response_once: AtomicBool::new(lose_sign_response_once),
             corrupt_status_result: AtomicBool::new(false),
             completed_result: parking_lot::Mutex::new(None),
@@ -8270,6 +8719,54 @@ mod tests {
             .collect::<Vec<_>>();
         let (preimages, hashes): (Vec<_>, Vec<_>) = prepared.into_iter().unzip();
         (refs, staged, preimages, hashes)
+    }
+
+    /// Stage one entry and stand the engine up over it — the single-payload
+    /// counterpart of `batch_material`. Keep the returned `TempDir` alive for
+    /// the whole test: it owns the outbox tree on disk.
+    fn single_material(
+        id: &str,
+        lose_sign_response_once: bool,
+    ) -> (
+        TxEngine,
+        Arc<TriadBrokerFixture>,
+        crate::outbox::OutboxEntry,
+        StagedTx,
+        Vec<u8>,
+        B256,
+        tempfile::TempDir,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        let mut staged = fake_staged_1559(id);
+        staged.created_ms = now_ms();
+        outbox.write_pending(&staged, "exact EVM review").unwrap();
+        let entry = outbox
+            .read_in_state("alice", "anvil", id, OutboxState::Pending)
+            .unwrap();
+        let (engine, fixture, _) = triad_batch_fixture(outbox, false, lose_sign_response_once);
+        let unsigned = UnsignedEvmTx::Eip1559(TxEip1559 {
+            chain_id: staged.chain_id,
+            nonce: staged.nonce,
+            gas_limit: staged.gas_limit,
+            max_fee_per_gas: 100,
+            max_priority_fee_per_gas: 10,
+            to: TxKind::Call(staged.to.as_deref().unwrap().parse().unwrap()),
+            value: U256::ZERO,
+            access_list: AccessList::default(),
+            input: Bytes::new(),
+        });
+        let preimage = TxEngine::unsigned_signing_preimage(&unsigned);
+        let signing_hash = TxEngine::unsigned_signing_hash(&unsigned);
+        (
+            engine,
+            fixture,
+            entry,
+            staged,
+            preimage,
+            signing_hash,
+            directory,
+        )
     }
 
     #[tokio::test]
@@ -8348,6 +8845,191 @@ mod tests {
                 .iter()
                 .any(|request| matches!(request, MachineBrokerRequest::SigningSign(_)))
         );
+    }
+
+    #[tokio::test]
+    async fn a_refused_batch_signature_replaces_the_stale_lineage() {
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+        let (engine, fixture, _) = triad_batch_fixture(outbox.clone(), false, false);
+        let (refs, staged, preimages, hashes) = batch_material(&["refused-a", "refused-b"]);
+
+        assert!(matches!(
+            engine
+                .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
+                .await,
+            Err(TxEngineError::ApprovalRequired(_))
+        ));
+        let state_path = batch_signing_state_path(outbox.root(), "alice", &refs).unwrap();
+        let first = read_triad_batch_signing_state(&state_path)
+            .unwrap()
+            .unwrap();
+
+        fixture.active.store(true, Ordering::SeqCst);
+        for code in [
+            ProtocolErrorCode::BackendInvalidRequest,
+            ProtocolErrorCode::UnauthenticatedPeer,
+            ProtocolErrorCode::UnsupportedVersion,
+            ProtocolErrorCode::AmbiguousProviderEffect,
+            ProtocolErrorCode::ServiceUnavailable,
+            ProtocolErrorCode::OperationIdConflict,
+        ] {
+            *fixture.deny_sign.lock() = Some(code);
+            let outcome = engine
+                .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
+                .await;
+            assert!(
+                matches!(
+                    outcome,
+                    Err(TxEngineError::ApprovalState(_)
+                        | TxEngineError::ApprovalServiceUnavailable(_))
+                ),
+                "{code:?}: {outcome:?}"
+            );
+            let held = read_triad_batch_signing_state(&state_path)
+                .unwrap()
+                .unwrap();
+            assert!(held.sign_dispatched, "{code:?}");
+            assert_eq!(held.approval_id, first.approval_id, "{code:?}");
+            assert_eq!(
+                held.signing_operation_id, first.signing_operation_id,
+                "{code:?}"
+            );
+            assert_eq!(held.request_nonce, first.request_nonce, "{code:?}");
+        }
+        // The simulated QUOTA_EXCEEDED above makes the Machine client refuse
+        // requests locally for its initial 250 ms backoff.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        *fixture.deny_sign.lock() = Some(ProtocolErrorCode::LimitExceededValue);
+        assert!(matches!(
+            engine
+                .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
+                .await,
+            Err(TxEngineError::ApprovalRequired(required))
+                if required.reason.contains("LIMIT_EXCEEDED_VALUE")
+        ));
+
+        let state = read_triad_batch_signing_state(&state_path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ProtocolErrorCode::LimitExceededValue
+                .contract()
+                .durable_effect,
+            DurableEffect::ReservationReleased,
+            "the premise of this test is the Broker releasing the reservation, so nothing durable remains"
+        );
+        // Regression: only this marker was cleared. The batch then reused its
+        // dead approval and immutable operation ID forever.
+        assert!(
+            !state.sign_dispatched,
+            "a refusal that changed nothing must not leave a dispatch recorded"
+        );
+        assert!(state.expected_operation_digest.is_none());
+        // The fresh lineage is already prepared, awaiting its own ceremony.
+        assert!(state.approval_id.is_some() && state.approval_id != first.approval_id);
+        assert_ne!(state.approval_operation_id, first.approval_operation_id);
+        assert_ne!(state.signing_operation_id, first.signing_operation_id);
+        assert_ne!(state.request_nonce, first.request_nonce);
+
+        *fixture.deny_sign.lock() = None;
+        fixture.active.store(false, Ordering::SeqCst);
+        assert!(matches!(
+            engine
+                .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
+                .await,
+            Err(TxEngineError::ApprovalRequired(_))
+        ));
+        let reissued = read_triad_batch_signing_state(&state_path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reissued.approval_operation_id, state.approval_operation_id);
+        assert_eq!(reissued.signing_operation_id, state.signing_operation_id);
+        assert!(reissued.approval_id.is_some());
+        assert_ne!(reissued.approval_id, first.approval_id);
+    }
+
+    #[tokio::test]
+    async fn a_definitely_terminal_batch_operation_releases_the_row_but_quarantine_holds_it() {
+        for (terminal, marker_should_clear) in [
+            // The Broker releases the reservation for these and calls them a
+            // definite terminal failure: no signature exists or can.
+            (OperationState::Denied, true),
+            (OperationState::Cancelled, true),
+            (OperationState::Failed, true),
+            // Quarantine is an ambiguous provider effect. A signature may be
+            // out there, so re-signing these nonces could double-spend them.
+            (OperationState::Quarantined, false),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
+            let (engine, fixture, _) = triad_batch_fixture(outbox.clone(), false, true);
+            let (refs, staged, preimages, hashes) = batch_material(&["terminal-a", "terminal-b"]);
+
+            assert!(matches!(
+                engine
+                    .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
+                    .await,
+                Err(TxEngineError::ApprovalRequired(_))
+            ));
+            // Lose the response so the row is left holding `sign_dispatched`,
+            // which is the only way to reach the status re-read below.
+            fixture.active.store(true, Ordering::SeqCst);
+            assert!(matches!(
+                engine
+                    .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
+                    .await,
+                Err(TxEngineError::ApprovalServiceUnavailable(_))
+            ));
+            let state_path = batch_signing_state_path(outbox.root(), "alice", &refs).unwrap();
+            let dispatched = read_triad_batch_signing_state(&state_path)
+                .unwrap()
+                .unwrap();
+            assert!(dispatched.sign_dispatched);
+
+            *fixture.operation_terminal.lock() = Some(terminal);
+            let outcome = engine
+                .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
+                .await;
+            if marker_should_clear {
+                assert!(matches!(outcome, Err(TxEngineError::ApprovalRequired(_))));
+            } else {
+                assert!(matches!(outcome, Err(TxEngineError::ApprovalState(_))));
+            }
+
+            let state = read_triad_batch_signing_state(&state_path)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                !state.sign_dispatched, marker_should_clear,
+                "{terminal:?} was handled as though it were the other kind of terminal"
+            );
+            if marker_should_clear {
+                assert!(state.approval_id.is_some());
+                assert_ne!(state.approval_id, dispatched.approval_id);
+                assert_ne!(
+                    state.approval_operation_id,
+                    dispatched.approval_operation_id
+                );
+                assert_ne!(state.signing_operation_id, dispatched.signing_operation_id);
+                assert_ne!(state.request_nonce, dispatched.request_nonce);
+
+                *fixture.operation_terminal.lock() = None;
+                *fixture.completed_result.lock() = None;
+                fixture.active.store(false, Ordering::SeqCst);
+                assert!(matches!(
+                    engine
+                        .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
+                        .await,
+                    Err(TxEngineError::ApprovalRequired(_))
+                ));
+            } else {
+                assert_eq!(state.approval_id, dispatched.approval_id);
+                assert_eq!(state.signing_operation_id, dispatched.signing_operation_id);
+                assert!(state.ceremony_url.is_none(), "{terminal:?}");
+                assert!(state.ceremony_expires_at_ms.is_none(), "{terminal:?}");
+            }
+        }
     }
 
     #[tokio::test]
