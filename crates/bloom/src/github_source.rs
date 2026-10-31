@@ -807,14 +807,19 @@ fn install_github_source_with_expectation(
 
 /// How an already-installed owner relates to the pinned catalog entry.
 ///
-/// Anything that is neither of these two states is a refusal: Bloom only ever
-/// replaces a Petal it can prove it installed itself from the same trusted
-/// catalog repository.
+/// Anything that is neither of these two states is a refusal. Bloom replaces
+/// a Petal only when it can identify it as a catalogued release: either by
+/// source provenance from the trusted catalog repository, or, when no source
+/// was recorded, by a package hash equal to a catalogued release's hash. The
+/// hash proves the bytes match; it does not prove where they were fetched from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PreinstalledState {
-    /// The installed owner is exactly the pinned commit and package hash.
+    /// The installed package is the pinned release: same commit and hash, or,
+    /// without source provenance, the pinned release's package hash.
     Current,
-    /// Same Petal name, same trusted catalog repository, older pinned commit.
+    /// An older catalogued release of the same Petal: same trusted repository
+    /// at another commit, or, without source provenance, a predecessor release
+    /// hash (`installed_commit` is then `"unrecorded"`).
     Outdated { installed_commit: String },
 }
 
@@ -1358,9 +1363,12 @@ fn validate_release_authority(
 ///
 /// Returns `Current` when the installation is already the pinned commit and
 /// hash, and `Outdated` when it is the same Petal from the same trusted catalog
-/// repository at a different commit. Every other shape — missing provenance, a
-/// different repository, or an identity that contradicts itself — is refused so
-/// that manually sourced or untrusted ownership is never overwritten.
+/// repository at a different commit. An installation without source
+/// provenance is identified by content alone: its package hash must equal the
+/// pinned or a predecessor release hash. Every other shape — missing
+/// provenance with an unknown hash, a different repository, or an identity
+/// that contradicts itself — is refused so that manually sourced or untrusted
+/// ownership is never overwritten.
 pub(crate) fn classify_existing_preinstalled(
     expected: &PreinstalledPetal,
     meta: &bloom_petals::meta::PetalMeta,
