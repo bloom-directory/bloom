@@ -42,6 +42,10 @@ pub const ACCOUNT_KEY_FILES: [&str; 7] = [
 /// only with outbox entries that account's EVM key staged.
 const EVM_MEMPOOL_LEAVES: [&str; 2] = ["pending_external.jsonl", "nonce_conflicts.json"];
 
+/// How long `holdings.json` waits for one chain before recording it as an
+/// error. Chains are read concurrently, so this bounds the whole read.
+const HOLDINGS_CHAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Sorted account-owned nonces and the transaction hashes grouped by nonce.
 type EvmOutboxNonces = (Vec<u64>, std::collections::BTreeMap<u64, Vec<String>>);
 
@@ -364,7 +368,7 @@ impl WalletsHandler {
     }
 
     fn account_dir_entries(view: &AccountView) -> Vec<Entry> {
-        let mut entries = vec![Entry::file("account.json")];
+        let mut entries = vec![Entry::file("account.json"), Entry::file("holdings.json")];
         entries.extend(
             ACCOUNT_KEY_FILES
                 .into_iter()
@@ -446,6 +450,13 @@ impl WalletsHandler {
     }
 
     fn chain_name_entries(&self, view: &AccountView) -> Vec<Entry> {
+        self.chain_names(view)
+            .into_iter()
+            .map(|name| Entry::dir(&name))
+            .collect()
+    }
+
+    fn chain_names(&self, view: &AccountView) -> std::collections::BTreeSet<String> {
         let mut names = std::collections::BTreeSet::new();
         if view.evm.as_ref().and_then(FamilyKey::address).is_some() {
             names.extend(self.chains.list_names());
@@ -456,7 +467,98 @@ impl WalletsHandler {
                 names.extend(solana.keys().cloned());
             }
         }
-        names.into_iter().map(|name| Entry::dir(&name)).collect()
+        names
+    }
+
+    /// `holdings.json`: the account's non-zero native and well-known token
+    /// balances on every chain it lists. Chains are read concurrently; one
+    /// that fails or times out is recorded under `errors` and the rest still
+    /// render.
+    async fn holdings_json(&self, view: &AccountView) -> Result<Vec<u8>, HandlerError> {
+        let names = self.chain_names(view);
+        let reads = futures::future::join_all(names.iter().map(|chain| async move {
+            let read =
+                tokio::time::timeout(HOLDINGS_CHAIN_TIMEOUT, self.chain_holdings(view, chain))
+                    .await
+                    .unwrap_or_else(|_| Err(HandlerError::backend("timed out")));
+            (chain, read)
+        }))
+        .await;
+        let mut holdings = Vec::new();
+        let mut errors = serde_json::Map::new();
+        for (chain, read) in reads {
+            match read {
+                Ok((found, unread)) => {
+                    holdings.extend(found);
+                    if !unread.is_empty() {
+                        let message = format!("could not read {}", unread.join(", "));
+                        errors.insert(chain.clone(), message.into());
+                    }
+                }
+                Err(error) => {
+                    errors.insert(chain.clone(), error.to_string().into());
+                }
+            }
+        }
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "holdings": holdings,
+            "errors": errors,
+        }))
+        .map_err(err_be)
+    }
+
+    /// One chain's non-zero balances for `holdings.json`: the native asset,
+    /// plus the curated tokens of `tokens/known.json` on EVM chains, and the
+    /// symbols of tokens whose balance could not be read. A failed native
+    /// read fails the chain.
+    async fn chain_holdings(
+        &self,
+        view: &AccountView,
+        chain: &str,
+    ) -> Result<(Vec<serde_json::Value>, Vec<&'static str>), HandlerError> {
+        use crate::handlers::balances::{SOL_DECIMALS, SOL_SYMBOL, amount_fields};
+        use alloy::primitives::U256;
+        let mut found = Vec::new();
+        let mut unread = Vec::new();
+        if self.is_solana_chain(chain) {
+            let (_, account) = Self::solana_family(view, chain)?;
+            let lamports = self.solana_balance(chain, &account.address).await?;
+            let native = U256::from(lamports);
+            found.push(amount_fields(
+                chain,
+                "native",
+                SOL_SYMBOL,
+                SOL_DECIMALS,
+                native,
+            ));
+        } else {
+            let client = self
+                .chains
+                .get(chain)
+                .ok_or_else(|| HandlerError::not_found(format!("chain '{chain}'")))?;
+            let holder = Self::evm_address(Self::evm_family(view, chain)?)?;
+            let spec = client.spec();
+            let native = client.balance(holder).await.map_err(err_be)?;
+            found.push(amount_fields(
+                chain,
+                "native",
+                &spec.native_symbol,
+                spec.native_decimals,
+                native,
+            ));
+            for token in bloom_proto::tokens::for_chain(spec.chain_id) {
+                let contract: alloy::primitives::Address = token.address.parse().map_err(err_be)?;
+                let Ok(Some(raw)) = client.erc20_balance(contract, holder).await else {
+                    unread.push(token.symbol);
+                    continue;
+                };
+                let mut held = amount_fields(chain, "erc20", token.symbol, token.decimals, raw);
+                held["address"] = bloom_proto::checksum_address(&contract).into();
+                found.push(held);
+            }
+        }
+        found.retain(|held| held["raw"] != "0");
+        Ok((found, unread))
     }
 
     pub(super) async fn lookup_account(
@@ -473,7 +575,11 @@ impl WalletsHandler {
                 let sessions = self.account_sessions(wallet, &view)?;
                 Self::lookup_account_session(&sessions, sessions_rest)
             }
-            [leaf] if leaf == "account.json" || Self::key_file_key(&view, leaf).is_some() => {
+            [leaf]
+                if leaf == "account.json"
+                    || leaf == "holdings.json"
+                    || Self::key_file_key(&view, leaf).is_some() =>
+            {
                 Ok(Entry::file(leaf))
             }
             [dir] if dir == "chains" => Ok(Entry::dir("chains")),
@@ -509,6 +615,7 @@ impl WalletsHandler {
         };
         match rest {
             [leaf] if leaf == "account.json" => self.account_json(wallet, &view),
+            [leaf] if leaf == "holdings.json" => self.holdings_json(&view).await,
             [leaf] if ACCOUNT_KEY_FILES.contains(&leaf.as_str()) => {
                 Self::read_account_key_file(&view, leaf)
             }

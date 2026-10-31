@@ -19,6 +19,27 @@ in `docs/examples.md` before using an unfamiliar write surface. For Petal work,
 use `docs/petals.md` to discover installed packages, then read that package's
 `README.md` and `AGENTS.md` before using its routes.
 
+To find where an account's funds are, read
+`wallets/<wallet>/<n>/holdings.json`. It lists the account's non-zero native
+and well-known token balances on every configured chain; a chain that could
+not be read appears under `errors` instead. Tokens outside
+`chains/<chain>/addresses/<address>/tokens/known.json` are not checked, and on
+Solana chains it shows SOL only, not SPL tokens.
+
+## When the request leaves something out
+
+Use live state to identify the wallet and account. Ask which chain to use
+when the user has not named one:
+
+- If there is only one wallet or account, use it.
+- Use `holdings.json` and the Petal's documentation to explain the available
+  choices, not to select a chain or default to mainnet. Holdings can be
+  incomplete when a read fails or a token is outside the curated list.
+- If the wallet, account or network is ambiguous, ask one question that names
+  the remaining choices before staging work.
+
+Report a failed or partially completed action as a failure, never as done.
+
 ## Authority and safety
 
 Machine exposes this VFS; Broker controls approval ceremonies and policy;
