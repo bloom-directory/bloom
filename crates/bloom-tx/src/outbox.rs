@@ -2,16 +2,120 @@
 //!
 //! Layout: `<home>/outbox/<wallet>/<chain>/{pending,sent,failed}/<id>/...`
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use bloom_broker_api::Digest32;
 use bloom_proto::{StagedTx, TxStatus};
+use fs2::FileExt as _;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+/// Broker signing state, kept in an entry directory or in a batch directory.
+pub const SIGNING_STATE_FILE: &str = "ceremony.json";
+/// Directory under the outbox root holding one signing state per EVM batch.
+pub const BATCH_SIGNING_STATE_DIR: &str = ".batch-signing";
+
+/// Lock file under the outbox root. Signing holds it while it records that a
+/// single or batch signing request is being sent, and the expiry sweep and
+/// every discard hold it from their final "provably unsigned" check through
+/// the move to failed/, so neither can act on a stale check.
+const LIFECYCLE_LOCK_FILE: &str = ".lifecycle.lock";
+
+/// Held lifecycle lock; dropping it releases the lock.
+pub struct LifecycleLock(#[allow(dead_code)] fs::File);
+
+#[derive(Deserialize)]
+struct SigningStateSummary {
+    #[serde(default)]
+    sign_dispatched: bool,
+}
+
+#[derive(Deserialize)]
+struct BatchStateSummary {
+    #[serde(default)]
+    sign_dispatched: bool,
+    wallet: String,
+    ordered_refs: Vec<BatchStateRef>,
+    #[serde(default)]
+    ordered_payload_digests: Vec<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct BatchStateRef {
+    chain: String,
+    id: String,
+}
+
+/// The pending attempts that dispatched batch signing states may have
+/// signed. Read once per sweep or discard.
+#[derive(Default)]
+pub struct BatchIndex {
+    /// `(wallet, chain, id)` to the payload digest each dispatched batch
+    /// signed for it; `None` for a legacy state that records no digest.
+    dispatched: HashMap<(String, String, String), Vec<Option<Digest32>>>,
+    /// Some batch state could not be read, so it may cover any entry.
+    unreadable: bool,
+}
+
+impl BatchIndex {
+    /// Whether a dispatched batch may have signed this specific attempt. A
+    /// batch that signed an earlier attempt under the same ID does not count:
+    /// its payload digest differs.
+    fn covers(&self, staged: &StagedTx) -> bool {
+        if self.unreadable {
+            return true;
+        }
+        let key = (
+            staged.wallet.clone(),
+            staged.chain.clone(),
+            staged.id.clone(),
+        );
+        let Some(signed) = self.dispatched.get(&key) else {
+            return false;
+        };
+        let digest = crate::tx_engine::staged_payload_digest(staged);
+        signed.iter().any(|signed| match (signed, &digest) {
+            (Some(signed), Some(digest)) => signed == digest,
+            _ => true,
+        })
+    }
+}
+
+/// Whether anything is at `path`. Only a clean "not found" proves absence.
+fn may_exist(path: &Path) -> bool {
+    !matches!(fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+}
+
+/// Whether a per-entry signing state records a dispatched signing request.
+/// A state that cannot be read or parsed counts as dispatched.
+fn signing_dispatched(path: &Path) -> bool {
+    match fs::read(path) {
+        Ok(bytes) => serde_json::from_slice::<SigningStateSummary>(&bytes)
+            .map_or(true, |state| state.sign_dispatched),
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
+/// The transaction hash an entry records, from its intent or any broadcast
+/// attempt marker.
+fn recorded_hash(entry: &OutboxEntry) -> Option<String> {
+    entry.staged.tx_hash.clone().or_else(|| {
+        BroadcastAttemptKind::ALL.iter().find_map(|kind| {
+            let bytes = fs::read(entry.dir.join(kind.marker_name())).ok()?;
+            Some(
+                serde_json::from_slice::<BroadcastAttempt>(&bytes)
+                    .ok()?
+                    .tx_hash,
+            )
+        })
+    })
+}
 
 /// A parsed view of a `<root>/<wallet>/<chain>/sent/<id>/intent.json` entry.
 /// Used by background scanners (e.g. `BumpScanner`) that walk all sent entries.
@@ -98,6 +202,18 @@ pub enum OutboxError {
     InvalidChain(String),
     #[error("structured valuation unavailable for staged tx '{0}'")]
     UnknownValuation(String),
+    #[error("cannot discard a possibly signed transaction '{id}': {}", match (tx_hash, batch_state_unreadable) {
+        (Some(hash), _) => format!("it may have been broadcast as {hash}"),
+        (None, true) => format!("a batch signing record under outbox/{BATCH_SIGNING_STATE_DIR} could not be read, so Bloom cannot prove this entry was never signed"),
+        (None, false) => "a signing request may have been sent, but no transaction hash is recorded".to_owned(),
+    })]
+    PossiblySigned {
+        id: String,
+        tx_hash: Option<String>,
+        /// The only evidence of signing is a batch state that cannot be
+        /// read, so it may cover any entry.
+        batch_state_unreadable: bool,
+    },
     #[error("{0}")]
     Other(String),
 }
@@ -1002,47 +1118,185 @@ impl Outbox {
         Ok(new_dir)
     }
 
+    /// Take the outbox lifecycle lock (see [`LIFECYCLE_LOCK_FILE`]). It is a
+    /// file lock, so it also excludes other processes using this outbox.
+    pub fn lock_lifecycle(&self) -> Result<LifecycleLock, OutboxError> {
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(self.inner.root.join(LIFECYCLE_LOCK_FILE))?;
+        file.lock_exclusive()?;
+        Ok(LifecycleLock(file))
+    }
+
+    /// Move a pending entry to failed/ as cancelled, only if it is provably
+    /// unsigned. A possibly signed entry stays pending, because its
+    /// transaction can still land and its nonce must not be reused.
     pub fn cancel(&self, wallet: &str, chain: &str, id: &str) -> Result<(), OutboxError> {
+        let _lock = self.lock_lifecycle()?;
         let entry = self.read_in_state(wallet, chain, id, OutboxState::Pending)?;
+        let batches = self.batch_index();
+        if self.possibly_signed(&entry, &batches) {
+            let readable = BatchIndex {
+                dispatched: batches.dispatched.clone(),
+                unreadable: false,
+            };
+            return Err(OutboxError::PossiblySigned {
+                id: id.into(),
+                tx_hash: recorded_hash(&entry),
+                batch_state_unreadable: batches.unreadable
+                    && !self.possibly_signed(&entry, &readable),
+            });
+        }
         let new_dir = self.transition_with_status(&entry, TxStatus::Cancelled)?;
         self.write_artefact(&new_dir, "cancel.txt", b"cancelled by user")?;
         Ok(())
     }
 
-    /// Pending entries whose expiry has passed, read without changing
-    /// anything, so a caller can tell whether a sweep would do any work.
-    pub fn expired_pending(&self, now_ms: u128) -> Result<Vec<OutboxEntry>, OutboxError> {
-        let mut expired = Vec::new();
-        if !self.inner.root.exists() {
-            return Ok(expired);
-        }
-        for w in fs::read_dir(&self.inner.root)? {
-            let w = w?;
-            if w.file_name().into_string().is_err() || !w.file_type()?.is_dir() {
+    /// Read every dispatched batch signing state once.
+    pub fn batch_index(&self) -> BatchIndex {
+        let mut index = BatchIndex::default();
+        let dir = self.inner.root.join(BATCH_SIGNING_STATE_DIR);
+        let batches = match fs::read_dir(&dir) {
+            Ok(batches) => batches,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return index,
+            Err(error) => {
+                tracing::warn!(path = %dir.display(), %error, "outbox.batch_state_unreadable");
+                index.unreadable = true;
+                return index;
+            }
+        };
+        for batch in batches {
+            let path = match batch {
+                Ok(batch) => batch.path().join(SIGNING_STATE_FILE),
+                Err(error) => {
+                    tracing::warn!(path = %dir.display(), %error, "outbox.batch_state_unreadable");
+                    index.unreadable = true;
+                    continue;
+                }
+            };
+            // Stray files beside the batch directories are not batch states.
+            if !path.parent().is_some_and(Path::is_dir) {
                 continue;
             }
-            for c in fs::read_dir(w.path())? {
-                let c = c?;
-                if c.file_name().into_string().is_err() || !c.file_type()?.is_dir() {
+            let state = match fs::read(&path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => Err(error.to_string()),
+                Ok(bytes) => serde_json::from_slice::<BatchStateSummary>(&bytes)
+                    .map_err(|error| error.to_string()),
+            };
+            let state = match state {
+                Ok(state) => state,
+                Err(error) => {
+                    tracing::warn!(path = %path.display(), %error, "outbox.batch_state_unreadable");
+                    index.unreadable = true;
                     continue;
                 }
+            };
+            if !state.sign_dispatched {
+                continue;
+            }
+            let digests_match = state.ordered_payload_digests.len() == state.ordered_refs.len();
+            for (position, child) in state.ordered_refs.into_iter().enumerate() {
+                let digest = digests_match
+                    .then(|| {
+                        serde_json::from_value(state.ordered_payload_digests[position].clone()).ok()
+                    })
+                    .flatten();
+                index
+                    .dispatched
+                    .entry((state.wallet.clone(), child.chain, child.id))
+                    .or_default()
+                    .push(digest);
+            }
+        }
+        index
+    }
+
+    /// Whether an entry is not provably unsigned: it records a hash, any
+    /// broadcast attempt or signed raw transaction, a dispatched signing
+    /// request of its own, or a dispatched batch signing request that covers
+    /// this attempt. Anything that cannot be read counts as signed.
+    pub fn possibly_signed(&self, entry: &OutboxEntry, batches: &BatchIndex) -> bool {
+        entry.staged.tx_hash.is_some()
+            || BroadcastAttemptKind::ALL.iter().any(|kind| {
+                may_exist(&entry.dir.join(kind.marker_name()))
+                    || may_exist(&entry.dir.join(kind.raw_name()))
+            })
+            || signing_dispatched(&entry.dir.join(SIGNING_STATE_FILE))
+            || batches.covers(&entry.staged)
+    }
+
+    /// Pending entries whose expiry has passed and that are provably
+    /// unsigned, read without changing anything, so a caller can tell whether
+    /// a sweep would do any work. An entry that cannot be read is skipped.
+    pub fn expired_pending(&self, now_ms: u128) -> Result<Vec<OutboxEntry>, OutboxError> {
+        let batches = self.batch_index();
+        let mut expired = Vec::new();
+        let skip = |path: &Path, error: &dyn std::fmt::Display| {
+            tracing::warn!(path = %path.display(), %error, "outbox.sweep_entry_unreadable");
+        };
+        let wallets = match fs::read_dir(&self.inner.root) {
+            Ok(wallets) => wallets,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(expired),
+            Err(error) => return Err(error.into()),
+        };
+        for w in wallets {
+            let Ok(w) = w else { continue };
+            if w.file_name().into_string().is_err() || !w.path().is_dir() {
+                continue;
+            }
+            let chains = match fs::read_dir(w.path()) {
+                Ok(chains) => chains,
+                Err(error) => {
+                    skip(&w.path(), &error);
+                    continue;
+                }
+            };
+            for c in chains.flatten() {
                 let pending = c.path().join("pending");
-                if !pending.exists() {
+                if c.file_name().into_string().is_err() || !pending.is_dir() {
                     continue;
                 }
-                for ent in fs::read_dir(&pending)? {
-                    let ent = ent?;
-                    let intent_path = ent.path().join("intent.json");
-                    if !intent_path.exists() {
+                let entries = match fs::read_dir(&pending) {
+                    Ok(entries) => entries,
+                    Err(error) => {
+                        skip(&pending, &error);
                         continue;
                     }
-                    let staged: StagedTx = serde_json::from_slice(&fs::read(&intent_path)?)?;
-                    if staged.expires_ms != 0 && now_ms >= staged.expires_ms {
-                        expired.push(OutboxEntry {
-                            state: OutboxState::Pending,
-                            staged,
-                            dir: ent.path(),
+                };
+                for ent in entries.flatten() {
+                    let intent_path = ent.path().join("intent.json");
+                    if !may_exist(&intent_path) {
+                        continue;
+                    }
+                    let staged = fs::read(&intent_path)
+                        .map_err(|error| error.to_string())
+                        .and_then(|bytes| {
+                            serde_json::from_slice::<StagedTx>(&bytes)
+                                .map_err(|error| error.to_string())
                         });
+                    let staged = match staged {
+                        Ok(staged) => staged,
+                        Err(error) => {
+                            skip(&intent_path, &error);
+                            continue;
+                        }
+                    };
+                    if staged.expires_ms == 0 || now_ms < staged.expires_ms {
+                        continue;
+                    }
+                    let entry = OutboxEntry {
+                        state: OutboxState::Pending,
+                        staged,
+                        dir: ent.path(),
+                    };
+                    // A possibly signed transaction can still land after its
+                    // stage TTL. Keep it pending so a confirm retry reconciles it.
+                    if !self.possibly_signed(&entry, &batches) {
+                        expired.push(entry);
                     }
                 }
             }
@@ -1050,13 +1304,44 @@ impl Outbox {
         Ok(expired)
     }
 
-    /// Remove pending entries that have expired.
+    /// Move expired, provably unsigned pending entries to failed/. Possibly
+    /// signed entries stay pending for reconciliation.
     pub fn sweep_expired(&self, now_ms: u128) -> Result<usize, OutboxError> {
-        let expired = self.expired_pending(now_ms)?;
-        for entry in &expired {
-            let staged = &entry.staged;
-            match self.transition_with_status(entry, TxStatus::Failed) {
+        let selected = self.expired_pending(now_ms)?;
+        self.retire_expired(selected, now_ms)
+    }
+
+    /// Recheck and move entries [`Self::expired_pending`] selected. Signing
+    /// may have dispatched since the selection, so the final check and the
+    /// move happen under the lock signing holds while it records a dispatch.
+    fn retire_expired(
+        &self,
+        selected: Vec<OutboxEntry>,
+        now_ms: u128,
+    ) -> Result<usize, OutboxError> {
+        if selected.is_empty() {
+            return Ok(0);
+        }
+        let _lock = self.lock_lifecycle()?;
+        let batches = self.batch_index();
+        let mut swept = 0;
+        for selected in selected {
+            let staged = &selected.staged;
+            let Ok(entry) = self.read_in_state(
+                &staged.wallet,
+                &staged.chain,
+                &staged.id,
+                OutboxState::Pending,
+            ) else {
+                continue;
+            };
+            if self.possibly_signed(&entry, &batches) {
+                tracing::info!(id = %staged.id, wallet = %staged.wallet, chain = %staged.chain, "outbox.sweep_kept_possibly_signed");
+                continue;
+            }
+            match self.transition_with_status(&entry, TxStatus::Failed) {
                 Ok(dir) => {
+                    swept += 1;
                     if let Err(e) =
                         self.write_artefact(&dir, "expired.txt", b"expired before approval")
                     {
@@ -1088,7 +1373,7 @@ impl Outbox {
                 }
             }
         }
-        Ok(expired.len())
+        Ok(swept)
     }
 
     /// Sum the structured valuation of every staged tx for `wallet` whose
@@ -1608,6 +1893,259 @@ mod tests {
             );
             assert_eq!(entry.dir.join("cancel.txt").exists(), id == "cancelled");
         }
+    }
+
+    fn write_expired(ob: &Outbox, id: &str) -> PathBuf {
+        let mut staged = fake_staged(id);
+        staged.expires_ms = 100;
+        ob.write_pending(&staged, "p").unwrap()
+    }
+
+    fn write_batch(root: &Path, name: &str, body: serde_json::Value) {
+        let batch = root.join(BATCH_SIGNING_STATE_DIR).join(name);
+        fs::create_dir_all(&batch).unwrap();
+        fs::write(batch.join(SIGNING_STATE_FILE), body.to_string()).unwrap();
+    }
+
+    /// The transaction behind a possibly signed entry can still land after
+    /// the stage TTL, so the sweep must leave it pending for reconciliation.
+    /// Only a provably unsigned entry is moved to failed/.
+    #[test]
+    fn sweep_keeps_possibly_signed_entries_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let ob = Outbox::new(dir.path()).unwrap();
+        let mut kept = Vec::new();
+        for kind in BroadcastAttemptKind::ALL {
+            let id = format!("marker-{}", kind.marker_name());
+            fs::write(write_expired(&ob, &id).join(kind.marker_name()), "{}").unwrap();
+            kept.push(id);
+            // Raw bytes are written before the attempt marker.
+            let id = format!("raw-{}", kind.raw_name());
+            fs::write(write_expired(&ob, &id).join(kind.raw_name()), "signed").unwrap();
+            kept.push(id);
+        }
+        let mut hashed = fake_staged("hashed");
+        hashed.expires_ms = 100;
+        hashed.tx_hash = Some("0x11".into());
+        ob.write_pending(&hashed, "p").unwrap();
+        kept.push("hashed".into());
+        for (id, state) in [
+            ("dispatched", r#"{"sign_dispatched":true}"#),
+            ("corrupt", "{"),
+        ] {
+            fs::write(write_expired(&ob, id).join(SIGNING_STATE_FILE), state).unwrap();
+            kept.push(id.into());
+        }
+        fs::create_dir(write_expired(&ob, "state-is-dir").join(SIGNING_STATE_FILE)).unwrap();
+        kept.push("state-is-dir".into());
+
+        // Batch membership is by attempt: the payload digest must match, and
+        // a legacy state without digests stays conservative.
+        let digest = crate::tx_engine::staged_payload_digest(&fake_staged("x")).unwrap();
+        let mut other = fake_staged("x");
+        other.nonce = 9;
+        let old_digest = crate::tx_engine::staged_payload_digest(&other).unwrap();
+        for id in ["batched", "legacy-batched", "retried"] {
+            write_expired(&ob, id);
+        }
+        kept.extend(["batched".into(), "legacy-batched".into()]);
+        write_batch(
+            dir.path(),
+            "current",
+            serde_json::json!({"wallet":"alice","sign_dispatched":true,
+                "ordered_refs":[{"chain":"anvil","id":"batched"}],
+                "ordered_payload_digests":[digest]}),
+        );
+        write_batch(
+            dir.path(),
+            "legacy",
+            serde_json::json!({"wallet":"alice","sign_dispatched":true,
+                "ordered_refs":[{"chain":"anvil","id":"legacy-batched"}]}),
+        );
+        write_batch(
+            dir.path(),
+            "old-attempt",
+            serde_json::json!({"wallet":"alice","sign_dispatched":true,
+                "ordered_refs":[{"chain":"anvil","id":"retried"}],
+                "ordered_payload_digests":[old_digest]}),
+        );
+        // A stray file beside the batch directories is not a batch state.
+        fs::write(dir.path().join(BATCH_SIGNING_STATE_DIR).join("stray"), "x").unwrap();
+
+        let undispatched = write_expired(&ob, "undispatched");
+        fs::write(
+            undispatched.join(SIGNING_STATE_FILE),
+            r#"{"sign_dispatched":false}"#,
+        )
+        .unwrap();
+        write_expired(&ob, "untouched");
+
+        assert_eq!(ob.sweep_expired(200).unwrap(), 3);
+        for id in &kept {
+            assert_eq!(
+                ob.read("alice", "anvil", id).unwrap().state,
+                OutboxState::Pending,
+                "{id}"
+            );
+        }
+        for id in ["retried", "undispatched", "untouched"] {
+            assert_eq!(
+                ob.read("alice", "anvil", id).unwrap().state,
+                OutboxState::Failed,
+                "{id}"
+            );
+        }
+        assert!(ob.expired_pending(200).unwrap().is_empty());
+    }
+
+    /// One unreadable entry or batch state neither aborts the sweep (staging
+    /// runs it first) nor counts as proof that anything is unsigned.
+    #[test]
+    fn sweep_isolates_unreadable_entries_and_batch_states() {
+        let dir = tempfile::tempdir().unwrap();
+        let ob = Outbox::new(dir.path()).unwrap();
+        let corrupt = write_expired(&ob, "corrupt-intent");
+        fs::write(corrupt.join("intent.json"), "{").unwrap();
+        write_expired(&ob, "plain");
+        assert_eq!(ob.sweep_expired(200).unwrap(), 1);
+        assert!(corrupt.join("intent.json").exists());
+        assert_eq!(
+            ob.read("alice", "anvil", "plain").unwrap().state,
+            OutboxState::Failed
+        );
+
+        // A batch state that cannot be read may cover any entry.
+        fs::create_dir_all(
+            dir.path()
+                .join(BATCH_SIGNING_STATE_DIR)
+                .join("broken")
+                .join(SIGNING_STATE_FILE),
+        )
+        .unwrap();
+        write_expired(&ob, "maybe-batched");
+        assert_eq!(ob.sweep_expired(200).unwrap(), 0);
+        assert_eq!(
+            ob.read("alice", "anvil", "maybe-batched").unwrap().state,
+            OutboxState::Pending
+        );
+    }
+
+    /// Cancel still keeps an entry an unreadable batch state may cover, but
+    /// names that state as the reason rather than a signing request of the
+    /// entry's own, which a retried confirm could reconcile.
+    #[test]
+    fn cancel_names_an_unreadable_batch_state_as_the_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let ob = Outbox::new(dir.path()).unwrap();
+        fs::create_dir_all(
+            dir.path()
+                .join(BATCH_SIGNING_STATE_DIR)
+                .join("broken")
+                .join(SIGNING_STATE_FILE),
+        )
+        .unwrap();
+        ob.write_pending(&fake_staged("unrelated"), "p").unwrap();
+        let error = ob.cancel("alice", "anvil", "unrelated").unwrap_err();
+        assert!(
+            matches!(
+                error,
+                OutboxError::PossiblySigned {
+                    batch_state_unreadable: true,
+                    ..
+                }
+            ),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("batch signing record"),
+            "{error}"
+        );
+
+        let own = ob.write_pending(&fake_staged("own"), "p").unwrap();
+        fs::write(own.join(SIGNING_STATE_FILE), r#"{"sign_dispatched":true}"#).unwrap();
+        let error = ob.cancel("alice", "anvil", "own").unwrap_err();
+        assert!(
+            matches!(
+                error,
+                OutboxError::PossiblySigned {
+                    batch_state_unreadable: false,
+                    ..
+                }
+            ),
+            "{error}"
+        );
+    }
+
+    /// Signing can dispatch after the sweep selected an entry. The sweep's
+    /// final check runs under the lifecycle lock, after the selection, so it
+    /// sees the dispatch marker and keeps the entry.
+    #[test]
+    fn sweep_rechecks_after_selection_under_the_lifecycle_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let ob = Outbox::new(dir.path()).unwrap();
+        let entry = write_expired(&ob, "racing");
+        let selected = ob.expired_pending(200).unwrap();
+        assert_eq!(selected.len(), 1);
+        // Signing publishes its dispatch marker between selection and move.
+        fs::write(
+            entry.join(SIGNING_STATE_FILE),
+            r#"{"sign_dispatched":true}"#,
+        )
+        .unwrap();
+        assert_eq!(ob.retire_expired(selected, 200).unwrap(), 0);
+        assert_eq!(
+            ob.read("alice", "anvil", "racing").unwrap().state,
+            OutboxState::Pending
+        );
+
+        // While another holder has the lock, the sweep waits for it.
+        let held = ob.lock_lifecycle().unwrap();
+        fs::remove_file(entry.join(SIGNING_STATE_FILE)).unwrap();
+        let sweeper = {
+            let ob = ob.clone();
+            std::thread::spawn(move || ob.sweep_expired(200).unwrap())
+        };
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!sweeper.is_finished());
+        drop(held);
+        assert_eq!(sweeper.join().unwrap(), 1);
+    }
+
+    /// Discard uses the same rule as the sweep and reports the recorded hash
+    /// when there is one.
+    #[test]
+    fn cancel_keeps_possibly_signed_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let ob = Outbox::new(dir.path()).unwrap();
+        let raw = ob.write_pending(&fake_staged("raw"), "p").unwrap();
+        fs::write(raw.join("cancel_raw_tx"), "signed").unwrap();
+        let error = ob.cancel("alice", "anvil", "raw").unwrap_err();
+        assert!(
+            matches!(error, OutboxError::PossiblySigned { tx_hash: None, .. }),
+            "{error}"
+        );
+        assert_eq!(
+            ob.read("alice", "anvil", "raw").unwrap().state,
+            OutboxState::Pending
+        );
+
+        let attempted = ob.write_pending(&fake_staged("attempted"), "p").unwrap();
+        fs::write(
+            attempted.join(BroadcastAttemptKind::Replacement.marker_name()),
+            serde_json::json!({"schema":"bloom.broadcast_attempted.v1","tx_hash":"0xabc",
+                "raw_tx_blake3":"","raw_tx_path":"replacement_raw_tx","from":"0x1","to":null,
+                "nonce":0,"chain_id":31337,"created_ms":0,"transport":"public_rpc"})
+            .to_string(),
+        )
+        .unwrap();
+        let error = ob.cancel("alice", "anvil", "attempted").unwrap_err();
+        assert!(error.to_string().contains("0xabc"), "{error}");
+
+        ob.write_pending(&fake_staged("unsigned"), "p").unwrap();
+        ob.cancel("alice", "anvil", "unsigned").unwrap();
+        let discarded = ob.read("alice", "anvil", "unsigned").unwrap();
+        assert_eq!(discarded.state, OutboxState::Failed);
+        assert!(discarded.dir.join("cancel.txt").exists());
     }
 
     /// Fix #8: `read_in_state` must NotFound an id that exists in a
