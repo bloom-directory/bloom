@@ -590,21 +590,30 @@ impl TxEngine {
     async fn lock_signing_dispatch(
         &self,
         wallet: &str,
-        entries: &[(&str, &str)],
+        expected: &[&StagedTx],
     ) -> Result<crate::outbox::LifecycleLock, TxEngineError> {
         let lock = self.off_worker(|outbox| outbox.lock_lifecycle()).await??;
         let now = now_ms();
-        for (chain, id) in entries {
-            let entry = match self.outbox.read(wallet, chain, id) {
+        for expected in expected {
+            let id = &expected.id;
+            let retired = || {
+                TxEngineError::ApprovalState(format!(
+                    "transaction '{id}' was expired, discarded, or restaged before signing; nothing was signed"
+                ))
+            };
+            let entry = match self.outbox.read(wallet, &expected.chain, id) {
                 Ok(entry) => entry,
-                Err(OutboxError::NotFound(_)) => continue,
+                Err(OutboxError::NotFound(_)) => return Err(retired()),
                 Err(error) => return Err(error.into()),
             };
             let staged = &entry.staged;
-            if entry.state == OutboxState::Failed {
-                return Err(TxEngineError::ApprovalState(format!(
-                    "transaction '{id}' was expired or discarded before signing; nothing was signed"
-                )));
+            // Deployment ids are deterministic, so a discarded deployment can
+            // be restaged under the same id with different gas or fees. Sign
+            // only the exact row this confirm read, never its replacement.
+            if entry.state == OutboxState::Failed
+                || serde_json::to_value(staged).ok() != serde_json::to_value(expected).ok()
+            {
+                return Err(retired());
             }
             if entry.state == OutboxState::Pending
                 && staged.expires_ms != 0
@@ -3556,10 +3565,7 @@ impl TxEngine {
             // response reconciles through operation status instead of signing
             // twice, and an absent marker proves no signature exists.
             let _lifecycle = self
-                .lock_signing_dispatch(
-                    &entry.staged.wallet,
-                    &[(&entry.staged.chain, &entry.staged.id)],
-                )
+                .lock_signing_dispatch(&entry.staged.wallet, &[&entry.staged])
                 .await?;
             state.sign_dispatched = true;
             state.expected_operation_digest = Some(expected_operation_digest);
@@ -3914,10 +3920,7 @@ impl TxEngine {
             // signing only ever dispatches with an activated approval, so a
             // lost response reconciles and an absent marker proves no batch
             // signature exists.
-            let children = ordered_refs
-                .iter()
-                .map(|child| (child.chain.as_str(), child.id.as_str()))
-                .collect::<Vec<_>>();
+            let children = staged_plans.iter().collect::<Vec<_>>();
             let _lifecycle = self.lock_signing_dispatch(wallet, &children).await?;
             state.sign_dispatched = true;
             write_triad_batch_signing_state(&state_path, &state)?;
@@ -8116,7 +8119,7 @@ mod tests {
                 let signer = engine.clone();
                 let signing = tokio::spawn(async move {
                     signer
-                        .lock_signing_dispatch("alice", &[("anvil", "unsigned")])
+                        .lock_signing_dispatch("alice", &[&staged])
                         .await
                         .map(drop)
                 });
@@ -8657,6 +8660,9 @@ mod tests {
         let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
         let (engine, fixture, _) = triad_batch_fixture(outbox, false, false);
         let (refs, staged, preimages, hashes) = batch_material(&["batch-a", "batch-b"]);
+        for plan in &staged {
+            engine.outbox.write_pending(plan, "p").unwrap();
+        }
 
         let error = engine
             .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
@@ -8750,6 +8756,9 @@ mod tests {
         let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
         let (engine, fixture, broker) = triad_batch_fixture(outbox.clone(), false, false);
         let (refs, staged, preimages, hashes) = batch_material(&["loss-a", "loss-b"]);
+        for plan in &staged {
+            engine.outbox.write_pending(plan, "p").unwrap();
+        }
         assert!(matches!(
             engine
                 .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
@@ -8797,6 +8806,9 @@ mod tests {
         let outbox = Outbox::new(directory.path().join("outbox")).unwrap();
         let (engine, fixture, _) = triad_batch_fixture(outbox, false, false);
         let (refs, staged, preimages, hashes) = batch_material(&["bad-a", "bad-b"]);
+        for plan in &staged {
+            engine.outbox.write_pending(plan, "p").unwrap();
+        }
         assert!(matches!(
             engine
                 .triad_sign_evm_batch("alice", &refs, &staged, &preimages, &hashes)
@@ -9854,7 +9866,8 @@ mod tests {
     }
 
     /// Signing records a dispatch only under the lifecycle lock, and only
-    /// for an entry that is neither expired nor already moved to failed/.
+    /// for the exact row the confirm read: not expired, not moved to failed/,
+    /// not missing, and not replaced by a restage under the same id.
     #[tokio::test]
     async fn signing_dispatch_refuses_expired_or_retired_entries() {
         let (engine, _, _dir) = fake_engine(60_000);
@@ -9862,28 +9875,36 @@ mod tests {
         staged.expires_ms = 1;
         engine.outbox.write_pending(&staged, "p").unwrap();
         assert!(matches!(
-            engine
-                .lock_signing_dispatch("alice", &[("anvil", "late")])
-                .await,
+            engine.lock_signing_dispatch("alice", &[&staged]).await,
             Err(TxEngineError::Outbox(OutboxError::StagedExpired { .. }))
         ));
         assert_eq!(engine.outbox.sweep_expired(now_ms()).unwrap(), 1);
         assert!(matches!(
+            engine.lock_signing_dispatch("alice", &[&staged]).await,
+            Err(TxEngineError::ApprovalState(_))
+        ));
+        assert!(matches!(
             engine
-                .lock_signing_dispatch("alice", &[("anvil", "late")])
+                .lock_signing_dispatch("alice", &[&fake_staged_1559("absent")])
                 .await,
             Err(TxEngineError::ApprovalState(_))
         ));
-        engine
-            .outbox
-            .write_pending(&fake_staged_1559("live"), "p")
-            .unwrap();
+        let live = fake_staged_1559("live");
+        engine.outbox.write_pending(&live, "p").unwrap();
         drop(
             engine
-                .lock_signing_dispatch("alice", &[("anvil", "live")])
+                .lock_signing_dispatch("alice", &[&live])
                 .await
                 .unwrap(),
         );
+        // A restage under the same id (deterministic deployment ids) must not
+        // admit a confirm that read the earlier bytes.
+        let mut stale = live.clone();
+        stale.gas_limit += 1;
+        assert!(matches!(
+            engine.lock_signing_dispatch("alice", &[&stale]).await,
+            Err(TxEngineError::ApprovalState(_))
+        ));
     }
 
     /// `bloom wallet cancel` releases a pending entry locally only under the

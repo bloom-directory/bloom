@@ -2890,6 +2890,11 @@ fn record_confirm_error(entry_dir: &Path, wallet: &str, id: &str, error: &Handle
                 "The wallet policy does not yet allow the Petal that staged this transaction. Give the owner the ceremony link in error (pending updates are under wallets/{wallet}/policy-updates/pending/); once they approve, write confirm again."
             ),
         )
+    } else if message.contains("batch signing record") {
+        (
+            "possibly_signed",
+            "Bloom could not read a batch signing record, and that record could cover any entry, so `cancel` kept this one. Confirm still works. An operator must repair the record named by `outbox.batch_state_unreadable` in the Machine log, or remove it only after the Broker shows that batch never signed; then write cancel again.".to_owned(),
+        )
     } else if message.contains("no transaction hash is recorded") {
         (
             "possibly_signed",
@@ -10116,6 +10121,7 @@ value = "0""#,
             "dispatched",
             "malformed",
             "batch",
+            "unreadable_batch",
         ];
         for marker in markers {
             for control in ["confirm", "confirm.override"] {
@@ -10155,6 +10161,11 @@ value = "0""#,
                         )
                         .unwrap();
                     }
+                    "unreadable_batch" => {
+                        let batch = outbox.root().join(".batch-signing/unreadable");
+                        std::fs::create_dir_all(&batch).unwrap();
+                        std::fs::write(batch.join("ceremony.json"), b"invalid").unwrap();
+                    }
                     name if name.ends_with(".json") => {
                         std::fs::write(entry.dir.join(name), attempt(&entry)).unwrap()
                     }
@@ -10184,6 +10195,16 @@ value = "0""#,
                 .unwrap();
                 assert_eq!(record["kind"], "possibly_signed", "{marker}");
                 let next = record["next"].as_str().unwrap();
+                if marker == "unreadable_batch" {
+                    // No signing operation of this entry's own is recorded, so
+                    // retrying confirm cannot reconcile it; an operator must.
+                    assert!(
+                        next.contains("could not read a batch signing record"),
+                        "{next}"
+                    );
+                    assert!(!next.contains("Write the same confirm again"), "{next}");
+                    continue;
+                }
                 assert!(next.contains("bloom wallet cancel"), "{marker}: {next}");
                 // Without a recorded hash, the next step is to reconcile the
                 // recorded signing operation, not to use a hash.

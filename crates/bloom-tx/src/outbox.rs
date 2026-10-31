@@ -202,11 +202,18 @@ pub enum OutboxError {
     InvalidChain(String),
     #[error("structured valuation unavailable for staged tx '{0}'")]
     UnknownValuation(String),
-    #[error("cannot discard a possibly signed transaction '{id}': {}", match tx_hash {
-        Some(hash) => format!("it may have been broadcast as {hash}"),
-        None => "a signing request may have been sent, but no transaction hash is recorded".to_owned(),
+    #[error("cannot discard a possibly signed transaction '{id}': {}", match (tx_hash, batch_state_unreadable) {
+        (Some(hash), _) => format!("it may have been broadcast as {hash}"),
+        (None, true) => format!("a batch signing record under outbox/{BATCH_SIGNING_STATE_DIR} could not be read, so Bloom cannot prove this entry was never signed"),
+        (None, false) => "a signing request may have been sent, but no transaction hash is recorded".to_owned(),
     })]
-    PossiblySigned { id: String, tx_hash: Option<String> },
+    PossiblySigned {
+        id: String,
+        tx_hash: Option<String>,
+        /// The only evidence of signing is a batch state that cannot be
+        /// read, so it may cover any entry.
+        batch_state_unreadable: bool,
+    },
     #[error("{0}")]
     Other(String),
 }
@@ -1130,10 +1137,17 @@ impl Outbox {
     pub fn cancel(&self, wallet: &str, chain: &str, id: &str) -> Result<(), OutboxError> {
         let _lock = self.lock_lifecycle()?;
         let entry = self.read_in_state(wallet, chain, id, OutboxState::Pending)?;
-        if self.possibly_signed(&entry, &self.batch_index()) {
+        let batches = self.batch_index();
+        if self.possibly_signed(&entry, &batches) {
+            let readable = BatchIndex {
+                dispatched: batches.dispatched.clone(),
+                unreadable: false,
+            };
             return Err(OutboxError::PossiblySigned {
                 id: id.into(),
                 tx_hash: recorded_hash(&entry),
+                batch_state_unreadable: batches.unreadable
+                    && !self.possibly_signed(&entry, &readable),
             });
         }
         let new_dir = self.transition_with_status(&entry, TxStatus::Cancelled)?;
@@ -2013,6 +2027,52 @@ mod tests {
         assert_eq!(
             ob.read("alice", "anvil", "maybe-batched").unwrap().state,
             OutboxState::Pending
+        );
+    }
+
+    /// Cancel still keeps an entry an unreadable batch state may cover, but
+    /// names that state as the reason rather than a signing request of the
+    /// entry's own, which a retried confirm could reconcile.
+    #[test]
+    fn cancel_names_an_unreadable_batch_state_as_the_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let ob = Outbox::new(dir.path()).unwrap();
+        fs::create_dir_all(
+            dir.path()
+                .join(BATCH_SIGNING_STATE_DIR)
+                .join("broken")
+                .join(SIGNING_STATE_FILE),
+        )
+        .unwrap();
+        ob.write_pending(&fake_staged("unrelated"), "p").unwrap();
+        let error = ob.cancel("alice", "anvil", "unrelated").unwrap_err();
+        assert!(
+            matches!(
+                error,
+                OutboxError::PossiblySigned {
+                    batch_state_unreadable: true,
+                    ..
+                }
+            ),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("batch signing record"),
+            "{error}"
+        );
+
+        let own = ob.write_pending(&fake_staged("own"), "p").unwrap();
+        fs::write(own.join(SIGNING_STATE_FILE), r#"{"sign_dispatched":true}"#).unwrap();
+        let error = ob.cancel("alice", "anvil", "own").unwrap_err();
+        assert!(
+            matches!(
+                error,
+                OutboxError::PossiblySigned {
+                    batch_state_unreadable: false,
+                    ..
+                }
+            ),
+            "{error}"
         );
     }
 
