@@ -19,6 +19,7 @@ enrollment_scratch=""
 upgrade_transaction=""
 upgrade_transaction_scratch=""
 upgrade_rollback_required=false
+linux_upgrade_resume=false
 
 cleanup_scratch() {
   status=$?
@@ -606,15 +607,18 @@ install_linux_release() {
   mv "$stage" "$release"
 }
 
-# Prints the durable state version a release declares for one service, or
-# nothing when the release predates the record.
-linux_release_state_version() {
+# Prints one field (current, downgrade_floor, migration_floor) of a service's
+# declared durable state, or nothing when the release predates the record.
+# The fields mean what they mean in install-macos.sh: `current` is the state
+# the release writes, `downgrade_floor` the oldest reader that can still open
+# it, and `migration_floor` the oldest state the release can migrate from.
+linux_release_state_field() {
   local record="$1/usr/libexec/bloom/releases/$2/compatibility-v1.toml"
   [[ -f "$record" && ! -L "$record" ]] || return 0
-  awk -v section="[state.$3]" '
+  awk -v section="[state.$3]" -v field="$4" '
     $0 == section { inside = 1; next }
     inside && /^\[/ { exit }
-    inside && $1 == "current" && $2 == "=" { print $3; exit }
+    inside && $1 == field && $2 == "=" { print $3; exit }
   ' "$record"
 }
 
@@ -625,14 +629,43 @@ linux_release_state_version() {
 # candidate accepted. A release installed before this record existed is
 # treated as forward-only, because nothing says which state it reads.
 linux_upgrade_is_forward_only() {
-  local install_root="$1" old_digest="$2" new_digest="$3" service installed candidate
+  local install_root="$1" old_digest="$2" new_digest="$3" service installed floor
   for service in machine broker signer; do
-    installed="$(linux_release_state_version "$install_root" "$old_digest" "$service")"
-    candidate="$(linux_release_state_version "$install_root" "$new_digest" "$service")"
-    [[ "$installed" =~ ^[1-9][0-9]*$ && "$candidate" =~ ^[1-9][0-9]*$ ]] || return 0
-    ((candidate <= installed)) || return 0
+    installed="$(linux_release_state_field "$install_root" "$old_digest" "$service" current)"
+    floor="$(linux_release_state_field "$install_root" "$new_digest" "$service" downgrade_floor)"
+    [[ "$installed" =~ ^[1-9][0-9]*$ && "$floor" =~ ^[1-9][0-9]*$ ]] || return 0
+    ((installed >= floor)) || return 0
   done
   return 1
+}
+
+# Refuses, before anything is stopped or switched, a candidate whose state
+# record is malformed, older than the installed state, or unable to migrate
+# from it — the same checks install-macos.sh makes. An installed release with
+# no record is not checked; its upgrade is forward-only instead.
+check_linux_candidate_state() {
+  local install_root="$1" old_digest="$2" new_digest="$3" service installed current floor migration
+  for service in machine broker signer; do
+    installed="$(linux_release_state_field "$install_root" "$old_digest" "$service" current)"
+    [[ -n "$installed" ]] || return 0
+    current="$(linux_release_state_field "$install_root" "$new_digest" "$service" current)"
+    floor="$(linux_release_state_field "$install_root" "$new_digest" "$service" downgrade_floor)"
+    migration="$(linux_release_state_field "$install_root" "$new_digest" "$service" migration_floor)"
+    [[ "$installed" =~ ^[1-9][0-9]*$ && "$current" =~ ^[1-9][0-9]*$ && \
+      "$floor" =~ ^[1-9][0-9]*$ && "$migration" =~ ^[1-9][0-9]*$ ]] &&
+      ((migration <= floor && floor <= current)) || {
+      echo "malformed $service state compatibility metadata; nothing was changed" >&2
+      return 65
+    }
+    ((current >= installed)) || {
+      echo "$service state-schema downgrade rejected; nothing was changed" >&2
+      return 65
+    }
+    ((installed >= migration)) || {
+      echo "$service installed state is below the candidate migration floor; nothing was changed" >&2
+      return 65
+    }
+  done
 }
 
 capture_legacy_linux_release() {
@@ -1000,6 +1033,14 @@ start_linux_release_set() {
 upgrade_root=""
 upgrade_old_digest=""
 
+# Succeeds when the install must run the upgrade steps: it changes the
+# release, or recovery kept a forward-only candidate that has not yet
+# started under the health gate.
+linux_release_upgrade_required() {
+  local installed="$1" requested="$2"
+  [[ "$linux_upgrade_resume" == true || (-n "$installed" && "$installed" != "$requested") ]]
+}
+
 begin_linux_upgrade() {
   local install_root="$1" old_digest="$2" new_digest="$3"
   local transaction_root="$install_root/var/lib/bloom"
@@ -1009,6 +1050,18 @@ begin_linux_upgrade() {
     return 65
   }
   upgrade_transaction="$transaction_root/upgrade-transaction"
+  if [[ "$linux_upgrade_resume" == true ]]; then
+    linux_upgrade_resume=false
+    # Retrying the kept candidate resumes its recorded transaction.
+    if [[ "$new_digest" == "$(<"$upgrade_transaction/new-digest")" ]]; then
+      upgrade_root="$install_root"
+      upgrade_rollback_required=true
+      return 0
+    fi
+    # A different release supersedes it; the kept candidate is now the
+    # installed release this upgrade starts from.
+    retire_linux_upgrade_transaction
+  fi
   [[ ! -e "$upgrade_transaction" && ! -L "$upgrade_transaction" ]] || {
     echo "an interrupted Linux upgrade must be recovered first" >&2
     return 65
@@ -1106,7 +1159,8 @@ finish_linux_upgrade() {
   upgrade_old_digest=""
 }
 
-# Interrupted transactions always recover through one path: restore the
+# A forward-only transaction keeps its candidate selected (see below). Every
+# other interrupted transaction recovers through one path: restore the
 # coherent previous installation, then let the verified installation that
 # triggered recovery retry the requested release through the normal upgrade
 # steps. Starting the interrupted candidate directly is unsafe because the
@@ -1160,15 +1214,17 @@ recover_interrupted_linux_upgrade() {
   # transaction for the next run rather than attempting a restart from the
   # EXIT trap.
   if [[ -e "$transaction/forward-only" ]]; then
-    # Keep the candidate. The requested release is installed over it next,
-    # which rewrites every unit and starts the set under its health gate.
+    # Keep the candidate and the transaction. The install that follows runs
+    # the upgrade steps even when it requests this same candidate, so every
+    # login is rewritten and started under the health gate before the
+    # transaction is retired. Until then, any later run lands here again.
     echo "the interrupted Bloom Linux upgrade is forward-only; keeping its candidate release and retrying" >&2
     if ! switch_linux_release "$install_root" "$new_digest" ||
       ! rewrite_linux_release_set "$install_root" "$new_digest" active; then
       echo "Bloom Linux upgrade recovery failed; transaction preserved for retry" >&2
       return 65
     fi
-    finish_linux_upgrade
+    linux_upgrade_resume=true
     return 0
   fi
   echo "restoring the interrupted Bloom Linux release before retrying" >&2
@@ -1463,6 +1519,8 @@ case "$action" in
         echo "a different Linux release must be installed through an active enrollment" >&2
         exit 65
       }
+    fi
+    if linux_release_upgrade_required "$shared_release_digest" "$release_digest"; then
       release_upgrade=true
     fi
     if [[ "$release_upgrade" == true ]]; then
@@ -1471,6 +1529,7 @@ case "$action" in
     capture_legacy_linux_release "$root" "$shared_release_digest"
     install_linux_release "$root" "$payload" "$release_digest"
     if [[ "$release_upgrade" == true ]]; then
+      check_linux_candidate_state "$root" "$shared_release_digest" "$release_digest"
       begin_linux_upgrade "$root" "$shared_release_digest" "$release_digest"
       stop_linux_release_set "$root"
       rewrite_linux_release_set "$root" "$release_digest" activating
