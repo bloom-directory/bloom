@@ -216,8 +216,9 @@ bloom petals install my-petal.petal.tar
 A Petal can be installed on any Bloom, but signing authority depends on
 provenance. Broker authorizes a Petal's signing and approval routes only for
 package hashes in its installer-signed provenance catalog, and refuses
-anything else with `PROVENANCE_REQUIRED` ("subject is absent from Broker's
-installer-owned current catalog"). On a release install that catalog is signed
+anything else with `PROVENANCE_MISMATCH` (for example "subject is absent from
+Broker's installer-owned current catalog"; Machine can refuse with the same
+code before the request reaches Broker). On a release install that catalog is signed
 at installation and lists only the Petal releases that Bloom ships, so a
 locally built package under a new name can be installed and read but cannot
 sign. A local build cannot replace a shipped Petal of the same name either:
