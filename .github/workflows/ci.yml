@@ -4,6 +4,9 @@ on:
   pull_request:
     paths: &code_paths
       - ".github/workflows/ci.yml"
+      # The macOS source assertions read both conformance workflows.
+      - ".github/workflows/macos-unix-conformance.yml"
+      - ".github/workflows/macos-two-login-conformance.yml"
       - "Cargo.toml"
       - "Cargo.lock"
       - "deny.toml"
