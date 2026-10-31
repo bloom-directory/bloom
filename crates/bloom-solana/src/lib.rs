@@ -167,6 +167,27 @@ impl SolanaClient {
             .await
     }
 
+    /// The lowest finalized block height across every configured endpoint,
+    /// probed directly without failover. Any endpoint that cannot answer
+    /// fails the whole read, so a lagging or unavailable endpoint can never
+    /// be outvoted by a fast one.
+    pub async fn finalized_block_height_all_endpoints(&self) -> Result<u64, SolanaRpcError> {
+        let mut lowest = None;
+        for probe in self
+            .inner
+            .rpc
+            .probe_all_endpoints("getBlockHeight", &json!([{ "commitment": "finalized" }]))
+            .await
+        {
+            let height = probe
+                .outcome?
+                .as_u64()
+                .ok_or_else(|| SolanaRpcError::Decode("getBlockHeight: expected integer".into()))?;
+            lowest = Some(lowest.map_or(height, |low: u64| low.min(height)));
+        }
+        lowest.ok_or_else(|| SolanaRpcError::NoEndpoints(String::new()))
+    }
+
     /// Native SOL balance in lamports for a base58 account address.
     pub async fn get_balance(&self, account: &str) -> Result<u64, SolanaRpcError> {
         let result: Value = self.inner.rpc.call("getBalance", &json!([account])).await?;
@@ -332,10 +353,10 @@ impl SolanaClient {
     /// finalized status. Each probe is a single direct request — no retry,
     /// no failover — so the returned quorum is honest per-endpoint evidence.
     ///
-    /// Reconciliation uses this before turning a `null` from the ordinary
-    /// failover path into a terminal "never landed": one lagging or
-    /// non-archival endpoint must not be able to outweigh an endpoint that
-    /// actually observed the signature.
+    /// Callers act only on an observed status. A `null`, even from every
+    /// endpoint, is not proof the transfer never landed: history search can
+    /// miss a landed transaction (BigTable lookup errors, pruned or
+    /// index-disabled ledgers).
     pub async fn probe_signature_status_all_endpoints(
         &self,
         signature: &str,

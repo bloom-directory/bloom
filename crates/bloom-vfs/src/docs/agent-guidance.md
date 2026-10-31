@@ -417,7 +417,11 @@ signature in `broadcast_attempted.json` with `receipt.json` and inspect the
 outcome and confirmation status. Receipts have no account fingerprint and
 private signing sidecars are not mounted. Genesis checks must pass before
 broadcast; ambiguous sends reconcile by signature, never blind retry or
-endpoint failover. See the Solana walkthrough in `docs/examples.md`.
+endpoint failover. A `sent` entry with `unresolved.md` and no receipt is one
+no RPC reports after its blockhash expired; that does not prove it failed. Show
+the owner its signature to check in an explorer, and stage a new transfer only
+if they confirm it did not land. See the Solana walkthrough in
+`docs/examples.md`.
 
 ## Sealed Approvals
 
