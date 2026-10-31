@@ -95,6 +95,8 @@ pub struct SolanaSentEntry {
 
 /// Filename of the mined-outcome sibling, written by the reconciliation loop.
 pub const RECEIPT_FILE: &str = "receipt.json";
+/// Operator notice on a `sent` transfer that no RPC reports after expiry.
+pub const UNRESOLVED_FILE: &str = "unresolved.md";
 
 /// The persistent record of a sent transfer's on-chain outcome.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

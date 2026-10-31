@@ -2965,6 +2965,7 @@ const PUBLIC_SOLANA_OUTBOX_ARTIFACTS: &[&str] = &[
     "approval_challenge.json",
     "restage_advice.json",
     "restage.md",
+    bloom_solana_tx::types::UNRESOLVED_FILE,
 ];
 
 /// A Solana child account as projected by the Broker.
@@ -6233,6 +6234,70 @@ value = "0""#
                 .unwrap();
             assert_eq!(sink.mode, 0o644, "{path}/restage must be writable");
         }
+    }
+
+    /// A crash after the move to `failed/` but before the intent rewrite
+    /// leaves `pending` on disk. The mounted `intent.json` must report the
+    /// same `expired` status the outbox uses to offer `restage`.
+    #[tokio::test]
+    async fn interrupted_solana_failure_serves_the_projected_status() {
+        use bloom_solana_tx::outbox::SolanaOutboxState;
+        use bloom_solana_tx::types::{SolanaTxStatus, StagedSolanaTransfer};
+        let f = make_handler_with_chain(true);
+        let (projection, _evm0, _evm1) = two_account_projection(&f);
+        use sha2::Digest as _;
+        let mut spki = vec![
+            0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+        ];
+        spki.extend_from_slice(&[0x20; 32]);
+        let fp0 = bloom_broker_api::Digest32::from_bytes(sha2::Sha256::digest(&spki).into())
+            .as_str()
+            .to_owned();
+        let (engine, outbox) = solana_engine_fixture(&f._tmp);
+        seed_solana_entry(
+            &outbox,
+            "sol-crash",
+            &fp0,
+            &bs58::encode([0x20; 32]).into_string(),
+            false,
+        );
+        let mut entry = outbox
+            .read_in_state(
+                "alice",
+                "solana-devnet",
+                "sol-crash",
+                SolanaOutboxState::Pending,
+            )
+            .unwrap();
+        entry.staged.status = SolanaTxStatus::Expired;
+        // Move without the follow-up rewrite_intent, as a crash would.
+        let failed_dir = outbox
+            .transition(&entry, SolanaOutboxState::Failed)
+            .unwrap();
+        let on_disk: StagedSolanaTransfer =
+            serde_json::from_slice(&std::fs::read(failed_dir.join("intent.json")).unwrap())
+                .unwrap();
+        assert_eq!(on_disk.status, SolanaTxStatus::Pending);
+
+        let mut handler = f.handler.clone();
+        handler.wallet_projections = Some(projection);
+        handler.broker = Some(MachineBrokerClient::new(Arc::new(StubBroker)));
+        handler = handler.with_solana(std::collections::BTreeMap::from([(
+            "solana-devnet".to_string(),
+            std::sync::Arc::new(engine),
+        )]));
+        let w = &f.wallet_name;
+        let served: StagedSolanaTransfer = serde_json::from_slice(
+            &handler
+                .read(&vfs(format!(
+                    "/{w}/0/chains/solana-devnet/outbox/failed/sol-crash/intent.json"
+                )))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(served.status, SolanaTxStatus::Expired);
+        assert_eq!(served.signature, None);
     }
 
     /// GETATTR must never render an expired entry's write-only `restage`

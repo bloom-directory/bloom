@@ -537,37 +537,17 @@ impl SolanaTransferEngine {
             .map_err(|e| EngineError::Invalid(e.to_string()))?;
         let tx_b64 = base64::engine::general_purpose::STANDARD.encode(&tx_bytes);
 
-        // Run an explicit signature-verifying preflight over the exact bytes
-        // that will be submitted and persist only its public diagnostics.
-        let simulation = self.client.simulate_transaction(&tx_b64).await?;
-        let artifact = SimulationArtifact {
-            schema: SIMULATION_SCHEMA,
-            block_height,
-            last_valid_block_height: entry.staged.last_valid_block_height,
-            success: simulation.err.is_none(),
-            error: &simulation.err,
-            units_consumed: simulation.units_consumed,
-            logs: &simulation.logs,
-        };
-        let artifact_bytes = serde_json::to_vec_pretty(&artifact)
-            .map_err(|error| EngineError::Invalid(format!("simulation artifact: {error}")))?;
-        self.outbox.write_simulation(&entry, &artifact_bytes)?;
-        if let Some(error) = simulation.err {
-            return Err(EngineError::Invalid(format!(
-                "signed transaction simulation failed: {error}"
-            )));
-        }
-
         // Persist the exact attempt before any network effect. The marker is
         // written after the private raw bytes, so every published marker is
         // complete and hash-verifiable after a crash.
         self.outbox
             .write_broadcast_attempt(&entry, &signature_b58, &tx_bytes, now_ms)?;
 
-        // Claim the entry for reconciliation before sendTransaction. Once in
-        // `sent`, neither cancel nor restage can race the network write, and a
-        // crash or ambiguous response is recoverable by deterministic
-        // signature without retrying the write.
+        // Claim the entry for reconciliation before simulation, which already
+        // gives the signed bytes to an RPC. Once in `sent`, neither cancel nor
+        // restage can present a transaction that may still land as terminal,
+        // and a crash, failed simulation or ambiguous response is recoverable
+        // by deterministic signature without retrying the write.
         let mut staged = entry.staged.clone();
         staged.status = SolanaTxStatus::Sent;
         let target_state = SolanaOutboxState::from_status(&staged.status);
@@ -578,6 +558,27 @@ impl SolanaTransferEngine {
             dir: sent_dir,
         };
         self.outbox.rewrite_intent(&sent_entry)?;
+
+        // Run an explicit signature-verifying preflight over the exact bytes
+        // that will be submitted and persist only its public diagnostics.
+        let simulation = self.client.simulate_transaction(&tx_b64).await?;
+        let artifact = SimulationArtifact {
+            schema: SIMULATION_SCHEMA,
+            block_height,
+            last_valid_block_height: sent_entry.staged.last_valid_block_height,
+            success: simulation.err.is_none(),
+            error: &simulation.err,
+            units_consumed: simulation.units_consumed,
+            logs: &simulation.logs,
+        };
+        let artifact_bytes = serde_json::to_vec_pretty(&artifact)
+            .map_err(|error| EngineError::Invalid(format!("simulation artifact: {error}")))?;
+        self.outbox.write_simulation(&sent_entry, &artifact_bytes)?;
+        if let Some(error) = simulation.err {
+            return Err(EngineError::Invalid(format!(
+                "signed transaction simulation failed: {error}"
+            )));
+        }
 
         let submitted = self.client.send_transaction(&tx_b64).await?;
         if submitted != signature_b58 {

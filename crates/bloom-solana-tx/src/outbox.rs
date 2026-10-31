@@ -293,6 +293,19 @@ impl SolanaOutbox {
         if target.exists() {
             return Err(OutboxError::TargetExists(target.display().to_string()));
         }
+        if new_state == SolanaOutboxState::Failed {
+            // Persist the reason before the atomic move. Readers use it if a
+            // crash prevents the subsequent intent rewrite, preserving the
+            // expired/restage route rather than inventing a generic failure.
+            let status = match entry.staged.status {
+                SolanaTxStatus::Expired | SolanaTxStatus::Cancelled => entry.staged.status,
+                _ => SolanaTxStatus::Cancelled,
+            };
+            write_atomic(
+                entry.dir.join("transition-status.json"),
+                &serde_json::to_vec(&status)?,
+            )?;
+        }
         fs::rename(&entry.dir, &target)?;
         if new_state == SolanaOutboxState::Failed {
             let _ = fs::remove_file(target.join(BROADCAST_RAW_TX));
@@ -305,7 +318,12 @@ impl SolanaOutbox {
             let _ = fs::remove_file(target.join(PRIVATE_APPROVAL_FILE));
             let _ = fs::remove_file(target.join(APPROVAL_CHALLENGE_FILE));
         }
+        // Persist the move in both directories, or a crash can resurrect
+        // the source entry beside (or instead of) the target.
         sync_dir(&target_parent)?;
+        if let Some(source_parent) = entry.dir.parent() {
+            sync_dir(source_parent)?;
+        }
         Ok(target)
     }
 
@@ -337,7 +355,7 @@ impl SolanaOutbox {
         ] {
             let dir = self.state_dir(wallet, chain, state)?.join(id);
             if dir.join("intent.json").exists() {
-                let staged = serde_json::from_slice(&fs::read(dir.join("intent.json"))?)?;
+                let staged = read_projected_intent(&dir, state)?;
                 return Ok(SolanaOutboxEntry { state, staged, dir });
             }
         }
@@ -361,6 +379,11 @@ impl SolanaOutbox {
     ) -> Result<(SolanaOutboxEntry, SolanaOutboxState), OutboxError> {
         for state in [SolanaOutboxState::Pending, SolanaOutboxState::Failed] {
             if let Ok(entry) = self.read_in_state(wallet, chain, id, state) {
+                // A broadcast marker means the signed bytes may be on-chain;
+                // a replacement could pay twice.
+                if entry.dir.join(BROADCAST_ATTEMPT_FILE).exists() {
+                    return Err(OutboxError::BroadcastAttempted(id.into()));
+                }
                 return Ok((entry, state));
             }
         }
@@ -410,7 +433,7 @@ impl SolanaOutbox {
     ) -> Result<SolanaOutboxEntry, OutboxError> {
         let dir = self.state_dir(wallet, chain, expected)?.join(id);
         if dir.join("intent.json").exists() {
-            let staged = serde_json::from_slice(&fs::read(dir.join("intent.json"))?)?;
+            let staged = read_projected_intent(&dir, expected)?;
             return Ok(SolanaOutboxEntry {
                 state: expected,
                 staged,
@@ -598,17 +621,17 @@ impl SolanaOutbox {
         Ok(entry.staged.signature.clone())
     }
 
-    /// Atomically persist the sanitized, public preflight result next to a
-    /// pending entry. It follows the entry across a successful transition.
+    /// Atomically persist the sanitized, public preflight result next to an
+    /// entry already claimed as `sent`, since simulation exposes signed bytes.
     pub fn write_simulation(
         &self,
         entry: &SolanaOutboxEntry,
         body: &[u8],
     ) -> Result<(), OutboxError> {
-        if entry.state != SolanaOutboxState::Pending {
+        if entry.state != SolanaOutboxState::Sent {
             return Err(OutboxError::StateMismatch {
                 id: entry.staged.id.clone(),
-                expected: SolanaOutboxState::Pending.dirname(),
+                expected: SolanaOutboxState::Sent.dirname(),
                 actual: entry.state.dirname(),
             });
         }
@@ -732,29 +755,22 @@ impl SolanaOutbox {
         self.sweep_expired_with_statuses(now_ms, live_block_heights, &Default::default())
     }
 
-    /// Status observations must include transaction history, taken after the
-    /// validity window closes. Missing/error observations leave signed entries
-    /// untouched; true means observed, false means all endpoints report absent.
+    /// `observed` holds the (chain, signature) pairs some endpoint reported,
+    /// searching transaction history after the window closed. Absence is
+    /// never proof a signed transfer did not land, so:
+    /// - a broadcast marker or an observed signature moves the entry to
+    ///   `sent` for reconciliation;
+    /// - an unobserved signature stays `pending` for the operator to cancel
+    ///   or restage;
+    /// - only an unsigned entry becomes `failed/expired`.
     pub fn sweep_expired_with_statuses(
         &self,
         now_ms: u128,
         live_block_heights: &std::collections::HashMap<String, u64>,
-        signature_statuses: &std::collections::HashMap<(String, String), bool>,
+        observed: &std::collections::HashSet<(String, String)>,
     ) -> Result<usize, OutboxError> {
-        let expired = self.expired_pending(now_ms, live_block_heights)?;
         let mut count = 0;
-        for entry in &expired {
-            let mut expired = entry.clone();
-            let state = match self.recorded_signature(entry)? {
-                Some(signature) => {
-                    match signature_statuses.get(&(entry.staged.chain.clone(), signature)) {
-                        Some(true) => SolanaOutboxState::Sent,
-                        Some(false) => SolanaOutboxState::Failed,
-                        None => continue,
-                    }
-                }
-                None => SolanaOutboxState::Failed,
-            };
+        for (mut expired, state) in self.sweep_targets(now_ms, live_block_heights, observed)? {
             expired.staged.status = if state == SolanaOutboxState::Sent {
                 SolanaTxStatus::Sent
             } else {
@@ -775,6 +791,34 @@ impl SolanaOutbox {
             count += 1;
         }
         Ok(count)
+    }
+
+    /// The expired pending entries a sweep would move, with their target
+    /// state. Empty when the sweep has nothing to do.
+    pub fn sweep_targets(
+        &self,
+        now_ms: u128,
+        live_block_heights: &std::collections::HashMap<String, u64>,
+        observed: &std::collections::HashSet<(String, String)>,
+    ) -> Result<Vec<(SolanaOutboxEntry, SolanaOutboxState)>, OutboxError> {
+        let mut targets = Vec::new();
+        for entry in self.expired_pending(now_ms, live_block_heights)? {
+            let state = if entry.dir.join(BROADCAST_ATTEMPT_FILE).exists() {
+                SolanaOutboxState::Sent
+            } else {
+                match self.recorded_signature(&entry)? {
+                    None => SolanaOutboxState::Failed,
+                    Some(signature) => {
+                        if !observed.contains(&(entry.staged.chain.clone(), signature)) {
+                            continue;
+                        }
+                        SolanaOutboxState::Sent
+                    }
+                }
+            };
+            targets.push((entry, state));
+        }
+        Ok(targets)
     }
 
     /// Pending entries [`Self::sweep_expired`] would expire, read without
@@ -811,9 +855,10 @@ impl SolanaOutbox {
                     }
                     let staged: StagedSolanaTransfer =
                         serde_json::from_slice(&fs::read(&intent_path)?)?;
-                    // Signed bytes may already have reached the RPC through
-                    // simulation. The sweep must check their signature before
-                    // retiring them; a missing broadcast marker proves nothing.
+                    // Signed bytes may already have reached an RPC, through
+                    // an older binary's simulation or a crash after the
+                    // broadcast marker. The sweep decides by marker and
+                    // observed signature; see `sweep_expired_with_statuses`.
                     let entry = SolanaOutboxEntry {
                         state: SolanaOutboxState::Pending,
                         staged,
@@ -822,8 +867,7 @@ impl SolanaOutbox {
                     let cluster_past_window = live_block_heights
                         .get(&entry.staged.chain)
                         .is_some_and(|height| *height > entry.staged.last_valid_block_height);
-                    if !entry.dir.join(BROADCAST_ATTEMPT_FILE).exists()
-                        && entry.staged.expires_ms != 0
+                    if entry.staged.expires_ms != 0
                         && now_ms >= entry.staged.expires_ms
                         && cluster_past_window
                     {
@@ -838,6 +882,38 @@ impl SolanaOutbox {
 
 fn blake3_hash(bytes: &[u8]) -> String {
     blake3::hash(bytes).to_hex().to_string()
+}
+
+fn read_projected_intent(
+    dir: &Path,
+    state: SolanaOutboxState,
+) -> Result<StagedSolanaTransfer, OutboxError> {
+    let mut staged: StagedSolanaTransfer =
+        serde_json::from_slice(&fs::read(dir.join("intent.json"))?)?;
+    match state {
+        SolanaOutboxState::Sent => staged.status = SolanaTxStatus::Sent,
+        SolanaOutboxState::Failed
+            if !matches!(
+                staged.status,
+                SolanaTxStatus::Expired | SolanaTxStatus::Cancelled
+            ) =>
+        {
+            staged.status = match fs::read(dir.join("transition-status.json")) {
+                Ok(bytes) => match serde_json::from_slice::<SolanaTxStatus>(&bytes)? {
+                    SolanaTxStatus::Expired => SolanaTxStatus::Expired,
+                    _ => SolanaTxStatus::Cancelled,
+                },
+                // Legacy interrupted moves cannot prove expiry; never offer
+                // automatic restaging based on a guessed terminal reason.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    SolanaTxStatus::Cancelled
+                }
+                Err(error) => return Err(error.into()),
+            };
+        }
+        _ => {}
+    }
+    Ok(staged)
 }
 
 fn write_atomic(path: impl AsRef<Path>, body: &[u8]) -> Result<(), OutboxError> {

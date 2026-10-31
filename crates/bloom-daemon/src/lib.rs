@@ -5106,26 +5106,8 @@ impl Daemon {
                             },
                         }
                         if let Some(solana_outbox) = &solana_outbox {
-                            // Live heights first: a Solana entry may only be
-                            // terminally expired when the cluster itself has
-                            // moved past the blockhash window. Chains whose
-                            // height cannot be observed are retained this
-                            // tick rather than judged by the wall estimate.
-                            let mut live_heights = std::collections::HashMap::new();
-                            for name in solana_chains.list_names() {
-                                let Some(client) = solana_chains.get(&name) else {
-                                    continue;
-                                };
-                                match client.get_block_height().await {
-                                    Ok(height) => {
-                                        live_heights.insert(name, height);
-                                    }
-                                    Err(error) => {
-                                        warn!(chain = %name, error = %error, "solana_outbox.sweep_height_unavailable")
-                                    }
-                                }
-                            }
-                            let mut signature_statuses = std::collections::HashMap::new();
+                            let live_heights = solana_sweep_heights(&solana_chains).await;
+                            let mut observed = std::collections::HashSet::new();
                             match solana_outbox.expired_pending(now_ms, &live_heights) {
                                 Ok(entries) => for entry in entries {
                                     let Ok(Some(signature)) = solana_outbox.recorded_signature(&entry) else {
@@ -5134,18 +5116,16 @@ impl Daemon {
                                     let Some(client) = solana_chains.get(&entry.staged.chain) else {
                                         continue;
                                     };
-                                    // Each probe searches transaction history. A single
-                                    // lagging endpoint cannot establish absence.
+                                    // Each probe searches transaction history. Only an
+                                    // observation counts; absence never retires a signature.
                                     let probes = client.probe_signature_status_all_endpoints(&signature).await;
-                                    let found = probes.iter().any(|probe| matches!(&probe.status, Ok(Some(_))));
-                                    let absent = !probes.is_empty() && probes.iter().all(|probe| matches!(&probe.status, Ok(None)));
-                                    if found || absent {
-                                        signature_statuses.insert((entry.staged.chain, signature), found);
+                                    if probes.iter().any(|probe| matches!(&probe.status, Ok(Some(_)))) {
+                                        observed.insert((entry.staged.chain, signature));
                                     }
                                 },
                                 Err(error) => warn!(error = %error, "solana_outbox.sweep_signature_scan_failed"),
                             }
-                            match run_solana_expiry_sweep_once(solana_outbox, &audit, now_ms, &live_heights, &signature_statuses) {
+                            match run_solana_expiry_sweep_once(solana_outbox, &audit, now_ms, &live_heights, &observed) {
                                 Ok(0) => tracing::trace!("solana_outbox.sweep_expired.empty"),
                                 Ok(n) => info!(swept = n, "solana_outbox.sweep_expired"),
                                 Err(e) => warn!(error = %e, "solana_outbox.sweep_expired_failed"),
@@ -5336,6 +5316,31 @@ fn run_expiry_sweep_once(
     swept.map_err(|error| error.to_string())
 }
 
+/// Live heights for the expiry sweep: a Solana entry may only be terminally
+/// expired when every configured endpoint has finalized past the blockhash
+/// window. Chains where any endpoint lags or cannot answer report their
+/// lowest height or none, so their entries are retained this tick rather
+/// than judged by the wall estimate.
+async fn solana_sweep_heights(
+    chains: &bloom_solana::SolanaChainRegistry,
+) -> std::collections::HashMap<String, u64> {
+    let mut live_heights = std::collections::HashMap::new();
+    for name in chains.list_names() {
+        let Some(client) = chains.get(&name) else {
+            continue;
+        };
+        match client.finalized_block_height_all_endpoints().await {
+            Ok(height) => {
+                live_heights.insert(name, height);
+            }
+            Err(error) => {
+                warn!(chain = %name, error = %error, "solana_outbox.sweep_height_unavailable")
+            }
+        }
+    }
+    live_heights
+}
+
 /// Solana sibling of [`run_expiry_sweep_once`]: same audit-wrapped shape,
 /// over `bloom_solana_tx::outbox::SolanaOutbox` instead of EVM's
 /// `bloom_tx::outbox::Outbox` (Fix D, PLAN-SOLANA-PR-FIXES.md).
@@ -5344,11 +5349,11 @@ fn run_solana_expiry_sweep_once(
     audit: &AuditLog,
     now_ms: u128,
     live_block_heights: &std::collections::HashMap<String, u64>,
-    signature_statuses: &std::collections::HashMap<(String, String), bool>,
+    observed: &std::collections::HashSet<(String, String)>,
 ) -> Result<usize, String> {
     // As for EVM: an idle tick changes nothing and is not journaled.
     if outbox
-        .expired_pending(now_ms, live_block_heights)
+        .sweep_targets(now_ms, live_block_heights, observed)
         .map_err(|error| error.to_string())?
         .is_empty()
     {
@@ -5380,7 +5385,7 @@ fn run_solana_expiry_sweep_once(
         .map_err(|error| {
             format!("Machine audit unavailable before Solana expiry sweep: {error}")
         })?;
-    let swept = outbox.sweep_expired_with_statuses(now_ms, live_block_heights, signature_statuses);
+    let swept = outbox.sweep_expired_with_statuses(now_ms, live_block_heights, observed);
     let result = match &swept {
         Ok(count) => serde_json::json!({"outcome": "completed", "swept": count}),
         Err(error) => serde_json::json!({"outcome": "error", "error": error.to_string()}),
@@ -8192,7 +8197,7 @@ ws_url = "wss://example.invalid"
                     &d.audit,
                     now_ms,
                     &std::collections::HashMap::new(),
-                    &std::collections::HashMap::new(),
+                    &std::collections::HashSet::new(),
                 )
                 .unwrap(),
                 0
@@ -8213,6 +8218,59 @@ ws_url = "wss://example.invalid"
     // above: call the sweep function directly rather than waiting on the
     // real 60s tick, but exercise the exact outbox root
     // `spawn_background_tasks` itself constructs (`home.outbox_dir()`).
+    /// A loopback Solana RPC answering `getBlockHeight` with `height`, or
+    /// failing every request when `height` is `None`.
+    async fn spawn_solana_height_stub(height: Option<u64>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let _ = socket.read(&mut [0u8; 8192]).await;
+                let body = match height {
+                    Some(h) => format!(r#"{{"jsonrpc":"2.0","id":1,"result":{h}}}"#),
+                    None => r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"down"}}"#
+                        .to_string(),
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        format!("http://{addr}/")
+    }
+
+    /// Every configured endpoint must be past the window before the sweep
+    /// may retire even an unsigned entry.
+    #[tokio::test]
+    async fn solana_sweep_height_requires_every_endpoint() {
+        let fast = spawn_solana_height_stub(Some(200)).await;
+        for slow in [Some(50), None] {
+            let slow = spawn_solana_height_stub(slow).await;
+            let registry = bloom_solana::SolanaChainRegistry::new();
+            registry.add(
+                bloom_solana::SolanaClient::build(&bloom_solana::SolanaSpec {
+                    name: "solana-devnet".into(),
+                    endpoints: [&fast, &slow]
+                        .map(|url| bloom_solana::EndpointSpec {
+                            url: url.to_string(),
+                            weight: 100,
+                            cu_per_sec: None,
+                            max_rps: None,
+                            http_only: false,
+                        })
+                        .to_vec(),
+                    expected_genesis_base58: None,
+                })
+                .unwrap(),
+            );
+            let heights = solana_sweep_heights(&registry).await;
+            assert!(heights.get("solana-devnet").is_none_or(|h| *h <= 50));
+        }
+    }
+
     #[tokio::test]
     async fn solana_sweep_reaps_an_expired_staged_transfer() {
         let dir = tempfile::tempdir().unwrap();
@@ -8248,7 +8306,7 @@ ws_url = "wss://example.invalid"
             &d.audit,
             2,
             &std::collections::HashMap::from([("solana-devnet".to_string(), 101_u64)]),
-            &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
         )
         .unwrap();
         assert_eq!(n, 1, "an abandoned, expired Solana stage must be reaped");
